@@ -65,7 +65,7 @@ def family_of(tiles: "Tiles", dtype) -> mosaic.Family:
     warps arranged for a consumer's share of the tile (`mosaic_sm80.Mma.for_tile`)."""
     if tiles.family != 'mma.sync':
         return FAMILY
-    return mosaic_sm80.Mma.for_tile(dtype, tiles.block_m // tiles.warpgroups, tiles.block_n, tiles.block_k)
+    return mosaic_sm80.Mma.for_tile(dtype, tiles.block_m // tiles.warpgroups, tiles.block_n)
 
 
 @dataclasses.dataclass(frozen=True)

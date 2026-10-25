@@ -104,18 +104,13 @@ class Mma(mosaic.Family):
     operands_in_registers = True
 
     @classmethod
-    def for_tile(cls, dtype, rows: int, columns: int, depth: int) -> "Mma":
-        """The bundle for a warpgroup's `rows` x `columns` of a tile stepping `depth` deep: its warps
-        arranged as `MMALayouts` allows (an accumulator atom of `m_warps * 16` rows by `(4 // m_warps) * 8`
-        columns dividing them), the arrangement whose replicated fragments are fewest: the left operand's
-        rows a step deep replicated over the warps along the columns, the right operand's columns a
-        sub-step deep over those along the rows (`lhs_copies`, `rhs_copies`, `fragment_depth`), at the most
-        warps along the rows of those tied (CUTLASS's warp tiles split both)."""
-        bundle = cls(jnp.dtype(dtype))
-        sub = bundle.fragment_depth(depth)
-        fitting = [m for m in (4, 2, 1) if rows % (m * 16) == 0 and columns % ((4 // m) * 8) == 0]
-        return cls(jnp.dtype(dtype),
-                   min(fitting or [4], key=lambda m: 4 // m * rows * depth + m * sub * columns))
+    def for_tile(cls, dtype, rows: int, columns: int) -> "Mma":
+        """The bundle for a warpgroup's `rows` x `columns` of a tile, its warps arranged as Mosaic GPU's
+        layout inference arranges an mma of that accumulator (`MMALayouts.for_shape`, which its mma rule
+        fixes: the most warps along the rows whose atom, `m_warps * 16` rows by `(4 // m_warps) * 8`
+        columns, divides it), so its layouts are the ones the lowering assigns."""
+        m_warps = next((m for m in (4, 2, 1) if rows % (m * 16) == 0 and columns % ((4 // m) * 8) == 0), 4)
+        return cls(jnp.dtype(dtype), m_warps)
 
     @property
     def lhs_copies(self) -> int:
@@ -131,6 +126,7 @@ class Mma(mosaic.Family):
         # 8-row tiles allow (a swizzled row takes no slice narrower than its tile).
         return min(depth, 8 * max(32 // (jnp.dtype(self.dtype).itemsize * 8), 1))
     most_shared = 163 * 1024  # sm80's and sm87's opt-in block (sm86's and sm89's 99 KiB)
+    copy_unit = mosaic.THREADS  # cp.async spreads a copy over the warpgroup's threads
     reduction_scratch = plgpu.CompilerParams().reduction_scratch_bytes  # its kernels' default parameters
     column_scratch = 0  # its column sums take its kernels' reduction scratch
 

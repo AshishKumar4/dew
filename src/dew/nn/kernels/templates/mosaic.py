@@ -460,6 +460,11 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     (TMA's, 256): an operand block tiled in 8 rows by a swizzled row stays far below it at any tile its
     registers hold, and a one-dimensional side operand's block, untiled, is at most it
     (`grouped_matmul._Mosaic.fitting`); None where cp.async moves a block (mma.sync's)."""
+    copy_unit: int = 1
+    """The elements a copy of an untiled block moves a multiple of: one where TMA moves it, a warpgroup's
+    threads' (128) where cp.async does (Mosaic GPU spreads a copy over its threads, an element each at
+    least: 'CP_ASYNC requires the number of elements to be a multiple of 128', R9-gpu-a100), which a
+    one-dimensional side operand's block along its axis is (`grouped_matmul._Mosaic.legal`)."""
     most_shared: int
     """The most shared memory a block of any GPU of the family holds (CUDA's opt-in limit), which bounds
     the stages a generated tile takes; a GPU's own (`generation.shared_budget`) bounds the tiles its
