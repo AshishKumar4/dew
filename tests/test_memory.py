@@ -16,8 +16,9 @@ from dew.nn.memory import Gate, InContextMemory, LinearMemory, MLPMemory, Object
 from dew.nn.precision import L2NORM_EPS
 
 WIDTH, HEADS, FEATURES, LENGTH, CHUNK, ROWS = 32, 2, 16, 12, 4, 8
-MEMORY_SEEDS = 32
-"""The declared seeds for check 1 of the memories (`assert_as_exact`), sized by `seeds_for` on armada."""
+MEMORY_SEEDS = 8
+"""The declared seeds for check 1 of the memories (`assert_as_exact`): `seeds_for` on armada sizes every
+configuration, its token-by-token path included, at 8 over the drawn weights."""
 
 CONFIGURATIONS = {
     # TTT-Linear (Sec 2.7): f(x) = x + LN(W x), the L2 reconstruction (Eq 4), eta(x) = eta_base sigmoid(.).
