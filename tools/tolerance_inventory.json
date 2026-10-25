@@ -494,7 +494,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_optim.py": {
-   "comparisons": 2,
+   "comparisons": 1,
    "lane": "Training"
   },
   "tests/test_optim_schedules.py": {
