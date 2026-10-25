@@ -1825,5 +1825,6 @@ def every_layer_windowed(fields: CausalTransformer) -> bool:
 
 
 def check_decoder_tree(variables: Mapping[str, object], model) -> None:
-    """`check_tree` against a decoder, whose `init` reads one row of token ids."""
+    """`check_tree` against a decoder or its media wrapper, whose `init` reads one row of token ids
+    (a wrapper's conditioners then build the smallest media their towers take)."""
     check_tree(variables, model, np.zeros((1, 2), np.int32))
