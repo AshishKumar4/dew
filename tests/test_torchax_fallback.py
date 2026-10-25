@@ -36,6 +36,7 @@ from reference_error import (
 from dew.data.dataset import Loader
 from dew.interop import Pretrained
 from dew.interop.torchax_fallback import TorchLayout, TransformersTierWarning
+from dew.nn.inputs import coordinates
 from dew.nn.protocols import Lacks
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -368,64 +369,73 @@ PACKED_SEEDS = 8
 
 
 def packed_rows(seed):
-    """Two rows of SEQ token ids, each two documents cut at a drawn place, and their documents."""
+    """Two rows of SEQ + 1 token ids, each two documents cut at a drawn place, their documents, and the
+    loss's cotangent, one."""
     rng = np.random.default_rng([0xBAC, seed])
-    ids = rng.integers(0, TINY["vocab_size"], (2, SEQ)).astype(np.int32)
+    ids = rng.integers(0, TINY["vocab_size"], (2, SEQ + 1)).astype(np.int32)
     cuts = rng.integers(3, SEQ - 3, 2)
-    return ids, np.where(np.arange(SEQ)[None, :] < cuts[:, None], 1, 2).astype(np.int32)
+    segments = np.where(np.arange(SEQ + 1)[None, :] < cuts[:, None], 1, 2).astype(np.int32)
+    return ids, segments, np.float32(1)
 
 
-def documents_alone(model, ids, segments):
-    """transformers' run of each document of the rows on its own: the logits laid back where the
-    document sits, the summed next-token loss within the documents, and each parameter's gradient."""
-    model.zero_grad()
-    logits, total = torch.zeros((*ids.shape, TINY["vocab_size"]), dtype=torch.float64), 0
-    for row in range(ids.shape[0]):
-        for document in np.unique(segments[row]):
-            at = np.flatnonzero(segments[row] == document)
-            run = torch.from_numpy(ids[row, at].astype(np.int64))[None]
-            out = model(run).logits
-            logits[row, at] = out[0].detach().double()
-            total = total + torch.nn.functional.cross_entropy(out[0, :-1], run[0, 1:], reduction="sum")
-    total.backward()
-    return {"logits": logits.numpy(), "loss": np.asarray([total.item()])} | {
-        name: parameter.grad.double().numpy() for name, parameter in model.named_parameters()}
+def documents_alone(model, ids, segments, cotangent, stored=torch.float32):
+    """transformers' run of each document of the rows on its own: the mean next-token loss over every
+    document's targets, as `LMObjective` scores a packed batch, and each parameter's gradient under
+    the cotangent (`torch_with_gradients`)."""
+    entry = torch.float64 if next(model.parameters()).dtype == torch.float64 else torch.float32
+    weights = {name: parameter.detach().to(entry).numpy() for name, parameter in model.named_parameters()}
+    runs = [torch.from_numpy(ids[row, segments[row] == document].astype(np.int64))[None]
+            for row in range(ids.shape[0]) for document in np.unique(segments[row])]
+
+    def loss(params):
+        total = sum(torch.nn.functional.cross_entropy(
+            torch.func.functional_call(model, params, (run,)).logits[0, :-1], run[0, 1:], reduction="sum")
+            for run in runs)
+        return total / sum(run.shape[1] - 1 for run in runs)
+
+    value, gradients = torch_with_gradients(loss)(weights, cotangent)
+    return {"loss": np.asarray([value], np.float64)} | {
+        name: torch.from_numpy(gradient).to(stored).double().numpy() for name, gradient in gradients.items()}
 
 
 def test_a_packed_row_trains_each_document_as_transformers_runs_it_alone(tmp_path):
-    """On Dew's attention a tier-3 model reads packed rows: each document attends within itself and
-    rotates from its own first token, so the packed rows' logits, their next-token loss within the
-    documents and every parameter's gradient are as exact as transformers' run of each document on
-    its own, measured from that run in float64 (check 1)."""
+    """On Dew's attention a tier-3 model trains on packed rows: each document attends within itself and
+    rotates from its own first token, so `LMObjective`'s loss over the packed rows and every
+    parameter's gradient are as exact as transformers' run of each document on its own, measured from
+    that run in float64 (check 1)."""
     model = saved_cohere(tmp_path)
     with pytest.warns(TransformersTierWarning):
         loaded = Pretrained.load(tmp_path, dtype="float32")
+    objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
     names = [name for name, _ in model.named_parameters()]
 
     @jax.jit
-    def stepped(params, ids, segments):
+    def stepped(params, ids, segments, cotangent):
         def loss(params):
-            logits = loaded.model.apply({**loaded.variables, "params": params}, ids, segment_ids=segments,
-                                        method="logits")
-            chosen = jnp.take_along_axis(jax.nn.log_softmax(logits[:, :-1]), ids[:, 1:, None], -1)[..., 0]
-            return -jnp.sum(jnp.where(segments[:, 1:] == segments[:, :-1], chosen, 0)), logits
-        (value, logits), gradients = jax.value_and_grad(loss, has_aux=True)(params)
-        return {"logits": logits, "loss": value[None]} | {name: gradients[name] for name in names}
+            stats, _ = objective.loss({**loaded.variables, "params": params},
+                                      {"text": ids, "text_coordinates": coordinates(segments=segments)},
+                                      Step(step=jnp.int32(0), key=jax.random.key(1), ema=None))
+            return objective.reduce_loss(stats)[0]
+        value, gradients = with_gradients(loss)(params, cotangent)
+        return {"loss": value[None]} | {name: gradients[name] for name in names}
 
-    def ours(ids, segments):
-        return stepped(loaded.variables["params"], jnp.asarray(ids), jnp.asarray(segments))
+    def ours(ids, segments, cotangent):
+        return stepped(loaded.variables["params"], jnp.asarray(ids), jnp.asarray(segments), cotangent)
 
+    reference = copy.deepcopy(model)
     with float64():
         wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
                                                              attn_implementation="eager")
         wide.load_state_dict(model.state_dict())
 
-    def truth(ids, segments):
+    def truth(ids, segments, cotangent):
         with float64():
-            return documents_alone(wide, ids, segments)
+            return documents_alone(wide, ids, segments, cotangent, torch.float64)
 
-    assert_as_exact(ours, lambda ids, segments: documents_alone(model, ids, segments), packed_rows,
-                    "tier 3 cohere packed rows", seeds=PACKED_SEEDS, truth_fn=truth)
+    def theirs(ids, segments, cotangent):
+        return documents_alone(reference, ids, segments, cotangent)
+
+    assert_as_exact(ours, theirs, packed_rows, "tier 3 cohere packed rows", seeds=PACKED_SEEDS, truth_fn=truth)
 
 
 def test_a_type_whose_attention_asks_no_interface_runs_its_own_and_reads_no_packing(tmp_path):
@@ -439,7 +449,7 @@ def test_a_type_whose_attention_asks_no_interface_runs_its_own_and_reads_no_pack
     with pytest.warns(TransformersTierWarning):
         loaded = Pretrained.load(tmp_path, dtype="float32")
     assert loaded.model.graph.attention_impl is None
-    ids, segments = packed_rows(0)
+    ids, segments, _ = packed_rows(0)
     with pytest.raises(Lacks):
         loaded.model.apply(loaded.variables, jnp.asarray(ids), segment_ids=jnp.asarray(segments),
                            method="logits")
