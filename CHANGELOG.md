@@ -5,6 +5,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- An autoencoder's latent normalization is one traced map, `dew.nn.autoencoders.LatentAffine`, which
+  `AutoEncoder.encode` and `decode` apply through one hook, `latent_affine(params, dtype)`: a configured
+  autoencoder's comes from its `LatentNormalization` (`affine`), a tuned REPA-E run's from its running
+  statistics. `LatentNormalization.normalized`/`restored` and `TunedAutoEncoder.running_normalization` are
+  gone: `latent_affine(...).normalized`/`restored` replace them.
 - A filtered or packed read resumes on any number of readers once it is prepared: publish its rows (and
   a terminal pack's plan) as a generation with `dew data publish` and read it by index, and a new run
   lowers to the global order. A per-share read refused on another topology now says so.
