@@ -67,9 +67,12 @@ GLM_FLASH = {"num_key_value_heads": 4, "n_routed_experts": 4, "num_experts_per_t
 
 @pytest.mark.parametrize("head_dim", ["absent", "null", "explicit"])
 def test_an_optional_size_stated_null_states_nothing(head_dim):
-    """CWM derives `head_dim` from its width and heads where its config leaves it out or states it
-    null, and the probe reads both alike, as an explicit one, verifying the same convention."""
-    from dew.interop.verify import VerifiedMapping, verify_mapping
+    """CwmConfig reads a null `head_dim` as its width over its heads and an absent one as its default,
+    128 (configuration_cwm.py:82, :109-110): the probe reads a null as stating nothing, so a null and an
+    explicit width over heads verify alike as the convention that computes them, and an absent one,
+    which no convention reads as 128, is a type none computes (`Unmapped`), never a probe that cannot
+    run."""
+    from dew.interop.verify import Unmapped, VerifiedMapping, verify_mapping
 
     config = tiny_config("cwm", sliding_window=4).to_dict()
     config.pop("head_dim", None)
@@ -77,7 +80,8 @@ def test_an_optional_size_stated_null_states_nothing(head_dim):
         config["head_dim"] = None
     elif head_dim == "explicit":
         config["head_dim"] = config["hidden_size"] // config["num_attention_heads"]
-    assert isinstance(verify_mapping(config), VerifiedMapping)
+    verdict = verify_mapping(config)
+    assert isinstance(verdict, Unmapped if head_dim == "absent" else VerifiedMapping), verdict
 
 
 @pytest.mark.parametrize("model_type, fields", [("cwm", {"sliding_window": 4}), ("glm4_moe_lite", GLM_FLASH)])
