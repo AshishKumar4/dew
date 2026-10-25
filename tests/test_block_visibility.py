@@ -127,7 +127,7 @@ def test_a_loaded_model_reads_blocks_on_the_kinds_an_override_names(tmp_path):
     """`Pretrained.load(..., modeling_overrides=)` turns block reading on for the layer kinds it names,
     on a family whose release states none, through the reader a release's own overrides take: a
     Llama's attention reads its blocks as the block-causal rule keeps them, bitwise, and without
-    groups computes the plain release's logits, bitwise; a hybrid's named kind reads blocks and its
+    groups computes the plain release's logits, bitwise; a wrapped hybrid's named kind reads blocks and its
     other kind is the release's; the saved model states the override and reloads reading blocks;
     and a recurrent kind refuses to read blocks."""
     from dew.interop import Pretrained
@@ -149,8 +149,9 @@ def test_a_loaded_model_reads_blocks_on_the_kinds_an_override_names(tmp_path):
     hybrid = Pretrained.load(HF / "qwen38-dense-tiny", dtype="float32", attention_impl="xla",
                              modeling_overrides=BLOCKED)
     release = Pretrained.load(HF / "qwen38-dense-tiny", dtype="float32", attention_impl="xla")
-    assert hybrid.model.kind_of("full_attention").mixer.bidirectional_blocks
-    assert hybrid.model.kind_of("linear_attention") == release.model.kind_of("linear_attention")
+    assert hybrid.model.language_model.kind_of("full_attention").mixer.bidirectional_blocks
+    assert hybrid.model.language_model.kind_of("linear_attention") == release.model.language_model.kind_of(
+        "linear_attention")
 
     blocked.save(tmp_path / "saved")
     stated = json.loads((tmp_path / "saved" / "config.json").read_text())["modeling_overrides"]
