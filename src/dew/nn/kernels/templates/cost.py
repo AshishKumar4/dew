@@ -15,9 +15,10 @@ multiprocessor's `resident` programs (`resident`) wait together (Little's law). 
     program  = max(program_flops / tensor rate, program_staged / shared-memory rate,
                    program_exponentials / special-function rate)
              + serial_staged / shared-memory rate + serial_exponentials / special-function rate
-    waiting  = steps · load latency / (stages - 1)
+    waiting  = steps · load latency / min(stages - 1, steps)
     tile     = program + serial_stored / (memory bandwidth / multiprocessors)
-    compute  = ceil(programs / (multiprocessors · resident)) · max(resident · tile, waiting)
+    compute  = ceil(programs / (multiprocessors · resident))
+               · max(min(resident, ceil(programs / multiprocessors)) · tile, waiting)
     memory   = device_bytes / memory bandwidth
     l2       = l2_bytes / L2 bandwidth
     seconds  = max(compute, memory, l2) + programs * steps * grid step seconds (TPU's)
@@ -108,10 +109,12 @@ def seconds(cost: Cost, target: generation.GpuTarget) -> float:
     program = program_seconds(cost, rate, clock) + cost.serial_stored * multiprocessors / bandwidth
     waiting = 0.0 if latency is None else waiting_seconds(cost, latency, clock)
     waves = math.ceil(cost.programs / (multiprocessors * cost.resident))
+    # A multiprocessor holds no more programs at once than a wave gives it.
+    resident = min(cost.resident, max(math.ceil(cost.programs / multiprocessors), 1))
     l2 = 0.0 if facts.l2_bandwidth is None else cost.l2_bytes / facts.l2_bandwidth
     step = facts.grid_step_seconds
     stepping = 0.0 if step is None else cost.programs * cost.steps * step
-    return max(waves * max(cost.resident * program, waiting), cost.device_bytes / bandwidth, l2) + stepping
+    return max(waves * max(resident * program, waiting), cost.device_bytes / bandwidth, l2) + stepping
 
 
 def program_seconds(cost: Cost, rate: float, clock: float) -> float:
@@ -127,8 +130,8 @@ def program_seconds(cost: Cost, rate: float, clock: float) -> float:
 
 def waiting_seconds(cost: Cost, latency: float, clock: float) -> float:
     """The seconds a program's steps wait on loads `latency` clocks long, its stages in flight hiding
-    `stages - 1` steps of it (Little's law, the module's docstring)."""
-    return cost.steps * latency / max(cost.stages - 1, 1) / clock
+    `stages - 1` steps of it, and never more steps than it takes (Little's law, the module's docstring)."""
+    return cost.steps * latency / max(min(cost.stages - 1, math.ceil(cost.steps)), 1) / clock
 
 
 def resident(target: generation.GpuTarget, staged: int, threads: int, registers: int) -> int:
