@@ -830,15 +830,6 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
                             tokenizer=recorded_tokenizer(self.processor),
                             processor=recorded_processor(self.processor))
 
-    def build_task(self, variables: Variables, *,
-                   processor: Processor | None | Omitted = OMITTED) -> TextGeneration:
-        """Return the decoder over `variables` as a generation task.
-
-        It samples, and uses the same token budget, as this objective's previews do.
-        """
-        return TextGeneration.from_settings(self.model, variables, self.task_settings(),
-                                            self.processor if processor is OMITTED else processor)
-
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      segment_ids=None, positions=None, routing: bool = False,
                      depths: bool = False, roles=None, qk_stats: bool = False,
