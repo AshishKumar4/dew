@@ -58,7 +58,7 @@ from dew.training.distributed import Layout
 
 if TYPE_CHECKING:
     import torch
-    from jax.extend.core import ClosedJaxpr
+    from jax.extend.core import Jaxpr
     from torchax.interop import JittableModule
     from transformers import PretrainedConfig, PreTrainedModel
 
@@ -620,7 +620,7 @@ def _at_opmath(env, lowering, keeps_fp32: tuple[int, str] | None):
     return computed
 
 
-def _accumulating(closed: ClosedJaxpr, *arguments: jax.Array) -> list[jax.Array]:
+def _accumulating(closed: Jaxpr, *arguments: jax.Array) -> list[jax.Array]:
     """`closed` evaluated on `arguments` with each broadcast of a floating value
     narrower than fp32 summing its gradient in fp32 (`_accumulated`): an explicit
     `broadcast_in_dim`, and the size-1 dimensions an elementwise operation
