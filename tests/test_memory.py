@@ -177,17 +177,21 @@ def test_a_decode_continues_the_full_pass():
 
 
 def test_a_zero_step_reads_the_initial_network():
-    """With no step, every token reads the initial network over its query, bit for bit, as that
-    network computes it: the update adds exact zeros."""
+    """With no step, every token reads the initial network over its query, as that network computes
+    it over the queries, on par against float64 (check 1): the update adds exact zeros."""
     module = InContextMemory(network=functools.partial(ResidualMemory, hidden=4 * FEATURES), heads=HEADS,
                              head_features=FEATURES, learning_rate=Gate(value=0.0), output=False,
                              chunk=CHUNK)
     params = module.init(jax.random.key(0), jnp.zeros((1, LENGTH, WIDTH)))
-    x = draw(2)[0]
-    read = np.asarray(module.apply(params, x)).reshape(2, LENGTH, HEADS, FEATURES)
-    network = ResidualMemory(hidden=4 * FEATURES)
-    queries = (x @ np.asarray(params["params"]["q_proj"]["kernel"])).reshape(2, LENGTH, HEADS, FEATURES)
-    for h in range(HEADS):
-        head = jax.tree.map(functools.partial(_head, h), params["params"]["initial"])
-        expected = network.apply({"params": head}, queries[:, :, h])
-        np.testing.assert_array_equal(read[:, :, h], np.asarray(expected))
+
+    def initial(x):
+        kernel = params["params"]["q_proj"]["kernel"].astype(x.dtype)
+        queries = (x @ kernel).reshape(-1, LENGTH, HEADS, FEATURES)
+        network = ResidualMemory(hidden=4 * FEATURES, dtype=x.dtype)
+        stored = params["params"]["initial"]
+        heads = [network.apply({"params": jax.tree.map(functools.partial(_head, h), stored)},
+                               queries[:, :, h]) for h in range(HEADS)]
+        return jnp.stack(heads, axis=2).reshape(-1, LENGTH, HEADS * FEATURES)
+
+    assert_as_exact(jax.jit(lambda x: module.apply(params, x)), jax.jit(initial), draw, "zero-step memory",
+                    seeds=MEMORY_SEEDS, truth_fn=initial)
