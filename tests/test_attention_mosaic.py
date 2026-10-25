@@ -445,33 +445,34 @@ def _forward_call(shape, width: int, value_width: int, residuals: bool):
 
 @pytest.mark.parametrize("residuals", [False, True], ids=["forward", "training"])
 @pytest.mark.parametrize(("width", "value_width"), [(128, 64), (128, 128), (128, 256), (256, 256)])
-def test_every_fitting_tile_stages_within_a_hoppers_block(width, value_width, residuals):
-    """On an H100 every forward tile that fits stages within its block (`generation.shared_budget`) and a
-    consumer's registers (`MosaicForward.register_budget`), whatever the widths, and the cost model picks one
-    of them: no table's tile, which at heads 256 wide staged 320 KiB against its 227 (ledger 1582). Where
-    none fits (a training forward's split sums and kept anchor row beside 256-wide values hold more
-    registers than a consumer has), the op is not eligible, so the route takes another mainloop. At D 128
-    the measured spill is out (a consumer of 128 queries: 2.9 to 4.6 ms against 0.49) and
-    FlashAttention-3's 64 queries over 128 keys in."""
+def test_the_derived_tiles_stage_within_a_hoppers_block(width, value_width, residuals):
+    """On an H100 the forward's tiles derived from the facts (`MosaicForward.derived`) stage within its
+    block (`generation.shared_budget`) and a consumer's registers (`register_budget`), whatever the widths:
+    no table's tile, which at heads 256 wide staged 320 KiB against its 227 (ledger 1582). Where none is
+    legal (a training forward's split sums and kept anchor row beside 256-wide values hold more registers
+    than a consumer has), the op is not eligible, so the route takes another mainloop. At D 128 the facts
+    give FlashAttention-3's 64 queries a consumer over 128 keys, two consumers, and three stages where the
+    walk keeps a value slot a step (the owed product), two for the training walk: a consumer of 128 queries
+    spills (2.9 to 4.6 ms against 0.49 measured)."""
     with generation.assumed("sm90"):
         target = generation.gpu_target()
         op, ba = _forward_call((2, 4096, 32, 8), width, value_width, residuals)
-        fits = op.fits(ba, target)
-        assert all(op.staged_bytes(ba, tiles, target) <= generation.shared_budget(target) for tiles in fits)
-        assert all(op.registers(ba, tiles) <= op.register_budget(tiles) for tiles in fits)
-        assert op.eligible(ba, target) == bool(fits)
-        assert not fits or op.estimate(ba, target)[1] in fits
-    assert bool(fits) == (value_width < 256 or not residuals)
-    if (width, value_width, residuals) == (128, 128, False):
-        assert not any(tiles.block_q == 128 and tiles.consumers == 2 for tiles in fits)
-        assert attention_mosaic.Tiles(64, 128, 2, 2) in fits
+        derived = op.derived(ba, target)
+        assert op.eligible(ba, target) == (derived is not None)
+        if derived is not None:
+            assert op.legal(ba, derived, target)
+            assert op.staged_bytes(ba, derived, target) <= generation.shared_budget(target)
+            assert op.registers(ba, derived) <= op.register_budget(derived)
+    assert (derived is not None) == (value_width < 256 or not residuals)
+    if (width, value_width) == (128, 128):
+        assert derived == attention_mosaic.Tiles(64, 128, 2 if residuals else 3, 2)
 
 
 @pytest.mark.parametrize("unseen", UNSEEN)
 def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give(unseen):
     """On a GPU no row measured the forward's and the backward's tiles come from the family's facts and the
     call's extents and fit the GPU's block, and the forward, the training forward and the backward at the
-    tiles the cost model picks on its facts alone are on par interpreted; on a family without this
+    tiles derived from its facts alone are on par interpreted; on a family without this
     mainloop's bundle neither op is eligible, so the route takes another mainloop
     (`attention_mosaic.backward_takes`)."""
     target = UNSEEN[unseen]
@@ -486,9 +487,9 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give(unseen):
             assert not attention_mosaic.backward_takes(query, key, value, spans, None, dout,
                                                       residuals=residuals)
             return
-        fits = op.fitting(ba, target)
-        assert fits and {tiles.family for tiles in fits} == {"wgmma"}
-        assert all(op.staged_bytes(ba, tiles, target) <= 180 * 1024 for tiles in fits)
+        derived = op.derived(ba, target)
+        assert derived is not None and derived.family == "wgmma"
+        assert op.staged_bytes(ba, derived, target) <= 180 * 1024
     _check_forward("causal", jnp.bfloat16, shape, natural=False, interpret=True, target=target)
     _check_forward("causal", jnp.bfloat16, shape, natural=False, interpret=True, training=True, target=target)
     _check_backward("causal", shape, form=None, interpret=True, target=target)

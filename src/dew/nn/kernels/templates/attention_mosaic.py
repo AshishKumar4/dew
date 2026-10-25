@@ -1,9 +1,9 @@
 """The attention template's Mosaic GPU mainloop as Template implementations (`MosaicForward`,
 `MosaicBackward`; design §6 and §7): the forward, its training form and the backward over every call form,
-their configs generated from the instruction family's facts and the call's extents, never a table, fitted to
-the device's block and a consumer's registers, and ranked by the cost model from the allocations, registers
-and work their launches take. A GPU nobody measured of a family with a bundle here (`BUNDLES`) takes its own
-facts' pick. The launches are `attention_mosaic_forward`'s and `attention_mosaic_backward`'s; what they share,
+each launch's one config derived from the instruction family's and the device's facts and the call's extents
+(`derived`), legal where its programs stage within the device's block and a consumer's registers hold its
+live set (`legal`): no table, no sweep, no space ranked. A GPU nobody measured of a family with a bundle here
+(`BUNDLES`) takes its own facts' config. The launches are `attention_mosaic_forward`'s and `attention_mosaic_backward`'s; what they share,
 `attention_mosaic_program`'s."""
 
 import dataclasses
@@ -258,8 +258,8 @@ class MosaicForward(_Mainloop[Tiles]):
     parameters (`score_params`, `output_params`, laid out by `score_kinds` and `output_kinds`) and the
     softmax's initial state (`Initial`, or None). Returns the output `[B, Q, H, Dv]` and, with `residuals`,
     the backward's residuals (`forward`'s). Its configs come from the family's facts and the call's extents
-    (`space`), fitted to the device's block and a consumer's registers (`fits`), the cost model's fastest
-    the heuristic (`costed`)."""
+    (`derived`), legal within the device's block and a consumer's registers (`legal`); its cost record
+    (`costed`) reports its predicted time."""
 
     HOOKS = ("score_mod", "output_mod")
     config_cls = Tiles
@@ -464,9 +464,9 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     """The template's backward on this mainloop (`gradients`) over the call's own arrays (`backward` gives
     them): its queries, keys, values and output cotangent, its spans' arrays, its score hook's parameters, its
     initial state (`Initial`, or None) and a training forward's residuals (`forward`'s). Returns its
-    gradients (`Gradients`). Its configs come from the family's facts and the call's extents (`space`),
-    fitted to the device's block and a consumer's registers (`fits`), the cost model's fastest the heuristic
-    (`cost`, both launches')."""
+    gradients (`Gradients`). Its config comes from the family's facts and the call's extents (`derived`),
+    legal within the device's block and a consumer's registers (`legal`); its cost (both launches') reports
+    its predicted time."""
 
     HOOKS = ("score_mod",)
     DIFFERENTIATED = True
