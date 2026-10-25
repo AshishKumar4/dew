@@ -528,28 +528,30 @@ def _families() -> dict[str, Family]:
         "a weight at the exponent's edge on a large value, bfloat16": edge("bfloat16"),
         "a decode step's weight at the exponent's edge on a large value, float32": edge_step("float32"),
         "a decode step's weight at the exponent's edge on a large value, bfloat16": edge_step("bfloat16"),
-        # The headroom is the accurate form's: the fold's sum of those values overflows.
+        # Their one divergence in the default form is their sums passing fp32's largest (`overflows`): the
+        # fold's sum of those values overflows where a walk does not guard its sums.
         "a small column beside an overflowing one": Family(_mixed_columns, np.ones((128, 1, 1, 5), bool),
-                                                           folded=False),
+                                                           folded=False, overflows=True),
         # Its values near 1, so the column's output is near fp32's least normal, a shifted product of
         # which would flush (`algebra.Partial.low`).
         "a column near fp32's least normal beside an overflowing one": Family(
-            functools.partial(_mixed_columns, small=(0.5, 1.0)), np.ones((128, 1, 1, 5), bool), folded=False),
+            functools.partial(_mixed_columns, small=(0.5, 1.0)), np.ones((128, 1, 1, 5), bool), folded=False,
+            overflows=True),
         "a cotangent on a small column beside an overflowing one": Family(
             functools.partial(_mixed_columns, small_cotangent=True), np.ones((128, 1, 1, 5), bool),
-            folded=False),
+            folded=False, overflows=True),
         "a tiny value beside an overflowing column at equal weights": Family(
-            _tiny_beside_large, np.ones((128, 1, 1, 4), bool), folded=False),
+            _tiny_beside_large, np.ones((128, 1, 1, 4), bool), folded=False, overflows=True),
         "an anchor-relative share beside an overflowing column": Family(
-            _anchor_relative, np.ones((64, 1, 1, 33), bool), folded=False),
+            _anchor_relative, np.ones((64, 1, 1, 33), bool), folded=False, overflows=True),
         "a column near fp32's least normal under a large cotangent": Family(
-            _least_normal_column, np.ones((64, 1, 1, 3), bool), folded=False),
+            _least_normal_column, np.ones((64, 1, 1, 3), bool), folded=False, overflows=True),
         # A share whose normalized weight is subnormal, in either dtype (the normalized pass's small
         # weights, `algebra.normalized_terms`).
         "a subnormal share of an overflowing row, float32": Family(
-            _subnormal_share, np.ones((64, 1, 1, 256), bool), folded=False),
+            _subnormal_share, np.ones((64, 1, 1, 256), bool), folded=False, overflows=True),
         "a subnormal share of an overflowing row, bfloat16": Family(
-            _subnormal_share, np.ones((64, 1, 1, 256), bool), folded=False, dtype="bfloat16"),
+            _subnormal_share, np.ones((64, 1, 1, 256), bool), folded=False, overflows=True, dtype="bfloat16"),
         # Every weight but one 1/255, bf16's worst rounding of a weight, beside the subnormal share.
         "keys near fp32's largest at equal logits": Family(_large_keys, _kept(1, 8)),
         "a far maximum in a later key tile": Family(_far_maximum_in_a_later_tile,
@@ -559,7 +561,7 @@ def _families() -> dict[str, Family]:
         "keys an ulp apart, bfloat16": Family(_near_keys("bfloat16"), _kept(1, 2), dtype="bfloat16"),
         "a subnormal share beside 255 equal weights, bfloat16": Family(
             functools.partial(_subnormal_share, equal=True), np.ones((64, 1, 1, 256), bool), folded=False,
-            dtype="bfloat16"),
+            overflows=True, dtype="bfloat16"),
     }
     return {**families, **_structured_families()}
 
@@ -580,18 +582,18 @@ def _structured_families() -> dict[str, Family]:
     documents = np.tile(np.asarray([[1, 1, 2, 2, 2, 2]], np.int32), (ROWS, 1))
     families["a row that overflows beside one that does not"] = Family(
         _beside, documents[:, None, :, None] == documents[:, None, None, :], {"segment_ids": documents},
-        folded=False)
+        folded=False, overflows=True)
 
     families["two finite slices whose merge overflows"] = Family(_slices, _kept(1, 64), splits=2,
-                                                                 folded=False)
+                                                                 folded=False, overflows=True)
 
     families["a resumed state of a large denominator"] = Family(_resumed, np.ones((RESUMED, 1, 1, 2), bool),
                                                                 folded=False)
-    # The headroom is the accurate form's: the fold's sum of those values overflows.
+    # Their one divergence in the default form is their sums passing fp32's largest (`overflows`).
     families["a resumed state beside an overflowing column"] = Family(
-        _resumed_beside_overflow, np.ones((RESUMED, 1, 1, 2), bool), folded=False)
+        _resumed_beside_overflow, np.ones((RESUMED, 1, 1, 2), bool), folded=False, overflows=True)
     families["a resumed state of a denominator near fp32's largest beside an overflowing column"] = Family(
-        _resumed_huge_denominator, np.ones((RESUMED, 1, 1, 3), bool), folded=False)
+        _resumed_huge_denominator, np.ones((RESUMED, 1, 1, 3), bool), folded=False, overflows=True)
     families["fp16 values near their largest beside a state near fp32's largest"] = Family(
         _fp16_beside_a_large_state, np.ones((RESUMED, 1, 1, 2), bool), dtype="float16")
     for low, high, label in ((-3.0, 3.0, ""), (1e38, 3e38, " near fp32's largest")):
