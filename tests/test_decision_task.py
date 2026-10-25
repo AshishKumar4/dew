@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from decision_support import decision_rows
@@ -600,3 +601,91 @@ def test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh(decide):
     alone, scores = task.score(examples), spread(decide.variables).score(examples)
     assert set(scores) == set(alone) and all(np.isfinite(value) for value in scores.values())
     assert scores["accuracy"] == alone["accuracy"]
+
+
+AVERAGE_SEEDS = 8
+"""Check 1's declared seeds for three runs' fp32 mean against float64's."""
+
+
+def trained_runs(decide, tmp_path, count: int, *, name: str = "run") -> list[str]:
+    """`count` runs of the task trained apart, one more step each, from one head (the task's own, held):
+    each a checkpoint of its own, as averaging reads them."""
+    import optax
+
+    from dew.checkpoints import Checkpoints
+    from dew.decision import DecisionObjective
+    from dew.training.trainer import Trainer
+
+    runs = []
+    for index in range(count):
+        objective = DecisionObjective(decide)
+        data = decision_rows(answered() * 2, 8, answered(), objective=objective.data())
+        directory = str(tmp_path / f"{name}{index}")
+        checkpoints = Checkpoints(directory, keep=1)
+        Trainer(objective, optax.adam(1e-3), key=index, checkpoints=checkpoints).fit(
+            data, steps=index + 1, log_every=100, checkpoint_every=index + 1, eval_every=100)
+        checkpoints.wait()
+        runs.append(directory)
+    return runs
+
+
+def test_runs_that_share_a_head_average_their_weights_in_fp32_as_float64_does(decide, tmp_path):
+    from etils import epath
+
+    """Runs trained apart from one held head average: two runs' mean is float64's rounded to fp32
+    exactly (halves are exact, and the sum rounds once), and three runs' within check 1 of float64's
+    mean, over draws of their weights; the task's weights record every run's step and read, so no one
+    run's directory may hold its calibration (`save` refuses), and `calibrate_on` refits it."""
+    runs = trained_runs(decide, tmp_path, 3)
+    tasks = [Decide.from_run(run) for run in runs]
+    two = Decide.averaged(runs[:2])
+    for leaf, one, other in zip(jax.tree.leaves(two.variables), jax.tree.leaves(tasks[0].variables),
+                                jax.tree.leaves(tasks[1].variables), strict=True):
+        if np.issubdtype(np.asarray(leaf).dtype, np.floating):
+            halves = (np.asarray(one, np.float64) + np.asarray(other, np.float64)) / 2
+            expected = halves.astype(np.float32)
+            assert np.array_equal(np.asarray(leaf), expected)
+    assert two.weights is not None
+    assert [entry[0] for entry in two.weights.averaged] == [str(epath.Path(run)) for run in runs[:2]]
+    assert two.calibration == Calibration()
+    with pytest.raises(ValueError):
+        two.save(runs[0])
+
+    def draw(seed):
+        rng = np.random.default_rng([0xA7, seed])
+        return tuple(rng.standard_normal(8).astype(np.float32) * (10.0 ** rng.integers(-3, 4))
+                     for _ in range(3))
+
+    def averaged(*leaves):
+        shares = [jnp.asarray(leaf, jnp.float32) / 3 for leaf in leaves]
+        return sum(shares[1:]) + shares[0]
+
+    def wide(*leaves):
+        return sum(leaves) / 3
+
+    assert_as_exact(averaged, wide, draw, "three runs' mean", seeds=AVERAGE_SEEDS)
+    calibrated = Decide.averaged(runs[:2], calibrate_on=answered())
+    assert calibrated.calibration != Calibration()
+
+
+def test_runs_whose_heads_started_apart_do_not_average(decide, tmp_path):
+    """A run whose head was drawn from another seed, or that recorded no head identity, does not
+    average with others, nor does a single run."""
+    from dew.decision import DecisionObjective
+    from dew.objectives.base import joined
+
+    runs = trained_runs(decide, tmp_path, 2)
+    with pytest.raises(ValueError):
+        Decide.averaged(runs[:1])
+    backbone = {name: value["backbone"] for name, value in decide.variables.items() if "backbone" in value}
+    drawn = []
+    for seed in (0, 1, None):
+        objective = DecisionObjective(decide.model.backbone, variables=joined({"backbone": backbone}),
+                                      tokenizer=decide.tokenizer, specials=decide.specials,
+                                      layout=decide.layout, head=decide.model.head, head_seed=seed)
+        identity = objective.task_settings().head_identity
+        assert identity == (None if seed is None else {"drawn": seed})
+        drawn.append(identity)
+    held = DecisionObjective(decide).task_settings().head_identity
+    assert isinstance(held, dict) and set(held) == {"held"}
+    assert drawn[0] != drawn[1] and held not in drawn
