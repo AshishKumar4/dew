@@ -18,8 +18,9 @@ import optax
 import pytest
 from jax.extend.core import ClosedJaxpr, Jaxpr, Literal
 from jax.sharding import NamedSharding, PartitionSpec as P
+from learning_gate import assert_learns, within
 from model_support import largest_difference
-from reference_error import assert_as_exact_as_the_reference, equations
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations, without_ynn
 
 from dew.config import OptimConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -42,7 +43,7 @@ from dew.optim import (
     weight_decay_mask,
 )
 from dew.training import MeshSpec
-from tools.muonclip_reference import clip_qk_kernel, clip_scale
+from tools.muonclip_reference import clip_mla_reference, clip_qk_kernel, clip_scale
 
 LR = 1e-3
 
@@ -99,77 +100,79 @@ def at(tree, path):
     return tree
 
 
-def test_the_embedding_the_head_and_the_norms_take_the_adamw_update():
-    """AdamW's own update for the three kinds the labs keep out of Muon.
-    Anything orthogonalized here would carry Newton-Schulz's shape scaling
-    instead, which is a factor, not a rounding difference.
+UPDATE_SEEDS = 8
+"""Check 1's declared seeds for a group's update against optax's transform on the parameter alone
+(`seeds_for`)."""
 
-    Equality is at fp32, not bitwise: the same transform inside the whole
-    tree fuses differently from the same transform on one parameter. Largest
-    observed absolute difference 3.5e-10, on updates of 1.5e-3.
-    """
-    params = decoder_params()
-    updates, grads = group_updates(params)
+
+def drawn_tree(params, seed):
+    """`params`'s tree drawn afresh for a seed, its parameters and a gradient of each, both standard
+    normal scaled as the decoder's own init and its gradients run (a gradient a hundredth)."""
+    keys = iter(jax.random.split(jax.random.key(seed), 2 * len(jax.tree.leaves(params))))
+
+    def normal(scale):
+        return lambda leaf: np.asarray(scale * jax.random.normal(next(keys), leaf.shape, leaf.dtype))
+
+    return jax.tree.map(normal(1.0), params), jax.tree.map(normal(1e-2), params)
+
+
+def assert_updates_as(solver, reference, params, paths, label, *, flatten=None, seeds=UPDATE_SEEDS):
+    """Check 1: `solver`'s update of drawn parameters under drawn gradients, at each of `paths`, on par with
+    `reference`'s update of each parameter alone, both from `reference`'s float64 run. `flatten` reshapes a
+    path's gradient to the matrix the reference steps, and the update back."""
+    shape = flatten or (lambda path, value: value)
+
+    def dew(params, grads):
+        updates, _ = solver.update(grads, solver.init(params), params)
+        return [shape(path, at(updates, path)) for path in paths]
+
+    def alone(params, grads):
+        steps = []
+        for path in paths:
+            grad, param = shape(path, at(grads, path)), shape(path, at(params, path))
+            steps.append(reference.update(grad, reference.init(param), param)[0])
+        return steps
+
+    assert_as_exact(without_ynn(dew), without_ynn(alone), lambda seed: drawn_tree(params, seed), label,
+                    seeds=seeds, truth_fn=alone)
+
+
+def test_the_embedding_the_head_and_the_norms_take_the_adamw_update():
+    """AdamW's own update for the three kinds the labs keep out of Muon, on
+    par with optax's AdamW on each parameter alone (check 1). Anything
+    orthogonalized here would carry Newton-Schulz's shape scaling instead,
+    which is a factor, not a rounding difference."""
     # optax.adamw decays by 1e-4 unless told otherwise, and this solver was
     # built with no weight decay at all.
-    reference = optax.adamw(LR, nesterov=True, weight_decay=0.0)
-
-    for path in [('params', 'embed_tokens', 'embedding'),
-                 ('params', 'lm_head', 'kernel'),
-                 ('params', 'norm', 'scale'),
-                 ('params', 'layers_0', 'self_attn', 'q_norm', 'scale')]:
-        param, grad = at(params, path), at(grads, path)
-        expected, _ = reference.update(grad, reference.init(param), param)
-        np.testing.assert_allclose(np.asarray(at(updates, path)),
-                                   np.asarray(expected), atol=1e-8)
+    assert_updates_as(muon_solver(), optax.adamw(LR, nesterov=True, weight_decay=0.0), decoder_params(),
+                      [('params', 'embed_tokens', 'embedding'), ('params', 'lm_head', 'kernel'),
+                       ('params', 'norm', 'scale'), ('params', 'layers_0', 'self_attn', 'q_norm', 'scale')],
+                      "the AdamW group")
 
 
 def test_the_projections_and_the_mlp_take_the_muon_update():
-    """The other side of the split, against Muon run on that matrix alone.
-    Largest observed absolute difference 8.4e-10, on updates of 5e-4."""
-    params = decoder_params()
-    updates, grads = group_updates(params)
-    reference = optax.contrib.muon(LR)
-
-    for path in [('params', 'layers_0', 'self_attn', 'q_proj', 'kernel'),
-                 ('params', 'layers_0', 'self_attn', 'o_proj', 'kernel'),
-                 ('params', 'layers_1', 'mlp', 'down_proj', 'kernel')]:
-        param, grad = at(params, path), at(grads, path)
-        expected, _ = reference.update(grad, reference.init(param), param)
-        np.testing.assert_allclose(np.asarray(at(updates, path)),
-                                   np.asarray(expected), atol=1e-8)
+    """The other side of the split, on par with Muon run on that matrix alone (check 1)."""
+    assert_updates_as(muon_solver(), optax.contrib.muon(LR), decoder_params(),
+                      [('params', 'layers_0', 'self_attn', 'q_proj', 'kernel'),
+                       ('params', 'layers_0', 'self_attn', 'o_proj', 'kernel'),
+                       ('params', 'layers_1', 'mlp', 'down_proj', 'kernel')], "the Muon group")
 
 
 def test_a_head_expanded_projection_orthogonalizes_its_flattened_head_side():
     """The axes the recipe cares about. A DiT query kernel is
     [embed, heads, head_dim] and a decoder's is [embed, heads * head_dim], so
     the update has to be the same either way: the head dimensions are one side
-    of the matrix, not a batch of matrices.
-
-    Newton-Schulz reduces over the same elements in a different order once the
-    head axes are separate, so this is equality at fp32 and not bitwise. The
-    largest observed absolute difference is 5.3e-10, on updates of order
-    2.5e-4.
-    """
-    params = dit_params()
-    updates, grads = group_updates(params)
-    reference = optax.contrib.muon(LR)
-
+    of the matrix, not a batch of matrices. Over drawn kernels and gradients,
+    each update on par with optax's Muon of the flattened matrix (check 1)."""
     query = ('params', 'dit_block_0', 'attention', 'to_q', 'kernel')
-    grad = at(grads, query)
-    flat = {'kernel': grad.reshape(grad.shape[0], -1)}
-    expected, _ = reference.update(flat, reference.init(flat), flat)
-    np.testing.assert_allclose(
-        np.asarray(at(updates, query)).reshape(flat['kernel'].shape),
-        np.asarray(expected['kernel']), atol=1e-8)
-
     out = ('params', 'dit_block_0', 'attention', 'to_out_0', 'kernel')
-    out_grad = at(grads, out)
-    out_flat = {'kernel': out_grad.reshape(-1, out_grad.shape[-1])}
-    expected_out, _ = reference.update(out_flat, reference.init(out_flat), out_flat)
-    np.testing.assert_allclose(
-        np.asarray(at(updates, out)).reshape(out_flat['kernel'].shape),
-        np.asarray(expected_out['kernel']), atol=1e-8)
+
+    def flattened(path, value):
+        # The query's heads are its output side, the output projection's its input side.
+        return value.reshape(value.shape[0], -1) if path == query else value.reshape(-1, value.shape[-1])
+
+    assert_updates_as(muon_solver(), optax.contrib.muon(LR), dit_params(), [query, out],
+                      "the head-expanded projections", flatten=flattened)
 
 
 
@@ -190,20 +193,15 @@ def test_a_schedule_that_marks_no_rate_is_its_own_shape():
     state = solver.init(params)
     for step in range(3):
         _, state = solver.update({"w": jnp.ones(3)}, state, params)
-        np.testing.assert_allclose(float(learning_rate(state)), 0.4 * 0.5 ** step, rtol=1e-6)
+        # A power of two times the float32 start: exact.
+        np.testing.assert_array_equal(learning_rate(state), np.float32(0.4) * np.float32(0.5) ** step)
 
 def test_weight_decay_reaches_the_norm_scales():
     """Decay on the norm scale is the piece of the recipe that lives in the
     AdamW group (docs/research/frontier-training.md:184), so the config's
     decay has to reach that group as well as Muon's."""
-    params = decoder_params()
-    decayed, _ = group_updates(params, weight_decay=0.1)
-    plain, _ = group_updates(params)
-
-    path = ('params', 'norm', 'scale')
-    difference = np.asarray(at(decayed, path)) - np.asarray(at(plain, path))
-    np.testing.assert_allclose(difference, -LR * 0.1 * np.asarray(at(params, path)),
-                               rtol=1e-5)
+    assert_updates_as(muon_solver(weight_decay=0.1), optax.adamw(LR, nesterov=True, weight_decay=0.1),
+                      decoder_params(), [('params', 'norm', 'scale')], "the norm scale's decay")
 
 
 @pytest.mark.parametrize('optimizer, state_dtype', [('adam', 'float32'), ('adam', 'bfloat16'),
@@ -232,29 +230,38 @@ def test_both_groups_step_with_the_one_schedule():
     """One schedule multiplies both groups. Neither group's state depends on
     the learning rate, so a scheduled run is the unscaled run times the
     schedule, for a Muon parameter and an AdamW one alike. A second constant
-    on either group would break that on the group that kept it.
-    """
-    params = decoder_params()
-    grads = fixed_gradients(params)
+    on either group would break that on the group that kept it. Over drawn
+    parameters and gradients, each of five scheduled updates on par with the
+    unscaled run's times the rate the scheduled run reports at its step
+    (check 1), both from the unscaled run's float64 run times optax's warmup
+    cosine in float64. The rate's own rounding is the schedules' tests'."""
     cosine = Cosine(init_value=1e-4, peak_value=4e-3, end_value=1e-3, warmup_steps=1, decay_steps=4)
     scheduled = OptimConfig(optimizer='muon', learning_rate=cosine).build(4)
     unscaled = OptimConfig(optimizer='muon', learning_rate=1.0).build(4)
     rate = optax.warmup_cosine_decay_schedule(
         init_value=cosine.init_value, peak_value=cosine.peak_value,
         warmup_steps=cosine.warmup_steps, decay_steps=4, end_value=cosine.end_value)
+    paths = [('params', 'embed_tokens', 'embedding'), ('params', 'layers_0', 'mlp', 'up_proj', 'kernel')]
+    params = decoder_params()
+    state, reported = scheduled.init(params), []
+    for _ in range(5):
+        _, state = scheduled.update(jax.tree.map(jnp.zeros_like, params), state, params)
+        reported.append(np.float32(learning_rate(state)))
 
-    scheduled_state, unscaled_state = scheduled.init(params), unscaled.init(params)
-    for step in range(5):
-        scheduled_updates, scheduled_state = scheduled.update(
-            grads, scheduled_state, params)
-        unscaled_updates, unscaled_state = unscaled.update(
-            grads, unscaled_state, params)
-        for path in [('params', 'embed_tokens', 'embedding'),
-                     ('params', 'layers_0', 'mlp', 'up_proj', 'kernel')]:
-            np.testing.assert_allclose(
-                np.asarray(at(scheduled_updates, path)),
-                float(rate(step)) * np.asarray(at(unscaled_updates, path)),
-                rtol=2e-4, atol=1e-12, err_msg=f"step {step} {path}")
+    def steps(solver, scale):
+        def walked(params, grads):
+            state, taken = solver.init(params), []
+            for step in range(5):
+                updates, state = solver.update(grads, state, params)
+                taken += [scale(step) * at(updates, path) for path in paths]
+            return taken
+        return walked
+
+    assert_as_exact(without_ynn(steps(scheduled, lambda step: 1.0)),
+                    without_ynn(steps(unscaled, lambda step: reported[step])),
+                    lambda seed: drawn_tree(decoder_params(), seed), "one schedule over both groups",
+                    seeds=UPDATE_SEEDS,
+                    truth_fn=jax.jit(steps(unscaled, lambda step: rate(jnp.asarray(step, jnp.float64)))))
 
 
 def test_an_expert_stack_is_orthogonalized_one_expert_at_a_time():
@@ -272,14 +279,23 @@ def test_an_expert_stack_is_orthogonalized_one_expert_at_a_time():
     spec = at(muon_weight_dimension_numbers(params), path)
     assert spec.reduction_axis == (1,) and spec.output_axis == (2,)
 
-    updates, grads = group_updates(params)
-    grad = at(grads, path)
-    reference = optax.contrib.muon(LR)
-    for expert in range(experts):
-        one = {'kernel': grad[expert]}
-        expected, _ = reference.update(one, reference.init(one), one)
-        np.testing.assert_allclose(np.asarray(at(updates, path)[expert]),
-                                   np.asarray(expected['kernel']), atol=1e-8)
+    assert_updates_as(muon_solver(), ExpertByExpert(optax.contrib.muon(LR)), params, [path],
+                      "an expert stack, one expert at a time")
+
+
+class ExpertByExpert(typing.NamedTuple):
+    """`transform` stepping each matrix of an expert stack, its leading axis, alone: the reference of a
+    stack Muon steps one expert at a time."""
+
+    transform: optax.GradientTransformation
+
+    def init(self, params):
+        return [self.transform.init(one) for one in params]
+
+    def update(self, grads, state, params):
+        steps = [self.transform.update(grad, one, param)[0]
+                 for grad, one, param in zip(grads, state, params, strict=True)]
+        return jnp.stack(steps), state
 
 
 @pytest.mark.mesh(devices=4)
@@ -291,26 +307,33 @@ def test_an_expert_stack_placed_over_the_mesh_is_orthogonalized_one_expert_at_a_
     scales, so each normalized alone takes optax's update for that matrix
     alone, where normalizing the stack as one would share a scale among them."""
     experts, embed, mlp = 4, 8, 16
-    path = ('params', 'layers_0', 'mlp', 'experts', 'gate_proj', 'kernel')
     mesh = MeshSpec(**spec).build(jax.devices()[:4])
     placement = NamedSharding(mesh, P("expert", "fsdp" if "fsdp" in spec else None, None))
-    grad = (jnp.asarray([1.0, 16.0, 0.25, 2.0])[:, None, None]
-            * jnp.concatenate([jnp.eye(embed), jnp.zeros((embed, mlp - embed))], axis=1))
+    scales = np.asarray([1.0, 16.0, 0.25, 2.0], np.float32)[:, None, None]
 
-    def stacked(value):
-        return {'params': {'layers_0': {'mlp': {'experts': {'gate_proj': {
-            'kernel': jax.device_put(value, placement)}}}}}}
+    def draw(seed):
+        grad = np.asarray(jax.random.normal(jax.random.key(seed), (embed, mlp)))
+        return (np.asarray(jax.random.normal(jax.random.key(seed + (1 << 20)), (experts, embed, mlp))),
+                scales * grad)
 
-    params, grads = stacked(jnp.zeros((experts, embed, mlp))), stacked(grad)
     solver = muon_solver()
-    with jax.set_mesh(mesh):
-        updates, _ = jax.jit(solver.update)(grads, solver.init(params), params)
-    reference = optax.contrib.muon(LR)
-    for expert in range(experts):
-        one = {'kernel': grad[expert]}
-        expected, _ = reference.update(one, reference.init(one), one)
-        np.testing.assert_allclose(np.asarray(at(updates, path)[expert]),
-                                   np.asarray(expected['kernel']), atol=1e-8)
+
+    def placed(params, grads):
+        def stacked(value):
+            return {'params': {'layers_0': {'mlp': {'experts': {'gate_proj': {
+                'kernel': jax.device_put(value, placement)}}}}}}
+
+        with jax.set_mesh(mesh):
+            updates, _ = jax.jit(solver.update)(stacked(grads), solver.init(stacked(params)), stacked(params))
+        return np.asarray(updates['params']['layers_0']['mlp']['experts']['gate_proj']['kernel'])
+
+    alone = ExpertByExpert(optax.contrib.muon(LR))
+
+    def reference(params, grads):
+        return alone.update(grads, alone.init(params), params)[0]
+
+    assert_as_exact(placed, without_ynn(reference), draw, f"an expert stack over {spec}", seeds=UPDATE_SEEDS,
+                    truth_fn=reference)
 
 
 def test_a_matrix_declared_with_no_axis_named_is_orthogonalized_as_one_matrix():
@@ -340,12 +363,8 @@ def test_the_router_gate_takes_the_adamw_update():
     path = ('params', 'layers_0', 'mlp', 'gate', 'kernel')
     assert at(muon_weight_dimension_numbers(params), path) is None
 
-    updates, grads = group_updates(params)
-    reference = optax.adamw(LR, nesterov=True, weight_decay=0.0)
-    param, grad = at(params, path), at(grads, path)
-    expected, _ = reference.update(grad, reference.init(param), param)
-    np.testing.assert_allclose(np.asarray(at(updates, path)),
-                               np.asarray(expected), atol=1e-8)
+    assert_updates_as(muon_solver(), optax.adamw(LR, nesterov=True, weight_decay=0.0), params, [path],
+                      "the router gate")
 
 
 # --------------------------------------------------------------------------
@@ -421,26 +440,33 @@ def test_a_quiet_clip_steps_like_muon():
     assert largest_difference(updates, expected) == 0.0
 
 
+CLIP_SEEDS = 8
+"""Check 1's declared seeds for the QK-Clip against the paper's equations (`seeds_for`)."""
+
+
 def test_the_clip_matches_the_paper_equations():
     """Per-head query and key rescale against the paper's equations in
-    tools/muonclip_reference.py: one head fires at half, the rest hold.
-    Observed on CPU: 6.0e-08."""
-    params, grads = qk_tree()
+    tools/muonclip_reference.py, over drawn kernels and gradients (check 1):
+    one head fires at half, the rest hold."""
     stats = qk_stats(values=[[200.0, 50.0, 10.0, 5.0],
                              [10.0, 10.0, 10.0, 10.0],
                              [10.0, 10.0, 10.0, 10.0]])
     tx = scale_by_qk_clip(100.0)
-    updates, _ = tx.update(grads, tx.init(params), params, qk_stats=stats)
-    s_max = np.max(np.asarray(stats['layers_0']['self_attn']['max_logits'][0]),
-                   axis=0)
-    gamma = clip_scale(s_max, 100.0)
-    for proj in ('q_proj', 'k_proj'):
-        stepped = (np.asarray(params['layers_0']['self_attn'][proj]['kernel'])
-                   + np.asarray(grads['layers_0']['self_attn'][proj]['kernel']))
-        expected = clip_qk_kernel(stepped, np.asarray(gamma), 4)
-        applied = (np.asarray(params['layers_0']['self_attn'][proj]['kernel'])
-                   + np.asarray(updates['layers_0']['self_attn'][proj]['kernel']))
-        assert float(np.max(np.abs(applied - expected))) < 1e-6
+
+    def applied(params, grads):
+        updates, _ = tx.update(grads, tx.init(params), params, qk_stats=stats)
+        return optax.apply_updates(params, updates)
+
+    def paper(params, grads):
+        s_max = jnp.max(jnp.asarray(stats['layers_0']['self_attn']['max_logits'][0], params[
+            'layers_0']['self_attn']['q_proj']['kernel'].dtype), axis=0)
+        gamma = clip_scale(s_max, 100.0)
+        return {'layers_0': {'self_attn': {proj: {'kernel': clip_qk_kernel(
+            params['layers_0']['self_attn'][proj]['kernel'] + grads['layers_0']['self_attn'][proj]['kernel'],
+            gamma, 4)} for proj in ('q_proj', 'k_proj')}}}
+
+    assert_as_exact(without_ynn(applied), without_ynn(paper), lambda seed: qk_tree(seed=seed),
+                    "the clip against the paper", seeds=CLIP_SEEDS, truth_fn=paper)
 
 
 @pytest.mark.parametrize("case", ["gqa", "mha"])
@@ -493,14 +519,53 @@ def test_a_gated_query_clips_its_query_half_and_bounds_the_logits():
     params = variables["params"]
     updates, _ = tx.update(jax.tree.map(jnp.zeros_like, params), tx.init(params), params, qk_stats=stats)
     clipped = optax.apply_updates(params, updates)
-    _, resown = model.apply({**variables, "params": clipped}, ids, mutable=["qk"])
     query, query_after = (np.asarray(tree["layers_0"]["self_attn"]["q_proj"]["kernel"]).reshape(16, 4, 2, -1)
                           for tree in (params, clipped))
     np.testing.assert_array_equal(query_after[:, :, 1], query[:, :, 1])
     eta = np.minimum(1.0, tau / before.reshape(2, 2).max(axis=1)).repeat(2)
     assert 0 < np.sum(eta < 1) < 4
-    after = np.max(np.asarray(resown["qk"]["layers_0"]["self_attn"]["max_logits"][0]), axis=0)
-    np.testing.assert_allclose(after, before * eta, rtol=1e-5)
+
+    # Over drawn decoders and tokens, the maxima read after the clip on par with the maxima before it
+    # times each group's eta (check 1), the truth both of the decoder in float64. The threshold is the
+    # draw's, between the two groups' float32 maxima; the clip takes it as a number.
+    initialized = jax.jit(lambda key: model.init(key, jnp.ones((1, 8), jnp.int32)))
+
+    def maxima(of, variables, ids):
+        _, sown = of.apply(variables, ids, mutable=["qk"])
+        return sown["qk"], jnp.max(sown["qk"]["layers_0"]["self_attn"]["max_logits"][0], axis=0)
+
+    def draw(seed):
+        variables = initialized(jax.random.key(seed))
+        tokens = jax.random.randint(jax.random.key(seed + (1 << 20)), (2, 8), 0, 32)
+        groups = np.asarray(maxima(model, variables, tokens)[1]).reshape(2, 2).max(axis=1)
+        return variables, tokens, np.float32(np.mean(groups))
+
+    def read_after(variables, ids, tau):
+        stats, _ = maxima(model, variables, ids)
+        tx = scale_by_qk_clip(float(tau))
+        params = variables["params"]
+        updates, _ = tx.update(jax.tree.map(jnp.zeros_like, params), tx.init(params), params, qk_stats=stats)
+        return maxima(model, {**variables, "params": optax.apply_updates(params, updates)}, ids)[1]
+
+    def paper(of):
+        def clipped_then_read(variables, ids, tau):
+            # The paper's clip, written on the weights: each group's query heads and its key head by
+            # the root of its eta, the gate half of each query head untouched; then the same tokens read.
+            before = maxima(of, variables, ids)[1]
+            root = jnp.sqrt(clip_scale(before.reshape(2, 2).max(axis=1), tau))
+            attention = dict(variables["params"]["layers_0"]["self_attn"])
+            query = jnp.asarray(attention["q_proj"]["kernel"]).reshape(16, 2, 2, 2, -1)
+            query = query.at[:, :, :, 0].multiply(root[None, :, None, None].astype(query.dtype))
+            key = jnp.asarray(attention["k_proj"]["kernel"]).reshape(16, 2, -1) * root[None, :, None].astype(
+                query.dtype)
+            attention["q_proj"] = {**attention["q_proj"], "kernel": query.reshape(16, -1)}
+            attention["k_proj"] = {**attention["k_proj"], "kernel": key.reshape(16, -1)}
+            layer = {**variables["params"]["layers_0"], "self_attn": attention}
+            return maxima(of, {**variables, "params": {**variables["params"], "layers_0": layer}}, ids)[1]
+        return clipped_then_read
+
+    assert_as_exact(read_after, paper(model), draw, "the gated query's clip", seeds=CLIP_SEEDS,
+                    truth_fn=paper(model.clone(dtype=jnp.float64)))
 
 
 def test_a_biased_projection_clips_its_bias_with_its_kernel_and_bounds_the_logits():
@@ -538,31 +603,39 @@ def test_the_latent_branches_match_maxtext():
     """The MLA branches against MaxText 0.2.4's own outputs, committed as
     tests/fixtures/muonclip/maxtext_mla.json: `q_proj` stands in for `wq_b`
     and `kv_b_proj` for `wkv_b`, the same per-head tensors under Dew's
-    names. Observed on CPU: at most 4.7e-09."""
+    names. Each case's clipped kernel held by the float64 rule to MaxText's
+    own float32 output, its truth the fixture's transcription of MaxText
+    (`clip_mla_reference`, recorded bit for bit equal to it) in float64."""
     fixture = json.loads(QK_FIXTURE.read_text())
     assert fixture['maxtext'] == '0.2.4'
-    worst = 0.0
     tx = scale_by_qk_clip(100.0)
-    for case in fixture['cases']:
+    for index, case in enumerate(fixture['cases']):
         proj = 'q_proj' if case['layer'] == 'wq_b' else 'kv_b_proj'
-        flat = np.asarray(case['param']).reshape(
-            len(case['param']), -1)
+        param = np.asarray(case['param'], np.float32)
+        flat = param.reshape(len(param), -1)
         params = {'l': {'m': {proj: {'kernel': jnp.asarray(flat)}}}}
         grads = jax.tree.map(jnp.zeros_like, params)
-        stats = {'l': {'m': {
-            'max_logits': (jnp.asarray(case['max_logits'], jnp.float32),),
-            'qk_nope': jnp.asarray(case['qk_nope'])}}}
+        max_logits = np.asarray(case['max_logits'], np.float32)
+        stats = {'l': {'m': {'max_logits': (jnp.asarray(max_logits),),
+                             'qk_nope': jnp.asarray(case['qk_nope'])}}}
         updates, _ = tx.update(grads, tx.init(params), params, qk_stats=stats)
-        applied = (flat + np.asarray(updates['l']['m'][proj]['kernel'])
-                   ).reshape(np.asarray(case['expected']).shape)
-        worst = max(worst, float(np.max(np.abs(applied - case['expected']))))
-    assert worst < 1e-6, worst
+        applied = np.asarray(optax.apply_updates(params, updates)['l']['m'][proj]['kernel'])
+        applied = applied.reshape(param.shape)
+        with jax.enable_x64(new_val=True):
+            scale = np.asarray(clip_scale(np.max(max_logits.astype(np.float64), axis=0), case['tau']))
+        truth = clip_mla_reference(param.astype(np.float64), scale, case['qk_nope'], case['layer'])
+        assert_as_exact_as_the_reference(applied, np.asarray(case['expected'], np.float32), truth,
+                                         f"MaxText's {case['layer']}, case {index}")
 
 
 def test_the_threshold_rides_optimizer_opts():
     """`--optim.optimizer-opts '{"qk_clip_threshold": 5.0}'` reaches the
     transform: maxima of 50 clip nothing at the default 100, and rescale
-    each side by sqrt(5/50) at 5, so their product carries the tenth."""
+    each side by sqrt(5/50) at 5, so their product carries the tenth. Held
+    to its prior bound: as an additive update, the clip's kernel loses about
+    one over the root of its scale of the accuracy the paper's direct rescale
+    keeps (3.1 times its distance from float64 at a tenth, over 40 draws),
+    a finding of its own (ledger 1659)."""
     params, grads = qk_tree()
     stats = qk_stats(values=[[50.0] * 4] * 3)
     default = muonclip_solver()
@@ -621,7 +694,9 @@ def test_the_sow_reports_the_kernels_logits():
     _, sown_doubled = model.apply(doubled, ids, mutable=["qk"])
     before = sown["qk"]["layers_0"]["self_attn"]["max_logits"][0]
     after = sown_doubled["qk"]["layers_0"]["self_attn"]["max_logits"][0]
-    assert float(jnp.max(jnp.abs(after / before - 2.0))) < 1e-5
+    # Doubling a binary float is exact, and the projection, the rotary and the scaled dot product
+    # commute with it, so the doubled queries' maxima are the maxima doubled, bit for bit.
+    np.testing.assert_array_equal(after, 2 * before)
     # Layer 1 reads layer 0's output, so its maxima legitimately move; what
     # has to hold there is presence and finiteness, not equality.
     (downstream,) = sown_doubled["qk"]["layers_1"]["self_attn"]["max_logits"]
@@ -710,21 +785,40 @@ def test_bf16_state_takes_optax_adamw_steps_from_the_fp32_moments():
     """The update is computed from the fp32 moments before they are rounded.
     The first starts from zero moments, which bf16 holds exactly, so it is
     the fp32-state AdamW update (`OPTIMIZER_MAP`), its options (nesterov,
-    eps_root, b2) included, to fp32 rounding; the second is that update to the
-    rounding of the bf16 state."""
-    params = decoder_params()
-    grads = jax.tree.map(lambda p: jax.random.normal(jax.random.key(1), p.shape) * 1e-2, params)
+    eps_root, b2) included; the second is AdamW's update from the bf16 state's
+    own moments, widened. Each over drawn parameters and gradients, on par
+    with optax's (check 1), its truth optax's float64 run from the same
+    moments."""
     opts = {'nesterov': True, 'eps_root': 1e-8}
     reference = OPTIMIZER_MAP['adamw'](LR, b2=0.99, weight_decay=0.0, **opts)
     solver = bf16_state_adamw(b2=0.99, optimizer_opts=opts)
-    expected_state, state = reference.init(params), solver.init(params)
-    for rtol, atol in ((1e-6, 0.0), (1e-2, 1e-7)):
-        expected, expected_state = reference.update(grads, expected_state, params)
-        update, state = solver.update(grads, state, params)
-        for want, have in zip(jax.tree.leaves(expected), jax.tree.leaves(update), strict=True):
-            np.testing.assert_allclose(have, want, rtol=rtol, atol=atol)
-    moments = state.inner_state[0]
-    assert {leaf.dtype for leaf in jax.tree.leaves((moments.mu, moments.nu))} == {jnp.dtype(jnp.bfloat16)}
+    first = jax.jit(lambda grads, params: solver.update(grads, solver.init(params), params)[1])
+
+    def draw(seed):
+        params, grads = drawn_tree(decoder_params(), seed)
+        moments = first(grads, params).inner_state[0]
+        # The bf16 state's moments after one step, widened exactly, and its count.
+        return params, grads, np.asarray(moments.count), *(jax.tree.map(
+            lambda leaf: np.asarray(leaf, np.float32), tree) for tree in (moments.mu, moments.nu))
+
+    def second(params, grads, count, mu, nu):
+        state = first(grads, params)
+        moments = state.inner_state[0]
+        assert {leaf.dtype for leaf in jax.tree.leaves((moments.mu, moments.nu))} == {jnp.dtype(jnp.bfloat16)}
+        return solver.update(grads, state, params)[0]
+
+    def from_moments(params, grads, count, mu, nu):
+        state = reference.init(params)
+        adam = state[0]._replace(count=jnp.asarray(count), mu=mu, nu=nu)
+        return reference.update(grads, (adam, *state[1:]), params)[0]
+
+    def fresh(params, grads, *_):
+        return reference.update(grads, reference.init(params), params)[0]
+
+    assert_as_exact(jax.jit(lambda params, grads, *_: solver.update(grads, solver.init(params), params)[0]),
+                    jax.jit(fresh), draw, "the bf16 state's first step", seeds=UPDATE_SEEDS, truth_fn=fresh)
+    assert_as_exact(second, jax.jit(from_moments), draw, "the bf16 state's second step", seeds=UPDATE_SEEDS,
+                    truth_fn=from_moments)
 
 
 def test_bf16_state_keeps_the_second_moments_small_increments():
@@ -745,9 +839,12 @@ def test_bf16_state_keeps_the_second_moments_small_increments():
         _, expected = reference_update(grads, expected, params)
         _, state = solver_update(grads, state, params)
     want = float(expected.nu['w'][0])
-    have = float(jnp.mean(state.inner_state[0].nu['w'].astype(jnp.float32)))
     assert want < 0.4
-    assert have == pytest.approx(want, rel=1e-2)
+    # Each entry's rounding is its own draw: over the entries, their mean within a hundredth of the fp32
+    # moment (the learning gate's two one-sided contrasts, each entry a unit).
+    entries = np.asarray(state.inner_state[0].nu['w'], np.float64)
+    assert_learns(lambda numbers: within("the second moment", entries[numbers], want, 1e-2 * want),
+                  "stochastically rounded second moments", units=entries.size)
 
 
 def program_of(closed) -> tuple:
@@ -834,6 +931,9 @@ def test_a_configured_optimizer_is_optaxs_own_at_the_rate_its_state_holds(optimi
         expected, expected_state = reference.update(grads, expected_state, params)
         for have, want in zip(jax.tree.leaves(updates), jax.tree.leaves(expected), strict=True):
             np.testing.assert_array_equal(np.asarray(have), np.asarray(want))
+        # The reported rate is the rate the reference steps by, and near its schedule's float64 value:
+        # held to its prior bound, as the rate is a scale and a shape each rounded (ledger 1660).
+        np.testing.assert_array_equal(learning_rate(state), np.float32(jnp.float32(scale) * ratio(step)))
         with jax.enable_x64(new_val=True):
             # optax counts in int32, which divides to float32: a float64 count keeps the schedule float64.
             exact = scale if schedule is None else float(
