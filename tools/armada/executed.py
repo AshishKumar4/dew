@@ -34,7 +34,7 @@ from pathlib import Path
 import followed
 import pytest
 from followed import CHILDREN, checkout, reads_backend
-from session import MARKS
+from session import DURATIONS, MARKS
 
 TOOL = 3
 """sys.monitoring's tool ids 0-2 and 5 are the debugger's, coverage's, the profiler's and the optimizer's."""
@@ -107,7 +107,9 @@ def conftest(name: str) -> bool:
 def audited(event, args):
     if event in followed.READS:
         read = followed.read(event, args, root)
-        if read is not None:
+        # The durations record is split.py's, which cuts a split file from it: the file's own entries are its
+        # groups' input (ci.py's `cache_key`), and no other file's.
+        if read is not None and read != str(DURATIONS):
             current[-1].add(read)
         return
     kind = followed.start(event, args, str(children)) if running else None

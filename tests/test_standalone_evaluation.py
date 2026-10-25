@@ -1,6 +1,5 @@
 """Standalone evaluation uses the same variables, RNG and metrics as fit."""
 
-import logging
 import pickle
 
 import jax
@@ -18,6 +17,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import LMObjective, Perplexity, Samples
 from dew.sampling import Sampling
+from dew.telemetry.instrumentation import Compiles
 from dew.training import MeshSpec
 
 
@@ -50,37 +50,27 @@ def test_a_run_compiles_its_evaluations_before_its_first_step():
     batch = {"text": np.tile(np.array([1, 2, 3, 4, 1], np.int32), (8, 1))}
     data = Loader(lambda partition: iter([batch] * 4), lambda partition: iter([batch, batch]), records=8,
                   batch=8)
-    compiles: list[str] = []
-
-    class Compiles(logging.Handler):
-        def emit(self, record):
-            if "Finished XLA compilation" in record.getMessage():
-                compiles.append(record.getMessage())
+    compiled = Compiles(None)
 
     class Reports(Recording):
-        """Each report's step, whether it is an evaluation's, and the compiles before it."""
+        """Each report's step, whether it is an evaluation's, and the programs compiled before it."""
         def __init__(self):
             super().__init__()
             self.reports = []
 
         def log(self, scalars, step):
             super().log(scalars, step)
-            self.reports.append((step, any(name.startswith("val/") for name in scalars), len(compiles)))
+            self.reports.append((step, any(name.startswith("val/") for name in scalars), compiled.count))
 
     tracker = Reports()
-    handler, logger = Compiles(), logging.getLogger("jax")
-    logger.addHandler(handler)
-    try:
-        with jax.log_compiles():
-            Trainer(objective, optax.adam(.01), key=jax.random.key(1), tracker=tracker).fit(
-                data, steps=4, eval_every=2, log_every=2, metrics=(Perplexity(),), preview=True)
-    finally:
-        logger.removeHandler(handler)
+    with compiled:
+        Trainer(objective, optax.adam(.01), key=jax.random.key(1), tracker=tracker).fit(
+            data, steps=4, eval_every=2, log_every=2, metrics=(Perplexity(),), preview=True)
     evaluated = [index for index, (_, evaluation, _) in enumerate(tracker.reports) if evaluation]
     assert [tracker.reports[index][0] for index in evaluated] == [2, 4], tracker.reports
     for index in evaluated:
         (_, steps, before), (_, _, after) = tracker.reports[index - 1], tracker.reports[index]
-        assert not steps and compiles[before:after] == [], (tracker.reports, compiles[before:after])
+        assert not steps and before == after, (tracker.reports, compiled.programs)
     assert sum(isinstance(artifact, TextSamples) for artifact in tracker.artifacts) == 2
 
 

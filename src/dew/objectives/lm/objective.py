@@ -449,7 +449,7 @@ def router_z_terms(routing: Variables, weight: float, batch: Batch, queries: jax
     for _, node in _sown_nodes(routing, "log_z"):
         (log_z,) = node["log_z"]
         valid = _router_queries(log_z.shape, queries, documents)
-        dtype = jnp.promote_types(log_z.dtype, jnp.float32)
+        dtype = at_least_fp32(log_z.dtype)
         total = Objective.row_mean(jnp.where(valid, jnp.square(log_z.astype(dtype)), 0), batch).total
         mass = Objective.row_mean(valid.astype(dtype), batch).total
         terms.append(Ratio(weight * total, mass))
@@ -464,7 +464,7 @@ def router_moments(scores: jax.Array, indices: jax.Array, batch: Batch,
     position chose, `[rows, positions, top_k]`.
     """
     experts = scores.shape[-1]
-    dtype = jnp.promote_types(scores.dtype, jnp.float32)
+    dtype = at_least_fp32(scores.dtype)
     valid = _router_queries(scores.shape[:2], queries, documents)
     # These counts enter a floating loss, unlike the exact integer bias effects.
     summed = Objective.row_mean(jnp.where(valid[..., None], scores.astype(dtype), 0), batch, axis=(0, 1))
@@ -910,7 +910,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         kept = tuple(self._layer_states().layer_state(gathered, index) for index in layers)
         predict = self.token_accuracy if predict is None else predict
         table = self._fused_head(params) if z_loss is not None else None
-        dtype = jnp.promote_types(hidden.dtype, jnp.float32)
+        dtype = at_least_fp32(hidden.dtype)
         weights = self._row_weights(prepared, roles, dtype)
         total = None
         whole = model_logits(self.model, params, hidden) if logits else None

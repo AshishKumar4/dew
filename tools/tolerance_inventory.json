@@ -149,10 +149,6 @@
    "comparisons": 4,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_decode_drift.py": {
-   "comparisons": 2,
-   "lane": "Accuracy Gate"
-  },
   "tests/test_decoder_export.py": {
    "comparisons": 16,
    "lane": "Models, Serving & RL"
@@ -458,7 +454,7 @@
    "lane": "Training"
   },
   "tests/test_mean_flow.py": {
-   "comparisons": 3,
+   "comparisons": 2,
    "lane": "Training"
   },
   "tests/test_mesh_axes.py": {
@@ -789,10 +785,6 @@
    "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
-  "tools/decode_drift.py": {
-   "comparisons": 3,
-   "lane": "Accuracy Gate"
-  },
   "tools/decoder_export_reference.py": {
    "comparisons": 1,
    "lane": "Models, Serving & RL"
@@ -848,10 +840,6 @@
   "tools/moe_exchange_probe.py": {
    "comparisons": 1,
    "lane": "Training"
-  },
-  "tools/reference_runs/qwen35_pair.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
   },
   "tools/reference_runs/torch_qwen35_step.py": {
    "comparisons": 3,
