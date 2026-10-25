@@ -530,10 +530,10 @@ REDRAW = 4
 class Finding:
     """One finding of the gate as data, beside its message: the leaf it names (the site's label and the
     leaf's path), the rule it fails (RULES), and its measure, finite and larger worse: the log of Dew's
-    error over the reference's for a ratio's rule (`log_ratio`), the seeds a value is not finite on,
-    Dew's own distance from float64 where the reference is exactly float64, and for too few seeds the
-    fewest over the given. What a train matches a candidate's failures to its parent's by: the same
-    leaf and rule, a measure no larger."""
+    error over the reference's for a ratio's rule (`log_ratio`, `log_sum`), the seeds a value is not
+    finite on, Dew's own distance from float64 where the reference is exactly float64, and for too few
+    seeds the fewest over the given. What a train matches a candidate's failures to its parent's by:
+    the same leaf and rule, a measure no larger."""
     leaf: str
     rule: str
     measure: float
@@ -551,19 +551,36 @@ where Dew is not (measured by Dew's own distance from it), a site where both are
 measured 0), and a leaf its seeds leave undecided."""
 
 
-TINIEST = float(np.finfo(np.float64).tiny)
-"""The least error a finding's measure reads (`log_ratio`): a reference's error of zero is TINIEST in
-it, so a candidate that errs further measures larger, finite at any error. An order among findings,
-never a bound any verdict reads."""
+LOG_ZERO = -1075 * math.log(2)
+"""What a finding's measure reads as the log of an error of exactly zero (`log_ratio`): below the log of
+the least positive float64, 2^-1074, so a reference error of zero orders under every positive one and
+a Dew error of zero under every positive one. An order among findings, never a bound any verdict
+reads."""
+
+
+def _logs(values) -> np.ndarray:
+    """Each nonnegative value's natural log, exact for every positive float64, subnormals included, and
+    LOG_ZERO for zero."""
+    values = np.asarray(values, np.float64)
+    with np.errstate(divide="ignore"):
+        return np.where(values > 0, np.log(np.where(values > 0, values, 1.0)), LOG_ZERO)
+
+
+def log_sum(values) -> float:
+    """The natural log of the sum of nonnegative values, scaled by their largest first, so no sum of
+    finite values overflows on the way: LOG_ZERO for a sum of zeros."""
+    values = np.asarray(values, np.float64)
+    largest = float(np.max(values)) if values.size else 0.0
+    if not largest > 0:
+        return LOG_ZERO
+    return math.log(largest) + math.log(float(np.sum(values / largest)))
 
 
 def log_ratio(mine, theirs) -> float:
-    """A ratio rule's measure: the natural log of Dew's error over the reference's, each read as at least
-    TINIEST, the largest over its elements. Finite at every finite error and growing with Dew's, where
-    the ratio itself overflows past an error of 4 over a reference of zero."""
-    mine = np.maximum(np.asarray(mine, np.float64), TINIEST)
-    theirs = np.maximum(np.asarray(theirs, np.float64), TINIEST)
-    return float(np.max(np.log(mine) - np.log(theirs)))
+    """A ratio rule's measure: the natural log of Dew's error over the reference's, the largest over its
+    elements, each log exact for every positive error (`_logs`). Finite at every finite error and
+    growing with Dew's, where the ratio itself overflows past an error of 4 over a reference of zero."""
+    return float(np.max(_logs(mine) - _logs(theirs)))
 
 
 class GateFailure(AssertionError):
@@ -943,8 +960,8 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
         else:
             ratio, low, high = _judged(draws, index, tails)
             status = _status(ratio, low, high, contained=contained)
-            # The ratio's log from its sums, finite where the ratio itself would overflow.
-            measure = log_ratio(np.sqrt(np.sum(a)), np.sqrt(np.sum(b)))
+            # The ratio's log from its sums' logs, finite where a sum or the ratio itself would overflow.
+            measure = (log_sum(a) - log_sum(b)) / 2
             if status == "inconclusive":
                 unresolved.append(Finding(
                     leaf, "inconclusive", measure, f"{leaf}: inconclusive: the pooled ratio {ratio:.3f}'s "
