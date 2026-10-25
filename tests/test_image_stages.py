@@ -96,9 +96,9 @@ def test_a_bucket_is_the_size_nearest_an_image_s_aspect_covered_and_cut_at_the_c
 
     assert [int(row["bucket"]) for row in bucketed] == [1, 2, 0]
     assert [row["image"].shape for row in bucketed] == [(12, 20, 3), (20, 12, 3), (16, 16, 3)]
-    # The ramp, 60 columns wide, covers 20 at 36 wide; the cut keeps columns 8 to 28 of 36, whose
-    # middle is the ramp's middle, 118.
-    assert abs(float(bucketed[0]["image"][:, 9:11].mean()) - 118) < 8
+    # The ramp, 60 columns wide, covers 20 at 36 wide; the cut keeps columns 8 to 28 of 36, its centre.
+    covered = images.Resize((12, 36), "area").map({"image": np.ascontiguousarray(ramp)})["image"]
+    np.testing.assert_array_equal(bucketed[0]["image"], covered[:, 8:28])
     with pytest.raises(ValueError):
         images.bucket(((16, 0),))
 

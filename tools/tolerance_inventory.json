@@ -101,10 +101,6 @@
    "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_data_av.py": {
-   "comparisons": 2,
-   "lane": "Data"
-  },
   "tests/test_data_mixtures.py": {
    "comparisons": 4,
    "lane": "Training"
@@ -208,10 +204,6 @@
   "tests/test_edm2.py": {
    "comparisons": 2,
    "lane": "Models, Serving & RL"
-  },
-  "tests/test_encoders.py": {
-   "comparisons": 3,
-   "lane": "Data"
   },
   "tests/test_end_to_end.py": {
    "comparisons": 8,
@@ -332,10 +324,6 @@
   "tests/test_image_metrics.py": {
    "comparisons": 5,
    "lane": "Training"
-  },
-  "tests/test_image_stages.py": {
-   "comparisons": 1,
-   "lane": "Data"
   },
   "tests/test_inference.py": {
    "comparisons": 10,
@@ -581,10 +569,6 @@
    "comparisons": 4,
    "lane": "Training"
   },
-  "tests/test_presets.py": {
-   "comparisons": 1,
-   "lane": "Data"
-  },
   "tests/test_pretrained_sources.py": {
    "comparisons": 2,
    "lane": "Models, Serving & RL"
@@ -688,10 +672,6 @@
   "tests/test_support_replay.py": {
    "comparisons": 5,
    "lane": "Models, Serving & RL"
-  },
-  "tests/test_t5_encoders.py": {
-   "comparisons": 5,
-   "lane": "Data"
   },
   "tests/test_text_data.py": {
    "comparisons": 1,
