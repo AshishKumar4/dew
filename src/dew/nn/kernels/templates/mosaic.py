@@ -460,6 +460,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     (TMA's, 256): an operand block tiled in 8 rows by a swizzled row stays far below it at any tile its
     registers hold, and a one-dimensional side operand's block, untiled, is at most it
     (`grouped_matmul._Mosaic.fitting`); None where cp.async moves a block (mma.sync's)."""
+    takes_tf32: bool = False
+    """Whether its products take fp32 operands, as TF32 (warpgroup MMA's kind::tf32: Mosaic's wgmma issues
+    fp32 shared-memory operands so); where not (mma.sync, whose Mosaic lowering takes 16-bit, fp8, int
+    and f64 operands), a template splits fp32 operands into bf16 parts instead."""
     copy_unit: int = 1
     """The elements a copy of an untiled block moves a multiple of: one where TMA moves it, a warpgroup's
     threads' (128) where cp.async does (Mosaic GPU spreads a copy over its threads, an element each at

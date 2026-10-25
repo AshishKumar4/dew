@@ -21,6 +21,7 @@ class Wgmma(mosaic.RingFamily):
     interpreted, such a product is the dot it would compute."""
 
     name = "wgmma"
+    takes_tf32 = True
     rows = 64
     consumers = 2
     role_rows = 64
