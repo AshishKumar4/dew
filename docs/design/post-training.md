@@ -147,7 +147,7 @@ With fp32 parameters, Adam's two moments and a frozen fp32 reference, persistent
 
 ## 10. External generation engines
 
-A remote `Rollout` posts generation requests and returns the same session layout the native collector produces. A `Rollout` that posts prompts to a vLLM server and returns token ids is one implementation of the protocol in §4, and the weights it serves come from `save_pretrained_decoder`, which writes the HF layout verl and vLLM already consume (`dew/interop/hf_decoders`). Weight publication and generation do not change the trainer, objective or checkpoint schema.
+A remote `Rollout` posts generation requests and returns the same session layout the native collector produces. A `Rollout` that posts prompts to a vLLM server and returns token ids is one implementation of the protocol in §4, and the weights it serves come from `Pretrained.save` (over `Pretrained.export`), which writes the HF layout verl and vLLM already consume (`dew/interop/pretrained`, `dew/interop/hf_decoders`). Weight publication and generation do not change the trainer, objective or checkpoint schema.
 
 ## 11. End-to-end qualification
 
