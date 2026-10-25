@@ -117,9 +117,10 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
 
 
 def test_a_python_no_run_has_timed_weighs_a_file_by_another_pythons_time(ci, tmp_path, monkeypatch):
-    """A file 3.14 has no measured time for (3.14 runs every file only on the daily run) weighs, and splits, by
-    3.12's measured time of it, not by its tests' least recorded times, so armada's longest-first dispatch does not
-    start it last (train 143: 3.14 tasks of 500-800 s, weighed near the target, started 550-760 s into the run)."""
+    """A file 3.14 has no measured time for (3.14 runs every file only on the daily run) weighs, and
+    splits, by 3.12's measured time of it, not by its tests' least recorded times, so armada's
+    longest-first dispatch does not start it last (train 143: 3.14 tasks of 500-800 s, weighed near
+    the target, started 550-760 s into the run)."""
     (tmp_path / "tests/test_heavy.py").write_text("")
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
         {"tests/test_heavy.py::test_a": 150.0, "tests/test_heavy.py::test_b": 100.0}))
