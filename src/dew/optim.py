@@ -328,10 +328,10 @@ def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArg
     per query group under grouped-query attention as Megatron Core clips it.
 
     The per-head maxima arrive as `qk_stats`, the `qk` collection the model
-    sowed, which the trainer asks every objective for when its optimizer's
-    state holds this transform's (`clips_qk`) and forwards from the loss's
-    `Aux`. An update given none is refused: a clip that steps aside would
-    leave the logits it bounds unbounded with no sign of it."""
+    sowed, which a run asks its objective for when its optimizer's state
+    holds this transform's (`clips_qk`) and forwards from the loss's `Aux`,
+    refusing a step whose objective returns none. Called without them, as a
+    loop of plain optax calls may, the transform steps aside."""
     if tau <= 0:
         raise ValueError(f"the clip threshold bounds positive logits, got {tau}")
 
@@ -340,14 +340,8 @@ def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArg
         return QKClipState()
 
     def update_fn(updates, state, params=None, qk_stats=None):
-        if params is None:
-            raise ValueError("QK-Clip rescales the query and key kernels of the parameters it is given, "
-                             "and this update was given none")
-        if qk_stats is None:
-            raise ValueError(
-                "QK-Clip clips by the step's attention logit maxima (qk_stats), and this update was given "
-                "none: a run hands them over from its objective's Aux.qk_stats, which an objective returns "
-                "where its step asks for them (Step.qk_stats); one that returns none cannot train under it")
+        if qk_stats is None or params is None:
+            return updates, state
         clipped = jax.tree_util.tree_map_with_path(
             functools.partial(_clip_leaf, qk_stats, tau, _qk_normed(params)), updates, params)
         return clipped, state

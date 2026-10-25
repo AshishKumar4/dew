@@ -237,7 +237,7 @@ class GRPOObjective(TokenScorer):
         sampled = self.sampled_log_probs(params, scores, ids, support, self.sampling_temperature)
         return onto_ids(batch, sampled), scores.qk
 
-    def _terms(self, params, batch, *, qk_stats: bool) -> _Terms:
+    def _terms(self, params, batch, *, qk_stats: bool = False) -> _Terms:
         """Read a packed batch onto its own `[rows, width]` grid.
 
         The old policy is `old_log_probs` when a rescoring or the sampler

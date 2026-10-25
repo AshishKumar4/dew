@@ -428,8 +428,8 @@ class Aux(Generic[Effects]):
     an MLA layer also holds `qk_nope`, an int scalar giving its nope width.
     Rows are the batch's rows, with microbatches concatenated under a
     pipeline. It is None where the step asked for none (`Step.qk_stats`),
-    and empty where it asked and no layer sowed any; the clip refuses an
-    update given None."""
+    and empty where it asked and no layer sowed any; a run whose optimizer
+    clips by it refuses a step that returns None."""
     effects: Effects | None = None
     """Additive observations that `Objective.apply_effects` applies once per optimizer commit."""
     record: Evaluated | Recorded | None = None
