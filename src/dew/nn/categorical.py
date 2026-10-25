@@ -4,7 +4,8 @@ A model's logits over a vocabulary, a classifier's over its classes, a decision'
 options and a sampler's over its next token are each a categorical distribution over the last axis.
 Every log-likelihood Dew takes of one composes on this module: the normalized log probabilities
 (`log_probs`), a label's cross entropy (`cross_entropy`), a soft target's (`soft_cross_entropy`), a
-divergence from a reference distribution (`kl_divergence`), the entropy (`entropy`), and, for a head
+divergence from a reference distribution (`kl_divergence`), the entropy (`entropy`), the divergence
+among a group's members over the classes they share (`group_divergence`), and, for a head
 that reads its vocabulary in blocks (`dew.objectives.lm.chunked`), the running partition it combines
 block by block (`rescaled`), a label's cross entropy from it (`target_loss`) and the log partition of
 each segment of a ragged row (`segment_log_partition`), a support's.
@@ -27,8 +28,8 @@ from jax.custom_derivatives import SymbolicZero
 
 from dew.nn.precision import at_least_fp32
 
-__all__ = ["cross_entropy", "entropy", "kl_divergence", "log_probs", "probabilities", "rescaled",
-           "segment_log_partition", "soft_cross_entropy", "target_loss"]
+__all__ = ["cross_entropy", "entropy", "group_divergence", "kl_divergence", "log_probs", "probabilities",
+           "rescaled", "segment_log_partition", "soft_cross_entropy", "target_loss"]
 
 
 def widened(logits: jax.Array, where: jax.Array | None = None) -> jax.Array:
@@ -44,8 +45,27 @@ def log_probs(logits: jax.Array, where: jax.Array | None = None) -> jax.Array:
 
 
 def probabilities(logits: jax.Array, where: jax.Array | None = None) -> jax.Array:
-    """The probabilities over the last axis (`jax.nn.softmax`)."""
-    return jax.nn.softmax(widened(logits, where), axis=-1)
+    """The probabilities over the last axis (`jax.nn.softmax`). Their derivative is softmax's,
+    `p (dz - sum p dz)`, but at the most probable class, which takes the other classes' derivative
+    summed, negated, so a row's derivative sums to zero: softmax's own subtracts two near-equal terms
+    there once its probability nears one, keeping only their rounding (as a label's `p - 1` does,
+    arXiv:2610.31642, eq. 4), while the others' sum keeps their precision, in either mode."""
+    return _probabilities(widened(logits, where))
+
+
+@jax.custom_jvp
+def _probabilities(logits: jax.Array) -> jax.Array:
+    return jax.nn.softmax(logits, axis=-1)
+
+
+@_probabilities.defjvp
+def _probabilities_tangent(primals, tangents):
+    (logits,), (d_logits,) = primals, tangents
+    probability = _probabilities(logits)
+    tangent = probability * (d_logits - jnp.sum(probability * d_logits, axis=-1, keepdims=True))
+    top = jax.nn.one_hot(jnp.argmax(probability, axis=-1), logits.shape[-1], dtype=bool)
+    rest = jnp.sum(jnp.where(top, 0.0, tangent), axis=-1, keepdims=True)
+    return probability, jnp.where(top, -rest, tangent)
 
 
 def cross_entropy(logits: jax.Array, labels: jax.Array, where: jax.Array | None = None) -> jax.Array:
@@ -222,6 +242,57 @@ def entropy(logits: jax.Array, where: jax.Array | None = None) -> jax.Array:
     log_p = log_probs(logits, where)
     held = jnp.where(jnp.isneginf(log_p), 0.0, log_p)
     return -(jnp.exp(log_p) * held).sum(axis=-1)
+
+
+def group_divergence(logits: jax.Array, groups: jax.Array, classes: jax.Array,
+                     where: jax.Array | None = None) -> tuple[jax.Array, jax.Array]:
+    """Each member's share of its group's generalized Jensen-Shannon divergence, and its share of the
+    group, `[..., M]` arrays whose members sum to each group's divergence and to one a group.
+
+    `logits` `[..., M, K]` are M members' categoricals, each over its own K classes (`where` masks those
+    it does not hold); `groups` `[..., M]` names each member's group among the M (-1: none); and
+    `classes` `[..., M, K]` each class's shared class, in `[0, K)` (-1: none), as questions that ask
+    one thing with their options re-ordered or reworded share their options. A member's answer is its
+    probabilities (`probabilities`) over its classes that map to a shared one, summed onto them; a
+    group's divergence is the mean of each member's KL divergence from the members' mean answer, zero
+    exactly where they agree, at most the log of the member count, computed in at least float32 and
+    finite at any finite logits. A shared class of no probability adds no term, in value or gradient;
+    the gradient is autodiff's, through the probabilities' own derivative, which a confident member
+    keeps. A member in no group, or with no class that maps, has share zero and takes no part."""
+    width, count = logits.shape[-1], logits.shape[-2]
+    held = jnp.ones(logits.shape, bool) if where is None else jnp.broadcast_to(where, logits.shape)
+    mapped = held & (classes >= 0)
+    # A member of no mapped class normalizes over nothing: it reads zeros instead, which its answer then
+    # takes no part of, so neither its value nor its gradient is NaN.
+    any_mapped = jnp.any(mapped, axis=-1, keepdims=True)
+    member_probabilities = probabilities(jnp.where(any_mapped, logits, 0.0), mapped | ~any_mapped)
+    slots = jnp.where(mapped, classes, width)
+
+    def summed(row_probabilities, row_slots):
+        return jax.ops.segment_sum(row_probabilities, row_slots, num_segments=width + 1)[:width]
+
+    rows = (-1, count, width)
+    answer = jax.vmap(jax.vmap(summed))(jnp.where(mapped, member_probabilities, 0.0).reshape(rows),
+                                        slots.reshape(rows))
+    # A member stands in its group where it holds a class that maps: one of none has no answer to share.
+    member = ((groups >= 0) & any_mapped[..., 0]).reshape(-1, count)
+    ids = jnp.where(member, groups.reshape(-1, count), count)
+
+    def window(answer, ids, member):
+        sizes = jax.ops.segment_sum(member.astype(answer.dtype), ids, num_segments=count + 1)[:count]
+        total = jax.ops.segment_sum(jnp.where(member[:, None], answer, 0.0), ids, num_segments=count + 1)
+        size = sizes[jnp.minimum(ids, count - 1)]
+        mean = total[jnp.minimum(ids, count - 1)] / jnp.maximum(size, 1.0)[:, None]
+        # A shared class of no probability adds no term, nor does a non-member's, whose mean is no
+        # group's: their logarithms read one, not zero, so no derivative meets 0 * inf.
+        held = (answer > 0) & member[:, None]
+        ratio = jnp.log(jnp.where(held, answer, 1.0)) - jnp.log(jnp.where(held, mean, 1.0))
+        each = jnp.sum(jnp.where(held, answer * ratio, 0.0), axis=-1)
+        return (jnp.where(member, each / jnp.maximum(size, 1.0), 0.0),
+                jnp.where(member, 1.0 / jnp.maximum(size, 1.0), 0.0))
+
+    divergence, shares = jax.vmap(window)(answer, ids, member)
+    return divergence.reshape(groups.shape), shares.reshape(groups.shape)
 
 
 def _wide(*operands: jax.Array) -> tuple[jax.Array, ...]:
