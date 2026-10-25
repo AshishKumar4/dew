@@ -80,7 +80,7 @@ from dew.objectives.base import (
     taken_record,
 )
 from dew.optim import learning_rate, with_rate_scales
-from dew.state import MODEL_STATE, Accumulation, TrainState, kept_window
+from dew.state import MODEL_STATE, Accumulation, TrainState, apart, kept_window, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import (
     StepFlops,
@@ -122,8 +122,8 @@ from dew.training.distributed import (
     microbatch,
     microbatch_shapes,
     placed_bytes,
-    placed_held,
     placed_shapes,
+    placed_start,
     prefetched_bytes,
     resumed_link_figures,
     ruled,
@@ -131,7 +131,7 @@ from dew.training.distributed import (
     split_fields,
     stage_microbatches,
     step_reads,
-    taking_over,
+    traced_start,
 )
 from dew.training.evaluation import EvalSuite, Evaluation
 from dew.training.interval import Interval, Taken, held
@@ -572,14 +572,17 @@ class Trainer(Generic[Loss, Effects]):
         # tree came in, so its placement, its updates and its restores share one structure.
         params = unfreeze(nn.unbox(initialized))
         # A held tree's initializer returns the objective's own arrays (`Objective.held_variables`),
-        # which the step's donation would free: the state takes buffers of its own, as a placed one
-        # does (`distributed.placed_held`). Traced, no leaf is a held array, so nothing is copied; a
-        # state held on the host is never donated, and takes the arrays over leaf by leaf as it is
-        # placed (`_placed_host`), so it takes them as they are.
+        # which the step's donation would free: the moving state takes buffers of its own, as a
+        # placed one does (`distributed.placed_held`). The frozen tree no step donates (`apart`), so
+        # it shares the held arrays as they are, one copy for the run. Traced, no leaf is a held array,
+        # so nothing is copied; a state held on the host is never donated, and takes the arrays over
+        # leaf by leaf as it is placed (`_placed_host`), so it takes them as they are.
         if not self.host_master:
             held = {id(leaf) for leaf in jax.tree.leaves(self.objective.held_variables())
                     if isinstance(leaf, jax.Array)}
-            params = jax.tree.map(lambda leaf: leaf.copy() if id(leaf) in held else leaf, params)
+            params = {collection: tree if collection == FROZEN else jax.tree.map(
+                lambda leaf: leaf.copy() if id(leaf) in held else leaf, tree)
+                for collection, tree in params.items()}
         if "params" not in params:
             raise ValueError(
                 f"the objective's tree has no params collection, only {sorted(params)}; "
@@ -764,7 +767,7 @@ class Trainer(Generic[Loss, Effects]):
         if self.host_master:
             from dew.training.host import transfer
             key = transfer(key, NamedSharding(self.state_mesh, P()))
-        abstract = jax.eval_shape(self.initial_state, initializer, key)
+        abstract, through = traced_start(self.initial_state, initializer, key)
         checkpoints = self.checkpoints
         # Each process lists the checkpoints itself, and on a shared filesystem one listing can lag
         # another's: every process resumes from one step or none does.
@@ -773,8 +776,8 @@ class Trainer(Generic[Loss, Effects]):
             shardings, _ = self._validated(abstract)
             if self.host_master:
                 return self._placed_host(initializer, key, shardings), shardings, None
-            held = placed_held(initializer, abstract.variables, shardings.variables, self.device_mesh)
-            return taking_over(self.initial_state, *held, shardings)(key), shardings, None
+            return (placed_start(self.initial_state, initializer, key, abstract, shardings, through,
+                                 self.device_mesh), shardings, None)
         abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(resume))
         shardings, _ = self._validated(abstract)
         if self.host_master and FROZEN in abstract.variables:
@@ -1190,12 +1193,15 @@ class Trainer(Generic[Loss, Effects]):
                     current = dataclasses.replace(self._initialize_accumulation(
                         current, candidate.micro, candidate.shapes, window=window),
                         window_size=jnp.asarray(window, jnp.int32))
-                    current = jax.device_put(current, candidate.shardings)
+                    # The moving state alone: the frozen tree stays the arrays the run holds.
+                    moving, frozen = apart(current)
+                    current = together(jax.device_put(moving, apart(candidate.shardings)[0]), frozen)
                 outputs = []
+                moving, frozen = apart(current)
                 for part in parts:
-                    current, *output = executable(current, batch, part)
+                    moving, *output = executable(moving, frozen, batch, part)
                     outputs.append(tuple(output))
-                return (current, *(outputs[0] if split == 1 else whole_step(outputs)))
+                return (together(moving, frozen), *(outputs[0] if split == 1 else whole_step(outputs)))
         return run
 
     def _planned(self, state: TrainState, batch: Batch, mesh: Mesh, schedule: Schedule, resumed: JSON,
@@ -1270,7 +1276,7 @@ class Trainer(Generic[Loss, Effects]):
             [field for field, kept in built if kept is None and field is not None])
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
-        lower = functools.partial(jitted.lower, prepared, batch, part)
+        lower = functools.partial(jitted.lower, *apart(prepared), batch, part)
         if launches is None or self.tune_kernels:
             lowered, launches = tuning.tune(lower, measure=self.tune_kernels)
         else:
@@ -1296,20 +1302,25 @@ class Trainer(Generic[Loss, Effects]):
     def _jitted(self, shapes, copies: dict, shardings: Placement[TrainState], placement,
                 replicated: NamedSharding, split: int):
         """The step over one of the `split` microbatches of a batch
-        (`microbatch`), which donates the state it is handed and counts the
-        step at its last microbatch."""
+        (`microbatch`), which counts the step at its last microbatch. It takes the state apart
+        (`apart`): the moving state, which it donates and returns advanced, and the frozen tree, which
+        it reads and neither donates nor returns, so the frozen arrays stay the ones the run (and the
+        objective's held tree) holds, and no output copies them."""
         body = self._step_body(shapes, copies, split)
+        moving, frozen = apart(shardings)
 
-        def step(current, batch, part):
+        def step(current, held, batch, part):
             # The body sees every field on the device; the out shardings
             # return the host-resident ones to pinned host memory.
+            current = together(current, held)
             micro = microbatch(batch, part, split)
             advanced, loss, aux, committed = body(self._fetched(current, shardings), self._model_batch(micro),
                                                   part, batch_tokens(micro))
-            return outcome(current, advanced, loss, aux, committed, batch, part == split - 1)
+            stepped, *rest = outcome(current, advanced, loss, aux, committed, batch, part == split - 1)
+            return (apart(stepped)[0], *rest)
 
-        return jax.jit(step, in_shardings=(shardings, placement, replicated),
-                       out_shardings=(shardings, replicated, replicated, replicated, replicated, replicated),
+        return jax.jit(step, in_shardings=(moving, frozen, placement, replicated),
+                       out_shardings=(moving, replicated, replicated, replicated, replicated, replicated),
                        donate_argnums=0)
 
     def _lowered_for(self, state: TrainState, batch: Batch, generation: str) -> jax.stages.Lowered:
@@ -1335,8 +1346,8 @@ class Trainer(Generic[Loss, Effects]):
             placement = batch_shardings(mesh, batch)
             replicated = NamedSharding(mesh, P())
             jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
-            placed = [placed_shapes(tree, at) for tree, at in ((prepared, shardings), (batch, placement))]
-            return jitted.trace(*placed, jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)).lower(
+            return jitted.trace(*apart(placed_shapes(prepared, shardings)), placed_shapes(batch, placement),
+                                jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)).lower(
                 lowering_platforms=('cuda',))
 
     def _narrow_copies(self, state: TrainState, batch: Batch) -> dict:
