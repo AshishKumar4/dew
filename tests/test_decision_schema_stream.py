@@ -1,7 +1,7 @@
 """A joint row whose schema is read as its context (`Schema(stream="context")`): the schema leaves the
 row for its context, the backbone reads it in a pass of its own with its own weights, its
 cross-attention layers read that pass beside the row, and the head pools the questions and options
-from it (`DecisionModel.context_states`), the row's memory and readout its own. The pass is counted
+from it (`dew.nn.cross_attention.encode_context`), the row's memory and readout its own. The pass is counted
 in the run's work, and the task serves the same way."""
 
 import dataclasses

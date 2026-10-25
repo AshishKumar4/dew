@@ -506,7 +506,3 @@ def verify_mapping(hf_config: Mapping[str, object]) -> VerifiedMapping | Unmappe
                     return VerifiedMapping(model_type, convention, name, error, bound, tuple(sorted(inert)))
     return Unmapped(model_type, {convention: reasons[convention] for convention, _ in CONVENTIONS},
                     {**fields, 'model_type': model_type})
-
-
-def _listed(reasons: Mapping[str, str]) -> str:
-    return "; ".join(f"{convention}: {reason}" for convention, reason in reasons.items())
