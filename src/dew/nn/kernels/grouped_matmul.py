@@ -772,7 +772,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                                            ('epilogue_operands', hooks.epilogue_axes))
                 for _, side_axes in zip(ba.arguments.get(name, ()), axes_of, strict=True)
                 if len(side_axes) == 1 for axis in side_axes}
-        extent, unit = family.copy_extent, family.copy_unit
+        # Each consumer copies its share of a block where a family's consumers share its copies.
+        extent, unit = family.copy_extent, family.copy_unit * config.warpgroups
         copied = all((extent is None or self.extents(config)[axis] <= extent)
                      and self.extents(config)[axis] % unit == 0 for axis in axes)
         return copied and super().legal(ba, config, target)

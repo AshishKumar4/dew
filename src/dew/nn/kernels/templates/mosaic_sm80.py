@@ -12,6 +12,7 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+from jax import lax
 from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
@@ -49,10 +50,12 @@ class Slots:
 @dataclasses.dataclass(frozen=True)
 class Pipeline:
     """A program's operand streams as `Mma.streams` describes them: each stream's tile `(shape, dtype)` by
-    name and the tiles `emit_pipeline` keeps in flight (`stages`); it allocates their slots itself."""
+    name, the tiles `emit_pipeline` keeps in flight (`stages`) and the consumer warpgroups that run it
+    together (`consumers`, its thread axis 'wg' where two); it allocates their slots itself."""
 
     blocks: dict
     stages: int
+    consumers: int = 1
 
 
 @dataclasses.dataclass(frozen=True)
@@ -62,6 +65,17 @@ class Streams:
 
     pipeline: Pipeline
     views: dict
+
+
+COLLECTIVE_PIPELINES = (0, 12, 0, 1, 24)
+"""The first JAX whose `emit_pipeline` runs over a kernel's thread axis (`thread_axis`, Dew's fork,
+0.12.0.1.post24): each consumer warpgroup cp.async-copies its share of every block, and they meet before a
+step reads it and before its slot is refilled, so an mma.sync program takes two consumers."""
+
+
+def collective_pipelines() -> bool:
+    """Whether this JAX's release is `COLLECTIVE_PIPELINES` or later."""
+    return _release() >= COLLECTIVE_PIPELINES
 
 
 STAGING_SOLVED = (0, 11, 2, 20)
@@ -81,10 +95,13 @@ and ran it (R10)."""
 def staging_solved() -> bool:
     """Whether this JAX's release (its version's numbers, a post release's last) is `STAGING_SOLVED` or
     later on a line whose layout inference solves mma.sync's tiles (not `UNSOLVED_LINE`'s)."""
-    import jax
-    numbers = tuple(int(part.removeprefix("post")) for part in jax.__version__.split(".")
-                    if part.removeprefix("post").isdigit())
-    return STAGING_SOLVED <= numbers < UNSOLVED_LINE
+    return STAGING_SOLVED <= _release() < UNSOLVED_LINE
+
+
+def _release() -> tuple[int, ...]:
+    """This JAX's release as its version's numbers, a post release's last."""
+    return tuple(int(part.removeprefix("post")) for part in jax.__version__.split(".")
+                 if part.removeprefix("post").isdigit())
 
 
 @dataclasses.dataclass(frozen=True)
@@ -98,7 +115,9 @@ class Mma(mosaic.Family):
 
     name = "mma.sync"
     rows = 16
-    consumers = 1
+    # Two consumer warpgroups where JAX's pipeline runs over them, each its share of a tile's rows and of
+    # every step's copies (CUTLASS's and cuBLASLt's A100 kernels' eight warps).
+    consumers = 2 if collective_pipelines() else 1
     bounded_loads = False
     role_rows = 4 * 16
     operands_in_registers = True
@@ -131,7 +150,9 @@ class Mma(mosaic.Family):
     column_scratch = 0  # its column sums take its kernels' reduction scratch
 
     def registers(self, consumers: int) -> int:
-        del consumers  # one role, at a thread's whole budget
+        # Each role at a thread's whole budget: two warpgroups' 256 threads hold 255 each of a
+        # multiprocessor's 64K registers.
+        _most(consumers)
         return 255
 
     def column_unit(self, dtype) -> int:
@@ -165,22 +186,25 @@ class Mma(mosaic.Family):
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None) -> Callable:
-        _one(consumers)
-        return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
+        # Its warpgroups are its consumers, no producer beside them: two a thread axis 'wg'.
+        _most(consumers)
+        threads = {} if consumers == 1 else {"num_threads": consumers, "thread_name": "wg"}
+        return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names, **threads,
                             compiler_params=plgpu.CompilerParams(approx_math=approx_math),
                             interpret=mosaic.interpreted(interpret), kernel_name=name)
 
     def scoped(self, body, *allocations, streams) -> None:
-        pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)
+        collective = {} if streams.consumers == 1 else {"collective_axes": "wg"}
+        pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations, **collective)
 
     def roles(self, consumers: int, consumer, producer) -> None:
-        _one(consumers)
+        _most(consumers)
         del producer
-        consumer(0)
+        consumer(0 if consumers == 1 else lax.axis_index("wg"))
 
     def streams(self, blocks: dict, stages: int, consumers: int):
-        _one(consumers)
-        return Pipeline(blocks, stages)
+        _most(consumers)
+        return Pipeline(blocks, stages, consumers)
 
     def opened(self, allocated, views: dict | None = None):
         if views is None:
@@ -192,30 +216,36 @@ class Mma(mosaic.Family):
 
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, consumer: Callable, *,
                 consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0) -> None:
-        # Each tile's pipeline is its own (`emit_pipeline` fills and drains it), its step count static; an
-        # output is staged after it, scoped apart from its stages though Mosaic reserves both at once
-        # (`grouped_matmul._Mosaic.staged_bytes`), and stored through registers (no TMA before Hopper).
-        _one(consumers)
+        # Each tile's pipeline is its own (`emit_pipeline` fills and drains it, its consumers together),
+        # its step count static; an output is staged after it, each consumer its own rows' in its share of
+        # one buffer scoped beside the pipeline (a threaded kernel's scoped allocations are collective;
+        # Mosaic reserves both at once: `grouped_matmul._Mosaic.staged_bytes`), and stored through
+        # registers (no TMA before Hopper).
+        _most(consumers)
         del in_flight
 
-        def store(output, value, ref, place):
-            shape, dtype = outputs[output]
+        def tiled(*staging):
+            index = 0 if consumers == 1 else lax.axis_index("wg")
 
-            @functools.partial(pl.run_scoped, smem=plgpu.SMEM(shape, dtype))
-            def _(smem):
-                smem[...] = value.astype(dtype)
+            def store(output, value, ref, place):
+                smem = staging[output].at[index]
+                smem[...] = value.astype(smem.dtype)
                 mosaic.store_rows(smem, ref, *place, copy=mosaic.copied)
 
-        @plgpu.nd_loop(tiles, collective_axes=axis)
-        def _(loop: plgpu.NDLoopInfo):
-            active, steps, views, tile = schedule(loop.index)
+            @plgpu.nd_loop(tiles, collective_axes=axis)
+            def _(loop: plgpu.NDLoopInfo):
+                active, steps, views, tile = schedule(loop.index)
 
-            def walk(step, start, shapes, *, initial=None):
-                return self.walk(self.opened(streams, views), ((step, 0, steps),), start, shapes, interpret,
-                                 initial=initial)
+                def walk(step, start, shapes, *, initial=None):
+                    return self.walk(self.opened(streams, views), ((step, 0, steps),), start, shapes,
+                                     interpret, initial=initial)
 
-            pl.when(active)(lambda: consumer(0, tile, walk, store, active=True))
-            pl.when(~active)(lambda: consumer(0, tile, mosaic.unwalked(self), store, active=False))
+                pl.when(active)(lambda: consumer(index, tile, walk, store, active=True))
+                pl.when(~active)(lambda: consumer(index, tile, mosaic.unwalked(self), store, active=False))
+
+        collective = {} if consumers == 1 else {"collective_axes": "wg"}
+        pl.run_scoped(tiled, *(plgpu.SMEM((consumers, *shape), dtype) for shape, dtype in outputs),
+                      **collective)
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None
@@ -245,9 +275,12 @@ class Mma(mosaic.Family):
                                      lambda j, lo=lo, index_map=streams.views[name][1]: index_map(j + lo),
                                      transforms=swizzled(*blocks[name]) if len(blocks[name][0]) > 1 else ())
                      for name in names]
-            carry = plgpu.emit_pipeline(body, grid=(hi - lo,), in_specs=specs,
-                                        max_concurrent_steps=streams.pipeline.stages,
-                                        init_carry=carry)(*(streams.views[name][0] for name in names))
+            # Two consumers run one pipeline, each copying its share of every block (`thread_axis`, JAX
+            # `COLLECTIVE_PIPELINES` on, which a one-consumer program's call leaves out).
+            emit = functools.partial(plgpu.emit_pipeline, body, grid=(hi - lo,), in_specs=specs,
+                                     max_concurrent_steps=streams.pipeline.stages, init_carry=carry)
+            pipeline = emit() if streams.pipeline.consumers == 1 else emit(thread_axis="wg")
+            carry = pipeline(*(streams.views[name][0] for name in names))
         return carry
 
     def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
@@ -357,9 +390,10 @@ class Mma(mosaic.Family):
         del pending
 
 
-def _one(consumers: int) -> None:
-    """mma.sync's programs take one compute warpgroup (`emit_pipeline`'s stages are no thread-collective
-    allocation)."""
-    if consumers != 1:
-        raise NotImplementedError(f"an mma.sync program takes one consumer warpgroup, not {consumers}")
+def _most(consumers: int) -> None:
+    """mma.sync's programs take as many compute warpgroups as its JAX's pipeline runs together
+    (`Mma.consumers`), one or two, and no producer."""
+    if consumers not in range(1, Mma.consumers + 1):
+        raise NotImplementedError(f"an mma.sync program takes one to {Mma.consumers} consumer warpgroups, "
+                                  f"not {consumers}")
 
