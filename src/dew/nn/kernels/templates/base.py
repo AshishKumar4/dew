@@ -130,11 +130,22 @@ class Template[Config: Hashable](tuning.KernelOp):
 
     def estimate(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[float, Config]:
         """The seconds `cost` estimates at the launch's fastest fitting config on `target`, and that
-        config, the first of `space`'s order where several tie."""
+        config: where several tie, the one moving the fewest device bytes (`tied_bytes`; memory traffic
+        contends below the roofline: an H100's dense projections ran 1.31 times slower at a band of 32
+        column tiles than at 8, tied in seconds, R4), then the first of `space`'s order."""
         fits = self.fitting(ba, target)
         costs = [self.cost(ba, config, target) for config in fits]
-        fastest = min(range(len(fits)), key=lambda index: (costs[index], index))
+        fastest = min(range(len(fits)),
+                      key=lambda index: (costs[index], self.tied_bytes(ba, fits[index], target), index))
         return costs[fastest], fits[fastest]
+
+    def tied_bytes(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> float:
+        """The device bytes a config moves, which break ties in its estimated seconds (`estimate`): its
+        cost record's (`costed`); none where the launch states no record."""
+        try:
+            return self.costed(ba, config, target).device_bytes
+        except NotImplementedError:
+            return 0.0
 
     def _get_autotuning_configs(self, ba: tokamax.BoundArguments) -> set[Config]:
         return set(self.fitting(ba, generation.gpu_target()))
