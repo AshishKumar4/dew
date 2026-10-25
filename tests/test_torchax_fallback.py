@@ -435,7 +435,8 @@ def test_a_packed_row_trains_each_document_as_transformers_runs_it_alone(tmp_pat
     def theirs(ids, segments, cotangent):
         return documents_alone(reference, ids, segments, cotangent)
 
-    assert_as_exact(ours, theirs, packed_rows, "tier 3 cohere packed rows", seeds=PACKED_SEEDS, truth_fn=truth)
+    assert_as_exact(ours, theirs, packed_rows, "tier 3 cohere packed rows", seeds=PACKED_SEEDS,
+                    truth_fn=truth)
 
 
 def test_a_type_whose_attention_asks_no_interface_runs_its_own_and_reads_no_packing(tmp_path):
