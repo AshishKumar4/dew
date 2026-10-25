@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER, decode_steps, model_draw, with_logit_cotangent
-from reference_error import assert_as_exact, torch_with_gradients, widened, with_gradients
+from reference_error import assert_as_exact, torch_with_gradients, widened, with_gradients, without_ynn
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -173,7 +173,8 @@ def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
     with jax.default_device(cpu):
         assert jax.tree.structure(jax.jit(forward_and_gradient(model))(params, held["ids"])) == \
             jax.tree.structure(before.call(params, held["ids"]))
-    current = jax.jit(forward_and_gradient(model))
+    # The two arms are two Dew programs, compiled alike (testing.md: both without YNNPACK's fusions).
+    current, exported = without_ynn(forward_and_gradient(model)), without_ynn(before.call)
 
     def draw(seed):
         ids = np.random.default_rng([0x0D, seed]).integers(0, 17, held["ids"].shape)
@@ -185,7 +186,7 @@ def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
 
     def theirs(ids):
         with jax.default_device(cpu):
-            return jax.device_get(before.call(params, ids))
+            return jax.device_get(exported(params, ids))
 
     def truth(ids):
         with jax.enable_x64(new_val=True), jax.default_device(cpu):
