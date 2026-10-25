@@ -700,8 +700,12 @@ class TextToImage:
         settings, settled = (agreed("image sampling setup", resolve) if mesh is not None else resolve())
         prepared, request, count, process, times, solver, chosen, signature = settings
         if mesh is not None and jax.process_count() > 1:
-            multihost_utils.assert_equal((signature, None if settled is None else settled.signature),
-                                         "image execution controls must agree across processes")
+            # The controls carry the request's kind, so once they agree every rank enters the same
+            # collectives: the prompts' preparation is compared only where every rank resolved one.
+            multihost_utils.assert_equal(signature, "image execution controls must agree across processes")
+            if settled is not None:
+                multihost_utils.assert_equal(settled.signature,
+                                             "image input shapes and sampling must agree across processes")
         if prepared is None:
             assert settled is not None, "prompts are resolved in the agreement above"
             prepared = self._inputs(settled, owns_grid=self.grid is not None)
