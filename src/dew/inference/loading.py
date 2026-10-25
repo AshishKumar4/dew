@@ -23,6 +23,7 @@ from etils import epath
 from jax.typing import DTypeLike
 
 from dew.cache import persist_compilations
+from dew.checkpoints import PYTHON_RUN, RUN_FILE
 from dew.data.text import Tokenizer
 from dew.inference.images import TextToImage
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
@@ -73,8 +74,6 @@ def pipeline(
     cache directory is already set, so a restarted process reuses what it
     already compiled.
     """
-    from dew.checkpoints import PYTHON_RUN, RUN_FILE
-
     persist_compilations()
     dtype = dtype_name(dtype)
     param_dtype = "auto" if param_dtype == "auto" else dtype_name(param_dtype)
