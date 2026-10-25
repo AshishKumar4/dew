@@ -77,10 +77,10 @@ def test_a_lora_run_over_a_decision_release_trains_its_factors_and_reloads(tmp_p
     default = Fitted(data=asked)
     # The release serves long rows; training pads each to the layout's length, so the run budgets it.
     config = dataclasses.replace(default, pretrained=str(release), lora=LoRA(rank=2, modules=("q_proj",)),
-                                 max_len=256, trainer=dataclasses.replace(default.trainer, multi_host=False,
+                                 max_len=512, trainer=dataclasses.replace(default.trainer, multi_host=False,
                                                                           compilation_cache_dir=None))
     objective, dataset = config.prepare().train("adapted")
-    assert objective.layout.max_len == 256
+    assert objective.layout.max_len == 512
     assert isinstance(objective.layout, QuestionLayout)
     head = objective.held_variables()["params"]["head"]
     for native, name in (("slots", "slot"), ("q", "q.weight"), ("k", "k.weight")):
