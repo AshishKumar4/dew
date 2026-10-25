@@ -411,9 +411,9 @@ class Pretrained:
 
         dtype = dtype_name(dtype)
         param_dtype = AUTO if param_dtype == AUTO else dtype_name(param_dtype)
-        directory, commit, folder, composite = _source_metadata(
-            name_or_dir, revision, subfolder, selected, fallback)
-        reference = sources.SourceReference(str(name_or_dir), commit, folder or None)
+        # The reference refuses a folder outside the source before anything is fetched.
+        directory, reference, composite = _source_metadata(
+            sources.SourceReference(str(name_or_dir), revision, subfolder), selected, fallback)
         loaded = _loaded_kind(reference, directory, composite, fallback=fallback, gguf_file=gguf_file,
                               single_file=single_file, dduf_file=dduf_file, placed=placed,
                               streaming=streaming or not weights, weights=weights, dtype=dtype,
@@ -422,7 +422,7 @@ class Pretrained:
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
-        loaded = _published(loaded, name_or_dir, selected=bool(selected) or bool(folder))
+        loaded = _published(loaded, name_or_dir, selected=bool(selected) or reference.subfolder is not None)
         if not weights:
             loaded = loaded.map_variables(lambda tree: jax.tree.map(
                 lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), tree))
@@ -1412,18 +1412,18 @@ def _selected_payload(fallback: str | None, **files: str | None) -> list[str]:
 
 
 
-def _source_metadata(name_or_dir: str | Path, revision: str | None, subfolder: str | None,
-                      selected: list, fallback: str | None
-                      ) -> tuple[Path, str | None, str, CompositeSource | None]:
-    """Resolve one metadata snapshot and selected folder before any component's weights are read.
-    Explicit payload/fallback selections take precedence over composite metadata."""
-    directory = sources.snapshot(str(name_or_dir), revision, weights=False)
-    commit = None if os.path.isdir(name_or_dir) else directory.name
-    folder = "" if subfolder is None else subfolder
-    if Path(folder).is_absolute() or ".." in Path(folder).parts:
-        raise ValueError("subfolder must stay inside the resolved source")
-    composite = None if selected or fallback is not None else _composite_description(directory / folder)
-    return directory, commit, folder, composite
+def _source_metadata(requested: sources.SourceReference, selected: list, fallback: str | None
+                     ) -> tuple[Path, sources.SourceReference, CompositeSource | None]:
+    """Resolve one metadata snapshot of `requested` before any component's weights are read: the
+    snapshot, the reference pinned to its commit (none for a local directory), and the composite
+    release its selected folder describes. Explicit payload/fallback selections take precedence over
+    composite metadata."""
+    directory = sources.snapshot(requested.name, requested.revision, weights=False)
+    commit = None if os.path.isdir(requested.name) else directory.name
+    reference = replace(requested, revision=commit, subfolder=requested.subfolder or None)
+    composite = (None if selected or fallback is not None
+                 else _composite_description(reference.directory(directory)))
+    return directory, reference, composite
 
 
 def _composite_description(directory: Path) -> CompositeSource | None:
@@ -1448,26 +1448,38 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
     from dew.interop.weights import record_layouts
 
     component = description.backbone
+    head_source = description.head
     directory = source.directory(root)
-    backbone, shared, prefix = None, {}, ""
+    backbone, prefix = None, ""
+    shared: Mapping[str, np.ndarray] = {}
     if component is not None:
-        weight_source = source.component(component.weights_folder)
-        root = weight_source.weights(root)
-        directory = source.directory(root)
-        if source.revision is not None:
-            source = replace(source, revision=root.name)
-        shared = sources.load_shards(weight_source.directory(root))
         prefix = component.tensor_prefix
-        tensors = ({name[len(prefix):]: tensor for name, tensor in shared.items() if name.startswith(prefix)}
-                   if prefix else shared)
+        # The route of the config the backbone translates, a mamba_ssm one's normalized as
+        # `_load_native_source` normalizes it. The transformers forward reads its backbone's weights
+        # itself, and none without them; the shared file is read for it only where the head is stored
+        # in it, but its weights' snapshot is resolved and pinned here whenever it reads weights.
+        routed = (mamba2.config_from_mamba_ssm(component.config) if mamba2.is_mamba_ssm(component.config)
+                  else component.config)
+        forwarded = isinstance(source_route(routed), TorchRoute)
+        reads_shared = not forwarded or bool(head_source.weight_file is None and prefix)
+        if weights or reads_shared:
+            weight_source = source.component(component.weights_folder)
+            root = weight_source.weights(root)
+            directory = source.directory(root)
+            if source.revision is not None:
+                source = replace(source, revision=root.name)
+            if reads_shared:
+                shared = sources.load_shards(weight_source.directory(root))
+        tensors = None if forwarded else (
+            {name[len(prefix):]: tensor for name, tensor in shared.items() if name.startswith(prefix)}
+            if prefix else shared)
         backbone = _load_native_source(
             source, root,
             gguf_file=None, component=component, tensors=tensors,
             placed=placed, streaming=streaming, dtype=dtype, param_dtype=param_dtype,
-            attention_impl=attention_impl, max_seq_len=max_seq_len, overrides=overrides)
+            attention_impl=attention_impl, max_seq_len=max_seq_len, weights=weights, overrides=overrides)
     else:
         _unread_overrides(overrides, "a release without a native backbone")
-    head_source = description.head
     missing = False
     if head_source.weight_file is None:
         head_tensors = {name: tensor for name, tensor in shared.items() if not name.startswith(prefix)}

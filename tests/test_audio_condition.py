@@ -16,6 +16,7 @@ import optax
 import pytest
 import torch
 from diffusion_support import images_of
+from learning_gate import assert_learns
 
 from dew.config import ModelConfig, ObjectiveConfig
 from dew.config.diffusion import DiffusionRunConfig
@@ -131,10 +132,10 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
     The loss is the denoising loss over drawn noise levels and noise, so it
     is scored before and after training on the same 64 draws, and the drop
     is held to a test rather than a share: training lowered the expected
-    loss when the paired drops' t statistic clears Student's t with 63
-    degrees of freedom at one in a billion, 7.0
-    (scipy.stats.t.isf(1e-9, 63)). A run that learns nothing scores near 0;
-    this one scored 15.9, on the pixel regime's sigmas a pixel run draws."""
+    loss when the paired drops over the 64 draws, a unit each, clear the
+    learning gate's threshold (Student's t with 63 degrees of freedom at one
+    in a billion, 7.0). A run that learns nothing scores near 0; this one
+    scored 15.9, on the pixel regime's sigmas a pixel run draws."""
     for hertz in range(220, 1100, 110):
         _clip(tmp_path / f"{hertz}.avi", hertz)
     # Two frames at 25 fps, their sound a frame wider on each side, at the rate wav2vec2 reads.
@@ -165,8 +166,8 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
     state = Trainer(objective, optax.adam(3e-3), key=jax.random.PRNGKey(0)).fit(
         dataset, steps=40, log_every=100)
     drop = before - losses(state.variables)
-    statistic = drop.mean() / (drop.std(ddof=1) / np.sqrt(drop.size))
-    assert statistic > 7.0, (statistic, drop.mean())
+    assert_learns(lambda draws: {"training lowers the loss": drop[draws]}, "audio-conditioned loss",
+                  units=drop.size)
 
     pipe = objective.pipeline(state, ema=False)
     low, high = (pipe([{"audio": _tone(hertz, seconds)}], key=0).host().images
