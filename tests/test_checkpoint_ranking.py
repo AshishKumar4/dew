@@ -155,6 +155,34 @@ def test_an_aggregate_reads_a_split_on_its_own_cadence_as_nan_where_it_was_not_s
     assert run.checkpoints.resolve('best:aggregate:1') == 2
 
 
+@pytest.mark.parametrize("end", ["stream", "plateau"])
+def test_a_run_that_ends_off_a_rare_suites_cadence_is_ranked_by_it_at_its_last_step(tmp_path, end):
+    """Whatever ends a run, its last step is scored by every suite before its checkpoint is saved: a
+    training stream that runs out after four batches, or a plateau that stops the run at step 4. The
+    rare suite, scored every third step, rises as training does, so its best is the last step, which a
+    checkpoint saved before that suite scored it would never rank."""
+    from dew.training import EvalSuite
+
+    metric = Value('value', Shown(better='lower'))
+
+    class Ending(Counting):
+        def __next__(self):
+            if self.index == 4:
+                raise StopIteration
+            batch = super().__next__()
+            return {**batch, 'validation': np.zeros(len(batch['x']), bool)}
+
+    loaded = dataclasses.replace(data(), train=lambda partition: Ending()) if end == "stream" else data()
+    run = trainer(tmp_path / 'run')
+    state = run.fit(loaded, steps=10, log_every=1, eval_every=1, checkpoint_every=1, metrics=[metric],
+                    validation={'often': data().val, 'rare': EvalSuite(data().val, (metric,), 3)},
+                    best=Best(lambda scores: scores[('rare', metric)], mode='max'),
+                    stop=Plateau(('often', metric), evals=3) if end == "plateau" else None)
+    run.checkpoints.wait()
+    assert int(state.step) == 4
+    assert run.checkpoints.resolve('best:aggregate:0') == 4
+
+
 def test_an_aggregate_reads_a_training_scalar_whose_name_has_parts(tmp_path):
     """A training scalar may name itself in parts, as a critic's `critic/loss`: an aggregate reads
     it by the scalar the objective declares, under its whole name, and ranks by it."""
