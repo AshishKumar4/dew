@@ -27,7 +27,7 @@ import functools
 import shutil
 
 import pytest
-from multiprocess_worker import published_matrix
+from matrix_support import published_matrix
 from process_support import run_pool
 from test_multiprocess import assert_identical_parameters, assert_same_parameters, dumped_params
 

@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
+from matrix_support import MATRIX_RECORDS, matrix_prefix, published_matrix
 from process_support import serve_mode, worker_parser
 
 from dew.data import Loading
@@ -2335,8 +2336,6 @@ def mode_host_fields(args) -> dict:
     return {"seen": named_records(MeshSpec().build())}
 
 
-MATRIX_RECORDS = 96
-
 
 @dataclasses.dataclass(frozen=True)
 class Imaged:
@@ -2347,33 +2346,6 @@ class Imaged:
     def __call__(self, element) -> dict[str, np.ndarray]:
         tokens = np.asarray(element["text"], np.int64)
         return {"image": np.resize(tokens % 256, (RES, RES, 3)).astype(np.uint8)}
-
-
-def matrix_prefix(rejecting: bool, *, lengths: bool = False):
-    """The data matrix's records, of one to eight tokens each holding its own id, with each one's length
-    stated (`_dew_length`, which a published packing plan reads) where `lengths`, and the filter that
-    rejects every third where the cell has one."""
-    from dew.data import Memory
-    from dew.data.pipeline import Pipeline
-
-    records = [{"text": np.full(1 + index % 8, index, np.int32),
-                **({"_dew_length": np.int32(1 + index % 8)} if lengths else {})}
-               for index in range(MATRIX_RECORDS)]
-    pipeline = Pipeline(Memory(records, shard_rows=16))
-    if rejecting:
-        pipeline = pipeline.filter(lambda row: int(row["text"][0]) % 3 != 0, identity="thirds@1")
-    return pipeline
-
-
-def published_matrix(rejecting: bool, packed: bool, cache_dir: Path):
-    """The matrix prefix's rows published once as a sealed generation (`dew.data.compile.publish`),
-    with the packing plan of its windows where the cell packs: the preparation that makes a filtered or
-    packed read a global order."""
-    from dew.data.cache import Cache
-    from dew.data.compile import publish
-
-    prefix = matrix_prefix(rejecting, lengths=True)
-    return publish(prefix.pack(8, bins=2) if packed else prefix, Cache(str(cache_dir)), read="indexed")
 
 
 def matrix_data(read: str, cached: str, rejecting: bool, packed: bool, cache_dir: Path):
