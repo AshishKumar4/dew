@@ -84,6 +84,37 @@ def test_a_slot_release_loads_its_readout_and_exports_the_same_task(tmp_path, re
         np.testing.assert_array_equal(actual, expected)
 
 
+_REOPENED = """
+import sys
+import numpy as np
+from dew.interop import Pretrained
+bundle = Pretrained.load("dew/tiny-slot", dtype="float32", attention_impl="xla")
+np.savez(sys.argv[1], revision=np.asarray(bundle.revision),
+         **{name: np.asarray(value) for name, value in bundle.head_variables["params"].items()})
+"""
+
+
+def test_a_cached_slot_release_reopens_with_the_hub_offline(tmp_path):
+    """A Hub slot release whose readout file the cache holds at its commit reopens with the Hub
+    offline: the pinned snapshot holding the file is its presence, so nothing asks the Hub."""
+    import os
+    import subprocess
+    import sys
+
+    from interop_support import hub_cache
+
+    source, stored = slot_release(tmp_path, "head")
+    commit = hub_cache(tmp_path / "hub", "dew/tiny-slot", source)
+    env = {**os.environ, "HF_HUB_CACHE": str(tmp_path / "hub"), "HF_HUB_OFFLINE": "1", "JAX_PLATFORMS": "cpu"}
+    run = subprocess.run([sys.executable, "-c", _REOPENED, str(tmp_path / "head.npz")], capture_output=True,
+                         text=True, env=env)
+    assert run.returncode == 0, run.stderr[-2000:]
+    with np.load(tmp_path / "head.npz") as head:
+        assert str(head["revision"]) == commit
+        for name, native in (("slot", "slots"), ("q.weight", "q"), ("k.weight", "k")):
+            np.testing.assert_array_equal(head[native], stored[name])
+
+
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("readout", ["slot_lm", "head", "fresh_head"])
 @pytest.mark.parametrize("n_slots", [16, 32, 512])

@@ -66,6 +66,34 @@ def test_a_decision_source_loads_through_pretrained_and_its_declared_pipeline(de
                                 decide.systemone(request), "public source pipeline")
 
 
+_ANSWERED = """
+import json
+import sys
+from dew.decision import Decide
+task = Decide.from_pretrained("dew/tiny-laya", subfolder="release", attention_impl="xla")
+print(json.dumps(task.systemone(json.loads(sys.argv[1]))))
+"""
+
+
+def test_a_hub_folder_release_answers_under_the_name_it_was_asked_by(tmp_path):
+    """A release in a folder of a Hub repo answers under the repo and folder it was loaded by, not
+    the cache directory it resolved to, as Laya's server names the model it serves."""
+    import os
+    import subprocess
+    import sys
+    from shutil import copytree
+
+    from interop_support import hub_cache
+
+    copytree(TINY, tmp_path / "repo" / "release")
+    hub_cache(tmp_path / "hub", "dew/tiny-laya", tmp_path / "repo")
+    env = {**os.environ, "HF_HUB_CACHE": str(tmp_path / "hub"), "HF_HUB_OFFLINE": "1", "JAX_PLATFORMS": "cpu"}
+    run = subprocess.run([sys.executable, "-c", _ANSWERED, json.dumps(CASES["quickstart"])],
+                         capture_output=True, text=True, env=env)
+    assert run.returncode == 0, run.stderr[-2000:]
+    assert json.loads(run.stdout.splitlines()[-1])["model"] == "dew/tiny-laya/release"
+
+
 def assert_same_rounded_answers(found: dict, expected: dict, case: str) -> None:
     """Two `systemone(details=True)` answers to `case` from logits that differ
     by fp32 rounding: the same choices, and every reported number within one
