@@ -52,6 +52,7 @@ from dew.data.dataset import (
 )
 from dew.data.pipeline import Dataset, DeviceStep
 from dew.nn.flops import MissingFlopsCount
+from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, backend, gpu_mesh, gpu_target, measured_kernel
 from dew.nn.sharding import (
     SEQUENCE_AXIS,
@@ -163,7 +164,7 @@ from dew.training.narrow import narrowed, narrowed_paths
 from dew.training.observe import Observe
 from dew.training.planning import Candidate, Planned, Timer, plan_step, settled, splits, whole_step
 from dew.training.profiling import ProfileWindow, owned_capture, start_capture, stop_capture
-from dew.training.rungs import keep_rung, plan_flops, recorded_rung
+from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, HeldBest, rankings
 from dew.training.state import MODEL_STATE, Accumulation, TrainState, kept_window
@@ -438,6 +439,7 @@ class Trainer(Generic[Loss, Effects]):
         rollout: Rollout | None = None,
         profile: ProfileWindow | None = None,
         lower_for: str | None = None,
+        tune_kernels: bool = False,
         record: bool = False,
     ):
         """Hold everything a run needs, without opening any of it.
@@ -458,8 +460,10 @@ class Trainer(Generic[Loss, Effects]):
         `microbatches` is how many a pipelined step feeds through the mesh's stage axis, a
         multiple of its size; None feeds one a stage. `lower_for`, a CUDA generation, lowers
         the first step for it in place of compiling it (`dew.training._lowering.Lowered`).
-        `record` makes each step return in its metrics what each evaluation, replays too, sampled or
-        passed as a boundary (`taken_record`).
+        `tune_kernels` measures each Pallas launch of a step that has no config measured on this GPU,
+        where the process has the GPU to itself (`dew.nn.kernels.tuning.tune`); without it such a
+        launch runs the nearest measured shape's config or its heuristic. `record` makes each step return in
+        its metrics what each evaluation, replays too, sampled or passed as a boundary (`taken_record`).
         """
         whole = _read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
@@ -479,6 +483,7 @@ class Trainer(Generic[Loss, Effects]):
         self.tracker = tracker
         self.step = step
         self.rollout = rollout
+        self.tune_kernels = tune_kernels
         if record and step is not None:
             raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach: "
                              "build them with Step(record=True)")
@@ -1168,7 +1173,8 @@ class Trainer(Generic[Loss, Effects]):
         shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
 
         def lower(split: int) -> Candidate:
-            return self._candidate(state, batch, schedule, placement, replicated, split)
+            return self._candidate(state, batch, schedule, placement, replicated, split,
+                                   recorded_launches(recorded, {**self._rung(), 'split': split}))
 
         # Read before anything traces, so a recorded rung is the first one lowered.
         record_path, key, recorded = recorded_rung(self.objective.program_key(), (state, batch), candidates,
@@ -1196,16 +1202,19 @@ class Trainer(Generic[Loss, Effects]):
         chosen = {**self._rung(), 'split': planned.split}
         flops, counted = plan_flops(recorded, planned.executable)
         if record_path is not None:
-            keep_rung(record_path, key, {**chosen, 'flops': counted})
+            keep_rung(record_path, key, {**chosen, 'flops': counted, 'launches': planned.candidate.launches})
         self.plan = settled(planned, plans, seconds, probes)
         if planned.split != candidates[0] or seconds:
             _log.info("the step fits the devices in the plan %s", self.plan)
         return planned, flops
 
     def _candidate(self, state: TrainState, batch: Batch, schedule: Schedule, placement, replicated,
-                   split: int) -> Candidate:
+                   split: int, launches: str | None) -> Candidate:
         """The step reading `batch` in `split` microbatches, lowered at the
-        objective's current rung, with what the fit check holds beside it."""
+        objective's current rung, with what the fit check holds beside it.
+        `launches` are its kernel launches where a record holds them, which
+        settle their configs before it lowers; otherwise, or where the run
+        measures configs (`tune_kernels`), its lowering records them (`tune`)."""
         micro = microbatch_shapes(batch, split)
         shapes, copies, prepared = self._prepared(state, micro, schedule, split * self.accumulation)
         shardings = self.shardings(prepared)
@@ -1221,8 +1230,14 @@ class Trainer(Generic[Loss, Effects]):
             [field for field, kept in built if kept is None and field is not None])
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
-        lowered = jitted.lower(prepared, batch, part)
-        return Candidate(micro, shapes, copies, shardings, prepared, held, lowered)
+        lower = functools.partial(jitted.lower, prepared, batch, part)
+        if launches is None or self.tune_kernels:
+            lowered, launches = tuning.tune(lower, measure=self.tune_kernels)
+        else:
+            # The lowering reads the launch configs the record settled.
+            tuning.settled(launches)
+            lowered = lower()
+        return Candidate(micro, shapes, copies, shardings, prepared, held, lowered, launches)
 
     def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, window: int):
         """The loss's shapes (None under a custom step), the narrow copies and the state's shapes

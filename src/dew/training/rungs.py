@@ -123,6 +123,16 @@ def recorded_rung(modules: Sequence[object], arguments: tuple[TrainState, Batch]
     return path, key, json_value(stored.get('rung'), f"rung record {path}")
 
 
+def recorded_launches(recorded: JSON, plan: Mapping[str, JSON]) -> str | None:
+    """The kernel launches (`dew.nn.kernels.tuning.tune`) the record holds of
+    the program `plan` compiles, where `plan` is the `recorded` one: the
+    record beside its FLOPs (`plan_flops`)."""
+    kept = dict(record(recorded, 'recorded plan')) if recorded is not None else {}
+    kept.pop('flops', None)
+    launches = kept.pop('launches', None)
+    return launches if kept == plan and isinstance(launches, str) else None
+
+
 def plan_flops(recorded: JSON, executable: jax.stages.Compiled) -> tuple[StepFlops | None, JSON]:
     """A microbatch's FLOPs in the plan `executable` runs, and what a record
     keeps of them: those the `recorded` plan's record holds where they were

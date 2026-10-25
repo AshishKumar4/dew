@@ -3305,7 +3305,7 @@ mode are on the branch `perf/lora-in-gemm` at `837154b54`:
 
 A frozen projection takes part in two products a step, its forward and its input's gradient, and
 neither needs the kernel's gradient, so its kernel can be packed in E4M3 once for both
-(`dew.quantization.frozen_fp8_leaves`, `LoRA.apply`'s `fp8_base`). Each product then casts its other
+(`dew.quantization.frozen_fp8_leaves`, `LoRA.fp8_base`). Each product then casts its other
 operand's rows to E4M3 at their current amax, multiplies the codes widened to fp32, which XLA
 rewrites to a cuBLASLt FP8 GEMM, and applies both rows' scales after. The cast of the activation
 rows costs a read and a write of them each product, so FP8 pays where the product is wide in both
@@ -3325,9 +3325,9 @@ jitted medians of five interleaved groups of thirty calls, 8192 tokens (jax 0.11
 | 12288 x 4096 | 2.639 | 1.820 | 1.45 |
 
 So a Qwen3.5-0.8B's projections (1024 wide) stay in bf16, and a 9B's attention and MLP
-projections gain. Which sites run FP8 a run names (`InputQuantization.frozen_fp8`), with the
-generation they were measured on (`measured_on`); nothing measures them on the user's side. The
-function changes by E4M3's rounding of both operands.
+projections gain. Which sites run FP8 is that measurement on the run's own GPU and token count
+(`measured_fp8_sites`), recorded with the generation it was taken on; another generation is
+refused rather than reusing it. The function changes by E4M3's rounding of both operands.
 
 The packed codes stand in the train state in place of the frozen kernels they encode, two bytes a
 parameter as bf16's are, and a merge decodes them (`frozen_fp8_kernel`). A whole run, Qwen3.5-9B
@@ -3402,7 +3402,7 @@ and with no cap differed bitwise in 2090 of the kernel's 4096 outputs and 2111 o
 
 ### The Mamba-2 SSD scan on GPU: mamba_ssm's kernels
 
-`dew.nn.kernels.mamba_ssd` ports mamba_ssm 2.3.2.post1's Triton SSD (`mamba_chunk_scan_combined`) kernel for kernel to Pallas: five forward and nine backward launches, each a `KernelOp`. `chunk_ssd` runs it wherever the GPU's target row names `'ssd': 'pallas'` (sm80 and sm90, measured below), and the XLA scan stays the oracle and the CPU and unmeasured-GPU path. Mamba-2 hands the scan its compute dtype, as mamba_ssm's conv hands its scan, so a bf16 model's `x`, `B` and `C` reach it in bf16. `chunk_ssd` forward, and forward plus backward of a sum of its output, bf16 `x`, `B`, `C` and fp32 step, median of 20 after a warmup, 2026-10-13, jax 0.11.2.post3. XLA is main `8ccb9cdfd`, whose scan casts every operand to fp32. mamba_ssm ran on torch 2.14 and Triton 3.8 on the same GPU in the same session. The port ran at its heuristic configs:
+`dew.nn.kernels.mamba_ssd` ports mamba_ssm 2.3.2.post1's Triton SSD (`mamba_chunk_scan_combined`) kernel for kernel to Pallas: five forward and nine backward launches, each a tuner `KernelOp`. `chunk_ssd` runs it wherever the GPU's target row names `'ssd': 'pallas'` (sm80 and sm90, measured below), and the XLA scan stays the oracle and the CPU and unmeasured-GPU path. Mamba-2 hands the scan its compute dtype, as mamba_ssm's conv hands its scan, so a bf16 model's `x`, `B` and `C` reach it in bf16. `chunk_ssd` forward, and forward plus backward of a sum of its output, bf16 `x`, `B`, `C` and fp32 step, median of 20 after a warmup, 2026-10-13, jax 0.11.2.post3. XLA is main `8ccb9cdfd`, whose scan casts every operand to fp32. mamba_ssm ran on torch 2.14 and Triton 3.8 on the same GPU in the same session. The port ran at its heuristic configs:
 
 | GPU | shape (batch x tokens; heads of 64 over groups, state 128, chunk) | XLA | port | mamba_ssm |
 |---|---|---|---|---|
@@ -3415,7 +3415,7 @@ and with no cap differed bitwise in 2090 of the kernel's 4096 outputs and 2111 o
 | A100-SXM4-40GB | the same, 4 x 4096 | 35.89 / 119.92 | 7.09 / 17.34 | 5.30 / 25.39 |
 | A100-SXM4-40GB | Mamba-2 2.7B, 2 x 4096 | 6.75 / 70.40 | 1.02 / 2.89 | 1.08 / 4.51 |
 
-The heuristic configs were the fastest measured on an H100 at Ultra's shape. There, every launch timed alone at each config of mamba_ssm's autotune list took 2.03 ms summed at its best against mamba_ssm's autotuned picks on the port's kernels, whose chunk state ran 0.267 against 0.157 ms. On the A100 at the H100's picks the launches summed 5.18 ms against 4.73 at their own best; there the port's forward runs behind mamba_ssm's at Ultra's shapes and its forward plus backward ahead. fp32 operands, which an fp32 model hands, take TF32x3 products where mamba_ssm takes one TF32 pass: 1.70 / 5.26 ms at Ultra 1 x 4096 on the H100 against XLA's 4.89 / 12.59, and 9.33 / 19.52 against 9.67 / 36.42 on the A100 at the H100's picks, whose fp32 launches the A100's own picks take from 26.9 to 17.0 ms summed.
+The heuristic configs are the tuner's picks on an H100 at Ultra's shape. There, every launch timed alone at each config of its space (the tuner's own measurement) took 2.03 ms summed at its best against mamba_ssm's autotuned picks on the port's kernels, whose chunk state ran 0.267 against 0.157 ms. On the A100 at the H100's picks the launches summed 5.18 ms against 4.73 at their own best; there the port's forward runs behind mamba_ssm's at Ultra's shapes and its forward plus backward ahead. fp32 operands, which an fp32 model hands, take TF32x3 products where mamba_ssm takes one TF32 pass: 1.70 / 5.26 ms at Ultra 1 x 4096 on the H100 against XLA's 4.89 / 12.59, and 9.33 / 19.52 against 9.67 / 36.42 on the A100 at the H100's picks, whose fp32 launches the A100's own picks take from 26.9 to 17.0 ms summed.
 
 Through the trainer (`tools/reference_runs/dew_lm.py`, bf16 compute, AdamW, 4 x 1024 tokens, 40 steps on synthetic token windows), Mamba-2 130M ran 71.2k tokens/s on main and 174.7k on the port on the H100 (MFU 6.0% to 14.7%, peak memory 18.6 to 5.9 GiB), and 33.9k and 83.5k on the A100 (MFU 9.0% to 22.2%). Mamba-2 2.7B on the H100 ran 5.47k and 16.5k tokens/s (MFU 9.2% to 27.8%). The losses after 40 steps agree to the third decimal (130M 11.182 and 11.174, 2.7B 10.924 and 10.918). The conv handing the scan `x`, `B` and `C` as three arrays (`causal_conv1d`'s `parts`) would save the copies at the port's edge, but the conv runs one kernel a part and the 130M step lost 6% with it (164.4k), so the conv hands one array that XLA splits. The scan's output is stored in fp32, so that a sequence-sharded scan adds the earlier shards' state before any rounding; that costs the 130M step 3% (169.4k with a bf16 output).
 
