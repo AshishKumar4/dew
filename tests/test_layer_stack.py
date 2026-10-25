@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 import selection_margins
 from model_support import largest_difference
-from reference_error import assert_as_exact, widened, without_ynn
+from reference_error import FEWEST_SEEDS, assert_as_exact, widened, without_ynn
 from sharded import assert_sharded
 from token_support import token_rows
 
@@ -290,12 +290,13 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
 def test_a_scanned_gate_at_another_sparsity_fails_check_1():
     """A Gemma 3n scanned stack whose sparse layers cut at 0.951 in place of 0.95 moves each cutoff about
     0.0035 of its row's deviation, far past the draws' margin: on the rows that clear it, it keeps other
-    units than the plain loop and float64 do, and check 1 fails it."""
+    units than the plain loop and float64 do, and check 1 fails it over the fewest seeds it judges, a
+    fault this large failing as surely there as over the site's declared ones."""
     case = ScanCase("gemma3n", activation_sparsity_pattern=(0.951,) * 5 + (0.0,) * 5)
     scanned, plain, truth = case.arms()
     with pytest.raises(AssertionError) as raised:
         assert_as_exact(scanned, plain, case.draw, "gemma3n scanned stack at 0.951",
-                        seeds=SCAN_SEEDS["gemma3n"], truth_fn=truth)
+                        seeds=FEWEST_SEEDS, truth_fn=truth)
     assert raised.type is AssertionError
 
 
