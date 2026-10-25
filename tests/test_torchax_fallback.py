@@ -1,4 +1,5 @@
-"""Tier 3: `Pretrained.load(..., fallback="torchax")` over transformers' own forward.
+"""Tier 3: transformers' own forward, run by torchax: `Pretrained.load` of an unregistered causal LM
+no registered convention computes, and `Pretrained.load(..., fallback="torchax")` of any.
 
 The offline cases build a tiny random GPT-NeoX, an architecture Dew has no
 family for and whose rotary `inv_freq` is a buffer, save it the way
@@ -28,7 +29,7 @@ from reference_error import assert_as_exact, assert_as_exact_as_the_reference, e
 
 from dew.data.dataset import Loader
 from dew.interop import Pretrained
-from dew.interop.torchax_fallback import TorchLayout
+from dew.interop.torchax_fallback import TorchLayout, TransformersTierWarning
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec, Trainer
@@ -296,6 +297,41 @@ def test_a_head_trains_as_transformers_does_by_what_it_is(head, tokens, tmp_path
                     truth_fn=truth_fn)
     if head in ("zero bias", "bias"):
         assert np.abs(dew["lm_head.bias"]).max() > 0
+
+
+BIOGPT = {"num_hidden_layers": 2, "hidden_size": 64, "num_attention_heads": 4, "intermediate_size": 256,
+          "vocab_size": 256, "max_position_embeddings": 64}
+"""A tiny BioGPT: learned positions offset by two over a scaled embedding, a type Dew registers no
+family for and no registered family's convention computes."""
+UNREGISTERED_SEEDS = 8
+"""The unregistered type's check-1 seeds, sized by `seeds_for` on armada."""
+
+
+def test_an_unregistered_causal_lm_loads_as_transformers_own_forward(tokens, tmp_path):
+    """A causal model_type Dew registers no family for, which no registered family's convention
+    computes, loads without `fallback` as tier 3, warning so (`TransformersTierWarning`): its LM
+    loss and the gradient of every parameter are as exact as transformers' own over the same
+    stored weights, measured from transformers in float64 (check 1)."""
+    torch.manual_seed(0)
+    model = transformers.BioGptForCausalLM(transformers.BioGptConfig(**BIOGPT)).eval()
+    model.save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32")
+
+    dew_fn = loss_and_gradients(loaded, model, {name: jnp.asarray(leaf)
+                                                for name, leaf in loaded.variables["params"].items()})
+    reference = copy.deepcopy(model)
+    with float64():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager").eval()
+        wide.load_state_dict(model.state_dict())
+
+    def truth_fn(ids):
+        with float64():
+            return torch_step(wide, ids, torch.float64)
+
+    assert_as_exact(dew_fn, lambda ids: torch_step(reference, ids), token_draws(tokens),
+                    "tier 3 biogpt LM step", seeds=UNREGISTERED_SEEDS, truth_fn=truth_fn)
 
 
 @pytest.mark.parametrize("family", ["llama", "neox"])

@@ -11,8 +11,12 @@ The fields a candidate does not read are not trusted by name. Before any
 weight downloads, the installed transformers builds its own class for the
 type from the same config with the sizes shrunk, gives it random weights and
 runs it; Dew loads that checkpoint through each candidate and runs it too.
-The load goes ahead as the first candidate that agrees. Anything else is
-refused with each candidate's reason, naming the generic route
+The load goes ahead as the first candidate that agrees. A type none computes
+is `Unmapped`, with each candidate's reason and the probe's shrunken config,
+on which tier 3 decides whether transformers' own forward runs it
+(`torchax_fallback.admitted`). A type whose probe cannot run (the config does
+not shrink by the standard sizes, or transformers builds or runs no shrunken
+model) is refused as `ProbeUnavailable`, naming the generic route
 (`fallback="torchax"`).
 The probe runs LENGTH tokens, so a field that acts only past that many
 positions agrees there and is not caught.
@@ -135,6 +139,45 @@ def reference_logits(model: PreTrainedModel, ids: np.ndarray) -> np.ndarray:
     return out.logits.to(torch.float32).cpu().numpy()
 
 
+@dataclass(frozen=True)
+class _Sizes:
+    """A source config's standard sizes as its transformers config class reads them: each under the
+    config's own key for it (`PretrainedConfig.attribute_map`: OpenAI-GPT's `n_embd` for
+    `hidden_size`), and one the config leaves unstated at the class's default."""
+
+    config: Mapping[str, object]
+    keys: Mapping[str, str]
+    defaults: object | None
+
+    @classmethod
+    def of(cls, hf_config: Mapping[str, object]) -> _Sizes:
+        """`hf_config`'s sizes; a type transformers does not know reads its keys as they are, with
+        no defaults."""
+        from transformers import AutoConfig
+        from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+        model_type = hf_config.get('model_type')
+        if not isinstance(model_type, str) or model_type not in CONFIG_MAPPING:
+            return cls(hf_config, {}, None)
+        defaults = AutoConfig.for_model(model_type)
+        return cls(hf_config, dict(type(defaults).attribute_map), defaults)
+
+    def key(self, name: str) -> str:
+        """The config's own key for the standard size `name`."""
+        return self.keys.get(name, name)
+
+    def stated(self, name: str, *default: object) -> object:
+        """The size `name` as the config states it, else its class's default, else `default`, else a
+        KeyError naming it."""
+        if self.key(name) in self.config:
+            return self.config[self.key(name)]
+        if getattr(self.defaults, name, None) is not None:
+            return getattr(self.defaults, name)
+        if default:
+            return default[0]
+        raise KeyError(name)
+
+
 def shrink(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     """Return a config with the sizes the convention reads made small and the rest kept.
 
@@ -144,19 +187,22 @@ def shrink(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     The query-to-key-head ratio stays, and so does whether the hidden width
     is the heads' total width; a stated window shrinks below the probe's
     length so it acts, and a token id past the probe's vocabulary moves
-    inside it.
+    inside it. Each standard size is read and written under the source's own key for it (`_Sizes`),
+    a size the config leaves unstated at its class's default; a size neither states is a KeyError.
     """
-    heads = records.integer(hf_config['num_attention_heads'], 'num_attention_heads')
-    kv_heads = records.integer(hf_config.get('num_key_value_heads') or heads, 'num_key_value_heads')
-    hidden = records.integer(hf_config['hidden_size'], 'hidden_size')
-    head_dim = records.integer(hf_config.get('head_dim') or hidden // heads, 'head_dim')
+    sizes = _Sizes.of(hf_config)
+    key, stated = sizes.key, sizes.stated
+    heads = records.integer(stated('num_attention_heads'), 'num_attention_heads')
+    kv_heads = records.integer(stated('num_key_value_heads', None) or heads, 'num_key_value_heads')
+    hidden = records.integer(stated('hidden_size'), 'hidden_size')
+    head_dim = records.integer(stated('head_dim', None) or hidden // heads, 'head_dim')
     small_kv = min(kv_heads, 2)
     small_heads = small_kv * (heads // kv_heads)
     small_hidden = small_heads * _HEAD_DIM * (1 if hidden == heads * head_dim else 2)
     fields = {key: value for key, value in hf_config.items()
               if key not in _PROBE_DROPPED and key != 'model_type'}
-    fields.update(hidden_size=small_hidden, num_attention_heads=small_heads,
-                  intermediate_size=2 * small_hidden, vocab_size=_VOCAB)
+    fields.update({key('hidden_size'): small_hidden, key('num_attention_heads'): small_heads,
+                   key('intermediate_size'): 2 * small_hidden, key('vocab_size'): _VOCAB})
     # A routed or latent-attention type keeps its structure at small widths:
     # four experts, two per token, and small latent ranks.
     small = {'num_experts': 4, 'n_routed_experts': 4, 'num_local_experts': 4, 'num_experts_per_tok': 2,
@@ -167,10 +213,10 @@ def shrink(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     if 'first_k_dense_replace' in hf_config:
         fields['first_k_dense_replace'] = min(records.integer(hf_config['first_k_dense_replace'],
                                                               'first_k_dense_replace'), 1)
-    if 'num_key_value_heads' in hf_config:
-        fields['num_key_value_heads'] = small_kv
-    if 'head_dim' in hf_config:
-        fields['head_dim'] = _HEAD_DIM
+    if key('num_key_value_heads') in hf_config:
+        fields[key('num_key_value_heads')] = small_kv
+    if key('head_dim') in hf_config:
+        fields[key('head_dim')] = _HEAD_DIM
     if isinstance(hf_config.get('sliding_window'), int):
         fields['sliding_window'] = _WINDOW
     for key in ('pad_token_id', 'bos_token_id', 'eos_token_id'):
@@ -199,6 +245,27 @@ def _refuse(model_type: str, detail: str) -> ValueError:
         f"model_type {model_type!r} is not a registered family and cannot load through a "
         f"registered family's verified convention (tier 2): {detail}. To run transformers' own "
         f"forward instead, opt into the generic route with {_FALLBACK}")
+
+
+class ProbeUnavailable(ValueError):
+    """An unregistered type whose probe cannot run: its config does not shrink by the standard sizes,
+    or transformers builds or runs no shrunken model of it. Neither tier 2 nor tier 3 can qualify such
+    a source without the probe (ledger 1595)."""
+
+
+def _unavailable(model_type: str, detail: str) -> ProbeUnavailable:
+    return ProbeUnavailable(*_refuse(model_type, detail).args)
+
+
+@dataclass(frozen=True)
+class Unmapped:
+    """The verdict on an unregistered type no registered convention computes: why each candidate did
+    not (`reasons`), and the probe's shrunken config (`fields`, `shrink`), on which tier 3 decides
+    whether transformers' own forward runs the source (`torchax_fallback.admitted`)."""
+
+    model_type: str
+    reasons: Mapping[str, str]
+    fields: Mapping[str, object]
 
 
 class _Mismatch(ValueError):
@@ -289,8 +356,8 @@ def _reference_config(model_type: str, fields: Mapping[str, object]) -> tuple[Pr
         with torch.device('meta'):
             skeleton = AutoModelForCausalLM.from_config(config, trust_remote_code=False)
     except Exception as error:
-        raise _refuse(model_type, f"transformers {__version__} builds no causal LM from its shrunken "
-                      f"config ({type(error).__name__}: {error})") from error
+        raise _unavailable(model_type, f"transformers {__version__} builds no causal LM from its shrunken "
+                           f"config ({type(error).__name__}: {error})") from error
     size = sum(parameter.numel() for parameter in skeleton.parameters())
     return config, size, f"transformers {__version__}'s {type(skeleton).__name__}"
 
@@ -335,7 +402,7 @@ def _agreement(convention: str, family: decoder_parts.DecoderFamily, model: nn.M
     return error, bound
 
 
-def verify_mapping(hf_config: Mapping[str, object]) -> VerifiedMapping:
+def verify_mapping(hf_config: Mapping[str, object]) -> VerifiedMapping | Unmapped:
     """Check an unregistered model_type against transformers before its weights download.
 
     transformers builds its class for the type from `shrink(hf_config)` with
@@ -345,13 +412,21 @@ def verify_mapping(hf_config: Mapping[str, object]) -> VerifiedMapping:
     is within twice `_ROUNDING` eps per layer per unit of the reference's
     largest logit is the mapping. When several read the config and match,
     the `CONVENTIONS` order is the tie-break: each computed the probe's
-    logits, so any of them is sound. With none, the refusal names every
-    candidate's reason.
+    logits, so any of them is sound. With none, the type is `Unmapped`, with
+    every candidate's reason and the shrunken config. A type transformers has
+    no class for is refused (its repo's own code is not run), and one whose
+    probe cannot run is refused as `ProbeUnavailable`.
     """
     model_type = hf_config.get('model_type')
     if not isinstance(model_type, str):
         raise ValueError("config.json states no model_type, so neither a family nor a reference "
                          "class can be chosen for it")
+    from transformers import __version__
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    if model_type not in CONFIG_MAPPING:
+        raise _refuse(model_type, f"transformers {__version__} has no class for it, and its repo's own "
+                      "code is not run")
     reasons: dict[str, str] = {}
     candidates = []
     for convention, family in CONVENTIONS:
@@ -360,18 +435,15 @@ def verify_mapping(hf_config: Mapping[str, object]) -> VerifiedMapping:
             candidates.append((convention, family))
         except _Mismatch as error:
             reasons[convention] = str(error)
-    if not candidates:
-        raise _refuse(model_type, f"its config reads as no registered family's: {_listed(reasons)}")
-    try:
-        fields = shrink(hf_config)
-        layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
-    except KeyError as error:
-        # A reader may take a config by its own names or its defaults (OPT's
-        # defaults every size); the probe shrinks it by the shared names.
-        read = ", ".join(convention for convention, _ in candidates)
-        raise _refuse(model_type, f"its config reads as {read}'s but states no {error.args[0]!r}, "
-                      "by which the probe shrinks it") from error
     with _quiet():
+        try:
+            fields = shrink(hf_config)
+            layers = records.integer(_Sizes.of(hf_config).stated('num_hidden_layers'), 'num_hidden_layers')
+        except (KeyError, ValueError) as error:
+            # A reader may take a config by its own names or its defaults (OPT's
+            # defaults every size); the probe shrinks it by the standard names.
+            raise _unavailable(model_type, f"its config states no {error.args[0]!r} the probe shrinks it "
+                               "by") from error
         config, size, name = _reference_config(model_type, fields)
         # A candidate that builds another architecture is dismissed on its
         # parameter count before the reference is allocated or run.
@@ -397,8 +469,8 @@ def verify_mapping(hf_config: Mapping[str, object]) -> VerifiedMapping:
                 scatter_weights(reference)
                 expected = reference_logits(reference, probe_ids(_VOCAB).astype(np.int64))
             except Exception as error:
-                raise _refuse(model_type, f"{name} does not run its shrunken config "
-                              f"({type(error).__name__}: {error})") from error
+                raise _unavailable(model_type, f"{name} does not run its shrunken config "
+                                   f"({type(error).__name__}: {error})") from error
             with tempfile.TemporaryDirectory() as scratch:
                 reference.save_pretrained(scratch)
                 for convention, family, model, record, inert in sized:
@@ -409,9 +481,8 @@ def verify_mapping(hf_config: Mapping[str, object]) -> VerifiedMapping:
                         reasons[convention] = str(mismatch)
                         continue
                     return VerifiedMapping(model_type, convention, name, error, bound, tuple(sorted(inert)))
-    tried = {convention: reasons[convention] for convention, _ in candidates}
-    raise _refuse(model_type, f"no family whose config reading it takes computes {name}'s model: "
-                  f"{_listed(tried)}")
+    return Unmapped(model_type, {convention: reasons[convention] for convention, _ in CONVENTIONS},
+                    {**fields, 'model_type': model_type})
 
 
 def _listed(reasons: Mapping[str, str]) -> str:

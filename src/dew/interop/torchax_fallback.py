@@ -1,6 +1,9 @@
 """Tier 3: a transformers PyTorch causal LM, lowered to JAX by torchax.
 
-`Pretrained.load(source, fallback="torchax")` builds the model with
+`Pretrained.load` takes this tier for an unregistered causal model_type no
+registered convention computes (`verify.Unmapped`) once `admitted` decides
+transformers' own forward runs it, and `Pretrained.load(source,
+fallback="torchax")` takes it for any source. It builds the model with
 transformers on the host and hands its forward to torchax, which runs every
 torch op as a JAX op, so the model jits, differentiates and shards like any
 other JAX function. Dew knows nothing about the architecture: no Dew
@@ -39,7 +42,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.extend.core import Literal, primitives
 
-from dew.interop import sources
+from dew.interop import sources, verify
 from dew.interop.generation_config import read_generation_config
 from dew.interop.pickles import host_view
 from dew.interop.pretrained import PretrainedFallback, source_processor
@@ -59,6 +62,76 @@ if TYPE_CHECKING:
     from dew.nn.backbones.decoder_stack import DecoderBank
 
 INSTALL = "pip install 'dewml[torchax]'"
+
+
+class TransformersTierWarning(UserWarning):
+    """A source loaded as tier 3: transformers' own PyTorch forward, run by torchax, in place of a
+    registered family's."""
+
+
+EXPERTS = "batched_mm"
+"""The routed-experts implementation tier 3 builds transformers' models with: its batched products
+over each token's chosen experts, whose shapes the token count fixes, where the default
+(`grouped_mm`) has no torchax lowering and an eager loop selects tokens by `nonzero`. A model whose
+experts do not dispatch through transformers' `ExpertsInterface` runs its own, which `admitted`
+observes."""
+
+
+def _summary(reasons: Mapping[str, str], shown: int = 3) -> str:
+    """The first `shown` of `reasons`, each convention's, and how many more there are."""
+    listed = "; ".join(f"{convention}: {reason}" for convention, reason in list(reasons.items())[:shown])
+    rest = len(reasons) - shown
+    return listed + (f"; and {rest} more conventions" if rest > 0 else "")
+
+
+@dataclass(frozen=True)
+class Admitted:
+    """An unregistered causal LM no registered convention computes that tier 3 runs (`admitted`):
+    its model_type, and why each convention did not compute it (`verify.Unmapped.reasons`)."""
+
+    model_type: str
+    reasons: Mapping[str, str]
+
+
+def admitted(unmapped: verify.Unmapped) -> Admitted:
+    """Tier 3's decision on an unregistered model_type no registered convention computes, on the
+    probe's shrunken config with random weights (`verify.scatter_weights`), before any weight
+    downloads: transformers builds the type as a causal LM (`AutoModelForCausalLM`); its forward is
+    causal, so changing a row's last token leaves every earlier position's logits bit for bit (a
+    decoder configured bidirectionally, BERT's with is_decoder False, is not); and its eager forward
+    runs no operation on the traced values whose output's shape or value those values decide
+    (`_Untraceable`), which torchax could not trace. Each refusal names its cause."""
+    import torch
+    from transformers import AutoConfig, AutoModelForCausalLM
+    from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
+
+    model_type = unmapped.model_type
+    detail = _summary(unmapped.reasons)
+    if model_type not in MODEL_FOR_CAUSAL_LM_MAPPING_NAMES:
+        raise ValueError(f"model_type {model_type!r} is no registered family, no registered family's "
+                         f"convention computes it ({detail}), and transformers builds no causal LM for it, "
+                         "which tier 3 runs")
+    fields = {key: value for key, value in unmapped.fields.items() if key != "model_type"}
+    config = AutoConfig.for_model(model_type, **fields, experts_implementation=EXPERTS)
+    model = AutoModelForCausalLM.from_config(config, trust_remote_code=False, dtype=torch.float32).eval()
+    verify.scatter_weights(model)
+    ids = torch.from_numpy(verify.probe_ids(int(config.vocab_size)).astype(np.int64))
+    traced = [*model.parameters(), *model.buffers(), ids]
+    with torch.no_grad(), _Untraceable(traced) as untraceable:
+        logits = model(input_ids=ids, use_cache=False).logits
+    if untraceable.found:
+        raise ValueError(f"model_type {model_type!r} runs as transformers' own forward only, and that "
+                         f"forward computes {sorted(set(untraceable.found))} on its inputs or weights, whose "
+                         "output's shape or value they decide, which a traced program cannot hold")
+    changed = ids.clone()
+    changed[:, -1] = (changed[:, -1] + 1) % int(config.vocab_size)
+    with torch.no_grad():
+        moved = model(input_ids=changed, use_cache=False).logits
+    if not torch.equal(logits[:, :-1], moved[:, :-1]):
+        raise ValueError(f"model_type {model_type!r} as configured attends to later tokens (its earlier "
+                         "positions' logits move with a row's last token), and tier 3 runs causal LMs")
+    return Admitted(model_type, dict(unmapped.reasons))
+
 
 TORCH_AXES: tuple[tuple[str, LogicalAxes], ...] = (
     # nn.Linear stores [out, in]; its bias is the output side alone.
@@ -212,6 +285,66 @@ def _Draws():
             return tensor
 
     return Draws()
+
+
+def _Untraceable(traced):
+    """A torch function mode recording, by name, each call of an operation whose output's shape or
+    value the values it reads decide (`found`), where it reads one of the `traced` tensors or a value
+    computed from them: what torchax, tracing the forward over those tensors, could not hold. A
+    value built from constants alone (`torch.arange` over a length) is concrete in the trace too."""
+    import torch
+    from torch.overrides import TorchFunctionMode
+
+    Tensor = torch.Tensor
+    deciding = {Tensor.item, Tensor.tolist, Tensor.__bool__, Tensor.__int__, Tensor.__float__,
+                Tensor.__index__, torch.nonzero, Tensor.nonzero, torch.argwhere, Tensor.argwhere,
+                torch.masked_select, Tensor.masked_select, torch.unique, Tensor.unique,
+                torch.unique_consecutive, Tensor.unique_consecutive, torch.bincount, Tensor.bincount}
+
+    def tensors(value):
+        if isinstance(value, Tensor):
+            yield value
+        elif isinstance(value, (tuple, list)):
+            for item in value:
+                yield from tensors(item)
+        elif isinstance(value, Mapping):
+            for item in value.values():
+                yield from tensors(item)
+
+    def decides(func, args, kwargs) -> bool:
+        if func in deciding:
+            return True
+        if func is Tensor.__getitem__:
+            # A boolean mask selects as many elements as it holds true.
+            return any(index.dtype == torch.bool for index in tensors(args[1:]))
+        if func is torch.where:
+            return len(args) + len(kwargs) == 1
+        if func in (torch.repeat_interleave, Tensor.repeat_interleave):
+            repeats = args[1] if len(args) > 1 else kwargs.get("repeats")
+            return isinstance(repeats, Tensor) and kwargs.get("output_size") is None
+        return False
+
+    class Untraceable(TorchFunctionMode):
+        def __init__(self):
+            super().__init__()
+            self.found: list[str] = []
+            # Held for the probe's length, so no id is reused by a later tensor.
+            self.kept = list(traced)
+            self.reached = {id(tensor) for tensor in traced}
+
+        def __torch_function__(self, func, types, args=(), kwargs=None):
+            kwargs = kwargs or {}
+            reads = any(id(tensor) in self.reached for tensor in tensors((args, kwargs)))
+            if reads and decides(func, args, kwargs):
+                self.found.append(getattr(func, "__qualname__", getattr(func, "__name__", repr(func))))
+            output = func(*args, **kwargs)
+            if reads:
+                for tensor in tensors(output):
+                    self.kept.append(tensor)
+                    self.reached.add(id(tensor))
+            return output
+
+    return Untraceable()
 
 
 _OPMATH: Mapping[str, tuple[int, str] | None] = {
@@ -479,21 +612,23 @@ def _refuse_packing(packing: Mapping[str, object]) -> None:
 
 
 def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtype: str,
-         param_dtype: str, attention_impl: str, max_seq_len: int | None) -> PretrainedFallback:
+         param_dtype: str, attention_impl: str, max_seq_len: int | None,
+         admission: Admitted | None = None) -> PretrainedFallback:
     """Load `directory`'s causal LM through transformers and torchax.
 
     `directory` is the metadata snapshot `Pretrained.load` resolved and
     `revision` its commit (None for a local directory); the weights come
     from the same commit through `sources.snapshot`, so the file
-    selection is the native loader's.
+    selection is the native loader's. `admission` is the decision that sent an
+    unregistered type here (`admitted`), None for `fallback="torchax"`.
     """
     if attention_impl != "auto":
         raise ValueError(
-            f"attention_impl={attention_impl!r} selects a Dew kernel, and fallback='torchax' "
-            "runs transformers' own attention; leave attention_impl at 'auto'")
+            f"attention_impl={attention_impl!r} selects a Dew kernel, and tier 3 runs "
+            "transformers' own attention; leave attention_impl at 'auto'")
     if max_seq_len is not None:
         raise ValueError(
-            "max_seq_len sizes Dew's decode cache and rotary table, which fallback='torchax' "
+            "max_seq_len sizes Dew's decode cache and rotary table, which tier 3 "
             "does not build; leave it unset and feed rows no longer than the model's "
             "max_position_embeddings")
     if not (directory / "config.json").is_file():
@@ -518,7 +653,8 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     # Before transformers, whose reader fails on a malformed file without naming it.
     generation_config = read_generation_config(directory)
     storage = "auto" if param_dtype == AUTO else getattr(torch, param_dtype)
-    model = AutoModelForCausalLM.from_pretrained(str(directory), dtype=storage, local_files_only=True)
+    model = AutoModelForCausalLM.from_pretrained(str(directory), dtype=storage, local_files_only=True,
+                                                 experts_implementation=EXPERTS)
     model.eval()
     jittable = JittableModule(model)
     head = model.get_output_embeddings()
@@ -545,12 +681,15 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     source = str(name_or_dir) if revision is None else f"{name_or_dir}@{revision}"
     processor = source_processor(directory, config, config, module, source=source)
     versions = {name: importlib.metadata.version(name) for name in ("transformers", "torchax", "torch")}
+    why = ("fallback='torchax'" if admission is None else
+           f"model_type {admission.model_type!r} is no registered family and no registered family's "
+           f"convention computes it: {_summary(admission.reasons)}")
     warnings.warn(
-        f"{name_or_dir} loads as tier 3 (fallback='torchax'): transformers {versions['transformers']}'s "
+        f"{name_or_dir} loads as tier 3 ({why}): transformers {versions['transformers']}'s "
         f"PyTorch forward lowered by torchax {versions['torchax']}, pinned to torch "
         f"{versions['torch']}; no Dew kernels, sharding rules beyond TorchLayout's name table, "
-        f"or KV-cache generation; the load holds the torch model on the host, at least 2x "
-        f"the checkpoint", stacklevel=3)
+        f"packing or KV-cache generation; the load holds the torch model on the host, at least 2x "
+        f"the checkpoint", TransformersTierWarning, stacklevel=3)
     built = {**config, "dtype": dtype, "fallback": "torchax", **versions}
     return PretrainedFallback(module, {"params": params, "buffers": buffers}, processor, config, directory,
                               built, generation_config, export_adapter=graph.export, revision=revision)
