@@ -135,6 +135,9 @@ def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backwar
     which `forward` and `backward` refuse by and the route's chooser and the stability suite read."""
     hooks = Hooks() if hooks is None else hooks
     sixteen = (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16))
+    if hooks.drop is not None:
+        return ("the Mosaic mainloop takes no probability dropout yet (the route runs a dropping call on the "
+                "reference path, ledger row 1521)")
     if backward and hooks != Hooks():
         return "the Mosaic backward takes no hooks yet"
     if backward and jnp.dtype(dtype) != jnp.dtype(jnp.bfloat16):

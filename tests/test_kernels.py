@@ -26,6 +26,8 @@ from dew.nn import kernels
 from dew.nn.attention import NormalAttention, scaled_dot_product_attention, weighted_values
 from dew.nn.kernels import bf16_dot_runs
 from dew.nn.kernels.selection import KernelRefused
+from dew.nn.kernels.templates import attention as template
+from dew.nn.precision import at_least_fp32
 
 pytestmark = pytest.mark.kernel
 
@@ -858,7 +860,12 @@ def test_the_reference_path_is_flax_attention_op_for_op(dtype, forced, dropout_r
     `dot_product_attention` handed the key heads repeated over their group and
     Dew's value product (`weighted_values`), bitwise: in each compute dtype,
     the softmax forced to fp32 or not, an fp32 bias wider than half-precision
-    logits, a causal mask and a probability draw from the same key."""
+    logits and a causal mask. Its probability draw is Dew's own (row 1521: the
+    keep bits every route draws from one rng, `template.dropout_keep`, so a
+    route never changes which weights drop) and its multiplier Dew's (row 1533:
+    1 / (1 - rate) rounded once in at least fp32), applied where flax applies
+    its own: flax's weights (`dot_product_attention_weights`) under Dew's keep
+    mask and multiplier, then the value product."""
     keys = jax.random.split(jax.random.key(0), 5)
     query = jax.random.normal(keys[0], (2, 6, 4, 8), dtype)
     key, value = (jax.random.normal(drawn, (2, 6, 2, 8), dtype) for drawn in keys[1:3])
@@ -866,11 +873,15 @@ def test_the_reference_path_is_flax_attention_op_for_op(dtype, forced, dropout_r
     drop = {"dropout_rate": dropout_rate, "dropout_rng": keys[4], "deterministic": not dropout_rate}
     ours = scaled_dot_product_attention(query, key, value, implementation="reference", causal=True, bias=bias,
                                         force_fp32_for_softmax=forced, **drop)
-    theirs = nn.dot_product_attention(
-        query, jnp.repeat(key, 2, axis=2), jnp.repeat(value, 2, axis=2), bias=bias,
-        mask=jnp.tril(jnp.ones((6, 6), bool))[None, None], broadcast_dropout=False,
-        force_fp32_for_softmax=forced, qk_attn_weights_einsum=jnp.einsum,
-        attn_weights_value_einsum=weighted_values, **drop)
+    weights = nn.dot_product_attention_weights(
+        query, jnp.repeat(key, 2, axis=2), bias=bias, mask=jnp.tril(jnp.ones((6, 6), bool))[None, None],
+        force_fp32_for_softmax=forced, einsum=jnp.einsum)
+    if dropout_rate:
+        wide = at_least_fp32(dtype)
+        keep = template.dropout_keep(template.dropout_seed(keys[4]), dropout_rate, weights.shape)
+        scale = jnp.asarray(1.0 / (1.0 - dropout_rate), wide)
+        weights = (weights.astype(wide) * jnp.where(keep, scale, 0)).astype(dtype)
+    theirs = weighted_values('...hqk,...khd->...qhd', weights, jnp.repeat(value, 2, axis=2))
     np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 
