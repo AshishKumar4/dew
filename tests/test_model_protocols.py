@@ -59,7 +59,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
-from reference_error import assert_as_exact_as_the_reference, widened
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened
 from test_architectures import CASES as ARCHITECTURES, MASK, TEXT_FEATURES, TEXT_TOKENS, VOCAB
 from tiny_models import build_model, tiny_inputs
 
@@ -570,9 +570,31 @@ one compiled step a rung, and a checkpoint's whole ladder (kimi-k3-tiny's) took 
 past a CI task's 240."""
 
 
+RUNG_SEEDS = 8
+"""Check 1's declared seeds for a rung's forward against the model's, sized paired by `seeds_for` on
+an A100, where a rung's checkpoint barriers change the forward program."""
+
+
+def _redrawn(inputs, seed: int):
+    """`inputs` drawn afresh at `seed` with their shapes and kinds: integer ids below the largest given
+    (a token model's ids stay in its vocabulary), floats from a normal, the rest as given."""
+    rng = np.random.default_rng([0x2A, seed])
+
+    def leaf(value):
+        value = np.asarray(value)
+        if np.issubdtype(value.dtype, np.integer):
+            return rng.integers(0, int(value.max()) + 1, value.shape).astype(value.dtype)
+        if np.issubdtype(value.dtype, np.floating):
+            return rng.standard_normal(value.shape).astype(value.dtype)
+        return value
+    return jax.tree.map(leaf, inputs)
+
+
 def _climbs_and_restores(model, variables, inputs, share: int, **apply) -> None:
-    """Each rung holds less than the one below it and steps the same forward,
-    bitwise. Its backward recomputes, which can round apart (gemma2-tiny's
+    """Each rung holds less than the one below it and steps the forward the
+    model does: a rung's checkpoint makes its forward another program, which
+    check 1 holds against the model's from the model's float64 twin over drawn
+    inputs. Its backward recomputes, which can round apart (gemma2-tiny's
     gradients by up to 1.2e-4, kimi-k3-tiny's 8.3e-3 of 10.8; test_decoder_remat.py
     found the same), so the gradients are the model's bits or as exact as them.
     A rung's record restores it from any rung below it and moves no rung
@@ -589,15 +611,24 @@ def _climbs_and_restores(model, variables, inputs, share: int, **apply) -> None:
             assert restored == records[max(low, high)], (records[low], records[high], restored)
     assert all(rung.restore_recompute("no rung").recompute_record() == record
                for rung, record in zip(rungs, records, strict=True))
-    output, gradient_tree = _stepped(model, variables, inputs, **apply)
+    _, gradient_tree = _stepped(model, variables, inputs, **apply)
     truth = functools.cache(
         lambda: _stepped(_float64(model), widened(variables), widened(inputs), **apply)[1])
     written = model.apply(variables, *inputs, mutable=True, **apply)[1]
     shared = rungs[1 + share::RUNG_SHARES]
     assert shared or len(rungs) <= 1 + share, records
+    # Applied as the step applies them: some models read their ids on the host.
+    def forward_truth(*inputs):
+        with jax.enable_x64(new_val=True):
+            wide = _call(_float64(model), widened(variables), widened(inputs), **apply)
+            return np.asarray(wide, np.float64)
+
     for rung in shared:
         stepped = _stepped(rung, variables, inputs, **apply)
-        same(stepped[0], output)
+        assert_as_exact(lambda *inputs, rung=rung: np.asarray(_call(rung, variables, inputs, **apply)),
+                        lambda *inputs: np.asarray(_call(model, variables, inputs, **apply)),
+                        lambda seed: _redrawn(inputs, seed), f"forward at {rung.recompute_record()}",
+                        seeds=RUNG_SEEDS, truth_fn=forward_truth)
         as_exact(stepped[1], gradient_tree, truth, f"gradient at {rung.recompute_record()}")
         assert rung.apply(variables, *inputs, mutable=True, **apply)[1].keys() == written.keys()
 
