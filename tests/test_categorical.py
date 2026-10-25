@@ -181,6 +181,23 @@ def near_reference(seed: int) -> tuple[np.ndarray, np.ndarray]:
             reference.astype(np.float32))
 
 
+def test_a_confident_soft_targets_derivative_keeps_its_shift_invariance():
+    """Soft targets as confident as the logits, `[1, a]` against logits `[20, 0]` whose second probability
+    is `a`, and the logits' own distribution: the derivative's entries sum to exactly 0, its derivative
+    along all-ones, which shift invariance makes 0, and against its own distribution it is exactly 0,
+    where the dominant class's other target mass taken as `T - t` rounds its entry to `-a`."""
+    logits = jnp.asarray([20.0, 0.0], jnp.float32)
+    own = jax.nn.softmax(logits)
+    for targets in (jnp.asarray([1.0, own[1]]), own):
+        def loss(row, targets=targets):
+            return categorical.soft_cross_entropy(row, targets)
+
+        _, along = jax.jvp(loss, (logits,), (jnp.ones(2, jnp.float32),))
+        assert float(along) == 0.0
+    np.testing.assert_array_equal(jax.grad(lambda row: categorical.soft_cross_entropy(row, own))(logits),
+                                  np.zeros(2, np.float32))
+
+
 def divergence_derivative(logits: np.ndarray, reference: np.ndarray) -> np.ndarray:
     """`KL(q || p)`'s derivative in `logits` by arXiv:2610.31642's eq. 9 in NumPy, in the inputs' own
     dtype, its `p` the reference's softmax and its `q` the logits'."""
