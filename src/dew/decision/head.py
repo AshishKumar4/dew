@@ -11,7 +11,7 @@ given it as `[V, D]` rows.
 
 import functools
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import ClassVar, NamedTuple
 
 import jax
@@ -35,7 +35,6 @@ from dew.nn.mixers import AttentionMixer
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import accumulated, at_least_fp32, capped_logits, scaled_logits
 from dew.nn.scatter import DROPPED
-from dew.records import JSON
 from dew.registry import Record, class_record, from_record, import_path, imported, record_fields
 
 
@@ -89,7 +88,7 @@ class Head(nn.Module):
         return {"class": import_path(type(self)), "fields": fields}
 
     @staticmethod
-    def from_record(record: JSON, width: int) -> "Head":
+    def from_record(record: records.JSON | Mapping[str, object], width: int) -> "Head":
         """Rebuild the head a run recorded (`dew.registry.class_record`), reading states `width`
         wide, the one field its record leaves to the backbone, in the numerics it recorded."""
         held = class_record(records.record(record, "head"))
