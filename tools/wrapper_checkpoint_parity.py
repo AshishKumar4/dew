@@ -53,7 +53,7 @@ def float64_logits(checkpoint, revision, weights, batches) -> list[np.ndarray]:
     float32, and every float32 pin in it (norms, softmax, a pooler's or standardizer's casts) is
     widened; its experts, where it has them, run one at a time, as Torch's grouped GEMM takes no
     float64; the fp32 checkpoint `weights` load into it exactly."""
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     torch.set_num_threads(1)
     with float64(), torch.no_grad():
