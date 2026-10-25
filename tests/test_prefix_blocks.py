@@ -3,10 +3,11 @@
 The data stage `Blocks` makes a packed row's blocks, each document's
 first tokens, its prompt, or a user's runs. The objective trains on
 them, scoring no target in its source's block, and a served prompt
-takes the same blocks (`prompt_blocks`). The trained loss and a greedy
-cached rollout agree with float64 under the mask `block_causal` writes
-apart from Dew (check 1); the counted targets are exact; with no prefix
-the loss is the causal one, bitwise.
+takes the same blocks (`prompt_blocks`). The trained loss agrees with
+float64 under the mask `block_causal` writes apart from Dew (check 1); a
+served rollout is bitwise the one a request carrying the trained blocks
+gets; the counted targets are exact; with no prefix the loss is the
+causal one, bitwise.
 """
 
 import jax
@@ -16,17 +17,17 @@ import optax
 import pytest
 from block_support import VOCAB, block_causal, model, wrapped
 from model_support import TINY_DECODER, model_draw
-from reference_error import assert_as_exact, seeds_for
+from reference_error import assert_as_exact, seeds_for, without_ynn
 
 from dew.data.chat import Role
 from dew.data.steps.blocks import Blocks
 from dew.data.steps.text import CountTargets
 from dew.inference.serving import Server
 from dew.inference.tasks import TextGeneration
-from dew.nn.inputs import coordinates
+from dew.nn.inputs import BLOCKS_FIELD, ModelInputs, coordinates
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixers import AttentionMixer
-from dew.nn.visibility import prompt_blocks
+from dew.nn.visibility import prefix_blocks, prompt_blocks
 from dew.objectives.lm import TEXT_KEY, LMObjective
 from dew.objectives.lm.objective import batch_text
 from dew.sampling import Sampling
@@ -95,9 +96,9 @@ def test_a_prefix_run_trains_the_block_mask_on_par_with_float64():
         tokens = jax.random.randint(jax.random.fold_in(jax.random.key(1), seed), (BATCH, ROW), 0, VOCAB)
         return init(jax.random.fold_in(jax.random.key(0), seed), tokens[:, :-1]), tokens
 
-    reference = jax.jit(lambda params, tokens: masked(decoder, params, tokens))
-    truth = jax.jit(lambda params, tokens: masked(wide, params, tokens))
-    dew = jax.jit(lambda params, tokens: trained(objective, params, tokens))
+    reference = without_ynn(lambda params, tokens: masked(decoder, params, tokens))
+    truth = without_ynn(lambda params, tokens: masked(wide, params, tokens))
+    dew = without_ynn(lambda params, tokens: trained(objective, params, tokens))
     seeds = seeds_for(reference, draw, "prefix run loss", truth_fn=truth)
     assert_as_exact(dew, reference, draw, "prefix run loss", seeds=seeds, truth_fn=truth)
 
@@ -110,37 +111,22 @@ def test_the_counted_targets_leave_out_exactly_the_in_block_ones():
     np.testing.assert_array_equal(counts, [2, 3])
 
 
-def test_a_greedy_cached_rollout_serves_the_prefix_mask_on_par_with_float64():
+def test_a_prefix_runs_task_serves_the_blocks_the_run_trained_on():
+    """A prefix run's task serves the trained mask: its greedy cached rollout is bit for bit the rollout
+    the same model's causal task gives a request that carries the run's blocks itself, each prompt's
+    first `PREFIX` real tokens one block (`prefix_blocks`, the rule the run's data stage writes): the same
+    program on the same mask. That a cached rollout reads its blocks as a full pass does is
+    tests/test_block_visibility.py's check 1."""
     decoder = blocky()
-    objective = LMObjective(decoder, SEQ, prefix=PREFIX)
-    wide = decoder.clone(dtype=jnp.float64, attention_impl="reference")
-
-    init = jax.jit(decoder.init)
-
-    def draw(seed):
-        prompt = jax.random.randint(jax.random.fold_in(jax.random.key(1), seed), (BATCH, PROMPT), 0, VOCAB)
-        params = init(jax.random.fold_in(jax.random.key(0), seed), prompt)
-        task = objective.build_task(params, processor=None)
-        return params, prompt, task(prompt, NEW, key=0).tokens[:, PROMPT:]
-
-    def rollout(params, prompt, continuation):
-        return objective.build_task(params, processor=None)(prompt, NEW, key=0).raw_log_probs
-
-    def full_pass(model_, params, prompt, continuation):
-        """The continuation's log-probabilities under one full pass over prompt and continuation: the
-        prompt's first `PREFIX` tokens are one block, and the continuation's tokens are causal."""
-        sequence = jnp.concatenate([prompt, continuation], axis=1)
-        blocks = np.full(sequence.shape, -1, np.int32)
-        blocks[:, :PREFIX] = 1
-        keep = block_causal(blocks)[:, :-1, :-1]
-        logits = model_.apply(params, sequence[:, :-1], attention_pairwise_mask=jnp.asarray(keep))
-        log_probs = jax.nn.log_softmax(logits[:, PROMPT - 1:], axis=-1)
-        return jnp.take_along_axis(log_probs, continuation[..., None], axis=-1)[..., 0]
-
-    reference = jax.jit(lambda *inputs: full_pass(decoder, *inputs))
-    truth = jax.jit(lambda *inputs: full_pass(wide, *inputs))
-    seeds = seeds_for(reference, draw, "prefix rollout", truth_fn=truth)
-    assert_as_exact(rollout, reference, draw, "prefix rollout", seeds=seeds, truth_fn=truth)
+    params = jax.jit(decoder.init)(jax.random.key(0), jnp.zeros((1, PROMPT), jnp.int32))
+    prompt = jax.random.randint(jax.random.key(1), (BATCH, PROMPT), 0, VOCAB)
+    served = LMObjective(decoder, SEQ, prefix=PREFIX).build_task(params, processor=None)(prompt, NEW, key=0)
+    places = jnp.broadcast_to(jnp.arange(PROMPT), prompt.shape)
+    blocks = prefix_blocks(jnp.ones(prompt.shape, jnp.int32), places, PREFIX)
+    causal = LMObjective(decoder, SEQ).build_task(params, processor=None)
+    given = causal(ModelInputs(prompt, {BLOCKS_FIELD: blocks}), NEW, key=0)
+    np.testing.assert_array_equal(served.tokens, given.tokens)
+    np.testing.assert_array_equal(served.raw_log_probs, given.raw_log_probs)
 
 
 def test_with_no_prefix_the_loss_is_the_causal_one_bitwise():
@@ -337,9 +323,9 @@ def test_a_prefix_run_trains_and_serves_through_a_wrapper_of_a_block_reading_dec
         scores = scorer.token_scores(variables, batch)
         return scores.losses, scores.weights
 
-    reference = jax.jit(lambda variables, tokens: scored(bare, language_model(variables), tokens))
-    truth = jax.jit(lambda variables, tokens: scored(wide, language_model(variables), tokens))
-    dew = jax.jit(lambda variables, tokens: scored(objective, variables, tokens))
+    reference = without_ynn(lambda variables, tokens: scored(bare, language_model(variables), tokens))
+    truth = without_ynn(lambda variables, tokens: scored(wide, language_model(variables), tokens))
+    dew = without_ynn(lambda variables, tokens: scored(objective, variables, tokens))
     seeds = seeds_for(reference, draw, "wrapped prefix run loss", truth_fn=truth)
     assert_as_exact(dew, reference, draw, "wrapped prefix run loss", seeds=seeds, truth_fn=truth)
     variables = wrapper.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
