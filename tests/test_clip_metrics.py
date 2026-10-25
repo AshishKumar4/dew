@@ -16,14 +16,15 @@ CLIP_TINY = Path(__file__).resolve().parent / "fixtures" / "clip" / "tiny"
 
 def clip_fixture():
     """The reference's inputs and embeddings, and the sampler-shaped batch
-    that carries them: images in [-1, 1] and the tokenized captions."""
+    that carries them: images in [-1, 1] and the captions as host text, which
+    CLIP's own tokenizer reads as the reference did."""
     reference = np.load(CLIP_TINY / "reference.npz")
-    recipe = json.loads((CLIP_TINY / "prompts.json").read_text())["images"]
+    recorded = json.loads((CLIP_TINY / "prompts.json").read_text())
+    recipe = recorded["images"]
     images = np.random.RandomState(recipe["seed"]).randint(
         0, 256, tuple(recipe["shape"]), dtype=np.uint8)
     generated = jnp.asarray(images, jnp.float32) / 127.5 - 1.0
-    batch = {"text": {"input_ids": reference["input_ids"],
-                      "attention_mask": reference["attention_mask"]}}
+    batch = {"caption": np.asarray(recorded["prompts"])}
     image = reference["image_embeds"].astype(np.float64)
     text = reference["text_embeds"].astype(np.float64)
     cosine = ((image * text).sum(-1)
@@ -106,3 +107,33 @@ def test_each_images_clip_score_is_a_term_of_the_sets():
     np.testing.assert_allclose(metric.scores(images, prompts, batch_size=3), each, rtol=1e-6)
     assert metric.score(images, prompts) == pytest.approx(each.mean(), abs=1e-9)
     assert metric.scores(images[::-1], prompts[::-1])[::-1] == pytest.approx(each, abs=1e-9)
+
+
+
+def test_a_validation_batch_scores_its_captions_by_clips_tokenizer_whatever_its_conditions_read():
+    """A diffusion objective's validation batch (`data().evaluate_batch`) holds its conditions' own
+    tokens, a character table's here, and its captions beside them as host text: CLIP scores the
+    captions through its own tokenizer, as it scores the captions alone, held to the reference's
+    cosines, and never the conditions' ids. A batch whose caption field holds anything but text is
+    refused."""
+    from dew.diffusion import presets
+    from dew.inputs import CharTable, Condition, Field, InputSpec
+    from dew.nn.backbones import SimpleDiT
+    from dew.objectives.diffusion.objective import DiffusionObjective
+
+    inputs = InputSpec(Field("image", (4, 4, 3)),
+                       {"text": Condition(CharTable.from_pretrained("char_table"))})
+    model = SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
+    objective = DiffusionObjective(model, presets.Flow()(), inputs, ema_decay=None)
+    prompts = json.loads((CLIP_TINY / "prompts.json").read_text())["prompts"]
+    generated, captioned, _ = clip_fixture()
+    batch = {"caption": list(prompts)}
+    for step in objective.data().evaluate_batch:
+        batch = step(batch)
+    assert "text" in batch and list(batch["caption"]) == prompts
+    metric = CLIPDistance(modelname=str(CLIP_TINY))
+    # The captions alone, which the reference's cosines are held to (above), score the same.
+    assert metric.finalize(metric(ImageGrid(generated), batch)) == metric.finalize(
+        metric(ImageGrid(generated), captioned))
+    with pytest.raises(ValueError):
+        metric(ImageGrid(generated), {"caption": batch["text"]})
