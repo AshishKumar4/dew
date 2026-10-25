@@ -31,7 +31,7 @@ import numpy as np
 from flax import linen as nn
 from jax.typing import ArrayLike
 
-from dew.nn.autoencoders import AutoEncoder
+from dew.nn.autoencoders import AutoEncoder, LatentAffine
 from dew.nn.autoencoders.kl import posterior_moments
 from dew.nn.conv import Conv
 from dew.nn.precision import at_least_fp32
@@ -115,35 +115,26 @@ class TunedAutoEncoder(AutoEncoder):
     def latent_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
         return self.autoencoder.latent_shape(shape)
 
-    def running_normalization(self, params, dtype=jnp.float32) -> tuple[jax.Array, jax.Array]:
-        """The latent shift and scale the running statistics in `params` give, in `dtype`."""
+    def latent_affine(self, params, dtype) -> LatentAffine:
+        """The latent shift and scale the running statistics in `params` give, in `dtype`, which the
+        base `encode` and `decode` apply."""
         statistics = params[LATENT_STATS]
-        return jnp.asarray(statistics["mean"], dtype), jnp.asarray(jax.lax.rsqrt(statistics["var"]), dtype)
+        return LatentAffine(jnp.asarray(statistics["mean"], dtype),
+                            jnp.asarray(jax.lax.rsqrt(statistics["var"]), dtype))
 
     @property
     def latent_shift(self):
         raise TypeError("a tuned autoencoder's latent shift is its run's running statistics, which each "
-                        "call's variables hold (`running_normalization`)")
+                        "call's variables hold (`latent_affine`)")
 
     @property
     def latent_scale(self):
         raise TypeError("a tuned autoencoder's latent scale is its run's running statistics, which each "
-                        "call's variables hold (`running_normalization`)")
+                        "call's variables hold (`latent_affine`)")
 
     def with_normalization(self, normalization):
         raise TypeError("a tuned autoencoder normalizes by its run's running statistics, which each "
                         "call's variables hold, not by a fixed normalization")
-
-    def encode(self, params, x, key=None, noise=None):
-        latent = (self.encode_video(params, x, key, noise) if x.ndim == 5
-                  else self.encode_batch(params, x, key=key, noise=noise))
-        shift, scale = self.running_normalization(params, latent.dtype)
-        return (latent - shift) * scale
-
-    def decode(self, params, z):
-        shift, scale = self.running_normalization(params, z.dtype)
-        z = z / scale + shift
-        return self.decode_video(params, z) if z.ndim == 5 else self.decode_batch(params, z)
 
 
 
