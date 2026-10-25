@@ -3,6 +3,7 @@ the short conv's kernels at their training shapes, compiles for its GPU within t
 memory, and the port's dots refuse mixed dtypes. None runs a kernel, so the GPU tier, whose kernel tests
 are the verdict, runs none of them: the file carries no `kernel` mark."""
 
+import dataclasses
 import functools
 import tempfile
 from pathlib import Path
@@ -418,12 +419,14 @@ def _attention_cases(target: generation.GpuTarget) -> list:
         name = f"mosaic backward {form}{' fused' if pins else ''}{' hooked' if hooks else ''}"
         return support.KernelCase(name, call)
 
-    # The fast form's one launch at its cheapest fitting config, which the cost model may rank below the two.
+    # The fast form's one launch at the derived tiles, which a test names (`MosaicBackward.legal`).
     op = attention_mosaic.MosaicBackward(form="causal", keys=tokens, scale=width ** -0.5, accurate=False)
     ba = op.bind(query, key, key, query, spans.start, spans.end, None, None, (), None, residuals,
                  interpret=False)
-    fused = min((config for config in op.fits(ba, target) if config.fused),
-                key=lambda config: op.cost(ba, config, target))
+    derived = op.derived(ba, target)
+    assert derived is not None
+    fused = dataclasses.replace(derived, fused=True)
+    assert op.legal(ba, fused, target)
     return [forward(training, hooks) for training in (False, True) for hooks in (False, True)] + [
         backward(form, hooks, {}) for form in ("default", "accurate") for hooks in (False, True)] + [
         backward("default", hooks=False, pins={attention_mosaic.MosaicBackward: fused})]
