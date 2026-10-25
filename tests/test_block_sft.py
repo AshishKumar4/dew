@@ -28,6 +28,8 @@ from dew.interop.diffusion_gemma import translate_weights
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs
+from dew.nn.multimodal import VisionConditioner
+from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.objectives.base import FROZEN, Step, freeze, model_rngs, select, thaw
 from dew.objectives.diffusion.block import BlockDiffusionObjective, _cache_geometry
 from dew.objectives.lm.chunked import chunked_tile, model_logits
@@ -651,13 +653,32 @@ def unnormed_objective(**options):
     return BlockDiffusionObjective(DiffusionGemma(text=text, canvas_length=4), prompt_length=4, **options)
 
 
-def image_objective(loaded):
-    """The fixture's image-conditioned model with its text queries and keys unnormed, so QK-Clip may
-    rescale them. Its vision tower's projections carry no norm to begin with, so the clip reaches them too."""
-    text = loaded.model.text.clone(qk_norm=False)
-    model = DiffusionGemma(text=text, canvas_length=loaded.model.canvas_length,
-                           conditioner=loaded.model.conditioner)
+def unnormed_image_objective():
+    """A small image-conditioned DiffusionGemma with no query or key norm anywhere, so QK-Clip may rescale
+    every projection it reads: its text layers and its vision tower's (`SiglipVision`'s layers, built with
+    `qk_norm=False`). The fixture's own vision tower is Gemma's, and it norms its queries and keys."""
+    text = CausalTransformer(vocab_size=32, emb_features=8, num_layers=2, num_heads=2, mlp_features=16,
+                             max_seq_len=16, qk_norm=False, layer_scalar="trainable")
+    vision = SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2, image_size=8,
+                          patch_size=4)
+    projection = GemmaProjector(text_width=8, patches_per_side=2, tokens_per_side=1)
+    model = DiffusionGemma(text=text, canvas_length=4, conditioner=VisionConditioner(
+        vision, projection, dtype=jnp.float32))
     return BlockDiffusionObjective(model, prompt_length=8)
+
+
+def unnormed_image_batch(rows):
+    """`rows` rows of an image batch over the unnormed model's vocabulary: one image a row, and each row's
+    text slots 2 and 3 its image's soft tokens."""
+    tokens = jnp.asarray([[0, 2, 9, 9, 5, 0, 6, 7, 8, 9, 0, 0]] * rows, jnp.int32)
+    indices = jnp.asarray([[-1, -1, 0, 1, -1, -1, -1, -1, -1, -1, -1, -1]] * rows, jnp.int32)
+    valid = jnp.asarray([[0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0]] * rows, bool)
+    positions = jnp.asarray([[0, 0, 1, 2, 4, 5, 7, 8, 9, 10, 10, 10]] * rows, jnp.int32)
+    pixels = jnp.broadcast_to(jnp.linspace(-0.5, 0.5, 3 * 8 * 8).reshape(1, 1, 3, 8, 8), (rows, 1, 3, 8, 8))
+    return {"text": ModelInputs(tokens, {"image_indices": indices, "attention_mask": valid,
+                                         "image_groups": jnp.where(indices >= 0, indices // 2, -1),
+                                         "positions": positions},
+                                {"pixel_values": pixels, "image_lengths": jnp.ones((rows,), jnp.int32)})}
 
 
 def qk_clip(limit):
@@ -714,14 +735,13 @@ def test_a_block_run_clips_its_attention_at_its_passes_maxima():
     jax.tree.map(np.testing.assert_array_equal, unclipped["params"], start["params"])
 
 
-def test_an_image_conditioned_run_clips_its_text_and_vision_attention_at_their_maxima(image_source):
-    """The image run clips where its projections carry no norm: its text layers at their merged maxima, and
-    its vision tower at its own, which the encoder pass alone observes. A threshold no head reaches moves
-    nothing."""
-    loaded, inputs, _, _, _ = image_source
-    obj = image_objective(loaded)
+def test_an_image_conditioned_run_clips_its_text_and_vision_attention_at_their_maxima():
+    """The image run clips where its projections carry no norm: its text layers and its vision tower alike,
+    each at its merged maxima (`merged`), where the vision tower's attention is what only the encoder pass
+    observes. A threshold no head reaches moves nothing."""
+    obj = unnormed_image_objective()
     rows = math.lcm(2, jax.device_count())
-    batch = {"text": jax.tree.map(lambda leaf: jnp.asarray(np.concatenate([leaf] * (rows // 2))), inputs)}
+    batch = unnormed_image_batch(rows)
     threshold = 0.05
     start, opt_state, passes, final, updates = clipped_run(obj, batch, threshold)
     assert updates == 1
