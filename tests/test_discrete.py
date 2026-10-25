@@ -292,6 +292,18 @@ def test_masked_generation_names_what_a_model_lacks(rng, model, lacks):
         process.generate(model, model.init(rng, jnp.zeros((1, 4), jnp.int32)), [[1, 2]], 3, key=0)
 
 
+def test_a_masked_walk_whose_model_scores_nothing_refuses_rather_than_reveal_a_token(rng):
+    """A model whose scores are NaN holds no distribution to reveal a token from, so masked generation
+    raises instead of committing an arbitrary one; the same model with finite scores generates."""
+    model = transformer(causal=False)
+    variables = model.init(rng, jnp.zeros((1, 4), jnp.int32))
+    process = DiscreteProcess(LogLinear(), mask_id=MASK)
+    process.generate(model, variables, [[1, 2]], 3, key=0, steps=4)
+    poisoned = jax.tree.map(lambda leaf: jnp.full_like(leaf, jnp.nan), variables)
+    with pytest.raises(ValueError):
+        process.generate(model, poisoned, [[1, 2]], 3, key=0, steps=4)
+
+
 def test_masked_generation_reads_its_ids_as_every_parser_of_ids_does(rng):
     """NumPy integers are token ids as Python's are (`dew.nn.inputs.token_id`), so a request built
     from a tokenizer's arrays generates as one built from Python ints; a flag or a fraction where
@@ -398,6 +410,38 @@ def test_a_bidirectional_media_wrapper_fills_a_response_after_an_image():
     np.testing.assert_array_equal(generated.tokens[:, :4], tokens)
     assert generated.tokens.shape == (1, 9) and not np.any(generated.tokens == 31)
     np.testing.assert_array_equal(generated.lengths, [5])
+
+
+def test_a_media_wrapper_around_a_shifted_decoder_reads_the_logits_its_decoder_reads():
+    """A multimodal wrapper around a decoder whose predictions are the position before's logits
+    (Dream's, `shifted_logits`) reads its scores as its decoder does: over text alone, the masked
+    walk's unmasking distribution and the masked objective's loss are the decoder's own."""
+    from dew.nn.multimodal import MultimodalTransformer
+    from dew.nn.vision import GemmaProjector, SiglipVision
+    from dew.objectives.base import Step
+    from dew.objectives.diffusion import MaskedDiffusionObjective
+
+    text = CausalTransformer(vocab_size=32, emb_features=16, num_layers=1, num_heads=2, head_dim=8,
+                             mlp_features=32, max_seq_len=16, causal=False, mask_token_id=31,
+                             shifted_logits=True)
+    model = MultimodalTransformer(
+        text, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
+                           image_size=8, patch_size=4),
+        GemmaProjector(text_width=16, patches_per_side=2, tokens_per_side=1),
+        family="gemma3", image_token_id=1)
+    tokens = jnp.array([[2, 31, 3, 31, 4, 31]])
+    variables = model.init(jax.random.key(0), tokens)
+    alone = {"params": variables["params"]["language_model"]}
+    process = DiscreteProcess(LogLinear(), mask_id=31)
+    _, wrapped = process.denoiser(model, variables)(tokens, jnp.ones((1,)))
+    _, decoded = process.denoiser(text, alone)(tokens, jnp.ones((1,)))
+    np.testing.assert_array_equal(wrapped, decoded)
+    batch, step = {"text": np.array([[2, 5, 3, 6, 4, 7]])}, Step(jnp.array(0), jax.random.key(1), None)
+    wrapped_loss, decoded_loss = (
+        MaskedDiffusionObjective(network, process, 6, ema_decay=None).loss(held, batch, step)[0]
+        for network, held in ((model, variables), (text, alone)))
+    for leaf, own in zip(jax.tree.leaves(wrapped_loss), jax.tree.leaves(decoded_loss), strict=True):
+        np.testing.assert_array_equal(leaf, own)
 
 
 ############################################################################################################

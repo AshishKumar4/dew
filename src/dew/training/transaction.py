@@ -27,11 +27,11 @@ from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
 from dew.data.dataset import rows_of
+from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import rows_spec
 from dew.objectives.base import (
     EXAMPLE_ROWS,
     EXAMPLE_STREAM,
-    FROZEN,
     Aux,
     Batch,
     Evaluated,
@@ -45,7 +45,7 @@ from dew.objectives.base import (
 )
 from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
-from dew.training.state import Accumulation, TrainState
+from dew.training.state import Accumulation, TrainState, apart, together
 
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)
@@ -211,7 +211,7 @@ def _unscale(gradient: jax.Array, factor: jax.typing.ArrayLike) -> jax.Array:
     The division happens in fp32 or wider, so a bf16 gradient does not round
     twice on the way back to its true magnitude.
     """
-    dtype = jnp.promote_types(gradient.dtype, jnp.float32)
+    dtype = at_least_fp32(gradient.dtype)
     return gradient.astype(dtype) / jnp.asarray(factor, dtype)
 
 
@@ -516,7 +516,7 @@ class Transaction:
         native = jax.tree.map(_descending, gradient, current.variables["params"])
         native_finite = _all_finite(native)
         norm = optax.global_norm(native)
-        norm = norm.astype(jnp.result_type(norm.dtype, jnp.float32))
+        norm = norm.astype(at_least_fp32(norm.dtype))
 
         def apply(current):
             # The update applies to the parameters the model's constraint projects
@@ -749,12 +749,8 @@ class Transaction:
                 aux, pending, gradient = jax.tree.map(
                     jax.lax.optimization_barrier, (realized.aux, pending, gradient))
                 return finish(state, batch, aux, pending, gradient, attempt, tokens)
-            if FROZEN not in state.variables:
-                return finish(state, batch, realized.aux, pending, gradient, attempt, tokens)
-            held = state.variables[FROZEN]
-            moving = {name: tree for name, tree in state.variables.items() if name != FROZEN}
-            advanced, loss, aux, committed = finish(dataclasses.replace(state, variables=moving), batch,
-                                                    realized.aux, pending, gradient, attempt, tokens)
-            return (dataclasses.replace(advanced, variables={**advanced.variables, FROZEN: held}),
-                    loss, aux, committed)
+            moving, held = apart(state)
+            advanced, loss, aux, committed = finish(moving, batch, realized.aux, pending, gradient, attempt,
+                                                    tokens)
+            return together(advanced, held), loss, aux, committed
         return run

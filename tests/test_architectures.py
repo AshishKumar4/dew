@@ -406,24 +406,24 @@ def widened_state(state):
 
 
 LAYOUT_SEEDS: dict[str, int] = {
-    "unet": 128, "uvit": 128, "simple_udit": 64, "simple_dit": 64, "simple_mmdit": 64,
-    "hierarchical_mmdit": 128, "hybrid_dit": 64, "video_dit": 64, "unet_3d": 128, "jepa_encoder": 128,
-    "jepa_video_encoder": 256, "causal_transformer": 64, "causal_transformer+moe": 128,
-    "causal_transformer+gpt_oss": 256, "causal_transformer+deepseek_v2": 256,
-    "causal_transformer+glm4_moe": 256, "causal_transformer+llama4": 256,
-    "causal_transformer+gemma4_moe": 256, "causal_transformer+gemma3n": 128,
-    "causal_transformer+mla": 64, "causal_transformer+qwen35": 8,
+    "unet": 64, "uvit": 8, "simple_udit": 8, "simple_dit": 8, "simple_mmdit": 8,
+    "hierarchical_mmdit": 8, "hybrid_dit": 8, "video_dit": 8, "unet_3d": 32, "jepa_encoder": 128,
+    "jepa_video_encoder": 128, "causal_transformer": 32, "causal_transformer+moe": 32,
+    "causal_transformer+gpt_oss": 256, "causal_transformer+deepseek_v2": 64,
+    "causal_transformer+glm4_moe": 128, "causal_transformer+llama4": 32,
+    "causal_transformer+gemma4_moe": 64, "causal_transformer+gemma3n": 64,
+    "causal_transformer+mla": 32, "causal_transformer+qwen35": 8,
 }
 """Each cell's declared seeds for check 1 (`assert_as_exact`), the most any layout and step count took,
-sized by `seeds_for` on armada. Every cell's arms share their upstream rounding (the same state, batch
-and draws); a cell whose errors are also heavy-tailed across draws is sized paired with the layout's
-arm (`dew_fn`), as testing.md has it: Gemma 3n's and Qwen 3.5's (the four largest of 64 draws hold
-half of a layer's pooled error, LONG_SEQ_LEN), and MLA's, where one draw in 1024 holds all of one
-device's pooled error (seed 247, an indexer selection the draw filter lets through: ledger 1527) and
-the reference compared with itself resolves no momentum within 4096 draws. Every other cell's errors
-are light-tailed (the four largest of 64 draws hold 7 to 12% of an arm's pooled error at the median
-leaf, 6% being uniform), and it is sized by the reference against itself. Every cell is named: one
-added is sized."""
+sized paired by `seeds_for` (`dew_fn`, the layout's arm) on armada: every cell's arms share their
+upstream rounding (the same state, batch and draws), so the paired ratio the verdict judges resolves in
+the draws it needs, as few as the reference compared with itself needs or up to 16 times fewer
+(testing.md states how paired counts were validated). For three cells it is the only count that
+resolves at all: Gemma 3n's and Qwen 3.5's errors are heavy-tailed across draws (the four largest of
+64 draws hold half of a layer's pooled error, LONG_SEQ_LEN), and MLA's (one draw in 1024 holds all of
+one device's pooled error, seed 247, an indexer selection the draw filter lets through: ledger 1527),
+where the reference compared with itself resolves no momentum within 4096 draws. Every cell is named:
+one added is sized."""
 
 def selects(case: Case) -> bool:
     """Whether the cell's model selects discontinuously (`selection_margins.selects`)."""
@@ -466,13 +466,54 @@ def reordered(state, order):
     return state.replace(variables=permuted(state.variables, order), ema=ema)
 
 
+def in_identity_order(stepped: dict, order):
+    """A drawn step's variables, optimizer state and EMA (`drawn_steps`) with the residual stream's
+    units taken back out of `order`: each tree that mirrors the parameters (the parameters, the EMA's,
+    the optimizer's momentum) permuted by its inverse, so that every order of one draw is judged against
+    that draw's one truth (`ORBIT`). A permutation moves no leaf's RMS nor any row's, so a cell judged
+    at one order alone keeps its verdict."""
+    if not len(order):
+        return stepped
+    inverse = np.argsort(order)
+    params = jax.tree.structure(stepped["variables"]["params"])
+
+    def mirrors(node) -> bool:
+        return jax.tree.structure(node) == params
+
+    return jax.tree.map(lambda node: permuted({"params": node}, inverse)["params"] if mirrors(node) else node,
+                        stepped, is_leaf=mirrors)
+
+
+ORBIT = 4
+"""The residual orders each draw of a mixture cell runs at (`assert_as_exact`'s `orders`): its own and
+ORBIT - 1 more, each arm's worst row its worst over them. A routed expert's row of a step's momentum
+can nearly cancel on one draw, its rounding then set by the order its few tokens sum in; one order's
+worst row of either arm is then an extreme of that order alone (ledger 1531), where over the same
+orders both arms meet the same cancellation. A mitigation measured, not a bound: over fresh windows of
+the one-step 8x1-data site, the seven mixture cells' own arms failed 2 of 898 verdicts over four orders
+where they failed 12 at the draw's order alone, and every arm scaled 1.6 times or given an independent
+error 2.5 times its own failed at both."""
+
+
+def orbit(width: int):
+    """`ORBIT` orders of each draw (`assert_as_exact`'s `orders`): the draw's own, and its order
+    composed with ORBIT - 1 fixed shuffles of the `width` residual units, each as uniform over the orders
+    as the draw's own."""
+    shuffles = [np.random.default_rng([0x0B17, width, at]).permutation(width) for at in range(1, ORBIT)]
+
+    def orders(inputs):
+        raw, order = inputs
+        return [inputs, *((raw, order[shuffle]) for shuffle in shuffles)]
+    return orders
+
+
 def drawn_steps(case: Case, tmp_path, fsdp, devices, initial, steps: int, *, exact: bool = False):
     """`steps` steps of a layout over the batch a draw gives, from `initial` in the residual order
     it gives (`reordered`), every step on the same rows, as `run_case`'s `fit` takes them, the step
     compiled once for every draw: a function of the raw batch and the order returning the stepped
-    state's variables, optimizer state and EMA. `exact` runs one device in float64 from the state
-    widened, the batch's samples widened (`wide`), built at its first call, so under the caller's
-    float64."""
+    state's variables, optimizer state and EMA taken back to the identity order
+    (`in_identity_order`). `exact` runs one device in float64 from the state widened, the batch's
+    samples widened (`wide`), built at its first call, so under the caller's float64."""
     built = []
 
     def stepped(raw, order):
@@ -490,7 +531,8 @@ def drawn_steps(case: Case, tmp_path, fsdp, devices, initial, steps: int, *, exa
             built.append(trainer.compile(state, batch))
         for _ in range(steps):
             state, *_ = built[1](state, batch)
-        return jax.device_get({name: getattr(state, name) for name in ("variables", "opt_state", "ema")})
+        return in_identity_order(
+            jax.device_get({name: getattr(state, name) for name in ("variables", "opt_state", "ema")}), order)
 
     return stepped
 
@@ -501,10 +543,16 @@ def test_a_residual_order_is_the_same_decoder(case):
     """The residual orders the layout cells draw (`permuted`) reorder sums only: each language cell's
     float64 logits under an order other than the identity are the identity's within float64's
     rounding of their own longest chain (`assert_computes_the_oracle`), so a draw over orders is a
-    draw of roundings and never another model."""
+    draw of roundings and never another model. Every parameter is drawn apart from its initial value,
+    a norm's or a router's scale as uneven as a trained one, so a residual-wide parameter `permuted`
+    leaves in place moves the logits; a step's state, which `in_identity_order` takes back, holds no
+    other."""
     model = models.build(case.architecture, **case.config)
     ids = np.random.default_rng(3).integers(0, LM["vocab_size"], (2, SEQ_LEN)).astype(np.int32)
-    variables = jax.jit(model.init)(jax.random.key(0), ids)
+    initial = jax.jit(model.init)(jax.random.key(0), ids)
+    rng = np.random.default_rng(4)
+    variables = jax.tree.map(lambda leaf: leaf + rng.normal(0, 0.1, leaf.shape).astype(leaf.dtype)
+                             if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, initial)
     width = residual_width(variables)
     with jax.enable_x64(new_val=True):
         wide = widened(variables)
@@ -587,8 +635,10 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
                 assert mine.dtype == theirs.dtype and mine.shape == theirs.shape, name
                 assert np.array_equal(mine.view(np.uint8), theirs.view(np.uint8)), name
     truth = drawn_steps(case, tmp_path, 1, 1, initial, steps, exact=True)
+    # A mixture's rows are judged over each draw's orbit of residual orders (`ORBIT`).
+    orders = orbit(width) if case.is_lm and selection_margins.routes(case.config) else None
     assert_as_exact(drawn[layout], drawn["one device"], draw, f"{case.name} {layout}, {steps} step(s)",
-                    seeds=seeds, truth_fn=truth)
+                    seeds=seeds, truth_fn=truth, orders=orders)
     if fsdp == 1:
         assert not fsdp_leaves(state.variables), "nothing may shard on a 1-wide fsdp axis"
         return

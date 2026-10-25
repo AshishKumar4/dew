@@ -1,7 +1,9 @@
-"""Dew's CPU policy for float32 products (`dew.nn.precision.accumulated`): a CPU sums them in float64
-and rounds once, through every product a layer forms, its gradient's and tangent's included, and a
-bias's gradient (`dew.nn.precision.spread`), with x64 off; 16-bit products and other backends keep their
-own arithmetic."""
+"""Dew's CPU policy for float32 products (`dew.nn.precision.accumulated`) in the suite's wide CPU
+arithmetic (`dew.nn.precision.WIDE_CPU_ARITHMETIC`, which tests/lane_environment.py sets): a CPU sums
+them in float64 and rounds once, through every product a layer forms, its gradient's and tangent's
+included, and a bias's gradient (`dew.nn.precision.spread`), with x64 off; 16-bit products and other
+backends keep their own arithmetic. A library process, without the setting, traces the plain
+products."""
 
 import contextlib
 
@@ -9,10 +11,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import with_gradients
+from reference_error import equations, with_gradients
 
 from dew.nn.dense import Dense
-from dew.nn.precision import FP32_SUMS, accumulated, float32_dot_general, float32_einsum, float32_matmul
+from dew.nn.precision import (
+    FP32_SUMS,
+    WIDE_CPU_ARITHMETIC,
+    accumulated,
+    float32_dot_general,
+    float32_einsum,
+    float32_matmul,
+)
 
 pytestmark = pytest.mark.skipif(jax.default_backend() != "cpu", reason="the policy is the CPU's")
 
@@ -207,6 +216,44 @@ def test_a_mixed_product_converts_its_operands_as_the_product_does():
     assert float(accumulated(jnp.dot, 2.0, 3.0, preferred_element_type=jnp.float32)) == 6.0
 
 
+def doubling(kind: str):
+    """A dot stating its own derivative, twice the dot's: as a `jax.custom_jvp` or a `jax.custom_vjp`
+    (Qwix's kind, when it quantizes a model directly)."""
+    def dot(x, y, preferred_element_type=None):
+        return jnp.dot(x, y, preferred_element_type=preferred_element_type)
+
+    if kind == "custom_jvp":
+        doubled = jax.custom_jvp(dot, nondiff_argnums=(2,))
+
+        @doubled.defjvp
+        def _(preferred_element_type, primals, tangents):
+            (x, y), (dx, dy) = primals, tangents
+            return dot(x, y), 2 * (jnp.dot(dx, y) + jnp.dot(x, dy))
+        return doubled
+    doubled = jax.custom_vjp(dot, nondiff_argnums=(2,))
+
+    def forward(x, y, preferred_element_type):
+        return dot(x, y), (x, y)
+
+    def backward(preferred_element_type, saved, cotangent):
+        x, y = saved
+        return 2 * jnp.dot(cotangent, y.T), 2 * jnp.dot(x.T, cotangent)
+
+    doubled.defvjp(forward, backward)
+    return doubled
+
+
+@pytest.mark.parametrize("kind", ["custom_jvp", "custom_vjp"])
+def test_a_product_that_states_its_own_derivative_keeps_it(kind):
+    """A product with a derivative of its own (a `jax.custom_jvp`, or a `jax.custom_vjp` as Qwix's
+    are when it quantizes a model directly) is its library's: `accumulated`'s gradient through it is
+    its own, twice the dot's here, where a transpose of its primal would give the dot's."""
+    doubled = doubling(kind)
+    lhs, rhs = CANCELLING[None], np.ones((3, 1), np.float32)
+    gradient = jax.jit(jax.grad(lambda rhs: jnp.sum(accumulated(doubled, lhs, rhs))))(rhs)
+    assert np.asarray(gradient).tolist() == [[2.0 ** 25], [2.0], [-(2.0 ** 25)]]
+
+
 def test_a_portable_recurrence_product_sums_in_float64():
     """The recurrence's portable products (`recurrence_algebra.portable` and the weighed `paired`)
     are real CPU execution's, and sum in float64: 1 exactly over the cancelling terms."""
@@ -218,3 +265,50 @@ def test_a_portable_recurrence_product_sums_in_float64():
     decay = np.ones((1, 1, 3), np.float32)
     weighed = jax.jit(lambda *operands: paired("product", *operands))(left, right, decay)
     assert np.asarray(weighed).tolist() == [[1.0]]
+
+
+@pytest.mark.parametrize("wide", [True, False], ids=["test setting", "library"])
+def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
+    """Each site of the wide CPU arithmetic, a float32 product and a bias's spread, a row's logsumexp
+    and a float64 division, traces a platform choice in a process running Dew's test setting
+    (`WIDE_CPU_ARITHMETIC`), and in a library process, which sets nothing, the plain computation:
+    no platform choice and no float64 beside a float32 computation. Each is traced afresh, as a
+    process with either setting traces it."""
+    from dew.diffusion.schedules.common import divided
+    from dew.nn.protocols import OutputTable
+    from dew.objectives.lm.chunked import chunked_cross_entropy
+
+    if wide:
+        monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "1")
+    else:
+        monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
+    lhs, rhs = np.ones((4, 3), np.float32), np.ones((3, 2), np.float32)
+    layer = Dense(2)
+    variables = layer.init(jax.random.key(0), lhs)
+    states, table = np.ones((2, 5, 8), np.float32), np.ones((7, 8), np.float32)
+    targets = np.zeros((2, 5), np.int32)
+
+    def traced(fn, *arguments):
+        """The equations of `fn` traced afresh on `arguments` (a new function, so no trace is reused)."""
+        return list(equations(jax.make_jaxpr(lambda *values: fn(*values))(*arguments)))
+
+    def float64(found) -> bool:
+        return any(var.aval.dtype == jnp.float64 for equation in found
+                   for var in (*equation.invars, *equation.outvars) if hasattr(var, "aval"))
+
+    def chosen(found) -> bool:
+        return any(equation.primitive.name == "platform_index" for equation in found)
+
+    sites = {
+        "product": traced(lambda a, b: float32_dot_general(a, b, (((1,), (0,)), ((), ()))), lhs, rhs),
+        "bias": traced(jax.grad(lambda params: jnp.sum(layer.apply({"params": params}, lhs))),
+                       variables["params"]),
+        "logsumexp": traced(lambda states, table: chunked_cross_entropy(
+            states, OutputTable(table, vocab_major=True), targets, 1, tile=None)[0], states, table),
+    }
+    with jax.enable_x64(new_val=True):
+        division = traced(divided, np.ones(3, np.float64), np.float64(3.0))
+    for name, found in sites.items():
+        assert chosen(found) == wide, name
+        assert float64(found) == wide, name
+    assert chosen(division) == wide
