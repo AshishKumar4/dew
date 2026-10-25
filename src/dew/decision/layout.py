@@ -30,6 +30,7 @@ from typing_extensions import get_protocol_members
 
 from dew import records
 from dew.data.text import HFTokenizer, Offsets, Tokenizer
+from dew.data.tokens import share_tokens
 from dew.decision.questions import Choice, Noul, Question, Score, kind_of
 from dew.decision.renderer import Chunk, Rendered, Unit, render as rendered_chunks
 from dew.nn.inputs import Coordinates, coordinates, pad_token_rows
@@ -613,7 +614,8 @@ class QuestionLayout(Layout):
             return built([]), (0, 0)
         counts = [len(encoder.encode(text, add_special_tokens=False)) if text else 0 for text in texts]
         full = built(list(texts))
-        capped = any(copy.max_tokens is not None and copy.max_tokens < count
+        # A copy kept whole is never cut, so its cap sends no row down the cutting path.
+        capped = any(copy.keep != "all" and copy.max_tokens is not None and copy.max_tokens < count
                      for copy, count in zip(copies, counts, strict=True))
         if len(full.tokens) <= self.max_len and not capped:
             return full, _least_kept([(count, count) for count in counts])
@@ -974,8 +976,8 @@ type Render = Literal["question", "compact", "entry", "state"]
 class State:
     """The state, as compact JSON with sorted keys, its start kept: cut to its own budget
     (`max_tokens`, or a joint layout's `max_state_tokens` where it gives none) and to its share of
-    what the rest of the row leaves of its `max_len` (`shared_budgets`). A row may hold the state more
-    than once, each copy its own segment, budget and `keep`, the copies of a row rendered alike. A
+    what the rest of the row leaves of its `max_len` (`dew.data.tokens.share_tokens`). A row may hold
+    the state more than once, each copy its own segment, render, budget and `keep`. A
     question row's segments say how it renders (`render`, `rendered`) and what a cut keeps of it
     (`keep`: its start, its end, or all of it, a row that it leaves too long then unfit); a joint row
     renders it compact."""
@@ -989,36 +991,14 @@ class State:
             _least("max_tokens", self.max_tokens, 0)
 
 
-def shared_budgets(lengths: Sequence[int], caps: Sequence[int | None], room: int) -> list[int]:
-    """How many tokens each copy of the state keeps: as many as it holds (`lengths`) up to its cap
-    (`caps`, None for none), and where those exceed `room`, what the copies share of it max-min
-    fairly: no copy keeps more than another wants while that one keeps less than it wants, every
-    share is nonnegative, they sum to at most `room`, and none is left over while a copy wants more."""
-    wants = [length if cap is None else min(cap, length) for length, cap in zip(lengths, caps, strict=True)]
-    left = max(0, room)
-    if sum(wants) <= left:
-        return wants
-    shares = [0] * len(wants)
-    remaining = len(wants)
-    for index in sorted(range(len(wants)), key=lambda at: wants[at]):
-        shares[index] = min(wants[index], left // remaining)
-        left -= shares[index]
-        remaining -= 1
-    return shares
-
-
 def allocated(lengths: Sequence[int], copies: "Sequence[State]", room: int,
               default_cap: int | None = None) -> list[int]:
-    """How many of its own tokens each copy of the state keeps, the one allocation every row's copies
-    read: a copy kept whole (`keep="all"`) takes all of its `lengths` first, and the others share what
-    is left of `room` (`shared_budgets`), each at most its own cap (`max_tokens`, or `default_cap`
-    where it gives none)."""
-    whole = sum(length for length, copy in zip(lengths, copies, strict=True) if copy.keep == "all")
-    cut = [(length, copy) for length, copy in zip(lengths, copies, strict=True) if copy.keep != "all"]
-    caps = [default_cap if copy.max_tokens is None else copy.max_tokens for _, copy in cut]
-    shares = iter(shared_budgets([length for length, _ in cut], caps, room - whole))
-    return [length if copy.keep == "all" else next(shares)
-            for length, copy in zip(lengths, copies, strict=True)]
+    """How many of its own tokens each copy of the state keeps of `room` (`dew.data.tokens.share_tokens`):
+    a copy kept whole (`keep="all"`) all of its `lengths`, whatever its cap, and the others what is
+    left, each at most its own cap (`max_tokens`, or `default_cap` where it gives none)."""
+    return share_tokens(lengths, room, caps=[default_cap if copy.max_tokens is None else copy.max_tokens
+                                             for copy in copies],
+                        whole=[copy.keep == "all" for copy in copies])
 
 
 def _least_kept(pairs: Sequence[tuple[int, int]]) -> tuple[int, int]:

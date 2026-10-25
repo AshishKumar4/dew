@@ -22,11 +22,11 @@ from dew.data.text import ByteTokenizer
 from dew.decision import Choice, Decide, Example
 from dew.decision.images import Images
 from dew.decision.layout import DecisionInputs, Specials
-from dew.decision.model import ContextEncoder, DecisionModel
+from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.questions import ChoiceAnswer
 from dew.interop import Pretrained
-from dew.nn.cross_attention import CrossAttention, crossing
+from dew.nn.cross_attention import ContextEncoder, CrossAttention, crossing
 from dew.nn.multimodal import MultimodalTransformer
 from dew.objectives.base import FROZEN, thaw
 from dew.training import Trainer
@@ -314,10 +314,11 @@ def test_a_request_with_images_reads_its_context_beside_them():
 
 def test_a_backbone_encoded_context_is_the_backbones_own_pass_over_it():
     """With `context_encoder="backbone"` the cross-attention reads the backbone's final states over the
-    context, its own pass (`context_states`): the decision states are the backbone's over the row with
+    context, its own pass (`encode_context`): the decision states are the backbone's over the row with
     that conditioning, exactly; they differ from the table encoder's, both read the same weights, and
     the encoder rides the task's settings, so a reload reads its context the same way."""
     from dew.decision.task import DecideSettings
+    from dew.nn.cross_attention import encode_context
     from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS
 
     table, encoded = conditioned(32, (0, 1)), conditioned(32, (0, 1), "backbone")
@@ -330,7 +331,8 @@ def test_a_backbone_encoded_context_is_the_backbones_own_pass_over_it():
     states = [np.asarray(task.model.states(variables, inputs)) for task in tasks]
     model = encoded.model
     backbone = {name: value["backbone"] for name, value in variables.items() if "backbone" in value}
-    context = model.context_states(variables, inputs)
+    context = encode_context(model.backbone, backbone, inputs.context, inputs.context_lengths,
+                             encoder="backbone")[CONTEXT]
     direct = model.backbone.apply(backbone, inputs.tokens, coordinates=inputs.coordinates(),
                                   conditioning={CONTEXT: context.astype(model.backbone.context_dtype),
                                                 CONTEXT_LENGTHS: inputs.context_lengths},

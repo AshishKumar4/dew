@@ -159,24 +159,15 @@ def test_a_whole_request_whose_row_leaves_its_state_out_is_refused():
         scoring.admit(body)
 
 
-def test_copies_of_the_state_share_the_room_each_within_its_own_budget():
-    """`shared_budgets` gives each copy as many tokens as it holds up to its cap; where those exceed the
-    room, a max-min fair share: nonnegative, summing to at most the room, none left over while a copy
-    wants more, and the copy that wants least taking all it wants first."""
-    from dew.decision.layout import shared_budgets
+def test_copies_of_the_state_share_the_room_as_any_rows_segments_do():
+    """A row's copies of the state share its room as any row's segments do (`share_tokens`): each its
+    cap, its own or the joint layout's, a whole copy all it holds (row 1616)."""
+    from dew.data.tokens import share_tokens
+    from dew.decision.layout import allocated
 
-    assert shared_budgets([10, 10], [None, 4], 100) == [10, 4]
-    assert shared_budgets([10, 10], [None, None], 7) == [3, 4]
-    assert shared_budgets([10, 10, 10], [2, None, None], 11) == [2, 4, 5]
-    assert shared_budgets([10, 10], [None, None], -3) == [0, 0]
-    for lengths, caps, room in (([5, 9, 3], [None, 6, None], 10), ([8, 8], [8, 1], 4),
-                                ([0, 7], [None, None], 2)):
-        shares = shared_budgets(lengths, caps, room)
-        wants = [length if cap is None else min(cap, length)
-                 for length, cap in zip(lengths, caps, strict=True)]
-        assert all(0 <= share <= want for share, want in zip(shares, wants, strict=True))
-        assert sum(shares) <= max(room, 0)
-        assert sum(shares) == min(sum(wants), max(room, 0))
+    copies = [State(max_tokens=4), State(keep="all", max_tokens=2), State()]
+    assert allocated([10, 6, 10], copies, 12, default_cap=5) == share_tokens(
+        [10, 6, 10], 12, caps=[4, 2, 5], whole=[False, True, False]) == [3, 6, 3]
 
 
 def test_a_joint_row_holds_the_state_twice_each_copy_cut_to_its_own_budget():

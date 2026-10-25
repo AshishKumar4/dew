@@ -33,7 +33,7 @@ from dew.decision.layout import (
     question_fields,
     with_context,
 )
-from dew.decision.model import ContextEncoder, DecisionModel
+from dew.decision.model import DecisionModel
 from dew.decision.questions import KINDS, Choice, Question, Score
 from dew.decision.scoring import LogLoss, ScoringRule
 from dew.decision.task import Decide, DecideSettings, Weights, laid_out
@@ -43,7 +43,7 @@ from dew.inputs import Field, InputSpec
 from dew.interop.processors import Processor
 from dew.lora import Adapter
 from dew.nn import categorical
-from dew.nn.cross_attention import crosses_alone
+from dew.nn.cross_attention import ContextEncoder, crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import ModelInputs
 from dew.nn.protocols import CountedDecisions, CountedTraining, CrossAttending, TokenModel, VocabularyRows
@@ -94,8 +94,8 @@ class Encoding:
     fitted the example with (`Fit`), which the row lays out again.
 
     With a `context_length`, a row also carries its example's context as
-    `context`, the tokens of its text (`render`), its first `context_length`
-    of them, and none for an example without one.
+    `context`, the tokens of its text (`render`), a context longer than
+    `context_length` refused (`Fit`), and none for an example without one.
     """
 
     layout: Layout
@@ -622,7 +622,7 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
             own = 0.0 if context is None else model.backbone.training_flops(context)
             return model.backbone.training_flops(lengths) + own + trained
         if self._backbone_frozen():
-            # A context's pass trains nothing, so it runs forward alone (`DecisionModel.context_states`).
+            # A context's pass trains nothing, so it runs forward alone (`encode_context`).
             forward = counted_flops(model.backbone, lengths)
             return (frozen_training_flops(forward, parameter_flops(model.backbone, lengths))
                     + self._context_flops(model, batch) + trained)

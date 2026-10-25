@@ -47,7 +47,7 @@ from dew.decision.layout import (
     render,
     with_context,
 )
-from dew.decision.model import ContextEncoder, DecisionModel
+from dew.decision.model import DecisionModel
 from dew.decision.questions import (
     KINDS,
     Answer,
@@ -64,6 +64,7 @@ from dew.files import write_atomically
 from dew.inference import scoring
 from dew.inference.tasks import shape_bucket
 from dew.interop.processors import Processor
+from dew.nn.cross_attention import ContextEncoder
 from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
 from dew.nn.kernels.options import compiler_options
 from dew.nn.sharding import batch_axes
