@@ -262,7 +262,6 @@ def test_the_autoencoder_folds_and_normalizes_as_the_pipeline_does(source, array
                       f"{name} autoencoder", VAE_SEEDS[name])
 
 
-@pytest.mark.network
 PUBLISHED_CROPS = 8
 """The noisy crops of the published autoencoder's draw, each its own noise, code and cotangent: its code
 gradient reads a 4x6 code a crop, whose group norms read too few positions for one crop's code gradient
@@ -270,6 +269,7 @@ to resolve 1.5 within 64 seeds (the reference compared with itself, on an A100);
 averages eight times the positions for far less than eight times a draw's cost."""
 
 
+@pytest.mark.network
 def test_the_published_autoencoder_matches_the_source(monkeypatch):
     """FLUX.2's VAE as `FLUX.2-klein-4B` publishes it (the one FLUX.2 [dev]
     ships), downloaded, against the source loaded beside it in float32 and
