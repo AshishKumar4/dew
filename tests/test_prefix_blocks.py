@@ -14,8 +14,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from block_support import VOCAB, block_causal, model
-from model_support import TINY_DECODER
+from block_support import VOCAB, block_causal, model, wrapped
+from model_support import TINY_DECODER, model_draw
 from reference_error import assert_as_exact, seeds_for
 
 from dew.data.chat import Role
@@ -26,9 +26,7 @@ from dew.inference.tasks import TextGeneration
 from dew.nn.inputs import coordinates
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixers import AttentionMixer
-from dew.nn.multimodal import MultimodalTransformer
 from dew.nn.visibility import prompt_blocks
-from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.objectives.lm import TEXT_KEY, LMObjective
 from dew.objectives.lm.objective import batch_text
 from dew.sampling import Sampling
@@ -317,15 +315,6 @@ def test_a_batch_of_blocks_is_refused_where_every_layer_that_reads_them_is_chunk
     assert np.asarray(scored.weights).sum() > 0
 
 
-def wrapped(decoder):
-    """`decoder` under a multimodal wrapper, with a tiny vision tower and projector beside it."""
-    return MultimodalTransformer(
-        decoder, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2, image_size=8,
-                              patch_size=4),
-        GemmaProjector(text_width=TINY_DECODER["emb_features"], patches_per_side=2, tokens_per_side=1),
-        family="gemma3", image_token_id=1)
-
-
 def test_a_prefix_run_trains_and_serves_through_a_wrapper_of_a_block_reading_decoder():
     """A wrapper answers for its decoder's block reading (`DecoderWrapper`): its prefix run is built, scored
     as the bare decoder's objective scores it (check 1, float64 from the widened decoder), and served the
@@ -335,11 +324,7 @@ def test_a_prefix_run_trains_and_serves_through_a_wrapper_of_a_block_reading_dec
     objective = LMObjective(wrapper, SEQ, prefix=PREFIX)
     bare = LMObjective(decoder, SEQ, prefix=PREFIX)
     wide = LMObjective(decoder.clone(dtype=jnp.float64, attention_impl="reference"), SEQ, prefix=PREFIX)
-    init = jax.jit(wrapper.init)
-
-    def draw(seed):
-        tokens = jax.random.randint(jax.random.fold_in(jax.random.key(1), seed), (BATCH, ROW), 0, VOCAB)
-        return init(jax.random.fold_in(jax.random.key(0), seed), tokens[:, :-1]), tokens
+    draw = model_draw(wrapper, (BATCH, ROW), VOCAB)
 
     def language_model(variables):
         return {"params": variables["params"][wrapper.wraps]}
@@ -354,7 +339,7 @@ def test_a_prefix_run_trains_and_serves_through_a_wrapper_of_a_block_reading_dec
     dew = jax.jit(lambda variables, tokens: scored(objective, variables, tokens))
     seeds = seeds_for(reference, draw, "wrapped prefix run loss", truth_fn=truth)
     assert_as_exact(dew, reference, draw, "wrapped prefix run loss", seeds=seeds, truth_fn=truth)
-    variables = init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+    variables = wrapper.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
     prompt = np.asarray([[3, 1, 4, 1, 5]])
     sampling = Sampling(temperature=0, pad_token_id=0)
     served = TextGeneration(wrapper, variables, sampling=sampling, prefix=PREFIX)
