@@ -250,7 +250,8 @@ def test_the_hub_census_routes_a_config_as_the_loader_does(tmp_path):
     transformers has no class for, asked only after those, is remote code; a registered family's
     config is tier 1; a type a registered convention computes, verified, is tier 2; an unregistered
     causal LM none computes is tier 3; and each configuration of a type is its own verdict, in either
-    order (BERT as a decoder is tier 3, as an encoder refused), every route counted in the summary."""
+    order (BERT as a decoder is tier 3, as an encoder refused; Cohere asking for an attention backend
+    transformers has none of is refused), every route counted in the summary."""
     from tool_support import load
 
     census = load("hf_coverage")
@@ -265,9 +266,11 @@ def test_the_hub_census_routes_a_config_as_the_loader_does(tmp_path):
         "cohere": tiny_config("cohere").to_dict(),
         "bert decoder": tiny_config("bert", is_decoder=True).to_dict(),
         "bert encoder": tiny_config("bert", is_decoder=False).to_dict(),
+        "cohere, no backend": {**tiny_config("cohere").to_dict(), "attn_implementation": "no_such_backend"},
     }
     expected = {"storage": "refused", "gptq": "refused", "custom": "remote code", "llama": "tier 1",
-                "cwm": "tier 2", "cohere": "tier 3", "bert decoder": "tier 3", "bert encoder": "refused"}
+                "cwm": "tier 2", "cohere": "tier 3", "bert decoder": "tier 3", "bert encoder": "refused",
+                "cohere, no backend": "refused"}
     for ordered in (list(configs), list(reversed(configs))):
         rows = [{"id": name, "model_type": configs[name]["model_type"], "downloads": len(configs) - index,
                  "config": configs[name]} for index, name in enumerate(ordered)]

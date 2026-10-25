@@ -13,7 +13,7 @@ sorts every model into the route that loads it: a registered family (tier
 family's verified convention (tier 2, `verify.verify_mapping` on the shrunk
 config, no weights), transformers' own forward run by torchax (tier 3,
 `torchax_fallback.admitted` on the same shrunk config), each run once per
-model_type and computational config (`_probed`), a GGUF repo's stub config,
+distinct config (`_probed`), a GGUF repo's stub config,
 a refusal with its reason, or a refusal by design (`DrafterRefused`, a
 speculative drafter that is no model on its own). Types
 transformers does not know (remote code only) have no reference to verify
@@ -62,13 +62,10 @@ ROUTES = ("tier 1", "tier 2", "tier 3", "gguf", "refused", "by design", "remote 
 
 
 def _probed(config: dict) -> tuple[str, str]:
-    """The key a probe's verdict is kept under: the model_type and the config's computational fields,
-    those past `decoder_parts.IGNORED_FIELDS` (ids, metadata), so two configs of a type that compute
-    alike share one probe and two that differ (BERT as a decoder and as an encoder) do not."""
-    from dew.interop import decoder_parts
-
-    computed = {key: value for key, value in config.items() if key not in decoder_parts.IGNORED_FIELDS}
-    return config["model_type"], json.dumps(computed, sort_keys=True, default=str)
+    """The key a probe's verdict is kept under: the model_type and the whole config, so two configs
+    that differ in any field (BERT as a decoder and as an encoder, a requested attention backend) are
+    each probed, and two Hub copies of one config share one probe."""
+    return config["model_type"], json.dumps(config, sort_keys=True, default=str)
 
 
 class NoReference(ValueError):
@@ -149,9 +146,9 @@ def classify(out: Path) -> None:
         return found
 
     def verified(config: dict) -> VerifiedMapping | Unmapped:
-        """`verify.verify_mapping`, run once per model_type and computational config (`_probed`), its
-        mapping, verdict or refusal reused after; a refusal is kept as its type and arguments, not the
-        probe's frames, and raised afresh."""
+        """`verify.verify_mapping`, run once per distinct config (`_probed`), its mapping, verdict or
+        refusal reused after; a refusal is kept as its type and arguments, not the probe's frames, and
+        raised afresh."""
         model_type = config["model_type"]
         if model_type not in CONFIG_MAPPING:
             # Asked only once the loader has passed the storage format and the registered families.

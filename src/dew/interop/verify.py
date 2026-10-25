@@ -220,6 +220,9 @@ def shrink(hf_config: Mapping[str, object]) -> Mapping[str, object]:
               if key not in _PROBE_DROPPED and key != 'model_type' and key not in aliases}
     fields.update({key('hidden_size'): small_hidden, key('num_attention_heads'): small_heads,
                    key('intermediate_size'): 2 * small_hidden, key('vocab_size'): _VOCAB})
+    if (depth := sizes.given('num_hidden_layers')) is not None:
+        # The depth stays as stated, under the config's own key for it.
+        fields[key('num_hidden_layers')] = depth
     # A routed or latent-attention type keeps its structure at small widths:
     # four experts, two per token, and small latent ranks.
     small = {'num_experts': 4, 'n_routed_experts': 4, 'num_local_experts': 4, 'num_experts_per_tok': 2,
