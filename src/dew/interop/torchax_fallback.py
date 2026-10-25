@@ -307,15 +307,16 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
     """One layer's attention, as transformers' attention interface calls it, computed by Dew's
     (`dew.nn.attention.scaled_dot_product_attention`): `[B, H, S, D]` queries and `[B, H_kv, S, D]`
     keys and values in, `[B, S, H, D]` out, causal as an admitted model's mask is (`_Probe`),
-    inside the call's documents (`_Attending`). A window counts each document's real tokens, as Dew's
-    windowed attention does (`dew.nn.local_attention.local_attention`), where no dropout draws; the
+    inside the call's documents (`_Attending`). A row with padding among its tokens attends over its
+    real tokens moved to its front (`dew.nn.local_attention.compacted`), so each document is one run
+    of slots and a window counts its real tokens, whichever kernel runs, dropout's included; the
     query carries the ratio of `scaling` to the kernels' own 1/sqrt(D), as Dew's attention layers
     carry a checkpoint's scale (`dew.nn.precision.scaled`); attention dropout draws from the call's
     key folded by the layer, and a training call that drops with no key is refused."""
     from torchax.interop import jax_view, torch_view
 
     from dew.nn.attention import scaled_dot_product_attention
-    from dew.nn.local_attention import local_attention
+    from dew.nn.local_attention import compacted
 
     call = _ATTENDING.get()
     if call is None:
@@ -335,17 +336,20 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
     if drawn and call.key is None:
         raise ValueError("this model's training forward drops attention probabilities (dropout) and was "
                          "given no 'dropout' rng")
-    if window is not None and not drawn:
-        out = local_attention(q, k, v, window=window, segment_ids=call.documents, max_segments=max_segments,
-                              valid=call.valid, implementation=call.implementation, sinks=sinks,
-                              softcap=softcap)
-    else:
-        out = scaled_dot_product_attention(
+
+    def attend(q, k, v, *, places, segment_ids, valid):
+        del places, valid  # the documents hold the padding apart, as 0
+        return scaled_dot_product_attention(
             q, k, v, implementation=call.implementation, causal=True, sliding_window=window,
-            softcap=softcap, sinks=sinks, segment_ids=call.documents, max_segments=max_segments,
+            softcap=softcap, sinks=sinks, segment_ids=segment_ids, max_segments=max_segments,
             dropout_rate=float(dropout) if drawn else 0.0,
             dropout_rng=jax.random.fold_in(call.key, module.layer_idx) if drawn and call.key is not None
             else None, deterministic=not drawn)
+
+    if call.valid is None:
+        out = attend(q, k, v, places=None, segment_ids=call.documents, valid=None)
+    else:
+        out = compacted(attend, q, k, v, None, call.documents, call.valid)
     return torch_view(out.astype(q.dtype)), None
 
 
