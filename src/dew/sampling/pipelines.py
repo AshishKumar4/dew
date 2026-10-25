@@ -23,7 +23,7 @@ from dew.diffusion.process import Conditioning, Denoiser, Process
 from dew.inputs import InputSpec, encode_conditions, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, local_rows, mesh_of, request_key
-from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.options import program
 from dew.objectives.base import OMITTED, Omitted, Variables, thaw
 from dew.records import JSON
 from dew.registry import dtype_name, resolve_dtype
@@ -647,8 +647,11 @@ class TextToImage:
             return given, null, _noise(plan.sharding)(process, plan.keys(settled.request),
                                                       settled.shape)
         start = process.times(settled.count)[0] if settled.times is None else settled.times[0]
-        options = () if self.autoencoder is None else tuple(compiler_options(self.autoencoder.model).items())
-        initial_state, spatial = _image_start(plan.sharding, options)(
+        starting = program(_image_start, *([] if self.autoencoder is None else [self.autoencoder.model]),
+                           static_argnums=(0, 1, 2),
+                           in_shardings=(None, plan.sharding, plan.sharding, None, None),
+                           out_shardings=plan.sharding)
+        initial_state, spatial = starting(
             self.autoencoder, process, settled.shape, self.variables,
             plan.place(plan.pad(settled.samples)), plan.keys(settled.request),
             settled.posterior, start)
@@ -697,7 +700,10 @@ class TextToImage:
             grid = _default_grid(process, count) if times is None else times
             initial = _initial(plan.sharding)(solver, process, grid, prepared.noise, walk)
             models = sampling_modules(self.model, chosen, self.autoencoder)
-            walked = _run(plan.sharding, tuple(compiler_options(*models).items()))
+            walked = program(_walk, *models, static_argnums=(0, 1, 2, 3, 4, 5),
+                             in_shardings=(None, None, None, None, None, plan.sharding, None, plan.sharding,
+                                           None),
+                             out_shardings=plan.sharding)
             generated = walked(self.model, process, self.autoencoder, self.finish, self.final_denoise, decode,
                                solver, chosen, np.asarray(grid, np.float32), initial, self.variables,
                                prepared.conditions, prepared.unconditional, prepared.noise, walk)
@@ -762,39 +768,33 @@ def _image_rows(value, rows: int, shape: tuple[int, ...], name: str) -> np.ndarr
     return np.broadcast_to(array, (rows, *shape))
 
 
-@functools.cache
-def _image_start(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
-    """The image a walk starts from over `rows`, compiled with the autoencoder's own XLA `options`
-    (`dew.nn.kernels.options.compiler_options`)."""
-    def prepare(autoencoder, process, shape, params, samples, keys, encode_key, start):
-        spatial = {}
-        pixels = samples.get("image")
-        if "initial" in samples:
-            value = samples["initial"]
-        else:
-            clean = samples.get("image_latents")
-            if clean is None:
-                if autoencoder is None:
-                    clean = pixels
-                else:
-                    clean = autoencoder.encode(params["autoencoder"], pixels, encode_key)
-            noise = samples.get("noise")
-            if noise is None:
-                noise = jax.vmap(lambda key: jax.random.normal(key, shape))(keys)
-            alpha, sigma = process.sampler_schedule.rates(start)
-            value = alpha * clean + sigma * noise
-        if "mask" in samples:
-            from dew.inputs.diffusion import latent_image_conditions
+def _image_start(autoencoder, process, shape, params, samples, keys, encode_key, start):
+    """The image a walk starts from, and the spatial conditions its mask adds: the given initial
+    latents, or the clean image (encoded by `autoencoder` where there is one) noised to `start`.
+    Compiled over the rows with the autoencoder's own XLA options (`program`)."""
+    spatial = {}
+    pixels = samples.get("image")
+    if "initial" in samples:
+        value = samples["initial"]
+    else:
+        clean = samples.get("image_latents")
+        if clean is None:
+            if autoencoder is None:
+                clean = pixels
+            else:
+                clean = autoencoder.encode(params["autoencoder"], pixels, encode_key)
+        noise = samples.get("noise")
+        if noise is None:
+            noise = jax.vmap(lambda key: jax.random.normal(key, shape))(keys)
+        alpha, sigma = process.sampler_schedule.rates(start)
+        value = alpha * clean + sigma * noise
+    if "mask" in samples:
+        from dew.inputs.diffusion import latent_image_conditions
 
-            spatial = latent_image_conditions(
-                autoencoder, params["autoencoder"], pixels, samples["mask"], encode_key
-            )
-        return value, spatial
-    return jax.jit(prepare, static_argnums=(0, 1, 2),
-                   in_shardings=(None, rows, rows, None, None), out_shardings=rows,
-                   compiler_options=dict(options))
-
-
+        spatial = latent_image_conditions(
+            autoencoder, params["autoencoder"], pixels, samples["mask"], encode_key
+        )
+    return value, spatial
 
 
 
@@ -862,25 +862,18 @@ def walk_and_decode(denoise: Denoiser, autoencoder: AutoEncoder | None, params, 
     return Images(jnp.clip(images, -1.0, 1.0), latents=latents)
 
 
-@functools.cache
-def _run(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
-    """The walk over `rows`, compiled with the XLA `options` of its denoiser, its guidance's guide and
-    its autoencoder (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never
-    share it."""
-    # Rebinding weights must not change the static compilation identity, nor a
-    # solver's or guidance's numbers, nor the grid's values: the solver and the
-    # guidance are pytrees whose structure is static and whose numbers (a
-    # guidance scale, a Brownian seed) are data, and the grid is data with the
-    # solver state `_initial` built from it.
-    def run(model, process, autoencoder, finish, final_denoise, decode,
-            solver, guidance, times, initial, params, given, null, x_T, key):
-        variables = {name: value for name, value in params.items() if name not in ("encoders", "autoencoder")}
-        denoise = process.denoiser(model, variables, given, None if guidance is None else null)
-        walked = walk_and_decode(denoise, autoencoder, params, x_T, solver=solver, guidance=guidance, key=key,
-                                 times=times, final_denoise=final_denoise, initial=initial, decode=decode)
-        if finish is None or walked.images is None:
-            return walked
-        return Images(finish(params, walked.images), latents=walked.latents)
-    return jax.jit(run, static_argnums=(0, 1, 2, 3, 4, 5),
-                   in_shardings=(None, None, None, None, None, rows, None, rows, None), out_shardings=rows,
-                   compiler_options=dict(options))
+def _walk(model, process, autoencoder, finish, final_denoise, decode,
+          solver, guidance, times, initial, params, given, null, x_T, key):
+    """The walk over the rows, compiled with the XLA options of its denoiser, its guidance's guide and
+    its autoencoder (`program`), so a quantized model and another never share it. Rebinding weights
+    must not change the static compilation identity, nor a solver's or guidance's numbers, nor the
+    grid's values: the solver and the guidance are pytrees whose structure is static and whose numbers
+    (a guidance scale, a Brownian seed) are data, and the grid is data with the solver state
+    `_initial` built from it."""
+    variables = {name: value for name, value in params.items() if name not in ("encoders", "autoencoder")}
+    denoise = process.denoiser(model, variables, given, None if guidance is None else null)
+    walked = walk_and_decode(denoise, autoencoder, params, x_T, solver=solver, guidance=guidance, key=key,
+                             times=times, final_denoise=final_denoise, initial=initial, decode=decode)
+    if finish is None or walked.images is None:
+        return walked
+    return Images(finish(params, walked.images), latents=walked.latents)
