@@ -254,8 +254,9 @@ def main(config: Config) -> Path:
         model=ModelConfig.from_model(model), data=train, validation=test,
         objective=ObjectiveConfig("block_diffusion", {"prompt_length": config.prompt_tokens,
                                                       "pad_token_id": PAD}),
-        optim=OptimConfig(weight_decay=0.05, clip_grads=1.0, rate=Cosine(
-            peak=config.learning_rate, warmup_steps=config.warmup_steps, end=config.learning_rate / 20)),
+        optim=OptimConfig(weight_decay=0.05, clip_grads=1.0, learning_rate=Cosine(
+            peak_value=config.learning_rate, warmup_steps=config.warmup_steps,
+            end_value=config.learning_rate / 20)),
         # A smoke run keeps both of its checkpoints, so what training moved between them can be read.
         trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"), keep=2 if config.smoke else 1,
                               steps=config.steps,

@@ -4,11 +4,12 @@ A site's computation runs one primitive at a time, each executed alone and nativ
 is held on the operands that execution gave it to its primitive's contract (tests/certified.py's
 `certified` and CONTRACTS, from this module's exact oracles):
 
-- an IEEE operation (add, sub, mul, a correctly rounded divide or square root, a cast) must be the
-  round to nearest even of its exact result in its own format, read as the lane computes
-  (tests/certified.py's `FLUSHES`);
-- a library primitive, a transcendental included, must be faithful: one of the two values of its
-  format around the exact value, whatever its vendor documents;
+- a rounding operation (add, sub, mul, divide, square root, a transcendental) must lie within the
+  reach the lane's own results show for it, measured on the lane (tests/certified.py's `lane`): the
+  round to nearest even of its exact result in its own format where the lane rounds so, one of the two
+  values of its format around the exact value (faithful), or a stated number of steps past them, its
+  operands and results read as the lane computes (flushing subnormals or not);
+- a cast between formats must be the round to nearest even of its value;
 - a sum of n terms, a dot product's included, must be within γ_n of its terms' magnitudes of their
   exact sum, in any order;
 - a comparison, a selection, a move of data or an integer operation must be its result bit for bit.

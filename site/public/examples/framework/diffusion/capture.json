@@ -1,7 +1,7 @@
 {
 	"about": "The screen diffusion.py left on a terminal, written by site/scripts/capture_snippets.py.",
 	"arguments": [],
-	"script_sha256": "328edc76b95e5659ee0318f8c038760ed4b587cf57582ad9634f263dd83b15f6",
+	"script_sha256": "5e502de83d291fb51337ed9fd881eefdcc4f51055396e44660f7743a32bae630",
 	"meta": {
 		"where": "a 4-vCPU Cloudflare container",
 		"python": "3.12.15",

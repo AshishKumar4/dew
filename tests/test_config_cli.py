@@ -228,17 +228,20 @@ def test_param_groups_on_the_command_line_read_their_schedules_as_records():
     per epoch by its `every`."""
     from dew.optim import Cosine, OneCycle, ParamGroup
     groups = [{"name": "delays", "patterns": ["*/delay"], "bounds": [0, 24],
-               "schedule": {"class": "cosine", "fields": {"peak": 0.1, "warmup_steps": 0, "every": 40}}},
+               "schedule": {"class": "cosine",
+                            "fields": {"peak_value": 0.1, "warmup_steps": 0, "every": 40}}},
               {"name": "rest", "patterns": ["*"],
-               "b1": {"class": "one_cycle", "fields": {"peak": 0.85, "init": 0.95, "end": 0.95}}}]
-    rate = {"class": "one_cycle", "fields": {"peak": 5e-3, "every": 40}}
-    config = parse(RunConfig, ["--optim.param-groups", json.dumps(groups), "--optim.rate", json.dumps(rate)])
-    assert config.optim.rate == OneCycle(peak=5e-3, every=40)
-    assert parse(RunConfig, ["--optim.rate", "3e-4"]).optim.rate == 3e-4
+               "b1": {"class": "one_cycle",
+                      "fields": {"peak_value": 0.85, "init_value": 0.95, "end_value": 0.95}}}]
+    rate = {"class": "one_cycle", "fields": {"peak_value": 5e-3, "every": 40}}
+    config = parse(RunConfig, ["--optim.param-groups", json.dumps(groups),
+                               "--optim.learning-rate", json.dumps(rate)])
+    assert config.optim.learning_rate == OneCycle(peak_value=5e-3, every=40)
+    assert parse(RunConfig, ["--optim.learning-rate", "3e-4"]).optim.learning_rate == 3e-4
     assert config.optim.param_groups == (
-        ParamGroup("delays", ("*/delay",), schedule=Cosine(peak=0.1, warmup_steps=0, every=40),
+        ParamGroup("delays", ("*/delay",), schedule=Cosine(peak_value=0.1, warmup_steps=0, every=40),
                    bounds=(0.0, 24.0)),
-        ParamGroup("rest", ("*",), b1=OneCycle(peak=0.85, init=0.95, end=0.95)))
+        ParamGroup("rest", ("*",), b1=OneCycle(peak_value=0.85, init_value=0.95, end_value=0.95)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -254,11 +257,11 @@ def test_a_mapping_of_class_records_reads_from_one_flag_and_round_trips_its_reco
     object on the command line and written back by the run's record."""
     from dew.optim import Exponential, Linear
 
-    given = {"sigma": {"class": "linear", "fields": {"peak": 0.5, "warmup_steps": 0, "end": 0.1}},
-             "delay": {"class": "exponential", "fields": {"init": 10.0, "end": 1.0, "every": 4}}}
+    given = {"sigma": {"class": "linear", "fields": {"peak_value": 0.5, "warmup_steps": 0, "end_value": 0.1}},
+             "delay": {"class": "exponential", "fields": {"init_value": 10.0, "end_value": 1.0, "every": 4}}}
     config = parse(_Schedules, ["--schedules", json.dumps(given)])
 
-    assert config.schedules == {"sigma": Linear(peak=0.5, warmup_steps=0, end=0.1),
-                                "delay": Exponential(init=10.0, end=1.0, every=4)}
+    assert config.schedules == {"sigma": Linear(peak_value=0.5, warmup_steps=0, end_value=0.1),
+                                "delay": Exponential(init_value=10.0, end_value=1.0, every=4)}
     assert _Schedules.from_dict(json.loads(json.dumps(config.to_dict()))) == config
     assert parse(_Schedules, []).schedules == {}

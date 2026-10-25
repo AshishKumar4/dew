@@ -848,6 +848,26 @@ def test_cli_record_exports_still_default_to_parquet(tmp_path):
     assert stored.records("indexed")[0] == {"text": "a document"}
 
 
+def test_cli_exports_the_chain_of_the_file_it_names_and_no_other(tmp_path):
+    """Two files of one name in two directories each export their own chain, and a file named as a
+    module the process holds elsewhere (the standard library's `json`), or as a package's module
+    (`email.utils`), is refused, not read as it."""
+    from dew.cli.main import main
+    from dew.data.sources import source
+
+    for corpus in ("first", "second"):
+        (tmp_path / corpus).mkdir()
+        (tmp_path / corpus / "corpus.py").write_text(
+            f"from dew.data import Memory\ndata = Memory([{{'text': '{corpus}'}}])\n")
+        exported = tmp_path / f"{corpus}-out"
+        assert main(["data", "export", str(tmp_path / corpus / "corpus.py"), str(exported)]) == 0
+        assert source(str(exported)).records("indexed")[0] == {"text": corpus}
+    for named in ("json.py", "email.utils.py"):
+        (tmp_path / named).write_text("from dew.data import Memory\ndata = Memory([{'text': 'mine'}])\n")
+        with pytest.raises(ValueError):
+            main(["data", "export", str(tmp_path / named), str(tmp_path / f"{named}-out")])
+
+
 @pytest.mark.parametrize("read", [None, "memory", "indexed"])
 def test_snapshot_uses_requested_or_preferred_read_and_loading(tmp_path, read):
     import time
