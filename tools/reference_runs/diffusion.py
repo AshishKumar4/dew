@@ -56,7 +56,7 @@ from common import (
 )
 from dew_lm import recorded_norm
 from flax.traverse_util import flatten_dict, unflatten_dict
-from reference_source import git_head
+from reference_source import dew_revision
 
 # The DiT both packages define, at 64x64 pixels: 256 patches of 4x4.
 MODEL = {"output_channels": 3, "patch_size": 4, "emb_features": 384, "num_layers": 8,
@@ -277,7 +277,7 @@ def main() -> None:
     args = arguments()
     # Read before the run, so a source that cannot be traced fails at once.
     built_from = {"jax": jax.__version__, "optax": optax.__version__, "flax": __import__("flax").__version__,
-                  "dew": git_head(Path(__file__).resolve().parents[2]),
+                  "dew": dew_revision(),
                   "flaxdiff": source_version(args.flaxdiff_path) if args.flaxdiff_path else None}
     if args.dtype == "float32":
         jax.config.update("jax_default_matmul_precision", "highest")
