@@ -406,14 +406,17 @@ def _along(layout: Layout, grouped: bool = False) -> tuple[str, ...]:
     `TRAINING_FIELDS`): its readout's where its options stand under labels, and their consistency
     groups' where they carry them (`grouped`)."""
     labelled = isinstance(layout, QuestionLayout) and layout.labels is not None
-    carried = {"always", "trained", *(("labelled",) if labelled else ()), *(("grouped",) if grouped else ())}
-    return tuple(field.name for field in (*QUESTION_FIELDS, *TRAINING_FIELDS) if field.when in carried)
+    carried = ("always", "trained", *(("labelled",) if labelled else ()), *(("grouped",) if grouped else ()))
+    declared = (*QUESTION_FIELDS, *TRAINING_FIELDS)
+    # The model's and training's fields, then the labelled readout, then the groups, as rows carry them.
+    return tuple(field.name for when in carried for field in declared if field.when == when)
 
 
-def _along_fields(element: Batch) -> tuple[str, ...]:
+def _along_fields(element: Batch, when: tuple[str, ...] = ("always", "trained")) -> tuple[str, ...]:
     """The declared fields along the questions (`QUESTION_FIELDS`, `TRAINING_FIELDS`) that `element`
-    carries."""
-    return tuple(field.name for field in (*QUESTION_FIELDS, *TRAINING_FIELDS) if field.name in element)
+    carries and a row carries `when`, in their declared order."""
+    return tuple(field.name for field in (*QUESTION_FIELDS, *TRAINING_FIELDS)
+                 if field.name in element and field.when in when)
 
 
 def packing(layout: Layout, bounds: Bounds, context_length: int | None = None, grouped: bool = False) -> Pack:
