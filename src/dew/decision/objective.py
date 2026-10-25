@@ -42,6 +42,7 @@ from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import Field, InputSpec
 from dew.interop.processors import Processor
 from dew.lora import Adapter
+from dew.nn import categorical
 from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import ModelInputs
@@ -62,7 +63,7 @@ from dew.objectives.base import (
     model_rngs,
     part,
 )
-from dew.records import JSON, integer, record
+from dew.records import integer, record
 
 if TYPE_CHECKING:
     from dew.training.state import TrainState
@@ -494,52 +495,6 @@ class PackedRows(pygrain.MapTransform):
         return laid
 
 
-def consistency_divergence(logits: jax.Array, options: jax.Array, groups: jax.Array,
-                           canonical: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Each question's share of its consistency group's divergence, and its share of the group, as
-    `[B, Q]` arrays a window's questions sum to each group's divergence and one a group.
-
-    `groups` `[B, Q]` names each question's group in its window (-1: none), and `canonical` `[B, Q, K]`
-    each option slot's canonical option (-1: none). A member's answer over the canonical options is its
-    distribution over its slots that map to one (`categorical.probabilities`, the categorical owner's),
-    summed onto them; a group's divergence is the generalized Jensen-Shannon divergence of its members'
-    answers, the mean of each one's KL divergence from their mean, so it is zero exactly where they
-    agree, at most the log of the member count, and computed in at least float32, finite at any finite
-    logits. A canonical option of no probability adds no term, in value or gradient; the gradient is
-    autodiff's, through the probabilities' own derivative, which a confident member keeps."""
-    from dew.nn import categorical
-
-    width = logits.shape[-1]
-    mapped = options & (canonical >= 0)
-    # A question of no mapped slot (in no group, or padding) normalizes over nothing: it reads zeros
-    # instead, which its answer then takes no part of, so neither its value nor its gradient is NaN.
-    any_mapped = jnp.any(mapped, axis=-1, keepdims=True)
-    softmax = categorical.probabilities(jnp.where(any_mapped, logits, 0.0), mapped | ~any_mapped)
-    slots = jnp.where(mapped, canonical, width)
-
-    def summed(row_probabilities, row_slots):
-        return jax.ops.segment_sum(row_probabilities, row_slots, num_segments=width + 1)[:width]
-
-    answer = jax.vmap(jax.vmap(summed))(jnp.where(mapped, softmax, 0.0), slots)
-    member = groups >= 0
-    count = groups.shape[-1]
-    ids = jnp.where(member, groups, count)
-
-    def window(answer, ids, member):
-        sizes = jax.ops.segment_sum(member.astype(answer.dtype), ids, num_segments=count + 1)[:count]
-        total = jax.ops.segment_sum(jnp.where(member[:, None], answer, 0.0), ids, num_segments=count + 1)
-        size = sizes[jnp.minimum(ids, count - 1)]
-        mean = total[jnp.minimum(ids, count - 1)] / jnp.maximum(size, 1.0)[:, None]
-        # A canonical option of no probability adds no term: its logarithms read one, not zero.
-        held = answer > 0
-        ratio = jnp.log(jnp.where(held, answer, 1.0)) - jnp.log(jnp.where(held, mean, 1.0))
-        each = jnp.sum(jnp.where(held, answer * ratio, 0.0), axis=-1)
-        return (jnp.where(member, each / jnp.maximum(size, 1.0), 0.0),
-                jnp.where(member, 1.0 / jnp.maximum(size, 1.0), 0.0))
-
-    return jax.vmap(window)(answer, ids, member)
-
-
 @struct.dataclass
 class DecisionStatistics:
     """A decision loss's statistics where it adds a consistency term: the label loss and the groups'
@@ -583,7 +538,7 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
     scored questions. With `consistency` w > 0 it adds w times the mean over
     the batch's consistency groups (`Example.groups`) of the generalized
     Jensen-Shannon divergence of their members' answers over the group's
-    canonical options (`consistency_divergence`), reported as the
+    canonical options (`categorical.group_divergence`), reported as the
     `consistency` metric; a group's members stand in one row, so a layout of a
     question a row refuses an example with groups under it. At 0 the groups
     are not read, and the loss is the label loss alone.
@@ -685,7 +640,7 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
                  label_smoothing: float = 0.0, shuffle_options: bool = True,
                  none_of_the_above: float = 0.0, temperatures: Temperatures | None = None,
                  segments: int | None = 16, context_encoder: ContextEncoder | None = None,
-                 consistency: float = 0.0, head_seed: int | None = None, head_source: str | None = None):
+                 consistency: float = 0.0):
         held: Variables | None = None
         self.image_processor = None
         match backbone:
@@ -734,8 +689,6 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
         if not consistency >= 0.0:
             raise ValueError(f"consistency weighs a divergence, so it is nonnegative, got {consistency}")
         self.consistency = consistency
-        self.head_seed = head_seed
-        self.head_source = head_source
         self.shuffle_options = shuffle_options
         self.none_of_the_above = none_of_the_above
         self.temperatures = temperatures
@@ -845,8 +798,10 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
         loss = Ratio(self.row_mean(charge * scored, batch).total, self.row_mean(scored, batch).total)
         if not self.consistency:
             return loss, Aux(metrics={"accuracy": accuracy})
-        divergence, members = consistency_divergence(logits, options, jnp.asarray(batch["groups"]),
-                                                     jnp.asarray(batch["canonical"]))
+        # Each question's group in its window, and each option slot's canonical option: the group's
+        # members' answers over the canonical options (`categorical.group_divergence`).
+        divergence, members = categorical.group_divergence(logits, jnp.asarray(batch["groups"]),
+                                                           jnp.asarray(batch["canonical"]), options)
         term = Ratio(self.row_mean(divergence, batch).total, self.row_mean(members, batch).total)
         return (DecisionStatistics(loss, term),
                 Aux(metrics={"accuracy": accuracy, "consistency": term.mean()[0]}))
@@ -941,27 +896,7 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
             # A decision task reads text through its own tokenizer, so only a media processor is kept.
             None if self.image_processor is None or self.image_processor.directory is None
             else self.image_processor.source,
-            self.model.context_encoder,
-            self._head_identity())
-
-    def _head_identity(self) -> JSON:
-        """Where this objective's head starts (`DecideSettings.head_identity`): the digest of a head it
-        holds, every leaf's path, dtype, shape and bytes, or the seed a fresh head is drawn from."""
-        from dew.data.plan import fingerprint
-
-        held = None if self.variables is None else {name: collection["head"] for name, collection
-                                                     in self.variables.items() if "head" in collection}
-        if held:
-            leaves = jax.tree_util.tree_leaves_with_path(held)
-            return {"held": fingerprint({jax.tree_util.keystr(path): fingerprint(np.asarray(leaf))
-                                         for path, leaf in leaves})}
-        if self.head_seed is None:
-            return None
-        head = self.model.head
-        if head.reads_labels or head.reads_table or head.draws_from_rows:
-            # A head drawn from the backbone's output rows starts from its source's weights too.
-            return None if self.head_source is None else {"drawn": self.head_seed, "source": self.head_source}
-        return {"drawn": self.head_seed}
+            self.model.context_encoder)
 
     def recorded_model(self) -> nn.Module:
         """The backbone; the head is a task setting of its own."""
