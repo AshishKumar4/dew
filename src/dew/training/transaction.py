@@ -173,13 +173,14 @@ def ema_update(ema, params, decay):
     """Update the EMA leaves toward `params`, keeping each leaf's storage dtype.
 
     Each leaf of `ema` becomes `decay * average + (1 - decay) * live`, and a
-    leaf the step left as it was keeps its average bit for bit, however a
-    program fuses the sum (a select, not a difference that finite leaves of
-    opposite signs overflow); the live value is the leaf of `params` at the
-    same path; leaves that `ema` does not hold are not averaged. The
-    arithmetic runs in fp32 or wider, so fp64 leaves keep fp64 precision. A
-    decay of 1 or more returns the average leaf as it was, even when it
-    holds nonfinite values, as a frozen reference can.
+    leaf the step left as it was keeps its average bit for bit wherever that
+    sum is finite, however a program fuses it (a select, not a difference
+    that finite leaves of opposite signs overflow; a NaN decay stays NaN);
+    the live value is the leaf of `params` at the same path; leaves that
+    `ema` does not hold are not averaged. The arithmetic runs in fp32 or
+    wider, so fp64 leaves keep fp64 precision. A decay of 1 or more returns
+    the average leaf as it was, even when it holds nonfinite values, as a
+    frozen reference can.
     """
     def step(average, live):
         dtype = jnp.result_type(average.dtype, live.dtype, decay, jnp.float32)
@@ -187,7 +188,8 @@ def ema_update(ema, params, decay):
             average, live = jax.lax.optimization_barrier((average, live))
         weight = jnp.asarray(decay, dtype)
         wide, moved = average.astype(dtype), live.astype(dtype)
-        updated = jnp.where(moved == wide, wide, weight * wide + (1 - weight) * moved)
+        weighted = weight * wide + (1 - weight) * moved
+        updated = jnp.where((moved == wide) & jnp.isfinite(weighted), wide, weighted)
         stored = updated.astype(average.dtype)
         return jnp.where(jnp.asarray(decay) >= 1.0, average, stored)
     return jax.tree.map(step, ema, _project(params, ema))
