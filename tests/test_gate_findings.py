@@ -3,6 +3,7 @@ its rule and its measure, larger worse, and a test the gate fails reports them a
 `gate_findings` (tests/conftest.py), what a promotion matches a candidate's failures to its parent's by."""
 
 import json
+import math
 import os
 import subprocess
 import sys
@@ -17,8 +18,8 @@ from reference_error import GateFailure, assert_as_exact_as_the_reference, row_e
 def test_the_one_draw_rule_measures_its_worst_zero_row_and_names_a_value_not_finite():
     """A row five times the reference's error (over ROW_FACTOR, under the pooled factor), and two rows of
     float64 zero that Dew misses by 5 and by 100 times the reference's own: the zero rows' measure is
-    the worst row's, not the first's. A value that is not finite is that rule's finding, measured 1,
-    not a ratio NaN would leave unorderable."""
+    the worst row's log ratio, not the first's. A value that is not finite is that rule's finding,
+    measured 1, not a ratio NaN would leave unorderable."""
     truth = np.concatenate([np.linspace(1.0, 2.0, 64).reshape(32, 2), np.zeros((2, 2))])
     reference = truth + np.concatenate([np.full((32, 2), 1e-6), np.full((2, 2), 1e-9)])
     dew = reference.copy()
@@ -29,8 +30,8 @@ def test_the_one_draw_rule_measures_its_worst_zero_row_and_names_a_value_not_fin
     rules = {finding.rule: finding.measure for finding in raised.value.findings}
     _, mine = row_errors(dew, truth)
     _, theirs = row_errors(reference, truth)
-    first, worst = (float(mine[row] / theirs[row]) for row in (32, 33))
-    assert "row" in rules and rules["zero rows"] == worst > first
+    first, worst = (math.log(mine[row] / theirs[row]) for row in (32, 33))
+    assert "row" in rules and rules["zero rows"] > (first + worst) / 2
     dew[1, 0] = np.nan
     with pytest.raises(GateFailure) as raised:
         assert_as_exact_as_the_reference(dew, reference, truth, "nan")
@@ -65,6 +66,22 @@ def test_an_exact_reference_measures_dew_by_its_own_distance_and_two_exact_arms_
         [finding] = raised.value.findings
         assert finding.rule == "exact reference"
         measures.append(finding.measure)
+    assert measures[0] < measures[1]
+
+
+def test_a_zero_reference_row_measures_dews_error_on_it_finitely_and_a_worse_one_larger():
+    """Rows of float64 zero the reference keeps exactly, where Dew errs by 8 and then by 16: each is a
+    finding of finite measure (a ratio over a reference error of zero, divided, would be infinite both
+    times and order nothing), the larger error the larger measure."""
+    truth = np.array([[1.0, 1.0], [0.0, 0.0]])
+    reference = np.array([[17.0, 17.0], [0.0, 0.0]])
+    measures = []
+    for off in (8.0, 16.0):
+        with pytest.raises(GateFailure) as raised:
+            assert_as_exact_as_the_reference(np.array([[17.0, 17.0], [off, off]]), reference, truth, "zero")
+        [zero] = [finding for finding in raised.value.findings if finding.rule == "zero rows"]
+        assert math.isfinite(zero.measure)
+        measures.append(zero.measure)
     assert measures[0] < measures[1]
 
 

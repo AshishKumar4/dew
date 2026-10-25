@@ -454,14 +454,14 @@ def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[tup
         their_row = float(np.max(theirs[sized] / sizes[sized]))
         allowed = max(their_row, floor)
         if not within(row, ROW_FACTOR * allowed):
-            over.append(("row", row / max(allowed, TINIEST), f"the worst row is {row:.3e} from "
+            over.append(("row", log_ratio(row, allowed), f"the worst row is {row:.3e} from "
                          f"float64 over its size, the reference's {their_row:.3e}, allowed "
                          f"{ROW_FACTOR * allowed:.3e}"))
     zero = ~sized & ~(mine <= ROW_FACTOR * theirs)
     if zero.any():
         at = int(np.flatnonzero(zero)[0])
         # The measure is the worst of them, the first the example.
-        over.append(("zero rows", _worst_ratio(mine[zero], theirs[zero]),
+        over.append(("zero rows", log_ratio(mine[zero], theirs[zero]),
                      f"{int(zero.sum())} rows of float64 zero are further from it than the reference's own, "
                      f"row {at} by {mine[at]:.3e} against {theirs[at]:.3e}"))
     return over
@@ -486,8 +486,8 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms
                                    f"float64, so the site measures nothing")])
     found = []
     if not within(mine, FACTOR * theirs):
-        found.append(("pooled", mine / theirs, f"dew is {mine:.3e} from float64 (rms), the reference "
-                      f"{theirs:.3e} (ratio {mine / theirs:.2f}, allowed {FACTOR})"))
+        found.append(("pooled", log_ratio(mine, theirs), f"dew is {mine:.3e} from float64 (rms), the "
+                      f"reference {theirs:.3e} (ratio {mine / theirs:.2f}, allowed {FACTOR})"))
     # Every rule's findings at once, so a change that eases one rule and breaks another shows both.
     found += rows_over(dew, reference, truth, terms)
     if found:
@@ -529,11 +529,11 @@ REDRAW = 4
 @dataclasses.dataclass(frozen=True)
 class Finding:
     """One finding of the gate as data, beside its message: the leaf it names (the site's label and the
-    leaf's path), the rule it fails (RULES), and its measure, larger worse: Dew's error over the
-    reference's for a ratio's rule, the seeds a value is not finite on, Dew's own distance from float64
-    where the reference is exactly float64, and for too few seeds the fewest over the given. What a train
-    matches a candidate's failures to its parent's by: the same leaf and rule, a measure no larger, so
-    no measure is infinite on both sides."""
+    leaf's path), the rule it fails (RULES), and its measure, finite and larger worse: the log of Dew's
+    error over the reference's for a ratio's rule (`log_ratio`), the seeds a value is not finite on,
+    Dew's own distance from float64 where the reference is exactly float64, and for too few seeds the
+    fewest over the given. What a train matches a candidate's failures to its parent's by: the same
+    leaf and rule, a measure no larger."""
     leaf: str
     rule: str
     measure: float
@@ -552,14 +552,18 @@ measured 0), and a leaf its seeds leave undecided."""
 
 
 TINIEST = float(np.finfo(np.float64).tiny)
-"""What a finding's ratio divides by where the reference's error is zero: an order among findings, so a
-candidate that errs further measures larger, never a bound any verdict reads."""
+"""The least error a finding's measure reads (`log_ratio`): a reference's error of zero is TINIEST in
+it, so a candidate that errs further measures larger, finite at any error. An order among findings,
+never a bound any verdict reads."""
 
 
-def _worst_ratio(mine: np.ndarray, theirs: np.ndarray) -> float:
-    """The largest of Dew's errors over the reference's (TINIEST where the reference's is zero): a
-    finding's measure over rows."""
-    return float(np.max(mine / np.maximum(theirs, TINIEST)))
+def log_ratio(mine, theirs) -> float:
+    """A ratio rule's measure: the natural log of Dew's error over the reference's, each read as at least
+    TINIEST, the largest over its elements. Finite at every finite error and growing with Dew's, where
+    the ratio itself overflows past an error of 4 over a reference of zero."""
+    mine = np.maximum(np.asarray(mine, np.float64), TINIEST)
+    theirs = np.maximum(np.asarray(theirs, np.float64), TINIEST)
+    return float(np.max(np.log(mine) - np.log(theirs)))
 
 
 class GateFailure(AssertionError):
@@ -939,19 +943,21 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
         else:
             ratio, low, high = _judged(draws, index, tails)
             status = _status(ratio, low, high, contained=contained)
+            # The ratio's log from its sums, finite where the ratio itself would overflow.
+            measure = log_ratio(np.sqrt(np.sum(a)), np.sqrt(np.sum(b)))
             if status == "inconclusive":
                 unresolved.append(Finding(
-                    leaf, "inconclusive", ratio, f"{leaf}: inconclusive: the pooled ratio {ratio:.3f}'s "
+                    leaf, "inconclusive", measure, f"{leaf}: inconclusive: the pooled ratio {ratio:.3f}'s "
                     f"interval over {count} seeds is [{low:.3f}, {high:.3f}], wider than {PARITY}; give the "
                     f"site larger inputs or more seeds (`seeds_for`)"))
             elif status == "over":
-                over.append(Finding(leaf, "pooled", ratio, f"{leaf}: dew's RMS error from float64 is "
+                over.append(Finding(leaf, "pooled", measure, f"{leaf}: dew's RMS error from float64 is "
                                     f"{ratio:.3f} times the reference's over {count} seeds, interval "
                                     f"[{low:.3f}, {high:.3f}] (allowed {PARITY})"))
         my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
         factor = NARROW_FACTORS.get(draws.widths[index], ROW_FACTOR)
         if not within(my_row, factor * their_row):
-            over.append(Finding(leaf, "row", my_row / max(their_row, TINIEST),
+            over.append(Finding(leaf, "row", log_ratio(my_row, their_row),
                                 f"{leaf}: the worst row over {count} seeds is {my_row:.3e} from float64 "
                                 f"over its size, the reference's {their_row:.3e}, allowed "
                                 f"{factor * their_row:.3e} ({factor} times it)"))
@@ -959,7 +965,7 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
         if zero:
             # The measure is the worst of them, the first the example.
             at, my_error, their_error = zero[0]
-            worst = _worst_ratio(np.asarray([row[1] for row in zero]), np.asarray([row[2] for row in zero]))
+            worst = log_ratio([row[1] for row in zero], [row[2] for row in zero])
             over.append(Finding(leaf, "zero rows", worst,
                                 f"{leaf}: {len(zero)} rows of float64 zero are further from it over "
                                 f"{count} seeds than ROW_FACTOR times the reference's own, row {at} by "
