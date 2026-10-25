@@ -26,7 +26,7 @@ from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
-from dew.batch import EXAMPLE_ROWS, FROZEN, Batch, Variables, merge
+from dew.batch import EXAMPLE_ROWS, Batch, Variables, merge
 from dew.data.dataset import rows_of
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import rows_spec
@@ -40,7 +40,7 @@ from dew.objectives.base import (
     recorded_metrics,
     with_projected,
 )
-from dew.state import Accumulation, TrainState
+from dew.state import Accumulation, TrainState, apart, together
 from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
 
@@ -746,12 +746,8 @@ class Transaction:
                 aux, pending, gradient = jax.tree.map(
                     jax.lax.optimization_barrier, (realized.aux, pending, gradient))
                 return finish(state, batch, aux, pending, gradient, attempt, tokens)
-            if FROZEN not in state.variables:
-                return finish(state, batch, realized.aux, pending, gradient, attempt, tokens)
-            held = state.variables[FROZEN]
-            moving = {name: tree for name, tree in state.variables.items() if name != FROZEN}
-            advanced, loss, aux, committed = finish(dataclasses.replace(state, variables=moving), batch,
-                                                    realized.aux, pending, gradient, attempt, tokens)
-            return (dataclasses.replace(advanced, variables={**advanced.variables, FROZEN: held}),
-                    loss, aux, committed)
+            moving, held = apart(state)
+            advanced, loss, aux, committed = finish(moving, batch, realized.aux, pending, gradient, attempt,
+                                                    tokens)
+            return together(advanced, held), loss, aux, committed
         return run

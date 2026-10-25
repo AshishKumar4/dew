@@ -9,7 +9,7 @@ import optax
 from flax import struct
 from flax.training.dynamic_scale import DynamicScale
 
-from dew.batch import Batch, Variables, merge
+from dew.batch import FROZEN, Batch, Variables, merge
 
 __all__ = ["CHECKPOINTED", "MODEL_STATE", "Accumulation", "TrainState"]
 
@@ -129,3 +129,21 @@ VARIABLE_FIELDS = tuple(field.name for field in dataclasses.fields(TrainState)
 """The train-state fields that each hold a variables tree, keyed by collection (`params`,
 `FROZEN`, ...), as their declarations mark them; the optimizer's state mirrors the trained
 parameters' paths instead."""
+
+
+def apart[State: TrainState](state: State) -> tuple[State, Variables | None]:
+    """`state` less its frozen tree (`variables[FROZEN]`), and the frozen tree, None where it holds
+    none: a step donates the first and reads the second, so the frozen arrays are one set of buffers
+    a run shares with the tree its objective holds (`together`). A state's shardings or shapes split
+    the same way."""
+    variables = state.variables
+    if FROZEN not in variables:
+        return state, None
+    moving = {collection: tree for collection, tree in variables.items() if collection != FROZEN}
+    return dataclasses.replace(state, variables=moving), variables[FROZEN]
+
+
+def together[State: TrainState](moving: State, frozen: Variables | None) -> State:
+    """The state `apart` split, its frozen tree the very arrays given."""
+    return moving if frozen is None else dataclasses.replace(moving, variables={**moving.variables,
+                                                                                FROZEN: frozen})
