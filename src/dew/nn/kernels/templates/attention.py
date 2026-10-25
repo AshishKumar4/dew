@@ -350,10 +350,10 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     and `[B, K, Hk, Dv]`, a query head reading the key head it shares with `H // Hk` others, the keys
     `spans` leaves it. As the kernels compute it: products of the inputs accumulated in fp32 (fp64 for
     fp64 inputs) as Dew's every product is (`dew.nn.precision.float32_einsum`, which a CPU under Dew's
-    tests sums in float64 and rounds once, as the reference path's), the scale and `score_mod` on the fp32 logits, the softmax from `hooks.initial` in fp32
-    (or the wider of the inputs' and the state's dtypes), the probabilities rounded to the values' dtype
-    for their product, the output normalized in fp32 and `output_mod` applied before it rounds to the
-    query's dtype. A query that sees no key and starts from no state gives zeros. With `residuals`, also
+    tests sums in float64 and rounds once, as the reference path's), the scale and `score_mod` on the
+    fp32 logits, the softmax from `hooks.initial` in fp32 (or the wider of the inputs' and the state's
+    dtypes), the probabilities rounded to the values' dtype for their product, the output normalized in
+    fp32 and `output_mod` applied before it rounds to the query's dtype. A query that sees no key and starts from no state gives zeros. With `residuals`, also
     each query's running maximum `m` and denominator `total` `[B, H, Q]` (natural log, unnormalized), in
     the softmax's dtype, a query that sees no key and starts from no state holding 0 for both, so every
     residual is finite; a softmax resumed from them (`Initial`) starts such a query from `m = -inf`. No
