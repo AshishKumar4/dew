@@ -111,9 +111,10 @@ Python holds `PYTHON_RUN`, which its first checkpoint writes."""
 
 PYTHON_RUN: dict[str, JSON] = {
     "rebuildable": False,
-    "defined": "in Python, by Trainer.fit: each checkpoint records the inference declaration it loads by, "
-               "and no record rebuilds the run. A run built as a dew.config.RunConfig in Python, and trained "
-               "by its run(), writes a run.json that rebuilds it (docs/recipes.md, Python experiments)",
+    "defined": "in Python, without a recorded RunConfig: each checkpoint records the inference "
+               "declaration it loads by, and no record rebuilds the run. A run built as a "
+               "dew.config.RunConfig in Python, and trained by its run(), writes a run.json that rebuilds it "
+               "(docs/recipes.md, Python experiments)",
 }
 """The root record of a run defined in Python (`RUN_FILE`), beside which the trainer's checkpoints say
 why its record cannot rebuild it (`Checkpoints.python_run`)."""
