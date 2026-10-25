@@ -3,7 +3,7 @@
 
     python3 tools/armada/ci.py plan --target=SECONDS --timings=FILE
     python3 tools/armada/ci.py task --python=3.12 --tests="tests/a.py tests/b.py" --split=[G/N] --out=FILE
-    python3 tools/armada/ci.py durations VERDICT...
+    python3 tools/armada/ci.py durations VERDICT
     python3 tools/armada/ci.py gpu-tier [--marked] [--evidence] [--shards=N]
     python3 tools/armada/ci.py gpu-lane --tests="tests/a.py tests/b.py" --out=FILE --cache=on --processes=N
     python3 tools/armada/ci.py coverage items --target=SECONDS --timings=FILE > ITEMS
@@ -30,11 +30,12 @@ with CI's selection, and writes a verdict row for each. A row is red on a
 failed or erroring test, on a test skipped because its import failed (a file
 CI would never have run), or when pytest left no report of it. A task still
 running at its deadline, short of armada's own timeout, is interrupted and
-every row it holds is red, so a hang is graded with its stack dump rather
-than leaving the task without a verdict. Each row also carries its tests' own
-times, from which `durations` rewrites tests/test_durations.json: given green
-runs' verdicts (`armada verdict <sha> --json`), the newest first, it records
-each test of the newest at its least time as the floor's Python ran it.
+every row it holds is red, so a hang is graded, with what pytest reports as
+it is interrupted, rather than leaving the task without a verdict. Each row
+also carries its tests' own times, which `durations` folds into tests/test_durations.json from main's CI
+(`armada verdict <sha> --json`): a file whose record no longer cuts it as it
+runs takes what its tests took (`folded`). The land queue folds main's CI so
+at each train, as a head of its own, and no hand edits the record.
 
 The test cache reuses a file's row when its inputs are unchanged since it ran green. A
 green row records the checkout's Python files its tests executed
@@ -163,12 +164,14 @@ SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 across the containers of an armada gang."""
 SHARED = ("pyproject.toml", "constraints.txt", ".armada.json", "tools/armada/session.py",
           "tools/armada/child_groups.py", "tools/armada/split.py", "tools/armada/executed.py",
-          "tools/armada/followed.py", str(session.DURATIONS))
+          "tools/armada/followed.py")
 """The files every test file's key covers whole, beside tests/ and src/'s data, every lock (a GPU node
 builds its environment from its CUDA lock) and the environment's own inputs, which .armada.json
 names (`environment_files`): what every test process runs or reads, the session it runs in, the
 process group it runs as and the plugins loaded into it among them. The plan's own code (this file)
-runs outside the tests, so a change to it reruns none of them."""
+runs outside the tests, so a change to it reruns none of them; nor does the durations record
+(`session.DURATIONS`), which only a split file's groups are cut from, so a group's key covers its own
+file's entries alone (`cache_key`)."""
 
 
 def environment_files() -> list[str]:
@@ -202,7 +205,7 @@ def shared(python: str) -> str:
     digest = hashlib.sha256(python.encode())
     for top in ("tests", "src"):
         for path in sorted(Path(top).rglob("*")):
-            if not path.is_file() or "__pycache__" in path.parts:
+            if not path.is_file() or "__pycache__" in path.parts or path == session.DURATIONS:
                 continue
             if path.suffix == ".py" and (top == "src" or path.name.startswith("test_")):
                 continue
@@ -234,23 +237,31 @@ def contents(name: str) -> bytes:
     return b"missing"
 
 
-def cache_key(common: str, name: str, depends: list[str]) -> str:
-    """The key of test file `name` whose run executed or read `depends` (executed.py): its `inputs`'
-    contents, its directories' entries, and `common`."""
+def cache_key(common: str, name: str, split: str, depends: list[str]) -> str:
+    """The key of test file `name`'s row in `split`'s group whose run executed or read `depends`
+    (executed.py): its `inputs`' contents, its directories' entries, `common`, and for a group of a split
+    file, the group and its file's entries in the durations record (`recorded_entries`), which split.py
+    cuts it from, the record's only part a run's outcome depends on."""
     digest = hashlib.sha256(common.encode())
     for path in inputs(name, depends):
         digest.update(path.encode() + contents(path))
+    if split and split != COLLECT:
+        digest.update(split.encode() + json.dumps(recorded_entries(name), sort_keys=True).encode())
     return digest.hexdigest()
 
 
 def inputs(name: str, depends: list[str]) -> list[str]:
     """What test file `name`'s key covers, given that its run executed or read `depends`: those, and each
-    directory under src/ that holds a module it executed, however deep, whose entries name the modules an
-    import there finds: a module added beside one it imported (which shadows it, or which an import it
-    tried now finds), or an __init__.py added to a namespace package on the way to one, which executes
-    as the import passes, changes its key; one added to a package it never imported does not."""
-    packages = {str(parent) for path in depends if path.startswith("src/") and path.endswith(".py")
-                for parent in Path(path).parents if parent.parts[:1] == ("src",) and parent != Path("src")}
+    directory under src/ or tools/ that holds a module it executed, however deep, whose entries name the
+    modules an import there finds: a module added beside one it imported (which shadows it, or which an
+    import it tried now finds), or an __init__.py added to a namespace package on the way to one, which
+    executes as the import passes, changes its key; one added to a package it never imported does not.
+    tools/ itself is among them, as a test puts it, or a directory under it, on sys.path and imports a tool
+    by its name, which a package added there shadows; src/'s own entries every key covers (`shared`)."""
+    packages = {str(parent) for path in depends
+                if path.startswith(("src/", "tools/")) and path.endswith(".py")
+                for parent in Path(path).parents
+                if parent.parts[:1] in (("src",), ("tools",)) and parent != Path("src")}
     return sorted({name, *depends, *packages})
 
 
@@ -323,18 +334,16 @@ def record_of(key: str, token: str) -> bytes | None:
         return None
 
 
-def reused(python: str, name: str, split: str, common: str, stale: tuple[str, ...] = ()) -> dict | None:
+def reused(python: str, name: str, split: str, common: str) -> dict | None:
     """The green row of test file `name` (in `split`'s group) recorded on this host's class
-    (`device_class`), if it ran green there on exactly these inputs and read nothing under the `stale`
-    directories (the policy's, `policy`); else None. The record of the last run on these shared inputs
-    decides: a key hashes them (`cache_key`), so no run on others, whose record the last run's may be,
-    can be fresh here."""
+    (`device_class`), if it ran green there on exactly these inputs; else None. The record of the last
+    run on these shared inputs decides: a key hashes them (`cache_key`), so no run on others, whose
+    record the last run's may be, can be fresh here."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
     found = recorded(record_key(python, row(python, name, split), device_class(), common), token)
-    if found is None or not fresh(found, name, common) or any(
-            path.startswith(stale) for path in found["depends"]):
+    if found is None or not fresh(found, name, common):
         return None
     return found["row"]
 
@@ -342,7 +351,8 @@ def reused(python: str, name: str, split: str, common: str, stale: tuple[str, ..
 def fresh(recorded: dict, name: str, common: str) -> bool:
     """Whether test file `name`'s record was made by a green run on exactly these inputs. A red run,
     or one of a file that started another Python process, whose code no event saw, leaves no key."""
-    return recorded["key"] is not None and recorded["key"] == cache_key(common, name, recorded["depends"])
+    return recorded["key"] is not None and recorded["key"] == cache_key(
+        common, name, parsed_row(recorded["row"]["name"])[2], recorded["depends"])
 
 
 RECORD_TRIES = 4
@@ -352,10 +362,19 @@ RECORD_TRIES = 4
 def recorded_tests() -> dict[str, list[float]]:
     """Each file's tests' times in tests/test_durations.json, in node-id order."""
     tests: dict[str, list[float]] = {}
-    if session.DURATIONS.is_file():
-        for node, seconds in sorted(json.loads(session.DURATIONS.read_text()).items()):
-            tests.setdefault(node.split("::")[0], []).append(seconds)
+    for node, seconds in sorted(durations_record().items()):
+        tests.setdefault(node.split("::")[0], []).append(seconds)
     return tests
+
+
+def durations_record() -> dict[str, float]:
+    """The durations record (`session.DURATIONS`): each test's node id and its seconds."""
+    return json.loads(session.DURATIONS.read_text()) if session.DURATIONS.is_file() else {}
+
+
+def recorded_entries(name: str) -> dict[str, float]:
+    """Test file `name`'s entries in the durations record."""
+    return {node: seconds for node, seconds in durations_record().items() if node.split("::")[0] == name}
 
 
 def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[str, float | None]:
@@ -470,20 +489,16 @@ PLACED_FILES = ("README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE")
 def policy(base: str) -> str:
     """The test cache's policy (DEW_TEST_CACHE) for this checkout's change from `base`: 'off', every file
     run, for a change to what every test process runs or reads (`SHARED`, a lock, the environment's
-    files) or to a file the records do not place (`PLACED`); 'stale:tools/' for a change under tools/,
-    where every file whose run read a tool runs again; else 'on', each file run where its inputs
-    changed."""
+    files) or to a file the records do not place (`PLACED`); else 'on', each file run where its inputs
+    changed. A tool is such an input of each file whose run executed or read it, which its key hashes, so
+    a changed tool runs those files again and no other (train 115 reran its whole suite for five tools
+    no pulled head had touched, under a policy that reran every file that read any tool)."""
     changed = subprocess.run(["git", "diff", "--name-only", f"{base}...HEAD"], check=True,
                              capture_output=True, text=True).stdout.split()
     whole = {*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files(), ".python-version"}
     if any(name in whole or not (name.startswith(PLACED) or name in PLACED_FILES) for name in changed):
         return "off"
-    return "stale:tools/" if any(name.startswith("tools/") for name in changed) else "on"
-
-
-def stale_of(cache: str) -> tuple[str, ...]:
-    """The directories policy `cache` reruns every file that read them of (`policy`)."""
-    return tuple(cache.removeprefix("stale:").split(",")) if cache.startswith("stale:") else ()
+    return "on"
 
 
 def plan(target: float, timings: dict) -> list[dict]:
@@ -551,13 +566,6 @@ def red_as(kind: str, nodes: list[str]) -> dict:
     return {"kind": kind, "failed": nodes}
 
 
-def shown(output: str) -> str:
-    """The end of a task's output, and the stack faulthandler printed for a test that hung, if one did."""
-    stack = output.rfind("Timeout (")
-    hung = output[stack:stack + 6000] + "\n...\n" if 0 <= stack < len(output) - 4000 else ""
-    return hung + output[-4000:]
-
-
 def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
     """Import `tests` under `python` without running them and write one verdict row a file: red
     where collecting it errs or skips on a missing import, which running it would have."""
@@ -619,7 +627,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     reused as the cache's policy (`policy`) allows."""
     began = time.monotonic()
     rows = [found for name in tests
-            if cache != "off" and (found := reused(python, name, split, common, stale_of(cache)))]
+            if cache != "off" and (found := reused(python, name, split, common))]
     tests = [name for name in tests if row(python, name, split) not in {found["name"] for found in rows}]
     if rows:
         print(f"{len(rows)} files ran green on these inputs on {device_class()}; their rows are reused")
@@ -708,7 +716,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         # armada times a file at the sum of its rows' timings, a split file's groups together, each
         # Python's apart.
         ran.append({"name": row(python, name, split), "exitCode": 1 if red else 0, "seconds": seconds,
-                     "output": "\n".join(red + ([shown(output)] if red else [])),
+                     "output": "\n".join(red + ([output[-4000:]] if red else [])),
                      # Its first failed test's exception as pytest gave it ("RuntimeError: ..."), which
                      # `exhausted` reads.
                      **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
@@ -739,7 +747,8 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str) ->
         if row_["exitCode"] == 0 and name not in executed:
             continue
         green = row_["exitCode"] == 0 and ran["depends"] is not None
-        body = json.dumps({"key": cache_key(common, name, ran["depends"]) if green else None,
+        key = cache_key(common, name, parsed_row(row_["name"])[2], ran["depends"]) if green else None
+        body = json.dumps({"key": key,
                            "depends": ran["depends"], "row": row_, "reads": ran["reads"],
                            "peak": ran["peak"], "shares": ran["shares"], "pools": ran["pools"]}).encode()
         # The record under these inputs, which `reused` reads, and the last run's, which the GPU tier and
@@ -994,27 +1003,58 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     return 0
 
 
-def durations(verdicts: list[dict]) -> dict[str, float]:
-    """Each test of the first of green runs' `verdicts`, the newest, at its least time over them all,
-    as their floor's Python ran it: what it takes where nothing slows it. A container can run three
-    times as slowly as the rest of its run, and a run's compilations can miss the shared cache, and
-    neither moves a test's time. A test the newest run did not have is gone; a reused row (the test
-    cache) carries the times of the run that recorded it."""
-    times: dict[str, list[float]] = {}
-    for verdict in verdicts:
-        rows = verdict["rows"]
-        red = [row["name"] for row in rows if row["exitCode"] != 0]
-        if red:
-            raise SystemExit(f"{len(red)} rows are red, {red[0]} first: record durations from green runs")
-        floor = [row for row in rows if row["name"].startswith(f"{PYTHONS[0]}:")]
-        if not all("tests" in row for row in floor):
-            raise SystemExit("a verdict's rows carry no test times; record them from runs of this version")
-        for row in floor:
-            for node, seconds in row["tests"].items():
-                times.setdefault(node, []).append(seconds)
-    newest_rows = [row for row in verdicts[0]["rows"] if row["name"].startswith(f"{PYTHONS[0]}:")]
-    newest = {node for row in newest_rows for node in row["tests"]}
-    return {node: round(min(seconds), 3) for node, seconds in sorted(times.items()) if node in newest}
+def folded(record: dict[str, float], verdict: dict, target: float) -> dict[str, float]:
+    """The durations `record` with main's CI `verdict` (`armada verdict <sha> --json`) folded in, one test
+    file at a time, each whole, as its floor Python's rows ran it. A file whose rows are all green and
+    complete (its whole row, or every group of its cut) takes the times they observed where its record is
+    stale (`stale`); a file with a red or missing row keeps its entries, as does a file the verdict did not
+    run, and a file the checkout no longer has loses them. A reused row (the test cache) carries the times
+    of the run that recorded it. Each train folds main's CI so (the land queue), and nothing else writes the
+    record."""
+    rows: dict[str, list[dict]] = {}
+    for row_ in verdict["rows"]:
+        python, name, split_ = parsed_row(row_["name"])
+        if python == PYTHONS[0] and split_ != COLLECT and Path(name).is_file():
+            rows.setdefault(name, []).append(row_)
+    kept = {node: seconds for node, seconds in record.items() if Path(node.split("::")[0]).is_file()}
+    for name, held in rows.items():
+        splits = {parsed_row(row_["name"])[2] for row_ in held}
+        counts = {int(split_.split("/")[1]) for split_ in splits if split_}
+        complete = splits == {""} or (len(counts) == 1 and splits == {f"{group}/{count}" for count in counts
+                                                                      for group in range(1, count + 1)})
+        if not complete or any(row_["exitCode"] != 0 or "tests" not in row_ for row_ in held):
+            continue
+        observed = {node: seconds for row_ in held for node, seconds in row_["tests"].items()}
+        own = {node: seconds for node, seconds in kept.items() if node.split("::")[0] == name}
+        if stale(own, observed, sum(row_["seconds"] for row_ in held), max(counts, default=1), target):
+            kept = {node: seconds for node, seconds in kept.items() if node.split("::")[0] != name}
+            kept.update({node: round(seconds, 3) for node, seconds in observed.items()})
+    return dict(sorted(kept.items()))
+
+
+def stale(own: dict[str, float], observed: dict[str, float], seconds: float, cut: int, target: float) -> bool:
+    """Whether a file's record `own` no longer cuts it as it runs: its tests differ from those its rows
+    `observed` (one added, removed or renamed); a file within `target` (it took `seconds`), or one with no
+    tests to cut, is recorded past it, so the plan would split what runs whole; or, for a file past it (as
+    `cut` groups), the groups the
+    plan cuts from the record (`split`) run a group past `KEPT` of the target as its tests ran, setup
+    included, and those it would cut from what they took run their heaviest shorter. A cut that fits is
+    kept whatever its tests' times drift, as the plan keeps it, and so is one whose heaviest group no cut
+    shortens (a test heavier than the budget, which runs alone either way): a fold rewrites a file only
+    where its plan changes for the better."""
+    if own.keys() != observed.keys():
+        return True
+    if seconds <= target or not own:
+        return sum(own.values()) > target
+    nodes = sorted(own)
+    recorded, ran = [own[node] for node in nodes], [observed[node] for node in nodes]
+    setup = max(seconds - sum(ran), 0.0) / cut
+
+    def heaviest(weights: list[float]) -> float:
+        count = len(split(weights, seconds, target, cut))
+        return max(sum(ran[run.start:run.stop]) + setup for run in session.groups(weights, count) if run)
+
+    return heaviest(recorded) > KEPT * target and heaviest(ran) < heaviest(recorded)
 
 
 ARTIFACTS = "/armada/task/artifacts"
@@ -1126,7 +1166,7 @@ def main() -> int:
     running.add_argument("--out", type=Path, required=True)
     running.add_argument(
         "--cache", required=True,
-        help="the plan's DEW_TEST_CACHE (`policy`): on, off, or stale:<directories> whose readers run again")
+        help="the plan's DEW_TEST_CACHE (`policy`): on, or off")
     running.add_argument("--deadline", type=float, default=session.DEADLINE,
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
     running.add_argument("--coverage", type=Path, default=None,
@@ -1160,8 +1200,7 @@ def main() -> int:
     versions.add_argument("--check", action="store_true",
                           help="refuse a .python-version other than the oldest, or a smoke of other versions")
     recording = operations.add_parser("durations")
-    recording.add_argument("verdicts", type=Path, nargs="+",
-                           help="green runs' verdicts, the newest first: armada verdict <sha> --json")
+    recording.add_argument("verdict", type=Path, help="main's CI verdict: armada verdict <sha> --json")
     args = parser.parse_args()
     if args.operation == "pythons":
         return pythons(check=args.check)
@@ -1169,9 +1208,15 @@ def main() -> int:
         print(json.dumps(gangs()))
         return 0
     if args.operation == "durations":
-        recorded = durations([json.loads(path.read_text()) for path in args.verdicts])
-        session.DURATIONS.write_text(json.dumps(dict(sorted(recorded.items())), indent=0) + "\n")
-        print(f"{len(recorded)} tests, {sum(recorded.values()):.0f} s, in {session.DURATIONS}")
+        target = json.loads(Path(".armada.json").read_text())["target"]
+        before = durations_record()
+        recorded = folded(before, json.loads(args.verdict.read_text()), target)
+        if recorded != before:
+            session.DURATIONS.write_text(json.dumps(recorded, indent=0) + "\n")
+        changed = sorted({node.split("::")[0] for node in before.keys() ^ recorded.keys()}
+                         | {node.split("::")[0] for node in before.keys() & recorded.keys()
+                            if before[node] != recorded[node]})
+        print(f"{len(changed)} files refolded in {session.DURATIONS}: {' '.join(changed) or 'none'}")
         return 0
     if args.operation == "gpu-tier":
         tier = ({name: [f"{count} marked"] for name, count in marked(PYTHONS[0]).items()} if args.marked

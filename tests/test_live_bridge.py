@@ -459,7 +459,7 @@ batches = [compile_data(records.batch(64)).batch, compile_data(rows(64)).batch,
            compile_data(tokens.pipe(presets.lm, None, batch=64, **windows)).batch]
 model = CausalTransformer(vocab_size=400, emb_features=8, num_layers=1, num_heads=1, mlp_features=16,
                           max_seq_len=4)
-run = Trainer(LMObjective(model, seq_len=4), OptimConfig(rate=1e-3), key=0).fit
+run = Trainer(LMObjective(model, seq_len=4), OptimConfig(learning_rate=1e-3), key=0).fit
 state = run(tokens.pipe(presets.lm, None, batch=64, **windows), **dict(steps=1000))
 read, import_builtins = locals, __import__("builtins")
 frames = ["records" in read(), "records" in import_builtins.locals(), "records" in locals()]

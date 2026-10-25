@@ -1,9 +1,11 @@
 """Check 2 as a gate: a site's computation run one primitive at a time (`certified`), each equation
 held on the operands its execution gave it to its primitive's contract (CONTRACTS), from the exact
 oracles of tests/op_certificates.py; a primitive no contract covers fails the site
-(`assert_certified`), and the lane's flushes are read as it computes (`FLUSHES`)."""
+(`assert_certified`), and the lane's arithmetic is held as it computes, measured on it (`lane`)."""
 
+import dataclasses
 import fractions
+import functools
 import math
 
 import ml_dtypes
@@ -21,16 +23,45 @@ from op_certificates import (
     two_sum,
 )
 
-FLUSHES = True
-"""Whether the lane's float arithmetic flushes, as XLA on the CPU lane does, jitted or eager, with
-YNNPACK's fusions or without (tests/test_check2.py holds each fact, so a JAX that changes one fails
-there first): an arithmetic operation or comparison reads a subnormal operand as a zero of its sign,
-and a result that is tiny after rounding (below the least normal once rounded to its precision with an
-unbounded exponent) is a zero of the exact result's sign. A move of data, a sign operation (neg, abs)
-and a cast between float formats are bit manipulation: they keep subnormals."""
-
 STORAGE = {"float32": np.uint32, "bfloat16": np.uint16}
 """Each format's storage bits, which a move of data is compared by."""
+
+VALUES = {"float32": np.float32, "bfloat16": ml_dtypes.bfloat16}
+"""Each format's NumPy type."""
+
+UNREACHED = np.iinfo(np.int64).max
+"""The level (`LEVELS`) of a result no reach admits: a NaN where the exact value is a number or the
+reverse, a wrong exact case (an infinite or named result), or a value off the lane's grid (a subnormal
+from a lane that flushes)."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Lane:
+    """The float arithmetic of the lane check 2 runs on, as measured there (`lane`).
+
+    `flushes`: whether an arithmetic operation or comparison reads a subnormal operand as a zero of its
+    sign and a result tiny after rounding (below the least normal once rounded to its precision with an
+    unbounded exponent) is a zero of the exact result's sign, as XLA on the CPU does; XLA on a GPU keeps
+    subnormals unless `--xla_gpu_ftz` is set. A move of data, a sign operation (neg, abs) and a cast
+    between float formats are bit manipulation: they keep subnormals on every lane.
+
+    `reach`: by rounding primitive and format, the largest level (`LEVELS`) of the lane's own results
+    over its probes (`_probes`): 0 where every one was its exact value rounded to nearest, 1 where each
+    was one of the two neighbours of its exact value on the lane's grid (faithful), n where each was
+    within n - 1 steps of the grid past them."""
+    flushes: bool
+    reach: dict[tuple[str, str], int]
+
+
+def _grid_index(value, fmt: Format, flushes: bool) -> np.ndarray:
+    """Each value of `fmt` (as float64, finite or infinite) as its place on the lane's grid, in steps
+    from zero, negative below it: its storage bits' magnitude, less the subnormals the grid skips where
+    the lane flushes, so that the least normal is one step from zero there."""
+    value = np.asarray(value, np.float64)
+    magnitude = np.abs(value).astype(VALUES[fmt.name]).view(STORAGE[fmt.name]).astype(np.int64)
+    if flushes:
+        magnitude = np.where(magnitude > 0, magnitude - (2 ** (fmt.precision - 1) - 1), 0)
+    return np.where(np.signbit(value), -magnitude, magnitude)
 
 
 def _format(dtype) -> Format | None:
@@ -63,20 +94,20 @@ def _bits(value) -> np.ndarray:
     return value.view(np.dtype(f"u{value.dtype.itemsize}"))
 
 
-def _daz(value, fmt: Format) -> np.ndarray:
-    """`value` (float64) with every subnormal of `fmt` read as a zero of its sign, as the lane's
-    arithmetic reads it."""
+def _daz(value, fmt: Format, flushes: bool) -> np.ndarray:
+    """`value` (float64) with every subnormal of `fmt` read as a zero of its sign where the lane
+    `flushes`, as its arithmetic reads it."""
     value = np.asarray(value, np.float64)
-    if not FLUSHES:
+    if not flushes:
         return value
     return np.where(np.abs(value) < 2.0 ** fmt.emin, np.copysign(0.0, value), value)
 
 
-def _read(value) -> np.ndarray:
+def _read(value, flushes: bool) -> np.ndarray:
     """An operand as the lane's arithmetic reads it: a float of a known format as float64, flushed
-    (`_daz`); any other as it is."""
+    where the lane flushes (`_daz`); any other as it is."""
     fmt = _format(np.asarray(value).dtype)
-    return np.asarray(value) if fmt is None else _daz(np.asarray(value, np.float64), fmt)
+    return np.asarray(value) if fmt is None else _daz(np.asarray(value, np.float64), fmt, flushes)
 
 
 def _same(native, expected) -> np.ndarray:
@@ -92,49 +123,60 @@ _UNBOUNDED = {name: Format(f"{name} unbounded", fmt.precision, -1022, fmt.emax)
 """Each format's precision at every exponent: what the lane's tininess is read from."""
 
 
-def _rounded_on_lane(hi, lo, fmt: Format) -> np.ndarray:
-    """RN of the exact hi + lo in `fmt` as the lane's arithmetic rounds it: gradually, or with FLUSHES a
-    zero of the exact value's sign wherever the value rounded with an unbounded exponent is below the
-    least normal (tininess after rounding)."""
+def _rounded_on_lane(hi, lo, fmt: Format, flushes: bool) -> np.ndarray:
+    """RN of the exact hi + lo in `fmt` as the lane's arithmetic rounds it: gradually, or where it
+    `flushes` a zero of the exact value's sign wherever the value rounded with an unbounded exponent is
+    below the least normal (tininess after rounding)."""
     gradual = rounded(hi, lo, fmt)
-    if not FLUSHES:
+    if not flushes:
         return gradual
     unbounded = rounded(hi, lo, _UNBOUNDED[fmt.name])
     tiny = np.isfinite(unbounded) & (np.abs(unbounded) < 2.0 ** fmt.emin)
     return np.where(tiny, np.copysign(0.0, np.where(hi != 0, hi, gradual)), gradual)
 
 
-def _step(value, fmt: Format, direction: float) -> np.ndarray:
+def _step(value, fmt: Format, direction: float, flushes: bool) -> np.ndarray:
     """The next value of `fmt` after each `value` (a value of `fmt`, as float64) toward `direction`,
-    on the lane's grid: with FLUSHES its outputs hold no subnormal, so the next value past zero is the
-    least normal and the next below the least normal is zero."""
-    dtype = {"float32": np.float32, "bfloat16": ml_dtypes.bfloat16}[fmt.name]
+    on the lane's grid: where it `flushes` its outputs hold no subnormal, so the next value past zero is
+    the least normal and the next below the least normal is zero."""
+    dtype = VALUES[fmt.name]
     value = np.asarray(value, np.float64)
     stepped = np.nextafter(value.astype(dtype), np.full(value.shape, direction, dtype)).astype(np.float64)
-    if FLUSHES:
+    if flushes:
         least = 2.0 ** fmt.emin
         tiny = np.abs(stepped) < least
         # Past zero toward a subnormal the grid's next value is the least normal; from the least
-        # normal toward zero it is zero.
-        jumped = np.where(np.abs(value) >= least, 0.0, np.copysign(least, direction))
+        # normal toward zero it is the zero of its sign.
+        jumped = np.where(np.abs(value) >= least, np.copysign(0.0, value), np.copysign(least, direction))
         stepped = np.where(tiny, jumped, stepped)
     return stepped
 
 
-def _faithful(native, low, high, fmt: Format) -> tuple[np.ndarray, np.ndarray]:
-    """Whether `native` is faithful to an exact value enclosed in [low, high] (float64, outward): the
-    greatest value of the lane's grid at or below the value or the least at or above it. Returns
-    `(holds, decided)`: an enclosure that straddles a value of the grid, its ends not two neighbours,
-    decides nothing, and is refined by the caller."""
-    native = np.asarray(native, np.float64)
-    down = _rounded_on_lane(low, np.zeros_like(low), fmt)
-    down = np.where(down > low, _step(down, fmt, -np.inf), down)
-    up = _rounded_on_lane(high, np.zeros_like(high), fmt)
-    up = np.where(up < high, _step(up, fmt, np.inf), up)
+def _past(native, down, up, fmt: Format, flushes: bool) -> np.ndarray:
+    """Each native value's level against the two neighbours `down` and `up` of its exact value on the
+    lane's grid (equal where the exact value is on it): 1 at either, one more for each step of the grid
+    past them; UNREACHED for a NaN, a value off the grid, or a zero of the sign the exact value's side
+    does not take (the side of `up`, a negative value or a negative zero, or else positive)."""
+    native, up = np.asarray(native, np.float64), np.asarray(up, np.float64)
+    index = _grid_index(native, fmt, flushes)
+    past = np.maximum(_grid_index(down, fmt, flushes) - index, index - _grid_index(up, fmt, flushes))
+    negative = (up < 0) | ((up == 0) & np.signbit(up))
+    off = (np.isnan(native) | (flushes & (native != 0) & (np.abs(native) < 2.0 ** fmt.emin))
+           | ((native == 0) & (np.signbit(native) != negative)))
+    return np.where(off, UNREACHED, 1 + np.maximum(past, 0))
+
+
+def _neighbours(low, high, fmt: Format, flushes: bool) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """The greatest value of the lane's grid at or below an exact value enclosed in [low, high]
+    (float64, outward), the least at or above it, and whether the enclosure decides them: one that
+    straddles a value of the grid, its ends not two neighbours, decides nothing, and is refined by the
+    caller."""
+    down = _rounded_on_lane(low, np.zeros_like(low), fmt, flushes)
+    down = np.where(down > low, _step(down, fmt, -np.inf, flushes), down)
+    up = _rounded_on_lane(high, np.zeros_like(high), fmt, flushes)
+    up = np.where(up < high, _step(up, fmt, np.inf, flushes), up)
     exact = (low == high) & (down == up)
-    decided = exact | (_step(down, fmt, np.inf) == up)
-    holds = _same(native, down) | _same(native, up) | (np.isnan(native) & np.isnan(low))
-    return holds, decided
+    return down, up, exact | (_step(down, fmt, np.inf, flushes) == up)
 
 
 def _outward(end: fractions.Fraction, direction: float) -> float:
@@ -191,12 +233,17 @@ def _erfinv_enclosed(values, bits):
 
 
 def _log_special(value):
-    named = np.isnan(value) | (value <= 0) | (value == np.inf)
-    return np.select([value < 0, value == 0, value == np.inf], [np.nan, -np.inf, np.inf], np.nan), named
+    """log's limits at 0 and infinity, its NaN below zero, and its one exact value, log(1) = +0, named."""
+    named = np.isnan(value) | (value <= 0) | (value == np.inf) | (value == 1)
+    expected = np.select([value < 0, value == 0, value == np.inf, value == 1], [np.nan, -np.inf, np.inf, 0.0],
+                         np.nan)
+    return expected, named
 
 
 def _exp_special(value):
-    return np.select([value == np.inf, value == -np.inf], [np.inf, 0.0], np.nan), ~np.isfinite(value)
+    """exp's limits at the infinities and its one exact value, exp(±0) = 1, named."""
+    named = ~np.isfinite(value) | (value == 0)
+    return np.select([value == np.inf, value == -np.inf, value == 0], [np.inf, 0.0, 1.0], np.nan), named
 
 
 def _erfinv_special(value):
@@ -206,46 +253,51 @@ def _erfinv_special(value):
 
 
 def _transcendental(enclose, special):
-    """A faithful contract: where `special(value)` names an exact result (a limit, a pole, outside the
-    domain), that result; elsewhere faithful to `enclose(values, bits)`, refined at rising precision
-    wherever it decides nothing."""
-    def contract(params, operands, result, fmt):
-        (value,) = _floats(operands)
+    """A transcendental's levels (`LEVELS`): where `special(value)` names an exact result (a limit, a
+    pole, outside the domain), 0 at that result and UNREACHED elsewhere; at every other value at least
+    1, its place against the two neighbours of `enclose(values, bits)` (`_past`), the enclosure refined
+    at rising precision wherever it decides nothing."""
+    def levels(operands, result, fmt, flushes):
+        (value,) = _floats(operands, flushes)
+        result = np.asarray(result, np.float64)
         expected, named = special(value)
-        holds = np.array(_same(result, expected), dtype=bool, copy=True)
+        found = np.where(_same(result, expected), 0, UNREACHED)
         rest = np.flatnonzero(~named)
         for bits in (96, 192, 384, 768):
             if not rest.size:
                 break
             low, high = enclose(value.flat[rest], bits)
-            held, decided = _faithful(np.asarray(result, np.float64).flat[rest], low, high, fmt)
-            holds.flat[rest[decided]] = held[decided]
+            down, up, decided = _neighbours(low, high, fmt, flushes)
+            found.flat[rest[decided]] = _past(result.flat[rest], down, up, fmt, flushes)[decided]
             rest = rest[~decided]
         if rest.size:
             raise ArithmeticError(f"undecided at 768 bits at {rest[:4]}")
-        return holds
-    return contract
+        return found
+    return levels
 
 
-def _terms_hold(native, terms, fmt: Format) -> np.ndarray:
+def _terms_hold(native, terms, fmt: Format, flushes: bool) -> np.ndarray:
     """Whether each native sum of `terms` (exact float64 values, summed along the last axis) is within
     the bound of any order of summing them in `fmt`, fused multiply-adds included: γ_n Σ|terms| (Higham,
     Accuracy and Stability of Numerical Algorithms, 2002, §3.1: n terms, at most n - 1 roundings on any
-    path), plus a flushed partial's least normal at each rounding, around the terms' float64-rounded
-    exact sum (`exact_sum`, within 2^-53 of it relative to Σ|terms|, in the allowance). An empty sum is
-    the additive identity, +0."""
+    path), around the terms' float64-rounded exact sum (`exact_sum`, within 2^-53 of it relative to
+    Σ|terms|, in the allowance), plus what underflow loses past that relative bound at each rounding:
+    where the lane flushes, a flushed partial's least normal; where it keeps subnormals, half their
+    spacing (a product, or a sum carried wider and rounded into `fmt`). An empty sum is the additive
+    identity, +0."""
     native = np.asarray(native, np.float64)
     count = terms.shape[-1]
     if count == 0:
         return _same(native, np.zeros_like(native))
     magnitude = magnitude_sum(terms, -1)
-    allowance = (gamma(count, fmt) + 2.0 ** -52) * magnitude + count * 2.0 ** fmt.emin
+    underflow = 2.0 ** fmt.emin if flushes else 2.0 ** (fmt.emin - fmt.precision)
+    allowance = (gamma(count, fmt) + 2.0 ** -52) * magnitude + count * underflow
     error = np.abs(native - exact_sum(terms, -1))
     return np.isfinite(error) & (error <= np.nextafter(allowance, np.inf))
 
 
-def _floats(operands):
-    return [_read(value) for value in operands]
+def _floats(operands, flushes: bool):
+    return [_read(value, flushes) for value in operands]
 
 
 def _wrapping(operator):
@@ -258,13 +310,33 @@ def _wrapping(operator):
     return integral
 
 
-def _arithmetic(build, integral):
-    """A correctly rounded contract (`build(*operands)` the exact result as a double-double), or an
-    integer one where the result is an integer (`integral`, bit for bit)."""
+def _arithmetic(build):
+    """An IEEE operation's levels (`LEVELS`), its exact result `build(*operands)` as a double-double: 0
+    where the result is that rounded to nearest on the lane (`_rounded_on_lane`), else its place against
+    the exact result's two neighbours (`_past`); an exactly infinite or undefined result (an infinite
+    operand, a division by zero) 0 where the lane's is the same and UNREACHED elsewhere."""
+    def levels(operands, result, fmt, flushes):
+        hi, lo = build(*_floats(operands, flushes))
+        result = np.asarray(result, np.float64)
+        nearest = _rounded_on_lane(hi, lo, fmt, flushes)
+        # Rounding took the exact value up, or down: the other neighbour is one step of the grid away.
+        above = (nearest > hi) | ((nearest == hi) & (lo < 0))
+        below = (nearest < hi) | ((nearest == hi) & (lo > 0))
+        down = np.where(above, _step(nearest, fmt, -np.inf, flushes), nearest)
+        up = np.where(below, _step(nearest, fmt, np.inf, flushes), nearest)
+        placed = np.where(np.isfinite(hi), _past(result, down, up, fmt, flushes), UNREACHED)
+        return np.where(_same(result, nearest), 0, placed)
+    return levels
+
+
+def _rounding(name: str, integral):
+    """A rounding primitive's contract: each float result's level (`LEVELS[name]`) within the lane's
+    reach for it (`lane`); an integer result bit for bit (`integral`), where the primitive has one."""
     def contract(params, operands, result, fmt):
         if fmt is None:
             return _bits(result) == _bits(integral(result, *operands))
-        return _same(result, _rounded_on_lane(*build(*_floats(operands)), fmt))
+        measured = lane()
+        return LEVELS[name](operands, result, fmt, measured.flushes) <= measured.reach[name, fmt.name]
     return contract
 
 
@@ -305,12 +377,13 @@ def _converted(params, operands, result, fmt):
         exact = _exact_integer(value) if source is None else (value.astype(np.float64), np.zeros(value.shape))
         return _same(result, rounded(*exact, fmt))
     if result.dtype == bool:
-        return result == (_read(value) != 0)
+        return result == (_read(value, lane().flushes) != 0)
     if source is not None:
         limits = np.iinfo(result.dtype)
         # Each element's exact truncation, clamped in exact integers (64-bit limits are not float64s).
+        read = _read(value, lane().flushes)
         expected = [0 if math.isnan(v) else limits.max if v == math.inf else limits.min if v == -math.inf else
-                    min(max(int(v), int(limits.min)), int(limits.max)) for v in _read(value).flat]
+                    min(max(int(v), int(limits.min)), int(limits.max)) for v in read.flat]
         return result == np.array(expected, dtype=object).reshape(result.shape)
     return result == value.astype(result.dtype)
 
@@ -321,10 +394,11 @@ def _reduced_sum(params, operands, result, fmt):
     if fmt is None:
         summed = _wrapping(lambda t: np.sum(t, axis=axes, dtype=np.uint64))
         return _bits(result) == _bits(summed(result, terms))
-    moved = np.moveaxis(_read(terms), axes, tuple(range(-len(axes), 0)))
+    flushes = lane().flushes
+    moved = np.moveaxis(_read(terms, flushes), axes, tuple(range(-len(axes), 0)))
     kept = moved.shape[:moved.ndim - len(axes)]
     count = int(np.prod(moved.shape[len(kept):], dtype=np.int64))
-    return _terms_hold(result, moved.reshape(*kept, count), fmt)
+    return _terms_hold(result, moved.reshape(*kept, count), fmt, flushes)
 
 
 def _dot(params, operands, result, fmt):
@@ -352,9 +426,10 @@ def _dot(params, operands, result, fmt):
     if fmt is None:
         summed = _wrapping(lambda lhs, rhs: paired(lhs, rhs).sum(-1))
         return _bits(result) == _bits(summed(result, left, right).reshape(result.shape))
-    products = paired(_read(left), _read(right))
+    flushes = lane().flushes
+    products = paired(_read(left, flushes), _read(right, flushes))
     native = np.asarray(result, np.float64).reshape(products.shape[:-1])
-    return _terms_hold(native, products, fmt).reshape(result.shape)
+    return _terms_hold(native, products, fmt, flushes).reshape(result.shape)
 
 
 def _moved(oracle):
@@ -370,7 +445,7 @@ def _moved(oracle):
 def _compared(oracle):
     """A comparison or logical operation on values as the lane's arithmetic reads them (`_read`)."""
     def contract(params, operands, result, fmt):
-        expected = np.asarray(oracle(params, *(_read(value) for value in operands)))
+        expected = np.asarray(oracle(params, *(_read(value, lane().flushes) for value in operands)))
         return np.asarray(result) == expected.astype(np.asarray(result).dtype)
     return contract
 
@@ -393,7 +468,7 @@ def _extreme(choose, integral):
     def contract(params, operands, result, fmt):
         if fmt is None:
             return np.asarray(result) == integral(*(np.asarray(value) for value in operands))
-        return _same(result, choose(*_floats(operands)))
+        return _same(result, choose(*_floats(operands, lane().flushes)))
     return contract
 
 
@@ -405,7 +480,7 @@ def _extremum(choose, integral):
         (value,) = operands
         if fmt is None:
             return np.asarray(result) == integral(np.asarray(value), axes)
-        moved = np.moveaxis(_read(value), axes, tuple(range(-len(axes), 0)))
+        moved = np.moveaxis(_read(value, lane().flushes), axes, tuple(range(-len(axes), 0)))
         flat = moved.reshape(*moved.shape[:moved.ndim - len(axes)], -1)
         if flat.shape[-1] == 0:
             identity = -np.inf if choose is _signed_max else np.inf
@@ -496,21 +571,114 @@ def _unwrapped(params, operands, result, fmt):
     return _bits(result) == _bits(np.asarray(jax.random.key_data(operands[0])))
 
 
+LEVELS = {
+    "add": _arithmetic(two_sum),
+    "sub": _arithmetic(lambda a, b: two_sum(a, -b)),
+    "mul": _arithmetic(_product),
+    "square": _arithmetic(lambda a: _product(a, a)),
+    "div": _arithmetic(_quotient),
+    "sqrt": _arithmetic(_root),
+    "log": _transcendental(_interval(lambda iv, x: iv.log(x)), _log_special),
+    "exp": _transcendental(_exp_interval, _exp_special),
+    "erf_inv": _transcendental(_erfinv_enclosed, _erfinv_special),
+}
+"""Each rounding primitive's measure, `levels(operands, result, fmt, flushes) -> level`, element by
+element, on a lane that flushes or not: 0 where the result is its exact value rounded to nearest (an
+IEEE operation's), 1 at either neighbour of its exact value on the lane's grid (faithful), n at n - 1
+steps of the grid past them; UNREACHED where no reach admits it. The lane's reach for each is measured
+(`lane`), and its contract is its reach (CONTRACTS)."""
+
+PROBES = 2048
+"""The operands drawn for each rounding primitive in each format that measure the lane's reach for it
+(`lane`, `_probes`): the reach is the largest level over them, so a rarer rounding a site meets past
+it is a finding there, and the probes grow; few enough that the transcendentals' exact enclosures,
+one interval evaluation each, take seconds once a process."""
+
+
+def _probes(name: str, fmt: Format) -> list[np.ndarray]:
+    """PROBES operands of the rounding primitive `name` in `fmt`, over its domain at every scale its
+    results reach: sums of every alignment, a quarter of them nearly cancelling; products and quotients
+    from about 2^-140 (subnormal on a lane that keeps subnormals) to 2^126; roots of every binade,
+    subnormals included; logarithms of every binade and a quarter near one; exponentials across fp32's
+    range and a quarter near zero; inverse error functions across (-1, 1) and a quarter near its poles;
+    and each transcendental at its exact value (exp(0), log(1), erf_inv(0)), which a lane must return
+    exactly. One fixed draw per primitive and format."""
+    rng = np.random.default_rng([*name.encode(), fmt.precision])
+    quarter = PROBES // 4
+
+    def scaled(low: int, high: int) -> np.ndarray:
+        signs = rng.choice([-1.0, 1.0], PROBES)
+        return signs * rng.uniform(1, 2, PROBES) * 2.0 ** rng.integers(low, high, PROBES)
+
+    if name in ("add", "sub"):
+        a, b = scaled(-30, 30), scaled(-30, 30)
+        near = a[:quarter] * (1 + rng.uniform(-2.0 ** -10, 2.0 ** -10, quarter))
+        b[:quarter] = -near if name == "add" else near
+        drawn = [a, b]
+    elif name in ("mul", "square"):
+        drawn = [scaled(-70, 63) for _ in range(1 if name == "square" else 2)]
+    elif name == "div":
+        drawn = [scaled(-70, 63), scaled(-63, 70)]
+    elif name == "sqrt":
+        drawn = [np.abs(scaled(-149, 127))]
+    elif name == "log":
+        value = np.abs(scaled(-126, 127))
+        value[:quarter] = 1 + rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
+        value[0] = 1.0
+        drawn = [value]
+    elif name == "exp":
+        value = rng.uniform(-104, 89, PROBES)
+        value[:quarter] = rng.uniform(-2.0 ** -8, 2.0 ** -8, quarter)
+        value[0] = 0.0
+        drawn = [value]
+    else:
+        value = rng.uniform(-1, 1, PROBES)
+        poles = 1 - 2.0 ** -rng.uniform(1, fmt.precision, quarter)
+        value[:quarter] = rng.choice([-1.0, 1.0], quarter) * poles
+        value[0] = 0.0
+        drawn = [value]
+    return [value.astype(VALUES[fmt.name]) for value in drawn]
+
+
+@functools.cache
+def lane() -> Lane:
+    """The lane check 2 runs on (the process's default backend), measured once: whether it reads a
+    subnormal operand as zero (2^-140 times 2^100), and each rounding primitive's reach in each format,
+    the largest level (`LEVELS`) of the lane's own results on its probes (`_probes`), each operation
+    run as `certified` runs it, eagerly and alone. A lane result that breaks an exact case (UNREACHED)
+    is a finding no reach admits, raised here."""
+    import jax
+
+    flushes = float(jax.lax.mul(np.float32(2.0 ** -140), np.float32(2.0 ** 100))) == 0.0
+    reach = {}
+    for name, levels in LEVELS.items():
+        for fmt in FORMATS.values():
+            operands = _probes(name, fmt)
+            # Each primitive is `jax.lax`'s function of its own name.
+            found = levels(operands, np.asarray(getattr(jax.lax, name)(*operands)), fmt, flushes)
+            if np.any(found == UNREACHED):
+                at = int(np.argmax(found == UNREACHED))
+                raise ArithmeticError(f"the lane's {name} in {fmt.name} breaks an exact case at "
+                                      f"{[operand[at] for operand in operands]}")
+            reach[name, fmt.name] = int(np.max(found))
+    return Lane(flushes, reach)
+
+
 CONTRACTS = {
-    "add": _arithmetic(two_sum, _wrapping(np.add)),
-    "sub": _arithmetic(lambda a, b: two_sum(a, -b), _wrapping(np.subtract)),
-    "mul": _arithmetic(_product, _wrapping(np.multiply)),
-    "square": _arithmetic(lambda a: _product(a, a), _wrapping(lambda a: a * a)),
-    "div": _arithmetic(_quotient, None),
-    "sqrt": _arithmetic(_root, None),
+    "add": _rounding("add", _wrapping(np.add)),
+    "sub": _rounding("sub", _wrapping(np.subtract)),
+    "mul": _rounding("mul", _wrapping(np.multiply)),
+    "square": _rounding("square", _wrapping(lambda a: a * a)),
+    "div": _rounding("div", None),
+    "sqrt": _rounding("sqrt", None),
     "neg": _moved(lambda params, a: -a),
     "abs": _moved(lambda params, a: np.abs(a)),
     "max": _extreme(_signed_max, np.maximum),
     "min": _extreme(_signed_min, np.minimum),
     "convert_element_type": _converted,
-    "log": _transcendental(_interval(lambda iv, x: iv.log(x)), _log_special),
-    "exp": _transcendental(_exp_interval, _exp_special),
-    "erf_inv": _transcendental(_erfinv_enclosed, _erfinv_special),
+    "log": _rounding("log", None),
+    "exp": _rounding("exp", None),
+    "erf_inv": _rounding("erf_inv", None),
     "reduce_sum": _reduced_sum,
     "dot_general": _dot,
     "eq": _compared(lambda params, a, b: np.equal(a, b)),
@@ -545,12 +713,13 @@ CONTRACTS = {
     "random_unwrap": _unwrapped,
 }
 """Each primitive's contract, `contract(params, operands, result, fmt) -> ok`, the result's elements
-that hold it, `fmt` the result's float format (None for an integer or boolean result): a correctly
-rounded result (IEEE arithmetic, as the lane rounds: `FLUSHES`), a faithful one (a transcendental,
-within its two neighbours of the exact value whatever its vendor documents), a sum within its bound in
-any order, an integer operation wrapped to its width, or a result with no rounding at all, bit for bit
-(a move of data, a sign operation, a comparison). A primitive missing here cannot be certified, which
-fails the site's coverage, as does an integer result of `div` or `sqrt`."""
+that hold it, `fmt` the result's float format (None for an integer or boolean result): a rounding
+primitive within the lane's measured reach for it (`LEVELS`, `lane`: correctly rounded, faithful or a
+stated number of steps past, as the lane computes it); a sum within its bound in any order; an integer
+operation wrapped to its width; or a result with no rounding at all, bit for bit (a move of data, a
+sign operation, a comparison), every operand read as the lane reads it (`Lane.flushes`). A primitive
+missing here cannot be certified, which fails the site's coverage, as does an integer result of a
+primitive with no integer form (`div`, `sqrt`, a transcendental)."""
 
 
 def certified(fn, *arguments) -> tuple:

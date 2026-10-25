@@ -10,9 +10,9 @@ dew tpu creates, sets up and reaches Cloud TPUs; `dew tpu --help` lists its comm
 from __future__ import annotations
 
 import dataclasses
-import importlib
 import json
 import sys
+import types
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Annotated, Literal
@@ -63,6 +63,18 @@ class Export:
         return 0
 
 
+def user_module(path: Path) -> types.ModuleType:
+    """The user's Python file at `path`, that file and no other, imported as the module its name names
+    (`dew.registry.module_from_file`), with its directory first on the path, as `python -m` runs one
+    beside its siblings, so it imports them."""
+    from dew.registry import module_from_file
+
+    directory = str(path.resolve().parent)
+    if directory not in sys.path:
+        sys.path.insert(0, directory)
+    return module_from_file(path, path.stem)
+
+
 def chain_of(named: str, branch: Literal["train", "validation"], trust: tuple[str, ...] = ()):
     """The chain `named` names as a `dew.data.compile` pipeline: a Python file's `data`, or with
     `branch="validation"` its `validation` (each a chain, or a function returning one); a chain's
@@ -74,8 +86,7 @@ def chain_of(named: str, branch: Literal["train", "validation"], trust: tuple[st
 
     path = Path(named)
     if path.suffix == ".py":
-        sys.path.insert(0, str(path.resolve().parent))
-        module = importlib.import_module(path.stem)
+        module = user_module(path)
         held = getattr(module, "data" if branch == "train" else "validation", None)
         chain = held() if callable(held) and not isinstance(held, Dataset) else held
     elif path.suffix == ".json":
@@ -182,11 +193,10 @@ class Train:
         if path.suffix == ".json":
             run = RunConfig.load(str(path), trust=self.trust)
         else:
-            # The file imports as the module its name names, as `python -m`
-            # imports one beside it, so a record names what it defines by that
-            # module, which the run trusts: `dew train run.json --trust <name>`.
-            sys.path.insert(0, str(path.resolve().parent))
-            built = importlib.import_module(path.stem).run
+            # The file imports as the module its name names, so a record names
+            # what it defines by that module, which the run trusts:
+            # `dew train run.json --trust <name>`.
+            built = user_module(path).run
             built = built() if callable(built) else built
             if not isinstance(built, RunConfig):
                 raise TypeError(f"{self.run}'s run is {built!r}, not a run config")

@@ -346,8 +346,8 @@ prevent a head that reaches parity from qualifying. A slower pair is
 unmeasured. Ordinary base-versus-head rows keep their existing rule, and the
 battery can still report its other rows on unsupported hardware. Per-probe JSON
 evidence is retained beside the gate file. `qwen35_pair.py --smoke` runs both
-tiny CPU steps from identical exported weights and checks loss agreement;
-it cannot qualify a performance claim.
+tiny CPU steps from identical exported weights; it judges no accuracy (check
+1's, at the tests) and cannot qualify a performance claim.
 
 A row that one tree cannot run is reported as not compared, not gated. The
 serving tool, for example, needs a newer PRNG API than main had on 2026-09-30.
