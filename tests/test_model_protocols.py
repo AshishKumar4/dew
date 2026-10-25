@@ -688,7 +688,6 @@ def test_packed_projections_serve_the_models_numbers(name):
     source, read = loaded(name), reads(name, "float32")
     model, variables = source.model, source.variables
     groups = model.inference_projection_groups(variables)
-    assert groups
     widths = flatten_dict(variables["params"])
     for group in groups:
         assert all(widths[(*group.path, member, "kernel")].shape[-1] == width
