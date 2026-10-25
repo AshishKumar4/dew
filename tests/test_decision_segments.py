@@ -86,7 +86,7 @@ class WiderHead(JointSchemaHead):
     """A head of a run's own package: a joint head under another name."""
 
 
-def test_a_layout_and_a_head_of_a_runs_own_reload_by_import_path_and_an_earlier_runs_record_too():
+def test_a_layout_and_a_head_of_a_runs_own_reload_by_import_path():
     """A layout's record names its class by import path, its segments with it, so a layout class of a
     package of the run's own reloads, as does a head's; an earlier run's record, which names a head of
     Dew's by class name alone under `name`, reloads as that class once read as a run is
@@ -114,15 +114,19 @@ def test_a_row_without_a_state_segment_keeps_none_of_the_state():
 
 def test_a_saved_run_reloads_its_segments_and_an_earlier_runs_record_reads_as_before(tmp_path):
     """A run of a joint layout of segments of its own reloads them from its record, its task answering
-    as the live one does; an earlier run's record, which names its layout and head by class name alone
-    and holds no segments, reads as the default composition."""
+    as the live one does; a run saved as an earlier Dew saved it, its record naming its layout and
+    head under "name" by class name alone and holding no segments, loads through the pinned run
+    boundary (`run_record`) as the default composition and the head it named, answering as the run
+    of today's record does. A head record of another shape there is refused."""
     import jax
     import numpy as np
+    import optax
+    from decision_support import decision_rows
     from test_decision_objective import EXAMPLES, INTENT, saved_and_reloaded, tiny_backbone
 
+    from dew.checkpoints import Checkpoints
     from dew.decision import Decide, DecisionObjective
-    from dew.decision.task import DecideSettings
-    from dew.inference.tasks import earlier_shapes, saved_settings
+    from dew.training import Trainer
 
     layout = JointLayout(max_len=1024, segments=SCHEMA_FIRST)
     head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
@@ -134,14 +138,28 @@ def test_a_saved_run_reloads_its_segments_and_an_earlier_runs_record_reads_as_be
     asked = {"team": INTENT}
     np.testing.assert_array_equal(reloaded(EXAMPLES[0].state, asked)["team"].probabilities,
                                   live(EXAMPLES[0].state, asked)["team"].probabilities)
+    default = dataclasses.replace(task, layout=JointLayout(max_len=1024))
+    objective = DecisionObjective(default)
+    state = Trainer(objective, optax.adam(1e-3), key=0).fit(
+        decision_rows(EXAMPLES, 8, objective=objective.data()), steps=1, log_every=100)
+    record = objective.inference_record()
+    assert isinstance(record, dict)
     fields = to_record(JointLayout(max_len=1024), JointLayout)
     assert isinstance(fields, dict)
-    earlier = {name: value for name, value in fields.items() if name not in ("segments", "framing")}
-    settings = saved_settings(earlier_shapes({"head": {"name": "JointSchemaHead", "fields": {}},
-                                              "layout": {"name": "JointLayout", "fields": earlier},
-                                              "specials": to_record(SPECIALS, Specials),
-                                              "tokenizer": "byte", "processor": None}), DecideSettings)
-    assert settings.layout == JointLayout(max_len=1024)
+    laid = {name: value for name, value in fields.items() if name not in ("segments", "framing")}
+    earlier = {**record, "head": {"name": "JointSchemaHead", "fields": record["head"]["fields"]},
+               "layout": {"name": "JointLayout", "fields": laid}}
+    for name, artifact in (("today", record), ("earlier", earlier),
+                           ("unread", {**earlier, "head": {**earlier["head"], "kind": "joint"}})):
+        with Checkpoints(str(tmp_path / name)) as checkpoints:
+            checkpoints.save(1, state, artifact=artifact)
+            checkpoints.wait()
+    today, loaded = (Decide.from_run(str(tmp_path / name)) for name in ("today", "earlier"))
+    assert loaded.layout == JointLayout(max_len=1024) and loaded.model.head == today.model.head
+    np.testing.assert_array_equal(loaded(EXAMPLES[0].state, asked)["team"].probabilities,
+                                  today(EXAMPLES[0].state, asked)["team"].probabilities)
+    with pytest.raises(ValueError):
+        Decide.from_run(str(tmp_path / "unread"))
 
 
 def test_a_whole_request_whose_row_leaves_its_state_out_is_refused():

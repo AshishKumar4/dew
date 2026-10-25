@@ -11,7 +11,7 @@ given it as `[V, D]` rows.
 
 import functools
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import ClassVar, NamedTuple
 
 import jax
@@ -36,7 +36,7 @@ from dew.nn.mixers import AttentionMixer
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import accumulated, at_least_fp32, capped_logits, scaled_logits
 from dew.nn.scatter import DROPPED
-from dew.registry import component, from_record, import_path, record_fields
+from dew.registry import Record, component, from_record, import_path, record_fields
 
 
 def _layer_norm(dtype: Dtype | None, name: str) -> nn.Module:
@@ -80,7 +80,7 @@ class Head(nn.Module):
             raise ValueError("this head reads one question a row; lay the rows out with a "
                              "QuestionLayout or use a joint head")
 
-    def record(self) -> JSON:
+    def record(self) -> Record:
         """Return the head as a run records it, the registry's class record (`dew.registry.component`):
         its class by import path and its fields but the width, which the backbone it reads gives, so
         any head reloads, one of a package the run trusts too."""
@@ -90,7 +90,7 @@ class Head(nn.Module):
         return {"class": import_path(type(self)), "fields": fields}
 
     @staticmethod
-    def from_record(record: JSON, width: int) -> "Head":
+    def from_record(record: JSON | Mapping[str, object], width: int) -> "Head":
         """Rebuild the head a run recorded, reading states `width` wide, in the numerics it
         recorded. An earlier run's record is read through `dew.inference.tasks.earlier_shapes`."""
         head, fields = component(Head, _records.record(record, "head"))
