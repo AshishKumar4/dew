@@ -1954,8 +1954,14 @@ def averaged(runs: Sequence[str | os.PathLike[str]], *, step: int | str | None =
                 means, leaves, strict=True)):
             raise ValueError(f"the run in {entry[0]} holds other variables than {read[0][0]}")
 
-        # A process whose shards refuse the run reports it where every process agrees on the run, so
-        # none of them reads the next one alone.
+        # Every process places the run's leaves as the first run's before any compares them: a placement
+        # is a collective, which no process may be left in because a peer refused. Then a process whose
+        # shards refuse the run reports it where every process agrees on the run, so none of them reads
+        # the next one alone.
+        for index, placement in enumerate(firsts):
+            leaf = leaves[index]
+            if placement is not None and not (isinstance(leaf, jax.Array) and leaf.sharding == placement):
+                leaves[index] = jax.device_put(leaf, placement)
         agreed(f"averaging {entry[0]}", functools.partial(_taken_in, means, leaves, firsts, count, entry[0],
                                                           read[0][0]))
         del leaves
@@ -1975,15 +1981,13 @@ def _taken_in(means: list, leaves: list, firsts: list, count: int, directory: st
 
 
 def _held(leaf, sharding):
-    """`leaf` on the host as the shards this process holds of it, placed as the first run's
-    (`dew.training.host.Held`, which holds a replicated block once), a floating one in fp32; a host
-    leaf whole."""
+    """`leaf`, placed as the first run's (`averaged` places it), on the host as the shards this process
+    holds of it (`dew.training.host.Held`, which holds a replicated block once), a floating one in fp32;
+    a host leaf whole. It reads this process's shards alone, no collective."""
     from dew.training.host import Held
 
     if sharding is None:
         return _on_host(leaf)
-    if not isinstance(leaf, jax.Array) or leaf.sharding != sharding:
-        leaf = jax.device_put(leaf, sharding)
     held = Held.of(leaf)
     return Held(held.shape, {index: _on_host(block) for index, block in held.shards.items()})
 
