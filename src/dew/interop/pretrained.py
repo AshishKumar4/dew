@@ -1404,16 +1404,22 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
     shared: Mapping[str, np.ndarray] = {}
     if component is not None:
         prefix = component.tensor_prefix
-        # The transformers forward reads its backbone's weights itself, and none without them; the
-        # shared file is read for it only where the head is stored in it.
-        forwarded = isinstance(source_route(component.config), TorchRoute)
-        if not forwarded or (head_source.weight_file is None and prefix):
+        # The route of the config the backbone translates, a mamba_ssm one's normalized as
+        # `_load_native_source` normalizes it. The transformers forward reads its backbone's weights
+        # itself, and none without them; the shared file is read for it only where the head is stored
+        # in it, but its weights' snapshot is resolved and pinned here whenever it reads weights.
+        routed = (mamba2.config_from_mamba_ssm(component.config) if mamba2.is_mamba_ssm(component.config)
+                  else component.config)
+        forwarded = isinstance(source_route(routed), TorchRoute)
+        reads_shared = not forwarded or bool(head_source.weight_file is None and prefix)
+        if weights or reads_shared:
             weight_source = source.component(component.weights_folder)
             root = weight_source.weights(root)
             directory = source.directory(root)
             if source.revision is not None:
                 source = replace(source, revision=root.name)
-            shared = sources.load_shards(weight_source.directory(root))
+            if reads_shared:
+                shared = sources.load_shards(weight_source.directory(root))
         tensors = None if forwarded else (
             {name[len(prefix):]: tensor for name, tensor in shared.items() if name.startswith(prefix)}
             if prefix else shared)
