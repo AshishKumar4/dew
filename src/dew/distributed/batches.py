@@ -119,6 +119,32 @@ def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Placement[Batch]
     return jax.tree.map(leaf_sharding, batch)
 
 
+def _placed_rows(mesh: Mesh) -> Callable[[tuple[int, ...]], tuple[int, ...]]:
+    """The shape a share's leaf is placed at on `mesh`: its rows those of every share
+    (`DataPartition.of`), each share whole rows, and every other dimension whole."""
+    count = DataPartition.of(mesh).count
+
+    def placed(shape: tuple[int, ...]) -> tuple[int, ...]:
+        return (shape[0] * count, *shape[1:]) if shape else ()
+
+    return placed
+
+
+def placed_abstract(mesh: Mesh, batch: Batch) -> Batch:
+    """The batch `shard_batch` would place from this process's share `batch`, as shapes with their
+    shardings and nothing transferred: what a run reads a step's plan and its whole state from before
+    any array of it is on a device (`Trainer.fit`)."""
+    device, host = split_fields(batch)
+    if host:
+        return with_host(placed_abstract(mesh, device), host)
+    batch = filled_validity(batch) if jax.process_count() > 1 else batch
+    placed = _placed_rows(mesh)
+
+    def shape(leaf, sharding: NamedSharding) -> jax.ShapeDtypeStruct:
+        return jax.ShapeDtypeStruct(placed(np.shape(leaf)), jnp.result_type(leaf), sharding=sharding)
+
+    return jax.tree.map(shape, batch, batch_shardings(mesh, batch))
+
 def shard_batch(mesh: Mesh, batch: Batch, reads: Mapping[Signature, tuple[bool, ...]] | None = None) -> Batch:
     """Assemble this process's share of each array into a globally sharded one.
 
@@ -163,12 +189,7 @@ def shard_batch(mesh: Mesh, batch: Batch, reads: Mapping[Signature, tuple[bool, 
     batch = filled_validity(batch) if jax.process_count() > 1 else batch
     cpu = all(device.platform == "cpu" for device in mesh.devices.flat)
     leaves, tree = jax.tree.flatten(batch)
-    count = DataPartition.of(mesh).count
-
-    def placed(shape: tuple[int, ...]) -> tuple[int, ...]:
-        # The share holds whole rows: `count` shares make the rows, and every other dimension is whole.
-        return (shape[0] * count, *shape[1:]) if shape else ()
-
+    placed = _placed_rows(mesh)
     signature = tree, tuple(jax.ShapeDtypeStruct(placed(np.shape(leaf)), jnp.result_type(leaf))
                             for leaf in leaves)
     read = (reads or {}).get(signature, (True,) * len(leaves))
@@ -267,6 +288,8 @@ class DevicePrefetchIterator:
 
     `prepare`, when supplied, transforms the source's host batch before
     placement, on the same worker and after its checkpoint position is read.
+    `peek` returns the first batch so prepared, on the host, before the worker
+    places anything; the worker places it, and reads on, from the first `next`.
     `reads` holds, by the placed batch's signature, which leaves a compiled
     step reads (`step_reads`); a batch of a signature it lacks, its step not
     yet compiled, is placed whole (`shard_batch`).
@@ -308,6 +331,10 @@ class DevicePrefetchIterator:
         # keeps per thread (`batch_shardings`).
         self._rules = nn.get_logical_axis_rules()
         self._reads = {} if reads is None else reads
+        # The first batch, read and prepared and held on the host while `_placing` is unset, which the
+        # first `next` sets (`peek`).
+        self._first: Batch | None = None
+        self._placing = False
         self._thread = threading.Thread(target=self._prefetch, name="dew-prefetch", daemon=True)
         self._withdraw_exit: Callable[[], None] | None = None
         # No source work may start until the caller owns this object. In
@@ -390,9 +417,18 @@ class DevicePrefetchIterator:
                 with region("data.position"):
                     read = source.get_state() if source is not None else None
                     state = read if read is None or isinstance(read, bytes) else json.dumps(read).encode()
-                with region("data.place"), nn.logical_axis_rules(self._rules):
-                    if self._prepare is not None:
+                if self._prepare is not None:
+                    with region("data.place"), nn.logical_axis_rules(self._rules):
                         batch = self._prepare(batch)
+                if not self._placing:
+                    with self._ready:
+                        self._first = batch
+                        self._ready.notify_all()
+                        self._ready.wait_for(lambda: self._stop.is_set() or self._placing)
+                        self._first = None
+                    if self._stop.is_set():
+                        break
+                with region("data.place"), nn.logical_axis_rules(self._rules):
                     placed = shard_batch(mesh, batch, self._reads)
                 batch = None
                 with region("data.enqueue"), self._ready:
@@ -491,9 +527,29 @@ class DevicePrefetchIterator:
     def __iter__(self):
         return self
 
+    def peek(self) -> Batch | None:
+        """The first batch as the source and `prepare` give it, on the host, before the worker places
+        any; None where the source holds none. A run checks what it will train against its shapes
+        before it places its state (`dew.distributed.batches.placed_abstract`); the first `next`
+        places this batch and reads on, after which the peeked batch's buffers are the reader's
+        again."""
+        self._start()
+        with self._ready:
+            self._ready.wait_for(lambda: self._first is not None or self._placing or self._queued
+                                 or self._done.is_set() or self._stop.is_set())
+            if self._first is not None:
+                return self._first
+            if self._placing or self._queued:
+                raise RuntimeError("peek reads the first batch, before any is placed")
+        self._raise_ended()
+        return None
+
     def __next__(self):
         if self._stop.is_set():
             raise StopIteration
+        with self._ready:
+            self._placing = True
+            self._ready.notify_all()
         self._start()
         with self._ready:
             self._ready.wait_for(lambda: self._queued or self._done.is_set() or self._stop.is_set())
@@ -504,7 +560,12 @@ class DevicePrefetchIterator:
                 self._ready.notify_all()
                 self.source_state = position
                 return batch
-        # The worker ended, every batch it published read: with its error, if it had one.
+        self._raise_ended()
+        raise StopIteration
+
+    def _raise_ended(self) -> None:
+        """Raise the worker's error, now it has ended with every batch it published read, if it had
+        one, or its source's cleanup failure."""
         error, self._error = self._error, None
         cleanup, self._cleanup_error = self._cleanup_error, None
         if error is not None:
@@ -513,7 +574,6 @@ class DevicePrefetchIterator:
             raise error from None
         if cleanup is not None:
             raise cleanup from None
-        raise StopIteration
 
 
-__all__ = ["DevicePrefetchIterator", "batch_shardings"]
+__all__ = ["DevicePrefetchIterator", "batch_shardings", "placed_abstract"]

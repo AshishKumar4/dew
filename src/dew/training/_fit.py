@@ -157,19 +157,23 @@ class FitRun:
         return next(self.train)
 
 
-def waited_read(run: FitRun, interval: Interval, *, agree: bool) -> Batch | None:
+def waited_read(run: FitRun, interval: Interval, *, agree: bool, peek: bool = False) -> Batch | None:
     """The training stream's next batch, its wait counted in `interval`, or None where it has run out
     on every process, which ends the run as its length would. Where `agree`, the read is agreed
     (`agreed_next`): one that fails, or runs out on some processes only, stops every process, as
     does a stream with no batch for a run at step 0. An endless stream's later reads are not agreed,
-    as it never runs out. A batch read ahead (`FitRun.ahead`) is this read's."""
+    as it never runs out. A batch read ahead (`FitRun.ahead`) is this read's. Where `peek`, an agreed
+    read of the stream's first batch as its source gives it, on the host, placed at the run's first
+    read (`DevicePrefetchIterator.peek`)."""
     if run.ahead is not None:
         (batch,), run.ahead = run.ahead, None
         return batch
     assert run.train is not None
+    # The prefetcher's peek, as a stream of one batch that ends where the source holds none.
+    stream = iter(run.train.peek, None) if peek else run.train
     with region("input.wait"):
         asked = time.perf_counter()
-        batch = agreed_next("training read", run.train) if agree else run.read()
+        batch = agreed_next("training read", stream) if agree or peek else run.read()
         interval.waited += time.perf_counter() - asked
     if batch is None and not run.current:
         raise ValueError("the training data holds no batch to train on")
