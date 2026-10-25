@@ -18,15 +18,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import selection_margins
-from flax import linen as nn
 from model_support import largest_difference
-from reference_error import GateFailure, assert_as_exact, widened, without_ynn
+from reference_error import FEWEST_SEEDS, GateFailure, assert_as_exact, widened, without_ynn
 from sharded import assert_sharded
 from token_support import token_rows
 
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
-from dew.nn.mlp import gaussian_cutoff
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -176,29 +174,22 @@ keep two, as the architectures cell found (tests/test_architectures.py); Gemma 4
 32 wide, where at the fixture's 8 Dew paired with the plain loop did not resolve within 4096 draws (the
 released E2B's are 256)."""
 SCAN_ROWS = {"gemma3n": 32}
-"""Each shape's rows a draw where more than BATCH's make its check cheaper: Gemma 3n's draws each run
-three programs to hold their choices alike (`ScanCase.agrees`), and at 8 rows the plain loop against
-itself resolved at 512 draws, a verdict of 417 s on armada, at 32 rows at 256, one of 57 s."""
+"""Each shape's rows a draw where more than BATCH's make its check cheaper: at 8 rows Gemma 3n's plain
+loop against itself resolved at 512 draws, a verdict of 417 s on armada, at 32 rows at 256, one of 57 s."""
 SCAN_MARGIN = 5e-5
-"""The least selection margin a scanned-stack draw of a DeepSeek shape admits (`selection_margins.margin`),
+"""The least selection margin a scanned-stack draw of a routed shape admits (`selection_margins.margin`),
 relative to the scale of what its routers select: ten times the largest distance float32 rounding moved
-their inputs from their float64 values over 48 draws of both parameter sets, 4.9e-6 of the scale."""
-KEPT_BOUND = 4.8e-4
-"""Where float64's own choice of a Gemma 3n unit is the float32 runs' too: a unit whose distance from its
-row's cutoff is past KEPT_BOUND of the row's deviation. Ten times the largest distance float32 rounding
-moved a gate value from its float64 value over 48 draws of both parameter sets at 32 rows a draw, 4.8e-5
-of the deviation (median 6.1e-6). No margin rule admits Gemma 3n's draws: at 32 rows none of those 96
-cleared it, the median draw's least margin being 7.3e-6, since every draw holds some of its 460,000 gate
-values near a cutoff. Its runs choose alike all the same, but for rounding's rare disagreement: over
-512 draws at 32 rows, the programs check 1 measures kept other units than float64 on 11 (17 units, at
-float64 margins up to 1.2e-6), and never past the bound."""
-SCAN_SEEDS = {"gemma4": 64, "gemma3n": 256, "deepseek": 8, "deepseek_widths": 8}
-"""Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada: Gemma 3n's
-by the plain loop against itself; the others' paired with the scanned stack, whose arms share every
-upstream rounding (the same weights, rows and arithmetic, the DeepSeek shapes' bit for bit on a CPU) and
-whose errors are heavy-tailed across draws: the four largest of 1024 draws hold up to 40% of a Gemma 4
-leaf's pooled error, of 64 up to 43% of a DeepSeek one's, which the plain loop against itself resolves
-within no 512 draws."""
+their inputs from their float64 values over 48 draws of both parameter sets, 4.9e-6 of the scale. A shape
+that selects otherwise, Gemma 3n's gaussian top-k, admits `selection_margins.MARGIN`: a unit every run
+keeps just above its cutoff holds an activation, its gate less the cutoff, that is mostly float32's
+rounding of either, so a draw near that tie measures which run rounded it worse."""
+SCAN_SEEDS = {"gemma4": 64, "gemma3n": 128, "deepseek": 8, "deepseek_widths": 8}
+"""Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` paired with the scanned
+stack, whose arms share every upstream rounding (the same weights, rows and arithmetic, the DeepSeek
+shapes' bit for bit on a CPU), the most any platform gives: Gemma 3n's 128 on an A100 over its draws past
+the selection margin (8 on armada); the others' on armada, whose errors are heavy-tailed across draws: the
+four largest of 1024 draws hold up to 40% of a Gemma 4 leaf's pooled error, of 64 up to 43% of a DeepSeek
+one's, which the plain loop against itself resolves within no 512 draws."""
 def same_metrics(left: dict, right: dict, relative: float = 1e-5) -> bool:
     """Every metric within `relative` of the other run's; perplexity is exp
     of the cross entropy, so an absolute bound would say nothing about it."""
@@ -216,9 +207,10 @@ def scanned_pair(build):
 class ScanCase:
     """A shape's scanned stack and plain loop over its declared draws (`draw`): their measured runs
     (`arms`) and their float64 truth, the plain loop's own in float64 on the CPU backend (every lane
-    keeps one beside its accelerator, and a TPU has no float64). Each run also returns the Gemma 3n units
-    its own forwards kept (`measured`), which a draw is held to (`agrees`). `scanned` overrides the
-    scanned stack's fields, a fault's way in."""
+    keeps one beside its accelerator, and a TPU has no float64). A shape that selects discretely (a
+    mixture's routing, Gemma 3n's gaussian top-k) draws rows whose selections clear their margin
+    (`SCAN_MARGIN`), so every run selects alike. `scanned` overrides the scanned stack's fields, a
+    fault's way in."""
 
     def __init__(self, shape: str, **scanned):
         self.shape = shape
@@ -227,7 +219,6 @@ class ScanCase:
         self.scanned = self.build(scan_layers=True, **scanned)
         self.training = gemma3n_training_variables(self.variables) if shape == "gemma3n" else self.variables
         self.config = SHAPE_CONFIGS[shape](**SCAN_WIDTHS.get(shape, {}))
-        selected = selection_margins.capture(self.plain)
         rows = SCAN_ROWS.get(shape, BATCH)
 
         def drawn(key):
@@ -235,134 +226,51 @@ class ScanCase:
             ids = np.random.default_rng([0x5CA7, key]).integers(0, VOCAB, (rows, SEQ_LEN)).astype(np.int32)
             return ids, np.float32(1.0)
 
-        def clears(inputs):
-            """Whether the draw's routing, in the forward of both parameter sets the arms read (the
-            logits' and the loss's), clears SCAN_MARGIN."""
-            ids = jnp.asarray(inputs[0])
-            return all(selection_margins.margin(self.config, selected(tree, ids), shape) > SCAN_MARGIN
-                       for tree in (self.variables, self.training))
-
         self.runs = {"scanned": self.measured(self.scanned, self.variables, self.training),
                      "plain": self.measured(self.plain, self.variables, self.training)}
-        self._ran = {}
-        # The DeepSeek shapes draw rows whose routing clears the margin, so every run routes alike
-        # (`selection_margins`); Gemma 3n's draws are its rows on which every run keeps float64's units
-        # (`agrees`). `drawn` is the rows alone.
         self.drawn = drawn
-        if selection_margins.routes(self.config):
+        if selection_margins.selects(self.config):
+            selected = selection_margins.capture(self.plain)
+            least = SCAN_MARGIN if selection_margins.routes(self.config) else selection_margins.MARGIN
+
+            def clears(inputs):
+                """Whether the draw's selections, in the forward of both parameter sets the arms read
+                (the logits' and the loss's), clear the shape's margin."""
+                ids = jnp.asarray(inputs[0])
+                return all(selection_margins.margin(self.config, selected(tree, ids), shape) > least
+                           for tree in (self.variables, self.training))
+
             self.draw = selection_margins.clearing(drawn, clears)
-        elif any(self.config.get("activation_sparsity_pattern", ())):
-            self.draw = selection_margins.clearing(drawn, self.agrees)
         else:
             self.draw = drawn
 
     def measured(self, model, forward, trained):
-        """The logits, and the loss with its gradients under the draw's cotangent (as `with_gradients`
-        gives them), compiled as both arms of a check between Dew's paths are (`without_ynn`), with the
-        units each of its two forwards kept (`GatedMLP.kept_units`) and the gate values they kept them
-        of: the choices of the very programs check 1 measures."""
-        def capture(module, method):
-            gate = (method == "__call__" and isinstance(module, nn.Dense) and module.name == "gate_proj"
-                    and bool(getattr(module.parent, "activation_sparsity", 0.0)))
-            return method == "kept_units" or gate
-
-        def applied(variables, ids):
-            logits, state = model.apply(variables, ids, capture_intermediates=capture,
-                                        mutable=["intermediates"])
-            return logits, state.get("intermediates", {})
-
+        """The logits under `forward`, and the loss with its gradients under `trained` and the draw's
+        cotangent (as `with_gradients` gives them), compiled as both arms of a check between Dew's paths
+        are (`without_ynn`)."""
         def run(ids, cotangent):
             def loss(params):
-                logits, chosen = applied({**trained, "params": params}, ids)
+                logits = model.apply({**trained, "params": params}, ids)
                 if self.shape == "gemma3n":
-                    return next_token_cross_entropy(logits, ids), chosen
-                return jnp.mean(logits ** 2), chosen
-            value, pull, trained_chose = jax.vjp(loss, trained["params"], has_aux=True)
+                    return next_token_cross_entropy(logits, ids)
+                return jnp.mean(logits ** 2)
+            value, pull = jax.vjp(loss, trained["params"])
             gradients, = pull(cotangent)
-            logits, forward_chose = applied(forward, ids)
-            return ({"logits": logits, "loss": value, "gradients": gradients},
-                    {"forward": forward_chose, "trained": trained_chose})
+            return {"logits": model.apply(forward, ids), "loss": value, "gradients": gradients}
         return without_ynn(run)
 
-    def ran(self, name: str, ids, cotangent):
-        """Run `name`'s program (a float32 run, or "truth") on a draw once: what `agrees` reads of it,
-        check 1 then judges, the same execution."""
-        key = (name, np.asarray(ids).tobytes())
-        if key not in self._ran:
-            if name == "truth":
-                with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
-                    if "truth" not in self.runs:
-                        self.runs["truth"] = self.measured(self.build(dtype=jnp.float64),
-                                                           widened(self.variables), widened(self.training))
-                    self._ran[key] = jax.device_get(self.runs["truth"](*widened((ids, cotangent))))
-            else:
-                self._ran[key] = jax.device_get(self.runs[name](ids, cotangent))
-        return self._ran[key]
-
     def arms(self):
-        """The scanned stack's measured run and the plain loop's, and the float64 truth: each its outputs
-        alone, from the execution `agrees` held to its choices."""
+        """The scanned stack's measured run and the plain loop's, and the plain loop's float64 truth."""
+        def truth(ids, cotangent):
+            with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
+                if "truth" not in self.runs:
+                    self.runs["truth"] = self.measured(self.build(dtype=jnp.float64),
+                                                       widened(self.variables), widened(self.training))
+                return jax.device_get(self.runs["truth"](*widened((ids, cotangent))))
+
         def arm(name):
-            def outputs(ids, cotangent):
-                found = self.ran(name, ids, cotangent)[0]
-                del self._ran[(name, np.asarray(ids).tobytes())]
-                return found
-            return outputs
-        return arm("scanned"), arm("plain"), arm("truth")
-
-    def agrees(self, inputs) -> bool:
-        """Whether every float32 run keeps exactly float64's Gemma 3n units on the rows `inputs`, both
-        parameter sets (`kept`): the precondition on which check 1 compares one computation. A unit
-        chosen otherwise within KEPT_BOUND of its cutoff is rounding's, and its rows are no draw check 1
-        judges; one past it is a wrong choice, and fails the site."""
-        found = self.kept(*inputs)
-        wrong = [entry for entry in found if entry[-1] > KEPT_BOUND]
-        assert wrong == [], wrong
-        if found:
-            # Rows no check judges: their executions go with them.
-            for name in ("scanned", "plain", "truth"):
-                del self._ran[(name, np.asarray(inputs[0]).tobytes())]
-        return not found
-
-    def kept(self, ids, cotangent) -> list[tuple[str, str, str, int, float]]:
-        """Where the float32 runs keep other Gemma 3n units than float64 does of its own accord on the
-        draw, each as its run, parameter set, layer, unit count and largest float64 margin there (a
-        unit's distance from its row's cutoff over the row's deviation, `gaussian_cutoff`)."""
-        _, truths = self.ran("truth", ids, cotangent)
-        sparsity = self.plain.activation_sparsity_pattern
-        found = []
-        for name in ("scanned", "plain"):
-            _, chose = self.ran(name, ids, cotangent)
-            for which, wide in truths.items():
-                ours, theirs = units(chose[which]), units(wide)
-                assert ours.keys() == theirs.keys(), (name, which)
-                for path, (kept, _) in theirs.items():
-                    differs = ours[path][0] != kept
-                    if differs.any():
-                        gate = theirs[path][1]
-                        # The truth's cutoff, in float64 as its program forms it.
-                        fraction = sparsity[layer_index(path)]
-                        with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
-                            cutoff = np.asarray(gaussian_cutoff(jnp.asarray(gate), fraction))
-                        margin = np.abs(gate - cutoff) / gate.std(-1, keepdims=True)
-                        found.append((name, which, path, int(differs.sum()), float(margin[differs].max())))
-        return found
-
-
-def units(captured) -> dict[str, tuple[np.ndarray, np.ndarray]]:
-    """A forward's kept units and gate values (`ScanCase.measured`) by each sparse layer's module path."""
-    layers: dict[str, dict[str, np.ndarray]] = {}
-    for path, value in jax.tree_util.tree_flatten_with_path(captured)[0]:
-        names = [str(getattr(part, "key", part)) for part in path]
-        at = names.index("kept_units") if "kept_units" in names else names.index("gate_proj")
-        layers.setdefault(jax.tree_util.keystr(path[:at]), {})[names[at]] = np.asarray(value)
-    return {path: (held["kept_units"], np.asarray(held["gate_proj"], np.float64))
-            for path, held in layers.items()}
-
-
-def layer_index(path: str) -> int:
-    """The decoder layer a module path (`jax.tree_util.keystr`) is in."""
-    return int(path.split("'layers_")[1].split("'")[0])
+            return lambda ids, cotangent: jax.device_get(self.runs[name](ids, cotangent))
+        return arm("scanned"), arm("plain"), truth
 
 
 @pytest.mark.parametrize("shape", sorted(SHAPES))
@@ -370,29 +278,25 @@ def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
     """The scanned stack's logits, loss and gradients on a stack deep enough to scan are as near a float64
     run as the plain loop's, over the shape's declared draws of token rows (check 1, `assert_as_exact`):
     scanning reorders the loop's fp32 sums where an accelerator fuses a scanned layer apart from its
-    neighbours, and is otherwise the same computation. Gemma 3n's gaussian top-k chooses discretely, so
-    each of its draws holds both float32 runs, in the programs check 1 measures, to the units float64
-    keeps of its own accord (`ScanCase.agrees`, KEPT_BOUND), the precondition on which check 1 compares
-    one computation: a unit past KEPT_BOUND chosen otherwise fails the site as a wrong choice, and rows on
-    which one within it is chosen otherwise, rounding's, are drawn again (`selection_margins.clearing`)."""
+    neighbours, and is otherwise the same computation. A shape that selects discretely draws rows whose
+    selections clear its margin (`SCAN_MARGIN`), the precondition on which check 1 compares one
+    computation."""
     case = ScanCase(shape)
     scanned, plain, truth = case.arms()
     assert_as_exact(scanned, plain, case.draw, f"{shape} scanned stack", seeds=SCAN_SEEDS[shape],
                     truth_fn=truth)
 
 
-def test_a_scanned_gate_at_another_sparsity_fails_its_choices_and_check_1():
+def test_a_scanned_gate_at_another_sparsity_fails_check_1():
     """A Gemma 3n scanned stack whose sparse layers cut at 0.951 in place of 0.95 moves each cutoff about
-    0.0035 of its row's deviation, far past KEPT_BOUND: its first draw keeps other units than float64
-    does past the bound, which fails the site's precondition, and check 1 over the rows alone fails it."""
+    0.0035 of its row's deviation, far past the draws' margin: on the rows that clear it, it keeps other
+    units than the plain loop and float64 do, and check 1 fails it over the fewest seeds it judges, a
+    fault this large failing as surely there as over the site's declared ones."""
     case = ScanCase("gemma3n", activation_sparsity_pattern=(0.951,) * 5 + (0.0,) * 5)
-    with pytest.raises(AssertionError):
-        case.draw(0)
-    assert any(run == "scanned" and margin > KEPT_BOUND for run, _, _, _, margin in case.kept(*case.drawn(0)))
     scanned, plain, truth = case.arms()
     with pytest.raises(AssertionError) as raised:
-        assert_as_exact(scanned, plain, case.drawn, "gemma3n scanned stack at 0.951",
-                        seeds=SCAN_SEEDS["gemma3n"], truth_fn=truth)
+        assert_as_exact(scanned, plain, case.draw, "gemma3n scanned stack at 0.951",
+                        seeds=FEWEST_SEEDS, truth_fn=truth)
     assert raised.type is GateFailure
 
 
