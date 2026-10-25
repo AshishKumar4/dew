@@ -88,11 +88,11 @@ class ToyVelocityMLP(nn.Module):
         return nn.Dense(3)(h).reshape(x.shape)
 
 
-MIXTURE_RUNS = 64
-"""The mixture site's declared training runs (the learning gate's, `learning_gate.units_for`), each its
-own initialization, data and noise: over 320 runs, each mode's mean sat 0.011 to 0.012 inside its center
-on average, against a margin of 0.04, and moved 0.017 from run to run, so one run missed the margin on
-an axis about one time in twenty-five."""
+MIXTURE_RUNS = 56
+"""The mixture site's declared training runs (the learning gate's), each its own initialization, data
+and noise: `learning_gate.units_for` over each of eight pilots of 192 runs declared 49 to 55. Each mode's
+mean sat 0.011 to 0.012 inside its center on average, against a margin of 0.04, and moved 0.017 from run
+to run, so one run missed the margin on an axis about one time in twenty-five."""
 
 
 @jax.jit
