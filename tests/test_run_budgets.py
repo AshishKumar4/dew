@@ -10,13 +10,13 @@ import pytest
 from recording import RecordingTracker
 from reference_error import assert_as_exact
 
+from dew.batch import VALID_ROWS
 from dew.config import OptimConfig, RunConfig, TrainerConfig
 from dew.data import Memory
 from dew.data.compile import compile
 from dew.data.dataset import Closeable, DataPartition, Loader
 from dew.data.pipeline import Pipeline
 from dew.objectives import Aux, Objective
-from dew.batch import VALID_ROWS
 from dew.optim import Linear
 from dew.training import Best, Checkpoints, Pause, Trainer
 
@@ -215,6 +215,42 @@ def test_a_stream_that_runs_out_after_a_ranked_step_ends_on_a_whole_checkpoint(t
     Trainer(objective, OptimConfig(optimizer="adam", learning_rate=0.1), key=0,
             checkpoints=Checkpoints(str(tmp_path))).fit(
         finite, steps=10, eval_every=1, best=Best(objective.loss, weights_only=True))
+    assert Checkpoints(str(tmp_path)).latest == 1
+
+
+def test_a_stream_that_runs_out_between_cadences_scores_only_the_suites_its_last_step_did_not():
+    """A one-batch stream under a run of five steps ends at step 1, where the suite scored every step
+    already reported and the one scored every other step did not: the run's end scores that one alone,
+    each suite once at step 1."""
+    from dew.training import EvalSuite
+
+    (x,) = records(0)
+    tracker = RecordingTracker()
+    batch = {"x": x[:BATCH]}
+
+    def held(partition):
+        return iter([batch])
+
+    finite = Loader(lambda partition: iter([batch]), None, None, BATCH)
+    Trainer(Pulled(), OptimConfig(optimizer="adam", learning_rate=0.1), key=0, tracker=tracker).fit(
+        finite, steps=5, log_every=1, validation={"often": EvalSuite(held, every=1),
+                                                   "rare": EvalSuite(held, every=2)})
+    reported = [(step, name) for step, scalars in tracker.scalars for name in ("often", "rare")
+                if f"{name}/loss" in scalars]
+    assert sorted(reported) == [(1, "often"), (1, "rare")]
+
+
+def test_a_stream_that_runs_out_with_no_final_checkpoint_writes_its_weights_only_best_whole(tmp_path):
+    """A one-batch stream under a run of five steps that writes no final checkpoint ends at step 1,
+    whose closing evaluation ranks its first best, kept as weights alone: the stream is closed by then,
+    so the run reads no further batch, and the best it writes is the whole state of its last step."""
+    (x,) = records(0)
+    objective = Pulled()
+    finite = Loader(lambda partition: iter([{"x": x[:BATCH]}]), lambda partition: iter([{"x": x[:BATCH]}]),
+                    None, BATCH)
+    Trainer(objective, OptimConfig(optimizer="adam", learning_rate=0.1), key=0,
+            checkpoints=Checkpoints(str(tmp_path))).fit(
+        finite, steps=5, checkpoint_final=False, best=Best(objective.loss, weights_only=True))
     assert Checkpoints(str(tmp_path)).latest == 1
 
 
