@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, seeds_for
 
 from dew.optim import delta_gradient_descent, newton_schulz, scale_by_m3
 
@@ -76,17 +76,23 @@ def m3_directions(gradients: np.ndarray) -> np.ndarray:
 def test_m3s_directions_are_algorithm_1s_across_its_chunks():
     """`scale_by_m3` over seven updates of a tree of matrices, one tall and one wide, two chunks closing:
     each direction on par with Algorithm 1's from float64 (check 1), the slow momentum's reaching the
-    updates from the second chunk on. Within a chunk the slow momentum and its orthogonalization hold
-    still, and each changes once, as the chunk closes; the first chunk's slow direction is zero."""
+    updates from the second chunk on, its products at full float32 as the reference's are (a GPU's
+    default float32 matmul is TF32; a run's precision is its own). Within a chunk the slow momentum and
+    its orthogonalization hold still, and each changes once, as the chunk closes; the first chunk's slow
+    direction is zero."""
     transform = scale_by_m3(**M3_FACTORS)
 
     @jax.jit
-    def directions(gradients):
+    def scanned(gradients):
         def step(state, gradient):
             direction, state = transform.update(gradient, state)
             return state, direction
         first = jax.tree.map(lambda sequence: sequence[0], gradients)
         return jax.lax.scan(step, transform.init(first), gradients)[1]
+
+    def directions(gradients):
+        with jax.default_matmul_precision("highest"):
+            return scanned(gradients)
 
     def draw(seed):
         rng = np.random.default_rng(seed)
@@ -96,7 +102,8 @@ def test_m3s_directions_are_algorithm_1s_across_its_chunks():
     def reference(gradients):
         return jax.tree.map(m3_directions, gradients)
 
-    assert_as_exact(directions, reference, draw, "M3 directions", seeds=NESTED_SEEDS)
+    seeds = seeds_for(reference, draw, "M3 directions", dew_fn=directions)
+    assert_as_exact(directions, reference, draw, "M3 directions", seeds=seeds)
     (gradients,) = draw(0)
     gradients = gradients["head"]
     state, held = transform.init(gradients[0]), []
