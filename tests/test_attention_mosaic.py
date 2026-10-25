@@ -507,14 +507,20 @@ def test_every_tuning_variant_is_on_par_interpreted(launch):
 
 
 @INTERPRETS
-def test_a_guarded_launchs_own_key_tile_reads_its_spans_in_its_own_units():
-    """A spans call (documents over 256 keys) whose weighted values pass fp32's largest, at forward tiles of
-    128 keys, a consumer's registers holding the guarded launch's live set over 64 (`_guarded_tiles`): the
-    guarded launch walks each block's keys from its own block map, not the plain launch's 128-key one, so
-    every row's output is the reference's, finite (bf16 values near their largest, equal logits)."""
+@pytest.mark.parametrize("tiles", [attention_mosaic.Tiles(64, 128, 2, 2),
+                                   attention_mosaic.Tiles(64, 192, 2, 1)], ids=["128-keys", "192-keys"])
+def test_a_guarded_launch_walks_its_own_key_tiles(tiles):
+    """A spans call (four documents over 256 keys, their ids from 1: 0 is padding) whose weighted values
+    pass fp32's largest, at forward tiles whose consumers' registers hold the guarded launch's live set
+    over a narrower key tile (`_guarded_tiles`), 128 keys halved, 192 keys cut to a whole tile of the
+    family's rows that divides it: the guarded launch runs on tiles its program takes, reads each block's
+    keys from its own block map, not the plain launch's, and every row's output is on par with jax's own
+    attention, which normalizes its weights before their product (bf16 values near their largest, equal
+    logits)."""
     rows, queries, heads, kv_heads = 1, 256, 2, 1
-    spans = template.spans(queries, queries, rows,
-                           segment_ids=jnp.repeat(jnp.arange(4, dtype=jnp.int32), queries // 4)[None])
+    documents = jnp.repeat(jnp.arange(1, 5, dtype=jnp.int32), queries // 4)[None]
+    spans = template.spans(queries, queries, rows, segment_ids=documents)
+    keep = (documents[:, :, None] == documents[:, None, :])[:, None]
 
     def draw(seed):
         streams = jax.random.split(jax.random.key(seed), 3)
@@ -522,16 +528,14 @@ def test_a_guarded_launchs_own_key_tile_reads_its_spans_in_its_own_units():
         key = jnp.zeros((rows, queries, kv_heads, 128), jnp.bfloat16)
         value = jax.random.uniform(streams[2], (rows, queries, kv_heads, 128), jnp.float32, 2.9e38,
                                    3.3e38).astype(jnp.bfloat16)
-        return query, key, value, jnp.zeros_like(query)
+        return query, key, value
 
-    def ours(query, key, value, dout):
-        del dout
-        with _device(interpret=True), _pinned(attention_mosaic.Tiles(64, 128, 2, 2)):
+    def ours(query, key, value):
+        with _device(interpret=True), _pinned(tiles):
             return attention_mosaic.forward(query, key, value, spans, interpret=True)
 
-    def reference(query, key, value, dout):
-        del dout
-        return template.reference(query, key, value, spans)
+    def reference(query, key, value):
+        return jax.nn.dot_product_attention(query, key, value, mask=keep, implementation="xla")
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "mosaic guarded spans forward", seeds=SEEDS)
 
