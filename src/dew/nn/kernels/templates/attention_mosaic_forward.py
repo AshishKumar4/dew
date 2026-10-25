@@ -108,6 +108,8 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
         # An output hook reads a row's whole output, so its call takes the guarded launch at its full width.
         unit = v.shape[-1] if hooks.output_mod is not None else min(v.shape[-1], family.column_unit(v.dtype))
         guarded = _guarded_tiles(family, tiles, unit, v.dtype)
+        # A spans call's block map counts blocks of the launch's own key tile.
+        guarded_spans = _spans_of(spec, call, guarded.block_q, guarded.block_k)
         blocks = []
         for first in range(0, v.shape[-1], unit):
             # The guarded launch reads its live rows and its values' largest magnitudes (`algebra.room`), and
@@ -117,8 +119,8 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
             initial = hooked.initial
             held = hooked if initial is None else hooked._replace(
                 initial=(*initial[:2], initial[2][..., first:first + unit]))
-            blocks.append(_launch(q, k, columns, spans_of, held, guard, spec=form, hooks=hooks, tiles=guarded,
-                                  family=family, training=False, interpret=interpret)[0])
+            blocks.append(_launch(q, k, columns, guarded_spans, held, guard, spec=form, hooks=hooks,
+                                  tiles=guarded, family=family, training=False, interpret=interpret)[0])
         # Its maxima and overflows `walked_launches` reads of the plain launch alone.
         return jnp.concatenate(blocks, axis=-1), jnp.zeros(live.shape, jnp.float32), jnp.zeros_like(live)
 
