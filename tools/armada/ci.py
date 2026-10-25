@@ -1276,6 +1276,9 @@ def main() -> int:
         arguments = args.arguments[1:] if args.arguments[:1] == ["--"] else args.arguments
         return targeted(args.python, arguments, args.report)
     if args.operation == "gpu-lane":
+        if args.tests is None and not args.network:
+            parser.error("gpu-lane names its --tests; only the network lane (--network) takes every file "
+                         "holding a network-marked test by default")
         tests = args.tests.split() if args.tests is not None else list(network_files(PYTHONS[0]))
         return gpu_lane(PYTHONS[0], tests, args.out, cache=args.cache, processes=args.processes,
                         deadline=args.deadline, network=args.network)
