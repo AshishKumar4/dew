@@ -10,7 +10,7 @@ initialization, the group norms' unit scales and zero shifts included (and
 rounded to bfloat16-representable values, so the fixture compresses). The
 tool records the moments and, against a fixed cotangent, the gradients of
 the image and of every parameter, at a batch of one and of four: once in
-float32 and once in float64 (`diffusers_wan_reference.widened`), the truth
+float32 and once in float64 (`torch_precision.widened`), the truth
 tests/reference_error.py measures both from.
 
 Run with the Dew test environment's torch and diffusers, on CPU:
@@ -49,8 +49,8 @@ def walk(encoder, image, probe, dtype):
 
 
 def main():
-    from diffusers_wan_reference import widened
     from reference_source import saved_fixture
+    from torch_precision import widened
 
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)

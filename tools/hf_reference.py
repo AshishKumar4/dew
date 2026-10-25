@@ -72,47 +72,80 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Dict
-from huggingface_hub import get_safetensors_metadata, hf_hub_download
 
 import numpy as np
 import torch
+from huggingface_hub import get_safetensors_metadata, hf_hub_download
 from transformers import (
-    AutoModelForCausalLM, AutoTokenizer, BloomConfig, BloomForCausalLM, DeepseekV3Config, DeepseekV3ForCausalLM,
-    Gemma2Config, Gemma2ForCausalLM, Gemma3Config, Gemma3ForCausalLM, Gemma3TextConfig,
-    GemmaConfig, GemmaForCausalLM, GPTNeoConfig, GPTNeoForCausalLM, LlamaConfig, LlamaForCausalLM,
-    PhiConfig, PhiForCausalLM, Phi3Config, Phi3ForCausalLM,
-    FalconConfig, FalconForCausalLM,
-    GPTJConfig, GPTJForCausalLM, GPTBigCodeConfig, GPTBigCodeForCausalLM, Starcoder2Config,
-    Starcoder2ForCausalLM, MiMoV2FlashConfig, MiMoV2FlashForCausalLM,
-    Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
-    MixtralConfig, MixtralForCausalLM, Qwen2Config, Qwen2ForCausalLM,
-    Qwen3MoeConfig, Qwen3MoeForCausalLM, Olmo3Config, Olmo3ForCausalLM,
-    SiglipVisionConfig, SiglipVisionModel,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BloomConfig,
+    BloomForCausalLM,
+    DeepseekV3Config,
+    DeepseekV3ForCausalLM,
+    FalconConfig,
+    FalconForCausalLM,
+    Gemma2Config,
+    Gemma2ForCausalLM,
+    Gemma3Config,
+    Gemma3ForCausalLM,
+    Gemma3TextConfig,
+    GemmaConfig,
+    GemmaForCausalLM,
+    GPTBigCodeConfig,
+    GPTBigCodeForCausalLM,
+    GPTJConfig,
+    GPTJForCausalLM,
+    GPTNeoConfig,
+    GPTNeoForCausalLM,
+    LlamaConfig,
+    LlamaForCausalLM,
+    MiMoV2FlashConfig,
+    MiMoV2FlashForCausalLM,
+    MistralConfig,
+    MistralForCausalLM,
+    MixtralConfig,
+    MixtralForCausalLM,
+    Olmo3Config,
+    Olmo3ForCausalLM,
+    Phi3Config,
+    Phi3ForCausalLM,
+    PhiConfig,
+    PhiForCausalLM,
+    PreTrainedModel,
+    Qwen2Config,
+    Qwen2ForCausalLM,
+    Qwen3Config,
+    Qwen3ForCausalLM,
+    Qwen3MoeConfig,
+    Qwen3MoeForCausalLM,
+    SiglipVisionConfig,
+    SiglipVisionModel,
+    Starcoder2Config,
+    Starcoder2ForCausalLM,
 )
-from transformers.models.deepseek_v32.configuration_deepseek_v32 import (
-    DeepseekV32Config,
-)
-from transformers.models.deepseek_v32.modeling_deepseek_v32 import (
-    DeepseekV32ForCausalLM,
-)
+from transformers.models.deepseek_v32.configuration_deepseek_v32 import DeepseekV32Config
+from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32ForCausalLM
 from transformers.models.gemma3.modeling_gemma3 import Gemma3MultiModalProjector
-from transformers.models.gemma4.configuration_gemma4 import (
-    Gemma4Config, Gemma4TextConfig, Gemma4VisionConfig,
-)
+from transformers.models.gemma4.configuration_gemma4 import Gemma4Config, Gemma4TextConfig, Gemma4VisionConfig
 from transformers.models.gemma4.modeling_gemma4 import (
-    Gemma4ForConditionalGeneration, Gemma4MultimodalEmbedder, Gemma4VisionModel,
+    Gemma4ForConditionalGeneration,
+    Gemma4MultimodalEmbedder,
+    Gemma4VisionModel,
 )
 from transformers.models.llama4.configuration_llama4 import Llama4VisionConfig
-from transformers.models.llama4.modeling_llama4 import (
-    Llama4MultiModalProjector, Llama4VisionModel,
-)
+from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector, Llama4VisionModel
 from transformers.models.nemotron_h.configuration_nemotron_h import NemotronHConfig
 from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHForCausalLM
 from transformers.models.qwen3_5.configuration_qwen3_5 import (
-    Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig,
+    Qwen3_5Config,
+    Qwen3_5TextConfig,
+    Qwen3_5VisionConfig,
 )
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
-    Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration, Qwen3_5VisionModel,
+    Qwen3_5ForCausalLM,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5VisionModel,
 )
 
 from dew.interop.verify import BATCH, probe_ids, reference_logits, scatter_weights
@@ -299,7 +332,7 @@ def write_classic_tiny(name: str, model: PreTrainedModel) -> None:
     generate drops the prefix at that crossing (transformers issue #49334),
     so that output is recorded separately from the intended continuation.
     """
-    from diffusers_wan_reference import float64
+    from torch_precision import float64, float64_twin
 
     write_tiny(name, model)
     directory = FIXTURES / name
@@ -338,13 +371,11 @@ def write_classic_tiny(name: str, model: PreTrainedModel) -> None:
         losses = torch.nn.functional.cross_entropy(
             full[:, :-1].transpose(1, 2), torch.from_numpy(ids[:, 1:]).long(), reduction='none')
         np.save(directory / 'losses.npy', losses.numpy())
+    # Its float64 twin (`float64_twin`): frequency and sinusoidal buffers built in float64 rather than
+    # widened from a rounded fp32 table, the checkpoint's values loaded into it.
+    truth_model = float64_twin(model, lambda: AutoModelForCausalLM.from_config(
+        model.config, dtype=torch.float64, attn_implementation='eager'))
     with float64(), torch.no_grad():
-        # Rebuild frequency/sinusoidal buffers in float64 rather than
-        # widening an already-rounded fp32 table. Parameters remain the
-        # same checkpoint values, loaded into the wider reference model.
-        truth_model = AutoModelForCausalLM.from_config(
-            model.config, dtype=torch.float64, attn_implementation='eager').eval()
-        truth_model.load_state_dict(model.state_dict())
         truth = truth_model(torch.from_numpy(ids).long(), use_cache=False).logits.double().numpy()
         if affine:
             losses = torch.nn.functional.cross_entropy(
@@ -373,12 +404,9 @@ MINIMAX_M2_CONFIGS = (
 
 def write_minimax_m2() -> None:
     """The fixed MiniMax rotary port, saved under the released per-expert names."""
-    from diffusers_wan_reference import float64
-    from safetensors.torch import save_file
-    import transformers
-    from transformers import MiniMaxM2Config, MiniMaxM2ForCausalLM
-
     from reference_releases import require
+    from safetensors.torch import save_file
+    from transformers import MiniMaxM2Config, MiniMaxM2ForCausalLM
 
     require("minimax-m2")
     torch.manual_seed(0)
@@ -390,11 +418,7 @@ def write_minimax_m2() -> None:
         bos_token_id=1, eos_token_id=2))
     model.set_experts_implementation('eager')
     write_tiny('minimax-m2-tiny', model, padded=True)
-    directory = FIXTURES / 'minimax-m2-tiny'
-    ids = torch.from_numpy(np.load(directory / 'input_ids.npy')).long()
-    with float64(), torch.no_grad():
-        truth = model.double()(input_ids=ids, use_cache=False).logits.numpy()
-    np.save(directory / 'logits_f64.npy', truth)
+    directory = write_float64_logits('minimax-m2-tiny', model)
     weights = {}
     for name, value in model.float().state_dict().items():
         if '.mlp.experts.' in name:
@@ -408,16 +432,17 @@ def write_minimax_m2() -> None:
             weights[name.replace('.mlp.', '.block_sparse_moe.')] = value.contiguous()
     save_file(weights, str(directory / 'model.safetensors'))
     (directory / 'model.safetensors').chmod(0o644)
-    write_minimax_m2_fp8(model.config.to_dict(), weights, ids)
+    write_minimax_m2_fp8(model.config.to_dict(), weights,
+                         torch.from_numpy(np.load(directory / 'input_ids.npy')).long())
     for name, repo, revision in MINIMAX_M2_CONFIGS:
         write_released_config(name, repo, revision)
 
 
 def write_minimax_m2_fp8(config: dict, weights: dict, ids: torch.Tensor) -> None:
     """Run Transformers' CPU dequantization on the released FP8 storage layout."""
-    from diffusers_wan_reference import float64
     from safetensors.torch import save_file
-    from transformers import MiniMaxM2ForCausalLM, FineGrainedFP8Config
+    from torch_precision import float64, float64_twin
+    from transformers import FineGrainedFP8Config, MiniMaxM2ForCausalLM
 
     directory = FIXTURES / 'minimax-m2-fp8-tiny'
     directory.mkdir(parents=True, exist_ok=True)
@@ -445,13 +470,13 @@ def write_minimax_m2_fp8(config: dict, weights: dict, ids: torch.Tensor) -> None
     with torch.no_grad():
         np.save(directory / 'logits.npy', model(input_ids=ids, use_cache=False).logits.numpy())
     with float64(), torch.no_grad():
-        np.save(directory / 'logits_f64.npy', model.double()(input_ids=ids, use_cache=False).logits.numpy())
+        truth = float64_twin(model)(input_ids=ids, use_cache=False).logits.numpy()
+    np.save(directory / 'logits_f64.npy', truth)
     (directory / 'model.safetensors').chmod(0o644)
 
 
 def write_qwen2_moe() -> None:
     """Three mixed-window layers, two routed layers and a gated shared expert."""
-    from diffusers_wan_reference import float64
     from transformers import Qwen2MoeConfig, Qwen2MoeForCausalLM
 
     torch.manual_seed(0)
@@ -464,10 +489,7 @@ def write_qwen2_moe() -> None:
         max_position_embeddings=64, rope_theta=1000000.0, tie_word_embeddings=False))
     model.set_experts_implementation('eager')
     write_tiny('qwen2-moe-tiny', model, padded=True)
-    directory = FIXTURES / 'qwen2-moe-tiny'
-    ids = torch.from_numpy(np.load(directory / 'input_ids.npy')).long()
-    with float64(), torch.no_grad():
-        np.save(directory / 'logits_f64.npy', model.double()(input_ids=ids, use_cache=False).logits.numpy())
+    directory = write_float64_logits('qwen2-moe-tiny', model)
     (directory / 'model.safetensors').chmod(0o644)
     write_released_config('qwen1.5-moe-a2.7b', 'Qwen/Qwen1.5-MoE-A2.7B',
                           '1a758c50ecb6350748b9ce0a99d2352fd9fc11c9')
@@ -475,7 +497,6 @@ def write_qwen2_moe() -> None:
 
 def write_granitemoe() -> None:
     """Granite's four non-unit multipliers and the released packed expert layout."""
-    from diffusers_wan_reference import float64
     from safetensors.torch import save_file
     from transformers import GraniteMoeConfig, GraniteMoeForCausalLM
 
@@ -488,10 +509,7 @@ def write_granitemoe() -> None:
         attention_multiplier=0.015625, tie_word_embeddings=True, bos_token_id=0, eos_token_id=0))
     model.set_experts_implementation('eager')
     write_tiny('granitemoe-tiny', model, padded=True)
-    directory = FIXTURES / 'granitemoe-tiny'
-    ids = torch.from_numpy(np.load(directory / 'input_ids.npy')).long()
-    with float64(), torch.no_grad():
-        np.save(directory / 'logits_f64.npy', model.double()(input_ids=ids, use_cache=False).logits.numpy())
+    directory = write_float64_logits('granitemoe-tiny', model)
     weights = {}
     for name, value in model.float().state_dict().items():
         name = name.replace('.block_sparse_moe.experts.gate_up_proj', '.block_sparse_moe.input_linear.weight')
@@ -523,7 +541,7 @@ def write_modernbert_tiny(name: str = 'modernbert-tiny') -> None:
     rows packing two documents, whose reference is each document run alone
     at positions from zero.
     """
-    from diffusers_wan_reference import float64
+    from torch_precision import float64, float64_twin
     from transformers import ModernBertConfig, ModernBertForMaskedLM
 
     torch.manual_seed(0)
@@ -544,7 +562,7 @@ def write_modernbert_tiny(name: str = 'modernbert-tiny') -> None:
     np.save(directory / 'attention_mask.npy', mask)
     np.save(directory / 'segment_ids.npy', documents.astype(np.int32))
 
-    def states(dtype_scope):
+    def states(model, dtype_scope):
         with dtype_scope, torch.no_grad():
             encoder = model.model
             plain = encoder(torch.from_numpy(ids).long()).last_hidden_state
@@ -558,7 +576,7 @@ def write_modernbert_tiny(name: str = 'modernbert-tiny') -> None:
     import contextlib
 
     model.eval()
-    for key, value in states(contextlib.nullcontext()).items():
+    for key, value in states(model, contextlib.nullcontext()).items():
         np.save(directory / f'{key}.npy', value.float().numpy())
     # The reference's own bf16 run, which a bf16 forward is held to, on a
     # copy: a round trip through bf16 would round the float64 run's weights.
@@ -568,14 +586,10 @@ def write_modernbert_tiny(name: str = 'modernbert-tiny') -> None:
         narrow = copy.deepcopy(model).to(torch.bfloat16)
         np.save(directory / 'hidden_bf16.npy',
                 narrow.model(torch.from_numpy(ids).long()).last_hidden_state.float().numpy())
+    # Its float64 twin (`float64_twin`), whose inverse frequencies are built in float64.
+    wide = float64_twin(model)
     with float64():
-        model.double()
-        # The inverse frequencies are buffers built at construction, in float32.
-        rotary = model.model.rotary_emb
-        for layer_type in rotary.layer_types:
-            inverse, _ = rotary.compute_default_rope_parameters(model.config, layer_type=layer_type)
-            setattr(rotary, f'{layer_type}_inv_freq', inverse.double())
-        truths = states(contextlib.nullcontext())
+        truths = states(wide, contextlib.nullcontext())
     for key, value in truths.items():
         np.save(directory / f'{key}_f64.npy', value.double().numpy())
 
@@ -600,7 +614,7 @@ def write_nemotron_h(*, moe: bool = False, latent: bool = False) -> None:
     MoE uses nonzero selection bias, two routing groups and an ungated shared
     expert; the latent case leaves top-k weights unnormalized.
     """
-    from diffusers_wan_reference import float64
+    from torch_precision import float64
 
     torch.manual_seed(0)
     name = "nemotron-h-moe-latent-tiny" if latent else "nemotron-h-moe-tiny" if moe else "nemotron-h-tiny"
@@ -972,9 +986,7 @@ def write_gemma3_mm_tiny() -> None:
     np.save(directory / "projector_ref.npy", system["soft"])
     ids = np.array([[2, 5, 202, 7, 9], [202, 3, 4, 5, 6]], np.int32)
     with torch.no_grad():
-        from transformers.models.gemma3.modeling_gemma3 import (
-            Gemma3ForConditionalGeneration,
-        )
+        from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
         wrapper = Gemma3ForConditionalGeneration(Gemma3Config(
             text_config={k: v for k, v in text_config.items()
                          if k not in ("architectures", "model_type")},
@@ -1023,9 +1035,7 @@ def write_llama4_mm_tiny() -> None:
     ids = np.array([[2, 5, 92, 7, 9], [92, 3, 4, 5, 6]], np.int32)
     with torch.no_grad():
         from transformers.models.llama4.configuration_llama4 import Llama4Config
-        from transformers.models.llama4.modeling_llama4 import (
-            Llama4ForConditionalGeneration,
-        )
+        from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
         wrapper = Llama4ForConditionalGeneration(Llama4Config(
             text_config={k: v for k, v in text_config.items()
                          if k not in ("architectures", "model_type")},
@@ -1353,12 +1363,8 @@ def write_diffusion_sc_tiny() -> None:
     """The self-conditioning MLP alone: its weights, narrow config, fixed
     inputs and the fp32 reference output."""
     from safetensors.torch import save_file
-    from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
-        DiffusionGemmaTextConfig,
-    )
-    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
-        DiffusionGemmaSelfConditioning,
-    )
+    from transformers.models.diffusion_gemma.configuration_diffusion_gemma import DiffusionGemmaTextConfig
+    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaSelfConditioning
 
     config = DiffusionGemmaTextConfig(
         hidden_size=32, intermediate_size=64, hidden_activation="gelu_pytorch_tanh",
@@ -1411,11 +1417,10 @@ def diffusion_gemma_tiny(fields: dict, canvas_length: int):
     dew tree holds them once, and the loader's tied check refuses a
     checkpoint that disagrees there."""
     from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
-        DiffusionGemmaConfig, DiffusionGemmaTextConfig,
+        DiffusionGemmaConfig,
+        DiffusionGemmaTextConfig,
     )
-    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
-        DiffusionGemmaForBlockDiffusion,
-    )
+    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
     from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
 
     text = DiffusionGemmaTextConfig(**{key: value for key, value in fields.items() if key != "model_type"})
@@ -1482,7 +1487,7 @@ def write_diffusion_window_tiny() -> None:
     every canvas key reads every other (modeling_diffusion_gemma.py:1399-1401).
     The fp32 and float64 reference logits, the latter for the float64 rule.
     """
-    from diffusers_wan_reference import float64
+    from torch_precision import float64, float64_twin
 
     fields = {**DIFFUSION_DENOISER_TEXT, "sliding_window": 4,
               "layer_types": ["sliding_attention", "full_attention"]}
@@ -1496,17 +1501,33 @@ def write_diffusion_window_tiny() -> None:
     prompt = np.array([[2, 5, 7, 9, 11, 13]], np.int32)
     canvas = np.array([[3, 4, 5, 6, 8, 10]], np.int32)
 
-    def logits():
+    def logits(model):
         with torch.no_grad():
             return model(input_ids=torch.from_numpy(prompt).long(),
                          decoder_input_ids=torch.from_numpy(canvas).long()).logits
 
     np.save(directory / "prompt.npy", prompt)
     np.save(directory / "canvas.npy", canvas)
-    np.save(directory / "logits.npy", logits().to(torch.float32).numpy())
+    np.save(directory / "logits.npy", logits(model).to(torch.float32).numpy())
     with float64():
-        model.double()
-        np.save(directory / "logits_f64.npy", logits().double().numpy())
+        twin = float64_twin(model)
+        for module in twin.modules():
+            if hasattr(module, "experts") and hasattr(module.experts, "config"):
+                module.experts.config._experts_implementation = "eager"
+        np.save(directory / "logits_f64.npy", logits(twin).double().numpy())
+
+
+def write_float64_logits(name: str, model: PreTrainedModel) -> Path:
+    """The fixture `name`'s float64 logits, `logits_f64.npy`: `model`'s float64 truth (`float64_twin`) on
+    the fixture's ids, run inside `torch_precision.float64`. Returns the fixture's directory."""
+    from torch_precision import float64, float64_twin
+
+    directory = FIXTURES / name
+    ids = torch.from_numpy(np.load(directory / 'input_ids.npy')).long()
+    with float64(), torch.no_grad():
+        truth = float64_twin(model)(input_ids=ids, use_cache=False).logits.numpy()
+    np.save(directory / 'logits_f64.npy', truth)
+    return directory
 
 
 def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234, *, padded: bool = False,
@@ -1521,8 +1542,7 @@ def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234, *, padded: b
     np.save(directory / "input_ids.npy", ids)
     np.save(directory / "logits.npy", reference_logits(model, ids))
     if padded:
-        from copy import deepcopy
-        from diffusers_wan_reference import float64
+        from torch_precision import float64, float64_twin
 
         tokens = torch.from_numpy(ids.astype(np.int64))
         valid = torch.ones_like(tokens)
@@ -1533,7 +1553,7 @@ def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234, *, padded: b
         with torch.no_grad():
             reference = model(**inputs).logits.numpy()
         with float64(), torch.no_grad():
-            truth = deepcopy(model).double()(**inputs).logits.numpy()
+            truth = float64_twin(model)(**inputs).logits.numpy()
         np.savez(directory / 'padded.npz', input_ids=tokens.numpy().astype(np.int32),
                  attention_mask=valid.numpy().astype(bool), position_ids=positions.numpy().astype(np.int32),
                  logits=reference, logits_f64=truth)
@@ -1550,12 +1570,11 @@ def write_logits_recording(name: str, model: PreTrainedModel, command: str) -> N
     sketch (`record_case`'s summary), which the test's float64 run of Dew's model is held to, in
     recorded_logits.npz beside the fixture."""
     import sys
-    from copy import deepcopy
 
     import jax
-    from diffusers_wan_reference import float64
     from fetched_fixtures import save
     from recorded_references import provenance, record_case
+    from torch_precision import float64, float64_twin
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
     from interop_support import drawn_ids, float64_logits
@@ -1565,21 +1584,7 @@ def write_logits_recording(name: str, model: PreTrainedModel, command: str) -> N
     directory = FIXTURES / name
     model = model.float().eval()
     model.set_attn_implementation("eager")
-    wide = deepcopy(model).double()
-    with float64():
-        # Rotary inverse frequencies are buffers built at construction in float32: rebuilt in float64.
-        for module in wide.modules():
-            build = (getattr(module, "rope_init_fn", None)
-                     or getattr(module, "compute_default_rope_parameters", None))
-            if hasattr(module, "inv_freq"):
-                if build is None:
-                    raise ValueError(f"{type(module).__name__} holds float32 inverse frequencies and no rule "
-                                     f"to rebuild them in float64")
-                inverse, _ = build(module.config, None)
-                module.inv_freq = inverse.double()
-                if hasattr(module, "original_inv_freq"):
-                    module.original_inv_freq = inverse.double()
-                print(f"{type(module).__name__}: inverse frequencies rebuilt in float64", flush=True)
+    wide = float64_twin(model)
     vocab = model.config.vocab_size
     native = Pretrained.load(directory, dtype="float32", attention_impl="reference")
 

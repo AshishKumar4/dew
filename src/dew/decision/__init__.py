@@ -6,7 +6,9 @@ The model lays the questions out with the state (Laya's `MarkerLayout`, the
 `StateFirstLayout` for a causal backbone, or the `JointLayout`, every
 question of a request in one row), reads the rows with a backbone, scores
 every option with a head (Laya's `DecisionHead`, or the `JointSchemaHead`,
-which decides a row's questions together), and answers with a distribution
+which decides a row's questions together, or a readout of options written under
+`Labels`: `LabelReadout`, the backbone's own logits at them, and a slot release's
+`SlotReadout`), and answers with a distribution
 over exactly the options each question names. `Decide` is the task that
 answers requests, and `DecisionObjective` trains one on proper scoring
 rules. `LayaCheckpoint` reads convaiinnovations/laya's released
@@ -16,20 +18,25 @@ reads.
 """
 
 from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures, bucket
-from dew.decision.data import Example, corpus, decisions, mixture
-from dew.decision.head import DecisionHead, Head, JointSchemaHead
+from dew.decision.data import Example, Group, corpus, decisions, mixture
+from dew.decision.head import DecisionHead, Head, JointSchemaHead, LabelReadout, SlotReadout
 from dew.decision.joint_checkpoint import JointCheckpoint, StoredJointHead
 from dew.decision.laya import LayaCheckpoint
 from dew.decision.layout import (
+    AnswerCue,
     DecisionInputs,
     Encoded,
     Framing,
+    Instructions,
     JointLayout,
+    Labels,
     Laid,
     Layout,
     MarkerLayout,
     Media,
+    OptionLines,
     QuestionLayout,
+    QuestionSegment,
     Schema,
     Segment,
     Specials,
@@ -69,6 +76,7 @@ __all__ = [
     "Abstention",
     "Accuracy",
     "Answer",
+    "AnswerCue",
     "Answered",
     "Binning",
     "Brier",
@@ -88,11 +96,15 @@ __all__ = [
     "EntropyConfidence",
     "Example",
     "Framing",
+    "Group",
     "Head",
+    "Instructions",
     "JevConfidence",
     "JointCheckpoint",
     "JointLayout",
     "JointSchemaHead",
+    "LabelReadout",
+    "Labels",
     "Laid",
     "LayaCheckpoint",
     "Layout",
@@ -101,8 +113,10 @@ __all__ = [
     "Media",
     "Noul",
     "NoulAnswer",
+    "OptionLines",
     "Question",
     "QuestionLayout",
+    "QuestionSegment",
     "RankedProbability",
     "Schema",
     "Score",
@@ -110,6 +124,7 @@ __all__ = [
     "Scored",
     "ScoringRule",
     "Segment",
+    "SlotReadout",
     "Specials",
     "Spherical",
     "State",

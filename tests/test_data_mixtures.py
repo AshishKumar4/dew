@@ -403,6 +403,13 @@ def weighted_packed(tmp_path, weights, *, tokenizer: str = "byte"):
     return {first: weights[0], second: weights[1]}, first, second
 
 
+def grains_corpora(weights) -> pygrain.MapDataset:
+    """Grain's own weighted mix (`MapDataset.mix`) of one repeated corpus a weight, each position the
+    number of the corpus Grain's mix reads there: the reference a mix's member order is held to."""
+    return pygrain.MapDataset.mix([pygrain.MapDataset.range(1).map(lambda _, tag=tag: tag).repeat()
+                                   for tag in range(len(weights))], weights)
+
+
 def corpus_of(window: tuple[int, ...]) -> int:
     values = {value for value in window if value}
     corpora = {0 if value < 100 else 1 for value in values}
@@ -412,15 +419,17 @@ def corpus_of(window: tuple[int, ...]) -> int:
 
 def test_weighted_packed_corpora_fill_every_step_at_their_shares(tmp_path):
     """MaxText's weighted `grain_train_files`, over packed windows: every
-    window is one corpus's documents, and every prefix of the stream holds
-    each corpus's share of its windows to within one, the contract grain's
-    `MapDataset.mix` keeps. At 3:1 a batch of four is three and one."""
-    stores, _, _ = weighted_packed(tmp_path, (3.0, 1.0))
+    window is one corpus's documents, and the stream's windows come from the
+    corpora Grain's own `MapDataset.mix` reads at each position, which holds
+    every prefix to each corpus's share of it within one. At 3:1 a batch of
+    four is three and one."""
+    weights = (3.0, 1.0)
+    stores, _, _ = weighted_packed(tmp_path, weights)
     rows = [row for batch in packed_rows(trained(mixed_packed(stores)).train(DataPartition()), 12)
             for row in batch]
     drawn = [corpus_of(row) for row in rows]
-    for prefix in range(1, len(drawn) + 1):
-        assert abs(drawn[:prefix].count(1) - prefix / 4) <= 1
+    grains = grains_corpora(weights)
+    assert drawn == [grains[position] for position in range(len(drawn))]
     assert all(drawn[step * 4:step * 4 + 4].count(1) == 1 for step in range(12))
 
 
@@ -1340,9 +1349,7 @@ def test_an_epoch_of_repeated_corpora_ends_where_grains_mix_has_read_every_one_o
     corpora = [Pipeline(Memory(Indexed(tag, size)), name=f"corpus-{tag}").repeat()
                for tag, size in enumerate(sizes, start=1)]
     data = compile(mix(corpora, weights=weights).batch(1), read="memory", loading=READ)
-    # Each position of Grain's mix of repeated corpora says which corpus it reads (its tag).
-    grains = pygrain.MapDataset.mix([pygrain.MapDataset.range(1).map(lambda _, tag=tag: tag).repeat()
-                                     for tag in range(len(sizes))], weights)
+    grains = grains_corpora(weights)
     reads, covered = [0] * len(sizes), 0
     while any(read < size for read, size in zip(reads, sizes, strict=True)):
         reads[grains[covered]] += 1

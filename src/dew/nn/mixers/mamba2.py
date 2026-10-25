@@ -397,17 +397,16 @@ def _sequence_mix(mixed, dt, segments, starts, valid, weights, *, scan, dtype):
         halo = _halo(mixed, valid, segments, width)
         convolved, _ = held_conv1d(mixed, taps, valid, halo, bias=bias, segments=segments, dtype=dtype)
         out, _ = scan(convolved, dt, (dt_bias, A, D), starts=starts, valid=valid, axis=SEQUENCE_AXIS)
-        # The scan's output, attention's 'context' (a remat policy's `RESIDUALS`), as `held_scan` names it.
-        return checkpoint_name(out, 'context')
-    forward = [(shard, shard + 1) for shard in range(jax.lax.axis_size(SEQUENCE_AXIS) - 1)]
-    history = jax.lax.ppermute(mixed[:, length - width:], SEQUENCE_AXIS, forward)
-    owners = None
-    if segments is not None:
-        before = jax.lax.ppermute(segments[:, length - width:], SEQUENCE_AXIS, forward)
-        owners = jnp.concatenate([before, segments], axis=1)
-    stream = jnp.concatenate([history, mixed], axis=1)
-    convolved = causal_conv1d(stream, taps, bias=bias, segments=owners, dtype=dtype)[:, width:]
-    out, _ = scan(convolved, dt, (dt_bias, A, D), starts=starts, axis=SEQUENCE_AXIS)
+    else:
+        forward = [(shard, shard + 1) for shard in range(jax.lax.axis_size(SEQUENCE_AXIS) - 1)]
+        history = jax.lax.ppermute(mixed[:, length - width:], SEQUENCE_AXIS, forward)
+        owners = None
+        if segments is not None:
+            before = jax.lax.ppermute(segments[:, length - width:], SEQUENCE_AXIS, forward)
+            owners = jnp.concatenate([before, segments], axis=1)
+        stream = jnp.concatenate([history, mixed], axis=1)
+        convolved = causal_conv1d(stream, taps, bias=bias, segments=owners, dtype=dtype)[:, width:]
+        out, _ = scan(convolved, dt, (dt_bias, A, D), starts=starts, axis=SEQUENCE_AXIS)
     # The scan's output as `held_scan` names it, a mixer's 'context' and a recurrence's 'scan'
     # (a remat policy's `RESIDUALS`).
     return checkpoint_name(checkpoint_name(out, 'scan'), 'context')

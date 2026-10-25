@@ -57,6 +57,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   `bidirectional_images` keeps Gemma's images, read whole within the window. A kind may read both,
   and every other kind stays causal. A cached call reads the groups of its own tokens, so no cache
   keeps them, and a layer that shares another's keys and values reads them too.
+- `dew.nn.categorical.cross_entropy` and `kl_divergence` differentiate by Barron,
+  Gnanapragasam and Tschannen's fix (arXiv:2610.31642): a label whose margin
+  rounds Optax's `p - 1` to 0 keeps its derivative, each row's derivative sums to
+  zero, and a divergence from logits equal to its reference has derivative
+  exactly zero. Their values are unchanged.
 - A joint decision row's user turn is composed of segments, `JointLayout.segments`, a tuple of
   `Text`, `Media`, `State` and `Schema` in the order the row writes them: the default is the Laya
   joint release's turn, and another writes the schema before the state, or text of its own

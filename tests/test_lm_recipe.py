@@ -432,6 +432,54 @@ def test_a_pretrained_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
         assert (tmp_path / "from-run" / name).read_bytes() == (tmp_path / "in-process" / name).read_bytes()
 
 
+class Started(LMRunConfig):
+    """A run that hands back the objective it would train, rather than training it."""
+
+    def train(self, objective, dataset, **settings):
+        return objective
+
+
+@pytest.mark.parametrize(("lora", "whole"), [(True, False), (True, True), (False, False)],
+                         ids=["lora", "lora-frozen-whole", "full"])
+def test_a_pretrained_runs_source_loads_where_its_start_keeps_it(tmp_path, lora, whole):
+    """A LoRA run from a source reads each leaf of its frozen base onto its trainer's fsdp mesh,
+    sharded as its layout shards the state (every leaf past `min_shard=1`, so some split), never into
+    a host array (`TrainerConfig.source_placement`): its start places none of the base again, the
+    state's frozen leaves the source's arrays themselves, each where the state keeps it. A layout
+    that keeps the frozen tree whole, and a run that trains the source itself, read it on the host."""
+    import optax
+
+    from dew.batch import FROZEN
+    from dew.training import Layout, MeshSpec, Trainer
+
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
+    adapter = ("--lora.rank", "4", "--lora.modules", "q_proj") if lora else ()
+    config = Started.cli(recipe_args(tokens, "--pretrained", str(checkpoint), "--trainer.steps", "1",
+                                     "--max-new-tokens", "0", *adapter),
+                         default=Started(data=windows(tokens), validation=windows(tokens, held=True)))
+    sharded = Layout(min_shard=1, frozen_whole=whole)
+    config = dataclasses.replace(config, trainer=dataclasses.replace(
+        config.trainer, mesh=MeshSpec(fsdp=jax.device_count()), layout=sharded))
+    objective = config.prepare().train("placed")
+    held = objective.held_variables()
+    assert held is not None
+    base = held[FROZEN] if lora else held["params"]
+    if whole or not lora:
+        assert not any(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(base))
+        return
+    assert all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(base))
+    assert any(leaf.addressable_shards[0].data.shape != leaf.shape for leaf in jax.tree.leaves(base))
+    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0), mesh=config.trainer.mesh,
+                      layout=config.trainer.layout)
+    state, shardings = trainer.place()[:2]
+    assert ({id(leaf) for leaf in jax.tree.leaves(state.variables[FROZEN])}
+            == {id(leaf) for leaf in jax.tree.leaves(base)})
+    placed = jax.tree.leaves(shardings.variables[FROZEN])
+    for leaf, sharding in zip(jax.tree.leaves(base), placed, strict=True):
+        assert leaf.sharding == sharding
+
+
 def test_a_scratch_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
     """From scratch, `--lora.rank 2 --lora.modules q_proj v_proj`
     binds the adapter to a fresh draw of the model from the run's key and

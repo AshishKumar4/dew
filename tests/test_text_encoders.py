@@ -109,7 +109,7 @@ def precision(dtype):
 
     import torch
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     return float64() if dtype == torch.float64 else contextlib.nullcontext()
 

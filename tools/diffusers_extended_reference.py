@@ -7,31 +7,42 @@ TASK: xl-img2img, xl-inpaint, refiner, safety. BASE_XL comes from
  diffusers_pipeline_reference.py (use its SD output for safety).
 
 `truth ROOT OUTPUT` reruns each saved task under ROOT in float64, the truth its float32 reference is
-measured from (`diffusers_wan_reference.float64`), every noise the call draws the float32 draw widened
+measured from (`torch_precision.float64`), every noise the call draws the float32 draw widened
 so the draws are the reference's own, and adds them as `{task}/{name}` to the npz OUTPUT
 (tests/fixtures/tiny_diffusers_f64.npz, which `diffusers_pipeline_reference.py truth` writes first).
 """
 import argparse
 import json
-from pathlib import Path
 import tempfile
+from pathlib import Path
 
 import jax
 import numpy as np
 import torch
+from diffusers import (
+    AutoencoderKL,
+    DDIMScheduler,
+    FlaxStableDiffusionPipeline,
+    FlaxStableDiffusionXLPipeline,
+    FlaxUNet2DConditionModel,
+    StableDiffusionPipeline,
+    StableDiffusionXLImg2ImgPipeline,
+    StableDiffusionXLInpaintPipeline,
+    UNet2DConditionModel,
+)
+from diffusers.models.modeling_pytorch_flax_utils import load_flax_checkpoint_in_pytorch_model
+from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from flax import serialization
 from flax.traverse_util import flatten_dict, unflatten_dict
 from PIL import Image
-from diffusers import (FlaxStableDiffusionPipeline, FlaxStableDiffusionXLPipeline,
-                       FlaxUNet2DConditionModel, UNet2DConditionModel, AutoencoderKL,
-                       DDIMScheduler, StableDiffusionXLImg2ImgPipeline, StableDiffusionXLInpaintPipeline)
-from diffusers.models.modeling_pytorch_flax_utils import load_flax_checkpoint_in_pytorch_model
-from transformers import (CLIPConfig, CLIPVisionConfig, CLIPImageProcessor,
-                          CLIPTextModel, CLIPTextModelWithProjection)
-from diffusers import StableDiffusionPipeline
-from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
-
 from reference_releases import require
+from transformers import (
+    CLIPConfig,
+    CLIPImageProcessor,
+    CLIPTextModel,
+    CLIPTextModelWithProjection,
+    CLIPVisionConfig,
+)
 
 
 def convert(model_class, config, parameters, *, vae=False):
@@ -144,7 +155,8 @@ def truth(root, destination):
     from unittest.mock import patch
 
     from diffusers.utils import torch_utils
-    from diffusers_wan_reference import float64
+    from diffusers_wan_reference import float64_scheduler
+    from torch_precision import float64
 
     require("diffusers-pipelines")
     torch.set_num_threads(2)
@@ -164,6 +176,8 @@ def truth(root, destination):
                      "diffusers.schedulers.scheduling_ddim"):
             scope.enter_context(patch.object(importlib.import_module(name), "randn_tensor", narrow_draw))
         scope.enter_context(float64())
+        # The DDIM scheduler's tables are its module's own, built and set at every call inside it.
+        scope.enter_context(float64_scheduler(importlib.import_module("diffusers.schedulers.scheduling_ddim")))
         for task in ("xl-img2img", "xl-inpaint", "refiner", "safety"):
             directory = Path(root) / task
             reference = np.load(directory / "reference.npz")

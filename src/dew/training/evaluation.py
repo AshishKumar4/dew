@@ -30,8 +30,7 @@ from dew.batch import VALID_ROWS, Batch, Variables
 from dew.data.dataset import Closeable, DataPartition, Reader, rows_of, take_rows
 from dew.data.pipeline import Dataset
 from dew.objectives.base import Effects, Loss, Metric, Objective, Step, TrainingScalar, recorded_name
-
-from .distributed import MeshSpec, shard_batch, split_fields, with_host
+from dew.training.distributed import MeshSpec, shard_batch, split_fields, with_host
 
 
 @dataclass(frozen=True)

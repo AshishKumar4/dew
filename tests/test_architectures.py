@@ -412,7 +412,7 @@ LAYOUT_SEEDS: dict[str, int] = {
     "causal_transformer+gpt_oss": 256, "causal_transformer+deepseek_v2": 64,
     "causal_transformer+glm4_moe": 128, "causal_transformer+llama4": 32,
     "causal_transformer+gemma4_moe": 64, "causal_transformer+gemma3n": 64,
-    "causal_transformer+mla": 32, "causal_transformer+qwen35": 8,
+    "causal_transformer+mla": 32, "causal_transformer+qwen35": 64,
 }
 """Each cell's declared seeds for check 1 (`assert_as_exact`), the most any layout and step count took,
 sized paired by `seeds_for` (`dew_fn`, the layout's arm) on armada: every cell's arms share their

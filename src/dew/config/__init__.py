@@ -37,7 +37,7 @@ import typing
 from collections.abc import Callable, Mapping, Sequence
 from enum import Enum
 from pathlib import Path
-from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Self, Union
+from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Self, TypedDict, Union
 
 import jax
 import tyro
@@ -311,6 +311,16 @@ def _cadence_argument():
     )
 
 
+class SourcePlacement(TypedDict, total=False):
+    """Where a run reads the source it starts from: `Pretrained.load`'s keywords
+    (`TrainerConfig.source_placement`)."""
+
+    weights: bool
+    on_host: bool
+    mesh: MeshSpec
+    layout: Layout
+
+
 @dataclasses.dataclass(frozen=True)
 class TrainerConfig:
     """Holds the run length, checkpointing, sharding and run tracking."""
@@ -499,6 +509,21 @@ class TrainerConfig:
             return False
         with Checkpoints(os.path.join(self.checkpoint_dir, self.name), keep=self.keep) as checkpoints:
             return checkpoints.latest is not None
+
+    def source_placement(self, *, frozen: bool) -> SourcePlacement:
+        """Where a run that starts from a source (`Pretrained.load`) reads it: the load's keywords,
+        `frozen` where the run keeps the source as it is (an adapter trained over it). A run that
+        resumes reads no weights (`resumes`), as its checkpoint holds them. A frozen source is read onto
+        this run's mesh, sharded as its layout shards the state, each process reading its devices'
+        shards, and the start takes those arrays as they are (`Trainer.place`): the run and its
+        objective hold one copy. A source the run trains stays on the host, as its start copies the
+        arrays it trains, and so does one whose state lives on the host (`Layout.host` holds the
+        variables) or keeps its frozen tree whole (`frozen_whole`), which its start places itself."""
+        if self.resumes():
+            return {"weights": False}
+        if not frozen or "variables" in self.layout.host or self.layout.frozen_whole:
+            return {"on_host": True}
+        return {"mesh": self.mesh, "layout": self.layout}
 
     def total_steps(self, dataset: Loader) -> int | None:
         """Return the step cap from `steps` or `epochs`, None for a token-only run (`run_steps`, the

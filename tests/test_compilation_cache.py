@@ -9,8 +9,6 @@ import sys
 
 import pytest
 
-from dew._host import cpu_class
-
 RUN = """
 import json
 import sys
@@ -37,8 +35,8 @@ print(json.dumps({"directory": run()}))
 def test_a_run_caches_its_compilations_under_the_users_cache_directory(tmp_path, entry, enabled):
     """A run readied by `prepare_process` with no directory of its own, or by a `Trainer.fit` no
     `prepare_process` came before, writes its compiled programs under $XDG_CACHE_HOME/dew/xla, in its
-    Python minor's and its host CPU class's directory, so its restart reads them;
-    JAX_ENABLE_COMPILATION_CACHE=false leaves it without the cache."""
+    Python minor's directory, so its restart reads them; JAX_ENABLE_COMPILATION_CACHE=false leaves it
+    without the cache."""
     env = {key: value for key, value in os.environ.items()
            if key not in ("JAX_COMPILATION_CACHE_DIR", "JAX_ENABLE_COMPILATION_CACHE")}
     env.update(JAX_PLATFORMS="cpu", XDG_CACHE_HOME=str(tmp_path))
@@ -51,7 +49,7 @@ def test_a_run_caches_its_compilations_under_the_users_cache_directory(tmp_path,
     assert done.returncode == 0, done.stderr[-2000:]
     directory = json.loads(done.stdout.strip().splitlines()[-1])["directory"]
     minor = f"python{sys.version_info.major}.{sys.version_info.minor}"
-    expected = tmp_path / "dew" / "xla" / minor / cpu_class()
+    expected = tmp_path / "dew" / "xla" / minor
     if enabled:
         assert directory == str(expected)
         assert any(path.is_file() and "autotune" not in path.parts for path in expected.rglob("*"))
