@@ -1,8 +1,9 @@
-"""The grouped launches' cost model against every tile measured on an A100 and an H100
-(tests/fixtures/gemm_sweeps: bench_gmm_template.py over seven MoE shapes, each product): the config it
-picks runs within 10% of the measured best, or the case is a known miss whose missing term `MISSES`
+"""The grouped launches' cost model against every tile measured on an A100 and H100s
+(tests/fixtures/gemm_sweeps, one a device: tools/sweep_grouped_gemm.py over seven MoE shapes, each product,
+costed on the device's facts): the config it picks runs within 10% of the measured best, or the case is a known miss whose missing term `MISSES`
 names. A miss the model comes to rank fails too, so the table only shrinks."""
 
+import dataclasses
 import json
 from pathlib import Path
 
@@ -54,7 +55,7 @@ MISSES = {
     ("sm90", "mosaic_gpu", "mixtral down", "input_gradient"): L2_REUSE,
     ("sm90", "triton", "mixtral down", "input_gradient"): L2_REUSE,
 }
-"""Each case whose pick runs past 10% of the best, by generation, implementation, shape and product, with
+"""Each case whose pick runs past 10% of the best, by sweep, implementation, shape and product, with
 the term the model lacks: 27 of the 84 swept (2026-10-25; GMMT-a100, GMMCOOP-h100, whose sweep times the
 cooperative tiles)."""
 
@@ -89,26 +90,34 @@ def _config(text: str):
     return {"Tile": Tile, "Tiles": Tiles}[name](**parsed)
 
 
+def _target(sweep: str) -> generation.GpuTarget:
+    """The device a sweep timed on: its generation's canonical device, or the facts its provenance states
+    (`tools/sweep_grouped_gemm.py`), which the launches read there."""
+    provenance = json.loads((SWEEPS / f"{sweep}.json").read_text())["provenance"]
+    canonical = generation.TARGETS[provenance.get("generation", sweep)]
+    return dataclasses.replace(canonical, device_kind=provenance["device"], **provenance.get("facts", {}))
+
+
 def _cases():
-    for generation_name in ("sm80", "sm90"):
-        for record in json.loads((SWEEPS / f"{generation_name}.json").read_text())["records"]:
-            name = f"{generation_name}-{record['implementation']}-{record['shape']}-{record['product']}"
-            yield pytest.param(generation_name, record, id=name)
+    for path in sorted(SWEEPS.glob("*.json")):
+        for record in json.loads(path.read_text())["records"]:
+            name = f"{path.stem}-{record['implementation']}-{record['shape']}-{record['product']}"
+            yield pytest.param(path.stem, record, id=name)
 
 
-@pytest.mark.parametrize("generation_name,record", list(_cases()))
-def test_the_cost_model_picks_within_10_percent_of_the_measured_best_or_names_its_miss(generation_name: str,
+@pytest.mark.parametrize("sweep,record", list(_cases()))
+def test_the_cost_model_picks_within_10_percent_of_the_measured_best_or_names_its_miss(sweep: str,
                                                                                       record: dict):
-    """The measured time of the config the launch runs (its heuristic, the cost model's choice among
-    every fitting config) over the fastest swept config's: the pick was swept, and runs at most 1.10
-    times the best, or the case is in `MISSES` and still past it."""
+    """The measured time of the config the launch runs on the swept device (its heuristic, the cost
+    model's choice among every searched config) over the fastest swept config's: the pick was swept, and
+    runs at most 1.10 times the best, or the case is in `MISSES` and still past it."""
     launch, args, options = _launch(record)
     configs = {_config(text): ms for text, ms in record["times"].items()}
-    with generation.assumed(generation_name):
+    with generation.assumed(_target(sweep)):
         pick = launch.bind(*args, **options, interpret=False).heuristics_config
     assert pick in configs, f"the sweep did not time the pick {pick}"
     ratio = configs[pick] / min(configs.values())
-    miss = MISSES.get((generation_name, record["implementation"], record["shape"], record["product"]))
+    miss = MISSES.get((sweep, record["implementation"], record["shape"], record["product"]))
     if miss is None:
         assert ratio <= 1.10, f"{pick} runs {ratio:.2f}x the best"
     else:
