@@ -98,15 +98,17 @@ def triton_tiles(dtype, roles: Mapping[str, str], extents: Mapping[str, int | No
     # rows) or shared memory (a step over rows) leave beside the other roles' least.
     resourced = {'rows': held // least['columns'], 'columns': held // least['rows'],
                  'step': shared // ((least['rows'] + least['columns']) * size)}
-    spans = {role: _doubling(least[role], resourced[role] if extents.get(role) is None
-                             else max(called[role], _covering(extents[role])))
-             for role in least}
+    spans = {}
+    for role in least:
+        extent = extents.get(role)
+        spans[role] = _doubling(least[role], resourced[role] if extent is None
+                                else max(called[role], _covering(extent)))
     fields = {field: spans[role] for field, role in roles.items()}
     tiles = []
     for block_m in fields['block_m']:
         for block_n in fields['block_n']:
             for block_k in reversed(fields['block_k']):
-                of = dict(zip(('block_m', 'block_n', 'block_k'), (block_m, block_n, block_k), strict=True))
+                of: dict[str, int] = {'block_m': block_m, 'block_n': block_n, 'block_k': block_k}
                 rows, columns, step = (next(of[field] for field, role in roles.items() if role == wanted)
                                        for wanted in ('rows', 'columns', 'step'))
                 loaded = (rows + columns) * step * size

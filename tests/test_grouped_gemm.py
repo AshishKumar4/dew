@@ -315,7 +315,7 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
           tuning.seen() as launches):
         for product, shapes in products(65536, 2048, 1536, 128):
             jax.jit(product).trace(*shapes)
-        for (launch, ba), tile in zip(launches, launches.taken, strict=True):
+        for (launch, _), (tile, ba) in zip(launches, launches.taken, strict=True):
             if not isinstance(launch, grouped_matmul._Mosaic):
                 continue
             assert tile.family == family and tile in launch.fitting(ba, target)
@@ -346,7 +346,7 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
     with tuning.seen() as launches:
         assert_as_exact(through_mosaic, jax.jit(with_gradients(projection())), ragged_draw,
                         f"unseen {unseen}", seeds=SEEDS, truth_fn=with_gradients(projection(jnp.float64)))
-    mosaic = [(launch, ba, tile) for (launch, ba), tile in zip(launches, launches.taken, strict=True)
+    mosaic = [(launch, ba, tile) for (launch, _), (tile, ba) in zip(launches, launches.taken, strict=True)
               if isinstance(launch, grouped_matmul._Mosaic)]
     assert {type(launch).__name__ for launch, _, _ in mosaic} == launched
     with generation.assumed(target):
@@ -376,7 +376,7 @@ def test_a_gpu_no_one_measured_runs_the_triton_tiles_its_facts_fit_exactly(unsee
         assert_as_exact(jax.jit(through_triton), jax.jit(with_gradients(projection())), ragged_draw,
                         f"unseen {unseen} Triton", seeds=SEEDS,
                         truth_fn=with_gradients(projection(jnp.float64)))
-    triton = [(launch, ba, tile) for (launch, ba), tile in zip(launches, launches.taken, strict=True)
+    triton = [(launch, ba, tile) for (launch, _), (tile, ba) in zip(launches, launches.taken, strict=True)
               if isinstance(launch, grouped_matmul._Triton)]
     assert {type(launch).__name__ for launch, _, _ in triton} == {"Gmm", "Tgmm"}
     budget = generation.shared_budget(target)
