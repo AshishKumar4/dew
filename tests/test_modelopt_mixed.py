@@ -179,9 +179,12 @@ def test_a_modelopt_nvfp4_model_with_experts_is_read_by_its_stored_layers(tmp_pa
 def fp8(name: str, weight: np.ndarray, input_scale: float) -> dict[str, np.ndarray]:
     """`weight` as ModelOpt's FP8 exporter stores it: E4M3 codes under one float32 scale (amax/448),
     beside the static input multiplier it calibrated."""
+    import ml_dtypes
+
     stem = name.removesuffix('.weight')
     grid = {stem + '.weight_scale': np.asarray(np.abs(weight).max() / 448, np.float32),
-            stem + '.input_scale': np.asarray(input_scale, np.float32)}
+            stem + '.input_scale': np.asarray(input_scale, np.float32),
+            name: np.zeros(weight.shape, ml_dtypes.float8_e4m3fn)}
     quantization = {'quant_method': 'modelopt', 'quant_algo': 'FP8'}
     codec = codecs.source_quantization({'quantization_config': quantization}, grid=grid)
     assert codec is not None
