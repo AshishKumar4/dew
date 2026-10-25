@@ -228,7 +228,8 @@ def test_a_run_resumed_where_its_finite_stream_ran_out_ends_there_with_nothing_t
     def run(steps):
         trainer = Trainer(Pulled(), OptimConfig(optimizer="adam", learning_rate=0.1), key=0,
                           checkpoints=Checkpoints(str(tmp_path)))
-        return trainer.fit(compile(chain(x), read="memory"), steps=steps)
+        return trainer.fit(compile(Pipeline(Memory({"x": x})).repeat(1).batch(BATCH), read="memory"),
+                           steps=steps)
 
     first, again = run(10), run(12)
     assert 0 < int(first.step) == int(again.step) < 10
