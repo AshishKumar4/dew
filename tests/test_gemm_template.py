@@ -1123,6 +1123,36 @@ def test_a_tile_states_a_schedule_the_kernels_run():
                         out_dtype=jnp.float32, multiprocessors=2)
 
 
+def test_a_pin_names_only_a_config_the_launchs_kernel_takes():
+    """A pinned config is checked by the launch's legality as it traces: Mosaic's ring of one stage (its
+    walk keeps a step's products in flight while the next step loads, so it needs two slots) and Triton's
+    exact-sums kernel gradient over more rows a step than its sums stay exact for (`EXACT_STEP`, which its
+    fitting, not its resources, states) are refused; a legal pin of either runs."""
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    sizes = jnp.asarray([128, 128], jnp.int32)
+    x, w, dy = bf16((256, 128)), bf16((2, 128, 64)), bf16((256, 64))
+
+    def forward(x, w):
+        return template.gemm(x, w, sizes, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+
+    def gradient(x, dy):
+        return template.gemm_t(x, dy, sizes, out_dtype=jnp.float32, precision="highest",
+                               interpret_on_cpu=True)
+
+    calls = ((forward, (x, w), "mosaic_gpu", grouped_matmul.MosaicGmm, mosaic_gpu.Tiles(64, 64, 64, 1, 1),
+              mosaic_gpu.Tiles(64, 64, 64, 2, 1)),
+             (gradient, (x, dy), "triton", grouped_matmul.Tgmm, grouped_matmul.Tile(128, 128, 64, 4, 3),
+              grouped_matmul.Tile(64, 128, 64, 4, 3)))
+    for run, args, named, launch, refused, legal in calls:
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul=named):
+            with tuning.pinned({launch: refused}), pytest.raises(tuning.Unpinnable):
+                jax.jit(run).trace(*args)
+            with tuning.pinned({launch: legal}), tuning.seen() as launches:
+                jax.jit(run).trace(*args)
+        assert legal in {config for (op, _), (config, _) in zip(launches, launches.taken, strict=True)
+                         if isinstance(op, launch)}
+
+
 def test_a_launch_takes_no_pair():
     """The bundle's rings stream to one multiprocessor: no launch derives a pair, and a pair pinned on the
     forward is refused rather than launched."""
