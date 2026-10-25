@@ -2000,9 +2000,10 @@ def _effective_weights(directory: str, step: int | str | None, ema: bool | None,
 
 
 def _on_host(leaf) -> np.ndarray:
-    """`leaf` on the host, a floating one in fp32."""
+    """`leaf` on the host, a floating one in fp32, bf16 and the float8 types among them, which
+    NumPy's own type hierarchy does not count as floating."""
     value = np.asarray(leaf)
-    return value.astype(np.float32) if np.issubdtype(value.dtype, np.inexact) else value
+    return value.astype(np.float32) if jnp.issubdtype(value.dtype, jnp.inexact) else value
 
 
 def _taken(held: np.ndarray, leaf: np.ndarray, count: int, directory: str, first: str) -> np.ndarray:
@@ -2013,7 +2014,7 @@ def _taken(held: np.ndarray, leaf: np.ndarray, count: int, directory: str, first
     `held + (leaf - held) / count` where both share a sign, whose difference cannot overflow, and
     `held * (1 - 1/count) + leaf / count` where they differ, whose terms cannot. An integer or
     boolean leaf must equal `held`."""
-    if not np.issubdtype(held.dtype, np.inexact):
+    if not jnp.issubdtype(held.dtype, jnp.inexact):
         if not np.array_equal(held, leaf):
             raise ValueError(f"an integer or boolean variable of the run in {directory} differs from "
                              f"{first}'s, which no mean of their weights reconciles")
