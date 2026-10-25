@@ -3331,7 +3331,8 @@ product's distance from float64 at the highest precision (3011 times at the defa
 split. The product now multiplies the codes widened to bf16 and held apart from the dot, which XLA
 runs as a bf16 GEMM with exact products and fp32 sums (0.53 times that distance), in 1.7 times the
 FP8 GEMM's time, so no site measures faster in FP8 until a kernel whose FP8 sum keeps fp32's
-accuracy returns (ledger 1625). Which sites run FP8 is that measurement on the run's own GPU and token count
+accuracy returns (ledger 1625). Until then a frozen FP8 base saves neither memory nor time: its codes
+take two bytes a parameter, as bf16's do, and multiply as bf16 values. Which sites run FP8 is that measurement on the run's own GPU and token count
 (`measured_fp8_sites`), recorded with the generation it was taken on; another generation is
 refused rather than reusing it. The function changes by E4M3's rounding of both operands.
 
