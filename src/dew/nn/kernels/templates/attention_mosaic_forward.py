@@ -206,21 +206,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     q_pos, columns = first + family.iota(shape, 0), family.iota(shape, 1)
     # The output's sums are as wide as its stage, the values' width whatever the query's.
     value_width = out_smem.shape[-1]
-    # The weighted values' running sums live in the family's accumulator (`Family.walk`), from the initial
-    # state's where there is one; the walk carries the maxima and denominators, the state's `acc` an empty
-    # place the algebra passes through (`algebra.Keys.accumulate`), a constant no loop may carry.
-    state_rows = (row, head, pl.ds(first, tiles.block_q))
-    live = None if guard is None else family.rows_of(guard.live.at[state_rows]) > 0
-    if hooked.initial is not None:
-        m0, total0, acc0 = hooked.initial
-        start = algebra.resumed(spec, family.rows_of(m0.at[state_rows]),
-                                family.rows_of(total0.at[state_rows]), family.tile_of(acc0.at[state_rows]),
-                                live=live)
-    else:
-        # `algebra.started`'s empty state, in the family's layouts.
-        start = algebra.Partial(family.zeros((tiles.block_q, value_width)),
-                                family.full((tiles.block_q,), -jnp.inf), family.zeros((tiles.block_q,)))
-        start = start if live is None else algebra.headroomed(start, live)
+    start = _started(spec, family, hooked, guard, (row, head, pl.ds(first, tiles.block_q)),
+                     (tiles.block_q, value_width))
     pl.when(consumer == 1)(turn)
     # FlashAttention-3's order where the family's products run on beside the role's work (`_owed`): a
     # step's two products issued in one turn on the tensor cores, which a passed step takes too.
@@ -310,6 +297,23 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         rows = (maximum, denominator, own, others_total, family.zeros((tiles.block_q,)))
         family.stored(tuple(family.as_row(part) for part in rows), residuals.rows, smem=row_smem)
         family.stored((family.as_row(key),), (residuals.keys,), smem=residuals.keys_smem)
+
+
+def _started(spec: algebra.Forward, family: mosaic.Family, hooked: _Hooked, guard: _Guard | None,
+             state_rows: tuple, shape: tuple[int, int]) -> algebra.Partial:
+    """A consumer's walk's start for its query rows `state_rows` of the state's arrays, its sums of `shape`:
+    the initial state's where there is one, else `algebra.started`'s empty state, in the family's layouts;
+    on the guarded walk its rows `live` shifting under headroom. The weighted values' running sums then live
+    in the family's accumulator (`Family.walk`), the walk carrying the maxima and denominators, the state's
+    `acc` an empty place the algebra passes through (`algebra.Keys.accumulate`)."""
+    live = None if guard is None else family.rows_of(guard.live.at[state_rows]) > 0
+    if hooked.initial is not None:
+        m0, total0, acc0 = hooked.initial
+        return algebra.resumed(spec, family.rows_of(m0.at[state_rows]), family.rows_of(total0.at[state_rows]),
+                               family.tile_of(acc0.at[state_rows]), live=live)
+    rows = (shape[0],)
+    start = algebra.Partial(family.zeros(shape), family.full(rows, -jnp.inf), family.zeros(rows))
+    return start if live is None else algebra.headroomed(start, live)
 
 
 def _owed(spec: algebra.Forward, family: mosaic.Family, start: algebra.Partial, scored, turn, reach, streams,
