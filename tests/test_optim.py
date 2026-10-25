@@ -38,6 +38,7 @@ from dew.optim import (
     ScheduleBase,
     learning_rate,
     muon_weight_dimension_numbers,
+    rates_of,
     scale_by_qk_clip,
     stepped,
     weight_decay_mask,
@@ -1083,6 +1084,9 @@ def optax_schedule(name: str, multiplier: float, steps: int = 10) -> optax.Sched
 RATE_SEEDS = 8
 """Check 1's declared seeds for a scheduled rate against optax's float32 schedule (`seeds_for`)."""
 
+RATE_MULTIPLIERS = 64
+"""The multipliers a draw scales a schedule's rates by, one rate of each step's leaf apiece."""
+
 
 @pytest.mark.parametrize("name", sorted(SCHEDULES))
 def test_a_scheduled_rate_is_as_near_float64_as_optaxs(name):
@@ -1091,31 +1095,41 @@ def test_a_scheduled_rate_is_as_near_float64_as_optaxs(name):
     (check 1, `optax_schedule`), the truth that schedule in float64: Dew holds the rate fields as
     operands, each rounded once as optax's are, where a scale times the schedule's ratios to it
     rounded three times and overflowed where two rates are far apart (ledger 1660). Each step's rate
-    is a leaf of its own, and each draw scales the rates by its own multiplier."""
-    params = {"w": jnp.ones(3)}
+    is a leaf, over a draw's multipliers: every multiplier's state holds its group's fields
+    (`rates_of`, as a `ParamGroup`'s multiplier sets them) and steps through the one compiled update,
+    which the fields being operands makes possible."""
+    schedule, params = SCHEDULES[name], {"w": jnp.ones(3)}
+    solver = OptimConfig(optimizer="adam", learning_rate=schedule, clip_grads=0).build(10)
+    initial = solver.init(params)
+    update = jax.jit(jax.vmap(solver.update, in_axes=(None, 0, None)))
 
     def draw(seed):
-        return (np.float64(np.exp(np.random.default_rng(seed).uniform(-3.0, 3.0))),)
+        return (np.exp(np.random.default_rng(seed).uniform(-3.0, 3.0, RATE_MULTIPLIERS)),)
 
-    def dew(multiplier):
-        group = ParamGroup("all", ("*",), learning_rate_multiplier=float(multiplier))
-        config = OptimConfig(optimizer="adam", learning_rate=SCHEDULES[name], clip_grads=0,
-                             param_groups=(group,))
-        solver = config.build(10)
-        state, rates = solver.init(params), {}
+    def dew(multipliers):
+        fields = [rates_of(schedule, float(multiplier)) for multiplier in multipliers]
+
+        def at(path, leaf):
+            if len(path) >= 2 and path[-2] == jax.tree_util.GetAttrKey("rates"):
+                return jnp.asarray([held[path[-1].key] for held in fields], leaf.dtype)
+            return jnp.broadcast_to(leaf, (len(fields), *jnp.shape(leaf)))
+
+        state, rates = jax.tree_util.tree_map_with_path(at, initial), {}
         for step in range(10):
-            _, state = solver.update({"w": jnp.ones(3)}, state, params)
+            _, state = update({"w": jnp.ones(3)}, state, params)
             rates[f"step {step}"] = jnp.asarray(learning_rate(state))
         return rates
 
-    def optax_rates(multiplier):
-        values = optax_schedule(name, float(multiplier))
-        return {f"step {step}": jnp.asarray(values(step), jnp.float32) for step in range(10)}
+    def optax_rates(multipliers):
+        built = [optax_schedule(name, float(multiplier)) for multiplier in multipliers]
+        return {f"step {step}": jnp.stack([jnp.asarray(values(step), jnp.float32) for values in built])
+                for step in range(10)}
 
-    def truth(multiplier):
-        values = optax_schedule(name, float(multiplier))
+    def truth(multipliers):
+        built = [optax_schedule(name, float(multiplier)) for multiplier in multipliers]
         # optax counts in int32, which divides to float32: a float64 count keeps the schedule float64.
-        return {f"step {step}": values(jnp.asarray(step, jnp.float64)) for step in range(10)}
+        return {f"step {step}": jnp.stack([values(jnp.asarray(step, jnp.float64)) for values in built])
+                for step in range(10)}
 
     assert_as_exact(dew, optax_rates, draw, f"the {name} rate", seeds=RATE_SEEDS, truth_fn=truth)
 
