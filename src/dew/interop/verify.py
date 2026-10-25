@@ -147,7 +147,7 @@ class _Sizes:
 
     config: Mapping[str, object]
     keys: Mapping[str, str]
-    defaults: object | None
+    defaults: PretrainedConfig | None
 
     @classmethod
     def of(cls, hf_config: Mapping[str, object]) -> _Sizes:
@@ -166,16 +166,21 @@ class _Sizes:
         """The config's own key for the standard size `name`."""
         return self.keys.get(name, name)
 
-    def stated(self, name: str, *default: object) -> object:
-        """The size `name` as the config states it, else its class's default, else `default`, else a
-        KeyError naming it."""
+    def given(self, name: str) -> int | None:
+        """The size `name` as the config states it, else its class's default, else None; a stated
+        size that is no whole number is a ValueError."""
         if self.key(name) in self.config:
-            return self.config[self.key(name)]
+            return records.integer(self.config[self.key(name)], self.key(name))
         if getattr(self.defaults, name, None) is not None:
-            return getattr(self.defaults, name)
-        if default:
-            return default[0]
-        raise KeyError(name)
+            return records.integer(getattr(self.defaults, name), name)
+        return None
+
+    def stated(self, name: str) -> int:
+        """The size `name` as `given` reads it, a KeyError naming it where neither gives it."""
+        size = self.given(name)
+        if size is None:
+            raise KeyError(name)
+        return size
 
 
 def shrink(hf_config: Mapping[str, object]) -> Mapping[str, object]:
@@ -191,11 +196,10 @@ def shrink(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     a size the config leaves unstated at its class's default; a size neither states is a KeyError.
     """
     sizes = _Sizes.of(hf_config)
-    key, stated = sizes.key, sizes.stated
-    heads = records.integer(stated('num_attention_heads'), 'num_attention_heads')
-    kv_heads = records.integer(stated('num_key_value_heads', None) or heads, 'num_key_value_heads')
-    hidden = records.integer(stated('hidden_size'), 'hidden_size')
-    head_dim = records.integer(stated('head_dim', None) or hidden // heads, 'head_dim')
+    key = sizes.key
+    heads, hidden = sizes.stated('num_attention_heads'), sizes.stated('hidden_size')
+    kv_heads = sizes.given('num_key_value_heads') or heads
+    head_dim = sizes.given('head_dim') or hidden // heads
     small_kv = min(kv_heads, 2)
     small_heads = small_kv * (heads // kv_heads)
     small_hidden = small_heads * _HEAD_DIM * (1 if hidden == heads * head_dim else 2)
@@ -438,7 +442,7 @@ def verify_mapping(hf_config: Mapping[str, object]) -> VerifiedMapping | Unmappe
     with _quiet():
         try:
             fields = shrink(hf_config)
-            layers = records.integer(_Sizes.of(hf_config).stated('num_hidden_layers'), 'num_hidden_layers')
+            layers = _Sizes.of(hf_config).stated('num_hidden_layers')
         except (KeyError, ValueError) as error:
             # A reader may take a config by its own names or its defaults (OPT's
             # defaults every size); the probe shrinks it by the standard names.
