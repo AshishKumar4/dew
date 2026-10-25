@@ -55,7 +55,7 @@ import os
 import threading
 import time
 import types
-from collections.abc import Callable, Hashable, Iterator, Mapping
+from collections.abc import Callable, Collection, Hashable, Iterator, Mapping
 from typing import ClassVar
 
 import filelock
@@ -429,11 +429,15 @@ class KernelOp(tokamax.Op):
         pins = dict(cache.KERNEL_PINS.value)
         if type(self) in pins:
             pin = pins[type(self)]
-            if pin not in keyed.autotuning_configs:
+            if pin not in self.pinnable(keyed):
                 raise Unpinnable(type(self).__name__, pin, self.unpinnable(keyed, pin))
             return pin
         pick = _pick(keyed) or self._nearest(keyed)
         return ba.heuristics_config if pick is None else pick.fastest_config
+
+    def pinnable(self, ba: tokamax.BoundArguments) -> Collection[Hashable]:
+        """The configs a pin may name at `ba`'s key: those a measurement times (`autotuning_configs`)."""
+        return ba.autotuning_configs
 
     def unpinnable(self, ba: tokamax.BoundArguments, config: Hashable) -> str:
         """Why the legal configs of `ba`'s launch do not hold `config`."""

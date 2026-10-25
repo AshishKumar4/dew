@@ -258,6 +258,23 @@ smaller block of an sm86 than an A100's, and a Hopper-class one with fewer multi
 block and another L2 bandwidth than an H100's."""
 
 
+def test_a_program_traced_for_one_gpu_traces_again_for_another_of_its_family():
+    """Two GPUs of one family whose facts differ key a jitted program's traces apart
+    (`generation.assumed`), so neither's launches are sized and picked by the other's facts."""
+    traced = []
+
+    @jax.jit
+    def program(x):
+        traced.append(generation.gpu_target())
+        return x + 1
+
+    targets = (UNSEEN["hopper-class"], generation.TARGETS["sm90"])
+    for target in targets:
+        with generation.assumed(target):
+            program(jnp.zeros(2))
+    assert traced == list(targets)
+
+
 @INTERPRETS
 @pytest.mark.parametrize("unseen", UNSEEN)
 def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
@@ -321,7 +338,7 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
     mosaic = [(launch, ba) for launch, ba in launches if isinstance(launch, grouped_matmul._Mosaic)]
     assert {type(launch).__name__ for launch, _ in mosaic} == launched
     with generation.assumed(target):
-        assert all(ba.heuristics_config == launch.estimate(ba, target)[1] for launch, ba in mosaic)
+        assert all(launch.chosen(ba) == launch.estimate(ba, target)[1] for launch, ba in mosaic)
 
 
 @INTERPRETS
@@ -353,9 +370,9 @@ def test_a_gpu_no_one_measured_runs_the_triton_tiles_its_facts_fit_exactly(unsee
     with generation.assumed(target):
         for launch, ba in triton:
             fits = launch.fitting(ba, target)
-            assert set(fits) <= set(grouped_matmul.triton_tiles(ba.arguments["tokens"].dtype))
+            assert set(fits) <= set(launch.space(ba))
             assert all(launch.staged_bytes(ba, tile, target) <= budget for tile in fits)
-            assert ba.heuristics_config == launch.estimate(ba, target)[1]
+            assert launch.chosen(ba) == launch.estimate(ba, target)[1]
 
 
 @INTERPRETS

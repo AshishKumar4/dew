@@ -100,41 +100,67 @@ class Tiles:
             raise ValueError(f"{self}: two warpgroups stream at least two stages")
 
 
-STAGES = (6, 5, 4, 3, 2)
-"""The stage counts a generated tile takes, deeper first, so where the cost model ties the deeper pipeline
-wins (more of a load's latency hidden than the model's mean charges); each is kept only where its block
-fits (`base.Template.fitting`). Past six no sweep or estimate found a stage worth its shared memory."""
+CALIBRATED_EXTENT = 256
+"""The longest tile axis the sweeps measured (GMMCOOP-h100, AMPERE3): the cost model is calibrated over
+tiles no longer (`grouped_matmul._Mosaic.calibrated`)."""
 
-BANDS = (8, 4, 2, 1)
-"""The column tiles a band of the planar snake takes (`Tiles.grid_block_n`), widest first: wider bands
-share a row block's loads across more column tiles in the L2 while a band is in flight."""
+CALIBRATED_STAGES = 6
+"""The deepest pipeline the sweeps measured: past six no sweep or estimate found a stage worth its shared
+memory."""
+
+CALIBRATED_BAND = 8
+"""The widest band of the planar snake the sweeps measured (`Tiles.grid_block_n`)."""
+
+
+def _holding(least: int, holds) -> list[int]:
+    """The multiples of `least` that `holds` (true of the smaller where of the larger), largest first."""
+    held = []
+    while holds(least * (len(held) + 1)):
+        held.append(least * (len(held) + 1))
+    return held[::-1]
 
 
 def generated(families, *, depth: int | None, width: int, dtype) -> tuple[Tiles, ...]:
     """Every tile a GEMM mainloop may take on each of `families`, from the family's facts and the call's
-    extents alone (no table of tiles): each count of consumer roles it has, rows in multiples of its
-    roles' (`Family.role_rows`), columns in multiples of its column unit dividing the call's `width`, a
-    step of each of its depths dividing `depth` (any, where None: steps over rows padded to whole steps),
-    each axis at most a block's extent; a tile whose
-    consumer threads would hold more registers than the family gives them (`mosaic.tile_registers`,
-    `Family.registers`) is none; each at every count of `STAGES` and of `BANDS`. Larger tiles first, which
-    read each operand fewest times, so the cost model's ties go to them."""
+    extents alone (no table of tiles): each count of consumer roles it has; columns in multiples of its
+    column unit dividing the call's `width`, at most its widest product (`Family.widest_product`); a step
+    of each of its depths dividing `depth` (any, where None: steps over rows padded to whole steps); rows
+    in multiples of its roles' (`Family.role_rows`) while its consumer threads hold the tile in their
+    registers (`mosaic.tile_registers`, `Family.registers`); each count of stages from two (a step loading
+    while one computes) to as many as a block of the family holds (`Family.most_shared`), deeper first;
+    and each band of column tiles (`Tiles.grid_block_n`) doubling from one to the call's column tiles,
+    wider first, which share a row block's loads across more column tiles in the L2 while a band is in
+    flight. Larger tiles first, which read each operand fewest times, and the deeper pipeline (more of a
+    load's latency hidden than the model's mean charges), so the cost model's ties go to them. A target's
+    launch keeps those that fit it (`base.Template.fitting`), and ranks those its cost model is
+    calibrated over (`base.Template.searched`)."""
+    size = jnp.dtype(dtype).itemsize
     tiles = []
     for family in families:
+        unit, widest = family.column_unit(dtype), min(width, family.widest_product or width)
+        steps = [step for step in family.depths(dtype) if depth is None or depth % step == 0]
         for consumers in range(1, family.consumers + 1):
-            unit = family.role_rows * consumers
-            for block_m in range(family.block_extent // unit * unit, 0, -unit):
-                columns = family.column_unit(dtype)
-                for block_n in range(family.block_extent // columns * columns, 0, -columns):
-                    for block_k in family.depths(dtype):
-                        legal = (width % block_n == 0 and (depth is None or depth % block_k == 0)
-                                 and mosaic.tile_registers(family, consumers, (block_m, block_n, block_k),
-                                                           dtype) <= family.registers(consumers))
-                        if legal:
-                            tiles += [Tiles(block_m, block_n, block_k, stages, band, warpgroups=consumers,
-                                            family=family.name)
-                                      for stages in STAGES for band in BANDS]
+            def holds(block, consumers=consumers, family=family):
+                return mosaic.tile_registers(family, consumers, block, dtype) <= family.registers(consumers)
+
+            shapes = {(block_m, block_n, block_k)
+                      for block_n in range(unit, widest + 1, unit) if width % block_n == 0
+                      for block_k in steps
+                      for block_m in _holding(family.role_rows * consumers,
+                                              lambda rows, n=block_n, k=block_k: holds((rows, n, k)))}
+            for block_m, block_n, block_k in sorted(shapes, key=lambda shape: (-shape[0], -shape[1],
+                                                                               steps.index(shape[2]))):
+                deepest = family.most_shared // ((block_m + block_n) * block_k * size)
+                bands = 1 << (-(-width // block_n) - 1).bit_length()
+                tiles += [Tiles(block_m, block_n, block_k, stages, band, warpgroups=consumers,
+                                family=family.name)
+                          for stages in range(deepest, 1, -1) for band in _halvings(bands)]
     return tuple(tiles)
+
+
+def _halvings(most: int) -> tuple[int, ...]:
+    """`most`, a power of two, and its halvings down to one."""
+    return tuple(most >> power for power in range(most.bit_length()))
 
 
 @dataclasses.dataclass(frozen=True)
