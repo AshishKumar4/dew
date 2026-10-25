@@ -2349,13 +2349,16 @@ class Imaged:
         return {"image": np.resize(tokens % 256, (RES, RES, 3)).astype(np.uint8)}
 
 
-def matrix_prefix(rejecting: bool):
-    """The data matrix's records, of one to eight tokens each holding its own id, and the filter that
+def matrix_prefix(rejecting: bool, *, lengths: bool = False):
+    """The data matrix's records, of one to eight tokens each holding its own id, with each one's length
+    stated (`_dew_length`, which a published packing plan reads) where `lengths`, and the filter that
     rejects every third where the cell has one."""
     from dew.data import Memory
     from dew.data.pipeline import Pipeline
 
-    records = [{"text": np.full(1 + index % 8, index, np.int32)} for index in range(MATRIX_RECORDS)]
+    records = [{"text": np.full(1 + index % 8, index, np.int32),
+                **({"_dew_length": np.int32(1 + index % 8)} if lengths else {})}
+               for index in range(MATRIX_RECORDS)]
     pipeline = Pipeline(Memory(records, shard_rows=16))
     if rejecting:
         pipeline = pipeline.filter(lambda row: int(row["text"][0]) % 3 != 0, identity="thirds@1")
@@ -2369,7 +2372,7 @@ def published_matrix(rejecting: bool, packed: bool, cache_dir: Path):
     from dew.data.cache import Cache
     from dew.data.compile import publish
 
-    prefix = matrix_prefix(rejecting)
+    prefix = matrix_prefix(rejecting, lengths=True)
     return publish(prefix.pack(8, bins=2) if packed else prefix, Cache(str(cache_dir)), read="indexed")
 
 
@@ -2381,7 +2384,7 @@ def matrix_data(read: str, cached: str, rejecting: bool, packed: bool, cache_dir
     from dew.data.cache import Cache
     from dew.data.compile import compile
 
-    pipeline = matrix_prefix(rejecting)
+    pipeline = matrix_prefix(rejecting, lengths=cached == "published")
     if cached == "cache":
         pipeline = pipeline.cache(Cache(str(cache_dir)))
     elif cached == "published":
@@ -2400,18 +2403,12 @@ def mode_matrix(args) -> dict:
     """Train one cell of the data matrix (`--cell read,cache,rejecting,packed`)
     for `--steps`, from where the run directory's checkpoint left it. `batches`
     is a digest of each batch this process read, in the order it read them."""
-    import jax
-    from jax.experimental import multihost_utils
-
     from dew.data.dataset import tapped
 
     read, cached, rejecting, packed = args.cell.split(",")
-    cache_dir = Path(args.run_dir).parent / "cache"
-    if cached == "published":
-        # Published once, before any process reads it, as a preparation job would.
-        if jax.process_index() == 0:
-            published_matrix(rejecting == "rejecting", packed == "packed", cache_dir)
-        multihost_utils.sync_global_devices("matrix generation published")
+    # A published cell reads the generation its test published once (`--prepared`), as every run of a
+    # prepared dataset does; a cache the pool fills lives beside its run.
+    cache_dir = Path(args.prepared) if cached == "published" else Path(args.run_dir).parent / "cache"
     data = matrix_data(read, cached, rejecting == "rejecting", packed == "packed", cache_dir)
     trainer = build_trainer(args.name, args.run_dir, args.fsdp_size)
     restored_step, _ = restored_state(trainer)
@@ -2481,7 +2478,9 @@ def parse_args(argv=None):
                         help="read the training records through a compiled global order, whose "
                              "saved position is a global record count")
     parser.add_argument("--profile-dir", help="directory the scheduled profile window writes")
-    parser.add_argument("--cell", help="read,cache|nocache,rejecting|all,packed|rows for the matrix mode")
+    parser.add_argument("--cell", help="read,cache|nocache|published,rejecting|all,packed|rows for the "
+                                       "matrix mode")
+    parser.add_argument("--prepared", help="the cache holding a published matrix cell's generation")
     return parser.parse_args(argv)
 
 def main(argv=None) -> None:

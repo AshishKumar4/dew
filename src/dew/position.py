@@ -32,6 +32,16 @@ source cares to report, and one of those must not be mistaken for dew's.
 """
 
 
+PER_SHARE = ("a per-share read resumes only on the shares, workers and cycle length that saved it, so "
+             "resume this checkpoint there. A new run resumes on any partition when it reads a global "
+             "order: publish its filtered or packed prefix (with a terminal pack's plan) once, by "
+             "`dew data publish` or `publish(chain, Cache(url))`, and read it by index with "
+             "`.cache(generation)`; provisioning a source's index (`dew data provision`) makes a read "
+             "global only where no step after it filters or packs online")
+"""What a refusal of a per-share position on another topology tells its reader (docs/design/data.md §10,
+the provisioned lowering)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Global:
     """`records` records of `order` have been read, by every process together.
