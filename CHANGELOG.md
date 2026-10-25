@@ -11,6 +11,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   autoencoder's comes from its `LatentNormalization` (`affine`), a tuned REPA-E run's from its running
   statistics. `LatentNormalization.normalized`/`restored` and `TunedAutoEncoder.running_normalization` are
   gone: `latent_affine(...).normalized`/`restored` replace them.
+- Two optimizers from Nested Learning (arXiv 2512.24695) as Optax transforms: `dew.optim.scale_by_m3`, M3's
+  Muon over Adam's second moment with a slow momentum gathered once per chunk, and
+  `dew.optim.delta_gradient_descent`, the step to eq. 56's minimizer given each kernel's input. M3
+  orthogonalizes through `dew.optim.newton_schulz`, Muon's quintic iteration on each matrix alone.
 - A filtered or packed read resumes on any number of readers once it is prepared: publish its rows (and
   a terminal pack's plan) as a generation with `dew data publish` and read it by index, and a new run
   lowers to the global order. A per-share read refused on another topology now says so.
