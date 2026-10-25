@@ -51,7 +51,7 @@ from .precision import at_least_fp32, l2norm
 CARRY = "memory_carry"
 """The name of the state a chunk hands the next (`checkpoint_name`), for a remat policy to save."""
 
-STATE, MOMENTUM, START, COUNT = "memory", "momentum", "memory_start", "count"
+STATE, MOMENTUM, START, COUNT = "memory_state", "memory_momentum", "memory_start", "memory_count"
 """The decode cache's variables: the network's parameters now, the momentum, the parameters at the
 chunk's start, and each row's real tokens seen, rows first."""
 
