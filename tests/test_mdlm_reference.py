@@ -87,7 +87,7 @@ def test_the_nelbo_and_its_gradient_are_mdlms():
                                      REFERENCE["grad/hidden_f64"], "gradient in the hidden states")
     assert_as_exact_as_the_reference(gradient["params"]["head"], REFERENCE["grad/head"],
                                      REFERENCE["grad/head_f64"], "gradient in the head")
-    np.testing.assert_allclose(value, REFERENCE["loss_f64"], rtol=1e-6)
+    assert_as_exact_as_the_reference(value, REFERENCE["loss"], REFERENCE["loss_f64"], "NELBO")
 
     tokens, corrupted = REFERENCE["tokens"], REFERENCE["corrupted"]
     logits = REFERENCE["hidden"].astype(np.float64) @ REFERENCE["head"].astype(np.float64)
@@ -95,8 +95,11 @@ def test_the_nelbo_and_its_gradient_are_mdlms():
     masked = corrupted == MASK
     assert 0 < masked.sum() < masked.size
     right = logits.argmax(-1)[masked] == tokens[masked]
-    np.testing.assert_allclose(aux.metrics["masked_accuracy"], right.mean())
-    np.testing.assert_allclose(aux.metrics["masked_fraction"], masked.mean())
+    # Each report is a count over a count, one float32 division, so it is that division's own value.
+    np.testing.assert_array_equal(aux.metrics["masked_accuracy"],
+                                  np.float32(right.sum()) / np.float32(right.size))
+    np.testing.assert_array_equal(aux.metrics["masked_fraction"],
+                                  np.float32(masked.sum()) / np.float32(masked.size))
 
 
 def test_the_reverse_step_draws_from_mdlms_categorical():

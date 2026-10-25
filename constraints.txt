@@ -32,13 +32,16 @@
 # default); and Mosaic GPU's layout inference solving unrelated unknowns apart,
 # which sm80's mma.sync GEMM tiles need; and a platform-dependent conditional
 # that keeps one branch lowered inline, so a collective in it is no runtime
-# conditional, on which XLA:CPU's devices diverged (ledger 1545). Every CI and
-# development install takes this one build.
+# conditional, on which XLA:CPU's devices diverged (ledger 1545); and a block's
+# Mosaic GPU warpgroups each taking their own share of the reduction scratch;
+# and linear_call lowered where a trace requires low primitives, which the TPU
+# GEMM launches' gradients need on 0.12. Every CI and development install takes
+# this one build.
 # Return to a release once one ships the fixes.
 # BEGIN package index (site/scripts/gen_install.py)
 --extra-index-url https://pypi.dewml.dev/simple
 # END package index
-jax==0.12.0.1.post22
+jax==0.12.0.1.post23
 
 # The CA bundle requests, httpx and the Hub verify TLS with: 2026.10.19 dropped emSign ECC Root CA - G3,
 # whose intermediates' private keys were compromised in October 2026 (tests/test_trust_store.py).
