@@ -131,9 +131,12 @@ def references(directory: Path, out: Path) -> None:
     agent = agent_module.Agent(str(directory), device="cpu")
     tokenizer, config = agent.tok, agent.cfg
     model = agent.model.float().eval()
-    # Its float64 twin (`float64_twin`), the agent's model built again inside the widening, so its
-    # inverse frequencies are float64's, the float32 model's weights in it.
-    exact = float64_twin(model, lambda: agent_module.Agent(str(directory), device="cpu").model)
+    # Its float64 twin (`float64_twin`), the decision model built again inside the widening by Laya's
+    # own builder, uninitialised for a checkpoint to fill (`common.build_model`), so its inverse
+    # frequencies are float64's, the float32 model's weights in it.
+    encoder = directory / "encoder"
+    exact = float64_twin(model, lambda: common.build_model(
+        config, encoder_dir=str(encoder) if encoder.exists() else None, pretrained=False))
     layouts, logits = {}, {}
     for parallel in (False, True):
         name = "parallel" if parallel else "sequential"
