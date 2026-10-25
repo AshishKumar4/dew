@@ -455,7 +455,8 @@ def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[tup
     zero = ~sized & ~(mine <= ROW_FACTOR * theirs)
     if zero.any():
         at = int(np.flatnonzero(zero)[0])
-        over.append(("zero rows", float(mine[at] / theirs[at]) if theirs[at] else math.inf,
+        # The measure is the worst of them, the first the example.
+        over.append(("zero rows", _worst_ratio(mine[zero], theirs[zero]),
                      f"{int(zero.sum())} rows of float64 zero are further from it than the reference's own, "
                      f"row {at} by {mine[at]:.3e} against {theirs[at]:.3e}"))
     return over
@@ -466,6 +467,10 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms
     its rows within ROW_FACTOR times the reference's (`rows_over`), each
     sized by its float64 `terms` where they are given (`float64_terms`)."""
     mine, theirs = distance(dew, truth), distance(reference, truth)
+    if not (math.isfinite(mine) and math.isfinite(theirs)):
+        raise GateFailure([Finding(label, "not finite", 1, f"{label}: a value of dew, the reference or "
+                                   f"float64 is not finite (dew {mine:.3e} and the reference {theirs:.3e} "
+                                   f"from float64)")])
     if not theirs > 0:
         raise GateFailure([Finding(label, "exact reference", math.inf,
                                    f"{label}: the reference equals float64, so it measures nothing")])
@@ -476,7 +481,8 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms
     over = rows_over(dew, reference, truth, terms)
     if over:
         raise GateFailure([Finding(label, rule, measure, f"{label}: {message}")
-                           for rule, measure, message in over])
+                           for rule, measure, message in over],
+                          f"{label}: " + "; ".join(message for _, _, message in over))
 
 
 
@@ -531,13 +537,22 @@ of float64 zero further from it than the reference's, a value not finite, a refe
 where Dew is not, and a leaf its seeds leave undecided."""
 
 
-class GateFailure(AssertionError):
-    """A site the gate fails, its findings as data (`Finding`), its message theirs, one a line. A test's
-    report carries them as the JUnit property `gate_findings` (tests/conftest.py)."""
+def _worst_ratio(mine: np.ndarray, theirs: np.ndarray) -> float:
+    """The largest of Dew's errors over the reference's, infinite where the reference's is zero and
+    Dew's is not: a finding's measure over rows."""
+    with np.errstate(divide="ignore", invalid="ignore"):
+        ratios = np.where(theirs > 0, mine / np.where(theirs > 0, theirs, 1), np.where(mine > 0, np.inf, 0))
+    return float(np.max(ratios))
 
-    def __init__(self, findings):
+
+class GateFailure(AssertionError):
+    """A site the gate fails, its findings as data (`Finding`), its message theirs, one a line, unless a
+    rule words its findings together. A test's report carries them as the JUnit property
+    `gate_findings` (tests/conftest.py)."""
+
+    def __init__(self, findings, message: str | None = None):
         self.findings = tuple(findings)
-        super().__init__("\n".join(map(str, self.findings)))
+        super().__init__("\n".join(map(str, self.findings)) if message is None else message)
 
 
 class Inconclusive(GateFailure):
@@ -922,8 +937,10 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
                                 f"{factor * their_row:.3e} ({factor} times it)"))
         zero = pooled_zero_rows([seed[index] for seed in draws.zero_rows])
         if zero:
+            # The measure is the worst of them, the first the example.
             at, my_error, their_error = zero[0]
-            over.append(Finding(leaf, "zero rows", my_error / their_error if their_error else math.inf,
+            worst = _worst_ratio(np.asarray([row[1] for row in zero]), np.asarray([row[2] for row in zero]))
+            over.append(Finding(leaf, "zero rows", worst,
                                 f"{leaf}: {len(zero)} rows of float64 zero are further from it over "
                                 f"{count} seeds than ROW_FACTOR times the reference's own, row {at} by "
                                 f"{my_error:.3e} against {their_error:.3e} (`pooled_zero_rows`)"))
