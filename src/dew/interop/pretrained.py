@@ -1257,6 +1257,9 @@ def _wrapper_source(config: Mapping[str, object], record: decoder_parts.WrapperF
     model = _wrapper_model(config, record, language_model, dtype=dtype)
     variables = native_variables({**parts, "language_model": decoders.with_constants(
         parts["language_model"], record["text"], directory)})
+    # Every component the record builds holds every leaf it computes with: a tower, projector or
+    # prediction-depth tensor the checkpoint lacks is refused here, as a decoder's is.
+    decoder_parts.check_decoder_tree(variables, model)
     layouts, retained = _wrapper_layouts(tensors, record, variables, language, media)
     return _Built(model, variables, record, wrapper, layouts, retained)
 
