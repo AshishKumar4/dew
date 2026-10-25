@@ -106,6 +106,9 @@ def test_a_lora_run_over_a_decision_release_trains_its_factors_and_reloads(tmp_p
 
 
 QWEN = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
+TICKETS = Memory([{"text": text, "label": label} for text, label in
+                  [("charged twice", "billing"), ("site down", "technical"), ("pro price", "sales")] * 4]
+                 ).pipe(decisions, question="team").read("memory").batch(8).loading(Loading(workers=0))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -245,14 +248,32 @@ def test_a_checkpoint_loops_at_the_passes_and_over_the_block_asked():
 @pytest.mark.parametrize("fields,checkpoint,message", [
     ({"loop_backprop_steps": 1}, QWEN, "has no loop"),
     ({"loop_remat": True}, QWEN, "has no loop"),
-    ({"loop_backprop_steps": 1}, TINY, "Laya checkpoint"),
-    ({"loop_remat": True}, TINY, "Laya checkpoint"),
-    ({"remat": "full"}, TINY, "Laya checkpoint"),
+    ({"loop_backprop_steps": 1}, TINY, "has no loop"),
+    ({"loop_remat": True}, TINY, "has no loop"),
     ({"remat": "unknown"}, QWEN, "remat names one of"),
 ])
 def test_a_decision_run_refuses_memory_options_without_their_backbone(fields, checkpoint, message):
     with pytest.raises(ValueError):
-        DecisionRunConfig(pretrained=str(checkpoint), **fields).prepare()
+        DecisionRunConfig(pretrained=str(checkpoint), data=TICKETS, **fields).prepare()
+
+
+def test_a_decision_release_takes_its_backbones_layer_recomputation():
+    """`--remat` chooses a decision release's backbone layer policy as a fresh backbone's: the
+    prepared objective's backbone recomputes its layers under that policy, under the release's own
+    head and layout."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.decoder_block import remat_policy
+
+    default = Fitted(data=TICKETS)
+    objective, _ = dataclasses.replace(default, pretrained=str(TINY), remat="full",
+                                       trainer=dataclasses.replace(default.trainer, multi_host=False,
+                                                                   compilation_cache_dir=None)).prepare().train("x")
+    released = Decide.from_pretrained(TINY, attention_impl="xla")
+    backbone = objective.model.backbone
+    assert isinstance(backbone, CausalTransformer) and backbone.remat == remat_policy("full")
+    assert released.model.backbone.remat != backbone.remat
+    assert type(objective.model.head) is type(released.model.head)
+    assert type(objective.layout) is type(released.layout)
 
 
 class Started(DecisionRunConfig):
