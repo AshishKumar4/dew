@@ -641,7 +641,7 @@ def test_a_stream_whose_workers_are_slow_to_stop_closes_within_grains_bound():
     close over 8 s: slow, but bounded by grain itself, so the close must not
     call it a hang (a TimeoutError). sft_gemma4's four workers took 5.1 to
     7.4 s to stop, past a budget of 2 s and 1 s a worker."""
-    from dew.distributed.placement import DevicePrefetchIterator
+    from dew.distributed.batches import DevicePrefetchIterator
     from dew.training import MeshSpec
 
     loading = Loading(workers=4, threads=1, read_buffer=1, worker_buffer=1)

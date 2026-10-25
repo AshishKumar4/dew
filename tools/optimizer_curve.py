@@ -36,7 +36,7 @@ from dew.data import Loading, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.sources.tokens import TokenFiles
-from dew.distributed.placement import DevicePrefetchIterator
+from dew.distributed.batches import DevicePrefetchIterator
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import MeshSpec, Trainer

@@ -63,7 +63,8 @@ def test_shard_batch_preserves_resident_nested_inputs_without_host_transfer():
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
 
-    from dew.distributed.placement import MeshSpec, shard_batch
+    from dew.distributed.batches import shard_batch
+    from dew.distributed.placement import MeshSpec
     from dew.mesh import batch_axes
     from dew.nn.inputs import ModelInputs
 

@@ -24,7 +24,7 @@ from token_support import repeated_token_batch, write_token_corpus
 
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
-from dew.distributed.placement import shard_batch
+from dew.distributed.batches import shard_batch
 from dew.mesh import mesh_axes
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.blocks import Upsample

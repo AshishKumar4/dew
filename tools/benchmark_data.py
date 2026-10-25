@@ -528,7 +528,7 @@ def training_measure(factory, objective, config: Worker) -> dict:
     import jax
     import optax
 
-    from dew.distributed.placement import DevicePrefetchIterator
+    from dew.distributed.batches import DevicePrefetchIterator
     from dew.telemetry.instrumentation import model_flops_utilization
     from dew.telemetry.profile import capture_options
     from dew.training import Trainer

@@ -29,7 +29,8 @@ from dew.artifacts import Artifact, Artifacts
 from dew.batch import VALID_ROWS, Batch, Variables
 from dew.data.dataset import Closeable, DataPartition, Reader, rows_of, take_rows
 from dew.data.pipeline import Dataset
-from dew.distributed.placement import MeshSpec, shard_batch, split_fields, with_host
+from dew.distributed.batches import shard_batch, split_fields, with_host
+from dew.distributed.placement import MeshSpec
 from dew.objectives.base import Effects, Loss, Metric, Objective, Step, TrainingScalar, recorded_name
 
 

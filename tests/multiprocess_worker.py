@@ -302,7 +302,8 @@ class YearAhead(datetime):
 def mode_topology(args) -> dict:
     import jax
 
-    from dew.distributed.placement import MeshSpec, shard_batch
+    from dew.distributed.batches import shard_batch
+    from dew.distributed.placement import MeshSpec
     from dew.training import runtime
 
     if args.process_id > 0:
@@ -480,7 +481,7 @@ def mode_reads(args) -> dict:
     import jax
     import jax.numpy as jnp
 
-    from dew.distributed.placement import batch_signature, shard_batch
+    from dew.distributed.batches import batch_signature, shard_batch
     from dew.training import MeshSpec
     from dew.training.distributed import step_reads
 
@@ -563,7 +564,7 @@ def mode_steps(args) -> dict:
     the losses it computed; fit reports them through the tracker on process 0
     alone.
     """
-    from dew.distributed.placement import shard_batch
+    from dew.distributed.batches import shard_batch
 
     trainer = build_trainer(args.name, args.run_dir, args.fsdp_size)
     checkpoints = trainer.checkpoints
@@ -988,7 +989,7 @@ def pipeline_trainer(stage: int, microbatches, fsdp: int):
 def pipeline_losses(trainer, rows, steps: int):
     """`steps` steps of the compiled step over this process's `rows` of the
     token batch, with the losses and the final parameters."""
-    from dew.distributed.placement import shard_batch
+    from dew.distributed.batches import shard_batch
 
     state, _, _ = trainer.place()
     batch = shard_batch(trainer.device_mesh, {"text": rows})
@@ -1410,7 +1411,7 @@ def mode_training_contract(args) -> dict:
     from test_training_transactions import ShortScaleTrainer, Tiny
 
     from dew.checkpoints import Checkpoints
-    from dew.distributed.placement import shard_batch
+    from dew.distributed.batches import shard_batch
 
     class Rows(Tiny):
         def loss(self, variables, batch, step):
@@ -1636,7 +1637,7 @@ def mode_rollout(args) -> dict:
     # A resident global array reaches the task as it is: a process cannot
     # fetch the rows the other process's devices hold, so a host round trip
     # would fail here before any model ran.
-    from dew.distributed.placement import shard_batch
+    from dew.distributed.batches import shard_batch
     from dew.inference import TextGeneration
 
     resident = shard_batch(trainer.device_mesh, {"prompt": local["prompt"]})["prompt"]
@@ -1931,7 +1932,7 @@ def mixed_validity_step(trainer, batch: dict, out: Path | None = None) -> dict:
     gradients between topologies instead of the state an optimizer with
     memory would have reached.
     """
-    from dew.distributed.placement import shard_batch
+    from dew.distributed.batches import shard_batch
 
     state, _, _ = trainer.place()
     placed = shard_batch(trainer.device_mesh, batch)
@@ -2239,8 +2240,8 @@ def mode_host_training(args) -> dict:
     import jax.numpy as jnp
     import optax
 
+    from dew.distributed.batches import shard_batch
     from dew.distributed.host import companion_mesh
-    from dew.distributed.placement import shard_batch
     from dew.objectives.base import Aux, Objective
     from dew.training import Layout, MeshSpec, Trainer
 

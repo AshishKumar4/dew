@@ -23,7 +23,7 @@ from recording import RecordingTracker
 
 from dew.cache import enable_compilation_cache
 from dew.data.dataset import Loader
-from dew.distributed.placement import shard_batch
+from dew.distributed.batches import shard_batch
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.telemetry.instrumentation import StepFlops, compiled_flops, hlo_flops

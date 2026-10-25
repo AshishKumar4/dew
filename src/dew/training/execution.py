@@ -34,8 +34,8 @@ import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.batch import FROZEN, merge, select, thaw, without
+from dew.distributed.batches import batch_shardings
 from dew.distributed.host import transfer
-from dew.distributed.placement import batch_shardings
 from dew.inference.banks import (
     assembled,
     bank_sharding,

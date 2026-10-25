@@ -85,7 +85,7 @@ def main() -> None:
 
     from dew.checkpoints import Checkpoints
     from dew.data.dataset import DataPartition, Loader
-    from dew.distributed.placement import shard_batch
+    from dew.distributed.batches import shard_batch
     from dew.objectives.lm import LMObjective
     from dew.registry import models
     from dew.training import Layout, MeshSpec, Trainer
