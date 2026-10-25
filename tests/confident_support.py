@@ -28,3 +28,14 @@ def label_derivative(rows: np.ndarray, label: int = 0) -> np.ndarray:
     others = np.exp(rest - np.logaddexp(0, -margin))
     summed = -others.sum(axis=-1, keepdims=True)
     return np.concatenate([others[:, :label], summed, others[:, label:]], axis=-1)
+
+
+def log_partition(rows: np.ndarray) -> np.ndarray:
+    """Each row's log partition over the last axis in NumPy, in the rows' own dtype, kept as a column."""
+    peak = rows.max(axis=-1, keepdims=True)
+    return peak + np.log(np.exp(rows - peak).sum(axis=-1, keepdims=True))
+
+
+def log_softmax(rows: np.ndarray) -> np.ndarray:
+    """NumPy's log softmax over the last axis, in the rows' own dtype."""
+    return rows - log_partition(rows)
