@@ -55,7 +55,7 @@ def written(module: InContextMemory, params: dict, *, dtype, segments=None):
     document where None), and the readout at `dtype`."""
     wide = jnp.promote_types(dtype, jnp.float32)
     grad_net, read_net = module.network(dtype=wide), module.network(dtype=dtype)
-    firsts = np.ones(LENGTH, bool) if segments is None else np.r_[True, segments[1:] != segments[:-1]]
+    firsts = np.arange(LENGTH) == 0 if segments is None else np.r_[True, segments[1:] != segments[:-1]]
 
     def gate(name, spec, x, p):
         if spec is None:
