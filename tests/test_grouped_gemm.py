@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS, generations, lowers
+from generation_support import INTERPRETS, generations, lowers, runs
 from jax.sharding import Mesh
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations, with_gradients
 
@@ -402,6 +402,7 @@ def test_a_frozen_matrix_forms_no_kernel_gradient():
     assert {type(launch).__name__ for launch, _ in launches} == {"MosaicGmm"}
 
 
+@runs("sm80")
 def test_the_kernels_forward_mode_keeps_the_projections_law():
     """An expert projection's tangent through the template (its launches interpreted, as an A100 runs
     them) is the XLA projection's, bit for bit: `dx @ Q(kernel) + Q(x) @ dkernel` with the tangents
@@ -430,6 +431,7 @@ def test_a_named_kernel_refuses_where_the_kernels_do_not_run():
         expert_projection(x, w, sizes, jnp.bfloat16, "auto", None)
 
 
+@runs("sm80")
 def test_a_call_of_no_rows_runs_xla_or_refuses_a_named_kernel():
     """A projection of no rows launches nothing: XLA gives its empty value, the route saying why, and a
     kernel `generation.chosen` names for it raises rather than running XLA."""

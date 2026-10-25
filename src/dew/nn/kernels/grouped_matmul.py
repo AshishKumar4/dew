@@ -755,11 +755,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         sides = [2 * _side_tile_bytes((side,), (axes,), extents)
                  for side, axes in zip(epilogue_sides, hooks.epilogue_axes, strict=True)]
         barriers = 2 * config.stages * len(streams) + 2 * (len(epilogue_sides) + len(prologue_sides) + 1)
-        if config.family == 'mma.sync':
-            # Its pipeline's stages are scoped within the walk and each output's staging after it, so the
-            # block holds the larger (`mosaic_sm80.Mma.persist`).
-            return max(mosaic.allocated(*(config.stages * stream for stream in streams)),
-                       mosaic.allocated(max(staged)))
+        # mma.sync's too, though its output's staging is scoped after its pipeline's stages: Mosaic places
+        # both at once (an L4 refused 114688 bytes for a 98304-byte pipeline and its 16384-byte output,
+        # GEN4-gpu-l4).
         return (mosaic.allocated(*(config.stages * stream for stream in streams), *staged, *sides)
                 + mosaic.BARRIER_BYTES * barriers)
 
