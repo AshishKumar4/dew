@@ -9,11 +9,14 @@ import time
 from collections.abc import Iterator, Mapping, Sequence
 
 import jax
+from jax.sharding import Mesh
 
 from dew._coordination import agreed_next
 from dew.batch import Batch
 from dew.data.dataset import Loader
+from dew.data.pipeline import Dataset
 from dew.distributed.batches import DevicePrefetchIterator, Signature
+from dew.distributed.placement import MeshSpec
 from dew.objectives.base import Metric
 from dew.telemetry.profile import region
 from dew.training.budget import Plateau
@@ -178,3 +181,26 @@ def waited_read(run: FitRun, interval: Interval, *, agree: bool, peek: bool = Fa
     if batch is None and not run.current:
         raise ValueError("the training data holds no batch to train on")
     return batch
+
+
+def unrecorded_parts(objective: str, dataset: Dataset | Loader, *, optimized: bool, seeded: bool,
+                     mesh: MeshSpec | Mesh | None, given: Mapping[str, object]) -> list[str]:
+    """Why a run's record cannot rebuild a trainer's run on `dataset`, each a part a
+    `dew.config.RunConfig` states otherwise, read from the trainer's own fields
+    (`Checkpoints.python_run`): an objective, of the class `objective` names, built in Python, an optax
+    optimizer (not `optimized` from an OptimConfig), a JAX key (no integer seed), a native mesh, a
+    compiled Loader, and each part `given` to the trainer that a run's record does not state. A run
+    built as a RunConfig writes its own record, which rebuilds it, before it trains."""
+    reasons = [f"the objective, {objective}, was built in Python; a run's record names it "
+               f"by an ObjectiveConfig over a ModelConfig"]
+    if not optimized:
+        reasons.append("the optimizer is an optax transformation; a run's record states an OptimConfig")
+    if not seeded:
+        reasons.append("the key is a JAX key; a run's record states an integer seed")
+    if isinstance(mesh, Mesh):
+        reasons.append("the mesh is a jax.sharding.Mesh; a run's record states a MeshSpec")
+    if isinstance(dataset, Loader):
+        reasons.append("the data is a compiled Loader; a run's record states its chain")
+    reasons += [f"{name} is given to the trainer, which a run's record does not state"
+                for name, part in given.items() if part is not None]
+    return reasons

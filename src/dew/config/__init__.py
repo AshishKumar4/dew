@@ -1256,7 +1256,11 @@ class RunConfig:
         """The run a class record (`record`) names, as its class, which must be
         this one or derive from it."""
         if record.get("rebuildable") is False:
-            raise ValueError("this run was defined in Python, so no record rebuilds it; it loads for "
+            reasons = record.get("reasons", [])
+            stated = "".join(f"; {reason}" for reason in reasons) if isinstance(reasons, list) else ""
+            raise ValueError("this run was defined in Python by Trainer.fit, so no record rebuilds it"
+                             f"{stated}. Build it as a RunConfig in Python and train it with run(), whose "
+                             "run.json rebuilds it (docs/recipes.md, Python experiments); this one loads for "
                              "inference through dew.pipeline or a task's from_run")
         registry.import_trusted(record, trust)
         named = registry.class_record(record)

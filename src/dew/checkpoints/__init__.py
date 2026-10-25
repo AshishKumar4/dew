@@ -111,10 +111,12 @@ Python holds `PYTHON_RUN`, which its first checkpoint writes."""
 
 PYTHON_RUN: dict[str, JSON] = {
     "rebuildable": False,
-    "defined": "in Python: each checkpoint records the inference declaration it loads by, and no record "
-               "rebuilds the run",
+    "defined": "in Python, by Trainer.fit: each checkpoint records the inference declaration it loads by, "
+               "and no record rebuilds the run. A run built as a dew.config.RunConfig in Python, and trained "
+               "by its run(), writes a run.json that rebuilds it (docs/recipes.md, Python experiments)",
 }
-"""The root record of a run defined in Python (`RUN_FILE`)."""
+"""The root record of a run defined in Python (`RUN_FILE`), beside which the trainer's checkpoints say
+why its record cannot rebuild it (`Checkpoints.python_run`)."""
 
 
 def _is_profiles(node) -> bool:
@@ -923,6 +925,8 @@ class Checkpoints:
         self._staged: dict[int, dict] = {}
         self.local_directory = None if local_directory is None else str(location(local_directory))
         self.local_every = local_every
+        # Why the run these checkpoints keep has no record that rebuilds it (`python_run`).
+        self._reasons: tuple[str, ...] = ()
         self._manager = None
         self._local_manager = None
         self._profile_snapshots: set[int] = set()
@@ -997,13 +1001,21 @@ class Checkpoints:
             retained.append(_kept(step, *self._committed[step]))
         return retained
 
+    def python_run(self, reasons: Sequence[str]) -> None:
+        """Why no record rebuilds the run these checkpoints keep, each part of it a run's record cannot
+        state, which `PYTHON_RUN` carries where a run defined in Python first saves (`Trainer.fit`
+        names them from its own fields) and `RunConfig.read` shows."""
+        self._reasons = tuple(reasons)
+
     def _identify_run(self) -> None:
-        """Write `PYTHON_RUN` at the run's root unless a run record is already there
-        (`RUN_FILE`), as a config's run writes its own before it trains."""
+        """Write `PYTHON_RUN`, with why the run is not rebuildable (`python_run`), at the run's root
+        unless a run record is already there (`RUN_FILE`), as a config's run writes its own before it
+        trains."""
         root = epath.Path(self.directory)
         if jax.process_index() == 0 and not (root / RUN_FILE).exists():
             root.mkdir(parents=True, exist_ok=True)
-            write_atomically(root / RUN_FILE, json.dumps(PYTHON_RUN, indent=2, sort_keys=True))
+            record = {**PYTHON_RUN, "reasons": list(self._reasons)}
+            write_atomically(root / RUN_FILE, json.dumps(record, indent=2, sort_keys=True))
 
     def artifact(self, step: int | str | None = None) -> JSON:
         """Return the selected step's inference declaration.
