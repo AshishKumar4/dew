@@ -62,7 +62,6 @@ from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_moments
 from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import (
-    AffineHead,
     CountedLogits,
     CountedLogitsTraining,
     CountedPredictions,
@@ -71,7 +70,6 @@ from dew.nn.protocols import (
     DecoderTraining,
     Lacks,
     LayerStates,
-    OutputTable,
     TokenModel,
     head_table,
 )
@@ -87,7 +85,6 @@ from dew.objectives.base import (
     Omitted,
     PathFilter,
     Prediction,
-    ProgramModule,
     Ratio,
     Shown,
     Step,
@@ -99,17 +96,15 @@ from dew.objectives.base import (
     thaw,
 )
 from dew.objectives.lm.chunked import (
-    chunked_tile,
     final_read,
     fused_head_loss,
-    head_cross_entropy,
     logits_cross_entropy,
     logits_support_log_probs,
     model_logits,
-    reads_states,
     refuse_without_logits,
     support_log_probs,
 )
+from dew.objectives.lm.head import HeadedObjective
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
@@ -575,14 +570,15 @@ def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, 
         counted = counted & (roles[:, span:] == role)
     return counted
 
-class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
+class TokenScorer(HeadedObjective[Ratio | LMStatistics, Variables]):
     """Scores a causal decoder's tokens: the machinery the LM, preference and
     policy losses share, without a loss of its own.
 
     It holds the decoder (`model`, a loaded source among them, with
     `variables` and `processor` overriding its own through
     `Objective.bind_model`), the row length `seq_len`, and how the head is
-    scored: `head_chunks` and `head_tile` (`LMObjective` describes each).
+    scored: `head_chunks` and `head_tile`, the head policy every token objective takes
+    (`dew.objectives.lm.head`; `LMObjective` describes each).
     `samples` draws previews. A loss built on it keeps no average unless it
     sets `ema`; `LMObjective` adds the language-model
     terms and loss, and the options only they read, `pad_id` and
@@ -593,16 +589,6 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     settings = TextSettings
     shown: Mapping[str, Shown] = {"ce": Shown(better="lower"), "perplexity": Shown(better="lower"),
              "token_accuracy": Shown(better="higher", percent=True)}
-
-    # tests/test_packed_grpo.py covers the tiled default.
-    keeps_whole_logits: ClassVar[bool] = True
-    """Whether the head's default (`head_tile` None) keeps the whole fp32 logits for the backward pass.
-
-    A plain LM step does, and the trainer's fit ladder tiles it when the step does
-    not fit (`recompute_more`). An objective whose devices also hold rollouts or a
-    frozen reference, as GRPO's and DPO's do, keeps the tiled head as its default,
-    so the loss's temporaries stay one tile in size whatever the vocabulary.
-    """
 
     counts_tokens = True
 
@@ -618,11 +604,6 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     token_accuracy: bool = False
     """Whether `token_scores` marks each prediction by default (`LMObjective`'s token accuracy).
     A policy or preference loss reports none, and asks for the marks where it scores them."""
-
-    head_fused: bool = True
-    """Whether a tiled head scored for its weighted sums takes their gradient in its forward
-    (`token_scores`' `z_loss`, `LMObjective`'s training loss): the fit ladder turns it off where the
-    fused chunk does not fit (`LMObjective.unfuse_head`), and tiling the head turns it on."""
 
     scored_fields: ClassVar[tuple[str, ...] | None] = None
     """The batch fields `_evaluation_scores` reads, which alone enter its compiled program (`evaluate`),
@@ -643,13 +624,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         _check_reads(model)
         self.model = model
         self.seq_len = seq_len
-        self.head_chunks = head_chunks
-        self.head_tile = _head_tile(head_tile, self.keeps_whole_logits)
-        # Each decoder a fused loss traced, by identity, and whether its head was one matrix
-        # (`chunked.head_table`): past a nonlinear head transform, beside an adapter's factors or
-        # in place of a frozen FP8 kernel no matrix is, and no head is fused. A decoder not yet
-        # traced is taken to have one.
-        self._head_matrices: dict[int, tuple[object, bool]] = {}
+        self.use_head(head_chunks, head_tile)
         self.samples = samples
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len + 1,)))
         if samples is not None and samples.max_new_tokens > 0:
@@ -805,9 +780,6 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     def bank_sites(self) -> tuple[DecoderBank, ...]:
         return self.model.bank_sites
 
-    def program_key(self) -> tuple[ProgramModule, ...]:
-        return (ProgramModule(self.model, self.head_tile, trained=True),)
-
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
 
@@ -908,7 +880,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         kls = gathered.get(INDEXER_COLLECTION) if indexer else None
         kept = tuple(self._layer_states().layer_state(gathered, index) for index in layers)
         predict = self.token_accuracy if predict is None else predict
-        table = self._fused_head(params) if z_loss is not None else None
+        table = self.fused_head(self.model, params) if z_loss is not None else None
         dtype = at_least_fp32(hidden.dtype)
         weights = self._row_weights(prepared, roles, dtype)
         total = None
@@ -920,8 +892,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
                 hidden, table, targets, weights, z_loss=float(z_loss or 0.0), tile=self.head_tile,
                 predict=predict)
         else:
-            losses, predicted, log_z = head_cross_entropy(
-                self.model, params, hidden, targets, self.head_chunks, tile=self.head_tile, predict=predict)
+            losses, predicted, log_z = self.head_terms(self.model, params, hidden, targets, predict=predict)
         weights = weights.astype(losses.dtype)
         correct = None if predicted is None else (predicted == targets).astype(losses.dtype)
         depth_scores = []
@@ -949,9 +920,8 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
                     depth_total, (depth_losses, _, _) = fused_head_loss(
                         state, table, targets[:, depth:], depth_weights, tile=self.head_tile, predict=False)
                 else:
-                    depth_losses, _, _ = head_cross_entropy(
-                        self.model, params, state, targets[:, depth:], self.head_chunks,
-                        tile=self.head_tile, predict=False)
+                    depth_losses, _, _ = self.head_terms(self.model, params, state, targets[:, depth:],
+                                                         predict=False)
                 depth_scores.append((depth_losses, depth_weights, depth_total))
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls, total,
                       whole)
@@ -977,31 +947,6 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         in `xp`: the loss's weights on the device and the FLOP count's on the host read one rule."""
         return scored_targets(xp, tokens, self.pad_id, mask, documents, depth, roles=roles,
                               role=None if self.loss_role is None else int(self.loss_role))
-
-    def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
-        """Move a head that keeps its whole logits to `tile`, and report what it moved to.
-
-        `tile` defaults to the generation's tile (`chunked.chunked_tile`).
-        """
-        if self.head_tile is not None:
-            return None
-        self.head_tile = chunked_tile() if tile is None else tile
-        self.head_fused = True
-        return f"the head tiled {self.head_tile}"
-
-    def _fused_head(self, params) -> OutputTable | None:
-        """The head as the one matrix a summed loss takes its gradient through in the forward
-        (`token_scores`' `z_loss`), None where it keeps the whole logits, is not fused or is no
-        matrix. What the trace finds of the decoder's head is kept (`_head_matrices`)."""
-        if self.head_tile is None or not reads_states(self.model):
-            return None
-        head = head_table(self.model, params)
-        self._head_matrices[id(self.model)] = (self.model, head is not None)
-        return head if self.head_fused else None
-
-    def restore_head(self, tile: tuple[int, int] | None, *, fused: bool) -> None:
-        self.head_tile = tile
-        self.head_fused = fused
 
     def _layer_states(self) -> LayerStates:
         """The model as the reader of its layers' states that a request for `layers` needs."""
@@ -1063,8 +1008,8 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         params = thaw(params)
         targets = tokens[:, 1:]
         if temperature != 1.0:
-            losses, _, _ = head_cross_entropy(self.model, params, scores.hidden, targets, self.head_chunks,
-                                              tile=self.head_tile, predict=False, temperature=temperature)
+            losses, _, _ = self.head_terms(self.model, params, scores.hidden, targets, predict=False,
+                                           temperature=temperature)
             log_probs = -losses
         if support is not None:
             ids, columns = (jnp.asarray(value, jnp.int32) for value in support)
@@ -1374,24 +1319,10 @@ class LMObjective(TokenScorer):
         total, mass = self._indexer_term(sown, prepared, batch)
         return Ratio(self.indexer.weight * total, mass), total / jnp.where(mass > 0, mass, 1)
 
-    def program_key(self) -> tuple[ProgramModule, ...]:
-        """The decoder, its head fused where its training loss takes the head's gradient in the
-        forward: a tiled head the model holds as one matrix (`token_scores`' `z_loss`), outside an
-        indexer's warm-up, which scores no head."""
-        model = self.model
-        fused = (self.head_fused and self.head_tile is not None and reads_states(model)
-                 and isinstance(model, AffineHead) and not self._warmup
-                 and self._head_matrices.get(id(model), (None, True))[1])
-        return (ProgramModule(self.model, self.head_tile, trained=True, head_fused=fused),)
-
-    def unfuse_head(self) -> str | None:
-        """Move a tiled head to take its gradient in the backward, and report the move; None where
-        the step's program does not change, a head no step fuses. A tiled head is unfused either
-        way, so a decoder traced later does not fuse a head its rung unfused."""
-        moved = self.program_key()[0].head_fused
-        if self.head_tile is not None:
-            self.head_fused = False
-        return f"the head tiled {self.head_tile}, its gradient taken in the backward" if moved else None
+    def fuses_head(self) -> bool:
+        """The training loss takes a tiled head's gradient in its forward (`token_scores`' `z_loss`),
+        outside an indexer's warm-up, which scores no head."""
+        return not self._warmup
 
     def loss(self, variables, batch, step: Step) -> tuple[Ratio | LMStatistics, Aux[Variables]]:
         if self._warmup:
@@ -1632,15 +1563,3 @@ class Perplexity:
         if count == 0:
             raise ValueError("no counted target in the validation pass")
         return float(np.exp(total / count))
-
-
-def _head_tile(tile, keeps_whole_logits: bool) -> tuple[int, int] | None:
-    """The head's tile: None keeps the whole logits; 'whole' and 'tiled' name
-    the choice; None on an objective that does not keep them by default is
-    the generation's tile (`chunked_tile`). A config's pair is a list, and
-    the tile is a static argument, so it becomes a tuple."""
-    if tile == 'whole' or (tile is None and keeps_whole_logits):
-        return None
-    if tile is None or tile == 'tiled':
-        return chunked_tile()
-    return (int(tile[0]), int(tile[1]))

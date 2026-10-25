@@ -19,10 +19,12 @@ from dew.checkpoints import Checkpoints
 from dew.data import Loading, presets
 from dew.data.compile import compile
 from dew.data.sources.tokens import TokenFiles
+from dew.diffusion.discrete import MDLM
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.kernels.generation import chosen
 from dew.nn.sharding import LayoutRefused
+from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_tile
 from dew.registry import mixers
@@ -135,6 +137,29 @@ def test_the_fit_ladder_tiles_the_head_fused_then_unfused_before_it_recomputes_m
     # A head put back whole, as a new shape starts from the run's own rung, tiles fused again.
     resumed.restore_head(None, fused=False)
     assert resumed.tile_head() is not None and rung_record(resumed, xla_defaults=False)["head_fused"]
+
+
+def test_the_fit_ladder_tiles_a_masked_diffusion_head_before_it_recomputes_more():
+    """A masked-diffusion objective runs its head by the policy every token objective takes
+    (`dew.objectives.lm.head`): the ladder keeps its whole logits, then tiles it, its gradient in the
+    backward as its loss fuses none, before it recomputes more with the whole logits back; a resumed
+    run climbs to a recorded tiled rung alike."""
+    model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                              max_seq_len=SEQ, causal=False)
+
+    def objective():
+        return MaskedDiffusionObjective(model, MDLM(mask_id=63)(), seq_len=SEQ)
+
+    climbing = objective()
+    rungs = [rung_record(climbing, xla_defaults=False)]
+    while len(rungs) < 4 and recompute_more(climbing):
+        rungs.append(rung_record(climbing, xla_defaults=False))
+    tile = list(chunked_tile())
+    assert [(rung["head_tile"], rung["head_fused"], rung["remat"]) for rung in rungs] == [
+        (None, False, None), (tile, False, None), (None, False, "minimal"), (tile, False, "minimal")]
+    resumed = objective()
+    climb_to(resumed, rungs[1])
+    assert rung_record(resumed, xla_defaults=False) == rungs[1]
 
 
 def test_a_microbatch_is_every_splitth_row():

@@ -27,7 +27,7 @@ from dew.inputs import Field, InputSpec
 from dew.nn.inputs import rotate_rows
 from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Aux, EMASpec, Ratio, Shown, Variables, thaw
-from dew.objectives.lm.chunked import final_read, head_cross_entropy
+from dew.objectives.lm.chunked import final_read
 from dew.rl import behavior_importance_weights, k3_kl, masked_mean, sequence_log_ratio, token_log_ratio
 from dew.rl.surrogate import (
     behavior_band_weights,
@@ -381,8 +381,7 @@ class GRPOObjective(TokenScorer):
         padding = prompts.shape[1] - lengths
         aligned = rotate_rows(prompts, padding)
         read = final_read(self.model, params, aligned[:, :-1], train=False)
-        losses, predicted, _ = head_cross_entropy(self.model, params, read, aligned[:, 1:],
-                                                  self.head_chunks, predict=True)
+        losses, predicted, _ = self.head_terms(self.model, params, read, aligned[:, 1:], predict=True)
         assert predicted is not None
         correct, _ = _unpadded(predicted == aligned[:, 1:], padding)
         losses, valid = _unpadded(losses, padding)
