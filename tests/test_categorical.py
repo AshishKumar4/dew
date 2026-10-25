@@ -235,10 +235,10 @@ def test_the_divergences_derivative_stays_finite_wherever_its_rows_are():
     np.testing.assert_array_equal(offset, np.zeros((1, 2), np.float32))
     extrema = jnp.asarray([1e38, -1e38], jnp.float32), jnp.asarray([-1e38, 1e38], jnp.float32)
     # A difference so large that its rounding (512 at 6.4e9) lifts a reconstructed log probability above 0,
-    # and an offset whose mean rounds a uniform difference to -512 rather than 0.
+    # and a uniform offset of 26 classes whose mean under q rounds the difference off 0.
     coarse = jnp.asarray([0.0, 6442450432.0], jnp.float32), jnp.asarray([0.0, -384.0], jnp.float32)
-    uniform = jnp.full((7,), 6442450944.0, jnp.float32), jnp.zeros((7,), jnp.float32)
-    for (row, reference), expected in ((extrema, [1.0, -1.0]), (coarse, [-1.0, 1.0]), (uniform, [0.0] * 7)):
+    uniform = jnp.full((26,), 2.0 ** 26, jnp.float32), jnp.zeros((26,), jnp.float32)
+    for (row, reference), expected in ((extrema, [1.0, -1.0]), (coarse, [-1.0, 1.0]), (uniform, [0.0] * 26)):
         for derivative in (jax.grad, jax.jacfwd):
             np.testing.assert_array_equal(
                 derivative(lambda row, reference=reference: categorical.kl_divergence(row, reference))(row),
