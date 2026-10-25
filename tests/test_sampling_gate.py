@@ -5,7 +5,7 @@ import itertools
 
 import numpy as np
 import pytest
-from sampling_gate import FALSE_RED, SamplingFailure, assert_draws_as_declared, p_value, statistics
+from sampling_gate import FALSE_RED, LEVEL, SamplingFailure, assert_draws_as_declared, p_value, statistics
 from scipy import stats
 
 SHARES = (0.85, 0.05, 0.1)
@@ -52,6 +52,6 @@ def test_a_fair_sampler_fails_at_most_false_red_even_at_sparse_counts(total, cha
                                for head in itertools.product(range(total + 1), repeat=chances.size - 1)
                                if sum(head) <= total])
     statistic = statistics(compositions, chances)
-    failed = np.asarray([p_value(value, total, tuple(chances.tolist())) < FALSE_RED for value in statistic])
+    failed = np.asarray([p_value(value, total, tuple(chances.tolist())) < LEVEL for value in statistic])
     rate = stats.multinomial.pmf(compositions[failed], total, chances).sum() if failed.any() else 0.0
     assert failed.any() and rate <= FALSE_RED
