@@ -667,11 +667,19 @@ def test_a_launch_takes_approximate_math_only_where_no_hook_computes_a_transcend
                                                     differentiated=differentiated) == approximated
 
 
-@pytest.mark.parametrize("operation", sorted(attention_mosaic_program.APPROXIMATED - {"pow"}))
+APPROXIMATED_BY_MOSAIC = ("exp", "exp2", "log", "log2", "log1p", "tanh", "logistic", "sin", "cos", "sqrt",
+                          "rsqrt")
+"""The unary operations whose Mosaic GPU lowering takes `approx_math` (jax's Pallas Mosaic GPU lowering rules
+for exp, exp2, log, log2, tanh, sin, cos, sqrt and rsqrt, which pass it to the lane implementation and set
+the fast-math flag; logistic and log1p lower through them), read from the lowering, not from the
+mainloop's own list."""
+
+
+@pytest.mark.parametrize("operation", APPROXIMATED_BY_MOSAIC)
 def test_every_approximated_operation_in_a_hook_takes_exact_math(operation):
     """A score hook and an output hook each computing one operation Mosaic GPU approximates under
-    `approx_math` (`APPROXIMATED`) take exact math, in the forward and differentiated: no such operation of
-    a hook passes unseen."""
+    `approx_math` (`APPROXIMATED_BY_MOSAIC`) take exact math, in the forward and differentiated: no such
+    operation of a hook passes unseen."""
     def applied(x):
         return getattr(jax.lax, operation)(jnp.abs(x) + 1.0)
 
