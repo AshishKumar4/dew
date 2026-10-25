@@ -102,7 +102,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_data_mixtures.py": {
-   "comparisons": 4,
+   "comparisons": 3,
    "lane": "Training"
   },
   "tests/test_dc_ae.py": {
@@ -177,10 +177,6 @@
    "comparisons": 7,
    "lane": "Training"
   },
-  "tests/test_discrete.py": {
-   "comparisons": 8,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_disk_banks.py": {
    "comparisons": 2,
    "lane": "Models, Serving & RL"
@@ -234,7 +230,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_flow_matching.py": {
-   "comparisons": 8,
+   "comparisons": 2,
    "lane": "Training"
   },
   "tests/test_flux_source.py": {
@@ -397,10 +393,6 @@
    "comparisons": 26,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_lora_peft.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_lpips.py": {
    "comparisons": 3,
    "lane": "Training"
@@ -426,7 +418,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_mdlm_reference.py": {
-   "comparisons": 5,
+   "comparisons": 2,
    "lane": "Training"
   },
   "tests/test_mean_flow.py": {
