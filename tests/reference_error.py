@@ -187,10 +187,15 @@ def without_ynn(fn, **jit_options):
     return jax.jit(fn, **jit_options)
 
 
-def with_gradients(fn):
+def with_gradients(fn, *, has_aux: bool = False):
     """`fn` as `run(*inputs, cotangent)`, which returns `fn(*inputs)` and the gradients of its inputs
-    under the cotangent passed last: a differentiated call's leaves, as the gate compares them."""
+    under the cotangent passed last: a differentiated call's leaves, as the gate compares them. Where
+    `has_aux`, `fn` returns its differentiated output and values beside it that carry no gradient,
+    which `run` returns after the gradients, from the same evaluation."""
     def run(*arguments):
+        if has_aux:
+            out, pull, aux = jax.vjp(fn, *arguments[:-1], has_aux=True)
+            return out, *pull(arguments[-1]), aux
         out, pull = jax.vjp(fn, *arguments[:-1])
         return out, *pull(arguments[-1])
 
@@ -732,7 +737,9 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                               for path, _ in jax.tree_util.tree_leaves_with_path(dew)]
             widths = widths or tuple(int(np.shape(leaf)[-1]) if np.ndim(leaf) >= 2 else 0
                                      for leaf in jax.tree.leaves(dew))
-            evidence = _evidence(dew, reference_fn(*theirs_at), truth, their_truth)
+            # The reference against itself on the same inputs is one evaluation (`seeds_for`'s sizing).
+            reference = dew if dew_fn is reference_fn and theirs_at is mine_at else reference_fn(*theirs_at)
+            evidence = _evidence(dew, reference, truth, their_truth)
             row = evidence if row is None else [
                 (first[0], first[1], float(np.fmax(first[2], other[2])), float(np.fmax(first[3], other[3])),
                  first[4], first[5] and other[5]) for first, other in zip(row, evidence, strict=True)]
@@ -956,8 +963,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     widened to float64, or `truth_fn` on them where the reference fixes a precision of its own (an
     output dtype it closes over). A draw may be an orbit's: the same values under an exact symmetry
     the seed picks. `seeds` is the site's declared count, sized by `seeds_for` so the reference
-    compared with itself resolves PARITY; jit the two functions so every seed reuses one compiled
-    program.
+    compared with itself resolves PARITY, or, where the arms share their upstream rounding, so Dew
+    paired with the reference does; jit the two functions so every seed reuses one compiled program.
 
     Where a computation has an orbit of summation orders, `orders(inputs)` lists a draw's inputs at K
     of them, the draw itself first: an exact symmetry of the result (a batch's rows in another order
@@ -1070,30 +1077,39 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     Dew's errors against the reference's on the same draws, the two resampled by the same seeds as the
     verdict resamples them (`_interval`), on draws from SIZING_FROM on that no verdict takes. A pair
     that shares its upstream rounding, the same inputs through the same upstream arithmetic, has errors
-    whose sizes vary across draws together: their ratio resolves where each alone, heavy-tailed across
-    draws, does not, and the verdict judges that same paired ratio. The width asked of it is PARITY
+    whose sizes vary across draws together: their ratio resolves in fewer draws than each alone does, or
+    where each alone, heavy-tailed across draws, never does, and the verdict judges that same paired
+    ratio, so a paired count is the one its verdict needs (docs/design/testing.md states how it was
+    validated). The width asked of it is PARITY
     either way. Paired sizing holds out its draws only where `draw` keys an independent stream by the
     whole seed: a draw that enumerates finitely or by a modulus (`(arange(n) + seed) % vocab`) repeats a
     verdict's inputs at SIZING_FROM and needs a pilot stream of its own first, and a recorded reference
     (`indexed_recording`), which holds its recorded seeds alone, is refused: its site keeps its
     recorded count. Fails past `most`, where the site needs larger inputs or fewer shared factors, not
-    more seeds."""
+    more seeds.
+
+    Each draw is evaluated once however many doublings the sizing takes: a count's draws are its
+    predecessor's and the seeds it adds, the reference compared with itself takes its seeds 0 to twice
+    the count (the first half against the second), and the reference on the same inputs runs once."""
     if dew_fn is not None and getattr(reference_fn, "recorded", False):
         raise ValueError(f"{label}: a recorded reference holds its recorded seeds alone, never a paired "
                          f"sizing's from SIZING_FROM; its site keeps its recorded count")
-    count = max(start, FEWEST_SEEDS)
+    count, drawn = max(start, FEWEST_SEEDS), None
+    first = 0 if dew_fn is None else SIZING_FROM
     while count <= most:
+        held = 0 if drawn is None else len(drawn.theirs)
+        fresh = _drawn(dew_fn or reference_fn, reference_fn, draw,
+                       range(first + held, first + (2 * count if dew_fn is None else count)), truth_fn)
+        drawn = fresh if drawn is None else drawn.joined(fresh)
         if dew_fn is None:
-            first = _drawn(reference_fn, reference_fn, draw, range(count), truth_fn)
-            second = _drawn(reference_fn, reference_fn, draw, range(count, 2 * count), truth_fn)
-            wide = [name for index, name in enumerate(first.names)
-                    if np.sum(first.theirs[:, index]) > 0 and np.sum(second.theirs[:, index]) > 0
-                    and not _resolves(*_interval(first.theirs[:, index], control=second.theirs[:, index]))]
+            halves = drawn.theirs[:count], drawn.theirs[count:2 * count]
+            wide = [name for index, name in enumerate(drawn.names)
+                    if np.sum(halves[0][:, index]) > 0 and np.sum(halves[1][:, index]) > 0
+                    and not _resolves(*_interval(halves[0][:, index], control=halves[1][:, index]))]
         else:
-            paired = _drawn(dew_fn, reference_fn, draw, range(SIZING_FROM, SIZING_FROM + count), truth_fn)
-            wide = [name for index, name in enumerate(paired.names)
-                    if np.sum(paired.theirs[:, index]) > 0
-                    and not _resolves(*_interval(paired.mine[:, index], paired.theirs[:, index]))]
+            wide = [name for index, name in enumerate(drawn.names)
+                    if np.sum(drawn.theirs[:, index]) > 0
+                    and not _resolves(*_interval(drawn.mine[:, index], drawn.theirs[:, index]))]
         if not wide:
             return count
         count *= 2
@@ -1353,7 +1369,7 @@ RETIRING_FACTOR = 2.0
 """The retiring one-draw helper's factor (`assert_leaves_as_exact`), today's check at its remaining
 sites until they convert: no other rule reads it."""
 
-RETIRING_SITES = frozenset({"tests/test_decision_option_slots.py", "tests/test_flux2_source.py"})
+RETIRING_SITES = frozenset({"tests/test_flux2_source.py"})
 """The sites that keep the retiring one-draw helper until they convert: every other caller is refused
 (tools/lint_slop.py, SLOP020), and the helper goes with its last caller."""
 

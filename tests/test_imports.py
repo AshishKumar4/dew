@@ -13,6 +13,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 import dew
 
 SOURCE = Path(dew.__file__).parent.parent
@@ -61,11 +63,13 @@ np.testing.assert_array_equal(result.images, np.zeros((1, 2, 2, 1), np.float32))
     assert run.returncode == 0, run.stderr
 
 
-def test_importing_the_data_layer_reads_no_configuration_and_its_workers_run(tmp_path):
-    """Importing dew.data reads no storage configuration, so a broken one fails the first store
-    that resolves, not the import, yet registers Dew's bounded cache, through which fsspec reads a
-    file before any store resolves; and a data pass with worker processes runs in a program that never parsed
-    absl's flags (`import dew` marks them parsed, as absl.app would)."""
+@pytest.mark.parametrize("named", ["DEW_STORAGE_CONFIG", "DEW_CONFIG_DIR"])
+def test_importing_the_data_layer_reads_no_configuration_and_its_workers_run(tmp_path, named):
+    """Importing dew.data reads no storage configuration, so a broken one, named by its own variable
+    or found in Dew's configuration directory as every configuration of Dew's is, fails the first
+    store that resolves, not the import, yet registers Dew's bounded cache, through which fsspec reads
+    a file before any store resolves; and a data pass with worker processes runs in a program that
+    never parsed absl's flags (`import dew` marks them parsed, as absl.app would)."""
     broken = tmp_path / "storage.toml"
     broken.write_text("this is not toml [")
     script = r"""
@@ -96,7 +100,7 @@ reader.close()
 """
     result = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=600,
                             env={**os.environ, "PYTHONPATH": str(SOURCE), "JAX_PLATFORMS": "cpu",
-                                 "DEW_STORAGE_CONFIG": str(broken)})
+                                 named: str(broken if named == "DEW_STORAGE_CONFIG" else tmp_path)})
     assert result.returncode == 0, result.stderr[-2000:]
     reported = json.loads(result.stdout.splitlines()[-1])
     assert reported == {"refused": "TOMLDecodeError", "cached": "cached bytes", "ids": list(range(8))}

@@ -27,6 +27,7 @@ import functools
 import shutil
 
 import pytest
+from matrix_support import published_matrix
 from process_support import run_pool
 from test_multiprocess import assert_identical_parameters, assert_same_parameters, dumped_params
 
@@ -54,18 +55,39 @@ ROWS = [
     ("indexed,nocache,all,rows", 4, 1),
     ("indexed,nocache,rejecting,rows", 2, 1),
     ("indexed,nocache,all,packed", 1, 2),
+    # The filtered and the packed read made global by preparation: their rows, and the plan of their
+    # windows, published once and read as a generation.
+    ("indexed,published,rejecting,rows", 2, 4),
+    ("indexed,published,rejecting,packed", 4, 1),
 ]
 
 
 @pytest.fixture(scope="module")
-def uninterrupted(tmp_path_factory):
+def prepared(tmp_path_factory):
+    """The flags a pool that trains `cell` takes: for a published cell, the cache its generation was
+    published to once here, in the test, as a preparation job would, which every pool training the cell
+    reads (saving, resuming and uninterrupted alike)."""
+    @functools.cache
+    def flags(cell: str) -> dict[str, str]:
+        _, cached, rejecting, packed = cell.split(",")
+        if cached != "published":
+            return {}
+        directory = tmp_path_factory.mktemp("prepared")
+        published_matrix(rejecting == "rejecting", packed == "packed", directory)
+        return {"prepared": str(directory)}
+
+    return flags
+
+
+@pytest.fixture(scope="module")
+def uninterrupted(tmp_path_factory, prepared):
     """A pool of `processes` that trains `cell` for six steps and nobody stops: its reports and
     where it wrote them, run once a cell and count."""
     @functools.cache
     def run(cell: str, processes: int):
         directory = tmp_path_factory.mktemp("whole")
         reports = run_pool("matrix", directory / "out", processes, run_dir=directory / "run", cell=cell,
-                           name="matrix", steps=2 * STEPS)
+                           name="matrix", steps=2 * STEPS, **prepared(cell))
         return reports, directory / "out"
 
     return run
@@ -73,12 +95,14 @@ def uninterrupted(tmp_path_factory):
 
 @pytest.mark.parametrize("cell, saved_by, other", ROWS,
                          ids=[f"{cell}-saved-by-{saved}-then-{other}" for cell, saved, other in ROWS])
-def test_a_saved_position_resumes_where_an_uninterrupted_pool_lands(tmp_path, uninterrupted, cell, saved_by,
-                                                                    other):
+def test_a_saved_position_resumes_where_an_uninterrupted_pool_lands(tmp_path, uninterrupted, prepared, cell,
+                                                                    saved_by, other):
     saved = tmp_path / "saved" / "run"
     first = run_pool("matrix", tmp_path / "first", saved_by, run_dir=saved, cell=cell, name="matrix",
-                     steps=STEPS, save_every=STEPS)
+                     steps=STEPS, save_every=STEPS, **prepared(cell))
     elastic = first[0]["lowering"] == "global"
+    # A published generation is the preparation that makes a filtered or packed read global.
+    assert elastic or ",published," not in cell
     for processes in (saved_by, other):
         directory = tmp_path / f"resumed{processes}" / "run"
         shutil.copytree(saved, directory)
@@ -90,10 +114,10 @@ def test_a_saved_position_resumes_where_an_uninterrupted_pool_lands(tmp_path, un
                 checkpoints.restore(share=DataPartition(0, processes))
             with pytest.raises(AssertionError):
                 run_pool("matrix", tmp_path / f"resumed{processes}-out", processes, run_dir=directory,
-                         cell=cell, name="matrix", steps=2 * STEPS)
+                         cell=cell, name="matrix", steps=2 * STEPS, **prepared(cell))
             continue
         resumed = run_pool("matrix", tmp_path / f"resumed{processes}-out", processes, run_dir=directory,
-                           cell=cell, name="matrix", steps=2 * STEPS)
+                           cell=cell, name="matrix", steps=2 * STEPS, **prepared(cell))
         whole, written = uninterrupted(cell, processes)
         # On the count that saved it a resume reduces in the order the run it continues did, so it lands
         # on that run's parameters bit for bit; on another count it reduces otherwise.
