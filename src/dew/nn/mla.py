@@ -28,18 +28,16 @@ from jax.ad_checkpoint import checkpoint_name
 from dew.nn.attention import (
     LayerNorm,
     RMSNorm,
-    cached_validity,
     causal_attention_mask,
     kernel_for_materialized_mask,
     max_attention_logits,
-    open_kv_cache,
     scaled_dot_product_attention,
 )
 from dew.nn.dense import Dense
 from dew.nn.documents import document_mask
 from dew.nn.flops import MissingFlopsCount, attention_flops, projection_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
-from dew.nn.kv_cache import KVCache, write_cache
+from dew.nn.kv_cache import KVCache, cached_validity, open_kv_cache, write_cache
 
 # dsa_kpool reads INDEXER and the expanded cache below. Reading the registry
 # contracts from base avoids importing the kind hub back during this module's
