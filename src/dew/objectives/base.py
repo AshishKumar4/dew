@@ -1061,7 +1061,7 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     def program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (),
                 holds: tuple[DeviceStep | AutoEncoder | Guidance, ...] = (),
-                modules: tuple[nn.Module, ...] = ()):
+                modules: tuple[nn.Module, ...] = (), step: Mapping[str, bool | int] | None = None):
         """`function` jitted as this objective's program `name`, reused only while its modules and head
         tiles stay fixed (`program_key`), and under the context it traced in (`trace_context`).
 
@@ -1074,8 +1074,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         step runs or a sample's guidance and autoencoder, whose numbers it bakes in: the program is
         reused only while they are the same objects, and one over others replaces it. `modules` are
         the networks it runs beside the objective's own, an autoguide's or an autoencoder's: they key
-        it as `holds` do, and its options cover them. Keep only the current specialization, not a
-        history of old models or steps.
+        it as `holds` do, and its options cover them. `step` are the XLA options of the training step
+        the program is part of (`dew.training.memory.step_compiler_options`), beside its modules' own,
+        so a host step's programs compile as the resident step does. Keep only the current
+        specialization, not a history of old models or steps.
         """
         programs = tuple((program.module, (program.head_tile, program.head_fused))
                          for program in self.program_key())
@@ -1087,8 +1089,8 @@ class Objective(ABC, Generic[Loss, Effects]):
             self._program_cache = cached
         from dew.nn.sharding import trace_context
         # The options follow where the program runs (`compiler_options`), so they key it too.
-        options = compiler_options(*(module for module, _ in programs), *modules)
-        key = (name, trace_context(), tuple(options.items()))
+        options = {**compiler_options(*(module for module, _ in programs), *modules), **(step or {})}
+        key = (name, trace_context(), tuple(sorted(options.items())))
         held = cached[1].get(key)
         kept = (*holds, *modules)
         if held is None or len(held[0]) != len(kept) or any(

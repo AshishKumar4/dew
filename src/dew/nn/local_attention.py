@@ -75,7 +75,7 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     runs banded: query blocks of the span against their own block and the one
     before under a `[W, 2W]` mask, so the logits are `[S, 2W]` per head. Banding
     pads to whole spans, so at most two spans take the dense call. A row with
-    padding among its tokens runs on its real tokens alone (`_compacted`), so
+    padding among its tokens runs on its real tokens alone (`compacted`), so
     a window's or a chunk's keys sit within the band, as the cache holds them.
     """
     if (window is None) == (chunk is None):
@@ -96,7 +96,7 @@ def local_attention(query, key, value, *, window: int | None = None, chunk: int 
     # A window counts tokens by their distance alone, so only a chunk reads the places.
     places = None if chunk is None else places
     if valid is not None and not right_padded:
-        return _compacted(attend, query, key, value, places, segment_ids, valid)
+        return compacted(attend, query, key, value, places, segment_ids, valid)
     return attend(query, key, value, places=places, segment_ids=segment_ids, valid=valid)
 
 
@@ -178,9 +178,12 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
     return checkpoint_name(out, 'attention_output')
 
 
-def _compacted(attend, query, key, value, places, segment_ids, valid):
+def compacted(attend, query, key, value, places, segment_ids, valid):
     """`attend` over each row's real tokens moved to its front in order, their
-    places and documents with them, and its outputs moved back to their slots.
+    places and documents with them, and its outputs moved back to their slots:
+    the one move every attention over rows with padding among their tokens
+    shares, this module's local attention and a tier-3 model's attention
+    (`dew.interop.torchax_fallback`) alike.
 
     A window spans `window` tokens and a chunk `chunk` places, and padding
     among a row's tokens spreads them over more slots than the band before a
