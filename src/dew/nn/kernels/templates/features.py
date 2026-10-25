@@ -74,7 +74,7 @@ def _predictions(costed: cost.Cost, facts: generation.GpuTarget) -> dict[str, fl
       last wave's slots no program fills;
     - `staged_per_step`, shared-memory bytes a program moves per pipeline step beside its matrix
       instructions, and `serial_per_step`, those it moves between them, which they wait for;
-    - `hidden_steps`, the steps its stages in flight cover (`stages - 1`, at most its steps) and
+    - `hidden_steps`, the steps loading ahead (`stages - 1 - in_flight`, at most its steps) and
       `waiting_share`, the waiting term's share beside the resident programs' service time
       (`cost.program_seconds`, `cost.waiting_seconds`, as `cost.seconds` reads them)."""
     flops = costed.programs * costed.program_flops
@@ -104,7 +104,7 @@ def _predictions(costed: cost.Cost, facts: generation.GpuTarget) -> dict[str, fl
         'waves': waves, 'tail': tail,
         'staged_per_step': costed.program_staged / costed.steps if costed.steps else None,
         'serial_per_step': costed.serial_staged / costed.steps if costed.steps else None,
-        'hidden_steps': max(min(costed.stages - 1, math.ceil(costed.steps)), 1),
+        'hidden_steps': max(min(costed.stages - 1 - costed.in_flight, math.ceil(costed.steps)), 0),
         'waiting_share': (waiting / (waiting + resident * program)
                           if waiting is not None and program is not None and waiting + program else None),
     }
