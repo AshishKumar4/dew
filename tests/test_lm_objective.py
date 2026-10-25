@@ -12,6 +12,8 @@ sampler runs in test_lm_recipe.
 """
 
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -89,29 +91,52 @@ def written_cross_entropy(model, counted=None, shift=1):
         logits = model.apply(params, tokens[:, :-1])
         targets = tokens[:, shift:tokens.shape[1] - 1 + shift]
         picked = jnp.take_along_axis(jax.nn.log_softmax(logits, axis=-1), targets[..., None], axis=-1)[..., 0]
-        weights = jnp.ones_like(picked) if counted is None else counted(tokens, *given).astype(picked.dtype)
+        weights = jnp.ones_like(picked) if counted is None else jnp.broadcast_to(
+            counted(tokens, *given), picked.shape).astype(picked.dtype)
         return -jnp.sum(picked * weights) / jnp.sum(weights)
     return loss
+
+
+INSTANCES = 64
+"""The independent decoders and batches each draw of a scalar loss's check 1 holds: one a draw, a
+scalar's error is one value a seed, and these sites took 256 to 512 seeds to resolve (`seeds_for`)."""
+
+
+def assert_as_exact_over_instances(dew, reference, draw, label, *, seeds, truth_fn):
+    """Check 1 of a scalar `dew` against `reference` and `truth_fn`, each draw INSTANCES of `draw`'s
+    seeds stacked (seed s their seeds s * INSTANCES on), every arm mapped over them in one program,
+    each instance as its own call computes it (`jax.lax.map`)."""
+    def stacked(seed):
+        drawn = [draw(seed * INSTANCES + index) for index in range(INSTANCES)]
+        return jax.tree.map(lambda *leaves: jnp.stack(leaves), *drawn)
+
+    def mapped(fn):
+        return lambda *inputs: jax.lax.map(lambda one: fn(*one), inputs)
+
+    assert_as_exact(without_ynn(mapped(dew)), without_ynn(mapped(reference)), stacked, label, seeds=seeds,
+                    truth_fn=mapped(truth_fn))
 
 
 def assert_scores_the_written_cross_entropy(dew, draw, label, *, seeds, counted=None, model=None):
     """Check 1: `dew(params, tokens, *given)` on par with the cross entropy written from the decoder's
     logits (`written_cross_entropy`), both from that cross entropy's float64 run, over `draw`'s
-    parameters, tokens and what each draw gives beside them."""
+    parameters, tokens and what each draw gives beside them, INSTANCES of them a draw."""
     model = model or tiny_decoder()
-    assert_as_exact(without_ynn(dew), without_ynn(written_cross_entropy(model, counted)), draw, label,
-                    seeds=seeds, truth_fn=written_cross_entropy(model.clone(dtype=jnp.float64), counted))
+    assert_as_exact_over_instances(dew, written_cross_entropy(model, counted), draw, label, seeds=seeds,
+                                   truth_fn=written_cross_entropy(model.clone(dtype=jnp.float64), counted))
 
 
-def drawn_tokens(counted=None, **options):
+@functools.cache
+def decoder_init():
+    """The test decoder's initialization, compiled once for every draw."""
+    return jax.jit(make_objective().init)
+
+
+def drawn_tokens(**options):
     """Each seed's draw: the decoder's parameters and a batch of its tokens (`token_batch`'s, of
-    `options`), and what `counted` gives beside them."""
-    initialized = jax.jit(make_objective().init)
-
+    `options`)."""
     def draw(seed):
-        tokens = token_batch(seed=seed, **options)[TEXT_KEY]
-        return (initialized(jax.random.key(seed)), tokens) if counted is None else (
-            initialized(jax.random.key(seed)), tokens, *counted(seed))
+        return decoder_init()(jax.random.key(seed)), token_batch(seed=seed, **options)[TEXT_KEY]
     return draw
 
 
@@ -343,7 +368,7 @@ def test_evaluation_reads_the_ema_copy():
 
     written = written_cross_entropy(objective.model)
     wide = written_cross_entropy(objective.model.clone(dtype=jnp.float64))
-    assert_as_exact(without_ynn(averaged), without_ynn(lambda params, ids, ema: written(ema, ids)), draw,
+    assert_as_exact_over_instances(averaged, lambda params, ids, ema: written(ema, ids), draw,
                     "evaluation of the averaged copy", seeds=EVALUATED_SEEDS,
                     truth_fn=lambda params, ids, ema: wide(ema, ids))
     params, ids, ema = draw(0)
@@ -475,9 +500,15 @@ def test_the_validation_pass_scores_perplexity_per_token_and_logs_it():
     count = sum(float(jnp.sum(scores.weights)) for scores, _ in scored)
     logged = [s["val/perplexity"] for _, s in tracker.scalars if "val/perplexity" in s]
     assert len(logged) == 1
-    # The pass scores the weights the step left, so it logs their perplexity, by the metric's own sums.
     assert 0 < count < 2 * BATCH * SEQ
-    assert logged[0] == metric.finalize(metric.merge(*(metric(scores, batch) for scores, batch in scored)))
+    # The pass scores the weights the step left, so it logs their perplexity per counted target: of the
+    # pass's scores recomputed here (by another program, to its rounding), the one by the metric's own
+    # sums, not the mean of each batch's.
+    per_target = metric.finalize(metric.merge(*(metric(scores, batch) for scores, batch in scored)))
+    per_batch = float(np.exp(np.mean([np.log(metric.finalize(metric(scores, batch)))
+                                      for scores, batch in scored])))
+    assert per_target != per_batch
+    assert abs(np.log(logged[0] / per_target)) < abs(np.log(logged[0] / per_batch))
 
 
 # --- packed batches --------------------------------------------------------
@@ -536,7 +567,7 @@ def drawn_documents(seed):
     rows of their own (`documents`, `only_document`)."""
     tokens, segment_ids, positions, documents_drawn = documents(seed=seed)
     alone = [piece for document in documents_drawn for piece in only_document(document)]
-    return jax.jit(packed_objective().init)(jax.random.key(seed)), tokens, segment_ids, positions, *alone
+    return decoder_init()(jax.random.key(seed)), tokens, segment_ids, positions, *alone
 
 
 def float64_packed():
@@ -572,7 +603,7 @@ def test_a_packed_batch_ignores_the_boundary_and_the_padding():
         return lambda params, tokens, segment_ids, positions, *_: weighted_mean(
             *counted_losses(of, params, tokens, segment_ids, positions))
 
-    assert_as_exact(without_ynn(scored), without_ynn(written(objective)), drawn_documents,
+    assert_as_exact_over_instances(scored, written(objective), drawn_documents,
                     "a packed row's written loss", seeds=PACKED_SEEDS, truth_fn=written(float64_packed()))
 
 
@@ -613,9 +644,9 @@ def test_a_packed_batch_scores_like_its_documents_alone():
             params, tokens, segment_ids=segment_ids, positions=positions)[:2])
 
     wide = float64_packed()
-    assert_as_exact(without_ynn(scored), without_ynn(written(objective)), drawn_documents,
+    assert_as_exact_over_instances(scored, written(objective), drawn_documents,
                     "the documents' written losses", seeds=PACKED_SEEDS, truth_fn=written(wide))
-    assert_as_exact(without_ynn(scored), without_ynn(chunked(objective)), drawn_documents,
+    assert_as_exact_over_instances(scored, chunked(objective), drawn_documents,
                     "the documents' chunked losses", seeds=PACKED_SEEDS, truth_fn=chunked(wide))
 
 
@@ -637,7 +668,7 @@ def test_a_packed_batch_reaches_the_objective_through_the_batch_dict():
             params, tokens, train=True, rngs={"dropout": jax.random.key(1)}, segment_ids=segment_ids,
             positions=positions)[:2])
 
-    assert_as_exact(without_ynn(packed), without_ynn(scored(objective)), drawn_documents,
+    assert_as_exact_over_instances(packed, scored(objective), drawn_documents,
                     "a packed batch's loss", seeds=PACKED_SEEDS, truth_fn=scored(float64_packed()))
     params, tokens, segment_ids, positions, *_ = drawn_documents(0)
     unpacked, _ = objective.scalar_loss(params, {TEXT_KEY: tokens}, step_at())
@@ -683,7 +714,7 @@ ROLES_SEEDS = 8
 def drawn_roles(seed):
     """A seed's decoder parameters, its tokens and the roles column marking every second target."""
     batch = assistant_batch(seed=seed)
-    return jax.jit(make_objective().init)(jax.random.key(seed)), batch[TEXT_KEY], batch[ROLES_KEY]
+    return decoder_init()(jax.random.key(seed)), batch[TEXT_KEY], batch[ROLES_KEY]
 
 
 def assistant_targets(tokens, roles):
@@ -872,7 +903,7 @@ def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
             return base + term, term
         return recomputed
 
-    assert_as_exact(without_ynn(scored), without_ynn(oracle(model)), draw, "router z-loss",
+    assert_as_exact_over_instances(scored, oracle(model), draw, "router z-loss",
                     seeds=ROUTER_SEEDS, truth_fn=oracle(model.clone(dtype=jnp.float64)))
 
 
