@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 import selection_margins
 from model_support import largest_difference
-from reference_error import FEWEST_SEEDS, assert_as_exact, widened, without_ynn
+from reference_error import FEWEST_SEEDS, GateFailure, assert_as_exact, widened, without_ynn
 from sharded import assert_sharded
 from token_support import token_rows
 
@@ -298,7 +298,7 @@ def test_a_scanned_gate_at_another_sparsity_fails_check_1():
     with pytest.raises(AssertionError) as raised:
         assert_as_exact(scanned, plain, case.draw, "gemma3n scanned stack at 0.951",
                         seeds=FEWEST_SEEDS, truth_fn=truth)
-    assert raised.type is AssertionError
+    assert raised.type is GateFailure
 
 
 def gemma3n_training_variables(variables):

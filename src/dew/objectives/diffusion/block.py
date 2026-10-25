@@ -246,16 +246,6 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
                              tokenizer=recorded_tokenizer(self.processor),
                              processor=recorded_processor(self.processor))
 
-    def build_task(self, variables: Variables, *,
-                   processor: Processor | None | Omitted = OMITTED) -> BlockGeneration:
-        """Return the model over `variables` as a `BlockGeneration` task.
-
-        The sampler keeps the published defaults, and the caller sets the
-        tokenizer's EOS ids.
-        """
-        return BlockGeneration.from_settings(self.model, variables, self.task_settings(),
-                                             self.processor if processor is OMITTED else processor)
-
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
         """The shared text stack, as the training model declares it."""

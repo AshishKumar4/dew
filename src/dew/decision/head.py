@@ -401,7 +401,7 @@ class JointSchemaHead(Head):
                  train: bool = False, spanned: jax.Array | None = None) -> jax.Array:
         """The `[B, Q, K]` logits of each question's options over the row's final `states`. Where the
         questions' spans are in the row's context (`DecisionInputs.spans_in_context`), `spanned` are
-        the backbone's final states over the context (`DecisionModel.context_states`), which the
+        the backbone's final states over the context (`dew.nn.cross_attention.encode_context`), which the
         questions and options are pooled from, their tokens the context's; the memory every option
         and field reads, and the readout, are the row's either way."""
         if table is None:
