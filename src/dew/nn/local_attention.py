@@ -15,6 +15,7 @@ from .attention import (
     combined_attention_mask,
     cudnn_takes_mask,
     kernel_for_materialized_mask,
+    query_split,
     resolve_implementation,
     scaled_dot_product_attention,
     split_with_queries,
@@ -258,11 +259,11 @@ def _local_over_sequence(kernel, query, key, value, shards: int, *, window, chun
     if placed is not None:
         split = jax.sharding.NamedSharding(placed.mesh, jax.sharding.PartitionSpec(*placed.spec[:2]))
         fields = {name: jax.sharding.reshard(field, split) for name, field in fields.items()}
-    rows = logical_spec(("activation_batch", "activation_length"), (batch, length))
-    specs = [rows] * len(fields)
+    specs = [query_split(("activation_batch", "activation_length"), field, queries, query.shape)
+             for field in fields.values()]
     if sinks is not None:
         fields['sinks'] = sinks
-        specs.append(logical_spec(("activation_heads",), sinks.shape))
+        specs.append(query_split(("activation_heads",), sinks, queries, query.shape))
     names = tuple(fields)
     local_length = length // shards
     # Chunks that start at every shard's first row stay inside their shard.

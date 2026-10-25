@@ -75,7 +75,6 @@ from .sharding import (
     logical_spec,
     manual_map,
     mesh_axes,
-    row_axes,
     sequence_shards,
     split_positions,
 )
@@ -919,7 +918,7 @@ def _per_shard(local, query, key, value, **extras):
     cache key keeps, so every fresh process would compile again; under a fully manual
     map jax lowers neither. `extras` maps each further argument to its array, or None,
     and the logical axes it splits on: a dimension named for the rows or the query heads splits as the
-    query's own rows or heads do (`_query_split`), whatever the rules give that name alone, so a shard's
+    query's own rows or heads do (`query_split`), whatever the rules give that name alone, so a shard's
     coordinates are its own rows' and heads' where axes contend for them.
     """
     given = {name: pair for name, pair in extras.items() if pair[0] is not None}
@@ -944,15 +943,18 @@ def _per_shard(local, query, key, value, **extras):
 
     # An extra may be a tree of arrays (`CrossDocuments`), each leaf split on its axes.
     specs = (queries, keys, keys,
-             *(jax.tree.map(lambda leaf, axes=axes: _query_split(axes, leaf, queries, query.shape), x)
+             *(jax.tree.map(lambda leaf, axes=axes: query_split(axes, leaf, queries, query.shape), x)
                for x, axes in given.values()))
     return manual_map(shard, specs, queries)(query, key, value, *(x for x, _ in given.values()))
 
 
-def _query_split(axes, leaf, queries: P, shape: tuple[int, ...]) -> P:
+def query_split(axes, leaf, queries: P, shape: tuple[int, ...]) -> P:
     """The spec of a per-shard argument `leaf` whose dimensions `axes` names, from the query's own split
     `queries` of its `shape`: a dimension of the rows, the queries or the query heads takes the query's,
-    where it is as long (a broadcast dimension of 1 stays whole), any other none."""
+    where it is as long (a broadcast dimension of 1 stays whole), any other none. Every manual map over
+    attention's rows splits its row-scoped arguments so (`_per_shard`, the sequence exchanges, local
+    attention over a sequence), so a shard's masks, lengths and ids are its own rows' where axes contend for
+    them, whatever the rules give those names alone."""
     of = {"activation_batch": 0, "activation_length": 1, "activation_heads": 2}
     return P(*(_entry(queries, of[axis]) if axis in of and length == shape[of[axis]] else None
                for axis, length in zip(axes, jnp.shape(leaf), strict=False)))
@@ -1007,13 +1009,14 @@ def exchanged_heads_attention(kernel, query, key, value, shards: int, *, causal,
     for name, x in (('mask', mask), ('bias', bias)):
         if x is not None:
             x = _four_dimensional(x)
-            extras[name] = (x, P(row_axes(x.shape[0]),
-                                 exchanged_heads if x.shape[1] == heads else None))
+            # Its rows split as the query's own (`query_split`), its heads as the exchange leaves them.
+            rows = _entry(queries, 0) if x.shape[0] == query.shape[0] else None
+            extras[name] = (x, P(rows, exchanged_heads if x.shape[1] == heads else None))
     if sinks is not None:
         extras['sinks'] = (sinks, P(exchanged_heads))
     if key_value_seq_lengths is not None:
-        extras['key_value_seq_lengths'] = (key_value_seq_lengths, logical_spec(
-            ("activation_batch",), key_value_seq_lengths.shape))
+        extras['key_value_seq_lengths'] = (key_value_seq_lengths, query_split(
+            ("activation_batch",), key_value_seq_lengths, queries, query.shape))
 
     def local(query, key, value, *arrays):
         query, key, value = (jax.lax.all_to_all(x, SEQUENCE_AXIS, 2, 1, tiled=True)
@@ -1072,12 +1075,12 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
     for name, x in (('mask', mask), ('bias', bias)):
         if x is not None:
             x = _four_dimensional(x)
-            extras[name] = (x, logical_spec(SCORES, x.shape))
+            extras[name] = (x, query_split(SCORES, x, queries, query.shape))
     if sinks is not None:
-        extras['sinks'] = (sinks, logical_spec(("activation_heads",), sinks.shape))
+        extras['sinks'] = (sinks, query_split(("activation_heads",), sinks, queries, query.shape))
     if key_value_seq_lengths is not None:
-        extras['key_value_seq_lengths'] = (key_value_seq_lengths, logical_spec(
-            ("activation_batch",), key_value_seq_lengths.shape))
+        extras['key_value_seq_lengths'] = (key_value_seq_lengths, query_split(
+            ("activation_batch",), key_value_seq_lengths, queries, query.shape))
 
     def local(query, key, value, *arrays):
         if gathered:

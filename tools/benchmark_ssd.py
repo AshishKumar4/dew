@@ -136,16 +136,19 @@ def measure(case: dict, config: BenchmarkConfig) -> dict:
     except (ValueError, NotImplementedError, jax.errors.JaxRuntimeError) as error:
         return {**row, 'served': False, 'reason': failure(error)}
 
-    def loss(*args):
-        scanned, final = scan(*args)
-        return jnp.sum(scanned * cotangents[0]) + jnp.sum(final * cotangents[1])
+    def trained(*args):
+        # The scan's results returned with their gradients, as a training step reads both: a pass
+        # returning the gradients alone leaves XLA to drop every forward launch the backward does not
+        # read (the forward's readout).
+        out, pull = jax.vjp(scan, *args)
+        return out, pull(cotangents)
 
     row['served'] = True
-    gradient = jax.jit(jax.grad(loss, argnums=(0, 1, 2, 3, 4)))
+    gradient = jax.jit(trained)
     gradients = None
     if not config.forward_only:
         try:
-            gradients = jax.block_until_ready(gradient(*built))
+            gradients = jax.block_until_ready(gradient(*built))[1]
         except (ValueError, NotImplementedError, jax.errors.JaxRuntimeError) as error:
             row['backward_reason'] = failure(error)
 
