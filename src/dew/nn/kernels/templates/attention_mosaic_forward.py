@@ -219,7 +219,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
             turn()
 
     # The slots before this block's first tile its partner reads, the turns it would have taken.
-    family.passed(streams, streamed[0], lo, first=streamed[0], between=passed_turns)
+    family.passed(streams, streamed[0], lo, first=streamed[0], before=passed_turns)
 
     def scored(index, slots, then=turn, pending: int = 0):
         # A key tile's logits under the score hook, and their products where the logits are a factor of
@@ -282,7 +282,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
                                    initial=(start.acc,))
         state = algebra.Partial(acc, *rows)
     # The slots past this block's last tile (a causal block whose diagonal ends first) its partner reads.
-    family.passed(streams, hi, streamed[1], first=streamed[0], between=passed_turns)
+    family.passed(streams, hi, streamed[1], first=streamed[0], before=passed_turns)
     pl.when(consumer == 0)(turn)
     overflowed = jnp.where(algebra.overflowed(state.acc), 1.0, 0.0)
     family.stored((family.as_row(state.m), family.as_row(overflowed)), status_views, smem=row_smem)
