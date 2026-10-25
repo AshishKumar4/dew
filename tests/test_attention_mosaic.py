@@ -425,8 +425,9 @@ sm86's block, whose family this mainloop has no bundle for (`attention_mosaic_pr
 
 def _bound(op, *arrays, **options):
     """`op`'s arguments for a call of `arrays` (`forward`'s, or `backward`'s with its residuals), as its
-    launch binds them."""
-    return op.bind(*arrays, interpret=True, **options)
+    launch binds them compiled, as a GPU process runs it (`MosaicForward.eligible` takes an interpreted call
+    in a CPU process alone)."""
+    return op.bind(*arrays, interpret=False, **options)
 
 
 def _forward_call(shape, width: int, value_width: int, residuals: bool):
