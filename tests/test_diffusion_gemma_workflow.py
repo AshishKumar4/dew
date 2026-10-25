@@ -123,7 +123,7 @@ def assert_transformers_reads(export, model, variables, reference):
     from test_block_diffusion import prefill
     from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     def theirs(dtype):
         loaded, report = DiffusionGemmaForBlockDiffusion.from_pretrained(
@@ -217,7 +217,10 @@ def test_transformers_reads_a_trained_image_reading_runs_export(tmp_path):
         reference = {name: stored[name] for name in stored.files}
     assert_transformers_reads(tmp_path / "export", exported.model, exported.variables, reference)
 
-    again = Pretrained.load(str(tmp_path / "export"), dtype="float32", attention_impl="xla")
+    # At the run's own cache length, so both reads are one program on the same values: a longer cache
+    # sums each query's keys over other tiles, which a GPU rounds otherwise.
+    again = Pretrained.load(str(tmp_path / "export"), dtype="float32", attention_impl="xla",
+                            max_seq_len=exported.model.max_seq_len)
     assert again.model.conditioner == exported.model.conditioner
     assert again.model.canvas_length == exported.model.canvas_length
 

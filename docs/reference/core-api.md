@@ -27,6 +27,14 @@ Import `Objective`, `Aux`, `Step` and `Ratio` from `dew.objectives`. `Ratio.mean
 
 `Aux` holds training measurements, sequential mutable replacements, QK maxima and additive deferred effects. The trainer applies the effects once per supported optimizer commit. `objective.scalar_loss(variables, batch, step)` returns a scalar and the same Aux for direct JAX differentiation.
 
+### Categorical log-likelihoods
+
+`dew.nn.categorical` is the one owner of a categorical distribution's log-likelihood over the last axis: a model's logits over its vocabulary, a classifier's over its classes, a decision's over a question's options.
+
+<!-- api: dew.nn.categorical.log_probs dew.nn.categorical.probabilities dew.nn.categorical.cross_entropy dew.nn.categorical.soft_cross_entropy dew.nn.categorical.kl_divergence dew.nn.categorical.entropy dew.nn.categorical.rescaled dew.nn.categorical.target_loss dew.nn.categorical.segment_log_partition -->
+
+Each computes in at least float32 and keeps float64 in float64. `where` excludes the classes a row does not hold; they take no probability and add no term, in value or gradient. `rescaled`, `target_loss` and `segment_log_partition` are the pieces of a partition read in blocks or over ragged supports, as `dew.objectives.lm.chunked` reads its vocabulary.
+
 ### Collections and EMA selection
 
 A variables tree is a nested mapping. Its outer keys name collections such as `params` and `batch_stats`; leaves are arrays such as a dense kernel or a running mean. The optimizer updates the `params` collection. A mutable Linen call returns replacement state collections, which the objective supplies through `Aux.variables`. See the [BatchNorm example](../concepts/objectives.md#non-parameter-state).
@@ -60,7 +68,7 @@ Import these from `dew.training`:
 - `host` names train-state fields out of `params`, `opt_state` and `ema`. A named `opt_state` or `ema` stays in pinned host memory between steps, and the step fetches it to the device. Naming `params` instead puts the whole `TrainState` on the CPU, including optimizer state, EMA and accumulation. The optimizer transaction then runs on a CPU companion of the mesh, and on every process the runtime CPU device count must match the accelerator count before JAX initializes.
 - `host_parameters` holds glob patterns over logical parameter paths (`params/layers_*`) that an inference placement keeps in pinned host memory. Only the `offloaded` placement reads them, and `check` refuses a layout that names them for any other placement.
 
-`shardings(mesh, tree)` returns a matching tree of placements, and `check(params, shardings, mesh)` checks for excessive replication. See [distributed training](../concepts/distributed.md).
+`shardings(mesh, tree)` returns a matching tree of placements, and `check(params, shardings, mesh)` checks for excessive replication. `validate(mesh, state, capacity=None)` reads a state as it will be placed, its leaves arrays or `jax.ShapeDtypeStruct`s that carry their shardings, and returns a `Validation`: each leaf's spec, shard shape and memory kind, the bytes each device holds between steps by device id, the axes a batch's rows split over, the collectives a step runs over each mesh axis by the role the placement gives it, and the logical axes no rule names. Rules naming an axis the mesh lacks are refused there as in `shardings`, and it raises `LayoutRefused` when a device would hold more than its capacity, the device's allocator `bytes_limit` unless `capacity` states it. See [distributed training](../concepts/distributed.md).
 
 ## Trainer
 
@@ -73,6 +81,8 @@ Import `Trainer` from `dew` or `dew.training`.
 `accumulation` counts accepted microbatches per effective window. Shared means use a weighted gradient accumulator with at least fp32 precision, and keep float64 when it is enabled in JAX. A TPU has no float64 (XLA rewrites it into pairs of float32, which are not IEEE doubles), so a trainer whose parameters are stored in float64 on a TPU mesh is refused when it places the state. Each finalized gradient enters Optax in its parameter's dtype, and partially accumulated gradients keep the wider working dtype.
 
 Composite statistics keep independent normalizers, and the inputs for scalar-VJP replay. Parameters and the EMA stay fixed within the window, and sequential mutable replacements keep the snapshots they originally read. `dynamic_scale=True` persists the scale and its history, and rejects nonfinite working or optimizer-input gradients. A rejection drops its whole accumulation window, as torch's AMP skips the whole update: the window's accepted microbatches go with it, the next microbatch begins a window, and the mutable collections they wrote keep what they wrote. A batch ramp's new stage drops a window a rejection left part filled, so every update pools one stage's batches.
+
+`validate(batch=None, steps=None, capacity=None)` runs the checks `fit` runs before it places the state, on the state a fresh run would place, without placing it. Given one global batch, the state includes the gradient accumulator `accumulation` pools. An `OptimConfig` is built over `steps`, as `fit` builds it. `capacity` states each device's bytes for a mesh whose devices report none, such as CPU devices standing in for GPUs.
 
 A custom `step(objective, optimizer)` factory is responsible for the accepted and update clocks, the scaler, the EMA and mutable writes. Its body returns `(state, loss, aux)`, and the common compiled wrapper advances the attempt counter `state.step`. A host `rollout` produces the actual training arrays once per consumed attempt, before differentiation or replay.
 
@@ -165,6 +175,10 @@ Import `Checkpoints` from `dew`.
 `save` schedules a persistent save. `saved` is the iterator position as bytes, or `None`, and `share` is the `DataPartition` that the stream read; a position requires a share. `wait()` waits for pending writes, and `latest` reports the newest eligible checkpoint. `restore` returns the restored state data and the iterator position that the reader of `share` resumes from, or `None` for the position when no share is given. A template controls structure and placement. `path(step)` gives the persistent checkpoint location.
 
 This object does not write `run.json`; run configuration saving is separate. Use the [complete resume example](../guides/checkpoints.md) before adapting these lower-level calls.
+
+<!-- api: dew.checkpoints.averaged dew.checkpoints.Averaged -->
+
+`dew.checkpoints.averaged(runs, step=None, ema=None, mesh=None, layout=None)` averages runs trained apart from one model, of any objective, in fp32, each read onto `mesh` as `layout` places it; a pool's processes each take the mean of the shards they hold. A LoRA run's factors are merged into its kernels first. It returns an `Averaged`: the mean `variables`, the `model` record they apply to (its adapter merged away), and each run's directory, step and whether its EMA was read. Runs of another model are refused.
 
 ## Language modeling and generation
 
@@ -417,7 +431,7 @@ Import `pipeline`, `TextGeneration`, `BlockGeneration`, `MaskedGeneration`, `Tex
 
 <!-- api: dew.inference.pipeline.pipeline dew.objectives.Objective.pipeline dew.objectives.Objective.build_task -->
 
-`Objective.pipeline` builds the objective's task over `state.averaged` or `state.variables`. An omitted processor keeps the objective's own; `None` clears it. `build_task` returns `TextGeneration` for LM, GRPO and PPO's actor, `MaskedGeneration` for MDLM, `BlockGeneration` for block SFT and `TextToImage` for diffusion, which takes no processor.
+`Objective.pipeline` builds the objective's task over `state.averaged` or `state.variables`. An omitted processor keeps the objective's own; `None` clears it. `build_task` returns `TextGeneration` for LM, GRPO and PPO's actor, `MaskedGeneration` for MDLM, `BlockGeneration` for block SFT and `TextToImage` for diffusion, which takes no processor. An objective whose `saved_task` builds from the settings its run records (`from_settings`, as Dew's token tasks do) needs no `build_task` of its own: the default builds that task from its `task_settings()` over its model, as a saved run of it loads.
 
 <!-- api: dew.inference.TextGeneration dew.inference.TextGeneration.__call__ dew.inference.TextGeneration.bind dew.inference.TextGeneration.decode dew.inference.TextGeneration.quantized dew.inference.TextGeneration.from_run dew.inference.TextGeneration.from_pretrained -->
 

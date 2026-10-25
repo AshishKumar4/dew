@@ -11,7 +11,7 @@ given it as `[V, D]` rows.
 
 import functools
 import math
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from typing import ClassVar, NamedTuple
 
 import jax
@@ -33,10 +33,10 @@ from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers import AttentionMixer
 from dew.nn.mlp import GatedMLP
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import accumulated, at_least_fp32, capped_logits, scaled_logits
 from dew.nn.scatter import DROPPED
 from dew.records import JSON
-from dew.registry import from_record, record_fields
+from dew.registry import from_record, import_path, imported, record_fields
 
 
 def _layer_norm(dtype: Dtype | None, name: str) -> nn.Module:
@@ -54,11 +54,24 @@ class Head(nn.Module):
     """
 
     reads_table: ClassVar[bool] = False
+    reads_labels: ClassVar[bool] = False
+    """Whether the head reads the answer state of each question at its row's answer cue
+    (`DecisionInputs.readout`) against labels (`Labels`), the backbone's output table its `table`
+    (`OutputTable`, None where no matrix alone is the backbone's head)."""
+    draws_from_rows: ClassVar[bool] = False
+    """Whether the head draws its parameters from the backbone's vocabulary rows (`VocabularyRows`),
+    its `table` when it is drawn, and reads no table after."""
     one_question: ClassVar[bool] = False
     """Whether the head reads one question a row, refusing a joint row's several
     questions at the host boundary (`validate_rows`)."""
     width_field: ClassVar[str] = "features"
     """The field holding the width of the states the head reads."""
+
+    @nn.nowrap
+    def tied_labels(self) -> tuple[tuple[int, ...], ...] | None:
+        """The label ids, `[K][V]`, at which the head reads the backbone's own logits (`tied`), or
+        None where it reads none."""
+        return None
 
     @nn.nowrap
     def validate_rows(self, rows: Sequence[Encoded]) -> None:
@@ -68,21 +81,26 @@ class Head(nn.Module):
                              "QuestionLayout or use a joint head")
 
     def record(self) -> JSON:
-        """Return the head's name and the fields a run records."""
+        """Return the head as a run records it: its class by import path (`dew.registry`) and its
+        fields but the width, which the backbone it reads gives, so any head reloads, one of a
+        package the run trusts too."""
         fields = record_fields(self, type(self))
         del fields[self.width_field]
-        return {"name": type(self).__name__, "fields": fields}
+        return {"name": import_path(type(self)), "fields": fields}
 
     @staticmethod
     def from_record(record: JSON, width: int) -> "Head":
         """Rebuild the head a run recorded, reading states `width` wide, in the numerics it
-        recorded."""
+        recorded. A record of an earlier run names its head by class name alone, one of this
+        module's, and is read as that class's path."""
         held = records.record(record, "head")
         name = records.text(held.get("name"), "head.name")
-        if name not in HEADS:
-            raise ValueError(f"a run's head is one of {sorted(HEADS)}, not {name!r}")
-        fields = {**records.record(held.get("fields"), "head.fields"), HEADS[name].width_field: width}
-        return from_record(HEADS[name], fields)
+        path = name if ":" in name else f"{__name__}:{name}"
+        head = imported(path)
+        if not (isinstance(head, type) and issubclass(head, Head)):
+            raise ValueError(f"a run's head is a decision head (`Head`), not {path!r}")
+        fields = {**records.record(held.get("fields"), "head.fields"), head.width_field: width}
+        return from_record(head, fields)
 
 
 class DecisionHead(Head):
@@ -112,8 +130,10 @@ class DecisionHead(Head):
     attention_impl: str = "auto"
 
     @nn.nowrap
-    def decision_flops(self, lengths, questions, options) -> float:
-        """Full-row encoder layers and the scorer at real option markers."""
+    def decision_flops(self, lengths, questions, options, *, pooled=None) -> float:
+        """Full-row encoder layers and the scorer at real option markers; it pools no spans."""
+        if pooled is not None:
+            raise TypeError("Laya's head scores options at their markers in the row, and pools no context")
         decision_geometry(lengths, questions, options)
         per_layer = (12 * projection_flops(lengths, self.features, self.features)
                      + attention_flops(lengths, 1, self.features, self.features, causal=False))
@@ -146,6 +166,9 @@ class DecisionHead(Head):
 
     def __call__(self, states: jax.Array, inputs: DecisionInputs, table: jax.Array | None = None,
                  train: bool = False) -> jax.Array:
+        if inputs.spans_in_context:
+            raise TypeError("Laya's head scores each option at its marker in the row, so it reads no "
+                            "schema read as the row's context; use a JointSchemaHead")
         # Every token takes its row's question type: a QuestionLayout row asks one question.
         owned = inputs.question_segments[:, None, :] == inputs.segments[:, :, None]
         kinds = jnp.sum(jnp.where(owned, inputs.kinds[:, None, :], 0), axis=-1)
@@ -242,7 +265,8 @@ def _span_means(values: jax.Array, spans: jax.Array) -> jax.Array:
     inside = (positions >= spans[..., :1]) & (positions < spans[..., 1:])
     counts = jnp.maximum(jnp.sum(inside, axis=-1, keepdims=True), 1)
     flat = inside.reshape(inside.shape[0], -1, inside.shape[-1]).astype(values.dtype)
-    summed = jnp.einsum("bnl,bld->bnd", flat, values).reshape(*inside.shape[:-1], values.shape[-1])
+    summed = accumulated(functools.partial(jnp.einsum, "bnl,bld->bnd"), flat, values)
+    summed = summed.reshape(*inside.shape[:-1], values.shape[-1])
     return summed / counts.astype(values.dtype)
 
 
@@ -319,8 +343,9 @@ class JointSchemaHead(Head):
     width_field: ClassVar[str] = "hidden_size"
 
     @nn.nowrap
-    def decision_flops(self, lengths, questions, options) -> float:
-        """Memory/option projections, evidence O-by-L and field Q-by-L attention.
+    def decision_flops(self, lengths, questions, options, *, pooled=None) -> float:
+        """Memory/option projections, evidence O-by-L and field Q-by-L attention, and the span
+        pooling over each row, or over `pooled` tokens a row where the spans are a context's.
 
         Each attention has query/output maps on its queries and key/value
         maps on memory. The field layers also have Q-by-Q self-attention.
@@ -340,7 +365,8 @@ class JointSchemaHead(Head):
                   + 4 * width * self.feedforward * np.sum(question))
         scorer = (8 * width * width + 2 * width) * np.sum(option)
         summaries = (6 * width + 2 * hidden) * np.sum(option)
-        pooling = 2 * hidden * np.sum(length * (question + 2 * option))
+        spanned = length if pooled is None else real_lengths(pooled)
+        pooling = 2 * hidden * np.sum(spanned * (question + 2 * option))
         return float(count + pooling + self.routing_layers * evidence
                      + self.layers * fields + scorer + summaries)
 
@@ -372,10 +398,22 @@ class JointSchemaHead(Head):
         self.residual_gate = self.param("residual_gate", nn.initializers.zeros_init(), ())
 
     def __call__(self, states: jax.Array, inputs: DecisionInputs, table: jax.Array | None = None,
-                 train: bool = False) -> jax.Array:
+                 train: bool = False, spanned: jax.Array | None = None) -> jax.Array:
+        """The `[B, Q, K]` logits of each question's options over the row's final `states`. Where the
+        questions' spans are in the row's context (`DecisionInputs.spans_in_context`), `spanned` are
+        the backbone's final states over the context (`dew.nn.cross_attention.encode_context`), which the
+        questions and options are pooled from, their tokens the context's; the memory every option
+        and field reads, and the readout, are the row's either way."""
         if table is None:
             raise ValueError("the joint schema head reads the backbone's output table, its lexical prior")
+        if inputs.spans_in_context != (spanned is not None):
+            raise ValueError("a schema read as the row's context comes with the context's states, and "
+                             "only then")
         hidden = self.hidden_norm(states)
+        pooled, pooled_tokens = hidden, inputs.tokens
+        if spanned is not None:
+            assert inputs.context is not None, "the context's states come with its tokens"
+            pooled, pooled_tokens = self.hidden_norm(spanned), inputs.context
         batch = inputs.tokens.shape[0]
         memory = self.memory_projection(hidden)
         # Each question reads its own row of the window: that row's last token, and its tokens alone.
@@ -383,15 +421,15 @@ class JointSchemaHead(Head):
         own = (rows[:, :, None] == inputs.segments[:, None, :]) | (rows[:, :, None] == 0)
         last = jnp.max(jnp.where(own, jnp.arange(inputs.tokens.shape[1]), 0), axis=-1)
         last_state = _gathered(hidden, last)
-        questions = _span_means(hidden, inputs.spans)
+        questions = _span_means(pooled, inputs.spans)
         count, width = inputs.options.shape[1:]
         # The option slots computed, `[B, P]` flat indices into the grid, and each one's question.
         slots = (jnp.broadcast_to(jnp.arange(count * width, dtype=jnp.int32), (batch, count * width))
                  if inputs.option_slots is None else inputs.option_slots)
         owners = slots // width
         option_spans = _gathered(inputs.option_spans.reshape(batch, count * width, 2), slots)
-        contexts = _span_means(hidden, option_spans)
-        rows_of_tokens = jnp.take(table, inputs.tokens, axis=0).astype(hidden.dtype)
+        contexts = _span_means(pooled, option_spans)
+        rows_of_tokens = jnp.take(table, pooled_tokens, axis=0).astype(hidden.dtype)
         lexical = _span_means(rows_of_tokens, option_spans)
 
         queries = (self.option_context_projection(contexts) + self.option_lexical_projection(lexical)
@@ -407,9 +445,11 @@ class JointSchemaHead(Head):
         grid = _laid_back(routed, inputs)
 
         fields = self.question_projection(questions)
-        affinity = jnp.einsum("bqkw,bqw->bqk", grid, fields) / math.sqrt(self.width)
+        affinity = (accumulated(functools.partial(jnp.einsum, "bqkw,bqw->bqk"), grid, fields)
+                    / math.sqrt(self.width))
         weights = jax.nn.softmax(jnp.where(inputs.options, affinity, -jnp.inf), axis=-1)
-        summaries = jnp.einsum("bqk,bqkw->bqw", jnp.where(inputs.options, weights, 0.0), grid)
+        summaries = accumulated(functools.partial(jnp.einsum, "bqk,bqkw->bqw"),
+                                jnp.where(inputs.options, weights, 0.0), grid)
         types = jnp.asarray(_TYPE_ROWS)[inputs.kinds]
         fields = (fields + self.option_summary_norm(summaries) + self.global_projection(last_state)
                   + self.type_embedding(types))
@@ -419,7 +459,8 @@ class JointSchemaHead(Head):
 
         anchor = _per_slot(l2_normalized(questions + last_state, 1e-12), owners, inputs)
         prior = (jnp.exp(jnp.minimum(self.prior_logit_scale, math.log(100.0)))
-                 * jnp.einsum("bpd,bpd->bp", l2_normalized(lexical, 1e-12), anchor))
+                 * accumulated(functools.partial(jnp.einsum, "bpd,bpd->bp"),
+                               l2_normalized(lexical, 1e-12), anchor))
         options = self.option_norm(routed)
         repeated = _per_slot(fields, owners, inputs)
         cosine = jnp.sum(l2_normalized(repeated, 1e-8) * l2_normalized(options, 1e-8), axis=-1)
@@ -438,5 +479,172 @@ def decision_geometry(lengths, questions, options):
     return geometry
 
 
-HEADS: Mapping[str, type[Head]] = {head.__name__: head for head in (DecisionHead, JointSchemaHead)}
-"""The heads a run may record, by name."""
+def _answers(states: jax.Array, inputs: DecisionInputs) -> jax.Array:
+    """Each question's answer state `[B, Q, D]`, at its row's answer cue (`DecisionInputs.readout`)."""
+    if inputs.readout is None:
+        raise ValueError("a readout of labels reads rows whose options stand under labels (Labels)")
+    return _gathered(states, inputs.readout)
+
+
+class LabelReadout(Head):
+    """Dew's readout of labels: each option slot's logit is the backbone's own logit for its label at
+    the question's answer cue (`dew.decision.layout.Labels`), through the output table's input QDQ,
+    scale, bias and softcap, computed in fp32 (`DecisionModel.label_logits`, `OutputTable.columns`).
+    A label read as several token variants (`label_ids[k]`, one id a variant) is their grouped logit,
+    the logsumexp of theirs. Untrained, the head is the backbone's own readout.
+
+    `untied` gives each slot's every variant a trainable row and bias of its own, drawn from its
+    variant's output row (scale folded in) and bias, read through the same input QDQ and softcap and
+    grouped alike, so at its draw it is the tied readout at every state; it needs the backbone's
+    output table to draw from (`table`). Its rows and their product compute in at least float32, its
+    table's or `dtype` where wider.
+
+    A row's labels are the head's, its first as many as the question has options (`validate_rows`);
+    option slots past the labels, a batch's padding, read -inf."""
+
+    features: int
+    label_ids: tuple[tuple[int, ...], ...]
+    untied: bool = False
+    dtype: Dtype | None = None
+    reads_labels: ClassVar[bool] = True
+
+    @nn.nowrap
+    def tied_labels(self) -> tuple[tuple[int, ...], ...] | None:
+        return None if self.untied else self.label_ids
+
+    @nn.nowrap
+    def validate_rows(self, rows: Sequence[Encoded]) -> None:
+        """Refuse rows whose labels are not the head's (`_labels_of`)."""
+        super().validate_rows(rows)
+        _refuse_other_labels(rows, self.label_ids)
+
+    @nn.nowrap
+    def decision_flops(self, lengths, questions, options) -> float:
+        """The labels' product over each answer state: its slots' variants, a row each."""
+        decision_geometry(lengths, questions, options)
+        variants = len(self.label_ids[0]) if self.label_ids else 1
+        return projection_flops(questions, self.features, len(self.label_ids) * variants)
+
+    @nn.compact
+    def __call__(self, states: jax.Array, inputs: DecisionInputs, table=None, train: bool = False, *,
+                 tied: jax.Array | None = None) -> jax.Array:
+        width = inputs.options.shape[-1]
+        ids = jnp.asarray(self.label_ids, jnp.int32)
+        if not self.untied:
+            assert tied is not None, "a tied readout reads the backbone's own label logits"
+            return _past_labels(jax.nn.logsumexp(tied[..., :width, :], axis=-1), width)
+        if table is None:
+            raise TypeError("an untied readout draws its rows from the backbone's output table, which a head "
+                            "past a transform, an adapter or a code has not; read the labels tied instead")
+
+        def drawn(values: jax.Array) -> jax.Array:
+            return values.astype(_wide(values.dtype, self.dtype))
+
+        rows = self.param("rows", lambda key: drawn(jnp.take(table.rows(), ids.reshape(-1), axis=0)).reshape(
+            *ids.shape, -1))
+        bias = self.param("bias", lambda key: (
+            jnp.zeros(ids.shape, _wide(table.matrix.dtype, self.dtype)) if table.bias is None
+            else drawn(jnp.take(table.bias, ids.reshape(-1)).reshape(ids.shape))))
+        answers = table.states(_answers(states, inputs))
+        answers = answers.astype(_wide(jnp.result_type(answers, rows), self.dtype))
+        logits = jnp.einsum("bqd,kvd->bqkv", answers, rows[:width], precision=jax.lax.Precision.HIGHEST)
+        capped = capped_logits(scaled_logits(logits, None, bias[:width]), table.softcap)
+        return _past_labels(jax.nn.logsumexp(capped, axis=-1), width)
+
+
+class SlotReadout(Head):
+    """A published slot release's head, its law as the release's runtime computes it: slot i's score
+    is `<slot_i, h> + <q(h), k(m_i)> / sqrt(head_dim)`, `h` the question's answer state
+    (`DecisionInputs.readout`), `m_i` the mean of the final states over option i's whole rendered line
+    (its span), `q` and `k` each a `[head_dim, features]` projection, with no slot bias and no softcap on
+    the sum. Its slot rows are drawn from the backbone's output rows of the slots' label ids, `q` from a
+    normal of std `features ** -0.5` and `k` at zero, so at its draw it scores the labels' rows alone;
+    a release's reader loads all three (`readout_head.pt`).
+
+    `slot_rows` is the rows the head holds, the labels' count where unset: a release may hold more
+    rows than its tokenizer spells labels for, the rows past the labels kept, drawn at zero, and read by
+    no option. Drawn fresh, its slot rows are the backbone's vocabulary rows at its labels
+    (`VocabularyRows`, its `table` then), or a normal of std `features ** -0.5` over a backbone that
+    gives none. It computes in at least float32, its states' or `dtype` where wider; option slots past
+    the labels, a batch's padding, read -inf."""
+
+    features: int
+    label_ids: tuple[int, ...]
+    head_dim: int = 64
+    slot_rows: int | None = None
+    dtype: Dtype | None = None
+    reads_labels: ClassVar[bool] = True
+    draws_from_rows: ClassVar[bool] = True
+
+    @nn.nowrap
+    def validate_rows(self, rows: Sequence[Encoded]) -> None:
+        """Refuse rows whose labels are not the head's (`_labels_of`)."""
+        super().validate_rows(rows)
+        _refuse_other_labels(rows, tuple((label,) for label in self.label_ids))
+
+    @nn.nowrap
+    def decision_flops(self, lengths, questions, options) -> float:
+        """Each real option's slot product and key, its affinity with its question's query, and its
+        line's pooling over the row; each question's query."""
+        widths, _, counted = decision_geometry(lengths, questions, options)
+        return (projection_flops(questions, self.features, self.head_dim)
+                + projection_flops(options, self.features, 1 + self.head_dim)
+                + 2 * np.sum(counted) * self.head_dim + 2 * np.sum(counted * widths) * self.features)
+
+    @nn.compact
+    def __call__(self, states: jax.Array, inputs: DecisionInputs, table=None, train: bool = False, *,
+                 tied: jax.Array | None = None) -> jax.Array:
+        width = inputs.options.shape[-1]
+        labels = len(self.label_ids)
+        held = labels if self.slot_rows is None else self.slot_rows
+        if held < labels:
+            raise ValueError(f"{held} slot rows hold fewer than the {labels} labels")
+        real = min(width, labels)
+        ids = jnp.asarray(self.label_ids, jnp.int32)
+        drawn_dtype = _wide(jnp.float32 if table is None else table.dtype, self.dtype)
+
+        def drawn(key):
+            if table is None:
+                rows = jax.random.normal(key, (labels, self.features), drawn_dtype) * self.features ** -0.5
+            else:
+                rows = jnp.take(table, ids, axis=0).astype(drawn_dtype)
+            return jnp.pad(rows, ((0, held - labels), (0, 0)))
+
+        slots = self.param("slots", drawn)
+        q = self.param("q", nn.initializers.normal(self.features ** -0.5), (self.head_dim, self.features),
+                       drawn_dtype)
+        k = self.param("k", nn.initializers.zeros, (self.head_dim, self.features), drawn_dtype)
+        states = states.astype(_wide(jnp.result_type(states, slots), self.dtype))
+        answers = _answers(states, inputs)
+        pooled = _span_means(states, inputs.option_spans[:, :, :real])
+        highest = jax.lax.Precision.HIGHEST
+        score = jnp.einsum("bqd,kd->bqk", answers, slots[:real], precision=highest)
+        query = jnp.einsum("bqd,hd->bqh", answers, q, precision=highest)
+        key = jnp.einsum("bqkd,hd->bqkh", pooled, k, precision=highest)
+        scores = score + jnp.einsum("bqh,bqkh->bqk", query, key, precision=highest) / math.sqrt(self.head_dim)
+        return _past_labels(scores, width)
+
+
+def _wide(dtype, floor: Dtype | None) -> jnp.dtype:
+    """`dtype` at least float32, and at least `floor` where one is given."""
+    return at_least_fp32(dtype if floor is None else jnp.promote_types(dtype, floor))
+
+
+def _past_labels(scores: jax.Array, width: int) -> jax.Array:
+    """`scores` `[B, Q, K]` of a readout's labels widened to `width` option slots, -inf past them."""
+    return jnp.pad(scores, ((0, 0), (0, 0), (0, width - scores.shape[-1])), constant_values=-jnp.inf)
+
+
+def _refuse_other_labels(rows: Sequence[Encoded], labels: tuple[tuple[int, ...], ...]) -> None:
+    """Refuse a row whose question stands under other labels than a readout's `labels`, or under none,
+    or has more options than the readout reads: each question's labels are the readout's first."""
+    for row in rows:
+        for laid in row.questions:
+            if laid.label_ids is None:
+                raise ValueError(f"question {laid.name!r} stands under no labels, which a readout reads; lay "
+                                 "its rows out with labels (QuestionLayout.labels)")
+            if tuple(laid.label_ids) != labels[:len(laid.label_ids)] or len(laid.label_ids) > len(labels):
+                raise ValueError(f"question {laid.name!r} stands under {len(laid.label_ids)} labels other "
+                                 f"than the readout's first, of {len(labels)}; lay the rows out under the "
+                                 "readout's labels")
+

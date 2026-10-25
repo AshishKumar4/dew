@@ -103,8 +103,9 @@ def muon_weight_dimension_numbers(params):
     space, or the expert a router picks. That is the split four labs
     cross-confirmed. Everything else is a matrix and goes to Muon.
 
-    An undeclared matrix of rank two takes Linen's kernel convention,
-    contracting axis 0 into axis 1. An undeclared parameter of higher rank
+    An undeclared matrix of rank two, or one declared with no axis named
+    (replicated, as Gemma 3n's AltUp matrices are), takes Linen's kernel
+    convention, contracting axis 0 into axis 1. An undeclared parameter of higher rank
     raises, because its matrix axes are what this spec cannot guess, and
     orthogonalizing the wrong pair would show up as a worse loss curve.
 
@@ -117,7 +118,9 @@ def muon_weight_dimension_numbers(params):
         if not decays:
             return None
         axes = declared_axes(path, param.ndim, declared)
-        if axes is None:
+        # A declaration that names no axis says how the parameter shards (whole, on every device),
+        # not which of its axes form the matrix, so it reads as an undeclared one (AltUp's).
+        if axes is None or all(axis is None for axis in axes):
             if param.ndim > 2:
                 raise ValueError(
                     f"{jax.tree_util.keystr(path)} has rank {param.ndim} and no "
@@ -377,19 +380,25 @@ def _bias_corrected(moment, decay, count):
 
 
 def scale_by_adam(b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, *,
-                  nesterov: bool = False) -> optax.GradientTransformation:
+                  nesterov: bool = False, nu_dtype=None) -> optax.GradientTransformation:
     """`optax.scale_by_adam` (optax 0.2.8) with its bias corrections formed in double
     (`_bias_corrected`): optax's moments, state layout (`optax.ScaleByAdamState`) and update,
-    composed from optax's public tree math."""
+    composed from optax's public tree math. `nu_dtype` stores the second moment as `mu_dtype` does
+    the first, each the parameter's dtype where None; a gradient narrower than its moment is
+    widened before either reads it, so an fp16 gradient's square does not underflow first."""
     mu_dtype = None if mu_dtype is None else jax.dtypes.canonicalize_dtype(mu_dtype)
+    nu_dtype = None if nu_dtype is None else jax.dtypes.canonicalize_dtype(nu_dtype)
 
     def init_fn(params):
         return optax.ScaleByAdamState(count=jnp.zeros([], jnp.int32),
                                       mu=optax.tree.zeros_like(params, dtype=mu_dtype),
-                                      nu=optax.tree.zeros_like(params))
+                                      nu=optax.tree.zeros_like(params, dtype=nu_dtype))
 
     def update_fn(updates, state, params=None):
         del params  # Adam reads only the gradients
+        updates = jax.tree.map(lambda update, moment: None if update is None else update.astype(
+            jnp.promote_types(update.dtype, moment.dtype)), updates, state.nu,
+            is_leaf=lambda leaf: leaf is None)
         mu = optax.tree.update_moment(updates, state.mu, b1, 1)
         nu = optax.tree.update_moment_per_elem_norm(updates, state.nu, b2, 2)
         count = optax.safe_increment(state.count)
@@ -484,17 +493,17 @@ def _adam_chain(moments: optax.GradientTransformation, learning_rate, weight_dec
 
 
 def _adam(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, weight_decay=0.0,
-          mask=None, *, nesterov: bool = False):
+          mask=None, *, nesterov: bool = False, nu_dtype=None):
     """optax.adam over `scale_by_adam`, with torch's coupled weight decay."""
-    return _adam_chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov), learning_rate,
-                       weight_decay, mask, coupled=True)
+    return _adam_chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov, nu_dtype=nu_dtype),
+                       learning_rate, weight_decay, mask, coupled=True)
 
 
 def _adamw(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, weight_decay=1e-4,
-           mask=None, *, nesterov: bool = False):
+           mask=None, *, nesterov: bool = False, nu_dtype=None):
     """optax.adamw over `scale_by_adam`."""
-    return _adam_chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov), learning_rate,
-                       weight_decay, mask, coupled=False)
+    return _adam_chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov, nu_dtype=nu_dtype),
+                       learning_rate, weight_decay, mask, coupled=False)
 
 
 def _bf16_adam(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, weight_decay=0.0, mask=None, *,
@@ -741,7 +750,7 @@ class ParamGroup:
     `OptimConfig.param_groups` that has a pattern it matches, as in
     lm-engine, and a parameter that matches no group raises `ValueError`.
 
-    The group's learning rate is its own `schedule` (the config's rate when
+    The group's learning rate is its own `schedule` (the config's `learning_rate` when
     None) times `learning_rate_multiplier`. `b1` schedules the first-moment
     decay of adam, adamw and lamb, as torch's `OneCycleLR(cycle_momentum=True)`
     cycles Adam's beta1; None keeps the optimizer's own. `weight_decay`
@@ -774,16 +783,16 @@ class ParamGroup:
                 raise ValueError(f"param group {self.name!r} bounds its parameters from a lower to a "
                                  f"higher value, got {self.bounds}")
 
-    def rate(self, learning_rate: float | ScheduleBase) -> tuple[float, ScheduleBase | None]:
+    def learning_rate(self, learning_rate: float | ScheduleBase) -> tuple[float, ScheduleBase | None]:
         """This group's rate scale and shape (`scaled`): its own `schedule`,
-        else the config's `rate`, times `learning_rate_multiplier`."""
+        else the config's `learning_rate`, times `learning_rate_multiplier`."""
         scale, shape = scaled(learning_rate if self.schedule is None else self.schedule)
         return scale * self.learning_rate_multiplier, shape
 
     def solver(self, make: Callable[..., optax.GradientTransformation],
                learning_rate: float | ScheduleBase, steps: int | None,
                opts: Mapping[str, object]) -> optax.GradientTransformation:
-        """Build this group's optimizer: `make` at the group's `rate`, its
+        """Build this group's optimizer: `make` at the group's `learning_rate`, its
         scale held in state (`scaled_solver`), with the group's `b1`
         schedule and `bounds`, over a run of `steps` updates.
 
@@ -793,7 +802,7 @@ class ParamGroup:
         if self.b1 is not None and 'b1' not in inspect.signature(make).parameters:
             raise ValueError(f"param group {self.name!r} schedules b1, and its optimizer "
                              f"takes no b1 (adam, adamw and lamb do)")
-        solver = scaled_solver(make, *self.rate(learning_rate), steps, opts, self.b1)
+        solver = scaled_solver(make, *self.learning_rate(learning_rate), steps, opts, self.b1)
         if self.bounds is not None:
             solver = optax.chain(solver, _keep_within(*self.bounds))
         return solver
@@ -936,17 +945,17 @@ class ScheduleBase:
 
 @dataclasses.dataclass(frozen=True)
 class Cosine(ScheduleBase):
-    """A linear warmup from `init` to `peak`, then a cosine decay to `end` at
+    """A linear warmup from `init_value` to `peak_value`, then a cosine decay to `end_value` at
     step `decay_steps`, or at the run's end when that is None.
 
     It is `optax.warmup_cosine_decay_schedule`.
     `warmup_steps` must be smaller than the decay horizon in schedule steps.
     """
 
-    peak: float = dataclasses.field(metadata={'rate': True})
+    peak_value: float = dataclasses.field(metadata={'rate': True})
     warmup_steps: int = 10000
-    end: float = dataclasses.field(default=0.0, metadata={'rate': True})
-    init: float = dataclasses.field(default=0.0, metadata={'rate': True})
+    end_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
+    init_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
     decay_steps: int | None = None
 
     def values(self, steps: int | None) -> optax.Schedule:
@@ -955,32 +964,33 @@ class Cosine(ScheduleBase):
             raise ValueError(f"Cosine needs warmup_steps={self.warmup_steps} smaller than "
                              f"decay_steps={decay_steps}")
         return optax.warmup_cosine_decay_schedule(
-            init_value=self.init, peak_value=self.peak, warmup_steps=self.warmup_steps,
+            init_value=self.init_value, peak_value=self.peak_value,
+            warmup_steps=self.warmup_steps,
             decay_steps=decay_steps,
-            end_value=self.end)
+            end_value=self.end_value)
 
 
 @dataclasses.dataclass(frozen=True)
 class PowerTail:
     """The linear tail of a power schedule, from the power law's rate at step
-    `start` to `end` at step `steps`, or at the run's end when that is None."""
+    `start` to `end_value` at step `steps`, or at the run's end when that is None."""
 
     start: int
     steps: int | None = None
-    end: float = dataclasses.field(default=0.0, metadata={'rate': True})
+    end_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
 
 
 @dataclasses.dataclass(frozen=True)
 class Power(ScheduleBase):
     """lm-engine's power schedule (`power_schedule`), a power law of the step after a linear warmup.
 
-    After the warmup, the rate is min(peak, a * (step * c) ** b). With a
+    After the warmup, the rate is min(peak_value, a * (step * c) ** b). With a
     `tail`, a linear decay follows the power law, as in the last 29% of
     Rigel's run. lm-engine's examples set `a` to 4 * batch size and `c` to
     the tokens per step.
     """
 
-    peak: float = dataclasses.field(metadata={'rate': True})
+    peak_value: float = dataclasses.field(metadata={'rate': True})
     warmup_steps: int
     a: float = dataclasses.field(metadata={'rate': True})
     b: float = -0.51
@@ -990,46 +1000,46 @@ class Power(ScheduleBase):
     def values(self, steps: int | None) -> optax.Schedule:
         tail = self.tail
         if tail is None:
-            return power_schedule(self.peak, self.warmup_steps, self.a, self.b, self.c)
+            return power_schedule(self.peak_value, self.warmup_steps, self.a, self.b, self.c)
         return power_schedule(
-            self.peak, self.warmup_steps, self.a, self.b, self.c, decay_start=tail.start,
+            self.peak_value, self.warmup_steps, self.a, self.b, self.c, decay_start=tail.start,
             decay_end=self._horizon(steps if tail.steps is None else tail.steps, "tail.steps"),
-            end_value=tail.end)
+            end_value=tail.end_value)
 
 
 @dataclasses.dataclass(frozen=True)
 class Linear(ScheduleBase):
     """lm-engine's linear schedule (`linear_schedule`), with a warmup, a constant rate and a linear decay.
 
-    The rate warms up from zero to `peak`, stays constant until
+    The rate warms up from zero to `peak_value`, stays constant until
     `decay_start` (the end of the warmup when None), then falls linearly to
-    `end` at `decay_steps` (the run's end when None).
+    `end_value` at `decay_steps` (the run's end when None).
     """
 
-    peak: float = dataclasses.field(metadata={'rate': True})
+    peak_value: float = dataclasses.field(metadata={'rate': True})
     warmup_steps: int = 0
     decay_start: int | None = None
     decay_steps: int | None = None
-    end: float = dataclasses.field(default=0.0, metadata={'rate': True})
+    end_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
 
     def values(self, steps: int | None) -> optax.Schedule:
-        return linear_schedule(self.peak, self.warmup_steps, self.decay_start,
+        return linear_schedule(self.peak_value, self.warmup_steps, self.decay_start,
                                self._horizon(steps if self.decay_steps is None else self.decay_steps,
                                              "decay_steps"),
-                               end_value=self.end)
+                               end_value=self.end_value)
 
 
 @dataclasses.dataclass(frozen=True)
 class OneCycle(ScheduleBase):
     """torch's `OneCycleLR` with its default two phases and cosine annealing.
 
-    The value follows a half cosine from `init` to `peak` at step
-    `warmup_fraction * steps - 1`, then another to `end` at the run's last
-    step, `steps - 1`, and holds `end` after it, where torch raises. `init`
-    is torch's `max_lr / div_factor` (`peak / 25` when None) and `end` its
-    `init / final_div_factor` (`init / 1e4` when None). Adam's momentum cycle
-    under `cycle_momentum=True` is `OneCycle(peak=0.85, init=0.95, end=0.95)`
-    as a group's `b1`.
+    The value follows a half cosine from `init_value` to `peak_value` at step
+    `warmup_fraction * steps - 1`, then another to `end_value` at the run's last
+    step, `steps - 1`, and holds `end_value` after it, where torch raises. `init_value`
+    is torch's `max_lr / div_factor` (`peak_value / 25` when None) and `end_value` its
+    `init_value / final_div_factor` (`init_value / 1e4` when None). Adam's momentum cycle
+    under `cycle_momentum=True` is `OneCycle(peak_value=0.85, init_value=0.95,
+    end_value=0.95)` as a group's `b1`.
 
     optax's `cosine_onecycle_schedule` places its phase boundaries at
     `pct_start * steps` and `steps`, one step later than torch's
@@ -1037,15 +1047,15 @@ class OneCycle(ScheduleBase):
     one step late and it cannot reproduce a torch run.
     """
 
-    peak: float = dataclasses.field(metadata={'rate': True})
-    init: float | None = dataclasses.field(default=None, metadata={'rate': True})
-    end: float | None = dataclasses.field(default=None, metadata={'rate': True})
+    peak_value: float = dataclasses.field(metadata={'rate': True})
+    init_value: float | None = dataclasses.field(default=None, metadata={'rate': True})
+    end_value: float | None = dataclasses.field(default=None, metadata={'rate': True})
     warmup_fraction: float = 0.3
 
     def values(self, steps: int | None) -> optax.Schedule:
         steps = self._horizon(steps, "trainer.steps")
-        init = self.peak / 25 if self.init is None else self.init
-        end = init / 1e4 if self.end is None else self.end
+        init = self.peak_value / 25 if self.init_value is None else self.init_value
+        end = init / 1e4 if self.end_value is None else self.end_value
         # torch's phase ends, kept as floats as torch keeps them.
         rise, last = self.warmup_fraction * steps - 1, steps - 1
         if not 0 < rise < last:
@@ -1057,37 +1067,38 @@ class OneCycle(ScheduleBase):
 
         def value(count) -> jax.Array:
             step = jnp.minimum(jnp.asarray(count, jnp.float32), last)
-            return jnp.where(step <= rise, anneal(init, self.peak, step / rise),
-                             anneal(self.peak, end, (step - rise) / (last - rise)))
+            return jnp.where(step <= rise, anneal(init, self.peak_value, step / rise),
+                             anneal(self.peak_value, end, (step - rise) / (last - rise)))
 
         return value
 
 
 @dataclasses.dataclass(frozen=True)
 class Exponential(ScheduleBase):
-    """A geometric decay from `offset + init` to `offset + end` over
+    """A geometric decay from `offset + init_value` to `offset + end_value` over
     `decay_steps` steps (the run's when None), then constant.
 
     Up to `decay_steps`, the value at step t is
-    `offset + init * (end / init) ** (t / decay_steps)`. That is torch's
-    `ExponentialLR` with `gamma = (end / init) ** (1 / decay_steps)`, stepped
+    `offset + init_value * (end_value / init_value) ** (t / decay_steps)`. That is torch's
+    `ExponentialLR` with `gamma = (end_value / init_value) ** (1 / decay_steps)`, stepped
     `decay_steps` times and then no more, plus `offset`. It is
-    `optax.exponential_decay` with `end` as its bound. SNN-delays anneals
+    `optax.exponential_decay` with `end_value` as its bound. SNN-delays anneals
     DCLS's kernel width this way, the raw width decaying and a constant
     added to it.
     """
 
-    init: float = dataclasses.field(metadata={'rate': True})
-    end: float = dataclasses.field(metadata={'rate': True})
+    init_value: float = dataclasses.field(metadata={'rate': True})
+    end_value: float = dataclasses.field(metadata={'rate': True})
     decay_steps: int | None = None
     offset: float = dataclasses.field(default=0.0, metadata={'rate': True})
 
     def values(self, steps: int | None) -> optax.Schedule:
         span = self._horizon(steps if self.decay_steps is None else self.decay_steps, "decay_steps")
-        if span <= 0 or self.init <= 0 or self.end <= 0:
-            raise ValueError(f"an exponential decay needs positive steps, init and end, got "
-                             f"{span}, {self.init} and {self.end}")
-        decay = optax.exponential_decay(self.init, span, self.end / self.init, end_value=self.end)
+        if span <= 0 or self.init_value <= 0 or self.end_value <= 0:
+            raise ValueError(f"an exponential decay needs positive steps, init_value and end_value, got "
+                             f"{span}, {self.init_value} and {self.end_value}")
+        decay = optax.exponential_decay(self.init_value, span, self.end_value / self.init_value,
+                                        end_value=self.end_value)
         if not self.offset:
             return decay
         return lambda count: self.offset + decay(count)

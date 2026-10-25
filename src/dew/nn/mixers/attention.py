@@ -92,7 +92,7 @@ def exclusive_self_attention(attention: jax.Array, value: jax.Array) -> jax.Arra
     heads, kv_heads = attention.shape[-2], value.shape[-2]
     if heads % kv_heads:
         raise ValueError(f"{heads} query heads do not group over {kv_heads} value heads")
-    dtype = jnp.promote_types(jnp.promote_types(attention.dtype, value.dtype), jnp.float32)
+    dtype = at_least_fp32(jnp.result_type(attention, value))
     value = jnp.repeat(value.astype(dtype), heads // kv_heads, axis=-2)
     work = attention.astype(dtype)
     norm = jnp.sum(value * value, axis=-1, keepdims=True)
@@ -220,7 +220,7 @@ class CausalSelfAttention(nn.Module):
     multiplies by its sigmoid."""
     bidirectional_images: bool = False
     """Whether a causal layer lets each token of an image (`AttentionMetadata.image_groups`) see the
-    image's later tokens too (Gemma 3's, and Gemma 4's sliding layers')."""
+    image's later tokens too, within its window (Gemma 3's, and Gemma 4's sliding layers')."""
     bidirectional_blocks: bool = False
     """Whether a causal layer lets each token of a block (`AttentionMetadata.block_groups`) see the whole
     block, whatever its window (transformers' `block_sequence_ids`): a decision prompt's blocks, read both
@@ -492,9 +492,9 @@ class CausalSelfAttention(nn.Module):
 
     def _rotary_tables(self, rotary_positions, dtype, reach=None):
         """The rotary cos and sin at `dtype`. Interleaved mRoPE, YaRN and the
-        plain rope each build their own angles; YaRN rotates whole heads at
-        its own frequencies, so it takes neither a partial rotary nor a
-        Llama 3.1 ramp."""
+        plain rope each build their own angles; YaRN ramps the rotated width,
+        a whole head or a 'default' partial rotary's (`rotary_freqs`), at its
+        own frequencies, so it takes no Llama 3.1 ramp."""
         if self.rotary_axes is not None:
             if rotary_positions is None or rotary_positions.ndim != 3:
                 raise ValueError(f"a rotary over {len(self.rotary_axes)} axes reads their ids "

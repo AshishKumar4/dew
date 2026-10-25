@@ -49,8 +49,9 @@ def rule_launches(module) -> list:
         return port(*args, None, 0.125, 64, interpret=True)
 
     def both(q, k, v, g, beta, h0, do):
-        (_, final), pull = jax.vjp(rule, q, k, v, g, beta, h0)
-        return pull((do, jnp.zeros_like(final)))
+        # The output returned, so the forward's every launch is live: a dead one is DCE'd (jax 0.12).
+        (out, final), pull = jax.vjp(rule, q, k, v, g, beta, h0)
+        return out, pull((do, jnp.zeros_like(final)))
 
     beta = g.update(shape=g.shape[:3], dtype=jnp.bfloat16)
     with tuning.seen() as found:

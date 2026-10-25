@@ -20,6 +20,8 @@ from reference_error import (
     assert_computes_the_oracle,
     assert_rounds_where_the_reference_does,
     chain_roundings,
+    float64_forward,
+    without_ynn,
 )
 from tool_support import load as load_tool
 
@@ -382,12 +384,16 @@ def train(objective, directory: Path, steps: int):
     return jax.device_get(state.variables)
 
 
+MERGED_SEEDS = 8
+"""The merged-adapter site's declared draws (`seeds_for`)."""
+
+
 def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     """A rank-2 adapter on all eight projections of every layer, the attention's output gate
     (`g_proj`) apart from the feed-forward's `gate_proj`: one step moves every B factor, so the
     loss reaches each projection; a run resumed after its first step ends where two uninterrupted
     steps end; the factors save as PEFT names them and load back; and the merged checkpoint
-    reloads to the adapted model's logits."""
+    reloads to logits on par with the adapted model's from float64."""
     loaded = load()
     adapted = loaded.adapt(LoRA(rank=2, modules=PROJECTIONS), key=0)
     targets = {'/'.join(module[1:]) for module in adapted.adapter.targets}
@@ -422,7 +428,18 @@ def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     np.testing.assert_array_equal(np.asarray(again.model.apply(again.variables, ids)), logits)
     adapted.save(tmp_path / 'merged', variables=resumed)
     merged = Pretrained.load(tmp_path / 'merged', dtype='float32', attention_impl='xla')
-    np.testing.assert_allclose(np.asarray(merged.model.apply(merged.variables, ids)), logits, atol=1e-5)
+    # Merging folds each adapter into its projection's weight, a rounding of its own: the merged
+    # model's logits are on par with the adapted model's over drawn ids, both from the adapted
+    # model's float64 forward (check 1).
+    vocabulary = adapted.model.vocab_size
+
+    def draw(seed):
+        return (np.random.default_rng([0xD0E, seed]).integers(0, vocabulary, ids.shape, dtype=np.int32),)
+
+    merged_logits = without_ynn(lambda drawn: merged.model.apply(merged.variables, drawn))
+    adapted_logits = without_ynn(lambda drawn: adapted.model.apply(resumed, drawn))
+    assert_as_exact(merged_logits, adapted_logits, draw, 'merged adapter logits', seeds=MERGED_SEEDS,
+                    truth_fn=lambda drawn: float64_forward(adapted.model, resumed, drawn)[0])
 
 
 INTENT = Choice('which team?', {'billing': 'payments', 'technical': 'outages', 'sales': 'pricing'})

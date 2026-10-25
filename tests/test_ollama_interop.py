@@ -143,7 +143,7 @@ def train_and_export(root: Path) -> Path:
         "--trainer.checkpoint-dir", str(root / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
         "--model.dtype", "float32", "--max-new-tokens", "0",
-        "--optim.rate", "3e-3",
+        "--optim.learning-rate", "3e-3",
         *model_args], default=LMRunConfig(data=windows))
     state = config.run()
     assert int(state.step) == STEPS
@@ -270,7 +270,7 @@ def test_the_daemon_reports_dews_own_logprobs(imported, client):
     from reference_error import FACTOR, distance
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     _, export, _ = imported
     tokenizer = AutoTokenizer.from_pretrained(str(export), local_files_only=True)

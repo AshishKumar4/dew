@@ -24,7 +24,7 @@ import numpy as np
 
 from dew.artifacts import Artifact, Decisions
 from dew.decision.metrics import Answered
-from dew.nn.precision import at_least_fp32
+from dew.nn import categorical
 from dew.objectives.base import Batch, Metric, Shown, mean_of_totals, merge_totals
 
 
@@ -69,15 +69,6 @@ class ScoringRule(ABC):
         return mean_of_totals(accumulated)
 
 
-def _masked(logits: jax.Array, options: jax.Array) -> jax.Array:
-    """The logits of the real options, at least float32, -inf elsewhere."""
-    return jnp.where(options, logits.astype(at_least_fp32(logits.dtype)), -jnp.inf)
-
-
-def _probabilities(logits: jax.Array, options: jax.Array) -> jax.Array:
-    return jax.nn.softmax(_masked(logits, options), axis=-1)
-
-
 @dataclass(frozen=True)
 class LogLoss(ScoringRule):
     """The cross entropy, -sum_k t_k log p_k: the logarithmic score."""
@@ -85,8 +76,7 @@ class LogLoss(ScoringRule):
     name = "log_loss"
 
     def charge(self, logits, target, options, ordinal):
-        log_p = jax.nn.log_softmax(_masked(logits, options), axis=-1)
-        return -jnp.sum(jnp.where(target > 0, target * log_p, 0.0), axis=-1)
+        return categorical.soft_cross_entropy(logits, target, options)
 
 
 @dataclass(frozen=True)
@@ -96,7 +86,7 @@ class Brier(ScoringRule):
     name = "brier"
 
     def charge(self, logits, target, options, ordinal):
-        p = _probabilities(logits, options)
+        p = categorical.probabilities(logits, options)
         return jnp.sum(jnp.where(options, (p - target) ** 2, 0.0), axis=-1)
 
 
@@ -107,7 +97,7 @@ class Spherical(ScoringRule):
     name = "spherical"
 
     def charge(self, logits, target, options, ordinal):
-        p = _probabilities(logits, options)
+        p = categorical.probabilities(logits, options)
         return 1.0 - jnp.sum(target * p, axis=-1) / jnp.linalg.norm(p, axis=-1)
 
 
@@ -125,7 +115,7 @@ class RankedProbability(ScoringRule):
     name = "rps"
 
     def charge(self, logits, target, options, ordinal):
-        p = _probabilities(logits, options)
+        p = categorical.probabilities(logits, options)
         gaps = (jnp.cumsum(p, axis=-1) - jnp.cumsum(jnp.where(options, target, 0.0), axis=-1)) ** 2
         cuts = jnp.maximum(jnp.sum(options, axis=-1) - 1, 1)
         # The last cut, past every level, is always zero.

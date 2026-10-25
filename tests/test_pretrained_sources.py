@@ -21,6 +21,9 @@ from interop_support import tiny_config
 
 from dew.interop import hf_decoders, sources
 
+# Tier 3's admission traces its forward through torchax (`torchax_fallback.admitted`).
+pytestmark = pytest.mark.torchax
+
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 
 def fixture_config(name):
@@ -160,11 +163,13 @@ def test_a_source_is_routed_on_its_config_alone_as_the_loader_reads_it():
     """`source_route` is the loader's decision before any weight downloads, which a census of configs
     reads too: a registered family's config is its decoder, translated; a media wrapper's is the
     wrapper; DiffusionGemma's its own; an unregistered model_type a registered family's convention
-    computes is verified against transformers (tier 2), and one transformers has no class for is
-    refused, as are a storage format the codecs cannot decode and a family's refusal."""
+    computes is verified against transformers (tier 2), an unregistered causal LM none computes runs
+    as transformers' own forward (tier 3), and one transformers has no class for is refused, as are a
+    storage format the codecs cannot decode and a family's refusal."""
     from dew.interop.pretrained import (
         DecoderRoute,
         DiffusionGemmaRoute,
+        TorchRoute,
         VerifiedRoute,
         WrapperRoute,
         source_route,
@@ -177,6 +182,8 @@ def test_a_source_is_routed_on_its_config_alone_as_the_loader_reads_it():
     assert isinstance(source_route(fixture_config("diffusion-gemma-sft")), DiffusionGemmaRoute)
     verified = source_route(tier_two_config())
     assert isinstance(verified, VerifiedRoute) and verified.verified.error <= verified.verified.bound
+    torch_route = source_route(tiny_config("cohere").to_dict())
+    assert isinstance(torch_route, TorchRoute) and torch_route.admitted.model_type == "cohere"
     llama = fixture_config("llama-tiny")
     for refused in ({**llama, "model_type": "an_unregistered_decoder"},
                     {**llama, "quantization_config": {"quant_method": "mlx", "bits": 4, "group_size": 64,
@@ -187,12 +194,81 @@ def test_a_source_is_routed_on_its_config_alone_as_the_loader_reads_it():
             source_route(refused)
 
 
+def test_tier_three_admits_a_causal_lm_it_can_train_and_refuses_the_rest():
+    """Tier 3 runs an unregistered type's forward only where it is a causal LM tier 3 can train, each
+    refusal its own: BERT configured as a decoder (`is_decoder`) is one, each position reading the
+    tokens before it, and configured as an encoder it reads the later tokens too and is refused; a
+    speculative drafter is no model on its own (`DrafterRefused`), whatever its type; a rotary whose
+    tables transformers recomputes from each call's positions (dynamic NTK) cannot be traced; BioGPT's
+    training forward draws its layer drop on the host, which a traced step would fix; a quantized
+    source is refused, tier 3 reading float weights; and one whose shrunken model does not run at the
+    probe's length (a BERT decoder of 8 positions) is `ProbeUnavailable`, not a model none computes."""
+    from dew.interop import decoder_parts, verify
+    from dew.interop.pretrained import TorchRoute, source_route
+
+    assert isinstance(source_route(tiny_config("bert", is_decoder=True).to_dict()), TorchRoute)
+    cohere = tiny_config("cohere").to_dict()
+    for refused in (tiny_config("bert", is_decoder=False).to_dict(),
+                    tiny_config("cohere", rope_parameters={"rope_type": "dynamic", "rope_theta": 10000.0,
+                                                           "factor": 2.0}).to_dict(),
+                    tiny_config("biogpt").to_dict(),
+                    {**cohere, "quantization_config": {"quant_method": "gptq", "bits": 4, "group_size": 64,
+                                                       "desc_act": False, "sym": True}}):
+        with pytest.raises(ValueError):
+            source_route(refused)
+    with pytest.raises(decoder_parts.DrafterRefused):
+        source_route({**cohere, "num_target_layers": 4})
+    with pytest.raises(verify.ProbeUnavailable):
+        source_route(tiny_config("bert", is_decoder=True, max_position_embeddings=8).to_dict())
+
+
+def test_tier_three_runs_dews_attention_where_every_layer_asks_the_interface_for_it():
+    """Tier 3 observes, on the probe's model, whether every decoder layer asks transformers' attention
+    interface for its attention with a mask Dew's visibility reproduces: StableLM's do, though its
+    class declares no attention backend, and run on Dew's; OpenAI GPT's and GPT-NeoX Japanese's compute
+    their own, and keep them, saying why."""
+    from dew.interop.pretrained import source_route
+
+    stablelm = source_route(tiny_config("stablelm").to_dict()).admitted
+    assert stablelm.attends and not stablelm.why
+    openai = source_route(tiny_config("openai-gpt").to_dict()).admitted
+    assert not openai.attends and openai.why
+    # GPT-NeoX Japanese adds the mask it is given to its scores in its own code: the probe's mask is
+    # transformers' eager one, so its attention stays causal and the type is admitted on its own.
+    japanese = source_route(tiny_config("gpt_neox_japanese").to_dict()).admitted
+    assert not japanese.attends and japanese.why
+
+
+@pytest.mark.parametrize("spelled", ["its own names", "the standard names"])
+def test_the_probe_shrinks_a_config_by_whichever_names_its_class_reads(spelled):
+    """OpenAI-GPT's class reads its width, heads and depth as `n_embd`, `n_head` and `n_layer`, and the
+    standard names as aliases of them: a config spelled either way shrinks to a small model, the
+    transformers config built from it as small, and is probed rather than refused for want of a name."""
+    from transformers import AutoConfig
+
+    from dew.interop import verify
+
+    sizes = ({"n_embd": 256, "n_head": 4, "n_layer": 2} if spelled == "its own names"
+             else {"hidden_size": 256, "num_attention_heads": 4, "num_hidden_layers": 2})
+    config = {**{key: value for key, value in tiny_config("openai-gpt").to_dict().items()
+                 if key not in ("n_embd", "n_head", "n_layer", "hidden_size", "num_attention_heads",
+                                "num_hidden_layers", "num_key_value_heads", "head_dim")}, **sizes}
+    shrunk = verify.shrink(config)
+    rebuilt = AutoConfig.for_model("openai-gpt", **{key: value for key, value in shrunk.items()
+                                                    if key != "model_type"})
+    assert rebuilt.hidden_size < 256 and rebuilt.num_hidden_layers == 2
+    assert isinstance(verify.verify_mapping(config), verify.Unmapped)
+
+
 def test_the_hub_census_routes_a_config_as_the_loader_does(tmp_path):
     """tools/hf_coverage.py classifies a census of configs by the loader's own route (`source_route`),
     with the real verifier: a storage format the codecs refuse is refused before transformers is
     asked about the type, as is one a codec's own reader refuses (GPTQ at three bits); a type
     transformers has no class for, asked only after those, is remote code; a registered family's
-    config is tier 1; and a type a registered convention computes, verified, is tier 2."""
+    config is tier 1; a type a registered convention computes, verified, is tier 2; an unregistered
+    causal LM none computes is tier 3; and each configuration of a type is its own verdict, in either
+    order (BERT as a decoder is tier 3, as an encoder refused; Cohere asking for an attention backend
+    transformers has none of is refused), every route counted in the summary."""
     from tool_support import load
 
     census = load("hf_coverage")
@@ -204,15 +280,24 @@ def test_the_hub_census_routes_a_config_as_the_loader_does(tmp_path):
         "custom": {**llama, "model_type": "a_custom_decoder"},
         "llama": llama,
         "cwm": tier_two_config(),
+        "cohere": tiny_config("cohere").to_dict(),
+        "bert decoder": tiny_config("bert", is_decoder=True).to_dict(),
+        "bert encoder": tiny_config("bert", is_decoder=False).to_dict(),
+        "cohere, no backend": {**tiny_config("cohere").to_dict(), "attn_implementation": "no_such_backend"},
     }
-    rows = [{"id": name, "model_type": config["model_type"], "downloads": len(configs) - index,
-             "config": config} for index, (name, config) in enumerate(configs.items())]
-    (tmp_path / "census.json").write_text(json.dumps(rows))
-    census.classify(tmp_path)
-    routes = {model["id"]: model["route"]
-              for model in json.loads((tmp_path / "coverage.json").read_text())["models"]}
-    assert routes == {"storage": "refused", "gptq": "refused", "custom": "remote code", "llama": "tier 1",
-                      "cwm": "tier 2"}
+    expected = {"storage": "refused", "gptq": "refused", "custom": "remote code", "llama": "tier 1",
+                "cwm": "tier 2", "cohere": "tier 3", "bert decoder": "tier 3", "bert encoder": "refused",
+                "cohere, no backend": "refused"}
+    for ordered in (list(configs), list(reversed(configs))):
+        rows = [{"id": name, "model_type": configs[name]["model_type"], "downloads": len(configs) - index,
+                 "config": configs[name]} for index, name in enumerate(ordered)]
+        (tmp_path / "census.json").write_text(json.dumps(rows))
+        census.classify(tmp_path)
+        coverage = json.loads((tmp_path / "coverage.json").read_text())
+        assert {model["id"]: model["route"] for model in coverage["models"]} == expected
+        shares = coverage["summary"]["all types"]
+        assert sum(entry["models"] for entry in shares.values()) == len(configs)
+        assert shares["tier 3"]["models"] == 2
 
 
 

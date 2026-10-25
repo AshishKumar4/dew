@@ -360,6 +360,12 @@ class LazyTensors(Mapping[str, np.ndarray]):
         return len(self.specs)
 
 
+def tensor_specs(tensors: Mapping[str, np.ndarray]) -> Mapping[str, jax.ShapeDtypeStruct]:
+    """Stored shape and dtype metadata without reading deferred tensor values."""
+    return (tensors.specs if isinstance(tensors, LazyTensors)
+            else {name: jax.ShapeDtypeStruct(array.shape, array.dtype) for name, array in tensors.items()})
+
+
 def write_index(directory: Path, weight_map: Mapping[str, str], total_size: int | None = None,
                 stem: str = "model") -> None:
     """Publish `<stem>.safetensors.index.json` naming each tensor's shard file."""
@@ -422,8 +428,7 @@ def save_sharded(
     from huggingface_hub import split_state_dict_into_shards_factory
 
     folder = Path(directory)
-    specs = (tensors.specs if isinstance(tensors, LazyTensors)
-             else {name: jax.ShapeDtypeStruct(array.shape, array.dtype) for name, array in tensors.items()})
+    specs = tensor_specs(tensors)
     split = split_state_dict_into_shards_factory(
         dict(specs), get_storage_size=lambda spec: math.prod(spec.shape) * np.dtype(spec.dtype).itemsize,
         filename_pattern=stem + "{suffix}.safetensors", max_shard_size=max_shard_size)

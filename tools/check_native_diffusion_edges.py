@@ -3,7 +3,6 @@ near float64 as the source's float32 (tools/native_diffusion_edges_reference.py 
 every walk, and the tiny UNet's output and its gradients, on par with diffusers' float32 run over
 drawn inputs, both measured from diffusers' run in float64 (check 1, tests/reference_error.py)."""
 import argparse
-import copy
 import json
 import sys
 from pathlib import Path
@@ -108,13 +107,13 @@ def check_schedule(ref, case):
 def check_unet(directory, case):
     import torch
     from diffusers import UNet2DConditionModel
-    from diffusers_wan_reference import float64
+    from torch_precision import float64, float64_twin
 
     model = UNet2DCondition(**unet_fields(json.loads((directory / "unet/config.json").read_text()),
                                           attention_impl="xla"))
     params, _ = translate_unet_weights(component_tensors(directory, "unet"), model)
     source = UNet2DConditionModel.from_pretrained(directory / "unet").eval()
-    wide = copy.deepcopy(source).double()
+    wide = float64_twin(source)
     width = WIDTHS[case]
 
     def draw(seed):

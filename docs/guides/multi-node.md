@@ -149,7 +149,7 @@ model = CausalTransformer(vocab_size=256, emb_features=512,
                           num_layers=8, num_heads=8, max_seq_len=1024)
 # fsdp over the eight GPUs of each node, and the data axis of 2 across the nodes.
 mesh = MeshSpec(fsdp=8, replicas=2)
-trainer = Trainer(LMObjective(model, seq_len=1024), OptimConfig(rate=3e-4),
+trainer = Trainer(LMObjective(model, seq_len=1024), OptimConfig(learning_rate=3e-4),
                   key=jax.random.key(0), mesh=mesh)
 ```
 
@@ -161,7 +161,7 @@ On GPU hosts whose device ids run host by host, `jax.make_mesh` already puts the
 
 With `replicas=1`, `jax.make_mesh` places the devices, which is what you want on a single node or a single TPU slice. To choose which devices share an axis, pass them to `spec.build(devices)`. It fills the mesh with the list in the order you give, row-major over `MESH_AXES`, so the last axes get neighbouring entries. For example, on a machine whose NVLink pairs are GPUs 0-1 and 2-3, `[0, 2, 1, 3]` puts a two-way tensor axis across the pairs instead of inside them. `jax.make_mesh` would sort GPU devices by id and lose that order.
 
-Hybrid sharding keeps a full copy of the parameters and optimizer state on every replica group. Plain fsdp across all nodes divides them by the total device count instead. Choose hybrid sharding when one node's memory holds the sharded state, and plain fsdp when it does not.
+Hybrid sharding keeps a full copy of the parameters and optimizer state on every replica group. Plain fsdp across all nodes divides them by the total device count instead. Choose hybrid sharding when one node's memory holds the sharded state, and plain fsdp when it does not. `Trainer.validate` reads, on a CPU host, what each GPU would hold under either mesh, and refuses the one whose state a GPU cannot hold ([checking a distributed run](../concepts/distributed.md#checking-a-distributed-run)).
 
 ## Sequence parallelism
 

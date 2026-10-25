@@ -37,7 +37,7 @@ import torch
 from interop_support import fixture_arrays
 from jax.sharding import PartitionSpec as P
 from recording import RecordingTracker
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, torch_with_gradients, with_gradients
 from tool_support import load
 
 from dew.data.dataset import Loader
@@ -48,6 +48,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import MixerCall
 from dew.nn.kernels import generation
 from dew.nn.mla import MultiHeadLatentAttention
+from dew.nn.precision import FP32_SUMS
 from dew.nn.rope import YarnScaling, rotary_freqs, yarn_attention_factor, yarn_inv_freq, yarn_query_scale
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, MeshSpec, Trainer
@@ -144,7 +145,7 @@ their names in tools/mla_reference.py."""
 def reference_block(name: str, wide: bool = False):
     """The fixture's transformers block and rotary embedding, its weights the fixture's; built in
     float64, every float32 pin widened (`float64`), where `wide`."""
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     fields, config, block, rotary = (getattr(GENERATOR, part) for part in REFERENCE[name])
     weights = {key: torch.from_numpy(value) for key, value in fixture(name).items()
@@ -157,37 +158,30 @@ def reference_block(name: str, wide: bool = False):
 
 
 def reference_walk(name: str, wide: bool = False):
-    """The reference block as a function of a draw, run in float32, or in float64 where `wide` (the
-    truth): its output and the gradient of `sum(output * probe)` into the hidden states."""
-    from tools.diffusers_wan_reference import float64
+    """The reference block as a function of a draw `(hidden, cotangent)`, run in float32, or in
+    float64 where `wide` (the truth): its output and the hidden states' gradient under the drawn
+    cotangent (`torch_with_gradients`)."""
+    from tools.torch_precision import float64
 
     block, rotary = reference_block(name, wide)
-    dtype = torch.float64 if wide else torch.float32
 
-    def run(hidden, probe):
-        states = torch.tensor(np.asarray(hidden), dtype=dtype).requires_grad_()
+    def forward(states):
         batch, length = states.shape[:2]
         positions = torch.arange(length).unsqueeze(0).expand(batch, length)
-        mask = torch.triu(torch.full((length, length), float("-inf"), dtype=dtype), diagonal=1)
+        mask = torch.triu(torch.full((length, length), float("-inf"), dtype=states.dtype), diagonal=1)
         with float64() if wide else contextlib.nullcontext(), stable_top_k():
             output, _ = block(states, rotary(states, positions), mask.expand(batch, 1, length, length),
                               position_ids=positions)
-            (gradient,) = torch.autograd.grad((output * torch.tensor(np.asarray(probe), dtype=dtype)).sum(),
-                                              [states])
-        return {"output": output.detach().numpy(), "grad_hidden": gradient.numpy()}
-    return run
+        return output
+    return torch_with_gradients(forward)
 
 
 def dew_walk(name: str, settings: dict, attention_impl: str = "reference"):
     """Dew's block on the fixture's weights as a function of a draw: what `reference_walk` returns."""
     module = mla_module(settings, attention_impl=attention_impl)
     variables = block_variables(fixture(name))
-
-    @jax.jit
-    def run(hidden, probe):
-        output, pullback = jax.vjp(lambda states: module.apply(variables, states), hidden)
-        return {"output": output, "grad_hidden": pullback(probe)[0]}
-    return lambda hidden, probe: run(jnp.asarray(hidden), jnp.asarray(probe))
+    run = jax.jit(with_gradients(lambda states: module.apply(variables, states)))
+    return lambda hidden, cotangent: run(jnp.asarray(hidden), jnp.asarray(cotangent))
 
 
 def boundary_gap(name: str, hidden: np.ndarray) -> float:
@@ -227,7 +221,7 @@ def boundary_gap(name: str, hidden: np.ndarray) -> float:
 
 
 def block_draw(name: str):
-    """Check 1's draw for a block: a seed's hidden states and probe, rows LENGTH tokens long, for the
+    """Check 1's draw for a block: a seed's hidden states and cotangent, rows LENGTH tokens long, for the
     V3.2 block the first of the seed's candidates its reference selects by more than MARGIN
     (`boundary_gap`)."""
     shape = (CONFIG["batch"], LENGTH, CONFIG["v3"]["hidden_size"])
@@ -247,7 +241,7 @@ def test_yarn_matches_the_reference_derivation():
     frequencies, the cos/sin amplitude and the query scale exactly (as computed, the same float32 and
     Python arithmetic), and cos and sin at drawn positions on par with the reference's float32 from
     its float64 run (check 1)."""
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     yarn = yarn_of(CONFIG["v3"])
     _, rotary = reference_block("mla_v3")
@@ -276,14 +270,20 @@ def test_yarn_matches_the_reference_derivation():
                     truth_fn=lambda positions: reference(positions, wide_run=True))
 
 
-def test_yarn_rotates_whole_heads_and_refuses_a_partial_rotary():
-    """YaRN ramps a whole head's frequencies, so the rope refuses a narrower rotated width beside it
-    under either partial convention."""
+def test_yarn_over_a_partial_rotary_ramps_the_rotated_width_and_refuses_a_proportional_one():
+    """YaRN ramps the rotated width: a 'default' partial rotary of 8 of a head's 16 dims rotates as a
+    whole head of 8 does, the reference's `dim = head_dim * partial_rotary_factor`, bit for bit, while
+    a proportional one, which has no YaRN form, is refused."""
     yarn = yarn_of(CONFIG["v3"])
-    for convention in ("proportional", "default"):
-        with pytest.raises(ValueError):
-            rotary_freqs(jnp.arange(4), 8, 10000.0, rot_dim=4, partial_rotary_type=convention,
-                         rope_scaling=yarn, dtype=np.float32)
+    positions = jnp.arange(0, 4096 * 40, 997)
+    whole = rotary_freqs(positions, 8, 10000.0, rope_scaling=yarn, dtype=np.float32)
+    partial = rotary_freqs(positions, 16, 10000.0, rot_dim=8, partial_rotary_type="default",
+                           rope_scaling=yarn, dtype=np.float32)
+    for ours, theirs in zip(partial, whole, strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    with pytest.raises(ValueError):
+        rotary_freqs(positions, 16, 10000.0, rot_dim=8, partial_rotary_type="proportional",
+                     rope_scaling=yarn, dtype=np.float32)
 
 
 def decode_loop(module, variables, tokens):
@@ -352,15 +352,9 @@ def test_mla_reproduces_the_v32_block():
 
 
 def walked(module):
-    """`module`'s output and the gradients of `sum(output * probe)` into its every parameter and the
-    hidden states, as a function of a draw `(variables, hidden, probe)`, compiled."""
-    @jax.jit
-    def run(variables, hidden, probe):
-        output, pullback = jax.vjp(lambda variables, hidden: module.apply(variables, hidden),
-                                   variables, hidden)
-        grad_variables, grad_hidden = pullback(probe)
-        return {"output": output, "grad_hidden": grad_hidden, "grad_params": grad_variables["params"]}
-    return run
+    """`module`'s output and the gradients of its every parameter and the hidden states under the
+    drawn cotangent, as a function of a draw `(variables, hidden, cotangent)`, compiled."""
+    return jax.jit(with_gradients(module.apply))
 
 
 @pytest.mark.parametrize("name", ["mla_v3", "mla_v3n", "mla_v32"])
@@ -396,8 +390,8 @@ def test_the_fused_path_returns_the_value_columns_and_not_the_padding():
         return tuple(jnp.asarray(rng.standard_normal(shape), jnp.float32)
                      for shape in ((2, 7, 4, 16), (2, 7, 4, 16), (2, 7, 4, 8)))
 
-    # A CPU's calls take the reference path, whose softmax derivative the fused kernel's is not;
-    # routed as an A100's, the call runs the fused kernel this test is about.
+    # A CPU's calls take the reference path, whose float64 sums and exact softmax derivative the
+    # fused kernel's are not; routed as an A100's, the call runs the fused kernel this test is about.
     query, key, value = draw(0)
     fused = functools.partial(scaled_dot_product_attention, query, key, implementation="xla", causal=True)
     with generation.assumed("sm80"):
@@ -409,7 +403,13 @@ def test_the_fused_path_returns_the_value_columns_and_not_the_padding():
             fused(jnp.pad(value, ((0, 0), (0, 0), (0, 0), (0, 16))))
         xla, reference = (functools.partial(scaled_dot_product_attention, implementation=name, causal=True)
                           for name in ("xla", "reference"))
-        assert_as_exact(jax.jit(xla), jax.jit(reference), draw, "narrow value columns",
+
+        def summed(*arrays):
+            # The fused kernel's products sum as an A100's do, so the reference states those sums.
+            with jax.default_matmul_precision(FP32_SUMS):
+                return reference(*arrays)
+
+        assert_as_exact(jax.jit(xla), jax.jit(summed), draw, "narrow value columns",
                         seeds=SEEDS["value columns"])
 
 
