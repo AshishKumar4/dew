@@ -635,8 +635,8 @@ class _Mosaic(base.Template[mosaic_gpu.Tiles]):
         return next((family for family in self._families(ba) if family.name == wanted), None)
 
     def _families(self, ba) -> tuple[mosaic.Family, ...]:
-        """The bundles the launch takes at its operands' dtype (`_families`)."""
-        return _families(ba.arguments['tokens'].dtype)
+        """The bundles the launch takes at its operands' dtype, interpreted or lowered (`_families`)."""
+        return _families(ba.arguments['tokens'].dtype, interpreted=bool(ba.arguments['interpret']))
 
     @abc.abstractmethod
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
@@ -1352,12 +1352,13 @@ def _bundle(config: mosaic_gpu.Tiles, dtype) -> mosaic.Family:
     return family(jnp.dtype(dtype)) if isinstance(family, type) else family
 
 
-def _families(dtype) -> tuple[mosaic.Family, ...]:
+def _families(dtype, *, interpreted: bool) -> tuple[mosaic.Family, ...]:
     """The bundles the Mosaic GPU launches generate tiles for at operands of `dtype`: Hopper's warpgroup
-    MMA's, and Ampere's mma.sync's in a CPU process (which interprets them, or lowers them for an assumed
-    GPU only where asked) or where this JAX's layout inference places its tiles
-    (`mosaic_sm80.staging_solved`); a launch derives its tile on its target's (`_Mosaic._family`)."""
-    ampere = mosaic_sm80.staging_solved() or jax.default_backend() == 'cpu'
+    MMA's, and Ampere's mma.sync's where this JAX's layout inference places its tiles
+    (`mosaic_sm80.staging_solved`), or `interpreted` in a CPU process, whose interpreter takes them at
+    any JAX (a CPU's lowering for an assumed Ampere GPU takes them only where the GPU's own would); a
+    launch derives its tile on its target's (`_Mosaic._family`)."""
+    ampere = mosaic_sm80.staging_solved() or (interpreted and jax.default_backend() == 'cpu')
     return mosaic_sm90.WGMMA, *((mosaic_sm80.Mma(jnp.dtype(dtype)),) if ampere else ())
 
 
