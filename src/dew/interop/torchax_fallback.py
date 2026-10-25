@@ -57,7 +57,7 @@ if TYPE_CHECKING:
     import torch
     from jax.extend.core import ClosedJaxpr
     from torchax.interop import JittableModule
-    from transformers import PreTrainedModel
+    from transformers import PretrainedConfig, PreTrainedModel
 
     from dew.nn.backbones.decoder_stack import DecoderBank
 
@@ -113,16 +113,28 @@ def admitted(unmapped: verify.Unmapped) -> Admitted:
                          "which tier 3 runs")
     fields = {key: value for key, value in unmapped.fields.items() if key != "model_type"}
     config = AutoConfig.for_model(model_type, **fields, experts_implementation=EXPERTS)
+    if (moving := _position_dependent_rope(config)) is not None:
+        raise ValueError(f"model_type {model_type!r} rotates by rope_type {moving!r}, whose tables "
+                         "transformers recomputes from each call's positions, which a traced program "
+                         "cannot branch on (ledger 1493, H5)")
     model = AutoModelForCausalLM.from_config(config, trust_remote_code=False, dtype=torch.float32).eval()
     verify.scatter_weights(model)
     ids = torch.from_numpy(verify.probe_ids(int(config.vocab_size)).astype(np.int64))
     traced = [*model.parameters(), *model.buffers(), ids]
-    with torch.no_grad(), _Untraceable(traced) as untraceable:
-        logits = model(input_ids=ids, use_cache=False).logits
-    if untraceable.found:
+    found = []
+    # The training forward too, which tier 3 runs: dropout and any layer drop run only there.
+    for training in (False, True):
+        model.train(training)
+        with torch.no_grad(), _Untraceable(traced) as untraceable:
+            logits = model(input_ids=ids, use_cache=False).logits
+        found.extend(untraceable.found)
+    model.eval()
+    if found:
         raise ValueError(f"model_type {model_type!r} runs as transformers' own forward only, and that "
-                         f"forward computes {sorted(set(untraceable.found))} on its inputs or weights, whose "
+                         f"forward computes {sorted(set(found))} on its inputs or weights, whose "
                          "output's shape or value they decide, which a traced program cannot hold")
+    with torch.no_grad():
+        logits = model(input_ids=ids, use_cache=False).logits
     changed = ids.clone()
     changed[:, -1] = (changed[:, -1] + 1) % int(config.vocab_size)
     with torch.no_grad():
@@ -130,7 +142,41 @@ def admitted(unmapped: verify.Unmapped) -> Admitted:
     if not torch.equal(logits[:, :-1], moved[:, :-1]):
         raise ValueError(f"model_type {model_type!r} as configured attends to later tokens (its earlier "
                          "positions' logits move with a row's last token), and tier 3 runs causal LMs")
+    # Its training forward traced as tier 3 traces it: a draw on the host would be fixed for every step.
+    from torchax.interop import JittableModule, extract_all_buffers
+
+    jittable = JittableModule(model)
+    params = {name: host_view(leaf, name) for name, leaf in jittable.params.items()}
+    buffers = {name: host_view(leaf, name) for name, leaf in extract_all_buffers(model)[1].items()}
+    _, _, draws = TorchGraph(jittable, ()).traced(params, buffers, ids.numpy().astype(np.int32),
+                                                    jax.random.key(0), train=True)
+    if draws.host:
+        raise ValueError(f"model_type {model_type!r}'s training forward draws on the host ({draws.host} "
+                         "draws, BioGPT's layer drop among them), which a traced step would fix for every "
+                         "step, and tier 3 trains the models it loads")
     return Admitted(model_type, dict(unmapped.reasons))
+
+
+def _position_dependent_rope(config: PretrainedConfig) -> str | None:
+    """The rope_type of `config`'s rotary whose tables transformers recomputes from each call's
+    positions ('dynamic', 'longrope'; `dynamic_rope_update`), or None: its `rope_parameters`, one
+    record or one per layer kind, as transformers' config class normalizes them (empty for a model
+    with no rotary)."""
+    stated = config.to_dict().get("rope_parameters") or {}
+    kinds = stated.values() if all(isinstance(entry, Mapping) for entry in stated.values()) else [stated]
+    return next((entry.get("rope_type") for entry in kinds
+                 if entry.get("rope_type") in ("dynamic", "longrope")), None)
+
+
+def refuse_quantized(config: Mapping[str, object]) -> None:
+    """Refuse a source whose config declares a quantization: tier 3 reads float weights only."""
+    quantization = config.get("quantization_config")
+    if quantization is not None:
+        method = quantization.get("quant_method") if isinstance(quantization, Mapping) else None
+        raise ValueError(
+            f"tier 3 reads float weights only, and this source declares a "
+            f"{method or 'quantization'} quantization_config; load the model's BF16 or FP32 "
+            f"release, or drop fallback for a registered family whose codec Dew reads")
 
 
 TORCH_AXES: tuple[tuple[str, LogicalAxes], ...] = (
@@ -219,6 +265,24 @@ class TorchGraph:
         torch's operators state none. Each broadcast of a value narrower than fp32 sums
         its gradient in fp32 (`_accumulating`), as torch's reduction of a broadcast's
         gradient does."""
+        arguments = (dict(params), dict(buffers), tokens, key)
+        traced, shapes, draws = self.traced(*arguments, train=train, precision=precision)
+        logits, hidden = jax.tree.unflatten(jax.tree.structure(shapes),
+                                            _accumulating(traced, *jax.tree.leaves(arguments)))
+        if draws.host:
+            raise ValueError(
+                f"tier 3 traces this model's training forward once, and it draws on the host "
+                f"({draws.host} draws, e.g. a layer drop), which tracing would fix for every step; set "
+                f"that rate to 0 in its config, or train a family Dew loads natively")
+        if draws.device and key is None:
+            raise ValueError("this model's training forward draws (dropout) and was given no 'dropout' rng")
+        return logits, hidden
+
+    def traced(self, params: Mapping[str, jax.typing.ArrayLike], buffers: Mapping[str, jax.typing.ArrayLike],
+               tokens: jax.typing.ArrayLike, key: jax.Array | None, *, train: bool,
+               precision: jax.lax.PrecisionLike = None):
+        """The forward over these arguments traced once (`jax.make_jaxpr`), its output shapes, and the
+        draws it made (`_Draws`): on torchax's device, a key's, or on the host, fixed by the trace."""
         env = _environment()
         draws = _Draws()
 
@@ -232,19 +296,10 @@ class TorchGraph:
             finally:
                 self.module.eval()
 
-        arguments = (dict(params), dict(buffers), tokens, key)
         with configured_precision(precision):
-            traced, shapes = jax.make_jaxpr(forward, return_shape=True)(*arguments)
-        logits, hidden = jax.tree.unflatten(jax.tree.structure(shapes),
-                                            _accumulating(traced, *jax.tree.leaves(arguments)))
-        if draws.host:
-            raise ValueError(
-                f"fallback='torchax' traces this model's training forward once, and it draws on the host "
-                f"({draws.host} draws, e.g. a layer drop), which tracing would fix for every step; set "
-                f"that rate to 0 in its config, or train a family Dew loads natively")
-        if draws.device and key is None:
-            raise ValueError("this model's training forward draws (dropout) and was given no 'dropout' rng")
-        return logits, hidden
+            closed, shapes = jax.make_jaxpr(forward, return_shape=True)(
+                dict(params), dict(buffers), tokens, key)
+        return closed, shapes, draws
 
     def export(self, model: nn.Module, variables: Mapping[str, object],
                config: Mapping[str, object]) -> dict[str, np.ndarray]:
@@ -637,13 +692,7 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
             f"fallback='torchax' builds the model a transformers config.json describes, and "
             f"{name_or_dir} has none; load a repo that ships config.json and its weights")
     config = json.loads((directory / "config.json").read_text())
-    quantization = config.get("quantization_config")
-    if quantization is not None:
-        method = quantization.get("quant_method") if isinstance(quantization, Mapping) else None
-        raise ValueError(
-            f"fallback='torchax' reads float weights only, and this source declares a "
-            f"{method or 'quantization'} quantization_config; load the model's BF16 or FP32 "
-            f"release, or drop fallback for a registered family whose codec Dew reads")
+    refuse_quantized(config)
     try:
         import torch
         from torchax.interop import JittableModule, extract_all_buffers
