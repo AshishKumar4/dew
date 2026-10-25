@@ -89,9 +89,11 @@ def staging_solved() -> bool:
 @dataclasses.dataclass(frozen=True)
 class Mma(mosaic.Family):
     """mma.sync's bundle for operands of `dtype`: one compute warpgroup a program and no producer
-    (`emit_pipeline` issues its loads), accumulators in registers, products synchronous."""
+    (`emit_pipeline` issues its loads), accumulators in registers, products synchronous, its warps
+    `m_warps` along a tile's rows and the rest along its columns (JAX's `MMALayouts`; `for_tile`)."""
 
     dtype: jnp.dtype
+    m_warps: int = 4
 
     name = "mma.sync"
     rows = 16
@@ -99,7 +101,29 @@ class Mma(mosaic.Family):
     bounded_loads = False
     role_rows = 4 * 16
     operands_in_registers = True
-    rhs_copies = 4
+
+    @classmethod
+    def for_tile(cls, dtype, rows: int, columns: int) -> "Mma":
+        """The bundle for a warpgroup's `rows` x `columns` of a tile: its warps arranged as `MMALayouts`
+        allows (an accumulator atom of `m_warps * 16` rows by `(4 // m_warps) * 8` columns dividing them),
+        the arrangement whose replicated fragments are fewest: the left operand's rows replicated over the
+        warps along the columns, the right operand's columns over those along the rows (`lhs_copies`,
+        `rhs_copies`), at the most warps along the rows of those tied (CUTLASS's warp tiles split both)."""
+        fitting = [m for m in (4, 2, 1) if rows % (m * 16) == 0 and columns % ((4 // m) * 8) == 0]
+        return cls(jnp.dtype(dtype), min(fitting or [4], key=lambda m: m * columns + 4 // m * rows))
+
+    @property
+    def lhs_copies(self) -> int:
+        return 4 // self.m_warps
+
+    @property
+    def rhs_copies(self) -> int:
+        return self.m_warps
+
+    def fragment_depth(self, depth: int) -> int:
+        # A product's fragments are loaded one MMA depth at a time (16 for 16-bit operands: `MMALayouts`'
+        # k), CUTLASS's warp-level k-iterations, never a whole step's.
+        return min(depth, 8 * max(32 // (jnp.dtype(self.dtype).itemsize * 8), 1))
     most_shared = 163 * 1024  # sm80's and sm87's opt-in block (sm86's and sm89's 99 KiB)
     reduction_scratch = plgpu.CompilerParams().reduction_scratch_bytes  # its kernels' default parameters
     column_scratch = 0  # its column sums take its kernels' reduction scratch
@@ -119,7 +143,7 @@ class Mma(mosaic.Family):
 
     @property
     def layout(self):
-        return plgpu.Layout.MMA_ACC(self.dtype)
+        return plgpu.Layout.MMA_ACC(self.dtype, m_warps=self.m_warps)
 
     @property
     def row(self):
@@ -131,11 +155,11 @@ class Mma(mosaic.Family):
 
     @property
     def lhs(self):
-        return plgpu.Layout.MMA_LHS(self.dtype)
+        return plgpu.Layout.MMA_LHS(self.dtype, m_warps=self.m_warps)
 
     @property
     def rhs(self):
-        return plgpu.Layout.MMA_RHS(self.dtype)
+        return plgpu.Layout.MMA_RHS(self.dtype, m_warps=self.m_warps)
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
                interpret: bool, approx_math: bool = True, name: str | None = None) -> Callable:
@@ -279,7 +303,15 @@ class Mma(mosaic.Family):
         if interpret:
             # mma has no rule on a CPU: its sum, in fp32.
             return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
-        return plgpu.mma(acc, self._left(lhs), plgpu.load(rhs, layout=self.rhs))
+        if isinstance(lhs, jax.Array):
+            return plgpu.mma(acc, self._left(lhs), plgpu.load(rhs, layout=self.rhs))
+        # A step's fragments one MMA depth at a time (`fragment_depth`): the registers a thread holds for
+        # its operands are a sub-step's, not the step's.
+        depth = self.fragment_depth(rhs.shape[0])
+        for start in range(0, rhs.shape[0], depth):
+            part = pl.ds(start, depth)
+            acc = plgpu.mma(acc, self._left(lhs.at[:, part]), plgpu.load(rhs.at[part], layout=self.rhs))
+        return acc
 
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
         del interpret

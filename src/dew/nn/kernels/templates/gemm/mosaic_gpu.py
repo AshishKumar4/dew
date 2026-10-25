@@ -61,8 +61,11 @@ FAMILY: mosaic.Family = mosaic_sm90.WGMMA
 
 
 def family_of(tiles: "Tiles", dtype) -> mosaic.Family:
-    """The bundle a tile runs on: its instruction family's (`Tiles.family`), mma.sync's a dtype's."""
-    return mosaic_sm80.Mma(jnp.dtype(dtype)) if tiles.family == 'mma.sync' else FAMILY
+    """The bundle a tile runs on: its instruction family's (`Tiles.family`), mma.sync's a dtype's with its
+    warps arranged for a consumer's share of the tile (`mosaic_sm80.Mma.for_tile`)."""
+    if tiles.family != 'mma.sync':
+        return FAMILY
+    return mosaic_sm80.Mma.for_tile(dtype, tiles.block_m // tiles.warpgroups, tiles.block_n)
 
 
 @dataclasses.dataclass(frozen=True)
