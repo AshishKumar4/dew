@@ -1417,9 +1417,10 @@ def test_runs_average_across_a_pool_each_process_its_own_shards(tmp_path):
     from dew.checkpoints import Checkpoints
 
     corpus = document_corpus(tmp_path / "corpus", 24, length=7)
-    reports = run_pool("averaged", tmp_path / "out", 2, run_dir=tmp_path / "runs", fsdp_size=2,
+    # The fsdp axis spans both processes' devices, so a split leaf is half on each.
+    reports = run_pool("averaged", tmp_path / "out", 2, run_dir=tmp_path / "runs", fsdp_size=MESH_DEVICES,
                        tokens=corpus.train, seq_len=7)
-    assert all(report["pool_sharded"] for report in reports)
+    assert all(report["split"] for report in reports)
     trees = []
     for run in reports[0]["runs"]:
         with Checkpoints(run) as checkpoints:
