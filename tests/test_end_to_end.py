@@ -527,7 +527,8 @@ def test_a_repae_step_moves_the_running_statistics_as_train_repae_does(repae_ste
                                1 / np.sqrt(STEPPED["bn/running_var_f64"]), rtol=4 * np.finfo(np.float64).eps)
     decoder, decoding = task.published_autoencoder({**variables, "params": params, LATENT_STATS: statistics})
     assert isinstance(decoder, TunedAutoEncoder)
-    shift, scale, _ = decoder.latent_affine(decoding["autoencoder"], jnp.float32)
+    affine = decoder.latent_affine(decoding["autoencoder"], jnp.float32)
+    shift, scale = affine.shift, affine.factor
     np.testing.assert_array_equal(np.asarray(shift), np.asarray(statistics["mean"]))
     np.testing.assert_allclose(np.asarray(scale, np.float64),
                                1 / np.sqrt(np.asarray(statistics["var"], np.float64)), rtol=gamma(2), atol=0)

@@ -4,12 +4,12 @@ import copy
 import dataclasses
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Mapping
-from typing import NamedTuple, Self
+from typing import Self
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import linen as nn
+from flax import linen as nn, struct
 
 from dew.objectives.base import Variables
 
@@ -70,15 +70,16 @@ class LatentNormalization:
         return LatentAffine(jnp.asarray(self.shift, dtype), jnp.asarray(self.factor, dtype), self.divides)
 
 
-class LatentAffine(NamedTuple):
+@struct.dataclass
+class LatentAffine:
     """The affine map an autoencoder's latents are normalized by, as the arrays a trace holds
     (`AutoEncoder.latent_affine`): `(z - shift) * factor` and back as `z / factor + shift`, or, one that
     `divides`, `(z - shift) / factor` and back as `z * factor + shift`. A configured normalization gives
     its host values (`LatentNormalization.affine`); a tuned run, the running statistics each call's
-    variables hold."""
+    variables hold. `divides` is static, so the map crosses a jit boundary as its two arrays."""
     shift: jax.Array
     factor: jax.Array
-    divides: bool = False
+    divides: bool = struct.field(pytree_node=False, default=False)
 
     def normalized(self, latent: jnp.ndarray) -> jnp.ndarray:
         shifted = latent - self.shift
