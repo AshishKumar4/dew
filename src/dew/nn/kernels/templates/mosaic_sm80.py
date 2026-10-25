@@ -129,11 +129,11 @@ class Mma(mosaic.Family):
         return plgpu.Layout.MMA_RHS(self.dtype)
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
-               interpret: bool, approx_math: bool = True) -> Callable:
+               interpret: bool, approx_math: bool = True, name: str | None = None) -> Callable:
         _one(consumers)
         return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                             compiler_params=plgpu.CompilerParams(approx_math=approx_math),
-                            interpret=mosaic.interpreted(interpret))
+                            interpret=mosaic.interpreted(interpret), kernel_name=name)
 
     def scoped(self, body, *allocations, streams) -> None:
         pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)

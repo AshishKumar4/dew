@@ -109,7 +109,7 @@ def _cases():
 def test_the_cost_model_picks_within_10_percent_of_the_measured_best_or_names_its_miss(sweep: str,
                                                                                       record: dict):
     """The measured time of the config the launch runs on the swept device (its heuristic, the cost
-    model's choice among every searched config) over the fastest swept config's: the pick was swept, and
+    model's choice among every fitting config) over the fastest swept config's: the pick was swept, and
     runs at most 1.10 times the best, or the case is in `MISSES` and still past it."""
     launch, args, options = _launch(record)
     configs = {_config(text): ms for text, ms in record["times"].items()}

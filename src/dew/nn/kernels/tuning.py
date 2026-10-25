@@ -431,15 +431,11 @@ class KernelOp(tokamax.Op):
         pins = dict(cache.KERNEL_PINS.value)
         if type(self) in pins:
             pin = pins[type(self)]
-            if pin not in self.pinnable(keyed):
+            if pin not in keyed.autotuning_configs:
                 raise Unpinnable(type(self).__name__, pin, self.unpinnable(keyed, pin))
             return pin
         pick = _pick(keyed) or self._nearest(keyed)
         return ba.heuristics_config if pick is None else pick.fastest_config
-
-    def pinnable(self, ba: tokamax.BoundArguments) -> Collection[Hashable]:
-        """The configs a pin may name at `ba`'s key: those a measurement times (`autotuning_configs`)."""
-        return ba.autotuning_configs
 
     def unpinnable(self, ba: tokamax.BoundArguments, config: Hashable) -> str:
         """Why the legal configs of `ba`'s launch do not hold `config`."""
@@ -655,7 +651,8 @@ def materialized(op: KernelOp, ba: tokamax.BoundArguments, arrays: list | None =
 
 
 def measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None, *,
-             arrays: list | None = None, outputs: dict | None = None) -> Timings:
+             arrays: list | None = None, outputs: dict | None = None,
+             configs: Collection[Hashable] | None = None) -> Timings:
     """Every config of `ba`'s launch (at its key's shapes), each compiled on a
     thread and timed alone: the device time CUPTI reads for the launch's own
     kernels, each run after `FLUSH_BYTES` are read, so every config starts
@@ -663,7 +660,8 @@ def measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None, *,
     reads the times, or a stand-in with its `Cupti`; `arrays`, a caller's own
     draw of the launch's operands (`materialized`), else the tuner's; `outputs`,
     where given, takes each timed config's outputs from its first run, so a
-    caller checking them compiles nothing more."""
+    caller checking them compiles nothing more; `configs`, the configs to time
+    where not every one (a sweep's sample of them)."""
     if profiler is None:
         from jax.experimental.mosaic.gpu import profiler
 
@@ -689,7 +687,8 @@ def measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None, *,
     timings: dict[Hashable, tokamax.BenchmarkData | Exception] = {}
     read = {}
     with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as pool:
-        futures = {config: pool.submit(compiled, config) for config in ba.autotuning_configs}
+        timed = ba.autotuning_configs if configs is None else configs
+        futures = {config: pool.submit(compiled, config) for config in timed}
     # CUPTI reads every run, the flush's own first, subscribing for each and
     # unsubscribing after. It takes one subscriber, so where a profile capture
     # holds it, from the first run or any later one, the launch keeps its
@@ -716,7 +715,7 @@ def measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None, *,
     except RuntimeError as error:
         if not _another_subscriber(error):
             raise
-        return Timings(dict.fromkeys(ba.autotuning_configs, error))
+        return Timings(dict.fromkeys(timed, error))
     finally:
         _detach(profiler, evicting, flush)
         # Every config measured before an exit, a failed one's or another subscriber's too, is logged.

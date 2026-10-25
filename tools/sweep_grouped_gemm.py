@@ -1,12 +1,12 @@
-"""Times every searched config of the grouped GEMM's launches on this GPU, the records the cost model's
+"""Times every fitting config of the grouped GEMM's launches on this GPU, the records the cost model's
 ranking test reads (tests/fixtures/gemm_sweeps/<generation>.json).
 
     python tools/sweep_grouped_gemm.py --out records.json [--implementations mosaic_gpu triton]
-        [--products forward ...] [--shapes NAME ...]
+        [--products forward ...] [--shapes NAME ...] [--sample N]
 
 For each swept shape (the fixture's seven MoE projections) and product (forward, input_gradient,
-kernel_gradient, kernel_gradient_fp32), each launch's searched configs (`Template.searched` on this
-device's facts: the fitting ones its cost model is calibrated over) are timed as the tuner times them
+kernel_gradient, kernel_gradient_fp32), each launch's fitting configs (`Template.fitting` on this
+device's facts) are timed as the tuner times them
 (`tuning.measured`: compiled in parallel, each run after the L2 is flushed, the device time CUPTI reads)
 on the fixture's draw, each checked against float32 host products. The output is the fixture's form:
 provenance (the device and its facts, jax and the commit) and one record a shape, product and
@@ -64,6 +64,18 @@ def references(x, w, dy, sizes) -> dict:
             "kernel_gradient": np.stack([x[a:b].T @ dy[a:b] for a, b in spans])}
 
 
+def sampled(launch, ba, target, count: int):
+    """`launch`'s fitting configs at `ba` on `target` a sweep times: every one where `count` is 0, else the
+    `count` the cost model estimates fastest, which the pick and its nearest rivals lie in, and `count`
+    more spread evenly over the rest by estimate, from the next-fastest to the slowest."""
+    fits = launch.fitting(ba, target)
+    if not count or len(fits) <= 2 * count:
+        return None
+    ranked = sorted(fits, key=lambda config: launch.cost(ba, config, target))
+    rest = ranked[count:]
+    return ranked[:count] + [rest[round(index * (len(rest) - 1) / max(count - 1, 1))] for index in range(count)]
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -71,6 +83,9 @@ def main() -> None:
     parser.add_argument("--implementations", nargs="+", default=["mosaic_gpu", "triton"])
     parser.add_argument("--products", nargs="+", default=list(PRODUCTS), choices=PRODUCTS)
     parser.add_argument("--shapes", nargs="+", default=list(SHAPES), choices=list(SHAPES))
+    parser.add_argument("--sample", type=int, default=0,
+                        help="time the model's N best fitting configs and N more spread over the rest by "
+                             "estimate (0: every one)")
     args = parser.parse_args()
 
     import jax
@@ -110,7 +125,8 @@ def main() -> None:
                     continue
                 # Each config's outputs from its first timed run (`tuning.measured`), checked with no compile.
                 outputs: dict = {}
-                timings = tuning.measured(launch, ba, arrays=list(call), outputs=outputs)
+                timings = tuning.measured(launch, ba, arrays=list(call), outputs=outputs,
+                                          configs=sampled(launch, ba, target, args.sample))
                 times, failures, errors = {}, {}, {}
                 for config, timing in timings.items():
                     if isinstance(timing, Exception):

@@ -80,8 +80,8 @@ def triton_tiles(dtype, roles: Mapping[str, str], extents: Mapping[str, int | No
     within its registers at the most warps (`cost.THREAD_REGISTERS`) and a step's blocks a block of the
     roomiest family holds (`mosaic.Family.most_shared`); one warpgroup a program or as many as warpgroup
     MMA's consumer roles (`mosaic.Family.consumers`), over which Triton spreads a dot; and stages from two
-    to as many steps as that block holds. A target's launch keeps those that fit it (`_Triton.fitting`)
-    and ranks those its cost model is calibrated over (`_Triton.calibrated`). Where the model ties (it
+    to as many steps as that block holds. A target's launch ranks those that fit it (`_Triton.fitting`).
+    Where the model ties (it
     charges a compute-bound tile's work alike), the first wins: the fewest `block_m` and `block_n`, which
     a group's boundary tile computes past its group's; the deepest `block_k`, which synchronizes its
     pipeline fewer times a tile (at 128 x 256 on an H100, a step of 64 took 1.56 ms where 32 took 1.78,
@@ -128,12 +128,12 @@ def _covering(extent: int) -> int:
 
 TRITON_CALIBRATED = {'block_m': (64, 256), 'block_n': (128, 256), 'block_k': (32, 128), 'stages': (2, 4)}
 """The least and most of each tile axis the Triton sweeps measured (GMMT-a100, GMM-h100-2; the steps
-those of 16-bit operands): the region `_Triton.calibrated` holds its cost model to."""
+those of 16-bit operands): provenance a pick's record carries (`_Triton.calibrated`), never a bound."""
 
 
 TPU_CALIBRATED_EXTENT = 4 * mosaic_tpu.LANES
-"""The longest axis of a TPU block the launches have taken (Megablox's default is 128 cubed), past which
-no measurement has calibrated the cost model (`_MosaicTpu.calibrated`)."""
+"""The longest axis of a TPU block the launches' measurements have taken (Megablox's default is 128 cubed):
+provenance a pick's record carries (`_MosaicTpu.calibrated`), never a bound."""
 
 
 def tpu_blocks(extents: tuple[int, int, int]) -> tuple[mosaic_tpu.Blocks, ...]:
@@ -747,6 +747,19 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                 and self._hooks_lower(ba, first, target)
                 and (self.EXACT_SUMS or not ba.arguments.get('exact_sums')))
 
+    def registers(self, ba, config: mosaic_gpu.Tiles) -> int:
+        # A consumer thread's live set (`mosaic.tile_registers`).
+        dtype = ba.arguments['tokens'].dtype
+        return mosaic.tile_registers(_bundle(config, dtype), config.warpgroups,
+                                     (config.block_m, config.block_n, config.block_k), dtype)
+
+    def register_budget(self, config: mosaic_gpu.Tiles) -> int:
+        # Its family's budget a consumer, whatever the operands' dtype (`mosaic.Family.registers`).
+        return _bundle(config, jnp.bfloat16).registers(config.warpgroups)
+
+    def holding_threads(self, config: mosaic_gpu.Tiles) -> int:
+        return mosaic.THREADS * config.warpgroups
+
     def calibrated(self, config: mosaic_gpu.Tiles) -> bool:
         return (max(config.block_m, config.block_n) <= mosaic_gpu.CALIBRATED_EXTENT
                 and config.stages <= mosaic_gpu.CALIBRATED_STAGES
@@ -865,6 +878,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             # Warpgroup MMA's walk keeps a step's products running past it (`mosaic_gpu._IN_FLIGHT`);
             # mma.sync's products are synchronous (`mosaic_sm80.Mma.walk`).
             in_flight=0 if family.operands_in_registers else mosaic_gpu._IN_FLIGHT,
+            spilled_bytes=self.spilled(ba, config),
             serial_stored=(config.block_m * config.block_n * out
                            if self.STORES_SERIALLY and config.warpgroups == 1 else 0))
 
@@ -1417,6 +1431,12 @@ def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]
 
 _FAMILIES = {mosaic_sm90.WGMMA.name: mosaic_sm90.WGMMA, mosaic_sm80.Mma.name: mosaic_sm80.Mma}
 """The bundles by name, as a tile names its (`mosaic_gpu.Tiles.family`), for their class-wide facts."""
+
+
+def _bundle(config: mosaic_gpu.Tiles, dtype) -> mosaic.Family:
+    """The bundle `config` runs on, for operands of `dtype`."""
+    family = _FAMILIES[config.family]
+    return family(jnp.dtype(dtype)) if isinstance(family, type) else family
 
 
 def _families(dtype) -> tuple[mosaic.Family, ...]:
