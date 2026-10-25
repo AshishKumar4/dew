@@ -297,17 +297,23 @@ class Mma(mosaic.Family):
             ref[...] = plgpu.load(view, layout=layout, optimized=False)
 
     def stored(self, parts, views, *, smem) -> None:
-        del smem
+        # Through `smem` where given, copied out in whole rows (an MMA-layout tile stored from registers
+        # writes partial 32-byte sectors, which JAX 0.12's global transfers refuse).
         for part, view in zip(parts, views, strict=True):
-            view[...] = part.astype(view.dtype)
+            if smem is None:
+                view[...] = part.astype(view.dtype)
+            else:
+                smem[...] = part.astype(smem.dtype)
+                mosaic.copied(smem, view)
 
     def added(self, value: jax.Array, view, interpret: bool, *, smem) -> None:
+        # Element-wise atomic adds into global memory (`red.global`; no TMA reduction before Hopper), so
+        # every other role's and program's adds into the view stay whole.
         del smem
-        if not interpret:
-            # No TMA reduction before Hopper, and no atomic add through registers in Mosaic GPU's
-            # lowering (jax 0.11.2).
-            raise NotImplementedError("mma.sync's bundle adds into global memory only interpreted")
-        view[...] = view[...] + value
+        if interpret:
+            view[...] = view[...] + value
+        else:
+            plgpu.atomic_add(view, value, optimized=False)
 
     def column_sums(self, value: jax.Array, scratch, interpret: bool) -> jax.Array:
         # One warpgroup a program: Mosaic GPU's own reduction across its warps, through the scratch its
