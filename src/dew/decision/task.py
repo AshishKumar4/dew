@@ -103,6 +103,9 @@ class Weights:
 
     step: int
     ema: bool
+    averaged: tuple[tuple[str, int, bool], ...] = ()
+    """The runs' checkpoints these weights are the fp32 mean of (`Decide.averaged`): each run's
+    directory, step, and whether its own average was read; none for one run's weights."""
 
 
 @dataclass(frozen=True)
@@ -144,6 +147,12 @@ class DecideSettings:
     context_encoder: ContextEncoder = "table"
     """How the model encodes a row's context (`DecisionModel.context_encoder`); a run recorded before
     the choice existed embedded it by its token table."""
+    head_identity: JSON = None
+    """Where the run's head started: `{"drawn": seed}`, a fresh head drawn from its trainer's key (with
+    its backbone's `source` where the head is drawn from the backbone's rows), or `{"held": digest}`, a
+    head it was given, by its variables' digest; None where the run recorded neither, as one from
+    before the field or a trainer given no seed. Runs whose heads started apart do not average
+    (`Decide.averaged`)."""
 
     @staticmethod
     def of(record: Mapping[str, object]) -> "DecideSettings":
@@ -214,6 +223,27 @@ class Decide:
                    checkpoint.specials, Calibration(temperatures), name=label)
 
     @classmethod
+    def _recorded(cls, directory: str, record: Mapping[str, object], backbone, variables: Variables,
+                  weights: Weights, dtype: DTypeLike | None) -> Self:
+        """The task a run's `record` describes over `backbone` and `variables`, the `weights` they are:
+        its head, layout, tokenizer, special tokens and processor as the run recorded them."""
+        from dew.data.text import tokenizer_for
+        from dew.interop.pretrained import load_processor
+
+        settings = DecideSettings.of(record)
+        width, head_dtype = DecisionModel.head_size(backbone)
+        head = Head.from_record(records.json_value(settings.head, "head"), width)
+        # The head computes in the dtype it recorded, or as a fresh head over
+        # the backbone would where the caller overrides the compute dtype.
+        model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype),
+                              settings.context_encoder)
+        if settings.tokenizer is None:
+            raise ValueError("the run records no tokenizer to lay its rows out with")
+        processor = None if settings.processor is None else load_processor(settings.processor, backbone)
+        return cls(model, variables, settings.layout, tokenizer_for(settings.tokenizer), settings.specials,
+                   name=str(epath.Path(directory).name), weights=weights, processor=processor)
+
+    @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: "MeshSpec | Mesh | None" = None, layout: "Placement | None" = None,
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> Self:
@@ -227,24 +257,10 @@ class Decide:
         The image processor reloads from its recorded source independently of
         the tokenizer that lays out the task's text.
         """
-        from dew.data.text import tokenizer_for
         from dew.inference.tasks import run_record, saved_model
-        from dew.interop.pretrained import load_processor
         from dew.registry import from_record, objectives
 
         record, step = run_record(directory, step)
-        settings = DecideSettings.of(record)
-        backbone = saved_model(record, dtype).build()
-        width, head_dtype = DecisionModel.head_size(backbone)
-        head = Head.from_record(records.json_value(settings.head, "head"), width)
-        # The head computes in the dtype it recorded, or as a fresh head over
-        # the backbone would where the caller overrides the compute dtype.
-        model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype),
-                              settings.context_encoder)
-        rows = settings.layout
-        if settings.tokenizer is None:
-            raise ValueError("the run records no tokenizer to lay its rows out with")
-        processor = None if settings.processor is None else load_processor(settings.processor, backbone)
         variables = objectives[records.text(record["objective"], "objective")]._saved_variables(
             directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
         if ema is None:
@@ -252,9 +268,8 @@ class Decide:
                 averaged = checkpoints.stored(step).get("ema") is not None
         else:
             averaged = ema
-        task = cls(model, variables, rows, tokenizer_for(settings.tokenizer), settings.specials,
-                   name=str(epath.Path(directory).name), weights=Weights(step, averaged),
-                   processor=processor)
+        task = cls._recorded(directory, record, saved_model(record, dtype).build(), variables,
+                             Weights(step, averaged), dtype)
         saved = epath.Path(directory) / TASK_FILE
         if not saved.exists():
             return task
@@ -269,6 +284,46 @@ class Decide:
                                                                                     "calibration")),
                        budget=from_record(Budget, records.json_value(settings["budget"], "budget")),
                        name=records.text(settings["name"], "name"))
+
+    @classmethod
+    def averaged(cls, runs: Sequence[str], *, step: int | str | None = None, ema: bool | None = None,
+                 calibrate_on: "Iterable[Example | Mapping[str, object]] | Reader | None" = None) -> Self:
+        """The task over the fp32 mean of `runs`' weights as any runs average (`dew.checkpoints.averaged`:
+        each run's at `step`, its latest where None, and `ema` as `from_run` reads them, a LoRA
+        backbone's factors merged first), its calibration the identity, or refit on `calibrate_on`'s
+        held-out answers (`calibrated`): temperatures are fitted to one set of weights.
+
+        The runs are one task trained apart: their heads started alike (each recorded
+        `DecideSettings.head_identity`, the same), with the same head, layout, tokenizer, special
+        tokens, processor and context encoder; a run that differs in any, or that recorded no head
+        identity, is refused (ValueError), naming it. The task's `weights` record each run's directory,
+        step and whether its average was read, so it is no one run's: `save` refuses it, and
+        `save_pretrained` releases it."""
+        from dew.checkpoints import averaged
+        from dew.inference.tasks import run_record
+
+        first = None
+        for directory in runs:
+            record, _ = run_record(directory, step)
+            settings = DecideSettings.of(record)
+            if settings.head_identity is None:
+                raise ValueError(f"the run in {directory} records no head identity (head_identity), so "
+                                 "whether its head started as the others' is unknown; it cannot average")
+            shared = {"head": settings.head, "head_identity": settings.head_identity,
+                      "layout": settings.layout, "tokenizer": settings.tokenizer,
+                      "specials": settings.specials, "processor": settings.processor,
+                      "context_encoder": settings.context_encoder}
+            if first is None:
+                first = record, shared
+            for name, value in shared.items():
+                if value != first[1][name]:
+                    raise ValueError(f"the run in {directory} differs from {runs[0]} in its {name}, so their "
+                                     "weights are not one task's to average")
+        average = averaged(runs, step=step, ema=ema)
+        assert first is not None, "an average reads two or more runs"
+        task = cls._recorded(runs[0], first[0], average.model.build(), average.variables,
+                             Weights(average.runs[0][1], ema=False, averaged=average.runs), None)
+        return task if calibrate_on is None else task.calibrated(calibrate_on)
 
     def save_pretrained(self, directory: str | Path) -> None:
         """Write this task as a released checkpoint, which `from_pretrained` reads back.
@@ -304,6 +359,9 @@ class Decide:
         if self.weights is None:
             raise ValueError("this task's weights came from no run checkpoint, so a run has no "
                              "calibration of them to hold; save a task from `pipeline` or `from_run`")
+        if self.weights.averaged:
+            raise ValueError("this task's weights are an average of runs, which no one run holds, so its "
+                             "calibration belongs in no run's directory; release it with `save_pretrained`")
         write_atomically(epath.Path(directory) / TASK_FILE, json.dumps({
             "weights": to_record(self.weights, Weights),
             "calibration": to_record(self.calibration, Calibration),

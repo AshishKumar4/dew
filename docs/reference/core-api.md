@@ -176,6 +176,10 @@ Import `Checkpoints` from `dew`.
 
 This object does not write `run.json`; run configuration saving is separate. Use the [complete resume example](../guides/checkpoints.md) before adapting these lower-level calls.
 
+<!-- api: dew.checkpoints.averaged dew.checkpoints.Averaged -->
+
+`dew.checkpoints.averaged(runs, step=None, ema=None)` averages runs trained apart from one model, of any objective, in fp32. A LoRA run's factors are merged into its kernels first. It returns an `Averaged`: the mean `variables`, the `model` record they apply to (its adapter merged away), and each run's directory, step and whether its EMA was read. Runs of another model are refused.
+
 ## Language modeling and generation
 
 Import `LMObjective` from `dew.objectives.lm`.
