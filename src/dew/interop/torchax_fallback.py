@@ -44,7 +44,7 @@ from jax.extend.core import Literal, primitives
 
 from dew.interop import sources, verify
 from dew.interop.generation_config import read_generation_config
-from dew.interop.pickles import host_view
+from dew.interop.pickles import host_dtype, host_view
 from dew.interop.pretrained import PretrainedFallback, source_processor
 from dew.interop.weights import AUTO
 from dew.nn.precision import at_least_fp32, configured_precision, float32_products
@@ -55,7 +55,7 @@ from dew.training.distributed import Layout
 
 if TYPE_CHECKING:
     import torch
-    from jax.extend.core import ClosedJaxpr
+    from jax.extend.core import Jaxpr
     from torchax.interop import JittableModule
     from transformers import PretrainedConfig, PreTrainedModel
 
@@ -389,7 +389,7 @@ def _at_opmath(env, lowering, keeps_fp32: tuple[int, str] | None):
     return computed
 
 
-def _accumulating(closed: ClosedJaxpr, *arguments: jax.Array) -> list[jax.Array]:
+def _accumulating(closed: Jaxpr, *arguments: jax.Array) -> list[jax.Array]:
     """`closed` evaluated on `arguments` with each broadcast of a floating value
     narrower than fp32 summing its gradient in fp32 (`_accumulated`): an explicit
     `broadcast_in_dim`, and the size-1 dimensions an elementwise operation
@@ -599,14 +599,17 @@ def _refuse_packing(packing: Mapping[str, object]) -> None:
 
 def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtype: str,
          param_dtype: str, attention_impl: str, max_seq_len: int | None,
-         admission: TorchAdmission | None = None) -> PretrainedFallback:
+         admission: TorchAdmission | None = None, weights: bool = True) -> PretrainedFallback:
     """Load `directory`'s causal LM through transformers and torchax.
 
     `directory` is the metadata snapshot `Pretrained.load` resolved and
     `revision` its commit (None for a local directory); the weights come
     from the same commit through `sources.snapshot`, so the file
     selection is the native loader's. `admission` is the decision that sent an
-    unregistered type here (`admitted`), None for `fallback="torchax"`.
+    unregistered type here (`admitted`), None for `fallback="torchax"`. Without
+    `weights` the model is built from its config on torch's meta device, no
+    weight read, and its variables are their shapes and dtypes alone
+    (`jax.ShapeDtypeStruct`).
     """
     if attention_impl != "auto":
         raise ValueError(
@@ -629,12 +632,21 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
         from transformers import AutoModelForCausalLM
     except ImportError as error:
         raise ImportError(f"fallback='torchax' needs torch, torchax and transformers: {INSTALL}") from error
-    directory = sources.snapshot(str(name_or_dir), revision)
+    if weights:
+        directory = sources.snapshot(str(name_or_dir), revision)
     # Before transformers, whose reader fails on a malformed file without naming it.
     generation_config = read_generation_config(directory)
     storage = "auto" if param_dtype == AUTO else getattr(torch, param_dtype)
-    model = AutoModelForCausalLM.from_pretrained(str(directory), dtype=storage, local_files_only=True,
-                                                 experts_implementation=EXPERTS)
+    if weights:
+        model = AutoModelForCausalLM.from_pretrained(str(directory), dtype=storage, local_files_only=True,
+                                                     experts_implementation=EXPERTS)
+    else:
+        from transformers import AutoConfig
+
+        stated = AutoConfig.from_pretrained(str(directory), local_files_only=True)
+        with torch.device("meta"):
+            model = AutoModelForCausalLM.from_config(
+                stated, dtype=stated.dtype if storage == "auto" else storage, experts_implementation=EXPERTS)
     model.eval()
     jittable = JittableModule(model)
     head = model.get_output_embeddings()
@@ -644,12 +656,20 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     if not isinstance(head_weight, torch.Tensor):
         raise ValueError(f"{type(model).__name__}'s output head holds no weight tensor")
     head_name = next((name for name, value in jittable.params.items() if value is head_weight), None)
-    if head_name is not None and not _plain_head(model, head):
+    # The head's structure, which a forward shows: the loaded model's, or without its weights the
+    # same class at the probe's sizes (`verify.shrink`), since a forward on the meta device reads no
+    # values, which some forwards do.
+    if head_name is not None and not (_plain_head(model, head) if weights else _shrunk_plain_head(config)):
         head_name = None
     # Host views of torch's storage: nothing reaches a device before the
-    # caller's placement.
-    params = {name: host_view(leaf, name) for name, leaf in jittable.params.items()}
-    buffers = {name: host_view(leaf, name) for name, leaf in extract_all_buffers(model)[1].items()}
+    # caller's placement. Without the weights, their shapes and dtypes.
+    def held(leaf, name):
+        if weights:
+            return host_view(leaf, name)
+        return jax.ShapeDtypeStruct(tuple(leaf.shape), host_dtype(leaf, name))
+
+    params = {name: held(leaf, name) for name, leaf in jittable.params.items()}
+    buffers = {name: held(leaf, name) for name, leaf in extract_all_buffers(model)[1].items()}
     stored = model.state_dict()
     persistent = tuple(name for name in buffers if name in stored)
     vocab = int(head_weight.shape[0])
@@ -673,6 +693,18 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     built = {**config, "dtype": dtype, "fallback": "torchax", **versions}
     return PretrainedFallback(module, {"params": params, "buffers": buffers}, processor, config, directory,
                               built, generation_config, export_adapter=graph.export, revision=revision)
+
+
+def _shrunk_plain_head(config: Mapping[str, object]) -> bool:
+    """`_plain_head` of the class `config` builds, at the probe's sizes (`verify.shrink`) with
+    transformers' own initialization: the head's structure, which no size changes."""
+    import torch
+    from transformers import AutoConfig, AutoModelForCausalLM
+
+    fields = {key: value for key, value in verify.shrink(config).items() if key != "model_type"}
+    stated = AutoConfig.for_model(str(config["model_type"]), **fields)
+    model = AutoModelForCausalLM.from_config(stated, dtype=torch.float32, experts_implementation=EXPERTS)
+    return _plain_head(model.eval(), model.get_output_embeddings())
 
 
 def _plain_head(model: PreTrainedModel, head: torch.nn.Module) -> bool:

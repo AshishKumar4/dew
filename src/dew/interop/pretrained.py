@@ -403,7 +403,7 @@ class Pretrained:
             from dew.interop import torchax_fallback
             loaded = torchax_fallback.load(name_or_dir, directory, commit, dtype=dtype,
                                            param_dtype=param_dtype, attention_impl=attention_impl,
-                                           max_seq_len=max_seq_len)
+                                           max_seq_len=max_seq_len, weights=weights)
             loaded = replace(loaded, variables=placed(loaded.variables))
         elif gguf_file is None:
             # A selected GGUF file is a decoder, whatever pipeline index the repo also ships.
@@ -418,7 +418,7 @@ class Pretrained:
             loaded = _load_native_source(name_or_dir, directory, commit, gguf_file=gguf_file, placed=placed,
                                          streaming=streaming or not weights, dtype=dtype,
                                          param_dtype=param_dtype, attention_impl=attention_impl,
-                                         max_seq_len=max_seq_len)
+                                         max_seq_len=max_seq_len, weights=weights)
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
@@ -1344,7 +1344,7 @@ def _selected_payload(fallback: str | None, **files: str | None) -> list[str]:
 def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | None, *,
                         gguf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
                         dtype: str, param_dtype: str, attention_impl: str,
-                        max_seq_len: int | None) -> Pretrained:
+                        max_seq_len: int | None, weights: bool = True) -> Pretrained:
     """Decode native source weights and bind their processors and export layout.
 
     Diffusers pipelines and the explicit torchax fallback have already taken
@@ -1364,7 +1364,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
         from dew.interop import torchax_fallback
         loaded = torchax_fallback.load(name_or_dir, directory, commit, dtype=dtype, param_dtype=param_dtype,
                                        attention_impl=attention_impl, max_seq_len=max_seq_len,
-                                       admission=route.admitted)
+                                       admission=route.admitted, weights=weights)
         return replace(loaded, variables=placed(loaded.variables))
     if tensors is None:
         directory = sources.snapshot(str(name_or_dir), directory.name)
