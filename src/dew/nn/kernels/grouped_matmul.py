@@ -27,7 +27,7 @@ import importlib
 import importlib.util
 import itertools
 import math
-from collections.abc import Callable, Hashable, Mapping
+from collections.abc import Callable, Hashable
 from typing import ClassVar
 
 import jax
@@ -69,73 +69,18 @@ def _doubling(least: int, most: int) -> tuple[int, ...]:
                  if least << power <= most)
 
 
-def triton_tiles(dtype, roles: Mapping[str, str], extents: Mapping[str, int | None]) -> tuple[Tile, ...]:
-    """Every tile a Triton launch may take for operands of `dtype`, from the MMA's facts and Triton's alone
-    (no table of tiles), its fields playing the launch's `roles` (each of `block_m`, `block_n` and
-    `block_k` its output's 'rows' or 'columns', or its contraction's 'step') over the call's `extents` by
-    role (None where the call's rows set it, padded): each a power of two (`tl.arange`'s extents are);
-    rows from mma.sync's 16 (`mosaic_sm80.Mma.rows`) to the call's, at least a warpgroup MMA's
-    (`mosaic.Family.role_rows`); columns from a swizzled row's elements (`mosaic.SWIZZLE_BYTES`) to the
-    call's (Triton masks a block past it); a step from the narrowest swizzle mma.sync stages a step at
-    (`mosaic_sm80.Mma.depths`) to the call's; an output a thread's share of whose fp32 accumulator stays
-    within its registers at the most warps (`cost.THREAD_REGISTERS`) and a step's blocks a block of the
-    roomiest family holds (`mosaic.Family.most_shared`); one warpgroup a program or as many as warpgroup
-    MMA's consumer roles (`mosaic.Family.consumers`), over which Triton spreads a dot; and stages from two
-    to as many steps as that block holds. A target's launch ranks those that fit it (`_Triton.fitting`).
-    Where the model ties (it
-    charges a compute-bound tile's work alike), the first wins: the fewest `block_m` and `block_n`, which
-    a group's boundary tile computes past its group's; the deepest `block_k`, which synchronizes its
-    pipeline fewer times a tile (at 128 x 256 on an H100, a step of 64 took 1.56 ms where 32 took 1.78,
-    GMM-h100-2); the more warps; and three stages, then deeper, then two: three ran the fastest of a
-    tile's stage counts most often in the sweeps (30 of their 56 records, GMMT-a100 and GMM-h100-2)."""
-    family, size = mosaic_sm90.WGMMA, jnp.dtype(dtype).itemsize
-    warps = [mosaic.THREADS // 32 * consumers for consumers in range(family.consumers, 0, -1)]
-    held = max(warps) * 32 * cost.THREAD_REGISTERS
-    shared = max(mosaic_sm90.WGMMA.most_shared, mosaic_sm80.Mma.most_shared)
-    least = {'rows': mosaic_sm80.Mma.rows, 'columns': mosaic.SWIZZLE_BYTES // size,
-             'step': min(mosaic_sm80.Mma(jnp.dtype(dtype)).depths(dtype))}
-    called = {'rows': family.role_rows, 'columns': least['columns'], 'step': least['step']}
-    # The most each role spans: the call's extent where it sets one, else what registers (an output's
-    # rows) or shared memory (a step over rows) leave beside the other roles' least.
-    resourced = {'rows': held // least['columns'], 'columns': held // least['rows'],
-                 'step': shared // ((least['rows'] + least['columns']) * size)}
-    spans = {}
-    for role in least:
-        extent = extents.get(role)
-        spans[role] = _doubling(least[role], resourced[role] if extent is None
-                                else max(called[role], _covering(extent)))
-    tiles = []
-    # The tie order by role (each field's span in its role's order): the fewest rows, the fewest columns,
-    # the deepest step, whichever field plays each.
-    for rows, columns, step in itertools.product(spans['rows'], spans['columns'], reversed(spans['step'])):
-        of = {'rows': rows, 'columns': columns, 'step': step}
-        block_m, block_n, block_k = (of[roles[field]] for field in ('block_m', 'block_n', 'block_k'))
-        loaded = (rows + columns) * step * size
-        if rows * columns >= held or loaded > shared:
-            continue
-        deepest = shared // loaded + 1
-        stages = [count for count in (3, *range(4, deepest + 1), 2) if count <= deepest]
-        tiles += [Tile(block_m, block_n, block_k, warp_count, count)
-                  for warp_count in warps for count in stages]
-    return tuple(tiles)
+TILES = tuple(Tile(*shape) for shape in itertools.product((64, 128, 256), (128, 256), (128, 64, 32), (8, 4),
+                                                            (3, 4, 2)))
+"""Every tile the Triton launches may take: the ones the A100 and H100 sweeps found fastest lie inside.
+Where the cost model ties, the first wins: the deeper step, which synchronizes its pipeline fewer times
+a tile (at 128 x 256 on an H100, a step of 64 took 1.56 ms where 32 took 1.78, GMM-h100-2), and the
+more warps. The Triton launches are kept, not extended (ops/BIBLE.md): a fixed set the chooser prices
+with the model's shared terms, fitted to none of Triton's own."""
 
 
 def _covering(extent: int) -> int:
     """The least power of two at least `extent`."""
     return 1 << (max(extent, 1) - 1).bit_length()
-
-
-TRITON_IN_FLIGHT = 1
-"""The stages of a Triton launch's pipeline that load nothing ahead (`cost.Cost.in_flight`): on Ampere its
-step being consumed (Triton allocates `stages - 1` buffers, as an A100 and an L4 request, TSMEM-a100/l4),
-on Hopper its warpgroup MMA kept in flight. Counted, the model's picks over the R1/R3 sampled sweeps ran
-within 10% of the best at 26 of 28 A100 records and 24 of 28 H100 ones, against 11 and 8 without
-(scripts/eval_sweeps.py)."""
-
-
-TRITON_CALIBRATED = {'block_m': (64, 256), 'block_n': (128, 256), 'block_k': (32, 128), 'stages': (2, 4)}
-"""The least and most of each tile axis the Triton sweeps measured (GMMT-a100, GMM-h100-2; the steps
-those of 16-bit operands): provenance a pick's record carries (`_Triton.calibrated`), never a bound."""
 
 
 TPU_CALIBRATED_EXTENT = 4 * mosaic_tpu.LANES
@@ -447,20 +392,8 @@ class _Triton(_GroupedLaunch[Tile]):
     def _dense_extents(ba) -> tuple[int, int]:
         """The depth and width a dense call's tiles divide."""
 
-    ROLES: ClassVar[Mapping[str, str]]
-    """What each tile field spans (`triton_tiles`): its output's 'rows' or 'columns', or its contraction's
-    'step'."""
-
     def space(self, ba) -> tuple[Tile, ...]:
-        depth, width = self._dense_extents(ba)
-        # The call's depth is a product's step and a kernel gradient's output rows; its rows (None) are
-        # a product's output rows and a kernel gradient's steps, padded to the tile.
-        extents = {'columns': width, ('step' if self.ROLES['block_k'] == 'step' else 'rows'): depth}
-        return triton_tiles(ba.arguments['tokens'].dtype, self.ROLES, extents)
-
-    def calibrated(self, config: Tile) -> bool:
-        return all(least <= getattr(config, axis) <= most
-                   for axis, (least, most) in TRITON_CALIBRATED.items())
+        return TILES
 
     def fitting(self, ba, target) -> tuple[Tile, ...]:
         """The tiles that fit `target` (`Template.fitting`) whose accumulator (two with `exact_sums`)
@@ -551,7 +484,6 @@ class Gmm(_Triton):
     `kernel` `[groups, in, out]`, or of its transpose with `trans_rhs`."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
-    ROLES: ClassVar[Mapping[str, str]] = {'block_m': 'rows', 'block_n': 'columns', 'block_k': 'step'}
 
     @staticmethod
     def _dense_extents(ba) -> tuple[int, int]:
@@ -625,7 +557,7 @@ class Gmm(_Triton):
             programs=chunks * columns, device_bytes=moved,
             program_flops=flops / (chunks * columns), program_staged=staged,
             program_exponentials=exponentials, mode=_mode(tokens.dtype), steps=steps, stages=config.stages,
-            resident=self._resident(ba, config, target), in_flight=TRITON_IN_FLIGHT)
+            resident=self._resident(ba, config, target))
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
@@ -658,7 +590,6 @@ class Tgmm(_Triton):
     kernel gradient `[groups, in, out]`."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
-    ROLES: ClassVar[Mapping[str, str]] = {'block_m': 'step', 'block_n': 'columns', 'block_k': 'rows'}
 
     @staticmethod
     def _dense_extents(ba) -> tuple[int, int]:
@@ -710,7 +641,7 @@ class Tgmm(_Triton):
         return cost.Cost(
             programs=programs, device_bytes=moved, program_flops=flops, program_staged=staged,
             program_exponentials=exponentials, mode=_mode(tokens.dtype), steps=steps, stages=config.stages,
-            resident=self._resident(ba, config, target), in_flight=TRITON_IN_FLIGHT)
+            resident=self._resident(ba, config, target))
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,

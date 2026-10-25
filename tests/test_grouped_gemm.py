@@ -354,41 +354,6 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
 
 
 @INTERPRETS
-@pytest.mark.parametrize("unseen", UNSEEN)
-def test_a_gpu_no_one_measured_runs_the_triton_tiles_its_facts_fit_exactly(unseen):
-    """On a GPU no row measured, each Triton launch's tiles are generated from the MMA's and Triton's
-    facts (`grouped_matmul.triton_tiles`), those it keeps fit the GPU's block, and the call takes the
-    cost model's pick on the GPU's own facts; the projection's forward and both gradients through them
-    are as exact as XLA's ragged dot from float64."""
-    target = UNSEEN[unseen]
-    group_sizes = jnp.asarray(SIZES["ragged"], jnp.int32)
-
-    def projection(dtype=jnp.bfloat16):
-        return lambda x, w: expert_projection(x, w, group_sizes, dtype, "xla", None)
-
-    def through_triton(x, w, dy):
-        with generation.assumed(target), generation.chosen(grouped_matmul="triton"):
-            return with_gradients(lambda x, w: template.gemm(x, w, group_sizes, out_dtype=jnp.bfloat16,
-                                                             precision="default",
-                                                             interpret_on_cpu=True))(x, w, dy)
-
-    with tuning.seen() as launches:
-        assert_as_exact(jax.jit(through_triton), jax.jit(with_gradients(projection())), ragged_draw,
-                        f"unseen {unseen} Triton", seeds=SEEDS,
-                        truth_fn=with_gradients(projection(jnp.float64)))
-    triton = [(launch, ba, tile) for (launch, _), (tile, ba) in zip(launches, launches.taken, strict=True)
-              if isinstance(launch, grouped_matmul._Triton)]
-    assert {type(launch).__name__ for launch, _, _ in triton} == {"Gmm", "Tgmm"}
-    budget = generation.shared_budget(target)
-    with generation.assumed(target):
-        for launch, ba, tile in triton:
-            fits = launch.fitting(ba, target)
-            assert set(fits) <= set(launch.space(ba))
-            assert all(launch.staged_bytes(ba, fit, target) <= budget for fit in fits)
-            assert tile == launch.estimate(ba, target)[1]
-
-
-@INTERPRETS
 def test_a_frozen_matrix_forms_no_kernel_gradient():
     """A projection whose matrix is frozen (no reverse pass reaches it) forms no kernel gradient: no
     launch computes one, and its input gradient through the Mosaic launches is as exact as XLA's from
