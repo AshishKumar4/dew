@@ -201,6 +201,17 @@ class Tokenizer(Protocol):
     def decode(self, ids: ArrayLike | Sequence[int]) -> str: ...
 
 
+@runtime_checkable
+class Offsets(Protocol):
+    """A vocabulary that says which characters each token of a text covers (`offsets`): a layout that
+    encodes its prompt whole locates its spans by them (`dew.decision.renderer`)."""
+
+    def offsets(self, text: str) -> tuple[list[int], list[int], list[int]]:
+        """`text`'s ids without special tokens, and each token's first character and the character
+        after its last."""
+        ...
+
+
 def _token_row(ids: ArrayLike | Sequence[int]) -> list[int]:
     values = ids.tolist() if isinstance(ids, TokenArray) else ids
     if not isinstance(values, Sequence):
@@ -239,6 +250,16 @@ class ByteTokenizer:
 
     def decode(self, ids: ArrayLike | Sequence[int]) -> str:
         return bytes(_token_row(ids)).decode("utf-8", errors="replace")
+
+    def offsets(self, text: str) -> tuple[list[int], list[int], list[int]]:
+        """`text`'s bytes, each covering its character."""
+        ids, starts, ends = [], [], []
+        for index, character in enumerate(text):
+            encoded = character.encode("utf-8")
+            ids.extend(encoded)
+            starts.extend([index] * len(encoded))
+            ends.extend([index + 1] * len(encoded))
+        return ids, starts, ends
 
     def document(self, text: str, *, eos: bool) -> list[int]:
         """`text` as one document's ids, its utf-8 bytes, ended by the EOS with `eos` where it holds
@@ -311,6 +332,15 @@ class HFTokenizer:
 
     def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]:
         return self.tokenizer.encode(text, add_special_tokens=add_special_tokens)
+
+    def offsets(self, text: str) -> tuple[list[int], list[int], list[int]]:
+        """`text`'s ids and each token's character span, by the fast tokenizer's offsets; a slow
+        tokenizer keeps none and is refused (TypeError)."""
+        if not self.tokenizer.is_fast:
+            raise TypeError(f"{self.name} is a slow tokenizer, which keeps no character offsets")
+        encoded = self.tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
+        spans = encoded["offset_mapping"]
+        return list(encoded["input_ids"]), [start for start, _ in spans], [end for _, end in spans]
 
     def decode(self, ids: ArrayLike | Sequence[int]) -> str:
         # batch_decode of one row is decode's text, typed as one str.

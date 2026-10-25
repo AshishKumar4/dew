@@ -73,6 +73,7 @@ from dew.nn.protocols import (
     LayerStates,
     OutputTable,
     TokenModel,
+    head_table,
 )
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
@@ -102,7 +103,6 @@ from dew.objectives.lm.chunked import (
     final_read,
     fused_head_loss,
     head_cross_entropy,
-    head_table,
     logits_cross_entropy,
     logits_support_log_probs,
     model_logits,
