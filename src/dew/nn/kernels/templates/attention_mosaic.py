@@ -1,10 +1,10 @@
 """The attention template's Mosaic GPU mainloop as Template implementations (`MosaicForward`,
 `MosaicBackward`; design §6 and §7): the forward, its training form and the backward over every call form,
 each launch's one config derived from the instruction family's and the device's facts and the call's extents
-(`derived`), legal where its programs stage within the device's block and a consumer's registers hold its
-live set (`legal`): no table, no sweep, no space ranked. A GPU nobody measured of a family with a bundle here
-(`BUNDLES`) takes its own facts' config. The launches are `attention_mosaic_forward`'s and `attention_mosaic_backward`'s; what they share,
-`attention_mosaic_program`'s."""
+(`derived`), legal where its programs stage within the device's block and a consumer's registers hold its live
+set (`legal`): no table, no sweep, no space ranked. A GPU nobody measured of a family with a bundle here
+(`BUNDLES`) takes its own facts' config. The launches are `attention_mosaic_forward`'s and
+`attention_mosaic_backward`'s; what they share, `attention_mosaic_program`'s."""
 
 import dataclasses
 import functools
