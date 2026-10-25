@@ -384,7 +384,7 @@ def recorded_tokenizer(processor: Processor | None) -> str | None:
     own name, byte or Hugging Face. Any other processor records none, and the
     run loads as weights that take ids."""
     from dew.data.text import ByteTokenizer, HFTokenizer
-    from dew.inference.pipeline import RunProcessor
+    from dew.inference.loading import RunProcessor
 
     if isinstance(processor, RunProcessor) and isinstance(processor.tokenizer, ByteTokenizer | HFTokenizer):
         return processor.tokenizer.name
@@ -404,7 +404,7 @@ def _saved_processor(settings: TaskSettings, config: ModelConfig) -> Processor |
     """Build the run's host processor: the checkpoint's own, reloaded from the
     source it recorded beside `config`'s model, or its run tokenizer."""
     from dew.data.text import tokenizer_for
-    from dew.inference.pipeline import RunProcessor
+    from dew.inference.loading import RunProcessor
     from dew.interop.pretrained import load_processor
 
     if settings.processor is not None:
