@@ -33,17 +33,8 @@ from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoi
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_causal
 from dew.inference.projections import packed_owned
 from dew.interop.weights import decoding_storage
-from dew.nn.inputs import (
-    BLOCKS_FIELD,
-    Media,
-    ModelInputs,
-    default_placement,
-    mesh_of,
-    real_slots,
-    request_key,
-)
+from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel, refuse_prefix
-from dew.nn.visibility import prompt_blocks
 from dew.objectives.base import UNREAD, Variables, thaw
 from dew.records import integer, record as named_fields, text as named
 from dew.sampling import decoding, vocabulary
@@ -680,19 +671,6 @@ class TextGeneration(_NativeTextTask):
         return cls(model, variables, processor, sampling=settings.sampling,
                    max_new_tokens=settings.max_new_tokens or None, prefix=settings.prefix)
 
-    def _blocked(self, inputs: ModelInputs) -> ModelInputs:
-        """`inputs` with the blocks its prefix run gives each prompt (`prompt_blocks`), unless the request
-        has its own blocks, which stand. Counted on the host: a prompt shorter than an int prefix is refused,
-        since its trained block would cover tokens it lacks."""
-        if self.prefix is None or BLOCKS_FIELD in inputs.token_fields:
-            return inputs
-        real = np.asarray(real_slots(inputs.token_fields, inputs.tokens.shape))
-        if self.prefix != "prompt" and (real.sum(axis=1) < self.prefix).any():
-            raise ValueError(f"a prompt under prefix {self.prefix} needs {self.prefix} real tokens in every "
-                             "row")
-        fields = {**inputs.token_fields, BLOCKS_FIELD: prompt_blocks(real, self.prefix)}
-        return replace(inputs, token_fields=fields)
-
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
                  key: int | jax.Array | None = None, n: int | None = None,
                  sampling: Sampling | None = None, images: Media | None = None,
@@ -704,12 +682,11 @@ class TextGeneration(_NativeTextTask):
                                           max_new_tokens=max_new_tokens, default_tokens=self.max_new_tokens,
                                           max_length=self.max_length, key=key)
             shaped, trips, capacity = _bucketed(inputs, budget, cache_ceiling(self.model))
-            shaped = self._blocked(shaped)
             policy, chain, criteria = self._controls(sampling, logits, stopping)
             generated = generate(cache_sized(self.model, capacity), self.placed, shaped, budget,
                                  key=random_key, sampling=policy, n=self.n if n is None else n, logits=chain,
                                  stopping=criteria, strategy=self.strategy if strategy is None else strategy,
-                                 trips=trips)
+                                 trips=trips, prefix=self.prefix)
             padding = shaped.tokens.shape[1] - inputs.tokens.shape[1]
             return self._decoded(_requested(generated, budget, padding))
 

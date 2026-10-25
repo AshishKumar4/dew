@@ -126,7 +126,7 @@ from dew.nn.kernels.options import compiler_options
 from dew.nn.kv_cache import POOLED, ROW_CURSORS, TABLE, KVCache, is_paged, leaf_name
 from dew.nn.protocols import CrossAttending, Layered, ProjectionGroup, Serving
 from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
-from dew.nn.visibility import prompt_blocks
+from dew.nn.visibility import served_blocks
 from dew.objectives.base import Variables
 from dew.sampling.decoding import Finishing, LogitsTransform, StopStrings
 from dew.sampling.guided import Grammar
@@ -262,7 +262,7 @@ class _Row:
     """What the prompt's keys depend on beside its tokens, its context's digest, under which its
     prefix pages are named (`dew.inference.pages`); empty for none."""
     groups: np.ndarray | None = None
-    """The blocks of the prompt's tokens under the server's prefix run (`prompt_blocks`), None where it runs
+    """The blocks of the prompt's tokens under the server's prefix run (`served_blocks`), None where it runs
     causally."""
 
 
@@ -785,21 +785,19 @@ class Server:
         return _Row(tokens, budget, seed, fold, Ticket(), context=context, salt=salt, groups=groups)
 
     def _blocks_of(self, prompt: np.ndarray) -> np.ndarray | None:
-        """The blocks a request's prompt makes under the prefix run (`prompt_blocks`), None where the server
-        runs causally. A prompt shorter than an int prefix is refused: its trained block would cover tokens
-        it lacks. A block a layer reads whole is prefilled in one piece, so a server that prefills in pieces
-        of `chunk` tokens refuses a longer block."""
+        """The blocks a request's prompt makes under the prefix run (`served_blocks`, which refuses a prompt
+        shorter than an int prefix), None where the server runs causally. A block a layer reads whole is
+        prefilled in one piece, so a server that prefills in pieces of `chunk` tokens refuses a longer
+        block."""
         if self.prefix is None:
             return None
-        if self.prefix != "prompt" and len(prompt) < self.prefix:
-            raise ValueError(f"a prompt under prefix {self.prefix} needs at least {self.prefix} tokens, got "
-                             f"{len(prompt)}")
+        blocks = served_blocks(np.ones((1, len(prompt)), bool), self.prefix)[0]
         block = len(prompt) if self.prefix == "prompt" else self.prefix
         if self.rows.chunk is not None and block > self.rows.chunk:
             raise ValueError(f"a prefix block of {block} tokens would be prefilled in pieces of at most "
                              f"{self.rows.chunk} tokens, which split it; serve it without chunk, or with a "
                              "chunk at least as long as the block")
-        return prompt_blocks(np.ones((1, len(prompt)), bool), self.prefix, xp=np)[0]
+        return blocks
 
     def _request_context(self, embeddings: ArrayLike, lengths: ArrayLike | None) -> np.ndarray:
         """A request's context as its real tokens on the host, `[length, features]`, in the dtype

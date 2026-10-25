@@ -442,6 +442,19 @@ def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, 
         counted = counted & ~same_group(blocks[:, :-span], blocks[:, span:])
     return counted
 
+def _refuse_cut_blocks(model: nn.Module, seq_len: int) -> None:
+    """Refuse blocks `model` may read in part: a run of any places in a row of `seq_len` is read whole only
+    by a trunk layer that reads blocks with no attention chunk, or one of `seq_len` places or more
+    (`whole_block`).
+    The loss drops every target in its source's block, so a chunk that cut the block would drop one its
+    source never saw."""
+    chunks = block_chunks_of(model)
+    if not whole_block(chunks, seq_len):
+        raise ValueError(f"a row's blocks are runs of any places, which an attention chunk of {list(chunks)} "
+                         f"cuts; a run is read whole only by a layer with no chunk, or one of {seq_len} "
+                         "places or more")
+
+
 class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
     """Scores a causal decoder's tokens: the machinery the LM, preference and
     policy losses share, without a loss of its own.
@@ -693,11 +706,11 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                             processor=recorded_processor(self.processor), prefix=self.prefix)
 
     def _refuse_blocks(self, prepared: ModelInputs, depths: bool) -> None:
-        """Refuse a batch's blocks where no trunk layer reads them, or where prediction depths would read
-        them beyond their source, which `scored_targets` does not account for. A prefix run's blocks were
-        checked where the run was built. Any other batch's blocks are runs of any place in a row, which a
-        layer's chunk can cut, so they need a layer reading every run whole. The check is static, since a
-        trace cannot read the runs' places."""
+        """Refuse a batch's blocks where no trunk layer reads them, where prediction depths would read
+        them beyond their source, which `scored_targets` does not account for, or where a layer's chunk could
+        cut one (`_refuse_cut_blocks`): a batch's blocks are runs of any place in a row, a prefix run's
+        among them, since its batch may carry blocks of its own. The check is static, since a trace cannot
+        read the runs' places."""
         if BLOCKS_FIELD not in prepared.token_fields:
             return
         if depths:
@@ -707,10 +720,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         if not chunks:
             raise ValueError("the batch's blocks reach a model none of whose trunk layers reads blocks "
                              "(AttentionMixer.bidirectional_blocks), where they would drop targets")
-        if self.prefix is None and not whole_block(chunks, self.seq_len):
-            raise ValueError("a batch's blocks are runs of any place, which a layer's chunk can cut; "
-                             "a run is read whole only by a layer with no chunk, or one of "
-                             f"{self.seq_len} places or more")
+        _refuse_cut_blocks(self.model, self.seq_len)
 
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      segment_ids=None, positions=None, routing: bool = False,
@@ -1070,11 +1080,12 @@ class LMObjective(TokenScorer):
     would read off; every other target counts as usual. Serving reads the same blocks (`TextGeneration`'s
     `prefix`): a prompt's first `prefix` tokens, or the whole prompt under "prompt", are one block. None, the
     default, trains causally. A model none of whose trunk layers reads blocks is refused, as is an int above
-    `seq_len`, and `mtp_weight`, whose prediction depths read blocks beyond their source. A layer's
-    attention chunk (`LayerKind.chunk`) that cuts a block refuses it: a prefix's block is read whole only by
-    a trunk layer with no chunk, or one at least as long as the block (a prompt's block runs to `seq_len`).
-    A batch carrying `text_block_groups` (the data stage `dew.data.steps.blocks.Blocks`) trains the same way,
-    whatever `prefix` says.
+    `seq_len`, and `mtp_weight`, whose prediction depths read blocks beyond their source. A batch carrying
+    `text_block_groups` (the data stage `dew.data.steps.blocks.Blocks`) trains the same way, whatever
+    `prefix` says, so a run's blocks may be any runs of a row: a layer's attention chunk (`LayerKind.chunk`)
+    would cut one, and the loss would drop a target its source never saw. A run reads blocks only where a
+    trunk layer that reads them has no chunk, or one of `seq_len` places or more, and a prefix run on any
+    other model is refused where it is built.
 
     `model` may be a loaded source (`LMObjective(qwen, seq_len=512)`), and
     `variables` and `processor` override its own (`Objective.bind_model`).
@@ -1123,6 +1134,8 @@ class LMObjective(TokenScorer):
         self.pad_id = pad_id
         self.token_accuracy = token_accuracy
         refuse_prefix(self.model, prefix, longest=seq_len)
+        if prefix is not None:
+            _refuse_cut_blocks(self.model, seq_len)
         if prefix is not None and mtp_weight is not None:
             raise ValueError("a prefix run trains the trunk's targets alone: a prediction depth reads "
                              "blocks beyond its own source, so mtp_weight is refused with prefix")

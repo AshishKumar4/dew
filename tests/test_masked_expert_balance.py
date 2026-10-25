@@ -52,10 +52,6 @@ def text(seed, rows, length=SEQ):
     return {"text": jnp.asarray(ids, jnp.int32)}
 
 
-def leaves(tree):
-    return jax.tree.leaves(tree)
-
-
 def test_a_masked_run_moves_each_balancing_bias_once_per_committed_update():
     """Two microbatches make one committed update, which moves each router's bias by one step of the load
     its routers selected over both. The commit must equal that one step exactly, so applying the counts per
@@ -71,17 +67,18 @@ def test_a_masked_run_moves_each_balancing_bias_once_per_committed_update():
         first, second = text(2 * commit + 1, rows), text(2 * commit + 2, rows)
         partial, *_ = run(state, first)
         assert int(partial.updates) == commit
-        for before, after in zip(leaves(reference["moe"]), leaves(partial.variables["moe"]), strict=True):
+        for before, after in zip(jax.tree.leaves(reference["moe"]), jax.tree.leaves(partial.variables["moe"]),
+                                 strict=True):
             np.testing.assert_array_equal(before, after)
         state, *_ = run(partial, second)
         assert int(state.updates) == commit + 1
         pooled = {"text": jnp.concatenate([first["text"], second["text"]])}
         _, aux = obj.scalar_loss(reference, pooled, STEP)
         expected = obj.apply_effects(reference, aux.effects)["moe"]
-        for want, got in zip(leaves(expected), leaves(state.variables["moe"]), strict=True):
+        for want, got in zip(jax.tree.leaves(expected), jax.tree.leaves(state.variables["moe"]), strict=True):
             np.testing.assert_array_equal(got, want)
         moved = [not np.array_equal(before, after) for before, after in
-                 zip(leaves(reference["moe"]), leaves(state.variables["moe"]), strict=True)]
+                 zip(jax.tree.leaves(reference["moe"]), jax.tree.leaves(state.variables["moe"]), strict=True)]
         assert any(moved)
 
 
@@ -126,10 +123,11 @@ def test_padding_adds_nothing_to_a_masked_runs_router_counts_or_bias(kind):
     variables = uniform_gates(favour_expert_zero(initial(), 1.0))
     _, plain_aux = objective(variables).scalar_loss(variables, {"text": ids}, STEP)
     _, padded_aux = objective(variables, SEQ + pad).scalar_loss(variables, padded, STEP)
-    for before, after in zip(leaves(plain_aux.effects), leaves(padded_aux.effects), strict=True):
+    for before, after in zip(jax.tree.leaves(plain_aux.effects), jax.tree.leaves(padded_aux.effects),
+                             strict=True):
         assert jnp.issubdtype(before.dtype, jnp.integer)
         np.testing.assert_array_equal(before, after)
     plain_moe = objective(variables).apply_effects(variables, plain_aux.effects)["moe"]
     padded_moe = objective(variables).apply_effects(variables, padded_aux.effects)["moe"]
-    for before, after in zip(leaves(plain_moe), leaves(padded_moe), strict=True):
+    for before, after in zip(jax.tree.leaves(plain_moe), jax.tree.leaves(padded_moe), strict=True):
         np.testing.assert_array_equal(before, after)
