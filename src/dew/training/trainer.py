@@ -1657,10 +1657,6 @@ class Trainer(Generic[Loss, Effects]):
         notice stops the run at this step, whose checkpoint is then written."""
         current, checkpoints = run.current, self.checkpoints
         real = plan.real(interval)
-        # A run's last step, its budget's or the step after which its stream runs out (`_ends_here`), is
-        # scored and saved once, by `_wind_down`, with every suite: never here before a rarer suite has.
-        ending = plan.finished(current, real) or self._ends_here(run, interval)
-        paused = not ending and plan.paused(current, real)
         record, aux = taken_record(aux)
         if record is not None:
             self.records.append(record)
@@ -1682,6 +1678,13 @@ class Trainer(Generic[Loss, Effects]):
             run.checkpoint_due = bool(plan.checkpoint_every and current % plan.checkpoint_every == 0)
         due = plan.due(current)
         evaluation_due = bool(due) or bool(plan.eval_every and current % plan.eval_every == 0)
+        # A run's last step, its budget's or the step after which its stream runs out, is scored and saved
+        # once, by `_wind_down`, with every suite: never here before a rarer suite has. Only a step that
+        # evaluates or pauses could save first (a ranked save scores every suite), so only there is the
+        # stream read ahead (`_ends_here`): no other step's save waits on a batch a stream has yet to make.
+        ending = plan.finished(current, real) or (
+            (evaluation_due or plan.paused(current, real)) and self._ends_here(run, interval))
+        paused = not ending and plan.paused(current, real)
         ranked = bool((plan.validation or plan.best or plan.stop) and run.checkpoint_due)
         if not ending and (evaluation_due or ranked):
             self._read_taken(run)
