@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
+from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
 from steady_state import steady_state
 from test_training_transactions import ShortScaleTrainer, Terms, Tiny, batches
 
@@ -776,3 +776,59 @@ def test_a_later_run_of_one_objective_releases_the_device_steps_an_earlier_run_c
     _scaled_fit(shared, _Scaled(1.0))
     gc.collect()
     assert released() is None
+
+
+def test_a_tasks_held_weights_leave_the_callers_private_mapping_as_it_changed_it(tmp_path):
+    """A task's weights are placed into a tree of their own (`held`), so the caller's host arrays stay
+    as they were: a copy-on-write mapping's changed pages are not given back to the file they came from,
+    which would turn them back into the file's values."""
+    from dew.inference.tasks import held
+
+    path = tmp_path / "kernel.bin"
+    np.arange(4096, dtype=np.float32).tofile(path)
+    kernel = np.memmap(path, np.float32, mode="c", shape=(4096,))
+    kernel[:] = -1.0
+    placed = held({"params": {"kernel": kernel}})
+    np.testing.assert_array_equal(kernel, np.full(4096, -1.0, np.float32))
+    np.testing.assert_array_equal(np.asarray(placed["params"]["kernel"]), np.full(4096, -1.0, np.float32))
+
+
+def test_a_streamed_node_takes_the_one_target_its_placement_gives_it_whole():
+    """A placement may give a node of several arrays one sharding, as `jax.device_put` takes a prefix:
+    `stream` places each of the node's arrays there, read-only mappings of targets included, and the
+    tree the sources came from (`held`) is handed the placed node, so the two share one copy."""
+    import types
+
+    from dew.training.host import stream
+
+    sharding = NamedSharding(Mesh(np.asarray(jax.devices()[:1]), ("data",)), P())
+    pair = (np.arange(4, dtype=np.float32), np.ones((2, 3), np.float32))
+    held = {"params": {"kernel": pair}}
+    placed = stream({"params": {"kernel": pair}},
+                    types.MappingProxyType({"params": types.MappingProxyType({"kernel": sharding})}), held)
+    for got, want in zip(placed["params"]["kernel"], pair, strict=True):
+        assert isinstance(got, jax.Array) and got.sharding == sharding
+        np.testing.assert_array_equal(got, want)
+    assert held["params"]["kernel"] is placed["params"]["kernel"]
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_node_two_places_share_goes_to_each_places_own_target():
+    """A node held at two places of the tree it is streamed from, the tree also the one its sources
+    came from, lands at each place on that place's own target; and a held tree beside a tree whose
+    mapping is rebuilt (a defaultdict) is handed the placed node all the same."""
+    import collections
+
+    from dew.training.host import stream
+
+    first, second = (SingleDeviceSharding(device) for device in jax.devices()[:2])
+    pair = (np.arange(4, dtype=np.float32), np.ones((2, 3), np.float32))
+    state = {"params": {"first": pair, "second": pair}}
+    stream(state, {"params": {"first": first, "second": second}}, state)
+    for name, sharding in (("first", first), ("second", second)):
+        assert all(leaf.sharding == sharding for leaf in state["params"][name]), name
+
+    held = {"params": {"kernel": pair}}
+    placed = stream({"params": collections.defaultdict(dict, {"kernel": pair})},
+                    {"params": {"kernel": first}}, held)
+    assert held["params"]["kernel"] is placed["params"]["kernel"]
