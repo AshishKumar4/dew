@@ -1189,9 +1189,10 @@ class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
 
     def staged_bytes(self, ba, config: mosaic_tpu.Blocks, target) -> int:
         # Pallas's pipeline holds two of each operand's and output's blocks (one in flight), beside the
-        # fp32 accumulator; Mosaic TPU holds the rows' block it loads and the product's fp32 tile as
-        # temporaries beside them (a v5e refused 20.33 MiB for a 1024 x 512 x 2048 block the pipeline's
-        # buffers alone counted at 16.00, the compile gate's libtpu run).
+        # fp32 accumulator; Mosaic TPU may hold each operand block's value and the product's fp32 tile as
+        # temporaries beside them, at most (a v5e refused 20.33 and 20.95 MiB at a 1024 x 512 x 2048
+        # product and kernel gradient, 16.12 at a 256 x 512 x 4096 gradient, whose buffers alone counted
+        # 16.00, 16.00 and 13.0: the compile gate's libtpu runs).
         size = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
         hooks = ba.arguments['hooks']
         extents = self.extents(config)
@@ -1200,7 +1201,7 @@ class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
                  + _side_tile_bytes(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes, extents))
         operands = self.loaded(config) * size + sides
         rows, columns = self.output(config)
-        temporaries = config.block_m * config.block_k * size + 4 * rows * columns
+        temporaries = operands + 4 * rows * columns
         return 2 * (operands + outs * rows * columns) + 4 * rows * columns + temporaries
 
     def _lays_out(self, ba, blocks: mosaic_tpu.Blocks) -> bool:
