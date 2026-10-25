@@ -89,6 +89,20 @@ def test_the_published_run_reads_back_as_it_was_written(live):
     assert (built["guidance"], built["steps"]) == (stated["guidance"], stated["steps"])
 
 
+def test_a_saved_runs_retired_field_reads_in_either_encoding_and_a_fresh_run_refuses_it():
+    """A saved run's `trainer.tune_kernels` (`RETIRED`) reads through `RunConfig.read`, the saved run's
+    reader, whether its trainer is a plain mapping of fields or a class record (as a TrainerConfig
+    subclass's is written); a run's own fields stating it are refused, the field gone."""
+    held = json.loads(PUBLISHED.read_text())
+    assert "tune_kernels" in held["fields"]["trainer"]
+    as_class = json.loads(json.dumps(held))
+    as_class["fields"]["trainer"] = {"class": "dew.config:TrainerConfig", "fields": held["fields"]["trainer"]}
+    run = RunConfig.read(held)
+    assert RunConfig.read(as_class).trainer == run.trainer
+    with pytest.raises(ValueError):
+        type(run).from_dict({**run.to_dict(), "trainer": held["fields"]["trainer"]})
+
+
 LAYOUT = ROOT / "tests" / "fixtures" / "runs" / "hybrid-dit-176m" / "layout.json"
 
 

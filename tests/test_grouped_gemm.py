@@ -594,6 +594,21 @@ def test_an_mma_sync_forward_of_no_depth_is_zero():
     assert not np.any(np.asarray(got))
 
 
+def test_a_launch_of_fewer_programs_than_its_slots_costs_one_programs_service():
+    """A lone program costs its own service, however many a multiprocessor could hold, and its pipeline
+    hides no more steps' latency than it takes: the estimate is the same at any residency, and at any
+    stage count past its steps."""
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+
+    def seconds(**fields):
+        return cost.seconds(cost.Cost(**{"programs": 1, "device_bytes": 1.0, "program_flops": 1e6, "steps": 2,
+                                         "stages": 3, "resident": 1} | fields), target)
+
+    assert seconds(resident=12) == seconds(resident=1)
+    assert seconds(stages=9) == seconds(stages=3) < seconds(stages=2)
+
+
 def test_the_cost_model_names_a_fact_its_target_lacks():
     """A GPU outside every instruction family (sm60, before Turing) states no tensor rate and gives no
     estimate, naming the fact; the grouped kernels are then not eligible there, so XLA's ragged dot runs

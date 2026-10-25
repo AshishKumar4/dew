@@ -577,6 +577,20 @@ class StepLaunch(tuning.KernelOp):
             return WARPS
         return dataclasses.replace(COLUMNS, block=min(COLUMNS.block, ba.arguments['state'].shape[-1]))
 
+    def pinnable(self, ba, config) -> bool:
+        # A program's block of value columns: a whole head where a hook reads one (`_whole`), else a whole
+        # head or a block dividing the state's width.
+        width = ba.arguments['state'].shape[-1]
+        return isinstance(config, Launch) and (
+            config.block == 0 or (not _whole(ba.kwargs['hooks']) and 0 < config.block <= width
+                                  and width % config.block == 0))
+
+    def unpinnable(self, ba, config) -> str:
+        if not isinstance(config, Launch):
+            return super().unpinnable(ba, config)
+        return ("its block of value columns is neither the whole head a hook here reads whole nor a block "
+                "dividing the state's width")
+
 
 def _whole(hooks: Hooks) -> bool:
     """Whether a program needs a head's whole state: a conv reads all of a head's values, the epilogue's

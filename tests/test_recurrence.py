@@ -13,7 +13,7 @@ import pytest
 from reference_error import assert_as_exact
 from tuned import taken
 
-from dew.nn.kernels import recurrence
+from dew.nn.kernels import recurrence, tuning
 
 ROWS, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH, TAPS = 16, 2, 4, 16, 32, 4
 """A decode token with grouped heads, idle rows and a four-tap history."""
@@ -183,6 +183,18 @@ def test_every_hook_combination_steps_as_its_float64_form(hooks):
     if hooks.conv is not None:
         np.testing.assert_array_equal(np.asarray(history), np.asarray(reference[1]))
         np.testing.assert_array_equal(np.asarray(history)[1], np.asarray(given.held)[1])
+
+
+def test_a_column_block_pin_is_refused_where_a_hook_reads_a_whole_head():
+    """A hook reading a head's whole state (a conv, the epilogue's norm) takes a whole-head launch: a pin
+    of a block of value columns is refused as the step traces, a whole-head pin taken."""
+    hooks = next(form for form in HOOKS + FORMED if form.conv is not None or form.output is not None)
+    given = operands(hooks)
+    step = functools.partial(recurrence.step, hooks)
+    with tuning.pinned({recurrence.StepLaunch: recurrence.Launch(8, 4)}), pytest.raises(tuning.Unpinnable):
+        jax.jit(step).trace(given)
+    with tuning.pinned({recurrence.StepLaunch: recurrence.Launch(0, 4)}):
+        assert taken(recurrence.StepLaunch, step, given) == [recurrence.Launch(0, 4)]
 
 
 @pytest.mark.parametrize('hooks', [HOOKS[0], HOOKS[-1]], ids=str)
