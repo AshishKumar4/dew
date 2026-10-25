@@ -19,6 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.data.dataset import rows_of
+from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Batch
 from dew.telemetry.instrumentation import NO_FLOPS, StepFlops
 from dew.training.display import TrainingDisplay
@@ -70,7 +71,7 @@ def fresh_book(loss: jax.Array) -> Book:
     Counters on any other device would move to the step's devices at every count,
     and `bookkeep` would compile again.
     """
-    dtype = jnp.promote_types(loss.dtype, jnp.float32)
+    dtype = at_least_fp32(loss.dtype)
     zeros = (np.zeros((), dtype), np.zeros((), np.int32), np.zeros((), np.int32),
              np.zeros((), dtype), np.zeros((2,), np.uint32), np.zeros((), dtype), np.zeros((), np.int32))
     return Book(*jax.device_put(zeros, loss.sharding))
@@ -85,7 +86,7 @@ def bookkeep(book: Book, loss: jax.Array, finite: jax.Array, committed: Committe
     either on the host between logging ticks.
     """
     bad_run = jnp.where(finite, 0, book.bad_run + 1)
-    dtype = jnp.promote_types(loss.dtype, jnp.float32)
+    dtype = at_least_fp32(loss.dtype)
     norms, commits = book.norms, book.commits
     if committed is not None:
         norms, commits = norms + committed.norm.astype(dtype), commits + committed.count

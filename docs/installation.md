@@ -138,6 +138,7 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 | `guided` | Regex and JSON-schema guided decoding (`dew.sampling.guided`) |
 | `streaming` | Hugging Face `datasets` and online sources |
 | `delta` | deltalake, to read Delta tables |
+| `curation` | DataTrove's language, quality, fastText and decontamination filters with spaCy's word splitting (`dew.data.text.Language`, `Quality`, `Classifier`, `Decontaminated`) |
 | `tfds` | Reading prepared TFDS ArrayRecords without TensorFlow |
 | `av` | Video readers (moviepy, with ffmpeg) |
 | `vision` | Hugging Face image processors, run with torchvision on the host |
