@@ -9,9 +9,9 @@ kernel_gradient, kernel_gradient_fp32), each launch's searched configs (`Templat
 device's facts: the fitting ones its cost model is calibrated over) are timed as the tuner times them
 (`tuning.measured`: compiled in parallel, each run after the L2 is flushed, the device time CUPTI reads)
 on the fixture's draw, each checked against float32 host products. The output is the fixture's form:
-provenance (the device, jax and the commit) and one record a shape, product and implementation, its
-median times by config repr, the configs that failed apart, its worst error and the config the cost
-model picks.
+provenance (the device and its facts, jax and the commit) and one record a shape, product and
+implementation, its median times by config repr, the configs that failed apart, its worst error and the
+config the cost model picks.
 """
 
 from __future__ import annotations
@@ -80,8 +80,11 @@ def main() -> None:
 
     target = generation.gpu_target()
     commit = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True, text=True).stdout.strip()
+    # The device's facts, as its launches read them, so the ranking test costs the configs on this device's.
+    facts = {name: getattr(target, name) for name in ("multiprocessors", "shared_limit", "clock_hz",
+                                                       "memory_bandwidth")}
     provenance = {"job": os.environ.get("JOB", "sweep_grouped_gemm"), "device": jax.devices()[0].device_kind,
-                  "jax": jax.__version__, "commit": commit,
+                  "jax": jax.__version__, "commit": commit, "generation": target.generation, "facts": facts,
                   "bench": "tools/sweep_grouped_gemm.py: device ms (CUPTI, median of 5), bf16 operands"}
     records = []
     for name in args.shapes:
