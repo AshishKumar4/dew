@@ -25,7 +25,6 @@ SHAPES = {"qwen3-30b-a3b gate_up": (65536, 2048, 1536, 128), "qwen3-30b-a3b down
 """Rows (tokens x top-k), width in, width out and experts of each swept shape."""
 
 LOADED_LATENCY = "the load latency under load, the waiting term's being unloaded (no measurement gives it)"
-TRANSPOSED_READS = "the kernel gradient's transposed-operand shared-memory reads, which cost 8 warps more"
 FRAGMENT_PRESSURE = ("mma.sync's operand fragments held beside a larger tile's accumulator, which the "
                      "single-warp issue term charges alike at any tile")
 L2_REUSE = "the L2's reuse of a few experts' weights, which the device-byte term counts as rereads"
@@ -44,11 +43,8 @@ MISSES = {
     ("sm89", "triton", "targets-comment", "input_gradient"): LOADED_LATENCY,
     ("sm90", "mosaic_gpu", "kimi-linear down", "input_gradient"): LOADED_LATENCY,
     ("sm90", "mosaic_gpu", "kimi-linear down", "kernel_gradient_fp32"): LOADED_LATENCY,
-    ("sm90", "mosaic_gpu", "kimi-linear gate_up", "kernel_gradient"): LOADED_LATENCY,
     ("sm90", "mosaic_gpu", "kimi-linear gate_up", "kernel_gradient_fp32"): LOADED_LATENCY,
-    ("sm90", "mosaic_gpu", "mixtral up", "kernel_gradient_fp32"): L2_REUSE,
-    ("sm90", "mosaic_gpu", "qwen3-30b-a3b down", "kernel_gradient"): LOADED_LATENCY,
-    ("sm90", "mosaic_gpu", "targets-comment", "forward"): LOADED_LATENCY,
+    ("sm90", "mosaic_gpu", "qwen3-30b-a3b down", "forward"): LOADED_LATENCY,
     ("sm90", "mosaic_gpu", "targets-comment", "input_gradient"): LOADED_LATENCY,
     ("sm90", "triton", "kimi-linear down", "kernel_gradient"): LOADED_LATENCY,
     ("sm90", "triton", "mixtral down", "input_gradient"): L2_REUSE,
@@ -57,7 +53,7 @@ MISSES = {
     ("sm90", "triton", "targets-comment", "kernel_gradient"): LOADED_LATENCY,
 }
 """Each case whose pick runs past 10% of the best, by sweep, implementation, shape and product, with
-the term the model lacks: 25 of the 140 swept (2026-10-25; R1/R3 sampled sweeps on an A100, an L4 and an
+the term the model lacks: 22 of the 140 swept (2026-10-25; R1/R3 sampled sweeps on an A100, an L4 and an
 H100 PCIe, each record the model's 24 best configs and 24 spread over the rest, `--sample 24`)."""
 
 

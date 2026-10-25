@@ -144,6 +144,21 @@ def program_seconds(cost: Cost, rate: float, clock: float) -> float:
             + cost.serial_exponentials / (EXPONENTIALS_PER_CLOCK * clock))
 
 
+WRITE_GRANULE = 256
+"""The fewest bytes of a contiguous run of an output's row a write moves at the memory's full rate, two
+128-byte L2 lines: a launch writing shorter runs is charged as if each were this long (`written`). An
+H100's bf16 kernel gradients at 64 columns (128-byte runs) ran 1.15 to 1.43 times the best tile where
+fp32's 64 columns (256-byte runs) ran 1.01 to 1.13, both at the device-bytes floor; counted, the model's
+Mosaic picks over the H100 PCIe sweeps ran within 10% of the best at 23 of 28 records, from 22, its A100
+and L4 picks unchanged; 384 or 512 bytes counted worse (R1/R3-sweep-*, scripts/eval_sweeps.py)."""
+
+
+def written(nbytes: float, run: float) -> float:
+    """The device bytes writing `nbytes` in contiguous runs of `run` bytes moves: as if each run were
+    at least `WRITE_GRANULE` long."""
+    return nbytes * max(1.0, WRITE_GRANULE / run) if run > 0 else nbytes
+
+
 def waiting_seconds(cost: Cost, latency: float, clock: float) -> float:
     """The seconds a program's steps wait on loads `latency` clocks long, the steps loading ahead
     (`stages - 1 - in_flight`) hiding as many steps of it, and never more steps than it takes (Little's

@@ -327,6 +327,13 @@ def _output_bytes(ba) -> int:
                for dtype in (ba.arguments['hooks'].out_dtypes or (ba.arguments['out_dtype'],)))
 
 
+def _written(elements: int, ba, columns: int) -> float:
+    """The device bytes a launch writing `elements` output elements a row segment of `columns` at a time
+    moves: each segment at least `cost.WRITE_GRANULE` bytes (`cost.written`)."""
+    return sum(cost.written(elements * jnp.dtype(dtype).itemsize, columns * jnp.dtype(dtype).itemsize)
+               for dtype in (ba.arguments['hooks'].out_dtypes or (ba.arguments['out_dtype'],)))
+
+
 def _side_tile_bytes(operands, axes_of, extents: dict) -> int:
     """The bytes of one tile of each side operand at the block `extents` per launch axis."""
     return sum(math.prod(extents[axis] for axis in axes) * jnp.dtype(operand.dtype).itemsize
@@ -596,7 +603,8 @@ class Gmm(_Triton):
         # Side operands are read again as the operands are: with each column block, and with each row
         # tile where they follow no rows; the hooks' special functions on every element they see.
         rereads = {'rows': tiles, 'columns': columns}
-        moved = ((columns * rows * depth + tiles * depth * width) * size + rows * width * _output_bytes(ba)
+        moved = ((columns * rows * depth + tiles * depth * width) * size
+                 + _written(rows * width, ba, config.block_n)
                  + _side_bytes(prologue_sides, hooks.prologue_axes, rereads)
                  + _side_bytes(epilogue_sides, hooks.epilogue_axes, rereads))
         if ba.arguments.get('dense'):
@@ -688,7 +696,8 @@ class Tgmm(_Triton):
                                         generation.effective(target).wgmma) * size
         hooks, sides = ba.arguments['hooks'], ba.arguments['prologue_operands']
         rereads = {'rows': groups, 'depth': blocks[0], 'columns': blocks[1]}
-        moved = ((blocks[1] * rows * depth + blocks[0] * rows * width) * size + groups * depth * width * out
+        moved = ((blocks[1] * rows * depth + blocks[0] * rows * width) * size
+                 + cost.written(groups * depth * width * out, config.block_n * out)
                  + _side_bytes(sides, hooks.prologue_axes, rereads))
         if ba.arguments.get('dense'):
             moved += _padding_bytes((((rows, depth), ('rows', 'depth'), size),
@@ -862,8 +871,14 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # the stage of `lhs` and its side tiles and writes the stage back before the MMA may read it
         # (a commit to shared memory): serial with the MMAs, not beside them
         # (GMMSB-h100-main: a gated prologue at 3.7x the Triton launch's time).
-        step = 2 * (config.block_m + config.block_n) * config.block_k * size
         family = _FAMILIES[config.family]
+        # A step's stage written (its rows' and columns' blocks), and read by the products: each of the
+        # family's instructions spans `rows` output rows and the tile's columns, reading its rows' slice
+        # and the columns' whole block, so the columns' block is read once a `rows` of the tile (an H100's
+        # kernel gradients at 64 columns, which read most a FLOP, ran 1.08 to 1.43 times the best tile,
+        # R1/R3-sweep-h100).
+        reads = config.block_k * size * (config.block_m + config.block_m * config.block_n / family.rows)
+        step = (config.block_m + config.block_n) * config.block_k * size + reads
         fragments = 0.0
         if family.operands_in_registers:
             # Its products read their operands from registers the consumer's warps load from the stage
@@ -939,7 +954,7 @@ class MosaicGmm(_Mosaic):
         matrices = _routed(rows, groups) * kernel.size * size * math.ceil(per_group / in_flight)
         hooks = ba.arguments['hooks']
         rereads = {'rows': tiles, 'columns': bands}
-        moved = (bands * rows * depth * size + matrices + rows * width * _output_bytes(ba)
+        moved = (bands * rows * depth * size + matrices + _written(rows * width, ba, config.block_n)
                  + _side_bytes(ba.arguments['prologue_operands'], hooks.prologue_axes, rereads)
                  + _side_bytes(ba.arguments['epilogue_operands'], hooks.epilogue_axes, rereads))
         return self._cost(ba, config, tiles * columns, depth / config.block_k, moved)
@@ -1006,7 +1021,7 @@ class MosaicTgmm(_Mosaic):
         hooks = ba.arguments['hooks']
         rereads = {'rows': groups, 'depth': blocks[0], 'columns': bands}
         moved = ((bands * rows * depth + math.ceil(blocks[0] / in_flight) * rows * width) * size
-                 + groups * depth * width * out
+                 + cost.written(groups * depth * width * out, config.block_n * out)
                  + _side_bytes(ba.arguments['prologue_operands'], hooks.prologue_axes, rereads))
         steps = _block_tiles(rows, groups, config.block_k) / groups
         return self._cost(ba, config, groups * blocks[0] * blocks[1], steps, moved)
