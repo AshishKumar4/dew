@@ -42,27 +42,19 @@ class Wgmma(mosaic.RingFamily):
     column_scratch = 4 * 32 * 2
     """A WGMMA tile's columns sum across its four warps, each lane's two entries a register."""
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0,
-                interpret: bool = False) -> jax.Array:
-        if interpret:
-            # A dot in the caller's trace, as the interpreter takes a product (its waits no-ops), `then`
-            # beside it: the walk's accumulators are values there, which no scope may take out.
-            value = jnp.dot(lhs if isinstance(lhs, jax.Array) else lhs[...], rhs[...],
-                            preferred_element_type=jnp.float32)
-            if then is not None:
-                then()
-            return value
-
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
         def scores(acc_ref):
             plgpu.wgmma(acc_ref, lhs, rhs)
             if then is not None:
                 then()
-            return plgpu.wgmma_accumulator_load(acc_ref, wait_n=pending)
+            return acc_ref[...]
 
         return pl.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
-        return self.product(lhs, rhs, (lhs.shape[0], rhs.shape[1]), interpret=interpret)
+        if interpret:
+            return jnp.dot(lhs, rhs[...], preferred_element_type=jnp.float32)
+        return self.product(lhs, rhs, (lhs.shape[0], rhs.shape[1]))
 
     def products(self, acc, lhs, rhs, interpret: bool):
         if interpret:
@@ -92,15 +84,12 @@ class Wgmma(mosaic.RingFamily):
                 plgpu.wgmma(acc, lhs, rhs)
         return acc
 
-    def rescaled_products(self, acc, scale, parts, rhs, interpret: bool, *, pending: int = 0):
+    def rescaled_products(self, acc, scale, parts, rhs, interpret: bool):
         if interpret:
             return self.register_products(scale(acc), parts, rhs, interpret)
         # The accumulator's value read once its products are done, scaled, stored back.
-        if pending:
-            acc[...] = scale(plgpu.wgmma_accumulator_load(acc, wait_n=pending))
-        else:
-            plgpu.wgmma_wait(0)
-            acc[...] = scale(acc[...])
+        plgpu.wgmma_wait(0)
+        acc[...] = scale(acc[...])
         return self.register_products(acc, parts, rhs, interpret)
 
     def settled(self, pending: int = 0) -> None:
