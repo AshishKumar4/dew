@@ -24,6 +24,7 @@ import ml_dtypes
 import numpy as np
 import optax
 import pytest
+from confident_support import confident, label_derivative, log_partition, log_softmax
 from reference_error import assert_as_exact, with_gradients
 from residual_orders import order
 from sharded import collectives
@@ -275,10 +276,12 @@ def columns(vocab: int, seed: int = 0):
 SEEDS = {'bias': 128, 'fused': 512, 'quantized': 64, 'scale and bias': 128, 'vocabulary split': 512,
          'column orders': 32, 'split bias': 32, 'quantized split': 32, 'backbone states': 16, 'backbone': 128,
          'small vocabulary': 128, 'small vocabulary training': 128, 'bounded': 32, 'saturated': 256,
-         'excluded': 32, 'token tiles': 16, 'both outputs': 64, 'gemma': 16, 'bf16 cotangent': 8,
+         'excluded': 32, 'token tiles': 16, 'both outputs': 64, 'gemma': 256, 'bf16 cotangent': 256,
          'whole logits': 512}
-"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada):
-the most any of a site's cases took."""
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` on each platform the site
+runs on, the most any of its cases took: on armada, and paired (Dew's arm as `dew_fn`) on an A100 under
+JAX 0.12 for 'bf16 cotangent', 256 at the first tile, and for 'gemma', which runs on a GPU alone, 256 at
+softcap 30."""
 
 
 @pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
@@ -1063,6 +1066,9 @@ TILE = (1024, 8192)
 """The tiled head's tile on the Gemma-sized vocabulary: 1024 tokens by 8192 columns."""
 
 
+# A Gemma-sized vocabulary's float64 truth over the seeds its softcapped cases need is numeric work at
+# model size, a GPU's: on a CPU each case takes about eleven minutes.
+@pytest.mark.gpu(reason="a Gemma-sized vocabulary's float64 truth at the seeds it needs")
 @pytest.mark.parametrize("softcap", [None, 30.0], ids=["plain", "softcap-30"])
 @pytest.mark.parametrize("chunks", [4, 16], ids=["4-chunks", "16-chunks"])
 def test_a_gemma_sized_vocabulary_is_as_exact_as_the_whole_logits(chunks, softcap):
@@ -1214,3 +1220,215 @@ def test_a_fused_heads_overflowed_column_gradient_stays_infinite():
     gradient = np.asarray(gradient)
     assert np.isfinite(float(value))
     assert np.isposinf(gradient[0]) and np.all(np.isfinite(gradient[1:]))
+
+
+CONFIDENT_SEEDS = 8
+"""Check 1's declared seeds for a confident target's gradient, as `test_categorical`'s are."""
+
+
+def identity_head() -> OutputTable:
+    """A head whose logits are its states, so the gradient the states take is the logits' own."""
+    return OutputTable(jnp.eye(7), vocab_major=False, precision=jax.lax.Precision.HIGHEST)
+
+
+@pytest.mark.parametrize("label", [0, 5], ids=["column 0", "column 5"])
+@pytest.mark.parametrize("margin", [20.0, 40.0, 80.0])
+@pytest.mark.parametrize("path", ["tiled", "whole", "fused", "logits"])
+def test_a_confident_targets_logit_gradient_is_the_rest_of_the_rows_eq_7(path, margin, label):
+    """Every head's gradient of a confident target's loss with respect to the logits is arXiv:2610.31642's
+    eq. 7 from float64 (check 1): each other class's probability, and the target's entry the rest of the
+    row's mass, summed directly. A head that takes the target's entry as its share less one collapses it
+    to 0 once the share rounds to 1, and then the row stops summing to zero. The target's entry is
+    negative."""
+    targets = np.full((3,), label, np.int32)
+    head = identity_head()
+
+    def loss(logits):
+        if path == "logits":
+            return chunked.logits_cross_entropy(logits, targets)[0].sum()
+        if path == "fused":
+            return fused_head_loss(logits, head, targets, jnp.ones(targets.shape))[0]
+        tile = (3, 3) if path == "tiled" else None
+        return chunked_cross_entropy(logits, head, targets, 1, tile=tile)[0].sum()
+
+    gradient = jax.jit(jax.grad(loss))
+    assert_as_exact(gradient, lambda logits: label_derivative(logits, label),
+                    lambda seed: confident(margin, seed, label),
+                    f"{path} at margin {margin}, column {label}", seeds=CONFIDENT_SEEDS)
+    (rows,) = confident(margin, 0, label)
+    assert np.all(np.asarray(gradient(rows))[:, label] < 0)
+
+
+@pytest.mark.parametrize("path", ["tiled", "whole", "fused", "logits"])
+@pytest.mark.parametrize("margin", [20.0, 40.0, 80.0])
+def test_a_confident_targets_rest_of_the_row_leaves_an_excluded_column_out(path, margin):
+    """A masked diffusion model's excluded column (MDLM's mask token) gives no mass, so a confident target's
+    rest of the row leaves it out as the partition does, in every head: the gradient is eq. 7 over the other
+    columns from float64 (check 1), and the excluded column takes none. The excluded column scores highest in
+    every row, so a rest of the row that kept it would show."""
+    excluded, label = 6, 2
+    targets = np.full((3,), label, np.int32)
+    head = identity_head()
+
+    def draw(seed):
+        (rows,) = confident(margin, seed, label)
+        rows[:, excluded] = 40.0
+        return (rows,)
+
+    def loss(logits):
+        if path == "logits":
+            return chunked.logits_cross_entropy(logits, targets, excluded=excluded)[0].sum()
+        if path == "fused":
+            return fused_head_loss(logits, head, targets, jnp.ones(targets.shape), excluded=excluded)[0]
+        tile = (3, 3) if path == "tiled" else None
+        return chunked_cross_entropy(logits, head, targets, 1, tile=tile, excluded=excluded)[0].sum()
+
+    def reference(logits):
+        kept = label_derivative(np.delete(logits, excluded, axis=-1), label)
+        return np.concatenate([kept[:, :excluded], np.zeros((len(kept), 1), kept.dtype), kept[:, excluded:]],
+                              axis=-1)
+
+    gradient = jax.jit(jax.grad(loss))
+    assert_as_exact(gradient, reference, draw, f"{path} excluding column {excluded} at margin {margin}",
+                    seeds=CONFIDENT_SEEDS)
+    (rows,) = draw(0)
+    assert np.all(np.asarray(gradient(rows))[:, excluded] == 0)
+
+
+def vocabulary_split(gradient):
+    """`gradient(logits, matrix)` over two devices' vocabulary halves: rows `[B, 8]` split by their
+    columns through an identity head split the same way, at the highest matmul precision."""
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    from dew.training import MeshSpec
+
+    mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
+
+    def split(logits):
+        with jax.set_mesh(mesh), jax.default_matmul_precision("highest"):
+            placed = (jax.device_put(logits, NamedSharding(mesh, P("fsdp"))),
+                      jax.device_put(jnp.eye(8), NamedSharding(mesh, P(None, "fsdp"))))
+            return np.asarray(gradient(*placed))
+    return split
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("excluded", [None, 6], ids=["no column", "column 6 excluded"])
+@pytest.mark.parametrize("tile", [None, (2, 2)], ids=["whole", "tiled"])
+@pytest.mark.parametrize("margin", [20.0, 40.0, 80.0])
+def test_a_vocabulary_split_heads_confident_target_gradient_is_eq_7(tile, margin, excluded):
+    """Split over the vocabulary on a mesh, the head's gradient of a confident target's loss with respect to
+    the logits is eq. 7 from float64 (check 1), as one device's is, with a column excluded or none. The
+    target's shard takes its entry from the rest of the row summed over every shard, not from its share less
+    one, and an excluded column, in whichever shard it sits, joins neither the rest nor the mass."""
+    label = 5
+    targets = np.full((4,), label, np.int32)
+
+    def draw(seed):
+        (rows,) = confident(margin, seed, label, width=8, count=4)
+        if excluded is not None:
+            rows[:, excluded] = 40.0
+        return (rows,)
+
+    def loss(logits, matrix):
+        head = OutputTable(matrix, vocab_major=False, precision=jax.lax.Precision.HIGHEST)
+        return chunked_cross_entropy(logits, head, targets, 1, tile=tile, excluded=excluded)[0].sum()
+
+    gradient = jax.jit(jax.grad(loss))
+
+    def reference(logits):
+        if excluded is None:
+            return label_derivative(logits, label)
+        kept = label_derivative(np.delete(logits, excluded, axis=-1), label)
+        return np.concatenate([kept[:, :excluded], np.zeros((len(kept), 1), kept.dtype), kept[:, excluded:]],
+                              axis=-1)
+
+    split = vocabulary_split(gradient)
+    assert_as_exact(split, reference, draw, f"vocabulary-split at margin {margin}, {tile}, {excluded}",
+                    seeds=CONFIDENT_SEEDS)
+    if excluded is not None:
+        (rows,) = draw(0)
+        assert np.all(split(rows)[:, excluded] == 0)
+
+
+def softmax(rows: np.ndarray) -> np.ndarray:
+    """NumPy's softmax over the last axis, in the rows' own dtype (`log_softmax`)."""
+    return np.exp(log_softmax(rows))
+
+
+@pytest.mark.parametrize("margin", [20.0, 40.0, 80.0])
+@pytest.mark.parametrize("path", ["tiled", "whole", "logits"])
+def test_an_unlikely_targets_log_partition_gradient_is_its_own_probability(path, margin):
+    """The log partition's gradient is each column's probability, the target's included, whatever the
+    target: at a target `margin` below the row's lead, its probability, about exp(-margin), on par with
+    NumPy's softmax from float64 (check 1), where 1 less the rest of the row's share cancels it to 0."""
+    lead, target = 0, 5
+    targets = np.full((3,), target, np.int32)
+    head = identity_head()
+
+    def partition(logits):
+        if path == "logits":
+            return chunked.logits_cross_entropy(logits, targets)[2].sum()
+        tile = (3, 3) if path == "tiled" else None
+        return chunked_cross_entropy(logits, head, targets, 1, tile=tile)[2].sum()
+
+    gradient = jax.jit(jax.grad(partition))
+    assert_as_exact(gradient, softmax, lambda seed: confident(margin, seed, lead),
+                    f"{path} at margin {margin}", seeds=CONFIDENT_SEEDS)
+    (rows,) = confident(margin, 0, lead)
+    assert np.all(np.asarray(gradient(rows))[:, target] > 0)
+
+
+@pytest.mark.parametrize("margin", [20.0, 40.0])
+@pytest.mark.parametrize("path", ["tiled", "whole", "fused", "logits"])
+def test_a_dominant_z_loss_keeps_an_unlikely_targets_share(path, margin):
+    """A z-loss whose cotangent outweighs the loss's (PaLM's, at a large coefficient) moves an unlikely
+    target by its probability times that cotangent, less the rest of its row: the target's entry on par
+    with eq. 7 plus the z-loss's `2 z log Z p` in NumPy from float64 (check 1), which a target entry of
+    `d_partition (1 - rest / mass)` rounds to 0. The entry alone is measured: the lead column's, near the
+    cotangent itself, rounds by more than the target's whole value."""
+    lead, target, weight = 0, 5, 1e8
+    targets = np.full((3,), target, np.int32)
+    head = identity_head()
+
+    def loss(logits):
+        if path == "fused":
+            return fused_head_loss(logits, head, targets, jnp.ones(targets.shape), z_loss=weight)[0]
+        if path == "logits":
+            losses, _, log_z = chunked.logits_cross_entropy(logits, targets)
+        else:
+            losses, _, log_z = chunked_cross_entropy(logits, head, targets, 1,
+                                                     tile=(3, 3) if path == "tiled" else None)
+        return (losses + weight * jnp.square(log_z)).sum()
+
+    def reference(rows):
+        return (label_derivative(rows, target) + 2 * weight * log_partition(rows) * softmax(rows))[:, target]
+
+    gradient = jax.jit(jax.grad(loss))
+
+    def entry(rows):
+        return gradient(rows)[:, target]
+
+    assert_as_exact(entry, reference, lambda seed: confident(margin, seed, lead),
+                    f"{path} at margin {margin}", seeds=CONFIDENT_SEEDS)
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("tile", [None, (2, 2)], ids=["whole", "tiled"])
+@pytest.mark.parametrize("margin", [20.0, 40.0])
+def test_a_vocabulary_split_heads_unlikely_target_keeps_its_log_partition_share(tile, margin):
+    """Split over the vocabulary on a mesh, the log partition's gradient at an unlikely target is on par
+    with NumPy's softmax from float64 (check 1), as one device's is: the target's shard, which picks its
+    logit, takes the partition's share of it directly, not 1 less the rest of the row."""
+    lead, target = 0, 5
+    targets = np.full((4,), target, np.int32)
+
+    def partition(logits, matrix):
+        head = OutputTable(matrix, vocab_major=False, precision=jax.lax.Precision.HIGHEST)
+        return chunked_cross_entropy(logits, head, targets, 1, tile=tile)[2].sum()
+
+    gradient = jax.jit(jax.grad(partition))
+
+    assert_as_exact(vocabulary_split(gradient), softmax,
+                    lambda seed: confident(margin, seed, lead, width=8, count=4),
+                    f"vocabulary-split at margin {margin}, {tile}", seeds=CONFIDENT_SEEDS)

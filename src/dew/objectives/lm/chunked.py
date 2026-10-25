@@ -40,7 +40,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
-from dew.nn.categorical import rescaled, segment_log_partition, target_loss
+from dew.nn.categorical import label_derivative, rescaled, segment_log_partition, target_loss
 from dew.nn.kernels.generation import gpu_target
 from dew.nn.precision import (
     added_to,
@@ -204,14 +204,15 @@ def _tile_logits(states, matrix, precision: jax.lax.PrecisionLike):
                       precision=precision, preferred_element_type=at_least_fp32(states.dtype))
 
 
-def _row_terms(logits, predict: bool) -> tuple[
-        jax.Array, tuple[jax.Array, jax.Array] | None, tuple[jax.Array, jax.Array]]:
+def _row_terms(logits, predict: bool, labels) -> tuple[
+        jax.Array, tuple[jax.Array, jax.Array] | None, tuple[jax.Array, jax.Array, jax.Array]]:
     """Each row's logsumexp, with `predict` its maximum and the first
-    column that holds it, and its maximum and the sum of exponentials scaled
+    column that holds it, and its maximum, the sum of exponentials scaled to
+    it and the sum over the rest of the row (`labels`' column left out) scaled
     to it, from one pass over the row.
 
-    The running maximum, the sum of exponentials scaled to it and the
-    maximum's column ride together through `jax.lax.reduce`, so the row is
+    The running maximum, the two sums scaled to it and the maximum's column
+    ride together through `jax.lax.reduce`, so the row is
     read once, rather than once for the maximum and again for the sum. As
     a single reduction over the row, on an RTX 4080 (jax 0.11.2), fp32
     logits of 4096 x 151936 took 3.9 ms against `jax.nn.logsumexp` and
@@ -236,17 +237,21 @@ def _row_terms(logits, predict: bool) -> tuple[
     def combine(first, second):
         larger = jnp.maximum(first[0], second[0])
         total = rescaled(first[0], first[1], larger) + rescaled(second[0], second[1], larger)
+        beside = rescaled(first[0], first[2], larger) + rescaled(second[0], second[2], larger)
         if not predict:
-            return larger, total
-        keep = (first[0] > second[0]) | ((first[0] == second[0]) & (first[2] < second[2]))
-        return larger, total, jnp.where(keep, first[2], second[2])
+            return larger, total, beside
+        keep = (first[0] > second[0]) | ((first[0] == second[0]) & (first[3] < second[3]))
+        return larger, total, beside, jnp.where(keep, first[3], second[3])
 
     axis = logits.ndim - 1
-    operands = [logits, jnp.ones_like(logits)]
-    initial = [jnp.array(-jnp.inf, logits.dtype), jnp.array(0, logits.dtype)]
+    # A vocabulary column is int32 whatever the run's default integer width.
+    columns = jax.lax.broadcasted_iota(jnp.int32, logits.shape, axis)
+    # The rest of the row leaves each row's target column out, so the target's entry is its rest summed
+    # directly, never its share less one (`_softmax_cotangent`).
+    operands = [logits, jnp.ones_like(logits), (columns != labels[..., None]).astype(logits.dtype)]
+    initial = [jnp.array(-jnp.inf, logits.dtype), jnp.array(0, logits.dtype), jnp.array(0, logits.dtype)]
     if predict:
-        # A vocabulary column is int32 whatever the run's default integer width.
-        operands.append(jax.lax.broadcasted_iota(jnp.int32, logits.shape, axis))
+        operands.append(columns)
         initial.append(jnp.array(jnp.iinfo(jnp.int32).max, jnp.int32))
 
     def reduced(*operands):
@@ -261,7 +266,7 @@ def _row_terms(logits, predict: bool) -> tuple[
 
     terms = (jax.lax.platform_dependent(*operands, cpu=blocked, default=reduced) if wide_cpu_arithmetic()
              else reduced(*operands))
-    return terms[0] + jnp.log(terms[1]), ((terms[0], terms[2]) if predict else None), terms[:2]
+    return terms[0] + jnp.log(terms[1]), ((terms[0], terms[3]) if predict else None), terms[:3]
 
 
 ROW_BLOCK = 16
@@ -283,13 +288,15 @@ def _row_blocks(operands: list[jax.Array]) -> list[list[jax.Array]]:
 
 class _ChunkTerms(NamedTuple):
     """One tile's target logit, its best logit and column when a prediction
-    is asked for, and its maximum and the sum of exponentials scaled to it,
-    from which its rows' log partitions follow (`_forward`)."""
+    is asked for, and its maximum, the sum of exponentials scaled to it and
+    the sum over the rest of its row (the target's column left out), from
+    which its rows' log partitions and cotangents follow (`_forward`)."""
     picked: jax.Array
     best: jax.Array | None
     column: jax.Array | None
     peak: jax.Array
     mass: jax.Array
+    rest: jax.Array
 
 
 def _chunk_terms(hidden, head_chunk, targets, start: int,
@@ -299,7 +306,7 @@ def _chunk_terms(hidden, head_chunk, targets, start: int,
     logits = _without(capped_logits(columns.logits(_tile_logits(hidden, head_chunk, precision)),
                                     softcap, temperature), start, excluded)
     picked = _target_logits(logits, targets - start)
-    _, top, normalizer = _row_terms(logits, predict)
+    _, top, normalizer = _row_terms(logits, predict, targets - start)
     if top is None:
         return _ChunkTerms(picked, None, None, *normalizer)
     return _ChunkTerms(picked, top[0], top[1] + start, *normalizer)
@@ -323,9 +330,10 @@ def _forward(hidden, table, targets, excluded, chunks: int, tile: tuple[int, int
              picked: bool = False):
     """Losses, or with `picked` the targets' logits, top-1 columns (None
     unless `predict`) and log partitions, a token tile at a time, and apart
-    from them each row's maximum and the sum of its exponentials scaled to it.
-    The vocabulary tiles carry only that maximum and sum; a row's log
-    partition is formed from them once, after its last tile."""
+    from them each row's maximum, the sum of its exponentials scaled to it and
+    the sum over the rest of the row, scaled likewise. The vocabulary tiles
+    carry only those; a row's log partition is formed from them once, after
+    its last tile."""
     features = table.shape[1]
     flat = hidden.reshape(-1, features)
     labels = targets.reshape(-1)
@@ -347,46 +355,49 @@ def _forward(hidden, table, targets, excluded, chunks: int, tile: tuple[int, int
                 columns.sliced(first, count))
             peak = jnp.maximum(carry[1], terms.peak)
             merged = (carry[0] + terms.picked, peak,
-                      rescaled(carry[1], carry[2], peak) + rescaled(terms.peak, terms.mass, peak))
+                      rescaled(carry[1], carry[2], peak) + rescaled(terms.peak, terms.mass, peak),
+                      rescaled(carry[1], carry[3], peak) + rescaled(terms.peak, terms.rest, peak))
             if terms.best is None or terms.column is None:
                 return merged
-            better = terms.best > carry[3]
-            return (*merged, jnp.where(better, terms.best, carry[3]),
-                    jnp.where(better, terms.column, carry[4]))
+            better = terms.best > carry[4]
+            return (*merged, jnp.where(better, terms.best, carry[4]),
+                    jnp.where(better, terms.column, carry[5]))
 
-        initial = (jnp.zeros((size,), work), jnp.full((size,), -jnp.inf, work), jnp.zeros((size,), work))
+        initial = (jnp.zeros((size,), work), jnp.full((size,), -jnp.inf, work),
+                   jnp.zeros((size,), work), jnp.zeros((size,), work))
         if predict:
             initial += (jnp.full((size,), -jnp.inf, work), jnp.zeros((size,), jnp.int32))
-        target_logit, peak, mass, *rest = _over_tiles(initial, table.shape[0], width, vocabulary)
+        target_logit, peak, mass, rests, *top = _over_tiles(initial, table.shape[0], width, vocabulary)
         total = peak + jnp.log(mass)
         loss = target_logit if picked else target_loss(peak, mass, target_logit)
-        values = (loss, total, peak, mass, *rest[1:])
+        values = (loss, total, peak, mass, rests, *top[1:])
         return tuple(jax.lax.dynamic_update_slice_in_dim(out, value, start, axis=0)
                      for out, value in zip(outputs, values, strict=True))
 
     count = labels.shape[0]
-    outputs = (jnp.zeros((count,), work),) * 4
+    outputs = (jnp.zeros((count,), work),) * 5
     if predict:
         outputs += (jnp.zeros((count,), jnp.int32),)
-    losses, log_z, peak, mass, *predicted = (value.reshape(targets.shape) for value in
-                                             _over_tiles(outputs, count, token_tile, tokens))
-    return (losses, predicted[0] if predict else None, log_z), (peak, mass)
+    losses, log_z, peak, mass, rests, *predicted = (value.reshape(targets.shape) for value in
+                                                    _over_tiles(outputs, count, token_tile, tokens))
+    return (losses, predicted[0] if predict else None, log_z), (peak, mass, rests)
 
 
 def _shared_partition(outputs, normalizer, group: tuple[str, ...]):
-    """A head's outputs and its rows' maximum and sum of exponentials scaled to it, those of the whole
-    row where `group` names the axes the vocabulary is split over (`_vocabulary_split`): the shards'
-    sums moved to the largest maximum and added, and log Z formed from them once. Each shard's softmax
-    then takes its columns' shares against the whole row's maximum and sum, as the whole head's are.
-    The first output must be the target's logit (`picked`), which another shard's columns do not
-    move."""
+    """A head's outputs and its rows' maximum, sum of exponentials scaled to it and rest of the sum
+    (`_row_terms`), those of the whole row where `group` names the axes the vocabulary is split over
+    (`_vocabulary_split`): the shards' sums moved to the largest maximum and added, and log Z formed from
+    them once. Each shard's softmax then takes its columns' shares, and the target's entry from the rest,
+    against the whole row's maximum and sums, as the whole head's are. The first output must be the
+    target's logit (`picked`), which another shard's columns do not move."""
     if not group:
         return outputs, normalizer
     first, best, log_z = outputs
-    peak, mass = normalizer
+    peak, mass, rests = normalizer
     larger = jax.lax.pmax(peak, group)
     mass = jax.lax.psum(rescaled(peak, mass, larger), group)
-    return (first, best, (larger + jnp.log(mass)).reshape(log_z.shape)), (larger, mass)
+    rests = jax.lax.psum(rescaled(peak, rests, larger), group)
+    return (first, best, (larger + jnp.log(mass)).reshape(log_z.shape)), (larger, mass, rests)
 
 
 def _shared_cotangents(cotangents, group: tuple[str, ...]):
@@ -463,7 +474,7 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, gro
     features = table.shape[1]
     flat = hidden.reshape(-1, features)
     labels = targets.reshape(-1)
-    peaks, masses = (value.reshape(-1) for value in normalizer)
+    peaks, masses, rests = (value.reshape(-1) for value in normalizer)
     d_loss = loss_cotangent.reshape(-1)
     d_partition = partition_cotangent.reshape(-1)
     count = labels.shape[0]
@@ -484,6 +495,7 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, gro
                 flat, start, size).astype(work), operands)
             token_peak = jax.lax.dynamic_slice_in_dim(peaks, start, size)
             token_mass = jax.lax.dynamic_slice_in_dim(masses, start, size)
+            token_rest = jax.lax.dynamic_slice_in_dim(rests, start, size)
             token_loss = jax.lax.dynamic_slice_in_dim(d_loss, start, size)
             token_partition = jax.lax.dynamic_slice_in_dim(d_partition, start, size)
 
@@ -492,7 +504,7 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, gro
             # The scale and the bias act after the bf16 product rounds. Their
             # cotangents stay fp32; only the product's two backward operands round.
             states_tile, matrix_tile, cap_tile, terms_tile = _head_backward(
-                pullback, _softmax_cotangent(logits, first, excluded, token_peak, token_mass,
+                pullback, _softmax_cotangent(logits, first, excluded, token_peak, token_mass, token_rest,
                                              jax.lax.dynamic_slice_in_dim(labels, start, size), token_loss,
                                              token_partition, picked),
                 product_matrix, jax.lax.dynamic_slice_in_dim(flat, start, size).astype(operands), precision,
@@ -537,47 +549,62 @@ _bounded_head = jax.custom_vjp(_bounded_head_impl, nondiff_argnums=(4, 5, 7, 8, 
 _bounded_head.defvjp(_bounded_head_fwd, _bounded_head_bwd)
 
 
-def _softmax_cotangent(logits, first, excluded, peaks, masses, labels, d_first, d_partition,
+def _softmax_cotangent(logits, first, excluded, peaks, masses, rests, labels, d_first, d_partition,
                        picked: bool = False):
     """The cotangent of a row tile of logits whose first column is `first`:
     its share of the softmax times the loss's and the partition's
-    cotangents, less the loss's at the target; with `picked`, where the first
-    output is the target's logit, the share times the partition's alone, plus
-    that output's at the target. The share is taken against the whole row's
-    maximum and sum of exponentials scaled to it, so a tile needs no
-    renormalisation, where dividing by an exponentiated log Z would carry log
-    Z's rounding into every share. The cotangent over the sum is one number a
-    row, so each column's exponential rounds once more, in its product with
-    it, as autodiff of `jax.nn.logsumexp` takes it: a share divided out and
-    then scaled rounds twice, which held 61 of a vocabulary-split head's 8192
-    gradient elements more than twice as far from float64 as that
-    reference's over 52 orders of its columns, against 5. A target outside
-    the tile one-hots to zero rather than to a wrapped column."""
+    cotangents, the target's entry taken from the rest of its row; with
+    `picked`, where the first output is the target's logit, the share times
+    the partition's alone, plus that output's at the target. The share is
+    taken against the whole row's maximum and sum of exponentials scaled to
+    it, so a tile needs no renormalisation, where dividing by an exponentiated
+    log Z would carry log Z's rounding into every share. The cotangent over the
+    sum is one number a row, so each column's exponential rounds once more, in
+    its product with it, as autodiff of `jax.nn.logsumexp` takes it: a share
+    divided out and then scaled rounds twice, which held 61 of a
+    vocabulary-split head's 8192 gradient elements more than twice as far from
+    float64 as that reference's over 52 orders of its columns, against 5.
+
+    The loss's part of the target's entry is the rest of its row's share summed
+    directly, `rests` (the row's exponentials scaled to its maximum, the
+    target's column left out), never its share less one: once the share rounds
+    to 1 that is 0, while the rest of the row, arXiv:2610.31642's eq. 7, is
+    not. The partition's part is the target's own share, never 1 less the
+    rest, which an unlikely target's share would cancel to 0. Without `picked`
+    the entry is `(d_partition * e_t - d_first * rests) / masses`; with it,
+    `d_first + d_partition * p_t` taken as `(d_first * rests + (d_first +
+    d_partition) * e_t) / masses`, where the loss's cotangents `d_first =
+    -d_partition` leave the rest alone. A target outside the tile one-hots to
+    zero rather than to a wrapped column."""
     exponentials = jnp.exp(_without(logits, first, excluded) - peaks[:, None])
     # A target at the excluded column scores a constant +inf, which no logit moves.
-    selected = _without(jax.nn.one_hot(labels - first, logits.shape[-1], dtype=logits.dtype), first,
-                        excluded, value=0)
-    if picked:
-        return exponentials * (d_partition / masses)[:, None] + d_first[:, None] * selected
-    return exponentials * ((d_first + d_partition) / masses)[:, None] - d_first[:, None] * selected
+    selected = _without(jax.nn.one_hot(labels - first, logits.shape[-1], dtype=bool), first,
+                        excluded, value=False)
+    coefficient = d_partition if picked else d_first + d_partition
+    share = exponentials * (coefficient / masses)[:, None]
+    rest = (d_first * (rests / masses))[:, None]
+    target = (exponentials * ((d_first + d_partition) / masses)[:, None] + rest if picked
+              else exponentials * (d_partition / masses)[:, None] - rest)
+    return jnp.where(selected, target, share)
 
 
 def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, predict, temperature,
                       columns: _Columns, picked: bool):
     """The whole `[tokens, vocab]` product in at least fp32, each row's
-    maximum and sum of exponentials scaled to it, and what `_forward` returns
-    of the logits: losses, the top-1 column (None unless `predict`), log Z."""
+    maximum, the sum of exponentials scaled to it and the rest of the row's
+    sum scaled likewise (`_row_terms`), and what `_forward` returns of the
+    logits: losses, the top-1 column (None unless `predict`), log Z."""
     operands = _operand_dtype(precision, at_least_fp32(hidden.dtype))
     flat = hidden.reshape(-1, table.shape[1]).astype(operands)
     labels = targets.reshape(-1)
     raw = _tile_logits(flat, table.astype(operands), precision)
     logits = _without(capped_logits(columns.logits(raw), softcap, temperature), 0, excluded)
-    log_z, top, normalizer = _row_terms(logits, predict)
+    log_z, top, normalizer = _row_terms(logits, predict, labels)
     # The vocabulary-split head shifts each shard's targets by its first row
     # and sums the picked logit over shards, so only the owner may add one.
     picked_logits = _target_logits(logits, labels)
     best = None if top is None else top[1].reshape(targets.shape)
-    first = picked_logits if picked else target_loss(*normalizer, picked_logits)
+    first = picked_logits if picked else target_loss(normalizer[0], normalizer[1], picked_logits)
     return raw, normalizer, (first.reshape(targets.shape), best, log_z.reshape(targets.shape))
 
 
@@ -607,7 +634,7 @@ def _whole_head_bwd(chunks, precision, predict, temperature, picked, group, resi
     products, the head's gradient accumulated in fp32 once, and an fp32 head's
     state gradient over the tiled head's column tiles (`_state_product`)."""
     del predict
-    hidden, table, targets, excluded, raw, (peaks, masses), softcap, columns = residuals
+    hidden, table, targets, excluded, raw, (peaks, masses, rests), softcap, columns = residuals
     loss_cotangent, _, partition_cotangent = _shared_cotangents(cotangents, group)
     work = at_least_fp32(hidden.dtype)
     operands = _operand_dtype(precision, work)
@@ -615,7 +642,7 @@ def _whole_head_bwd(chunks, precision, predict, temperature, picked, group, resi
     logits, pullback = _capped(raw, softcap, columns, temperature)
     width = None if precision is BF16 else tile_columns(table.shape[0], chunks, chunked_tile()[1])
     d_states, d_table, d_cap, d_columns = _head_backward(
-        pullback, _softmax_cotangent(logits, 0, excluded, peaks, masses, targets.reshape(-1),
+        pullback, _softmax_cotangent(logits, 0, excluded, peaks, masses, rests, targets.reshape(-1),
                                      loss_cotangent.reshape(-1), partition_cotangent.reshape(-1), picked),
         table.astype(operands), hidden.reshape(-1, features).astype(operands), precision, work, width)
     return (d_states.reshape(hidden.shape).astype(hidden.dtype), d_table.astype(table.dtype),
@@ -814,7 +841,7 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, columns: _C
         # One masked row for the partition and the target: a target at the excluded column scores
         # +inf, as the chunked heads score it, and its gradient moves no logit.
         kept = _without(logits, 0, excluded)
-        log_z, top, (peaks, masses) = _row_terms(kept, predict)
+        log_z, top, (peaks, masses, rests) = _row_terms(kept, predict, targets)
         values = [target_loss(peaks, masses, _target_logits(kept, targets)), log_z]
         if predict:
             assert top is not None
@@ -822,7 +849,7 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, columns: _C
         if gradients:
             weight = jax.lax.dynamic_slice_in_dim(weights, start, size).astype(work)
             d_states, d_matrix, _, terms = _head_backward(
-                pullback, _softmax_cotangent(logits, 0, excluded, peaks, masses, targets, weight,
+                pullback, _softmax_cotangent(logits, 0, excluded, peaks, masses, rests, targets, weight,
                                              2 * z_loss * log_z * weight),
                 product_matrix, jax.lax.dynamic_slice_in_dim(hidden, start, size).astype(operands), precision,
                 work)
@@ -994,19 +1021,48 @@ def logits_cross_entropy(logits, targets, *, predict: bool = True, temperature: 
     """`chunked_cross_entropy`'s per-token losses, top-1 columns and log
     partitions, of whole `[..., vocab]` logits, in fp32 or wider (a float64
     reference's), as the tiled head sums, and over `temperature`, with column
-    `excluded` given no mass."""
+    `excluded` given no mass. Its derivative is the tiled head's
+    (`_whole_losses_tangent`)."""
     logits = _without(logits.astype(at_least_fp32(logits.dtype)) / temperature, 0,
                       None if excluded is None else jnp.asarray(excluded, jnp.int32))
-    # Not `_row_terms`: its variadic `jax.lax.reduce` has no derivative, which
-    # the tiled head's own backward never needs, and these losses are
-    # differentiated (a distilled student's prediction, a whole-logit model).
-    # A finite shift, as `jax.nn.logsumexp` takes one: an infinite maximum shifts by 0, so a row
-    # holding +inf scores +inf, and an all -inf row's partition is -inf, never inf - inf.
+    losses, log_z = _whole_losses(logits, targets)
+    return losses, jnp.argmax(logits, axis=-1) if predict else None, log_z
+
+
+def _whole_partition(logits):
+    """Each row's maximum, the sum of its exponentials scaled to it, and those exponentials.
+
+    The maximum is finite, as `jax.nn.logsumexp` takes one: an infinite maximum shifts by 0, so a row
+    holding +inf scores +inf, and an all -inf row's partition is -inf, never inf - inf.
+    """
     largest = jnp.max(logits, axis=-1)
-    peak = jax.lax.stop_gradient(jnp.where(jnp.isfinite(largest), largest, 0))
-    mass = jnp.sum(jnp.exp(logits - peak[..., None]), axis=-1)
-    loss = target_loss(peak, mass, _target_logits(logits, targets))
-    return loss, jnp.argmax(logits, axis=-1) if predict else None, peak + jnp.log(mass)
+    peak = jnp.where(jnp.isfinite(largest), largest, 0)
+    shifted = jnp.exp(logits - peak[..., None])
+    return peak, jnp.sum(shifted, axis=-1), shifted
+
+
+@jax.custom_jvp
+def _whole_losses(logits, targets):
+    """Each row's cross entropy and log partition of whole logits, differentiated by `_whole_losses_tangent`.
+
+    Not `_row_terms`: its variadic `jax.lax.reduce` has no derivative, and these losses are differentiated
+    (a distilled student's prediction, a whole-logit model).
+    """
+    peak, mass, _ = _whole_partition(logits)
+    return target_loss(peak, mass, _target_logits(logits, targets)), peak + jnp.log(mass)
+
+
+@_whole_losses.defjvp
+def _whole_losses_tangent(primals, tangents):
+    """The derivatives of each row's loss, the categorical's own (`dew.nn.categorical.label_derivative`,
+    arXiv:2610.31642's eq. 7), and of its log partition, the row's probabilities."""
+    logits, targets = primals
+    losses, log_z = _whole_losses(logits, targets)
+    _, mass, shifted = _whole_partition(logits)
+    probability = shifted / mass[..., None]
+    d_losses = jnp.sum(label_derivative(probability, targets) * tangents[0], axis=-1)
+    d_log_z = jnp.sum(probability * tangents[0], axis=-1)
+    return (losses, log_z), (d_losses, d_log_z)
 
 
 @overload

@@ -163,7 +163,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         """The negative ELBO, its reports and the per-token scores, from one corruption of the batch."""
         tokens, losses, weights, counted, predicted, real = self._token_losses(params, batch, step,
                                                                                train=train)
-        nelbo = Ratio(self.row_mean(losses * weights, batch).total,
+        nelbo = Ratio(self.row_mean(losses, batch, weights=weights).total,
                       self.row_mean(real.astype(jnp.float32), batch).total)
         correct = predicted == tokens
         accuracy, _ = self.accuracy(correct.astype(losses.dtype), batch, counted).mean()
