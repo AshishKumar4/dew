@@ -14,6 +14,9 @@ RESOLVED=2026-10-12T00:00:00Z
 # locks hold (-P); nothing else moves. jax itself, which constraints.txt pins to one build of Dew's package
 # index, takes no date: that index's static pages give no upload times, which a date would need.
 FLASH=2026-10-17T18:46:06Z
+# jaxlib and its CUDA plugins resolve as they stood when 0.12.0.1 was published, which the jax build Dew
+# carries its patches on pins exactly; nothing else moves.
+JAXLIB=2026-10-21T22:00:00Z
 # The agent environments' SDKs resolve as they stood when their adapters were written: OpenEnv
 # 0.9.0 and Daytona 0.225.0 with the API clients it pins to its own version.
 ENVIRONMENTS=2026-10-17T00:00:00Z
@@ -27,6 +30,8 @@ lock() {
     --exclude-newer "$RESOLVED" --exclude-newer-package "dew-flash-attn-cu12=$FLASH" \
     --exclude-newer-package "dew-flash-attn-cu13=$FLASH" -P dew-flash-attn-cu12 -P dew-flash-attn-cu13 \
     --exclude-newer-package jax=false --exclude-newer-package "certifi=$CERTIFI" -P certifi --emit-index-url \
+    $(for package in jaxlib jax-cuda12-plugin jax-cuda12-pjrt jax-cuda13-plugin jax-cuda13-pjrt libtpu; do
+      echo --exclude-newer-package "$package=$JAXLIB" -P "$package"; done) \
     $(for package in openenv daytona daytona-api-client daytona-api-client-async daytona-toolbox-api-client \
         daytona-toolbox-api-client-async daytona-analytics-api-client daytona-analytics-api-client-async; do
       echo --exclude-newer-package "$package=$ENVIRONMENTS"; done) \
