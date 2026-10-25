@@ -20,11 +20,15 @@ from reference_error import assert_as_exact, seeds_for
 from dew.data.chat import Role
 from dew.data.steps.blocks import Blocks
 from dew.data.steps.text import CountTargets
+from dew.inference.serving import Server
+from dew.inference.tasks import TextGeneration
 from dew.nn.inputs import coordinates
+from dew.nn.kv_cache import KVCache
 from dew.nn.mixers import AttentionMixer
 from dew.nn.visibility import prompt_blocks
 from dew.objectives.lm import TEXT_KEY, LMObjective
 from dew.objectives.lm.objective import batch_text
+from dew.sampling import Sampling
 
 SEQ = 8
 ROW = SEQ + 1
@@ -214,3 +218,37 @@ def test_the_prefix_option_puts_the_block_stage_before_the_counts():
     data = LMObjective(blocky(), SEQ, prefix="prompt").data()
     assert data.train[0] == Blocks(prompt=True)
     assert isinstance(data.train[1], CountTargets)
+
+
+SERVED_PROMPTS = [[3, 1, 4, 1, 5], [2, 7, 1, 8, 2, 8], [9, 9, 9, 9, 9, 9, 9]]
+SERVED_BUDGETS = [4, 3, 5]
+
+
+@pytest.mark.parametrize("prefix", [PREFIX, "prompt"], ids=["first-tokens", "prompt"])
+def test_a_served_prefix_run_draws_what_each_request_draws_alone(prefix):
+    """A server prefills each prompt with the blocks the run trained (`prompt_blocks`, through its
+    admission), so greedy requests of several lengths, queued past the slots, draw what the lone task
+    draws: the same tokens, lengths and terminations."""
+    decoder = blocky().clone(max_seq_len=128)
+    variables = decoder.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+    task = TextGeneration(decoder, variables, sampling=Sampling(temperature=0, pad_token_id=0), prefix=prefix)
+    alone = [task(np.asarray([prompt]), budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(SERVED_PROMPTS, SERVED_BUDGETS, strict=True))]
+    server = Server.from_task(task, slots=2, capacity=64, admission=2)
+    tickets = [server.submit(prompt, budget, key=index)
+               for index, (prompt, budget) in enumerate(zip(SERVED_PROMPTS, SERVED_BUDGETS, strict=True))]
+    server.run()
+    for ticket, expected in zip(tickets, alone, strict=True):
+        served, lone = ticket.result().host(), expected.host()
+        np.testing.assert_array_equal(served.tokens, lone.tokens)
+        np.testing.assert_array_equal(served.lengths, lone.lengths)
+        np.testing.assert_array_equal(served.terminated, lone.terminated)
+
+
+def test_a_prefix_run_served_in_pieces_refuses_a_block_longer_than_a_piece():
+    decoder = blocky().clone(max_seq_len=128)
+    variables = decoder.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+    task = TextGeneration(decoder, variables, sampling=Sampling(temperature=0, pad_token_id=0), prefix=PREFIX)
+    server = Server.from_task(task, slots=2, capacity=64, kv_cache=KVCache(page_size=16, pages=8), chunk=2)
+    with pytest.raises(ValueError):
+        server.submit(SERVED_PROMPTS[0], SERVED_BUDGETS[0], key=0)
