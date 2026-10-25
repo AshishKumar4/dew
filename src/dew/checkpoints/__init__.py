@@ -1682,6 +1682,26 @@ class Checkpoints:
         arrays["effects"] = tuple(arrays["effects"])
         return Accumulation(**arrays)
 
+    def position(self, step: int, share: DataPartition) -> bytes | None:
+        """The data position the reader of `share` resumes from at `step` (`read_position`), read
+        alone, before any state is restored: a run opens its data there and reads its first batch
+        while its state is still unplaced (`Trainer.fit`). None where the step saved no position."""
+        from_local = step == self._local_latest()
+        snapshot = self._step_metadata(step, local=from_local)
+        metadata = _item_metadata(snapshot)
+        if 'position' not in metadata or (snapshot.custom_metadata or {}).get('tree'):
+            return None
+        checkpointer = self._open_local() if from_local else self._open()
+        # A local checkpoint holds the table as a device array, replicated, which one device reads.
+        read = (ocp.ArrayRestoreArgs(sharding=jax.sharding.SingleDeviceSharding(jax.local_devices()[0]))
+                if from_local else ocp.ArrayRestoreArgs(restore_type=np.ndarray))
+        wanted = {'position': jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype),
+                                           dict(metadata['position']))}
+        restored = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
+            item=wanted, partial_restore=True, restore_args=jax.tree.map(lambda _: read, wanted)))
+        table = jax.tree.map(np.asarray, dict(restored['position']))
+        return read_position(table, self.local_path if from_local else self.path(step), share)
+
     @overload
     def restore[StateT](self, template: StateT, step: int | str | None = None, *,
                         share: DataPartition | None = None) -> tuple[StateT, bytes | None]: ...

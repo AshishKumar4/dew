@@ -242,6 +242,20 @@ def _suites(dataset: Loader, validation: Mapping[str, Reader | EvalSuite] | None
     return suites
 
 
+@dataclasses.dataclass(frozen=True)
+class _Start:
+    """What `Trainer.place` reads before it places the state (`Trainer._started`): the objective's
+    held tree and the key, the state's shapes and which frozen leaves its init passes through
+    (`traced_start`), the checkpoint step a run resumes from, and the state's placement."""
+
+    initializer: Initializer
+    key: jax.Array
+    abstract: TrainState
+    through: dict[int, int]
+    resume: int | None
+    shardings: Placement[TrainState]
+
+
 def _read_whole(accumulation: int, split: int | None, step: Callable[..., StepFn] | None, layout: Layout,
                 rollout: Rollout | None, mesh: MeshSpec | Mesh) -> str | None:
     """Why every step reads its batch whole, or None where a plan may split it,
@@ -617,8 +631,14 @@ class Trainer(Generic[Loss, Effects]):
         It returns the state with its shardings and the data position a resume
         continues from.
         """
-        # Resolved once, so that the shapes and the values are the same inputs through the same
-        # overridable method, and the objective is asked for what it holds exactly once.
+        return self._placed(self._started())
+
+    def _started(self) -> _Start:
+        """What placing the state reads before it places anything: the objective's held tree and
+        the key, resolved once, so that the shapes and the values are the same inputs through the
+        same overridable method and the objective is asked for what it holds exactly once; the
+        state's shapes; the checkpoint a run resumes from, the one every process agrees; and the
+        placement of the state, once its checks pass (`_validated`)."""
         initializer, key = self.objective.initializer, self.key
         if self.host_master:
             from dew.training.host import transfer
@@ -628,14 +648,22 @@ class Trainer(Generic[Loss, Effects]):
         # Each process lists the checkpoints itself, and on a shared filesystem one listing can lag
         # another's: every process resumes from one step or none does.
         resume = None if checkpoints is None else agreed_same("newest checkpoint", lambda: checkpoints.latest)
+        if checkpoints is not None and resume is not None:
+            abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(resume))
+        shardings, _ = self._validated(abstract)
+        return _Start(initializer, key, abstract, through, resume, shardings)
+
+    def _placed(self, start: _Start) -> tuple[TrainState, Placement[TrainState], bytes | None]:
+        """The state `start` describes on the mesh, fresh or restored, with its shardings and the
+        data position a resume continues from."""
+        initializer, key, abstract, shardings, resume = (start.initializer, start.key, start.abstract,
+                                                         start.shardings, start.resume)
+        checkpoints = self.checkpoints
         if checkpoints is None or resume is None:
-            shardings, _ = self._validated(abstract)
             if self.host_master:
                 return self._placed_host(initializer, key, shardings), shardings, None
-            return (placed_start(self.initial_state, initializer, key, abstract, shardings, through,
+            return (placed_start(self.initial_state, initializer, key, abstract, shardings, start.through,
                                  self.device_mesh), shardings, None)
-        abstract = dataclasses.replace(abstract, accumulation=checkpoints.accumulation_template(resume))
-        shardings, _ = self._validated(abstract)
         if self.host_master and FROZEN in abstract.variables:
             abstract = dataclasses.replace(abstract, variables={
                 **abstract.variables, FROZEN: self._banked_frozen(
@@ -1410,21 +1438,13 @@ class Trainer(Generic[Loss, Effects]):
         The loop is the state's one holder: each step donates the state it is
         handed, and a reference kept past that, as fit's own once was, holds
         an array whose buffers the step consumed."""
-        if initial is None:
-            state, shardings, position = self.place()
-            if checkpoints is not None and checkpoints.latest is not None:
-                run.stop_control = checkpoints.control(checkpoints.latest)
-        else:
-            # A supplied state's trees are held as dicts too (`initial_state`).
-            initial = dataclasses.replace(initial, variables=unfreeze(dict(initial.variables)))
-            shardings, _ = self._validated(initial)
-            state = jax.device_put(initial, shardings)
-            position = None
+        current, position, placed, abstract = self._starting(run, initial)
         run.last_checkpoint = time.perf_counter()
         interval = Interval.resumed(run.stop_control, last_saved=(
-            int(state.step) if checkpoints is not None and checkpoints.latest is not None else None))
-        if self._opened(plan, run, interval, state, position,
-                        resumed=initial is None and interval.last_saved is not None):
+            current if checkpoints is not None and checkpoints.latest is not None else None))
+        state, shardings, complete = self._opened(plan, run, interval, current, position, placed, abstract,
+                                                  resumed=initial is None and interval.last_saved is not None)
+        if complete:
             return state
         compiled: dict[Signature, tuple[CompiledStep, StepFlops | None]] = {}
         seen = 0
@@ -1550,40 +1570,49 @@ class Trainer(Generic[Loss, Effects]):
         run.other += time.perf_counter() - paused
         return self._reported_outcome(error, run)
 
-    def _opened(self, plan: FitPlan, run: FitRun, interval: Interval, state: TrainState, position, *,
-                resumed: bool) -> bool:
-        """Start `fit` from the placed state: report it, refuse a run already
-        past its steps, a checkpoint cadence with no checkpointer or a resume
-        its stream cannot continue, and open the training stream on its
-        prefetch worker. Returns whether the run
-        is already complete, a checkpoint at its last step having been
-        written, so there is nothing to do."""
+    def _starting(self, run: FitRun, initial: TrainState | None
+                  ) -> tuple[int, bytes | None, Callable[[], tuple[TrainState, Placement[TrainState]]],
+                             TrainState | None]:
+        """Where `fit` starts, before it places anything: the step, the data position a resume reads
+        alone (`Checkpoints.position`), so the data opens where the run left it, the placement still
+        to make, and the state's shapes it checks first. A supplied `initial` state is placed as it
+        is given, its shapes already placed."""
+        checkpoints = self.checkpoints
+        if initial is not None:
+            # A supplied state's trees are held as dicts too (`initial_state`).
+            initial = dataclasses.replace(initial, variables=unfreeze(dict(initial.variables)))
+            shardings, _ = self._validated(initial)
+            supplied = jax.device_put(initial, shardings)
+            return int(supplied.step), None, lambda: (supplied, shardings), None
+        start = self._started()
+        if checkpoints is not None and checkpoints.latest is not None:
+            run.stop_control = checkpoints.control(checkpoints.latest)
+        if checkpoints is None or start.resume is None:
+            return 0, None, lambda: self._placed(start)[:2], start.abstract
+        return (start.resume, checkpoints.position(start.resume, DataPartition.of(self.device_mesh)),
+                lambda: self._placed(start)[:2], start.abstract)
+
+    def _opened(self, plan: FitPlan, run: FitRun, interval: Interval, current: int, position,
+                placed: Callable[[], tuple[TrainState, Placement[TrainState]]],
+                abstract: TrainState | None, *, resumed: bool,
+                ) -> tuple[TrainState, Placement[TrainState], bool]:
+        """Start `fit` at step `current`: refuse a run already past its steps, a checkpoint cadence
+        with no checkpointer or a resume its stream cannot continue; open the training stream on its
+        prefetch worker at `position` and read its first batch, against which the whole state a
+        fresh or resumed run holds between steps (`abstract`'s, its accumulation included) is checked
+        before anything is placed (`_whole_validated`); then place the state (`placed`) and report
+        it. Returns the placed state, its shardings and whether the run is already complete, a
+        checkpoint at its last step having been written, so there is nothing to do."""
         mesh, checkpoints, steps = self.device_mesh, self.checkpoints, plan.steps
-        run.current = current = int(state.step)
-        started = FitStarted(current, steps,
-            checkpoints.source(current) if checkpoints is not None and position is not None else None,
-            sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
-            jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape),
-            split_share(state.variables),
-            seed=self.seed, tokens=plan.tokens)
-        self._refusal = None
-        self._report(started, current)
-        if plan.dataset.held_out:
-            self._display.note(f"validation: {plan.dataset.held_out} records held out of train")
         if steps is not None and current > steps:
             raise ValueError(f"the run is at step {current}, past the {steps} asked for")
-
         if plan.checkpoint_every and checkpoints is None:
             raise ValueError(
                 "checkpoint_every asks for checkpoints and this trainer has no "
                 "checkpointer; pass Checkpoints(directory) to write any")
         complete = (plan.ended(current, interval.real_tokens) and checkpoints is not None
                     and checkpoints.latest is not None)
-        if plan.observe:
-            plan.observe.opened(current, state, complete=complete)
-        if complete:
-            return True
-        if not plan.ended(current, interval.real_tokens):
+        if not complete and not plan.ended(current, interval.real_tokens):
             # A ramp's stages begin where updates do (`Ramp.stages`).
             partition = DataPartition.of(mesh, window=self.accumulation)
             run.source = plan.dataset.train(partition)
@@ -1608,6 +1637,28 @@ class Trainer(Generic[Loss, Effects]):
             run.train = DevicePrefetchIterator(run.source, mesh, self._prefetch, source_state=position,
                                                reads=run.reads, prepare=prepare)
             run.source = None  # Lifetime transferred to the prefetch worker.
+            if abstract is not None and self.rollout is None:
+                # Read before the state is placed, and agreed: a process whose read failed stops its peers
+                # before any of them places one. The first step reads it (`FitRun.ahead`).
+                run.ahead = (waited_read(run, interval, agree=True),)
+                if run.ahead[0] is not None:
+                    self._whole_validated(abstract, run.ahead[0])
+        state, shardings = placed()
+        run.current = int(state.step)
+        started = FitStarted(current, steps,
+            checkpoints.source(current) if checkpoints is not None and position is not None else None,
+            sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
+            jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape),
+            split_share(state.variables),
+            seed=self.seed, tokens=plan.tokens)
+        self._refusal = None
+        self._report(started, current)
+        if plan.dataset.held_out:
+            self._display.note(f"validation: {plan.dataset.held_out} records held out of train")
+        if plan.observe:
+            plan.observe.opened(current, state, complete=complete)
+        if complete:
+            return state, shardings, True
 
         trained = [entry.module for entry in self.objective.program_key() if entry.trained]
         stored = sorted({str(leaf.dtype) for leaf in jax.tree.leaves(state.variables["params"])})
@@ -1620,7 +1671,19 @@ class Trainer(Generic[Loss, Effects]):
             self._display.start, started, model=type(trained[0] if trained else self.objective).__name__,
             batch=plan.dataset.batch, precision=precision, shown=shown,
             averaged=self.objective.ema is not None and not self.objective.ema_is_reference))
-        return False
+        return state, shardings, False
+
+    def _whole_validated(self, state: TrainState, batch: Batch) -> None:
+        """Refuse, before anything is placed, a mesh whose devices hold `state` but not the whole
+        state the run's steps keep between them reading `batch`'s shapes: `state` with the
+        accumulation its window of microbatches pools and the narrow copies its step builds, as
+        `validate` reads it given a batch (`Layout.validate`)."""
+        device, _ = split_fields(batch)
+        split = self._split or 1
+        with self._traced_on(self.device_mesh) as schedule:
+            _, _, whole = self._prepared(state, microbatch_shapes(device, split), schedule,
+                                         split * self.accumulation)
+        self._validated(whole)
 
     def _local_devices(self) -> list:
         """This process's devices of the mesh, whose memory the fit check reads."""
