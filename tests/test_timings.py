@@ -206,9 +206,9 @@ def test_a_measurement_that_fails_part_way_logs_the_configs_it_timed(monkeypatch
     profiler = FailingProfiler(fails=2 + tuning.REPEATS, error=error)
     if raises:
         with pytest.raises(RuntimeError):
-            tuning.measured(ba.op, ba, profiler)
+            tuning._measured(ba.op, ba, profiler)
     else:
-        measured = tuning.measured(ba.op, ba, profiler)
+        measured = tuning._measured(ba.op, ba, profiler)
         assert all(isinstance(timing, RuntimeError) for timing in measured.values())
     [row] = [json.loads(line) for line in (tmp_path / "timings.jsonl").read_text().splitlines()]
     assert row['status'] == 'timed' and row['samples_ms'] == [1.0] * tuning.REPEATS

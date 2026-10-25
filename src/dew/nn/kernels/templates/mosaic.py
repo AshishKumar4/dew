@@ -267,8 +267,8 @@ def live_registers(family: "Family", carried, *phases) -> int:
     walk (`carried`, each `(rows, columns, dtype)`: its accumulators, a running statistic) and the largest
     of its `phases`' tiles held at once (a step's operand fragments, a rewrite's operands), each tile's
     32-bit words spread over a role's threads, and what it holds beside them (`Family.held_registers`).
-    The one register estimate every Mosaic template's launches state (`base.Template.registers`), its
-    excess over a thread's budget priced as spills (`base.Template.spilled`)."""
+    The one register estimate every Mosaic template's launches state (`base.Template.registers`), which
+    a legal config holds within a thread's budget (`base.Template.legal`)."""
     def words(tiles) -> float:
         return sum(rows * columns * jnp.dtype(dtype).itemsize / 4 for rows, columns, dtype in tiles)
 
@@ -286,6 +286,38 @@ def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int]
     fragments = ([(share, depth, dtype), (depth, columns * family.rhs_copies, dtype)]
                  if family.operands_in_registers else [])
     return live_registers(family, [(share, columns, jnp.float32)], fragments)
+
+
+def held_rows(family: "Family", consumers: int, columns: int) -> int:
+    """The most rows, in whole roles of `consumers` consumers of `family` (`Family.role_rows` each), whose
+    fp32 accumulator of `columns` columns their threads hold beside what they hold besides
+    (`Family.held_registers`): the rows a derived tile's registers bound (docs/design/kernel-templates.md
+    §7). A family whose products read registers holds a step's fragments too (`tile_registers`), which
+    its derivation checks at each step."""
+    share = (family.registers(consumers) - family.held_registers) * THREADS // columns
+    return share // family.role_rows * family.role_rows * consumers
+
+
+def deepest[C](make: Callable[[int], C], holds: Callable[[C], bool], most: int) -> C | None:
+    """`make(stages)` at the most stages, from `most` down to two (one loading beside one consumed), that
+    `holds` (a launch's legality: its ring within a block's shared memory); None where none does. A
+    derived ring is the deepest a block holds (CUTLASS's StageCountAutoCarveout's rule: the block's shared
+    memory less what else it stages, over a stage's bytes)."""
+    return next((made for made in map(make, range(most, 1, -1)) if holds(made)), None)
+
+
+def band(multiprocessors: int, block_m: int, block_n: int, column_tiles: int,
+         group_row_tiles: int | None = None) -> int:
+    """The planar snake's column tiles a band for a wave of one program a multiprocessor sharing its
+    blocks in the L2 (`grid_block_n`): the power of two, at most `column_tiles`, nearest below the band
+    that reads each operand fewest times from the device. The rows' and the columns' blocks balanced
+    (a wave as near a square of output tiles as their sides allow: √(programs · rows / columns)) or,
+    where the rows split into groups of `group_row_tiles` row tiles each, wider while a wave still spans
+    each group's row tiles whole (programs over a group's row tiles), whose columns' blocks it then
+    reads once a group."""
+    balanced = math.sqrt(multiprocessors * block_m / block_n)
+    spanning = multiprocessors / group_row_tiles if group_row_tiles else 0.0
+    return 1 << (max(1, min(int(max(balanced, spanning)), column_tiles)).bit_length() - 1)
 
 
 def consumer_registers(consumers: int) -> int:
