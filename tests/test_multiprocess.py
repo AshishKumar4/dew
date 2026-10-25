@@ -1405,3 +1405,32 @@ def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_pa
         if rank == 0:
             assert "training read failed on rank 1" in report["first_read"], report
             assert "training read failed on rank 1" in report["eof"], report
+
+
+@pytest.mark.distributed
+def test_runs_average_across_a_pool_each_process_its_own_shards(tmp_path):
+    """Two runs a pool trained, averaged in the pool onto its mesh, whose leaves no one process holds
+    whole: every process's gathered mean is float64's mean of the two runs' weights rounded to fp32,
+    read from their checkpoints in one process."""
+    import jax
+
+    from dew.checkpoints import Checkpoints
+
+    corpus = document_corpus(tmp_path / "corpus", 24, length=7)
+    reports = run_pool("averaged", tmp_path / "out", 2, run_dir=tmp_path / "runs", fsdp_size=2,
+                       tokens=corpus.train, seq_len=7)
+    assert all(report["pool_sharded"] for report in reports)
+    trees = []
+    for run in reports[0]["runs"]:
+        with Checkpoints(run) as checkpoints:
+            restored, _ = checkpoints.restore()
+        # The live weights, as the pool averages them (ema=False).
+        trees.append(restored["variables"])
+    flat = [{jax.tree_util.keystr(path): np.asarray(leaf) for path, leaf
+             in jax.tree_util.tree_flatten_with_path(tree)} for tree in trees]
+    for index in range(2):
+        dumped = dumped_params(tmp_path / "out" / f"process{index}.json")
+        assert set(dumped) == set(flat[0])
+        for name, got in dumped.items():
+            wide = (flat[0][name].astype(np.float64) + flat[1][name].astype(np.float64)) / 2
+            np.testing.assert_array_equal(got, wide.astype(np.float32), err_msg=name)
