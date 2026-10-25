@@ -1420,18 +1420,17 @@ def scaled_dot_product_attention(query, key, value, dtype=None, precision=None,
         segment_ids = CrossDocuments(segment_ids, key_segment_ids)
     if not causal:
         block_groups = image_groups = None
-    if ((block_groups is not None or image_groups is not None)
-            and ((dropout_rate and not deterministic) or shards > 1)):
-        # Only a single device's template reads block and image groups; elsewhere the call's spans are the
-        # mask they mean, its causality, window, documents, key lengths and starts among them.
+    if (block_groups is not None or image_groups is not None) and shards > 1:
+        # Only a single device's template reads block and image groups; across sequence shards the call's
+        # spans are the mask they mean, its causality, window, documents, key lengths and starts among them.
+        # On one device a route other than the template's takes them so (`_attention_kernel`).
         mask = visibility_mask(query.shape[-3], key.shape[-3], causal, sliding_window, mask, segment_ids,
                                key_value_seq_lengths, key_value_seq_starts, block_groups, image_groups)
         causal, sliding_window, segment_ids, block_groups, image_groups = False, None, None, None, None
         key_value_seq_lengths = key_value_seq_starts = None
-        if shards > 1:
-            implementation = kernel_for_materialized_mask(
-                implementation, query, key, dtype=dtype, precision=precision,
-                force_fp32_for_softmax=force_fp32_for_softmax)
+        implementation = kernel_for_materialized_mask(
+            implementation, query, key, dtype=dtype, precision=precision,
+            force_fp32_for_softmax=force_fp32_for_softmax)
     if (isinstance(segment_ids, CrossDocuments) and (causal or sliding_window is not None)
             and shards > 1):
         # Only a single device's kernels read documents aligned to their last keys; elsewhere they
