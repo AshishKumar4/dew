@@ -736,19 +736,21 @@ def _plane_template(ema, deltas):
     return jax.tree_util.tree_map_with_path(planes, ema), targets
 
 
-RETIRED_OPTIMIZER_STATES = {
-    "learning_rate_scale": "its rate as a scale times a schedule's shape (learning_rate_scale and "
-                           "learning_rate_shape), where Dew's optimizer now holds the schedule's own "
-                           "rate fields and steps at Optax's schedule of them (dew.optim.RateState)",
-}
-"""Keys of an optimizer state a Dew before 1.0 wrote and this one no longer does, by what each held:
-a resume refuses the checkpoint by name rather than as a mismatched tree."""
+RETIRED_RATE = ("learning_rate_scale", "learning_rate_shape")
+"""The hyperparameters Dew's optimizer injected before it held a schedule's own rate fields
+(`dew.optim.RateState`): a rate's scale and its schedule's shape, two scalars side by side in an
+injected state's hyperparameters, which a resume refuses by name rather than as a mismatched tree."""
 
 
-def _keys(tree) -> set[str]:
-    """Every mapping key on a leaf's path in a checkpoint's metadata `tree`."""
-    return {entry.key for path, _ in jax.tree_util.tree_flatten_with_path(tree)[0] for entry in path
-            if isinstance(entry, jax.tree_util.DictKey)}
+def _retired_rate(tree) -> bool:
+    """Whether a checkpoint's optimizer-state metadata `tree` holds the retired rate: one mapping with
+    both of `RETIRED_RATE` as scalars, an injected state's hyperparameters, and not a param group or a
+    parameter of either name, whose entry holds a state or a parameter's moments."""
+    if isinstance(tree, Mapping):
+        if all(tuple(getattr(tree.get(name), "shape", (None,))) == () for name in RETIRED_RATE):
+            return True
+        return any(_retired_rate(value) for value in tree.values())
+    return isinstance(tree, list | tuple) and any(_retired_rate(value) for value in tree)
 
 
 def _check_template(template, metadata, stored, *, mapping: bool) -> None:
@@ -765,11 +767,12 @@ def _check_template(template, metadata, stored, *, mapping: bool) -> None:
     if mapping:
         raise ValueError("the checkpoint holds a mapping saved in place of a train state; restore it "
                          "through a mapping template, or with none")
-    retired = sorted(_keys(metadata.get("opt_state")) & RETIRED_OPTIMIZER_STATES.keys())
-    if retired:
-        raise ValueError(f"the checkpoint's optimizer state holds {RETIRED_OPTIMIZER_STATES[retired[0]]}; "
-                         f"a run cannot resume it. Resume it with the Dew that wrote it, or start a "
-                         f"fresh run from its weights in a directory of its own.")
+    if _retired_rate(metadata.get("opt_state")):
+        raise ValueError(
+            "the checkpoint's optimizer state holds its rate as a scale times a schedule's shape "
+            f"({' and '.join(RETIRED_RATE)}), which Dew's optimizer no longer forms: it holds the "
+            "schedule's own rate fields (dew.optim.RateState), so a run cannot resume it. Resume it "
+            "with the Dew that wrote it, or start a fresh run from its weights in a directory of its own.")
     from dew.training.state import CHECKPOINTED
     missing = set(CHECKPOINTED).difference(stored)
     if missing:

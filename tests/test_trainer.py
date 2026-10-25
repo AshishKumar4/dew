@@ -915,6 +915,22 @@ def test_a_checkpoint_of_the_retired_rate_scale_and_shape_is_refused(tmp_path):
         make_trainer(tmp_path, optimizer=retired).place()
 
 
+def test_a_param_group_named_as_the_retired_rate_resumes(tmp_path):
+    """The retired rate is refused by its structure, a scale and a shape side by side as an injected
+    state's scalars: a run of today's optimizer whose param group takes one of those names writes a
+    checkpoint its resume reads back."""
+    from dew.optim import ParamGroup
+
+    config = OptimConfig(optimizer="adam", learning_rate=0.1, clip_grads=0,
+                         param_groups=(ParamGroup("learning_rate_scale", ("*",)),))
+    trained = make_trainer(tmp_path, optimizer=config).fit(dataset(), steps=1, log_every=1)
+    state, _, _ = make_trainer(tmp_path, optimizer=config).place()
+    assert int(state.step) == 1
+    for before, after in zip(jax.tree.leaves(trained.opt_state), jax.tree.leaves(state.opt_state),
+                             strict=True):
+        np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
+
+
 def _rewrite_position(trainer, step, rows, shares):
     """Save `step` again with `rows` as the checkpoint's position table, each
     row read for the share `shares` names."""

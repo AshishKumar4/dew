@@ -661,15 +661,17 @@ OPTIMIZER_MAP: dict[Optimizer, Callable[..., optax.GradientTransformation]] = {
 
 
 class RateState(NamedTuple):
-    """A scheduled solver's rate (`scheduled_solver`): the `updates` it has applied, and its schedule's
-    rate-valued fields by path (`ScheduleBase.rates`), or the one constant rate under `CONSTANT`."""
+    """A scheduled solver's schedule (`scheduled_solver`): the `updates` it has applied, and its
+    schedule's rate-valued fields by path (`ScheduleBase.rates`), or, for a schedule that marks none,
+    the factor its values take under `CONSTANT`."""
 
     updates: jax.Array
     rates: Mapping[str, jax.Array]
 
 
 CONSTANT = 'value'
-"""The name a constant rate is held under in its `RateState`."""
+"""The name a constant rate is held under (`rates_of`): a `RateState`'s for a schedule that marks no
+rate, and Optax's own `learning_rate` hyperparameter for a constant."""
 
 
 def rates_of(rate: float | ScheduleBase, multiplier: float = 1.0) -> dict[str, float]:
@@ -684,7 +686,7 @@ class _Rate(optax.schedules.StatefulSchedule):
     """Optax's stateful hyperparameter of a scheduled solver: the schedule's value at each update, with
     its rate-valued fields operands in the state rather than constants in the program."""
 
-    def __init__(self, rate: float | ScheduleBase, steps: int | None, dtype, multiplier: float = 1.0):
+    def __init__(self, rate: ScheduleBase, steps: int | None, dtype, multiplier: float = 1.0):
         self.rate, self.steps, self.dtype, self.rates = rate, steps, dtype, rates_of(rate, multiplier)
 
     def init(self) -> RateState:
@@ -697,8 +699,6 @@ class _Rate(optax.schedules.StatefulSchedule):
 
     def __call__(self, state: RateState, **extra_args) -> jax.typing.ArrayLike:
         del extra_args
-        if not isinstance(self.rate, ScheduleBase):
-            return state.rates[CONSTANT]
         if not self.rate.rates():
             return state.rates[CONSTANT] * self.rate.schedule(self.steps)(state.updates)
         return self.rate.schedule(self.steps, state.rates)(state.updates)
@@ -726,7 +726,9 @@ def scheduled_solver(make: Callable[..., optax.GradientTransformation], rate: fl
 
     def injected(dtype):
         return optax.inject_hyperparams(factory, hyperparam_dtype=dtype)(
-            learning_rate=_Rate(rate, steps, dtype, multiplier),
+            # A constant is Optax's own numeric hyperparameter, rounded once from its product.
+            learning_rate=(_Rate(rate, steps, dtype, multiplier) if isinstance(rate, ScheduleBase)
+                           else rates_of(rate, multiplier)[CONSTANT]),
             b1=None if b1 is None else b1.schedule(steps))
 
     def init_fn(params):
@@ -753,15 +755,30 @@ def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
 
 
 def with_rates(opt_state: optax.OptState, rates: Mapping[str | None, Mapping[str, float]]) -> optax.OptState:
-    """`opt_state` with each `scheduled_solver`'s rate-valued fields set to `rates`' for its param group,
-    by name, or under None for a solver of no group; each keeps the old field's dtype and placement."""
-    def replaced(path: jax.tree_util.KeyPath, leaf):
-        held = [entry.key for entry in path if isinstance(entry, jax.tree_util.DictKey)]
-        if len(path) < 3 or path[-2] != jax.tree_util.GetAttrKey('rates') or 'learning_rate' not in held:
-            return leaf
-        group = next((key for key in held if key in rates), None)
-        return jax.device_put(np.asarray(rates[group][path[-1].key], leaf.dtype), leaf.sharding)
-    return jax.tree_util.tree_map_with_path(replaced, opt_state)
+    """`opt_state` with each `scheduled_solver`'s rate set to `rates`' for its param group, by name, or
+    under None for a solver of no group (`rates_of`): a schedule's rate-valued fields in its
+    `RateState`, or a constant in Optax's `learning_rate` hyperparameter. Each keeps the old value's
+    dtype and placement."""
+    injected = optax.InjectStatefulHyperparamsState
+
+    def put(value, like):
+        return jax.device_put(np.asarray(value, like.dtype), like.sharding)
+
+    def replaced(path: jax.tree_util.KeyPath, node):
+        if not isinstance(node, injected) or 'learning_rate' not in node.hyperparams:
+            return node
+        group = next((entry.key for entry in path
+                      if isinstance(entry, jax.tree_util.DictKey) and entry.key in rates), None)
+        wanted, schedule = rates[group], node.hyperparams_states.get('learning_rate')
+        if isinstance(schedule, RateState):
+            fields = {name: put(wanted[name], held) for name, held in schedule.rates.items()}
+            states = {**node.hyperparams_states, 'learning_rate': schedule._replace(rates=fields)}
+            return node._replace(hyperparams_states=states)
+        rate = put(wanted[CONSTANT], node.hyperparams['learning_rate'])
+        return node._replace(hyperparams={**node.hyperparams, 'learning_rate': rate})
+
+    return jax.tree_util.tree_map_with_path(replaced, opt_state,
+                                            is_leaf=lambda node: isinstance(node, injected))
 
 
 def _keep_within(lower: float, upper: float) -> optax.GradientTransformation:
