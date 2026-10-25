@@ -49,6 +49,34 @@ def test_repeated_token_gradients_accumulate_in_master_precision(dtype):
     np.testing.assert_array_equal(gradient, expected)
 
 
+@pytest.mark.parametrize("vocab, padding_idx", [(5, 0), (5, 4), (5, -1), (5, -5), (1, 0), (1, -1)])
+def test_a_padding_rows_lookups_train_it_no_more_than_torchs(vocab, padding_idx):
+    """`padding_idx` leaves the row its id names untrained by every lookup of it, as torch's
+    `nn.Embedding(padding_idx=...)` does, a negative id counted from the table's end and a table of
+    one row alike: the gradient under a drawn cotangent of small integers is torch's to the bit, each
+    row the sum of its lookups' cotangents, exact in float32 in any order. An id outside the table is
+    refused."""
+    import torch
+
+    ids = np.asarray([[0, vocab - 1, 0], [vocab - 1, 0, vocab - 1]])
+    cotangent = np.random.default_rng(7).integers(-8, 8, (*ids.shape, 3)).astype(np.float32)
+    model = TokenEmbedding(vocab, 3, padding_idx=padding_idx)
+    variables = model.init(jax.random.key(4), jnp.asarray(ids, jnp.int32))
+
+    def loss(parameters):
+        return jnp.sum(model.apply({"params": parameters}, jnp.asarray(ids, jnp.int32)) * cotangent)
+
+    ours = jax.grad(loss)(variables["params"])["embedding"]
+    reference = torch.nn.Embedding(vocab, 3, padding_idx=padding_idx)
+    with torch.no_grad():
+        reference.weight.copy_(torch.from_numpy(np.asarray(variables["params"]["embedding"])))
+    (reference(torch.from_numpy(ids)) * torch.from_numpy(cotangent)).sum().backward()
+    np.testing.assert_array_equal(np.asarray(ours), reference.weight.grad.numpy())
+    assert not np.any(np.asarray(ours)[padding_idx])
+    with pytest.raises(ValueError):
+        TokenEmbedding(vocab, 3, padding_idx=vocab).init(jax.random.key(4), jnp.asarray(ids, jnp.int32))
+
+
 @pytest.mark.parametrize("family", ["clip-token", "clip-position", "clip-vision", "siglip",
                                     "gemma3n", "decision", "joint"])
 def test_family_embedding_gradients_sum_repeated_ids_in_master_precision(family):
