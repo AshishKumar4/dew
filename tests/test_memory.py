@@ -11,7 +11,7 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact
 
-from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
+from dew.nn.inputs import PLAIN_CALL, AttentionMetadata, MixerCall, coordinates
 from dew.nn.memory import Gate, InContextMemory, LinearMemory, MLPMemory, Objective, ResidualMemory
 
 WIDTH, HEADS, FEATURES, LENGTH, CHUNK, ROWS = 8, 2, 4, 12, 4, 8
@@ -48,7 +48,7 @@ def layer(name: str, dtype=jnp.float32) -> InContextMemory:
     return InContextMemory(heads=HEADS, head_features=FEATURES, dtype=dtype, **fields)
 
 
-def written(module: InContextMemory, params: dict, *, dtype, segments=None):
+def written(module: InContextMemory, *, dtype, segments=None):
     """The paper's update as a function of the stream, token by token, in `dtype` (float64 for the
     truth): the views and gates from the layer's projections, the state in at least float32, each
     gradient at its chunk's start counted from its document's first token (`segments` `[S]`, one
@@ -84,7 +84,7 @@ def written(module: InContextMemory, params: dict, *, dtype, segments=None):
         return jax.lax.scan(token, carry, (q, k, v, theta, mu, alpha, jnp.asarray(firsts)))[1]
 
     @jax.jit
-    def run(x):
+    def run(x, params):
         # Cast here, under the caller's float64 mode where the truth runs.
         p = jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype), params["params"])
         initial = jax.tree.map(lambda leaf: jnp.asarray(leaf, wide), params["params"]["initial"])
@@ -112,8 +112,19 @@ def _head(index: int, leaf):
     return leaf[index]
 
 
-def draw(seed: int) -> tuple[np.ndarray]:
-    return (np.random.default_rng([1645, seed]).standard_normal((ROWS, LENGTH, WIDTH)).astype(np.float32),)
+def drawn(module: InContextMemory):
+    """A seed's stream and its own weights for `module`: each draw a fresh model, so no one draw of
+    the weights is shared by every seed's error."""
+    def draw(seed: int) -> tuple[np.ndarray, dict]:
+        x = np.random.default_rng([1645, seed]).standard_normal((ROWS, LENGTH, WIDTH)).astype(np.float32)
+        params = module.init(jax.random.key(seed), jnp.zeros((1, LENGTH, WIDTH)))
+        return x, jax.tree.map(np.asarray, params)
+    return draw
+
+
+def applied(module: InContextMemory, call: MixerCall = PLAIN_CALL):
+    """`module` over a draw's stream under the draw's weights."""
+    return jax.jit(lambda x, params: module.apply(params, x, call))
 
 
 @pytest.mark.parametrize("name", sorted(CONFIGURATIONS))
@@ -121,10 +132,8 @@ def test_a_memory_follows_its_papers_update(name):
     """Each configuration computes its paper's update and readout token by token (`written`), on par
     with that written-out update in float32, against float64 (check 1)."""
     module = layer(name)
-    params = module.init(jax.random.key(0), jnp.zeros((1, LENGTH, WIDTH)))
-    assert_as_exact(jax.jit(lambda x: module.apply(params, x)), written(module, params, dtype=jnp.float32),
-                    draw, f"{name} memory", seeds=MEMORY_SEEDS,
-                    truth_fn=written(module, params, dtype=jnp.float64))
+    assert_as_exact(applied(module), written(module, dtype=jnp.float32), drawn(module), f"{name} memory",
+                    seeds=MEMORY_SEEDS, truth_fn=written(module, dtype=jnp.float64))
 
 
 def packed(segments: np.ndarray) -> MixerCall:
@@ -138,19 +147,16 @@ def test_the_chunk_parallel_memory_is_the_token_by_token_one(name):
     """A row of one document runs chunk by chunk; the same row as a packed call runs token by token,
     the definition. The two are on par against float64 (check 1)."""
     module = layer(name)
-    params = module.init(jax.random.key(0), jnp.zeros((1, LENGTH, WIDTH)))
-    one = np.ones((ROWS, LENGTH), np.int32)
-    stepped = jax.jit(lambda x: module.apply(params, x, packed(one)))
-    assert_as_exact(jax.jit(lambda x: module.apply(params, x)), stepped, draw, f"{name} chunked",
-                    seeds=MEMORY_SEEDS, truth_fn=written(module, params, dtype=jnp.float64))
+    stepped = applied(module, packed(np.ones((ROWS, LENGTH), np.int32)))
+    assert_as_exact(applied(module), stepped, drawn(module), f"{name} chunked", seeds=MEMORY_SEEDS,
+                    truth_fn=written(module, dtype=jnp.float64))
 
 
 def test_packed_documents_read_as_each_alone():
     """Two documents packed in a row each start from the initial network, their chunks counted from
     their own first token: each reads, bit for bit, as the document alone."""
     module = layer("titans")
-    params = module.init(jax.random.key(0), jnp.zeros((1, LENGTH, WIDTH)))
-    x = draw(0)[0]
+    x, params = drawn(module)(0)
     cut = 5
     segments = np.where(np.arange(LENGTH) < cut, 1, 2)[None].repeat(ROWS, 0)
     together = np.asarray(module.apply(params, x, packed(segments)))
@@ -163,11 +169,10 @@ def test_a_decode_continues_the_full_pass():
     """A prefill and then one token a call, through the cache, reads each token as the full pass does,
     momentum and chunk boundaries carried across the calls: on par against float64 (check 1)."""
     module = layer("titans")
-    params = module.init(jax.random.key(0), jnp.zeros((1, LENGTH, WIDTH)))
     decode = MixerCall(decode=True)
 
     @jax.jit
-    def decoded(x):
+    def decoded(x, params):
         _, cache = module.apply(params, x[:, :1], decode, mutable=["cache"])
         prefill, cache = module.apply({**params, **cache}, x[:, :6], decode, mutable=["cache"])
         reads = [prefill]
@@ -176,9 +181,9 @@ def test_a_decode_continues_the_full_pass():
             reads.append(token)
         return jnp.concatenate(reads, axis=1)
 
-    full = jax.jit(lambda x: module.apply(params, x, packed(np.ones((ROWS, LENGTH), np.int32))))
-    assert_as_exact(decoded, full, draw, "decoded memory", seeds=MEMORY_SEEDS,
-                    truth_fn=written(module, params, dtype=jnp.float64))
+    full = applied(module, packed(np.ones((ROWS, LENGTH), np.int32)))
+    assert_as_exact(decoded, full, drawn(module), "decoded memory", seeds=MEMORY_SEEDS,
+                    truth_fn=written(module, dtype=jnp.float64))
 
 
 def test_a_zero_step_reads_the_initial_network():
@@ -187,9 +192,8 @@ def test_a_zero_step_reads_the_initial_network():
     module = InContextMemory(network=functools.partial(ResidualMemory, hidden=4 * FEATURES), heads=HEADS,
                              head_features=FEATURES, learning_rate=Gate(value=0.0), output=False,
                              chunk=CHUNK)
-    params = module.init(jax.random.key(0), jnp.zeros((1, LENGTH, WIDTH)))
 
-    def initial(x):
+    def initial(x, params):
         kernel = params["params"]["q_proj"]["kernel"].astype(x.dtype)
         queries = (x @ kernel).reshape(-1, LENGTH, HEADS, FEATURES)
         network = ResidualMemory(hidden=4 * FEATURES, dtype=x.dtype)
@@ -198,8 +202,8 @@ def test_a_zero_step_reads_the_initial_network():
                                queries[:, :, h]) for h in range(HEADS)]
         return jnp.stack(heads, axis=2).reshape(-1, LENGTH, HEADS * FEATURES)
 
-    assert_as_exact(jax.jit(lambda x: module.apply(params, x)), jax.jit(initial), draw, "zero-step memory",
-                    seeds=MEMORY_SEEDS, truth_fn=initial)
+    assert_as_exact(applied(module), jax.jit(initial), drawn(module), "zero-step memory", seeds=MEMORY_SEEDS,
+                    truth_fn=initial)
 
 
 def decoder(**fields):
