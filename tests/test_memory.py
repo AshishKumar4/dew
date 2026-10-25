@@ -15,7 +15,7 @@ from dew.nn.inputs import PLAIN_CALL, AttentionMetadata, MixerCall, coordinates
 from dew.nn.memory import Gate, InContextMemory, LinearMemory, MLPMemory, Objective, ResidualMemory
 from dew.nn.precision import L2NORM_EPS
 
-WIDTH, HEADS, FEATURES, LENGTH, CHUNK, ROWS = 8, 2, 4, 12, 4, 8
+WIDTH, HEADS, FEATURES, LENGTH, CHUNK, ROWS = 32, 2, 16, 12, 4, 8
 MEMORY_SEEDS = 32
 """The declared seeds for check 1 of the memories (`assert_as_exact`), sized by `seeds_for` on armada."""
 
@@ -44,6 +44,8 @@ CONFIGURATIONS = {
 a step size of `STEP` times a sigmoid, the stable range the papers train in: an unnormalized key under
 a unit step drives the inner gradient descent off, where no precision computes the same update."""
 STEP = 0.1
+"""Heads 16 wide: a layer norm over a head's few features divides by a spread that a draw can bring
+near zero, so narrower heads leave the norm's rounding too heavy-tailed for any count to resolve."""
 
 
 def layer(name: str, dtype=jnp.float32) -> InContextMemory:
