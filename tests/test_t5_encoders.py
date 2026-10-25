@@ -144,12 +144,11 @@ def test_the_real_checkpoint_matches_the_reference():
     import torch
     from transformers import T5EncoderModel
 
-    from tools.torch_precision import float64
+    from tools.torch_precision import float64, float64_twin
 
     repo = "google-t5/t5-small"
     reference_model = T5EncoderModel.from_pretrained(repo, dtype=torch.float32).eval()
-    with float64():
-        wide = T5EncoderModel.from_pretrained(repo, dtype=torch.float64).eval()
+    wide = float64_twin(reference_model, lambda: T5EncoderModel.from_pretrained(repo, dtype=torch.float64))
 
     def ran(model, ids, mask):
         with torch.no_grad():
