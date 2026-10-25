@@ -43,6 +43,17 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   `dew.objectives.lm.objective`); the axis names, `DEFAULT_RULES`, `axis_rules`, `logical_spec`,
   `row_axes`, `batch_axes` and `LayoutRefused` (from `dew.nn.sharding`). Import them from their
   new modules; the old ones no longer hold them.
+- `Trainer.fit(examples=N)` and `--trainer.examples N` bound a run to the chain's
+  first N records, counted before packing and each read once, its steps (and so
+  its schedule) the ones the data plan counts for them. `Pause(fraction)`, as
+  `stop=` or `--trainer.stop.fraction`, ends a run at that fraction of its
+  budget, to resume as one that never paused. A training stream that runs out
+  ends the run with its final checkpoint, on every process at the same step,
+  instead of raising `StopIteration`.
+- A JEPA run's target momentum ramps over its optimizer updates, the steps
+  over its accumulation, where it ramped over its steps; its `--lora` adapts
+  the encoder, which the run used to record and ignore. An LM run bounded by
+  `--trainer.tokens` alone trains over data with no epoch length.
 - A causal attention kind may read blocks whole: `AttentionMixer(bidirectional_blocks=True)` lets
   each token of a block (`block_groups=`, `AttentionMetadata.block_groups`, `[B, S]`, -1 outside
   any) see its whole block, whatever its window, as transformers' `block_sequence_ids` does, while

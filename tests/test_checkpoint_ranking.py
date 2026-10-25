@@ -18,9 +18,8 @@ from dew.checkpoints import Checkpoints, Keep, Metrics, Ranking
 from dew.data.dataset import DataPartition
 from dew.objectives.base import Aux, Objective, Shown
 from dew.telemetry.records import FitEnded
-from dew.training import Trainer
+from dew.training import Best, Plateau, Trainer
 from dew.training.evaluation import MetricScores
-from dew.training.trainer import Best, Plateau
 
 
 class Overfit(Objective):
