@@ -26,12 +26,14 @@ rounds to the query's dtype (`reference`).
 
 import dataclasses
 import enum
+import math
 from collections.abc import Callable
 from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 
+from dew.hashing import fmix32
 from dew.nn.precision import at_least_fp32
 
 
@@ -426,6 +428,80 @@ def capped(softcap: float, logits: jax.Array, q_pos: jax.Array, k_pos: jax.Array
     return softcap * jnp.tanh(logits / softcap)
 
 
+DROP_DOMAIN = 0x6A09E667
+"""The keep draw's domain tag: the fraction bits of sqrt(2), so the draw's first word is one no other
+`fmix32` user mixes first, and its stream never coincides with theirs."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Draw:
+    """One program's keep draw for probability dropout (`Coords.drop`): the seed's two words, the global
+    batch row and query head the program holds, and the rate. Called on query and key indices, which
+    broadcast, it gives each entry's multiplier: `1 / (1 - rate)` where the draw keeps the entry, 0 where
+    it drops it, as a float32 array. The seed's words, the domain tag, the row, the head and the query mix
+    into one word, one `fmix32` each, and each key mixes into it by one more, so every mainloop and the
+    reference run the same ops and their masks agree bit for bit at the same coordinates."""
+
+    seed: tuple[jax.Array, jax.Array]
+    row: jax.Array
+    head: jax.Array
+    rate: float
+
+    @property
+    def bound(self) -> float:
+        """The multiplier a kept entry takes, `1 / (1 - rate)`, the largest an entry's weight takes."""
+        return 1.0 / (1.0 - self.rate)
+
+    def keep(self, queries: jax.Array, keys: jax.Array) -> jax.Array:
+        """Whether the draw keeps the entries at `queries` and `keys` (indices that broadcast): the keep bits
+        every mainloop and the reference share, each taking its own scale for a kept entry."""
+        word = fmix32(self.seed[0] ^ jnp.uint32(DROP_DOMAIN))
+        for part in (self.seed[1], self.row, self.head, queries):
+            word = fmix32(word ^ jnp.asarray(part).astype(jnp.uint32))
+        bits = fmix32(word ^ jnp.asarray(keys).astype(jnp.uint32))
+        return bits >= jnp.uint32(int(self.rate * 2 ** 32))
+
+    def __call__(self, queries: jax.Array, keys: jax.Array) -> jax.Array:
+        """The kernels' multiplier of the entries at `queries` and `keys`: `bound` where kept, in fp32, the
+        kernels' precision (a reference takes its own scale from `keep`)."""
+        return jnp.where(self.keep(queries, keys), jnp.float32(self.bound), jnp.float32(0.0))
+
+
+def dropout_seed(dropout_rng) -> jax.Array:
+    """The two uint32 words a dropout key draws a call's keep mask from (`Draw`)."""
+    return jax.random.bits(dropout_rng, (2,), jnp.uint32)
+
+
+def dropout_keep(seed: jax.Array, rate: float, shape) -> jax.Array:
+    """Which weights of `shape` `[..., H, Q, K]` probability dropout keeps, true where the draw keeps one.
+    Each weight takes its batch row (the leading dims, flattened), head, query and key, the coordinates the
+    attention templates draw at (`Draw`); a caller scales a kept weight by `1 / (1 - rate)` in its
+    own dtype."""
+    *rows, heads, queries, keys = shape
+    draw = Draw((seed[0], seed[1]), jnp.arange(math.prod(rows)).reshape(*rows, 1, 1, 1),
+                jnp.arange(heads).reshape(heads, 1, 1), rate)
+    return draw.keep(jnp.arange(queries)[:, None], jnp.arange(keys)[None, :])
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class Dropout:
+    """Attention's probability dropout as a weights hook (`Hooks.drop`): each softmax weight at a query
+    and key is kept where its draw keeps it and multiplied by `1 / (1 - rate)`, while the softmax's
+    denominator takes the undropped weights, so the output is the softmax over the values `z v`. `seed`
+    holds the call's two uint32 words, `rows` `[B]` and `heads` `[H]` each local batch row's and query
+    head's global index (a shard's own positions are not, `_per_shard`), and `rate` is static."""
+
+    seed: jax.Array
+    rows: jax.Array
+    heads: jax.Array
+    rate: float = dataclasses.field(metadata={"static": True})
+
+    def draw(self, row, head) -> Draw:
+        """The draw of the local batch row `row` and query head `head`, indices into `rows` and `heads`."""
+        return Draw((self.seed[0], self.seed[1]), self.rows[row], self.heads[head], self.rate)
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class Hooks:
@@ -434,13 +510,15 @@ class Hooks:
     indices, pointwise in the entries; `initial` the softmax's start; `output_mod(o, *params)` on the
     normalized output `[..., q, Dv]`, pointwise in its entries too (a gate, a scale): a kernel applies it
     to an output tile whose head width pads to a power of two. A pytree whose callables are static and
-    whose parameters and state are its leaves, so a compiled call takes new values of them."""
+    whose parameters and state are its leaves, so a compiled call takes new values of them. `drop` is
+    probability dropout's weights hook (`Dropout`), absent where None."""
 
     score_mod: Callable | None = dataclasses.field(default=None, metadata={"static": True})
     score_params: tuple[Param, ...] = ()
     initial: Initial | None = None
     output_mod: Callable | None = dataclasses.field(default=None, metadata={"static": True})
     output_params: tuple[Param, ...] = ()
+    drop: Dropout | None = None
 
 
 def _per_head(param: Param, row: jax.Array, head: jax.Array) -> jax.Array:
@@ -500,6 +578,7 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     batch, queries, heads, _ = query.shape
     kv_heads = key.shape[2]
     wide = jnp.promote_types(query.dtype, jnp.float32)
+    positions = jnp.arange(queries)[:, None], jnp.arange(spans.keys)[None, :]
     if hooks.initial is not None:
         for state in (hooks.initial.m, hooks.initial.total, hooks.initial.acc):
             wide = jnp.promote_types(wide, state.dtype)
@@ -520,9 +599,23 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         p = jnp.exp(s - safe[:, None])
         carried = jnp.where(jnp.isfinite(m0), jnp.exp(m0 - safe), 0)
         total = total0 * carried + jnp.sum(p, axis=-1)
-        acc = acc0 * carried[:, None] + jnp.einsum("qk,kd->qd", p.astype(value.dtype), v,
-                                                    preferred_element_type=wide)
-        o = jnp.where(total[:, None] > 0, acc / jnp.where(total > 0, total, 1)[:, None], 0)
+        if hooks.drop is None:
+            acc = acc0 * carried[:, None] + jnp.einsum("qk,kd->qd", p.astype(value.dtype), v,
+                                                        preferred_element_type=wide)
+            o = jnp.where(total[:, None] > 0, acc / jnp.where(total > 0, total, 1)[:, None], 0)
+        else:
+            # Normalized before the draw's multiplier narrows them, as the kernels take them: a kept weight's
+            # z times its normalized weight stays in the values' range where z times the unnormalized one may
+            # not (fp16 at a rate of 1 - 2^-16). The state's share is normalized the same way.
+            inverse = jnp.where(total > 0, 1 / jnp.where(total > 0, total, 1), 0)
+            # The keep bits are the draw's, shared with the kernels; a kept entry takes its own dtype's
+            # 1 / (1 - rate), rounded once from its double, so a float64 reference is exact at its rate.
+            draw = hooks.drop.draw(row, head)
+            scale = jnp.where(draw.keep(*positions), jnp.asarray(draw.bound, p.dtype), 0)
+            kept = (p * inverse[:, None]) * scale
+            acc = acc0 * (carried * inverse)[:, None] + jnp.einsum("qk,kd->qd", kept.astype(value.dtype), v,
+                                                                    preferred_element_type=wide)
+            o = acc
         if hooks.output_mod is not None:
             o = hooks.output_mod(o, *(_per_head(p, row, head) for p in hooks.output_params))
         return o.astype(query.dtype), safe, total
