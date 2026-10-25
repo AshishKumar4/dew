@@ -29,6 +29,8 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs
 from dew.nn.multimodal import VisionConditioner
+from dew.nn.precision import at_least_fp32
+from dew.nn.sharding import LOGITS, constrain
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.objectives.base import FROZEN, Step, freeze, model_rngs, select, thaw
 from dew.objectives.diffusion.block import BlockDiffusionObjective, _cache_geometry
@@ -600,7 +602,7 @@ def sown_passes(obj, variables, batch, step):
     cache = model.apply(params, tokens.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
     encoder_kwargs = prepared.kwargs()
     encoder_kwargs.update(positions=positions, attention_mask=full_valid)
-    _, encoded = model.apply(
+    encoder_states, encoded = model.apply(
         {**params, "cache": cache}, tokens, **encoder_kwargs, attention_pairwise_mask=encoder_mask,
         attention_key_positions=encoder_keys, method=model.encode, train=step.training, states=True,
         mutable=["cache", "qk"], rngs=rngs, capture_intermediates=False)
@@ -613,9 +615,10 @@ def sown_passes(obj, variables, batch, step):
             mutable=["qk"])
         return states, sown["qk"]
 
-    zero = jnp.zeros((*response.shape, model.vocab_size), jnp.float32)
+    zero = jnp.zeros((*response.shape, model.vocab_size), at_least_fp32(encoder_states.dtype))
     first_states, first = denoise(zero)
-    first_logits = model_logits(model, params, first_states)
+    first_logits = jax.lax.stop_gradient(constrain(model_logits(
+        model, params, jax.lax.stop_gradient(first_states)), LOGITS))
     _, second = denoise(jnp.where(use_sc[:, None, None], first_logits, zero))
     return encoded["qk"], first, second
 
