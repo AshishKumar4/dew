@@ -10,7 +10,7 @@ embeds a batch of images restricted to their context patches; the predictor
 takes those embeddings and predicts the target patches, as a JEPA step calls
 them. The tool records both outputs and, against fixed cotangents on both,
 the gradients of the images and of every parameter: once in float32 and
-once in float64 (`diffusers_wan_reference.widened`, under which the sincos
+once in float64 (`torch_precision.widened`, under which the sincos
 tables are generated in float64 too), the truth tests/reference_error.py
 measures both from. The blocks run V-JEPA's own exact (erf) GELU, as Dew's
 JEPA does.
@@ -112,7 +112,7 @@ def walk(encoder, predictor, inputs, probes, dtype):
 
 
 def main():
-    from diffusers_wan_reference import widened
+    from torch_precision import widened
 
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)
