@@ -262,19 +262,30 @@ SWIZZLE_BYTES = 128
 """The widest swizzle a shared-memory block's rows are staged at, which an MMA reads conflict-free."""
 
 
+def live_registers(family: "Family", carried, *phases) -> int:
+    """The registers a consumer thread of `family` holds over a live set: the tiles it carries across its
+    walk (`carried`, each `(rows, columns, dtype)`: its accumulators, a running statistic) and the largest
+    of its `phases`' tiles held at once (a step's operand fragments, a rewrite's operands), each tile's
+    32-bit words spread over a role's threads, and what it holds beside them (`Family.held_registers`).
+    The one register estimate every Mosaic template's launches state (`base.Template.registers`), its
+    excess over a thread's budget priced as spills (`base.Template.spilled`)."""
+    def words(tiles) -> float:
+        return sum(rows * columns * jnp.dtype(dtype).itemsize / 4 for rows, columns, dtype in tiles)
+
+    phase = max((words(tiles) for tiles in phases), default=0.0)
+    return int(-(-(words(carried) + phase) // THREADS)) + family.held_registers
+
+
 def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int], dtype) -> int:
-    """The registers a consumer thread holds at a `(rows, columns, depth)` tile of `consumers` roles of
-    `family`: its share of the fp32 accumulator, a step's operand fragments where its products read
-    registers (`Family.operands_in_registers`; the right operand's in each of its `rhs_copies` warps whole),
-    and what it holds beside them (`Family.held_registers`)."""
+    """The registers a consumer thread holds at a `(rows, columns, depth)` GEMM tile of `consumers` roles
+    of `family` (`live_registers`): its share of the fp32 accumulator carried, and a step's operand
+    fragments where its products read registers (`Family.operands_in_registers`; the right operand's in
+    each of its `rhs_copies` warps whole)."""
     rows, columns, depth = block
     share = rows // consumers
-    fragments = 0
-    if family.operands_in_registers:
-        words = jnp.dtype(dtype).itemsize / 4
-        lhs, rhs = share * depth * words, depth * columns * words * family.rhs_copies
-        fragments = int((lhs + rhs) / THREADS)
-    return share * columns // THREADS + fragments + family.held_registers
+    fragments = ([(share, depth, dtype), (depth, columns * family.rhs_copies, dtype)]
+                 if family.operands_in_registers else [])
+    return live_registers(family, [(share, columns, jnp.float32)], fragments)
 
 
 def consumer_registers(consumers: int) -> int:
@@ -423,9 +434,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
 
     @abc.abstractmethod
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
-               interpret: bool, approx_math: bool = True) -> Callable:
+               interpret: bool, approx_math: bool = True, name: str | None = None) -> Callable:
         """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own, with
-        `approx_math` the hardware's approximate exponential and reciprocal (`compiler_params`)."""
+        `approx_math` the hardware's approximate exponential and reciprocal (`compiler_params`), named
+        `name` where given (Mosaic names its kernel and its compile reports by it)."""
 
     @abc.abstractmethod
     def scoped(self, body, *allocations, streams) -> None:
@@ -608,11 +620,11 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         return (SWIZZLE_BYTES // jnp.dtype(dtype).itemsize,)
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
-               interpret: bool, approx_math: bool = True) -> Callable:
+               interpret: bool, approx_math: bool = True, name: str | None = None) -> Callable:
         return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                             num_threads=consumers + 1, thread_name="wg",
                             compiler_params=compiler_params(approx_math=approx_math),
-                            interpret=interpreted(interpret))
+                            interpret=interpreted(interpret), kernel_name=name)
 
     def scoped(self, body, *allocations, streams) -> None:
         pl.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations, **streams,

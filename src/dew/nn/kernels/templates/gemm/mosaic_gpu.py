@@ -101,15 +101,15 @@ class Tiles:
 
 
 CALIBRATED_EXTENT = 256
-"""The longest tile axis the sweeps measured (GMMCOOP-h100, AMPERE3): the cost model is calibrated over
-tiles no longer (`grouped_matmul._Mosaic.calibrated`)."""
+"""The longest tile axis the sweeps measured (GMMCOOP-h100, AMPERE3): provenance a pick's record carries
+(`grouped_matmul._Mosaic.calibrated`), never a bound."""
 
 CALIBRATED_STAGES = 6
-"""The deepest pipeline the sweeps measured: past six no sweep or estimate found a stage worth its shared
-memory."""
+"""The deepest pipeline the sweeps measured (provenance, as `CALIBRATED_EXTENT`)."""
 
 CALIBRATED_BAND = 8
-"""The widest band of the planar snake the sweeps measured (`Tiles.grid_block_n`)."""
+"""The widest band of the planar snake the sweeps measured (`Tiles.grid_block_n`; provenance, as
+`CALIBRATED_EXTENT`)."""
 
 
 def _holding(least: int, holds) -> list[int]:
@@ -132,8 +132,7 @@ def generated(families, *, depth: int | None, width: int, dtype) -> tuple[Tiles,
     wider first, which share a row block's loads across more column tiles in the L2 while a band is in
     flight. Larger tiles first, which read each operand fewest times, and the deeper pipeline (more of a
     load's latency hidden than the model's mean charges), so the cost model's ties go to them. A target's
-    launch keeps those that fit it (`base.Template.fitting`), and ranks those its cost model is
-    calibrated over (`base.Template.searched`)."""
+    launch ranks those that fit it (`base.Template.fitting`)."""
     size = jnp.dtype(dtype).itemsize
     tiles = []
     for family in families:
@@ -344,7 +343,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
 
     kernel = family.kernel(body, out_type=tuple(jax.ShapeDtypeStruct((m, n), dtype) for dtype in dtypes),
                            grid=(multiprocessors,), grid_names=("programs",), consumers=consumers,
-                           interpret=interpret, approx_math=False)
+                           interpret=interpret, approx_math=False, name="dew_gmm")
     return kernel(table, lhs, rhs, *prologue_operands, *epilogue_operands)
 
 
@@ -556,7 +555,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
 
     kernel = family.kernel(body, out_type=jax.ShapeDtypeStruct((g, m, n), out_dtype),
                            grid=(multiprocessors,), grid_names=("programs",), consumers=consumers,
-                           interpret=interpret, approx_math=False)
+                           interpret=interpret, approx_math=False, name="dew_tgmm")
     return kernel(*groups, lhs, rhs, *prologue_operands)
 
 

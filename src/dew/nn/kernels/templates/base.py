@@ -51,6 +51,22 @@ class Template[Config: Hashable](tuning.KernelOp):
         del config
         return cost.THREAD_REGISTERS
 
+    def holding_threads(self, config: Config) -> int | None:
+        """The threads of a program at `config` that hold `registers` (a Mosaic program's consumer
+        warpgroups', not its producer's); None where the launch states no register estimate."""
+        del config
+        return None
+
+    def spilled(self, ba: tokamax.BoundArguments, config: Config) -> float:
+        """The local-memory bytes a program at `config` moves a step for the registers its holding threads
+        hold past their budget (`registers`, `register_budget`, `holding_threads`): each spilled 32-bit
+        register stored and loaded again, which the cost model prices serially (`cost.Cost.spilled_bytes`);
+        none within the budget. Spec §7: predicted registers rank configs, they do not prune them."""
+        registers, threads = self.registers(ba, config), self.holding_threads(config)
+        if registers is None or threads is None:
+            return 0.0
+        return 2 * 4 * threads * max(0, registers - self.register_budget(config))
+
     def costed(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> cost.Cost:
         """The work, bytes and geometry the estimate of the launch of `ba` at `config` on `target` reads
         (`cost.Cost`): the analytic estimate's inputs as they are, for the choice layer's timing log."""
@@ -67,12 +83,19 @@ class Template[Config: Hashable](tuning.KernelOp):
         return True
 
     def fits(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[Config, ...]:
-        """The configs of `space` whose programs fit a block of `target` (`generation.shared_budget`) and
-        a thread's registers (`registers`, `register_budget`), in `space`'s order; none where none does,
-        which an implementation's eligibility reads."""
+        """The configs of `space` whose programs fit a block of `target` (`generation.shared_budget`), and
+        whose threads hold their registers where the launch states no spill price (`holding_threads`; one
+        that does ranks its spills, `spilled`), in `space`'s order; none where none does, which an
+        implementation's eligibility reads."""
         budget = generation.shared_budget(target)
         return tuple(config for config in self.space(ba) if self.staged_bytes(ba, config, target) <= budget
-                     and (self.registers(ba, config) or 0) <= self.register_budget(config))
+                     and self._held(ba, config))
+
+    def _held(self, ba: tokamax.BoundArguments, config: Config) -> bool:
+        """Whether `config`'s registers are legal: always where its spills are priced (`spilled`), else
+        within the budget."""
+        return (self.holding_threads(config) is not None
+                or (self.registers(ba, config) or 0) <= self.register_budget(config))
 
     def fitting(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[Config, ...]:
         """The configs that fit (`fits`). A call none fits raises, naming the least any config stages and
@@ -80,28 +103,16 @@ class Template[Config: Hashable](tuning.KernelOp):
         fits = self.fits(ba, target)
         if not fits:
             # The least any config whose threads hold their registers stages; None where none does.
-            held = (config for config in self.space(ba)
-                    if (self.registers(ba, config) or 0) <= self.register_budget(config))
+            held = (config for config in self.space(ba) if self._held(ba, config))
             least = min((self.staged_bytes(ba, config, target) for config in held), default=None)
             raise Unfitted(type(self).__name__, least, generation.shared_budget(target), target.generation)
         return fits
 
     def calibrated(self, config: Config) -> bool:
-        """Whether `config` lies in the region its cost model is calibrated over (the extents its sweeps
-        measured): a measured search restriction, apart from what is legal (`space`, `fitting`). Every
-        config does unless the launch states one."""
+        """Whether `config` lies in the region the launch's sweeps measured: provenance a pick's record
+        carries (`features`), never a filter on what the estimate ranks. Every config does unless the
+        launch states its region."""
         return True
-
-    def searched(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[Config, ...]:
-        """The fitting configs (`fitting`) the estimate ranks and a measurement times: those its cost model
-        is calibrated over (`calibrated`), or every fitting one where none is, in `space`'s order."""
-        fits = self.fitting(ba, target)
-        calibrated = tuple(config for config in fits if self.calibrated(config))
-        return calibrated if calibrated else fits
-
-    def pinnable(self, ba: tokamax.BoundArguments) -> set[Config]:
-        # Every legal config, calibrated or not: a pin is the caller's measurement.
-        return set(self.fitting(ba, generation.gpu_target()))
 
     def unpinnable(self, ba: tokamax.BoundArguments, config: Hashable) -> str:
         """Why `config` is not among `ba`'s legal configs: outside `space`, holding more registers than a
@@ -110,7 +121,7 @@ class Template[Config: Hashable](tuning.KernelOp):
         if not held:
             return "not in its space at this launch's key"
         registers, budget = self.registers(ba, held[0]) or 0, self.register_budget(held[0])
-        if registers > budget:
+        if not self._held(ba, held[0]):
             return f"its threads hold {registers} registers live, past the {budget} a thread has"
         target = generation.gpu_target()
         staged = self.staged_bytes(ba, held[0], target)
@@ -118,15 +129,15 @@ class Template[Config: Hashable](tuning.KernelOp):
                 f"{generation.shared_budget(target)} a block of {target.generation} holds")
 
     def estimate(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[float, Config]:
-        """The seconds `cost` estimates at the launch's fastest searched config on `target` (`searched`),
-        and that config, the first of `space`'s order where several tie."""
-        fits = self.searched(ba, target)
+        """The seconds `cost` estimates at the launch's fastest fitting config on `target`, and that
+        config, the first of `space`'s order where several tie."""
+        fits = self.fitting(ba, target)
         costs = [self.cost(ba, config, target) for config in fits]
         fastest = min(range(len(fits)), key=lambda index: (costs[index], index))
         return costs[fastest], fits[fastest]
 
     def _get_autotuning_configs(self, ba: tokamax.BoundArguments) -> set[Config]:
-        return set(self.searched(ba, generation.gpu_target()))
+        return set(self.fitting(ba, generation.gpu_target()))
 
     def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> Config:
         return self.estimate(ba, generation.gpu_target())[1]
