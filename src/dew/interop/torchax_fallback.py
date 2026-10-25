@@ -199,10 +199,11 @@ class _Probe:
         finally:
             _PROBING.reset(token)
 
-    def called(self, module, query, key, attention_mask, kwargs) -> None:
+    def called(self, module, query, key, attention_mask, scaling, kwargs) -> None:
         self.modules.add(id(module))
         self.unknown |= set(kwargs) - _PLUMBING - _COMPUTED
-        if not _visible(attention_mask, kwargs.get("sliding_window"), query.shape[2], key.shape[2]):
+        seen = _seen(module, query, key, attention_mask, scaling, kwargs)
+        if not _visible(seen, kwargs.get("sliding_window")):
             self.unmatched += 1
 
     def kept_from_dew(self, layers: int) -> str:
@@ -220,16 +221,31 @@ class _Probe:
         return ""
 
 
-def _visible(mask, window: int | None, queries: int, keys: int) -> bool:
-    """Whether transformers' eager mask `mask` (`[B, 1, Q, K]`, additive: 0 where a key is visible) is
-    the causal visibility Dew's attention computes with `window` (`dew.nn.visibility.visible`) over
-    `queries` by `keys`, the last query at the last key: a causal LM's (`admitted`)."""
+def _seen(module, query, key, attention_mask, scaling, kwargs) -> np.ndarray:
+    """Which keys each query of a call reads in transformers' SDPA attention as the probe runs it,
+    `[B, Q, H, K]`: its attention weights over one-hot values, nonzero where a key is read. Read from
+    the attention itself, so a mask transformers builds or one it leaves to the attention's causal
+    flag (None) alike."""
+    import torch
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    batch, heads, keys, _ = key.shape
+    identity = torch.eye(keys, dtype=query.dtype).expand(batch, heads, keys, keys)
+    weights, _ = ALL_ATTENTION_FUNCTIONS["sdpa"](module, query, key, identity, attention_mask,
+                                               scaling=scaling, dropout=0.0, **kwargs)
+    return weights.detach().cpu().numpy() > 0
+
+
+def _visible(seen: np.ndarray, window: int | None) -> bool:
+    """Whether the keys a call's queries read (`_seen`, `[B, Q, H, K]`) are the causal visibility Dew's
+    attention computes with `window` (`dew.nn.visibility.visible`), the last query at the last key: a
+    causal LM's (`admitted`)."""
     from dew.nn.visibility import visible
 
+    queries, keys = seen.shape[1], seen.shape[3]
     expected = np.asarray(visible(np.arange(queries)[:, None] + (keys - queries), np.arange(keys)[None, :],
                                   causal=True, window=window))
-    seen = mask.detach().cpu().numpy() == 0
-    return bool(np.array_equal(seen, np.broadcast_to(expected, seen.shape)))
+    return bool(np.array_equal(seen, np.broadcast_to(expected[None, :, None, :], seen.shape)))
 
 
 def _probe_attention(module, query, key, value, attention_mask, scaling=None, dropout=0.0, **kwargs):
@@ -239,7 +255,7 @@ def _probe_attention(module, query, key, value, attention_mask, scaling=None, dr
 
     probe = _PROBING.get()
     if probe is not None:
-        probe.called(module, query, key, attention_mask, kwargs)
+        probe.called(module, query, key, attention_mask, scaling, kwargs)
     return ALL_ATTENTION_FUNCTIONS["sdpa"](module, query, key, value, attention_mask, scaling=scaling,
                                          dropout=dropout, **kwargs)
 
