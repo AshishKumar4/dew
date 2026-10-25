@@ -54,7 +54,7 @@ An example's questions that ask the same thing, one negated, paraphrased or with
 
 ### Averaging runs
 
-`Decide.averaged(runs, step=, ema=, calibrate_on=)` averages decision runs' weights in fp32 (each floating leaf the sum of each run's share, an integer or boolean leaf equal across runs), read as `Decide.from_run` reads them. A run records where its head started (`DecideSettings.head_identity`: the digest of a head it held, or the trainer key a fresh head was drawn from); runs that differ in it, in their head, backbone, layout, tokenizer, special tokens or context encoder, or that record no head identity, are refused (ValueError). The average's calibration is the identity, refit on `calibrate_on`; its `Weights.averaged` records each run's directory, step and average read, and `Decide.save` refuses it, as no one run holds its weights.
+`Decide.averaged(runs, step=, ema=, calibrate_on=)` averages decision runs' weights in fp32 (each floating leaf a running mean that cannot overflow, float64's mean rounded once for two runs and on par with a stacked fp32 mean for more; an integer or boolean leaf equal across runs), read as `Decide.from_run` reads them. A run records where its head started (`DecideSettings.head_identity`: the digest of a head it held, or the trainer key a fresh head was drawn from); runs that differ in it, in their head, backbone, layout, tokenizer, special tokens or context encoder, or that record no head identity, are refused (ValueError). The average's calibration is the identity, refit on `calibrate_on`; its `Weights.averaged` records each run's directory, step and average read, and `Decide.save` refuses it, as no one run holds its weights.
 
 ### Options read at labels
 
