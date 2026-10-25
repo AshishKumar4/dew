@@ -558,9 +558,11 @@ def test_param_groups_with_schedules_momentum_and_bounds_round_trip():
 
 
 def test_a_run_recorded_with_its_qk_statistics_switch_reads_as_one_whose_step_asks():
-    """A run recorded while its LM objective took `qk_stats`, which the step whose optimizer clips by the
-    attention maxima now asks for (`Step.qk_stats`), reads as today's objective: the switch, stated or
-    defaulted, is dropped, where the record was refused as one of an argument the class no longer takes."""
-    for recorded in ({"defaults": {"qk_stats": False}}, {"fields": {"qk_stats": True}}):
-        config = ObjectiveConfig("lm", **recorded)
-        assert "qk_stats" not in {**config.fields, **config.defaults}
+    """A run recorded while its token objective took `qk_stats` (an LM's, or a policy's, PPO's passing
+    on to its actor), which the step whose optimizer clips by the attention maxima now asks for
+    (`Step.qk_stats`), reads as today's objective: the switch, stated or defaulted, is dropped, where the
+    record was refused as one of an argument the class no longer takes."""
+    for name in ("lm", "dpo", "grpo", "ppo"):
+        for recorded in ({"defaults": {"qk_stats": False}}, {"fields": {"qk_stats": True}}):
+            config = ObjectiveConfig(name, **recorded)
+            assert "qk_stats" not in {**config.fields, **config.defaults}
