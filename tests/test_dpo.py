@@ -28,6 +28,27 @@ from dew.data.preferences import IDS_KEY, MASK_KEY
 from dew.objectives.base import Step
 from dew.objectives.rl import DPOObjective
 
+
+def test_preference_rewards_and_gradients_ignore_nonfinite_completion_padding():
+    """Policy and reference likelihoods outside each completion carry no preference evidence,
+    even when those positions are nonfinite."""
+    from dew.rl.surrogate import preference_logsigmoid_terms
+
+    values = jnp.arange(24, dtype=jnp.float32).reshape(4, 2, 3) / -8
+    chosen = jnp.asarray([[1.0, 1.0, 0.0], [1.0, 0.0, 0.0]])
+    rejected = jnp.asarray([[1.0, 0.0, 0.0], [1.0, 1.0, 0.0]])
+    masks = jnp.stack([chosen, rejected, chosen, rejected])
+
+    def loss(log_probs):
+        terms, rewards = preference_logsigmoid_terms(*log_probs, chosen, rejected, beta=0.1)
+        return jnp.sum(terms), rewards
+
+    evaluate = jax.value_and_grad(loss, has_aux=True)
+    clean = evaluate(values)
+    poisoned = evaluate(jnp.where(masks != 0, values, jnp.nan))
+    for observed, expected in zip(jax.tree.leaves(poisoned), jax.tree.leaves(clean), strict=True):
+        np.testing.assert_array_equal(observed, expected)
+
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "dpo.npz"
 VOCAB = 8
 PAIRS = 2

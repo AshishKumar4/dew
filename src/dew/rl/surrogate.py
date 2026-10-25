@@ -39,7 +39,7 @@ import math
 import jax
 import jax.numpy as jnp
 
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, weighted_total
 from dew.rl.advantage import MEAN_EPS, masked_mean
 
 LOG_RATIO_CLAMP = 20.0
@@ -253,10 +253,10 @@ def preference_logsigmoid_terms(policy_chosen: jax.Array, policy_rejected: jax.A
     `beta` times its log-ratio. The masks come already shifted, with one
     value per scored token.
     """
-    chosen = (jnp.sum(policy_chosen * mask_chosen, axis=-1)
-              - jnp.sum(ref_chosen * mask_chosen, axis=-1))
-    rejected = (jnp.sum(policy_rejected * mask_rejected, axis=-1)
-                - jnp.sum(ref_rejected * mask_rejected, axis=-1))
+    chosen = (weighted_total(policy_chosen, mask_chosen, axis=-1)[0]
+              - weighted_total(ref_chosen, mask_chosen, axis=-1)[0])
+    rejected = (weighted_total(policy_rejected, mask_rejected, axis=-1)[0]
+                - weighted_total(ref_rejected, mask_rejected, axis=-1)[0])
     terms = -jax.nn.log_sigmoid(beta * (chosen - rejected))
     return terms, (beta * chosen, beta * rejected)
 

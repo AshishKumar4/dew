@@ -12,19 +12,19 @@ authors = [
   { name="Ashish Kumar Singh", email="ashishkmr472@gmail.com" }
 ]
 dependencies = [
-    # flax.nnx imports on jax 0.11.2 from 0.12.10 on (jax.experimental.hijax's
+    # flax.nnx imports on jax 0.12.0.1 from 0.12.10 on (jax.experimental.hijax's
     # HiPrim; qwix imports nnx); <0.13 so that a flax that changes linen or nnx
     # arrives through a bump the suite checks, as jax does below.
     "flax>=0.12.10,<0.13",
-    # Dew's JAX build: 0.11.2 with the fixes no release has yet (constraints.txt
+    # Dew's JAX build: 0.12.0.1 with the fixes no release has yet (constraints.txt
     # names them), which only Dew's package index serves, pypi.dewml.dev. The
-    # first build with every fix is post19; a release sorts below it, so an
+    # first build with every fix is post23; a release sorts below it, so an
     # install from PyPI alone stops at resolving jax rather than running on a
     # jax without them (docs/installation.md). The accelerator builds the
-    # cuda12, cuda13 and tpu extras name are 0.11.2's. A bump runs the GPU
+    # cuda12, cuda13 and tpu extras name are 0.12.0.1's. A bump runs the GPU
     # checks docs/installation.md lists under "Bumping JAX" first: CI is
     # CPU-only.
-    "jax>=0.11.2.post19,<0.11.3",
+    "jax>=0.12.0.1.post23,<0.12.1",
     "optax>=0.2.2",
     "orbax-checkpoint>=0.12.4",
     "numpy",
@@ -92,7 +92,7 @@ cuda12 = ["jax[cuda12]",
           "dew-flash-attn-cu12~=0.3.4; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 cuda13 = ["jax[cuda13]",
           "dew-flash-attn-cu13~=0.3.4; sys_platform == 'linux' and platform_machine == 'x86_64'"]
-tpu = ["libtpu==0.0.48.*", "requests"]
+tpu = ["libtpu==0.0.50.*", "requests"]
 # dew.telemetry.profile reads XProf's native converters, the same in 2.23.1
 # and 2.23.2. xprof 2.23.2 declares setuptools<70.0.0, which torch>=2.13's
 # setuptools>=77.0.3 cannot meet; the cap is the build lock's, read into the
@@ -189,6 +189,10 @@ streaming = ["datasets>=5.0.1"]
 # holds it, so locks/cpu.txt, which the container installs under, pins every one.
 live = ["websockets==17.1", "jupyter-kernel-gateway==3.0.1", "ipykernel", "ipywidgets"]
 delta = ["deltalake>=1.0"]
+# dew.data.text's curation steps (Language, Quality, Classifier, Decontaminated): DataTrove's language,
+# quality, fastText and n-gram decontamination filters. DataTrove splits English into words with a blank
+# spaCy pipeline, which its own multilingual extra brings beside TensorFlow; spaCy alone is enough here.
+curation = ["datatrove[processing]==0.10.1", "spacy>=3.8.2"]
 # lm-evaluation-harness task suites through dew.eval.harness.DewLM, which
 # subclasses TemplateLM. Before 0.4.10, TemplateLM keeps the BOS that DewLM's
 # tokenizer puts at the start of an empty-context continuation, and scores it
@@ -237,14 +241,14 @@ torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922"]
 # too), and each Mosaic TPU kernel with libtpu for a compile-only TPU, on a host with no accelerator:
 # locks/cpu.txt takes this extra, and a GPU host's lock has its own CUDA plugin already
 # (tools/lock_environment.sh).
-kernel-compile = ["jax-cuda12-plugin==0.11.2; sys_platform == 'linux' and platform_machine == 'x86_64'",
-                  "jax-cuda12-pjrt==0.11.2; sys_platform == 'linux' and platform_machine == 'x86_64'",
+kernel-compile = ["jax-cuda12-plugin==0.12.0.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
+                  "jax-cuda12-pjrt==0.12.0.1; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "nvidia-cuda-nvcc-cu12~=12.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
-                  "libtpu==0.0.48.*; sys_platform == 'linux' and platform_machine == 'x86_64'"]
+                  "libtpu==0.0.50.*; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 # The test suite's one environment: every package a test file imports, so no test skips for want
 # of one. CI's jobs, armada's (tools/armada/install.sh), the GPU nodes' and dew-ops' GPU jobs install
 # it under constraints.txt, locked in locks/ (tools/lock_environment.sh).
-ci = ["dewml[test,av,tfds,metrics,inference-clients,serve,environments,vision,augment,quantization,profile,torchax,gguf]",
+ci = ["dewml[test,av,tfds,metrics,inference-clients,serve,environments,vision,augment,quantization,profile,torchax,gguf,curation]",
       "flake8"]
 # The tutorial notebooks' environment outside Colab: the extras they import and a Jupyter kernel.
 # Tutorial 01, Diffusion from scratch, draws with matplotlib, which Colab installs.

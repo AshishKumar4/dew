@@ -29,6 +29,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.activations import gelu_tanh
 from dew.nn.attention import LayerNorm, NormalAttention, QKNorm
 from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.conv import Conv
@@ -251,7 +252,7 @@ class WanTransformer(nn.Module):
                              precision=self.precision).astype(tokens.dtype)
         modulation = jnp.stack(self._modulation()(embedded), axis=1)
         context = embedding(conditioning.context, self.features, "text_embedder",
-                            activation=lambda hidden: nn.gelu(hidden, approximate=True), **dense)
+                            activation=gelu_tanh, **dense)
         rotation = tuple(jnp.asarray(table[None], wide)
                          for table in wan_rotation(frames, rows, columns, self.attention_head_dim))
         for index in range(self.num_layers):

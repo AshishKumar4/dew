@@ -53,6 +53,25 @@ FP8_SITES = ("q_proj", "gate_proj", "up_proj", "down_proj", "lm_head")
 """The FP8 sites, the untargeted vocabulary head among them."""
 
 
+@pytest.mark.mesh(devices=2)
+def test_a_resident_frozen_kernel_packs_in_a_sharded_program():
+    """Packing a resident base executes in its sharded JAX program, without gathering the kernel
+    to NumPy. Both forward and input-gradient encodings equal the checkpoint codec's bytes."""
+    from jax.sharding import Mesh, PartitionSpec as P
+
+    matrix = np.random.default_rng(37).normal(size=(32, 48)).astype(np.float32)
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ("model",))
+    placed = jax.device_put(matrix, NamedSharding(mesh, P("model", None)))
+    actual = jax.jit(frozen_fp8_leaves)(placed)
+    hosted = frozen_fp8_leaves(matrix)
+    assert all(isinstance(leaf, np.ndarray) for leaf in hosted.values())
+    forward, forward_scale = quantize_fp8_blocks(matrix.T, (1, matrix.shape[0]))
+    backward, backward_scale = quantize_fp8_blocks(matrix, (1, matrix.shape[1]))
+    for key, expected in zip(FROZEN_FP8, (forward, forward_scale, backward, backward_scale), strict=True):
+        np.testing.assert_array_equal(np.asarray(actual[key]), expected)
+        np.testing.assert_array_equal(hosted[key], expected)
+
+
 def decoder(**overrides):
     fields = {**TINY_DECODER, "vocab_size": VOCAB, "emb_features": FEATURES, "mlp_features": MLP,
               "dtype": "bfloat16", "tie_embeddings": False}

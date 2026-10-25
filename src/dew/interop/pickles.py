@@ -101,16 +101,21 @@ def _state_dict(path: Path) -> dict[str, np.ndarray]:
     return tensors
 
 
-def host_view(tensor: torch.Tensor, what: str) -> np.ndarray:
-    """A CPU torch tensor's bytes as a NumPy array of its dtype, bfloat16 and
-    float8 through ml_dtypes, sharing its storage where it is contiguous."""
-    import torch
-
+def host_dtype(tensor: torch.Tensor, what: str) -> np.dtype:
+    """The NumPy dtype of a torch tensor's elements, bfloat16 and float8 through ml_dtypes."""
     kind = str(tensor.dtype).removeprefix("torch.")
     try:
-        dtype = np.dtype(getattr(ml_dtypes, kind, kind))
+        return np.dtype(getattr(ml_dtypes, kind, kind))
     except TypeError as error:
         raise ValueError(f"{what} is torch.{kind}, which NumPy and safetensors have no dtype for; "
                          "cast it to a floating or integer dtype") from error
+
+
+def host_view(tensor: torch.Tensor, what: str) -> np.ndarray:
+    """A CPU torch tensor's bytes as a NumPy array of its dtype (`host_dtype`), sharing its storage
+    where it is contiguous."""
+    import torch
+
+    dtype = host_dtype(tensor, what)
     flat = tensor.detach().contiguous().reshape(-1)
     return flat.view(torch.uint8).numpy().view(dtype).reshape(tuple(tensor.shape))

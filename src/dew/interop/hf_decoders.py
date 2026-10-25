@@ -48,13 +48,14 @@ from dew.interop.decoder_parts import (
     DecoderFields,
     Reading,
     WrapperFields,
-    _refuse_drafter,
     _unread,
     held_parts,
     hf_activation,
+    modeling_overrides,
     record_float,
     record_int,
     refuse,
+    refuse_drafter,
     translated,
 )
 from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
@@ -84,7 +85,7 @@ type AttentionResidualsFields = NativeFields[AttentionResiduals]
 def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
     """Translate one registered family's config, refusing any setting Dew does not compute."""
 
-    _refuse_drafter(hf_config)
+    refuse_drafter(hf_config)
     model_type = hf_config.get('model_type')
     # A multimodal repo's config.json is a wrapper whose model_type names the
     # whole model and whose text_config holds the decoder;
@@ -299,6 +300,7 @@ def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
                 "no supported multimodal wrapper is registered for this model")
     used = {"model_type"}
     record = read(hf_config, used)
+    modeling_overrides(hf_config, record["text"], used)
     unknown = _unread(hf_config, used)
     if unknown:
         refuse(f"config fields {sorted(unknown)}",
@@ -731,6 +733,7 @@ def translate_denoiser_weights(
     config: DecoderFields,
     *,
     param_dtype: str = "float32",
+    lazy: bool = False,
     checked: Checked = NOTHING_CHECKED,
 ) -> Variables:
     """Map a DiffusionGemma text checkpoint into the shared tree plus self-conditioning.
@@ -751,7 +754,7 @@ def translate_denoiser_weights(
     text = {local: hf_tensors[name] for local, name in text_names.items()}
     sc = {local: hf_tensors[name] for local, name in sc_names.items()}
     return {
-        "text": translate_weights(text, config, param_dtype=param_dtype,
+        "text": translate_weights(text, config, param_dtype=param_dtype, lazy=lazy,
                                   checked=_renamed(checked, text_names)),
         "self_conditioning": {
             "params": translate_sc_weights(sc, param_dtype=param_dtype)
@@ -879,6 +882,15 @@ def export_config(model) -> Mapping[str, object]:
         'hidden_act': hf_activation(model.mlp),
         'use_cache': model.causal,
     }
+    from dew.nn.mixers import AttentionMixer
+
+    overrides = {}
+    for name in set(model.per_layer_types):
+        mixer = model.kind_of(name).mixer or model.mixer or AttentionMixer()
+        if isinstance(mixer, AttentionMixer) and mixer.bidirectional_blocks:
+            overrides[name] = "block_bidirectional"
+    if overrides:
+        config["modeling_overrides"] = {"attention": overrides}
     # A dial only some families' references read cannot ride in another
     # family's config. Qwen2 splits the o_proj bias from the others, and
     # Dream's reference is that block with the causal mask dropped

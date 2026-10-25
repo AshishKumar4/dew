@@ -35,13 +35,12 @@ from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.typing import Dtype, PrecisionLike
 
-from .attention import LayerNorm, causal_attention_mask, kernel_for_materialized_mask
-from .inputs import PLAIN_CALL, MixerCall, PredictionPhase, coordinates_of, valid_order
+from .attention import LayerNorm
+from .inputs import MixerCall, PredictionPhase, coordinates_of, valid_order
 from .mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
-from .mla import INDEXER, IndexerFront, MultiHeadLatentAttention, latent_refusals, open_latent_cache
+from .mla import INDEXER, IndexerFront, MultiHeadLatentAttention, latent_refusals
 from .precision import at_least_fp32, float32_einsum
-from .sharding import down_projection
-from .sparse_selection import selection_mask, top_k_selection
+from .sparse_selection import top_k_selection
 
 
 def _real_slots(valid, count: int):
@@ -224,7 +223,6 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
     """The latent norms' epsilon, the model's rms_norm_eps (configuration_glm5_next.py's 1e-5)."""
     index_kpool: int = 16
     index_kpool_always_select_tail: bool = True
-    force_fp32_for_softmax: bool = True
 
     def setup(self):
         if self.qk_rope_head_dim or self.rotary:
@@ -251,93 +249,71 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
             kpool=self.index_kpool, always_select_tail=self.index_kpool_always_select_tail,
             dtype=self.dtype, precision=self.precision, name=INDEXER)
 
-    @nn.compact
-    def __call__(self, x, call: MixerCall = PLAIN_CALL, prediction_phase: PredictionPhase = "ordinary"):
-        # No rope: the slot positions order the keys and nothing rotates.
-        decode, attention_metadata = call.decode, call.metadata
-        batch, length, _ = x.shape
-        if coordinates_of(attention_metadata, batch, length).segments is not None:
+    def _check_call(self, call: MixerCall, batch: int, length: int) -> None:
+        if coordinates_of(call.metadata, batch, length).segments is not None:
             raise ValueError(
                 "kpool_sparse_attention pools one row's consecutive keys, which a packed "
                 "row of documents has no reference form for; pass one document per row")
-        valid = None if attention_metadata is None else attention_metadata.valid
-        if valid is not None:
-            valid = jnp.asarray(valid, bool)
-            if valid.shape != (batch, length):
-                raise ValueError(f"row validity must be {(batch, length)}, got {valid.shape}")
-        row_valid = jnp.ones((batch, length), bool) if valid is None else valid
-        # The latent attention's own projections, with no rope head.
-        place = down_projection(x, (self.q_lora_rank or 0) + self.kv_lora_rank)
-        query, q_resid = self._queries(x, place)
-        key, value = self._expand(*self._latents(x, place))
-        packed = self.indexer.packed(x, row_valid)
-        implementation = self.attention_impl
-        if decode:
-            allocated = self.has_variable("cache", "cache_index")
-            committed = self.get_variable("cache", "cache_index")
-            slots, append = open_latent_cache(self, key, self.v_head_dim, packed, self.max_seq_len,
-                                              valid=valid)
-            key, value, packed = append(key, value, packed)
-            # The reference's static cache: keys at every slot, causality
-            # by slot against the query's, validity from the cache
-            # (`get_visible_tokens`, modeling_glm5_next.py:879-897).
-            visible = self._visible(slots, key.shape[1])[:, 0]
-            # SGLang 97c6978 index_topk_share.py:22-28,48-64 carries the complete
-            # token list; draft hits must not append the new query's tail.
-            if prediction_phase != "ordinary" or self.has_variable("cache", "selection_position"):
-                if prediction_phase == "draft" and length != 1:
-                    raise ValueError("draft index reuse accepts one candidate per row")
-                pools = (self.index_topk or 0) // self.index_kpool
-                count = min(pools, -(-self.max_seq_len // self.index_kpool))
-                width = count * self.index_kpool + (
-                    self.index_kpool - 1 if self.index_kpool_always_select_tail else 0
-                )
-                saved = self.variable("cache", "selection_indices", jnp.full, (batch, width), -1, jnp.int32)
-                origin = self.variable("cache", "selection_position", jnp.full, (batch,), -1, jnp.int32)
-                active = jnp.any(row_valid, axis=1)
-                if committed is not None:
-                    origin.value = jnp.where(active & (origin.value >= committed), -1, origin.value)
-                hit = (
-                    (origin.value >= 0) & active if prediction_phase == "draft" else jnp.zeros((batch,), bool)
-                )
-                frozen = jnp.broadcast_to(saved.value[:, None], (batch, length, width))
-                if allocated and prediction_phase == "draft":
-                    indices = nn.cond(
-                        jnp.all(hit | ~active), lambda module: frozen,
-                        lambda module: module.indexer.select_indices(x, q_resid, packed, visible), self)
-                    indices = jnp.where(hit[:, None, None], frozen, indices)
-                else:
-                    indices = self.indexer.select_indices(x, q_resid, packed, visible)
-                if allocated:
-                    if prediction_phase == "ordinary":
-                        origin.value = jnp.where(active, -1, origin.value)
-                    else:
-                        last = jnp.max(jnp.where(row_valid, jnp.arange(length), 0), axis=1)
-                        publish = active & ~hit
-                        saved.value = jnp.where(
-                            publish[:, None], indices[jnp.arange(batch), last], saved.value
-                        )
-                        origin.value = jnp.where(publish, slots[jnp.arange(batch), last], origin.value)
-            else:
-                indices = self.indexer.select_indices(x, q_resid, packed, visible)
+        valid = None if call.metadata is None else call.metadata.valid
+        if valid is not None and valid.shape != (batch, length):
+            raise ValueError(f"row validity must be {(batch, length)}, got {valid.shape}")
+
+    def _index_keys(self, x, valid):
+        return self.indexer.packed(x, valid)
+
+    def _rotated_index_keys(self, keys, freqs_cos, freqs_sin):
+        return keys
+
+    def _attends_sparsely(self, selection, total: int) -> bool:
+        return False
+
+    def _selection(self, x, q_resid, index_keys, keep, freqs_cos, freqs_sin, call, row_valid, *,
+                    slots: jax.Array, allocated: bool = False, committed=None,
+                    prediction_phase: PredictionPhase = "ordinary"):
+        """Select pools, retaining the complete token list for opted-in draft reuse."""
+        if not call.decode or (prediction_phase == "ordinary"
+                               and not self.has_variable("cache", "selection_position")):
+            return self.indexer.select_indices(x, q_resid, index_keys, keep), None
+        # SGLang 97c6978 index_topk_share.py:22-28,48-64 carries the complete token list;
+        # a draft hit must not append the new query's tail.
+        batch, length = x.shape[:2]
+        if prediction_phase == "draft" and length != 1:
+            raise ValueError("draft index reuse accepts one candidate per row")
+        pools = (self.index_topk or 0) // self.index_kpool
+        count = min(pools, -(-self.max_seq_len // self.index_kpool))
+        width = count * self.index_kpool + (
+            self.index_kpool - 1 if self.index_kpool_always_select_tail else 0
+        )
+        saved = self.variable("cache", "selection_indices", jnp.full, (batch, width), -1, jnp.int32)
+        origin = self.variable("cache", "selection_position", jnp.full, (batch,), -1, jnp.int32)
+        active = jnp.any(row_valid, axis=1)
+        if committed is not None:
+            origin.value = jnp.where(active & (origin.value >= committed), -1, origin.value)
+        hit = (origin.value >= 0) & active if prediction_phase == "draft" else jnp.zeros((batch,), bool)
+        frozen = jnp.broadcast_to(saved.value[:, None], (batch, length, width))
+        if allocated and prediction_phase == "draft":
+            indices = nn.cond(
+                jnp.all(hit | ~active), lambda module: frozen,
+                lambda module: module.indexer.select_indices(x, q_resid, index_keys, keep), self)
+            indices = jnp.where(hit[:, None, None], frozen, indices)
         else:
-            visible = causal_attention_mask(jnp.arange(length), length, key_valid=row_valid)[:, 0]
-            # The selection is always a mask, so training takes the kernel
-            # a materialized mask runs on.
-            implementation = kernel_for_materialized_mask(
-                implementation, query, key, dtype=self.dtype, precision=self.precision,
-                force_fp32_for_softmax=self.force_fp32_for_softmax)
-            indices = self.indexer.select_indices(x, q_resid, packed, visible)
-        selected = selection_mask(indices, key.shape[1])
-        # An invalid query selects nothing (modeling_glm5_next.py:875).
-        mask = jnp.logical_and(selected, row_valid[:, :, None])[:, None]
+            indices = self.indexer.select_indices(x, q_resid, index_keys, keep)
+        if allocated:
+            if prediction_phase == "ordinary":
+                origin.value = jnp.where(active, -1, origin.value)
+            else:
+                last = jnp.max(jnp.where(row_valid, jnp.arange(length), 0), axis=1)
+                publish = active & ~hit
+                saved.value = jnp.where(publish[:, None], indices[jnp.arange(batch), last], saved.value)
+                origin.value = jnp.where(publish, slots[jnp.arange(batch), last], origin.value)
+        return indices, None
+
+    def _empty_selection(self, selected, row_valid):
         # A valid query that selects no pool, one of the first tokens before
         # a pool completes where no tail is always selected, reads every key
         # alike in the reference, whose masked logits are all equal there;
         # attention itself reads nothing for a row that sees no key.
-        unselected = jnp.logical_and(row_valid, ~jnp.any(selected, -1))[:, :, None, None]
-        return self._attend(query, key, value, x, mask, implementation, unselected=unselected,
-                            force_fp32_for_softmax=self.force_fp32_for_softmax)
+        return jnp.logical_and(row_valid, ~jnp.any(selected, -1))[:, :, None, None]
 
 
 @dataclasses.dataclass(frozen=True)

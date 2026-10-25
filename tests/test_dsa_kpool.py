@@ -158,7 +158,7 @@ def reference_block_output(block):
 def float64_block(block):
     """The reference block run in float64, every float32 pin widened (`float64`), as a function of a
     widened draw: the truth check 1 measures both sides from."""
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     wide = copy.deepcopy(block).double()
 
@@ -233,7 +233,7 @@ def torch_gradients(block):
     """The gradients of a readout of `block`'s output into its input and every attention parameter, as
     a function of a draw, by name (the input's 'x'); in float64, every float32 pin widened, where the
     block is."""
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     wide = next(block.parameters()).dtype == torch.float64
     named = {name: parameter.detach().numpy() for name, parameter in block.named_parameters()
@@ -292,6 +292,21 @@ def test_the_gradients_match_torch_autograd():
     for name, gradient in dew_gradients(variables, indexer)(hidden, valid, readout).items():
         if name != 'x':
             assert not np.any(gradient), name
+
+
+def test_decode_cache_preserves_the_expanded_projection_storage_dtype():
+    """A promoted KV projection stores its actual keys and values, even when the preceding
+    latent norm computes in a narrower dtype."""
+    with jax.enable_x64(new_val=True):
+        hidden, _ = inputs()
+        block = module()
+        variables = block.init(jax.random.key(91), jnp.asarray(hidden))
+        projection = variables["params"]["kv_b_proj"]
+        projection["kernel"] = projection["kernel"].astype(jnp.float64)
+        _, state = block.apply(variables, jnp.asarray(hidden[:, :1]), MixerCall(decode=True),
+                               mutable=["cache"])
+        assert state["cache"]["cached_key"].dtype == jnp.float64
+        assert state["cache"]["cached_value"].dtype == jnp.float64
 
 
 def decode_steps(block_module, variables, hidden, valid, prefill: int):

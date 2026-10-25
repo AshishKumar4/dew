@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 import jax
 import jax.numpy as jnp
 
-from dew.nn.precision import correctly_rounded_divide
+from dew.nn.precision import at_least_fp32, correctly_rounded_divide, wide_cpu_arithmetic
 
 
 def expand(coefficient, x):
@@ -30,17 +30,21 @@ def divided(numerator, rate):
     """`numerator / rate` as a source written in PyTorch divides a state by a rate: IEEE division,
     whatever the backend's own division does. A float32, bfloat16 or float16 quotient is
     `dew.nn.precision.correctly_rounded_divide`'s of the operands widened to float32, rounded to its
-    dtype, as PyTorch's float32 opmath gives it, under any compiler flags. A float64 one on a CPU is
-    the division by a full-shape divisor, the rate plus the numerator times zero: XLA:CPU rewrites a
-    division by a broadcast into a multiplication by its reciprocal, two roundings where the
-    division makes one (openxla/xla#51148), and no simplification folds that divisor back to the
-    broadcast (folding would change an infinite numerator's NaN). Other backends keep the division
-    as written, the rewrite being the CPU compiler's alone."""
+    dtype, as PyTorch's float32 opmath gives it, under any compiler flags. A float64 one is the plain
+    division, but in a process running wide CPU arithmetic (`dew.nn.precision.WIDE_CPU_ARITHMETIC`,
+    Dew's test setting, whose float64 truths read it) a CPU's is the division by a full-shape divisor,
+    the rate plus the numerator times zero: XLA:CPU rewrites a division by a broadcast into a
+    multiplication by its reciprocal, two roundings where the division makes one
+    (openxla/xla#51148), and no simplification folds that divisor back to the broadcast (folding
+    would change an infinite numerator's NaN). Other backends keep the division as written, the
+    rewrite being the CPU compiler's alone."""
     numerator, rate = jnp.asarray(numerator), jnp.asarray(rate)
     dtype = jnp.result_type(numerator, rate)
     if not jnp.issubdtype(dtype, jnp.floating):
         return numerator / rate
     if dtype == jnp.float64:
+        if not wide_cpu_arithmetic():
+            return numerator / rate
         return jax.lax.platform_dependent(numerator, rate, cpu=lambda value, by: value / (by + value * 0),
                                           default=lambda value, by: value / by)
     return correctly_rounded_divide(numerator.astype(jnp.float32), rate.astype(jnp.float32)).astype(dtype)
@@ -49,7 +53,7 @@ def divided(numerator, rate):
 def times(t) -> jax.Array:
     """`t` as an array of at least float32: a float64 run's times stay float64."""
     t = jnp.asarray(t)
-    return t.astype(jnp.promote_types(t.dtype, jnp.float32))
+    return t.astype(at_least_fp32(t.dtype))
 
 class NoiseScheduler(ABC):
     """Defines a forward process x_t = alpha(t) x_0 + sigma(t) eps on the time domain [0, T].

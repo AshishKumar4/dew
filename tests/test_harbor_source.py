@@ -245,6 +245,13 @@ if "lingering" in value("-p"):
     if "waits" in value("-p"):
         time.sleep(60)
     sys.exit(1)
+if "leaves" in value("-p"):
+    # A server it starts in its process group, its output elsewhere, which runs on as the trial ends.
+    import subprocess
+    server = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with open(os.path.join(trial, "child.json"), "w") as out:
+        json.dump(server.pid, out)
 if "once" in value("-p"):
     # The first trial of the task directory hangs, with its pid in the marker; the others finish.
     try:
@@ -502,6 +509,22 @@ def ended(pid):
         return Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0] == "Z"
     except FileNotFoundError:
         return True
+
+
+def test_a_finished_trial_ends_what_it_left_running_in_its_group(tmp_path, harbor):
+    """Harbor finishes its trial and exits with a server it started still running in its process
+    group, its output elsewhere: the trial completes, and the server ends with it."""
+    (tmp_path / "leaves").mkdir()
+    gateway, _ = fake_gateway()
+    source = HarnessSource(harbor_trials(harbor, tmp_path / "trials"), gateway, grace=1.0)
+    try:
+        (future,) = source.submit(Task("leaves", {HARBOR_KEY: str(tmp_path / "leaves")}), 1, version=0,
+                                  key=KEY)
+        rollout = future.result(timeout=30)
+    finally:
+        source.close()
+    (child,) = (tmp_path / "trials").glob("*/child.json")
+    assert rollout.status is Status.COMPLETED and ended(json.loads(child.read_text()))
 
 
 @pytest.mark.parametrize("task", ["lingering-exits", "lingering-waits", "lingering-detached-waits"])

@@ -9,6 +9,7 @@ loop's, with the largest observed difference written beside each bound.
 """
 
 import dataclasses
+import functools
 import json
 from pathlib import Path
 
@@ -16,8 +17,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import selection_margins
 from model_support import largest_difference
-from reference_error import assert_as_exact, widened, without_ynn
+from reference_error import FEWEST_SEEDS, GateFailure, assert_as_exact, widened, without_ynn
 from sharded import assert_sharded
 from token_support import token_rows
 
@@ -102,7 +104,7 @@ def test_a_scanned_fixture_decodes_through_the_cache(name):
         np.testing.assert_array_equal(steps[-1][:, -1].argmax(-1), whole[:, -1].argmax(-1))
 
 
-def gemma4_shaped(dtype=jnp.float32, **overrides):
+def gemma4_config(**overrides):
     """A gemma4-e2b shaped decoder twice the fixture's depth: runs of sliding
     layers, a full layer between them, four sharing layers at the end."""
     config = translate_config(json.loads((FIXTURES / "gemma4-e2b" / "config.json").read_text()))
@@ -112,10 +114,10 @@ def gemma4_shaped(dtype=jnp.float32, **overrides):
         + ("sliding_attention",) * 5 + ("full_attention",),
         kv_shared_layers=(8, 9, 10, 11), max_seq_len=16)
     config.update(overrides)
-    return models.build("causal_transformer", config, dtype=dtype, attention_impl="reference")
+    return config
 
 
-def gemma3n_shaped(dtype=jnp.float32, **overrides):
+def gemma3n_config(**overrides):
     """A gemma3n-tiny shaped decoder of ten layers: sparsity on the first
     five, one width, the last two sharing keys and values."""
     config = translate_config(json.loads((FIXTURES / "gemma3n-tiny" / "config.json").read_text()))
@@ -126,16 +128,16 @@ def gemma3n_shaped(dtype=jnp.float32, **overrides):
         mlp_features=(48,) * 10, activation_sparsity_pattern=(0.95,) * 5 + (0.0,) * 5,
         kv_shared_layers=(8, 9), max_seq_len=16)
     config.update(overrides)
-    return models.build("causal_transformer", config, dtype=dtype, attention_impl="reference")
+    return config
 
 
-def deepseek_shaped(dtype=jnp.float32, **overrides):
+def deepseek_config(**overrides):
     """A deepseek-v3-tiny shaped decoder of six layers, one dense then five routed."""
     config = translate_config(json.loads((FIXTURES / "deepseek-v3-tiny" / "config.json").read_text()))
     config.update(num_layers=6, layer_types=("full_attention",) * 6, max_seq_len=16)
     config["mixture"] = {**config["mixture"], "layers": (1, 2, 3, 4, 5)}
     config.update(overrides)
-    return models.build("causal_transformer", config, dtype=dtype, attention_impl="reference")
+    return config
 
 
 # Gemma 3n keeps the initialized forward check but checks gradients at
@@ -143,24 +145,51 @@ def deepseek_shaped(dtype=jnp.float32, **overrides):
 # default zero correction scales put that residual exactly at RMSNorm's
 # epsilon floor. The resulting high-gain Jacobian is sensitive even to
 # one-ULP weight perturbations without any sparse-ReLU branch changing.
-def deepseek_widths(dtype=jnp.float32, **overrides):
+def deepseek_widths_config(**overrides):
     """The DeepSeek-shaped stack with a dense width per layer beside the routed
     experts' own width, and no prediction depth, which would need one width."""
-    return deepseek_shaped(dtype, **{"mlp_features": (32, 48, 40, 48, 32, 40), "num_nextn_predict_layers": 0,
-                                     **overrides})
+    return deepseek_config(**{"mlp_features": (32, 48, 40, 48, 32, 40), "num_nextn_predict_layers": 0,
+                              **overrides})
 
 
-SHAPES = {"gemma4": gemma4_shaped, "gemma3n": gemma3n_shaped, "deepseek": deepseek_shaped,
-          "deepseek_widths": deepseek_widths}
-
-FLOOR_FACTOR = 4.0
-"""How far a scanned stack may sit from the plain loop, in multiples of the
-plain loop's own distance from its float64 run: the rule tools/layout_parity.py
-judges a layout by. Scanning reorders the loop's fp32 sums, since a GPU fuses
-a scanned layer apart from its neighbours (a CPU compiles the two alike), so
-each run sits within its own rounding of the float64 result."""
+SHAPE_CONFIGS = {"gemma4": gemma4_config, "gemma3n": gemma3n_config, "deepseek": deepseek_config,
+                 "deepseek_widths": deepseek_widths_config}
+"""Each shape's decoder record, its fields overridden by keyword."""
 
 
+def shaped(shape: str):
+    """A builder of `shape`'s decoder at a dtype, its fields overridden by keyword."""
+    def build(dtype=jnp.float32, **overrides):
+        return models.build("causal_transformer", SHAPE_CONFIGS[shape](**overrides), dtype=dtype,
+                            attention_impl="reference")
+    return build
+
+
+SHAPES = {shape: shaped(shape) for shape in SHAPE_CONFIGS}
+
+SCAN_WIDTHS = {"gemma3n": {"mlp_features": (192,) * 10}, "gemma4": {"per_layer_input_dim": 32}}
+"""Each shape's widths for the scanned stack's check 1, where the fixture's leave a draw's error to a few
+of its values: Gemma 3n's sparse layers keep about ten of 192 units a token at 0.95 sparsity, where 48
+keep two, as the architectures cell found (tests/test_architectures.py); Gemma 4's per-layer inputs are
+32 wide, where at the fixture's 8 Dew paired with the plain loop did not resolve within 4096 draws (the
+released E2B's are 256)."""
+SCAN_ROWS = {"gemma3n": 32}
+"""Each shape's rows a draw where more than BATCH's make its check cheaper: at 8 rows Gemma 3n's plain
+loop against itself resolved at 512 draws, a verdict of 417 s on armada, at 32 rows at 256, one of 57 s."""
+SCAN_MARGIN = 5e-5
+"""The least selection margin a scanned-stack draw of a routed shape admits (`selection_margins.margin`),
+relative to the scale of what its routers select: ten times the largest distance float32 rounding moved
+their inputs from their float64 values over 48 draws of both parameter sets, 4.9e-6 of the scale. A shape
+that selects otherwise, Gemma 3n's gaussian top-k, admits `selection_margins.MARGIN`: a unit every run
+keeps just above its cutoff holds an activation, its gate less the cutoff, that is mostly float32's
+rounding of either, so a draw near that tie measures which run rounded it worse."""
+SCAN_SEEDS = {"gemma4": 64, "gemma3n": 128, "deepseek": 8, "deepseek_widths": 8}
+"""Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` paired with the scanned
+stack, whose arms share every upstream rounding (the same weights, rows and arithmetic, the DeepSeek
+shapes' bit for bit on a CPU), the most any platform gives: Gemma 3n's 128 on an A100 over its draws past
+the selection margin (8 on armada); the others' on armada, whose errors are heavy-tailed across draws: the
+four largest of 1024 draws hold up to 40% of a Gemma 4 leaf's pooled error, of 64 up to 43% of a DeepSeek
+one's, which the plain loop against itself resolves within no 512 draws."""
 def same_metrics(left: dict, right: dict, relative: float = 1e-5) -> bool:
     """Every metric within `relative` of the other run's; perplexity is exp
     of the cross entropy, so an absolute bound would say nothing about it."""
@@ -175,62 +204,100 @@ def scanned_pair(build):
     return plain, scanned, variables, ids
 
 
-def judged(single, double, candidate) -> tuple[float, str]:
-    """The worst leaf of `candidate` against `single`, as a fraction of
-    FLOOR_FACTOR times `single`'s distance from `double`, and its path.
+class ScanCase:
+    """A shape's scanned stack and plain loop over its declared draws (`draw`): their measured runs
+    (`arms`) and their float64 truth, the plain loop's own in float64 on the CPU backend (every lane
+    keeps one beside its accelerator, and a TPU has no float64). A shape that selects discretely (a
+    mixture's routing, Gemma 3n's gaussian top-k) draws rows whose selections clear their margin
+    (`SCAN_MARGIN`), so every run selects alike. `scanned` overrides the scanned stack's fields, a
+    fault's way in."""
 
-    A leaf's floor is never below one fp32 rounding of the largest value in
-    its part (the logits, the loss or the gradients), as
-    tools/layout_parity.py measures a leaf against the rounding of the whole
-    step (`leaf_errors`): a sum's rounding scales with its terms, not with
-    the sum, so a leaf whose terms cancel sits below its part's rounding and
-    its own distance from float64 is noise. gemma3n's altup correction
-    coefficients are such leaves: on a TPU v6e at full fp32 matmuls, the
-    plain loop landed 2.3 of the leaf's own fp32 roundings from float64 and
-    the scanned stack 19, which read 2.0 of a floor taken from the leaf
-    alone."""
-    worst = (0.0, "")
-    for part in single:
-        scale = float(np.finfo(np.float32).eps) * max(
-            float(np.max(np.abs(np.asarray(leaf, np.float64)))) for leaf in jax.tree.leaves(double[part]))
-        for (path, reference), exact, other in zip(
-                jax.tree_util.tree_leaves_with_path(single[part]), jax.tree.leaves(double[part]),
-                jax.tree.leaves(candidate[part]), strict=True):
-            reference, exact, other = (np.asarray(leaf, np.float64) for leaf in (reference, exact, other))
-            floor = max(float(np.max(np.abs(reference - exact))), scale)
-            difference = float(np.max(np.abs(other - reference)))
-            ratio = difference / (FLOOR_FACTOR * floor) if floor else (0.0 if difference == 0 else np.inf)
-            worst = max(worst, (ratio, f"['{part}']{jax.tree_util.keystr(path)}"))
-    return worst
+    def __init__(self, shape: str, **scanned):
+        self.shape = shape
+        self.build = functools.partial(SHAPES[shape], **SCAN_WIDTHS.get(shape, {}))
+        self.plain, _, self.variables, _ = scanned_pair(self.build)
+        self.scanned = self.build(scan_layers=True, **scanned)
+        self.training = gemma3n_training_variables(self.variables) if shape == "gemma3n" else self.variables
+        self.config = SHAPE_CONFIGS[shape](**SCAN_WIDTHS.get(shape, {}))
+        rows = SCAN_ROWS.get(shape, BATCH)
+
+        def drawn(key):
+            """`rows` rows of SEQ_LEN token ids and the scalar loss's cotangent, one."""
+            ids = np.random.default_rng([0x5CA7, key]).integers(0, VOCAB, (rows, SEQ_LEN)).astype(np.int32)
+            return ids, np.float32(1.0)
+
+        self.runs = {"scanned": self.measured(self.scanned, self.variables, self.training),
+                     "plain": self.measured(self.plain, self.variables, self.training)}
+        self.drawn = drawn
+        if selection_margins.selects(self.config):
+            selected = selection_margins.capture(self.plain)
+            least = SCAN_MARGIN if selection_margins.routes(self.config) else selection_margins.MARGIN
+
+            def clears(inputs):
+                """Whether the draw's selections, in the forward of both parameter sets the arms read
+                (the logits' and the loss's), clear the shape's margin."""
+                ids = jnp.asarray(inputs[0])
+                return all(selection_margins.margin(self.config, selected(tree, ids), shape) > least
+                           for tree in (self.variables, self.training))
+
+            self.draw = selection_margins.clearing(drawn, clears)
+        else:
+            self.draw = drawn
+
+    def measured(self, model, forward, trained):
+        """The logits under `forward`, and the loss with its gradients under `trained` and the draw's
+        cotangent (as `with_gradients` gives them), compiled as both arms of a check between Dew's paths
+        are (`without_ynn`)."""
+        def run(ids, cotangent):
+            def loss(params):
+                logits = model.apply({**trained, "params": params}, ids)
+                if self.shape == "gemma3n":
+                    return next_token_cross_entropy(logits, ids)
+                return jnp.mean(logits ** 2)
+            value, pull = jax.vjp(loss, trained["params"])
+            gradients, = pull(cotangent)
+            return {"logits": model.apply(forward, ids), "loss": value, "gradients": gradients}
+        return without_ynn(run)
+
+    def arms(self):
+        """The scanned stack's measured run and the plain loop's, and the plain loop's float64 truth."""
+        def truth(ids, cotangent):
+            with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
+                if "truth" not in self.runs:
+                    self.runs["truth"] = self.measured(self.build(dtype=jnp.float64),
+                                                       widened(self.variables), widened(self.training))
+                return jax.device_get(self.runs["truth"](*widened((ids, cotangent))))
+
+        def arm(name):
+            return lambda ids, cotangent: jax.device_get(self.runs[name](ids, cotangent))
+        return arm("scanned"), arm("plain"), truth
 
 
 @pytest.mark.parametrize("shape", sorted(SHAPES))
 def test_runs_of_like_layers_scan_and_the_rest_unroll(shape):
-    """The grouping read off the geometry, and the scanned logits, loss and
-    gradients against the plain loop's on a stack deep enough to scan, each
-    leaf within FLOOR_FACTOR of the plain loop's own distance from its
-    float64 run. That run is on the CPU backend, which every lane keeps
-    beside its accelerator, since a TPU has no float64."""
-    build = SHAPES[shape]
-    plain, scanned, variables, ids = scanned_pair(build)
-    ids = np.asarray(ids)
-    training = gemma3n_training_variables(variables) if shape == "gemma3n" else variables
+    """The scanned stack's logits, loss and gradients on a stack deep enough to scan are as near a float64
+    run as the plain loop's, over the shape's declared draws of token rows (check 1, `assert_as_exact`):
+    scanning reorders the loop's fp32 sums where an accelerator fuses a scanned layer apart from its
+    neighbours, and is otherwise the same computation. A shape that selects discretely draws rows whose
+    selections clear its margin (`SCAN_MARGIN`), the precondition on which check 1 compares one
+    computation."""
+    case = ScanCase(shape)
+    scanned, plain, truth = case.arms()
+    assert_as_exact(scanned, plain, case.draw, f"{shape} scanned stack", seeds=SCAN_SEEDS[shape],
+                    truth_fn=truth)
 
-    def measured(model, forward, trained):
-        def loss(variables):
-            current = {**trained, "params": variables}
-            if shape == "gemma3n":
-                return next_token_loss(model, current, ids)
-            return jnp.mean(model.apply(current, ids) ** 2)
-        value, gradients = jax.jit(jax.value_and_grad(loss))(trained["params"])
-        return {"logits": jax.jit(model.apply)(forward, ids), "loss": value, "gradients": gradients}
 
-    single = measured(plain, variables, training)
-    candidate = measured(scanned, variables, training)
-    with jax.enable_x64(), jax.default_device(jax.devices("cpu")[0]):
-        double = measured(build(dtype=jnp.float64), widened(variables), widened(training))
-    ratio, path = judged(single, double, candidate)
-    assert ratio <= 1, f"{path} is {ratio:.2f} of its bound"
+def test_a_scanned_gate_at_another_sparsity_fails_check_1():
+    """A Gemma 3n scanned stack whose sparse layers cut at 0.951 in place of 0.95 moves each cutoff about
+    0.0035 of its row's deviation, far past the draws' margin: on the rows that clear it, it keeps other
+    units than the plain loop and float64 do, and check 1 fails it over the fewest seeds it judges, a
+    fault this large failing as surely there as over the site's declared ones."""
+    case = ScanCase("gemma3n", activation_sparsity_pattern=(0.951,) * 5 + (0.0,) * 5)
+    scanned, plain, truth = case.arms()
+    with pytest.raises(AssertionError) as raised:
+        assert_as_exact(scanned, plain, case.draw, "gemma3n scanned stack at 0.951",
+                        seeds=FEWEST_SEEDS, truth_fn=truth)
+    assert raised.type is GateFailure
 
 
 def gemma3n_training_variables(variables):
@@ -250,9 +317,12 @@ def gemma3n_training_variables(variables):
 
 
 def next_token_loss(model, variables, ids):
-    logits = model.apply(variables, ids)[:, :-1]
-    return -jnp.take_along_axis(
-        jax.nn.log_softmax(logits), ids[:, 1:, None], axis=-1).mean()
+    return next_token_cross_entropy(model.apply(variables, ids), ids)
+
+
+def next_token_cross_entropy(logits, ids):
+    """The mean cross entropy of each row's next token under `logits` of the row."""
+    return -jnp.take_along_axis(jax.nn.log_softmax(logits[:, :-1]), ids[:, 1:, None], axis=-1).mean()
 
 
 @pytest.mark.parametrize("shape", sorted(SHAPES))
@@ -274,7 +344,7 @@ def test_a_scanned_moe_stack_sows_and_balances_like_the_plain_loop():
     """The routers sow through the scanned view, so the balance loss and the
     aux-loss-free bias move as they do under the plain loop. Observed loss
     difference on CPU 0.0, bias difference 0.0."""
-    plain, scanned, variables, _ = scanned_pair(deepseek_shaped)
+    plain, scanned, variables, _ = scanned_pair(SHAPES["deepseek"])
     batch = {"text": jax.random.randint(jax.random.key(2), (BATCH, 12), 0, VOCAB)}
     step = Step(step=jnp.zeros((), jnp.int32), key=jax.random.key(3), ema=None)
 
@@ -666,7 +736,7 @@ def test_a_host_resident_key_sharing_stack_keeps_layer_states_through_cached_dec
     layers in host memory, read by a caller that keeps every layer's output: decoding a prompt
     through its cache, it computes the resident stack's tokens and keeps the same layer outputs,
     the providers' writes carried out of the lifted scope that fetches them."""
-    model = gemma4_shaped(scan_layers=True)
+    model = SHAPES["gemma4"](scan_layers=True)
     tokens = jnp.asarray([[1, 2, 3, 4, 5, 6]], jnp.int32)
     variables = model.init(jax.random.key(0), tokens)
     assert any(count > 1 for _, count in model.bind(variables).groups)

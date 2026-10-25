@@ -17,11 +17,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
-from rl_support import TinyHead, TinyLogits, clipped_surrogate, padded_text, token_mean
+from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, with_gradients
+from rl_support import TinyHead, TinyLogits, clipped_surrogate, token_mean
 from steady_state import steady_state
 
-from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY
+from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, _utf8
 from dew.objectives.base import Step
 from dew.objectives.rl import GRPOObjective, RolloutScheduler
 from dew.objectives.rl.sessions import (
@@ -55,20 +55,24 @@ def test_grpo_loss_and_gradient_match_verl(reference):
     rollouts (check 1), its float64 run the truth."""
     beta = float(reference["beta"])
     seeds = declared_seeds(FIXTURE)["grpo"]
-    draw, recorded, truth = indexed_recording(reference, "grpo", seeds)
+    recorded_draw, recorded, truth = indexed_recording(reference, "grpo", seeds)
 
     @jax.jit
-    def dew(index, rollout):
+    def dew(index, rollout, cotangent):
         def loss(current):
             ratio = token_log_ratio(current, rollout["old_log_probs"])
             pg, _ = clipped_surrogate(ratio, rollout["advantages"], rollout["response_mask"])
             kl = token_mean(k3_kl(current, rollout["ref_log_probs"]), rollout["response_mask"])
             return pg + beta * kl
 
-        value, gradient = jax.value_and_grad(loss)(rollout["current_log_probs"])
+        value, gradient = with_gradients(loss)(rollout["current_log_probs"], cotangent)
         return {"loss": value, "grad": gradient}
 
-    assert_as_exact(dew, recorded, draw, "GRPO loss and gradient", seeds=seeds, truth_fn=truth)
+    # The recording holds the loss's gradient, a scalar loss's under the cotangent 1, which each draw
+    # carries for Dew's arm.
+    assert_as_exact(dew, lambda index, rollout, cotangent: recorded(index, rollout),
+                    lambda seed: (*recorded_draw(seed), np.float32(1)), "GRPO loss and gradient", seeds=seeds,
+                    truth_fn=lambda index, rollout, cotangent: truth(index, rollout))
 
 
 # --- the objective -------------------------------------------------------------
@@ -190,7 +194,7 @@ def test_a_rollout_after_the_first_reuses_its_programs_and_reads_only_what_it_sc
                                        max_new_tokens=RESPONSE_WIDTH, sampling=Sampling(temperature=1.0))
     info = len("other")
     def pad(text):
-        return padded_text(text, info)
+        return _utf8(text, info)
 
     def batch(offset):
         rows = np.arange(PROMPT_WIDTH, dtype=np.int32)[None] + np.arange(2)[:, None] + offset

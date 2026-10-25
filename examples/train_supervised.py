@@ -75,6 +75,6 @@ def run() -> RunConfig:
         validation=Files(files["validation"]).map(Formatting()).batch(64),
         objective=ObjectiveConfig("supervised", {
             "loss": cross_entropy, "metrics": (Accuracy(),), "inputs": InputSpec(Field("x", (2,)))}),
-        optim=OptimConfig(rate=3e-3),
+        optim=OptimConfig(learning_rate=3e-3),
         trainer=TrainerConfig(steps=300, log_every=50, eval_every=100,
                               checkpoint_every=100))

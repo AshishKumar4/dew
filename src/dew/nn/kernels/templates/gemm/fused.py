@@ -192,9 +192,9 @@ def _split(producer, values):
         return generation.Refusal('input_unstaged',
                                   "an input reaches the operand only through a row or depth value")
     # What the stage reads, each computed whole in XLA (the operand itself, unread, is left out there).
-    arrays = jax_core.jaxpr_as_fun(jax_core.ClosedJaxpr(jaxpr.replace(outvars=[base, *sides]),
-                                                        closed.consts))(*leaves)
-    whole = functools.partial(_staged, jax_core.ClosedJaxpr(
+    arrays = jax_core.jaxpr_as_fun(jax_core.Jaxpr(jaxpr.replace(outvars=[base, *sides]),
+                                                  closed.consts))(*leaves)
+    whole = functools.partial(_staged, jax_core.Jaxpr(
         jax_core.Jaxpr(jaxpr.constvars, [base, *sides], [out], stage), closed.consts))
     axes = _prologue_axes(whole, arrays, shape)
     if isinstance(axes, generation.Refusal):
@@ -248,7 +248,6 @@ def _inlined(closed, *args):
                 if eqn.primitive.name in CALLS else None)
         invals = [read(var) for var in eqn.invars]
         if body is not None:
-            body = body if isinstance(body, jax_core.ClosedJaxpr) else jax_core.ClosedJaxpr(body, ())
             outvals = _inlined(body, *invals[len(invals) - len(body.jaxpr.invars):])
         else:
             outvals = eqn.primitive.bind(*invals, **eqn.params)

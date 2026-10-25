@@ -22,6 +22,7 @@ from typing import Annotated, ClassVar
 
 import tyro
 
+from dew.cache import dew_config_dir
 from dew.cli import config, ssh_config, tpu_setup
 from dew.cli.gcloud import Gcloud, Node, Tpu, emit, exit_code
 
@@ -367,7 +368,7 @@ class Create(Named):
 def _startup_script(dry_run: bool) -> Path:
     """The data disk mount script, on disk because gcloud reads it from a file; a dry run names
     the file without writing it."""
-    path = config.config_dir() / "disk-startup.sh"
+    path = dew_config_dir() / "disk-startup.sh"
     if not dry_run:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(tpu_setup.disk_startup_script())
@@ -653,7 +654,7 @@ class Setup(Named):
             gcs_bucket=cfg.gcs_bucket if self.gcs_bucket is None else self.gcs_bucket,
             git_key=self.git_key is not None,
         )
-        path = config.config_dir() / f"setup-{self.name}.sh"
+        path = dew_config_dir() / f"setup-{self.name}.sh"
         if not gcloud.dry_run:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(script)

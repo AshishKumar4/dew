@@ -39,6 +39,7 @@ from dew.nn.inputs import filled_validity
 from dew.nn.sharding import (
     DATA_AXIS,
     DEFAULT_RULES,
+    EXPERT_AXIS,
     FSDP_AXIS,
     MESH_AXES,
     SEQUENCE_AXIS,
@@ -59,11 +60,11 @@ from dew.nn.sharding import (
     microbatched,
     ruled_boxes,
 )
-from dew.objectives.base import EXAMPLE_ROWS, FROZEN, Batch, Variables
+from dew.objectives.base import EXAMPLE_ROWS, FROZEN, Batch, Initializer, Variables
 from dew.records import JSON, number, record
 from dew.telemetry.benchmark import samples
 from dew.telemetry.profile import region
-from dew.training.state import VARIABLE_FIELDS
+from dew.training.state import VARIABLE_FIELDS, TrainState, apart, together
 
 # The role axes no parameter splits over: data holds a batch's replicas, and
 # stage the pipeline's stages of the layer stack, which the decoder places
@@ -575,10 +576,17 @@ ema retains accelerator execution with pinned-host storage."""
 def _variable_path(path) -> str:
     """Spell a leaf's logical path as `host_parameters` patterns are written:
     `params/layers_3/self_attn/q_proj/kernel`, the collection first."""
-    return "/".join(
-        entry.key if isinstance(entry, jax.tree_util.DictKey)
-        else entry.name if isinstance(entry, jax.tree_util.GetAttrKey) else str(entry.idx)
-        for entry in path)
+    return jax.tree_util.keystr(path, simple=True, separator="/")
+
+
+def _within_variables(path) -> tuple | None:
+    """`path` inside the variables tree its leaf belongs to: as it is in a
+    variables tree, past the field in a train state's (`VARIABLE_FIELDS`), and
+    None in another field of one, which mirrors the parameters (the optimizer's
+    state, the accumulation) or holds none (the counters, the key)."""
+    if path and isinstance(path[0], jax.tree_util.GetAttrKey):
+        return path[1:] if path[0].name in VARIABLE_FIELDS else None
+    return path
 
 
 def host_selected(patterns: tuple[str, ...], path: str) -> bool:
@@ -590,6 +598,40 @@ def host_selected(patterns: tuple[str, ...], path: str) -> bool:
     """
     return any(fnmatch.fnmatchcase(path, pattern)
                or fnmatch.fnmatchcase(path, f"{pattern}/*") for pattern in patterns)
+
+
+@dataclasses.dataclass(frozen=True)
+class LeafPlacement:
+    """Where one leaf of a placed state lives (`Validation.leaves`)."""
+    spec: P
+    """The mesh axes each of its dimensions splits over."""
+    shard_shape: tuple[int, ...]
+    """The part of it each device holds."""
+    memory_kind: str
+    """The memory that part sits in: `device`, or the host memory a layout keeps it in
+    (`pinned_host`), which takes none of the device's."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Validation:
+    """What a placed state holds on a mesh before the first step (`Layout.validate`)."""
+    leaves: dict[str, LeafPlacement]
+    """Each leaf's placement by its path (`variables/params/...`), in the state's order."""
+    device_bytes: dict[int, int]
+    """The bytes each device of the mesh holds of the state in its own memory between steps,
+    by the device's id."""
+    capacity: dict[int, int]
+    """The bytes each device has, by its id, as the caller stated them or the device reports
+    them; a device that reports none, such as a CPU, is absent."""
+    batch_axes: tuple[str, ...]
+    """The mesh axes a batch's rows split over (`batch_axes`)."""
+    collectives: dict[str, tuple[str, ...]]
+    """The collectives a training step runs over each axis of the mesh above size one, by the
+    role the placement gives the axis, in HLO's names (`_implied_collectives`)."""
+    unbound: dict[str, tuple[str, ...]]
+    """Each logical axis the variables declare that no rule names, with the leaves that
+    declare it. A leaf keeps the dimensions it names whole on every device where a rule
+    places another of its names, and takes the shape heuristic where none does (`shardings`)."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -768,10 +810,8 @@ class Layout:
         whole: `FROZEN` heads a variables tree, the tree placed or one of a
         train state's (`VARIABLE_FIELDS`). The optimizer's state mirrors the
         trained parameters' paths, so a module or a group named so is none."""
-        head = list(path[:2])
-        if head and isinstance(head[0], jax.tree_util.GetAttrKey) and head[0].name in VARIABLE_FIELDS:
-            head = head[1:]
-        return self.frozen_whole and head[:1] == [jax.tree_util.DictKey(FROZEN)]
+        within = _within_variables(path)
+        return self.frozen_whole and within is not None and within[:1] == (jax.tree_util.DictKey(FROZEN),)
 
     def offloaded[TreeT](self, mesh: Mesh, tree: TreeT) -> Placement[TreeT]:
         """Return `shardings`, with the memory kind each leaf's path asks for.
@@ -876,6 +916,144 @@ class Layout:
             f"the sharding tolerance of {self.tolerance:.2%}.\n"
             f"Largest replicated parameters:\n{details}")
 
+    def validate(self, mesh: Mesh, state, *, capacity: int | None = None) -> Validation:
+        """Report what `state` holds on `mesh` before the first step, and refuse a state a
+        device cannot hold.
+
+        MaxText prints each parameter's logical and physical sharding before it trains
+        (`print_shardings_params`), and Megatron reports the weight and optimizer bytes a GPU
+        holds from a formula over the model's config (`report_theoretical_memory`). Here both
+        are read off the placement itself, so they hold for any rules, mesh and optimizer.
+
+        `state` is placed, or is about to be: each leaf an array, or a `jax.ShapeDtypeStruct`
+        carrying the `NamedSharding` it is placed with (`shardings`, `Trainer.shardings`), so
+        nothing is allocated. The report (`Validation`) gives each leaf's split and the part each
+        device holds, the bytes each device of `mesh` keeps between steps, the axes a batch's rows
+        split over, the collectives a step runs over each axis (`Validation.collectives`), and the
+        logical axes the variables declare that no rule names (`Validation.unbound`). A leaf in
+        host memory (`host`), or on devices outside `mesh` (a CPU-owned state's companion), takes
+        none of a device's memory. Rules naming an axis `mesh` lacks raise ValueError here, as
+        `shardings` refuses them.
+
+        `capacity` is the bytes each device of `mesh` has. Unset, each of this process's devices
+        gives its allocator's limit (`Device.memory_stats`' `bytes_limit`) where JAX reports one,
+        which is what an allocation fails against, under whatever memory fraction the process
+        set. A CPU device reports none, so a CPU mesh standing in for accelerators takes theirs
+        from the caller.
+
+        Raises `LayoutRefused`, naming the device and what it holds by field, when a device
+        would hold more than its capacity between steps: the state cannot be placed there,
+        before any of the step's temporaries, which the plan checks against the compiled step
+        (`dew.training.planning`).
+        """
+        self._refuse_unknown(mesh)
+        leaves: dict[str, LeafPlacement] = {}
+        devices = set(mesh.devices.flat)
+        # The ids of `mesh`'s devices each leaf's mesh shares, matched as devices, not ids: a CPU
+        # companion's devices number themselves as the accelerators do.
+        shared: dict[Mesh, frozenset[int]] = {}
+        # What the devices' own memory holds, leaf by leaf: its field, its devices, a device's bytes of it.
+        held: list[tuple[str, frozenset[int], int]] = []
+        # The axes of `mesh` that split some variable.
+        split: set[str] = set()
+        for path, leaf in jax.tree_util.tree_flatten_with_path(state)[0]:
+            sharding = leaf.sharding
+            if sharding.mesh == mesh and _within_variables(path) is not None:
+                split |= _spec_axes(sharding.spec)
+            # A sharding that names no memory places in its devices' default, their own.
+            kind = sharding.memory_kind or "device"
+            shard = sharding.shard_shape(leaf.shape)
+            leaves[_variable_path(path)] = LeafPlacement(sharding.spec, shard, kind)
+            if kind == "device":
+                on = sharding.mesh
+                if on not in shared:
+                    shared[on] = frozenset(device.id for device in devices.intersection(on.devices.flat))
+                held.append((_variable_path(path[:1]), shared[on], _shard_bytes(leaf)))
+        totals = collections.Counter()
+        for _, ids, size in held:
+            totals[ids] += size
+        device_bytes = dict.fromkeys(mesh.device_ids.ravel().tolist(), 0)
+        for ids, size in totals.items():
+            for device in ids:
+                device_bytes[device] += size
+        limits = (dict.fromkeys(device_bytes, capacity) if capacity is not None else
+                  {device.id: limit for device in mesh.local_devices
+                   if (limit := (device.memory_stats() or {}).get("bytes_limit")) is not None})
+        _refuse_overfull(held, device_bytes, limits)
+        with nn.logical_axis_rules(self.axis_rules):
+            rows = batch_axes(mesh)
+        return Validation(leaves, device_bytes, limits, rows, _implied_collectives(mesh, rows, split),
+                          self._unbound(state))
+
+    def _unbound(self, state) -> dict[str, tuple[str, ...]]:
+        """The logical axes the variables of `state` declare that no rule names, each with
+        the leaves that declare it, read from every declaration: a box none of whose names
+        a rule places too, which `shardings` leaves to the shape heuristic (`ruled_boxes`)."""
+        named = {name for name, _ in self.axis_rules}
+        found: dict[str, list[str]] = collections.defaultdict(list)
+        declared = declarations(state)
+        with boxed({**current_boxes(), **boxed_axes(state)}):
+            for path, leaf in jax.tree_util.tree_flatten_with_path(state)[0]:
+                if _within_variables(path) is None:
+                    continue
+                for name in self._axes(path, leaf.ndim, declared) or ():
+                    if name is not None and name not in named:
+                        found[name].append(_variable_path(path))
+        return {name: tuple(paths) for name, paths in found.items()}
+
+
+def _implied_collectives(mesh: Mesh, rows: tuple[str, ...], split: set[str]) -> dict[str, tuple[str, ...]]:
+    """The collectives a training step runs over each axis of `mesh` above size one, by the role a
+    placement gives the axis, in HLO's names (`dew.telemetry.instrumentation.COLLECTIVES`).
+
+    An axis whose devices each compute their own share of a batch, its rows (`rows`) or the
+    sequence axis's positions, sums the step's loss and the gradients of what it holds whole
+    (all-reduce). Where it also splits a variable (`split`), it gathers the variable whole to use
+    it (all-gather), and a row axis sums each gradient into its shares (reduce-scatter), as fully
+    sharded data parallelism does. An axis that splits a variable and no batch, tensor, sums the
+    partial products of the width it splits (all-reduce). The stage axis hands each microbatch's
+    activations on (collective-permute). How the experts on the expert axis meet their tokens, an
+    all-to-all or a gather by the layer's dispatch (`dew.nn.moe`), and the attention's exchange
+    over the sequence axis, an all-to-all or a gather by its heads and lengths
+    (`dew.nn.attention.sequence_parallel_attention`), are the model's choice, not the
+    placement's, and are not named."""
+    implied = {}
+    for axis, size in mesh.shape.items():
+        if size == 1:
+            continue
+        shares = axis in rows or axis == SEQUENCE_AXIS
+        ops = ["all-reduce"] if shares or axis in split else []
+        if shares and axis in split and axis != EXPERT_AXIS:
+            ops.append("all-gather")
+            if axis in rows:
+                ops.append("reduce-scatter")
+        if axis == STAGE_AXIS:
+            ops.append("collective-permute")
+        if ops:
+            implied[axis] = tuple(ops)
+    return implied
+
+
+def _refuse_overfull(held: list[tuple[str, frozenset[int], int]], device_bytes: Mapping[int, int],
+                     limits: Mapping[int, int]) -> None:
+    """Refuse a state some device would hold more of than its `limits`, naming the device
+    furthest over and its bytes by field, from `held` (`Layout.validate`); both by device id."""
+    over = [device for device, limit in limits.items() if device_bytes[device] > limit]
+    if not over:
+        return
+    fullest = max(over, key=lambda device: device_bytes[device] - limits[device])
+    fields = collections.Counter()
+    for field, ids, size in held:
+        if fullest in ids:
+            fields[field] += size
+    parts = ", ".join(f"{field} {size / 2 ** 30:.2f}" for field, size in fields.most_common())
+    raise LayoutRefused(
+        f"device {fullest} would hold {device_bytes[fullest] / 2 ** 30:.2f} GiB of the state between steps "
+        f"({parts} GiB), over the {limits[fullest] / 2 ** 30:.2f} GiB it has. Split the state over more "
+        f"devices (a larger fsdp axis), keep the optimizer state and the EMA in pinned host memory "
+        f"(Layout(host=('opt_state', 'ema'))), or keep Adam's moments in bfloat16 "
+        f"(OptimConfig.state_dtype)")
+
 
 def placeable(field) -> bool:
     """Whether a device can hold every leaf of `field`: arrays of numbers,
@@ -939,8 +1117,13 @@ def batch_layout(batch: Batch) -> str:
                      for path, leaf in jax.tree_util.tree_leaves_with_path(batch))
 
 
+STEP_BATCH = 2
+"""Where a compiled train step takes its batch among its arguments: after the moving state and the
+frozen tree (`dew.training.state.apart`, `Trainer._jitted`), before the part of the step it runs."""
+
+
 def step_reads(executable: jax.stages.Compiled, signature: Signature) -> tuple[bool, ...]:
-    """Which leaves of its batch, the second argument, a compiled step reads,
+    """Which leaves of its batch (`STEP_BATCH`) a compiled step reads,
     in the leaf order of the batch's own `signature` (`batch_signature`):
     those the executable kept, where JAX pruned the rest
     (`jax.stages.Compiled.input_shardings` names no sharding for those). A
@@ -949,7 +1132,7 @@ def step_reads(executable: jax.stages.Compiled, signature: Signature) -> tuple[b
     not the shardings', says where its leaves are."""
     arguments, _ = executable.input_shardings
     tree, _ = signature
-    return tuple(sharding is not None for sharding in tree.flatten_up_to(arguments[1]))
+    return tuple(sharding is not None for sharding in tree.flatten_up_to(arguments[STEP_BATCH]))
 
 
 def batch_shardings(mesh: Mesh | AbstractMesh, batch: Batch) -> Placement[Batch]:
@@ -1121,15 +1304,27 @@ def _without_state_axes(entry: MeshAxes) -> MeshAxes:
     return kept if kept else None
 
 
+def _shard_bytes(leaf) -> int:
+    """The bytes each device its sharding places it on holds of `leaf`, an
+    array or an abstract one that carries its sharding."""
+    return math.prod(leaf.sharding.shard_shape(np.shape(leaf))) * leaf.dtype.itemsize
+
+
 def placed_bytes(tree) -> int:
     """The bytes a device holds of `tree`'s arrays, each laid out as its
     sharding places it (abstract arrays carry their sharding)."""
-    return sum(math.prod(leaf.sharding.shard_shape(np.shape(leaf))) * np.dtype(leaf.dtype).itemsize
-               for leaf in jax.tree.leaves(tree))
+    return sum(map(_shard_bytes, jax.tree.leaves(tree)))
+
+
+def placed_shapes[TreeT](tree: TreeT, placement: Placement[TreeT]) -> TreeT:
+    """`tree`'s arrays as their shapes, each carrying where `placement` puts it: what a
+    lowering, a restore and `Layout.validate` read of a state not yet placed."""
+    return jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype,
+                                                                    sharding=sharding), tree, placement)
 
 
 def placed_held[Held](held: Held, variables: Variables, shardings: Placement[Variables],
-                      mesh: Mesh) -> tuple[Held, Held]:
+                      mesh: Mesh, shared: Mapping[int, NamedSharding] | None = None) -> tuple[Held, Held]:
     """A copy of `held` on `mesh` as two trees, each None where the other holds
     an array: the arrays a state of `variables` placed by `shardings` takes
     over, each where the state keeps the variable of its path and shape
@@ -1141,7 +1336,12 @@ def placed_held[Held](held: Held, variables: Variables, shardings: Placement[Var
     the free memory a step's temporaries need in one block
     (`step_headroom`). Placed where the state keeps them and donated
     (`taking_over`), they become the state's buffers. The copy leaves the
-    objective's own arrays alone."""
+    objective's own arrays alone. The held leaves whose ids `shared` maps to
+    where the state keeps them, which it keeps as they are and no step donates
+    (its frozen tree, `apart`, wherever its init moves them), are placed there
+    as they are, the same arrays where they are placed already, and kept: no
+    copy of them is made."""
+    shared = shared or {}
     kept = {path: (sharding, leaf.shape) for (path, leaf), sharding in zip(
         jax.tree_util.tree_leaves_with_path(variables), jax.tree.leaves(shardings), strict=True)}
     replicated = NamedSharding(mesh, P())
@@ -1157,11 +1357,14 @@ def placed_held[Held](held: Held, variables: Variables, shardings: Placement[Var
 
     # A copy of an array already on the devices: device_put can reuse a
     # buffer the target shares with the source, which donation would free.
-    owned = jax.tree.map(lambda leaf: leaf.copy() if isinstance(leaf, jax.Array) else leaf, held)
+    owned = jax.tree.map(lambda leaf: leaf if id(leaf) in shared or not isinstance(leaf, jax.Array)
+                         else leaf.copy(), held)
     placed = jax.device_put(owned, jax.tree_util.tree_map_with_path(
-        lambda path, leaf: variable(path, leaf) or replicated, held))
+        lambda path, leaf: shared.get(id(leaf)) or variable(path, leaf) or replicated, held))
+    keep = {id(placed_leaf) for leaf, placed_leaf in zip(jax.tree.leaves(held), jax.tree.leaves(placed),
+                                                         strict=True) if id(leaf) in shared}
     taken = jax.tree_util.tree_map_with_path(
-        lambda path, leaf: None if variable(path, leaf) is None else leaf, placed)
+        lambda path, leaf: None if variable(path, leaf) is None or id(leaf) in keep else leaf, placed)
     return taken, jax.tree.map(lambda one, leaf: leaf if one is None else None, taken, placed,
                                is_leaf=lambda leaf: leaf is None)
 
@@ -1180,6 +1383,64 @@ def taking_over[Held, Result](function: Callable[[Held, jax.Array], Result], tak
     return functools.partial(jax.jit(joined, out_shardings=shardings, donate_argnums=0), taken, kept)
 
 
+def traced_start(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
+                 key: jax.Array) -> tuple[TrainState, dict[int, int]]:
+    """The shapes of the fresh state `initial_state` builds, and which of its frozen leaves are the
+    initializer's arrays as they are: each such leaf's index among the frozen tree's leaves, to the
+    index of the initializer's leaf it is. An init that returns a held leaf as it is, by reference,
+    passes it through (`Objective.held_variables`); one trace finds both."""
+    through: dict[int, int] = {}
+
+    def traced(initializer: Initializer, key: jax.Array) -> TrainState:
+        state = initial_state(initializer, key)
+        inputs = {id(leaf): index for index, leaf in enumerate(jax.tree.leaves(initializer))}
+        frozen = jax.tree.leaves(apart(state)[1])
+        through.update({index: inputs[id(leaf)] for index, leaf in enumerate(frozen) if id(leaf) in inputs})
+        return state
+
+    return jax.eval_shape(traced, initializer, key), through
+
+
+def placed_start(initial_state: Callable[[Initializer, jax.Array], TrainState], initializer: Initializer,
+                 key: jax.Array, abstract: TrainState, shardings: Placement[TrainState],
+                 through: Mapping[int, int], mesh: Mesh) -> TrainState:
+    """A fresh state on `mesh`, built by `initial_state` from the objective's held tree (`placed_held`).
+    The frozen leaves the objective's init passes through as they are (`through`, `traced_start`),
+    which no step donates (`apart`), are the held arrays themselves, placed where the state keeps
+    them, the same arrays where they are placed already: the run and the objective then hold one
+    frozen tree between them. One program builds the rest, a frozen leaf the init builds among it,
+    taking the other held arrays over."""
+    moving, frozen = apart(shardings)
+    if frozen is None or not through:
+        taken, kept = placed_held(initializer, abstract.variables, shardings.variables, mesh)
+        return taking_over(initial_state, taken, kept, shardings)(key)
+    inputs = jax.tree.leaves(initializer)
+    where, structure = jax.tree.flatten(frozen)
+    # Each passed leaf is placed once, where the state keeps it, whatever path the init moves it to.
+    taken, kept = placed_held(initializer, abstract.variables, shardings.variables, mesh,
+                              shared={id(inputs[given]): where[index] for index, given in through.items()})
+    placed = jax.tree.leaves(jax.tree.map(lambda one, other: other if one is None else one, taken, kept,
+                                          is_leaf=lambda leaf: leaf is None))
+    built = [index for index in range(len(where)) if index not in through]
+
+    def rest(tree: Initializer, draw: jax.Array) -> tuple[TrainState, tuple[jax.Array, ...]]:
+        state, own = apart(initial_state(tree, draw))
+        leaves = jax.tree.leaves(own)
+        return state, tuple(leaves[index] for index in built)
+
+    state, made = taking_over(rest, taken, kept, (moving, tuple(where[index] for index in built)))(key)
+    drawn = dict(zip(built, made, strict=True))
+
+    def leaf(index: int) -> jax.Array:
+        if index in drawn:
+            return drawn[index]
+        # A held leaf an init passes through at two places of other shardings is placed at the second too.
+        held = placed[through[index]]
+        return held if held.sharding == where[index] else jax.device_put(held, where[index])
+
+    return together(state, jax.tree.unflatten(structure, [leaf(index) for index in range(len(where))]))
+
+
 def prefetched_bytes(batch: Batch, shardings: Placement[Batch], depth: int = PREFETCH_DEPTH) -> int:
     """Return the bytes a device holds of the batches `fit` places while a step runs.
 
@@ -1187,9 +1448,7 @@ def prefetched_bytes(batch: Batch, shardings: Placement[Batch], depth: int = PRE
     (`fit(device_prefetch=)`) and the one it is placing, each laid out as
     `shardings` places `batch`.
     """
-    placed = jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype,
-                                                                      sharding=sharding), batch, shardings)
-    return (depth + 1) * placed_bytes(placed)
+    return (depth + 1) * placed_bytes(placed_shapes(batch, shardings))
 
 
 class DevicePrefetchIterator:
@@ -1461,4 +1720,4 @@ class DevicePrefetchIterator:
         raise StopIteration
 
 
-__all__ = ["DevicePrefetchIterator", "Layout", "MeshSpec", "batch_shardings"]
+__all__ = ["DevicePrefetchIterator", "Layout", "LeafPlacement", "MeshSpec", "Validation", "batch_shardings"]

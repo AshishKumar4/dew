@@ -71,7 +71,7 @@ def main(config: Config):
         processor=RunProcessor(tokenizer),
     )
 
-    trainer = Trainer(objective, OptimConfig(rate=config.learning_rate), key=jax.random.key(0),
+    trainer = Trainer(objective, OptimConfig(learning_rate=config.learning_rate), key=jax.random.key(0),
                       checkpoints=Checkpoints(str(config.out / "checkpoints")))
     state = trainer.fit(data, steps=config.steps,
                         epochs=None if config.steps else config.epochs, log_every=50)

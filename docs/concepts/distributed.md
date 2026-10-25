@@ -32,7 +32,7 @@ model = CausalTransformer(vocab_size=512, emb_features=256, num_layers=2,
 rows = np.random.default_rng(0).integers(0, 512, (16, 65), dtype=np.int32)
 data = Loader(train=lambda partition: itertools.repeat({"text": rows}), val=None,
                records=16, batch=16)
-trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(rate=1e-3), key=jax.random.key(0),
+trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=jax.random.key(0),
                   mesh=MeshSpec(fsdp=2, tensor=2))
 state = trainer.fit(data, steps=4, log_every=2)
 
@@ -94,7 +94,7 @@ from jax.sharding import AxisType
 mesh = jax.make_mesh((2, 2, 2), ("replica", "zero", "zero2"), axis_types=(AxisType.Auto,) * 3)
 layout = Layout(rules={"embed": ("zero", "zero2"), "mlp": "zero", "vocab": "zero"},
                 data_axes=("replica", "zero", "zero2"))
-trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(rate=1e-3), key=0,
+trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0,
                   mesh=mesh, layout=layout)
 trainer.fit(data, steps=2, log_every=2)
 ```
@@ -177,7 +177,7 @@ An earlier synthetic BF16 bank load of 18.00 GiB (144 layers, width 2048, `bank_
 
 ## Rematerialization
 
-`CausalTransformer(remat=...)` sets which activations of each decoder block the backward pass recomputes and which it keeps. The value is a policy. The default, `None`, recomputes nothing, and `"full"` keeps only the block inputs. The other names in `dew.nn.backbones.decoder_block.REMAT_POLICIES` are `minimal`, `minimal_with_conv`, `minimal_with_context`, `save_dot_except_mlp`, `save_dot_with_context_except_mlp`, `save_dot_except_mlpwi`, `save_qkv_proj`, `save_out_proj`, `minimal_offloaded` and `qkv_proj_offloaded`. Each keeps some of the named projection outputs (`q_proj`, `k_proj`, `v_proj`, `kv_proj`, `context`, `conv`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`) or offloads them to host memory. They trade recompute time for memory the same way MaxText's recipes of the same names do. You can also pass a record with your own lists, such as `{"save": ["q_proj", "k_proj", "v_proj"], "offload": ["gate_proj", "up_proj"]}`. Every policy trains the same model. `tools/benchmark_decoder_remat.py --remat <name>` reports the residual and compiler memory of one configuration.
+`CausalTransformer(remat=...)` sets which activations of each decoder block the backward pass recomputes and which it keeps. The value is a policy. The default, `None`, recomputes nothing, and `"full"` keeps only the block inputs. The other names in `dew.nn.backbones.decoder_block.REMAT_POLICIES` are `minimal`, `minimal_with_conv`, `minimal_with_scan_and_conv`, `minimal_with_context`, `save_dot_except_mlp`, `save_dot_with_context_except_mlp`, `save_dot_except_mlpwi`, `save_qkv_proj`, `save_out_proj`, `minimal_offloaded` and `qkv_proj_offloaded`. Each keeps some of the named projection outputs (`q_proj`, `k_proj`, `v_proj`, `kv_proj`, `context`, `scan`, `conv`, `o_proj`, `gate_proj`, `up_proj`, `down_proj`) or offloads them to host memory: `context` is a mixer's output, attention's or a recurrence's, and `scan` a recurrence's alone, an SSM's or a delta rule's. They trade recompute time for memory the same way MaxText's recipes of the same names do. You can also pass a record with your own lists, such as `{"save": ["q_proj", "k_proj", "v_proj"], "offload": ["gate_proj", "up_proj"]}`. Every policy trains the same model. `tools/benchmark_decoder_remat.py --remat <name>` reports the residual and compiler memory of one configuration.
 
 ## Batches
 
@@ -199,7 +199,7 @@ A window that cuDNN accepts as its window flag runs through the all-to-all like 
 
 A token window has `seq_len + 1` IDs, and the model reads `seq_len` positions. Check the model length as well as the shape of the batch array. Packed segments, windows and rotary positions must stay aligned.
 
-Mamba-2 layers split the sequence the same way, so a hybrid of Mamba-2 and attention layers trains under `MeshSpec(sequence=N)`. Each device convolves its own slice, reading the last `conv_kernel - 1` tokens of the previous device's slice, and runs its scan from a zero state. It then needs the state that the earlier slices leave. The devices pass each slice's total decay and final state, `[batch, heads, head_dim, state_size]` in fp32, between them in `ceil(log2 N) + 1` shifts (a parallel prefix scan), and each device adds that state's decayed contribution to each of its outputs. Packed documents reset the state and the convolution at every segment change, including a change that falls on a slice boundary. The sequence length must be a multiple of `N`, and each slice needs at least `conv_kernel - 1` tokens. The tensor axis does not split the Mamba-2 scan, so every tensor shard runs the scan over the whole width.
+Mamba-2 layers split the sequence the same way, so a hybrid of Mamba-2 and attention layers trains under `MeshSpec(sequence=N)`. Each device convolves its own slice, reading the last `conv_kernel - 1` tokens of the previous device's slice, and runs its scan from a zero state. It then needs the state that the earlier slices leave. The devices pass each slice's total decay and final state, `[batch, heads, head_dim, state_size]` in fp32, between them in `ceil(log2 N) + 1` shifts (a parallel prefix scan), and each device adds that state's decayed contribution to each of its outputs. Packed documents reset the state and the convolution at every segment change, including a change that falls on a slice boundary. A row with padding runs as it runs on one device: a padded slot neither reads nor advances the convolution or the state. Each real token's convolution reads the `conv_kernel - 1` real tokens before it in its document, wherever they lie, gathered from every earlier slice, so a pool of processes, which always carries validity, trains a hybrid sequence-parallel too. Decoding stays on a mesh with `sequence=1`. The sequence length must be a multiple of `N`, and each slice needs at least `conv_kernel - 1` tokens. The tensor axis does not split the Mamba-2 scan, so every tensor shard runs the scan over the whole width.
 
 Cached autoregressive generation needs `sequence=1`. A mesh that trains with sequence parallelism may still be unable to run the decode cache.
 
@@ -232,5 +232,18 @@ The JAX process pool must be initialized before any device array or model is cre
 The local process-pool tests run real `jax.distributed` processes. They do not cover network failures, remote storage, TPU collectives or cluster preemption.
 
 ## Checking a distributed run
+
+Before booking the GPUs, read what the run would hold on them. On a CPU host, start Python with as many simulated devices as the run has GPUs, as this page's first block does (`XLA_FLAGS=--xla_force_host_platform_device_count=8`, set before JAX starts). Build the trainer as the run will, and validate it with one global batch against the memory each GPU's allocator will have, 95% of the GPU in a training process. Here the run is the model above on eight 80 GB H100s, pooling four steps into each update:
+
+```python
+trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0,
+                  mesh=MeshSpec(fsdp=8), accumulation=4)
+report = trainer.validate({"text": rows}, steps=400, capacity=int(0.95 * 80e9))
+print(report.leaves["variables/params/layers_0/mlp/up_proj/kernel"])
+print(max(report.device_bytes.values()), "bytes on the fullest device")
+print(report.batch_axes, report.collectives, report.unbound)
+```
+
+`validate` places nothing. It reports each leaf's split and the part each device holds, the bytes each device keeps between steps (parameters, optimizer state, EMA and the gradient accumulator), the axes a batch's rows split over, the collectives a step runs over each mesh axis (an all-gather and a reduce-scatter over `fsdp`, an all-reduce over `tensor` and over the data axes), and the logical axes your rules leave unnamed, whose dimensions stay whole on every device (a parameter none of whose axes a rule names takes the shape heuristic). It raises `LayoutRefused` when that state alone is over a device's `capacity`. On the GPUs themselves `fit` runs the same check against each GPU's allocator limit before it places anything, and the plan's fit check counts the accumulator and copies a step adds before it builds them; `trainer.validation` then holds the report of the plan the run takes. The step's activations and other temporaries come on top; the plan checks them against the compiled step on the GPU. A CPU host builds no narrow copies, the bf16 copies a GPU step reads of fp32 parameters, so it leaves out their 2 bytes a parameter.
 
 Compare a small global computation under each placement you plan to use: the loss and gradients, record identity, optimizer and EMA state, and a save and restore. Record the compiler and backend versions and the tolerances used. A device count and a finite loss do not show that two runs train the same way. The CPU tests on global arrays cover loss normalization with unequal masks and restarting partway through an accumulation window. [Checkpoints](../guides/checkpoints.md) and [Evaluation and tracking](../guides/evaluation.md) describe what a resumed run and a reported metric guarantee.

@@ -22,20 +22,24 @@ draws from.
 
 from __future__ import annotations
 
-import functools
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from dataclasses import dataclass, replace
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 
+from dew._distributions import draw, row_draw, wellformed
 from dew.diffusion.block import CanvasGeneration, through_eos
 from dew.diffusion.process import Conditioning
+from dew.diffusion.schedules import common
 from dew.interop.weights import decoding_storage
+from dew.nn import categorical
 from dew.nn.inputs import (
     RESPONSE_FIELDS,
+    Coordinates,
     ModelInputs,
     Request,
     continuation_keys,
@@ -46,9 +50,10 @@ from dew.nn.inputs import (
     real_slots,
     token_id,
     token_ids,
+    token_layout,
 )
-from dew.nn.kernels.options import compiler_options
-from dew.nn.protocols import Logits, TokenModel
+from dew.nn.kernels.options import program
+from dew.nn.protocols import Logits, ShiftsLogits, TokenModel
 from dew.nn.sharding import explicit_spec
 from dew.objectives.base import Variables
 
@@ -89,10 +94,10 @@ class LogLinear(MaskingSchedule):
     eps: float = 1e-3
 
     def alpha(self, t):
-        return 1 - (1 - self.eps) * jnp.asarray(t, jnp.float32)
+        return 1 - (1 - self.eps) * common.times(t)
 
     def alpha_prime(self, t):
-        return jnp.full_like(jnp.asarray(t, jnp.float32), -(1 - self.eps))
+        return jnp.full_like(common.times(t), -(1 - self.eps))
 
 
 @dataclass(frozen=True)
@@ -136,7 +141,7 @@ class DiscreteProcess:
         The weight is exactly zero at t = 0. Nothing is masked there, so no
         token contributes, and the quotient itself is undefined.
         """
-        t = jnp.asarray(t, jnp.float32)
+        t = common.times(t)
         return jnp.where(t > 0, -self.schedule.alpha_prime(t) / (1 - self.schedule.alpha(t)), 0.0)
 
     def times(self, steps: int) -> jax.Array:
@@ -200,11 +205,41 @@ class DiscreteProcess:
 
         request, _ = Request.prepare(inputs, key, mesh_of(variables), check, phase="masked generation")
         plan = request.plan
-        program = _compiled(plan.sharding, tuple(compiler_options(model).items()))
-        generated = program(model, decoding_storage(model, variables), plan.place(request.padded()),
-                            plan.keys(request.key), self, solver, max_new_tokens, steps, n, eos_token_ids,
-                            pad_token_id)
+        generation = program(
+            _generate, model,
+            static_argnames=("model", "process", "solver", "budget", "steps", "n", "eos_ids", "pad_id"),
+            in_shardings=(None, plan.sharding, plan.sharding), out_shardings=(plan.sharding, None))
+        generated, undefined = generation(model, decoding_storage(model, variables),
+                                          plan.place(request.padded()), plan.keys(request.key), self,
+                                          solver, max_new_tokens, steps, n, eos_token_ids, pad_token_id)
+        if bool(jax.device_get(undefined)):
+            raise ValueError(REVEALED_UNDEFINED)
         return replace(generated, rows=plan.rows * n, prompt_width=request.inputs.tokens.shape[1])
+
+
+REVEALED_UNDEFINED = "the model left a position it reveals without a distribution to draw its token from"
+"""What a masked walk raises when a revealed position's scores hold no distribution."""
+
+
+def aligned(model: nn.Module, scores: jax.Array,
+            fields: Mapping[str, jax.Array | np.ndarray | Coordinates] | None = None) -> jax.Array:
+    """`scores` `[B, S, ...]` per position as the model's predictions of each position's token: its
+    own for a model whose logits line up with its inputs (LLaDA's, MDLM's), and for one that declares
+    `shifted_logits` (Dream-v0's) the position before's, as its reference shifts them. A position
+    that opens its text, the row's first, the first real one after padding and each packed
+    document's first in the token `fields`' layout (`token_layout`), reads its own, as the
+    reference repeats a row's first: no document reads another's."""
+    if not (isinstance(model, ShiftsLogits) and model.shifted_logits):
+        return scores
+    before = jnp.concatenate([scores[:, :1], scores[:, :-1]], axis=1)
+    valid, documents = token_layout(fields or {})
+    opens = jnp.zeros(scores.shape[:2], bool).at[:, 0].set(True)
+    if valid is not None:
+        opens |= valid & ~jnp.concatenate([jnp.zeros_like(valid[:, :1]), valid[:, :-1]], axis=1)
+    if documents is not None:
+        changes = documents[:, 1:] != documents[:, :-1]
+        opens |= jnp.concatenate([jnp.ones_like(documents[:, :1], bool), changes], axis=1)
+    return jnp.where(opens.reshape(opens.shape + (1,) * (scores.ndim - 2)), scores, before)
 
 
 @dataclass(frozen=True)
@@ -240,11 +275,13 @@ class DiscreteDenoiser:
                                   capture_intermediates=False,
                                   method="logits" if isinstance(self.model, Logits) else None)
         assert not isinstance(logits, tuple)  # no mutable collections were asked for
-        # Normalized in fp32, as `token_log_probs` does: the reveal draws its
-        # categorical from these, and a bf16 log partition would quantize it.
-        logits = logits.astype(jnp.float32).at[..., self.process.mask_id].set(-jnp.inf)
-        log_probs = jax.nn.log_softmax(logits, axis=-1)
-        masked = self.masked(x_t)
+        # Normalized in at least fp32 (`dew.nn.categorical`) over the logits each position reads
+        # (`aligned`): the reveal draws its categorical from these, and a bf16 log partition would
+        # quantize it. The mask token takes no probability.
+        logits = aligned(self.model, logits, None if self.inputs is None else self.inputs.token_fields)
+        log_probs = categorical.log_probs(logits, jnp.arange(logits.shape[-1]) != self.process.mask_id)
+        # A masked position whose scores hold no distribution stays masked: its argmax is no token.
+        masked = self.masked(x_t) & wellformed(log_probs)
         filled = jnp.where(masked, jnp.argmax(log_probs, axis=-1), x_t)
         return filled, log_probs
 
@@ -256,7 +293,9 @@ class Unmask:
     Each masked position is revealed with probability
     (alpha(s) - alpha(t)) / (1 - alpha(t)), and a revealed position takes a
     token drawn from the model's categorical distribution. The rest stay
-    masked. Stepping any other kind of process raises `ValueError`.
+    masked, as does a position whose scores hold no distribution (a NaN), so
+    a walk never commits an arbitrary token: generation refuses a response
+    left masked. Stepping any other kind of process raises `ValueError`.
     """
 
     def init(self, x, times, process, *, key) -> tuple:
@@ -266,8 +305,10 @@ class Unmask:
         chance = self._reveal_chance(process, t, t_next)
         reveal_key, token_key = jax.random.split(key)
         reveal = jax.random.uniform(reveal_key, x.shape) < chance[:, None]
-        drawn = jax.random.categorical(token_key, log_probs, axis=-1)
-        return jnp.where(denoise.masked(x) & reveal, drawn, x), state
+        revealed = denoise.masked(x) & reveal
+        drawn = draw(token_key, log_probs, revealed, REVEALED_UNDEFINED)
+        # A position whose scores hold no distribution stays masked rather than take an arbitrary token.
+        return jnp.where(revealed & wellformed(log_probs), drawn, x), state
 
     def step_rows(self, x, t, t_next, denoised, log_probs, state, keys, process, denoise):
         """`step`, row `i` drawing its reveals and tokens from `keys[i]` alone (`RowSolver`), as the
@@ -275,8 +316,9 @@ class Unmask:
         chance = self._reveal_chance(process, t, t_next)
         split = jax.vmap(jax.random.split)(keys)
         reveal = jax.vmap(lambda key: jax.random.uniform(key, x.shape[1:]))(split[:, 0]) < chance[:, None]
-        drawn = jax.vmap(jax.random.categorical)(split[:, 1], log_probs)
-        return jnp.where(denoise.masked(x) & reveal, drawn, x), state
+        revealed = denoise.masked(x) & reveal
+        drawn = row_draw(split[:, 1], log_probs, revealed, REVEALED_UNDEFINED)
+        return jnp.where(revealed & wellformed(log_probs), drawn, x), state
 
     @staticmethod
     def _reveal_chance(process, t, t_next):
@@ -374,8 +416,9 @@ def _response_inputs(inputs: ModelInputs, width: int, mask_id: int) -> tuple[Mod
 
 def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys: jax.Array,
               process: DiscreteProcess, solver: Unmask, budget: int, steps: int, n: int,
-              eos_ids: tuple[int, ...], pad_id: int) -> CanvasGeneration:
-    """The compiled body: one masked walk per row, `n` continuations each.
+              eos_ids: tuple[int, ...], pad_id: int) -> tuple[CanvasGeneration, jax.Array]:
+    """The compiled body: one masked walk per row, `n` continuations each, and whether a response
+    position stayed masked, its scores holding no distribution at every step it would have revealed.
 
     One model call denoises the batch at each step; only the random draws
     map over row keys. Mapping the whole model would batch its kernels too,
@@ -388,7 +431,8 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
     batch, prompt = inputs.tokens.shape
     if budget == 0:
         zeros = jnp.zeros((batch * n,), jnp.int32)
-        return CanvasGeneration(jnp.repeat(inputs.tokens, n, axis=0), zeros, zeros.astype(bool), zeros)
+        return (CanvasGeneration(jnp.repeat(inputs.tokens, n, axis=0), zeros, zeros.astype(bool), zeros),
+                jnp.zeros((), bool))
     full, mutable = _response_inputs(inputs, budget, process.mask_id)
 
     denoise = process.denoiser(model, variables, inputs=full, mutable_mask=mutable)
@@ -396,26 +440,17 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
     def continued(draw_keys):
         tokens = sample(denoise, full.tokens, steps, solver=solver, key=RowKeys(draw_keys))
         active = jnp.any(mutable, axis=-1)
+        undefined = jnp.any(mutable & (tokens == process.mask_id))
         response, length, ended = jax.vmap(
             lambda row, count: through_eos(row, count, eos_ids, pad_id))(
                 tokens[:, prompt:], jnp.where(active, budget, 0))
         return CanvasGeneration(jnp.concatenate([tokens[:, :prompt], response], axis=-1), length,
-                                ended, jnp.where(active, steps, 0))
+                                ended, jnp.where(active, steps, 0)), undefined
 
-    return prompt_major(jax.lax.map(continued, continuation_keys(keys, n)))
-
-
-@functools.cache
-def _compiled(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
-    """The generation program over `rows`, compiled with the model's own XLA `options`
-    (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never share it."""
-    return jax.jit(
-        _generate,
-        static_argnames=("model", "process", "solver", "budget", "steps", "n", "eos_ids", "pad_id"),
-        in_shardings=(None, rows, rows),
-        out_shardings=rows,
-        compiler_options=dict(options),
-    )
+    generated, undefined = jax.lax.map(continued, continuation_keys(keys, n))
+    return prompt_major(generated), jnp.any(undefined)
 
 
-__all__ = ["MDLM", "DiscreteDenoiser", "DiscreteProcess", "LogLinear", "MaskingSchedule", "Unmask"]
+
+
+__all__ = ["MDLM", "DiscreteDenoiser", "DiscreteProcess", "LogLinear", "MaskingSchedule", "Unmask", "aligned"]

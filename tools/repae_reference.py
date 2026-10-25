@@ -66,9 +66,9 @@ from diffusers.models.autoencoders.autoencoder_kl import AutoencoderKL
 from einops import rearrange
 from lpips_weights import drawn_weights
 from recorded_draws import Tape, TorchDraws
-from torch_precision import float_as, replaced
 from reference_source import defined_in, fetched, ran
 from safetensors.torch import load as load_safetensors
+from torch_precision import float_as, replaced
 from torchvision import models
 
 from dew.diffusion import presets
@@ -394,6 +394,10 @@ def step() -> None:
     replayed, dropped = draws(pixels)
     arrays = {f"weights/{name}": value for name, value in drawn.items()}
     arrays.update(pixels=pixels, classes=classes, key=np.asarray(KEY), dropped=dropped)
+    # The draws as the test's step reads them, in Dew's layout: a float drawn again may round otherwise.
+    last = (0, 2, 3, 1)
+    arrays.update({"draw/posterior": replayed[0].transpose(last), "draw/times": replayed[1].reshape(-1),
+                   "draw/noise": replayed[2].transpose(last)})
     for dtype in (torch.float64, torch.float32):
         arrays.update(run(dtype, drawn, pixels, classes, replayed))
     np.savez(FIXTURE / "step.npz", **arrays)

@@ -40,6 +40,8 @@ from flax import linen as nn
 from typing_extensions import TypeVar
 
 from dew.artifacts import Artifacts
+from dew.nn import categorical
+from dew.nn.precision import accumulated
 from dew.objectives.base import (
     OMITTED,
     TEACHER,
@@ -263,21 +265,22 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         weights = student.weights.astype(jnp.float32)
         mass = statistics.mass
         counted = jnp.where(mass > 0, mass, 1)
-        divergence = optax.kl_divergence(jax.nn.log_softmax(student.logits / temperature),
-                                         jax.nn.softmax(teacher.logits / temperature))
-        soft = self.row_mean(divergence * weights, batch).total
+        divergence = categorical.kl_divergence(student.logits / temperature, teacher.logits / temperature)
+        soft = self.row_mean(divergence, batch, weights=weights).total
         total = (1 - alpha) * statistics.total + alpha * temperature ** 2 * soft
         reported = {**aux.metrics, "distill/alpha": alpha, "distill/temperature": temperature,
                     "distill/kl": soft / counted, "distill/soft_loss": temperature ** 2 * soft / counted,
-                    "distill/teacher_loss": self.row_mean(teacher.losses * weights, batch).total / counted}
+                    "distill/teacher_loss": (self.row_mean(teacher.losses, batch, weights=weights).total
+                                             / counted)}
         if self.features:
             projections = variables["params"].get(PROJECTIONS, {})
             distances = []
             for index, (own, other) in enumerate(zip(student.hidden, teacher.hidden, strict=True)):
                 if own.shape[-1] != other.shape[-1]:
-                    own = own.astype(jnp.float32) @ projections[f"projection_{index}"]
+                    own = accumulated(jnp.matmul, own.astype(jnp.float32), projections[f"projection_{index}"])
                 distances.append(self._distance(own, other))
-            feature = self.row_mean(jnp.stack(distances) * weights, batch, rows=1).total / len(self.features)
+            feature = (self.row_mean(jnp.stack(distances), batch, rows=1, weights=weights).total
+                       / len(self.features))
             total = total + beta * feature
             reported.update({"distill/beta": beta, "distill/feature": feature / counted})
         return Ratio(total, mass), replace(aux, metrics=reported)

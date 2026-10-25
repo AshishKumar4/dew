@@ -8,13 +8,52 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact
 
 from dew.inputs import Condition, Field, InputSpec
 from dew.nn.dit import ConditioningEmbed, TextContext, masked_mean
 
+
+def test_text_pooling_excludes_nonfinite_padding_from_values_and_gradients():
+    """Changing excluded text to NaN or infinity changes neither its pooled conditioning nor its
+    gradient, including an entirely padded row."""
+    values = jnp.arange(24, dtype=jnp.float32).reshape(2, 4, 3) / 8
+    weights = jnp.asarray([[0.5, 1.0, 0.0, 0.0], [0.0, 0.0, 0.0, 0.0]])
+
+    def loss(x):
+        return jnp.sum(masked_mean(x, weights))
+
+    clean = jax.value_and_grad(loss)(values)
+    for filler in (jnp.nan, jnp.inf, -jnp.inf):
+        poisoned = jnp.where(weights[:, :, None] != 0, values, filler)
+        actual = jax.value_and_grad(loss)(poisoned)
+        for observed, expected in zip(actual, clean, strict=True):
+            np.testing.assert_array_equal(observed, expected)
+
+
+@pytest.mark.parametrize("axis", [None, 0, 1])
+@pytest.mark.parametrize("weights", [[1.0, 0.0, 0.5], [[1.0, 0.0, 0.5]],
+                                     [[1.0], [0.0], [1.0], [0.5]]])
+def test_a_shared_mask_counts_every_row_in_a_weighted_mean(axis, weights):
+    """A mask shared across the batch weighs as many rows as its explicit broadcast, including
+    its denominator and the gradient of the pooled result."""
+    from dew.rl.advantage import masked_mean as token_mean
+
+    values = jnp.arange(12, dtype=jnp.float32).reshape(4, 3)
+    shared = jnp.asarray(weights)
+    explicit = jnp.broadcast_to(shared, values.shape)
+    values = jnp.where(explicit != 0, values, jnp.nan)
+    evaluate = jax.value_and_grad(lambda x, mask: jnp.sum(token_mean(x, mask, axis=axis)))
+    for observed, expected in zip(evaluate(values, shared), evaluate(values, explicit), strict=True):
+        np.testing.assert_array_equal(observed, expected)
+
 ############################################################################################################
 # Text pooling reads the mask (T23)
 ############################################################################################################
+
+PROJECTED_SEEDS = 64
+"""The pooled-projection site's declared draws (`seeds_for`)."""
+
 
 def test_the_text_conditioning_projects_each_row_once_not_each_token(rng):
     """The text reaches the adaLN vector only as the masked mean of its
@@ -24,26 +63,38 @@ def test_the_text_conditioning_projects_each_row_once_not_each_token(rng):
     repeated all of it on every device: 2.63 times one device's FLOPs on
     four 3090s. The vector is the same, a trained bias and an empty row
     included, and a longer text adds only its pooling's few operations per
-    element, not a projection's."""
+    element, not a projection's: over drawn texts and times, the pooled
+    projection is on par with projecting each token then pooling, from float64
+    (check 1)."""
     embed = ConditioningEmbed(emb_features=64, mlp_ratio=1)
-    hidden = jax.random.normal(rng, (3, 77, 32))
     mask = jnp.array([[1] * 20 + [0] * 57, [0] * 77, [1] * 77])
-    temb = jnp.array([1.0, 2.0, 3.0])
-    params = embed.init(rng, temb, TextContext(hidden, mask))
+    params = embed.init(rng, jnp.ones(3), TextContext(jnp.ones((3, 77, 32)), mask))
     projection = params["params"]["text_context_proj"]
     projection["bias"] = projection["bias"] + 0.5
 
-    got = embed.apply(params, temb, TextContext(hidden, mask))
-    tokens = hidden @ projection["kernel"] + projection["bias"]
-    want = embed.apply(params, temb, None) + masked_mean(tokens, mask)
-    np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
+    def draw(seed):
+        """A seed's text states and times, the trained parameters held."""
+        texts, times = jax.random.split(jax.random.key(seed))
+        return (params, jax.random.normal(texts, (3, 77, 32)),
+                jax.random.uniform(times, (3,), minval=0.0, maxval=3.0))
 
+    @jax.jit
+    def pooled(params, hidden, temb):
+        return embed.apply(params, temb, TextContext(hidden, mask))
 
+    @jax.jit
+    def each_token(params, hidden, temb):
+        kernel = params["params"]["text_context_proj"]
+        tokens = hidden @ kernel["kernel"] + kernel["bias"]
+        return embed.apply(params, temb, None) + masked_mean(tokens, mask)
+
+    assert_as_exact(pooled, each_token, draw, "pooled text projection", seeds=PROJECTED_SEEDS)
 
 
 def test_padded_rows_do_not_move_the_conditioning_vector():
     """The tokenizer pads every prompt to 77 slots; what the padded rows hold
-    must not reach the adaLN vector. Before the mask, they were averaged in
+    must not reach the adaLN vector: they hold no term of its sum, so it is the
+    same to the bit whatever they hold. Before the mask, they were averaged in
     and moved it."""
     embed = ConditioningEmbed(emb_features=16, mlp_ratio=1)
     key = jax.random.PRNGKey(0)
@@ -55,12 +106,12 @@ def test_padded_rows_do_not_move_the_conditioning_vector():
     baseline = embed.apply(params, temb, TextContext(hidden, mask))
     garbage = hidden.at[0, 3:].set(hidden[0, 3:] + 50.0)
     moved = embed.apply(params, temb, TextContext(garbage, mask))
-    assert jnp.allclose(moved, baseline, atol=1e-5)
+    np.testing.assert_array_equal(moved, baseline)
 
     # the same rows do count once the mask says they are real
     full = jnp.ones_like(mask)
-    assert not jnp.allclose(embed.apply(params, temb, TextContext(garbage, full)),
-                            embed.apply(params, temb, TextContext(hidden, full)), atol=1e-2)
+    assert not np.array_equal(embed.apply(params, temb, TextContext(garbage, full)),
+                              embed.apply(params, temb, TextContext(hidden, full)))
 
 
 def test_two_conditions_cannot_share_one_batch_field():

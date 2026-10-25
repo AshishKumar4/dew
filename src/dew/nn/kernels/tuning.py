@@ -566,10 +566,9 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
         for equation in jaxpr.eqns:
             for parameter in equation.params.values():
                 for inner in parameter if isinstance(parameter, (tuple, list)) else (parameter,):
-                    if isinstance(inner, jax_core.ClosedJaxpr):
+                    # A Jaxpr carries its own constants on JAX 0.12 (ClosedJaxpr is its alias).
+                    if isinstance(inner, jax_core.Jaxpr):
                         constants(inner.consts)
-                        nested(inner.jaxpr)
-                    elif isinstance(inner, jax_core.Jaxpr):
                         nested(inner)
 
     constants(closed.consts)

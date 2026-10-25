@@ -8,7 +8,6 @@ import importlib.util
 import json
 import os
 import posixpath
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -22,6 +21,7 @@ from filelock import FileLock
 
 from dew.cache import dew_cache_dir
 from dew.data.pipeline import Dataset
+from dew.files import published
 
 from ..dataset import Batch, Records
 from .base import Read, ShardManifest, _indexed_manifest, preparing
@@ -383,7 +383,7 @@ class TFDS(Dataset):
                 (staged / "READY").write_text(
                     json.dumps({"source": self.path, "split": self.split, "files": copied})
                 )
-                shutil.move(staged, destination)
+                published(staged, destination)
         return True
 
     def records(self, read: Read) -> Records:

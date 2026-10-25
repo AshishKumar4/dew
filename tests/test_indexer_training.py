@@ -21,7 +21,14 @@ import numpy as np
 import optax
 import pytest
 from recording import RecordingTracker
-from reference_error import assert_as_exact, assert_moves, declared_seeds, indexed_recording, recording
+from reference_error import (
+    assert_as_exact,
+    assert_moves,
+    declared_seeds,
+    indexed_recording,
+    recording,
+    with_gradients,
+)
 
 from dew.data.dataset import Loader
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -87,22 +94,27 @@ def test_the_loss_its_gradient_and_the_selection_are_maxtexts(name):
     selected = top_k_keys(data["scores"], keep, 6)
     np.testing.assert_array_equal(np.asarray(selected), PUBLISHED[f"{mask}/selected"])
 
-    def kl(inputs):
+    @jax.jit
+    def kl(inputs, cotangent):
+        """The loss and its gradient in the scores under `cotangent` (`with_gradients`), the selection
+        read off the scores as given."""
         region = top_k_keys(inputs["scores"], keep, 6) if phase == "sparse" else keep
-
-        def loss(scores):
-            return jnp.mean(indexer_kl(scores, inputs["query"], inputs["key"], region, scale))
-
-        value, gradient = jax.value_and_grad(loss)(inputs["scores"])
+        value, gradient = with_gradients(
+            lambda scores: jnp.mean(indexer_kl(scores, inputs["query"], inputs["key"], region, scale)))(
+            inputs["scores"], cotangent)
         return {"loss": value, "gradient": gradient}
 
     path = FIXTURES / f"recorded_{name}.npz"
     seeds = declared_seeds(path)[name]
-    draw, reference, truth = indexed_recording(recording(path), name, seeds, truth_fn=jax.jit(kl),
-                                               inputs_of=published_inputs)
-    dew = jax.jit(kl)
-    assert_as_exact(lambda index, inputs: dew(inputs), reference, draw, f"{name} indexer loss", seeds=seeds,
-                    truth_fn=truth)
+    # The recording holds the loss's gradient, a scalar loss's under the cotangent 1, which each draw
+    # carries for Dew's arm.
+    recorded_draw, reference, truth = indexed_recording(
+        recording(path), name, seeds, truth_fn=lambda inputs: kl(inputs, np.float64(1)),
+        inputs_of=published_inputs)
+    assert_as_exact(lambda index, inputs, cotangent: kl(inputs, cotangent),
+                    lambda index, inputs, cotangent: reference(index, inputs),
+                    lambda seed: (*recorded_draw(seed), np.float32(1)), f"{name} indexer loss", seeds=seeds,
+                    truth_fn=lambda index, inputs, cotangent: truth(index, inputs))
 
     legacy = fixture()
     legacy_keep = causal(META["length"]) if mask == "causal" else packed_keep(legacy["segments"])

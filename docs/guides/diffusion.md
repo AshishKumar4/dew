@@ -31,7 +31,7 @@ model = SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2,
                   mlp_ratio=2, dtype=jnp.float32, attention_impl="xla")
 objective = DiffusionObjective(model, Flow(), InputSpec(Field("image", (8, 8, 3))),
                                solver=Euler(), steps=4)
-trainer = Trainer(objective, OptimConfig(optimizer="adam", rate=0.001), key=jax.random.key(0))
+trainer = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=0.001), key=jax.random.key(0))
 state = trainer.fit(data, steps=3, log_every=1)
 info = Step(step=state.step, key=jax.random.key(1), ema=state.averaged)
 preview = objective.evaluate(state.variables, batch, info)
@@ -119,7 +119,7 @@ from dew.training import Trainer
 pipe = PretrainedPipeline.load("black-forest-labs/FLUX.1-schnell", dtype="bfloat16")
 tuned = pipe.adapt(LoRA(rank=16, modules=("to_q", "to_k", "to_v", "to_out.0")), key=0)
 objective = DiffusionObjective(tuned)
-state = Trainer(objective, OptimConfig(rate=1e-4), key=0).fit(data, steps=1000)
+state = Trainer(objective, OptimConfig(learning_rate=1e-4), key=0).fit(data, steps=1000)
 tuned.adapter.save(state.variables, "flux-adapter")
 tuned.save("flux-merged", variables=state.variables)
 images = objective.pipeline(state)(["a red bird"], key=0).host().images

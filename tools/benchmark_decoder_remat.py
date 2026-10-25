@@ -8,7 +8,9 @@ cuda. GPU runs set XLA_PYTHON_CLIENT_PREALLOCATE=false. For example:
     python tools/benchmark_decoder_remat.py --width 256 --depth 8 --length 256 --remat full
 
 `--remat` takes a name from `decoder_block.REMAT_POLICIES`; absent, the
-blocks keep every residual.
+blocks keep every residual. `--mixer mamba2` builds Mamba-2 layers in place
+of attention, with heads of 64 at twice the width, a state of 128, one group
+and a conv of 4 taps.
 
 The timed operation is a donated AdamW update on next-token cross entropy.
 Compiler temporary bytes include activation and gradient workspaces. Device
@@ -55,6 +57,8 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES, Mixture
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
+from dew.registry import mixers
+from dew.telemetry.benchmark import carried
 
 
 def main():
@@ -68,17 +72,27 @@ def main():
     parser.add_argument("--case", choices=("dense", "sparse", "shared"), default="dense")
     parser.add_argument("--scan", action="store_true")
     parser.add_argument("--remat", choices=sorted(REMAT_POLICIES), default=None)
+    parser.add_argument("--mixer", choices=("attention", "mamba2"), default="attention")
+    parser.add_argument("--vocab", type=int, default=256)
+    parser.add_argument("--heads", type=int, default=4)
+    parser.add_argument("--kv-heads", type=int, default=2)
+    parser.add_argument("--mlp", type=int, default=None, help="the MLP's width, twice the model's if absent")
+    parser.add_argument("--attention-impl", default="xla")
     args = parser.parse_args()
+    mixer = {} if args.mixer == "attention" else {"mixer": mixers.build("mamba2", {
+        "num_heads": 2 * args.width // 64, "head_dim": 64, "state_size": 128, "n_groups": 1,
+        "conv_kernel": 4})}
     model = CausalTransformer(
-        vocab_size=256, emb_features=args.width, num_layers=args.depth,
-        num_heads=4, num_kv_heads=2, mlp_features=2 * args.width,
-        max_seq_len=args.length, dtype=jnp.dtype(args.dtype), attention_impl="xla",
-        scan_layers=args.scan, remat=args.remat,
+        vocab_size=args.vocab, emb_features=args.width, num_layers=args.depth,
+        num_heads=args.heads, num_kv_heads=args.kv_heads,
+        mlp_features=2 * args.width if args.mlp is None else args.mlp,
+        max_seq_len=args.length, dtype=jnp.dtype(args.dtype), attention_impl=args.attention_impl,
+        scan_layers=args.scan, remat=args.remat, **mixer,
         mixture=Mixture(experts=4, top_k=2) if args.case == "sparse" else None,
         kv_shared_layers=tuple(range(args.depth // 2, args.depth)) if args.case == "shared" else None)
     objective = LMObjective(model, args.length)
     tokens = {"text": jnp.asarray(np.random.default_rng(0).integers(
-        1, 256, (args.batch, args.length + 1)), jnp.int32)}
+        1, args.vocab, (args.batch, args.length + 1)), jnp.int32)}
     info = Step(jnp.zeros((), jnp.int32), jax.random.key(3), None)
     shapes = jax.eval_shape(objective.init, jax.random.key(0))["params"]
     optimizer = optax.adamw(1e-4)
@@ -111,15 +125,12 @@ def main():
     jax.block_until_ready((params, opt_state, tokens))
     device = jax.devices()[0]
     allocated_before = device.memory_stats()
-    params, opt_state, value = jitted(params, opt_state, tokens)
-    for _ in range(2):
-        params, opt_state, value = jitted(params, opt_state, tokens)
-    jax.block_until_ready((params, opt_state, value))
-    started = time.perf_counter()
-    for _ in range(args.steps):
-        params, opt_state, value = jitted(params, opt_state, tokens)
-    jax.block_until_ready((params, opt_state, value))
-    milliseconds = 1000 * (time.perf_counter() - started) / args.steps
+    def stepped(carry):
+        return jitted(carry[0], carry[1], tokens)
+
+    warm, _ = carried(stepped, (params, opt_state, None), 3)
+    (params, opt_state, value), (seconds,) = carried(stepped, warm, args.steps)
+    milliseconds = 1000 * seconds / args.steps
     allocated_after = device.memory_stats()
     print(json.dumps({
         **vars(args), "device": device.device_kind, "backend": jax.default_backend(),
@@ -131,7 +142,8 @@ def main():
         "compiler_output_bytes": None if memory is None else memory.output_size_in_bytes,
         "compiler_alias_bytes": None if memory is None else memory.alias_size_in_bytes,
         "device_live_bytes_before": None if allocated_before is None else allocated_before["bytes_in_use"],
-        "device_peak_bytes_before": None if allocated_before is None else allocated_before["peak_bytes_in_use"],
+        "device_peak_bytes_before":
+            None if allocated_before is None else allocated_before["peak_bytes_in_use"],
         "device_peak_bytes_after": None if allocated_after is None else allocated_after["peak_bytes_in_use"],
     }, sort_keys=True))
 

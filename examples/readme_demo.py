@@ -51,7 +51,7 @@ def language_model(out: Path):
         dtype=jnp.float32, attention_impl="xla",
     )
     objective = LMObjective(model, seq_len=8, ema_decay=0.9)
-    optimizer = OptimConfig(optimizer="adam", rate=0.01)
+    optimizer = OptimConfig(optimizer="adam", learning_rate=0.01)
     checkpoints = Checkpoints(str(out / "lm-checkpoints"))
     trainer = Trainer(objective, optimizer, key=jax.random.key(0),
                       checkpoints=checkpoints)
@@ -86,7 +86,7 @@ def preferences(model, pretrained):
     # The objective predicts three next tokens from each four-ID sequence.
     objective = DPOObjective(model, seq_len=3, beta=0.1, variables=pretrained)
     reference = jax.tree.map(lambda x: np.array(x, copy=True), pretrained)
-    trainer = Trainer(objective, OptimConfig(optimizer="adam", rate=0.001), key=jax.random.key(2))
+    trainer = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=0.001), key=jax.random.key(2))
     state = trainer.fit(data, steps=4, log_every=1)
     delta = max(float(np.max(np.abs(np.asarray(after) - before)))
                 for before, after in zip(jax.tree.leaves(reference),
@@ -110,7 +110,7 @@ def flow_images(out: Path):
         model, Flow(), InputSpec(Field("image", (8, 8, 3))),
         solver=Euler(), guidance=None, steps=4,
     )
-    trainer = Trainer(objective, OptimConfig(optimizer="adam", rate=0.001), key=jax.random.key(3))
+    trainer = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=0.001), key=jax.random.key(3))
     state = trainer.fit(data, steps=3, log_every=1)
     preview = objective.preview(
         state.variables, batch,

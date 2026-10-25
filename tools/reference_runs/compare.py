@@ -1,19 +1,20 @@
 #!/usr/bin/env python3
-"""Compare runs of one reference case against the bound the reference sets.
+"""Report runs of one reference case against the distance the reference sets.
 
 Every run is measured from the truth, the reference framework's fp32 run
-(TF32 off) on the same weights, batches and schedule. The bound in each
-window of steps is the reference's own bf16 run's distance from that truth:
+(TF32 off) on the same weights, batches and schedule. Each window of steps
+reports each run's distance from that truth over the reference's own bf16
+run's distance, its ratio:
 
-    rms_w(run - truth) <= FACTOR * rms_w(reference_bf16 - truth)
+    rms_w(run - truth) / rms_w(reference_bf16 - truth)
 
-the root mean square taken over the window's steps. It is the rule
-tests/reference_error.py applies to single forwards, read over a training
-trajectory: a run that rounds where the reference rounds, or at as many
-points of the same size, lands near a ratio of one; FACTOR 2 admits three
-roundings of the reference's size per one of its own, and a dropped term,
-a wrong scale or a different optimizer moves the ratio by more. Losses are
-compared as differences (nats), gradient norms as relative differences.
+the root mean square taken over the window's steps. A run that rounds where
+the reference rounds, or at as many points of the same size, sits near a
+ratio of one, and a dropped term, a wrong scale or a different optimizer
+moves it further. The report states no verdict: a trajectory's windows are
+not the gate's draws, and accuracy is judged by check 1 at the tests that
+hold the same computations (tests/reference_error.py). Losses are compared
+as differences (nats), gradient norms as relative differences.
 
 Step 0 is reported on its own: both runs hold the same weights and read the
 same batch, so its loss and gradient-norm differences are the forward and
@@ -41,7 +42,6 @@ from common import kernel_summary, trimmed_kernels
 
 from dew.accuracy import rms
 
-FACTOR = 2.0
 CONDITIONS = ("batch", "seq", "schedule_steps", "data_sha256", "lr_peak", "lr_init", "lr_end", "warmup",
               "b1", "b2", "eps", "weight_decay", "clip")
 
@@ -88,9 +88,9 @@ def windows(steps: int, width: int) -> list[tuple[int, int]]:
 
 
 def divergence(truth: dict, reference: dict, runs: dict[str, dict], key: str, relative: bool,
-               width: int, factor: float, rerun: dict | None = None) -> dict:
+               width: int, rerun: dict | None = None) -> dict:
     """Per-window RMS distance from the truth of the reference and each run,
-    and each run's ratio to the bound's unit.
+    and each run's ratio to the unit.
 
     The unit is the reference's distance from the truth, or, with `rerun`
     (a second run of the reference at the same precision), the larger of
@@ -115,11 +115,10 @@ def divergence(truth: dict, reference: dict, runs: dict[str, dict], key: str, re
         reference_rms = rms(reference_gap[section])
         spread = None if spread_gap is None else rms(spread_gap[section])
         unit = reference_rms if spread is None else max(reference_rms, spread)
-        row = {"reference": reference_rms, "spread": spread, "bound": factor * unit}
+        row = {"reference": reference_rms, "spread": spread, "unit": unit}
         for name, gap in gaps.items():
             mine = rms(gap[section])
-            row[name] = {"rms": mine, "ratio": mine / unit if unit > 0 else math.inf,
-                         "within": bool(mine <= factor * unit)}
+            row[name] = {"rms": mine, "ratio": mine / unit if unit > 0 else math.inf}
         return row
 
     for start, stop in windows(steps, width):
@@ -168,7 +167,7 @@ def performance(records: dict[str, dict]) -> dict:
     return rows
 
 
-def router_probes(truth: dict, reference: dict, runs: dict[str, dict], factor: float,
+def router_probes(truth: dict, reference: dict, runs: dict[str, dict],
                   rerun: dict | None = None) -> list[dict]:
     """At every probed step, each run's RMS distance from the truth over the
     routers' per-expert load shares, and over their mean entropies, against
@@ -181,7 +180,7 @@ def router_probes(truth: dict, reference: dict, runs: dict[str, dict], factor: f
     reruns = None if rerun is None else by_step(rerun)
     others = {name: by_step(record) for name, record in runs.items()}
     rows = []
-    print(f"\nrouter probe on a fixed batch, rms from the truth; bound = {factor:g} x unit")
+    print("\nrouter probe on a fixed batch, rms from the truth and its ratio to the unit")
     print(f"  {'step':>5} {'quantity':<8} {'unit':>10}" + "".join(f" {name:>18}" for name in runs))
     steps = set(truths) & set(references)
     for probes in (*others.values(), *(() if reruns is None else (reruns,))):
@@ -198,8 +197,8 @@ def router_probes(truth: dict, reference: dict, runs: dict[str, dict], factor: f
                 name: rms(np.asarray(probes[step][quantity], np.float64) - base)
                 for name, probes in others.items()}}
             print(f"  {step:>5} {quantity:<8} {unit:>10.3e}" + "".join(
-                f" {row[quantity][name]:>10.3e} {row[quantity][name] / unit if unit else math.inf:>5.2f}"
-                f"{'  ' if row[quantity][name] <= factor * unit else ' !'}" for name in runs))
+                f" {row[quantity][name]:>10.3e} {row[quantity][name] / unit if unit else math.inf:>5.2f}  "
+                for name in runs))
         rows.append(row)
     return rows
 
@@ -218,9 +217,8 @@ def main() -> None:
     parser.add_argument("--truth", required=True, help="the reference framework's fp32 run")
     parser.add_argument("--reference", required=True, help="the reference framework's bf16 run")
     parser.add_argument("--run", action="append", default=[], metavar="NAME=PATH",
-                        help="a run held to the bound; repeat for several")
+                        help="a run reported against the reference; repeat for several")
     parser.add_argument("--window", type=int, default=16)
-    parser.add_argument("--factor", type=float, default=FACTOR)
     parser.add_argument("--pair", action="append", default=[], metavar="LEFT=RIGHT",
                         help="kernel-category gaps of LEFT against RIGHT; unset is every run "
                              "against the reference")
@@ -240,40 +238,31 @@ def main() -> None:
     for problem in problems:
         print("  DIFFERS", problem)
 
-    report = {"conditions": problems, "factor": args.factor, "window": args.window}
+    report = {"conditions": problems, "window": args.window}
     series = [("loss", False, "nats"), ("grad_norm", True, "relative")]
     if all("aux_loss" in record for record in everything.values()):
         series.append(("aux_loss", False, "absolute"))
     for key, relative, unit in series:
-        result = divergence(truth, reference, runs, key, relative, args.window, args.factor, rerun)
+        result = divergence(truth, reference, runs, key, relative, args.window, rerun)
         report[key] = result
         unit_name = "reference" if rerun is None else "max(reference, spread)"
-        print(f"\n{key} ({unit}) measured from the truth, rms per window; bound = "
-              f"{args.factor:g} x {unit_name}")
-        print(f"  step 0: truth {result['step0']['truth']:.6f}, reference {result['step0']['reference']:+.3e}, "
-              + ", ".join(f"{name} {result['step0'][name]:+.3e}" for name in runs))
+        print(f"\n{key} ({unit}) measured from the truth, rms per window; each run's ratio to {unit_name}")
+        step0 = result["step0"]
+        print(f"  step 0: truth {step0['truth']:.6f}, reference {step0['reference']:+.3e}, "
+              + ", ".join(f"{name} {step0[name]:+.3e}" for name in runs))
         spread_head = "" if rerun is None else f" {'spread':>10}"
-        header = f"  {'steps':>9} {'reference':>10}{spread_head} {'bound':>10}" + "".join(
-            f" {name:>18}" for name in runs)
-        print(header)
-        for row in result["windows"]:
-            cells = "".join(
-                f" {row[name]['rms']:>10.3e} {row[name]['ratio']:>5.2f}{'  ' if row[name]['within'] else ' !'}"
-                for name in runs)
+        print(f"  {'steps':>9} {'reference':>10}{spread_head}" + "".join(f" {name:>18}" for name in runs))
+        for row in [*result["windows"], {**result["overall"], "steps": None}]:
+            steps = f"{'all':>9}" if row["steps"] is None else f"{row['steps'][0]:>4}-{row['steps'][1]:<4}"
             spread = "" if row["spread"] is None else f" {row['spread']:>10.3e}"
-            print(f"  {row['steps'][0]:>4}-{row['steps'][1]:<4} {row['reference']:>10.3e}{spread} "
-                  f"{row['bound']:>10.3e}{cells}")
-        overall = result["overall"]
-        spread = "" if overall["spread"] is None else f" {overall['spread']:>10.3e}"
-        print(f"  {'all':>9} {overall['reference']:>10.3e}{spread} {overall['bound']:>10.3e}" + "".join(
-            f" {overall[name]['rms']:>10.3e} {overall[name]['ratio']:>5.2f}"
-            f"{'  ' if overall[name]['within'] else ' !'}" for name in runs))
+            print(f"  {steps} {row['reference']:>10.3e}{spread}" + "".join(
+                f" {row[name]['rms']:>10.3e} {row[name]['ratio']:>5.2f}  " for name in runs))
         last = result["last_window_mean"]
         print(f"  last-window mean: truth {last['truth']:.5f}, reference {last['reference']:+.2e}, "
               + ", ".join(f"{name} {last[name]:+.2e}" for name in runs))
 
     if all("router_probe" in record for record in everything.values()):
-        report["router_probe"] = router_probes(truth, reference, runs, args.factor, rerun)
+        report["router_probe"] = router_probes(truth, reference, runs, rerun)
 
     rows = performance(everything)
     report["performance"] = rows

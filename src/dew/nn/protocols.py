@@ -183,6 +183,38 @@ class OutputTable:
                               self.states(hidden), self.matrix, self.precision, compute=self.compute)
         return capped_logits(scaled_logits(logits, self.scale, self.bias), self.softcap, temperature)
 
+    def columns(self, hidden: jax.Array, ids: Sequence[int] | jax.Array, *, temperature: float = 1.0,
+                exact: bool = False) -> jax.Array:
+        """`hidden`'s logits at the vocabulary columns `ids` alone, `[..., len(ids)]`: `logits`
+        restricted to them by construction, the same states (the input quantizer's QDQ), product
+        (`head_product`) at the table's precision and compute, scale and bias at `ids`
+        (`scaled_logits`) and softcap, so a fixed set of a few columns costs no full-vocabulary
+        product. `exact` computes the product in fp32 or wider at fp32 precision, whatever the
+        table's compute, as a readout that reads a label's logit exactly does. (`dew.objectives.lm
+        .chunked`'s support log probabilities restrict each position to its own ids, another
+        contraction.) Static `ids` outside the vocabulary are refused (IndexError); traced ids are
+        the caller's to bound."""
+        if isinstance(ids, jax.Array):
+            index: jax.Array | np.ndarray = ids
+        else:
+            index = np.asarray(ids, np.int64)
+            vocab = self.matrix.shape[0 if self.vocab_major else 1]
+            if index.size and (index.min() < 0 or index.max() >= vocab):
+                raise IndexError(f"columns {index.tolist()} reach past a vocabulary of {vocab}")
+        matrix = jnp.take(self.matrix, index, axis=0 if self.vocab_major else 1)
+        states = self.states(hidden)
+        subscripts = '...d,vd->...v' if self.vocab_major else '...d,dv->...v'
+        if exact:
+            wide = jnp.promote_types(states.dtype, jnp.float32)
+            logits = head_product(subscripts, states.astype(wide),
+                                  matrix.astype(jnp.promote_types(matrix.dtype, jnp.float32)),
+                                  jax.lax.Precision.HIGHEST, compute=wide)
+        else:
+            logits = head_product(subscripts, states, matrix, self.precision, compute=self.compute)
+        scale = None if self.scale is None else jnp.take(self.scale, index)
+        bias = None if self.bias is None else jnp.take(self.bias, index)
+        return capped_logits(scaled_logits(logits, scale, bias), self.softcap, temperature)
+
     def rows(self) -> jax.Array:
         """Each vocabulary token's `[vocab, features]` row: the matrix's, times
         the token's scale, whose dot product with a state is the token's logit
@@ -377,7 +409,11 @@ class CountedVideo(Protocol):
 class CountedDecisions(Protocol):
     """A decision head counts the layout's real questions and options with its rows."""
 
-    def decision_flops(self, lengths: np.ndarray, questions: np.ndarray, options: np.ndarray) -> float: ...
+    def decision_flops(self, lengths: np.ndarray, questions: np.ndarray, options: np.ndarray, *,
+                       pooled: np.ndarray | None = None) -> float:
+        """The head's work over rows of `lengths` tokens, their real questions and options, its spans
+        pooled over `pooled` tokens a row where they are not the row's (a context's)."""
+        ...
 
 
 @runtime_checkable
@@ -419,6 +455,17 @@ class AffineHead(Protocol):
     """
 
     def output_table(self) -> OutputTable | None: ...
+
+
+def head_table(model: nn.Module, variables) -> OutputTable | None:
+    """`model`'s head over `variables` as one matrix (`AffineHead.output_table`),
+    or None for a model whose head no matrix alone is, or that names none: the
+    one checked read of a model's output table, which a loss and a readout share."""
+    table = model.apply(variables, method="output_table") if isinstance(model, AffineHead) else None
+    if table is not None and not isinstance(table, OutputTable):
+        raise TypeError(f"{type(model).__name__}.output_table gives a {type(table).__name__}, "
+                        f"not an OutputTable")
+    return table
 
 
 @runtime_checkable
@@ -503,6 +550,11 @@ class CrossAttending(Protocol):
     def cross_flops(self, lengths, context_lengths) -> float:
         """The cross-attention layers' forward work over rows of `lengths` tokens reading contexts
         of `context_lengths` tokens."""
+        ...
+
+    def token_embeddings(self, tokens: jax.Array) -> jax.Array:
+        """Each token's row of the model's own table, unscaled and without positions: a context's
+        tokens as a cross-attention reads them by the table (`dew.nn.cross_attention.encode_context`)."""
         ...
 
     def with_cross_attention(self, cross: CrossAttention | None) -> Self: ...
@@ -663,6 +715,16 @@ class Serving(Protocol):
     def mixed_admission_refusal(self) -> str | None: ...
 
     def split_prefill_refusal(self) -> str | None: ...
+
+
+@runtime_checkable
+class ShiftsLogits(Protocol):
+    """A masked-diffusion model that declares how its logits line up with its inputs: with
+    `shifted_logits`, position i's prediction is position i-1's logits (Dream-v0's). A model that
+    declares nothing predicts each position's own."""
+
+    @property
+    def shifted_logits(self) -> bool: ...
 
 
 @runtime_checkable

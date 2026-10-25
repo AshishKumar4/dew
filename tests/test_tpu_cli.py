@@ -6,6 +6,7 @@ import subprocess
 import time
 from dataclasses import replace
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -42,6 +43,10 @@ def flag(name, default=""):
 fail = state.get("fail", "")
 if fail and fail in " ".join(argv):
     die("the fake was told to fail here", 3)
+hang = state.get("hang", "")
+if hang and hang in " ".join(argv):
+    import time
+    time.sleep(600)
 
 if program == "rsync":
     raise SystemExit(0)
@@ -112,7 +117,7 @@ class Fake:
         self.root = root
         self.calls_path = root / "calls.jsonl"
         self.state_path = root / "state.json"
-        self.state = {"nodes": {}, "listing": {}}
+        self.state: dict[str, Any] = {"nodes": {}, "listing": {}}
         self.flush()
 
     def flush(self) -> None:
@@ -131,6 +136,11 @@ class Fake:
 
     def fail_on(self, fragment: str) -> None:
         self.state["fail"] = fragment
+        self.flush()
+
+    def hang_on(self, fragment: str) -> None:
+        """Make every call whose arguments hold `fragment` hang, as a gcloud that never answers."""
+        self.state["hang"] = fragment
         self.flush()
 
     @property
@@ -208,6 +218,19 @@ def test_create_uses_the_configured_defaults(fake):
         "compute", "tpus", "tpu-vm", "create", "slice", "--zone=us-central2-b",
         "--accelerator-type=v5litepod-16", "--version=v2-alpha-tpuv5-lite")
     assert json.loads((config_dir() / "zones.json").read_text()) == {"slice": "us-central2-b"}
+
+
+def test_a_wait_on_a_gcloud_that_never_answers_ends_at_its_deadline(fake):
+    """Each readiness probe has what is left of the wait, so a listing that hangs is killed there and
+    the wait ends with the TPU unready, instead of running past its deadline."""
+    from dew.cli.gcloud import Gcloud, Tpu
+
+    fake.offer("slice", "us-central2-b")
+    fake.hang_on("list")
+    began = time.monotonic()
+    with pytest.raises(SystemExit):
+        Tpu(Gcloud("my-project"), "slice", "us-central2-b").ready(wait=2)
+    assert time.monotonic() - began < 60
 
 
 def test_a_dry_run_writes_nothing_it_would_keep(fake):

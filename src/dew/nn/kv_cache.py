@@ -46,6 +46,7 @@ from jax.sharding import PartitionSpec as P
 from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.generation import INHERENT, backend
 from dew.nn.kernels.selection import Kernel, Op, Requirement, selected
+from dew.nn.precision import float32_einsum
 from dew.nn.scatter import DROPPED
 from dew.nn.sharding import LayoutRefused, logical_spec, manual_map, mesh_axes, sequence_shards
 
@@ -178,8 +179,8 @@ def hadamard(size: int) -> jax.Array:
 
 def rotated(values: jax.Array, rotation: jax.Array) -> jax.Array:
     """`values` `[..., head_dim]` times the rotation, computed in float32, in `values`' dtype."""
-    product = jnp.einsum("...d,de->...e", values.astype(jnp.float32), rotation,
-                         precision=jax.lax.Precision.HIGHEST)
+    product = float32_einsum("...d,de->...e", values.astype(jnp.float32), rotation,
+                             precision=jax.lax.Precision.HIGHEST)
     return product.astype(values.dtype)
 
 

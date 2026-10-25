@@ -37,19 +37,28 @@ def checkpoint(tmp_path_factory):
     from transformers.models.muse_glimmer.configuration_muse_glimmer import MuseGlimmerTextConfig
     from transformers.models.muse_glimmer.modeling_muse_glimmer import MuseGlimmerTextModel
 
+    from tools.torch_precision import float64
+
     torch.manual_seed(0)
     config = MuseGlimmerTextConfig(**{key: value for key, value in TEXT.items()
-                                      if key not in ("model_type", "architectures")})
-    model = MuseGlimmerTextModel(config).to(torch.float64).eval()
+                                      if key not in ("model_type", "architectures")}, dtype=torch.float64)
+    # Built inside `float64`, so its rotary table is float64's: built in float32 and cast, it keeps
+    # float32's.
+    with float64():
+        model = MuseGlimmerTextModel(config).eval()
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.add_(torch.randn_like(parameter) * 0.1)
-    head = torch.randn(TEXT["vocab_size"], TEXT["hidden_size"], dtype=torch.float64) * 0.1
+            # The checkpoint's own float32 values, which Dew loads, are the truth's weights.
+            parameter.copy_(parameter.to(torch.float32))
+    head = (torch.randn(TEXT["vocab_size"], TEXT["hidden_size"], dtype=torch.float64) * 0.1).to(torch.float32)
     ids = torch.randint(0, TEXT["vocab_size"], (2, 24))
-    with torch.no_grad():
+    head = head.to(torch.float64)
+    with float64(), torch.no_grad():
         states = model(input_ids=ids).last_hidden_state
     softcap = TEXT["final_logit_softcapping"]
-    logits = softcap * torch.tanh(states @ head.T * TEXT["output_multiplier"] / softcap)
+    with float64():
+        logits = softcap * torch.tanh(states @ head.T * TEXT["output_multiplier"] / softcap)
 
     directory = tmp_path_factory.mktemp("muse-glimmer-text")
     weights = {f"model.{name}": tensor.to(torch.float32).contiguous()
