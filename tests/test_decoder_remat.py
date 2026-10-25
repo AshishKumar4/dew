@@ -99,8 +99,9 @@ STEP_SEEDS = 8
 """Check 1's declared seeds for a recomputed block's committed step against the plain block's (`seeds_for`,
 paired: both arms are one decoder's arithmetic, saved or recomputed), and for its forward."""
 
-MLA_STEP_SEEDS = 16
-"""The latent-attention block's step, unscanned, sized at 16 (`seeds_for`, paired)."""
+SIZED_STEP_SEEDS = {("mla", False): 16, ("altup", True): 128}
+"""The steps that size past STEP_SEEDS (`seeds_for`, paired): the latent-attention block unscanned, and
+the scanned AltUp block, whose initialized draws (zero momentum) spread its step's error wider."""
 
 
 def wide_step(model):
@@ -193,7 +194,7 @@ def test_recomputed_blocks_train_the_same_model(shape, scan):
                     truth_fn=jax.jit(lambda variables, *_: wide.apply(variables, ids)))
     assert_as_exact(committed(rerun), committed(run), draw,
                     f"a recomputed {shape} block's step, scan {scan}",
-                    seeds=MLA_STEP_SEEDS if shape == "mla" and not scan else STEP_SEEDS,
+                    seeds=SIZED_STEP_SEEDS.get((shape, scan), STEP_SEEDS),
                     truth_fn=committed(wide_step(plain)))
     moved, state, tokens, key = draw(0)
     key = jax.random.wrap_key_data(key)
