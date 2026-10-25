@@ -55,6 +55,7 @@ import datetime
 import hashlib
 import json
 import math
+import os
 from collections.abc import Callable, Mapping, Sequence
 from types import TracebackType
 from typing import TYPE_CHECKING, Literal, Protocol, overload, runtime_checkable
