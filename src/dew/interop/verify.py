@@ -105,13 +105,14 @@ _FALLBACK = 'Pretrained.load(..., fallback="torchax")'
 _ROUNDING = 6.46
 # How much farther the source's float32 gradient of any parameter may be from the float64 truth than
 # Dew's own float32 gradient of it is (`gradient_parity`, each parameter's pooled over its elements on
-# the probe's draw): rounding alone puts the two arms alike whatever the model's conditioning, and a
-# backward the source's forward does not show (a hook, a custom autograd function) orders of magnitude
-# apart.
-# Twice the largest tools/gradient_parity.py measured over the types and compositions that assemble
-# from parts: 1.261 (gemma; llama 1.047, mistral 1.047, mixtral 1.116, qwen2 1.155, qwen3 1.142,
-# qwen3_moe 1.081, Llama's attention with Mixtral's experts and Gemma's norms 1.164), transformers 5.16.1.
-_GRADIENT_PARITY = 2.53
+# the probe's draw). Two float32 roundings of one gradient put the ratio near one: tools/gradient_parity.py
+# measured 1.05 to 1.26 over the types and compositions that assemble from parts, and the tests' MoE
+# sources reach 2.70 on their smaller leaves, whose few elements make one draw's ratio spread. A backward
+# the source's forward does not show (a hook, a custom autograd function) that moves a gradient by a
+# relative r puts it near r / eps. The bound is the geometric middle of the two, eps ** -0.5 (2 ** 11.5,
+# 2896): a draw's rounding spread stays orders of magnitude below it, and any backward that moves a
+# gradient by more than about 3.5e-4 of itself, the square root of eps, is above it.
+_GRADIENT_PARITY = float(np.finfo(np.float32).eps) ** -0.5
 
 
 _REMOTE_CLASSES = ('AutoConfig', 'AutoModelForCausalLM')
@@ -638,7 +639,7 @@ def _trained(reference: PreTrainedModel, assembly: parts.Assembly, family: decod
     parity = gradient_parity(reference, family, record, variables)
     if not parity <= _GRADIENT_PARITY:
         raise _Mismatch(f"{name}'s gradients are {parity:.2f} times as far from the float64 truth as Dew's, "
-                        f"past the {_GRADIENT_PARITY} rounding reaches")
+                        f"past the {_GRADIENT_PARITY:.0f} that tells rounding from another backward")
 
 
 def verify_mapping(hf_config: Mapping[str, object], *,
