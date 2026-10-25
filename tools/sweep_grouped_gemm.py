@@ -115,30 +115,63 @@ def _part(name, product, implementation, sample, part, parts, lock, wanted, resu
 
     timings = tuning.measured(launch, ba, arrays=list(call), outputs=check, configs=configs[part::parts],
                               gpu=lambda: lock, compilers=max(1, (os.cpu_count() or 1) // parts))
-    results.put((*_summarized(timings), errors))
+    results.put((part, *_summarized(timings), errors))
 
 
-def _timed_apart(name, product, implementation, sample, parts, want) -> tuple[dict, dict, dict]:
+class PartDied(RuntimeError):
+    """A process of `_timed_apart` that exited without its share's results (killed out of memory, a
+    compiler's abort): its part and exit code."""
+
+
+def _timed_apart(name, product, implementation, sample, parts, want, *,
+                 part=_part) -> tuple[dict, dict, dict]:
     """A record timed by `parts` processes at once (`--processes`), each compiling its share of the configs
-    while another's run holds the GPU, the truth `want` read from a file they share."""
+    while another's run holds the GPU, the truth `want` read from a file they share. Results are collected
+    while the processes' exits are watched: one that exits without its results (killed, aborted) raises
+    `PartDied` once its siblings are stopped and reaped, never leaving the record waiting on it."""
+    import contextlib
     import multiprocessing
+    import queue
     import tempfile
 
     import numpy as np
 
     context = multiprocessing.get_context("spawn")
     lock, results = context.Lock(), context.Queue()
+    gathered = {}
     with tempfile.NamedTemporaryFile(suffix=".npy") as file:
         np.save(file.name, np.asarray(want, np.float32))
-        workers = [context.Process(target=_part, args=(name, product, implementation, sample, part, parts,
-                                                       lock, file.name, results)) for part in range(parts)]
+        workers = [context.Process(target=part, args=(name, product, implementation, sample, index, parts,
+                                                      lock, file.name, results)) for index in range(parts)]
         for worker in workers:
             worker.start()
-        gathered = [results.get() for _ in workers]
-        for worker in workers:
-            worker.join()
+        try:
+            while len(gathered) < parts:
+                with contextlib.suppress(queue.Empty):
+                    # Five seconds of no result: the processes' exits are looked at.
+                    index, *share = results.get(timeout=5)
+                    gathered[index] = share
+                    continue
+                dead = [index for index, worker in enumerate(workers)
+                        if index not in gathered and not worker.is_alive()]
+                if dead:
+                    # A result put just before its process exited may still be in the queue's pipe.
+                    try:
+                        index, *share = results.get(timeout=2)
+                        gathered[index] = share
+                        continue
+                    except queue.Empty:
+                        index = dead[0]
+                        raise PartDied(f"{name} {product} {implementation}: part {index} of {parts} exited "
+                                       f"{workers[index].exitcode} without its results") from None
+        finally:
+            for worker in workers:
+                if worker.is_alive():
+                    worker.terminate()
+            for worker in workers:
+                worker.join()
     times, failures, errors = {}, {}, {}
-    for part_times, part_failures, part_errors in gathered:
+    for part_times, part_failures, part_errors in gathered.values():
         times |= part_times
         failures |= part_failures
         errors |= part_errors
@@ -158,7 +191,7 @@ def sampled(launch, ba, target, count: int):
     return ranked[:count] + [rest[round(index * spacing)] for index in range(count)]
 
 
-def main() -> None:
+def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", type=Path, required=True)
@@ -218,8 +251,17 @@ def main() -> None:
 
                 configs = sampled(launch, ba, target, args.sample)
                 if args.processes > 1:
-                    times, failures, errors = _timed_apart(name, product, launch.name, args.sample,
-                                                           args.processes, want)
+                    try:
+                        times, failures, errors = _timed_apart(name, product, launch.name, args.sample,
+                                                               args.processes, want)
+                    except PartDied as died:
+                        # The record's failure written beside the records before it; the sweep stops.
+                        records.append({"shape": name, "product": product, "implementation": launch.name,
+                                        "times": {}, "failures": {"process": str(died)}, "worst_error": None})
+                        args.out.write_text(json.dumps({"provenance": provenance, "records": records},
+                                                       indent=1))
+                        print(died, file=sys.stderr, flush=True)
+                        return 1
                 else:
                     timings = tuning.measured(launch, ba, arrays=list(call), outputs=check, configs=configs)
                     times, failures = _summarized(timings)
@@ -230,6 +272,7 @@ def main() -> None:
                 print(json.dumps({key: value for key, value in record.items() if key != "times"}), flush=True)
                 args.out.write_text(json.dumps({"provenance": provenance, "records": records}, indent=1))
         del truth
+    return 0
 
 
 if __name__ == "__main__":
