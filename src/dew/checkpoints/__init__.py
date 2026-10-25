@@ -52,6 +52,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import datetime
+import functools
 import hashlib
 import json
 import math
@@ -1930,7 +1931,10 @@ def averaged(runs: Sequence[str | os.PathLike[str]], *, step: int | str | None =
     across the runs. `trust` is as `run_record` takes it."""
     if len(runs) < 2:
         raise ValueError(f"an average is of two or more runs, got {len(runs)}")
-    means: list[list[np.ndarray]] = []
+    from dew.coordination import agreed
+    from dew.training.host import place_leaf
+
+    means: list = []
     structure, firsts, model, read = None, [], None, []
     for count, run in enumerate(runs, start=1):
         tree, base, entry = _effective_weights(str(epath.Path(run)), step, ema, mesh, layout, trust)
@@ -1941,66 +1945,55 @@ def averaged(runs: Sequence[str | os.PathLike[str]], *, step: int | str | None =
         leaves, shape = jax.tree.flatten(tree)
         del tree
         if structure is None:
-            structure, firsts = shape, [_Placed.of(leaf) for leaf in leaves]
-            means = [first.local(leaf) for first, leaf in zip(firsts, leaves, strict=True)]
-        elif shape != structure or any(np.shape(leaf) != first.shape for first, leaf in zip(
-                firsts, leaves, strict=True)):
+            structure, firsts = shape, [getattr(leaf, "sharding", None) for leaf in leaves]
+            means = [_held(leaf, sharding) for leaf, sharding in zip(leaves, firsts, strict=True)]
+            del leaves
+            read.append(entry)
+            continue
+        if shape != structure or any(np.shape(leaf) != tuple(held.shape) for held, leaf in zip(
+                means, leaves, strict=True)):
             raise ValueError(f"the run in {entry[0]} holds other variables than {read[0][0]}")
-        else:
-            # Each leaf is taken in and let go in turn, so the run's tree leaves as the mean takes it.
-            for index, leaf in enumerate(leaves):
-                means[index] = [_taken(held, piece, count, entry[0], read[0][0])
-                                for held, piece in zip(means[index], firsts[index].local(leaf), strict=True)]
-                leaves[index] = None
+
+        # A process whose shards refuse the run reports it where every process agrees on the run, so
+        # none of them reads the next one alone.
+        agreed(f"averaging {entry[0]}", functools.partial(_taken_in, means, leaves, firsts, count, entry[0],
+                                                          read[0][0]))
         del leaves
         read.append(entry)
     assert structure is not None and model is not None
-    placed = [first.assembled(pieces) for first, pieces in zip(firsts, means, strict=True)]
+    placed = [held if sharding is None else place_leaf(held, sharding)
+              for held, sharding in zip(means, firsts, strict=True)]
     return Averaged(jax.tree.unflatten(structure, placed), model, tuple(read))
 
 
-@dataclasses.dataclass(frozen=True)
-class _Placed:
-    """Where the first run's leaf is (`averaged`): its global shape and, for a device array, its
-    sharding, the devices of this process that hold its shards, and which distinct block of the leaf
-    each holds (`blocks`), a replicated block held by several devices taken once."""
-
-    shape: tuple[int, ...]
-    sharding: jax.sharding.Sharding | None
-    devices: tuple = ()
-    blocks: tuple[tuple, ...] = ()
-
-    @classmethod
-    def of(cls, leaf) -> _Placed:
-        if not isinstance(leaf, jax.Array):
-            return cls(tuple(np.shape(leaf)), None)
-        shards = leaf.addressable_shards
-        return cls(tuple(leaf.shape), leaf.sharding, tuple(shard.device for shard in shards),
-                   tuple(_block(shard.index) for shard in shards))
-
-    def local(self, leaf) -> list[np.ndarray]:
-        """`leaf` placed as the first run's, as each distinct block this process holds of it, on the
-        host, a floating one in fp32 (`_on_host`)."""
-        if self.sharding is None:
-            return [_on_host(leaf)]
-        if not isinstance(leaf, jax.Array) or leaf.sharding != self.sharding:
-            leaf = jax.device_put(leaf, self.sharding)
-        held = {_block(shard.index): shard.data for shard in leaf.addressable_shards}
-        return [_on_host(held[block]) for block in dict.fromkeys(self.blocks)]
-
-    def assembled(self, pieces: list[np.ndarray]):
-        """The leaf whose distinct blocks on this process are `pieces`, placed as the first run's."""
-        if self.sharding is None:
-            return pieces[0]
-        by_block = dict(zip(dict.fromkeys(self.blocks), pieces, strict=True))
-        return jax.make_array_from_single_device_arrays(
-            self.shape, self.sharding, [jax.device_put(by_block[block], device)
-                                        for block, device in zip(self.blocks, self.devices, strict=True)])
+def _taken_in(means: list, leaves: list, firsts: list, count: int, directory: str, first: str) -> None:
+    """`means` with the `count`th run's `leaves` taken in (`_mean_of`), each let go in turn, so the run's
+    tree leaves as the mean takes it."""
+    for index, leaf in enumerate(leaves):
+        means[index] = _mean_of(means[index], _held(leaf, firsts[index]), count, directory, first)
+        leaves[index] = None
 
 
-def _block(index: tuple[slice, ...]) -> tuple:
-    """A shard's place in its leaf (`Shard.index`) as a key: each dimension's start, stop and step."""
-    return tuple((part.start, part.stop, part.step) for part in index)
+def _held(leaf, sharding):
+    """`leaf` on the host as the shards this process holds of it, placed as the first run's
+    (`dew.training.host.Held`, which holds a replicated block once), a floating one in fp32; a host
+    leaf whole."""
+    from dew.training.host import Held
+
+    if sharding is None:
+        return _on_host(leaf)
+    if not isinstance(leaf, jax.Array) or leaf.sharding != sharding:
+        leaf = jax.device_put(leaf, sharding)
+    held = Held.of(leaf)
+    return Held(held.shape, {index: _on_host(block) for index, block in held.shards.items()})
+
+
+def _mean_of(mean, taken, count: int, directory: str, first: str):
+    """The running mean `mean` with the `count`th run's `taken` (`_held`'s), block by block (`_taken`)."""
+    if isinstance(mean, np.ndarray):
+        return _taken(mean, taken, count, directory, first)
+    return type(mean)(mean.shape, {index: _taken(block, taken.shards[index], count, directory, first)
+                                   for index, block in mean.shards.items()})
 
 
 def _effective_weights(directory: str, step: int | str | None, ema: bool | None, mesh, layout,
