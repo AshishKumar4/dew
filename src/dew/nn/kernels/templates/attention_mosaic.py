@@ -414,17 +414,19 @@ def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int
     """The registers a backward launch's consumer holds at `config` (`mosaic.live_registers`): a dQ consumer's
     dQ sums `[bq, D]` fp32 carried (and the accurate form's keyed sums), beside a step's logits and output
     cotangents' products fp32, then its score cotangents fp32 and their parts in the operands' dtype; a dK/dV
-    consumer's dK and dV sums `[bk, D]`, `[bk, Dv]` fp32 carried, beside a step's two products, and a fused
-    launch's dQ tile `[bq, D]` fp32."""
+    consumer's dK and dV sums `[bk, D]`, `[bk, Dv]` fp32 carried, beside a step's two products `[bk, bq]`,
+    then its weights and score cotangents fp32 and the products' left operands from registers in the
+    operands' dtype (dV's weights, dK's parts), and a fused launch's dQ tile `[bq, D]` fp32."""
     block_q, block_k = config.block_q, config.block_k
     products = [(block_q, block_k, jnp.float32)] * 2
+    operands = [(block_q, block_k, dtype)] * _parts(accurate, dtype)
     if dq:
         carried = [(block_q, width, jnp.float32)] * (2 if accurate else 1)
-        cotangents = [(block_q, block_k, jnp.float32), *[(block_q, block_k, dtype)] * _parts(accurate, dtype)]
-        return mosaic.live_registers(family, carried, products, cotangents)
+        return mosaic.live_registers(family, carried, products, [(block_q, block_k, jnp.float32), *operands])
     carried = [(block_k, width, jnp.float32), (block_k, value_width, jnp.float32)]
     fused = [(block_q, width, jnp.float32)] if config.fused else []
-    return mosaic.live_registers(family, carried, products, fused)
+    step = [(block_k, block_q, jnp.float32), (block_k, block_q, dtype), *operands, *fused]
+    return mosaic.live_registers(family, carried, products, step)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -498,7 +500,6 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         width, value_width = (_width(array.shape[-1], family, dtype) for array in (query, value))
         padded_q, padded_k = _padded(query.shape[1], key.shape[1], config)
         dkv = _staged(_dkv_allocations(family, config, width, value_width, dtype,
-                                       parts=_parts(self.accurate, dtype),
                                        stages=min(config.stages, padded_q // config.block_q)))
         if config.fused:
             return dkv
@@ -541,11 +542,12 @@ def _backward_costs(op: MosaicBackward, ba: tokamax.BoundArguments, config: Back
       with the key slot (`algebra.cotangent_parts`) and the accurate form's keyed weights' parts' too
       (`algebra.weights_parts`), the parts in registers;
     - the dK/dV launch's (a key head's consumers' key blocks) walking the query tiles reading them
-      (`_readers`), a step's logits and output cotangents' products against its resident keys and values,
-      then dV's from its staged weights and dK's from each staged part, against the query and cotangent
-      slots, the staged parts written before their products read them (`serial_staged`); a fused launch's
-      dQ tile, the staged part times the resident keys, added into dQ in fp32 through its output stage and
-      the L2 (read and written) in place of the dQ launch;
+      (`_readers`), a step's logits and output cotangents' products, keys by queries, of its resident keys
+      and values with the query and cotangent slots, then dV's from its weights and dK's from each part,
+      both in registers, against the cotangent and query slots (FlashAttention-3's); a fused launch's dQ
+      tile, its staged part's transpose times the resident keys, the part written before its product reads
+      it (`serial_staged`), added into dQ in fp32 through its output stage and the L2 (read and written) in
+      place of the dQ launch;
     - each streamed tile written once a program, each resident or staged block once, each output staged
       and stored; every array read once a launch and every gradient written once in fp32, the dQ launch's
       rows only for the score kinds it sums (`DQ_GRADS`);
@@ -586,16 +588,16 @@ def _backward_costs(op: MosaicBackward, ba: tokamax.BoundArguments, config: Back
     consumed, streamed = _readers(causal, consumers, block_q, block_k, key_programs, padded_q // block_q,
                                   keys)
     slot = block_q * (width + value_width) * size
-    # A step's reads: the logits' and cotangents' slots and resident blocks, dV's staged weights and
-    # cotangent slot, each dK part and its query slot, a fused step's staged part and resident keys.
-    dkv_reads = ((block_q + block_k) * (width + value_width) + tile + block_q * value_width
-                 + parts * (tile + block_q * width) + fused * (tile + block_k * width)) * size
+    # A step's reads: the logits' and cotangents' slots and resident blocks, dV's cotangent slot, each dK
+    # part's query slot, a fused step's staged part and resident keys.
+    dkv_reads = ((block_q + block_k) * (width + value_width) + block_q * value_width
+                 + parts * block_q * width + fused * (tile + block_k * width)) * size
     once = key_programs * consumers * block_k * (width + value_width) * (size + 2 * 4)
     dkv_staged = streamed * slot + consumed * dkv_reads + once
     dkv_products = width + 2 * value_width + width * parts + width * fused
-    # A step's staged parts, written before their products read them, and a fused step's dQ tile, staged
-    # and added by TMA, which its next store waits for.
-    dkv_serial = (1 + parts) * tile * size + fused * 2 * block_q * width * 4
+    # A fused step's staged part, written before its product reads it, and its dQ tile, staged and added by
+    # TMA, which its next store waits for.
+    dkv_serial = fused * (tile * size + 2 * block_q * width * 4)
     written = key_rows * (width + value_width) * 4
     l2 = batch * heads * streamed * slot
     # Around the launches: D from the split sums and the anchor's value row, gathered from the values for

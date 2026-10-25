@@ -481,6 +481,54 @@ def test_a_training_step_holding_its_sums_and_anchor_row_is_the_gathering_steps_
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
 
 
+@pytest.mark.parametrize("form", ["causal", "spans"])
+@pytest.mark.parametrize("how", [algebra.Recompute(), algebra.Recompute(exact=True), algebra.Recompute(0.5)],
+                         ids=["fast", "exact", "raw"])
+def test_a_tile_whose_rows_are_its_keys_is_the_query_rows_tile_transposed(form, how):
+    """The backward's tile functions over a tile whose rows are its keys (`keyed`, `[bk, bq]`: a product
+    that takes the keys as M, FlashAttention-3's dK/dV) give the transpose of their query-rows results,
+    bitwise: the visibility (`seen`: a causal call's diagonal and padding keys, or a spans call's
+    intervals and documents), the weights (`normalized`), the score cotangents (`grad_scores`) and a score
+    hook's pulled pieces (`pulled`: a key's sums, a query's and a tile's, on cotangents and slopes whose
+    products and sums are exact, so the axis a sum runs along changes none)."""
+    rng = np.random.default_rng(0)
+    rows, columns = 16, 24
+    q_pos, k_pos = 40 + np.arange(rows)[:, None], 32 + np.arange(columns)[None, :]
+    spans = ids = None
+    if form == "spans":
+        start = rng.integers(20, 40, rows)
+        spans = ((jnp.asarray(start), jnp.asarray(start + rng.integers(1, 30, rows))),)
+        ids = (jnp.asarray(rng.integers(0, 2, rows)), jnp.asarray(rng.integers(0, 2, columns)))
+    spec = algebra.Forward(form, 50, ids=ids is not None, scale=0.5, natural=True)
+    tile = jnp.asarray(rng.normal(size=(rows, columns)) * 4, jnp.float32)
+    peak, total = jnp.asarray(rng.normal(size=rows) + 6, jnp.float32), jnp.asarray(rng.uniform(1, 9, rows))
+    anchor, delta = (jnp.asarray(rng.normal(size=rows), jnp.float32) for _ in range(2))
+    chosen = jnp.asarray(rng.integers(32, 56, rows))
+    products = jnp.asarray(rng.normal(size=(rows, columns)), jnp.float32)
+    kinds = (template.Kind.HEAD, template.Kind.QUERY, template.Kind.KEY, template.Kind.TILE)
+    cotangents = jnp.asarray(rng.integers(-8, 8, (rows, columns)), jnp.float32)
+    slopes = tuple(jnp.asarray(rng.integers(-4, 4, (rows, columns)), jnp.float32) for _ in range(5))
+
+    def computed(keyed: bool):
+        # Each tile and each tile-shaped coordinate transposed where the rows are the keys.
+        turned = (lambda x: x.T) if keyed else (lambda x: x)
+        coords = algebra.Coords(jnp.asarray(turned(q_pos)), jnp.asarray(turned(k_pos)), spans, ids)
+        seen = algebra.seen(spec, coords, turned(tile), keyed)
+        logits = algebra.where_seen(seen, turned(tile), -jnp.inf)
+        exponentials, weights = algebra.normalized(logits, peak, total, how, keyed)
+        at_anchor = coords.k_pos == algebra.per_query(chosen, turned(tile), keyed)
+        scores = algebra.grad_scores(exponentials, turned(products), anchor, delta, seen, at_anchor,
+                                     algebra.inverse(total), keyed=keyed)
+        pulled, pieces = algebra.pulled(turned(cotangents), tuple(map(turned, slopes)), seen, kinds,
+                                        keyed=keyed)
+        tiles = (seen, exponentials, weights, scores, pulled, pieces[3])
+        return tuple(turned(x) for x in tiles), pieces[:3]
+
+    (tiles, sums), (keyed_tiles, keyed_sums) = computed(keyed=False), computed(keyed=True)
+    for mine, theirs in zip((*keyed_tiles, *keyed_sums), (*tiles, *sums), strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
+
+
 @pytest.mark.parametrize("edge", ["small scale", "large scale"])
 def test_the_accurate_form_is_as_exact_as_the_reference_at_its_raw_domains_edges(edge):
     """The accurate form at scales just outside the raw form's domain (`algebra.RAW_SCALES`), where raw
