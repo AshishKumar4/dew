@@ -471,7 +471,8 @@ def test_a_failing_site_raises_its_findings_as_data():
         assert_as_exact(_lost_term, _product, _draw, "lost", seeds=seeds_for(_product, _draw, "product"))
     assert str(raised.value) == "\n".join(map(str, raised.value.findings))
     pooled = [finding for finding in raised.value.findings if finding.rule == "pooled"]
-    assert pooled and all(finding.leaf.startswith("lost") and finding.measure > PARITY for finding in pooled)
+    assert pooled and all(finding.leaf.startswith("lost") and finding.measure > math.log(PARITY)
+                          for finding in pooled)
 
 
 def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
