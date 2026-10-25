@@ -667,6 +667,27 @@ def test_a_launch_takes_approximate_math_only_where_no_hook_computes_a_transcend
                                                     differentiated=differentiated) == approximated
 
 
+@pytest.mark.parametrize("operation", sorted(attention_mosaic_program.APPROXIMATED - {"pow"}))
+def test_every_approximated_operation_in_a_hook_takes_exact_math(operation):
+    """A score hook and an output hook each computing one operation Mosaic GPU approximates under
+    `approx_math` (`APPROXIMATED`) take exact math, in the forward and differentiated: no such operation of
+    a hook passes unseen."""
+    def applied(x):
+        return getattr(jax.lax, operation)(jnp.abs(x) + 1.0)
+
+    def score_mod(s, q_pos, k_pos):
+        del q_pos, k_pos
+        return s + applied(s)
+
+    def output_mod(out):
+        return applied(out)
+
+    for hooks in (template.Hooks(score_mod), template.Hooks(output_mod=output_mod)):
+        for differentiated in (False, True):
+            assert not attention_mosaic_program.approximate(hooks, (64, 64), 64,
+                                                            differentiated=differentiated)
+
+
 def _fullest(op, ba, target):
     """The fitting config of `op`'s launch of `ba` on `target` that stages the most shared memory."""
     return max(op.fitting(ba, target), key=lambda config: op.staged_bytes(ba, config, target))
