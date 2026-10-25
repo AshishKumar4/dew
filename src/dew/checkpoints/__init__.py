@@ -746,12 +746,9 @@ a resume refuses the checkpoint by name rather than as a mismatched tree."""
 
 
 def _keys(tree) -> set[str]:
-    """Every mapping key anywhere in a checkpoint's metadata `tree`."""
-    if isinstance(tree, Mapping):
-        return set(tree).union(*(_keys(value) for value in tree.values()))
-    if isinstance(tree, list | tuple):
-        return set().union(*(_keys(value) for value in tree))
-    return set()
+    """Every mapping key on a leaf's path in a checkpoint's metadata `tree`."""
+    return {entry.key for path, _ in jax.tree_util.tree_flatten_with_path(tree)[0] for entry in path
+            if isinstance(entry, jax.tree_util.DictKey)}
 
 
 def _check_template(template, metadata, stored, *, mapping: bool) -> None:
