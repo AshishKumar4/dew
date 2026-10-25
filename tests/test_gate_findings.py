@@ -89,7 +89,8 @@ def test_a_subnormal_row_error_and_an_overflowing_sum_still_measure_a_worse_cand
     """A row error of 2^-1030 and one of 2^-1029 over a reference row error of zero (the row normalized by
     a size of 2^500) measure apart, the larger larger, where flooring them at the least normal would
     measure both alike; and a check-1 site whose per-seed squared errors are finite but sum past
-    float64's range measures its pooled ratio finitely, a farther Dew larger."""
+    float64's range measures its pooled ratio finitely, a farther Dew larger, and so does one whose
+    reference is exactly float64 (its measure Dew's own distance)."""
     truth = np.array([[2.0 ** 500, 0.0], [0.0, 0.0]])
     reference = np.array([[2.0 ** 500, 0.0], [2.0 ** -520, 2.0 ** -520]])
     measures = []
@@ -110,6 +111,16 @@ def test_a_subnormal_row_error_and_an_overflowing_sum_still_measure_a_worse_cand
 
     def truth_fn(x):
         return {"y": x}
+
+    exact = []
+    for far in (1e154, 1.2e154):
+        with pytest.raises(GateFailure) as raised:
+            assert_as_exact(lambda x, far=far: {"y": x + far}, lambda x: {"y": x}, draw, "exact far", seeds=8,
+                            truth_fn=truth_fn)
+        [finding] = [finding for finding in raised.value.findings if finding.rule == "exact reference"]
+        assert math.isfinite(finding.measure)
+        exact.append(finding.measure)
+    assert exact[0] < exact[1]
 
     measures = []
     for far in (1e154, 1.2e154):
