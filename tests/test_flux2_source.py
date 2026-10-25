@@ -263,6 +263,13 @@ def test_the_autoencoder_folds_and_normalizes_as_the_pipeline_does(source, array
 
 
 @pytest.mark.network
+PUBLISHED_CROPS = 8
+"""The noisy crops of the published autoencoder's draw, each its own noise, code and cotangent: its code
+gradient reads a 4x6 code a crop, whose group norms read too few positions for one crop's code gradient
+to resolve 1.5 within 64 seeds (the reference compared with itself, on an A100); a draw of eight
+averages eight times the positions for far less than eight times a draw's cost."""
+
+
 def test_the_published_autoencoder_matches_the_source(monkeypatch):
     """FLUX.2's VAE as `FLUX.2-klein-4B` publishes it (the one FLUX.2 [dev]
     ships), downloaded, against the source loaded beside it in float32 and
@@ -291,12 +298,13 @@ def test_the_published_autoencoder_matches_the_source(monkeypatch):
     model = AutoencoderKLFlux2.from_pretrained(repo, subfolder="vae", revision=revision).eval().to(device)
     with float64():
         wide = copy.deepcopy(model).double()
-    smooth = tool.smooth_image()[..., :64, :96]
-    folded = (1, 128, 4, 6)
-    assert autoencoder.encode(params, nhwc(smooth)).shape == (1, 4, 6, 128)
+    smooth = np.repeat(tool.smooth_image()[..., :64, :96], PUBLISHED_CROPS, axis=0)
+    folded = (PUBLISHED_CROPS, 128, 4, 6)
+    assert autoencoder.encode(params, nhwc(smooth)).shape == (PUBLISHED_CROPS, 4, 6, 128)
 
     def draw(seed):
-        """The smooth image with fresh noise, and normal codes and cotangents."""
+        """PUBLISHED_CROPS copies of the smooth crop, each with fresh noise, and normal codes and
+        cotangents."""
         rng = np.random.default_rng([19, seed])
         image = np.clip(smooth + 0.05 * rng.standard_normal(smooth.shape), -1, 1).astype(np.float32)
         return (image, *(rng.standard_normal(shape).astype(np.float32)
