@@ -655,13 +655,13 @@ def materialized(op: KernelOp, ba: tokamax.BoundArguments, arrays: list | None =
 
 
 def measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None, *,
-             arrays: list | None = None, results: dict | None = None) -> Timings:
+             arrays: list | None = None, outputs: dict | None = None) -> Timings:
     """Every config of `ba`'s launch (at its key's shapes), each compiled on a
     thread and timed alone: the device time CUPTI reads for the launch's own
     kernels, each run after `FLUSH_BYTES` are read, so every config starts
     with its operands out of cache. `profiler` is Mosaic GPU's, whose `Cupti`
     reads the times, or a stand-in with its `Cupti`; `arrays`, a caller's own
-    draw of the launch's operands (`materialized`), else the tuner's; `results`,
+    draw of the launch's operands (`materialized`), else the tuner's; `outputs`,
     where given, takes each timed config's outputs from its first run, so a
     caller checking them compiles nothing more."""
     if profiler is None:
@@ -701,10 +701,10 @@ def measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None, *,
         for config, future in futures.items():
             try:
                 executable, lowering, compiling = future.result()
-                (_, outputs), first = cupti.measure(executable, aggregate=False)(flush, arrays)
-                if results is not None:
-                    results[config] = outputs
-                del outputs
+                (_, launched), first = cupti.measure(executable, aggregate=False)(flush, arrays)
+                if outputs is not None:
+                    outputs[config] = launched
+                del launched
                 runs = [first if isinstance(first, list) else [],
                         *(_kernel_times(cupti, executable, flush, arrays) for _ in range(REPEATS - 1))]
             except jax.errors.JaxRuntimeError as error:
