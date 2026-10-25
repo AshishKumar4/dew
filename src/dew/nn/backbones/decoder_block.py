@@ -417,6 +417,7 @@ class RematPolicy:
 REMAT_POLICIES: Mapping[str, RematPolicy] = {
     'full': RematPolicy(),
     'all_but_delta_memory': RematPolicy(recompute=('delta_memory',)),
+    'minimal_with_scan_and_conv': RematPolicy(save=(*ATTENTION_RESIDUALS, 'scan', 'conv', *MLP_RESIDUALS)),
     'minimal_with_conv': RematPolicy(save=(*ATTENTION_RESIDUALS, 'conv', *MLP_RESIDUALS)),
     'minimal': RematPolicy(save=ATTENTION_RESIDUALS + MLP_RESIDUALS),
     'minimal_with_context': RematPolicy(save=(*ATTENTION_RESIDUALS, 'context', *MLP_RESIDUALS)),
@@ -430,7 +431,11 @@ REMAT_POLICIES: Mapping[str, RematPolicy] = {
 }
 """MaxText's remat recipes (nnx_decoders.py, get_remat_policy), fastest and
 largest first, and Dew's `all_but_delta_memory`, which recomputes only a
-delta rule's memory. `full` keeps nothing but the block's inputs."""
+delta rule's memory, and `minimal_with_scan_and_conv` and
+`minimal_with_conv`, which keep a recurrence's scan output and its conv, or
+the conv alone, beside `minimal`'s. The context recipes keep a mixer's output
+of either kind, attention's context or a recurrence's scan. `full` keeps
+nothing but the block's inputs."""
 
 
 def remat_policy(
@@ -463,16 +468,23 @@ def remat_policy(
 
 
 DECODER_REMAT: tuple[RematPolicy | None, ...] = (
-    None, REMAT_POLICIES['all_but_delta_memory'], REMAT_POLICIES['minimal_with_conv'],
-    REMAT_POLICIES['minimal'], REMAT_POLICIES['save_dot_except_mlp'], REMAT_POLICIES['full'])
+    None, REMAT_POLICIES['all_but_delta_memory'], REMAT_POLICIES['minimal_with_scan_and_conv'],
+    REMAT_POLICIES['minimal_with_conv'], REMAT_POLICIES['minimal'], REMAT_POLICIES['save_dot_except_mlp'],
+    REMAT_POLICIES['full'])
 """What a decoder recomputes in its backward pass when its step does not fit,
 weakest first; each rung is slower and holds less (docs/performance.md). On
 Qwen 3.5-0.8B at 8 x 3072 on an A100, 'minimal' cost 14.7% a token over none
 and kept 13.5 GiB of temporaries, 'save_dot_except_mlp' 18.4% and 6.4 GiB,
 none 59 GiB; 'all_but_delta_memory' recomputes a delta rule's memory alone,
-as fla's backward always does; 'minimal_with_conv' keeps a linear-attention
-or SSM layer's short conv output beside 'minimal''s. A decoder's own remat is where it
-starts, and it moves up one rung at a time (`CausalTransformer.recompute_more`),
+as fla's backward always does; 'minimal_with_scan_and_conv' keeps a
+recurrence's scan output and its short conv output beside 'minimal''s, so a
+step that does not fit recomputes the rest of a layer before its scan (on an
+A100 an 8-layer Mamba-2 decoder's bf16 step over 16,384 tokens took 145.6 ms
+there and 149.4 ms at 'minimal_with_conv', for 1.1 GB more at its peak,
+docs/performance.md); 'minimal_with_conv' keeps the conv alone. A decoder
+without a recurrence skips both, as it would compile 'minimal''s step. A
+decoder's own remat is where it starts, and it moves up one rung at a time
+(`CausalTransformer.recompute_more`),
 past a rung that keeps nothing more of its layers' names than the next, never
 past a policy the ladder names."""
 

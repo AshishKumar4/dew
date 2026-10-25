@@ -18,7 +18,7 @@ from dew.optim import Cosine, Exponential, OneCycle, ParamGroup
 
 TORCH = np.load(Path(__file__).resolve().parent / "fixtures" / "torch_optim" / "reference.npz")
 EPOCHS, PER_EPOCH = 6, 2
-MOMENTUM = OneCycle(peak=0.85, init=0.95, end=0.95)
+MOMENTUM = OneCycle(peak_value=0.85, init_value=0.95, end_value=0.95)
 """torch's Adam beta1 cycle under `OneCycleLR(cycle_momentum=True)`."""
 
 # float32 rounding of a value, two ulps of it. Near a cosine's end, where
@@ -39,9 +39,9 @@ def test_one_cycle_is_torchs_one_cycle_lr():
     """Largest difference observed 4.8e-10 at a peak of 5e-3; the largest
     relative one, 3.6e-6, is at the second-to-last step, where the cosine's
     `cos + 1` cancels in float32."""
-    np.testing.assert_allclose(values(OneCycle(peak=5e-3), 40), TORCH["one_cycle/lr"],
+    np.testing.assert_allclose(values(OneCycle(peak_value=5e-3), 40), TORCH["one_cycle/lr"],
                                rtol=SCHEDULE_RTOL, atol=ULPS * 5e-3)
-    custom = OneCycle(peak=0.1, init=0.01, end=1e-4, warmup_fraction=0.25)
+    custom = OneCycle(peak_value=0.1, init_value=0.01, end_value=1e-4, warmup_fraction=0.25)
     np.testing.assert_allclose(values(custom, 23), TORCH["one_cycle_custom/lr"],
                                rtol=SCHEDULE_RTOL, atol=ULPS * 0.1)
 
@@ -53,36 +53,37 @@ def test_one_cycle_cycles_adams_b1_as_torch_does():
 def test_exponential_is_torchs_exponential_lr_stepped_to_decay_steps_then_held():
     """The geometric decay from 12 to 0.23 over 10 steps, then 0.23 for the
     rest, plus the offset torch has no field for."""
-    np.testing.assert_allclose(values(Exponential(init=12.0, end=0.23, decay_steps=10), 16),
+    np.testing.assert_allclose(values(Exponential(init_value=12.0, end_value=0.23, decay_steps=10), 16),
                                TORCH["exponential/lr"], rtol=SCHEDULE_RTOL)
-    np.testing.assert_allclose(values(Exponential(init=12.0, end=0.23, decay_steps=10, offset=0.27), 16),
+    decayed = Exponential(init_value=12.0, end_value=0.23, decay_steps=10, offset=0.27)
+    np.testing.assert_allclose(values(decayed, 16),
                                TORCH["exponential/lr"] + 0.27, rtol=SCHEDULE_RTOL)
 
 
 def test_cosine_without_warmup_is_torchs_cosine_annealing():
-    np.testing.assert_allclose(values(Cosine(peak=0.1, warmup_steps=0), 15), TORCH["cosine/lr"],
+    np.testing.assert_allclose(values(Cosine(peak_value=0.1, warmup_steps=0), 15), TORCH["cosine/lr"],
                                rtol=SCHEDULE_RTOL, atol=ULPS * 0.1)
 
 
 def test_every_holds_each_value_for_an_epoch_as_a_torch_scheduler_stepped_per_epoch():
     """A run of 40 epochs of 3 updates reads epoch e's value at each of its updates."""
-    stepped = values(OneCycle(peak=5e-3, every=3), 40 * 3)
+    stepped = values(OneCycle(peak_value=5e-3, every=3), 40 * 3)
     np.testing.assert_allclose(stepped, np.repeat(TORCH["one_cycle/lr"], 3), rtol=SCHEDULE_RTOL,
                                atol=ULPS * 5e-3)
 
 
 def test_every_counts_the_schedules_fields_in_its_own_steps():
     """`decay_steps` counts epochs: the decay ends after 10 epochs of 4 updates."""
-    stepped = values(Exponential(init=12.0, end=0.23, decay_steps=10, every=4), 16 * 4)
+    stepped = values(Exponential(init_value=12.0, end_value=0.23, decay_steps=10, every=4), 16 * 4)
     np.testing.assert_allclose(stepped, np.repeat(TORCH["exponential/lr"], 4), rtol=SCHEDULE_RTOL)
 
 
 def snn_delays_config() -> OptimConfig:
     """SNN-delays' optimizer at the reference's size, as records only."""
-    rate = OneCycle(peak=5e-3, every=PER_EPOCH)
-    b1 = OneCycle(peak=0.85, init=0.95, end=0.95, every=PER_EPOCH)
+    rate = OneCycle(peak_value=5e-3, every=PER_EPOCH)
+    b1 = OneCycle(peak_value=0.85, init_value=0.95, end_value=0.95, every=PER_EPOCH)
     return OptimConfig(optimizer="adam", param_groups=(
-        ParamGroup("delays", ("delay",), schedule=Cosine(peak=0.1, warmup_steps=0, every=PER_EPOCH),
+        ParamGroup("delays", ("delay",), schedule=Cosine(peak_value=0.1, warmup_steps=0, every=PER_EPOCH),
                    bounds=(0.0, 3.0)),
         ParamGroup("weights", ("kernel",), schedule=rate, b1=b1, weight_decay=WEIGHT_DECAY),
         ParamGroup("norms", ("*",), schedule=rate, b1=b1),
@@ -134,7 +135,7 @@ def test_grouped_adam_is_torchs_adam_with_param_groups_a_momentum_cycle_and_a_cl
 
 def test_a_bounded_group_clamps_its_parameters_and_no_others():
     params = {"delay": jnp.asarray([0.05, 2.95]), "kernel": jnp.asarray([0.05, 2.95])}
-    config = OptimConfig(optimizer="adam", rate=0.5, param_groups=(
+    config = OptimConfig(optimizer="adam", learning_rate=0.5, param_groups=(
         ParamGroup("delays", ("delay",), bounds=(0.0, 3.0)), ParamGroup("rest", ("*",))))
     solver = config.build(1)
     grads = {"delay": jnp.asarray([1.0, -1.0]), "kernel": jnp.asarray([1.0, -1.0])}
