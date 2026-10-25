@@ -262,6 +262,7 @@ def test_a_tpu_runs_an_exactly_summed_product_in_xla():
     [found] = [route for route in taken if route.choice == 'grouped_matmul']
     assert found.kernel == 'xla' and "MXUs" in found.refusal.detail
 
+@runs("sm80")
 def test_an_empty_rows_undefined_derivative_reaches_no_shared_gradient():
     """A row past the routed ones whose mean square is zero has no defined derivative of `rsqrt`; it
     multiplied nothing, so the norm weight's and the matrix's gradients are the routed row's alone, and
@@ -286,6 +287,7 @@ def test_an_empty_rows_undefined_derivative_reaches_no_shared_gradient():
     assert not np.any(np.asarray(dx[1], np.float32)) and float(dms[1]) == 0
 
 
+@runs("sm80")
 def test_a_wide_cotangent_meets_the_rounded_matrix_once():
     """An fp32 output's cotangent 1.00390625 times a bf16 matrix entry 1.0078125 rounds once to bf16's
     1.015625, as JAX's derivative of the plain program has it; rounding the cotangent first would give
@@ -303,6 +305,7 @@ def test_a_wide_cotangent_meets_the_rounded_matrix_once():
     assert float(dx[0, 0]) == 1.015625
 
 
+@runs("sm80")
 def test_the_prologues_rounding_is_in_its_derivative():
     """A prologue returning fp32 is rounded to the rows' dtype before its product, so its cotangent is
     rounded there too: the template's scale gradient is JAX's of the plain program, bit for bit."""
@@ -341,6 +344,7 @@ def test_a_prologue_never_sees_the_depths_padding(generation_name, sizes):
     np.testing.assert_array_equal(np.asarray(out), np.full((3, 16), 17.0))
 
 
+@runs("sm80")
 @pytest.mark.parametrize("transpose_rhs", [False, True])
 def test_a_dense_product_whose_extents_no_tile_divides_holds_check_1(transpose_rhs):
     """A dense product of 65 rows, 40 deep and 100 wide, which no tile divides, through the plain kernel's
@@ -510,6 +514,7 @@ def test_the_backward_reads_what_the_epilogues_derivative_reads():
     assert not template._passes_cotangent(doubled, acc, (), bf16 * 2, jnp.bfloat16)
 
 
+@runs("sm80")
 def test_forward_mode_takes_the_plain_programs_tangent():
     """`jax.jvp` of the template through its kernels gives the portable arithmetic's tangent, the value
     from the kernels (`generation.linear_tangent`)."""
@@ -682,6 +687,7 @@ def _three_gemms(sizes):
     return fused_gemm, plain_gemm, truth_gemm
 
 
+@runs("sm80")
 @pytest.mark.parametrize("producer", [rms_norm, dew_rms_norm, relu], ids=lambda producer: producer.__name__)
 def test_a_fused_producers_gradients_are_its_own(producer):
     """Every input's gradient through a producer fused into the prologue is the unfused program's: the
@@ -710,6 +716,7 @@ def test_a_fused_producers_gradients_are_its_own(producer):
     assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
 
 
+@runs("sm80")
 @pytest.mark.parametrize("composition", ["jvp", "radial_jvp", "jvp_of_grad"])
 def test_a_fused_producers_forward_and_higher_derivatives_are_its_own(composition):
     """Forward mode and a higher order through a norm fused into the prologue differentiate the whole
@@ -747,6 +754,7 @@ def test_a_fused_producers_forward_and_higher_derivatives_are_its_own(compositio
     assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
 
 
+@runs("sm80")
 def test_chosen_routes_each_fused_stage_through_xla_or_insists_on_the_kernels():
     """`generation.chosen(gemm_epilogue='xla', gemm_prologue='xla')` runs both stages in XLA beside the
     product (each route says so) with the fused program's value, as exact as the unfused program from
@@ -781,6 +789,7 @@ def test_chosen_routes_each_fused_stage_through_xla_or_insists_on_the_kernels():
         jax.jit(fuser.fuse(positioned)).trace(x, w, b, u[:, :WIDTH])
 
 
+@runs("sm80")
 def test_a_one_row_normed_operand_fuses():
     """A one-row operand's row statistic keeps its rows axis: the product of one normed row, as exact as
     the unfused program from float64."""
@@ -803,6 +812,7 @@ def test_a_one_row_normed_operand_fuses():
     assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
 
 
+@runs("sm80")
 @pytest.mark.parametrize(("consumer", "kernel", "code"), [(bias_cast, 'fused', None),
                                                           (positional, 'xla', 'reads_position')],
                          ids=("tiled", "positional"))
@@ -1199,6 +1209,7 @@ def transposed_twice_nested(x, side):
     return (_wide(x) + jax.jit(jax.jit(lambda s: s.T))(side)).astype(x.dtype)
 
 
+@runs("sm80")
 def test_an_fp32_product_above_the_default_precision_runs_xla():
     """fp32 products are TF32 in the kernels, which only the default precision asks for: an explicit
     'highest' under a configured default runs XLA's portable program, reported as the route with the
@@ -1228,6 +1239,7 @@ def test_an_fp32_product_above_the_default_precision_runs_xla():
     np.testing.assert_array_equal(np.asarray(got), np.asarray(xla))
 
 
+@runs("sm80")
 def test_an_integer_side_operand_takes_no_gradient():
     """A prologue selecting rows by an integer mask differentiates as JAX's plain program does: the
     rows' gradient through the kernels, the mask's float0."""
@@ -1246,6 +1258,7 @@ def test_an_integer_side_operand_takes_no_gradient():
     np.testing.assert_array_equal(np.asarray(got, np.float32), np.asarray(portable, np.float32))
 
 
+@runs("sm80")
 @pytest.mark.parametrize("consumer", [lambda p, s: p * s, lambda p, s: p.T.astype(jnp.bfloat16)],
                          ids=["scalar", "transpose"])
 def test_a_consumer_the_kernels_cannot_tile_runs_after_the_product(consumer):
@@ -1279,6 +1292,7 @@ def test_mosaic_reads_a_hooks_primitives_at_any_depth():
         assert not launch.eligible(ba, generation.gpu_target())
 
 
+@runs("sm80")
 def test_a_broadcast_hooks_launch_stores_and_reads_back():
     """A launch whose side operand has a dimension of one keeps its module-level hook and the dimension's
     place as data: the launches a trace records store as JSON and read back."""
@@ -1302,6 +1316,7 @@ def test_a_measured_launch_draws_its_integer_side_operands_as_operands():
     assert int(jnp.sum(arrays[2])) == 128
 
 
+@runs("sm80")
 def test_a_dense_product_runs_the_plain_tiled_kernel():
     """On Triton a dense product (no group sizes) runs `triton_dense`'s kernels, forward and both gradients,
     keyed apart from a one-group ragged call's: their launches are told `dense`."""
