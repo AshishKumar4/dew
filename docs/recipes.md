@@ -124,7 +124,7 @@ Each setting's default is the recipe's own, which can differ from the configurat
 | `--model.attention-impl` | A name `AttentionImpl` declares ([dew/nn/attention.py](../src/dew/nn/attention.py)). The example uses `reference` so no device-specific kernel runs. |
 | `--optim.optimizer` | `adam`, `adamw`, `lamb`, `muon` or `muonclip`. |
 | `--optim.learning-rate` | The learning rate: a number, or a schedule's record as JSON (`'{"class": "cosine", "fields": {...}}'`). |
-| `--optim.state-dtype` | `bfloat16` stores Adam's moments stochastically rounded, for `adam` and `adamw` only. |
+| `--optim.state-dtype` | `bfloat16` stores Adam's moments stochastically rounded, and `int8` stores them blockwise in 8 bits, for `adam` and `adamw` only. |
 | `--trainer.steps` / `--trainer.epochs` | Run length; set one, not both. |
 | `--set data.<preset>.batch` | Global batch across all JAX processes, the preset's (`data.token_windows.batch`, `data.images.batch`). |
 | `--trainer.eval-every`, `--trainer.checkpoint-every` | A step interval, `epoch`, or `None`. |
@@ -140,7 +140,7 @@ Muon treats matrix parameters separately from embedding, head and normalization 
 
 Two optimizers from Nested Learning (arXiv 2512.24695) are Optax transforms in `dew.optim`, composed in a Python run's own `optax.chain` rather than named by `--optim.optimizer`. `scale_by_m3` is M3, its Algorithm 1: Muon's orthogonalized momentum over Adam's second moment, plus a slow momentum that gathers each chunk of `frequency` updates and reaches the next chunk's updates, weighted by `alpha`; follow it with `optax.scale_by_learning_rate`, and partition a model's vectors to another optimizer as Muon's do. `delta_gradient_descent` steps each kernel to the minimizer of its eq. 56, forgetting what the kernel held along the step's input `x`: its update takes `inputs=`, the input of each kernel, and suits a memory or fast weight that sees one input a step.
 
-`--optim.state-dtype bfloat16` halves the memory the optimizer state takes. Its effect on step time depends on the device ([Performance measurements](performance.md)).
+`--optim.state-dtype bfloat16` halves the memory the optimizer state takes, and `--optim.state-dtype int8` quarters it, about 2 bytes a parameter for both moments (bitsandbytes' and torchao's 8-bit Adam, `dew.optim.int8_moments`). Its effect on step time depends on the device ([Performance measurements](performance.md)).
 
 With `trainer.wandb` unset, the recipe prints to the terminal and keeps a local tracking journal in `<checkpoint-dir>/<name>/tracking`. To use Weights & Biases, select it with `trainer.wandb:wandb` and set `--trainer.wandb.project NAME`; the run shows in W&B under its own name, or under `--trainer.wandb.name` where that is set, while its checkpoints stay under the run's name. `--trainer.wandb.offline` stops the tracker from opening an online session, but the recipe can still download datasets and models. Profiling is off unless `trainer.profile` is set. `run.json` records the configuration only, so to reproduce a run, archive the dataset contents, the package versions and the source checkout separately.
 
