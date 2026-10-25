@@ -10,7 +10,7 @@ import optax
 import pytest
 from reference_error import assert_as_exact
 
-from dew.optim import delta_gradient_descent, scale_by_m3
+from dew.optim import delta_gradient_descent, newton_schulz, scale_by_m3
 
 M3_FACTORS = {"beta1": 0.9, "beta2": 0.99, "beta3": 0.5, "alpha": 0.3, "eps": 1e-8, "frequency": 3}
 """M3's factors in the proofs below: three updates a chunk, so seven updates close two chunks."""
@@ -18,7 +18,7 @@ NESTED_SEEDS = 8
 """Check 1's declared seeds for M3's directions and delta gradient descent's step."""
 
 
-def newton_schulz(matrix: np.ndarray, steps: int = 5) -> np.ndarray:
+def newton_schulz_reference(matrix: np.ndarray, steps: int = 5) -> np.ndarray:
     """Muon's quintic Newton-Schulz in NumPy, in the matrix's own dtype: the matrix over its Frobenius
     norm (plus 1e-8), the wide way round, then `a X + (b A + c A A) X` with `A = X X^T` `steps` times, at
     Jordan's coefficients (modded-nanogpt)."""
@@ -32,6 +32,27 @@ def newton_schulz(matrix: np.ndarray, steps: int = 5) -> np.ndarray:
     return wide.T if tall else wide
 
 
+def test_newton_schulz_orthogonalizes_a_matrix_and_a_stack_as_muons_iteration_does():
+    """`newton_schulz` on a tall and a wide matrix, and on a stack of four 6 x 4 matrices whose stack axis
+    sits between their reduction and output axes (Muon's dimension numbers), each matrix on par with
+    Muon's quintic iteration in NumPy from float64 (check 1), the stack's matrices each as alone."""
+    numbers = optax.contrib.MuonDimensionNumbers(reduction_axis=0, output_axis=2)
+
+    @jax.jit
+    def orthogonalized(tall, wide, stacked):
+        return newton_schulz(tall), newton_schulz(wide), newton_schulz(stacked, dimension_numbers=numbers)
+
+    def reference(tall, wide, stacked):
+        return (newton_schulz_reference(tall), newton_schulz_reference(wide),
+                np.stack([newton_schulz_reference(stacked[:, index]) for index in range(4)], axis=1))
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return tuple(rng.standard_normal(shape).astype(np.float32) for shape in ((6, 4), (4, 6), (6, 4, 4)))
+
+    assert_as_exact(orthogonalized, reference, draw, "Newton-Schulz", seeds=NESTED_SEEDS)
+
+
 def m3_directions(gradients: np.ndarray) -> np.ndarray:
     """Algorithm 1 of arXiv 2512.24695 in NumPy, in the gradients' own dtype: each update's
     `(NS(M1) + alpha O2) / sqrt(V + eps)`, `M1` and `V` summing `beta1 g` and `beta2 g**2`, and `O2`
@@ -43,33 +64,27 @@ def m3_directions(gradients: np.ndarray) -> np.ndarray:
     directions = []
     for update, gradient in enumerate(gradients, 1):
         fast, second = fast + beta1 * gradient, second + beta2 * gradient * gradient
-        directions.append((newton_schulz(fast) + alpha * slow_direction) / np.sqrt(second + eps))
+        directions.append((newton_schulz_reference(fast) + alpha * slow_direction) / np.sqrt(second + eps))
         chunk = chunk + gradient
         if update % frequency == 0:
             slow, chunk = slow + beta3 * chunk, np.zeros_like(chunk)
-            slow_direction = newton_schulz(slow)
+            slow_direction = newton_schulz_reference(slow)
     return np.stack(directions)
 
 
 def test_m3s_directions_are_algorithm_1s_across_its_chunks():
     """`scale_by_m3` over seven updates of a tree of matrices, one tall and one wide, two chunks closing:
     each direction on par with Algorithm 1's from float64 (check 1), the slow momentum's reaching the
-    updates from the second chunk on, its Newton-Schulz products at full float32 as the reference's are
-    (a run's own matmul precision is the run's, as Muon's is). Within a chunk the slow momentum and its
-    orthogonalization hold still, and each changes once, as the chunk closes; the first chunk's slow
-    direction is zero."""
+    updates from the second chunk on. Within a chunk the slow momentum and its orthogonalization hold
+    still, and each changes once, as the chunk closes; the first chunk's slow direction is zero."""
     transform = scale_by_m3(**M3_FACTORS)
 
     @jax.jit
-    def scanned(gradients):
+    def directions(gradients):
         def step(state, gradient):
             direction, state = transform.update(gradient, state)
             return state, direction
         return jax.lax.scan(step, transform.init(gradients[0]), gradients)[1]
-
-    def directions(gradients):
-        with jax.default_matmul_precision("highest"):
-            return scanned(gradients)
 
     def draw(seed):
         rng = np.random.default_rng(seed)
