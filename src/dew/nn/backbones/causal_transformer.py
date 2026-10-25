@@ -2260,6 +2260,14 @@ class CausalTransformer(nn.Module):
         return scaling.original_max_position_embeddings if isinstance(scaling, LongRopeScaling) else None
 
     @nn.nowrap
+    def reads_blocks(self) -> bool:
+        """Whether a layer reads a block whole (`AttentionMixer.bidirectional_blocks`): a trunk or prediction
+        depth layer kind's mixer, each kind's own mixer or else the model's (`BlockReading`)."""
+        kinds = self.layer_kinds(self.per_layer_types)
+        return any(isinstance(mixer, AttentionMixer) and mixer.bidirectional_blocks
+                   for mixer in (kind.mixer or self.mixer for kind in kinds.values()))
+
+    @nn.nowrap
     def mixed_admission_refusal(self) -> str | None:
         """A cache rebuilt per request, a reader beyond the token, a context
         read beside the tokens, or a layer whose mixer, over the context it is

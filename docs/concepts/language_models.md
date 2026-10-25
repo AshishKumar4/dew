@@ -177,6 +177,7 @@ export([{"text": ids[:held]}], "data/corpus-byte/val", format="array_record",
 | `mtp_weight` | `None` | Weight of DeepSeek V3's multi-token prediction loss. |
 | `z_loss` | `0.0` | PaLM's squared log-partition auxiliary. |
 | `token_accuracy` | `True` | Report argmax accuracy. |
+| `prefix` | `None` | A prefix run: each document's first tokens (an int) or its prompt (`"prompt"`) form one block the model reads whole, and no target inside it is scored ([Prefix blocks](#prefix-blocks)). |
 
 The step reports `ce`, `perplexity` and `token_accuracy`. `LMObjective` refuses a model built with `causal=False`.
 
@@ -211,6 +212,22 @@ To measure validation perplexity, give the dataset a validation split and set `e
 ### Gradient accumulation
 
 With gradient accumulation, the cross-entropy and multi-token-prediction (MTP) losses are weighted by the mass of supported main targets, including the target-role masks at each MTP depth. Sequence-level router losses normalize by rows. Global router losses first add up the selected-slot counts and the score sums, then take their product. The routing bias stays fixed during an accumulation window and is updated from the window's total counts. A window with zero cross-entropy can still update when a router auxiliary loss is active. Accumulated and combined batches match only when their random draws are the same and mutable state follows its declared rules.
+
+### Prefix blocks
+
+`prefix` trains a prefix run. Each document's first `prefix` tokens, an int, or its tokens before the first assistant token, `"prompt"`, form one block. A layer that reads blocks whole (`AttentionMixer(bidirectional_blocks=True)` on one of the model's layer kinds) lets each token of the block see the block's later tokens too, and every other token stays causal. The loss scores no target inside its source's block, since the source would read that target off; each other target counts as usual.
+
+```python
+LMObjective(decoder, seq_len=1024, prefix=64)  # or prefix="prompt" on chat rows
+```
+
+On the recipe, `--objective.prefix 64` or `--objective.prefix prompt`. The model must read blocks in at least one layer kind. The run refuses a prefix longer than `seq_len`, and `mtp_weight`, because a prediction depth's layers read blocks beyond their own source and the exclusion does not cover them.
+
+Serving reads the same blocks. A served prompt's first `prefix` tokens form the block (the whole prompt under `"prompt"`), and its generated tokens stay causal, as in training. `TextGeneration` does this for a task built from a run's settings, and a server does it per request. A server refuses a prompt shorter than `prefix`, since its trained block would cover tokens the prompt does not hold, and one that prefills in pieces (`chunk`) refuses a block longer than a piece, since a block read whole cannot be split across pieces. Shared prefix pages (`prefix_cache`) are shared only between prompts whose blocks hold the same tokens.
+
+The data stage `Blocks` (`dew.data.steps.blocks`) makes blocks for any chain: `Blocks(prefix=N)`, `Blocks(prompt=True)` on chat rows, or `Blocks(given="field")`, where the field gives each token a number (-1 for none) and each run of consecutive tokens with one number inside one document is a block. A batch carrying `text_block_groups` trains with those blocks whatever `prefix` says, and a model that reads no blocks refuses such a batch.
+
+A layer that reads blocks builds a dense mask and runs the XLA attention kernel. The in-block targets are not scored, so a prefix run counts fewer targets than the causal run over the same rows.
 
 ## Pretrained checkpoints
 
