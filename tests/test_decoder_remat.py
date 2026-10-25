@@ -20,7 +20,7 @@ import optax
 import pytest
 import selection_margins
 from model_support import largest_difference
-from reference_error import assert_as_exact, without_ynn
+from reference_error import as_given, assert_as_exact, without_ynn
 
 from dew.checkpoints import Checkpoints
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -187,11 +187,11 @@ def test_recomputed_blocks_train_the_same_model(shape, scan):
     rerun, _ = training_step(remat)
     draw = drawn_steps(plain, stepped, routed=shape == "sparse")
     wide = plain.clone(dtype=jnp.float64)
-    assert_as_exact(without_ynn(lambda variables, *_: remat.apply(variables, ids)),
-                    without_ynn(lambda variables, *_: plain.apply(variables, ids)), draw,
+    assert_as_exact(lambda variables, *_: remat.apply(variables, ids),
+                    lambda variables, *_: plain.apply(variables, ids), draw,
                     f"a recomputed {shape} block's forward, scan {scan}", seeds=STEP_SEEDS,
                     truth_fn=jax.jit(lambda variables, *_: wide.apply(variables, ids)))
-    assert_as_exact(without_ynn(committed(rerun)), without_ynn(committed(run)), draw,
+    assert_as_exact(committed(rerun), committed(run), draw,
                     f"a recomputed {shape} block's step, scan {scan}",
                     seeds=MLA_STEP_SEEDS if shape == "mla" and not scan else STEP_SEEDS,
                     truth_fn=committed(wide_step(plain)))
@@ -256,12 +256,14 @@ def test_recomputed_pipeline_preserves_updates_and_sown_values(shape, scan):
         def on_mesh(variables, state, tokens, key):
             variables, tokens = place(variables, tokens)
             with staged():
-                return jax.device_get(committed(step)(variables, state, tokens, key))
+                # Both arms are Dew's programs, each compiled as the gate compiles two Dew arms.
+                return jax.device_get(without_ynn(committed(step))(variables, state, tokens, key))
         return on_mesh
 
     draw = drawn_steps(plain, stepped, routed=shape == "sparse", within=staged, place=place)
-    assert_as_exact(placed(rerun), placed(run), draw, f"a recomputed {shape} pipeline's step, scan {scan}",
-                    seeds=STEP_SEEDS, truth_fn=placed(wide_step(plain)))
+    assert_as_exact(as_given(placed(rerun)), as_given(placed(run)), draw,
+                    f"a recomputed {shape} pipeline's step, scan {scan}", seeds=STEP_SEEDS,
+                    truth_fn=placed(wide_step(plain)))
 
 
 @pytest.mark.parametrize("saved_remat", [None, 'full'])
@@ -335,7 +337,7 @@ def against_full(scan):
     def draw(seed):
         return initialized(jax.random.key(seed)), jax.random.key_data(jax.random.key(seed + (1 << 20)))
 
-    return full, draw, without_ynn(gradient_step(full)), jax.jit(gradient_step(full.clone(dtype=jnp.float64)))
+    return full, draw, gradient_step(full), jax.jit(gradient_step(full.clone(dtype=jnp.float64)))
 
 
 @pytest.mark.parametrize("policy", NAMED)
@@ -346,5 +348,5 @@ def test_named_policies_train_the_same_model_as_full(policy, scan):
     decoders and keys, a named policy's loss, gradients and metrics on par
     with `full`'s, both from `full`'s float64 run (check 1)."""
     full, draw, reference, truth = against_full(scan)
-    assert_as_exact(without_ynn(gradient_step(full.clone(remat=policy))), reference, draw,
+    assert_as_exact(gradient_step(full.clone(remat=policy)), reference, draw,
                     f"{policy} against full, scan {scan}", seeds=POLICY_SEEDS, truth_fn=truth)

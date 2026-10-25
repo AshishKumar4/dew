@@ -21,7 +21,6 @@ from reference_error import (
     assert_rounds_where_the_reference_does,
     chain_roundings,
     float64_forward,
-    without_ynn,
 )
 from tool_support import load as load_tool
 
@@ -436,8 +435,12 @@ def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
     def draw(seed):
         return (np.random.default_rng([0xD0E, seed]).integers(0, vocabulary, ids.shape, dtype=np.int32),)
 
-    merged_logits = without_ynn(lambda drawn: merged.model.apply(merged.variables, drawn))
-    adapted_logits = without_ynn(lambda drawn: adapted.model.apply(resumed, drawn))
+    def merged_logits(drawn):
+        return merged.model.apply(merged.variables, drawn)
+
+    def adapted_logits(drawn):
+        return adapted.model.apply(resumed, drawn)
+
     assert_as_exact(merged_logits, adapted_logits, draw, 'merged adapter logits', seeds=MERGED_SEEDS,
                     truth_fn=lambda drawn: float64_forward(adapted.model, resumed, drawn)[0])
 

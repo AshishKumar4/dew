@@ -154,19 +154,28 @@ def windows(draw, count: int):
     return drawn
 
 
+class _Windowed:
+    """An arm of one draw (`fn`) over `windows`' stacked arguments, window by window (`over_windows`):
+    the gate compiles `fn` as it compiles any arm (`_arms`) and runs the windows through that program."""
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def __call__(self, *arguments):
+        return _stack_host([self.fn(*jax.tree.map(lambda leaf, index=index: leaf[index], arguments))
+                            for index in range(_window_count(arguments))])
+
+
 def over_windows(fn):
     """`fn`, an arm of one draw, run over `windows`' stacked arguments window by window, each window's
     arguments sliced from the stack, with its outputs stacked on their leading axis as host arrays.
 
     Each window runs the program one draw runs, never a batched one: a batch axis changes the program
     XLA compiles (its fusions, its reductions' order, its dots' batching, a kernel's route), which XLA
-    holds to no common bits with one draw's, so check 1 would judge a program users never run. Pass a
-    JAX arm jitted (`jax.jit(fn)`, `without_ynn(fn)`), so it compiles once a signature and every window
-    calls that program; a torch or NumPy reference as it is."""
-    def run(*arguments):
-        return _stack_host([fn(*jax.tree.map(lambda leaf, index=index: leaf[index], arguments))
-                            for index in range(_window_count(arguments))])
-    return run
+    holds to no common bits with one draw's, so check 1 would judge a program users never run. The gate
+    compiles `fn` as it compiles an arm of one draw (`_arms`), once a signature, and every window calls
+    that program; a torch or NumPy reference passes `as_given`."""
+    return _Windowed(fn)
 
 
 WITHOUT_YNN = {"xla_cpu_experimental_ynn_fusion_type": ""}
@@ -182,16 +191,60 @@ because compiler options take no such spelling and that one leaves a scan's redu
 
 def without_ynn(fn, **jit_options):
     """`fn` jitted with WITHOUT_YNN on the CPU lane, the process's default backend
-    (`jax.default_backend()`), and plain `jax.jit` elsewhere. It compiles both arms of a check 1
-    between two Dew paths, such as an interpreted kernel and the XLA program it replaces, the latter
-    the arm the check measures against, so that the two run the same kind of code on any host. A
-    program Dew's users run compiles with the fusions, as they do. Call it at top level, since on the
-    CPU lane its compiler options refuse to be nested in another jit, differentiated through or
-    batched; `over_windows` runs it window by window. A caller's own compiler options take
-    precedence over WITHOUT_YNN's."""
+    (`jax.default_backend()`), and plain `jax.jit` elsewhere: how the gate compiles both arms of a
+    check 1 between two Dew paths (`_arms`), such as an interpreted kernel and the XLA program it
+    replaces, so that the two run the same kind of code on any host. A program Dew's users run compiles
+    with the fusions, as they do. On the CPU lane its compiler options refuse to be nested in another
+    jit, differentiated through or batched, so the gate compiles an arm whole; a site passes its arms
+    as functions and never calls this. A caller's own compiler options take precedence over
+    WITHOUT_YNN's; `fn` already compiled so is returned as it is."""
+    if getattr(fn, "without_ynn", False):
+        return fn
     if jax.default_backend() == "cpu":
         jit_options["compiler_options"] = {**WITHOUT_YNN, **(jit_options.get("compiler_options") or {})}
-    return jax.jit(fn, **jit_options)
+    compiled = jax.jit(fn, **jit_options)
+    compiled.without_ynn = True
+    return compiled
+
+
+def as_given(fn):
+    """`fn`, an arm the gate runs as it is given and never compiles: a torch or NumPy reference, or a Dew
+    arm that runs whole programs of its own (a trainer's fit, a placement on a mesh and the program
+    run there, a host loop). The other arm of its check then compiles as Dew's users run it, with the
+    fusions (`_arms`), as the programs this one runs do."""
+    def given(*inputs):
+        return fn(*inputs)
+    given.as_given = True
+    given.__wrapped__ = fn
+    return given
+
+
+def _given(fn) -> bool:
+    """Whether the gate runs `fn` as it is given (`as_given`, a recorded reference)."""
+    return bool(getattr(fn, "as_given", False) or getattr(fn, "recorded", False))
+
+
+def _compiled(fn, compile):
+    """`fn` as the gate runs it: as given (`_given`), or compiled by `compile`, a window loop's arm
+    within it (`over_windows`)."""
+    if _given(fn):
+        return fn
+    if isinstance(fn, _Windowed):
+        return _Windowed(_compiled(fn.fn, compile))
+    return compile(fn)
+
+
+def _arms(dew_fn, reference_fn):
+    """The two arms of a check as the gate runs them (docs/design/testing.md, "the numerical contract"):
+    where the gate compiles both, two Dew paths, each without YNNPACK's fusions (`without_ynn`), whose
+    microkernels the host's instruction set picks at run time, so the two run the same kind of code on
+    any host; where one runs as it is given (`as_given`: torch, NumPy, a recording, a Dew program that
+    compiles itself), the other as Dew's users run it, with the fusions (`jax.jit`). A site passes
+    plain functions; the gate compiles them, so no site can compile one arm otherwise than its
+    other. One function as both arms compiles once."""
+    compile = jax.jit if _given(dew_fn) or _given(reference_fn) else without_ynn
+    reference = _compiled(reference_fn, compile)
+    return (reference if dew_fn is reference_fn else _compiled(dew_fn, compile)), reference
 
 
 def with_gradients(fn, *, has_aux: bool = False):
@@ -1091,7 +1144,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     output dtype it closes over). A draw may be an orbit's: the same values under an exact symmetry
     the seed picks. `seeds` is the site's declared count, sized by `seeds_for` so the reference
     compared with itself resolves PARITY, or, where the arms share their upstream rounding, so Dew
-    paired with the reference does; jit the two functions so every seed reuses one compiled program.
+    paired with the reference does. The gate compiles the two functions (`_arms`), once for every seed:
+    two Dew paths without YNNPACK's fusions, a Dew arm beside an arm run `as_given` with them.
 
     Where a computation has an orbit of summation orders, `orders(inputs)` lists a draw's inputs at K
     of them, the draw itself first: an exact symmetry of the result (a batch's rows in another order
@@ -1124,6 +1178,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                                     f"seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
                                     f"(`seeds_for`)")])
     narrow_leaves: list[str] = []
+    dew_fn, reference_fn = _arms(dew_fn, reference_fn)
 
     def drawn(start, stop):
         draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders)
@@ -1180,6 +1235,7 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
         raise Inconclusive([Finding(label, "inconclusive", FEWEST_SEEDS / max(seeds, 1), f"{label}: {seeds} "
                                     f"seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
                                     f"(`seeds_for`)")])
+    changed_fn, original_fn = _arms(changed_fn, original_fn)
     draws = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn)
     moved, kept, unresolved = _moved(draws, 1)
     if not moved:
@@ -1224,6 +1280,8 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     if dew_fn is not None and getattr(reference_fn, "recorded", False):
         raise ValueError(f"{label}: a recorded reference holds its recorded seeds alone, never a paired "
                          f"sizing's from SIZING_FROM; its site keeps its recorded count")
+    dew_fn, reference_fn = _arms(reference_fn if dew_fn is None else dew_fn, reference_fn)
+    dew_fn = None if dew_fn is reference_fn else dew_fn
     count, drawn = max(start, FEWEST_SEEDS), None
     first = 0 if dew_fn is None else SIZING_FROM
     while count <= most:

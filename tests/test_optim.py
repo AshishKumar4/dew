@@ -20,7 +20,7 @@ from jax.extend.core import ClosedJaxpr, Jaxpr, Literal
 from jax.sharding import NamedSharding, PartitionSpec as P
 from model_support import largest_difference
 from optim_support import LR, decoder_params, drawn_tree
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations, without_ynn
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, equations
 
 from dew.config import OptimConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -113,7 +113,7 @@ def assert_updates_as(solver, reference, params, paths, label, *, flatten=None, 
             steps.append(reference.update(grad, reference.init(param), param)[0])
         return steps
 
-    assert_as_exact(without_ynn(dew), without_ynn(alone), lambda seed: drawn_tree(params, seed), label,
+    assert_as_exact(dew, alone, lambda seed: drawn_tree(params, seed), label,
                     seeds=seeds, truth_fn=alone)
 
 
@@ -237,8 +237,7 @@ def test_both_groups_step_with_the_one_schedule():
             return taken
         return walked
 
-    assert_as_exact(without_ynn(steps(scheduled, lambda step: 1.0)),
-                    without_ynn(steps(unscaled, lambda step: reported[step])),
+    assert_as_exact(steps(scheduled, lambda step: 1.0), steps(unscaled, lambda step: reported[step]),
                     lambda seed: drawn_tree(decoder_params(), seed), "one schedule over both groups",
                     seeds=UPDATE_SEEDS,
                     truth_fn=jax.jit(steps(unscaled, lambda step: rate(jnp.asarray(step, jnp.float64)))))
@@ -312,7 +311,7 @@ def test_an_expert_stack_placed_over_the_mesh_is_orthogonalized_one_expert_at_a_
     def reference(params, grads):
         return alone.update(grads, alone.init(params), params)[0]
 
-    assert_as_exact(placed, without_ynn(reference), draw, f"an expert stack over {spec}", seeds=UPDATE_SEEDS,
+    assert_as_exact(as_given(placed), reference, draw, f"an expert stack over {spec}", seeds=UPDATE_SEEDS,
                     truth_fn=reference)
 
 
@@ -445,7 +444,7 @@ def test_the_clip_matches_the_paper_equations():
             params['layers_0']['self_attn'][proj]['kernel'] + grads['layers_0']['self_attn'][proj]['kernel'],
             gamma, 4)} for proj in ('q_proj', 'k_proj')}}}
 
-    assert_as_exact(without_ynn(applied), without_ynn(paper), lambda seed: qk_tree(seed=seed),
+    assert_as_exact(applied, paper, lambda seed: qk_tree(seed=seed),
                     "the clip against the paper", seeds=CLIP_SEEDS, truth_fn=paper)
 
 
