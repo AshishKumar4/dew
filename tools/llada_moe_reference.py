@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch_precision import float64
+from torch_precision import float64, float64_twin
 from remote_code_reference import FIXTURES, RELEASES as REGISTERED, released_model
 from safetensors.torch import save_file
 
@@ -91,8 +91,8 @@ def serve(name: str) -> None:
     REGISTERED.update(RELEASES)
     with tempfile.TemporaryDirectory() as workspace, torch.no_grad():
         native = released_model(name, Path(workspace) / 'fp32').float()
-        with float64():
-            wide = released_model(name, Path(workspace) / 'f64').double()
+        # Its float64 twin (`float64_twin`): built inside `float64`, its constructor's tables float64's.
+        wide = float64_twin(native, lambda: released_model(name, Path(workspace) / 'f64'))
         while True:
             request = _received(sys.stdin.buffer)
             ids = torch.from_numpy(request['ids'].astype(np.int64))

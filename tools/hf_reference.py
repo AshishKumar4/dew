@@ -411,7 +411,7 @@ def write_minimax_m2() -> None:
 
 def write_minimax_m2_fp8(config: dict, weights: dict, ids: torch.Tensor) -> None:
     """Run Transformers' CPU dequantization on the released FP8 storage layout."""
-    from torch_precision import float64
+    from torch_precision import float64, float64_twin
     from safetensors.torch import save_file
     from transformers import MiniMaxM2ForCausalLM, FineGrainedFP8Config
 
@@ -441,7 +441,7 @@ def write_minimax_m2_fp8(config: dict, weights: dict, ids: torch.Tensor) -> None
     with torch.no_grad():
         np.save(directory / 'logits.npy', model(input_ids=ids, use_cache=False).logits.numpy())
     with float64(), torch.no_grad():
-        truth = float64_model(model)(input_ids=ids, use_cache=False).logits.numpy()
+        truth = float64_twin(model)(input_ids=ids, use_cache=False).logits.numpy()
     np.save(directory / 'logits_f64.npy', truth)
     (directory / 'model.safetensors').chmod(0o644)
 
@@ -1471,7 +1471,7 @@ def write_diffusion_window_tiny() -> None:
     every canvas key reads every other (modeling_diffusion_gemma.py:1399-1401).
     The fp32 and float64 reference logits, the latter for the float64 rule.
     """
-    from torch_precision import float64
+    from torch_precision import float64, float64_twin
 
     fields = {**DIFFUSION_DENOISER_TEXT, "sliding_window": 4,
               "layer_types": ["sliding_attention", "full_attention"]}
@@ -1494,41 +1494,22 @@ def write_diffusion_window_tiny() -> None:
     np.save(directory / "canvas.npy", canvas)
     np.save(directory / "logits.npy", logits(model).to(torch.float32).numpy())
     with float64():
-        twin = float64_model(model)
+        twin = float64_twin(model)
         for module in twin.modules():
             if hasattr(module, "experts") and hasattr(module.experts, "config"):
                 module.experts.config._experts_implementation = "eager"
         np.save(directory / "logits_f64.npy", logits(twin).double().numpy())
 
 
-def float64_model(model: PreTrainedModel) -> PreTrainedModel:
-    """`model`'s float64 truth, its class built from a copy of its config at float64 inside
-    `torch_precision.float64`, so every value its constructor computes (a rotary `inv_freq`, Gemma's
-    `embed_scale`) is computed in float64, where `model.double()` leaves it rounded to float32; the
-    copied config keeps the model's attention and experts implementations. Its weights and persistent
-    buffers are `model`'s, loaded strictly, on `model`'s device, in eval mode. Run it inside
-    `torch_precision.float64` too, whose casts widen what its forward pins to float32."""
-    import copy
-
-    from torch_precision import float64
-
-    config = copy.deepcopy(model.config)
-    config.dtype = torch.float64
-    with float64():
-        twin = type(model)(config)
-    twin.load_state_dict(model.state_dict(), strict=True)
-    return twin.to(next(model.parameters()).device).eval()
-
-
 def write_float64_logits(name: str, model: PreTrainedModel) -> Path:
-    """The fixture `name`'s float64 logits, `logits_f64.npy`: `model`'s float64 truth (`float64_model`) on
+    """The fixture `name`'s float64 logits, `logits_f64.npy`: `model`'s float64 truth (`float64_twin`) on
     the fixture's ids, run inside `torch_precision.float64`. Returns the fixture's directory."""
-    from torch_precision import float64
+    from torch_precision import float64, float64_twin
 
     directory = FIXTURES / name
     ids = torch.from_numpy(np.load(directory / 'input_ids.npy')).long()
     with float64(), torch.no_grad():
-        truth = float64_model(model)(input_ids=ids, use_cache=False).logits.numpy()
+        truth = float64_twin(model)(input_ids=ids, use_cache=False).logits.numpy()
     np.save(directory / 'logits_f64.npy', truth)
     return directory
 
@@ -1545,7 +1526,7 @@ def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234, *, padded: b
     np.save(directory / "input_ids.npy", ids)
     np.save(directory / "logits.npy", reference_logits(model, ids))
     if padded:
-        from torch_precision import float64
+        from torch_precision import float64, float64_twin
 
         tokens = torch.from_numpy(ids.astype(np.int64))
         valid = torch.ones_like(tokens)
@@ -1556,7 +1537,7 @@ def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234, *, padded: b
         with torch.no_grad():
             reference = model(**inputs).logits.numpy()
         with float64(), torch.no_grad():
-            truth = float64_model(model)(**inputs).logits.numpy()
+            truth = float64_twin(model)(**inputs).logits.numpy()
         np.savez(directory / 'padded.npz', input_ids=tokens.numpy().astype(np.int32),
                  attention_mask=valid.numpy().astype(bool), position_ids=positions.numpy().astype(np.int32),
                  logits=reference, logits_f64=truth)
@@ -1573,10 +1554,9 @@ def write_logits_recording(name: str, model: PreTrainedModel, command: str) -> N
     sketch (`record_case`'s summary), which the test's float64 run of Dew's model is held to, in
     recorded_logits.npz beside the fixture."""
     import sys
-    from copy import deepcopy
 
     import jax
-    from torch_precision import float64
+    from torch_precision import float64, float64_twin
     from fetched_fixtures import save
     from recorded_references import provenance, record_case
 
@@ -1588,21 +1568,7 @@ def write_logits_recording(name: str, model: PreTrainedModel, command: str) -> N
     directory = FIXTURES / name
     model = model.float().eval()
     model.set_attn_implementation("eager")
-    wide = deepcopy(model).double()
-    with float64():
-        # Rotary inverse frequencies are buffers built at construction in float32: rebuilt in float64.
-        for module in wide.modules():
-            build = (getattr(module, "rope_init_fn", None)
-                     or getattr(module, "compute_default_rope_parameters", None))
-            if hasattr(module, "inv_freq"):
-                if build is None:
-                    raise ValueError(f"{type(module).__name__} holds float32 inverse frequencies and no rule "
-                                     f"to rebuild them in float64")
-                inverse, _ = build(module.config, None)
-                module.inv_freq = inverse.double()
-                if hasattr(module, "original_inv_freq"):
-                    module.original_inv_freq = inverse.double()
-                print(f"{type(module).__name__}: inverse frequencies rebuilt in float64", flush=True)
+    wide = float64_twin(model)
     vocab = model.config.vocab_size
     native = Pretrained.load(directory, dtype="float32", attention_impl="reference")
 
