@@ -385,7 +385,7 @@ Audio clips have a mask that is True for valid frames. Gemma 4 inserts one place
 
 The Gemma 3n and Gemma 4 audio encoders are `dew.nn.audio.Gemma3nAudio` and `Gemma4Audio`, with the tower aliases `gemma3n_audio` and `gemma4_audio`. `audio_config` reads the checkpoint's `audio_config` record and rejects unknown computational fields. `audio_weights` converts the tower's own tensors and keeps Gemma 4's checkpointed clipping bounds in a frozen `constants` collection.
 
-An encoder takes `input_features` shaped `[B, T, F]` and a boolean `input_features_mask` that is True for valid frames, and returns `AudioEncoding(features, mask)`, with the mask subsampled to the encoder's frame rate. A loaded source's processor (`Pretrained.load(...).processor`) runs the checkpoint's own Transformers feature extractor, which turns 16 kHz mono waveforms into those two arrays. Nothing resamples the audio. Gemma 3n projects audio through `Gemma3nProjectorModule.soft_embeddings`, without the scaling used for vision. Gemma 4 reuses `Gemma4ProjectorModule`, with its input width taken from `output_proj_dims`.
+An encoder takes `input_features` shaped `[B, T, F]` and a boolean `input_features_mask` that is True for valid frames, and returns `AudioEncoding(features, mask)`, with the mask subsampled to the encoder's frame rate. A loaded source's processor (`Pretrained.load(...).processor`) runs the checkpoint's own Transformers feature extractor, which turns 16 kHz mono waveforms into those two arrays. Nothing resamples the audio. Gemma 3n projects audio through `Gemma3nProjector.soft_embeddings`, without the scaling used for vision. Gemma 4 reuses `Gemma4Projector`, with its input width taken from `output_proj_dims`.
 
 ## Masked diffusion language models
 

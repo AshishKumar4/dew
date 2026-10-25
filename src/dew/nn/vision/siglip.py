@@ -9,25 +9,16 @@ from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import jax
-import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
 from dew.interop.weights import checkpoint_array, in_params
-from dew.nn.attention import LayerNorm, RMSNorm
-from dew.nn.blocks import TokenEmbedding
-from dew.nn.conv import Conv
+from dew.nn.attention import RMSNorm
 from dew.nn.dense import Dense
 from dew.nn.precision import float32_dot_general
-from dew.nn.text_encoders import (
-    TOWER_ACTIVATIONS,
-    _encoder_layer_path,
-    checked_image,
-    clip_layer,
-    tower_activation,
-)
+from dew.nn.text_encoders import TOWER_ACTIVATIONS, _encoder_layer_path, tower_activation
 from dew.objectives.base import Variables
 from dew.registry import Record
 
@@ -43,56 +34,10 @@ from .common import (
     head_width,
     trunk_geometry,
 )
+from .vit import LearnedPositions, VisionTransformer, ViTLayout
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
-
-
-class SiglipVisionTransformer(nn.Module):
-    """The SigLIP vision trunk, param layout of `SiglipVisionConfig`.
-
-    `pixel_values` are what the checkpoint's image processor emits: [B, C, H,
-    W] at `image_size`, normalized. The sequence returned is the encoder
-    output through the post norm. The attention pooling head some SigLIP
-    checkpoints carry is not built; the Gemma path reads the sequence alone.
-    """
-
-    config: SiglipVision
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    def setup(self):
-        cfg = self.config
-        head_width(cfg.hidden_size, cfg.num_heads)
-        patches = (cfg.image_size // cfg.patch_size) ** 2
-        # torch Conv2d carries a bias unless told otherwise; the CLIP tower's
-        # convolution is the bias-free exception, not the rule.
-        self.patch_embedding = Conv(
-            cfg.hidden_size, (cfg.patch_size, cfg.patch_size),
-            strides=(cfg.patch_size, cfg.patch_size), padding="VALID",
-            use_bias=True, dtype=self.dtype, precision=self.precision,
-            name="patch_embedding")
-        self.position_embedding = TokenEmbedding(patches, cfg.hidden_size,
-                                           dtype=self.dtype, name="position_embedding")
-        self.layers = [
-            clip_layer(cfg.hidden_size, cfg.num_heads, cfg.intermediate_size, patches,
-                       activation=tower_activation(cfg.hidden_act), eps=cfg.layer_norm_eps, dtype=self.dtype,
-                       precision=self.precision, name=f"layers_{index}")
-            for index in range(cfg.num_layers)]
-        self.post_layernorm = LayerNorm(
-            epsilon=cfg.layer_norm_eps, dtype=self.dtype, name="post_layernorm")
-
-    def __call__(self, pixel_values) -> jax.Array:
-        cfg = self.config
-        pixel_values = checked_image(pixel_values, cfg.num_channels, cfg.image_size)
-        batch = pixel_values.shape[0]
-        patches = self.patch_embedding(jnp.transpose(pixel_values, (0, 2, 3, 1)))
-        hidden_states = patches.reshape(batch, -1, cfg.hidden_size)
-        hidden_states = hidden_states + self.position_embedding(
-            jnp.arange(hidden_states.shape[1]))
-        for layer in self.layers:
-            hidden_states = layer(hidden_states)
-        return self.post_layernorm(hidden_states)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -109,15 +54,28 @@ class SiglipVision(TowerBase):
     hidden_act: str = "gelu_pytorch_tanh"
     layer_norm_eps: float = 1e-6
 
+    def layout(self) -> ViTLayout:
+        return ViTLayout(
+            depth=self.num_layers, hidden_size=self.hidden_size, num_heads=self.num_heads,
+            num_kv_heads=self.num_heads, head_dim=head_width(self.hidden_size, self.num_heads),
+            intermediate_size=self.intermediate_size, activation=tower_activation(self.hidden_act),
+            in_channels=self.num_channels, patch_size=self.patch_size, temporal_patch_size=1,
+            spatial_merge_size=1, norm_type="fast_layer", norm_eps=self.layer_norm_eps, norm_bias=True,
+            mlp_bias=True, packed=False, patch_bias=True, attention=("full",) * self.num_layers,
+            order=("patches",) * self.num_layers, sinks=(False,) * self.num_layers,
+            positions=LearnedPositions(self.image_size // self.patch_size, "fixed"),
+            patch_projection="conv", image_size=self.image_size, rotary=None, post_norm="layer",
+            outer_norm_eps=self.layer_norm_eps, merge_blocks=False)
+
     def build(self) -> nn.Module:
-        return SiglipVisionTransformer(self)
+        return VisionTransformer(self.layout())
 
     def geometry(self) -> TowerGeometry:
         return TowerGeometry(image_size=self.image_size, patch_size=self.patch_size,
                              channels=self.num_channels)
 
 
-class GemmaProjectorModule(nn.Module):
+class GemmaProjector(ProjectorBase):
     """Patch features into soft tokens: block average, norm, map to text width.
 
     The reference reshapes the trunk sequence into its patch grid, averages
@@ -158,28 +116,12 @@ class GemmaProjectorModule(nn.Module):
             self.mm_soft_emb_norm(pooled.reshape(batch, tokens * tokens, width)))
 
 
-@dataclasses.dataclass(frozen=True)
-class GemmaProjector(ProjectorBase):
-    """Gemma's projector fields: the decoder width and the patch grid pooled
-    into the soft-token grid."""
-
-    text_width: int
-    patches_per_side: int
-    tokens_per_side: int
-    norm_eps: float = 1e-6
-
-    def build(self) -> nn.Module:
-        return GemmaProjectorModule(
-            text_width=self.text_width, patches_per_side=self.patches_per_side,
-            tokens_per_side=self.tokens_per_side, norm_eps=self.norm_eps)
-
-
 _SIGLIP_TENSORS = {
-    "embeddings.patch_embedding.weight": ("patch_embedding", "kernel"),
-    "embeddings.patch_embedding.bias": ("patch_embedding", "bias"),
-    "embeddings.position_embedding.weight": ("position_embedding", "embedding"),
-    "post_layernorm.weight": ("post_layernorm", "scale"),
-    "post_layernorm.bias": ("post_layernorm", "bias"),
+    "embeddings.patch_embedding.weight": ("patch_embed", "kernel"),
+    "embeddings.patch_embedding.bias": ("patch_embed", "bias"),
+    "embeddings.position_embedding.weight": ("position_table", "embedding"),
+    "post_layernorm.weight": ("post_norm", "scale"),
+    "post_layernorm.bias": ("post_norm", "bias"),
 }
 
 
@@ -192,7 +134,7 @@ def siglip_vision_path(hf_name: str) -> tuple[str, ...] | None:
     """
     if hf_name == "embeddings.position_ids" or hf_name.split(".")[0] == "head":
         return None
-    path = _SIGLIP_TENSORS.get(hf_name) or _encoder_layer_path(hf_name.split("."), "encoder")
+    path = _SIGLIP_TENSORS.get(hf_name) or _encoder_layer_path(hf_name.split("."), "encoder", block="blocks")
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
     return path

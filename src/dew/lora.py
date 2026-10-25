@@ -53,10 +53,11 @@ from flax.linen.dtypes import promote_dtype
 from flax.linen.module import Interceptor
 from flax.nnx import bridge
 
+from dew.cache import INTERCEPTED
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
-from dew.nn.dense import Dense, DenseGeneral
+from dew.nn.dense import _contractions, _linear_site
 from dew.nn.flops import (
     MissingFlopsCount,
     counted_flops,
@@ -561,23 +562,17 @@ class _Branch:
             child = getattr(module, name)
             a, b = child.get_variable("params", "lora_A"), child.get_variable("params", "lora_B")
             return _updated(kernel, a, b, _scale(target, self.rslora))
-        target = _target_at(self.targets, root + module.path) if context.method_name == "__call__" else None
+        target = (_target_at(self.targets, root + module.path)
+                  if context.method_name in ("__call__", "_linear") else None)
         if target is None:
             return next_fun(*args, **kwargs)
-        # Dew's layers are flax's with the bias summed at fp32; a model built on flax's own adapts alike.
-        if type(module) not in (Dense, DenseGeneral, nn.Dense, nn.DenseGeneral):
-            raise TypeError(
-                f"{'/'.join(root + module.path)} is a {type(module).__name__}; an adapter "
-                "targets Dense and DenseGeneral kernels")
+        if not _linear_site(context, "/".join(root + module.path)):
+            return next_fun(*args, **kwargs)
         x = args[0] if args else kwargs["inputs"]
         output = next_fun(*args, **kwargs)
-        if isinstance(module, nn.DenseGeneral):
-            if module.batch_dims:
-                raise TypeError(f"{'/'.join(root + module.path)} contracts with batch dims")
-            axes = (module.axis,) if isinstance(module.axis, int) else tuple(module.axis)
-        else:
-            axes = (-1,)
-        axes = tuple(sorted(axis % x.ndim for axis in axes))
+        axes, batch_dims = _contractions(module, x.ndim)
+        if batch_dims:
+            raise TypeError(f"{'/'.join(root + module.path)} contracts with batch dims")
         if module.has_variable("params", "lora_A"):
             # A frozen FP8 site holds no kernel past init (`_fp8_packed`); its factors hold their shapes.
             a, b = module.get_variable("params", "lora_A"), module.get_variable("params", "lora_B")
@@ -758,11 +753,11 @@ def _adapted(model: nn.Module, bound: _Bound) -> nn.Module:
             return _record(bound)
 
         def apply(self, variables, *args, **kwargs):
-            with nn.intercept_methods(branch):
+            with INTERCEPTED(new_value=True), nn.intercept_methods(branch):
                 return super().apply(thaw(variables), *args, **kwargs)
 
         def init_with_output(self, *args, **kwargs):
-            with nn.intercept_methods(branch):
+            with INTERCEPTED(new_value=True), nn.intercept_methods(branch):
                 output, variables = super().init_with_output(*args, **kwargs)
             return output, _fp8_packed(model, dict(freeze(variables, lambda path: path in factors)))
 

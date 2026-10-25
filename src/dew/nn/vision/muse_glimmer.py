@@ -29,7 +29,7 @@ from .common import (
     block_tensor_path,
     rope_base,
 )
-from .vit import MergeProjector, VisionTransformer, ViTLayout
+from .vit import LearnedPositions, MergeProjector, VisionTransformer, ViTLayout
 
 
 def default_layer_types(layers: int) -> tuple[str, ...]:
@@ -82,7 +82,7 @@ class MuseGlimmerVision(TowerBase):
             norm_eps=1e-5, norm_bias=True, mlp_bias=True, packed=False, patch_bias=False,
             attention=tuple("window" if kind == "window_attention" else "full" for kind in self.layer_types),
             order=("windows",) * self.num_hidden_layers, sinks=(False,) * self.num_hidden_layers,
-            position_table=self.pos_emb_height * self.pos_emb_width, align_corners=False, pre_norm=True,
+            positions=LearnedPositions(self.pos_emb_height, align_corners=False), pre_norm=True,
             post_norm="layer", outer_norm_eps=self.layer_norm_eps, rope_theta=self.rope_theta,
             rotary_columns_first=True, rotary_origin=1, window=self.pos_emb_height, merge_blocks=False,
             channels_first=False)
@@ -94,7 +94,7 @@ class MuseGlimmerVision(TowerBase):
         return TowerGeometry(patch_size=self.patch_size, block_size=self.merge_size, channels=3)
 
 
-class MuseGlimmerProjectorModule(nn.Module):
+class MuseGlimmerProjector(ProjectorBase):
     """The merged image tokens as the decoder reads them (MuseGlimmerModel.get_image_features): each
     merge block's features channel by channel through the adapter's two bias-free maps, each followed
     by the activation (`MergeProjector`), a bias-free map to the decoder width, and a scale-free RMS
@@ -119,24 +119,6 @@ class MuseGlimmerProjectorModule(nn.Module):
         projected = Dense(self.text_width, use_bias=False, dtype=self.dtype, precision=self.precision,
                           name="projection", dot_general=float32_dot_general)(adapted)
         return RMSNorm(epsilon=self.norm_eps, with_scale=False, dtype=self.dtype, name="norm")(projected)
-
-
-@dataclasses.dataclass(frozen=True)
-class MuseGlimmerProjector(ProjectorBase):
-    """Muse Glimmer's projector fields: the trunk width, the merge size, the adapter's width and
-    activation, the decoder width and its RMS epsilon."""
-
-    vision_width: int
-    merge_size: int
-    adapter_width: int
-    text_width: int
-    activation: str = "gelu"
-    norm_eps: float = 1e-6
-
-    def build(self) -> nn.Module:
-        return MuseGlimmerProjectorModule(vision_width=self.vision_width, merge_size=self.merge_size,
-                                          adapter_width=self.adapter_width, text_width=self.text_width,
-                                          activation=self.activation, norm_eps=self.norm_eps)
 
 
 _TENSORS = {

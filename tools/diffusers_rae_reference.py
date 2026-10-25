@@ -16,6 +16,8 @@ transformers `Dinov2Model` (no registers; REPA's encoder), `dinov2_plain`:
 - `mae`: ViT-MAE, 16-pixel patches at 128 pixels, whose 14x14 table is
   resized to the grid, and no latent statistics. SigLIP's and MAE's decoders
   paint 8-pixel patches, so a 64x64 image is enlarged to the encoder's input.
+  It is 96 wide: the source derives its head count as width // 64, so its one
+  head is 96 wide, not 64.
 
 Each is saved with `save_pretrained` - its real config and safetensors - and
 recorded in float32, channel-first:
@@ -72,7 +74,7 @@ CONFIGS = {
     "siglip2": {**DECODER, "encoder_type": "siglip2", "encoder_hidden_size": 64, "encoder_num_hidden_layers": 1,
                 "encoder_patch_size": 16, "encoder_input_size": 128, "patch_size": 8,
                 "encoder_norm_mean": [0.5, 0.5, 0.5], "encoder_norm_std": [0.5, 0.5, 0.5]},
-    "mae": {**DECODER, "encoder_type": "mae", "encoder_hidden_size": 64, "encoder_num_hidden_layers": 1,
+    "mae": {**DECODER, "encoder_type": "mae", "encoder_hidden_size": 96, "encoder_num_hidden_layers": 1,
             "encoder_patch_size": 16, "encoder_input_size": 128, "patch_size": 8},
 }
 STATISTICS = {"dinov2": ("std",), "siglip2": ("mean", "std"), "mae": ()}
