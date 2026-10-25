@@ -22,9 +22,11 @@ def row_joins(choice: str, *, joins: bool = True):
 
 
 def dots(function, *args) -> int:
-    """The dot products `function`'s jaxpr runs, its sub-jaxprs' included."""
+    """The dot products an accelerator's run of `function` executes, its sub-jaxprs' included: of each
+    platform choice, the model's own products, where a CPU sums them in float64 and spreads a bias
+    by a product (`dew.nn.precision`, tests/test_cpu_accumulation.py)."""
     graph = jax.make_jaxpr(lambda *operands: function(*operands))(*args)
-    return sum(equation.primitive.name == "dot_general" for equation in equations(graph))
+    return sum(equation.primitive.name == "dot_general" for equation in equations(graph, platform="cuda"))
 
 
 def assert_joined_as_exact(choice: str, run, arguments, wide_run):

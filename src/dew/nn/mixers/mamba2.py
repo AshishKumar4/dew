@@ -70,7 +70,7 @@ from dew.nn.kernels.recurrence_chunk import RESET_DECAY, Chunk, chunk
 from dew.nn.linear import DepthwiseConv1d, causal_conv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
-from dew.nn.precision import at_least_fp32, float32_dot_general, float32_products
+from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum
 from dew.nn.sharding import (
     SEQUENCE_AXIS,
     LayoutRefused,
@@ -157,7 +157,7 @@ def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
         x_t, dt_t, B_t, C_t, start = step                   # [B, H, P], [B, H], [B, H, N], [B]
         decay = jnp.where(start[:, None], 0.0, jnp.exp(dt_t * A))
         s = s * decay[..., None, None] + (dt_t[..., None] * x_t)[..., None] * B_t[..., None, :]
-        read = jnp.einsum('bhps,bhs->bhp', s, C_t, precision=float32_products(s.dtype))
+        read = float32_einsum('bhps,bhs->bhp', s, C_t)
         return s, read + x_t * D[None, :, None]
 
     final, out = jax.lax.scan(
@@ -371,8 +371,7 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
         entering = entering.reshape(batch, n_groups, num_heads // n_groups, head_dim, state_size)
         decayed = jnp.exp(jnp.cumsum(log_decay, axis=1)).reshape(
             batch, length, n_groups, num_heads // n_groups)
-        carried = jnp.einsum('bsgn,bgkpn,bsgk->bsgkp', C, entering, decayed,
-                             precision=float32_products(C.dtype))
+        carried = float32_einsum('bsgn,bgkpn,bsgk->bsgkp', C, entering, decayed)
         out = out + carried.reshape(batch, length, num_heads, head_dim)
     return out.reshape(batch, length, intermediate), final
 

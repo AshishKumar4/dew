@@ -22,7 +22,7 @@ from dew.nn import kernels
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import chunked_launch, fla_kda, tuning
 from dew.nn.kernels.recurrence_chunk import fla_rule
-from dew.nn.precision import l2norm
+from dew.nn.precision import FP32_SUMS, l2norm
 
 pytestmark = pytest.mark.kernel
 
@@ -74,15 +74,22 @@ the float64 recurrence (2026-10-21, on armada, where this test runs: a GPU skips
 def test_the_rule_on_the_port_is_as_exact_as_the_math(key_heads, value_heads, width, columns, length):
     """`fla_rule` with a decay per key dimension, the port as a GPU runs it: padded to the kernels'
     blocks, through every kernel and the custom VJP, its output, final memory and six gradients on
-    par with the portable math on fla's plain prefix (`fla_math`) by check 1 (`assert_as_exact`)
-    over fresh operands drawn from each seed, truth the float64 token recurrence on them."""
+    par with the portable math on fla's plain prefix (`fla_math`) as a GPU runs it too, its products
+    summed in fp32 (`FP32_SUMS`), by check 1 (`assert_as_exact`) over fresh operands drawn from each
+    seed, truth the float64 token recurrence on them."""
     def draw(seed):
         return operands(1, length, key_heads, value_heads, width, columns, jnp.float32, seed=seed)
 
     def run(rule):
         return lambda q, k, v, g, beta, h0, do, dht: through(rule, do, dht)(q, k, v, g, beta, h0)
 
-    assert_as_exact(jax.jit(run(fla_rule)), jax.jit(run(fla_math)), draw,
+    def as_a_gpu_sums(function):
+        def summed(*arguments):
+            with jax.default_matmul_precision(FP32_SUMS):
+                return function(*arguments)
+        return summed
+
+    assert_as_exact(jax.jit(run(fla_rule)), as_a_gpu_sums(jax.jit(run(fla_math))), draw,
                     f"fla_kda {(key_heads, value_heads, width, columns, length)}",
                     seeds=SEEDS[(key_heads, value_heads, width, columns, length)],
                     truth_fn=jax.jit(run(recurrence)))

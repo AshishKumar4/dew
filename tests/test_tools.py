@@ -1613,6 +1613,38 @@ def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_pat
 # tools/benchmark_data.py
 # ---------------------------------------------------------------------------
 
+def test_the_data_benchmark_times_a_chain_under_its_own_loading_unless_its_flags_set_one():
+    """Without a `--loading.` flag the benchmark compiles the chain with no loading of its own, so the
+    chain's `loading(...)` is what it times, as a run reads it; a flag sets the tool's, which the
+    compile takes over the chain's."""
+    from dew.data.dataset import Loading
+
+    tool = load("benchmark_data")
+    assert tool.benchmark(["--steps", "3"]).loading is None
+    assert tool.benchmark(["--loading.workers", "2", "--steps", "3"]).loading == Loading(workers=2)
+
+
+@pytest.mark.parametrize("timeline", [None, 0.01, 0.2])
+def test_the_data_benchmark_checks_the_device_timelines_idle_and_reports_the_hosts_wait_beside_it(timeline):
+    """The loop's wait in `next(reader)` overlaps the updates still running on the device, so a host
+    that waits half of each step leaves the check to the device's own traced idle: it passes at 1%,
+    fails at 20%, and a run with no accelerator to trace has no check."""
+    tool = load("benchmark_data")
+    device = None if timeline is None else {"device_idle_fraction": timeline,
+                                            "device_input_idle_fraction": 0.0}
+
+    def arm(engine):
+        return {"workload": "text", "engine": engine, "loader": {"tokens_per_second": 100.0},
+                "parent_rss_peak_bytes": 1, "worker_rss_peak_bytes": 1,
+                "first_batch_from_open_seconds": 1.0,
+                "training": {"data_wait_ms": 2.0, "step_ms": 2.0, "device_timeline": device}}
+
+    [verdict] = tool.comparison([arm("dew"), arm("grain")])
+    assert verdict["host_data_wait_fraction"] == 0.5
+    checked = verdict["checks"].get("device_idle_under_5_percent")
+    assert checked == (None if timeline is None else timeline < 0.05)
+
+
 def test_the_data_benchmark_counts_a_grain_packing_and_dews_alike_as_the_objective_counts_them():
     """The data benchmark counts a batch's tokens and work as the run's objective counts them
     (`real_lengths`, `training_flops`), whichever packer laid the batch out: Grain's first-fit

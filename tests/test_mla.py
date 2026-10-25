@@ -48,6 +48,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import MixerCall
 from dew.nn.kernels import generation
 from dew.nn.mla import MultiHeadLatentAttention
+from dew.nn.precision import FP32_SUMS
 from dew.nn.rope import YarnScaling, rotary_freqs, yarn_attention_factor, yarn_inv_freq, yarn_query_scale
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, MeshSpec, Trainer
@@ -396,8 +397,8 @@ def test_the_fused_path_returns_the_value_columns_and_not_the_padding():
         return tuple(jnp.asarray(rng.standard_normal(shape), jnp.float32)
                      for shape in ((2, 7, 4, 16), (2, 7, 4, 16), (2, 7, 4, 8)))
 
-    # A CPU's calls take the reference path, whose softmax derivative the fused kernel's is not;
-    # routed as an A100's, the call runs the fused kernel this test is about.
+    # A CPU's calls take the reference path, whose float64 sums and exact softmax derivative the
+    # fused kernel's are not; routed as an A100's, the call runs the fused kernel this test is about.
     query, key, value = draw(0)
     fused = functools.partial(scaled_dot_product_attention, query, key, implementation="xla", causal=True)
     with generation.assumed("sm80"):
@@ -409,7 +410,13 @@ def test_the_fused_path_returns_the_value_columns_and_not_the_padding():
             fused(jnp.pad(value, ((0, 0), (0, 0), (0, 0), (0, 16))))
         xla, reference = (functools.partial(scaled_dot_product_attention, implementation=name, causal=True)
                           for name in ("xla", "reference"))
-        assert_as_exact(jax.jit(xla), jax.jit(reference), draw, "narrow value columns",
+
+        def summed(*arrays):
+            # The fused kernel's products sum as an A100's do, so the reference states those sums.
+            with jax.default_matmul_precision(FP32_SUMS):
+                return reference(*arrays)
+
+        assert_as_exact(jax.jit(xla), jax.jit(summed), draw, "narrow value columns",
                         seeds=SEEDS["value columns"])
 
 

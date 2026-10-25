@@ -17,7 +17,7 @@ reads.
 
 from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures, bucket
 from dew.decision.data import Example, corpus, decisions, mixture
-from dew.decision.head import HEADS, DecisionHead, Head, JointSchemaHead
+from dew.decision.head import DecisionHead, Head, JointSchemaHead
 from dew.decision.joint_checkpoint import JointCheckpoint, StoredJointHead
 from dew.decision.laya import LayaCheckpoint
 from dew.decision.layout import (
@@ -28,9 +28,14 @@ from dew.decision.layout import (
     Laid,
     Layout,
     MarkerLayout,
+    Media,
     QuestionLayout,
+    Schema,
+    Segment,
     Specials,
+    State,
     StateFirstLayout,
+    Text,
     render,
 )
 from dew.decision.metrics import AURC, ECE, Accuracy, Answered
@@ -58,7 +63,6 @@ from dew.decision.task import TASK_FILE, Budget, Decide, Usage, Weights
 __all__ = [
     "AURC",
     "ECE",
-    "HEADS",
     "KINDS",
     "NONE_OF_THE_ABOVE",
     "TASK_FILE",
@@ -94,20 +98,25 @@ __all__ = [
     "Layout",
     "LogLoss",
     "MarkerLayout",
+    "Media",
     "Noul",
     "NoulAnswer",
     "Question",
     "QuestionLayout",
     "RankedProbability",
+    "Schema",
     "Score",
     "ScoreAnswer",
     "Scored",
     "ScoringRule",
+    "Segment",
     "Specials",
     "Spherical",
+    "State",
     "StateFirstLayout",
     "StoredJointHead",
     "Temperatures",
+    "Text",
     "TopProbability",
     "Usage",
     "Weights",
