@@ -212,9 +212,9 @@ class GRPOObjective(TokenScorer):
 
         The loss and a proximal rescoring share its scoring path. A
         packed column whose shape differs from `input_ids` raises `ValueError`.
-        With `qk_stats`, the loss scores through `_packed_scores`, which returns
-        the QK collection from the same forward, so an override of this method
-        must override that one too.
+        Where its step asks for the attention logit maxima (`Step.qk_stats`), the
+        loss scores through `_packed_scores`, which returns the QK collection from
+        the same forward, so an override of this method must override that one too.
         """
         return self._packed_scores(params, batch)[0]
 
@@ -237,7 +237,7 @@ class GRPOObjective(TokenScorer):
         sampled = self.sampled_log_probs(params, scores, ids, support, self.sampling_temperature)
         return onto_ids(batch, sampled), scores.qk
 
-    def _terms(self, params, batch) -> _Terms:
+    def _terms(self, params, batch, *, qk_stats: bool) -> _Terms:
         """Read a packed batch onto its own `[rows, width]` grid.
 
         The old policy is `old_log_probs` when a rescoring or the sampler
@@ -254,7 +254,7 @@ class GRPOObjective(TokenScorer):
         weights = batch.get(SESSION_WEIGHTS_KEY)
         # `packed_log_probs` is the scoring seam a subclass may replace; the QK
         # collection MuonClip reads comes from the same live forward when asked for.
-        policy, qk = (self._packed_scores(params, batch, qk_stats=True) if self.qk_stats
+        policy, qk = (self._packed_scores(params, batch, qk_stats=True) if qk_stats
                       else (self.packed_log_probs(params, batch), None))
         return _Terms(policy, old, behavior,
                       jnp.asarray(batch[ADVANTAGES_KEY], jnp.float32), mask,
@@ -267,7 +267,7 @@ class GRPOObjective(TokenScorer):
         The policy's log-probabilities are recomputed from the rollout's own
         ids, so every term uses the tokens that were actually sampled.
         """
-        terms = self._terms(variables, batch)
+        terms = self._terms(variables, batch, qk_stats=step.qk_stats)
         mask = terms.mask
         correction = self.behavior_importance
         if isinstance(correction, float) and not terms.proximal:

@@ -44,6 +44,7 @@ from dew.objectives.base import (
     recorded_metrics,
     with_projected,
 )
+from dew.optim import clips_qk
 from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
 from dew.training.state import Accumulation, TrainState
@@ -473,6 +474,7 @@ class Transaction:
         # The part its input ran as, which an attempt counts (`step` times `split` plus its part).
         step_info = Step(accepted // self.split, jax.random.fold_in(state.key, attempt),
                          with_ema(variables, state.ema), committed=state.updates, record=self.record,
+                         qk_stats=clips_qk(state.opt_state),
                          **self.examples(state, index, batch, part=attempt % self.split,
                                          rejected=attempt - accepted))
         return self.read(variables, state.compute), batch, step_info
@@ -683,7 +685,7 @@ class Transaction:
             rejected = attempt - state.microstep
             step_info = Step(state.microstep // self.split, jax.random.fold_in(state.key, attempt),
                              with_ema(state.variables, state.ema), committed=state.updates,
-                             record=self.record,
+                             record=self.record, qk_stats=clips_qk(state.opt_state),
                              **self.examples(state, state.microstep % self.size, batch, part, rejected))
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
             realized = realize(self.read(state.variables, state.compute), batch, step_info)

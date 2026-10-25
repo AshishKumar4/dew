@@ -210,7 +210,7 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         qk = None
         if qk_stats:
             values, gathered = values
-            qk = gathered.get("qk")
+            qk = gathered.get("qk", {})
         if not isinstance(values, jax.Array) or values.shape != ids[:, :-1].shape:
             raise ValueError("PPO critic must return one scalar value per input position")
         return onto_ids(batch, values.astype(jnp.float32)), qk
@@ -227,7 +227,7 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
         policy_step = replace(step, ema=None if step.ema is None else part(step.ema, "policy"))
         pg, aux = self.actor.loss(part(variables, "policy"), batch, policy_step)
         mask = jnp.asarray(batch[RESPONSE_MASK_KEY])
-        values, critic_qk = self._critic_scores(variables, batch, qk_stats=self.actor.qk_stats)
+        values, critic_qk = self._critic_scores(variables, batch, qk_stats=step.qk_stats)
         terms = clipped_value_loss_terms(values, jnp.asarray(batch[RETURNS_KEY]),
                                          jnp.asarray(batch[OLD_VALUES_KEY]), self.value_clip)
         critic = Ratio(jnp.sum(jnp.where(mask != 0, terms, 0) * mask), jnp.sum(mask))

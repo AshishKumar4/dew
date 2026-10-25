@@ -582,9 +582,9 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     It holds the decoder (`model`, a loaded source among them, with
     `variables` and `processor` overriding its own through
     `Objective.bind_model`), the row length `seq_len`, and how the head is
-    scored: `head_chunks`, `head_tile` and `qk_stats` (`LMObjective`
-    describes each). `samples` draws previews. A loss built on it keeps no
-    average unless it sets `ema`; `LMObjective` adds the language-model
+    scored: `head_chunks` and `head_tile` (`LMObjective` describes each).
+    `samples` draws previews. A loss built on it keeps no average unless it
+    sets `ema`; `LMObjective` adds the language-model
     terms and loss, and the options only they read, `pad_id` and
     `token_accuracy`.
     """
@@ -637,7 +637,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     def __init__(self, model, seq_len: int, *, head_chunks: int = 4,
                  head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
                  samples: Samples | None = None, variables: Variables | None | Omitted = OMITTED,
-                 qk_stats: bool = False, processor: Processor | None | Omitted = OMITTED):
+                 processor: Processor | None | Omitted = OMITTED):
         """Bind the decoder and set how its tokens are scored; the class docstring describes each argument."""
         model = self.bind_model(model, variables=variables, processor=processor)
         _check_reads(model)
@@ -651,7 +651,6 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         # traced is taken to have one.
         self._head_matrices: dict[int, tuple[object, bool]] = {}
         self.samples = samples
-        self.qk_stats = qk_stats
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len + 1,)))
         if samples is not None and samples.max_new_tokens > 0:
             self._prompt = prompt_batch(samples.prompt)
@@ -905,7 +904,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         hidden, gathered = self._hidden_states(params, inputs, train, rngs, opened,
                                                {**packing, **replay}, layers)
         sown = gathered.get("router", {}) if routing else None
-        qk = gathered.get("qk") if qk_stats else None
+        qk = gathered.get("qk", {}) if qk_stats else None
         kls = gathered.get(INDEXER_COLLECTION) if indexer else None
         kept = tuple(self._layer_states().layer_state(gathered, index) for index in layers)
         predict = self.token_accuracy if predict is None else predict
@@ -1201,10 +1200,11 @@ class LMObjective(TokenScorer):
     model needs `num_nextn_predict_layers` above zero. Unset leaves
     the term out and the depths untrained.
 
-    `qk_stats` opens the `qk` collection where the attention layers record
-    their per-head logit maxima, and reports them for the optimizer's
-    QK-Clip. The recipe sets it when the optimizer is `muonclip`. Unset, the
-    collection stays closed and costs no extra matmul.
+    A step whose optimizer clips by the attention logit maxima (`Step.qk_stats`,
+    a QK-Clip such as `muonclip`'s) opens the `qk` collection where the
+    attention layers record their per-head maxima, reports the largest as
+    `qk/max_logit` and returns them for the clip. Otherwise the collection
+    stays closed and costs no extra matmul.
 
     `indexer` trains DeepSeek-V3.2's lightning indexer, one
     `IndexerTraining` phase at a time, on a model whose mla mixer has the
@@ -1256,14 +1256,13 @@ class LMObjective(TokenScorer):
         mtp_weight: float | None = None,
         z_loss: float = 0.0,
         router_z_loss: float = 0.0,
-        qk_stats: bool = False,
         indexer: IndexerTraining | None = None,
         token_accuracy: bool = True,
         processor: Processor | None | Omitted = OMITTED,
     ):
         """Build the objective; the class docstring describes each argument."""
         super().__init__(model, seq_len, head_chunks=head_chunks, head_tile=head_tile, samples=samples,
-                         variables=variables, qk_stats=qk_stats, processor=processor)
+                         variables=variables, processor=processor)
         self.pad_id = pad_id
         self.token_accuracy = token_accuracy
         _check_terms(self.model, aux_loss_alpha=aux_loss_alpha, mtp_weight=mtp_weight, z_loss=z_loss,
@@ -1355,14 +1354,14 @@ class LMObjective(TokenScorer):
         assert self.indexer is not None
         prepared = batch_text(batch)
         inputs, _ = self._rows(prepared.tokens)
-        collections = [INDEXER_COLLECTION] + (["qk"] if self.qk_stats else [])
+        collections = [INDEXER_COLLECTION] + (["qk"] if step.qk_stats else [])
         _, gathered = self._hidden_states(
             thaw(params), inputs, train=step.training, rngs=model_rngs(step.key, training=step.training),
             collections=collections, packing=prepared.slice_tokens(stop=-1).kwargs())
         statistics, kl = self._warmup_statistics(gathered[INDEXER_COLLECTION], prepared, batch)
         reported = {"indexer_kl": kl}
-        qk = gathered.get("qk") if self.qk_stats else None
-        if self.qk_stats:
+        qk = gathered.get("qk", {}) if step.qk_stats else None
+        if step.qk_stats:
             peak = _global_qk_max(qk)
             if peak is not None:
                 reported["qk/max_logit"] = peak
@@ -1444,7 +1443,7 @@ class LMObjective(TokenScorer):
             params, prepared, train=train, rngs=model_rngs(step.key, training=train),
             routing=rate is not None or alpha is not None or bool(self.router_z_loss),
             depths=self.mtp_weight is not None, roles=self._batch_roles(batch),
-            qk_stats=self.qk_stats, indexer=self.indexer is not None, layers=layers,
+            qk_stats=step.qk_stats, indexer=self.indexer is not None, layers=layers,
             z_loss=self.z_loss if summed else None, logits=logits, predict=predict)
         losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums, _ = scores
         mass = jax.lax.stop_gradient(self.row_mean(weights, batch).total)
@@ -1499,7 +1498,7 @@ class LMObjective(TokenScorer):
         if rate is not None:
             effects, load = self._router_load(params, routing, queries, documents)
             reported.update(load)
-        if self.qk_stats:
+        if step.qk_stats:
             peak = _global_qk_max(qk)
             if peak is not None:
                 reported["qk/max_logit"] = peak

@@ -308,6 +308,19 @@ def _clip_leaf(qk_stats, tau: float, normed: set[tuple[str, ...]], path: jax.tre
     return _rescaled_update(update, param, jnp.sqrt(grouped[columns])[None], 1)
 
 
+class QKClipState(NamedTuple):
+    """A QK-Clip's state (`scale_by_qk_clip`), which holds nothing: its place in an optimizer's state
+    says the optimizer's updates read the step's attention logit maxima (`clips_qk`)."""
+
+
+def clips_qk(opt_state) -> bool:
+    """Whether an optimizer state holds a QK-Clip's (`QKClipState`), however the optimizer composes it:
+    a run then asks its objective for the step's attention logit maxima (`dew.objectives.Step.qk_stats`)
+    and hands them to the update."""
+    return any(isinstance(node, QKClipState) for node in jax.tree.leaves(
+        opt_state, is_leaf=lambda node: isinstance(node, QKClipState)))
+
+
 def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArgs:
     """Rescale the query and key projections of every head past `tau`.
 
@@ -315,19 +328,26 @@ def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArg
     per query group under grouped-query attention as Megatron Core clips it.
 
     The per-head maxima arrive as `qk_stats`, the `qk` collection the model
-    sowed, which the trainer forwards from the loss's `Aux`. Without them
-    the transform steps aside, leaving every other optimizer and every run
-    whose loss never opened the collection on its old update."""
+    sowed, which the trainer asks every objective for when its optimizer's
+    state holds this transform's (`clips_qk`) and forwards from the loss's
+    `Aux`. An update given none is refused: a clip that steps aside would
+    leave the logits it bounds unbounded with no sign of it."""
     if tau <= 0:
         raise ValueError(f"the clip threshold bounds positive logits, got {tau}")
 
-    def init_fn(params) -> optax.EmptyState:
+    def init_fn(params) -> QKClipState:
         del params
-        return optax.EmptyState()
+        return QKClipState()
 
     def update_fn(updates, state, params=None, qk_stats=None):
-        if qk_stats is None or params is None:
-            return updates, state
+        if params is None:
+            raise ValueError("QK-Clip rescales the query and key kernels of the parameters it is given, "
+                             "and this update was given none")
+        if qk_stats is None:
+            raise ValueError(
+                "QK-Clip clips by the step's attention logit maxima (qk_stats), and this update was given "
+                "none: a run hands them over from its objective's Aux.qk_stats, which an objective returns "
+                "where its step asks for them (Step.qk_stats); one that returns none cannot train under it")
         clipped = jax.tree_util.tree_map_with_path(
             functools.partial(_clip_leaf, qk_stats, tau, _qk_normed(params)), updates, params)
         return clipped, state
