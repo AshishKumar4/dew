@@ -181,7 +181,7 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         and the routers' balance terms where the objective balances them (`balance`)."""
         tokens, losses, weights, counted, predicted, real, sown = self._token_losses(params, batch, step,
                                                                                    train=train)
-        prediction = Ratio(self.row_mean(losses * weights, batch).total,
+        prediction = Ratio(self.row_mean(losses, batch, weights=weights).total,
                            self.row_mean(real.astype(jnp.float32), batch).total)
         correct = predicted == tokens
         accuracy, _ = self.accuracy(correct.astype(losses.dtype), batch, counted).mean()
