@@ -1409,9 +1409,9 @@ def test_a_pool_refuses_what_its_processes_do_not_share_before_any_trains(tmp_pa
 
 @pytest.mark.distributed
 def test_runs_average_across_a_pool_each_process_its_own_shards(tmp_path):
-    """Two runs a pool trained, averaged in the pool onto its mesh, whose leaves no one process holds
-    whole: every process's gathered mean is float64's mean of the two runs' weights rounded to fp32,
-    read from their checkpoints in one process."""
+    """Two runs a pool trained, averaged in the pool onto its mesh with their leaves split over its
+    fsdp axis, which no one process holds whole: every process's gathered mean is float64's mean of
+    the two runs' weights rounded to fp32, read from their checkpoints in one process."""
     import jax
 
     from dew.checkpoints import Checkpoints
@@ -1427,7 +1427,7 @@ def test_runs_average_across_a_pool_each_process_its_own_shards(tmp_path):
         # The live weights, as the pool averages them (ema=False).
         trees.append(restored["variables"])
     flat = [{jax.tree_util.keystr(path): np.asarray(leaf) for path, leaf
-             in jax.tree_util.tree_flatten_with_path(tree)} for tree in trees]
+             in jax.tree_util.tree_leaves_with_path(tree)} for tree in trees]
     for index in range(2):
         dumped = dumped_params(tmp_path / "out" / f"process{index}.json")
         assert set(dumped) == set(flat[0])

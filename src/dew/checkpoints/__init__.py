@@ -1911,7 +1911,7 @@ class Averaged:
 
 
 def averaged(runs: Sequence[str | os.PathLike[str]], *, step: int | str | None = None,
-             ema: bool | None = None, trust: Sequence[str] = ()) -> Averaged:
+             ema: bool | None = None, mesh=None, layout=None, trust: Sequence[str] = ()) -> Averaged:
     """The fp32 mean of `runs`' effective weights, each run's at `step` (its latest where None) and
     `ema` as its loaders read them (its average where None and it keeps one): a model soup of runs
     trained apart from one start, any objective's.
@@ -1931,7 +1931,7 @@ def averaged(runs: Sequence[str | os.PathLike[str]], *, step: int | str | None =
     means: list[np.ndarray] = []
     structure, placements, model, read = None, [], None, []
     for count, run in enumerate(runs, start=1):
-        tree, base, entry = _effective_weights(str(epath.Path(run)), step, ema, trust)
+        tree, base, entry = _effective_weights(str(epath.Path(run)), step, ema, mesh, layout, trust)
         if model is not None and base != model:
             raise ValueError(f"the run in {entry[0]} trains another model than {read[0][0]}'s, so their "
                              "weights are not one model's to average")
@@ -1957,8 +1957,8 @@ def averaged(runs: Sequence[str | os.PathLike[str]], *, step: int | str | None =
     return Averaged(jax.tree.unflatten(structure, placed), model, tuple(read))
 
 
-def _effective_weights(directory: str, step: int | str | None, ema: bool | None, trust: Sequence[str]
-                       ) -> tuple[Variables, ModelConfig, tuple[str, int, bool]]:
+def _effective_weights(directory: str, step: int | str | None, ema: bool | None, mesh, layout,
+                       trust: Sequence[str]) -> tuple[Variables, ModelConfig, tuple[str, int, bool]]:
     """The run in `directory`'s model tree as `averaged` takes it, its model record with any adapter
     merged away, and its directory, step and average read: the adapter's factors merged where the
     recorded model's tree is (`Objective._recorded_part`), beside any part its record leaves out, and
@@ -1972,7 +1972,8 @@ def _effective_weights(directory: str, step: int | str | None, ema: bool | None,
     declaration, pinned = run_record(directory, step, trust)
     objective = objectives[records.text(declaration["objective"], "objective")]
     config = ModelConfig.from_dict(records.record(declaration["model"], "model"))
-    tree = objective._saved_variables(directory, step=pinned, ema=ema, param_dtype=jnp.float32)
+    tree = objective._saved_variables(directory, step=pinned, ema=ema, mesh=mesh, layout=layout,
+                                      param_dtype=jnp.float32)
     if config.adapter is not None:
         name = objective._recorded_part
         own = tree if name is None else part(tree, name)
