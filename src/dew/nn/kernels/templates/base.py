@@ -41,8 +41,15 @@ class Template[Config: Hashable](tuning.KernelOp):
 
     def registers(self, ba: tokamax.BoundArguments, config: Config) -> int | None:
         """The 32-bit registers a thread of the launch's program holds live at `config`, from its tiles'
-        sizes; None where the launch states none. Past `cost.THREAD_REGISTERS` the program spills."""
+        sizes; None where the launch states none. Past `register_budget` the program spills."""
         return None
+
+    def register_budget(self, config: Config) -> int:
+        """The registers a thread of the launch's program may hold at `config`: a thread's own
+        (`cost.THREAD_REGISTERS`) unless the launch's roles share the file otherwise (a warp-specialized
+        program's consumers, `mosaic.consumer_registers`)."""
+        del config
+        return cost.THREAD_REGISTERS
 
     def costed(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> cost.Cost:
         """The work, bytes and geometry the estimate of the launch of `ba` at `config` on `target` reads
@@ -59,18 +66,24 @@ class Template[Config: Hashable](tuning.KernelOp):
         target's facts): every one does unless it says otherwise."""
         return True
 
-    def fitting(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[Config, ...]:
+    def fits(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[Config, ...]:
         """The configs of `space` whose programs fit a block of `target` (`generation.shared_budget`) and
-        a thread's registers (`registers`, `cost.THREAD_REGISTERS`), in `space`'s order. A call none fits
-        raises, naming the least any config stages and the budget: the template's own requirements refuse
-        the call before it reaches a launch."""
+        a thread's registers (`registers`, `register_budget`), in `space`'s order; none where none does,
+        which an implementation's eligibility reads."""
         budget = generation.shared_budget(target)
-        space = tuple(self.space(ba))
-        fits = tuple(config for config in space if self.staged_bytes(ba, config, target) <= budget
-                     and (self.registers(ba, config) or 0) <= cost.THREAD_REGISTERS)
+        return tuple(config for config in self.space(ba) if self.staged_bytes(ba, config, target) <= budget
+                     and (self.registers(ba, config) or 0) <= self.register_budget(config))
+
+    def fitting(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[Config, ...]:
+        """The configs that fit (`fits`). A call none fits raises, naming the least any config stages and
+        the budget: the template's own requirements refuse the call before it reaches a launch."""
+        fits = self.fits(ba, target)
         if not fits:
-            least = min((self.staged_bytes(ba, config, target) for config in space), default=None)
-            raise Unfitted(type(self).__name__, least, budget, target.generation)
+            # The least any config whose threads hold their registers stages; None where none does.
+            held = (config for config in self.space(ba)
+                    if (self.registers(ba, config) or 0) <= self.register_budget(config))
+            least = min((self.staged_bytes(ba, config, target) for config in held), default=None)
+            raise Unfitted(type(self).__name__, least, generation.shared_budget(target), target.generation)
         return fits
 
     def calibrated(self, config: Config) -> bool:
@@ -96,10 +109,9 @@ class Template[Config: Hashable](tuning.KernelOp):
         held = [candidate for candidate in self.space(ba) if candidate == config]
         if not held:
             return "not in its space at this launch's key"
-        registers = self.registers(ba, held[0]) or 0
-        if registers > cost.THREAD_REGISTERS:
-            return (f"its threads hold {registers} registers live, past the {cost.THREAD_REGISTERS} a "
-                    "thread has")
+        registers, budget = self.registers(ba, held[0]) or 0, self.register_budget(held[0])
+        if registers > budget:
+            return f"its threads hold {registers} registers live, past the {budget} a thread has"
         target = generation.gpu_target()
         staged = self.staged_bytes(ba, held[0], target)
         return (f"its programs stage {staged} bytes of shared memory, past the "
@@ -129,12 +141,15 @@ def dividing[C](configs: Sequence[C], extents: tuple[int, ...],
 
 
 class Unfitted(ValueError):
-    """A call no config of a launch holds: its programs stage at least `least` bytes of shared memory
-    (None where the launch declares no config), past the `budget` a block of `generation` holds."""
+    """A call no config of a launch holds: its programs stage at least `least` bytes of shared memory,
+    past the `budget` a block of `generation` holds, or (`least` None) no config's threads hold their
+    registers (`Template.register_budget`), or the launch declares none."""
 
     def __init__(self, launch: str, least: int | None, budget: int, generation: str):
-        super().__init__(f"{launch}'s programs stage at least {least} bytes of shared memory for this "
-                         f"call, past the {budget} a block of {generation} holds")
+        super().__init__(f"{launch}'s programs stage at least {least} bytes of shared memory for this call, "
+                         f"past the {budget} a block of {generation} holds" if least is not None else
+                         f"no config of {launch} holds this call within a thread's registers or a block of "
+                         f"{generation}")
         self.launch, self.least, self.budget, self.generation = launch, least, budget, generation
 
     def __reduce__(self):
