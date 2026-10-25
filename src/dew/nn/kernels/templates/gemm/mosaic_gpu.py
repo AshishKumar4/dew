@@ -135,11 +135,11 @@ def tile_groups(lengths: jax.Array, tile: int, tiles: int) -> jax.Array:
     ends = jnp.cumsum(lengths)
     starts = ends - lengths
     index = jnp.arange(lengths.shape[0], dtype=jnp.int32)
-    tile = jnp.int32(tile)
+    rows = jnp.int32(tile)
     # A group's tiles are its blocks shifted by its index (one tile per group boundary a block shares),
     # as upstream counted them, its divisions truncating as `lax.div` does.
-    begin = lax.div(starts, tile) + index
-    end = lax.div(ends - 1, tile) + 1 + index
+    begin = lax.div(starts, rows) + index
+    end = lax.div(ends - 1, rows) + 1 + index
     tids = jnp.arange(tiles, dtype=jnp.int32)[:, None]
     ours = (begin[None] <= tids) & (tids < end[None])
     # The last group whose range holds the tile, as upstream's selects let the last match win.
