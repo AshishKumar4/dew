@@ -3503,6 +3503,28 @@
     }
    ]
   },
+  "t5/tiny-seeds.npz": {
+   "tool": "tools/t5_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "The seeds mode runs transformers' encoder on the committed t5/tiny checkpoint over check 1's seeds (tools/recorded_references.py's record_case, summary): each seed's drawn ids, the fp32 last hidden state's evidence and its float64 truth's sketch, built and run inside tools/torch_precision.py's float64."
+  },
+  "t5/tiny-umt5-seeds.npz": {
+   "tool": "tools/t5_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "The seeds mode runs transformers' encoder on the committed t5/tiny-umt5 checkpoint over check 1's seeds (tools/recorded_references.py's record_case, summary): each seed's drawn ids, the fp32 last hidden state's evidence and its float64 truth's sketch, built and run inside tools/torch_precision.py's float64."
+  },
   "tiny_diffusers.tar.xz": {
    "tool": "tools/diffusers_pipeline_reference.py",
    "sources": [
