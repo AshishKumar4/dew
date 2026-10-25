@@ -176,6 +176,10 @@ Import `Checkpoints` from `dew`.
 
 This object does not write `run.json`; run configuration saving is separate. Use the [complete resume example](../guides/checkpoints.md) before adapting these lower-level calls.
 
+<!-- api: dew.checkpoints.averaged dew.checkpoints.Averaged -->
+
+`dew.checkpoints.averaged(runs, step=None, ema=None)` averages runs trained apart from one model, of any objective, in fp32. A LoRA run's factors are merged into its kernels first. It returns an `Averaged`: the mean `variables`, the `model` record they apply to (its adapter merged away), and each run's directory, step and whether its EMA was read. Runs of another model are refused.
+
 ## Language modeling and generation
 
 Import `LMObjective` from `dew.objectives.lm`.
@@ -427,7 +431,7 @@ Import `pipeline`, `TextGeneration`, `BlockGeneration`, `MaskedGeneration`, `Tex
 
 <!-- api: dew.inference.pipeline.pipeline dew.objectives.Objective.pipeline dew.objectives.Objective.build_task -->
 
-`Objective.pipeline` builds the objective's task over `state.averaged` or `state.variables`. An omitted processor keeps the objective's own; `None` clears it. `build_task` returns `TextGeneration` for LM, GRPO and PPO's actor, `MaskedGeneration` for MDLM, `BlockGeneration` for block SFT and `TextToImage` for diffusion, which takes no processor.
+`Objective.pipeline` builds the objective's task over `state.averaged` or `state.variables`. An omitted processor keeps the objective's own; `None` clears it. `build_task` returns `TextGeneration` for LM, GRPO and PPO's actor, `MaskedGeneration` for MDLM, `BlockGeneration` for block SFT and `TextToImage` for diffusion, which takes no processor. An objective whose `saved_task` builds from the settings its run records (`from_settings`, as Dew's token tasks do) needs no `build_task` of its own: the default builds that task from its `task_settings()` over its model, as a saved run of it loads.
 
 <!-- api: dew.inference.TextGeneration dew.inference.TextGeneration.__call__ dew.inference.TextGeneration.bind dew.inference.TextGeneration.decode dew.inference.TextGeneration.quantized dew.inference.TextGeneration.from_run dew.inference.TextGeneration.from_pretrained -->
 

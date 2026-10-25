@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from reference_error import assert_as_exact, without_ynn
+from reference_error import assert_as_exact, with_gradients, without_ynn
 
 from dew.nn import categorical
 from dew.objectives.base import token_log_probs
@@ -173,6 +173,28 @@ def test_a_confident_labels_derivative_survives_and_sums_to_zero(margin):
                                   optax.softmax_cross_entropy_with_integer_labels(jnp.asarray(rows), labels))
 
 
+def written_softmax(rows: jax.Array) -> jax.Array:
+    """The softmax written out: each row moved to its largest logit, exponentiated and normalized, its
+    derivative autodiff's, through the maximum too."""
+    moved = jnp.exp(rows - jnp.max(rows, axis=-1, keepdims=True))
+    return moved / moved.sum(axis=-1, keepdims=True)
+
+
+@pytest.mark.parametrize("margin", sorted(COLLAPSE_SEEDS))
+def test_a_confident_rows_probabilities_differentiate_as_the_softmax_written_out(margin):
+    """Past the margin where the most probable class's `p - 1` rounds to 0 in float32 (arXiv:2610.31642,
+    eq. 4), the probabilities and their derivative under a drawn cotangent are on par from float64 with
+    the softmax written out (check 1), whose derivative through the row's maximum gives the most
+    probable class the others' sum, negated."""
+    def draw(seed):
+        (rows,) = confident(margin, seed)
+        return rows, np.random.default_rng([margin, seed]).standard_normal(rows.shape).astype(np.float32)
+
+    assert_as_exact(without_ynn(with_gradients(categorical.probabilities)),
+                    without_ynn(with_gradients(written_softmax)), draw, f"probabilities at margin {margin}",
+                    seeds=COLLAPSE_SEEDS[margin])
+
+
 def near_reference(seed: int) -> tuple[np.ndarray, np.ndarray]:
     """A row of float32 logits a thousandth of a unit from its reference row's, and the reference."""
     rng = np.random.default_rng(seed)
@@ -259,3 +281,117 @@ def test_the_divergences_derivative_stays_finite_wherever_its_rows_are():
     jacobian = np.asarray(jax.jacfwd(lambda rows: categorical.kl_divergence(rows, rows[::-1], held))(rows))
     assert np.all(np.isfinite(jacobian)) and np.all(jacobian[1] == 0)
 
+
+GROUP_SEEDS = 16
+"""Check 1's declared seeds for a group's divergence and its gradient."""
+
+
+def drawn(seed: int):
+    """Two windows of four question slots of five options each: two groups in the first window (one of
+    three members, one of two whose second member maps one option to no canonical key), one in the
+    second, an ungrouped question and a padded slot, logits wide enough to set the answers apart."""
+    rng = np.random.default_rng([0xC0, seed])
+    logits = jnp.asarray(rng.standard_normal((2, 4, 5)) * 3, jnp.float32)
+    options = jnp.asarray([[[1, 1, 1, 0, 0], [1, 1, 1, 0, 0], [1, 1, 1, 1, 0], [1, 1, 1, 0, 0]],
+                           [[1, 1, 0, 0, 0], [1, 1, 0, 0, 0], [1, 1, 1, 0, 0], [0, 0, 0, 0, 0]]], bool)
+    groups = jnp.asarray([[0, 0, 1, 0], [0, 0, -1, -1]], jnp.int32)
+    canonical = jnp.asarray([[[0, 1, 2, -1, -1], [2, 0, 1, -1, -1], [1, 0, -1, 2, -1], [1, 2, 0, -1, -1]],
+                             [[0, 1, -1, -1, -1], [1, 0, -1, -1, -1], [-1, -1, -1, -1, -1],
+                              [-1, -1, -1, -1, -1]]], jnp.int32)
+    cotangent = tuple(jnp.asarray(rng.standard_normal((2, 4)), jnp.float32) for _ in range(2))
+    return logits, options, groups, canonical, cotangent
+
+
+def written_out(logits, options, groups, canonical):
+    """The divergence written out: each member's softmax over its mapped slots summed onto the
+    canonical options by a one-hot product, the group's mean, and each member's KL from it over its
+    group's size; each member's share of its group its inverse size."""
+    mapped = options & (canonical >= 0)
+    any_mapped = jnp.any(mapped, -1, keepdims=True)
+    peak = jnp.max(jnp.where(mapped, logits, -jnp.inf), -1, keepdims=True)
+    p = jnp.where(mapped, jnp.exp(jnp.where(mapped, logits, 0.0) - jnp.where(any_mapped, peak, 0.0)), 0.0)
+    p = p / jnp.where(any_mapped, jnp.sum(p, -1, keepdims=True), 1.0)
+    onehot = (canonical[..., None] == jnp.arange(logits.shape[-1])) & mapped[..., None]
+    answers = jnp.einsum("bqk,bqkc->bqc", p, onehot.astype(p.dtype))
+    member = (groups >= 0) & any_mapped[..., 0]
+    same = (groups[..., :, None] == groups[..., None, :]) & member[..., :, None] & member[..., None, :]
+    size = jnp.sum(same, -1).astype(p.dtype)
+    mean = jnp.einsum("bqr,brc->bqc", same.astype(p.dtype), answers) / jnp.maximum(size, 1)[..., None]
+    counted = (answers > 0) & member[..., None]
+    terms = jnp.where(counted, answers * (jnp.log(jnp.where(counted, answers, 1))
+                                          - jnp.log(jnp.where(counted, mean, 1))), 0.0)
+    return (jnp.where(member, jnp.sum(terms, -1) / jnp.maximum(size, 1), 0.0),
+            jnp.where(member, 1 / jnp.maximum(size, 1), 0.0))
+
+
+def test_the_group_divergence_is_its_groups_jensen_shannon_divergence():
+    """Each member's share of its group's generalized Jensen-Shannon divergence, and its share of the
+    group, are on par from float64 with the divergence written out (check 1), their gradients under
+    drawn cotangents too; every member's shares of a group sum to its divergence and to one."""
+    def dew(logits, options, groups, canonical, cotangent):
+        return with_gradients(lambda logits: divergence_of(logits, options, groups, canonical))(
+            logits, cotangent)
+
+    def reference(logits, options, groups, canonical, cotangent):
+        return with_gradients(lambda logits: written_out(logits, options, groups, canonical))(
+            logits, cotangent)
+
+    assert_as_exact(without_ynn(dew), without_ynn(reference), drawn, "group divergence",
+                    seeds=GROUP_SEEDS)
+    logits, options, groups, canonical, _ = drawn(0)
+    divergence, members = (np.asarray(value) for value in categorical.group_divergence(logits, groups,
+                                                                                       canonical, options))
+    for window, group in ((0, 0), (0, 1), (1, 0)):
+        held = np.asarray(groups[window]) == group
+        count = int(held.sum())
+        assert np.array_equal(members[window][held], np.full(count, np.float32(1) / np.float32(count)))
+        assert divergence[window][held].sum() >= 0
+    assert np.all(members[np.asarray(groups) < 0] == 0) and np.all(divergence[np.asarray(groups) < 0] == 0)
+
+
+def agreeing(seed: int):
+    """A group of two members that give one answer over the canonical options: the second shows the
+    first's options in another order, its slots mapped back onto the first's canonical options."""
+    rng = np.random.default_rng([0xA6, seed])
+    first = rng.standard_normal(4) * 3
+    order = rng.permutation(4)
+    logits = jnp.asarray(np.stack([first, first[order]])[None], jnp.float32)
+    canonical = jnp.asarray(np.stack([np.arange(4), order])[None], jnp.int32)
+    return logits, jnp.ones((1, 2, 4), bool), jnp.asarray([[0, 0]], jnp.int32), canonical
+
+
+def divergence_of(logits, options, groups, canonical):
+    """`group_divergence` over the draws' arguments, in their order."""
+    return categorical.group_divergence(logits, groups, canonical, options)
+
+
+def test_members_that_agree_have_no_divergence_and_extreme_logits_stay_finite():
+    """Members that give one answer over the canonical options, in other slot orders, have a divergence
+    whose float64 truth is zero, met on par (check 1); logits of a thousand keep the divergence and its
+    gradient finite."""
+    assert_as_exact(without_ynn(divergence_of), without_ynn(written_out), agreeing,
+                    "agreeing members", seeds=GROUP_SEEDS)
+    logits, options, groups, canonical = agreeing(0)
+    apart = canonical.at[0, 1].set(jnp.arange(4))
+    divergence, _ = categorical.group_divergence(logits * 1000, groups, apart, options)
+    gradient = jax.grad(lambda x: divergence_of(x, options, groups, apart)[0].sum())(logits * 1000)
+    assert bool(jnp.all(jnp.isfinite(divergence))) and bool(jnp.all(jnp.isfinite(gradient)))
+
+
+def test_a_member_of_no_group_or_of_no_mapped_class_takes_no_part():
+    """A member in no group whose classes map, and a grouped member none of whose classes map, take no
+    part: the group's other member alone has divergence zero and the whole share, the outsider none,
+    and the divergence's derivative is finite and zero in both modes."""
+    logits = jnp.zeros((1, 2, 2), jnp.float32)
+    cases = ((jnp.asarray([[0, -1]]), jnp.asarray([[[0, 1], [0, 1]]])),
+             (jnp.asarray([[0, 0]]), jnp.asarray([[[0, 1], [-1, -1]]])))
+    for groups, classes in cases:
+        divergence, shares = categorical.group_divergence(logits, groups, classes)
+        np.testing.assert_array_equal(np.asarray(divergence), np.zeros((1, 2), np.float32))
+        np.testing.assert_array_equal(np.asarray(shares), np.asarray([[1.0, 0.0]], np.float32))
+        def total(x, groups=groups, classes=classes):
+            return categorical.group_divergence(x, groups, classes)[0].sum()
+
+        np.testing.assert_array_equal(np.asarray(jax.grad(total)(logits)), np.zeros((1, 2, 2), np.float32))
+        _, tangent = jax.jvp(total, (logits,), (jnp.ones_like(logits),))
+        assert float(tangent) == 0.0
