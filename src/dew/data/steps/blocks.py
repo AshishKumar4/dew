@@ -8,7 +8,7 @@ import grain.python as grain
 import numpy as np
 
 from dew.data.dataset import Batch
-from dew.data.steps.text import counted_by_rule
+from dew.data.steps.text import recounted
 
 
 @dataclasses.dataclass(frozen=True)
@@ -20,7 +20,7 @@ class Blocks(grain.MapTransform):
     the record's `<field>_roles` (a chat row's), which a row without refuses. `given` names a per-token field
     of the record, -1 for none, whose blocks are the runs of consecutive tokens in one document that carry one
     number, each run a block of its own. Padding is -1, and an unpacked record is one document. A count the
-    record carries is counted again over its blocks (`counted_by_rule`), so counts agree with the loss.
+    record carries is counted again over its blocks (`recounted`), so counts agree with the loss.
     """
 
     prefix: int | None = None
@@ -49,9 +49,7 @@ class Blocks(grain.MapTransform):
         else:
             groups = _prompt_groups(segments, _named(element, f"{self.field}_roles"))
         blocked = {**element, f"{self.field}_block_groups": np.asarray(groups, np.int32)}
-        if "_dew_valid_targets" not in element:
-            return blocked
-        return {**blocked, "_dew_valid_targets": counted_by_rule(blocked)}
+        return recounted(element, blocked)
 
 
 def _named(element: Batch, name: str) -> np.ndarray:
