@@ -277,11 +277,23 @@ def _heuristic(programs: int, steps: int, processors: int | None) -> Split:
                      default=counts[0]))
 
 
+def _whole(rows: int, keys: int) -> jax.Array:
+    """`rows` spans of every one of `keys` keys."""
+    return jnp.stack([jnp.zeros(rows, jnp.int32), jnp.full(rows, keys, jnp.int32)], axis=1)
+
+
 @dataclasses.dataclass(frozen=True)
 class DecodeAttention(tuning.KernelOp):
     """`attend`'s launch over a contiguous cache: programs a row, a head and a slice."""
 
     config_cls: ClassVar[type[Split]] = Split
+
+    ROWS: ClassVar[tuple[str, ...]] = ('query', 'key', 'value', 'spans')
+
+    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
+        """Normal floats, each row's span its whole capacity."""
+        arrays = super().operands(specs, seed)
+        return [*arrays[:3], _whole(specs[3].shape[0], specs[1].shape[1]), *arrays[4:]]
 
     def _fwd(self, query: jax.Array, key: jax.Array, value: jax.Array, spans: jax.Array,
              sinks: jax.Array | None = None, *, interpret: bool, softcap: float | None = None,
@@ -329,6 +341,16 @@ class PagedDecodeAttention(tuning.KernelOp):
     """`attend_paged`'s launch: programs a row, a key head and a slice."""
 
     config_cls: ClassVar[type[Split]] = Split
+
+    ROWS: ClassVar[tuple[str, ...]] = ('query', 'table', 'spans')
+
+    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
+        """Normal floats, each row's table naming pages of the pool in turn and its span the whole
+        table."""
+        arrays = super().operands(specs, seed)
+        (rows, per_row), count, page_size = specs[3].shape, specs[1].shape[1], specs[1].shape[2]
+        table = (jnp.arange(rows * per_row, dtype=jnp.int32) % count).reshape(rows, per_row)
+        return [*arrays[:3], table, _whole(rows, per_row * page_size), *arrays[5:]]
 
     def _fwd(self, query: jax.Array, key_pages: jax.Array, value_pages: jax.Array, table: jax.Array,
              spans: jax.Array, sinks: jax.Array | None = None, *, interpret: bool,
