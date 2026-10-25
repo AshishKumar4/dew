@@ -39,6 +39,9 @@ class Wgmma(mosaic.RingFamily):
     def column(self):
         return plgpu.Layout.WGMMA.reduce(0)
 
+    column_scratch = 4 * 32 * 2
+    """A WGMMA tile's columns sum across its four warps, each lane's two entries a register."""
+
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
         def scores(acc_ref):
             plgpu.wgmma(acc_ref, lhs, rhs)

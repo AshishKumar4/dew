@@ -20,13 +20,15 @@ import jax.numpy as jnp
 import tokamax
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels import generation, tuning
+from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention_algebra as algebra, cost as costs
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     DKV_GRADS,
     DQ_GRADS,
     NATURAL,
+    TRACED_TILE,
+    AttentionLaunch,
     Gradients,
     Hooks,
     KeySpans,
@@ -74,65 +76,29 @@ BLOCK = max(max(tiles.block_q for tiles in SPACE), max(tiles.block_k for tiles i
 
 def _eligible(ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
     """Whether a launch runs on `target`: a CUDA GPU, one dtype of `DTYPES` on the queries, keys and
-    values, and bf16 only from `generation.BF16_GPU` on, where Triton compiles its products."""
+    values, and bf16 only from `generation.BF16_GPU` on, where Triton compiles its products; spans of one
+    interval a query (`refused`)."""
     query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
     capability = generation.capability(target.generation)
     return (capability is not None and query.dtype == key.dtype == value.dtype and query.dtype in DTYPES
-            and (query.dtype != jnp.bfloat16 or 10 * capability[0] + capability[1] >= generation.BF16_GPU))
+            and (query.dtype != jnp.bfloat16 or 10 * capability[0] + capability[1] >= generation.BF16_GPU)
+            and ba.arguments["start"].ndim == 2)
+
+
+def refused(spans: KeySpans) -> str | None:
+    """Why this mainloop takes no call over `spans`, or None: a call's runs, several key intervals a query
+    (`KeySpans`), which the frozen mainloop does not walk; the Mosaic and plain-JAX mainloops do (ledger
+    956, `attention_route`)."""
+    if spans.start.ndim == 3:
+        return ("the Triton mainloop walks one key interval a query; a call's runs take the Mosaic or the "
+                "plain-JAX mainloop")
+    return None
 
 
 def _mode(dtype) -> str:
     """The arithmetic a launch's products take (`_dot`): IEEE fp32 for fp32 operands, else 16-bit
     products summed in fp32."""
     return 'fp32' if dtype == jnp.float32 else '16bit'
-
-
-TRACED_TILE = 16
-"""The tile a hook is traced at for its picks' key (`_hook_program`)."""
-
-
-def _hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], *,
-                  differentiated: bool = False, width: int = TRACED_TILE) -> str | None:
-    """What a score or output hook computes, as its launch's picks key it (`tuning.program`): a score
-    hook traced at a `TRACED_TILE` square fp32 tile, an output hook at `TRACED_TILE` queries of the
-    call's padded value `width`, the entries' indices and each parameter as its kind lays it out there,
-    in its dtype in the kernels (`dtypes`); `differentiated`, its pullback too, so a hook whose
-    derivative is its own rule (`jax.custom_vjp`) keys by that rule. None or an already traced key as
-    it is."""
-    if hook is None or isinstance(hook, str):
-        return hook
-    tile = TRACED_TILE
-    layouts = {Kind.HEAD: (), Kind.QUERY: (tile, 1), Kind.KEY: (1, tile), Kind.TILE: (tile, tile),
-               Kind.OUTPUT: (tile, width)}
-    params = [jax.ShapeDtypeStruct(layouts[kind], dtype) for kind, dtype in zip(kinds, dtypes, strict=True)]
-    square = jax.ShapeDtypeStruct((tile, tile), jnp.float32)
-    if name == "output_mod":
-        return tuning.program(hook, jax.ShapeDtypeStruct((tile, width), jnp.float32), *params)
-    positions = (jax.ShapeDtypeStruct((tile, 1), jnp.int32), jax.ShapeDtypeStruct((1, tile), jnp.int32))
-    if not differentiated:
-        return tuning.program(hook, square, *positions, *params)
-    floating = algebra.floating_params(params)
-
-    def pulled(s, q_pos, k_pos, *values):
-        hooked = algebra.differentiable(hook, q_pos, k_pos, values, floating)
-        out, pull = jax.vjp(hooked, s, *(values[index] for index in floating))
-        return out, pull(jnp.ones_like(out))
-
-    return tuning.program(pulled, square, *positions, *params)
-
-
-def _spanned(specs: list[jax.ShapeDtypeStruct], arrays: list[jax.Array]) -> list[jax.Array]:
-    """A launch's timing operands with its spans whole: of its integer operands by row `[B, Q]` (the
-    others, an anchor key `[B, H, Q]`, keep their draw), the first two each query's first key (0) and
-    one past its last (every key, `specs[1]` being the keys), the rest its documents' ids (one
-    document), so a timed launch visits every tile a dense call does."""
-    rows = [index for index, spec in enumerate(specs)
-            if jnp.issubdtype(spec.dtype, jnp.integer) and spec.ndim == 2]
-    keys = specs[1].shape[1]
-    for place, index in enumerate(rows):
-        filled = (0, keys)[place] if place < 2 else 1
-        arrays[index] = jnp.full(specs[index].shape, filled, specs[index].dtype)
-    return arrays
 
 
 def _tile_param(ref, kind: Kind, head, queries: jax.Array, keys: pl.Slice | None):
@@ -200,7 +166,8 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         # A key tile's logits; its values load where the step calls for them, after the softmax, where
         # jax's mha loads them.
         tile = pl.ds(index * block_k, block_k)
-        coords = algebra.Coords(q_pos, index * block_k + jnp.arange(block_k)[None, :], spans,
+        coords = algebra.Coords(q_pos, index * block_k + jnp.arange(block_k)[None, :],
+                                None if spans is None else (spans,),
                                 None if ids is None else (ids[0], ids[1][tile]))
         params = tuple(_tile_param(ref, kind, head, q_pos, tile)
                        for ref, kind in zip(score_refs, score_kinds, strict=True))
@@ -267,7 +234,7 @@ def _written(spec, walked, *, rows, out_ref, residual_refs, flag_ref, residuals:
 
 
 @dataclasses.dataclass(frozen=True)
-class TritonForward(Template[Tiles]):
+class TritonForward(AttentionLaunch, Template[Tiles]):
     """The template's forward in Pallas Triton over padded operands (`forward` pads them): queries
     `[B, Qp, H, Dp]` over keys `[B, Kp, Hk, Dp]` and values `[B, Kp, Hk, Dvp]`, each query's keys
     `start` to `end` `[B, Qp]` and, with documents, its id `[B, Qp]` against the keys' `[B, Kp]`; the
@@ -429,14 +396,6 @@ class TritonForward(Template[Tiles]):
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         return _eligible(ba, target)
 
-    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
-        return _spanned(specs, super().operands(specs, seed))
-
-    def traced(self, name: str, value: Callable | str | None) -> str | None:
-        if name == "output_mod":
-            return _hook_program(name, value, self.output_kinds, self.output_dtypes, width=self.output_width)
-        return _hook_program(name, value, self.score_kinds, self.score_dtypes)
-
 
 def _dividing[T: (Tiles, BackwardTiles)](space: tuple[T, ...], ba: tokamax.BoundArguments) -> tuple[T, ...]:
     """The configs of `space` whose tiles divide the launch's padded queries and keys."""
@@ -483,7 +442,9 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     denominators `[B, H, Q]` too, and each query's anchor key `[B, H, Q]` int32 (`backward` reads them
     all). The operands pad to whole blocks of the largest tile and to power-of-two
     head widths (`padded_call`). `natural` keeps the logits natural (`algebra.Forward.base2`).
-    `interpret` runs it on the CPU."""
+    `interpret` runs it on the CPU. A call over runs is refused (`refused`)."""
+    if reason := refused(spans):
+        raise NotImplementedError(reason)
     hooks = Hooks() if hooks is None else hooks
     call = padded_call(query, key, value, spans, hooks, BLOCK)
     queries, value_width = call.queries, value.shape[-1]
@@ -731,12 +692,16 @@ its dK/dV launch, its default first."""
 
 
 @dataclasses.dataclass(frozen=True)
-class TritonBackward(Template[BackwardTiles]):
+class TritonBackward(AttentionLaunch, Template[BackwardTiles]):
     """The template's backward over padded operands (`backward` pads them), one tuning decision for its
     two launches: the dQ launch (`_dq_launch`), then the dK/dV launch (`_dkv_launch`) under its softmax.
     Returns the dQ launch's outputs, then the dK/dV launch's."""
 
     HOOKS = ("score_mod",)
+    DIFFERENTIATED = True
+    SPANS = 15
+    """Its arrays' spans after the queries, keys, values, the output's cotangent and the forward's eleven
+    residual and state arrays (`_fwd`)."""
     name = "triton"
     config_cls = BackwardTiles
     score_mod: Callable | None = None
@@ -794,12 +759,6 @@ class TritonBackward(Template[BackwardTiles]):
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         return _eligible(ba, target)
-
-    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
-        return _spanned(specs, super().operands(specs, seed))
-
-    def traced(self, name: str, value: Callable | str | None) -> str | None:
-        return _hook_program(name, value, self.score_kinds, self.score_dtypes, differentiated=True)
 
 
 def _backward_registers(ba: tokamax.BoundArguments, config: BackwardTiles, *, dq: bool) -> int:
@@ -1041,7 +1000,10 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     `residuals`: its maxima, denominators, anchor keys and split sums (`forward`'s, which it takes again
     where None). With `split`, D comes from the split sums; without, the dQ launch takes its own first pass
     over the keys (`algebra.off_anchor`). `natural` keeps the forward's logits natural; `accurate` takes
-    the backward's accurate form (`ACCURATE`). `interpret` runs it on the CPU."""
+    the backward's accurate form (`ACCURATE`). `interpret` runs it on the CPU. A call over runs is refused
+    (`refused`)."""
+    if reason := refused(spans):
+        raise NotImplementedError(reason)
     if residuals is None:
         plain = Hooks() if hooks is None else Hooks(hooks.score_mod, hooks.score_params, hooks.initial)
         _, maxima, totals, anchors, sums = forward(query, key, value, spans, plain, scale=scale,

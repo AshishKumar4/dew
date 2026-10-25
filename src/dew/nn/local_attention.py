@@ -146,6 +146,12 @@ def _local_attention(query, key, value, *, window, chunk, places, segment_ids, m
     # slice is at least that long. A wider span takes the dense call, whose
     # mask the sequence exchange carries.
     halo = length % shards == 0 and length // shards >= span
+    if (length <= 2 * span or not halo) and chunk is None:
+        # A window over documents and real keys is the template's spans, which the whole call reads as
+        # they are where its kernel takes them, else as the mask they mean (`visibility_mask`).
+        return whole(implementation=implementation if implementation == 'auto' else masked, causal=True,
+                     sliding_window=window, segment_ids=segment_ids, max_segments=max_segments,
+                     key_valid=valid)
     if length <= 2 * span or not halo:
         # A mask pairs every query with every key, which an Explicit axis splitting both sides of it
         # would place twice, so the `[B, S]` fields it is built from are each device's whole.

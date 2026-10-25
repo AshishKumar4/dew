@@ -39,8 +39,12 @@ barriers."""
 def compiler_params(*, approx_math: bool = False) -> plgpu.CompilerParams:
     """A mainloop's compiler parameters: Mosaic GPU's warpgroup lowering, whose arrays are a warpgroup's,
     and with `approx_math` the hardware's approximate exponential and reciprocal (ex2.approx, as Triton's
-    exp2 and FlashAttention's are)."""
-    return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup, approx_math=approx_math)
+    exp2 and FlashAttention's are). No shared memory is reserved for reductions across warps: a block's
+    warpgroups reduce at once, so each takes its own scratch, the consumers' from the kernel's allocations
+    (`Family.column_sums`), and a reduction that would take Mosaic GPU's implicit scratch fails to lower
+    rather than share it."""
+    return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup, approx_math=approx_math,
+                                reduction_scratch_bytes=0)
 
 
 def meet(halves) -> None:
@@ -350,9 +354,9 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     streams (`streams`, `opened`, `stream` the producer's, `walk` and `passed` the consumer's), its products
     (`product` into a fresh accumulator, `products`, `register_products` and `staged_products` in place,
     `settled`), and its accumulator's layouts (`layout`, `row`, `column`, which `zeros`, `full`, `iota`,
-    `rows_of`, `columns_of` and `as_row` read). It is generic in its streams' allocations (`Allocated`,
-    `streams`'), its opened streams (`Opened`, `opened`'s) and the accumulator its products issue into in
-    place (`Accumulator`: a warpgroup accumulator ref, or a register array)."""
+    `rows_of`, `columns_of`, `column_zeros`, `column_sums` and `as_row` read). It is generic in its streams'
+    allocations (`Allocated`, `streams`'), its opened streams (`Opened`, `opened`'s) and the accumulator its
+    products issue into in place (`Accumulator`: a warpgroup accumulator ref, or a register array)."""
 
     name: str
     rows: int
@@ -533,10 +537,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """fp32 zeros in the accumulator's layout (two-dimensional) or a row's (one-dimensional)."""
         return self.full(shape, 0.0)
 
-    def full(self, shape: tuple[int, ...], value: float) -> jax.Array:
-        """fp32 `value` in the accumulator's layout or a row's (`zeros`)."""
+    def full(self, shape: tuple[int, ...], value: float, dtype=jnp.float32) -> jax.Array:
+        """`value` in `dtype` (fp32 unless given) in the accumulator's layout or a row's (`zeros`)."""
         layout = self.layout if len(shape) == 2 else self.row
-        return plgpu.layout_cast(jnp.full(shape, value, jnp.float32), layout)
+        return plgpu.layout_cast(jnp.full(shape, value, dtype), layout)
 
     def iota(self, shape: tuple[int, int], dimension: int) -> jax.Array:
         """Indices along `dimension` of a tile in the accumulator's layout."""
@@ -553,6 +557,32 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     def tile_of(self, ref) -> jax.Array:
         """A tile read from `ref` (`[rows, columns]`) in the accumulator's layout."""
         return plgpu.load(ref, layout=self.layout, optimized=False)
+
+    def column_zeros(self, count: int) -> jax.Array:
+        """fp32 zeros `[count]` in a column's layout (`columns_of`'s), the carry of a tile's key sums."""
+        return plgpu.layout_cast(jnp.zeros((count,), jnp.float32), self.column)
+
+    column_scratch: int
+    """The fp32 entries of shared memory a consumer's `column_sums` takes: a reduction across the warps
+    holding a tile's rows takes one register's partial sums at a time."""
+
+    def column_sums(self, value: jax.Array, scratch, interpret: bool) -> jax.Array:
+        """The sums of `value`'s columns `[columns]` in a column's layout, `value` `[rows, columns]` in the
+        accumulator's layout: across the warps holding its rows, through the consumer's own `scratch`
+        (`column_scratch` fp32 entries), as the block's other warpgroups reduce at once."""
+        if interpret:
+            return value.sum(axis=0)
+
+        def sums(ctx, tile, scratch):
+            del ctx
+            return tile.reduce("add", axis=0, scratch=scratch)
+
+        # Mosaic GPU's own reduction across the warps, through the given scratch; inline_mgpu passes the
+        # launch context first and takes the tile and its scratch.
+        summed: Callable[..., jax.Array] = plgpu.inline_mgpu(
+            arg_types=(self.layout, plgpu.RefType()),
+            return_type=plgpu.ShapeDtypeStruct((value.shape[1],), jnp.float32, layout=self.column))(sums)
+        return summed(value, scratch)
 
     def as_row(self, vector: jax.Array) -> jax.Array:
         """`vector` `[rows]` in a row's layout, whatever its own."""
