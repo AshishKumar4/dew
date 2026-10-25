@@ -849,10 +849,6 @@
    "comparisons": 1,
    "lane": "Training"
   },
-  "tools/reference_runs/qwen35_pair.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
   "tools/reference_runs/torch_qwen35_step.py": {
    "comparisons": 3,
    "lane": "Models, Serving & RL"
