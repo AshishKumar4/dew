@@ -630,12 +630,15 @@ def trained_runs(decide, tmp_path, count: int, *, name: str = "run") -> list[str
 
 
 def test_runs_that_share_a_head_average_their_weights_in_fp32_as_float64_does(decide, tmp_path):
+    """Runs trained apart from one held head average: two runs' mean is float64's rounded to fp32
+    exactly (halves are exact, and the sum rounds once); the running mean over three is on par from
+    float64 with an fp32 stacked mean (check 1), and exact at repeated maxima and opposite extremes;
+    the task's weights record every run's step and read, so no one run's directory may hold its
+    calibration (`save` refuses), and `calibrate_on` refits it."""
     from etils import epath
 
-    """Runs trained apart from one held head average: two runs' mean is float64's rounded to fp32
-    exactly (halves are exact, and the sum rounds once), and three runs' within check 1 of float64's
-    mean, over draws of their weights; the task's weights record every run's step and read, so no one
-    run's directory may hold its calibration (`save` refuses), and `calibrate_on` refits it."""
+    from dew.decision.task import _running_mean
+
     runs = trained_runs(decide, tmp_path, 3)
     tasks = [Decide.from_run(run) for run in runs]
     two = Decide.averaged(runs[:2])
@@ -652,19 +655,21 @@ def test_runs_that_share_a_head_average_their_weights_in_fp32_as_float64_does(de
         two.save(runs[0])
 
     def draw(seed):
+        # Leaves of both signs across six orders of magnitude, as runs' weights hold.
         rng = np.random.default_rng([0xA7, seed])
-        return tuple(rng.standard_normal(8).astype(np.float32) * (10.0 ** rng.integers(-3, 4))
+        return tuple(rng.standard_normal(64).astype(np.float32) * np.float32(10.0 ** rng.integers(-3, 4))
                      for _ in range(3))
 
-    def averaged(*leaves):
-        shares = [jnp.asarray(leaf, jnp.float32) / 3 for leaf in leaves]
-        return sum(shares[1:]) + shares[0]
+    def running(*leaves):
+        mean = {"w": jnp.asarray(leaves[0], jnp.float32)}
+        for count, leaf in enumerate(leaves[1:], start=2):
+            mean = _running_mean(mean, {"w": leaf}, count, "run", "first")
+        return mean["w"]
 
-    def wide(*leaves):
-        return sum(leaves) / 3
+    def stacked(*leaves):
+        return jnp.mean(jnp.stack([jnp.asarray(leaf) for leaf in leaves]), axis=0)
 
-    assert_as_exact(averaged, wide, draw, "three runs' mean", seeds=AVERAGE_SEEDS)
-    from dew.decision.task import _running_mean
+    assert_as_exact(running, stacked, draw, "three runs' mean", seeds=AVERAGE_SEEDS)
 
     biggest = np.float32(np.finfo(np.float32).max)
     mean = {"w": jnp.full(4, biggest)}
