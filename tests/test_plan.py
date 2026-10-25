@@ -403,6 +403,25 @@ def test_a_split_plan_is_timed_against_its_batch_whole_a_rung_up_and_the_faster_
     assert np.isfinite(float(loss))
 
 
+def test_a_plan_over_several_devices_that_fits_whole_is_timed_against_its_batch_whole_a_rung_up(monkeypatch):
+    """Over two devices a plan that fits the batch whole without recomputing is timed against the batch
+    whole one rung up too, whose freed memory lets the scheduler overlap the collectives, and the faster
+    is kept; on one device the same plan is not timed."""
+    free(monkeypatch, LIMIT)
+    trainer = lm()
+    trainer.device_mesh = MeshSpec().build(jax.devices()[:2])
+    state, _, _ = trainer.place()
+    timed = []
+    trainer.compile(state, BATCH, lambda steps: (timed.append(len(steps)), [2.0, 1.0])[1])
+    assert timed == [2]
+    assert [(plan["split"], plan["remat"]) for plan in trainer.plan["timed"]] == [(1, None), (1, "minimal")]
+    assert (trainer.plan["split"], trainer.plan["remat"]) == (1, "minimal")
+    alone = lm()
+    state, _, _ = alone.place()
+    alone.compile(state, BATCH, lambda steps: pytest.fail("a single device's whole plan was timed"))
+    assert alone.plan["timed"] is None
+
+
 @pytest.mark.parametrize("split", [1, 2])
 def test_a_plan_with_no_second_point_to_fit_is_not_timed(monkeypatch, split):
     """With room for the batch whole, or for two microbatches and not the
