@@ -364,7 +364,7 @@ def test_an_unregistered_causal_lm_loads_as_transformers_own_forward(tokens, tmp
                     "tier 3 cohere LM step", seeds=UNREGISTERED_SEEDS, truth_fn=truth_fn)
 
 
-PACKED_SEEDS = 8
+PACKED_SEEDS = 256
 """The packed rows' check-1 seeds, sized by `seeds_for` on armada."""
 
 
