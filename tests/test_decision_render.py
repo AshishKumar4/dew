@@ -16,8 +16,8 @@ from dew.data.text import ByteTokenizer, HFTokenizer
 from dew.decision import Choice, Noul, Question, Score
 from dew.decision.layout import LETTERS, AnswerCue, Framing, Labels, QuestionLayout, Specials, State, Text
 from dew.decision.renderer import Chunk, render
-from dew.records import JSON
 from dew.decision.slot_source import SLOT_LABELS, SLOT_SYSTEM, SlotSource
+from dew.records import JSON
 
 QWEN = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
 """Qwen3.5's ChatML template, with its thinking switch, over a tiny vocabulary of bytes and Qwen's

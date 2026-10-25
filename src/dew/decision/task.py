@@ -63,9 +63,9 @@ from dew.files import write_atomically
 from dew.inference import scoring
 from dew.inference.tasks import shape_bucket
 from dew.interop.processors import Processor
-from dew.nn.cross_attention import ContextEncoder
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.sources import SourceReference
+from dew.nn.cross_attention import ContextEncoder
 from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
 from dew.nn.kernels.options import program
 from dew.nn.sharding import batch_axes
