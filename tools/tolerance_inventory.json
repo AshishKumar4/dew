@@ -202,7 +202,7 @@
    "lane": "Training"
   },
   "tests/test_dory.py": {
-   "comparisons": 3,
+   "comparisons": 2,
    "lane": "Recurrence & Dory"
   },
   "tests/test_dpo.py": {
@@ -239,10 +239,6 @@
   },
   "tests/test_fla_gdn.py": {
    "comparisons": 19,
-   "lane": "Recurrence & Dory"
-  },
-  "tests/test_fla_kda.py": {
-   "comparisons": 1,
    "lane": "Recurrence & Dory"
   },
   "tests/test_flaxdiff.py": {
@@ -436,10 +432,6 @@
   "tests/test_mamba2_interop.py": {
    "comparisons": 3,
    "lane": "Models, Serving & RL"
-  },
-  "tests/test_mamba_ssd.py": {
-   "comparisons": 2,
-   "lane": "Recurrence & Dory"
   },
   "tests/test_masked_diffusion.py": {
    "comparisons": 2,
