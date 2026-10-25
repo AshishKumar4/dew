@@ -244,7 +244,6 @@ def test_the_templates_gradients_hold_check_1(generation_name, case):
     spec = CASES[case]
     with generation.assumed(generation_name):
         dew = _gradients(_dew(spec, interpret_on_cpu=True))
-        dew = jax.jit(dew) if generation_name == "sm80" else dew
         assert_as_exact(dew, jax.jit(_gradients(_plain(spec))), _gradient_draw(spec),
                         f"{case} gradients on {generation_name}", seeds=SEEDS,
                         truth_fn=_gradients(_plain(spec, truth=True)))
@@ -397,9 +396,9 @@ def _dense_draw(rows: int, depth: int, width: int, *, cotangent: bool = False):
 
 @runs("sm90")
 def test_a_dense_gradient_takes_a_padded_tile_where_no_dividing_one_fits():
-    """A dense kernel gradient at depth 96 on Hopper: the tiles dividing 96 have 32 output rows, which
-    Hopper's warpgroup MMA refuses, so a 64-row tile runs over the padded depth, and the gradients hold
-    check 1 against JAX's derivative of the plain product."""
+    """A dense kernel gradient at depth 96 on Hopper through Triton's launches (`generation.chosen`): the
+    tiles dividing 96 have 32 output rows, which Hopper's warpgroup MMA refuses, so a 64-row tile runs
+    over the padded depth, and the gradients hold check 1 against JAX's derivative of the plain product."""
     draw = _dense_draw(256, 96, 128, cotangent=True)
 
     def dew(x, w):
@@ -409,7 +408,7 @@ def test_a_dense_gradient_takes_a_padded_tile_where_no_dividing_one_fits():
         # A 16-bit output: an fp32 one's cotangent makes the kernel gradient an fp32 product, XLA's.
         return jnp.dot(x.astype(wide), w.astype(wide)).astype(out)
 
-    with generation.assumed("sm90"), tuning.seen() as launches:
+    with generation.assumed("sm90"), generation.chosen(grouped_matmul="triton"), tuning.seen() as launches:
         assert_as_exact(jax.jit(with_gradients(dew)), jax.jit(with_gradients(plain)), draw, "dense depth 96",
                         seeds=SEEDS,
                         truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64, out=jnp.float64)))
@@ -442,7 +441,9 @@ def test_a_dense_products_exact_sums_survive_one_row_tile():
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_a_side_operands_rows_may_be_any_of_its_dimensions(generation_name):
     """A side operand's rows as its second dimension load each group's rows as its first would: the
-    forward product and the kernel gradient are the same bit for bit, whatever rows are a multiple of."""
+    forward product and the kernel gradient are the same bit for bit, whatever rows are a multiple of,
+    through Triton's launches (`generation.chosen`), the one implementation that takes both layouts
+    (Mosaic's lowering has no transpose)."""
     rows, sizes = 136, jnp.asarray([70, 66])
     rng = np.random.default_rng(0)
     x = jnp.asarray(rng.normal(size=(rows, 64)), jnp.bfloat16)
@@ -460,7 +461,7 @@ def test_a_side_operands_rows_may_be_any_of_its_dimensions(generation_name):
                                                    prologue_operands=((operand, layout),),
                                                    out_dtype=jnp.float32, interpret_on_cpu=True))
 
-    with generation.assumed(generation_name):
+    with generation.assumed(generation_name), generation.chosen(grouped_matmul="triton"):
         products = [call(template.gemm, hook, layout)(x, w, operand) for hook, layout, operand in layouts]
         gradients = [call(template.gemm_t, hook, layout)(x, dy, operand) for hook, layout, operand in layouts]
     np.testing.assert_array_equal(np.asarray(products[0]), np.asarray(products[1]))
@@ -1250,10 +1251,10 @@ def test_mosaic_reads_a_hooks_primitives_at_any_depth():
 
 @runs("sm80")
 def test_a_dense_product_runs_the_plain_tiled_kernel():
-    """On Triton a dense product (no group sizes) runs `triton_dense`'s kernels, forward and both gradients,
-    keyed apart from a one-group ragged call's: their launches are told `dense`."""
+    """On Triton (`generation.chosen`) a dense product (no group sizes) runs `triton_dense`'s kernels,
+    forward and both gradients, apart from a one-group ragged call's: their launches are told `dense`."""
     spec = CASES["dense norm and bias"]
-    with generation.assumed("sm80"), tuning.seen() as launches:
+    with generation.assumed("sm80"), generation.chosen(grouped_matmul="triton"), tuning.seen() as launches:
         jax.jit(_gradients(_dew(spec, interpret_on_cpu=True))).trace(*_gradient_draw(spec)(9)).lower()
     told = {(type(launch).__name__, ba.arguments.get('trans_rhs'), ba.arguments.get('dense'))
             for launch, ba in launches}

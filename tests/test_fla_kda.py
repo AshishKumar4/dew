@@ -121,7 +121,7 @@ GPU_CASES = {
     # Packed documents as fla's varlen sequences, on and off the chunk grid, one shorter than a chunk,
     # two value heads a key head.
     "packed": ((4096, 4, 8, 128, 128), (0, 1000, 1037, 2500)),
-    # Every tile the tuner may pick: a partial last chunk, eight value heads a program can block.
+    # Each launch's tiles: a partial last chunk, eight value heads a program can block.
     "tiles": ((1000, 8, 8, 128, 128), None),
 }
 

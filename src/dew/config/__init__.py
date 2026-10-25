@@ -1025,14 +1025,6 @@ def _unrecorded(value: Dataset | Mapping[str, Dataset] | None) -> list[str]:
     return [encoded.reason] if isinstance(encoded, records.Unrecorded) else []
 
 
-def _current(name: str, written: object) -> object:
-    """The run field `name`'s record without the fields retired from it (`RETIRED`)."""
-    retired = RETIRED.get(name, frozenset())
-    if not retired or not isinstance(written, Mapping):
-        return written
-    return {field: value for field, value in written.items() if field not in retired}
-
-
 def _read_chain(name: str, written: object) -> Dataset | dict[str, Dataset] | None:
     """The chain field `name` its record holds (`_chain_record`). Raises ValueError for a chain that was
     not recorded, naming why, and for a recipe's record, naming it: a run.json written before runs
@@ -1231,10 +1223,14 @@ class RunConfig:
     @classmethod
     def from_dict(cls, values: Mapping[str, object]) -> Self:
         """Read back what `to_dict` wrote, for subclasses too. A field the
-        record lacks takes its default; an unknown field raises. A chain
+        record lacks takes its default, one retired since it was written
+        (`RETIRED`) is dropped, and an unknown field raises. A chain
         recorded as unrecorded, or a recipe's record written before runs
         recorded chains, is refused by name."""
-        rest = {name: _current(name, value) for name, value in values.items() if name not in _CHAINS}
+        rest = {name: value for name, value in values.items() if name not in _CHAINS}
+        for name, retired in RETIRED.items():
+            if isinstance(held := rest.get(name), Mapping):
+                rest[name] = {field: value for field, value in held.items() if field not in retired}
         chains = {name: _read_chain(name, values[name]) for name in _CHAINS if name in values}
         return dataclasses.replace(from_record(cls, rest, dtypes=False), **chains)
 
