@@ -1122,12 +1122,14 @@ def _decoded(tensors: Mapping[str, np.ndarray], config: Mapping[str, object], pa
 def _input_quantization(model: nn.Module, variables: Variables, layouts: tuple[WeightLayout, ...],
                         config: Mapping[str, object], grid: Mapping[str, np.ndarray]
                         ) -> tuple[nn.Module, Variables]:
-    """Write each stored input scale into its Linear's own `QUANTIZATION`
-    variables, and return the model computing under them.
+    """Write each stored input scale into the `QUANTIZATION` variables of every Linear its source
+    weight binds, and return the model computing under them.
 
-    Expert stacks and concatenated projections need one quantizer per
-    member, which this per-Linear binding cannot compute, so they are refused
-    before returning a model with the wrong activation forward.
+    A source weight split along its outputs (Phi-3's fused `qkv_proj`, `gate_up_proj`) binds one
+    Linear a member, each reading the fused projection's one input, so each takes its scale. An
+    expert stack's members read their own tokens, and a split along the inputs reads parts of the
+    input, which one stored scale does not quantize; those are refused before returning a model
+    with the wrong activation forward. Every stored scale must bind a Linear.
     """
     from dew.quantization import INPUT_SCALES, QUANTIZATION, InputKind, InputQuantization, InputQuantizer
 
@@ -1135,14 +1137,17 @@ def _input_quantization(model: nn.Module, variables: Variables, layouts: tuple[W
     if codec is None or codec.input_scale_dtype is None:
         return model, variables
     sites: dict[tuple[str, ...], tuple[InputKind, jax.Array]] = {}
+    consumed: set[str] = set()
     for layout in layouts:
         part = layout.name.removesuffix('.weight') + codec.input_suffix
         if part not in grid:
             continue
-        if (len(layout.paths) != 1 or layout.paths[0][-1] != 'kernel'
-                or layout.expert_index is not None or layout.concatenate is not None):
-            raise ValueError(f"{layout.name} needs NVFP4 input QDQ per expert or projection member, "
-                             "which this checkpoint provider does not compute")
+        # A kernel leaf is [inputs, outputs]: a split on its last axis splits the outputs.
+        if (any(path[-1] != 'kernel' for path in layout.paths) or layout.expert_index is not None
+                or layout.concatenate not in (None, -1)):
+            raise ValueError(f"{layout.name} needs its input QDQ per expert or input part, "
+                             "which one stored input scale does not quantize")
+        consumed.add(part)
         scale = np.asarray(grid[part])
         if scale.dtype != np.float32 or scale.size != 1:
             raise ValueError(f"{part} must be one float32 stored global scale, "
@@ -1151,10 +1156,12 @@ def _input_quantization(model: nn.Module, variables: Variables, layouts: tuple[W
         quantizer = (InputQuantizer.fp8(value) if codec.input_kind(layout.name) == 'fp8' else
                      InputQuantizer.nvfp4(value, codec.input_scale_dtype == 'float8_e4m3fn',
                                           format=codec.input_format))
-        sites[layout.paths[0][1:-1]] = (quantizer.kind, quantizer.scale)
-    if len(sites) != sum(name.endswith(codec.input_suffix) for name in grid):
-        raise ValueError("NVFP4 input scales must each bind one Linear scope; "
-                         "an unbound scale would drop QDQ")
+        for path in layout.paths:
+            sites[path[1:-1]] = (quantizer.kind, quantizer.scale)
+    unbound = {name for name in grid if name.endswith(codec.input_suffix)} - consumed
+    if unbound:
+        raise ValueError(f"input scales {sorted(unbound)} bind no Linear; an unbound scale would "
+                         "drop its QDQ")
     scheme = InputQuantization(codec.input_scale_dtype == 'float8_e4m3fn', codec.input_format,
                                tuple(sorted(('/'.join(path), kind) for path, (kind, _) in sites.items())))
     held = unflatten_dict({(*path, INPUT_SCALES[kind]): scale for path, (kind, scale) in sites.items()})
