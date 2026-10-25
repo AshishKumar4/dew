@@ -9,6 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from confident_support import confident, label_derivative
 from reference_error import assert_as_exact, with_gradients, without_ynn
 
 from dew.nn import categorical
@@ -133,25 +134,6 @@ def log_softmax(rows: np.ndarray) -> np.ndarray:
     """NumPy's log softmax over the last axis, in the rows' own dtype."""
     peak = rows.max(axis=-1, keepdims=True)
     return rows - peak - np.log(np.exp(rows - peak).sum(axis=-1, keepdims=True))
-
-
-def confident(margin: float, seed: int) -> tuple[np.ndarray]:
-    """Three rows of seven float32 logits whose label, class 0, leads the other classes' log partition
-    by `margin` (arXiv:2610.31642, eq. 2)."""
-    others = np.random.default_rng(seed).standard_normal((3, 6))
-    peak = others.max(axis=-1, keepdims=True)
-    lead = margin + peak + np.log(np.exp(others - peak).sum(axis=-1, keepdims=True))
-    return (np.concatenate([lead, others], axis=-1).astype(np.float32),)
-
-
-def label_derivative(rows: np.ndarray) -> np.ndarray:
-    """The label loss's derivative by arXiv:2610.31642's eq. 7 in NumPy, in the rows' own dtype, the
-    label class 0: each other class's `exp(z_j - z_t - softplus(-m))`, the label minus their sum."""
-    rest = rows[:, 1:] - rows[:, :1]
-    peak = rest.max(axis=-1, keepdims=True)
-    margin = -(peak + np.log(np.exp(rest - peak).sum(axis=-1, keepdims=True)))
-    others = np.exp(rest - np.logaddexp(0, -margin))
-    return np.concatenate([-others.sum(axis=-1, keepdims=True), others], axis=-1)
 
 
 @pytest.mark.parametrize("margin", sorted(COLLAPSE_SEEDS))
