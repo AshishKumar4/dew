@@ -47,7 +47,7 @@ if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
 
 HEAD_WIDTH = 64
-"""Every encoder's attention head width; the source sets the heads from it."""
+"""The source's divisor for deriving the number of attention heads from its encoder width."""
 
 
 PUBLISHED = ("AutoencoderRAE",)
@@ -98,9 +98,10 @@ class RepresentationEncoder(nn.Module):
     @nn.nowrap
     def layout(self) -> ViTLayout:
         spec = ENCODERS[self.kind]
+        heads = self.width // HEAD_WIDTH
         return ViTLayout(
-            depth=self.layers, hidden_size=self.width, num_heads=self.width // HEAD_WIDTH,
-            num_kv_heads=self.width // HEAD_WIDTH, head_dim=HEAD_WIDTH,
+            depth=self.layers, hidden_size=self.width, num_heads=heads,
+            num_kv_heads=heads, head_dim=self.width // heads,
             intermediate_size=spec.intermediate or 4 * self.width, activation=activation(spec.activation),
             in_channels=3, patch_size=self.patch, temporal_patch_size=1, spatial_merge_size=1,
             norm_type="fast_layer", norm_eps=spec.epsilon, norm_bias=True, mlp_bias=True,
