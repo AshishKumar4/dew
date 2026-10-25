@@ -246,7 +246,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_flow_matching.py": {
-   "comparisons": 8,
+   "comparisons": 3,
    "lane": "Training"
   },
   "tests/test_flux_source.py": {
