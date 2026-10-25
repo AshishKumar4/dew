@@ -411,7 +411,7 @@ def _bias_corrected(moment, decay, count):
 
     Optax forms 1 - decay**count inside a jit, where a Python decay is already rounded to float32:
     0.999 becomes 0.99900001, so the correction at count 1 is 1.3e-5 off (2.2e-4 at 0.9999), where
-    torch forms it in double. A decay given as an array, a schedule's (`scaled_solver`), takes
+    torch forms it in double. A decay given as an array, a schedule's (`scheduled_solver`), takes
     optax's own. google-deepmind/optax#1827 makes this optax's; delete this, and
     `scale_by_adam` with it, once a release carries it.
     """
@@ -634,122 +634,107 @@ OPTIMIZER_MAP: dict[Optimizer, Callable[..., optax.GradientTransformation]] = {
 }
 
 
-RATE_SCALE, RATE_SHAPE = 'learning_rate_scale', 'learning_rate_shape'
-"""The hyperparameters a `scaled_solver` injects: its rate's scale, and its
-schedule's shape at the last update, whose product is the rate."""
+class RateState(NamedTuple):
+    """A scheduled solver's rate (`scheduled_solver`): the `updates` it has applied, and its schedule's
+    rate-valued fields by path (`ScheduleBase.rates`), or the one constant rate under `CONSTANT`."""
+
+    updates: jax.Array
+    rates: Mapping[str, jax.Array]
 
 
-def scaled_solver(make: Callable[..., optax.GradientTransformation], scale: float,
-                  shape: ScheduleBase | None, steps: int | None, opts: Mapping[str, object],
-                  b1: ScheduleBase | None = None) -> optax.GradientTransformation:
-    """`make(learning_rate, **opts)` at the rate `scale` times `shape`'s
-    schedule (1 when None), with the scale an operand in the optimizer's
-    state: runs at different rates of one shape lower to one executable.
+CONSTANT = 'value'
+"""The name a constant rate is held under in its `RateState`."""
 
-    Optax injects the scale, the shape's value at each update and a `b1`
-    schedule (`optax.inject_hyperparams`), and rebuilds the factory from
-    their traced values; every other option keeps the Python value the
-    factory branches on. The rate reaches the factory as a schedule, so
-    Optax casts it to each update leaf's dtype, and the injected values are
-    at least float32 on a bf16 tree. The factory is built once here too, so
-    a bad option raises now rather than at the state's init.
+
+def rates_of(rate: float | ScheduleBase, multiplier: float = 1.0) -> dict[str, float]:
+    """`rate`'s rate-valued fields (`ScheduleBase.rates`), or the constant under `CONSTANT`, each times
+    `multiplier` on the host: the values a solver's `RateState` holds, each rounded once into it. A
+    schedule that marks no rate holds the multiplier alone, which scales its values."""
+    held = (rate.rates() or {CONSTANT: 1.0}) if isinstance(rate, ScheduleBase) else {CONSTANT: rate}
+    return {path: value * multiplier for path, value in held.items()}
+
+
+class _Rate(optax.schedules.StatefulSchedule):
+    """Optax's stateful hyperparameter of a scheduled solver: the schedule's value at each update, with
+    its rate-valued fields operands in the state rather than constants in the program."""
+
+    def __init__(self, rate: float | ScheduleBase, steps: int | None, dtype, multiplier: float = 1.0):
+        self.rate, self.steps, self.dtype, self.rates = rate, steps, dtype, rates_of(rate, multiplier)
+
+    def init(self) -> RateState:
+        return RateState(jnp.zeros([], jnp.int32),
+                         {path: jnp.asarray(value, self.dtype) for path, value in self.rates.items()})
+
+    def update(self, state: RateState, **extra_args) -> RateState:
+        del extra_args
+        return state._replace(updates=optax.safe_increment(state.updates))
+
+    def __call__(self, state: RateState, **extra_args) -> jax.typing.ArrayLike:
+        del extra_args
+        if not isinstance(self.rate, ScheduleBase):
+            return state.rates[CONSTANT]
+        if not self.rate.rates():
+            return state.rates[CONSTANT] * self.rate.schedule(self.steps)(state.updates)
+        return self.rate.schedule(self.steps, state.rates)(state.updates)
+
+
+def scheduled_solver(make: Callable[..., optax.GradientTransformation], rate: float | ScheduleBase,
+                     steps: int | None, opts: Mapping[str, object], b1: ScheduleBase | None = None,
+                     multiplier: float = 1.0) -> optax.GradientTransformation:
+    """`make(learning_rate, **opts)` at `rate`, a constant or a schedule over a run of `steps` updates,
+    times `multiplier`, its rate-valued fields operands in the optimizer's state (`RateState`): runs
+    at different rates of one schedule's timings lower to one executable, and each update's rate is
+    the schedule's own value from those fields, Optax's arithmetic where it is Optax's schedule.
+
+    Optax injects the rate and a `b1` schedule (`optax.inject_stateful_hyperparams`), and rebuilds the
+    factory from their traced values; every other option keeps the Python value the factory branches
+    on. The rate reaches the factory as a schedule, so Optax casts it to each update leaf's dtype, and
+    the injected values are at least float32 on a bf16 tree. The factory is built once here too, so a
+    bad option raises now rather than at the state's init.
     """
-    rate = 1.0 if shape is None else shape.schedule(steps)
-    make(rate, **opts)
+    make(1.0 if isinstance(rate, ScheduleBase) else rate, **opts)
 
-    def factory(learning_rate_scale, learning_rate_shape, b1):
+    def factory(learning_rate, b1):
         given = opts if b1 is None else {**opts, 'b1': b1}
-        return make(lambda count: learning_rate_scale * learning_rate_shape, **given)
+        return make(lambda count: learning_rate, **given)
 
     def injected(dtype):
-        return optax.inject_hyperparams(factory, hyperparam_dtype=dtype)(
-            **{RATE_SCALE: scale, RATE_SHAPE: rate}, b1=None if b1 is None else b1.schedule(steps))
+        return optax.inject_stateful_hyperparams(factory, hyperparam_dtype=dtype)(
+            learning_rate=_Rate(rate, steps, dtype, multiplier),
+            b1=None if b1 is None else b1.schedule(steps))
 
     def init_fn(params):
         return injected(at_least_fp32(optax.tree.dtype(params, 'highest'))).init(params)
 
     def update_fn(updates, state, params=None, **extra_args):
-        return injected(state.hyperparams[RATE_SCALE].dtype).update(updates, state, params, **extra_args)
+        return injected(state.hyperparams['learning_rate'].dtype).update(updates, state, params, **extra_args)
 
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
-
-
-def scaled(rate: float | ScheduleBase) -> tuple[float, ScheduleBase | None]:
-    """A rate as a scale and the schedule of its ratios to it (None, a
-    constant rate): a schedule's first nonzero rate-valued field, and the
-    schedule with every rate-valued field (`metadata={'rate': True}`, nested
-    records such as PowerTail too) divided by it. Timings, powers and the
-    rates' ratios stay in the shape, so runs at different scales share it.
-    A schedule of zeros has the scale 0 and a shape whose first rate field
-    is 1, so it applies exactly zero. A None field keeps its derived
-    default (OneCycle's init and end). A schedule that marks no field a
-    rate, a subclass implementing `values` alone, is its own shape at the
-    scale 1: its values are the rates."""
-    if not isinstance(rate, ScheduleBase):
-        return rate, None
-
-    def rates(record):
-        for field in dataclasses.fields(record):
-            value = getattr(record, field.name)
-            if field.metadata.get('rate') and value is not None:
-                yield value
-            elif dataclasses.is_dataclass(value):
-                yield from rates(value)
-
-    found = list(rates(rate))
-    if not found:
-        return 1.0, rate
-    scale = next((value for value in found if value != 0), 0.0)
-
-    def normalized(record):
-        fields = {}
-        for field in dataclasses.fields(record):
-            value = getattr(record, field.name)
-            if field.metadata.get('rate') and value is not None:
-                fields[field.name] = value / (scale or 1.0)
-            elif dataclasses.is_dataclass(value):
-                fields[field.name] = normalized(value)
-        return dataclasses.replace(record, **fields)
-
-    shape = normalized(rate)
-    first = next((field.name for field in dataclasses.fields(rate) if field.metadata.get('rate')), None)
-    if scale == 0 and first is not None:
-        shape = dataclasses.replace(shape, **{first: 1.0})
-    return scale, shape
 
 
 def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
     """Return the learning rate stored in `opt_state`, if the optimizer stores one.
 
-    An OptimConfig's solver holds a rate scale and the schedule's value at
-    the last applied update (`dew.optim.scaled_solver`), whose
-    product is the rate; an Optax optimizer can inject `learning_rate`
-    itself (`optax.inject_hyperparams`). The result is None when the
-    optimizer closes over the rate, or when parameter groups hold several
-    rates.
+    An OptimConfig's solver holds the rate it stepped at last (`dew.optim.scheduled_solver`), and an
+    Optax optimizer can inject `learning_rate` itself (`optax.inject_hyperparams`). The result is None
+    when the optimizer closes over the rate, or when parameter groups hold several rates.
     """
     injected = (optax.InjectHyperparamsState, optax.InjectStatefulHyperparamsState)
-    rates = []
-    for node in jax.tree.leaves(opt_state, is_leaf=lambda node: isinstance(node, injected)):
-        if not isinstance(node, injected):
-            continue
-        if RATE_SCALE in node.hyperparams:
-            rates.append(node.hyperparams[RATE_SCALE] * node.hyperparams[RATE_SHAPE])
-        elif "learning_rate" in node.hyperparams:
-            rates.append(node.hyperparams["learning_rate"])
+    rates = [node.hyperparams["learning_rate"]
+             for node in jax.tree.leaves(opt_state, is_leaf=lambda node: isinstance(node, injected))
+             if isinstance(node, injected) and "learning_rate" in node.hyperparams]
     return rates[0] if len(rates) == 1 else None
 
 
-def with_rate_scales(opt_state: optax.OptState, scales: Mapping[str | None, float]) -> optax.OptState:
-    """`opt_state` with each `scaled_solver`'s rate scale set to `scales`'
-    value for its param group, by name, or under None for a solver of no
-    group; each new scale keeps the old one's dtype and placement."""
+def with_rates(opt_state: optax.OptState, rates: Mapping[str | None, Mapping[str, float]]) -> optax.OptState:
+    """`opt_state` with each `scheduled_solver`'s rate-valued fields set to `rates`' for its param group,
+    by name, or under None for a solver of no group; each keeps the old field's dtype and placement."""
     def replaced(path: jax.tree_util.KeyPath, leaf):
-        if not path or path[-1] != jax.tree_util.DictKey(RATE_SCALE):
+        held = [entry.key for entry in path if isinstance(entry, jax.tree_util.DictKey)]
+        if len(path) < 3 or path[-2] != jax.tree_util.GetAttrKey('rates') or 'learning_rate' not in held:
             return leaf
-        group = next((entry.key for entry in path
-                      if isinstance(entry, jax.tree_util.DictKey) and entry.key in scales), None)
-        return jax.device_put(np.asarray(scales[group], leaf.dtype), leaf.sharding)
+        group = next((key for key in held if key in rates), None)
+        return jax.device_put(np.asarray(rates[group][path[-1].key], leaf.dtype), leaf.sharding)
     return jax.tree_util.tree_map_with_path(replaced, opt_state)
 
 
@@ -825,18 +810,18 @@ class ParamGroup:
                 raise ValueError(f"param group {self.name!r} bounds its parameters from a lower to a "
                                  f"higher value, got {self.bounds}")
 
-    def learning_rate(self, learning_rate: float | ScheduleBase) -> tuple[float, ScheduleBase | None]:
-        """This group's rate scale and shape (`scaled`): its own `schedule`,
-        else the config's `learning_rate`, times `learning_rate_multiplier`."""
-        scale, shape = scaled(learning_rate if self.schedule is None else self.schedule)
-        return scale * self.learning_rate_multiplier, shape
+    def rates(self, learning_rate: float | ScheduleBase) -> dict[str, float]:
+        """This group's rate-valued fields (`RateState`): its own `schedule`'s, else the config's
+        `learning_rate`'s, times `learning_rate_multiplier`."""
+        return rates_of(learning_rate if self.schedule is None else self.schedule,
+                      self.learning_rate_multiplier)
 
     def solver(self, make: Callable[..., optax.GradientTransformation],
                learning_rate: float | ScheduleBase, steps: int | None,
                opts: Mapping[str, object]) -> optax.GradientTransformation:
-        """Build this group's optimizer: `make` at the group's `learning_rate`, its
-        scale held in state (`scaled_solver`), with the group's `b1`
-        schedule and `bounds`, over a run of `steps` updates.
+        """Build this group's optimizer: `make` at the group's rate, its fields held in state
+        (`scheduled_solver`), with the group's `b1` schedule and `bounds`, over a run of `steps`
+        updates.
 
         A `b1` schedule replaces any `b1` in `opts`, and needs a `make` that
         names a `b1` argument (adam, adamw, lamb; not muon).
@@ -844,7 +829,8 @@ class ParamGroup:
         if self.b1 is not None and 'b1' not in inspect.signature(make).parameters:
             raise ValueError(f"param group {self.name!r} schedules b1, and its optimizer "
                              f"takes no b1 (adam, adamw and lamb do)")
-        solver = scaled_solver(make, *self.learning_rate(learning_rate), steps, opts, self.b1)
+        solver = scheduled_solver(make, learning_rate if self.schedule is None else self.schedule, steps,
+                                  opts, self.b1, self.learning_rate_multiplier)
         if self.bounds is not None:
             solver = optax.chain(solver, _keep_within(*self.bounds))
         return solver
@@ -891,9 +877,10 @@ def param_labels(groups: Sequence[ParamGroup]):
     return labels
 
 
-def power_schedule(peak: float, warmup_steps: int, a: float, b: float, c: float = 1.0,
+def power_schedule(peak: jax.typing.ArrayLike, warmup_steps: int, a: jax.typing.ArrayLike, b: float,
+                   c: float = 1.0,
                    decay_start: int | None = None, decay_end: int | None = None,
-                   end_value: float = 0.0) -> optax.Schedule:
+                   end_value: jax.typing.ArrayLike = 0.0) -> optax.Schedule:
     """lm-engine's power scheduler (optimization/lr_scheduler/power.py at
     45b6b57b) with an optional linear tail.
 
@@ -907,7 +894,7 @@ def power_schedule(peak: float, warmup_steps: int, a: float, b: float, c: float 
     def law(step):
         return jnp.minimum(peak, a * (jnp.asarray(step, jnp.float32) * c) ** b)
 
-    warm = min(peak, a * (warmup_steps * c) ** b) if warmup_steps else peak
+    warm = jnp.minimum(peak, a * (warmup_steps * c) ** b) if warmup_steps else peak
     pieces = [optax.linear_schedule(0.0, warm, warmup_steps)] if warmup_steps else []
     pieces.append(lambda count: law(count + warmup_steps))
     boundaries = [warmup_steps] if warmup_steps else []
@@ -916,14 +903,14 @@ def power_schedule(peak: float, warmup_steps: int, a: float, b: float, c: float 
             raise ValueError(
                 f"the linear tail runs from decay_start past the warmup to a later "
                 f"decay_end, got {decay_start} to {decay_end} after {warmup_steps} warmup steps")
-        pieces.append(optax.linear_schedule(float(law(decay_start)), end_value,
+        pieces.append(optax.linear_schedule(law(decay_start), end_value,
                                             decay_end - decay_start))
         boundaries.append(decay_start)
     return optax.join_schedules(pieces, boundaries) if boundaries else pieces[0]
 
 
-def linear_schedule(peak: float, warmup_steps: int, decay_start: int | None,
-                    decay_end: int, end_value: float = 0.0) -> optax.Schedule:
+def linear_schedule(peak: jax.typing.ArrayLike, warmup_steps: int, decay_start: int | None,
+                    decay_end: int, end_value: jax.typing.ArrayLike = 0.0) -> optax.Schedule:
     """lm-engine's linear scheduler (lr_scheduler/linear.py at 45b6b57b): from
     zero to `peak` over the warmup, constant to `decay_start` (None: the
     warmup's end), then linear to `end_value` at `decay_end`."""
@@ -939,6 +926,11 @@ def linear_schedule(peak: float, warmup_steps: int, decay_start: int | None,
     ], [warmup_steps, start])
 
 
+type Rates = Mapping[str, jax.Array | float]
+"""A schedule's rate-valued fields by path (`ScheduleBase.rates`): the configured values, or a solver's
+operands for them (`RateState`)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class ScheduleBase:
     """The base of the schedule records, each of which holds its own fields
@@ -946,7 +938,11 @@ class ScheduleBase:
 
     A run's record names the schedule's class and holds only the fields that
     schedule reads; `dew.registry.schedules` holds the short aliases. A
-    subclass builds its values in `values`; `schedule` reads them.
+    subclass builds its values in `values`; `schedule` reads them. The fields
+    it marks `metadata={'rate': True}` are its rates (`rates`), which a solver
+    holds as operands (`scheduled_solver`) and `values` reads from `rates`, so
+    a run's program does not depend on them; a subclass that marks none
+    implements `values(steps)` alone.
     """
 
     every: int = dataclasses.field(default=1, kw_only=True)
@@ -963,15 +959,36 @@ class ScheduleBase:
         if self.every < 1:
             raise ValueError(f"a schedule advances once every 1 or more updates, not {self.every}")
 
-    def schedule(self, steps: int | None) -> optax.Schedule:
-        """Return the value at each update of a run of `steps` updates, as an optax schedule."""
+    def rates(self) -> dict[str, float]:
+        """Each rate-valued field's value (`metadata={'rate': True}`) by its dotted path, nested
+        records such as PowerTail's too, a None field's derived default resolved where the schedule
+        derives one (OneCycle's) and left out otherwise."""
+        def walked(record, prefix):
+            for field in dataclasses.fields(record):
+                value = getattr(record, field.name)
+                if field.metadata.get('rate') and value is not None:
+                    yield prefix + field.name, value
+                elif dataclasses.is_dataclass(value):
+                    yield from walked(value, f"{prefix}{field.name}.")
+        return dict(walked(self, ""))
+
+    def schedule(self, steps: int | None, rates: Rates | None = None
+                 ) -> optax.Schedule:
+        """Return the value at each update of a run of `steps` updates, as an optax schedule, its
+        rate-valued fields `rates`' (`rates()` by default): operands in a solver's state, or the
+        configured values."""
+        held = self.rates() if rates is None else rates
+
+        def built(own):
+            return self.values(own, held) if held else self.values(own)
+
         if self.every == 1:
-            return self.values(steps)
+            return built(steps)
         own = None if steps is None else steps // self.every
         if own is not None and own < 1:
             raise ValueError(f"a run of {steps} updates never advances a schedule that steps once "
                              f"every {self.every}")
-        values, every = self.values(own), self.every
+        values, every = built(own), self.every
         return lambda count: values(jnp.asarray(count) // every)
 
     def _horizon(self, steps: int | None, field: str) -> int:
@@ -980,8 +997,12 @@ class ScheduleBase:
             raise ValueError(f"{type(self).__name__} needs {field} or trainer.steps as its step horizon")
         return steps
 
-    def values(self, steps: int | None) -> optax.Schedule:
-        """Return the value at each of the schedule's own steps, over `steps` of them."""
+    def values(self, steps: int | None, rates: Rates | None = None
+               ) -> optax.Schedule:
+        """Return the value at each of the schedule's own steps, over `steps` of them, from its
+        rate-valued fields `rates` (`rates()`). A value derived from the rates alone, as a ratio of
+        two, is the configured fields', which a solver's operands keep: they differ from them by
+        one factor, a param group's multiplier."""
         raise NotImplementedError
 
 
@@ -1000,16 +1021,20 @@ class Cosine(ScheduleBase):
     init_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
     decay_steps: int | None = None
 
-    def values(self, steps: int | None) -> optax.Schedule:
+    def values(self, steps: int | None, rates: Rates | None = None
+               ) -> optax.Schedule:
+        rates = self.rates() if rates is None else rates
         decay_steps = self._horizon(steps if self.decay_steps is None else self.decay_steps, "decay_steps")
         if self.warmup_steps >= decay_steps:
             raise ValueError(f"Cosine needs warmup_steps={self.warmup_steps} smaller than "
                              f"decay_steps={decay_steps}")
-        return optax.warmup_cosine_decay_schedule(
-            init_value=self.init_value, peak_value=self.peak_value,
-            warmup_steps=self.warmup_steps,
-            decay_steps=decay_steps,
-            end_value=self.end_value)
+        # `optax.warmup_cosine_decay_schedule`'s own pieces, joined as it joins them; it forms the
+        # floor's ratio by branching on the peak, so the ratio is the configured fields' (`values`).
+        alpha = 0.0 if self.peak_value == 0.0 else self.end_value / self.peak_value
+        return optax.join_schedules([
+            optax.linear_schedule(rates['init_value'], rates['peak_value'], self.warmup_steps),
+            optax.cosine_decay_schedule(rates['peak_value'], decay_steps - self.warmup_steps, alpha),
+        ], [self.warmup_steps])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1039,14 +1064,16 @@ class Power(ScheduleBase):
     c: float = 1.0
     tail: PowerTail | None = None
 
-    def values(self, steps: int | None) -> optax.Schedule:
+    def values(self, steps: int | None, rates: Rates | None = None
+               ) -> optax.Schedule:
+        rates = self.rates() if rates is None else rates
         tail = self.tail
         if tail is None:
-            return power_schedule(self.peak_value, self.warmup_steps, self.a, self.b, self.c)
+            return power_schedule(rates['peak_value'], self.warmup_steps, rates['a'], self.b, self.c)
         return power_schedule(
-            self.peak_value, self.warmup_steps, self.a, self.b, self.c, decay_start=tail.start,
+            rates['peak_value'], self.warmup_steps, rates['a'], self.b, self.c, decay_start=tail.start,
             decay_end=self._horizon(steps if tail.steps is None else tail.steps, "tail.steps"),
-            end_value=tail.end_value)
+            end_value=rates['tail.end_value'])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1064,11 +1091,13 @@ class Linear(ScheduleBase):
     decay_steps: int | None = None
     end_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
 
-    def values(self, steps: int | None) -> optax.Schedule:
-        return linear_schedule(self.peak_value, self.warmup_steps, self.decay_start,
+    def values(self, steps: int | None, rates: Rates | None = None
+               ) -> optax.Schedule:
+        rates = self.rates() if rates is None else rates
+        return linear_schedule(rates['peak_value'], self.warmup_steps, self.decay_start,
                                self._horizon(steps if self.decay_steps is None else self.decay_steps,
                                              "decay_steps"),
-                               end_value=self.end_value)
+                               end_value=rates['end_value'])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1094,23 +1123,30 @@ class OneCycle(ScheduleBase):
     end_value: float | None = dataclasses.field(default=None, metadata={'rate': True})
     warmup_fraction: float = 0.3
 
-    def values(self, steps: int | None) -> optax.Schedule:
-        steps = self._horizon(steps, "trainer.steps")
+    def rates(self) -> dict[str, float]:
+        """The peak, and the init and end values with torch's derived defaults resolved."""
         init = self.peak_value / 25 if self.init_value is None else self.init_value
-        end = init / 1e4 if self.end_value is None else self.end_value
+        return {'peak_value': self.peak_value, 'init_value': init,
+                'end_value': init / 1e4 if self.end_value is None else self.end_value}
+
+    def values(self, steps: int | None, rates: Rates | None = None
+               ) -> optax.Schedule:
+        rates = self.rates() if rates is None else rates
+        steps = self._horizon(steps, "trainer.steps")
+        init, peak, end = rates['init_value'], rates['peak_value'], rates['end_value']
         # torch's phase ends, kept as floats as torch keeps them.
         rise, last = self.warmup_fraction * steps - 1, steps - 1
         if not 0 < rise < last:
             raise ValueError(f"a one-cycle schedule over {steps} steps with warmup fraction "
                              f"{self.warmup_fraction} has no rise or no fall; give it more steps")
 
-        def anneal(start: float, stop: float, done: jax.Array) -> jax.Array:
+        def anneal(start: jax.Array | float, stop: jax.Array | float, done: jax.Array) -> jax.Array:
             return stop + (start - stop) / 2 * (jnp.cos(jnp.pi * done) + 1)
 
         def value(count) -> jax.Array:
             step = jnp.minimum(jnp.asarray(count, jnp.float32), last)
-            return jnp.where(step <= rise, anneal(init, self.peak_value, step / rise),
-                             anneal(self.peak_value, end, (step - rise) / (last - rise)))
+            return jnp.where(step <= rise, anneal(init, peak, step / rise),
+                             anneal(peak, end, (step - rise) / (last - rise)))
 
         return value
 
@@ -1134,16 +1170,20 @@ class Exponential(ScheduleBase):
     decay_steps: int | None = None
     offset: float = dataclasses.field(default=0.0, metadata={'rate': True})
 
-    def values(self, steps: int | None) -> optax.Schedule:
+    def values(self, steps: int | None, rates: Rates | None = None
+               ) -> optax.Schedule:
+        rates = self.rates() if rates is None else rates
         span = self._horizon(steps if self.decay_steps is None else self.decay_steps, "decay_steps")
         if span <= 0 or self.init_value <= 0 or self.end_value <= 0:
             raise ValueError(f"an exponential decay needs positive steps, init_value and end_value, got "
                              f"{span}, {self.init_value} and {self.end_value}")
-        decay = optax.exponential_decay(self.init_value, span, self.end_value / self.init_value,
-                                        end_value=self.end_value)
+        # optax branches on the decay rate, so it is the configured fields' ratio (`values`).
+        decay = optax.exponential_decay(rates['init_value'], span,
+                                        self.end_value / self.init_value,
+                                        end_value=rates['end_value'])
         if not self.offset:
             return decay
-        return lambda count: self.offset + decay(count)
+        return lambda count: rates['offset'] + decay(count)
 
 
 __all__ = ["Cosine", "Exponential", "Linear", "OneCycle", "ParamGroup", "Power", "PowerProfilesState",

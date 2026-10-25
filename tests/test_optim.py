@@ -39,7 +39,6 @@ from dew.optim import (
     learning_rate,
     muon_weight_dimension_numbers,
     scale_by_qk_clip,
-    scaled,
     stepped,
     weight_decay_mask,
 )
@@ -178,8 +177,9 @@ def test_a_head_expanded_projection_orthogonalizes_its_flattened_head_side():
 
 
 def test_a_schedule_that_marks_no_rate_is_its_own_shape():
-    """A ScheduleBase subclass implementing `values` alone, with fields of its own and
-    none marked a rate, builds under OptimConfig and steps at the values it gives."""
+    """A ScheduleBase subclass implementing `values(steps)` alone, with fields of its own and
+    none marked a rate, builds under OptimConfig and steps at the values it gives: it holds no rate
+    fields as operands (`rates`), so its values are constants of its program."""
 
     @dataclasses.dataclass(frozen=True)
     class Halving(ScheduleBase):
@@ -188,7 +188,7 @@ def test_a_schedule_that_marks_no_rate_is_its_own_shape():
         def values(self, steps):
             return lambda count: self.start * 0.5 ** count
 
-    assert scaled(Halving()) == (1.0, Halving())
+    assert Halving().rates() == {}
     solver = OptimConfig(optimizer="adam", learning_rate=Halving(), clip_grads=0).build(4)
     params = {"w": jnp.ones(3)}
     state = solver.init(params)
@@ -929,52 +929,123 @@ def test_rates_of_one_schedule_lower_to_one_update(optimizer, form):
                zip(jax.tree.leaves(updates[0]), jax.tree.leaves(updates[1]), strict=True))
 
 
+SCHEDULES = {
+    "cosine": Cosine(peak_value=1e-2, warmup_steps=2, end_value=1e-3, init_value=1e-4),
+    "linear": Linear(peak_value=3e-3, warmup_steps=2, decay_start=3, end_value=1e-4),
+    "exponential": Exponential(init_value=1e-2, end_value=1e-3, offset=1e-4),
+    "power": Power(peak_value=2e-2, warmup_steps=2, a=4e-2, tail=PowerTail(start=4, end_value=1e-3)),
+    "one_cycle": OneCycle(peak_value=1e-2),
+}
+
+
 @pytest.mark.parametrize(("optimizer", "schedule"), [
-    ("lamb", Cosine(peak_value=1e-2, warmup_steps=2, end_value=1e-3, init_value=1e-4)),
-    ("adam", Linear(peak_value=3e-3, warmup_steps=2, decay_start=3, end_value=1e-4)),
-    ("adamw", Exponential(init_value=1e-2, end_value=1e-3, offset=1e-4)),
-    ("muon", Power(peak_value=2e-2, warmup_steps=2, a=4e-2, tail=PowerTail(start=4, end_value=1e-3))),
-    ("muonclip", OneCycle(peak_value=1e-2)),
-    ("adamw", None),
+    ("lamb", SCHEDULES["cosine"]), ("adam", SCHEDULES["linear"]), ("adamw", SCHEDULES["exponential"]),
+    ("muon", SCHEDULES["power"]), ("muonclip", SCHEDULES["one_cycle"]), ("adamw", None),
 ], ids=["lamb-cosine", "adam-linear", "adamw-exponential", "muon-power", "muonclip-one_cycle",
         "adamw-constant"])
 def test_a_configured_optimizer_is_optaxs_own_at_the_rate_its_state_holds(optimizer, schedule):
     """`OptimConfig` runs the optax optimizer it names (`OPTIMIZER_MAP`)
     behind the global-norm clip, its betas and `optimizer_opts` reaching
-    it, at a rate its state holds: the schedule's first rate as a scale, and
-    the schedule of the rates' ratios to it (`scaled_solver`). Six steps on
+    it, at the rate its state holds (`scheduled_solver`). Six steps on
     changing gradients, through the warmups, decays and tails, are optax's
-    own optimizer at that rate bit for bit, and the rate each step reports
-    is the float64 schedule's to float32 rounding: two ulps of it, or of the
-    peak where its terms cancel, as tests/test_optim_schedules.py holds the
-    schedules themselves."""
+    own optimizer at the schedule's own values bit for bit, and each step
+    reports the rate it stepped at. How near float64 that rate is, the
+    schedule's, is `test_a_scheduled_rate_is_as_near_float64_as_optaxs`."""
     params = decoder_params()["params"]
     adam = optimizer in ("adam", "adamw", "lamb")
     betas, opts = ({"b1": 0.8, "b2": 0.95}, {"eps": 1e-5, "eps_root": 1e-9}) if adam else ({}, {})
     config = OptimConfig(optimizer=optimizer, **betas, optimizer_opts=opts,
                          learning_rate=3e-3 if schedule is None else schedule, clip_grads=0.5)
     solver = config.build(10)
-    scale, shape = scaled(config.learning_rate)
-    ratio = (lambda count: 1.0) if shape is None else shape.schedule(10)
     given = {**betas, **opts, **({"mask": weight_decay_mask} if adam else {})}
+    # The reference steps at the rate each of Dew's updates reports, read as it is reported.
+    reported = []
     reference = optax.chain(optax.clip_by_global_norm(0.5), OPTIMIZER_MAP[optimizer](
-        lambda count: jnp.float32(scale) * ratio(count), **given))
+        lambda count: jnp.stack(reported)[count], **given))
     state, expected_state = solver.init(params), reference.init(params)
     for step in range(6):
         grads = jax.tree.map(lambda grad, step=step: grad * (step + 1) * 0.3, fixed_gradients(params))
         updates, state = solver.update(grads, state, params)
+        reported.append(jnp.asarray(learning_rate(state)))
         expected, expected_state = reference.update(grads, expected_state, params)
         for have, want in zip(jax.tree.leaves(updates), jax.tree.leaves(expected), strict=True):
             np.testing.assert_array_equal(np.asarray(have), np.asarray(want))
-        # The reported rate is the rate the reference steps by, and near its schedule's float64 value:
-        # held to its prior bound, as the rate is a scale and a shape each rounded (ledger 1660).
-        np.testing.assert_array_equal(learning_rate(state), np.float32(jnp.float32(scale) * ratio(step)))
-        with jax.enable_x64(new_val=True):
-            # optax counts in int32, which divides to float32: a float64 count keeps the schedule float64.
-            exact = scale if schedule is None else float(
-                schedule.schedule(10)(jnp.asarray(step, jnp.float64)))
-        assert abs(float(learning_rate(state)) - exact) <= 2.4e-7 * (abs(exact) + scale)
         params = optax.apply_updates(params, updates)
+
+
+def optax_schedule(name: str, multiplier: float) -> optax.Schedule:
+    """`SCHEDULES[name]` over ten steps, its rates times `multiplier`, as optax's own schedules build
+    it, the reference a scheduled rate is held to: optax's builders, and for the two schedules optax
+    has none of, lm-engine's power law and torch's one-cycle, their published formulas in optax's
+    pieces (`optax.join_schedules`)."""
+    m = multiplier
+    if name == "cosine":
+        return optax.warmup_cosine_decay_schedule(1e-4 * m, 1e-2 * m, 2, 10, end_value=1e-3 * m)
+    if name == "linear":
+        return optax.join_schedules([optax.linear_schedule(0.0, 3e-3 * m, 2),
+                                     optax.constant_schedule(3e-3 * m),
+                                     optax.linear_schedule(3e-3 * m, 1e-4 * m, 10 - 3)], [2, 3])
+    if name == "exponential":
+        decay = optax.exponential_decay(1e-2 * m, 10, 1e-3 / 1e-2, end_value=1e-3 * m)
+        return lambda count: 1e-4 * m + decay(count)
+    # The count in the default float, float32 for the reference and float64 for its truth.
+    if name == "power":
+        def law(step):
+            counted = jnp.asarray(step, jnp.result_type(float))
+            return jnp.minimum(2e-2 * m, 4e-2 * m * (counted * 1.0) ** -0.51)
+        warm = jnp.minimum(2e-2 * m, 4e-2 * m * 2.0 ** -0.51)
+        return optax.join_schedules([optax.linear_schedule(0.0, warm, 2), lambda count: law(count + 2),
+                                     optax.linear_schedule(law(4), 1e-3 * m, 10 - 4)], [2, 4])
+    init, peak, end = 1e-2 * m / 25, 1e-2 * m, 1e-2 * m / 25 / 1e4
+    rise, last = 0.3 * 10 - 1, 10 - 1
+
+    def anneal(start, stop, done):
+        return stop + (start - stop) / 2 * (jnp.cos(jnp.pi * done) + 1)
+
+    def one_cycle(count):
+        step = jnp.minimum(jnp.asarray(count, jnp.result_type(float)), last)
+        return jnp.where(step <= rise, anneal(init, peak, step / rise),
+                         anneal(peak, end, (step - rise) / (last - rise)))
+    return one_cycle
+
+
+RATE_SEEDS = 8
+"""Check 1's declared seeds for a scheduled rate against optax's float32 schedule (`seeds_for`)."""
+
+
+@pytest.mark.parametrize("name", sorted(SCHEDULES))
+def test_a_scheduled_rate_is_as_near_float64_as_optaxs(name):
+    """The rate a configured optimizer reports at each of a ten-step run's updates, a group's
+    multiplier on its schedule, is on par with optax's own float32 schedule of the multiplied rates
+    (check 1, `optax_schedule`), the truth that schedule in float64: Dew holds the rate fields as
+    operands, each rounded once as optax's are, where a scale times the schedule's ratios to it
+    rounded three times (ledger 1660). Each draw scales the rates by its own multiplier."""
+    params = {"w": jnp.ones(3)}
+
+    def draw(seed):
+        return (np.float64(np.exp(np.random.default_rng(seed).uniform(-3.0, 3.0))),)
+
+    def dew(multiplier):
+        group = ParamGroup("all", ("*",), learning_rate_multiplier=float(multiplier))
+        config = OptimConfig(optimizer="adam", learning_rate=SCHEDULES[name], clip_grads=0,
+                             param_groups=(group,))
+        solver = config.build(10)
+        state, rates = solver.init(params), []
+        for _ in range(10):
+            _, state = solver.update({"w": jnp.ones(3)}, state, params)
+            rates.append(jnp.asarray(learning_rate(state)))
+        return jnp.stack(rates)
+
+    def optax_rates(multiplier):
+        values = optax_schedule(name, float(multiplier))
+        return jnp.stack([jnp.asarray(values(step), jnp.float32) for step in range(10)])
+
+    def truth(multiplier):
+        values = optax_schedule(name, float(multiplier))
+        # optax counts in int32, which divides to float32: a float64 count keeps the schedule float64.
+        return jnp.stack([values(jnp.asarray(step, jnp.float64)) for step in range(10)])
+
+    assert_as_exact(dew, optax_rates, draw, f"the {name} rate", seeds=RATE_SEEDS, truth_fn=truth)
 
 
 def test_adamw_steps_land_as_near_float64_as_torchs():
