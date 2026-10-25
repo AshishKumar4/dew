@@ -142,14 +142,13 @@ def write_seeds(directory: Path, name: str, reader) -> None:
     sys.path[:0] = [str(FIXTURES.parents[1]), str(Path(__file__).resolve().parent)]
     from recorded_references import provenance, record_case, save
     from test_t5_encoders import t5_draw
-    from torch_precision import float64
+    from torch_precision import float64, float64_twin
 
     from dew.inputs import T5Text
 
     torch.set_num_threads(1)
     model = reader.from_pretrained(directory, dtype=torch.float32).eval()
-    with float64():
-        wide = reader.from_pretrained(directory, dtype=torch.float64).eval()
+    wide = float64_twin(model, lambda: reader.from_pretrained(directory, dtype=torch.float64))
 
     def evaluate(inputs):
         ids = torch.from_numpy(inputs["input_ids"]).long()
