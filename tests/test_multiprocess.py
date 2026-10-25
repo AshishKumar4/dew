@@ -58,6 +58,8 @@ STEPS = 9
 SAVE_EVERY = 3
 BLOCK_AFTER = 5
 RECORDS = worker.BATCH * 16
+AVERAGING = Path(__file__).with_name("averaging_worker.py")
+"""The worker of the pools that average runs."""
 
 
 def dumped_params(out: Path, suffix: str = ".npz") -> dict:
@@ -1418,8 +1420,8 @@ def test_runs_average_across_a_pool_each_process_its_own_shards(tmp_path):
 
     corpus = document_corpus(tmp_path / "corpus", 24, length=7)
     # The fsdp axis spans both processes' devices, so a split leaf is half on each.
-    reports = run_pool("averaged", tmp_path / "out", 2, run_dir=tmp_path / "runs", fsdp_size=MESH_DEVICES,
-                       tokens=corpus.train, seq_len=7)
+    reports = run_pool("averaged", tmp_path / "out", 2, script=AVERAGING, run_dir=tmp_path / "runs",
+                       fsdp_size=MESH_DEVICES, tokens=corpus.train, seq_len=7)
     assert all(report["split"] for report in reports)
     trees = []
     for run in reports[0]["runs"]:
@@ -1443,7 +1445,7 @@ def test_runs_one_process_refuses_are_refused_by_every_process_of_the_pool(tmp_p
     refuses them (ValueError), and its peer hears the refusal where the pool agrees on each run
     (PeerFailure), rather than reading on alone to hang or average."""
     corpus = document_corpus(tmp_path / "corpus", 24, length=7)
-    reports = run_pool("averaged_refused", tmp_path / "out", 2, run_dir=tmp_path / "runs",
+    reports = run_pool("averaged_refused", tmp_path / "out", 2, script=AVERAGING, run_dir=tmp_path / "runs",
                        fsdp_size=MESH_DEVICES, tokens=corpus.train, seq_len=7)
     assert all(report["split"] for report in reports)
     assert [report["refused"] for report in reports] == ["ValueError", "PeerFailure"]
