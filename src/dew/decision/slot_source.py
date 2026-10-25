@@ -104,7 +104,7 @@ class SlotSource(SourceKind):
         head = records.record(bundle.head.record(), "head")
         fields = records.record(head["fields"], "head.fields")
         names = {import_path(LabelReadout): "slot_lm", import_path(SlotReadout): "head"}
-        mode = names.get(records.text(head["name"], "head.name"))
+        mode = names.get(records.text(head["class"], "head.class"))
         if mode is None or fields.get("untied", False):
             raise ValueError("the slot format holds its tied label readout or its slot-and-pointer head")
         layout = bundle.layout
@@ -202,9 +202,9 @@ class SlotSource(SourceKind):
             config["modeling_overrides"] = native
         tokenizer = HFTokenizer(str(directory), local_files_only=True)
         labels, ids = _labels(tokenizer, count)
-        head = (SlotHeadSource({"name": import_path(LabelReadout), "fields": {
+        head = (SlotHeadSource({"class": import_path(LabelReadout), "fields": {
                     "label_ids": [list(row) for row in ids]}}, _path)
-                if mode == "slot_lm" else SlotHeadSource({"name": import_path(SlotReadout), "fields": {
+                if mode == "slot_lm" else SlotHeadSource({"class": import_path(SlotReadout), "fields": {
                     "label_ids": [row[0] for row in ids], "head_dim": dimension, "slot_rows": count}},
                     _path, weight_file="readout_head.pt", initialize=_initialize))
         layout = SlotSource.layout(labels=labels, blocks=attention == "noncausal")

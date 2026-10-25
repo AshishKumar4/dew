@@ -111,7 +111,7 @@ class DecisionSource(SourceKind):
             backbone = NativeComponent({**native, "architectures": ["ModernBertModel"]},
                                        config_folder="encoder", tensor_prefix="encoder.")
             head = DecisionHeadSource(
-                {"name": import_path(DecisionHead), "fields": {
+                {"class": import_path(DecisionHead), "fields": {
                     "layers": records.integer(config.get("head_layers", 2), "head_layers")}},
                 _head_path, IN_PROJ)
             layout = MarkerLayout(
@@ -136,7 +136,7 @@ class DecisionSource(SourceKind):
             backbone = (NativeComponent(records.record(json.loads(config_path.read_text()), "config.json"))
                         if config_path.is_file() else None)
             fields = {key: records.integer(config[key], key) for key in joint_checkpoint.SIZES}
-            head = DecisionHeadSource(records.json_value({"name": import_path(JointSchemaHead),
+            head = DecisionHeadSource(records.json_value({"class": import_path(JointSchemaHead),
                                                           "fields": fields}, "head"),
                                       _path, IN_PROJ, HEAD_WEIGHTS,
                                       partial(_shaped, fields["hidden_size"]))
