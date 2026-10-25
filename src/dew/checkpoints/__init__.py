@@ -742,12 +742,18 @@ RETIRED_RATE = ("learning_rate_scale", "learning_rate_shape")
 injected state's hyperparameters, which a resume refuses by name rather than as a mismatched tree."""
 
 
+INJECTED_STATE = ("count", "hyperparams", "inner_state")
+"""The fields of Optax's injected state (`optax.inject_hyperparams`), which a checkpoint's metadata
+holds as a mapping's keys, as Orbax names a NamedTuple's."""
+
+
 def _retired_rate(tree) -> bool:
-    """Whether a checkpoint's optimizer-state metadata `tree` holds the retired rate: one mapping with
-    both of `RETIRED_RATE` as scalars, an injected state's hyperparameters, and not a param group or a
-    parameter of either name, whose entry holds a state or a parameter's moments."""
+    """Whether a checkpoint's optimizer-state metadata `tree` holds the retired rate: an injected
+    state (`INJECTED_STATE`) whose hyperparameters hold both of `RETIRED_RATE`, and not a param group
+    or a parameter of either name, which sits in a group's states or a parameter's moments."""
     if isinstance(tree, Mapping):
-        if all(tuple(getattr(tree.get(name), "shape", (None,))) == () for name in RETIRED_RATE):
+        held = tree.get("hyperparams") if set(INJECTED_STATE) <= tree.keys() else None
+        if isinstance(held, Mapping) and set(RETIRED_RATE) <= held.keys():
             return True
         return any(_retired_rate(value) for value in tree.values())
     return isinstance(tree, list | tuple) and any(_retired_rate(value) for value in tree)

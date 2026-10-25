@@ -929,6 +929,30 @@ def test_a_param_group_named_as_the_retired_rate_resumes(tmp_path):
     assert int(resumed.step) == 2
 
 
+def test_a_model_whose_parameters_are_named_as_the_retired_rate_resumes(tmp_path):
+    """A model may name two scalar parameters as the retired rate's scale and shape: Adam's moments then
+    hold the pair side by side, which is not an injected state's hyperparameters, so the checkpoint its
+    run writes resumes."""
+    from dew.checkpoints import RETIRED_RATE as RETIRED_NAMES
+
+    class Named(Regression):
+        def fresh_variables(self, key, held):
+            return {"params": {name: jnp.zeros(()) for name in RETIRED_NAMES}}
+
+        def loss(self, variables, batch, step):
+            weights = variables["params"]
+            return jnp.mean((batch["x"][:, 0] * weights["learning_rate_scale"]
+                             + weights["learning_rate_shape"] - batch["y"][:, 0]) ** 2), Aux({})
+
+    def run(steps):
+        return make_trainer(tmp_path, objective=Named(), optimizer=optax.adam(0.1)).fit(
+            dataset(), steps=steps, log_every=1)
+
+    run(1)
+    resumed = run(2)
+    assert int(resumed.step) == 2
+
+
 def _rewrite_position(trainer, step, rows, shares):
     """Save `step` again with `rows` as the checkpoint's position table, each
     row read for the share `shares` names."""
