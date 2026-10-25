@@ -12,7 +12,13 @@ from xml.etree import ElementTree
 
 import numpy as np
 import pytest
-from reference_error import GateFailure, assert_as_exact, assert_as_exact_as_the_reference, row_errors
+from reference_error import (
+    GateFailure,
+    as_given,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    row_errors,
+)
 
 
 def test_the_one_draw_rule_measures_its_worst_zero_row_and_names_a_value_not_finite():
@@ -115,8 +121,9 @@ def test_a_subnormal_row_error_and_an_overflowing_sum_still_measure_a_worse_cand
     exact = []
     for far in (1e154, 1.2e154):
         with pytest.raises(GateFailure) as raised:
-            assert_as_exact(lambda x, far=far: {"y": x + far}, lambda x: {"y": x}, draw, "exact far", seeds=8,
-                            truth_fn=truth_fn)
+            # NumPy arms, as given: a Dew arm compiled would compute in float32 and overflow.
+            assert_as_exact(as_given(lambda x, far=far: {"y": x + far}), as_given(lambda x: {"y": x}), draw,
+                            "exact far", seeds=8, truth_fn=truth_fn)
         [finding] = [finding for finding in raised.value.findings if finding.rule == "exact reference"]
         assert math.isfinite(finding.measure)
         exact.append(finding.measure)
@@ -125,8 +132,8 @@ def test_a_subnormal_row_error_and_an_overflowing_sum_still_measure_a_worse_cand
     measures = []
     for far in (1e154, 1.2e154):
         with pytest.raises(GateFailure) as raised:
-            assert_as_exact(lambda x, far=far: {"y": x + far}, reference_fn, draw, "far", seeds=8,
-                            truth_fn=truth_fn)
+            assert_as_exact(as_given(lambda x, far=far: {"y": x + far}), as_given(reference_fn), draw, "far",
+                            seeds=8, truth_fn=truth_fn)
         [pooled] = [finding for finding in raised.value.findings
                     if finding.rule in ("pooled", "inconclusive")]
         assert math.isfinite(pooled.measure)

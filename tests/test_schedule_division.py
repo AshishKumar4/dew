@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 
 from dew.diffusion.schedules import divided
 from dew.diffusion.transforms import EpsilonPredictionTransform, from_clean
@@ -108,6 +108,7 @@ def test_a_schedules_division_is_ieee_division(broadcast, dtype):
 
 def torch_wide(fn, dtype):
     """`fn` over the draw's arrays as torch tensors of `dtype`, its result as numpy."""
+    @as_given
     def run(*drawn):
         return fn(*(torch.from_numpy(np.asarray(array, np.float64)).to(dtype) for array in drawn)).numpy()
     return run

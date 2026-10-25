@@ -15,7 +15,7 @@ import pytest
 from decision_support import decision_rows
 from model_support import flat_tree
 from recording import RecordingTracker
-from reference_error import assert_as_exact, widened, without_ynn
+from reference_error import as_given, assert_as_exact, widened, without_ynn
 
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
@@ -155,7 +155,7 @@ def test_a_backbone_with_fresh_context_layers_scores_every_row_as_its_source_doe
                 wide["task"] = in_float64(asked_task)
             return scored(wide["task"], [(drawn(seed)[0], None)])
 
-    for read in (lambda seed: scored(reading, [(drawn(seed)[0], None)]),
+    for read in (as_given(lambda seed: scored(reading, [(drawn(seed)[0], None)])),
                  lambda seed: scored(reading, [drawn(seed)])):
         assert_as_exact(read, lambda seed: scored(asked_task, [(drawn(seed)[0], None)]),
                         lambda seed: (np.int64(seed),), "shut gates against the source", seeds=FRESH_SEEDS,
@@ -268,7 +268,7 @@ def test_a_batch_answers_each_request_from_its_own_context():
         # The draw is its seed; the requests are made from it, their text no array the check widens.
         return (np.int64(seed),)
 
-    assert_as_exact(lambda seed: read(task, seed, together=True),
+    assert_as_exact(as_given(lambda seed: read(task, seed, together=True)),
                     lambda seed: read(task, seed, together=False), draw,
                     "batched answers with their contexts", seeds=CONTEXT_SEEDS, truth_fn=truth)
 
@@ -303,7 +303,7 @@ def test_a_request_with_images_reads_its_context_beside_them():
                 wide["task"] = in_float64(shut)
             return scored(wide["task"], [(drawn(seed)[0], None)], images)
 
-    assert_as_exact(lambda seed: scored(shut, [drawn(seed)], images),
+    assert_as_exact(as_given(lambda seed: scored(shut, [drawn(seed)], images)),
                     lambda seed: scored(shut, [(drawn(seed)[0], None)], images),
                     lambda seed: (np.int64(seed),), "shut gates beside images", seeds=FRESH_SEEDS,
                     truth_fn=truth)

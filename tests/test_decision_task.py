@@ -10,7 +10,7 @@ import jax
 import numpy as np
 import pytest
 from decision_support import decision_rows
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference
 from steady_state import steady_state
 
 from dew.artifacts import Decisions
@@ -340,8 +340,8 @@ def test_score_is_a_validation_pass_through_the_task_s_temperatures(decide):
         return np.concatenate([softmax_of(logits, temperatures.of(KINDS[kind].kind, len(logits)))
                                for kind, logits, _ in passed(objective, variables, examples)])
 
-    assert_as_exact(lambda variables: np.concatenate([found for _, _, found in passed(objective, variables,
-                                                                                       examples)]),
+    assert_as_exact(as_given(lambda variables: np.concatenate(
+                        [found for _, _, found in passed(objective, variables, examples)])),
                     lambda variables: tempered(variables, float32_softmax), draw, "tempered probabilities",
                     seeds=TEMPERED_SEEDS,
                     truth_fn=lambda variables: tempered(variables, lambda logits, scale: softmax(
@@ -591,7 +591,8 @@ def test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh(decide):
     def truth(variables) -> np.ndarray:
         return held_logits(replace(wide, variables=variables))
 
-    assert_as_exact(lambda variables: held_logits(spread(variables)), alone, draw, "scored on a mesh",
+    assert_as_exact(as_given(lambda variables: held_logits(spread(variables))), alone, draw,
+                    "scored on a mesh",
                     seeds=MESH_SEEDS, truth_fn=truth)
     assert_as_exact(lambda variables: evaluated(spread(variables)),
                     lambda variables: evaluated(replace(task, variables=variables)), draw,

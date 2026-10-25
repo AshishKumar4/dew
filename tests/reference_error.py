@@ -63,6 +63,7 @@ rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
 import dataclasses
+import functools
 import hashlib
 import math
 
@@ -212,10 +213,10 @@ def as_given(fn):
     arm that runs whole programs of its own (a trainer's fit, a placement on a mesh and the program
     run there, a host loop). The other arm of its check then compiles as Dew's users run it, with the
     fusions (`_arms`), as the programs this one runs do."""
-    def given(*inputs):
-        return fn(*inputs)
+    @functools.wraps(fn)
+    def given(*inputs, **options):
+        return fn(*inputs, **options)
     given.as_given = True
-    given.__wrapped__ = fn
     return given
 
 
@@ -297,7 +298,8 @@ def torch_with_gradients(fn):
     - An input the output does not reach has a zero gradient, a non-floating one none, and an output no
       input reaches pulls nothing back.
     - A narrow float array (bfloat16, the float8 formats) goes in and comes out through the float32 that
-      holds it."""
+      holds it.
+    The gate runs the torch arm as it is given (`as_given`)."""
     def run(*arguments):
         import torch
 
@@ -323,7 +325,7 @@ def torch_with_gradients(fn):
             gradients[index] = _host_array(torch.zeros_like(flat[index]) if grad is None else grad)
         return jax.tree.map(_host_array, out), *jax.tree.unflatten(tree, gradients)
 
-    return run
+    return as_given(run)
 
 
 REPLAYED = frozenset({

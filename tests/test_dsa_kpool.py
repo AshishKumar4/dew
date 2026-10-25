@@ -31,7 +31,14 @@ import pytest
 import torch
 import torch.nn.functional as F
 from flax import linen as nn
-from reference_error import assert_as_exact, assert_moves, torch_with_gradients, widened, with_gradients
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_moves,
+    torch_with_gradients,
+    widened,
+    with_gradients,
+)
 from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextAttention
 
@@ -337,8 +344,8 @@ def decode_steps(block_module, variables, hidden, valid, prefill: int):
 def stepped(variables, rows: bool = True):
     """Dew's prefill of five tokens and then one at a time (`decode_steps`) as a function of a draw:
     its output on the valid rows, the steps told the row's validity where `rows`."""
-    return lambda hidden, valid: {'output': on_valid_rows(
-        decode_steps(module(), variables, hidden, valid if rows else None, prefill=5), valid)}
+    return as_given(lambda hidden, valid: {'output': on_valid_rows(
+        decode_steps(module(), variables, hidden, valid if rows else None, prefill=5), valid)})
 
 
 def test_prefill_then_token_steps_reproduce_the_parallel_block():

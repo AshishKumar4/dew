@@ -153,7 +153,7 @@ def prompts(vocab_limit: int, length: int, seed: int) -> np.ndarray:
 
 
 def main() -> int:
-    from reference_error import assert_as_exact
+    from reference_error import as_given, assert_as_exact
 
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--model", required=True)
@@ -193,7 +193,8 @@ def main() -> int:
 
     finding = None
     try:
-        assert_as_exact(lambda rows, tokens, scores: blocks(scores), replay, draw,
+        # Both arms read the decode's scores on the host, as given.
+        assert_as_exact(as_given(lambda rows, tokens, scores: blocks(scores)), as_given(replay), draw,
                         f"{args.model}'s decode", seeds=args.seeds,
                         truth_fn=lambda rows, tokens, scores: blocks(true(rows[0], tokens)))
     except AssertionError as failed:

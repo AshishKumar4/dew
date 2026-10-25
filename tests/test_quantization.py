@@ -22,6 +22,7 @@ import optax
 import pytest
 from flax import linen as nn
 from reference_error import (
+    as_given,
     assert_as_exact,
     assert_as_exact_as_the_reference,
     assert_fp32_reduction_bound,
@@ -821,6 +822,7 @@ def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_mode
     def raw(generation):
         return generation.raw_log_probs[0, :generation.lengths[0]]
 
+    @as_given
     def packed_side(seed):
         _, actual, from_server = drawn(int(seed))
         return {"logits": np.asarray(served.model.apply(served.variables, prompt_of(seed))),
@@ -1037,6 +1039,7 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
         mesh = spec.build()
         program = gradient(LMObjective(qmodel, SEQ_LEN))
 
+        @as_given
         def run(variables, rows, cotangent):
             placed = jax.device_put(variables, Layout(min_shard=256).shardings(mesh, variables))
             with jax.set_mesh(mesh), pipeline_microbatches(microbatches):

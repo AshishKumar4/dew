@@ -24,6 +24,7 @@ from certified import assert_certified
 from flax import linen as nn
 from recording import RecordingTracker
 from reference_error import (
+    as_given,
     assert_as_exact,
     declared_seeds,
     indexed_recording,
@@ -273,7 +274,7 @@ def test_a_prediction_undefined_at_pure_noise_is_refused_only_where_a_walk_evalu
         states, log_probs = walk(start)
         return {"recorded": log_probs, "rescored": rescored(states)}
 
-    assert_as_exact(scored, lambda start: closed(walk(start)[0], np.float32), drawn_rows((2,)),
+    assert_as_exact(scored, as_given(lambda start: closed(walk(start)[0], np.float32)), drawn_rows((2,)),
                     f"{type(prediction).__name__} rescored walk", seeds=SEEDS['rescored walk'],
                     truth_fn=lambda start: closed(walked_in_float32(walk, start)[0], np.float64))
 
@@ -383,7 +384,8 @@ def test_flow_objective_matches_clipping_and_conditional_gaussian_kl():
         density = walk_density(trajectory, lambda t: t, lambda index, x, t: 0.25 * x + 0.1 * t, 0.6, dtype)
         return {"recorded": density, "rescored": density}
 
-    assert_as_exact(recorded_and_rescored(walk, rescore, old), lambda start: walked(walk(start), np.float32),
+    assert_as_exact(recorded_and_rescored(walk, rescore, old),
+                    as_given(lambda start: walked(walk(start), np.float32)),
                     drawn_rows((2,)), "rescored clipping walk", seeds=SEEDS['rescored walk'],
                     truth_fn=lambda start: walked(walked_in_float32(walk, start), np.float64))
 
@@ -546,6 +548,7 @@ def assert_rescores_as_walked(objective, variables, rollout_of, density, label: 
     rescore = jax.jit(objective.log_probs)
 
     def closed(variables, dtype):
+        @as_given
         def run(batch):
             found = density(variables, batch, dtype)
             return {"recorded": found, "rescored": found}
@@ -743,6 +746,7 @@ def test_flow_evaluation_and_preview_use_live_policy_with_frozen_reference():
         return {"evaluated": objective.evaluate(live, batch, step).images,
                 "previewed": objective.preview(live, batch, step).images}
 
+    @as_given
     def walked(speed, key):
         with jax.enable_x64(new_val=False):
             noise_key, _ = jax.random.split(jax.random.wrap_key_data(key))
@@ -779,6 +783,7 @@ def test_mixed_precision_transition_keeps_density_arithmetic_in_float32():
         sampled = transition.sample(jax.random.wrap_key_data(key))
         return {"sample": sampled, "log_prob": transition.log_prob(sampled)}
 
+    @as_given
     def gaussian(mean, variance, key):
         with jax.enable_x64(new_val=False):
             normal = np.asarray(jax.random.normal(jax.random.wrap_key_data(key), np.shape(mean)))
@@ -900,6 +905,7 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
         # The DiT computing at `dtype`: its own float32 floor would round a float64 truth's times.
         apply = jax.jit(model.clone(dtype=dtype).apply)
 
+        @as_given
         def run(key):
             with jax.enable_x64(new_val=False):
                 noise_key, _ = jax.random.split(jax.random.wrap_key_data(key))

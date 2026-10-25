@@ -13,7 +13,7 @@ import numpy as np
 import optax
 import pytest
 from etils import epath
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 
 from dew.checkpoints import Checkpoints, averaged
 from dew.data import Loading, Memory
@@ -108,6 +108,7 @@ def test_runs_that_agree_average_to_their_own_weights_and_a_runs_average_is_read
         assert [read for _, _, read in average.runs] == [ema is None] * 3
 
 
+@as_given
 def running(*leaves) -> np.ndarray:
     """The leaves' running mean as `averaged` takes it, one run after another."""
     from dew.checkpoints import _taken

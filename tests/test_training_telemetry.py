@@ -10,7 +10,7 @@ import numpy as np
 import optax
 import pytest
 from recording import RecordingTracker
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 
 import dew.config
 from dew.config import OptimConfig, RunConfig, TrainerConfig, Wandb
@@ -251,7 +251,7 @@ def test_complex_weights_descend_and_resume_where_the_whole_run_lands(tmp_path, 
         (weight, _), _ = jax.lax.scan(update, (start, optax.sgd(.1).init(start)), None, length=4)
         return weight
 
-    assert_as_exact(lambda target: parts(fit(4, target).variables['params']['weight']),
+    assert_as_exact(as_given(lambda target: parts(fit(4, target).variables['params']['weight'])),
                     lambda target: parts(optax_descent(target)), complex_target, "complex descent",
                     seeds=COMPLEX_SEEDS,
                     truth_fn=lambda target: parts(np.asarray(target, np.complex128) * (1 - 0.8 ** 4)))

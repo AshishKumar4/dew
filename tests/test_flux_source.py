@@ -24,6 +24,7 @@ import numpy as np
 import pytest
 from interop_support import extract_fixture, packed, unpacked
 from reference_error import (
+    as_given,
     assert_as_exact,
     assert_as_exact_as_the_reference,
     torch_with_gradients,
@@ -152,6 +153,7 @@ def test_native_flux_matches_the_source_forward_and_every_gradient(name, source)
         with float64():
             return reference_walk(wide_model, inputs)
 
+    @as_given
     def native(inputs):
         *values, gradients = walk(inputs)
         return (*values, {tensor: layout["transformer/" + tensor].export({"params": gradients})

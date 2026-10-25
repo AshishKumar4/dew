@@ -22,7 +22,7 @@ import optax
 import pytest
 import torch
 from model_support import TINY_DECODER, Digits, decoder, flat_tree
-from reference_error import assert_as_exact, torch_with_gradients, with_gradients
+from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 from test_serving import assert_same_generation
 
 from dew.checkpoints import Checkpoints
@@ -141,6 +141,7 @@ def idefics_block(wide: bool):
                 "image_hidden_states": context, "image_attention_mask": mask,
                 "cross_attention_gate": torch.ones(x.shape[:2], dtype=x.dtype)})
 
+    @as_given
     def run(x, context, params, lengths, cotangent):
         arm = torch_with_gradients(functools.partial(forward, lengths=lengths))
         return arm(x, context, params, cotangent)

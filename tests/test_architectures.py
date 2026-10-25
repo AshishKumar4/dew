@@ -26,7 +26,7 @@ import selection_margins
 from diffusion_stubs import StubText
 from diffusion_support import images_of
 from recording import RecordingTracker
-from reference_error import assert_as_exact, assert_computes_the_oracle, chain_roundings, widened
+from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, chain_roundings, widened
 from residual_orders import permuted, residual_width
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
@@ -516,6 +516,7 @@ def drawn_steps(case: Case, tmp_path, fsdp, devices, initial, steps: int, *, exa
     samples widened (`wide`), built at its first call, so under the caller's float64."""
     built = []
 
+    @as_given
     def stepped(raw, order):
         if not built:
             trainer, _ = make_trainer(case, tmp_path / f"drawn-{devices}-{fsdp}-{steps}-{exact}", fsdp,

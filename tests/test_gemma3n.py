@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from interop_support import fixture_arrays
-from reference_error import assert_as_exact, torch_with_gradients, with_gradients
+from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock
 from dew.nn.mlp import GatedMLP, gaussian_topk
@@ -162,7 +162,7 @@ def test_altup_trains_past_its_coefficient_clip_as_the_reference_does():
         outputs, gradient = with_gradients(run)(params, tuple(cotangents))
         return {"outputs": list(outputs), "params": gradient}
 
-    assert_as_exact(stepped, lambda *inputs: reference(torch.float32, *inputs), draw,
+    assert_as_exact(stepped, as_given(lambda *inputs: reference(torch.float32, *inputs)), draw,
                     "an AltUp step past its clip", seeds=ALTUP_SEEDS,
                     truth_fn=lambda *inputs: reference(torch.float64, *inputs))
 
@@ -294,6 +294,7 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
         committed, _, _ = transaction.commit(state, gradient, (), None)
         return committed.variables["params"]
 
+    @as_given
     def stepped(rows, gradient):
         return exported(loaded, updated(rows, gradient))
 
@@ -316,7 +317,7 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
         return {name: state_dict[name].detach().numpy() for name in names}
 
     label = f"a clamped AltUp update, decay {decay}"
-    assert_as_exact(stepped, lambda *inputs: reference(torch.float32, *inputs), draw, label,
+    assert_as_exact(stepped, as_given(lambda *inputs: reference(torch.float32, *inputs)), draw, label,
                     seeds=UPDATE_SEEDS[decay], truth_fn=lambda *inputs: reference(torch.float64, *inputs))
 
 
@@ -370,6 +371,7 @@ def test_the_dense_decoders_gradient_is_the_references():
         _, gradient = with_gradients(lambda params: loss(params, rows))(stored, one)
         return gradient
 
+    @as_given
     def differentiated(rows, one):
         return exported(loaded, gradient_of(rows, one))
 
@@ -389,7 +391,7 @@ def test_the_dense_decoders_gradient_is_the_references():
             _, gradients = torch_with_gradients(run)(held, one)
         return {name: gradients[name] for name in names}
 
-    assert_as_exact(differentiated, lambda *inputs: reference(torch.float32, *inputs), draw,
+    assert_as_exact(differentiated, as_given(lambda *inputs: reference(torch.float32, *inputs)), draw,
                     "the dense decoder's gradient", seeds=DENSE_SEEDS,
                     truth_fn=lambda *inputs: reference(torch.float64, *inputs), orders=orders)
 
@@ -538,7 +540,7 @@ def test_the_sparse_mlp_trains_on_padded_rows_as_the_reference_does():
     def stepped(hidden, cotangent):
         return differentiated(mlp, params, hidden, cotangent)
 
-    assert_as_exact(stepped, lambda *inputs: reference(torch.float32, *inputs), draw,
+    assert_as_exact(stepped, as_given(lambda *inputs: reference(torch.float32, *inputs)), draw,
                     "a sparse MLP step over padded rows", seeds=PADDED_SEEDS,
                     truth_fn=lambda *inputs: reference(torch.float64, *inputs))
 
@@ -624,8 +626,8 @@ def test_the_sparse_mlp_is_as_exact_as_the_reference_at_each_sparsity(sparsity):
     def stepped(rows, cotangent):
         return differentiated(model, params, rows, cotangent)
 
-    assert_as_exact(stepped, lambda rows, cotangent: reference(torch.float32, cotangent, rows), draw,
-                    f"a sparse MLP step at sparsity {sparsity}", seeds=SPARSITY_SEEDS[sparsity],
+    assert_as_exact(stepped, as_given(lambda rows, cotangent: reference(torch.float32, cotangent, rows)),
+                    draw, f"a sparse MLP step at sparsity {sparsity}", seeds=SPARSITY_SEEDS[sparsity],
                     truth_fn=lambda rows, cotangent: reference(torch.float64, cotangent, rows))
 
 
