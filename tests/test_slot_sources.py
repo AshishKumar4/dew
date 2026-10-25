@@ -115,6 +115,49 @@ def test_a_cached_slot_release_reopens_with_the_hub_offline(tmp_path):
             np.testing.assert_array_equal(head[native], stored[name])
 
 
+_SHAPES_OFFLINE = """
+import json
+import sys
+import warnings
+import jax
+from dew.interop import Pretrained
+warnings.simplefilter("ignore")
+bundle = Pretrained.load("dew/tiny-forwarded-slot", dtype="float32", weights=False)
+print(json.dumps(jax.tree.map(lambda leaf: [list(leaf.shape), str(leaf.dtype)], bundle.variables)))
+"""
+
+
+def test_a_slot_release_over_a_forwarded_backbone_states_its_shapes_from_metadata(tmp_path):
+    """A slot release whose backbone transformers runs (tier 3) loads without its weights from
+    metadata alone, as its backbone loaded alone does: from a Hub cache holding the commit's
+    metadata and no weight file, offline, it states every backbone leaf's shape and dtype as the
+    load with weights holds it."""
+    import os
+    import subprocess
+    import sys
+
+    import torch
+    import transformers
+    from interop_support import hub_cache
+    from test_torchax_fallback import COHERE
+
+    torch.manual_seed(0)
+    release = tmp_path / "release"
+    transformers.CohereForCausalLM(transformers.CohereConfig(**COHERE)).save_pretrained(release)
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        shutil.copy(BACKBONE / name, release / name)
+    (release / "readout.json").write_text(json.dumps({"readout": "slot_lm", "head_dim": 8, "n_slots": 4}))
+    whole = Pretrained.load(release, dtype="float32")
+    hub_cache(tmp_path / "hub", "dew/tiny-forwarded-slot", release)
+    for weights in (tmp_path / "hub").rglob("*.safetensors"):
+        weights.unlink()
+    env = {**os.environ, "HF_HUB_CACHE": str(tmp_path / "hub"), "HF_HUB_OFFLINE": "1", "JAX_PLATFORMS": "cpu"}
+    run = subprocess.run([sys.executable, "-c", _SHAPES_OFFLINE], capture_output=True, text=True, env=env)
+    assert run.returncode == 0, run.stderr[-2000:]
+    assert json.loads(run.stdout.splitlines()[-1]) == jax.tree.map(
+        lambda leaf: [list(leaf.shape), str(np.dtype(leaf.dtype))], whole.variables)
+
+
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("readout", ["slot_lm", "head", "fresh_head"])
 @pytest.mark.parametrize("n_slots", [16, 32, 512])
