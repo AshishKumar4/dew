@@ -69,10 +69,6 @@ class ScoringRule(ABC):
         return mean_of_totals(accumulated)
 
 
-def _probabilities(logits: jax.Array, options: jax.Array) -> jax.Array:
-    return categorical.probabilities(logits, options)
-
-
 @dataclass(frozen=True)
 class LogLoss(ScoringRule):
     """The cross entropy, -sum_k t_k log p_k: the logarithmic score."""
@@ -90,7 +86,7 @@ class Brier(ScoringRule):
     name = "brier"
 
     def charge(self, logits, target, options, ordinal):
-        p = _probabilities(logits, options)
+        p = categorical.probabilities(logits, options)
         return jnp.sum(jnp.where(options, (p - target) ** 2, 0.0), axis=-1)
 
 
@@ -101,7 +97,7 @@ class Spherical(ScoringRule):
     name = "spherical"
 
     def charge(self, logits, target, options, ordinal):
-        p = _probabilities(logits, options)
+        p = categorical.probabilities(logits, options)
         return 1.0 - jnp.sum(target * p, axis=-1) / jnp.linalg.norm(p, axis=-1)
 
 
@@ -119,7 +115,7 @@ class RankedProbability(ScoringRule):
     name = "rps"
 
     def charge(self, logits, target, options, ordinal):
-        p = _probabilities(logits, options)
+        p = categorical.probabilities(logits, options)
         gaps = (jnp.cumsum(p, axis=-1) - jnp.cumsum(jnp.where(options, target, 0.0), axis=-1)) ** 2
         cuts = jnp.maximum(jnp.sum(options, axis=-1) - 1, 1)
         # The last cut, past every level, is always zero.

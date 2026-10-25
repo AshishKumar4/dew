@@ -280,12 +280,13 @@ def written_out(logits, options, groups, canonical):
     p = p / jnp.where(any_mapped, jnp.sum(p, -1, keepdims=True), 1.0)
     onehot = (canonical[..., None] == jnp.arange(logits.shape[-1])) & mapped[..., None]
     answers = jnp.einsum("bqk,bqkc->bqc", p, onehot.astype(p.dtype))
-    same = (groups[..., :, None] == groups[..., None, :]) & (groups[..., :, None] >= 0)
+    member = (groups >= 0) & any_mapped[..., 0]
+    same = (groups[..., :, None] == groups[..., None, :]) & member[..., :, None] & member[..., None, :]
     size = jnp.sum(same, -1).astype(p.dtype)
     mean = jnp.einsum("bqr,brc->bqc", same.astype(p.dtype), answers) / jnp.maximum(size, 1)[..., None]
-    terms = jnp.where(answers > 0, answers * (jnp.log(jnp.where(answers > 0, answers, 1))
-                                              - jnp.log(jnp.where(answers > 0, mean, 1))), 0.0)
-    member = groups >= 0
+    counted = (answers > 0) & member[..., None]
+    terms = jnp.where(counted, answers * (jnp.log(jnp.where(counted, answers, 1))
+                                          - jnp.log(jnp.where(counted, mean, 1))), 0.0)
     return (jnp.where(member, jnp.sum(terms, -1) / jnp.maximum(size, 1), 0.0),
             jnp.where(member, 1 / jnp.maximum(size, 1), 0.0))
 
@@ -342,3 +343,22 @@ def test_members_that_agree_have_no_divergence_and_extreme_logits_stay_finite():
     divergence, _ = categorical.group_divergence(logits * 1000, groups, apart, options)
     gradient = jax.grad(lambda x: divergence_of(x, options, groups, apart)[0].sum())(logits * 1000)
     assert bool(jnp.all(jnp.isfinite(divergence))) and bool(jnp.all(jnp.isfinite(gradient)))
+
+
+def test_a_member_of_no_group_or_of_no_mapped_class_takes_no_part():
+    """A member in no group whose classes map, and a grouped member none of whose classes map, take no
+    part: the group's other member alone has divergence zero and the whole share, the outsider none,
+    and the divergence's derivative is finite and zero in both modes."""
+    logits = jnp.zeros((1, 2, 2), jnp.float32)
+    cases = ((jnp.asarray([[0, -1]]), jnp.asarray([[[0, 1], [0, 1]]])),
+             (jnp.asarray([[0, 0]]), jnp.asarray([[[0, 1], [-1, -1]]])))
+    for groups, classes in cases:
+        divergence, shares = categorical.group_divergence(logits, groups, classes)
+        np.testing.assert_array_equal(np.asarray(divergence), np.zeros((1, 2), np.float32))
+        np.testing.assert_array_equal(np.asarray(shares), np.asarray([[1.0, 0.0]], np.float32))
+        def total(x, groups=groups, classes=classes):
+            return categorical.group_divergence(x, groups, classes)[0].sum()
+
+        np.testing.assert_array_equal(np.asarray(jax.grad(total)(logits)), np.zeros((1, 2, 2), np.float32))
+        _, tangent = jax.jvp(total, (logits,), (jnp.ones_like(logits),))
+        assert float(tangent) == 0.0
