@@ -34,7 +34,9 @@ def test_the_dynamic_maps_hold_256_ascending_values_from_their_range():
 
 def test_a_moment_is_coded_by_its_blocks_nearest_value():
     """Each value is coded by the map value nearest its fraction of its block's largest magnitude, and
-    decoded as that value times the block's scale; a block's largest magnitude comes back exactly."""
+    decoded as that value times the block's scale: a block's positive peak, the map's 1, comes back
+    exactly, and a negative one as the signed map's least value, which stops short of -1 (the map
+    bitsandbytes' and torchao's share)."""
     moment = jnp.asarray(np.random.default_rng(0).standard_normal((4, 2 * BLOCK)), jnp.float32)
     values = jnp.asarray(dynamic_map(signed=True))
     coded = quantized(moment, values, BLOCK)
@@ -45,7 +47,9 @@ def test_a_moment_is_coded_by_its_blocks_nearest_value():
     np.testing.assert_array_equal(np.asarray(coded.codes), nearest)
     back = np.asarray(dequantized(coded, values, BLOCK)).reshape(4, 2, BLOCK)
     peaks = np.abs(blocked).argmax(-1)[..., None]
-    np.testing.assert_array_equal(np.take_along_axis(back, peaks, -1), np.take_along_axis(blocked, peaks, -1))
+    peak, decoded = np.take_along_axis(blocked, peaks, -1), np.take_along_axis(back, peaks, -1)
+    least = np.asarray(values)[0] * np.asarray(coded.scales)[..., None]
+    np.testing.assert_array_equal(decoded, np.where(peak > 0, peak, least))
 
 
 def test_int8_state_takes_optax_adamw_steps_from_the_fp32_moments():
