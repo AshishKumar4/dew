@@ -1323,5 +1323,5 @@ class Exponential(ScheduleBase):
 
 
 __all__ = ["NEWTON_SCHULZ", "BoundsState", "Cosine", "DeltaState", "Exponential", "Linear", "M3State",
-           "OneCycle", "ParamGroup", "Power", "PowerProfilesState", "PowerTail", "QKClipState", "ScheduleBase",
-           "delta_gradient_descent", "newton_schulz", "scale_by_m3", "stepped"]
+           "OneCycle", "ParamGroup", "Power", "PowerProfilesState", "PowerTail", "QKClipState",
+           "ScheduleBase", "delta_gradient_descent", "newton_schulz", "scale_by_m3", "stepped"]
