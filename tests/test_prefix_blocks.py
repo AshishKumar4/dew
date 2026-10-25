@@ -84,9 +84,11 @@ def test_a_prefix_run_trains_the_block_mask_on_par_with_float64():
     objective = LMObjective(decoder, SEQ, prefix=PREFIX)
     wide = decoder.clone(dtype=jnp.float64, attention_impl="reference")
 
+    init = jax.jit(decoder.init)
+
     def draw(seed):
         tokens = jax.random.randint(jax.random.fold_in(jax.random.key(1), seed), (BATCH, ROW), 0, VOCAB)
-        return decoder.init(jax.random.fold_in(jax.random.key(0), seed), tokens[:, :-1]), tokens
+        return init(jax.random.fold_in(jax.random.key(0), seed), tokens[:, :-1]), tokens
 
     reference = jax.jit(lambda params, tokens: masked(decoder, params, tokens))
     truth = jax.jit(lambda params, tokens: masked(wide, params, tokens))
@@ -108,9 +110,11 @@ def test_a_greedy_cached_rollout_serves_the_prefix_mask_on_par_with_float64():
     objective = LMObjective(decoder, SEQ, prefix=PREFIX)
     wide = decoder.clone(dtype=jnp.float64, attention_impl="reference")
 
+    init = jax.jit(decoder.init)
+
     def draw(seed):
         prompt = jax.random.randint(jax.random.fold_in(jax.random.key(1), seed), (BATCH, PROMPT), 0, VOCAB)
-        params = decoder.init(jax.random.fold_in(jax.random.key(0), seed), prompt)
+        params = init(jax.random.fold_in(jax.random.key(0), seed), prompt)
         task = objective.build_task(params, processor=None)
         return params, prompt, task(prompt, NEW, key=0).tokens[:, PROMPT:]
 
