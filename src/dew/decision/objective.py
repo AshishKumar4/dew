@@ -509,7 +509,10 @@ def consistency_divergence(logits: jax.Array, options: jax.Array, groups: jax.Ar
 
     width = logits.shape[-1]
     mapped = options & (canonical >= 0)
-    log_p = categorical.log_probs(logits, mapped)
+    # A question of no mapped slot (in no group, or padding) normalizes over nothing: it reads zeros
+    # instead, which its answer then takes no part of, so neither its value nor its gradient is NaN.
+    any_mapped = jnp.any(mapped, axis=-1, keepdims=True)
+    log_p = categorical.log_probs(jnp.where(any_mapped, logits, 0.0), mapped | ~any_mapped)
     slots = jnp.where(mapped, canonical, width)
 
     def answer(row_logits, row_slots):

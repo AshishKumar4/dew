@@ -4,13 +4,17 @@ float64 with that divergence written out (check 1), in value and gradient; the g
 encoding and a packed window, a weight of zero reads none of them, and the layouts that would split a
 group's members across rows refuse it."""
 
+import itertools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from decision_support import decision_rows
 from reference_error import assert_as_exact, with_gradients, without_ynn
 from test_decision_objective import SPECIALS, TOKENIZER, tiny_backbone
 
+from dew.data.dataset import DataPartition
 from dew.decision import Choice, DecisionObjective, Example, Group, JointLayout, Noul, StateFirstLayout
 from dew.decision.objective import DecisionStatistics, Encoding, Fit, _window_groups, consistency_divergence
 from dew.objectives.base import Ratio, Step
@@ -42,9 +46,10 @@ def written_out(logits, options, groups, canonical):
     canonical options by a one-hot product, the group's mean, and each member's KL from it over its
     group's size; each member's share of its group its inverse size."""
     mapped = options & (canonical >= 0)
-    shifted = jnp.where(mapped, logits, -jnp.inf)
-    p = jnp.where(mapped, jnp.exp(shifted - jnp.max(shifted, -1, keepdims=True)), 0.0)
-    p = p / jnp.sum(p, -1, keepdims=True)
+    any_mapped = jnp.any(mapped, -1, keepdims=True)
+    peak = jnp.max(jnp.where(mapped, logits, -jnp.inf), -1, keepdims=True)
+    p = jnp.where(mapped, jnp.exp(jnp.where(mapped, logits, 0.0) - jnp.where(any_mapped, peak, 0.0)), 0.0)
+    p = p / jnp.where(any_mapped, jnp.sum(p, -1, keepdims=True), 1.0)
     onehot = (canonical[..., None] == jnp.arange(logits.shape[-1])) & mapped[..., None]
     answers = jnp.einsum("bqk,bqkc->bqc", p, onehot.astype(p.dtype))
     same = (groups[..., :, None] == groups[..., None, :]) & (groups[..., :, None] >= 0)
@@ -76,22 +81,33 @@ def test_the_consistency_divergence_is_its_groups_jensen_shannon_divergence():
                                                                                  canonical))
     for window, group in ((0, 0), (0, 1), (1, 0)):
         held = np.asarray(groups[window]) == group
-        assert np.isclose(members[window][held].sum(), 1.0) and divergence[window][held].sum() >= 0
+        count = int(held.sum())
+        assert np.array_equal(members[window][held], np.full(count, np.float32(1) / np.float32(count)))
+        assert divergence[window][held].sum() >= 0
     assert np.all(members[np.asarray(groups) < 0] == 0) and np.all(divergence[np.asarray(groups) < 0] == 0)
 
 
+def agreeing(seed: int):
+    """A group of two members that give one answer over the canonical options: the second shows the
+    first's options in another order, its slots mapped back onto the first's canonical options."""
+    rng = np.random.default_rng([0xA6, seed])
+    first = rng.standard_normal(4) * 3
+    order = rng.permutation(4)
+    logits = jnp.asarray(np.stack([first, first[order]])[None], jnp.float32)
+    canonical = jnp.asarray(np.stack([np.arange(4), order])[None], jnp.int32)
+    return logits, jnp.ones((1, 2, 4), bool), jnp.asarray([[0, 0]], jnp.int32), canonical
+
+
 def test_members_that_agree_have_no_divergence_and_extreme_logits_stay_finite():
-    """A group whose members give one answer over the canonical options (a choice and its options in
-    another order) has a divergence of zero, and logits of a thousand stay finite."""
-    logits = jnp.asarray([[[3.0, 1.0, -2.0], [-2.0, 3.0, 1.0]]], jnp.float32)
-    options = jnp.ones((1, 2, 3), bool)
-    groups = jnp.asarray([[0, 0]], jnp.int32)
-    canonical = jnp.asarray([[[0, 1, 2], [2, 0, 1]]], jnp.int32)
-    divergence, _ = consistency_divergence(logits, options, groups, canonical)
-    assert float(jnp.abs(divergence).max()) < 1e-6
-    divergence, _ = consistency_divergence(logits * 1000, options, groups, canonical.at[0, 1].set([0, 1, 2]))
-    gradient = jax.grad(lambda x: consistency_divergence(x, options, groups, canonical)[0].sum())(
-        logits * 1000)
+    """Members that give one answer over the canonical options, in other slot orders, have a divergence
+    whose float64 truth is zero, met on par (check 1); logits of a thousand keep the divergence and its
+    gradient finite."""
+    assert_as_exact(without_ynn(consistency_divergence), without_ynn(written_out), agreeing,
+                    "agreeing members", seeds=CONSISTENCY_SEEDS)
+    logits, options, groups, canonical = agreeing(0)
+    apart = canonical.at[0, 1].set(jnp.arange(4))
+    divergence, _ = consistency_divergence(logits * 1000, options, groups, apart)
+    gradient = jax.grad(lambda x: consistency_divergence(x, options, groups, apart)[0].sum())(logits * 1000)
     assert bool(jnp.all(jnp.isfinite(divergence))) and bool(jnp.all(jnp.isfinite(gradient)))
 
 
@@ -105,22 +121,23 @@ NEGATED = Example("the customer was charged twice",
 
 
 def test_a_rows_slots_map_onto_their_groups_canonical_options_as_the_row_shows_them():
-    """Encoded under shuffled options, each grouped question's slot maps onto the canonical option of
-    the option it shows (`Laid.order`), a question of no group to none."""
+    """Encoded under shuffled questions and options, each grouped question's slots map onto the
+    canonical options of the options they show (`Laid.order`): both members' answers, the negated one
+    "false", stand at the canonical "yes" over every draw; the question of no group maps to none."""
     encoding = Encoding(LAYOUT, TOKENIZER, SPECIALS, 3, shuffle=True, grouped=True)
-    row = encoding(NEGATED, list(NEGATED.questions), np.random.default_rng(3))
-    encoded = LAYOUT.rows(TOKENIZER, SPECIALS, NEGATED.state, NEGATED.questions)[0]
-    names = [laid.name for laid in encoded.questions]
-    groups, canonical = np.asarray(row["groups"]), np.asarray(row["canonical"])
-    assert groups[names.index("team")] == -1 and np.all(canonical[names.index("team")] == -1)
-    keys = ["no", "yes"]
-    for name in ("billing", "other"):
-        slot = names.index(name)
-        assert groups[slot] == 0
-        mapped = NEGATED.groups[0].members[name]
-        shown = [canonical[slot][at] for at in range(2)]
-        assert sorted(shown) == [0, 1]
-        assert {keys[index] for index in shown} == set(mapped.values())
+    for seed in range(8):
+        row = encoding(NEGATED, list(NEGATED.questions), np.random.default_rng(seed))
+        groups, canonical = np.asarray(row["groups"]), np.asarray(row["canonical"])
+        targets, options = np.asarray(row["targets"]), np.asarray(row["options"])
+        asked = np.asarray(row["questions"])
+        assert sorted(groups[asked].tolist()) == [-1, 0, 0]
+        for slot in np.flatnonzero(asked):
+            real = canonical[slot][options[slot]]
+            if groups[slot] < 0:
+                assert np.all(canonical[slot] == -1)
+                continue
+            assert sorted(real.tolist()) == [0, 1]
+            assert canonical[slot][int(np.argmax(targets[slot]))] == ["no", "yes"].index("yes")
 
 
 def test_a_window_numbers_each_rows_groups_apart_and_restores_the_padding():
@@ -145,14 +162,11 @@ def test_a_weight_of_zero_reads_no_groups_and_a_weight_adds_the_term_beside_the_
     weighted = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
                                  consistency=0.5)
     zero = Encoding(LAYOUT, TOKENIZER, SPECIALS, 3, shuffle=False)
-    grouped = Encoding(LAYOUT, TOKENIZER, SPECIALS, 3, shuffle=False, grouped=True)
-    names = list(NEGATED.questions)
-    assert "groups" not in zero(NEGATED, names, None)
-    row = grouped(NEGATED, names, None)
-    assert {"groups", "canonical"} <= set(row)
+    assert "groups" not in zero(NEGATED, list(NEGATED.questions), None)
+    reader = decision_rows([NEGATED, NEGATED], None, objective=weighted.data(), tokens=LAYOUT.max_len)
+    [batch] = list(itertools.islice(reader.train(DataPartition()), 1))
+    assert {"groups", "canonical"} <= set(batch)
     variables = plain.init(jax.random.key(0))
-    batch = jax.tree.map(lambda leaf: np.asarray(leaf)[None], row)
-    batch["segments"] = (np.asarray(batch["tokens"]) != SPECIALS.pad).astype(np.int32)
     step = Step(jnp.asarray(0), jax.random.key(1), None)
     labelled, _ = plain.loss(variables, batch, step)
     stats, aux = weighted.loss(variables, batch, step)
