@@ -377,10 +377,6 @@
    "comparisons": 5,
    "lane": "Training"
   },
-  "tests/test_lm_objective.py": {
-   "comparisons": 38,
-   "lane": "Training"
-  },
   "tests/test_lm_recipe.py": {
    "comparisons": 6,
    "lane": "Models, Serving & RL"
@@ -502,7 +498,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_optim.py": {
-   "comparisons": 18,
+   "comparisons": 2,
    "lane": "Training"
   },
   "tests/test_optim_schedules.py": {
