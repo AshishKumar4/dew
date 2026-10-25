@@ -1385,10 +1385,16 @@ def launched(launches, arguments, options, *, product: Product, whole: bool):
     """The launch of `launches` that runs the call (`arguments`, `options`) as `GROUPED` selects it,
     ready to call, or None where XLA's program takes it. A GPU process's CPU branch, which never runs,
     interprets Triton's, the one launch that interprets there (`_Mosaic.eligible`), as the call's own
-    preference: a chosen implementation names the GPU's launch, the branch the call takes."""
+    preference: a chosen implementation names the GPU's launch, the branch the call takes. A CPU
+    process's GPU branch, which runs only where a lowering for the GPU takes it, takes a chosen
+    implementation where it can and the order's next launch where it cannot (mma.sync's where this JAX
+    lowers none: `_families`), the CPU branch, which runs, insisting on it."""
     case = grouped_case(launches, arguments, options, product=product, whole=whole)
-    stand_in = options['interpret'] and jax.default_backend() != 'cpu'
-    route = selection.select(GROUPED, case, 'triton' if stand_in else None, insist=not stand_in)
+    cpu = jax.default_backend() == 'cpu'
+    stand_in = options['interpret'] and not cpu
+    unrun = not options['interpret'] and cpu
+    named = 'triton' if stand_in else selection.forced(GROUPED.choice) if unrun else None
+    route = selection.select(GROUPED, case, named, insist=not (stand_in or unrun))
     if route.kernel == 'xla':
         return None
     return functools.partial(case.call.implementation(route.kernel), *arguments, **options)
