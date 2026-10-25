@@ -932,6 +932,8 @@ def test_rates_of_one_schedule_lower_to_one_update(optimizer, form):
 SCHEDULES = {
     "cosine": Cosine(peak_value=1e-2, warmup_steps=2, end_value=1e-3, init_value=1e-4),
     "linear": Linear(peak_value=3e-3, warmup_steps=2, decay_start=3, end_value=1e-4),
+    # Rates forty decades apart: their ratio overflows float32, though each rate is a float32.
+    "linear_wide": Linear(peak_value=1e-20, warmup_steps=2, decay_start=3, end_value=1e20),
     "exponential": Exponential(init_value=1e-2, end_value=1e-3, offset=1e-4),
     "power": Power(peak_value=2e-2, warmup_steps=2, a=4e-2, tail=PowerTail(start=4, end_value=1e-3)),
     "one_cycle": OneCycle(peak_value=1e-2),
@@ -973,31 +975,44 @@ def test_a_configured_optimizer_is_optaxs_own_at_the_rate_its_state_holds(optimi
         params = optax.apply_updates(params, updates)
 
 
-def optax_schedule(name: str, multiplier: float) -> optax.Schedule:
-    """`SCHEDULES[name]` over ten steps, its rates times `multiplier`, as optax's own schedules build
-    it, the reference a scheduled rate is held to: optax's builders, and for the two schedules optax
-    has none of, lm-engine's power law and torch's one-cycle, their published formulas in optax's
-    pieces (`optax.join_schedules`)."""
-    m = multiplier
-    if name == "cosine":
-        return optax.warmup_cosine_decay_schedule(1e-4 * m, 1e-2 * m, 2, 10, end_value=1e-3 * m)
-    if name == "linear":
-        return optax.join_schedules([optax.linear_schedule(0.0, 3e-3 * m, 2),
-                                     optax.constant_schedule(3e-3 * m),
-                                     optax.linear_schedule(3e-3 * m, 1e-4 * m, 10 - 3)], [2, 3])
-    if name == "exponential":
-        decay = optax.exponential_decay(1e-2 * m, 10, 1e-3 / 1e-2, end_value=1e-3 * m)
-        return lambda count: 1e-4 * m + decay(count)
-    # The count in the default float, float32 for the reference and float64 for its truth.
-    if name == "power":
+def optax_schedule(name: str, multiplier: float, steps: int = 10) -> optax.Schedule:
+    """`SCHEDULES[name]` over `steps`, its rates times `multiplier`, as optax's own schedules build it,
+    the reference a scheduled rate is held to: optax's builders, and for the two schedules optax has
+    none of, lm-engine's power law and torch's one-cycle, their published formulas in optax's pieces
+    (`optax.join_schedules`). The count is the default float, float32 for the reference and float64
+    for its truth."""
+    schedule, m = SCHEDULES[name], multiplier
+    if isinstance(schedule, Cosine):
+        return optax.warmup_cosine_decay_schedule(schedule.init_value * m, schedule.peak_value * m,
+                                                  schedule.warmup_steps, steps, schedule.end_value * m)
+    if isinstance(schedule, Linear):
+        peak, end, start = schedule.peak_value * m, schedule.end_value * m, schedule.decay_start
+        return optax.join_schedules([optax.linear_schedule(0.0, peak, schedule.warmup_steps),
+                                     optax.constant_schedule(peak),
+                                     optax.linear_schedule(peak, end, steps - start)],
+                                    [schedule.warmup_steps, start])
+    if isinstance(schedule, Exponential):
+        decay = optax.exponential_decay(schedule.init_value * m, steps,
+                                        schedule.end_value / schedule.init_value,
+                                        end_value=schedule.end_value * m)
+        return lambda count: schedule.offset * m + decay(count)
+    if isinstance(schedule, Power):
+        assert schedule.tail is not None
+        peak, a = schedule.peak_value * m, schedule.a * m
+        warmup, start, tail = schedule.warmup_steps, schedule.tail.start, schedule.tail.end_value * m
+
         def law(step):
             counted = jnp.asarray(step, jnp.result_type(float))
-            return jnp.minimum(2e-2 * m, 4e-2 * m * (counted * 1.0) ** -0.51)
-        warm = jnp.minimum(2e-2 * m, 4e-2 * m * 2.0 ** -0.51)
-        return optax.join_schedules([optax.linear_schedule(0.0, warm, 2), lambda count: law(count + 2),
-                                     optax.linear_schedule(law(4), 1e-3 * m, 10 - 4)], [2, 4])
-    init, peak, end = 1e-2 * m / 25, 1e-2 * m, 1e-2 * m / 25 / 1e4
-    rise, last = 0.3 * 10 - 1, 10 - 1
+            return jnp.minimum(peak, a * (counted * schedule.c) ** schedule.b)
+        warm = jnp.minimum(peak, a * (warmup * schedule.c) ** schedule.b)
+        return optax.join_schedules([optax.linear_schedule(0.0, warm, warmup),
+                                     lambda count: law(count + warmup),
+                                     optax.linear_schedule(law(start), tail, steps - start)],
+                                    [warmup, start])
+    peak = schedule.peak_value * m
+    init = peak / 25
+    end = init / 1e4
+    rise, last = schedule.warmup_fraction * steps - 1, steps - 1
 
     def anneal(start, stop, done):
         return stop + (start - stop) / 2 * (jnp.cos(jnp.pi * done) + 1)
@@ -1019,7 +1034,8 @@ def test_a_scheduled_rate_is_as_near_float64_as_optaxs(name):
     multiplier on its schedule, is on par with optax's own float32 schedule of the multiplied rates
     (check 1, `optax_schedule`), the truth that schedule in float64: Dew holds the rate fields as
     operands, each rounded once as optax's are, where a scale times the schedule's ratios to it
-    rounded three times (ledger 1660). Each draw scales the rates by its own multiplier."""
+    rounded three times and overflowed where two rates are far apart (ledger 1660). Each step's rate
+    is a leaf of its own, and each draw scales the rates by its own multiplier."""
     params = {"w": jnp.ones(3)}
 
     def draw(seed):
@@ -1030,20 +1046,20 @@ def test_a_scheduled_rate_is_as_near_float64_as_optaxs(name):
         config = OptimConfig(optimizer="adam", learning_rate=SCHEDULES[name], clip_grads=0,
                              param_groups=(group,))
         solver = config.build(10)
-        state, rates = solver.init(params), []
-        for _ in range(10):
+        state, rates = solver.init(params), {}
+        for step in range(10):
             _, state = solver.update({"w": jnp.ones(3)}, state, params)
-            rates.append(jnp.asarray(learning_rate(state)))
-        return jnp.stack(rates)
+            rates[f"step {step}"] = jnp.asarray(learning_rate(state))
+        return rates
 
     def optax_rates(multiplier):
         values = optax_schedule(name, float(multiplier))
-        return jnp.stack([jnp.asarray(values(step), jnp.float32) for step in range(10)])
+        return {f"step {step}": jnp.asarray(values(step), jnp.float32) for step in range(10)}
 
     def truth(multiplier):
         values = optax_schedule(name, float(multiplier))
         # optax counts in int32, which divides to float32: a float64 count keeps the schedule float64.
-        return jnp.stack([values(jnp.asarray(step, jnp.float64)) for step in range(10)])
+        return {f"step {step}": values(jnp.asarray(step, jnp.float64)) for step in range(10)}
 
     assert_as_exact(dew, optax_rates, draw, f"the {name} rate", seeds=RATE_SEEDS, truth_fn=truth)
 
