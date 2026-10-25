@@ -1,7 +1,7 @@
-"""Router parity readings, the router fixtures the balance tests share (`favour_expert_zero` and
-`uniform_gates`), and the two-process expert-exchange launch the MoE tests share. The routers stay
-with their tests: V2's softmax and best-expert group score and V3's sigmoid, two-best group score and
-bias differ."""
+"""Router parity readings, the fixtures the balance tests share (`balanced_decoder`,
+`favour_expert_zero` and `uniform_gates`), and the two-process expert-exchange launch the MoE tests
+share. The routers stay with their tests: V2's softmax and best-expert group score and V3's sigmoid,
+two-best group score and bias differ."""
 
 import sys
 from pathlib import Path
@@ -12,6 +12,20 @@ import numpy as np
 import optax
 from flax.traverse_util import flatten_dict, unflatten_dict
 from process_support import start_process
+
+BALANCED_VOCAB, BALANCED_EXPERTS = 16, 4
+"""The token ids and experts of the decoder the balance tests train (`balanced_decoder`)."""
+
+
+def balanced_decoder(max_seq_len: int, *, layers: int = 2, causal: bool = True):
+    """The decoder the expert-balance tests train: `layers` layers of four softmax-routed experts, two a
+    token, whose balancing bias is in the routing weights."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    return CausalTransformer(vocab_size=BALANCED_VOCAB, emb_features=8, num_layers=layers, num_heads=2,
+                             mlp_features=16, max_seq_len=max_seq_len, causal=causal, qk_norm=False,
+                             mixture={"experts": BALANCED_EXPERTS, "top_k": 2, "bias": True,
+                                      "bias_in_weights": True, "score_function": "softmax"})
 
 
 def by_expert(indices, weights):

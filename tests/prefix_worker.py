@@ -23,7 +23,6 @@ def mode_prefix_generation(args) -> dict:
 
     from dew.coordination import PeerFailure
     from dew.inference import TextGeneration
-    from dew.inference.pipeline import place
     from dew.nn.inputs import ModelInputs, mesh_of
     from dew.nn.mixers import AttentionMixer
     from dew.training import Layout, MeshSpec
@@ -32,7 +31,8 @@ def mode_prefix_generation(args) -> dict:
     rank, processes = jax.process_index(), jax.process_count()
     model = block_model(1, full_attention={"mixer": AttentionMixer(bidirectional_blocks=True)})
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
-    placed = place(params, MeshSpec(fsdp=args.fsdp_size), Layout(min_shard=TINY))
+    mesh = MeshSpec(fsdp=args.fsdp_size).build(jax.devices())
+    placed = jax.device_put(params, Layout(min_shard=TINY).shardings(mesh, params))
     task = TextGeneration(model, placed, prefix=3)
     prompts, lengths = continuation_prompts()
     mask = np.arange(prompts.shape[1])[None, :] >= prompts.shape[1] - lengths[:, None]
