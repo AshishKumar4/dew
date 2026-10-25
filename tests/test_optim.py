@@ -986,8 +986,9 @@ def optax_schedule(name: str, fields, steps: int = 10) -> optax.Schedule:
     return optax.join_schedules([lambda count: rising(rise - count), falling], [rise])
 
 
-RATE_SEEDS = 8
-"""Check 1's declared seeds for a scheduled rate against optax's float32 schedule (`seeds_for`)."""
+RATE_SEEDS = 32
+"""Check 1's declared seeds for a scheduled rate against optax's float32 schedule, sized paired by
+`seeds_for` on armada: the most any schedule took (the one-cycle's)."""
 
 RATE_MULTIPLIERS = 64
 """The multipliers a draw scales a schedule's rates by, one rate of each step's leaf apiece."""
