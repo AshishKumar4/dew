@@ -21,6 +21,7 @@ import optax
 
 from dew.artifacts import Artifact, Representations
 from dew.eval.common import metric_device
+from dew.nn import categorical
 from dew.nn.precision import accumulated
 from dew.objectives.base import Batch, Objective, Shown, mean_of_totals, merge_totals
 from dew.optim import OPTIMIZER_MAP
@@ -60,7 +61,7 @@ def linear_probe_accuracy(embeddings, labels, num_classes: int, steps: int = 100
 
     def objective(p: ProbeParams):
         logits = accumulated(jnp.matmul, fit_x, p.w) + p.b
-        return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, fit_y))
+        return jnp.mean(categorical.cross_entropy(logits, fit_y))
 
     def step(carry: tuple[ProbeParams, optax.OptState], _: None):
         p, opt_state = carry

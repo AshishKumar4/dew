@@ -257,10 +257,16 @@ def _tile_gate(kernel, width, features):
                 jnp.asarray(rng.normal(size=(rows, features)), jnp.bfloat16))
 
     def truth(x, kernel_matrix, dy):
-        # The products of the operands as the projection rounds them, in float64.
+        # The products of the operands as the projection rounds them, in float64, one matmul a group: a
+        # kernel gathered per row is rows x width x features doubles, 1.4 GB at Mosaic's widths, which
+        # numpy's einsum then reduced in a Python-speed loop past the hour.
         x, kernel_matrix, dy = (np.asarray(value, np.float64) for value in (x, rounded(kernel_matrix), dy))
-        return (np.einsum('ri,rio->ro', x, kernel_matrix[group]),
-                np.einsum('ro,rio->ri', dy, kernel_matrix[group]),
+        output, gradient = np.zeros((rows, kernel_matrix.shape[2])), np.zeros((rows, kernel_matrix.shape[1]))
+        for expert in range(len(TILE_SIZES)):
+            mine = group == expert
+            output[mine] = x[mine] @ kernel_matrix[expert]
+            gradient[mine] = dy[mine] @ kernel_matrix[expert].T
+        return (output, gradient,
                 np.stack([x[group == expert].T @ dy[group == expert] for expert in range(len(TILE_SIZES))]))
 
     xla = jax.jit(_tile_gate_arm('xla'))

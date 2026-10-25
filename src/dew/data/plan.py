@@ -10,7 +10,6 @@ import json
 import logging
 import platform
 import re
-import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
@@ -18,7 +17,9 @@ from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 import jax
 import numpy as np
 
+from dew import _checkout
 from dew.data.sources.codec import content_fingerprint
+from dew.position import PER_SHARE
 from dew.records import JSON, json_value, record
 
 _log = logging.getLogger(__name__)
@@ -289,29 +290,8 @@ class Manifest:
         ran: Sequence[StepIdentity] = (),
         fill: Mapping[str, object] | None = None,
     ) -> Manifest:
-        root = Path(__file__).resolve().parents[3]
-        versioned = (root / ".git").exists()
-        revision, clean = "unversioned", True
-        if versioned:
-            revision = subprocess.run(
-                ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True
-            ).stdout.strip()
-            dirty = subprocess.run(
-                ["git", "status", "--porcelain", "--untracked-files=no"],
-                cwd=root,
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-            added_code = subprocess.run(
-                ["git", "ls-files", "--others", "--exclude-standard", "src/dew"],
-                cwd=root,
-                check=True,
-                capture_output=True,
-                text=True,
-            ).stdout.strip()
-            clean = not dirty and not added_code
-        locked = [root / name for name in ("pyproject.toml", "uv.lock", "constraints.txt")]
+        revision, clean = _checkout.revision() or "unversioned", _checkout.clean()
+        locked = [_checkout.ROOT / name for name in ("pyproject.toml", "uv.lock", "constraints.txt")]
         dependencies = {
             distribution.metadata["Name"]: distribution.version
             for distribution in importlib.metadata.distributions()
@@ -509,8 +489,8 @@ class Plan:
             if ({name: value for name, value in topology.items() if name != "pools"}
                     != {name: value for name, value in saved_topology.items() if name != "pools"}
                     or any(pools.get(name) != saved_pools.get(name) for name in compared)):
-                raise ValueError("saved per-share data plan topology changed (shares, workers or cycle "
-                                 "length)")
+                raise ValueError(f"saved per-share data plan topology changed (shares, workers or cycle "
+                                 f"length): {PER_SHARE}")
         changed = _changed(record(saved.get("manifest"), "saved data manifest"), self.manifest.semantic())
         if edited is not None:
             changed = tuple(name for name in changed if name not in ("source", "steps", "tokenizer"))

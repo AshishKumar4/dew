@@ -92,6 +92,25 @@ def test_the_wrapped_forward_matches_qwixs_own_call(scan_layers):
     assert not np.array_equal(wrapped, plain)
 
 
+def test_a_dense_qwix_quantizes_directly_takes_its_gradient_on_a_cpu():
+    """A Dew Dense Qwix quantizes directly (`qwix.quantize_model`, outside `quantize_with`'s trace)
+    differentiates on a CPU: its product calls a backward of its own (a custom_vjp), so the float64
+    sums (`precision.accumulated`) leave it to Qwix, forward and backward, as on any platform."""
+    qwix = pytest.importorskip("qwix")
+    from dew.nn.dense import Dense
+
+    layer = Dense(8)
+    with jax.default_device(jax.devices("cpu")[0]):
+        x = jnp.asarray(np.random.default_rng(0).standard_normal((4, 16)), jnp.float32)
+        variables = layer.init(jax.random.key(0), x)
+        quantized = qwix.quantize_model(layer, qwix.QtProvider(
+            [qwix.QtRule(module_path=".*", weight_qtype=jnp.int8, act_qtype=jnp.int8)]))
+        loss = jax.grad(lambda variables: jnp.sum(quantized.apply(variables, x) ** 2))
+        gradients = jax.jit(loss)(variables)
+    kernel = np.asarray(gradients["params"]["kernel"])
+    assert np.all(np.isfinite(kernel)) and np.any(kernel)
+
+
 def test_quantized_and_plain_calls_of_one_shape_keep_their_own_products_in_one_process():
     """`x @ w` is `jnp.matmul`, a jitted function whose trace a quantized call takes under Qwix's
     interception. Beside the plain model at the same shapes, in either order and each shape's first
@@ -151,7 +170,7 @@ def test_an_int8_trunk_trains_down():
     _, qmodel, variables, _ = quantized_forward(Quantization())
     objective = LMObjective(qmodel, SEQ_LEN)
     batch = token_batch()
-    solver = OptimConfig(rate=1e-3).build(5)
+    solver = OptimConfig(learning_rate=1e-3).build(5)
     params, opt_state = variables["params"], solver.init(variables["params"])
 
     @jax.jit
@@ -737,6 +756,8 @@ def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix():
     task = TextGeneration(model, host, sampling=Sampling(temperature=0))
     served = task.quantized(spec)
     assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(served.variables))
+    # The weights its generations read are placed once, a quantized kernel's buffers included.
+    assert all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(served.placed))
     reference = quantize_with(model, qwix.PtqProvider([
         qwix.QuantizationRule(module_path=".*_proj", weight_qtype=jnp.int8,
                               op_names=("dot_general", "einsum", "dot"))]),
