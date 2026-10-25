@@ -1085,9 +1085,11 @@ class LMObjective(TokenScorer):
     def earlier_arguments(cls, arguments: Mapping[str, object]) -> Mapping[str, object]:
         """`TokenScorer.earlier_arguments`, and the four balance arguments an earlier run's record may hold,
         read as one `balance` record: the `ExpertBalance` they make, as the registry writes it, or None where
-        all four are at their defaults. Carried until 1.0."""
+        all four are at their defaults. A rate of 0, which moved no bias, reads as none. Carried until 1.0."""
         values = dict(super().earlier_arguments(arguments))
         retired = {name: values.pop(name) for name in _RETIRED_BALANCE if name in values}
+        if retired.get("balance_rate") == 0:
+            retired["balance_rate"] = None
         if retired:
             balance = from_record(ExpertBalance, retired)
             values["balance"] = None if balance == ExpertBalance() else to_record(balance, ExpertBalance)
