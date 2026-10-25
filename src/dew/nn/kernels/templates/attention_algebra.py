@@ -1591,7 +1591,7 @@ class Centre(NamedTuple):
 def centre_scale(keys: int) -> float:
     """The exponent `centre_step` takes products at, `-(2 + ceil(log2 keys))`. A centred product is at most
     twice the largest product's magnitude, and a sum of `keys` weighted ones at most `2 keys` times it, so
-    `2^k >= 2 keys` keeps every sum, the state's share included, below the largest for any finite input."""
+    `2^-k >= 2 keys` keeps every sum, the state's share included, below the largest for any finite input."""
     return -(2.0 + math.ceil(math.log2(max(keys, 1))))
 
 
