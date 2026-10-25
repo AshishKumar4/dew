@@ -540,6 +540,7 @@ def mode_averaged(args) -> dict:
     import jax
 
     from dew.checkpoints import averaged
+    from dew.training import Layout, MeshSpec
 
     runs = []
     for name, steps in (("one", 1), ("two", 2)):
@@ -549,7 +550,7 @@ def mode_averaged(args) -> dict:
         assert trainer.checkpoints is not None
         trainer.checkpoints.wait()
         runs.append(trainer.checkpoints.directory)
-    average = averaged(runs, ema=False)
+    average = averaged(runs, ema=False, mesh=MeshSpec(fsdp=args.fsdp_size), layout=Layout(min_shard=TINY))
     dump_params(args.out.with_suffix(".npz"), average.variables)
     return {"runs": runs, "read": [list(entry) for entry in average.runs],
             "pool_sharded": any(isinstance(leaf, jax.Array) and not leaf.is_fully_addressable
