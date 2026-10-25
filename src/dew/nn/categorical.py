@@ -249,7 +249,8 @@ def group_divergence(logits: jax.Array, groups: jax.Array, classes: jax.Array,
     rows = (-1, count, width)
     answer = jax.vmap(jax.vmap(summed))(jnp.where(mapped, member_probabilities, 0.0).reshape(rows),
                                         slots.reshape(rows))
-    member = (groups >= 0).reshape(-1, count)
+    # A member stands in its group where it holds a class that maps: one of none has no answer to share.
+    member = ((groups >= 0) & any_mapped[..., 0]).reshape(-1, count)
     ids = jnp.where(member, groups.reshape(-1, count), count)
 
     def window(answer, ids, member):
@@ -257,8 +258,9 @@ def group_divergence(logits: jax.Array, groups: jax.Array, classes: jax.Array,
         total = jax.ops.segment_sum(jnp.where(member[:, None], answer, 0.0), ids, num_segments=count + 1)
         size = sizes[jnp.minimum(ids, count - 1)]
         mean = total[jnp.minimum(ids, count - 1)] / jnp.maximum(size, 1.0)[:, None]
-        # A shared class of no probability adds no term: its logarithms read one, not zero.
-        held = answer > 0
+        # A shared class of no probability adds no term, nor does a non-member's, whose mean is no
+        # group's: their logarithms read one, not zero, so no derivative meets 0 * inf.
+        held = (answer > 0) & member[:, None]
         ratio = jnp.log(jnp.where(held, answer, 1.0)) - jnp.log(jnp.where(held, mean, 1.0))
         each = jnp.sum(jnp.where(held, answer * ratio, 0.0), axis=-1)
         return (jnp.where(member, each / jnp.maximum(size, 1.0), 0.0),
