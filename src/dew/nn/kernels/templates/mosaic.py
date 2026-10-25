@@ -117,17 +117,20 @@ def streamed(rings: tuple, views, lo, hi) -> None:
         ring.drain(hi - lo)
 
 
-def passed(rings: tuple, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
+def passed(rings: tuple, lo, hi, *, first: jax.Array | int = 0, before=None) -> None:
     """A consumer's steps `lo` to `hi` of `rings` it reads none of (another consumer's), each ring's load
     awaited and its slot released as a reading consumer's are (counted from `first`): a wait takes its
-    barrier's next phase, so every consumer waits on every load; `between()` after each step."""
+    barrier's next phase, so every consumer waits on every load; `before()` at each step, ahead of its
+    waits. A step's own syncs with the other consumers (their turns) go first: a load's slot may be held by
+    a consumer until past its own turn at that step (a walk keeping a stream's slot a step, `Family.walk`'s
+    `kept`), so a wait ahead of the turn would wait on a release the turn holds back."""
     @pl.loop(lo, hi)
     def _(index):
+        if before is not None:
+            before()
         for ring in rings:
             ring.acquire(index - first)
             ring.release(index - first)
-        if between is not None:
-            between()
 
 
 def loaded(copies) -> None:
@@ -320,8 +323,8 @@ class Slots:
     it (`slots[name]`) and released at the step's end, once its MMAs are done, unless the step `release`s it
     sooner (a slot its last product has read)."""
 
-    def __init__(self, rings: dict[str, Ring], counter):
-        self._rings, self._counter = rings, counter
+    def __init__(self, rings: dict[str, Ring], counter, kept: tuple[str, ...] = ()):
+        self._rings, self._counter, self._kept = rings, counter, kept
         self._held: dict[str, Ref] = {}
         self._released: set[str] = set()
 
@@ -338,10 +341,18 @@ class Slots:
 
     def done(self) -> None:
         """Every slot the step has not given back given back: each consumer waits on every load (a wait
-        takes its barrier's next phase), so a slot it never read is still acquired before it is released."""
+        takes its barrier's next phase), so a slot it never read is still acquired before it is released.
+        A kept stream's slot is acquired and held for the next step (`previous`)."""
         for name in self._rings:
-            if name not in self._released:
+            if name in self._kept:
+                self[name]
+            elif name not in self._released:
                 self.release(name)
+
+    def previous(self, name: str):
+        """Stream `name`'s slot of the step before, which a walk keeping the stream holds past it
+        (`Family.walk`'s `kept`), its load waited for then."""
+        return self._rings[name].at(self._counter - 1)
 
     def held(self) -> None:
         """Every slot the step has not read acquired, none given back: a step whose products stay running
@@ -385,6 +396,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     operands_in_registers: bool
     """Whether a product reads its operands from registers a consumer loads them into (mma.sync's), where
     warpgroup MMA reads both from shared memory."""
+    asynchronous: bool
+    """Whether a role's products run on beside its own work once issued (warpgroup MMA's commit groups), so a
+    mainloop may issue a product and go on before waiting for it (`product`'s `pending`, `walk`'s `kept`);
+    mma.sync's are synchronous."""
     rhs_copies: int = 1
     """The warps of a role each holding the right operand's whole fragment (mma.sync's four warps along
     the rows each hold every column's, JAX's `MMALayouts`' `rhs` replicated over its warps)."""
@@ -480,19 +495,23 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
 
     @abc.abstractmethod
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
-                first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None
-                ) -> tuple[C, tuple[jax.Array, ...]]:
+                first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
+                kept: tuple[str, ...] = (), last=None) -> tuple[C, tuple[jax.Array, ...]]:
         """A consumer's walk of `segments`, each `(step, lo, hi)`, `step(index, slots, carry, accumulators)
         -> (carry, accumulators)` given each stream's slots (`Slots`, the streams' steps counted from
         `first`), from `start`, with fp32 accumulators of `shapes` its products issue into in place, zero
         or their `initial` values (in the accumulator's layout; None, zero). `in_flight` steps' products stay
         running past their step (0 or 1): their slots go back once they are done, a step later, so the next
-        step's operands are waited for while they run. Returns the carry and the accumulators' values."""
+        step's operands are waited for while they run. The streams `kept` keep each step's slot past it,
+        the next step reading it (`Slots.previous`) and giving it back once its products are done; `last`,
+        a step after the walk's last where it took one, reads the last kept slots and issues what the walk
+        still owes them (an asynchronous family's, `asynchronous`). The segments run on one from another.
+        Returns the carry and the accumulators' values."""
 
     @abc.abstractmethod
-    def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
+    def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, before=None) -> None:
         """A consumer's steps `lo` to `hi` it reads none of, each load awaited and released as a reading
-        consumer's (counted from `first`); `between()` after each step."""
+        consumer's (counted from `first`); `before()` at each step, ahead of its waits (`passed`)."""
 
     @abc.abstractmethod
     def loaded(self, copies) -> None:
@@ -514,9 +533,14 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         or registers."""
 
     @abc.abstractmethod
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0,
+                interpret: bool = False) -> jax.Array:
         """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, its value, with `then` issued while the
-        product runs."""
+        product runs, in the caller's own trace (what it takes into a walk's accumulators, values where
+        `interpret`, stays the walk's). The value is read once at most `pending` of the role's products
+        issued after it (by `then`) still run: it is valid only once its own group retires, which a count of
+        the products `then` issues keeps (an asynchronous family's, `asynchronous`; a synchronous one's are
+        done as issued)."""
 
     @abc.abstractmethod
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
@@ -539,8 +563,12 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         where `transposed`)."""
 
     @abc.abstractmethod
-    def rescaled_products(self, acc: Accumulator, scale, parts, rhs, interpret: bool) -> Accumulator:
-        """`acc` taken by `scale(value)` in place, then `register_products` of `parts` with `rhs` into it."""
+    def rescaled_products(self, acc: Accumulator, scale, parts, rhs, interpret: bool, *,
+                          pending: int = 0) -> Accumulator:
+        """`acc` taken by `scale(value)` in place, then `register_products` of `parts` with `rhs` into it;
+        its value read once at most `pending` of the role's products issued since its own still run (an
+        asynchronous family's, `product`'s: a product issued after the accumulator's last runs on beside
+        the scaling)."""
 
     @abc.abstractmethod
     def settled(self, pending: int = 0) -> None:
@@ -609,6 +637,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     operands from the rings, a block's rows staged at the widest swizzle, 128 bytes."""
     bounded_loads = True
     operands_in_registers = False
+    asynchronous = True
     copy_extent = 256
 
     def registers(self, consumers: int) -> int:
@@ -717,19 +746,27 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
                       collective_axes="wg")
 
     def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
-                first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None
-                ) -> tuple[C, tuple[jax.Array, ...]]:
+                first: jax.Array | int = 0, in_flight: int = 0, initial: tuple | None = None,
+                kept: tuple[str, ...] = (), last=None) -> tuple[C, tuple[jax.Array, ...]]:
         if in_flight not in (0, 1):
             raise ValueError(f"a walk keeps no step's products or one step's in flight, not {in_flight}")
+        if in_flight and kept:
+            raise ValueError("a walk keeps a stream's slots past its steps or their products in flight, "
+                             "not both")
+        opening, closing = segments[0][1], segments[-1][2]
+        held = {name: streams[name] for name in kept}
 
         def slotted(step, lo):
             def run(index, carry, accumulators):
-                slots = Slots(streams, index - first)
+                slots = Slots(streams, index - first, kept)
                 carry, accumulators = step(index, slots, carry, accumulators)
                 if not in_flight:
-                    # The step's products done before its slots are given back.
+                    # The step's products done before its slots are given back, and the step before's kept
+                    # ones, which they read.
                     self.settled()
                     slots.done()
+                    if held:
+                        pl.when(index > opening)(lambda: released(held, index - 1 - first))
                     return carry, accumulators
                 # The step's products run on while the next step's operands are waited for: the previous
                 # step's, done now, give back its slots.
@@ -740,12 +777,21 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
             return run
 
-        walked = self.accumulated(tuple((slotted(step, lo), lo, hi) for step, lo, hi in segments), start,
-                                  shapes, interpret, initial)
+        steps = [(slotted(step, lo), lo, hi) for step, lo, hi in segments]
+        if last is not None:
+            # A step past the last, where the walk took one, reading only the kept slots of the step before.
+            def finale(index, carry, accumulators):
+                return last(index, Slots(streams, index - first, kept), carry, accumulators)
+
+            steps.append((finale, closing, closing + jnp.where(closing > opening, 1, 0)))
+        walked = self.accumulated(tuple(steps), start, shapes, interpret, initial)
         if in_flight:
             # Each segment's last step, its products done by the walk's end.
             for _, lo, hi in segments:
                 pl.when(hi > lo)(lambda hi=hi: released(streams, hi - 1 - first))
+        if held:
+            # The last step's kept slots, its products and `last`'s done by the walk's end.
+            pl.when(closing > opening)(lambda: released(held, closing - 1 - first))
         return walked
 
     @abc.abstractmethod
@@ -754,8 +800,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         """A walk of `segments`, `step(index, carry, accumulators)`, with the family's accumulators of
         `shapes` held across it from their `initial` values (`walk`)."""
 
-    def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
-        passed(tuple(streams.values()), lo, hi, first=first, between=between)
+    def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, before=None) -> None:
+        passed(tuple(streams.values()), lo, hi, first=first, before=before)
 
     def loaded(self, copies) -> None:
         loaded(copies)
