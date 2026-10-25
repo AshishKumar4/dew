@@ -713,6 +713,18 @@ class SavedTask(Protocol):
 
 
 @runtime_checkable
+class SettingsTask(SavedTask, Protocol):
+    """A saved task that builds from the settings its run records (`Objective.task_settings`), over a
+    model, its variables and a processor: a live objective builds it as a saved run loads it
+    (`Objective.build_task`). Dew's token tasks (`TextGeneration`, `BlockGeneration`,
+    `MaskedGeneration`) are such classes."""
+
+    @classmethod
+    def from_settings(cls, model: nn.Module, variables: Variables, settings,
+                      processor: Processor | None) -> Self: ...
+
+
+@runtime_checkable
 class ReleasedTask(SavedTask, Protocol):
     """A saved task that publishes its run as a released checkpoint of its own layout
     (`Decide.save_pretrained`), which `dew export` writes in place of its model's source layout."""
@@ -1513,11 +1525,18 @@ class Objective(ABC, Generic[Loss, Effects]):
         """Return the task over `variables`, the trained tree as the run keeps it.
 
         `processor` encodes and decodes in place of the objective's own, an
-        explicit None included. Objectives without a generation task raise
-        `TypeError`. A plugin objective returns its own `saved_task` class, so
-        the return type also allows a `SavedTask` besides Dew's own tasks.
+        explicit None included. An objective whose `saved_task` builds from
+        the settings its run records (`SettingsTask`) builds it from its own
+        (`task_settings`) over its model, as a saved run of it loads; any other
+        overrides this, or has no inference task and raises `TypeError`. A
+        plugin objective's task is its own `saved_task` class, so the return
+        type also allows a `SavedTask` besides Dew's own tasks.
         """
-        raise TypeError(f"{type(self).__name__} has no inference task")
+        task, settings, model = self.saved_task, self.task_settings(), vars(self).get("model")
+        if task is None or settings is None or model is None or not isinstance(task, SettingsTask):
+            raise TypeError(f"{type(self).__name__} has no inference task")
+        return task.from_settings(model, variables, settings,
+                                  self.processor if processor is OMITTED else processor)
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None,
                  processor: Processor | None | Omitted = OMITTED) -> Task | SavedTask:
