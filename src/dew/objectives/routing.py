@@ -7,8 +7,8 @@ V2's expert-level balance loss (`aux_loss_alpha` and `seq_aux`), and ST-MoE's
 router z-loss (`router_z_loss`, arXiv 2202.08906).
 
 An objective composes the policy with its own loss. Its model call opens the
-routers' collection (`dew.nn.moe.ROUTER_COLLECTION`), `terms` adds the balance
-and z-loss to its statistics (`RoutedStatistics`), `effects` counts the slots
+routers' collection (`dew.nn.moe.ROUTER_COLLECTION`), `compose` adds the
+balance and z-loss to its statistics (`RoutedStatistics`) and counts the slots
 each router selected for the bias, and the commit applies those counts once
 per update (`apply`). The layer's math stays in `dew.nn.moe`: the balance
 loss's moments and the bias update's arithmetic. The counting is here, once.
@@ -126,6 +126,19 @@ class ExpertBalance:
                           else dataclasses.replace(statistics, router_z=router_z))
             reported["router_z_loss"] = jnp.sum(jnp.stack([term.mean()[0] for term in router_z]))
         return statistics, reported
+
+    def compose(self, params: Variables, prediction: Ratio, routing: Variables, batch: Batch,
+                queries: jax.Array, fields: Mapping[str, jax.Array | Coordinates]
+                ) -> tuple[Ratio | RoutedStatistics, Variables | None, dict[str, jax.Array]]:
+        """The statistics an objective's `prediction` takes from this policy, the router counts its commit
+        applies (None where `balance_rate` is unset), and the metrics both report.
+
+        `params` holds the biases the counts are read against (`effects`); `routing`, `queries` and `fields`
+        are the forward's, as `terms` and `effects` take them.
+        """
+        statistics, balanced = self.terms(prediction, routing, batch, queries, fields)
+        effects, load = self.effects(params, routing, queries, fields)
+        return statistics, effects, {**balanced, **load}
 
     def _balance_loss(self, alpha: float, prediction: Ratio, routing: Variables, batch: Batch,
                       queries: jax.Array, fields: Mapping[str, jax.Array | Coordinates]
