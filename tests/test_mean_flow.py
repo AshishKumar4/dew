@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact, widened
 
 from dew.diffusion import presets
 from dew.inputs import CharTable, Condition, Field, InputSpec
@@ -52,12 +53,31 @@ def test_the_objective_trains_the_duration_and_one_step_samples_the_interval():
 
     given, _ = task._conditions(params, batch, jax.random.PRNGKey(0))
     denoise = task.denoiser(params, given, None)
-    x_T = jax.random.normal(jax.random.PRNGKey(3), (4, 4, 4, 3))
-    walked = sample(denoise, x_T, 2, solver=Euler(), key=jax.random.PRNGKey(0), final_denoise=False)
     schedule = task.process.schedule
-    u = task.model.apply(task.model_variables(params), x_T, schedule.model_time(jnp.ones((4,))), **given,
-                         duration=schedule.model_time(jnp.ones((4,))) - schedule.model_time(jnp.zeros((4,))))
-    np.testing.assert_allclose(np.asarray(walked), np.asarray(x_T - u), rtol=1e-5, atol=1e-6)
+    variables = task.model_variables(params)
+
+    def draw(seed):
+        return (jax.random.normal(jax.random.PRNGKey(seed), (4, 4, 4, 3)),)
+
+    def walked(x_T):
+        return sample(denoise, x_T, 2, solver=Euler(), key=jax.random.PRNGKey(0), final_denoise=False)
+
+    def interval(model, held, x_T, conditions):
+        start, end = (schedule.model_time(jnp.full((4,), time, x_T.dtype)) for time in (1, 0))
+        return x_T - model.apply(held, x_T, start, **conditions, duration=start - end)
+
+    def truth(x_T):
+        with jax.enable_x64(new_val=True):
+            return interval(task.model.clone(dtype=jnp.float64), *widened((variables, x_T, given)))
+
+    # The walk is one Euler step from t=1 to t=0 at the average velocity u over the interval, x_T - u:
+    # on par with u taken by the model itself (check 1), the model in float64 the truth.
+    assert_as_exact(jax.jit(walked), jax.jit(lambda x_T: interval(task.model, variables, x_T, given)), draw,
+                    "one-step walk", seeds=WALK_SEEDS, truth_fn=truth)
+
+
+WALK_SEEDS = 8
+"""Check 1's declared seeds for the one-step walk, sized by `seeds_for`."""
 
 
 def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp_path):

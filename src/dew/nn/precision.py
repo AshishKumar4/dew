@@ -33,6 +33,7 @@ import jax.numpy as jnp
 import numpy as np
 import opt_einsum
 from flax.typing import Dtype, PrecisionLike
+from jax.extend import core
 from jax.typing import DTypeLike
 
 
@@ -179,6 +180,19 @@ def _intercepted() -> bool:
     return QUANTIZED_TRACE.value is not None
 
 
+_OWN_DERIVATIVES = (core.primitives.custom_vjp_call_p, core.primitives.custom_jvp_call_p)
+"""JAX's primitives for a function that states its own derivative (`jax.custom_vjp`, `jax.custom_jvp`)."""
+
+
+def _own_backward(jaxpr) -> bool:
+    """Whether a product's trace states a derivative of its own (a `jax.custom_vjp`, as Qwix's
+    quantized products are when Qwix quantizes a model directly, or a `jax.custom_jvp`), in it or any
+    program inside it (`jax.extend.core.subjaxprs`): a product its library owns, which `accumulated`
+    neither widens nor transposes, since a transpose would differentiate its primal instead."""
+    return (any(eqn.primitive in _OWN_DERIVATIVES for eqn in jaxpr.eqns)
+            or any(_own_backward(program) for program in core.subjaxprs(jaxpr)))
+
+
 FP32_SUMS = "F32_F32_F32"
 """JAX's dot algorithm of fp32 operands summed in fp32: as a process's or a scope's default matmul
 precision, the statement that its fp32 products sum as an accelerator sums them, which `accumulated`
@@ -226,7 +240,9 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     keeps XLA's accumulation.
 
     A library that swaps JAX's products for its own while a model runs (Qwix, quantizing) owns them:
-    the product is its, as flax's own layers' would be.
+    the product is its, as flax's own layers' would be. One whose trace calls a backward of its own
+    (a `jax.custom_vjp`, Qwix's when it quantizes a model directly) is left to it whole, its forward
+    and its backward, read from the trace that gives the product's dtype (`_own_backward`).
 
     It is real CPU execution's policy alone, chosen by the platform the program is lowered for
     (`platform_dependent`), which keys every compiled program: a step a CPU lowers for a GPU target
@@ -240,9 +256,11 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     narrow = functools.partial(product, preferred_element_type=preferred_element_type)
     if not _sums_in_float64(*operands):
         return narrow(*operands)
-    dtype = jax.eval_shape(narrow, *operands).dtype
-    if jnp.promote_types(dtype, jnp.float32) != jnp.float32:
-        # A wider result converts the operands to it, so the products are not float32's.
+    traced, shape = jax.make_jaxpr(narrow, return_shape=True)(*operands)
+    dtype = shape.dtype
+    if jnp.promote_types(dtype, jnp.float32) != jnp.float32 or _own_backward(traced.jaxpr):
+        # A wider result converts the operands to it, so the products are not float32's; a product
+        # with a backward of its own is its library's.
         return narrow(*operands)
 
     def summed(*operands):

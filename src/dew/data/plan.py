@@ -21,6 +21,7 @@ from dew import _checkout
 from dew._hashing import array_header
 from dew._records import JSON, json_value, record
 from dew.data.sources.codec import content_fingerprint
+from dew.position import PER_SHARE
 
 _log = logging.getLogger(__name__)
 
@@ -490,8 +491,8 @@ class Plan:
             if ({name: value for name, value in topology.items() if name != "pools"}
                     != {name: value for name, value in saved_topology.items() if name != "pools"}
                     or any(pools.get(name) != saved_pools.get(name) for name in compared)):
-                raise ValueError("saved per-share data plan topology changed (shares, workers or cycle "
-                                 "length)")
+                raise ValueError(f"saved per-share data plan topology changed (shares, workers or cycle "
+                                 f"length): {PER_SHARE}")
         changed = _changed(record(saved.get("manifest"), "saved data manifest"), self.manifest.semantic())
         if edited is not None:
             changed = tuple(name for name in changed if name not in ("source", "steps", "tokenizer"))
