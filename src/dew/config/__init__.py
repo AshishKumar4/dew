@@ -788,13 +788,6 @@ class TrainerConfig:
     compile of the whole step still needs one. The program exits with status
     0 once the step lowers, and opens no W&B run.
     """
-    tune_kernels: bool = False
-    """Measure each Pallas launch of the step that has no config measured on this GPU.
-
-    Only a process with the GPU to itself measures, and the picks persist beside
-    the compilation cache for every later run. Unset, such a launch runs the
-    nearest measured shape's config or its heuristic, and the run says how many.
-    """
 
     def accumulating(self, dataset: Loader) -> Self:
         """This config with the accumulation its token budget sets over `dataset`'s token batches:
@@ -1003,6 +996,10 @@ def _chain_label(chain: Dataset | None) -> str:
 
 _CHAINS = ("data", "validation")
 """A run's fields that hold chains, which its record writes through the data's codec (`_chain_record`)."""
+
+RETIRED = {"trainer": frozenset({"tune_kernels"})}
+"""The fields a record written before their removal may hold, by the run's field they sit in, which a read
+drops: `trainer.tune_kernels`, the opt-in kernel tuner's switch, removed with the tuner."""
 
 
 def _chain_record(value: Dataset | Mapping[str, Dataset] | None) -> JSON:
@@ -1226,10 +1223,14 @@ class RunConfig:
     @classmethod
     def from_dict(cls, values: Mapping[str, object]) -> Self:
         """Read back what `to_dict` wrote, for subclasses too. A field the
-        record lacks takes its default; an unknown field raises. A chain
+        record lacks takes its default, one retired since it was written
+        (`RETIRED`) is dropped, and an unknown field raises. A chain
         recorded as unrecorded, or a recipe's record written before runs
         recorded chains, is refused by name."""
         rest = {name: value for name, value in values.items() if name not in _CHAINS}
+        for name, retired in RETIRED.items():
+            if isinstance(held := rest.get(name), Mapping):
+                rest[name] = {field: value for field, value in held.items() if field not in retired}
         chains = {name: _read_chain(name, values[name]) for name in _CHAINS if name in values}
         return dataclasses.replace(from_record(cls, rest, dtypes=False), **chains)
 
@@ -1561,7 +1562,7 @@ class RunConfig:
             agreed("run resume", check_resumed)
             agreed("run metadata", record_run)
             # The trainer holds mesh, microbatches, layout, accumulation, split,
-            # dynamic_scale, profile and tune_kernels; prepare_process read the
+            # dynamic_scale and profile; prepare_process read the
             # process fields, and the rest are fit's arguments or built the
             # checkpoints and the tracker.
             state = Trainer(
@@ -1569,7 +1570,6 @@ class RunConfig:
                 microbatches=trainer.microbatches, layout=trainer.layout, accumulation=trainer.accumulation,
                 split=trainer.split, dynamic_scale=trainer.dynamic_scale, checkpoints=checkpoints,
                 tracker=tracker, rollout=rollout, profile=trainer.profile, lower_for=trainer.lower_for,
-                tune_kernels=trainer.tune_kernels,
             ).fit(
                 dataset, steps=steps, tokens=trainer.tokens,
                 log_every=trainer.log_every,

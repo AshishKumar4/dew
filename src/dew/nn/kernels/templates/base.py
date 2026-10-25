@@ -1,11 +1,10 @@
 """What every algorithm template shares: a launch whose configs fit the device and whose heuristic is
 its cost model's fastest fitting config (`Template`), and one call of a template's implementations
-(`Call`), whose eligibility and estimates a selector over them reads (`dew.nn.kernels.selection`).
+(`Call`), whose eligibility a selector over them reads (`dew.nn.kernels.selection`).
 
 A template's launch declares the configs it is proven over (`space`), the shared memory a program
 stages at each (`staged_bytes`), and the seconds it estimates at each on a target (`cost`,
-`dew.nn.kernels.templates.cost`). The tuner measures among the fitting configs only where a run asks
-it to (`tuning.tune`); without a measurement the launch takes its heuristic, the same on every run.
+`dew.nn.kernels.templates.cost`). The launch takes its heuristic, the same on every run.
 """
 
 import dataclasses
@@ -25,10 +24,8 @@ class Template[Config: Hashable](tuning.KernelOp):
     model picks its heuristic from, ties going to the first in `space`'s order. `staged_bytes` and
     `registers` say whether a config fits a block of the device (`legal`, `fitting`), which a pin of any
     legal config is checked by. An implementation that does not run a call on a target says so in
-    `eligible`; its operands' token
-    counts are `ROWS`, as for any `KernelOp`, and every other argument is keyed as it is. A hook is a
-    plain JAX callable the kernel's body traces, and the ops beside the launch fuse into it through
-    `jax.experimental.pallas.fuser`: neither is the base's."""
+    `eligible`. A hook is a plain JAX callable the kernel's body traces, and the ops beside the launch
+    fuse into it through `jax.experimental.pallas.fuser`: neither is the base's."""
 
     name: ClassVar[str] = "template"
     """The implementation's name, as a route reports it and `generation.chosen` may name it."""
@@ -69,7 +66,7 @@ class Template[Config: Hashable](tuning.KernelOp):
 
     def costed(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> cost.Cost:
         """The work, bytes and geometry the estimate of the launch of `ba` at `config` on `target` reads
-        (`cost.Cost`): the analytic estimate's inputs as they are, for the choice layer's timing log."""
+        (`cost.Cost`)."""
         raise NotImplementedError(f"{type(self).__name__} declares no cost")
 
     def cost(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> float:
@@ -157,9 +154,6 @@ class Template[Config: Hashable](tuning.KernelOp):
         fastest = min(range(len(fits)), key=lambda index: (costs[index], index))
         return costs[fastest], fits[fastest]
 
-    def _get_autotuning_configs(self, ba: tokamax.BoundArguments) -> set[Config]:
-        return set(self.fitting(ba, generation.gpu_target()))
-
     def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> Config:
         return self.estimate(ba, generation.gpu_target())[1]
 
@@ -193,8 +187,7 @@ class Unfitted(ValueError):
 class Call:
     """One call of a template's implementations on `target`, each bound to the call's own arguments by
     its `name` (every implementation shares the template's signature): what a selector over them reads,
-    whether each runs the call (`Template.eligible`) and the seconds its fastest fitting config is
-    estimated to take (`Template.estimate`), each asked once."""
+    whether each runs the call (`Template.eligible`), asked once."""
 
     bound: Mapping[str, tuple[Template, tokamax.BoundArguments]]
     target: generation.GpuTarget
@@ -208,10 +201,6 @@ class Call:
             implementation, ba = self.bound[name]
             self._eligible[name] = implementation.eligible(ba, self.target)
         return self._eligible[name]
-
-    def seconds(self, name: str) -> float:
-        implementation, ba = self.bound[name]
-        return implementation.estimate(ba, self.target)[0]
 
 
 def call(implementations: Sequence[Template], *args, **kwargs) -> Call:

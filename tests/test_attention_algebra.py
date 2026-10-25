@@ -216,28 +216,6 @@ def test_an_fp16_backward_keeps_a_gradient_whose_scores_are_large_but_cancel(key
         np.testing.assert_array_equal(np.asarray(found.query, np.float32), 0)
 
 
-def test_a_timed_backward_launch_walks_every_key():
-    """The backward's timing operands (`TritonBackward.operands`) give each query every key: its first
-    key 0 and one past its last the key count, at the launch's place for its spans (`SPANS`, after its
-    operands and residuals in `_fwd`'s order), not at an integer residual (the anchor keys) before them."""
-    queries, keys = 64, 96
-    arrays = {"query": jax.ShapeDtypeStruct((1, queries, 2, 32), jnp.bfloat16),
-              "key": jax.ShapeDtypeStruct((1, keys, 1, 32), jnp.bfloat16)}
-    rows = jax.ShapeDtypeStruct((1, 2, queries), jnp.float32)
-    # The query, keys, values and cotangent; the maxima, denominators, initial terms and the forward's
-    # maxima; the anchor keys and their values; the shift, the others' sums, the own and others' totals
-    # and the forward's denominators; then the spans.
-    specs = [arrays["query"], arrays["key"], arrays["key"], arrays["query"], *[rows] * 4,
-             jax.ShapeDtypeStruct((1, 2, queries), jnp.int32),
-             jax.ShapeDtypeStruct((1, queries, 2, 32), jnp.float32), rows,
-             jax.ShapeDtypeStruct((1, 2, queries, 32), jnp.float32), *[rows] * 3,
-             *[jax.ShapeDtypeStruct((1, queries), jnp.int32)] * 2]
-    assert len(specs) == attention_triton.TritonBackward.SPANS + 2
-    filled = attention_triton.TritonBackward().operands(specs, 0)
-    np.testing.assert_array_equal(np.asarray(filled[-2]), 0)
-    np.testing.assert_array_equal(np.asarray(filled[-1]), keys)
-
-
 @pytest.mark.parametrize("peak0, scale, key_size",
                          [(87.0, 1.0, 1.0), (0.0, 2.0 ** -126, 1.0), (0.0, 1.0, 2.0 ** 30),
                           (0.0, 0.25, 2.0 ** 30)],

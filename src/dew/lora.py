@@ -83,13 +83,7 @@ from dew.nn.protocols import (
 )
 from dew.nn.sharding import LOW_RANK_FACTORS
 from dew.objectives.base import FROZEN, Path, Variables, freeze, merge as overlay, select, thaw
-from dew.quantization import (
-    FROZEN_FP8,
-    QUANTIZATION,
-    InputQuantization,
-    frozen_fp8_kernel,
-    measured_fp8_sites,
-)
+from dew.quantization import FROZEN_FP8, QUANTIZATION, InputQuantization, frozen_fp8_kernel
 from dew.records import finite
 from dew.registry import rebuilt, wrapper_layers
 
@@ -181,7 +175,7 @@ class LoRA:
         module from `key` in sorted name order, the way PEFT draws it, and B is
         zero, so the adapted model computes exactly what the source does.
 
-        `fp8_base` (`fp8_base`'s measurement) runs its frozen sites' products in
+        `fp8_base` (`InputQuantization.frozen_fp8`) runs its frozen sites' products in
         FP8: their kernels are packed from the base this adapter freezes, and the
         model computes them under the record, inside the adapter's branch. FP8
         changes the function, by about E4M3's rounding of each operand.
@@ -206,24 +200,6 @@ class LoRA:
         bases = {} if base is None else dict.fromkeys(_components(bound) or {""}, base)
         return Adapter.bound(model, overlay(source, leaves), targets, self.rslora, self.dropout, bound,
                              bases)
-
-    def fp8_base(self, model: nn.Module, variables: Variables, *, tokens: int,
-                 modules: Sequence[str] | None = None,
-                 layouts: Mapping[str, WeightLayout] | None = None) -> InputQuantization:
-        """Measure which projections of the base this adapter freezes run
-        faster in FP8 at `tokens` rows a step, on process 0's GPU for the
-        whole pool, and return the record `apply` takes as its `fp8_base`
-        (`measured_fp8_sites`).
-
-        `modules` names the projections as `modules` does (this adapter's own
-        when None) and `layouts` resolves them as `apply` does. The
-        measurement holds the GPU; a run records its result, so a rerun
-        reproduces the choice without measuring.
-        """
-        bound = _named(bound_layouts(model, thaw(variables), layouts or {}),
-                       self.modules if modules is None else tuple(modules))
-        sites = tuple("/".join(layout.paths[0][1:-1]) for layout in bound.values())
-        return measured_fp8_sites(thaw(variables), sites, tokens)
 
     @staticmethod
     def load(model: nn.Module, variables: Variables, path: str | FilePath, *,

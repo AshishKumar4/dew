@@ -132,7 +132,7 @@ def _step_lowered(generation: str):
     """A bf16 Qwen 3.5 hybrid's language-model training step (tests/fixtures/hf/qwen35-tiny: three gated
     delta net layers and one attention layer, its delta nets' heads 32 wide, a power of two as a real
     model's and the short conv's kernels take), lowered for `generation` from abstract state as
-    tools/kernel_picks.py lowers one (`Trainer(lower_for=...)`)."""
+    `Trainer(lower_for=...)` lowers one."""
     import optax
 
     from dew.interop.hf_decoders import translate_config
@@ -233,9 +233,7 @@ def test_an_expert_layer_lowers_for_the_gpu_with_the_grouped_matmul_its_generati
 
 def _mamba2_lowered(generation: str):
     """A bf16 Mamba-2 layer's forward and backward, as a hybrid's step runs them, lowered for
-    `generation` after its launches are settled as the trainer settles a step's (`tuning.tune`, which
-    lowers it with every launch's description and reads them back)."""
-    from dew.nn.kernels import tuning
+    `generation`."""
     from dew.nn.mixers.mamba2 import Mamba2
 
     layer = Mamba2(emb_features=128, num_heads=4, head_dim=64, state_size=64, chunk_size=64,
@@ -251,12 +249,12 @@ def _mamba2_lowered(generation: str):
 
     mesh = gpu_mesh(Mesh(np.array(jax.devices()[:1]), ('data',)), generation)
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
-        return tuning.tune(lower)[0]
+        return lower()
 
 
 @pytest.mark.parametrize("generation", GPUS)
 def test_a_mamba2_layer_lowers_for_the_gpu_with_the_ssd_scan_its_generation_chooses(generation):
-    """A Mamba-2 layer, its launches settled as the trainer settles them, lowers to the short conv's
+    """A Mamba-2 layer lowers to the short conv's
     kernels and, where the row names the port for the scan, mamba_ssm's fourteen ported kernels; where
     it does not, to none of them. Its unweighted norm takes the fused RMSNorm where the row names it."""
     expected = SHORT_CONV.union(*(FAMILIES[key][1] for key in chosen(generation, "mamba2")))
@@ -324,15 +322,6 @@ def test_an_unseen_member_of_a_family_takes_its_familys_facts_and_its_own_device
     assert target.load_latency == blackwell.load_latency
     assert target.l2_bandwidth == blackwell.l2_bytes_per_clock * 20 * 1.5e9
     assert cost.seconds(cost.Cost(programs=40, device_bytes=1e6, program_flops=1e9), target) > 0
-
-
-def test_a_devices_calibration_replaces_its_familys_model_values_and_nothing_else():
-    """The opt-in calibration's facts take the place of the family's model latency and L2 bandwidth; the
-    rates stay the family's."""
-    target = GpuTarget("sm90", "an H100", 227 * 1024, multiprocessors=132, clock_hz=1.83e9,
-                       calibration={"load_latency": 500.0, "l2_bandwidth": 1.0e13})
-    assert (target.load_latency, target.l2_bandwidth) == (500.0, 1.0e13)
-    assert target.tensor_rates == TARGETS["sm90"].tensor_rates and target.wgmma
 
 
 def test_a_gpu_the_table_does_not_name_keeps_the_resources_its_device_reports():

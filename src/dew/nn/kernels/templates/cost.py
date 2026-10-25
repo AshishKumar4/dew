@@ -78,10 +78,9 @@ size plus one reservation."""
 class Cost:
     """One launch's work at one config, as the model reads it (the module's docstring). `mode` names
     the tensor cores' arithmetic ('16bit' or 'tf32', `GpuTarget.tensor_rates`) and is read only where
-    `program_flops` is nonzero. `single_warp`: each scheduler issues one warp's products in order with the
-    fragment loads feeding them, which reach the family's `GpuTarget.single_warp_issue` of its rate.
-    `in_flight`: the steps whose products a program keeps running past their step (a mainloop's MMAs in
-    flight), each holding its stage, so `stages - 1 - in_flight` steps load ahead."""
+    `program_flops` is nonzero. `in_flight`: the steps whose products a program keeps running past their
+    step (a mainloop's MMAs in flight), each holding its stage, so `stages - 1 - in_flight` steps load
+    ahead."""
     programs: float
     device_bytes: float
     program_flops: float = 0.0
@@ -95,7 +94,6 @@ class Cost:
     serial_exponentials: float = 0.0
     l2_bytes: float = 0.0
     serial_stored: float = 0.0
-    single_warp: bool = False
     in_flight: int = 0
 
 
@@ -104,8 +102,6 @@ def seconds(cost: Cost, target: generation.GpuTarget) -> float:
     facts = generation.effective(target)
     multiprocessors, clock, bandwidth = facts.multiprocessors, facts.clock_hz, facts.memory_bandwidth
     rate = facts.tensor_rate(cost.mode) if cost.program_flops else 1.0
-    if rate is not None and cost.single_warp and facts.single_warp_issue is not None:
-        rate *= facts.single_warp_issue
     if multiprocessors is None or clock is None or bandwidth is None or rate is None:
         named = (('multiprocessors', multiprocessors), ('clock_hz', clock),
                  (f'tensor_rates[{cost.mode!r}]', rate), ('memory_bandwidth', bandwidth))
