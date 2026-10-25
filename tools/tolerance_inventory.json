@@ -458,7 +458,7 @@
    "lane": "Training"
   },
   "tests/test_mean_flow.py": {
-   "comparisons": 3,
+   "comparisons": 2,
    "lane": "Training"
   },
   "tests/test_mesh_axes.py": {
