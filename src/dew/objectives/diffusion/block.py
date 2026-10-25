@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Literal
 import jax
 import jax.numpy as jnp
 from flax import linen as nn, struct
+from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.artifacts import TokenScores
 from dew.inference.tasks import BlockGeneration, BlockSettings, recorded_processor, recorded_tokenizer
@@ -120,12 +121,19 @@ def _row_losses(losses: jax.Array, mask: jax.Array, batch: Batch) -> Ratio:
                               batch)
 
 
-def _elementwise_max(*passes: Variables) -> Variables:
-    """The elementwise maximum of one tree over several passes: each leaf's largest value in any of them.
+def _observed_maxima(*passes: Variables) -> Variables:
+    """The attention logit maxima of several passes, merged by module path (`Aux.qk_stats`).
 
-    `jnp.maximum` takes two arrays, so the passes reduce their stacked leaves instead.
+    A module that more than one pass observed keeps the elementwise maximum of what each sowed: a logit is
+    bounded by the largest any of them reads. A module only one pass observed keeps what it sowed, as an
+    image's vision tower does, since the encoder pass alone runs it.
     """
-    return jax.tree.map(lambda *leaves: jnp.max(jnp.stack(leaves), axis=0), *passes)
+    found: dict[tuple[str, ...], list[object]] = {}
+    for tree in passes:
+        for path, sown in flatten_dict(tree).items():
+            found.setdefault(path, []).append(sown)
+    return unflatten_dict({path: jax.tree.map(lambda *leaves: jnp.max(jnp.stack(leaves), axis=0), *sown)
+                           for path, sown in found.items()})
 
 
 class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
@@ -155,9 +163,10 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
     first denoising pass, whose logits condition the second pass and receive
     no gradient.
 
-    A step whose optimizer clips by the attention logit maxima (`Step.qk_stats`, a QK-Clip) gets
-    the maxima of all three passes the step runs through the trained projections: the encoder's and
-    both denoising passes', merged by their elementwise maximum (`Aux.qk_stats`).
+    A step whose optimizer clips by the attention logit maxima (`Step.qk_stats`, a QK-Clip) gets the
+    maxima of the attention its passes run through the trained projections, merged by module path
+    (`_observed_maxima`): a module several passes observe keeps their elementwise maximum, and one only
+    the encoder reaches keeps its own (`Aux.qk_stats`).
     """
 
     saved_task = BlockGeneration
@@ -430,8 +439,8 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         Returns the denoiser's per-token cross entropies over the response
         and the encoder's over the full row, each with the mask of the
         targets it counts, the canvas's argmax hits where the head reports
-        them, and the attention logit maxima of the three passes where the
-        step asks for them (`Step.qk_stats`).
+        them, and the attention logit maxima of the passes that run the trained projections, merged by
+        module path, where the step asks for them (`Step.qk_stats`).
         """
         params = thaw(params)
         prepared, tokens, response, validity, full_valid, canvas_mask, text_slots = self._row(batch)
@@ -476,7 +485,7 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         states, second_sown = denoise(sc_logits)
         qk = None
         if step.qk_stats:
-            qk = _elementwise_max(mutated["qk"], first_sown["qk"], second_sown["qk"])
+            qk = _observed_maxima(mutated["qk"], first_sown["qk"], second_sown["qk"])
         chosen = jnp.arange(response.shape[1])[None, :] // self.canvas_size == selected[:, None]
         target_mask = canvas_mask & chosen
         if text_slots is not None:
