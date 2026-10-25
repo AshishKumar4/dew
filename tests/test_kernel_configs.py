@@ -17,6 +17,7 @@ from generation_support import lowers
 from kernel_compile import compile_kernels, failures
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurrence, short_conv, tuning
+from dew.nn.kernels.templates import attention_mosaic_program
 
 LAUNCHES = {launch for module in (fla_gdn, fla_kda, recurrence) for launch in vars(module).values()
             if isinstance(launch, chunked_launch._Launch)}
@@ -213,6 +214,87 @@ def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources
     found = compile_mosaic_kernels([case(mosaic_gpu.Tiles(128, 128, 64, 3, 1)),
                                     case(mosaic_gpu.Tiles(128, 256, 64, 3, 1, warpgroups=2))], "sm90")
     assert len(found) == 2 and all(record.get("kernels") for record in found), found
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+ATTENTION_GENERATIONS = tuple(name for name in generation.TARGETS
+                              if generation.family(name) in attention_mosaic_program.BUNDLES)
+"""The CUDA generations whose instruction family has a Mosaic attention bundle: every one the attention
+mainloops' resource gate compiles them for."""
+
+
+def _attention_cases(target: generation.GpuTarget) -> list:
+    """Every Mosaic attention launch at the config the cost model picks for it on `target`, at a training
+    shape (one row of 1024 tokens, 8 query heads over 2 key heads, 128 wide, bf16, causal): the forward,
+    the training forward and the backward in each form (two launches, the fast form's one launch, and the
+    accurate form), each plain and under score hooks and an initial state (a softcap, ALiBi and sinks)."""
+    from dew.nn.kernels.templates import attention as template, attention_mosaic
+
+    rows, tokens, heads, kv_heads, width = 1, 1024, 8, 2, 128
+    spans = template.spans(tokens, tokens, rows, causal=True)
+    query = jax.ShapeDtypeStruct((rows, tokens, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, tokens, kv_heads, width), jnp.bfloat16)
+    stats = jax.ShapeDtypeStruct((rows, heads, tokens), jnp.float32)
+    others = jax.ShapeDtypeStruct((rows, heads, tokens, width), jnp.float32)
+    residuals = (stats, stats, jax.ShapeDtypeStruct((rows, heads, tokens), jnp.int32),
+                 template.Split(others, stats, stats, stats))
+    slopes = jax.ShapeDtypeStruct((heads,), jnp.float32)
+
+    def hooked(slope):
+        def score_mod(s, q_pos, k_pos, alibi):
+            return 30.0 * jnp.tanh(s / 30.0) + alibi * k_pos.astype(s.dtype)
+
+        return template.Hooks(score_mod, (template.Param(slope, template.Kind.HEAD),),
+                              template.sinks(jnp.zeros((heads,), jnp.float32), rows, tokens, width))
+
+    def forward(training: bool, hooks: bool):
+        def call():
+            def run(q, k, v, slope):
+                return attention_mosaic.forward(q, k, v, spans, hooked(slope) if hooks else None,
+                                                residuals=training)
+
+            return run, (query, key, key, slopes)
+
+        name = f"mosaic {'training ' if training else ''}forward{' hooked' if hooks else ''}"
+        return support.KernelCase(name, call)
+
+    def backward(form: str, hooks: bool, pins: dict):
+        def call():
+            def run(q, k, v, dout, slope, residuals):
+                with tuning.pinned(pins):
+                    grads = attention_mosaic.backward(q, k, v, spans, hooked(slope) if hooks else None, dout,
+                                                      residuals=residuals, accurate=form == "accurate")
+                return grads.query, grads.key, grads.value
+
+            return run, (query, key, key, query, slopes, residuals)
+
+        name = f"mosaic backward {form}{' fused' if pins else ''}{' hooked' if hooks else ''}"
+        return support.KernelCase(name, call)
+
+    # The fast form's one launch at its cheapest fitting config, which the cost model may rank below the two.
+    op = attention_mosaic.MosaicBackward(form="causal", keys=tokens, scale=width ** -0.5, accurate=False)
+    ba = op.bind(query, key, key, query, spans.start, spans.end, None, None, (), None, residuals,
+                 interpret=False)
+    fused = min((config for config in op.fits(ba, target) if config.fused),
+                key=lambda config: op.cost(ba, config, target))
+    return [forward(training, hooks) for training in (False, True) for hooks in (False, True)] + [
+        backward(form, hooks, {}) for form in ("default", "accurate") for hooks in (False, True)] + [
+        backward("default", hooks=False, pins={attention_mosaic.MosaicBackward: fused})]
+
+
+@pytest.mark.parametrize("name", ATTENTION_GENERATIONS)
+def test_every_mosaic_attention_launch_compiles_within_its_resources(name):
+    """Every Mosaic attention launch (`_attention_cases`) at the config the cost model picks on each
+    generation of a family with a bundle, compiled by Mosaic for a compile-only GPU of it on this CPU through
+    ptxas (tests/kernel_compile.py): within the multiprocessor's shared memory, no register spilled, every
+    kernel each launch compiles (a forward's guarded and natural rewalks among them). The resource gate
+    every Mosaic mainloop takes before a GPU round."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    with generation.assumed(name):
+        cases = _attention_cases(generation.gpu_target())
+    found = compile_mosaic_kernels(cases, name)
+    assert len(found) == len(cases) and all(record.get("kernels") for record in found), found
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
 
 
