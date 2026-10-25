@@ -44,8 +44,27 @@ def log_probs(logits: jax.Array, where: jax.Array | None = None) -> jax.Array:
 
 
 def probabilities(logits: jax.Array, where: jax.Array | None = None) -> jax.Array:
-    """The probabilities over the last axis (`jax.nn.softmax`)."""
-    return jax.nn.softmax(widened(logits, where), axis=-1)
+    """The probabilities over the last axis (`jax.nn.softmax`). Their derivative is softmax's,
+    `p (dz - sum p dz)`, but at the most probable class, which takes the other classes' derivative
+    summed, negated, so a row's derivative sums to zero: softmax's own subtracts two near-equal terms
+    there once its probability nears one, keeping only their rounding (as a label's `p - 1` does,
+    arXiv:2610.31642, eq. 4), while the others' sum keeps their precision, in either mode."""
+    return _probabilities(widened(logits, where))
+
+
+@jax.custom_jvp
+def _probabilities(logits: jax.Array) -> jax.Array:
+    return jax.nn.softmax(logits, axis=-1)
+
+
+@_probabilities.defjvp
+def _probabilities_tangent(primals, tangents):
+    (logits,), (d_logits,) = primals, tangents
+    probability = _probabilities(logits)
+    tangent = probability * (d_logits - jnp.sum(probability * d_logits, axis=-1, keepdims=True))
+    top = jax.nn.one_hot(jnp.argmax(probability, axis=-1), logits.shape[-1], dtype=bool)
+    rest = jnp.sum(jnp.where(top, 0.0, tangent), axis=-1, keepdims=True)
+    return probability, jnp.where(top, -rest, tangent)
 
 
 def cross_entropy(logits: jax.Array, labels: jax.Array, where: jax.Array | None = None) -> jax.Array:
