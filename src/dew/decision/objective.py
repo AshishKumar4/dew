@@ -501,12 +501,12 @@ def consistency_divergence(logits: jax.Array, options: jax.Array, groups: jax.Ar
 
     `groups` `[B, Q]` names each question's group in its window (-1: none), and `canonical` `[B, Q, K]`
     each option slot's canonical option (-1: none). A member's answer over the canonical options is its
-    distribution over its slots that map to one, summed onto them (`segment_log_partition`, the
-    categorical owner's); a group's divergence is the generalized Jensen-Shannon divergence of its
-    members' answers, the mean of each one's KL divergence from their mean, so it is zero exactly
-    where they agree, at most the log of the member count, and computed in at least float32 in the
-    log domain, finite at any finite logits. Its gradient is the divergence's in closed form,
-    `sum_c dP_c (log P_c - log M_c)` for each member, whose terms through the logarithms are zero."""
+    distribution over its slots that map to one (`categorical.probabilities`, the categorical owner's),
+    summed onto them; a group's divergence is the generalized Jensen-Shannon divergence of its members'
+    answers, the mean of each one's KL divergence from their mean, so it is zero exactly where they
+    agree, at most the log of the member count, and computed in at least float32, finite at any finite
+    logits. A canonical option of no probability adds no term, in value or gradient; the gradient is
+    autodiff's, through the probabilities' own derivative, which a confident member keeps."""
     from dew.nn import categorical
 
     width = logits.shape[-1]
