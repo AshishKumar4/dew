@@ -464,7 +464,7 @@ def test_a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further
         trainer.compile(state, BATCH, lambda steps: pytest.fail("the plan at its first split was timed"))
     assert (trainer.plan["split"], trainer.plan["remat"]) == (4, half)
     assert trainer.objective.model.remat == REMAT_POLICIES[half]
-    assert_searched(asked(trainer), (4, half), 2, (1, "minimal_with_conv"), half=half)
+    assert_searched(asked(trainer), (4, half), 2, (1, "minimal_with_scan_and_conv"), half=half)
 
 
 def test_a_plan_at_no_recomputation_times_its_frontier_past_the_half_rung(monkeypatch):
@@ -476,7 +476,8 @@ def test_a_plan_at_no_recomputation_times_its_frontier_past_the_half_rung(monkey
     state, _, _ = trainer.place()
     trainer.compile(state, BATCH, lambda steps: pytest.fail("a single plan was timed"))
     assert (trainer.plan["split"], trainer.plan["remat"]) == (4, None)
-    assert_searched(asked(trainer), (4, None), 2, (1, "minimal_with_conv"), half="all_but_delta_memory")
+    assert_searched(asked(trainer), (4, None), 2, (1, "minimal_with_scan_and_conv"),
+                    half="all_but_delta_memory")
 
 
 def test_a_decoder_without_a_half_rung_asks_its_splits_at_no_recomputation(monkeypatch):

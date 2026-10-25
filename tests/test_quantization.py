@@ -21,7 +21,12 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, assert_fp32_reduction_bound
+from reference_error import (
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    assert_fp32_reduction_bound,
+    with_gradients,
+)
 from token_support import token_rows
 
 from dew.config import ObjectiveConfig
@@ -86,6 +91,25 @@ def test_the_wrapped_forward_matches_qwixs_own_call(scan_layers):
     manual = jax.jit(reference.apply)(variables, ids)
     np.testing.assert_array_equal(wrapped, manual)
     assert not np.array_equal(wrapped, plain)
+
+
+def test_a_dense_qwix_quantizes_directly_takes_its_gradient_on_a_cpu():
+    """A Dew Dense Qwix quantizes directly (`qwix.quantize_model`, outside `quantize_with`'s trace)
+    differentiates on a CPU: its product calls a backward of its own (a custom_vjp), so the float64
+    sums (`precision.accumulated`) leave it to Qwix, forward and backward, as on any platform."""
+    qwix = pytest.importorskip("qwix")
+    from dew.nn.dense import Dense
+
+    layer = Dense(8)
+    with jax.default_device(jax.devices("cpu")[0]):
+        x = jnp.asarray(np.random.default_rng(0).standard_normal((4, 16)), jnp.float32)
+        variables = layer.init(jax.random.key(0), x)
+        quantized = qwix.quantize_model(layer, qwix.QtProvider(
+            [qwix.QtRule(module_path=".*", weight_qtype=jnp.int8, act_qtype=jnp.int8)]))
+        loss = jax.grad(lambda variables: jnp.sum(quantized.apply(variables, x) ** 2))
+        gradients = jax.jit(loss)(variables)
+    kernel = np.asarray(gradients["params"]["kernel"])
+    assert np.all(np.isfinite(kernel)) and np.any(kernel)
 
 
 def test_quantized_and_plain_calls_of_one_shape_keep_their_own_products_in_one_process():
@@ -733,6 +757,8 @@ def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix():
     task = TextGeneration(model, host, sampling=Sampling(temperature=0))
     served = task.quantized(spec)
     assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(served.variables))
+    # The weights its generations read are placed once, a quantized kernel's buffers included.
+    assert all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(served.placed))
     reference = quantize_with(model, qwix.PtqProvider([
         qwix.QuantizationRule(module_path=".*_proj", weight_qtype=jnp.int8,
                               op_names=("dot_general", "einsum", "dot"))]),
@@ -999,21 +1025,23 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
     def draw(seed):
         variables = init(jax.random.key(seed), jnp.ones((1, SEQ_LEN), jnp.int32))
         rows = np.random.default_rng(seed).integers(0, VOCAB, size=(8, SEQ_LEN + 1)).astype(np.int32)
-        return variables, rows
+        # A step's loss, taken with its backward under its own cotangent, one.
+        return variables, rows, np.float32(1)
 
     def gradient(objective):
-        def loss(params, variables, batch):
-            return objective.scalar_loss({**variables, "params": params}, batch, info)
-        return jax.jit(jax.value_and_grad(loss, has_aux=True))
+        def step(params, variables, batch, cotangent):
+            return with_gradients(lambda params: objective.scalar_loss(
+                {**variables, "params": params}, batch, info)[0])(params, cotangent)
+        return jax.jit(step)
 
     def runner(spec, microbatches=None):
         mesh = spec.build()
         program = gradient(LMObjective(qmodel, SEQ_LEN))
 
-        def run(variables, rows):
+        def run(variables, rows, cotangent):
             placed = jax.device_put(variables, Layout(min_shard=256).shardings(mesh, variables))
             with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
-                (value, _), grads = program(placed["params"], placed, shard_batch(mesh, {"text": rows}))
+                value, grads = program(placed["params"], placed, shard_batch(mesh, {"text": rows}), cotangent)
             return np.asarray(value), jax.tree.map(np.asarray, grads)
         return run
 
@@ -1023,8 +1051,8 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
     assert np.isfinite(loss) and all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(grads))
     assert_as_exact(lambda *inputs: {"loss": piped(*inputs)[0]}, lambda *inputs: {"loss": loop(*inputs)[0]},
                     draw, "quantized pipeline loss", seeds=PIPELINE_SEEDS,
-                    truth_fn=lambda variables, rows: {"loss": np.asarray(unquantized(
-                        variables["params"], variables, {"text": rows})[0][0])})
+                    truth_fn=lambda variables, rows, cotangent: {"loss": np.asarray(unquantized(
+                        variables["params"], variables, {"text": rows}, cotangent)[0])})
 
 
 def test_stochastic_rounding_draws_from_its_own_stream():
