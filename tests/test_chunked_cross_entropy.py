@@ -25,7 +25,7 @@ import numpy as np
 import optax
 import pytest
 from confident_support import confident, label_derivative, log_partition, log_softmax
-from reference_error import assert_as_exact, with_gradients
+from reference_error import as_given, assert_as_exact, with_gradients
 from residual_orders import order
 from sharded import collectives
 
@@ -1336,6 +1336,7 @@ def test_a_vocabulary_split_heads_confident_target_gradient_is_eq_7(tile, margin
 
     gradient = jax.jit(jax.grad(loss))
 
+    @as_given
     def reference(logits):
         if excluded is None:
             return label_derivative(logits, label)
@@ -1351,6 +1352,7 @@ def test_a_vocabulary_split_heads_confident_target_gradient_is_eq_7(tile, margin
         assert np.all(split(rows)[:, excluded] == 0)
 
 
+@as_given
 def softmax(rows: np.ndarray) -> np.ndarray:
     """NumPy's softmax over the last axis, in the rows' own dtype (`log_softmax`)."""
     return np.exp(log_softmax(rows))
@@ -1401,6 +1403,7 @@ def test_a_dominant_z_loss_keeps_an_unlikely_targets_share(path, margin):
                                                      tile=(3, 3) if path == "tiled" else None)
         return (losses + weight * jnp.square(log_z)).sum()
 
+    @as_given
     def reference(rows):
         return (label_derivative(rows, target) + 2 * weight * log_partition(rows) * softmax(rows))[:, target]
 

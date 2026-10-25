@@ -922,6 +922,7 @@ def test_z_loss_gradient_carries_the_reference_factor():
     compiled = {np.dtype(np.float32): programs(model),
                 np.dtype(np.float64): programs(model.clone(dtype=jnp.float64))}
 
+    @as_given
     def reference(params, tokens):
         wide = jax.tree.leaves(params)[0].dtype == np.float64
         apply, pull = compiled[np.dtype(np.float64 if wide else np.float32)]

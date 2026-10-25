@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as splash
 from model_support import model_draw
-from reference_error import assert_as_exact, with_gradients
+from reference_error import as_given, assert_as_exact, with_gradients
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -295,6 +295,7 @@ def test_a_chunked_kind_decodes_what_its_whole_sequence_pass_computes(origin, sh
     step = jax.jit(lambda variables, cache, tokens, places: model.apply(
         {**variables, "cache": cache}, tokens, positions=places, decode=True, mutable=["cache"]))
 
+    @as_given
     def decoded(variables, tokens):
         logits, mutated = step(variables, made(variables), tokens[:, :4], positions[..., :4])
         steps = [logits[:, -1]]

@@ -544,7 +544,7 @@ def test_a_host_master_step_draws_each_examples_noise_as_the_resident_step_does(
     programs compile under the resident step's options (`step_compiler_options`). A host-master run's
     draws by the attempt would read other times, noise and dropped conditions, and step elsewhere."""
     import optax
-    from reference_error import assert_as_exact
+    from reference_error import as_given, assert_as_exact
 
     from dew.training import Layout, Trainer
     from dew.training.transaction import example_fields
@@ -560,6 +560,7 @@ def test_a_host_master_step_draws_each_examples_noise_as_the_resident_step_does(
         run = trainer.compile(placed, batch)
         where = jax.tree.map(lambda leaf: leaf.sharding, template.variables)
 
+        @as_given
         def stepped(variables):
             # The step donates its state: each draw steps a copy of the untouched template.
             state = jax.tree.map(jnp.copy, template).replace(variables=jax.device_put(variables, where))

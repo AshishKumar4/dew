@@ -16,7 +16,7 @@ import numpy as np
 import optax
 import pytest
 from diffusion_support import as_a_step, float64_gradient, moved_weights, objective_gradient
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 from safetensors.numpy import load_file
 
 from dew import Trainer
@@ -139,6 +139,7 @@ def assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, 
     def draw(seed):
         return (*weights(seed), drawn(seed))
 
+    @as_given
     def trained(values, rows):
         state = stepped(values, rows)
         trace = jax.tree.map(np.asarray, optax.tree_utils.tree_get(state.opt_state, "trace"))

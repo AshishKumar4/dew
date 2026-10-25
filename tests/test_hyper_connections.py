@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import torch
-from reference_error import assert_as_exact, torch_with_gradients, with_gradients
+from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.nn.hyper_connections import (
     HyperConnection,
@@ -124,7 +124,8 @@ def test_the_mean_head_is_the_mean_and_expansion_repeats_a_stream():
         return (np.random.default_rng(seed).standard_normal((B, S, H, D)),)
 
     assert_as_exact(lambda streams: collapse_streams(jnp.asarray(streams, jnp.float32), None),
-                    lambda streams: np.asarray(streams, np.float32).mean(2), draw, "mean hyper head",
+                    as_given(lambda streams: np.asarray(streams, np.float32).mean(2)), draw,
+                    "mean hyper head",
                     seeds=SEEDS["mean"], truth_fn=lambda streams: np.asarray(streams, np.float64).mean(2))
     first = jnp.asarray(draw(0)[0][:, :, 0], jnp.float32)
     assert np.array_equal(expand_streams(first, H), np.repeat(np.asarray(first)[:, :, None], H, axis=2))

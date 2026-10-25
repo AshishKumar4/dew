@@ -9,7 +9,7 @@ import pytest
 from affine_run import dataset
 from learning_gate import assert_learns
 from recording import RecordingTracker
-from reference_error import assert_as_exact, widened
+from reference_error import as_given, assert_as_exact, widened
 from steady_state import steady_state
 
 from dew.artifacts import Representations
@@ -421,7 +421,7 @@ def health_of(z):
 def test_representation_health_is_the_float64_statistics():
     """Both statistics on par with numpy's (check 1) on embeddings whose dimensions are half
     redundant; a collapsed batch has neither, to float32's rounding of its mean."""
-    assert_as_exact(jax.jit(health_of), lambda z: health_in(z, z.dtype), redundant_embeddings,
+    assert_as_exact(jax.jit(health_of), as_given(lambda z: health_in(z, z.dtype)), redundant_embeddings,
                     "representation health", seeds=HEALTH_SEEDS)
     (z,) = redundant_embeddings(0)
     collapsed = representation_health(jnp.tile(jnp.asarray(z[:1]), (32, 1)))
@@ -624,6 +624,7 @@ def test_the_loss_is_the_mean_squared_error_to_normalized_targets_of_the_same_bl
             return modules.encode(part(target, "context_encoder"), samples), modules.predictor.apply(
                 part(live, "predictor"), *repeated, target_idx.reshape(len(samples) * blocks, -1))
 
+        @as_given
         def run(pixels, context_idx, target_idx):
             live, target = (params, averaged) if dtype == np.float32 else (widened(params), widened(averaged))
             samples = (jnp.asarray(pixels, dtype) - 127.5) / 127.5

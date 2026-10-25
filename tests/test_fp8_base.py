@@ -26,7 +26,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import NamedSharding, PartitionSpec
 from model_support import TINY_DECODER
 from process_support import READ_ONLY, fresh, keeping_picks
-from reference_error import assert_as_exact, widened, with_gradients, without_ynn
+from reference_error import as_given, assert_as_exact, widened, with_gradients, without_ynn
 
 from dew.data.dataset import Loader
 from dew.interop.codecs import fp8_block_cast, quantize_fp8_blocks
@@ -334,6 +334,7 @@ def test_split_over_fsdp_the_frozen_product_is_one_devices():
     split = NamedSharding(mesh, PartitionSpec("fsdp", None))
     products = jax.jit(fp8_products)
 
+    @as_given
     def placed(*arrays):
         # Placed before the jit, as a run's arrays arrive: a device_put inside one constrains nothing.
         arrays = jax.device_put(arrays, split)

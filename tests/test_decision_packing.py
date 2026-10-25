@@ -13,7 +13,7 @@ import optax
 import pytest
 from decision_support import decision_rows
 from recording import RecordingTracker
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
@@ -330,6 +330,7 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, held=lambda p
                                               for path, leaf in jax.tree_util.tree_leaves_with_path(tree))
                 if held(name)}
 
+    @as_given
     def packed(variables):
         logits, grads = decide(variables, batch)
         return asked(batch, logits), kept(grads)

@@ -22,7 +22,7 @@ import numpy as np
 import optax
 import pytest
 from model_support import decoder
-from reference_error import assert_as_exact, widened
+from reference_error import as_given, assert_as_exact, widened
 from rl_support import clipped_surrogate, prompt_inputs
 from test_mixers import KIND_FIELDS, tiny
 
@@ -160,7 +160,7 @@ def generation_draw(model, params, sampling, steps: int, *, margin: bool, **prom
 
 def only(name: str, run):
     """`run`'s leaf `name` alone."""
-    return lambda *draw: {name: run(*draw)[name]}
+    return as_given(lambda *draw: {name: run(*draw)[name]})
 
 
 def generated(model, params, sampling, steps: int):
@@ -336,6 +336,7 @@ def test_padding_repro_greedy_and_seeded_reproducibility(sampling, name):
         raise AssertionError(f"no draw of seed {seed} clears MARGIN")
 
     def recorded(generation):
+        @as_given
         def run(prompt, key, tokens):
             result = generation(prompt, key)
             np.testing.assert_array_equal(np.asarray(result.tokens)[:, -steps:], tokens)
@@ -411,6 +412,7 @@ def test_prompt_perplexity_uses_unpadded_context_and_real_transitions(kind):
         return {"prompt": prompt, "prompt_length": lengths, "data_source": np.zeros((ROWS, 1), np.int32),
                 "ground_truth": np.zeros((ROWS, 1), np.int32), "extra_info": np.zeros((ROWS, 1), np.int32)}
 
+    @as_given
     def evaluated(prompt, lengths):
         found = objective.evaluate(params, batch_of(prompt, lengths), step)
         real = np.arange(3)[None, :] >= 4 - lengths[:, None]
@@ -469,6 +471,7 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
         key = np.asarray(jax.random.key_data(jax.random.fold_in(jax.random.key(5), seed)))
         return key, rolled_from(jax.random.wrap_key_data(key))
 
+    @as_given
     def trained(key, rolled):
         data = Loader(train=lambda partition: iter([batch]), val=None, records=rows, batch=rows)
         trainer = Trainer(objective, optax.sgd(0.01), key=jax.random.wrap_key_data(key), rollout=rollout)
@@ -530,6 +533,7 @@ def test_padding_slots_do_not_consume_cache_capacity(kind):
                 return prompt, tokens
         raise AssertionError(f"no draw of seed {seed} clears MARGIN")
 
+    @as_given
     def behind_padding(prompt, tokens):
         rows = jnp.asarray(np.pad(prompt, ((0, 0), (6, 0))))
         inputs = ModelInputs(rows, {"attention_mask": jnp.broadcast_to(mask, rows.shape)})

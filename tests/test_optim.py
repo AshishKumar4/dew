@@ -519,6 +519,7 @@ def test_a_gated_query_clips_its_query_half_and_bounds_the_logits():
         groups = np.asarray(maxima(model, variables, tokens)[1]).reshape(2, 2).max(axis=1)
         return variables, tokens, np.float32(np.mean(groups))
 
+    @as_given
     def read_after(variables, ids, tau):
         stats, _ = maxima(model, variables, ids)
         tx = scale_by_qk_clip(float(tau))

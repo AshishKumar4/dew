@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, with_gradients
+from reference_error import as_given, assert_as_exact, with_gradients
 
 from dew.inference.banks import HeldBanks
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -282,6 +282,7 @@ def test_replay_on_banked_weights_scores_as_on_the_plain_tree(where):
     draw = replay_draw(plain, 2)
     scored = jax.jit(lambda store, tokens, routed: replayed_log_probs(banked, store, tokens, (routed, None)))
 
+    @as_given
     def from_banks(params, tokens, routed):
         return np.asarray(scored(HeldBanks(params).place(banked.model, layout=layout), tokens, routed))
 
@@ -371,7 +372,7 @@ def test_packed_grpo_preserves_each_calls_conflicting_prefix_routing(conflict):
     def draw(seed):
         return (init(jax.random.fold_in(jax.random.key(0), seed)),)
 
-    assert_as_exact(lambda params: np.asarray(packed(params))[sampled][order], calls(obj), draw,
+    assert_as_exact(as_given(lambda params: np.asarray(packed(params))[sampled][order]), calls(obj), draw,
                     f"{conflict} conflicting prefix", seeds=SEEDS['conflicting prefix'], truth_fn=calls(wide))
     np.testing.assert_array_equal(batch["behavior_log_probs"][sampled][order],
                                   np.array([-.1, -.2, -.3, -.4], np.float32))
@@ -387,6 +388,7 @@ def test_packed_grpo_replays_the_routing_its_batch_carries():
     grpo = GRPOObjective(obj.model, SEQ_LEN)
     packed = jax.jit(grpo.packed_log_probs)
 
+    @as_given
     def through_pack(params, tokens, routed):
         ids = [int(token) for token in np.asarray(tokens[0])]
         call = Call(tuple(ids[:5]), tuple(ids[5:]), (-1.0,) * (SEQ_LEN - 4), "length", 0,

@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import RESOLUTION, GateFailure, _drawn, assert_as_exact, seeds_for
+from reference_error import RESOLUTION, GateFailure, _drawn, as_given, assert_as_exact, seeds_for
 
 ROWS = 64
 
@@ -173,9 +173,11 @@ def test_a_narrow_rows_factor_holds_through_check_one():
             values[0] *= 2.0 ** -8
             return (values,)
 
+        @as_given
         def reference(values):
             return {"leaf": values * (1 + 2.0 ** -20)}
 
+        @as_given
         def dew(values):
             moved = values * (1 + 2.0 ** -20)
             moved[0] = values[0] * (1 + 10 * 2.0 ** -20)

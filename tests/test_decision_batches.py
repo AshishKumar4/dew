@@ -10,7 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from PIL import Image
-from reference_error import assert_as_exact, widened, without_ynn
+from reference_error import as_given, assert_as_exact, widened, without_ynn
 
 from dew.decision import Decide
 from dew.decision.images import Images
@@ -124,7 +124,7 @@ def test_a_batchs_probabilities_are_each_bodys_alone(decide):
         # The draw is its seed; the bodies are made from it, their text no array the check widens.
         return (np.int64(seed),)
 
-    assert_as_exact(lambda seed: scored(decide, seed, together=True),
+    assert_as_exact(as_given(lambda seed: scored(decide, seed, together=True)),
                     lambda seed: scored(decide, seed, together=False), draw,
                     "batched probabilities", seeds=BATCH_SEEDS, truth_fn=truth)
 
@@ -286,7 +286,7 @@ def test_two_requests_of_alike_images_join_one_pass_each_scored_as_alone(tmp_pat
             reading, held = wide["task"]
             return scored(reading, held, seed, together=False)
 
-    assert_as_exact(lambda seed: scored(task, variables, seed, together=True),
+    assert_as_exact(as_given(lambda seed: scored(task, variables, seed, together=True)),
                     lambda seed: scored(task, variables, seed, together=False),
                     lambda seed: (np.int64(seed),), "two requests of images in one pass", seeds=IMAGE_SEEDS,
                     truth_fn=truth)

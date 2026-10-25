@@ -21,7 +21,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fetched_fixtures import save
-from reference_error import REDRAW, input_digest, leaf_summary, seeds_for, truth_sketch
+from reference_error import REDRAW, as_given, input_digest, leaf_summary, seeds_for, truth_sketch
 
 __all__ = ["provenance", "record_case", "record_reference", "save"]
 
@@ -91,7 +91,8 @@ def record_case(label: str, draw, evaluate, proxy, *, truth_proxy=None, store_in
         return np.int32(seed), records[seed][0]
 
     ensure((1 + REDRAW) * planned)
-    confirmed = seeds_for(lambda index, inputs: records[int(index)][1], recorded_draw, label,
+    # The recorded reference is read by index from the host's records, as given.
+    confirmed = seeds_for(as_given(lambda index, inputs: records[int(index)][1]), recorded_draw, label,
                           truth_fn=lambda index, inputs: records[int(index)][2])
     # The recording is the confirmed count's draws and their redraw, no more: a proxy that planned more
     # than the recorded reference confirms leaves draws the recording does not keep.

@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
+from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
 from scipy import stats
 
 import dew.diffusion.schedules as schedulers
@@ -220,6 +220,7 @@ def assert_weights_are_the_authors(name, mean, options, table, process_of):
         recording(RECORDED), label, seeds, inputs_of=partial(table_inputs, table),
         truth_fn=jax.jit(partial(closed_form, name, mean, options, dtype=jnp.float64)))
 
+    @as_given
     def weighted(index, inputs):
         process = process_of(np.asarray(inputs["betas"]))
         return {"weight": process.weight(jnp.arange(process.schedule.T))}
@@ -306,6 +307,7 @@ def test_min_snr_weights_the_same_clean_image_prediction_the_same_whatever_the_p
         weight = process.weight(t)
         return {"weight": weight, "loss": weight * error}
 
+    @as_given
     def clean(t, x_0, epsilon, raw):
         sigma = karras_sigma(t)[:, None, None, None]
         x_t = x_0 + sigma * epsilon
@@ -352,6 +354,7 @@ def test_min_snr_weights_a_flow_velocity_as_the_clean_image_it_reads_out():
             losses[type(transform).__name__] = weight * jnp.mean(jnp.square(read - target), axis=(1, 2, 3))
         return losses
 
+    @as_given
     def clean(t, x_0, epsilon, velocity, estimate):
         path = t[:, None, None, None]
         weight = np.minimum(((1 - t) / t) ** 2, 5.0)
@@ -416,6 +419,7 @@ def test_edm_preset_samples_on_the_karras_grid():
         return {"weight": process.weight(t),
                 "scale": process.prediction.get_input_scale(process.schedule.rates(t))}
 
+    @as_given
     def edm(t):
         sigma = np.exp(t * 1.2 + -1.2)
         return {"weight": 1 / 0.7**2 + 1 / sigma**2, "scale": 1 / np.sqrt(0.7**2 + sigma**2)}
@@ -524,6 +528,7 @@ def test_the_edm_schedules_time_of_a_sigma_is_on_par_with_its_correctly_rounded_
     def draw(seed):
         return (np.exp(np.random.default_rng(seed).normal(-1.2, 1.2, 4096)).astype(np.float32),)
 
+    @as_given
     def reference(sigma):
         centred = np.log(sigma.astype(np.float64)).astype(sigma.dtype) - sigma.dtype.type(-1.2)
         return centred / sigma.dtype.type(1.2)

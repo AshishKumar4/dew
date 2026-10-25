@@ -13,7 +13,7 @@ import pytest
 from generation_support import INTERPRETS, SUMS_IN_IEEE, generations, lowers, runs
 from jax.experimental.pallas import fuser
 from jax.sharding import Mesh
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
 from dew.nn.kernels.templates import product
@@ -229,7 +229,7 @@ def test_the_templates_gradients_hold_check_1(generation_name, case):
     with generation.assumed(generation_name):
         dew = _loss(_dew(spec, interpret_on_cpu=True))
         dew = dew if generation_name == "sm90" else jax.jit(dew)
-        assert_as_exact(dew, jax.jit(_loss(_plain(spec))), _draw, f"{case} gradients on {generation_name}",
+        assert_as_exact(as_given(dew), _loss(_plain(spec)), _draw, f"{case} gradients on {generation_name}",
                         seeds=SEEDS, truth_fn=_loss(_plain(spec, truth=True)))
 
 
@@ -701,7 +701,7 @@ def test_a_cooperative_tiles_gradients_hold_check_1(case):
               grouped_matmul.MosaicTgmm: COOPERATIVE}
     with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"), tuning.pinned(pinned),
           generation.routes() as taken):
-        assert_as_exact(_loss(_dew(spec, interpret_on_cpu=True)), jax.jit(_loss(_plain(spec))), _draw,
+        assert_as_exact(as_given(_loss(_dew(spec, interpret_on_cpu=True))), _loss(_plain(spec)), _draw,
                         f"{case} cooperative gradients", seeds=SEEDS,
                         truth_fn=_loss(_plain(spec, truth=True)))
     assert _kernels(taken) == MOSAIC_RAN

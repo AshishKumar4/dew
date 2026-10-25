@@ -32,7 +32,7 @@ from interop_support import (
     fixture_arrays,
     source_transformer,
 )
-from reference_error import assert_as_exact, torch_with_gradients, with_gradients
+from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import z_image_fields, z_image_path
@@ -167,6 +167,7 @@ def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, nam
         with float64():
             return reference_walk(wide_model, inputs)
 
+    @as_given
     def native(inputs):
         width = inputs[captions[0]].shape[-1]
         context = np.zeros((len(lengths), BUDGET, width), np.float32)
@@ -281,7 +282,7 @@ def test_prompt_encoding_matches_the_source_pipeline(pipeline, source, record):
     _, mask = encoded(prompts)
     lengths = [np.count_nonzero(np.abs(row).sum(-1)) for row in source_encoded(narrow, prompts)]
     np.testing.assert_array_equal(mask, np.arange(encoder.tokens)[None] < np.asarray(lengths)[:, None])
-    assert_as_exact(lambda seed: encoded(prompts_of(seed))[0],
+    assert_as_exact(as_given(lambda seed: encoded(prompts_of(seed))[0]),
                     lambda seed: source_encoded(narrow, prompts_of(seed)), draw, "Z-Image prompts",
                     seeds=PIPELINE_SEEDS["prompts"],
                     truth_fn=lambda seed: widened_call(
@@ -307,6 +308,7 @@ def test_pipeline_walk_matches_the_source(load, source, record, request):
     def draw(seed):
         return (torch.randn(shape, generator=torch.Generator().manual_seed(53 + seed)).numpy(),)
 
+    @as_given
     def native(x_T):
         prepared = task.prepare(recorded["prompts"], initial=x_T.transpose(0, 2, 3, 1), key=0, steps=steps)
         walked = task(prepared, key=jax.random.PRNGKey(0)).host()

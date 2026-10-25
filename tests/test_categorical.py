@@ -10,7 +10,7 @@ import numpy as np
 import optax
 import pytest
 from confident_support import confident, label_derivative, log_softmax
-from reference_error import assert_as_exact, with_gradients
+from reference_error import as_given, assert_as_exact, with_gradients
 
 from dew.nn import categorical
 from dew.objectives.base import token_log_probs
@@ -199,6 +199,7 @@ def test_a_confident_soft_targets_derivative_keeps_its_shift_invariance():
                                   np.zeros(2, np.float32))
 
 
+@as_given
 def divergence_derivative(logits: np.ndarray, reference: np.ndarray) -> np.ndarray:
     """`KL(q || p)`'s derivative in `logits` by arXiv:2610.31642's eq. 9 in NumPy, in the inputs' own
     dtype, its `p` the reference's softmax and its `q` the logits'."""
