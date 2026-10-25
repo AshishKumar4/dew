@@ -16,6 +16,7 @@ import optax
 import pytest
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference
+from scipy import stats
 
 from dew.diffusion import broadcast_rates, expand, presets
 from dew.diffusion.schedules import FlowMatchingScheduler
@@ -40,16 +41,18 @@ def test_training_times_are_diffusers_sd3_densities(case, fields):
     assert_as_exact_as_the_reference(drawn, DENSITIES[case], DENSITIES[f"{case}_f64"], case)
 
 
+COSMAP_DRAWS = 4_000_000
+"""The cosmap site's draws: at one in a billion the Kolmogorov-Smirnov test fails an empirical CDF off
+the paper's by 3.27 / sqrt(COSMAP_DRAWS), 0.0016, under half the 1.63 / sqrt(200,000), 0.0036, the site
+held at one in a hundred before."""
+
+
 def test_cosmap_times_follow_the_papers_density(rng):
     """Eq. 21's density 2 / (pi (1 - 2t + 2t^2)) integrates to the CDF
-    (2 / pi) atan(t / (1 - t)); the draws' empirical CDF stays within the
-    Kolmogorov-Smirnov bound for 200k samples (1.63 / sqrt(n), p = 0.01)."""
-    count = 200_000
-    drawn = np.sort(np.asarray(FlowMatchingScheduler(density="cosmap").sample_t(rng, count),
-                               np.float64))
-    cdf = 2 / np.pi * np.arctan(drawn / (1 - drawn))
-    empirical = np.arange(1, count + 1) / count
-    assert np.max(np.abs(empirical - cdf)) < 1.63 / np.sqrt(count)
+    (2 / pi) atan(t / (1 - t)); the draws' empirical CDF is the paper's by
+    the Kolmogorov-Smirnov test at one in a billion."""
+    drawn = np.asarray(FlowMatchingScheduler(density="cosmap").sample_t(rng, COSMAP_DRAWS), np.float64)
+    assert stats.kstest(drawn, lambda t: 2 / np.pi * np.arctan2(t, 1 - t)).pvalue > 1e-9
 
 
 ############################################################################################################
