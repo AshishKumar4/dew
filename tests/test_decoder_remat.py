@@ -113,8 +113,9 @@ def drawn_steps(plain, stepped, *, routed: bool, within=contextlib.nullcontext, 
     optimizer state, the batch and the step's key. An even seed's decoder is initialized, its momentum
     zero; an odd seed's has taken one plain step under its own key, its momentum a step's. A routed
     decoder takes the seed's first draw whose routing clears `selection_margins.MARGIN` in the step's
-    own training forward (its dropout, its prediction depth, `within` the step's context on the
-    inputs as `place` lays them out), so its float32 runs and its float64 run route alike; routing
+    own training forward (its dropout, its prediction depth) and in the inference forward the forward
+    check reads, each `within` the step's context on the inputs as `place` lays them out, so its
+    float32 runs and its float64 run route alike; routing
     near a tie is the router's own tests'. `stepped` is `training_step(plain)`, compiled once for the
     draws and the reference arm."""
     run, solver = stepped
@@ -124,6 +125,8 @@ def drawn_steps(plain, stepped, *, routed: bool, within=contextlib.nullcontext, 
     scored = jax.jit(lambda variables, tokens, key: objective.token_scores(
         variables, tokens, train=True, rngs=model_rngs(key, training=True), routing=True,
         depths=objective.mtp_weight is not None, qk_stats=objective.qk_stats).routing)
+    inferred = jax.jit(lambda variables, tokens: objective.token_scores(
+        variables, tokens, routing=True).routing)
 
     def phase(primed: bool):
         def keyed(seed):
@@ -140,12 +143,13 @@ def drawn_steps(plain, stepped, *, routed: bool, within=contextlib.nullcontext, 
         variables, _, tokens, key = inputs
         laid = (variables, tokens) if place is None else place(variables, tokens)
         with within():
-            sown = scored(laid[0], laid[1]["text"], jax.random.wrap_key_data(key))
-        return selection_margins.routing_margin(jax.device_get(sown), variables.get("moe", {}), 2) \
-            >= selection_margins.MARGIN
+            sown = [scored(laid[0], laid[1]["text"], jax.random.wrap_key_data(key)),
+                    inferred(laid[0], laid[1]["text"])]
+        return all(selection_margins.routing_margin(jax.device_get(one), variables.get("moe", {}), 2)
+                   >= selection_margins.MARGIN for one in sown)
 
     initial, primed = phase(primed=False), phase(primed=True)
-    return lambda seed: (primed if seed % 2 else initial)(seed // 2)
+    return lambda seed: (primed if seed % 2 else initial)(seed)
 
 
 def committed(step):
