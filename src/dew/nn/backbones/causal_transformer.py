@@ -127,11 +127,12 @@ from .decoder_stack import (
     StageSplit,
     banked_collections,
     microbatch_count,
+    on_host,
     run_pipeline,
     run_stack,
     split_stages,
 )
-from .layer_plan import LayerKind, LayerSpec, ResolvedKind, layer_index, scan_groups
+from .layer_plan import LayerKind, LayerSpec, ResolvedKind, layer_index, run_period, scan_groups
 
 _INTERMEDIATES = "intermediates"
 """The collection flax's `capture_intermediates` fills."""
@@ -424,7 +425,11 @@ class CausalTransformer(nn.Module):
     (Dream-v0); False reads each position's own (LLaDA). The forward ignores it: it says how
     the checkpoint's logits line up, which `dew.diffusion.discrete.aligned` applies for the
     masked loss and the sampler alike."""
-    scan_layers: bool = False                 # runs of like layers under flax's scan
+    scan_layers: bool = False
+    """Runs of like layers under flax's scan. A decode step over weights resident on the device scans
+    each run of layers that repeat one period as one body of the period's layers too
+    (`scan_groups(periodic=True)`): Qwen3.5's `[linear, linear, linear, full]` x 6 is one body of
+    four, so a step's program grows with the period, not the depth."""
     bank_layers: int | None = None
     """The most layers one scanned run holds, which is also how many layers its
     parameter bank stacks. A longer run of like layers is split into
@@ -1898,7 +1903,16 @@ class CausalTransformer(nn.Module):
             if span is not None and banked:
                 raise LayoutRefused(f"a loop over layers {span} runs part of the stack, and a store banked "
                                     f"by run holds whole runs; {list(banked)} arrived banked")
-            view, split = (StackView(self.groups if span is None else spanned, banked=banked),
+            groups = self.groups if span is None else spanned
+            # A decode step over resident weights scans by period; weights a step reads a layer at
+            # a time (banked, streamed from disk or in host memory) keep the runs their banks hold,
+            # and a layer that leaves what a later one reads (`_provides`) runs alone.
+            if decode and not (banked or self._provides or 'streaming' in self.variables
+                               or on_host(self.variables.get('params', {}))):
+                keys = self.scan_keys[first:end]
+                groups = tuple((first + start, count) for start, count in scan_groups(keys, periodic=True))
+            periods = tuple(run_period(self.scan_keys, start, count) for start, count in groups)
+            view, split = (StackView(groups, banked=banked, periods=periods),
                            StageSplit(0, self.num_layers, 0))
         else:
             view, split = self._pipelined(x, stages, decode=decode, banked=banked, span=span)
@@ -2051,7 +2065,7 @@ class CausalTransformer(nn.Module):
                 self.layers, self.block, self.specs, view.groups, x,
                 train=train, decode=decode, kv_store={} if self._provides else None,
                 per_layer_input=per_layer_input, attention_metadata=attention_metadata,
-                banked='params' in view.banked)
+                banked='params' in view.banked, periods=view.periods)
         return run_pipeline(
             self,
             view,
