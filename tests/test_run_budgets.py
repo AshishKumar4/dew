@@ -218,6 +218,23 @@ def test_a_stream_that_runs_out_after_a_ranked_step_ends_on_a_whole_checkpoint(t
     assert Checkpoints(str(tmp_path)).latest == 1
 
 
+def test_a_run_resumed_where_its_finite_stream_ran_out_ends_there_with_nothing_to_read(tmp_path):
+    """A one-pass read of the corpus under a run asked for more steps than it holds ends where the read
+    runs out, on a checkpoint; resumed with a higher cap it opens the read where it stopped, finds it
+    has run out and ends at the same step, its state untouched, rather than refusing a stream that holds
+    no batch."""
+    (x,) = records(0)
+
+    def run(steps):
+        trainer = Trainer(Pulled(), OptimConfig(optimizer="adam", learning_rate=0.1), key=0,
+                          checkpoints=Checkpoints(str(tmp_path)))
+        return trainer.fit(compile(chain(x), read="memory"), steps=steps)
+
+    first, again = run(10), run(12)
+    assert 0 < int(first.step) == int(again.step) < 10
+    np.testing.assert_array_equal(again.variables["params"]["w"], first.variables["params"]["w"])
+
+
 def test_a_stream_that_runs_out_between_cadences_scores_only_the_suites_its_last_step_did_not():
     """A one-batch stream under a run of five steps ends at step 1, where the suite scored every step
     already reported and the one scored every other step did not: the run's end scores that one alone,
