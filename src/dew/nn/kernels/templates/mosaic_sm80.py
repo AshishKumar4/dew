@@ -103,14 +103,18 @@ class Mma(mosaic.Family):
     operands_in_registers = True
 
     @classmethod
-    def for_tile(cls, dtype, rows: int, columns: int) -> "Mma":
-        """The bundle for a warpgroup's `rows` x `columns` of a tile: its warps arranged as `MMALayouts`
-        allows (an accumulator atom of `m_warps * 16` rows by `(4 // m_warps) * 8` columns dividing them),
-        the arrangement whose replicated fragments are fewest: the left operand's rows replicated over the
-        warps along the columns, the right operand's columns over those along the rows (`lhs_copies`,
-        `rhs_copies`), at the most warps along the rows of those tied (CUTLASS's warp tiles split both)."""
+    def for_tile(cls, dtype, rows: int, columns: int, depth: int) -> "Mma":
+        """The bundle for a warpgroup's `rows` x `columns` of a tile stepping `depth` deep: its warps
+        arranged as `MMALayouts` allows (an accumulator atom of `m_warps * 16` rows by `(4 // m_warps) * 8`
+        columns dividing them), the arrangement whose replicated fragments are fewest: the left operand's
+        rows a step deep replicated over the warps along the columns, the right operand's columns a
+        sub-step deep over those along the rows (`lhs_copies`, `rhs_copies`, `fragment_depth`), at the most
+        warps along the rows of those tied (CUTLASS's warp tiles split both)."""
+        bundle = cls(jnp.dtype(dtype))
+        sub = bundle.fragment_depth(depth)
         fitting = [m for m in (4, 2, 1) if rows % (m * 16) == 0 and columns % ((4 // m) * 8) == 0]
-        return cls(jnp.dtype(dtype), min(fitting or [4], key=lambda m: m * columns + 4 // m * rows))
+        return cls(jnp.dtype(dtype),
+                   min(fitting or [4], key=lambda m: 4 // m * rows * depth + m * sub * columns))
 
     @property
     def lhs_copies(self) -> int:
@@ -121,8 +125,9 @@ class Mma(mosaic.Family):
         return self.m_warps
 
     def fragment_depth(self, depth: int) -> int:
-        # A product's fragments are loaded one MMA depth at a time (16 for 16-bit operands: `MMALayouts`'
-        # k), CUTLASS's warp-level k-iterations, never a whole step's.
+        # The right operand's fragments are loaded one MMA depth at a time (16 for 16-bit operands:
+        # `MMALayouts`' k), CUTLASS's warp-level k-iterations, sliced along the stage's rows, which its
+        # 8-row tiles allow (a swizzled row takes no slice narrower than its tile).
         return min(depth, 8 * max(32 // (jnp.dtype(self.dtype).itemsize * 8), 1))
     most_shared = 163 * 1024  # sm80's and sm87's opt-in block (sm86's and sm89's 99 KiB)
     reduction_scratch = plgpu.CompilerParams().reduction_scratch_bytes  # its kernels' default parameters
@@ -310,12 +315,14 @@ class Mma(mosaic.Family):
             return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
         if isinstance(lhs, jax.Array):
             return plgpu.mma(acc, self._left(lhs), plgpu.load(rhs, layout=self.rhs))
-        # A step's fragments one MMA depth at a time (`fragment_depth`): the registers a thread holds for
-        # its operands are a sub-step's, not the step's.
-        depth = self.fragment_depth(rhs.shape[0])
+        # The left operand a step deep, sliced in registers along the depth at its layout's tiles; the
+        # right one a sub-step at a time from the stage (`fragment_depth`).
+        left, depth = self._left(lhs), self.fragment_depth(rhs.shape[0])
+        if depth == rhs.shape[0]:
+            return plgpu.mma(acc, left, plgpu.load(rhs, layout=self.rhs))
         for start in range(0, rhs.shape[0], depth):
-            part = pl.ds(start, depth)
-            acc = plgpu.mma(acc, self._left(lhs.at[:, part]), plgpu.load(rhs.at[part], layout=self.rhs))
+            acc = plgpu.mma(acc, left[:, start:start + depth],
+                            plgpu.load(rhs.at[pl.ds(start, depth)], layout=self.rhs))
         return acc
 
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:

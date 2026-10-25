@@ -295,11 +295,11 @@ def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int]
     """The registers a consumer thread holds at a `(rows, columns, depth)` GEMM tile of `consumers` roles
     of `family` (`live_registers`): its share of the fp32 accumulator carried, and a step's operand
     fragments where its products read registers (`Family.operands_in_registers`; the right operand's in
-    each of its replicating warps: `lhs_copies`, `rhs_copies`), a sub-step's where it loads them so
-    (`Family.fragment_depth`)."""
+    each of its replicating warps: `lhs_copies`, `rhs_copies`), the right one's a sub-step deep where
+    it loads it so (`Family.fragment_depth`)."""
     rows, columns, depth = block
-    share, depth = rows // consumers, family.fragment_depth(depth)
-    fragments = ([(share * family.lhs_copies, depth, dtype), (depth, columns * family.rhs_copies, dtype)]
+    share, sub = rows // consumers, family.fragment_depth(depth)
+    fragments = ([(share * family.lhs_copies, depth, dtype), (sub, columns * family.rhs_copies, dtype)]
                  if family.operands_in_registers else [])
     return live_registers(family, [(share, columns, jnp.float32)], fragments)
 
@@ -447,9 +447,9 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         return 1
 
     def fragment_depth(self, depth: int) -> int:
-        """The depth of a step's operand fragments a consumer holds at once, where its products read
+        """The depth of a step's right operand fragments a consumer holds at once, where its products read
         registers (`operands_in_registers`): the step's, unless the family loads them a sub-step at a
-        time."""
+        time (the left operand's it holds a step deep)."""
         return depth
     widest_product: int | None = None
     """The most columns one product spans (warpgroup MMA's 256, wgmma's widest N), which a tile's columns
