@@ -20,13 +20,14 @@ import optax
 import pytest
 from flax import linen as nn
 from model_support import flat_tree
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, float64_terms
 
 from dew.checkpoints import Checkpoints
 from dew.data import ByteTokenizer
 from dew.data.dataset import Loader
 from dew.diffusion.discrete import MDLM, Unmask
 from dew.inference import RunProcessor, pipeline
+from dew.inference.projections import unpacked
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config, translate_weights
 from dew.nn.inputs import ModelInputs, coordinates, request_axes
@@ -393,7 +394,8 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     np.testing.assert_array_equal(converted(prompt, key=7).host().tokens,
                                   reference(prompt, 8, key=7).host().tokens)
     assert converted.model.dtype == jnp.float32
-    assert jax.tree.map(lambda leaf: leaf.dtype, converted.variables) == jax.tree.map(
+    held = unpacked(converted.model, converted.variables)
+    assert jax.tree.map(lambda leaf: leaf.dtype, held) == jax.tree.map(
         lambda leaf: leaf.dtype, reference.variables)
     expected_logits = jax.jit(lambda tokens: reference.model.apply(reference.variables, tokens))
     actual_logits = jax.jit(lambda tokens: converted.model.apply(converted.variables, tokens))
@@ -410,6 +412,51 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
         prompt, 8, key=7).host().tokens, expected)
     raw = restored(["a", "bc"], 3, key=7, steps=3)
     assert raw.text == restored.decode(raw)
+
+
+PACKED_SEEDS = 32
+"""The declared seeds for check 1 of the packed masked logits (`assert_as_exact`), sized by
+`seeds_for` on armada over every masked fixture."""
+
+
+def masked_draw(model):
+    """One seeded masked canvas: a row of tokens with about half masked, at the fixtures' length."""
+    def draw(seed):
+        rng = np.random.default_rng([0x1615, seed])
+        tokens = rng.integers(0, model.vocab_size, (2, 8), dtype=np.int32)
+        return (np.where(rng.random((2, 8)) < 0.5, model.mask_token_id, tokens).astype(np.int32),)
+    return draw
+
+
+def test_a_masked_task_packs_its_projections_as_a_decoder_does(masked_source, tmp_path):
+    """A bidirectional masked model packs its projection groups at load, as a decoder does: the task
+    the pipeline loads holds them packed; its denoising logits are on par with the unpacked
+    model's (check 1); its canvases are those of a task over the unpacked tree, which packs the same
+    groups in its call; and unpacking gives back the source's tree, exporting as the source does."""
+    from dew.inference.projections import packed_layout
+
+    source, prompt = masked_source
+    source.save(tmp_path / "source")
+    task = pipeline(str(tmp_path / "source"))
+    groups, _ = packed_layout(task.model, task.variables)
+    assert groups, "the masked task holds its projections packed"
+    for ours, theirs in zip(jax.tree.leaves(unpacked(task.model, task.variables)),
+                            jax.tree.leaves(source.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    exported, canonical = source.export(task.variables), source.export()
+    assert exported.keys() == canonical.keys()
+    for name, tensor in canonical.items():
+        np.testing.assert_array_equal(np.asarray(exported[name]), np.asarray(tensor), err_msg=name)
+
+    def apart(tokens):
+        return source.model.apply(source.variables, tokens)
+
+    assert_as_exact(jax.jit(lambda tokens: task.model.apply(task.variables, tokens)), jax.jit(apart),
+                    masked_draw(source.model), "packed masked logits", seeds=PACKED_SEEDS,
+                    truth_fn=float64_terms(apart))
+    held_apart = replace(task, variables=source.variables)
+    np.testing.assert_array_equal(task(prompt, 8, key=7, steps=4).host().tokens,
+                                  held_apart(prompt, 8, key=7, steps=4).host().tokens)
 
 
 def test_masked_source_accepts_neutral_controls_and_honors_task_metadata(masked_source):
