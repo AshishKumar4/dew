@@ -49,6 +49,37 @@ def prefix_blocks(segments, places, prefix: int, *, xp=jnp):
     return xp.where((segments > 0) & (places < prefix), segments, -1).astype(xp.int32)
 
 
+def document_places(segments, real, *, xp=jnp):
+    """Each token's place in its document `[B, S]`: the real tokens before it in the run of its segment id,
+    counted from 0, a padding slot the place before it. Documents are contiguous runs of `segments`."""
+    real = xp.asarray(real, xp.int32)
+    opens = xp.concatenate([xp.ones_like(segments[..., :1], bool), segments[..., 1:] != segments[..., :-1]],
+                           axis=-1)
+    counted = xp.cumsum(real, axis=-1, dtype=xp.int32)
+    before = _cummax(xp.where(opens, counted - real, 0), xp)
+    return counted - 1 - before
+
+
+def role_blocks(segments, roles, assistant: int, *, xp=jnp):
+    """Each document's tokens before its first `assistant` token as one block, numbered by the document's
+    segment id, -1 for the rest and for padding (segment 0): a chat row's prompt, which a prefix run of
+    "prompt" reads whole. `segments` and `roles` are `[B, S]`, documents contiguous runs of `segments`. The
+    data stage `Blocks` and the loss of a batch without blocks (`LMObjective`) read this one rule."""
+    places = xp.broadcast_to(xp.arange(segments.shape[-1], dtype=xp.int32), segments.shape)
+    opens = xp.concatenate([xp.ones_like(segments[..., :1], bool), segments[..., 1:] != segments[..., :-1]],
+                           axis=-1)
+    start = _cummax(xp.where(opens, places, 0), xp)
+    spoken = _cummax(xp.where((segments > 0) & (roles == assistant), places, -1), xp) >= start
+    return xp.where((segments > 0) & ~spoken, segments, -1).astype(xp.int32)
+
+
+def _cummax(values, xp):
+    """The running maximum along the last axis, in `xp`."""
+    if xp is np:
+        return np.maximum.accumulate(values, axis=-1)
+    return jax.lax.cummax(values, axis=values.ndim - 1)
+
+
 def prompt_blocks(valid, prefix: int | Literal["prompt"], *, xp=jnp):
     """The blocks a served prompt's real tokens `valid` `[B, S]` make under a prefix run, as a training row's
     do (`prefix_blocks`): the first `prefix` tokens under an int, the whole prompt under "prompt". Each row is

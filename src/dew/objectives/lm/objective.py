@@ -77,7 +77,7 @@ from dew.nn.protocols import (
     whole_block,
 )
 from dew.nn.sharding import LOGITS, constrain
-from dew.nn.visibility import same_group
+from dew.nn.visibility import document_places, prefix_blocks, role_blocks, same_group
 from dew.objectives.base import (
     FROZEN,
     OMITTED,
@@ -327,6 +327,35 @@ def batch_text(batch) -> ModelInputs:
                      block_groups=None if blocks is None else jnp.asarray(blocks, jnp.int32))
 
 
+def prefixed_fields(fields: Mapping[str, jax.Array | Coordinates], shape: tuple[int, ...],
+                    prefix: int | Literal["prompt"] | None, roles, *,
+                    xp=jnp) -> Mapping[str, jax.Array | Coordinates]:
+    """`fields` with the blocks a prefix run reads where they carry none: each document's first `prefix`
+    places (`prefix_blocks`), or under "prompt" its tokens before its first assistant token, read from the
+    rows' `roles` (`role_blocks`). A run's prefix is its loss's mask whatever built the batch, a precompiled
+    loader or a raw stream included, so the blocks it trains on are the ones it serves; the data stage
+    `Blocks` writes the same. `shape` is the rows' `[B, S]`, `xp` the array module (the host's counts read
+    numpy, the loss jax.numpy)."""
+    if prefix is None or BLOCKS_FIELD in fields:
+        return fields
+    _, documents = token_layout(fields, xp=xp)
+    real = real_slots(fields, shape, xp=xp)
+    segments = (real.astype(xp.int32) if documents is None
+                else xp.where(real, xp.asarray(documents), 0).astype(xp.int32))
+    if prefix == "prompt":
+        if roles is None:
+            raise ValueError(f"a prompt prefix run reads each row's roles ({ROLES_KEY}) to find its "
+                             "prompt, and this batch has none")
+        groups = role_blocks(segments, xp.asarray(roles), Role.ASSISTANT, xp=xp)
+    else:
+        laid = fields.get(COORDINATES_FIELD)
+        given = laid.positions if isinstance(laid, Coordinates) else fields.get("positions")
+        places = (document_places(segments, real, xp=xp) if given is None
+                  else xp.broadcast_to(xp.asarray(given), shape))
+        groups = prefix_blocks(segments, places, prefix, xp=xp)
+    return {**fields, BLOCKS_FIELD: groups}
+
+
 def text_preview[S](phase: str, setup: Callable[[], S | None],
                      generate: Callable[[S], tuple[ArrayLike, ArrayLike | None, ArrayLike | None]],
                      decode: Callable[[list[int]], str] | None) -> TextSamples | None:
@@ -439,17 +468,15 @@ def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, 
         counted = counted & ~same_group(blocks[:, :-span], blocks[:, span:])
     return counted
 
-def _refuse_cut_blocks(model: nn.Module, seq_len: int) -> None:
-    """Refuse blocks `model` may read in part: a run of any places in a row of `seq_len` is read whole only
-    by a trunk layer that reads blocks with no attention chunk, or one of `seq_len` places or more
-    (`whole_block`).
-    The loss drops every target in its source's block, so a chunk that cut the block would drop one its
-    source never saw."""
+def _refuse_cut_blocks(model: nn.Module) -> None:
+    """Refuse blocks `model` may read in part: a block is read whole only by a trunk layer that reads
+    blocks with no attention chunk (`whole_block`). The loss drops every target in its source's block, so a
+    chunk that cut the block would drop one its source never saw."""
     chunks = block_chunks_of(model)
-    if not whole_block(chunks, seq_len):
-        raise ValueError(f"a row's blocks are runs of any places, which an attention chunk of {list(chunks)} "
-                         f"cuts; a run is read whole only by a layer with no chunk, or one of {seq_len} "
-                         "places or more")
+    if not whole_block(chunks):
+        raise ValueError(f"a batch's blocks are read whole only by a layer with no attention chunk, and "
+                         f"every layer that reads them has one ({list(chunks)}), which cuts a block that "
+                         "crosses its multiples")
 
 
 class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
@@ -711,7 +738,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         if not chunks:
             raise ValueError("the batch's blocks reach a model none of whose trunk layers reads blocks "
                              "(AttentionMixer.bidirectional_blocks), where they would drop targets")
-        _refuse_cut_blocks(self.model, self.seq_len)
+        _refuse_cut_blocks(self.model)
 
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      segment_ids=None, positions=None, routing: bool = False,
@@ -1111,8 +1138,6 @@ class LMObjective(TokenScorer):
         self.pad_id = pad_id
         self.token_accuracy = token_accuracy
         refuse_prefix(self.model, prefix, longest=seq_len)
-        if prefix is not None:
-            _refuse_cut_blocks(self.model, seq_len)
         if prefix is not None and mtp_weight is not None:
             raise ValueError("a prefix run trains the trunk's targets alone: a prediction depth reads "
                              "blocks beyond its own source, so mtp_weight is refused with prefix")
@@ -1160,6 +1185,23 @@ class LMObjective(TokenScorer):
                 tree = merge(self.fresh_variables(key, None), tree)
         return tree if self.phase is None else freeze(tree, self.phase)
 
+    def _text(self, batch) -> ModelInputs:
+        """The batch's rows (`batch_text`) with the prefix's blocks where the batch carries none
+        (`prefixed_fields`)."""
+        prepared = batch_text(batch)
+        fields = prefixed_fields(prepared.token_fields, jnp.shape(prepared.tokens), self.prefix,
+                                 batch.get(ROLES_KEY))
+        return (prepared if fields is prepared.token_fields
+                else dataclasses.replace(prepared, token_fields=fields))
+
+    def _token_geometry(self, batch: Batch) -> tuple[np.ndarray, Mapping[str, jax.Array | Coordinates]]:
+        """`TokenScorer._token_geometry`, with the prefix's blocks where the batch carries none, so the
+        host counts the targets the loss scores (`prefixed_fields`)."""
+        tokens, fields = super()._token_geometry(batch)
+        roles = batch.get(ROLES_KEY)
+        return tokens, prefixed_fields(fields, tokens.shape, self.prefix,
+                                       None if roles is None else np.asarray(roles), xp=np)
+
     def data(self, tokenizer=None):
         from dew.data.pipeline import ObjectiveData
         from dew.data.steps.blocks import Blocks
@@ -1204,7 +1246,7 @@ class LMObjective(TokenScorer):
         The main loss is never scored, since nothing it reaches moves.
         """
         assert self.indexer is not None
-        prepared = batch_text(batch)
+        prepared = self._text(batch)
         inputs, _ = self._rows(prepared.tokens)
         collections = [INDEXER_COLLECTION] + (["qk"] if step.qk_stats else [])
         _, gathered = self._hidden_states(
@@ -1274,7 +1316,7 @@ class LMObjective(TokenScorer):
         `logits` scores them from the whole logits and keeps those
         (`token_scores`'s `logits`). `predict` is `token_scores`'.
         """
-        prepared = batch_text(batch)
+        prepared = self._text(batch)
         balance = self.balance
         summed = summed and VALID_ROWS not in batch
         scores = self.token_scores(
@@ -1332,7 +1374,7 @@ class LMObjective(TokenScorer):
     def evaluate(self, params, batch, step: Step):
         """Score the complete batch teacher-forced, using EMA when present; the
         rows and roles are read outside the compiled scoring."""
-        prepared = {TEXT_KEY: batch_text(batch), ROLES_KEY: self._batch_roles(batch)}
+        prepared = {TEXT_KEY: self._text(batch), ROLES_KEY: self._batch_roles(batch)}
         return super().evaluate(params, prepared, step)
 
     def _evaluation_scores(self, params, batch, step) -> TokenScores:
@@ -1345,7 +1387,7 @@ class LMObjective(TokenScorer):
         the loss's, or in the warm-up, whose loss is the indexer's KL alone
         (`_warmup_loss`), the tokens' with the KL the trunk sows."""
         if self._warmup:
-            prepared = batch_text(batch)
+            prepared = self._text(batch)
             scores = self.token_scores(params, prepared, roles=self._batch_roles(batch), indexer=True,
                                        predict=True)
             statistics, _ = self._warmup_statistics(scores.indexer, prepared, batch)

@@ -17,11 +17,10 @@ import optax
 import pytest
 from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
-from moe_support import favour_expert_zero, uniform_gates
+from moe_support import BALANCED_EXPERTS, BALANCED_VOCAB, balanced_decoder, favour_expert_zero, uniform_gates
 
 from dew.config import ObjectiveConfig
 from dew.data.preferences import IDS_KEY as PAIRS_KEY, MASK_KEY as PAIR_MASK_KEY
-from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Step
 from dew.objectives.rl import DPOObjective, GRPOObjective, PPOObjective
 from dew.objectives.rl.ppo import OLD_VALUES_KEY, RETURNS_KEY
@@ -37,8 +36,8 @@ from dew.objectives.routing import ExpertBalance
 from dew.registry import parameter_type, parameters
 from dew.training import Trainer
 
-VOCAB = 16
-EXPERTS = 4
+VOCAB = BALANCED_VOCAB
+EXPERTS = BALANCED_EXPERTS
 PROMPT = 3
 WIDTH = 9
 PAD = 4
@@ -70,10 +69,7 @@ class Critic(nn.Module):
 
 
 def routed(max_seq_len, layers=2):
-    return CausalTransformer(vocab_size=VOCAB, emb_features=8, num_layers=layers,
-                             num_heads=2, mlp_features=16, max_seq_len=max_seq_len, qk_norm=False,
-                             mixture={"experts": EXPERTS, "top_k": 2, "bias": True,
-                                      "bias_in_weights": True, "score_function": "softmax"})
+    return balanced_decoder(max_seq_len, layers=layers)
 
 
 def favoured():

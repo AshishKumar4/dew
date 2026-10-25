@@ -1330,6 +1330,7 @@ def test_a_pool_serves_a_prefix_run_as_one_process_and_refuses_a_short_prompt_to
     assert reports[0]["lengths"] + reports[1]["lengths"] == single["lengths"]
 
 
+@pytest.mark.distributed
 def test_a_pool_agrees_on_its_decoding_components_or_refuses_the_request(tmp_path):
     """Two processes resolving the same chain answer the same rows as one, and
     a rank whose components differ only in their values is refused on both

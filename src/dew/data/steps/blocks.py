@@ -35,7 +35,8 @@ class Blocks(grain.MapTransform):
             raise ValueError(f"Blocks' prefix is a positive number of tokens, got {self.prefix!r}")
 
     def map(self, element: Batch) -> Batch:
-        from dew.nn.visibility import prefix_blocks
+        from dew.data.chat import Role
+        from dew.nn.visibility import prefix_blocks, role_blocks
 
         length = len(element[self.field])
         segments = element.get(f"{self.field}_segment_ids")
@@ -47,7 +48,7 @@ class Blocks(grain.MapTransform):
         elif self.given is not None:
             groups = _given_groups(segments, _named(element, self.given))
         else:
-            groups = _prompt_groups(segments, _named(element, f"{self.field}_roles"))
+            groups = role_blocks(segments, _named(element, f"{self.field}_roles"), Role.ASSISTANT, xp=np)
         blocked = {**element, f"{self.field}_block_groups": np.asarray(groups, np.int32)}
         return recounted(element, blocked)
 
@@ -56,20 +57,6 @@ def _named(element: Batch, name: str) -> np.ndarray:
     if name not in element:
         raise ValueError(f"Blocks needs the record's {name!r} field, which this record lacks")
     return np.asarray(element[name])
-
-
-def _prompt_groups(segments: np.ndarray, roles: np.ndarray) -> np.ndarray:
-    """Each document's tokens before its first assistant token (`Role.ASSISTANT`) as one block."""
-    from dew.data.chat import Role
-
-    groups = np.full(segments.shape, -1, np.int32)
-    places = np.arange(len(segments))
-    for document in np.unique(segments[segments > 0]):
-        held = segments == document
-        speaks = np.flatnonzero(held & (roles == Role.ASSISTANT))
-        end = speaks[0] if speaks.size else len(segments)
-        groups[held & (places < end)] = document
-    return groups
 
 
 def _given_groups(segments: np.ndarray, numbers: np.ndarray) -> np.ndarray:

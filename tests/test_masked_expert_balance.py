@@ -12,29 +12,25 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from moe_support import favour_expert_zero, uniform_gates
+from moe_support import BALANCED_EXPERTS, BALANCED_VOCAB, balanced_decoder, favour_expert_zero, uniform_gates
 
 from dew.diffusion.discrete import MDLM
-from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs, coordinates
 from dew.objectives.base import Step
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.routing import ExpertBalance
 from dew.training import Trainer
 
-VOCAB = 16
+VOCAB = BALANCED_VOCAB
 MASK = VOCAB - 1
-EXPERTS = 4
+EXPERTS = BALANCED_EXPERTS
 SEQ = 8
 RATE = 0.05
 STEP = Step(step=jnp.asarray(0), key=jax.random.key(3), ema=None)
 
 
 def routed(max_seq_len=SEQ):
-    return CausalTransformer(vocab_size=VOCAB, emb_features=8, num_layers=2, num_heads=2, mlp_features=16,
-                             max_seq_len=max_seq_len, causal=False, qk_norm=False,
-                             mixture={"experts": EXPERTS, "top_k": 2, "bias": True, "bias_in_weights": True,
-                                      "score_function": "softmax"})
+    return balanced_decoder(max_seq_len, causal=False)
 
 
 def initial(length=SEQ):

@@ -733,20 +733,20 @@ def block_chunks_of(model: nn.Module) -> tuple[int | None, ...]:
     return model.block_chunks() if isinstance(model, BlockReading) else ()
 
 
-def whole_block(chunks: tuple[int | None, ...], extent: int | None) -> bool:
-    """Whether a layer that reads blocks reads a block of `extent` places whole: one with no chunk, or a
-    chunk of `extent` places or more. A document's places count from 0 (`counted_places`), so such a block
-    lies in one chunk, and every target in it is visible to that layer. None is unbounded: only a layer with
-    no chunk reads any block whole."""
-    return any(chunk is None or (extent is not None and chunk >= extent) for chunk in chunks)
+def whole_block(chunks: tuple[int | None, ...]) -> bool:
+    """Whether a layer that reads blocks reads every block whole: one with no attention chunk. A chunk is
+    a run of places counted from 0 (`chunk_mask`), and a block's places start wherever its tokens sit in
+    their document, a window that continues a document or a prompt after cached tokens included, so a
+    chunk of any length cuts a block that crosses one of its multiples. The loss drops every target inside
+    a block, so a layer must read the block's every token for its targets to be ones its source saw."""
+    return any(chunk is None for chunk in chunks)
 
 
 def refuse_prefix(model: nn.Module, prefix: int | Literal["prompt"] | None, *, longest: int | None) -> None:
     """Refuse a prefix run the model or its values cannot take. A prefix is "prompt" or a positive number of
     tokens, at most `longest` where a longest row is declared. Its blocks are read whole only by a trunk layer
-    that reads blocks (`block_chunks_of`), and only if its chunks do not cut the block: the loss drops the
-    targets inside a block, which the trunk sees only where a layer reads the whole block (`whole_block`).
-    A prompt's block is the whole prompt, up to `longest` tokens."""
+    that reads blocks (`block_chunks_of`) with no attention chunk (`whole_block`): the loss drops the targets
+    inside a block, which the trunk sees only where a layer reads the whole block."""
     if prefix is None:
         return
     if prefix != "prompt" and (type(prefix) is not int or prefix < 1):
@@ -758,11 +758,10 @@ def refuse_prefix(model: nn.Module, prefix: int | Literal["prompt"] | None, *, l
         raise ValueError("prefix needs a trunk layer that reads blocks "
                          "(AttentionMixer.bidirectional_blocks), and "
                          f"{type(model).__name__} has none")
-    extent = prefix if isinstance(prefix, int) else longest
-    if not whole_block(chunks, extent):
-        length = "any length" if extent is None else f"{extent} tokens"
-        raise ValueError(f"a prefix block of {length} crosses the attention chunks of every layer that "
-                         f"reads blocks ({list(chunks)})")
+    if not whole_block(chunks):
+        raise ValueError(f"a prefix's blocks are read whole only by a layer with no attention chunk, and "
+                         f"every layer of {type(model).__name__} that reads blocks has one ({list(chunks)}), "
+                         "which cuts a block that crosses its multiples")
 
 
 @runtime_checkable
