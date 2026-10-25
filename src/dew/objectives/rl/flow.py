@@ -25,7 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from dew.coordination import agreed, broadcast_from_process_zero, collective_host
+from dew.coordination import agreed, broadcast_from_process_zero, collective_host, from_every_process
 from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceGrid
@@ -39,6 +39,7 @@ from dew.rl.surrogate import clipped_surrogate_terms
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
 from dew.sampling.guidance import CFG, Walk
 from dew.sampling.solvers import Euler, Solver
+from dew.training.distributed import split_fields, with_host
 
 from .sessions import ADVANTAGES_KEY, OLD_LOG_PROBS_KEY
 
@@ -322,6 +323,17 @@ class FlowRollout:
             samples = objective.autoencoder.decode(params["autoencoder"], samples)
         return trajectory, jnp.clip(samples, -1, 1), spatial
 
+    def _source_rows(self, source: jax.Array) -> np.ndarray:
+        """The source rows this process holds, in order: every row for a lone process."""
+        if jax.process_count() == 1:
+            return np.arange(source.shape[0])
+        owned: set[int] = set()
+        for index in source.sharding.addressable_devices_indices_map(source.shape).values():
+            if index is None:
+                raise ValueError("source sharding has no addressable row index")
+            owned.update(range(*index[0].indices(source.shape[0])))
+        return np.asarray(sorted(owned), np.int64)
+
     def _owned_rows(self, source: jax.Array) -> slice | np.ndarray:
         """Select the expanded rows this process owns.
 
@@ -330,13 +342,30 @@ class FlowRollout:
         """
         if jax.process_count() == 1:
             return slice(None)
-        owned: set[int] = set()
-        for index in source.sharding.addressable_devices_indices_map(source.shape).values():
-            if index is None:
-                raise ValueError("source sharding has no addressable row index")
-            owned.update(range(*index[0].indices(source.shape[0])))
-        rows = np.asarray(sorted(owned), np.int64)
+        rows = self._source_rows(source)
         return (rows[:, None] * self.groups + np.arange(self.groups)).reshape(-1)
+
+    def _grouped(self, value, xp=jnp):
+        """`value`'s rows each repeated into its group of samples, in the array namespace `xp`."""
+        return xp.repeat(value, self.groups, axis=0)
+
+    def _host_context(self, host: Batch, source: jax.Array) -> Batch | None:
+        """The batch's host fields (`split_fields`: captions and other text a reward reads), every
+        source row in order and each repeated into its group (`_grouped`), as process zero scores them,
+        None on the other processes: each process's rows, held on its host alone, gathered in rank
+        order through the coordination service (`from_every_process`)."""
+        leaves, structure = jax.tree_util.tree_flatten(host)
+        held = from_every_process({"rows": self._source_rows(source).tolist(),
+                                   "leaves": [np.asarray(leaf).tolist() for leaf in leaves]})
+        if jax.process_index() != 0:
+            return None
+        ordered: list[dict[int, object]] = [{} for _ in leaves]
+        for rank in held:
+            for index, values in enumerate(rank["leaves"]):
+                ordered[index] |= dict(zip(rank["rows"], values, strict=True))
+        count = source.shape[0]
+        return jax.tree_util.tree_unflatten(structure, [
+            self._grouped(np.asarray([rows[row] for row in range(count)]), np) for rows in ordered])
 
     def _expanded(self, batch: Batch) -> tuple[Batch, slice | np.ndarray, int]:
         """Repeat every source row into its group of samples.
@@ -361,7 +390,7 @@ class FlowRollout:
                     f"a flow rollout over a pool of {jax.process_count()} processes reads a batch placed "
                     f"across them (shard_batch), and a {value.shape} leaf of this one is held by this "
                     f"process alone")
-            return jnp.repeat(value, self.groups, axis=0)
+            return self._grouped(value)
 
         return jax.tree.map(repeat, batch), owned, count
 
@@ -410,17 +439,25 @@ class FlowRollout:
         `train_steps` transitions. The processes agree that each phase
         succeeded before the next collective runs.
         """
+        # The text a reward reads stays on each host (`split_fields`); the rest is placed.
+        batch, host = split_fields(batch)
         expanded, owned, count = agreed("flow rollout setup", lambda: self._expanded(batch))
         # The objective owns the program; the rollout fixes only its count of time points.
         generate = self.objective.program(f"flow rollout over {self.steps} time points", self._generate_impl)
         generated = agreed("flow rollout generation", lambda: generate(state.variables, expanded, key))
         (trajectory, images, spatial), context = collective_host(
             (generated, expanded), phase="flow rollout")
+        # The reward reads the host fields beside the samples' context; the training rows read neither.
+        scored = context
+        if host:
+            source = _source(self.objective.inputs, batch)
+            gathered = agreed("flow rollout host fields", lambda: self._host_context(host, source))
+            scored = context if gathered is None else with_host(context, gathered)
 
         def score() -> np.ndarray | None:
             if jax.process_index() != 0:
                 return None
-            rewards = np.asarray(self.reward(np.asarray(images), context), np.float64)
+            rewards = np.asarray(self.reward(np.asarray(images), scored), np.float64)
             if rewards.shape != (count * self.groups,) or not np.isfinite(rewards).all():
                 raise ValueError("a flow reward must return one finite scalar per generated sample")
             return rewards

@@ -121,7 +121,7 @@ data = compile(train, validation=held, seed=7)
 
 `map(step)` after `batch` runs in the training process after batching and workers. It forwards position and ownership. Steps on only one branch affect that branch; `compile(..., host=(step,))` applies a common host step to both branches.
 
-For conditional image training, `Trainer.fit` compiles the chain with the objective's own stages (`objective.data()`), and a diffusion objective's encode the captions (`EncodeCaptions`). Without a caption reader, string fields stay on the host, where metrics read them: the prefetcher places only the fields a device holds.
+For conditional image training, `Trainer.fit` compiles the chain with the objective's own stages (`objective.data()`), and a diffusion objective's encode the captions for its conditions and keep them beside as host text (`EncodeCaptions(keep=True)`), where metrics and rewards read them with their own tokenizer (`CLIPScore` with CLIP's): the prefetcher places only the fields a device holds.
 
 ## Text, chat and packing
 
