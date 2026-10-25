@@ -353,18 +353,24 @@ class TritonForward(Template[Tiles]):
             out = launch(functools.partial(kernel, guard="none"), in_specs=in_specs, out_specs=out_specs,
                          out_shape=out_shape, name="attention_forward")(*arrays)
             return (tuple(out) if residuals else out[0]), None
-        # The plain launch writes which rows overflowed; the second walks again only the programs with one,
-        # its outputs the plain launch's (`_forward_kernel`).
+        # The plain launch writes which rows overflowed; the second, issued only where one did, walks again
+        # only the programs with one, its outputs the plain launch's (`_forward_kernel`): ordinary inputs
+        # take the one launch and a check.
         per_row = pl.BlockSpec((None, None, block_q), lambda i, b, h: (b, h, i))
         flagged = jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)
         *out, flags = launch(functools.partial(kernel, guard="flag"), in_specs=in_specs,
                              out_specs=[*out_specs, per_row], out_shape=[*out_shape, flagged],
                              name="attention_forward")(*arrays)
         first = len(arrays) + 1
-        out = launch(functools.partial(kernel, guard="rewalk"), in_specs=[*in_specs, per_row, *out_specs],
-                     out_specs=out_specs, out_shape=out_shape, name="attention_forward_headroom",
-                     input_output_aliases={first + index: index for index in range(len(out))},
-                     )(*arrays, flags, *out)
+
+        def rewalked(out):
+            return launch(functools.partial(kernel, guard="rewalk"),
+                          in_specs=[*in_specs, per_row, *out_specs], out_specs=out_specs, out_shape=out_shape,
+                          name="attention_forward_headroom",
+                          input_output_aliases={first + index: index for index in range(len(out))},
+                          )(*arrays, flags, *out)
+
+        out = jax.lax.cond(jnp.max(flags) > 0, rewalked, lambda out: list(out), list(out))
         return (tuple(out) if residuals else out[0]), None
 
     def space(self, ba: tokamax.BoundArguments) -> Sequence[Tiles]:
