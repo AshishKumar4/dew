@@ -408,7 +408,7 @@ def test_a_config_failing_for_more_than_its_shared_memory_stops_the_measurement(
     fields = {field.name: getattr(norm.op, field.name) for field in dataclasses.fields(norm.op) if field.init}
     broken = tokamax.BoundArguments(Broken(**fields), norm.arguments)
     with pytest.raises(KernelBug):
-        tuning.measured(broken.op, broken)
+        tuning._measured(broken.op, broken)
 
 
 @pytest.mark.gpu(reason="the tuner measures on CUDA")
@@ -421,11 +421,11 @@ def test_a_launch_measured_beside_a_profile_capture_keeps_its_heuristic(tmp_path
     [norm] = [ba for ba in found if type(ba.op) is norm_swiglu.RmsForward]
     jax.profiler.start_trace(str(tmp_path / "trace"))
     try:
-        beside = tuning.measured(norm.op, norm)
+        beside = tuning._measured(norm.op, norm)
     finally:
         jax.profiler.stop_trace()
     assert set(beside) == set(norm.autotuning_configs) and not beside.prune_errors()
-    alone = tuning.measured(norm.op, norm)
+    alone = tuning._measured(norm.op, norm)
     assert set(alone.prune_errors()) == set(norm.autotuning_configs)
 
 

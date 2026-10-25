@@ -55,7 +55,7 @@ import os
 import threading
 import time
 import types
-from collections.abc import Callable, Collection, Hashable, Iterator, Mapping
+from collections.abc import Callable, Hashable, Iterator, Mapping
 from typing import ClassVar
 
 import filelock
@@ -431,11 +431,15 @@ class KernelOp(tokamax.Op):
         pins = dict(cache.KERNEL_PINS.value)
         if type(self) in pins:
             pin = pins[type(self)]
-            if pin not in keyed.autotuning_configs:
+            if not self.pinnable(keyed, pin):
                 raise Unpinnable(type(self).__name__, pin, self.unpinnable(keyed, pin))
             return pin
         pick = _pick(keyed) or self._nearest(keyed)
         return ba.heuristics_config if pick is None else pick.fastest_config
+
+    def pinnable(self, ba: tokamax.BoundArguments, config: Hashable) -> bool:
+        """Whether a pin may name `config` at `ba`'s key: one a measurement times (`autotuning_configs`)."""
+        return config in ba.autotuning_configs
 
     def unpinnable(self, ba: tokamax.BoundArguments, config: Hashable) -> str:
         """Why the legal configs of `ba`'s launch do not hold `config`."""
@@ -633,10 +637,9 @@ def _resource_exhausted(error: Exception) -> bool:
             or "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES" in message)
 
 
-def materialized(op: KernelOp, ba: tokamax.BoundArguments, arrays: list | None = None):
-    """The arrays the tuner times `ba` on, `op.operands` of its `ShapeDtypeStruct` arguments (or `arrays`,
-    a caller's own draw of them, in their order), and `fill(arrays) -> (args, kwargs)`, its arguments
-    with those arrays (or traced ones) in their places."""
+def materialized(op: KernelOp, ba: tokamax.BoundArguments):
+    """The arrays the tuner times `ba` on, `op.operands` of its `ShapeDtypeStruct` arguments, and
+    `fill(arrays) -> (args, kwargs)`, its arguments with those arrays (or traced ones) in their places."""
     leaves, tree = jax.tree.flatten((ba.args, ba.kwargs),
                                     is_leaf=lambda leaf: isinstance(leaf, jax.ShapeDtypeStruct))
     places = [index for index, leaf in enumerate(leaves) if isinstance(leaf, jax.ShapeDtypeStruct)]
@@ -647,39 +650,20 @@ def materialized(op: KernelOp, ba: tokamax.BoundArguments, arrays: list | None =
             filled[index] = array
         return jax.tree.unflatten(tree, filled)
 
-    return (op.operands([leaves[index] for index in places], 0) if arrays is None else list(arrays)), fill
+    return op.operands([leaves[index] for index in places], 0), fill
 
 
-def measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None, *,
-             arrays: list | None = None, outputs: Callable[[Hashable, jax.Array], None] | None = None,
-             configs: Collection[Hashable] | None = None,
-             gpu: Callable[[], contextlib.AbstractContextManager] = contextlib.nullcontext,
-             compilers: int | None = None) -> Timings:
+def _measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None) -> Timings:
     """Every config of `ba`'s launch (at its key's shapes), each compiled on a
     thread and timed alone: the device time CUPTI reads for the launch's own
     kernels, each run after `FLUSH_BYTES` are read, so every config starts
     with its operands out of cache. `profiler` is Mosaic GPU's, whose `Cupti`
-    reads the times, or a stand-in with its `Cupti`; `arrays`, a caller's own
-    draw of the launch's operands (`materialized`), else the tuner's; `outputs`,
-    where given, is called with each timed config and its outputs from its
-    first run, which it reads before the next config runs (they are freed
-    after), so a caller checking them compiles nothing more and holds one
-    config's outputs at a time; `configs`, the configs to time where not every
-    one (a sweep's sample of them); `gpu`, held around every device operation
-    of the measurement (its operands' and flush's placement, each config's runs
-    and output reads, CUPTI's detaching read), where processes beside this one
-    time on the same GPU (a sweep's lock: their compiles run beside these runs,
-    never their device work);
-    `compilers`, the threads compiling (every CPU's where unsaid)."""
+    reads the times, or a stand-in with its `Cupti`."""
     if profiler is None:
         from jax.experimental.mosaic.gpu import profiler
 
-    # Every device operation of a measurement runs under `gpu`, host compiles outside it.
-    with gpu():
-        arrays, fill = materialized(op, ba, arrays)
-        # A caller's host arrays are placed once here, never again in each run.
-        arrays = jax.block_until_ready(jax.device_put(arrays))
-        flush = jax.block_until_ready(jnp.zeros(FLUSH_BYTES // 4, jnp.float32))
+    arrays, fill = materialized(op, ba)
+    flush = jnp.zeros(FLUSH_BYTES // 4, jnp.float32)
     evicting = jax.jit(jnp.sum).lower(flush).compile()
 
     def compiled(config):
@@ -699,9 +683,8 @@ def measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None, *,
 
     timings: dict[Hashable, tokamax.BenchmarkData | Exception] = {}
     read = {}
-    with concurrent.futures.ThreadPoolExecutor(compilers or os.cpu_count()) as pool:
-        timed = ba.autotuning_configs if configs is None else configs
-        futures = {config: pool.submit(compiled, config) for config in timed}
+    with concurrent.futures.ThreadPoolExecutor(os.cpu_count()) as pool:
+        futures = {config: pool.submit(compiled, config) for config in ba.autotuning_configs}
     # CUPTI reads every run, the flush's own first, subscribing for each and
     # unsubscribing after. It takes one subscriber, so where a profile capture
     # holds it, from the first run or any later one, the launch keeps its
@@ -709,19 +692,11 @@ def measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None, *,
     cupti = profiler.Cupti(finalize=False)
     flushes: set[str] = set()
     try:
-        with gpu():
-            flushes = {name for name, _ in _kernel_times(cupti, evicting, flush)}
+        flushes = {name for name, _ in _kernel_times(cupti, evicting, flush)}
         for config, future in futures.items():
             try:
                 executable, lowering, compiling = future.result()
-                with gpu():
-                    (_, launched), first = cupti.measure(executable, aggregate=False)(flush, arrays)
-                    runs = [first if isinstance(first, list) else [],
-                            *(_kernel_times(cupti, executable, flush, arrays) for _ in range(REPEATS - 1))]
-                    if outputs is not None:
-                        # Its read to the host is the device's work too.
-                        outputs(config, launched)
-                    del launched
+                runs = [_kernel_times(cupti, executable, flush, arrays) for _ in range(REPEATS)]
             except jax.errors.JaxRuntimeError as error:
                 if not _resource_exhausted(error):
                     raise
@@ -731,17 +706,16 @@ def measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None, *,
     except RuntimeError as error:
         if not _another_subscriber(error):
             raise
-        return Timings(dict.fromkeys(timed, error))
+        return Timings(dict.fromkeys(ba.autotuning_configs, error))
     finally:
-        with gpu():
-            _detach(profiler, evicting, flush)
+        _detach(profiler, evicting, flush)
         # Every config measured before an exit, a failed one's or another subscriber's too, is logged.
         observed(op, ba, {**timings, **_benchmarks(read, flushes)}, get_default_device())
     return Timings({**timings, **_benchmarks(read, flushes)})
 
 
 def _benchmarks(read: Mapping, flushes: set[str]) -> dict[Hashable, tokamax.BenchmarkData]:
-    """The configs `measured` timed, each run's time the sum of its own kernels', the flush's left out."""
+    """The configs `_measured` timed, each run's time the sum of its own kernels', the flush's left out."""
     benchmarks = {}
     for config, (runs, lowering, compiling) in read.items():
         times = tuple(sum(milliseconds for name, milliseconds in run if name not in flushes) for run in runs)
@@ -752,7 +726,7 @@ def _benchmarks(read: Mapping, flushes: set[str]) -> dict[Hashable, tokamax.Benc
 
 def observed(op: KernelOp, ba: tokamax.BoundArguments, measured: Mapping[Hashable, object],
              device) -> None:
-    """Log each config `measured` timed or saw exhaust the device's resources, with the launch's features
+    """Log each config `_measured` timed or saw exhaust the device's resources, with the launch's features
     and estimate where it states them, where `DEW_TIMINGS` asks (`kernels.timings`): after the timing
     loop, on the measuring thread, so logging never runs beside a measurement and changes no pick. A
     failure to log raises, failing the tune: logging was asked for."""
@@ -992,7 +966,7 @@ def _settle(found: list[Launch], *, measure: bool) -> int:
                 decisions.append((ba, fastest))
                 continue
             if measure and cache.measures_picks():
-                timings = measured(op, ba)
+                timings = _measured(op, ba)
                 if timings.prune_errors():
                     timed.append((ba, timings))
                     decisions.append((ba, timings.prune()))

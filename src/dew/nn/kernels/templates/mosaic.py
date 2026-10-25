@@ -56,6 +56,11 @@ def meet(halves) -> None:
         plgpu.barrier_wait(barrier)
 
 
+def meeting(consumers: int):
+    """The barriers two consumer warpgroups `meet` at: two, of `consumers` arrivals each."""
+    return plgpu.Barrier(num_arrivals=consumers, num_barriers=2)
+
+
 def staging(name: str, shaped) -> dict:
     """Each consumer warpgroup's staging buffer for each operand a tile reads (`shaped`: its tile's shape and
     its operand) and a barrier for each, as `{name}_smems` and `{name}_barriers`."""
@@ -64,17 +69,31 @@ def staging(name: str, shaped) -> dict:
             f'{name}_barriers': [plgpu.Barrier(num_barriers=2) for _ in shaped]}
 
 
-STAGED_BYTES = 256
-"""The widest row, in bytes, a consumer stages an output in at a time: a consumer's 256 bf16 columns
-written to shared memory as one 512-byte row conflicted on its banks 195 times as often as in two
-256-byte halves (ncu, Qwen3's down projection forward: 18.3M conflicts against 94K, the kernel 16%
-slower)."""
+STAGED_BYTES = 128
+"""The widest row, in bytes, a consumer stages an output in at a time: a swizzle's row. A consumer's 256
+bf16 columns written to shared memory as one 512-byte row conflicted on its banks 195 times as often as in
+two 256-byte halves (ncu, Qwen3's down projection forward: 18.3M conflicts against 94K, the kernel 16%
+slower); 128-byte chunks, two of them buffered (`output_staging`), stage a 256-column bf16 tile in half its
+width, which leaves the ring a stage more (unmeasured for conflicts at 128 bytes)."""
+
+OUTPUT_BUFFERS = 2
+"""The chunk buffers a consumer stages an output tile through: one written while the last one's store
+reads it."""
 
 
 def staged_columns(columns: int, dtypes) -> int:
     """The columns of each chunk a consumer stages a `columns`-wide output tile in: the most that divide the
     tile within `STAGED_BYTES` of the widest output (a 192-column tile's bf16 output in chunks of 64)."""
     return math.gcd(columns, STAGED_BYTES // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
+
+
+def output_staging(columns: int, dtypes) -> tuple[int, int]:
+    """The columns of each chunk a consumer stages a `columns`-wide output tile in (`staged_columns`) and
+    the chunk buffers it holds (`OUTPUT_BUFFERS`, at most its chunks): the tile's output staged in two
+    chunks' shared memory rather than its whole width, CUTLASS's sub-tiled epilogue, which leaves the
+    mainloop's ring the rest of the block (its StageCountAutoCarveout)."""
+    chunk = staged_columns(columns, dtypes)
+    return chunk, min(columns // chunk, OUTPUT_BUFFERS)
 
 
 def interpreted(interpret) -> plgpu.InterpretGPUParams | None:
@@ -267,8 +286,8 @@ def live_registers(family: "Family", carried, *phases) -> int:
     walk (`carried`, each `(rows, columns, dtype)`: its accumulators, a running statistic) and the largest
     of its `phases`' tiles held at once (a step's operand fragments, a rewrite's operands), each tile's
     32-bit words spread over a role's threads, and what it holds beside them (`Family.held_registers`).
-    The one register estimate every Mosaic template's launches state (`base.Template.registers`), its
-    excess over a thread's budget priced as spills (`base.Template.spilled`)."""
+    The one register estimate every Mosaic template's launches state (`base.Template.registers`), which
+    a legal config holds within a thread's budget (`base.Template.legal`)."""
     def words(tiles) -> float:
         return sum(rows * columns * jnp.dtype(dtype).itemsize / 4 for rows, columns, dtype in tiles)
 
@@ -286,6 +305,38 @@ def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int]
     fragments = ([(share, depth, dtype), (depth, columns * family.rhs_copies, dtype)]
                  if family.operands_in_registers else [])
     return live_registers(family, [(share, columns, jnp.float32)], fragments)
+
+
+def held_rows(family: "Family", consumers: int, columns: int) -> int:
+    """The most rows, in whole roles of `consumers` consumers of `family` (`Family.role_rows` each), whose
+    fp32 accumulator of `columns` columns their threads hold beside what they hold besides
+    (`Family.held_registers`): the rows a derived tile's registers bound (docs/design/kernel-templates.md
+    §7). A family whose products read registers holds a step's fragments too (`tile_registers`), which
+    its derivation checks at each step."""
+    share = (family.registers(consumers) - family.held_registers) * THREADS // columns
+    return share // family.role_rows * family.role_rows * consumers
+
+
+def deepest[C](make: Callable[[int], C], holds: Callable[[C], bool], most: int) -> C | None:
+    """`make(stages)` at the most stages, from `most` down to two (one loading beside one consumed), that
+    `holds` (a launch's legality: its ring within a block's shared memory); None where none does. A
+    derived ring is the deepest a block holds (CUTLASS's StageCountAutoCarveout's rule: the block's shared
+    memory less what else it stages, over a stage's bytes)."""
+    return next((made for made in map(make, range(most, 1, -1)) if holds(made)), None)
+
+
+def band(multiprocessors: int, block_m: int, block_n: int, column_tiles: int,
+         group_row_tiles: int | None = None) -> int:
+    """The planar snake's column tiles a band for a wave of one program a multiprocessor sharing its
+    blocks in the L2 (`grid_block_n`): the power of two, at most `column_tiles`, nearest below the band
+    that reads each operand fewest times from the device. The rows' and the columns' blocks balanced
+    (a wave as near a square of output tiles as their sides allow: √(programs · rows / columns)) or,
+    where the rows split into groups of `group_row_tiles` row tiles each, wider while a wave still spans
+    each group's row tiles whole (programs over a group's row tiles), whose columns' blocks it then
+    reads once a group."""
+    balanced = math.sqrt(multiprocessors * block_m / block_n)
+    spanning = multiprocessors / group_row_tiles if group_row_tiles else 0.0
+    return 1 << (max(1, min(int(max(balanced, spanning)), column_tiles)).bit_length() - 1)
 
 
 def consumer_registers(consumers: int) -> int:
@@ -498,6 +549,18 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     def loaded(self, copies) -> None:
         """Each `(view, ref, barrier)` copied whole into its shared-memory `ref`."""
 
+    def output_columns(self, columns: int, dtypes) -> int:
+        """The columns of a `columns`-wide output tile a consumer stages in shared memory at once
+        (`persist`'s stores): the whole tile's, where a family stages it whole."""
+        del dtypes
+        return columns
+
+    def published(self) -> None:
+        """A consumer's writes to shared memory made visible to the readers that read it asynchronously
+        (warpgroup MMA, TMA), before any of them reads it: a family whose products read shared memory
+        from its consumers' own loads (mma.sync's) overrides it."""
+        plgpu.commit_smem()
+
     @abc.abstractmethod
     def stored(self, parts, views, *, smem) -> None:
         """Each of `parts` written whole to its view of `views`, through `smem` where the family stores so."""
@@ -651,15 +714,19 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
         streamed(rings, tiles, lo, hi)
 
+    def output_columns(self, columns: int, dtypes) -> int:
+        # Two chunk buffers, not the whole tile (`output_staging`).
+        return math.prod(output_staging(columns, dtypes))
+
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, consumer: Callable, *,
                 consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0) -> None:
         # The producer loads every tile's steps into the rings at a counter running across the tiles, so
         # a tile's first loads go out while the consumers store the last one; each consumer stages its
-        # share of each output (`staged_columns` wide chunks) and stores it by TMA, waiting only for the
-        # last store's reads of the staging before it writes the next.
+        # share of each output in chunks (`output_staging`: two buffers of `staged_columns`) and stores each
+        # by TMA, waiting only for a buffer's last store to read it before it writes it again.
         rings = self.opened(streams)
-        staging = [plgpu.SMEM((consumers, shape[1] // staged_columns(shape[1], (dtype,)), shape[0],
-                               staged_columns(shape[1], (dtype,))), dtype)
+        staging = [plgpu.SMEM((consumers, output_staging(shape[1], (dtype,))[1], shape[0],
+                               output_staging(shape[1], (dtype,))[0]), dtype)
                    for shape, dtype in outputs]
 
         def producer():
@@ -683,15 +750,16 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             def run(index):
                 def store(output, value, ref, place):
                     smem = smems[output].at[index]
-                    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-                    chunks, width = smem.shape[0], smem.shape[-1]
-                    for chunk in range(chunks):
-                        smem[chunk] = value[:, chunk * width:(chunk + 1) * width].astype(smem.dtype)
-                    plgpu.commit_smem()
+                    buffers, width = smem.shape[0], smem.shape[-1]
                     row_start, first, stored, column, most = place
-                    for chunk in range(chunks):
-                        store_rows(smem.at[chunk], ref, row_start, first, stored, column + chunk * width,
-                                   most)
+                    for chunk in range(value.shape[1] // width):
+                        if chunk == 0 or chunk >= buffers:
+                            # The buffer's last store (the last tile's, at its first chunk) has read it.
+                            plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+                        buffer = smem.at[chunk % buffers]
+                        buffer[...] = value[:, chunk * width:(chunk + 1) * width].astype(smem.dtype)
+                        plgpu.commit_smem()
+                        store_rows(buffer, ref, row_start, first, stored, column + chunk * width, most)
 
                 @plgpu.nd_loop(tiles, collective_axes=axis, init_carry=jnp.int32(0))
                 def _(loop: plgpu.NDLoopInfo, carry):

@@ -17,7 +17,7 @@ program's share of the bandwidth) are serial with its work. Per multiprocessor,
 
     program  = max(program_flops / tensor rate, program_staged / shared-memory rate,
                    program_exponentials / special-function rate)
-             + (serial_staged + steps · spilled_bytes) / shared-memory rate
+             + serial_staged / shared-memory rate
              + serial_exponentials / special-function rate
     waiting  = steps · load latency / min(stages - 1 - in_flight, steps)
     tile     = program + serial_stored / (memory bandwidth / multiprocessors)
@@ -81,9 +81,7 @@ class Cost:
     `program_flops` is nonzero. `single_warp`: each scheduler issues one warp's products in order with the
     fragment loads feeding them, which reach the family's `GpuTarget.single_warp_issue` of its rate.
     `in_flight`: the steps whose products a program keeps running past their step (a mainloop's MMAs in
-    flight), each holding its stage, so `stages - 1 - in_flight` steps load ahead. `spilled_bytes`: the
-    local-memory bytes a program's spilled registers move a step (`base.Template.spilled`), serial with
-    its work through the L1, which serves them at shared memory's rate."""
+    flight), each holding its stage, so `stages - 1 - in_flight` steps load ahead."""
     programs: float
     device_bytes: float
     program_flops: float = 0.0
@@ -99,7 +97,6 @@ class Cost:
     serial_stored: float = 0.0
     single_warp: bool = False
     in_flight: int = 0
-    spilled_bytes: float = 0.0
 
 
 def seconds(cost: Cost, target: generation.GpuTarget) -> float:
@@ -140,7 +137,7 @@ def program_seconds(cost: Cost, rate: float, clock: float) -> float:
     return (max(cost.program_flops / (rate * clock),
                 cost.program_staged / (SHARED_BYTES_PER_CLOCK * clock),
                 cost.program_exponentials / (EXPONENTIALS_PER_CLOCK * clock))
-            + (cost.serial_staged + cost.steps * cost.spilled_bytes) / (SHARED_BYTES_PER_CLOCK * clock)
+            + cost.serial_staged / (SHARED_BYTES_PER_CLOCK * clock)
             + cost.serial_exponentials / (EXPONENTIALS_PER_CLOCK * clock))
 
 

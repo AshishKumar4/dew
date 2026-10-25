@@ -100,66 +100,67 @@ class Tiles:
             raise ValueError(f"{self}: two warpgroups stream at least two stages")
 
 
-CALIBRATED_EXTENT = 256
-"""The longest tile axis the sweeps measured (GMMCOOP-h100, AMPERE3): provenance a pick's record carries
-(`grouped_matmul._Mosaic.calibrated`), never a bound."""
+def derived(family, *, rows: int, depth: int | None, width: int, dtype, multiprocessors: int, holds,
+            grouped: bool) -> Tiles | None:
+    """The one tile a GEMM mainloop runs on `family` for a call whose output has `rows` rows (a group's,
+    on average, where `grouped`: a product's rows split among its groups) and `width` columns and whose
+    steps run over `depth` (None: a group's rows, padded to whole steps), from the family's facts, the
+    call's extents and the device's multiprocessors alone (no table, no ranking;
+    docs/design/kernel-templates.md §7). `holds(tile)` is the launch's legality on the device (its
+    staged bytes within a block, its registers within a consumer's: `Template.legal`).
 
-CALIBRATED_STAGES = 6
-"""The deepest pipeline the sweeps measured (provenance, as `CALIBRATED_EXTENT`)."""
+    - Columns: the widest the family's one product spans (`Family.widest_product`) that divides the
+      call's width in its column unit, which reads its rows' slice fewest times a FLOP (each instruction
+      reads the columns' block whole) and writes its output in the longest runs.
+    - Consumers: as many roles as the family has (`Family.consumers`), a warpgroup each, or one where
+      rows a tile must divide (not grouped) take no whole role for each, or where no tile of them holds.
+    - Rows: the most, in whole roles of its consumers, its consumers' registers hold
+      (`mosaic.held_rows`, `mosaic.tile_registers`), and no more than the call's rows rounded up to a
+      role's or, where grouped, half a group's in whole roles, at least one role (each group takes a
+      partial tile more, so at half its rows that tile adds at most a third of its work).
+    - Step: the family's widest depth dividing the call's (`Family.depths`) at those rows, a shallower
+      one before fewer rows (a family whose products read registers holds a step's fragments).
+    - Stages: the deepest a block holds (`holds`, `mosaic.deepest`), at least those the walk keeps busy
+      (one loading ahead beside the one consumed and, on a family that keeps its products in flight,
+      the one in flight: `_IN_FLIGHT`); a tile that cannot stage that deep gives way to the next
+      narrower or shorter one.
+    - Band: the planar snake's column tiles a band (`mosaic.band`), the rows' and the columns' blocks
+      balanced over a wave or, grouped, wider while a wave spans each group's row tiles whole.
 
-CALIBRATED_BAND = 8
-"""The widest band of the planar snake the sweeps measured (`Tiles.grid_block_n`; provenance, as
-`CALIBRATED_EXTENT`)."""
+    None where no tile holds."""
+    unit = family.column_unit(dtype)
+    widest = min(width, family.widest_product or width)
+    columns = [block_n for block_n in range(widest - widest % unit, 0, -unit) if width % block_n == 0]
+    steps = [step for step in family.depths(dtype) if depth is None or depth % step == 0]
+    busy = 2 + (0 if family.operands_in_registers else _IN_FLIGHT)
 
+    def tiled(consumers: int) -> Tiles | None:
+        role = family.role_rows * consumers
+        most_rows = max(role, rows // 2 // role * role if grouped else -(-rows // role) * role)
+        fallback = None
+        for block_n in columns:
+            for block_m in range(min(most_rows, mosaic.held_rows(family, consumers, block_n)), 0, -role):
+                band = mosaic.band(multiprocessors, block_m, block_n, width // block_n,
+                                   -(-rows // block_m) if grouped else None)
+                # More rows before a deeper step: each reads the columns' block fewer times a FLOP, where
+                # a step's depth only sets how many steps a tile takes (and, in registers, its fragments').
+                for step in steps:
+                    tile = mosaic.deepest(
+                        lambda stages, block_m=block_m, block_n=block_n, step=step, band=band: Tiles(
+                            block_m, block_n, step, stages, band, warpgroups=consumers, family=family.name),
+                        holds, family.most_shared // ((block_m + block_n) * step))
+                    if tile is None:
+                        continue
+                    if tile.stages >= busy:
+                        return tile
+                    fallback = fallback or tile
+        return fallback
 
-def _holding(least: int, holds) -> list[int]:
-    """The multiples of `least` that `holds` (true of the smaller where of the larger), largest first."""
-    held = []
-    while holds(least * (len(held) + 1)):
-        held.append(least * (len(held) + 1))
-    return held[::-1]
-
-
-def generated(families, *, depth: int | None, width: int, dtype) -> tuple[Tiles, ...]:
-    """Every tile a GEMM mainloop may take on each of `families`, from the family's facts and the call's
-    extents alone (no table of tiles): each count of consumer roles it has; columns in multiples of its
-    column unit dividing the call's `width`, at most its widest product (`Family.widest_product`); a step
-    of each of its depths dividing `depth` (any, where None: steps over rows padded to whole steps); rows
-    in multiples of its roles' (`Family.role_rows`) while its consumer threads hold the tile in their
-    registers (`mosaic.tile_registers`, `Family.registers`); each count of stages from two (a step loading
-    while one computes) to as many as a block of the family holds (`Family.most_shared`), deeper first;
-    and each band of column tiles (`Tiles.grid_block_n`) doubling from one to the call's column tiles,
-    wider first, which share a row block's loads across more column tiles in the L2 while a band is in
-    flight. Larger tiles first, which read each operand fewest times, and the deeper pipeline (more of a
-    load's latency hidden than the model's mean charges), so the cost model's ties go to them. A target's
-    launch ranks those that fit it (`base.Template.fitting`)."""
-    size = jnp.dtype(dtype).itemsize
-    tiles = []
-    for family in families:
-        unit, widest = family.column_unit(dtype), min(width, family.widest_product or width)
-        steps = [step for step in family.depths(dtype) if depth is None or depth % step == 0]
-        for consumers in range(1, family.consumers + 1):
-            def holds(block, consumers=consumers, family=family):
-                return mosaic.tile_registers(family, consumers, block, dtype) <= family.registers(consumers)
-
-            shapes = {(block_m, block_n, block_k)
-                      for block_n in range(unit, widest + 1, unit) if width % block_n == 0
-                      for block_k in steps
-                      for block_m in _holding(family.role_rows * consumers,
-                                              lambda rows, n=block_n, k=block_k: holds((rows, n, k)))}
-            for block_m, block_n, block_k in sorted(shapes, key=lambda shape: (-shape[0], -shape[1],
-                                                                               steps.index(shape[2]))):
-                deepest = family.most_shared // ((block_m + block_n) * block_k * size)
-                bands = 1 << (-(-width // block_n) - 1).bit_length()
-                tiles += [Tiles(block_m, block_n, block_k, stages, band, warpgroups=consumers,
-                                family=family.name)
-                          for stages in range(deepest, 1, -1) for band in _halvings(bands)]
-    return tuple(tiles)
-
-
-def _halvings(most: int) -> tuple[int, ...]:
-    """`most`, a power of two, and its halvings down to one."""
-    return tuple(most >> power for power in range(most.bit_length()))
+    # Rows a tile divides (a kernel gradient's) that take no whole role for each consumer take one, as
+    # does a call no cooperative tile holds (a wide epilogue's outputs past a block).
+    whole = grouped or rows % (family.role_rows * family.consumers) == 0
+    return next((tile for consumers in dict.fromkeys((family.consumers if whole else 1, 1))
+                 if (tile := tiled(consumers)) is not None), None)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -373,6 +374,7 @@ def _gmm_step(_, slots, nothing, accumulators, *, family: mosaic.Family, prologu
         tiles_of = {i: fixed_tiles[i] if i in fixed_tiles else slots[f'side_{i}']
                     for i in range(len(prologue_axes))}
         _rewritten(prologue, prologue_axes, stage.at[mine_rows], tiles_of, 'rows', mine_rows)
+        family.published()
     matrix = slots['matrix'].transpose((1, 0)) if transpose_rhs else slots['matrix']
     (acc,) = accumulators
     return nothing, (family.products(acc, stage.at[mine_rows], matrix, interpret),)
@@ -380,11 +382,11 @@ def _gmm_step(_, slots, nothing, accumulators, *, family: mosaic.Family, prologu
 
 def _rewritten(prologue, axes_of: tuple, mine, tiles_of: dict, halved: str, half) -> None:
     """Dew: `mine`, this warpgroup's half of a stage, rewritten by the prologue on its side tiles
-    (`tiles_of`, by operand) cut to the same half along the `halved` launch axis."""
+    (`tiles_of`, by operand) cut to the same half along the `halved` launch axis; its reader publishes
+    the writes (`mosaic.Family.published`)."""
     cut = [tiles_of[i].at[tuple(half if axis == halved else slice(None) for axis in axes)][...]
            for i, axes in enumerate(axes_of)]
     mine[...] = prologue(mine[...], *cut).astype(mine.dtype)
-    plgpu.commit_smem()
 
 
 _IN_FLIGHT = 1
@@ -406,26 +408,6 @@ def _matrix_columns(gmem, column_tile, *, block_n: int, transpose_rhs: bool):
 def _rhs_index(transpose_rhs: bool):
     """A pipeline step's block of the matrix's column tile: its depth block `step`."""
     return (lambda step: (0, step)) if transpose_rhs else (lambda step: (step, 0))
-
-
-def _epilogue(epilogue, acc, gmems, axes_of, row_start, column_start, block_m: int, block_n: int):
-    """Dew: `epilogue(acc, *side_tiles)` as a tuple of outputs, each side operand's tile brought to shared
-    memory by TMA at the output tile's rows and columns first."""
-    origins = {'rows': (row_start, block_m), 'columns': (column_start, block_n)}
-    shapes = [tuple(origins[axis][1] for axis in axes) for axes in axes_of]
-
-    smems = [plgpu.SMEM(shape, gmem.dtype) for shape, gmem in zip(shapes, gmems, strict=True)]
-
-    @functools.partial(pl.run_scoped, smems=smems, barriers=[plgpu.Barrier() for _ in gmems])
-    def scope(smems, barriers):
-        for gmem, smem, barrier, axes in zip(gmems, smems, barriers, axes_of, strict=True):
-            plgpu.copy_gmem_to_smem(gmem.at[tuple(pl.ds(*origins[axis]) for axis in axes)], smem, barrier)
-        for barrier in barriers:
-            plgpu.barrier_wait(barrier)
-        outs = epilogue(acc, *(smem[...] for smem in smems))
-        return outs if isinstance(outs, tuple) else (outs,)
-
-    return scope
 
 
 def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles, out_dtype,
@@ -553,7 +535,7 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                            in_flight=_IN_FLIGHT)
 
         family.scoped(scope, fixed_staging['fixed_smems'], fixed_staging['fixed_barriers'],
-                      plgpu.Barrier(num_arrivals=consumers, num_barriers=2),
+                      mosaic.meeting(consumers),
                       streams=family.streams({f'ring_{i}': (block, gmem.dtype)
                                               for i, (block, gmem) in enumerate(blocks)}, tiles.stages,
                                              consumers))
@@ -589,7 +571,7 @@ def _staged_halves(family: mosaic.Family, stages: list, group: tuple, mine: tupl
     shares += [(cotangent_stage.at[:, pl.ds((first_atom + j) * atom, atom)],
                 first_atom + j < atoms if short else None) for j in range(atoms_each)]
     boundary = _zero_neighbours_of(family, shares, *group)
-    plgpu.commit_smem()
+    family.published()
     if halves is not None:
         pl.when(boundary)(lambda: mosaic.meet(halves))
     return rows_stage.at[:, mine_depth].transpose((1, 0)), cotangent_stage
