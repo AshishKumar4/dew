@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import numpy as np
 import torch
-from diffusers_wan_reference import float64
+from torch_precision import float64
 from mimo_reference import FIXTURES, packed_rows, padded, scatter, write
 from transformers.models.muse_glimmer.configuration_muse_glimmer import MuseGlimmerVisionConfig
 from transformers.models.muse_glimmer.image_processing_muse_glimmer import MuseGlimmerImageProcessor

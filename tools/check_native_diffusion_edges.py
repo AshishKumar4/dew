@@ -108,7 +108,7 @@ def check_schedule(ref, case):
 def check_unet(directory, case):
     import torch
     from diffusers import UNet2DConditionModel
-    from diffusers_wan_reference import float64
+    from torch_precision import float64
 
     model = UNet2DCondition(**unet_fields(json.loads((directory / "unet/config.json").read_text()),
                                           attention_impl="xla"))

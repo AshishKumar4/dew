@@ -75,7 +75,7 @@ def test_phi3_mixed_tables_match_each_rows_batch_one_reference_under_the_float64
     import torch
     from transformers import AutoModelForCausalLM
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference', max_seq_len=64)
     ids = np.load(DIRECTORY / 'input_ids.npy')[:, :4]
