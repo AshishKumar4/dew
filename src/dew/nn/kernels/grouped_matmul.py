@@ -862,6 +862,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             serial_exponentials=prologue_exponentials,
             # One warpgroup a program and one program a multiprocessor: one warp a scheduler.
             single_warp=family.operands_in_registers,
+            # Warpgroup MMA's walk keeps a step's products running past it (`mosaic_gpu._IN_FLIGHT`);
+            # mma.sync's products are synchronous (`mosaic_sm80.Mma.walk`).
+            in_flight=0 if family.operands_in_registers else mosaic_gpu._IN_FLIGHT,
             serial_stored=(config.block_m * config.block_n * out
                            if self.STORES_SERIALLY and config.warpgroups == 1 else 0))
 
