@@ -137,13 +137,6 @@ class MaskedDiffusionObjective(Objective[Ratio]):
                               tokenizer=recorded_tokenizer(self.processor),
                               processor=recorded_processor(self.processor))
 
-    def build_task(self, variables: Variables, *,
-                   processor: Processor | None | Omitted = OMITTED) -> MaskedGeneration:
-        """Return the model over `variables` as a full-response MDLM task, with this
-        objective's solver, steps and row length as its budget, as `task_settings` saves them."""
-        return MaskedGeneration.from_settings(self.model, variables, self.task_settings(),
-                                              self.processor if processor is OMITTED else processor)
-
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
 
