@@ -57,29 +57,30 @@ def threshold(runs: int) -> float:
     return float(stats.t.isf(LEVEL, runs - 1))
 
 
-def assert_learns(contrasts_of, label: str, *, runs: int) -> None:
-    """`contrasts_of(run)`, one independent run's contrasts by claim (a mapping of each claim's name to
-    its old margin less the run's miss, positive where the run meets it), over `runs` runs: each claim's
-    t (`t_statistics`) at least `threshold(runs)`.
+def assert_learns(contrasts_of, label: str, *, units: int) -> None:
+    """`contrasts_of(numbers)`, the contrasts of the independent units numbered `numbers` (an integer
+    array; a unit is a training run, its own initialization, data and noise, or a trained model's
+    independent draw) by claim: a mapping of each claim's name to its contrasts, one a unit, each the
+    old margin less the unit's miss, positive where the unit meets it. Over `units` units numbered
+    from zero, each claim's t (`t_statistics`) at least `threshold(units)`. A site whose units are
+    training runs trains them together, one program for all of them.
 
-    Raises LearningFailure naming each claim that falls short, with its mean contrast, its runs' spread
-    and its t; refuses a site of fewer than FEWEST_RUNS runs, runs that name other claims, and a contrast
-    that is not finite."""
-    if runs < FEWEST_RUNS:
-        raise ValueError(f"{label}: {runs} runs, fewer than {FEWEST_RUNS}; declare more")
-    first = dict(contrasts_of(0))
-    claims = sorted(first)
-    measured = [first] + [dict(contrasts_of(run)) for run in range(1, runs)]
-    for run, contrasts in enumerate(measured):
-        if sorted(contrasts) != claims:
-            raise ValueError(f"{label}: run {run} states claims {sorted(contrasts)}, not {claims}")
-    table = np.asarray([[float(contrasts[claim]) for claim in claims] for contrasts in measured])
+    Raises LearningFailure naming each claim that falls short, with its mean contrast, its units'
+    spread and its t; refuses a site of fewer than FEWEST_UNITS units, contrasts of another count, and a
+    contrast that is not finite."""
+    if units < FEWEST_UNITS:
+        raise ValueError(f"{label}: {units} units, fewer than {FEWEST_UNITS}; declare more")
+    contrasts = contrasts_of(np.arange(units))
+    claims = sorted(contrasts)
+    table = np.stack([np.asarray(contrasts[claim], np.float64) for claim in claims], axis=-1)
+    if table.shape != (units, len(claims)):
+        raise ValueError(f"{label}: contrasts must be {units} a claim, not shaped {table.shape}")
     if not np.all(np.isfinite(table)):
         raise ValueError(f"{label}: contrasts must be finite, not {table.tolist()}")
-    t, needed = t_statistics(table), threshold(runs)
+    t, needed = t_statistics(table), threshold(units)
     short = [index for index, value in enumerate(t) if not value >= needed]
     if short:
         missed = "; ".join(f"{claims[index]}: mean contrast {table[:, index].mean():.4g}, spread "
                            f"{table[:, index].std(ddof=1):.3g}, t {t[index]:.3g}" for index in short)
-        raise LearningFailure(f"{label}: over {runs} runs, {missed}; the gate needs t at least {needed:.3g}, "
+        raise LearningFailure(f"{label}: over {units} units, {missed}; the gate needs t at least {needed:.3g}, "
                               f"which a trainer at the claim's margin reaches with chance {LEVEL}")
