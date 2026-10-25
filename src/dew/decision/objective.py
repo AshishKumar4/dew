@@ -514,45 +514,30 @@ def consistency_divergence(logits: jax.Array, options: jax.Array, groups: jax.Ar
     # A question of no mapped slot (in no group, or padding) normalizes over nothing: it reads zeros
     # instead, which its answer then takes no part of, so neither its value nor its gradient is NaN.
     any_mapped = jnp.any(mapped, axis=-1, keepdims=True)
-    safe, held_slots = jnp.where(any_mapped, logits, 0.0), mapped | ~any_mapped
-    log_p = categorical.log_probs(safe, held_slots)
+    softmax = categorical.probabilities(jnp.where(any_mapped, logits, 0.0), mapped | ~any_mapped)
     slots = jnp.where(mapped, canonical, width)
-
-    def answer(row_logits, row_slots):
-        return categorical.segment_log_partition(row_logits, row_slots, width)
 
     def summed(row_probabilities, row_slots):
         return jax.ops.segment_sum(row_probabilities, row_slots, num_segments=width + 1)[:width]
 
-    log_answer, present = jax.vmap(jax.vmap(answer))(log_p, slots)
-    # The answer's probabilities from the softmax itself, not the exponent of its logarithm, whose
-    # rounding grows with the logarithm's size and would set each term's weight less exactly.
-    probability = jax.vmap(jax.vmap(summed))(categorical.probabilities(safe, held_slots), slots)
+    answer = jax.vmap(jax.vmap(summed))(jnp.where(mapped, softmax, 0.0), slots)
     member = groups >= 0
     count = groups.shape[-1]
     ids = jnp.where(member, groups, count)
 
-    def window(log_answer, probability, present, ids, member):
-        sizes = jax.ops.segment_sum(member.astype(log_answer.dtype), ids, num_segments=count + 1)[:count]
-        held = jnp.where(present & member[:, None], ids[:, None], count)
-
-        def mean_of(column, owners):
-            return categorical.segment_log_partition(column, owners, count)[0]
-
-        given = jnp.where(present, log_answer, -jnp.inf)
-        log_mean = jax.vmap(mean_of, in_axes=(1, 1), out_axes=1)(given, held)
-        log_mean = log_mean - jnp.log(jnp.maximum(sizes, 1.0))[:, None]
-        theirs = log_mean[jnp.minimum(ids, count - 1)]
-        # The divergence's gradient is sum_c dP_c (log P_c - log M_c): its terms through the logarithms,
-        # sum_c P_c dlog P_c and the mean's sum_c dM_c, are each zero, as P and M are distributions,
-        # and differentiating them adds only their rounding. So the ratio carries no gradient.
-        ratio = jax.lax.stop_gradient(jnp.where(present, log_answer - theirs, 0.0))
-        each = jnp.sum(jnp.where(present, probability * ratio, 0.0), axis=-1)
+    def window(answer, ids, member):
+        sizes = jax.ops.segment_sum(member.astype(answer.dtype), ids, num_segments=count + 1)[:count]
+        total = jax.ops.segment_sum(jnp.where(member[:, None], answer, 0.0), ids, num_segments=count + 1)
         size = sizes[jnp.minimum(ids, count - 1)]
+        mean = total[jnp.minimum(ids, count - 1)] / jnp.maximum(size, 1.0)[:, None]
+        # A canonical option of no probability adds no term: its logarithms read one, not zero.
+        held = answer > 0
+        ratio = jnp.log(jnp.where(held, answer, 1.0)) - jnp.log(jnp.where(held, mean, 1.0))
+        each = jnp.sum(jnp.where(held, answer * ratio, 0.0), axis=-1)
         return (jnp.where(member, each / jnp.maximum(size, 1.0), 0.0),
                 jnp.where(member, 1.0 / jnp.maximum(size, 1.0), 0.0))
 
-    return jax.vmap(window)(log_answer, probability, present, ids, member)
+    return jax.vmap(window)(answer, ids, member)
 
 
 @struct.dataclass
