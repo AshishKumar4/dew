@@ -80,7 +80,7 @@ class Head(nn.Module):
             raise ValueError("this head reads one question a row; lay the rows out with a "
                              "QuestionLayout or use a joint head")
 
-    def record(self) -> JSON:
+    def record(self) -> dict[str, object]:
         """Return the head as a run records it: its class by import path (`dew.registry`) and its
         fields but the width, which the backbone it reads gives, so any head reloads, one of a
         package the run trusts too."""
