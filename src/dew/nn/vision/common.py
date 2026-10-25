@@ -112,6 +112,9 @@ class TowerGeometry:
     block_size: int | None = None
     channels: int | None = None
     mel_features: int | None = None
+    frames_per_token: int | None = None
+    """How many input frames an audio tower encodes into one token: its convolutions' time strides
+    times any frame reduction after them."""
 
 
 class TowerBase:
