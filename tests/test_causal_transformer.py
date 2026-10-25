@@ -192,6 +192,7 @@ def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
         with jax.default_device(cpu), jax.default_matmul_precision(FP32_SUMS):
             return jax.device_get(current(params, ids))
 
+    @as_given
     def theirs(ids):
         with jax.default_device(cpu):
             return jax.device_get(exported(params, ids))

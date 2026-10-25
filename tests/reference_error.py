@@ -226,9 +226,10 @@ def _given(fn) -> bool:
 
 
 def _compiled(fn, compile):
-    """`fn` as the gate runs it: as given (`_given`), or compiled by `compile`, a window loop's arm
-    within it (`over_windows`)."""
-    if _given(fn):
+    """`fn` as the gate runs it: as given (`_given`), as it is where it is a `without_ynn` program
+    already (another jit around it would nest its compiler options), or compiled by `compile`, a
+    window loop's arm within it (`over_windows`)."""
+    if _given(fn) or getattr(fn, "without_ynn", False):
         return fn
     if isinstance(fn, _Windowed):
         return _Windowed(_compiled(fn.fn, compile))
