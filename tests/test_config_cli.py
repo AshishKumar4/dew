@@ -231,11 +231,11 @@ def test_a_jepa_run_trains_its_lora_factors_and_ramps_their_momentum_over_its_up
     import jax
     import numpy as np
 
+    from dew.batch import FROZEN
     from dew.config import ObjectiveConfig, TrainerConfig
-    from dew.registry import ModelConfig
     from dew.data import TFDS, Loading, presets
     from dew.lora import LoRA
-    from dew.batch import FROZEN
+    from dew.registry import ModelConfig
 
     images = TFDS("dew_images", path=str(REPO_ROOT / "tests" / "fixtures" / "tfds" / "dew_images" / "1.0.0"),
                   split="all")
