@@ -16,6 +16,10 @@ from dew.objectives.base import token_log_probs
 
 MASKED_SEEDS = 8
 """Check 1's declared seeds for a masked row against the row of its held classes alone."""
+COLLAPSE_SEEDS = {20: 8, 40: 8, 80: 8}
+"""Check 1's declared seeds for a confident label's derivative at each margin, sized by `seeds_for`."""
+CANCELLATION_SEEDS = 256
+"""Check 1's declared seeds for the divergence's derivative near its reference, sized by `seeds_for`."""
 
 
 def logits(dtype, shape=(3, 7), seed=0):
@@ -123,3 +127,102 @@ def test_a_ragged_rows_segments_each_normalize_as_the_segment_alone():
     log_z, present = categorical.segment_log_partition(logits(jnp.float32, (7,)), segments, 4)
     np.testing.assert_array_equal(present, [True, False, True, False])
     np.testing.assert_array_equal(np.asarray(log_z)[[1, 3]], 0)
+
+
+def log_softmax(rows: np.ndarray) -> np.ndarray:
+    """NumPy's log softmax over the last axis, in the rows' own dtype."""
+    peak = rows.max(axis=-1, keepdims=True)
+    return rows - peak - np.log(np.exp(rows - peak).sum(axis=-1, keepdims=True))
+
+
+def confident(margin: float, seed: int) -> tuple[np.ndarray]:
+    """Three rows of seven float32 logits whose label, class 0, leads the other classes' log partition
+    by `margin` (arXiv:2610.31642, eq. 2)."""
+    others = np.random.default_rng(seed).standard_normal((3, 6))
+    peak = others.max(axis=-1, keepdims=True)
+    lead = margin + peak + np.log(np.exp(others - peak).sum(axis=-1, keepdims=True))
+    return (np.concatenate([lead, others], axis=-1).astype(np.float32),)
+
+
+def label_derivative(rows: np.ndarray) -> np.ndarray:
+    """The label loss's derivative by arXiv:2610.31642's eq. 7 in NumPy, in the rows' own dtype, the
+    label class 0: each other class's `exp(z_j - z_t - softplus(-m))`, the label minus their sum."""
+    rest = rows[:, 1:] - rows[:, :1]
+    peak = rest.max(axis=-1, keepdims=True)
+    margin = -(peak + np.log(np.exp(rest - peak).sum(axis=-1, keepdims=True)))
+    others = np.exp(rest - np.logaddexp(0, -margin))
+    return np.concatenate([-others.sum(axis=-1, keepdims=True), others], axis=-1)
+
+
+@pytest.mark.parametrize("margin", sorted(COLLAPSE_SEEDS))
+def test_a_confident_labels_derivative_survives_and_sums_to_zero(margin):
+    """Past the margin where the label's `p - 1` rounds to 0 in float32 (arXiv:2610.31642, eq. 4), the
+    label loss's derivative, and a one-hot target's, is on par with the paper's eq. 7 from float64
+    (check 1), every row of it summing to zero as float64's does, the label's own entry below zero; the
+    loss is Optax's."""
+    labels = jnp.zeros(3, jnp.int32)
+    losses = {"label": lambda rows: categorical.cross_entropy(rows, labels),
+              "one-hot target": lambda rows: categorical.soft_cross_entropy(rows, jax.nn.one_hot(labels, 7))}
+    (rows,) = confident(margin, 0)
+    for name, loss in losses.items():
+        gradient = jax.jit(jax.grad(lambda rows, loss=loss: loss(rows).sum()))
+        assert_as_exact(gradient, label_derivative, lambda seed: confident(margin, seed),
+                        f"{name} at margin {margin}", seeds=COLLAPSE_SEEDS[margin])
+        assert np.all(np.asarray(gradient(rows))[:, 0] < 0)
+    np.testing.assert_array_equal(categorical.cross_entropy(rows, labels),
+                                  optax.softmax_cross_entropy_with_integer_labels(jnp.asarray(rows), labels))
+
+
+def near_reference(seed: int) -> tuple[np.ndarray, np.ndarray]:
+    """A row of float32 logits a thousandth of a unit from its reference row's, and the reference."""
+    rng = np.random.default_rng(seed)
+    reference = rng.standard_normal((3, 7)) * 4
+    return ((reference + 1e-3 * rng.standard_normal((3, 7))).astype(np.float32),
+            reference.astype(np.float32))
+
+
+def divergence_derivative(logits: np.ndarray, reference: np.ndarray) -> np.ndarray:
+    """`KL(q || p)`'s derivative in `logits` by arXiv:2610.31642's eq. 9 in NumPy, in the inputs' own
+    dtype, its `p` the reference's softmax and its `q` the logits'."""
+    log_q = log_softmax(reference)
+    q, p = np.exp(log_q), np.exp(log_softmax(logits))
+    delta = logits - reference
+    d = delta - (q * delta).sum(axis=-1, keepdims=True)
+    s = d - np.log1p((q * np.expm1(d)).sum(axis=-1, keepdims=True))
+    u = q * np.expm1(s)
+    return u - p * u.sum(axis=-1, keepdims=True)
+
+
+def test_the_divergences_derivative_near_its_reference_keeps_the_differences_precision():
+    """The divergence from a reference row is differentiated through the two rows' difference
+    (arXiv:2610.31642, eq. 9): at the reference itself its derivative is exactly zero, and a thousandth
+    of a unit away it is on par with the paper's form from float64 (check 1), where two softmaxes
+    subtracted would keep only their own rounding."""
+    gradient = jax.jit(jax.grad(lambda rows, reference: categorical.kl_divergence(rows, reference).sum()))
+    rows = logits(jnp.float32)
+    np.testing.assert_array_equal(gradient(rows, rows), np.zeros(rows.shape, np.float32))
+    assert_as_exact(gradient, divergence_derivative, near_reference, "near the reference",
+                    seeds=CANCELLATION_SEEDS)
+
+
+def test_the_divergences_derivative_stays_finite_wherever_its_rows_are():
+    """Rows each finite but far apart in offset have the derivative of the distributions they hold, here
+    two uniform rows' zero; rows far apart in shape have a finite Hessian; logits -inf where the
+    reference is not take `p - q` in forward mode as in reverse; and a row whose classes `where`
+    excludes entirely has derivative 0 beside a held row's."""
+    far = jnp.asarray([[2e38, 2e38]], jnp.float32), jnp.asarray([[-2e38, -2e38]], jnp.float32)
+    offset = jax.grad(lambda rows: categorical.kl_divergence(rows, far[1]).sum())(far[0])
+    np.testing.assert_array_equal(offset, np.zeros((1, 2), np.float32))
+    apart = jnp.asarray([200.0, 0.0]), jnp.asarray([-200.0, 0.0])
+    for hessian in (jax.hessian, lambda f: jax.jacfwd(jax.jacrev(f)), lambda f: jax.jacrev(jax.jacrev(f))):
+        held = hessian(lambda row: categorical.kl_divergence(row, apart[1]))(apart[0])
+        assert np.all(np.isfinite(np.asarray(held)))
+    student, reference = jnp.asarray([-jnp.inf, 0.0]), jnp.asarray([0.0, 0.0])
+    _, forward = jax.jvp(lambda row: categorical.kl_divergence(row, reference), (student,),
+                         (jnp.asarray([0.0, 1.0]),))
+    backward = jax.grad(lambda row: categorical.kl_divergence(row, reference))(student)
+    assert forward == backward[1] == 0.5
+    rows, held = logits(jnp.float32, (2, 7)), jnp.asarray([[True] * 7, [False] * 7])
+    jacobian = np.asarray(jax.jacfwd(lambda rows: categorical.kl_divergence(rows, rows[::-1], held))(rows))
+    assert np.all(np.isfinite(jacobian)) and np.all(jacobian[1] == 0)
+
