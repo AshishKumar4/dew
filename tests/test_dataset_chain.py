@@ -96,7 +96,7 @@ HOLDOUT_SHARES = (0.85, 0.05, 0.1)
 
 HOLDOUT_RECORDS = 500
 """The records of each drawn corpus the holdout's shares are read over: as many as hold a part
-favoured by 0.02 of the records over check 1's PARITY of an independent draw's error (5,000 records read
+favoured by 0.02 of the records over check 1's PARITY of an independent draw's error (4,000 records read
 whole in one corpus held it to 0.02 by hand)."""
 
 HOLDOUT_SEEDS = 256
