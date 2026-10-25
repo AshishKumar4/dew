@@ -377,6 +377,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     """The most columns one product spans (warpgroup MMA's 256, wgmma's widest N), which a tile's columns
     are at most; None where a tile's columns are many products' (mma.sync's 8 each), held by its
     registers alone (`tile_registers`)."""
+    copy_extent: int | None = None
+    """The most elements one asynchronous copy moves along a dimension (TMA's box, 256), which a tile's
+    rows and columns, each loaded by one, are at most; None where cp.async moves a block (mma.sync's),
+    whose tiles registers bound alone."""
     most_shared: int
     """The most shared memory a block of any GPU of the family holds (CUDA's opt-in limit), which bounds
     the stages a generated tile takes; a GPU's own (`generation.shared_budget`) bounds the tiles its
@@ -561,6 +565,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     operands from the rings, a block's rows staged at the widest swizzle, 128 bytes."""
     bounded_loads = True
     operands_in_registers = False
+    copy_extent = 256
 
     def registers(self, consumers: int) -> int:
         return consumer_registers(consumers)

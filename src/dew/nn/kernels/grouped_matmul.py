@@ -73,9 +73,10 @@ def triton_tiles(dtype, depth: int, width: int) -> tuple[Tile, ...]:
     span `depth` and `width` (`_Triton._dense_extents`), from the MMA's facts and Triton's alone (no table
     of tiles): each axis a power of two (`tl.arange`'s extents are); rows from one warpgroup's MMA rows
     (`mosaic.Family.role_rows`: wgmma's 64, four warps of mma.sync's 16) and columns from a swizzled row's
-    elements (`mosaic.SWIZZLE_BYTES`) to the call's `width`, while a thread's share of the fp32 accumulator
-    stays within its registers at the most warps (`cost.THREAD_REGISTERS`); a step from half a swizzled
-    row to the call's `depth`; one warpgroup a program or as many as warpgroup MMA's consumer roles
+    elements (`mosaic.SWIZZLE_BYTES`) to the call's `width` (Triton masks a block past it), while a
+    thread's share of the fp32 accumulator stays within its registers at the most warps
+    (`cost.THREAD_REGISTERS`); a step from half a swizzled row to the call's `depth`; one warpgroup a
+    program or as many as warpgroup MMA's consumer roles
     (`mosaic.Family.consumers`), over which Triton spreads a dot; and stages from two to as many steps as
     a block of the roomiest family holds (`mosaic.Family.most_shared`). A target's launch keeps those that
     fit it (`_Triton.fitting`) and ranks those its cost model is calibrated over (`_Triton.calibrated`).
@@ -91,10 +92,10 @@ def triton_tiles(dtype, depth: int, width: int) -> tuple[Tile, ...]:
     held = max(warps) * 32 * cost.THREAD_REGISTERS
     tiles = []
     for block_m in _doubling(family.role_rows, held // row):
-        for block_n in _doubling(row, min(_covering(width), held // block_m)):
+        for block_n in _doubling(row, max(row, min(_covering(width), held // block_m))):
             if block_m * block_n >= held:
                 continue
-            for block_k in reversed(_doubling(row // 2, _covering(depth))):
+            for block_k in reversed(_doubling(row // 2, max(row // 2, _covering(depth)))):
                 # A step's blocks, a product's (`Gmm.loaded`) or a kernel gradient's (`Tgmm.loaded`).
                 step = min((block_m + block_n) * block_k, block_m * (block_k + block_n)) * size
                 deepest = max(mosaic_sm90.WGMMA.most_shared, mosaic_sm80.Mma.most_shared) // step + 1
@@ -109,10 +110,9 @@ def _covering(extent: int) -> int:
     return 1 << (max(extent, 1) - 1).bit_length()
 
 
-TRITON_CALIBRATED = (256, 128, 4)
-"""The longest row and column axis, the deepest step (two swizzled rows of 16-bit operands) and the
-deepest pipeline the Triton sweeps measured (GMMT-a100, GMM-h100-2): the region `_Triton.calibrated`
-holds its cost model to."""
+TRITON_CALIBRATED = {'block_m': (64, 256), 'block_n': (128, 256), 'block_k': (32, 128), 'stages': (2, 4)}
+"""The least and most of each tile axis the Triton sweeps measured (GMMT-a100, GMM-h100-2; the steps
+those of 16-bit operands): the region `_Triton.calibrated` holds its cost model to."""
 
 
 TPU_CALIBRATED_EXTENT = 4 * mosaic_tpu.LANES
@@ -421,9 +421,8 @@ class _Triton(_GroupedLaunch[Tile]):
         return triton_tiles(ba.arguments['tokens'].dtype, *self._dense_extents(ba))
 
     def calibrated(self, config: Tile) -> bool:
-        longest, deepest, stages = TRITON_CALIBRATED
-        return (max(config.block_m, config.block_n) <= longest and config.block_k <= deepest
-                and config.stages <= stages)
+        return all(least <= getattr(config, axis) <= most
+                   for axis, (least, most) in TRITON_CALIBRATED.items())
 
     def fitting(self, ba, target) -> tuple[Tile, ...]:
         """The tiles that fit `target` (`Template.fitting`) whose accumulator (two with `exact_sums`)
