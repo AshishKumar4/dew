@@ -806,10 +806,11 @@ def _refuse_overfull(held: list[tuple[str, frozenset[int], int]], device_bytes: 
 
 
 def placeable(field) -> bool:
-    """Whether a device can hold every leaf of `field`: arrays of numbers,
-    not strings, bytes or Python objects, such as a caption or an image's
-    catalog URL."""
-    return all(isinstance(leaf, jax.Array) or (
+    """Whether a device can hold every leaf of `field`: arrays of numbers, or
+    their shapes (`jax.ShapeDtypeStruct`) where a run reads a batch before
+    placing it, not strings, bytes or Python objects, such as a caption or
+    an image's catalog URL."""
+    return all(isinstance(leaf, (jax.Array, jax.ShapeDtypeStruct)) or (
         not isinstance(leaf, (str, bytes)) and np.asarray(leaf).dtype.kind not in "OSUV")
         for leaf in jax.tree.leaves(field))
 
