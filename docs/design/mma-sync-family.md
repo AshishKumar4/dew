@@ -85,6 +85,17 @@ duplicating it.
 4. **mma.sync stays per tile**, with no cross-tile streaming: each tile's `emit_pipeline` drains. Streaming
    across mma.sync tiles would need the cp.async producer JAX lacks. It is a later measurement, not a need yet.
 
+### Sources the derivation learns from (owner, bible §6)
+
+Use JAX's machinery where it is as good or better: `emit_pipeline` and its warp-specialized form, the fuser,
+and Tokamax. The derivation's rules are learned from what the best kernels choose on each family, and each
+rule cites its source:
+- CUTLASS's builders and schedulers: StageCountAutoCarveout, raster and swizzle, the sm80 defaults.
+- cuBLASLt's heuristic per shape (PROF1).
+- Triton's compiler: how it picks `num_stages`, layouts, and warp specialization (its `AccelerateMatmul`,
+  `Pipeliner` and `WarpSpecialization` passes).
+- ThunderKittens' kernels: tile shapes, producer and consumer counts, and the register split per family.
+
 ## 4. Two warpgroups
 
 - `Mma.consumers = 2`, with no producer. The kernel names its warpgroups `wg` (`num_threads` 1 or 2), and its
