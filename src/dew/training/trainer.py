@@ -586,13 +586,9 @@ class Trainer(Generic[Loss, Effects]):
         """
         self._schedule(None if steps is None else steps // self.accumulation)
         state = jax.eval_shape(self.initial_state)
-        if batch is not None:
-            device, _ = split_fields(marked(DataPartition(), self._counted_batch)(batch))
-            split = self._split or 1
-            with self._traced_on(self.device_mesh) as schedule:
-                _, _, state = self._prepared(state, microbatch_shapes(device, split), schedule,
-                                             split * self.accumulation)
-        return self._validated(state, capacity)[1]
+        if batch is None:
+            return self._validated(state, capacity)[1]
+        return self._whole_validated(state, marked(DataPartition(), self._counted_batch)(batch), capacity)
 
     def _validated(self, state: TrainState, capacity: int | None = None
                    ) -> tuple[Placement[TrainState], Validation]:
@@ -1612,6 +1608,10 @@ class Trainer(Generic[Loss, Effects]):
                 "checkpointer; pass Checkpoints(directory) to write any")
         complete = (plan.ended(current, interval.real_tokens) and checkpoints is not None
                     and checkpoints.latest is not None)
+        # The step the run reads from, as the pre-read's empty-stream check reads it, and the FLOP
+        # count's refusal cleared before the prefetch worker counts its first batch.
+        run.current = current
+        self._refusal = None
         if not complete and not plan.ended(current, interval.real_tokens):
             # A ramp's stages begin where updates do (`Ramp.stages`).
             partition = DataPartition.of(mesh, window=self.accumulation)
@@ -1644,14 +1644,14 @@ class Trainer(Generic[Loss, Effects]):
                 if run.ahead[0] is not None:
                     self._whole_validated(abstract, run.ahead[0])
         state, shardings = placed()
-        run.current = int(state.step)
+        if int(state.step) != current:
+            raise ValueError(f"the checkpoint of step {current} holds a state at step {int(state.step)}")
         started = FitStarted(current, steps,
             checkpoints.source(current) if checkpoints is not None and position is not None else None,
             sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
             jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape),
             split_share(state.variables),
             seed=self.seed, tokens=plan.tokens)
-        self._refusal = None
         self._report(started, current)
         if plan.dataset.held_out:
             self._display.note(f"validation: {plan.dataset.held_out} records held out of train")
@@ -1673,17 +1673,17 @@ class Trainer(Generic[Loss, Effects]):
             averaged=self.objective.ema is not None and not self.objective.ema_is_reference))
         return state, shardings, False
 
-    def _whole_validated(self, state: TrainState, batch: Batch) -> None:
-        """Refuse, before anything is placed, a mesh whose devices hold `state` but not the whole
-        state the run's steps keep between them reading `batch`'s shapes: `state` with the
-        accumulation its window of microbatches pools and the narrow copies its step builds, as
-        `validate` reads it given a batch (`Layout.validate`)."""
+    def _whole_validated(self, state: TrainState, batch: Batch, capacity: int | None = None) -> Validation:
+        """`Layout.validate` of the whole state the run's steps keep between them reading `batch`'s
+        shapes (a marked batch, as the stream gives it): `state` with the accumulation its window
+        of microbatches pools and the narrow copies its step builds, read in the split the trainer
+        fixes, else whole. `validate` and `fit` check it before anything is placed."""
         device, _ = split_fields(batch)
         split = self._split or 1
         with self._traced_on(self.device_mesh) as schedule:
             _, _, whole = self._prepared(state, microbatch_shapes(device, split), schedule,
                                          split * self.accumulation)
-        self._validated(whole)
+        return self._validated(whole, capacity)[1]
 
     def _local_devices(self) -> list:
         """This process's devices of the mesh, whose memory the fit check reads."""
