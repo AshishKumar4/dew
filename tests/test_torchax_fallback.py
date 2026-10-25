@@ -354,6 +354,30 @@ def test_an_unregistered_causal_lm_loads_as_transformers_own_forward(tokens, tmp
                     "tier 3 cohere LM step", seeds=UNREGISTERED_SEEDS, truth_fn=truth_fn)
 
 
+@pytest.mark.parametrize("route", ["tier 3", "fallback"])
+def test_a_load_without_weights_reads_none_and_states_their_shapes(route, tmp_path):
+    """Without its weights a tier-3 source is built from its config alone, its weight files never read
+    (here removed), and its variables state every leaf's shape and dtype as the load with weights
+    holds it: what a run resuming from its own checkpoint builds its state around. The explicit route
+    and the automatic one read it alike."""
+    import shutil
+
+    torch.manual_seed(0)
+    transformers.CohereForCausalLM(transformers.CohereConfig(**COHERE)).save_pretrained(tmp_path / "whole")
+    options = {"fallback": "torchax"} if route == "fallback" else {}
+    with pytest.warns(TransformersTierWarning):
+        whole = Pretrained.load(tmp_path / "whole", dtype="float32", **options)
+    shutil.copytree(tmp_path / "whole", tmp_path / "shapes")
+    for weights in (tmp_path / "shapes").glob("*.safetensors"):
+        weights.unlink()
+    with pytest.warns(TransformersTierWarning):
+        shapes = Pretrained.load(tmp_path / "shapes", dtype="float32", weights=False, **options)
+    assert type(shapes.model) is type(whole.model)
+    assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), shapes.variables) == jax.tree.map(
+        lambda leaf: (leaf.shape, jnp.dtype(leaf.dtype)), whole.variables)
+    assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(shapes.variables))
+
+
 @pytest.mark.parametrize("family", ["llama", "neox"])
 def test_bf16_compute_gradients_are_as_exact_as_torchs_bf16(family, tokens, tmp_path):
     """A bf16 checkpoint computing in bf16: LMObjective's loss and its gradient of every parameter

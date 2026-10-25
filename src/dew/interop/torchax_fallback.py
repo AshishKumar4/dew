@@ -44,7 +44,7 @@ from jax.extend.core import Literal, primitives
 
 from dew.interop import sources, verify
 from dew.interop.generation_config import read_generation_config
-from dew.interop.pickles import host_view
+from dew.interop.pickles import host_dtype, host_view
 from dew.interop.pretrained import PretrainedFallback, source_processor
 from dew.interop.weights import AUTO
 from dew.nn.precision import at_least_fp32, configured_precision, float32_products
@@ -599,14 +599,17 @@ def _refuse_packing(packing: Mapping[str, object]) -> None:
 
 def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtype: str,
          param_dtype: str, attention_impl: str, max_seq_len: int | None,
-         admission: TorchAdmission | None = None) -> PretrainedFallback:
+         admission: TorchAdmission | None = None, weights: bool = True) -> PretrainedFallback:
     """Load `directory`'s causal LM through transformers and torchax.
 
     `directory` is the metadata snapshot `Pretrained.load` resolved and
     `revision` its commit (None for a local directory); the weights come
     from the same commit through `sources.snapshot`, so the file
     selection is the native loader's. `admission` is the decision that sent an
-    unregistered type here (`admitted`), None for `fallback="torchax"`.
+    unregistered type here (`admitted`), None for `fallback="torchax"`. Without
+    `weights` the model is built from its config on torch's meta device, no
+    weight read, and its variables are their shapes and dtypes alone
+    (`jax.ShapeDtypeStruct`).
     """
     if attention_impl != "auto":
         raise ValueError(
@@ -629,12 +632,21 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
         from transformers import AutoModelForCausalLM
     except ImportError as error:
         raise ImportError(f"fallback='torchax' needs torch, torchax and transformers: {INSTALL}") from error
-    directory = sources.snapshot(str(name_or_dir), revision)
+    if weights:
+        directory = sources.snapshot(str(name_or_dir), revision)
     # Before transformers, whose reader fails on a malformed file without naming it.
     generation_config = read_generation_config(directory)
     storage = "auto" if param_dtype == AUTO else getattr(torch, param_dtype)
-    model = AutoModelForCausalLM.from_pretrained(str(directory), dtype=storage, local_files_only=True,
-                                                 experts_implementation=EXPERTS)
+    if weights:
+        model = AutoModelForCausalLM.from_pretrained(str(directory), dtype=storage, local_files_only=True,
+                                                     experts_implementation=EXPERTS)
+    else:
+        from transformers import AutoConfig
+
+        stated = AutoConfig.from_pretrained(str(directory), local_files_only=True)
+        with torch.device("meta"):
+            model = AutoModelForCausalLM.from_config(
+                stated, dtype=stated.dtype if storage == "auto" else storage, experts_implementation=EXPERTS)
     model.eval()
     jittable = JittableModule(model)
     head = model.get_output_embeddings()
@@ -647,9 +659,14 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     if head_name is not None and not _plain_head(model, head):
         head_name = None
     # Host views of torch's storage: nothing reaches a device before the
-    # caller's placement.
-    params = {name: host_view(leaf, name) for name, leaf in jittable.params.items()}
-    buffers = {name: host_view(leaf, name) for name, leaf in extract_all_buffers(model)[1].items()}
+    # caller's placement. Without the weights, their shapes and dtypes.
+    def held(leaf, name):
+        if weights:
+            return host_view(leaf, name)
+        return jax.ShapeDtypeStruct(tuple(leaf.shape), host_dtype(leaf, name))
+
+    params = {name: held(leaf, name) for name, leaf in jittable.params.items()}
+    buffers = {name: held(leaf, name) for name, leaf in extract_all_buffers(model)[1].items()}
     stored = model.state_dict()
     persistent = tuple(name for name in buffers if name in stored)
     vocab = int(head_weight.shape[0])
@@ -690,7 +707,7 @@ def _plain_head(model: PreTrainedModel, head: torch.nn.Module) -> bool:
         return False
     made: list[object] = []
     hook = head.register_forward_hook(lambda _, __, output: made.append(output))
-    tokens = torch.arange(min(8, int(head.out_features)))[None]
+    tokens = torch.arange(min(8, int(head.out_features)), device=head.weight.device)[None]
     try:
         with torch.no_grad():
             logits = model(input_ids=tokens, use_cache=False).logits
