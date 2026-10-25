@@ -337,8 +337,9 @@ def test_an_accumulating_step_updates_the_optimizer_in_its_commit_alone():
     assert not speculated, speculated
 
 
-CLIPPED_STEP_SEEDS = 8
-"""Check 1's declared seeds for a QK-Clip run's stepped kernels against the paper's (`seeds_for`)."""
+CLIPPED_STEP_SEEDS = 64
+"""Check 1's declared seeds for a QK-Clip run's stepped kernels against the paper's, sized paired by
+`seeds_for` on armada."""
 
 
 def test_a_clipped_run_stores_its_stepped_kernels_times_the_clip():
