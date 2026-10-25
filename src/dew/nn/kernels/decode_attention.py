@@ -169,7 +169,8 @@ def _guarded(launch: Callable[[algebra.Forward], jax.Array], spec: algebra.Forwa
     (`algebra.Forward.headroom`) the plain launch first, then the guarded one where some row's output is not
     finite (an overflowed sum's, or a merge's of two finite slices; or a call's own non-finite input, which
     the guarded launch gives again), so ordinary inputs take the one plain launch, its outputs and cost
-    unchanged but for that check (`algebra.walked_launches`' order, for a kernel that walks its keys once)."""
+    unchanged but for that check (`algebra.walked_launches`' order, for a kernel that walks its keys once).
+    The guarded launch is a kernel of its own name (`_headroom`), as the Triton forward's is."""
     if not spec.headroom:
         return launch(spec)
     out = launch(dataclasses.replace(spec, headroom=False))
@@ -324,7 +325,8 @@ class DecodeAttention(tuning.KernelOp):
                 out_specs=out_specs,
                 out_shape=out_shape,
                 compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=2),
-                interpret=interpret, name="decode_attention",
+                interpret=interpret,
+                name="decode_attention_headroom" if spec.headroom else "decode_attention",
             )(spans, query, key, value, *([] if sinks is None else [sinks]))
             return out if splits == 1 else _combined(spec, *out, axis=1).astype(query.dtype)
 
@@ -388,7 +390,8 @@ class PagedDecodeAttention(tuning.KernelOp):
                 out_specs=out_specs,
                 out_shape=out_shape,
                 compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=2),
-                interpret=interpret, name="paged_decode_attention",
+                interpret=interpret,
+                name="paged_decode_attention_headroom" if spec.headroom else "paged_decode_attention",
             )(spans, table, query, key_pages, value_pages, *([] if sinks is None else [sinks]))
             return out if splits == 1 else _combined(spec, *out, axis=2).astype(query.dtype)
 
