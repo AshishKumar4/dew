@@ -736,6 +736,24 @@ def _plane_template(ema, deltas):
     return jax.tree_util.tree_map_with_path(planes, ema), targets
 
 
+RETIRED_OPTIMIZER_STATES = {
+    "learning_rate_scale": "its rate as a scale times a schedule's shape (learning_rate_scale and "
+                           "learning_rate_shape), where Dew's optimizer now holds the schedule's own "
+                           "rate fields and steps at Optax's schedule of them (dew.optim.RateState)",
+}
+"""Keys of an optimizer state a Dew before 1.0 wrote and this one no longer does, by what each held:
+a resume refuses the checkpoint by name rather than as a mismatched tree."""
+
+
+def _keys(tree) -> set[str]:
+    """Every mapping key anywhere in a checkpoint's metadata `tree`."""
+    if isinstance(tree, Mapping):
+        return set(tree).union(*(_keys(value) for value in tree.values()))
+    if isinstance(tree, list | tuple):
+        return set().union(*(_keys(value) for value in tree))
+    return set()
+
+
 def _check_template(template, metadata, stored, *, mapping: bool) -> None:
     """Refuse a train-state template the checkpoint at hand cannot fill.
 
@@ -750,6 +768,11 @@ def _check_template(template, metadata, stored, *, mapping: bool) -> None:
     if mapping:
         raise ValueError("the checkpoint holds a mapping saved in place of a train state; restore it "
                          "through a mapping template, or with none")
+    retired = sorted(_keys(metadata.get("opt_state")) & RETIRED_OPTIMIZER_STATES.keys())
+    if retired:
+        raise ValueError(f"the checkpoint's optimizer state holds {RETIRED_OPTIMIZER_STATES[retired[0]]}; "
+                         f"a run cannot resume it. Resume it with the Dew that wrote it, or start a "
+                         f"fresh run from its weights in a directory of its own.")
     from dew.training.state import CHECKPOINTED
     missing = set(CHECKPOINTED).difference(stored)
     if missing:
