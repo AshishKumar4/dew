@@ -437,7 +437,7 @@ def test_a_masked_task_packs_its_projections_as_a_decoder_does(masked_source, tm
 
     source, prompt = masked_source
     source.save(tmp_path / "source")
-    task = pipeline(str(tmp_path / "source"))
+    task = pipeline(str(tmp_path / "source"), dtype="float32")
     groups, _ = packed_layout(task.model, task.variables)
     assert groups, "the masked task holds its projections packed"
     for ours, theirs in zip(jax.tree.leaves(unpacked(task.model, task.variables)),
