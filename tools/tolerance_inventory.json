@@ -314,7 +314,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoders.py": {
-   "comparisons": 21,
+   "comparisons": 20,
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_lifecycle.py": {
@@ -390,7 +390,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_layer_stack.py": {
-   "comparisons": 21,
+   "comparisons": 20,
    "lane": "Models, Serving & RL"
   },
   "tests/test_linear_attention.py": {
@@ -514,7 +514,7 @@
    "lane": "Training"
   },
   "tests/test_multimodal_model.py": {
-   "comparisons": 19,
+   "comparisons": 18,
    "lane": "Kernels"
   },
   "tests/test_multiprocess.py": {
@@ -718,7 +718,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_tools.py": {
-   "comparisons": 28,
+   "comparisons": 25,
    "lane": "Models, Serving & RL"
   },
   "tests/test_torchax_fallback.py": {
