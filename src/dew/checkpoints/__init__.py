@@ -71,7 +71,6 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy as preserva
 from dew import position, records
 from dew.cleanup import attempted
 from dew.coordination import broadcast_from_process_zero, from_every_process
-from dew.data.plan import MADE_GLOBAL
 from dew.files import write_atomically
 from dew.hashing import fmix32
 from dew.nn import sharding
@@ -493,7 +492,7 @@ def read_position(table: dict, where: str, share: DataPartition) -> bytes:
             f"{sorted(set(held))} (index, count), and this reader reads share "
             f"{share.index} of {share.count}. A position is where one share of "
             f"the data stopped and cannot be translated to another share, so "
-            f"resume it on a mesh whose processes read those shares; {MADE_GLOBAL}.")
+            f"resume it on a mesh whose processes read those shares: {position.PER_SHARE}.")
     if any(row != mine[0] for row in mine[1:]):
         raise ValueError(
             f"The checkpoint at {where} holds positions for share {share.index} "
