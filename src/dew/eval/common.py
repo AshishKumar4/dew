@@ -58,10 +58,7 @@ class Mean[Scored: Artifact]:
             raise ValueError(f"{self.name}: expected per-example values, not an already averaged scalar")
         return float(values.sum()), float(values.size)
 
-    def merge(
-        self, accumulated: tuple[float, float], contribution: tuple[float, float]
-    ) -> tuple[float, float]:
-        return merge_totals(accumulated, contribution)
+    merge = staticmethod(merge_totals)
 
     def finalize(self, accumulated: tuple[float, float]) -> float:
         if accumulated[1] <= 0:
