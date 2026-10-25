@@ -66,13 +66,13 @@ def _case_call(launch, tiles, shape, dtype, *, reverse=False):
     return functools.partial(_pinned, launch, tiles, **kwargs), operands[kernel]
 
 
-def kernel_cases(target: str) -> Iterator[KernelCase]:
+def kernel_cases(target: str, dtypes: tuple[str, ...] = ("bfloat16", "float32")) -> Iterator[KernelCase]:
     """Each kernel pinned to the tiles `target` runs it with unmeasured (its launch's `PICKS`, the reverse
-    recurrence's `WIDE_KEYS_PICK` past `WIDEST` keys) for both dtypes at each shape, and the reverse
+    recurrence's `WIDE_KEYS_PICK` past `WIDEST` keys) for each of `dtypes` at each shape, and the reverse
     cumsum, for the compile test."""
     with generation.assumed(target):
         wide = chunked_launch._wide()
-    for dtype in ("bfloat16", "float32"):
+    for dtype in dtypes:
         launches = [*vars(fla_gdn).values(), *vars(recurrence).values()]
         for launch in (x for x in launches if isinstance(x, chunked_launch._Launch)):
             for shape_name, shape in COMPILED_SHAPES.items():
