@@ -82,7 +82,7 @@ def test_a_lora_run_over_a_decision_release_trains_its_factors_and_reloads(tmp_p
         release, _ = slot_release(tmp_path, "head")
     rows = Memory([{"text": text, "label": label} for text, label in
                    [("charged twice", "billing"), ("site down", "technical"), ("pro price", "sales")] * 4])
-    asked = rows.pipe(decisions, question="team").read("memory").batch(4).loading(Loading(workers=0))
+    asked = rows.pipe(decisions, question="team").read("memory").batch(8).loading(Loading(workers=0))
     default = Fitted(data=asked)
     config = dataclasses.replace(default, pretrained=str(release), lora=LoRA(rank=2, modules=("q_proj",)),
                                  trainer=dataclasses.replace(default.trainer, multi_host=False,
