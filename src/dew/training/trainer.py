@@ -53,6 +53,28 @@ from dew.data.dataset import (
     stream_identity,
 )
 from dew.data.pipeline import Dataset, DeviceStep
+from dew.distributed.batches import (
+    PREFETCH_DEPTH,
+    DevicePrefetchIterator,
+    Signature,
+    batch_layout,
+    batch_shardings,
+    batch_signature,
+    prefetched_bytes,
+    shard_batch,
+    split_fields,
+)
+from dew.distributed.placement import (
+    Layout,
+    MeshSpec,
+    Placement,
+    Validation,
+    device_mesh,
+    explicit_axes,
+    link_topology,
+    placed_bytes,
+    placed_shapes,
+)
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, LogicalAxes, batch_axes
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
@@ -103,34 +125,16 @@ from dew.training._lowering import Lowered
 from dew.training.budget import Pause, Plateau, run_length, run_steps
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
-    PREFETCH_DEPTH,
-    DevicePrefetchIterator,
-    Layout,
-    MeshSpec,
-    Placement,
-    Signature,
-    Validation,
-    batch_layout,
-    batch_shardings,
-    batch_signature,
     check_batch,
     check_stream,
-    device_mesh,
-    explicit_axes,
     link_bandwidth,
     link_figures,
-    link_topology,
     marked,
     microbatch,
     microbatch_shapes,
-    placed_bytes,
-    placed_shapes,
     placed_start,
-    prefetched_bytes,
     resumed_link_figures,
     ruled,
-    shard_batch,
-    split_fields,
     stage_microbatches,
     step_reads,
     traced_start,
@@ -491,7 +495,7 @@ class Trainer(Generic[Loss, Effects]):
     def state_mesh(self) -> Mesh:
         if not self.host_master:
             return self.device_mesh
-        from dew.training.host import companion_mesh
+        from dew.distributed.host import companion_mesh
         return companion_mesh(self.device_mesh)
 
     def _boxed_init(self, initialized: Variables, params: Variables) -> optax.OptState:
@@ -637,7 +641,7 @@ class Trainer(Generic[Loss, Effects]):
         placement of the state, once its checks pass (`_validated`)."""
         initializer, key = self.objective.initializer, self.key
         if self.host_master:
-            from dew.training.host import transfer
+            from dew.distributed.host import transfer
             key = transfer(key, NamedSharding(self.state_mesh, P()))
         abstract, through = traced_start(self.initial_state, initializer, key)
         checkpoints = self.checkpoints
@@ -817,8 +821,8 @@ class Trainer(Generic[Loss, Effects]):
         transient is one leaf, not the tree, and one JIT could not have
         returned to the two device sets anyway.
         """
+        from dew.distributed.host import evict, place_leaf, stream, transfer
         from dew.training.execution import bank_bytes, check_bank_pool
-        from dew.training.host import evict, place_leaf, stream, transfer
         held = self.objective.held_variables()
         with jax.default_device(self.state_mesh.local_devices[0]):
             state = self.initial_state(initializer, key)
@@ -1262,8 +1266,8 @@ class Trainer(Generic[Loss, Effects]):
                 f"stage would compute the whole step; give those devices to the data or fsdp axis")
 
     def _compile_host(self, state: TrainState, batch: Batch) -> CompiledStep:
+        from dew.distributed.host import transfer
         from dew.training.execution import HostExecution
-        from dew.training.host import transfer
         cpu = self.state_mesh
         execution = HostExecution(self.objective, self.layout, self.device_mesh, cpu, device=self._device)
         cpu_batch = transfer(batch, batch_shardings(cpu, batch))

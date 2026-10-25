@@ -209,11 +209,11 @@ def dew_side(args, images, total, attention):
 
     from dew.diffusion.schedules import expand
     from dew.diffusion.transforms import broadcast_rates
+    from dew.distributed.batches import batch_shardings
     from dew.inputs import unit_range
     from dew.objectives.base import Aux, Ratio
     from dew.objectives.diffusion import DiffusionObjective
     from dew.training import MeshSpec, Trainer
-    from dew.training.distributed import batch_shardings
 
     class FixedDraws(DiffusionObjective):
         """Dew's `DiffusionObjective.loss`, the two draws read from the batch."""

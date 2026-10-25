@@ -1579,12 +1579,12 @@ class Checkpoints:
         (`dew.objectives.base.UNREAD`).
         """
         from dew.batch import FROZEN, without
-        from dew.inference.banks import banked_placement, placed_rows, shape_rows, spread
-        from dew.training.distributed import (
+        from dew.distributed.placement import (
             Layout as DefaultLayout,
             MeshSpec as DefaultMesh,
             device_mesh as resolve_mesh,
         )
+        from dew.inference.banks import banked_placement, placed_rows, shape_rows, spread
 
         step = self.pinned(step)
         stored = self.stored(step)

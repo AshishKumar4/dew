@@ -48,9 +48,9 @@ from dew.telemetry.profile import region
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
+    from dew.distributed.placement import Layout, MeshSpec
     from dew.quantization import Quantization
     from dew.registry import ModelConfig
-    from dew.training.distributed import Layout, MeshSpec
 
 Rows = ModelInputs | ArrayLike | Sequence[Sequence[int]]
 Request = str | Sequence[str] | Rows

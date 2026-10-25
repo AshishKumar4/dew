@@ -23,11 +23,11 @@ from recording import RecordingTracker
 
 from dew.cache import enable_compilation_cache
 from dew.data.dataset import Loader
+from dew.distributed.batches import shard_batch
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.telemetry.instrumentation import StepFlops, compiled_flops, hlo_flops
 from dew.training import Trainer
-from dew.training.distributed import shard_batch
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh

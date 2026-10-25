@@ -24,13 +24,14 @@ from dew._coordination import from_every_process
 from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import rows_of
+from dew.distributed.host import snapshot
+from dew.distributed.placement import Placement
 from dew.mesh import LayoutRefused
 from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import RECORD, Objective
 from dew.state import TrainState, apart, together
 from dew.telemetry.benchmark import samples
-from dew.training.distributed import Placement, batch_divisor
-from dew.training.host import snapshot
+from dew.training.distributed import batch_divisor
 from dew.training.memory import (
     compiled_if_it_fits,
     head_fused_of,

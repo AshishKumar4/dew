@@ -11,6 +11,7 @@ from test_model_flops import forward_products
 
 from dew.diffusion import presets
 from dew.diffusion.process import DenoisingCondition
+from dew.distributed.batches import shard_batch
 from dew.inputs import Condition, Field, InputSpec
 from dew.inputs.diffusion import DiffusionConditioner, T5Segment
 from dew.inputs.encoders import CharTable, ConditionWork, T5Text
@@ -43,7 +44,6 @@ from dew.nn.text_encoders import CLIPTextTransformer, CLIPVisionTransformer, T5E
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import TEXT_KEY, LMObjective
 from dew.training import MeshSpec
-from dew.training.distributed import shard_batch
 from dew.training.model_flops import TRAINING_FLOPS, prepare_counts, step_counts
 
 IMAGE = np.array([2, 5], np.int64)

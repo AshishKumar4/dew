@@ -26,6 +26,7 @@ from dew.decision.head import DecisionHead, JointSchemaHead
 from dew.decision.layout import DecisionInputs, Specials, StateFirstLayout
 from dew.decision.objective import DecisionObjective
 from dew.diffusion import presets
+from dew.distributed.batches import DevicePrefetchIterator
 from dew.inputs import Field, InputSpec
 from dew.interop.hf_decoders import translate_config
 from dew.lora import LoRA
@@ -65,7 +66,6 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.lm.objective import batch_text
 from dew.telemetry.instrumentation import StepFlops
 from dew.training import MeshSpec
-from dew.training.distributed import DevicePrefetchIterator
 from dew.training.interval import Interval
 from dew.training.model_flops import TOKENS, TRAINING_FLOPS, _TokenCount, prepare_counts, step_counts
 

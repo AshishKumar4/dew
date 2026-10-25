@@ -1014,7 +1014,7 @@ def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bo
     branch = dataclasses.replace(branch, stages=(*branch.stages, *suffix))
     steps = objective.train_batch if train else objective.evaluate_batch
     # A string or object field stays in the batch for the host code and metrics that read it; the
-    # prefetcher places the rest (`dew.training.distributed.split_fields`).
+    # prefetcher places the rest (`dew.distributed.batches.split_fields`).
     return branch._then(*(MapBatch(step) for step in steps))
 
 

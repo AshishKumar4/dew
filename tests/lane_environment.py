@@ -51,7 +51,7 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     io_callback) place their operands on a CPU device, float64 references run
     there, since a TPU has no float64, and a host layout pairs every
     accelerator device with a CPU device of its process
-    (`dew.training.host.companion_mesh`), so that backend holds one device
+    (`dew.distributed.host.companion_mesh`), so that backend holds one device
     per local accelerator device. A cuda lane's steps are made repeatable
     across processes (`REPEATABLE_GPU_FLAGS`), since exact state and
     gradient checks require it.

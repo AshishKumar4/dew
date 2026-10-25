@@ -19,6 +19,7 @@ from dew.checkpoints import Checkpoints
 from dew.data import Loading, presets
 from dew.data.compile import compile
 from dew.data.sources.tokens import TokenFiles
+from dew.distributed.placement import Layout, MeshSpec
 from dew.mesh import LayoutRefused
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
@@ -27,7 +28,7 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_tile
 from dew.registry import mixers
 from dew.training import Trainer
-from dew.training.distributed import Layout, MeshSpec, microbatch
+from dew.training.distributed import microbatch
 from dew.training.memory import climb_to, recompute_more, rung_record
 from dew.training.planning import Timer, planned, splits
 

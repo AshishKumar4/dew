@@ -32,11 +32,11 @@ import numpy as np
 from PIL import Image, ImageFilter
 
 from dew.diffusion.presets import EDM, Cosine, Flow
+from dew.distributed.batches import batch_shardings
 from dew.figures import THEMES, Figure
 from dew.nn.backbones import CausalTransformer, Mixture
 from dew.rl import clipped_surrogate_terms, group_advantage, k3_kl
 from dew.training import Layout, MeshSpec
-from dew.training.distributed import batch_shardings
 
 HERE = Path(__file__).resolve().parent
 

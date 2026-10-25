@@ -99,7 +99,7 @@ trainer = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3
 trainer.fit(data, steps=2, log_every=2)
 ```
 
-`jax.make_mesh` makes Explicit axes unless `axis_types` says otherwise. The partitioner places Dew's parameters, so their axes are Auto, and a rule that puts a parameter on an Explicit axis is refused by name; an Explicit axis can split the batch's rows, which then sit where their type places them. A batch placed outside the trainer, by `dew.training.distributed.shard_batch` say, reads the rules in context: put it under `flax.linen.logical_axis_rules(layout.axis_rules)`.
+`jax.make_mesh` makes Explicit axes unless `axis_types` says otherwise. The partitioner places Dew's parameters, so their axes are Auto, and a rule that puts a parameter on an Explicit axis is refused by name; an Explicit axis can split the batch's rows, which then sit where their type places them. A batch placed outside the trainer, by `dew.distributed.batches.shard_batch` say, reads the rules in context: put it under `flax.linen.logical_axis_rules(layout.axis_rules)`.
 
 ## Parameter placement
 
