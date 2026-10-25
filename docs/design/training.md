@@ -54,7 +54,7 @@ An example's questions that ask the same thing, one negated, paraphrased or with
 
 ### Averaging runs
 
-`Decide.averaged(runs, step=, ema=, calibrate_on=)` is the task over the runs' `dew.checkpoints.averaged` mean, its calibration the identity, refit on `calibrate_on`, as temperatures belong to one set of weights. The runs' recorded task settings (`DecideSettings`) must be the same, else the run is refused (ValueError). Its `Weights.averaged` records each run's directory, step and average read. As no one run holds its weights, `Decide.save(directory)` writes the average to a directory of its own as a run: one weights-only checkpoint under the record its runs share, its model the base an adapter merged into, and its calibration, which `Decide.from_run` and `dew.pipeline` read back for any layout; a directory holding another run's checkpoints is refused.
+`Decide.averaged(runs, step=, ema=, calibrate_on=)` is the task over the runs' `dew.checkpoints.averaged` mean, its calibration the identity, refit on `calibrate_on`, as temperatures belong to one set of weights. The runs' recorded task settings (`DecideSettings`) must be the same, else the run is refused (ValueError). Its `Weights.averaged` records each run's directory, step and average read. As no one run holds its weights, `Decide.save(directory)` writes the average to a directory of its own as a run: its calibration, then one checkpoint of the average (its optimizer state empty) under the record its runs share, its model the base an adapter merged into, and its calibration, which `Decide.from_run` and `dew.pipeline` read back for any layout; a directory holding another run's checkpoints is refused.
 
 ### Options read at labels
 
