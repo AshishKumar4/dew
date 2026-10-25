@@ -664,6 +664,15 @@ def test_runs_that_share_a_head_average_their_weights_in_fp32_as_float64_does(de
         return sum(leaves) / 3
 
     assert_as_exact(averaged, wide, draw, "three runs' mean", seeds=AVERAGE_SEEDS)
+    from dew.decision.task import _running_mean
+
+    biggest = np.float32(np.finfo(np.float32).max)
+    mean = {"w": jnp.full(4, biggest)}
+    for count in range(2, 26):
+        mean = _running_mean(mean, {"w": jnp.full(4, biggest)}, count, "run", "first")
+    assert np.array_equal(np.asarray(mean["w"]), np.full(4, biggest))
+    opposite = _running_mean({"w": jnp.full(4, -biggest)}, {"w": jnp.full(4, biggest)}, 2, "run", "first")
+    assert np.array_equal(np.asarray(opposite["w"]), np.zeros(4, np.float32))
     calibrated = Decide.averaged(runs[:2], calibrate_on=answered())
     assert calibrated.calibration != Calibration()
 

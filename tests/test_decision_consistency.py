@@ -218,3 +218,30 @@ def test_a_group_maps_every_option_of_every_member_onto_one_canonical_set():
                                                       for name in questions},
                           "answers": answers, "groups": {"g": {"a": both, "b": both}}})
     assert decoded.groups == (Group("g", {"a": both, "b": both}),)
+
+
+def test_a_questions_own_none_of_the_above_maps_as_its_group_says():
+    """A choice whose own option is named "none of the above" keeps its group's mapping, where no
+    augmentation added it: its slot maps to its canonical option, not to none."""
+    from dew.decision.objective import NONE_OF_THE_ABOVE
+
+    options = ["billing", "tech", NONE_OF_THE_ABOVE]
+    keys = {"billing": "b", "tech": "t", NONE_OF_THE_ABOVE: "n"}
+    questions = {"one": Choice("Which team?", options), "two": Choice("Which?", options)}
+    example = Example("charged twice", questions, {"one": "billing", "two": "billing"},
+                      groups=(Group("g", {"one": keys, "two": keys}),))
+    row = Encoding(LAYOUT, TOKENIZER, SPECIALS, 3, shuffle=False, grouped=True)(example, ["one", "two"], None)
+    canonical = np.asarray(row["canonical"])
+    assert sorted(canonical[0].tolist()) == [0, 1, 2] and sorted(canonical[1].tolist()) == [0, 1, 2]
+
+
+def test_a_flat_tables_groups_column_reaches_its_example():
+    """A flat table's row carries its `groups` field into its example, which refuses a group of its
+    one question rather than dropping it."""
+    from dew.decision.data import ParseTable
+
+    table = ParseTable(("billing", "tech"))
+    example = table({"text": "t", "label": "billing"})["example"]
+    assert isinstance(example, Example) and example.groups == ()
+    with pytest.raises(ValueError):
+        table({"text": "t", "label": "billing", "groups": {"g": {"label": {"billing": "b", "tech": "t"}}}})

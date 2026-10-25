@@ -129,8 +129,8 @@ class Encoding:
                 question, label = _none_of_the_above(question, labels[name], drop=rng.random() < 0.5)
                 gold = np.eye(len(question.options))[label]
                 gone = [key for key in original.options if key not in question.options]
-                if gone:
-                    dropped[name] = gone[0]
+                # The augmentation's own option: it stands for the option it replaced, or for none.
+                dropped[name] = gone[0] if gone else None
             asked[name] = question
             if gold is not None:
                 golds[name] = gold
@@ -191,13 +191,14 @@ class Encoding:
 
 
 
-def _grouped(example: Example, encoded: Encoded, asked: Mapping[str, Question], dropped: Mapping[str, str],
-             width: int) -> tuple[np.ndarray, np.ndarray]:
+def _grouped(example: Example, encoded: Encoded, asked: Mapping[str, Question],
+             dropped: Mapping[str, str | None], width: int) -> tuple[np.ndarray, np.ndarray]:
     """The row's consistency fields along its questions: each question's group in the example
     (`Example.groups`), -1 for none, and each of its option slots' canonical option in that group,
     the slot as the row shows it (`Laid.order`), -1 for padding and for an option the group does not
-    map. A "none of the above" that stands for the option it dropped maps to that option's canonical
-    one; one added beside every option maps to none."""
+    map. A "none of the above" the augmentation added (`dropped` names the question) that stands for
+    the option it dropped maps to that option's canonical one, and one added beside every option to
+    none; a question's own option of that name maps as its group says."""
     groups = np.full(len(encoded.questions), -1, np.int32)
     canonical = np.full((len(encoded.questions), width), -1, np.int32)
     for slot, laid in enumerate(encoded.questions):
@@ -211,8 +212,8 @@ def _grouped(example: Example, encoded: Encoded, asked: Mapping[str, Question], 
         options = asked[laid.name].options
         for shown, option in enumerate(laid.order):
             key = options[option]
-            if key == NONE_OF_THE_ABOVE:
-                key = dropped.get(laid.name)
+            if key == NONE_OF_THE_ABOVE and laid.name in dropped:
+                key = dropped[laid.name]
             if key is not None and key in mapped:
                 canonical[slot, shown] = keys.index(mapped[key])
     return groups, canonical
@@ -694,7 +695,7 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
                  label_smoothing: float = 0.0, shuffle_options: bool = True,
                  none_of_the_above: float = 0.0, temperatures: Temperatures | None = None,
                  segments: int | None = 16, context_encoder: ContextEncoder | None = None,
-                 consistency: float = 0.0, head_seed: int | None = None):
+                 consistency: float = 0.0, head_seed: int | None = None, head_source: str | None = None):
         held: Variables | None = None
         self.image_processor = None
         match backbone:
@@ -744,6 +745,7 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
             raise ValueError(f"consistency weighs a divergence, so it is nonnegative, got {consistency}")
         self.consistency = consistency
         self.head_seed = head_seed
+        self.head_source = head_source
         self.shuffle_options = shuffle_options
         self.none_of_the_above = none_of_the_above
         self.temperatures = temperatures
@@ -963,7 +965,13 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
             leaves = jax.tree_util.tree_leaves_with_path(held)
             return {"held": fingerprint({jax.tree_util.keystr(path): fingerprint(np.asarray(leaf))
                                          for path, leaf in leaves})}
-        return None if self.head_seed is None else {"drawn": self.head_seed}
+        if self.head_seed is None:
+            return None
+        head = self.model.head
+        if head.reads_labels or head.reads_table or head.draws_from_rows:
+            # A head drawn from the backbone's output rows starts from its source's weights too.
+            return None if self.head_source is None else {"drawn": self.head_seed, "source": self.head_source}
+        return {"drawn": self.head_seed}
 
     def recorded_model(self) -> nn.Module:
         """The backbone; the head is a task setting of its own."""
