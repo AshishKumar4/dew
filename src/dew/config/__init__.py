@@ -1076,10 +1076,11 @@ class RunConfig:
         if record.get("rebuildable") is False:
             reasons = record.get("reasons", [])
             stated = "".join(f"; {reason}" for reason in reasons) if isinstance(reasons, list) else ""
-            raise ValueError("this run was defined in Python by Trainer.fit, so no record rebuilds it"
-                             f"{stated}. Build it as a RunConfig in Python and train it with run(), whose "
-                             "run.json rebuilds it (docs/recipes.md, Python experiments); this one loads for "
-                             "inference through dew.pipeline or a task's from_run")
+            raise ValueError("this run was defined in Python without a recorded RunConfig, so no "
+                             f"record rebuilds it{stated}. It resumes through the Python that built it, and "
+                             "loads for inference through dew.pipeline or a task's from_run; a run built as "
+                             "a RunConfig in Python and trained with run() writes a run.json that rebuilds it "
+                             "(docs/recipes.md, Python experiments)")
         registry.import_trusted(record, trust)
         named = registry.class_record(record)
         if named is None:

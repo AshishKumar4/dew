@@ -2078,7 +2078,8 @@ class Trainer(Generic[Loss, Effects]):
         this trainer on the data it was `stated` (`Checkpoints.python_run`)."""
         if self.checkpoints is not None:
             given = {"a custom step (step=)": self.step, "a rollout (rollout=)": self.rollout,
-                     "a tracker (tracker=)": self.tracker}
+                     "a tracker (tracker=)": self.tracker, "recording each step's draws (record=True)":
+                     self.record or None}
             self.checkpoints.python_run(unrecorded_parts(
                 type(self.objective).__name__, stated, optimized=self._config is not None,
                 seeded=self.seed is not None, mesh=self.mesh, given=given))
