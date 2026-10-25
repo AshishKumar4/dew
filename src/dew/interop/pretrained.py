@@ -413,34 +413,11 @@ class Pretrained:
         directory = sources.snapshot(str(name_or_dir), revision, weights=False)
         # A Hub snapshot directory is named by its commit.
         commit = None if os.path.isdir(name_or_dir) else directory.name
-        if text_only and (fallback is not None or single_file is not None or dduf_file is not None):
-            raise ValueError("text_only takes a multimodal wrapper's language model; a fallback, a single "
-                             "file or a DDUF pipeline has none")
-        if fallback is not None:
-            from dew.interop import torchax_fallback
-            loaded = torchax_fallback.load(name_or_dir, directory, commit, dtype=dtype,
-                                           param_dtype=param_dtype, attention_impl=attention_impl,
-                                           max_seq_len=max_seq_len, weights=weights)
-            loaded = replace(loaded, variables=placed(loaded.variables))
-        elif gguf_file is None:
-            # A selected GGUF file is a decoder, whatever pipeline index the repo also ships.
-            loaded = _pipeline_source(name_or_dir, directory, commit, single_file, dduf_file, placed,
-                                      dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
-                                      streaming=streaming or not weights)
-        else:
-            loaded = None
-        if text_only and loaded is not None:
-            raise ValueError(f"{name_or_dir} is a {type(loaded).__name__} source, which has no language "
-                             "model for text_only to take")
-        if loaded is None:
-            # Without its weights, a decoder's leaves are translated as streaming translates them, each
-            # a view of its stored tensor that nothing reads.
-            remote = sources.remote_code(name_or_dir, directory) if trust_remote_code else None
-            loaded = _load_native_source(name_or_dir, directory, commit, gguf_file=gguf_file, placed=placed,
-                                         streaming=streaming or not weights, dtype=dtype,
-                                         param_dtype=param_dtype, attention_impl=attention_impl,
-                                         max_seq_len=max_seq_len, weights=weights, remote=remote,
-                                         text_only=text_only)
+        loaded = _loaded_source(name_or_dir, directory, commit, placed, fallback=fallback,
+                                gguf_file=gguf_file, single_file=single_file, dduf_file=dduf_file,
+                                streaming=streaming, weights=weights, dtype=dtype, param_dtype=param_dtype,
+                                attention_impl=attention_impl, max_seq_len=max_seq_len,
+                                trust_remote_code=trust_remote_code, text_only=text_only)
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
@@ -1417,6 +1394,45 @@ def _selected_payload(fallback: str | None, **files: str | None) -> list[str]:
                          f"and weights describe, and {' and '.join(selected)} selects another payload; "
                          "load it without fallback")
     return selected
+
+
+def _loaded_source(name_or_dir: str | Path, directory: Path, commit: str | None,
+                   placed: Callable[[Variables], Variables], *, fallback: str | None, gguf_file: str | None,
+                   single_file: str | None, dduf_file: str | None, streaming: bool, weights: bool, dtype: str,
+                   param_dtype: str, attention_impl: str, max_seq_len: int | None, trust_remote_code: bool,
+                   text_only: bool) -> Pretrained:
+    """The source `Pretrained.load` resolved, read by its kind: tier 3 where `fallback` asks, a
+    pipeline, or a natively translated decoder or wrapper (a wrapper's language model alone where
+    `text_only` asks)."""
+    if text_only and (fallback is not None or single_file is not None or dduf_file is not None):
+        raise ValueError("text_only takes a multimodal wrapper's language model; a fallback, a single "
+                         "file or a DDUF pipeline has none")
+    if fallback is not None:
+        from dew.interop import torchax_fallback
+        loaded = torchax_fallback.load(name_or_dir, directory, commit, dtype=dtype,
+                                       param_dtype=param_dtype, attention_impl=attention_impl,
+                                       max_seq_len=max_seq_len, weights=weights)
+        loaded = replace(loaded, variables=placed(loaded.variables))
+    elif gguf_file is None:
+        # A selected GGUF file is a decoder, whatever pipeline index the repo also ships.
+        loaded = _pipeline_source(name_or_dir, directory, commit, single_file, dduf_file, placed,
+                                  dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
+                                  streaming=streaming or not weights)
+    else:
+        loaded = None
+    if text_only and loaded is not None:
+        raise ValueError(f"{name_or_dir} is a {type(loaded).__name__} source, which has no language "
+                         "model for text_only to take")
+    if loaded is None:
+        # Without its weights, a decoder's leaves are translated as streaming translates them, each
+        # a view of its stored tensor that nothing reads.
+        remote = sources.remote_code(name_or_dir, directory) if trust_remote_code else None
+        loaded = _load_native_source(name_or_dir, directory, commit, gguf_file=gguf_file, placed=placed,
+                                     streaming=streaming or not weights, dtype=dtype,
+                                     param_dtype=param_dtype, attention_impl=attention_impl,
+                                     max_seq_len=max_seq_len, weights=weights, remote=remote,
+                                     text_only=text_only)
+    return loaded
 
 
 def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | None, *,

@@ -116,7 +116,7 @@ def _wrapper_text(hf_config: Mapping[str, object], used: set, *,
     return translate_config(_text_config(hf_config, declared_type))
 
 
-def _text_config(hf_config: Mapping[str, object], declared_type: str | None) -> dict[str, object]:
+def _text_config(hf_config: Mapping[str, object], declared_type: str | None) -> Mapping[str, object]:
     """The decoder config a wrapper's language model is: its text_config, typed `declared_type` where it
     names no type, with the wrapper's own head policy."""
     text = hf_config.get("text_config")
@@ -395,14 +395,17 @@ def _wrapper_sources(names: Collection[str], read: Callable[[str], np.ndarray], 
     return sources, tuple(aliases)
 
 
-def language_model_config(hf_config: Mapping[str, object], record: WrapperFields) -> dict[str, object]:
+def language_model_config(hf_config: Mapping[str, object], record: WrapperFields) -> Mapping[str, object]:
     """The config a wrapper's language model states as its text family's own checkpoint: the text_config
-    typed as the wrapper's text model, with the wrapper's head policy and the storage the wrapper
-    states for it (its quantization and dtype)."""
-    text = _text_config(hf_config, record["text_model_type"])
+    typed as the wrapper's text model, with the wrapper's head policy, the storage the wrapper states
+    for it (its quantization and dtype), and its family's causal-LM class where it names none."""
+    text = dict(_text_config(hf_config, record["text_model_type"]))
     for field in ("quantization_config", "torch_dtype", "dtype"):
         if field in hf_config and field not in text:
             text[field] = hf_config[field]
+    family = families().get(records.text(text["model_type"], "model_type"))
+    if family is not None and "architectures" not in text:
+        text["architectures"] = [family.architecture]
     return text
 
 
