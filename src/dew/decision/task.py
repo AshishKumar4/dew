@@ -110,9 +110,11 @@ class Weights:
 
 def _running_mean(mean, tree, count: int, directory: str, first: str):
     """`mean`, the fp32 mean of `count - 1` runs' variables, with the `count`th run's `tree` taken in:
-    each floating leaf `mean + (leaf - mean) / count` where both share a sign, whose difference cannot
-    overflow, and `mean * (1 - 1/count) + leaf / count` where they differ, whose terms cannot; an
-    integer or boolean leaf must equal the mean's. A tree of other variables or shapes is refused."""
+    for a second run each floating leaf `mean / 2 + leaf / 2`, two exact halves rounded once, so the
+    correctly rounded mean; for a later one `mean + (leaf - mean) / count` where both share a sign,
+    whose difference cannot overflow, and `mean * (1 - 1/count) + leaf / count` where they differ,
+    whose terms cannot. An integer or boolean leaf must equal the mean's. A tree of other variables or
+    shapes is refused."""
     pairs = list(zip(jax.tree.leaves(mean), jax.tree.leaves(tree), strict=False))
     if jax.tree.structure(tree) != jax.tree.structure(mean) or any(
             np.shape(a) != np.shape(b) for a, b in pairs):
@@ -125,6 +127,8 @@ def _running_mean(mean, tree, count: int, directory: str, first: str):
                                  f"{first}'s, which no mean of their weights reconciles")
             return held
         held, leaf = jnp.asarray(held, jnp.float32), jnp.asarray(leaf, jnp.float32)
+        if count == 2:
+            return held / 2 + leaf / 2
         same = jnp.sign(held) == jnp.sign(leaf)
         moved = held + (leaf - jnp.where(same, held, 0.0)) / count
         weighted = held * ((count - 1) / count) + leaf / count
