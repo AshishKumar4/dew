@@ -74,7 +74,7 @@ def _residual_axes(path, leaf, width: int, declared) -> tuple[int, ...]:
             return (COMPOSITE_RESIDUAL_AXES[names[-2:]],)
         module, name = names[-2:] if len(names) > 1 else ("", names[-1])
         final = module == "norm" and not any(LAYER.fullmatch(outer) for outer in names[:-2])
-        if name in ("scale", "bias") and (module in RESIDUAL_NORMS or final) or names[-2:] == ROUTER_SCALE:
+        if (name in ("scale", "bias") and (module in RESIDUAL_NORMS or final)) or names[-2:] == ROUTER_SCALE:
             found = (leaf.ndim - 1,)
         elif module in DEPTH_ATTENTION and name in ("scale", "kernel"):
             found = (leaf.ndim - (1 if name == "scale" else 2),)
