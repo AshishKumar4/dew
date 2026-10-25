@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from reference_error import assert_as_exact, without_ynn
+from reference_error import assert_as_exact, with_gradients, without_ynn
 
 from dew.nn import categorical
 from dew.objectives.base import token_log_probs
@@ -171,6 +171,28 @@ def test_a_confident_labels_derivative_survives_and_sums_to_zero(margin):
         assert np.all(np.asarray(gradient(rows))[:, 0] < 0)
     np.testing.assert_array_equal(categorical.cross_entropy(rows, labels),
                                   optax.softmax_cross_entropy_with_integer_labels(jnp.asarray(rows), labels))
+
+
+def written_softmax(rows: jax.Array) -> jax.Array:
+    """The softmax written out: each row moved to its largest logit, exponentiated and normalized, its
+    derivative autodiff's, through the maximum too."""
+    moved = jnp.exp(rows - jnp.max(rows, axis=-1, keepdims=True))
+    return moved / moved.sum(axis=-1, keepdims=True)
+
+
+@pytest.mark.parametrize("margin", sorted(COLLAPSE_SEEDS))
+def test_a_confident_rows_probabilities_differentiate_as_the_softmax_written_out(margin):
+    """Past the margin where the most probable class's `p - 1` rounds to 0 in float32 (arXiv:2610.31642,
+    eq. 4), the probabilities and their derivative under a drawn cotangent are on par from float64 with
+    the softmax written out (check 1), whose derivative through the row's maximum gives the most
+    probable class the others' sum, negated."""
+    def draw(seed):
+        (rows,) = confident(margin, seed)
+        return rows, np.random.default_rng([margin, seed]).standard_normal(rows.shape).astype(np.float32)
+
+    assert_as_exact(without_ynn(with_gradients(categorical.probabilities)),
+                    without_ynn(with_gradients(written_softmax)), draw, f"probabilities at margin {margin}",
+                    seeds=COLLAPSE_SEEDS[margin])
 
 
 def near_reference(seed: int) -> tuple[np.ndarray, np.ndarray]:
