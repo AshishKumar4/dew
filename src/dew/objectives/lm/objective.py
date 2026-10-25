@@ -105,7 +105,7 @@ from dew.objectives.lm.chunked import (
     support_log_probs,
 )
 from dew.objectives.lm.head import HeadedObjective
-from dew.objectives.routing import ExpertBalance, RoutedStatistics
+from dew.objectives.routing import ExpertBalance, RoutedStatistics, apply_routed, reduce_routed
 from dew.registry import from_record, to_record
 from dew.sampling.text import Sampling
 
@@ -1271,16 +1271,10 @@ class LMObjective(TokenScorer):
         return statistics, Aux(reported, qk_stats=qk, effects=effects), scores
 
     def reduce_loss(self, stats: Ratio | RoutedStatistics) -> tuple[jax.Array, jax.Array]:
-        if isinstance(stats, Ratio):
-            return stats.mean()
-        if self.balance is None:
-            raise ValueError("routed statistics require a balance (ExpertBalance)")
-        return self.balance.reduce(stats)
+        return reduce_routed(self.balance, stats)
 
     def apply_effects(self, variables: Variables, effects: Variables) -> Variables:
-        if self.balance is None:
-            raise ValueError("router count effects require a balance (ExpertBalance)")
-        return self.balance.apply(variables, effects)
+        return apply_routed(self.balance, variables, effects)
 
     def evaluate(self, params, batch, step: Step):
         """Score the complete batch teacher-forced, using EMA when present; the

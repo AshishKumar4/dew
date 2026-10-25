@@ -54,7 +54,7 @@ from dew.objectives.base import (
 from dew.objectives.lm.chunked import final_read, refuse_without_logits
 from dew.objectives.lm.head import HeadedObjective
 from dew.objectives.lm.objective import TEXT_KEY, batch_text, text_preview
-from dew.objectives.routing import ExpertBalance, RoutedStatistics
+from dew.objectives.routing import ExpertBalance, RoutedStatistics, apply_routed, reduce_routed
 from dew.sampling.sample import sample
 
 if TYPE_CHECKING:
@@ -176,16 +176,10 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         return nelbo, scores
 
     def reduce_loss(self, stats: Ratio | RoutedStatistics) -> tuple[jax.Array, jax.Array]:
-        if isinstance(stats, Ratio):
-            return stats.mean()
-        if self.balance is None:
-            raise ValueError("routed statistics require a balance (ExpertBalance)")
-        return self.balance.reduce(stats)
+        return reduce_routed(self.balance, stats)
 
     def apply_effects(self, variables: Variables, effects: Variables) -> Variables:
-        if self.balance is None:
-            raise ValueError("router count effects require a balance (ExpertBalance)")
-        return self.balance.apply(variables, effects)
+        return apply_routed(self.balance, variables, effects)
 
     def _scored(self, params, batch, step: Step, *, train: bool
                 ) -> tuple[Ratio | RoutedStatistics, Aux[Variables], TokenScores]:
