@@ -295,16 +295,15 @@ def _dkv_step(walk: _Backward, resident: tuple, rows_of, buffers, coords_of, par
         # pieces are taken where the mask is read (`algebra.pulled`).
         exponentials, weights, cotangents, slopes, seen = _scores(
             walk, coords_of(q_first), masked, params, s, dp, peak, denominator, centre, rest, chosen)
-        # dV's operand narrowed at once, so the fp32 weights it is taken from hold no registers past it.
-        narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype)
         column_sums = functools.partial(family.column_sums, scratch=sums_scratch, interpret=walk.interpret)
         logits, pieces = algebra.pulled(cotangents, slopes, seen, kinds, column_sums)
-        return narrowed, logits, pieces
+        return exponentials, weights, logits, pieces
 
     # The tiles a query block sees whole unmasked, the rest masked, chosen a tile at a time in one walk
     # (`_dq_step`).
-    narrowed, logits, pieces = lax.cond(whole(index), functools.partial(scores, masked=False),
-                                        functools.partial(scores, masked=True))
+    exponentials, weights, logits, pieces = lax.cond(whole(index), functools.partial(scores, masked=False),
+                                                     functools.partial(scores, masked=True))
+    narrowed = algebra.value_weights(exponentials, weights, do_slot.dtype)
     parts = algebra.cotangent_parts(logits * walk.scale, q_slot.dtype, accurate=walk.accurate)
     # Each staged part's transpose the left operand (`algebra.cotangent_product`'s `aᵀ @ b`).
     dv_acc = family.staged_products(dv_acc, ((narrowed, None),), do_slot, buffers.at[pl.ds(0, 1)],
