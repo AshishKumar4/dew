@@ -75,6 +75,18 @@ def _summarized(timings) -> tuple[dict, dict]:
     return times, failures
 
 
+def _checking(want, errors: dict[str, float]):
+    """A `tuning.measured` outputs callback: each config's worst error against the truth `want`, relative to
+    its largest magnitude, written into `errors` by the config's repr."""
+    import numpy as np
+
+    def check(config, got):
+        got = np.asarray(got, np.float32)
+        errors[repr(config)] = float(np.max(np.abs(got - want)) / np.max(np.abs(want)))
+
+    return check
+
+
 def _record(name: str, product: str, implementation: str):
     """A record's launch, its bound key, its call's arrays and options, from the fixture's own draw."""
     import jax
@@ -99,6 +111,7 @@ def _part(name, product, implementation, sample, part, parts, lock, wanted, resu
     """One process's share of a record (`_timed_apart`): every `parts`-th of its sampled configs from
     `part`, compiled here and timed under `lock`, checked against the truth at `wanted`; its times, failures
     and errors put on `results`."""
+    _shared_memory_policy(parts)
     import numpy as np
 
     from dew.nn.kernels import generation, tuning
@@ -107,15 +120,24 @@ def _part(name, product, implementation, sample, part, parts, lock, wanted, resu
     want = np.load(wanted, mmap_mode="r")
     target = generation.gpu_target()
     configs = list(sampled(launch, ba, target, sample) or launch.fitting(ba, target))
-    errors = {}
-
-    def check(config, got):
-        got = np.asarray(got, np.float32)
-        errors[repr(config)] = float(np.max(np.abs(got - want)) / np.max(np.abs(want)))
-
-    timings = tuning.measured(launch, ba, arrays=list(call), outputs=check, configs=configs[part::parts],
+    errors: dict[str, float] = {}
+    timings = tuning.measured(launch, ba, arrays=list(call), outputs=_checking(want, errors),
+                              configs=configs[part::parts],
                               gpu=lambda: lock, compilers=max(1, (os.cpu_count() or 1) // parts))
     results.put((part, *_summarized(timings), errors))
+
+
+GPU_SHARE = 0.9
+"""The share of the GPU's memory a sweep's processes divide among them (`_shared_memory_policy`), the rest
+left to the CUDA contexts and the driver."""
+
+
+def _shared_memory_policy(parts: int) -> None:
+    """This process's JAX memory policy where `parts` processes beside the sweep's own share one GPU, set
+    before JAX initializes: no preallocation, and at most its even split of `GPU_SHARE`, so the first to
+    allocate cannot take the memory its siblings need."""
+    os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
+    os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"] = f"{GPU_SHARE / (parts + 1):.3f}"
 
 
 class PartDied(RuntimeError):
@@ -205,9 +227,10 @@ def main() -> int:
                         help="processes compiling a record's configs at once, each timing its own under one "
                              "lock on the GPU (compiles run beside runs, never two runs at once)")
     args = parser.parse_args()
+    if args.processes > 1:
+        _shared_memory_policy(args.processes)
 
     import jax
-    import numpy as np
 
     from dew.nn.kernels import generation, grouped_matmul as gm, tuning
 
@@ -244,10 +267,7 @@ def main() -> int:
                 # Each config's outputs from its first timed run (`tuning.measured`), checked as they come,
                 # with no compile of their own and one config's outputs held at a time.
                 errors: dict[str, float] = {}
-
-                def check(config, got, want=want, errors=errors):
-                    got = np.asarray(got, np.float32)
-                    errors[repr(config)] = float(np.max(np.abs(got - want)) / np.max(np.abs(want)))
+                check = _checking(want, errors)
 
                 configs = sampled(launch, ba, target, args.sample)
                 if args.processes > 1:
