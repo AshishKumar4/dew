@@ -63,9 +63,11 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     # rope_scaling); a config transformers wrote nests both. Either way the
     # ramp is the model's, and every rotated layer applies it.
     used.update(('no_rope_layers', 'no_rope_layer_interval', 'layer_types'))
+    # Llama4TextRotaryEmbedding builds any rope_type, but the llama4 mixer rotates by Llama 3.1's
+    # ramp alone (`dew.nn.llama4`), so a YaRN record is refused here.
+    rope = read_rope(hf_config, used, _LLAMA4_SPELLING, ramps=('llama3',))
     config = base_config(hf_config, used, layer_types=layer_types,
-                          rope=dataclasses.replace(read_rope(hf_config, used, _LLAMA4_SPELLING),
-                                                   local_theta=None))
+                          rope=dataclasses.replace(rope, local_theta=None))
     if hf_config.get('router_jitter_noise', 0.0):
         refuse("router_jitter_noise", "the router selects on the logits alone")
     if hf_config.get('output_router_logits', False):
@@ -158,4 +160,5 @@ LLAMA4_TEXT = DecoderFamily(
               'max_position_embeddings': 131072},
     # A model whose rotated layers attend every key says so, against the class's 8192.
     export_nulls=('attention_chunk_size',),
+    padding_idx=True,
 )

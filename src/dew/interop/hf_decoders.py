@@ -649,7 +649,7 @@ def held_depths(fields: dict, params: Mapping[str, object]) -> None:
 def translate_weights(
     hf_tensors: Mapping[str, np.ndarray],
     config: DecoderFields,
-    model_type: str | None = None,
+    model_type: str | DecoderFamily | None = None,
     *,
     param_dtype: str = "float32",
     lazy: bool = False,
@@ -664,7 +664,7 @@ def translate_weights(
 def read_decoder(
     hf_tensors: Mapping[str, np.ndarray],
     config: DecoderFields,
-    model_type: str | None = None,
+    model_type: str | DecoderFamily | None = None,
     *,
     param_dtype: str = "float32",
     lazy: bool = False,
@@ -696,10 +696,10 @@ def read_decoder(
     what the backbone would be built from, so it cannot tell apart two families
     that compute the same thing under different tensor names. Kimi K2.5's
     decoder, for example, is DeepSeek V3's computation nested under
-    `language_model.`.
+    `language_model.`. A family that is no registered one, as a type verified from parts loads by
+    (`dew.interop.parts.family`), is passed itself.
     """
-    family = (_family_for_config(config) if model_type is None
-              else families()[model_type])
+    family = _family_for_config(config) if model_type is None else family_entry(model_type)
     # A tied head and a depth's embedding and head are checked copies of
     # tensors the tree already takes, so they are dropped here; any other
     # second tensor for a filled leaf is refused where it is placed.
@@ -960,6 +960,10 @@ def export_config(model) -> Mapping[str, object]:
         config.pop('rope_local_base_freq', None)
     elif ramped:
         config['rope_scaling'] = dataclasses.asdict(next(iter(ramped.values())))
+    defaulted = family.defaults.get('pad_token_id') is not None
+    if family.padding_idx and (model.padding_idx is not None or defaulted):
+        # An explicit null where the class defaults to a pad id, so that id takes no row the model trains.
+        config['pad_token_id'] = model.padding_idx
     config.update(exported)
     written = {key: value for key, value in config.items()
                if value is not None or key == 'pad_token_id' or key in family.export_nulls}
@@ -1050,6 +1054,11 @@ def bundles(config: Mapping[str, object]) -> bool:
 def families() -> dict[str, DecoderFamily]:
     """The single mutable name table, also used for registered source aliases."""
     return {name: family for family in ENTRIES for name in family.model_types}
+
+
+def family_entry(family: str | DecoderFamily) -> DecoderFamily:
+    """A registered family by its name, or a family given itself (one assembled from parts)."""
+    return family if isinstance(family, DecoderFamily) else families()[family]
 
 def _family_of(fields: CausalTransformer) -> DecoderFamily:
     return next(family for family in ENTRIES if family.matches(fields))

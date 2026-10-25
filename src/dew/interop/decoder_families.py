@@ -125,6 +125,7 @@ ENTRIES = (
         preserve_source_layout=False,
         # MinistralConfig's defaults for the fields its decoder reads.
         defaults={"sliding_window": 4096, "num_key_value_heads": 8, "max_position_embeddings": 131072},
+        padding_idx=True,
     ),
     DecoderFamily(
         ("llama",),
@@ -135,5 +136,8 @@ ENTRIES = (
         # LlamaMLP's projections carry biases where mlp_bias says so.
         lambda model: {"mlp_bias": True} if model.mlp_bias else {},
         preserve_source_layout=False,
+        # LlamaConfig's context (configuration_llama.py:71), which a YaRN record's omitted lengths read.
+        defaults={"max_position_embeddings": 2048},
+        padding_idx=True,
     ),
 )
