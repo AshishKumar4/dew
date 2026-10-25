@@ -491,6 +491,7 @@ def test_every_tuning_variant_is_on_par_interpreted(launch):
     among kernels the gate already holds."""
     shape = SHAPES["interpreted"]
     with generation.assumed("sm90"):
+        target = generation.gpu_target()
         if launch == "backward":
             op, ba = _backward_call(shape, 128, accurate=False)
         else:
@@ -499,10 +500,10 @@ def test_every_tuning_variant_is_on_par_interpreted(launch):
     assert len(variants) > 1
     for config in variants:
         if launch == "backward":
-            _check_backward("causal", shape, form=None, interpret=True, config=config)
+            _check_backward("causal", shape, form=None, interpret=True, config=config, target=target)
         else:
             _check_forward("causal", jnp.bfloat16, shape, natural=False, interpret=True, tiles=config,
-                           training=launch == "training", target=generation.gpu_target())
+                           training=launch == "training", target=target)
 
 
 @pytest.mark.parametrize("unseen", UNSEEN)
