@@ -47,7 +47,7 @@ from common import (
     window_rows,
     write_record,
 )
-from reference_source import git_head
+from reference_source import dew_revision
 
 
 class NormState(NamedTuple):
@@ -167,12 +167,14 @@ def build(args: argparse.Namespace) -> Run:
 
     work = measure(objective, rows(np.arange(args.batch)))
     work.write(args.work)
-    schedule = Cosine(peak=args.lr_peak, warmup_steps=args.warmup, end=args.lr_end, init=args.lr_init)
+    schedule = Cosine(peak_value=args.lr_peak, warmup_steps=args.warmup, end_value=args.lr_end,
+                      init_value=args.lr_init)
     # One group over every parameter, as torch_lm.py's AdamW decays the norms
     # and biases too.
     solver = OptimConfig(
         optimizer="adamw", b1=args.b1, b2=args.b2, optimizer_opts={"eps": args.eps},
-        state_dtype=args.state_dtype, rate=schedule, weight_decay=args.weight_decay, clip_grads=args.clip,
+        state_dtype=args.state_dtype, learning_rate=schedule, weight_decay=args.weight_decay,
+        clip_grads=args.clip,
         param_groups=(ParamGroup("all", ("*",)),)).build(schedule_steps)
     devices = jax.device_count()
     mesh = {"data": MeshSpec(), "fsdp": MeshSpec(fsdp=devices), "expert": MeshSpec(expert=devices)}[args.mesh]
@@ -270,7 +272,7 @@ def train(args: argparse.Namespace, run: Run, probe: RouterProbe | None) -> tupl
 def versions() -> dict:
     """The versions a record names, read before the run so an untraceable
     checkout fails at once rather than after it."""
-    return {"jax": jax.__version__, "dew": git_head(Path(__file__).resolve().parents[2]),
+    return {"jax": jax.__version__, "dew": dew_revision(),
             "optax": optax.__version__, "flax": __import__("flax").__version__}
 
 

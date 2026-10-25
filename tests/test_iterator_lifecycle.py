@@ -325,9 +325,10 @@ def test_a_field_no_compiled_step_reads_stays_on_the_host():
     mesh = MeshSpec().build()
     rows = jax.device_count()
     batch = {"x": np.ones((rows, 3), np.float32), "unused": np.arange(rows), "absent": None}
-    step = jax.jit(lambda state, batch, part: state + jnp.sum(batch["x"]) + part)
+    # A step's arguments as the trainer's: the moving state, the frozen tree, then the batch.
+    step = jax.jit(lambda state, frozen, batch, part: state + frozen + jnp.sum(batch["x"]) + part)
     first = shard_batch(mesh, batch)
-    compiled = step.lower(jnp.zeros(()), first, jnp.int32(0)).compile()
+    compiled = step.lower(jnp.zeros(()), jnp.zeros(()), first, jnp.int32(0)).compile()
     # The trainer publishes the mask under the placed batch's signature.
     signature = batch_signature(first)
     reads = {signature: step_reads(compiled, signature)}
@@ -335,7 +336,7 @@ def test_a_field_no_compiled_step_reads_stays_on_the_host():
     with DevicePrefetchIterator(iter([batch, wider]), mesh, reads=reads) as stream:
         placed, whole = next(stream), next(stream)
     assert isinstance(placed["x"], jax.Array) and isinstance(placed["unused"], np.ndarray)
-    assert float(compiled(jnp.zeros(()), placed, jnp.int32(0))) == 3 * rows
+    assert float(compiled(jnp.zeros(()), jnp.zeros(()), placed, jnp.int32(0))) == 3 * rows
     assert isinstance(whole["unused"], jax.Array)
 
 

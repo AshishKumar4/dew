@@ -18,6 +18,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import numpy as np
+from matrix_support import MATRIX_RECORDS, matrix_prefix, published_matrix
 from process_support import serve_mode, worker_parser
 
 from dew.data import Loading
@@ -487,15 +488,16 @@ def mode_reads(args) -> dict:
     rows = len(mesh.local_devices)
     batch = {"x": np.ones((rows, 3), np.float32), "unused": np.arange(rows)}
     first = shard_batch(mesh, batch)
-    step = jax.jit(lambda state, batch: state + jnp.sum(batch["x"]))
-    compiled = step.lower(jnp.zeros(()), first).compile()
+    # A step's arguments as the trainer's: the moving state, the frozen tree, then the batch.
+    step = jax.jit(lambda state, frozen, batch: state + frozen + jnp.sum(batch["x"]))
+    compiled = step.lower(jnp.zeros(()), jnp.zeros(()), first).compile()
     signature = batch_signature(first)
     placed = shard_batch(mesh, batch, {signature: step_reads(compiled, signature)})
     return {"read_differs_from_placed": batch_signature(batch) != batch_signature(first),
             "unused_on_host": isinstance(placed["unused"], np.ndarray),
             "unused_shape": list(np.shape(placed["unused"])),
             "x_placed": isinstance(placed["x"], jax.Array),
-            "sum": float(compiled(jnp.zeros(()), placed))}
+            "sum": float(compiled(jnp.zeros(()), jnp.zeros(()), placed))}
 
 
 def mode_packed_fit(args) -> dict:
@@ -1314,6 +1316,8 @@ def _builtin_sampler_failure(kind, phase, source, rank, fault):
                 terminated=jax.numpy.zeros((1,), bool),
                 behavior_log_probs=jax.numpy.zeros((1, 1)),
                 raw_log_probs=jax.numpy.zeros((1, 1)), rows=1)
+        if kind == "masked":
+            return result, np.zeros((), bool)
         return result
     return sample_failure
 
@@ -2335,8 +2339,6 @@ def mode_host_fields(args) -> dict:
     return {"seen": named_records(MeshSpec().build())}
 
 
-MATRIX_RECORDS = 96
-
 
 @dataclasses.dataclass(frozen=True)
 class Imaged:
@@ -2349,27 +2351,24 @@ class Imaged:
         return {"image": np.resize(tokens % 256, (RES, RES, 3)).astype(np.uint8)}
 
 
-def matrix_data(read: str, cached: bool, rejecting: bool, packed: bool, cache_dir: Path):
-    """One cell of the data matrix compiled for training: records of one to
-    eight tokens, each holding its own id; a filter that rejects every third;
-    a cache filled by the pool; online packing into eight-token windows; then
-    a global shuffle where the order stays indexed and a windowed one where it
-    streams."""
-    from dew.data import Memory
+def matrix_data(read: str, cached: str, rejecting: bool, packed: bool, cache_dir: Path):
+    """One cell of the data matrix compiled for training: the matrix prefix; a cache the pool fills
+    (`cache`), or the prefix's published generation read in its place (`published`); online packing into
+    eight-token windows (from the published plan where published); then a global shuffle where the order
+    stays indexed and a windowed one where it streams."""
     from dew.data.cache import Cache
     from dew.data.compile import compile
-    from dew.data.pipeline import Pipeline
 
-    records = [{"text": np.full(1 + index % 8, index, np.int32)} for index in range(MATRIX_RECORDS)]
-    pipeline = Pipeline(Memory(records, shard_rows=16))
-    if rejecting:
-        pipeline = pipeline.filter(lambda row: int(row["text"][0]) % 3 != 0, identity="thirds@1")
-    if cached:
+    pipeline = matrix_prefix(rejecting, lengths=cached == "published")
+    if cached == "cache":
         pipeline = pipeline.cache(Cache(str(cache_dir)))
+    elif cached == "published":
+        pipeline = pipeline.cache(published_matrix(rejecting, packed, cache_dir))
     if packed:
         pipeline = pipeline.pack(8, bins=2)
     pipeline = pipeline.map(Imaged(), identity="imaged@1")
-    indexed = read == "memory" or (read == "indexed" and not (cached or rejecting or packed))
+    indexed = read == "memory" or (read == "indexed" and (cached == "published"
+                                                          or not (cached == "cache" or rejecting or packed)))
     order = pipeline.shuffle(0, window=None if indexed else 8).repeat()
     return compile(order.batch(BATCH), read=read, seed=0,
                    loading=Loading(workers=0, threads=1, read_buffer=1))
@@ -2382,8 +2381,10 @@ def mode_matrix(args) -> dict:
     from dew.data.dataset import tapped
 
     read, cached, rejecting, packed = args.cell.split(",")
-    data = matrix_data(read, cached == "cache", rejecting == "rejecting", packed == "packed",
-                       Path(args.run_dir).parent / "cache")
+    # A published cell reads the generation its test published once (`--prepared`), as every run of a
+    # prepared dataset does; a cache the pool fills lives beside its run.
+    cache_dir = Path(args.prepared) if cached == "published" else Path(args.run_dir).parent / "cache"
+    data = matrix_data(read, cached, rejecting == "rejecting", packed == "packed", cache_dir)
     trainer = build_trainer(args.name, args.run_dir, args.fsdp_size)
     restored_step, _ = restored_state(trainer)
     batches = []
@@ -2452,7 +2453,9 @@ def parse_args(argv=None):
                         help="read the training records through a compiled global order, whose "
                              "saved position is a global record count")
     parser.add_argument("--profile-dir", help="directory the scheduled profile window writes")
-    parser.add_argument("--cell", help="read,cache|nocache,rejecting|all,packed|rows for the matrix mode")
+    parser.add_argument("--cell", help="read,cache|nocache|published,rejecting|all,packed|rows for the "
+                                       "matrix mode")
+    parser.add_argument("--prepared", help="the cache holding a published matrix cell's generation")
     return parser.parse_args(argv)
 
 def main(argv=None) -> None:

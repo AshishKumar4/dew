@@ -43,8 +43,9 @@ from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
 from dew.artifacts import Artifact, Artifacts, TokenScores
+from dew.nn import categorical
 from dew.nn.kernels.options import compiler_options
-from dew.nn.precision import accumulated, compensated_sum
+from dew.nn.precision import accumulated, at_least_fp32, compensated_sum
 from dew.nn.protocols import HiddenStates, ProjectsParameters
 from dew.nn.sharding import rows_taken
 from dew.records import JSON, strings
@@ -882,6 +883,13 @@ class Objective(ABC, Generic[Loss, Effects]):
         tower. The trainer calls this once and passes the result to `init`, so
         an objective never has to read its own held arrays inside a trace.
         The default is the starting tree, `variables`.
+
+        A leaf of the `FROZEN` collection that `init` returns as it is, by
+        reference, as the base `init` returns the whole collection (it projects
+        `params` alone), is shared: the trainer's state holds that very array,
+        which no step donates, so a run and its objective hold one frozen tree
+        (`dew.training.state.apart`). A frozen leaf `init` builds, another
+        array's copy or values of its own, is the state's own.
         """
         return self.variables
 
@@ -1146,7 +1154,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         batch-wide term computed through this count each real record once. Without
         `VALID_ROWS`, as in training, this is the sum (`compensated_sum`) and the size.
         """
-        dtype = jnp.promote_types(values.dtype, jnp.float32)
+        dtype = at_least_fp32(values.dtype)
         axes = (tuple(range(values.ndim)) if axis is None
                 else (axis,) if isinstance(axis, int) else tuple(axis))
         if VALID_ROWS not in batch:
@@ -1227,7 +1235,7 @@ class Objective(ABC, Generic[Loss, Effects]):
             return stats.mean()
         if isinstance(stats, (jax.Array, float, int)):
             value = jnp.asarray(stats)
-            value = value.astype(jnp.promote_types(value.dtype, jnp.float32))
+            value = value.astype(at_least_fp32(value.dtype))
             if value.ndim != 0:
                 raise ValueError("a unit-mass loss must be scalar")
             return value, jnp.asarray(a=True)
@@ -1640,16 +1648,11 @@ def mean_of_totals(accumulated: tuple[float, float]) -> float:
 
 
 def token_log_probs(logits: jax.Array, tokens: jax.Array) -> jax.Array:
-    """`log_softmax(logits)[..., tokens]`, reduced in fp32 whatever `logits` holds.
+    """`log_softmax(logits)[..., tokens]`, reduced in at least fp32 (`dew.nn.categorical`).
 
-    `tokens` is `logits.shape[:-1]` of ids and the result has that shape. A
-    bf16 log partition over a vocabulary carries bf16's 8-bit mantissa into
-    every score, which is error in the second decimal of a log probability
-    near -10; fp32 carries the logits exactly and rounds only the reduction.
-    optax's cross entropy reads the target logit without building the
-    normalized row.
+    `tokens` is `logits.shape[:-1]` of ids and the result has that shape.
     """
-    return -optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tokens)
+    return -categorical.cross_entropy(logits, tokens)
 
 __all__ = [
     "FROZEN",

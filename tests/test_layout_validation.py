@@ -23,7 +23,7 @@ from dew.nn.sharding import LayoutRefused, mesh_axes
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import DEFAULT_RULES, Layout, MeshSpec, Trainer
-from dew.training.distributed import placed_shapes
+from dew.training.distributed import STEP_BATCH, placed_shapes
 
 pytestmark = pytest.mark.mesh
 
@@ -102,7 +102,8 @@ def test_a_validated_fine_tune_is_placed_and_held_as_its_report_said(case):
         assert validation.device_bytes == held
 
     arguments, _ = run.executable.input_shardings
-    rows = {mesh_axes(sharding.spec[0]) for sharding in jax.tree.leaves(arguments[1]) if sharding.spec}
+    rows = {mesh_axes(sharding.spec[0]) for sharding in jax.tree.leaves(arguments[STEP_BATCH])
+            if sharding.spec}
     assert rows == {report.batch_axes}
     # Every collective the report says an axis implies, the compiled step runs over that axis.
     ran = collective_axes(run.executable.as_text(), run.device_mesh)
@@ -118,7 +119,7 @@ def test_a_fine_tune_over_a_devices_capacity_is_refused_before_anything_is_place
     holds of the state alone and of the state with the accumulator its steps pool, the state alone
     passes and the whole is refused, and exactly the whole passes."""
     mesh, layout, accumulation = CASES["fsdp_tensor_accumulating"]
-    run = fine_tune(mesh(), layout, accumulation, OptimConfig(optimizer="adam", rate=1e-3))
+    run = fine_tune(mesh(), layout, accumulation, OptimConfig(optimizer="adam", learning_rate=1e-3))
     alone = max(run.validate(steps=8).device_bytes.values())
     whole = max(run.validate(step_batch(), steps=8).device_bytes.values())
     assert alone < whole
