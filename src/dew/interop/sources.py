@@ -100,11 +100,12 @@ class SourceReference:
         return repo_file(self.name, root, (Path(self.subfolder or "") / filename).as_posix())
 
     def optional_file(self, root: Path, filename: str) -> Path | None:
-        """A file, or proven absence at the pinned source. An offline Hub lookup raises rather than
-        treating an uncached file as absent and initializing replacement parameters."""
+        """A file, or proven absence at the pinned source. A file the pinned snapshot already holds
+        needs no Hub lookup; an offline lookup for one it lacks raises rather than treating an
+        uncached file as absent and initializing replacement parameters."""
         selected = (Path(self.subfolder or "") / filename).as_posix()
-        if os.path.isdir(self.name):
-            path = root / selected
+        path = root / selected
+        if os.path.lexists(path) or os.path.isdir(self.name):
             return path if os.path.lexists(path) else None
         from huggingface_hub import file_exists
 

@@ -414,12 +414,10 @@ class Pretrained:
         elif fallback is not None:
             from dew.interop import torchax_fallback
 
-            resolved = reference.directory(reference.weights(directory))
-            loaded = torchax_fallback.load(resolved, resolved, None, dtype=dtype,
-                                           param_dtype=param_dtype, attention_impl=attention_impl,
-                                           max_seq_len=max_seq_len, weights=weights)
-            processor = (None if loaded.processor is None else replace(loaded.processor, source=reference))
-            loaded = replace(loaded, variables=placed(loaded.variables), processor=processor, revision=commit)
+            loaded = torchax_fallback.load(reference, directory, dtype=dtype, param_dtype=param_dtype,
+                                           attention_impl=attention_impl, max_seq_len=max_seq_len,
+                                           weights=weights)
+            loaded = replace(loaded, variables=placed(loaded.variables))
         elif gguf_file is None:
             # A selected GGUF file is a decoder, whatever pipeline index the repo also ships.
             loaded = _pipeline_source(reference, directory, single_file, dduf_file, placed,
@@ -1491,7 +1489,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     route = source_route(config)
     if isinstance(route, TorchRoute):
         from dew.interop import torchax_fallback
-        loaded = torchax_fallback.load(name_or_dir, directory, commit, dtype=dtype, param_dtype=param_dtype,
+        selected = source if component is None else source.component(component.config_folder)
+        loaded = torchax_fallback.load(selected, root, dtype=dtype, param_dtype=param_dtype,
                                        attention_impl=attention_impl, max_seq_len=max_seq_len,
                                        admission=route.admitted, weights=weights)
         return replace(loaded, variables=placed(loaded.variables))
