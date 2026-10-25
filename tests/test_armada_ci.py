@@ -195,24 +195,16 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
         "3.12:tests/test_pass.py": (1, "whole"), "3.12:tests/test_dies.py": (1, "whole")}
 
 
-def test_a_tasks_tests_run_beside_no_timed_dump_of_every_threads_stack(ci, tmp_path):
-    """A task's tests run until its deadline with no timed dump of every thread's stack beside them, which
-    killed a multithreaded test mid-dump (exit 245, a SIGSEGV, Main 2026-10-25): a test whose threads still
-    run is green, and its process carries no dump timer."""
-    (tmp_path / "tests/test_threads.py").write_text(
-        "import threading\n"
-        "def test_threads_run_on(request):\n"
-        "    stop = threading.Event()\n"
-        "    workers = [threading.Thread(target=stop.wait) for _ in range(8)]\n"
-        "    for worker in workers: worker.start()\n"
-        "    try:\n"
-        "        assert request.config.getini('faulthandler_timeout') == 0\n"
-        "    finally:\n"
-        "        stop.set()\n"
-        "        for worker in workers: worker.join()\n")
+def test_a_tasks_tests_run_with_no_timed_stack_dump_armed(ci, tmp_path):
+    """A task's pytest arms no timed dump of every thread's stack, which killed a multithreaded test mid-dump
+    (exit 245, a SIGSEGV, Main 2026-10-25): the test process CI starts carries no dump timer. A test running
+    past the old ten minutes through a task is green with no dump (armada receipt in the head's review)."""
+    (tmp_path / "tests/test_timer.py").write_text(
+        "def test_no_dump_timer(request):\n"
+        "    assert request.config.getini('faulthandler_timeout') == 0\n")
     interpreter(tmp_path, "3.12")
     out = tmp_path / "verdict.json"
-    ci.task("3.12", ["tests/test_threads.py"], "", out, 600.0)
+    ci.task("3.12", ["tests/test_timer.py"], "", out, 600.0)
     [row] = json.loads(out.read_text())["rows"]
     assert row["exitCode"] == 0, row["output"]
 
