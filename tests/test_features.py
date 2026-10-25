@@ -106,6 +106,20 @@ def test_the_waiting_share_reads_the_estimates_service_time():
     assert found.predictions['waiting_share'] == waiting / (waiting + program)
 
 
+def test_a_launch_of_fewer_programs_than_its_slots_costs_one_programs_service():
+    """A lone program costs its own service, however many a multiprocessor could hold, and its pipeline
+    hides no more steps' latency than it takes: the estimate is the same at any residency, and at any
+    stage count past its steps."""
+    target = _sm80()
+
+    def seconds(**fields):
+        return cost.seconds(cost.Cost(**{"programs": 1, "device_bytes": 1.0, "program_flops": 1e6, "steps": 2,
+                                         "stages": 3, "resident": 1} | fields), target)
+
+    assert seconds(resident=12) == seconds(resident=1)
+    assert seconds(stages=9) == seconds(stages=3) < seconds(stages=2)
+
+
 def test_a_launch_without_a_costed_record_has_no_features():
     """A kernel op that is no template, and a template costing by an override of `cost`, have none."""
     class Uncosted(base.Template):

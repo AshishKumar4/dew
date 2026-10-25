@@ -74,9 +74,9 @@ def _predictions(costed: cost.Cost, facts: generation.GpuTarget) -> dict[str, fl
       last wave's slots no program fills;
     - `staged_per_step`, shared-memory bytes a program moves per pipeline step beside its matrix
       instructions, and `serial_per_step`, those it moves between them, which they wait for;
-    - `hidden_steps`, the steps a stage in flight covers (`stages - 1`) and `waiting_share`, the waiting
-      term's share beside the resident programs' service time (`cost.program_seconds`,
-      `cost.waiting_seconds`, as `cost.seconds` reads them)."""
+    - `hidden_steps`, the steps its stages in flight cover (`stages - 1`, at most its steps) and
+      `waiting_share`, the waiting term's share beside the resident programs' service time
+      (`cost.program_seconds`, `cost.waiting_seconds`, as `cost.seconds` reads them)."""
     flops = costed.programs * costed.program_flops
     multiprocessors, clock, bandwidth = facts.multiprocessors, facts.clock_hz, facts.memory_bandwidth
     rate = facts.tensor_rate(costed.mode) if costed.program_flops else None
@@ -87,8 +87,13 @@ def _predictions(costed: cost.Cost, facts: generation.GpuTarget) -> dict[str, fl
     slots = multiprocessors * costed.resident if multiprocessors is not None else None
     waves = costed.programs / slots if slots else None
     tail = math.ceil(waves) - waves if waves else None
-    # A launch with no tensor work reads no rate, as `cost.seconds` does.
+    # A launch with no tensor work reads no rate, and a single-warp one its family's share of it, as
+    # `cost.seconds` does.
     service = 1.0 if not costed.program_flops else rate
+    if service is not None and costed.program_flops and costed.single_warp and facts.single_warp_issue:
+        service *= facts.single_warp_issue
+    resident = (min(costed.resident, max(math.ceil(costed.programs / multiprocessors), 1))
+                if multiprocessors else costed.resident)
     program = (cost.program_seconds(costed, service, clock)
                if service is not None and clock is not None else None)
     waiting = (cost.waiting_seconds(costed, facts.load_latency, clock)
@@ -99,7 +104,7 @@ def _predictions(costed: cost.Cost, facts: generation.GpuTarget) -> dict[str, fl
         'waves': waves, 'tail': tail,
         'staged_per_step': costed.program_staged / costed.steps if costed.steps else None,
         'serial_per_step': costed.serial_staged / costed.steps if costed.steps else None,
-        'hidden_steps': max(costed.stages - 1, 1),
-        'waiting_share': (waiting / (waiting + costed.resident * program)
+        'hidden_steps': max(min(costed.stages - 1, math.ceil(costed.steps)), 1),
+        'waiting_share': (waiting / (waiting + resident * program)
                           if waiting is not None and program is not None and waiting + program else None),
     }
