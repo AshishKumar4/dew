@@ -683,20 +683,25 @@ def test_packed_projections_serve_the_models_numbers(name):
     decode. One wider product can round apart from three (falcon-tiny's
     logits moved by 1.2e-7, Kimi K2's by 7.2e-7, qwen3-next-tiny's by 1.8e-5
     on another CPU), so the drawn tokens are the model's and the logits its
-    bits or as exact as them. A bidirectional decoder, which serves no
-    decode step, declares none."""
+    bits or as exact as them. A bidirectional decoder packs as a causal one does
+    and serves no decode step, so its logits alone are judged."""
     source, read = loaded(name), reads(name, "float32")
     model, variables = source.model, source.variables
     groups = model.inference_projection_groups(variables)
-    if not model.causal:
-        assert groups == ()
-        return
+    assert groups
     widths = flatten_dict(variables["params"])
     for group in groups:
         assert all(widths[(*group.path, member, "kernel")].shape[-1] == width
                    for member, width in zip(group.members, group.widths, strict=True))
     packed = _packed(variables, groups)
     assert model.inference_projection_groups(packed) == groups
+    if not model.causal:
+        def logits_truth():
+            return [_float64(model).apply(widened(variables), read.tokens, method="logits")]
+
+        as_exact([model.apply(packed, read.tokens, method="logits")], [read.logits], logits_truth,
+                 f"{name} packed")
+        return
     _, drawn, scores = _greedy(model, variables, read.tokens, decode=True)
     _, packed_drawn, packed_scores = _greedy(model, packed, read.tokens, decode=True)
     same(packed_drawn, drawn)
