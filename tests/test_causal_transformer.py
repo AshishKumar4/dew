@@ -48,7 +48,7 @@ SEEDS = {'decode': 16, 'kernels': 16, 'window kernels': 8, 'softcap': 32, 'route
          'grouped': 32, 'sliding decode': 16, 'hybrid decode': 512, 'sandwich': 8, 'packed alone': 16,
          'metadata': 128, 'packed kernels': 16, 'bf16 head': 8, 'strict head': 8, 'norm gradient': 8,
          'xsa': 32, 'xsa decode': 8, 'grouped decode': 32, 'cached prefill': 8, 'packed cudnn': 8,
-         'cudnn decode': 16, 'padded prefill': 8, 'right padded': 16, 'rotary': 8, 'old record': 8}
+         'cudnn decode': 16, 'padded prefill': 8, 'right padded': 16, 'rotary': 8, 'old record': 64}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, and the GPU
 sites on an A100): the most any of a site's cases took."""
 
