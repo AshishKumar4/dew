@@ -401,6 +401,14 @@ def unplaced(order: dict[str, JSON] | list[JSON] | str | int | float | bool | No
     return order
 
 
+MADE_GLOBAL = ("a per-share read resumes only on the shares, workers and cycle length that saved it. "
+               "To resume on others, prepare it once so it reads a global order: publish its filtered or "
+               "packed rows (`dew data publish`, or `publish(chain, Cache(url))` and `.cache(generation)`) "
+               "or provision its source's index (`dew data provision`, or `provision=True`)")
+"""How a per-share read becomes one that resumes on any partition, which every refusal of another
+topology names (docs/design/data.md §10, provisioned orders)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Plan:
     """Order-defining fields checked before a restored iterator opens readers.
@@ -509,8 +517,8 @@ class Plan:
             if ({name: value for name, value in topology.items() if name != "pools"}
                     != {name: value for name, value in saved_topology.items() if name != "pools"}
                     or any(pools.get(name) != saved_pools.get(name) for name in compared)):
-                raise ValueError("saved per-share data plan topology changed (shares, workers or cycle "
-                                 "length)")
+                raise ValueError(f"saved per-share data plan topology changed (shares, workers or cycle "
+                                 f"length); {MADE_GLOBAL}")
         changed = _changed(record(saved.get("manifest"), "saved data manifest"), self.manifest.semantic())
         if edited is not None:
             changed = tuple(name for name in changed if name not in ("source", "steps", "tokenizer"))
