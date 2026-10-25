@@ -21,6 +21,7 @@ base-2 fold and natural logits, under the default's guards over whole launches (
 program walks its keys once, so the call walks again in the natural form where some row's logits pass the
 fold's reach, and its overflowed rows again shifting under headroom). Its legality rule is `refused`."""
 
+import dataclasses
 import functools
 from typing import NamedTuple
 
@@ -71,6 +72,22 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     return scoped, family.streams(blocks, stages, consumers)
 
 
+def _guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype) -> Tiles:
+    """The guarded launch's tiles beside the plain launch's `tiles` (`_plain_forward`): its consumers and
+    query blocks, and the widest key tile, halved from the plain one's to a swizzled row of keys
+    (`mosaic.SWIZZLE_BYTES`), whose live set a consumer's registers hold (`mosaic.live_registers`): its
+    shifted and unshifted sums of `columns` value columns fp32 carried, beside a step's logits and weights
+    fp32 and the two products the step forms (`algebra.stepped`)."""
+    budget = family.registers(tiles.consumers)
+    rows, least = tiles.block_q, mosaic.SWIZZLE_BYTES // jnp.dtype(dtype).itemsize
+    carried = [(rows, columns, jnp.float32)] * 2
+    block = tiles.block_k
+    while block > least and mosaic.live_registers(
+            family, carried, [(rows, block, jnp.float32)] * 2 + [(rows, columns, jnp.float32)] * 2) > budget:
+        block //= 2
+    return dataclasses.replace(tiles, block_k=block)
+
+
 def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
                    scale: float, natural: bool, tiles: Tiles, interpret: bool) -> jax.Array:
     """`MosaicForward`'s launch without residuals, at `tiles`, under the default's guards over whole launches
@@ -90,6 +107,7 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
             return out, status[0], status[1] > 0
         # An output hook reads a row's whole output, so its call takes the guarded launch at its full width.
         unit = v.shape[-1] if hooks.output_mod is not None else min(v.shape[-1], family.column_unit(v.dtype))
+        guarded = _guarded_tiles(family, tiles, unit, v.dtype)
         blocks = []
         for first in range(0, v.shape[-1], unit):
             # The guarded launch reads its live rows and its values' largest magnitudes (`algebra.room`), and
@@ -99,7 +117,7 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
             initial = hooked.initial
             held = hooked if initial is None else hooked._replace(
                 initial=(*initial[:2], initial[2][..., first:first + unit]))
-            blocks.append(_launch(q, k, columns, spans_of, held, guard, spec=form, hooks=hooks, tiles=tiles,
+            blocks.append(_launch(q, k, columns, spans_of, held, guard, spec=form, hooks=hooks, tiles=guarded,
                                   family=family, training=False, interpret=interpret)[0])
         # Its maxima and overflows `walked_launches` reads of the plain launch alone.
         return jnp.concatenate(blocks, axis=-1), jnp.zeros(live.shape, jnp.float32), jnp.zeros_like(live)
