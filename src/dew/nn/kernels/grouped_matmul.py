@@ -860,6 +860,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             program_exponentials=epilogue_exponentials, mode=_mode(tokens.dtype), steps=steps,
             stages=config.stages, serial_staged=rewritten + fragments,
             serial_exponentials=prologue_exponentials,
+            # One warpgroup a program and one program a multiprocessor: one warp a scheduler.
+            single_warp=family.operands_in_registers,
             serial_stored=(config.block_m * config.block_n * out
                            if self.STORES_SERIALLY and config.warpgroups == 1 else 0))
 
@@ -1423,20 +1425,11 @@ def _families(dtype) -> tuple[mosaic.Family, ...]:
     return mosaic_sm90.WGMMA, *((mosaic_sm80.Mma(jnp.dtype(dtype)),) if ampere else ())
 
 
-AMPERE_MEASURED = _Need(
-    'mma_sync', lambda case: case.call.target.wgmma,
-    "an A100 ran the Mosaic GPU forward's mma.sync tiles at 2.8 to 3.3 times Triton's time (AMPERE3), so "
-    "they run where the call names them", row='ledger 1297', kind='measured')
-"""What the targets measured of the Mosaic GPU launches without warpgroup MMA: slower than Triton's, so
-they run only by name (`generation.chosen`)."""
-
-
 _GMMS = (MosaicGmm(), CutlassGmm(), MosaicTpuGmm(), Gmm())
 _TGMMS = (MosaicTgmm(), CutlassTgmm(), MosaicTpuTgmm(), Tgmm())
 
 GROUPED: selection.Op[GroupedCase] = selection.Op('grouped_matmul', (
-    *(_launch_kernel(launch.name, *((AMPERE_MEASURED,) if launch.name == 'mosaic_gpu' else ()))
-      for launch in _GMMS),
+    *(_launch_kernel(launch.name) for launch in _GMMS),
     selection.Kernel[GroupedCase]('xla', (), generic=True)))
 """The grouped selector: the launch whose fastest fitting config the cost model estimates fewest seconds
 among those that take the call (the first of Mosaic GPU's, CUTLASS's, the TPU's and Triton's where

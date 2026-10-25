@@ -592,10 +592,11 @@ def ampere(generation_name: str = "sm80"):
 @pytest.mark.skipif(not AMPERE_CLASS, reason="no mma.sync kernel this GPU and JAX lower")
 @pytest.mark.parametrize("out_dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("sizes", [name for name in SIZES if any(SIZES[name])])
-def test_an_ampere_gpu_runs_the_mosaic_forward_only_by_name(sizes, out_dtype):
-    """Without warpgroup MMA the Mosaic GPU forward runs mma.sync's tiles (`mosaic_gpu.generated`, on the
-    GPU's own facts) only where the call names it: chosen, it is as exact as XLA's ragged dot rounded to its
-    output dtype from float64, unrouted rows and empty groups included; unchosen, Triton's launch runs it."""
+def test_an_ampere_gpu_runs_the_launch_its_facts_rank_first(sizes, out_dtype):
+    """Without warpgroup MMA, the Mosaic GPU forward's mma.sync tiles (`mosaic_gpu.generated`) and Triton's
+    launch are ranked by the cost model on the GPU's own facts (its family's single-warp issue among them):
+    unnamed, the call runs the one estimated faster; named, each is as exact as XLA's ragged dot rounded to
+    its output dtype from float64, unrouted rows and empty groups included."""
     x, w, dy, group = operands(SIZES[sizes], jnp.bfloat16)
     truth = oracle.products(x, w, dy, SIZES[sizes])
     group_sizes = jnp.asarray(SIZES[sizes], jnp.int32)
@@ -609,15 +610,23 @@ def test_an_ampere_gpu_runs_the_mosaic_forward_only_by_name(sizes, out_dtype):
         return template.gemm(x, w, group_sizes, out_dtype=out_dtype, precision="default",
                              interpret_on_cpu=True)
 
-    for named, kernel in ((None, "Gmm"), ("mosaic_gpu", "MosaicGmm")):
-        chosen = {} if named is None else {"grouped_matmul": named}
+    def running(**chosen):
+        # The launches of the branch the call runs; a GPU process's CPU branch beside it interprets Triton's.
         with ampere(), generation.chosen(**chosen), tuning.seen() as launches:
             got = jax.jit(forward)(lhs, rhs)
-        # The branch the call runs; a GPU process's CPU branch beside it interprets Triton's.
-        ran = {type(launch).__name__ for launch, ba in launches
-               if ba.arguments["interpret"] == (jax.default_backend() == "cpu")}
-        assert ran == {kernel} and got.dtype == out_dtype
+        ran = [(launch, ba) for (launch, _), (_, ba) in zip(launches, launches.taken, strict=True)
+               if ba.arguments["interpret"] == (jax.default_backend() == "cpu")]
+        return got, ran
+
+    estimated = {}
+    for named, kernel in (("triton", "Gmm"), ("mosaic_gpu", "MosaicGmm")):
+        got, ran = running(grouped_matmul=named)
+        assert {type(launch).__name__ for launch, _ in ran} == {kernel} and got.dtype == out_dtype
         check(got, reference, truth[0], group, f"sm80 forward through {kernel} to {jnp.dtype(out_dtype)}")
+        with ampere():
+            estimated[kernel] = sum(launch.estimate(ba, generation.gpu_target())[0] for launch, ba in ran)
+    _, ran = running()
+    assert {type(launch).__name__ for launch, _ in ran} == {min(estimated, key=estimated.__getitem__)}
 
 
 @pytest.mark.skipif(not AMPERE_CLASS, reason="no mma.sync kernel this GPU and JAX lower")
