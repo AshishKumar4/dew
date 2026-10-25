@@ -175,9 +175,10 @@ class _Sizes:
 
     def given(self, name: str) -> int | None:
         """The size `name` as the config states it under its own key or the standard one, which its
-        class reads alike, else None; a stated size that is no whole number is a ValueError."""
+        class reads alike, else None, a null stating nothing (CWM's `head_dim`, derived from the width
+        and the heads); a stated size that is no whole number is a ValueError."""
         for spelled in (self.key(name), name):
-            if spelled in self.config:
+            if self.config.get(spelled) is not None:
                 return records.integer(self.config[spelled], spelled)
         return None
 

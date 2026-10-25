@@ -65,6 +65,21 @@ GLM_FLASH = {"num_key_value_heads": 4, "n_routed_experts": 4, "num_experts_per_t
              "topk_group": 1, "head_dim": None}
 
 
+@pytest.mark.parametrize("head_dim", ["absent", "null", "explicit"])
+def test_an_optional_size_stated_null_states_nothing(head_dim):
+    """CWM derives `head_dim` from its width and heads where its config leaves it out or states it
+    null, and the probe reads both alike, as an explicit one, verifying the same convention."""
+    from dew.interop.verify import VerifiedMapping, verify_mapping
+
+    config = tiny_config("cwm", sliding_window=4).to_dict()
+    config.pop("head_dim", None)
+    if head_dim == "null":
+        config["head_dim"] = None
+    elif head_dim == "explicit":
+        config["head_dim"] = config["hidden_size"] // config["num_attention_heads"]
+    assert isinstance(verify_mapping(config), VerifiedMapping)
+
+
 @pytest.mark.parametrize("model_type, fields", [("cwm", {"sliding_window": 4}), ("glm4_moe_lite", GLM_FLASH)])
 def test_a_verified_load_saves_the_source_config_and_reloads(tmp_path, model_type, fields):
     """A verified type is not its family: it saves under its own config and
