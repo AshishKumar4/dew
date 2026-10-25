@@ -107,7 +107,7 @@ class Images(Generic[ArrayT]):
 
     def host(self) -> Images[np.ndarray]:
         """Return this process's real rows as host arrays, without the padding added to fill the devices."""
-        return host_rows(self, self.rows)
+        return jax.tree.map(lambda leaf: host_rows(leaf, self.rows), self)
 
     def pil(self) -> list[PILImage]:
         """Return this process's real rows of an NHWC image batch as PIL images.
