@@ -75,6 +75,7 @@ from dew.sampling.text import Sampling
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
+    from dew.interop.torchax_fallback import TorchAdmission
     from dew.lora import Adapter, LoRA
     from dew.nn.cross_attention import CrossAttention
     from dew.training.distributed import Layout, MeshSpec
@@ -1207,27 +1208,47 @@ class VerifiedRoute:
     verified: verify.VerifiedMapping
 
 
-type SourceRoute = DecoderRoute | WrapperRoute | DiffusionGemmaRoute | VerifiedRoute
+@dataclasses.dataclass(frozen=True)
+class TorchRoute:
+    """An unregistered causal LM no registered convention computes, run as transformers' own forward
+    by torchax (tier 3, `dew.interop.torchax_fallback`), `admitted` the decision that it runs."""
+
+    admitted: TorchAdmission
+
+
+type SourceRoute = DecoderRoute | WrapperRoute | DiffusionGemmaRoute | VerifiedRoute | TorchRoute
 """How `Pretrained.load` reads a source, decided on its config alone before any weight downloads
 (`source_route`): each case carries what its reader reads."""
 
 
 def source_route(config: Mapping[str, object], *,
-                 verified: Callable[[Mapping[str, object]], verify.VerifiedMapping] = verify.verify_mapping
-                 ) -> SourceRoute:
+                 verified: Callable[[Mapping[str, object]], verify.VerifiedMapping | verify.Unmapped]
+                 = verify.verify_mapping,
+                 admitted: Callable[[verify.Unmapped], TorchAdmission] | None = None) -> SourceRoute:
     """The route `Pretrained.load` reads `config`'s source by, or the refusal it raises for it, on the
     config alone: a storage format the codecs cannot decode, a registered family's or wrapper's own
-    refusal of the config (`decoder_parts.DrafterRefused` among them), or an unregistered model_type
-    no registered family's convention computes. `verified` checks an unregistered decoder against
-    transformers (`verify.verify_mapping`); a census over many configs passes a memo of it."""
+    refusal of the config, a speculative drafter of any model_type (`decoder_parts.DrafterRefused`),
+    or an unregistered model_type no registered family's convention computes and tier 3 does not run
+    (`torchax_fallback.admitted`; tier 3 reads float weights only).
+    `verified` checks an unregistered decoder against transformers (`verify.verify_mapping`), and
+    `admitted` decides whether tier 3 runs one it leaves unmapped (`torchax_fallback.admitted` when
+    None); a census over many configs passes a memo of each."""
     source_quantization(config)
+    decoder_parts.refuse_drafter(config)
     family = config.get("model_type")
     if family == "diffusion_gemma":
         return DiffusionGemmaRoute()
     if _media_wrapper(config):
         return WrapperRoute(decoders.translate_wrapper_config(config))
     if isinstance(family, str) and family not in decoders.families():
-        return VerifiedRoute(verified(config))
+        match verified(config):
+            case verify.VerifiedMapping() as mapping:
+                return VerifiedRoute(mapping)
+            case verify.Unmapped() as unmapped:
+                from dew.interop import torchax_fallback
+
+                torchax_fallback.refuse_quantized(config)
+                return TorchRoute((admitted or torchax_fallback.admitted)(unmapped))
     return DecoderRoute(decoders.translate_config(config))
 
 
@@ -1327,7 +1348,8 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
     """Decode native source weights and bind their processors and export layout.
 
     Diffusers pipelines and the explicit torchax fallback have already taken
-    their own routes; this boundary handles native decoders and media wrappers.
+    their own routes; this boundary handles native decoders and media wrappers,
+    and hands an unregistered causal LM tier 3 runs (`TorchRoute`) to it.
     """
     gguf_path = None if gguf_file is None else sources.repo_file(name_or_dir, directory, gguf_file)
     config, tensors = _source_config(name_or_dir, directory, commit, gguf_path)
@@ -1336,8 +1358,14 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
         config = mamba2.config_from_mamba_ssm(config)
     family = config.get("model_type")
     # Before any weight downloads, on the config alone: a format the codec cannot read, a family's
-    # refusal, an unregistered decoder checked against transformers (tier 2).
+    # refusal, an unregistered decoder checked against transformers (tiers 2 and 3).
     route = source_route(config)
+    if isinstance(route, TorchRoute):
+        from dew.interop import torchax_fallback
+        loaded = torchax_fallback.load(name_or_dir, directory, commit, dtype=dtype, param_dtype=param_dtype,
+                                       attention_impl=attention_impl, max_seq_len=max_seq_len,
+                                       admission=route.admitted)
+        return replace(loaded, variables=placed(loaded.variables))
     if tensors is None:
         directory = sources.snapshot(str(name_or_dir), directory.name)
         tensors = sources.load_shards(directory)

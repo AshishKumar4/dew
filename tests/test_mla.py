@@ -271,14 +271,20 @@ def test_yarn_matches_the_reference_derivation():
                     truth_fn=lambda positions: reference(positions, wide_run=True))
 
 
-def test_yarn_rotates_whole_heads_and_refuses_a_partial_rotary():
-    """YaRN ramps a whole head's frequencies, so the rope refuses a narrower rotated width beside it
-    under either partial convention."""
+def test_yarn_over_a_partial_rotary_ramps_the_rotated_width_and_refuses_a_proportional_one():
+    """YaRN ramps the rotated width: a 'default' partial rotary of 8 of a head's 16 dims rotates as a
+    whole head of 8 does, the reference's `dim = head_dim * partial_rotary_factor`, bit for bit, while
+    a proportional one, which has no YaRN form, is refused."""
     yarn = yarn_of(CONFIG["v3"])
-    for convention in ("proportional", "default"):
-        with pytest.raises(ValueError):
-            rotary_freqs(jnp.arange(4), 8, 10000.0, rot_dim=4, partial_rotary_type=convention,
-                         rope_scaling=yarn, dtype=np.float32)
+    positions = jnp.arange(0, 4096 * 40, 997)
+    whole = rotary_freqs(positions, 8, 10000.0, rope_scaling=yarn, dtype=np.float32)
+    partial = rotary_freqs(positions, 16, 10000.0, rot_dim=8, partial_rotary_type="default",
+                           rope_scaling=yarn, dtype=np.float32)
+    for ours, theirs in zip(partial, whole, strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    with pytest.raises(ValueError):
+        rotary_freqs(positions, 16, 10000.0, rot_dim=8, partial_rotary_type="proportional",
+                     rope_scaling=yarn, dtype=np.float32)
 
 
 def decode_loop(module, variables, tokens):
