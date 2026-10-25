@@ -145,6 +145,31 @@ def test_padded_targets_are_left_out_of_the_average():
     assert abs(masked - unmasked) > 1e-4, "masking made no difference to check"
 
 
+def test_a_padded_target_the_head_gives_no_mass_adds_nothing_to_the_loss_or_its_gradient():
+    """A head that never predicts the pad id (its bias -inf there) gives a padded target an infinite
+    loss, at weight 0: the loss, its gradient and the perplexity metric over the counted targets are
+    each bit for bit those of the same head at a bias so low its pad column's probability is 0 too,
+    where an infinite loss times its zero weight would make every one NaN (row 1481)."""
+    pad_id = 0
+    objective = make_objective(pad_id=pad_id, model=tiny_decoder(head_bias=True))
+    params = objective.init(jax.random.key(0))
+    batch = token_batch(seed=3)
+    assert (np.asarray(batch[TEXT_KEY])[:, 1:] == pad_id).any(), "this batch has no padding to skip"
+
+    def scored(floor):
+        bias = params["params"]["head_bias"].at[pad_id].set(floor)
+        held = {**params, "params": {**params["params"], "head_bias": bias}}
+        scalar = jax.value_and_grad(objective.scalar_loss, has_aux=True)
+        (loss, aux), gradient = scalar(held, batch, step_at())
+        scores = objective.evaluate(held, batch, step_at())
+        return loss, aux.metrics["ce"], gradient, Perplexity()(scores, batch)
+
+    masked, finite = scored(-jnp.inf), scored(-1e30)
+    assert np.isfinite(float(finite[0]))
+    for got, want in zip(jax.tree.leaves(masked), jax.tree.leaves(finite), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
 def test_aux_reports_perplexity_and_token_accuracy():
     objective = make_objective()
     params = objective.init(jax.random.key(0))
