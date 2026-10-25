@@ -64,6 +64,87 @@ def references(x, w, dy, sizes) -> dict:
             "kernel_gradient": np.stack([x[a:b].T @ dy[a:b] for a, b in spans])}
 
 
+def _summarized(timings) -> tuple[dict, dict]:
+    """A record's median time and failure by config repr, from `tuning.measured`'s timings."""
+    times, failures = {}, {}
+    for config, timing in timings.items():
+        if isinstance(timing, Exception):
+            failures[repr(config)] = f"{type(timing).__name__}: {str(timing)[:300]}"
+            continue
+        times[repr(config)] = statistics.median(timing.evaluation_times_ms)
+    return times, failures
+
+
+def _record(name: str, product: str, implementation: str):
+    """A record's launch, its bound key, its call's arrays and options, from the fixture's own draw."""
+    import jax
+
+    from dew.nn.kernels import grouped_matmul as gm
+
+    x, w, dy, sizes = operands(*SHAPES[name])
+    if product == "forward":
+        launches, call, options = (gm.MosaicGmm(), gm.Gmm()), (x, w, sizes), {"trans_rhs": False}
+    elif product == "input_gradient":
+        launches, call, options = (gm.MosaicGmm(), gm.Gmm()), (dy, w, sizes), {"trans_rhs": True}
+    else:
+        launches, call, options = (gm.MosaicTgmm(), gm.Tgmm()), (x, dy, sizes), {}
+    options = {**options, "out_dtype": "float32" if product.endswith("fp32") else "bfloat16",
+               "interpret": False}
+    launch = next(launch for launch in launches if launch.name == implementation)
+    ba = launch.bind(*(jax.ShapeDtypeStruct(array.shape, array.dtype) for array in call), **options)
+    return launch, ba, call
+
+
+def _part(name, product, implementation, sample, part, parts, lock, wanted, results) -> None:
+    """One process's share of a record (`_timed_apart`): every `parts`-th of its sampled configs from
+    `part`, compiled here and timed under `lock`, checked against the truth at `wanted`; its times, failures
+    and errors put on `results`."""
+    import numpy as np
+
+    from dew.nn.kernels import generation, tuning
+
+    launch, ba, call = _record(name, product, implementation)
+    want = np.load(wanted, mmap_mode="r")
+    target = generation.gpu_target()
+    configs = list(sampled(launch, ba, target, sample) or launch.fitting(ba, target))
+    errors = {}
+
+    def check(config, got):
+        got = np.asarray(got, np.float32)
+        errors[repr(config)] = float(np.max(np.abs(got - want)) / np.max(np.abs(want)))
+
+    timings = tuning.measured(launch, ba, arrays=list(call), outputs=check, configs=configs[part::parts],
+                              gpu=lambda: lock, compilers=max(1, (os.cpu_count() or 1) // parts))
+    results.put((*_summarized(timings), errors))
+
+
+def _timed_apart(name, product, implementation, sample, parts, want) -> tuple[dict, dict, dict]:
+    """A record timed by `parts` processes at once (`--processes`), each compiling its share of the configs
+    while another's run holds the GPU, the truth `want` read from a file they share."""
+    import multiprocessing
+    import tempfile
+
+    import numpy as np
+
+    context = multiprocessing.get_context("spawn")
+    lock, results = context.Lock(), context.Queue()
+    with tempfile.NamedTemporaryFile(suffix=".npy") as file:
+        np.save(file.name, np.asarray(want, np.float32))
+        workers = [context.Process(target=_part, args=(name, product, implementation, sample, part, parts,
+                                                       lock, file.name, results)) for part in range(parts)]
+        for worker in workers:
+            worker.start()
+        gathered = [results.get() for _ in workers]
+        for worker in workers:
+            worker.join()
+    times, failures, errors = {}, {}, {}
+    for part_times, part_failures, part_errors in gathered:
+        times |= part_times
+        failures |= part_failures
+        errors |= part_errors
+    return times, failures, errors
+
+
 def sampled(launch, ba, target, count: int):
     """`launch`'s fitting configs at `ba` on `target` a sweep times: every one where `count` is 0, else the
     `count` the cost model estimates fastest, which the pick and its nearest rivals lie in, and `count`
@@ -87,6 +168,9 @@ def main() -> None:
     parser.add_argument("--sample", type=int, default=0,
                         help="time the model's N best fitting configs and N more spread over the rest by "
                              "estimate (0: every one)")
+    parser.add_argument("--processes", type=int, default=1,
+                        help="processes compiling a record's configs at once, each timing its own under one "
+                             "lock on the GPU (compiles run beside runs, never two runs at once)")
     args = parser.parse_args()
 
     import jax
@@ -132,14 +216,13 @@ def main() -> None:
                     got = np.asarray(got, np.float32)
                     errors[repr(config)] = float(np.max(np.abs(got - want)) / np.max(np.abs(want)))
 
-                timings = tuning.measured(launch, ba, arrays=list(call), outputs=check,
-                                          configs=sampled(launch, ba, target, args.sample))
-                times, failures = {}, {}
-                for config, timing in timings.items():
-                    if isinstance(timing, Exception):
-                        failures[repr(config)] = f"{type(timing).__name__}: {str(timing)[:300]}"
-                        continue
-                    times[repr(config)] = statistics.median(timing.evaluation_times_ms)
+                configs = sampled(launch, ba, target, args.sample)
+                if args.processes > 1:
+                    times, failures, errors = _timed_apart(name, product, launch.name, args.sample,
+                                                           args.processes, want)
+                else:
+                    timings = tuning.measured(launch, ba, arrays=list(call), outputs=check, configs=configs)
+                    times, failures = _summarized(timings)
                 record = {"shape": name, "product": product, "implementation": launch.name,
                           "heuristic": repr(launch.estimate(ba, target)[1]), "times": times,
                           "failures": failures, "worst_error": max(errors.values(), default=None)}
