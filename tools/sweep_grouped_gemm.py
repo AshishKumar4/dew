@@ -1,7 +1,7 @@
 """Times every fitting config of the grouped GEMM's launches on this GPU, the records the cost model's
 ranking test reads (tests/fixtures/gemm_sweeps/<generation>.json).
 
-    python tools/sweep_grouped_gemm.py --out records.json [--implementations mosaic_gpu triton]
+    python tools/sweep_grouped_gemm.py --out records.json [--implementations mosaic_gpu]
         [--products forward ...] [--shapes NAME ...] [--sample N]
 
 For each swept shape (the fixture's seven MoE projections) and product (forward, input_gradient,
@@ -222,7 +222,8 @@ def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--implementations", nargs="+", default=["mosaic_gpu", "triton"])
+    # The Triton launches are kept, not extended (ops/BIBLE.md): a sweep times the Mosaic mainloops.
+    parser.add_argument("--implementations", nargs="+", default=["mosaic_gpu"], choices=["mosaic_gpu"])
     parser.add_argument("--products", nargs="+", default=list(PRODUCTS), choices=PRODUCTS)
     parser.add_argument("--shapes", nargs="+", default=list(SHAPES), choices=list(SHAPES))
     parser.add_argument("--sample", type=int, default=0,
