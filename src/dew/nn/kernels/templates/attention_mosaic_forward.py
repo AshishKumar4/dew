@@ -23,6 +23,7 @@ fold's reach, and its overflowed rows again shifting under headroom). Its legali
 
 import dataclasses
 import functools
+import math
 from typing import NamedTuple
 
 import jax
@@ -74,18 +75,24 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
 
 def _guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype) -> Tiles:
     """The guarded launch's tiles beside the plain launch's `tiles` (`_plain_forward`): its consumers and
-    query blocks, and the widest key tile, halved from the plain one's to a swizzled row of keys
-    (`mosaic.SWIZZLE_BYTES`), whose live set a consumer's registers hold (`mosaic.live_registers`): its
-    shifted and unshifted sums of `columns` value columns fp32 carried, beside a step's logits and weights
-    fp32 and the two products the step forms (`algebra.stepped`)."""
+    query blocks, and the widest key tile that divides the plain one in whole rows of the family's roles
+    (`Family.rows`) and of a swizzled row of keys (`mosaic.SWIZZLE_BYTES`), so the plain launch's padded keys
+    are whole tiles of it, whose live set a consumer's registers hold (`mosaic.live_registers`): its shifted
+    and unshifted sums of `columns` value columns fp32 carried, beside a step's logits and weights fp32 and
+    the two products the step forms (`algebra.stepped`); the least such tile where none fits."""
     budget = family.registers(tiles.consumers)
-    rows, least = tiles.block_q, mosaic.SWIZZLE_BYTES // jnp.dtype(dtype).itemsize
+    rows = tiles.block_q
+    unit = math.lcm(family.rows, mosaic.SWIZZLE_BYTES // jnp.dtype(dtype).itemsize)
     carried = [(rows, columns, jnp.float32)] * 2
-    block = tiles.block_k
-    while block > least and mosaic.live_registers(
-            family, carried, [(rows, block, jnp.float32)] * 2 + [(rows, columns, jnp.float32)] * 2) > budget:
-        block //= 2
-    return dataclasses.replace(tiles, block_k=block)
+
+    def held(block: int) -> bool:
+        stepped = [(rows, block, jnp.float32)] * 2 + [(rows, columns, jnp.float32)] * 2
+        return mosaic.live_registers(family, carried, stepped) <= budget
+
+    blocks = [block for block in range(unit, tiles.block_k + 1, unit) if tiles.block_k % block == 0][::-1]
+    if not blocks:
+        return tiles
+    return dataclasses.replace(tiles, block_k=next((block for block in blocks if held(block)), blocks[-1]))
 
 
 def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
