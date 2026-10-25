@@ -70,7 +70,7 @@ class DataPartition:
     Each reads the same records. A source whose rows can differ between reads
     of one share, such as a network fetch that drops failed records, must
     either refuse more than one reader or read on the first reader alone and
-    send its batch to the others (`dew.distributed.placement.first_reader_batch`).
+    send its batch to the others (`dew.distributed.batches.first_reader_batch`).
     """
     reader: int = 0
     """This process's place among the share's readers, in process order (0 for the first)."""
@@ -707,7 +707,7 @@ type Position = bytes | Mapping[str, object]
 """Where a stream stopped, as the stream reports it.
 
 Dew's own envelope is bytes, and Grain reports a JSON object, which
-`dew.distributed.placement` encodes before a checkpoint stores it.
+`dew.distributed.batches` encodes before a checkpoint stores it.
 `dew.position` tells which of the two kinds a saved position is."""
 
 
