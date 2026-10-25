@@ -1642,7 +1642,11 @@ class Trainer(Generic[Loss, Effects]):
                 # before any of them places one. The first step reads it (`FitRun.ahead`).
                 run.ahead = (waited_read(run, interval, agree=True),)
                 if run.ahead[0] is not None:
-                    self._whole_validated(abstract, run.ahead[0])
+                    # A process whose reader changed a field or a shape is refused by every process, as
+                    # a compile refuses it, before the state it would check is traced from that batch.
+                    first = run.ahead[0]
+                    agreed_same("training batch layout", lambda: batch_layout(split_fields(first)[0]))
+                    self._whole_validated(abstract, first)
         state, shardings = placed()
         if int(state.step) != current:
             raise ValueError(f"the checkpoint of step {current} holds a state at step {int(state.step)}")
