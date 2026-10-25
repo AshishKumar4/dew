@@ -446,6 +446,16 @@ def test_a_quiet_clip_steps_like_muon():
     assert largest_difference(moved, optax.apply_updates(params, expected)) == 0.0
 
 
+def clip_step(solver, stats):
+    """One step of `solver` from fresh state over drawn kernels and their gradients, under the sown
+    maxima `stats`, the weights as the step stores them (`stepped`)."""
+    def step(params, grads):
+        initial = solver.init(params)
+        updates, state = solver.update(grads, initial, params, qk_stats=stats)
+        return stepped(params, updates, initial, state)
+    return step
+
+
 def test_a_clip_rescales_the_weights_only_after_the_updates_it_takes_part_in():
     """`stepped` rescales after an update the clip ran in and no other. Under `optax.MultiSteps`, which
     runs its optimizer every second update and returns its state as it was on the others, a clip that
@@ -497,11 +507,7 @@ def test_the_clip_matches_the_paper_equations():
                              [10.0, 10.0, 10.0, 10.0],
                              [10.0, 10.0, 10.0, 10.0]])
     tx = scale_by_qk_clip(100.0)
-
-    def applied(params, grads):
-        initial = tx.init(params)
-        updates, state = tx.update(grads, initial, params, qk_stats=stats)
-        return stepped(params, updates, initial, state)
+    applied = clip_step(tx, stats)
 
     def paper(params, grads):
         s_max = jnp.max(jnp.asarray(stats['layers_0']['self_attn']['max_logits'][0], params[
@@ -699,12 +705,7 @@ def test_the_threshold_rides_optimizer_opts():
     updates, state = default.update(grads, initial, params, qk_stats=stats)
     moved = stepped(params, updates, initial, state)
     assert largest_difference(moved, optax.apply_updates(params, plain)) == 0.0
-    low = muonclip_solver(optimizer_opts={'qk_clip_threshold': 5.0})
-
-    def clipped(params, grads):
-        initial = low.init(params)
-        updates, state = low.update(grads, initial, params, qk_stats=stats)
-        return stepped(params, updates, initial, state)
+    clipped = clip_step(muonclip_solver(optimizer_opts={'qk_clip_threshold': 5.0}), stats)
 
     def paper(solver):
         def rescaled(params, grads):
