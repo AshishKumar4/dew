@@ -28,9 +28,9 @@ from dew.decision import (
     Specials,
     StateFirstLayout,
 )
-from dew.decision.head import DecisionHead, JointSchemaHead
-from dew.decision.layout import OPTION_TILE, DecisionInputs, compacted
-from dew.decision.objective import _ALONG_THE_QUESTIONS
+from dew.decision.head import DecisionHead, JointSchemaHead, LabelReadout
+from dew.decision.layout import OPTION_TILE, DecisionInputs, Labels, compacted
+from dew.decision.objective import _ALONG_THE_QUESTIONS, _READ_OUT
 from dew.decision.task import laid_out
 from dew.interop import Pretrained
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -71,14 +71,19 @@ def attending(length: int) -> CausalTransformer:
 
 
 ROWS = StateFirstLayout(max_len=256, head_max_len=64, option_tokens=8)
+LABELS = Labels(variants=("{}",))
+"""Labels a byte vocabulary spells as one token each: the bare letter."""
 ARMS = {
     "joint": (JointLayout(max_len=1536), qwen35,
              lambda: JointSchemaHead(64, width=32, routing_layers=1, layers=1, heads=2, feedforward=64)),
     "marker": (ROWS, qwen35, lambda: DecisionHead(64, layers=1)),
     "parallel": (replace(ROWS, parallel=True), attending, lambda: DecisionHead(32, layers=1)),
+    "readout": (replace(ROWS, head_max_len=128, option_tokens=24, labels=LABELS), qwen35,
+                lambda: LabelReadout(64, LABELS.ids(TOKENIZER, 3))),
 }
 """Joint rows under the joint schema head and rows of one question under the marker head,
-both over Qwen3.5; parallel options, whose pairwise mask Gated DeltaNet refuses, over attention."""
+both over Qwen3.5; parallel options, whose pairwise mask Gated DeltaNet refuses, over attention;
+options under labels read at each row's answer cue by the backbone's own logits, over Qwen3.5."""
 
 
 def objective_for(arm: str) -> DecisionObjective:
@@ -98,6 +103,11 @@ def windows(objective, rows: int) -> dict:
     return {name: np.asarray(value) for name, value in batch.items() if name != VALID_ROWS}
 
 
+def along(batch) -> tuple[str, ...]:
+    """The batch's fields along its questions, its answer cues' where its options stand under labels."""
+    return tuple(name for name in (*_ALONG_THE_QUESTIONS, *_READ_OUT) if name in batch)
+
+
 def owners(batch) -> np.ndarray:
     """Each question slot's row in its window, 0 for a padding slot."""
     rows = np.take_along_axis(batch["segments"], batch["spans"][..., 0], axis=1)
@@ -109,11 +119,13 @@ def alone(batch, window: int, row: int) -> dict:
     where = np.flatnonzero(batch["segments"][window] == row)
     start, end = int(where[0]), int(where[-1]) + 1
     asked = np.flatnonzero(owners(batch)[window] == row)
-    one = {name: batch[name][window, asked][None] for name in _ALONG_THE_QUESTIONS}
-    along = ("tokens", "positions", "slots")
-    one |= {name: batch[name][window, start:end][None] for name in along if name in batch}
+    one = {name: batch[name][window, asked][None] for name in along(batch)}
+    tokens = ("tokens", "positions", "slots")
+    one |= {name: batch[name][window, start:end][None] for name in tokens if name in batch}
     one |= {"segments": np.ones((1, end - start), np.int32), "spans": one["spans"] - start,
             "option_spans": one["option_spans"] - start * one["options"][..., None]}
+    if "readout" in one:
+        one["readout"] = one["readout"] - start
     if "option_slots" in batch:
         slots, real = compacted(one["options"][0], OPTION_TILE)
         one["option_slots"], one["slotted"] = slots[None], real[None]
@@ -134,7 +146,7 @@ def at_offset(batch, window: int, row: int) -> dict:
     mine = segments == row
     before = np.arange(segments.size) < np.flatnonzero(mine)[0]
     asked = np.flatnonzero(owners(batch)[window] == row)
-    one = {name: batch[name][window, asked][None] for name in _ALONG_THE_QUESTIONS}
+    one = {name: batch[name][window, asked][None] for name in along(batch)}
     one |= {name: np.where(mine.reshape(-1, *(1,) * (batch[name].ndim - 2)), batch[name][window], 0)[None]
             for name in ("tokens", "slots") if name in batch}
     if "positions" in batch:
@@ -211,6 +223,21 @@ def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
                                           objective.model.head.clone(dtype=jnp.float64)), PACKING_SEEDS[arm])
 
 
+def test_a_labelled_readout_reads_each_packed_row_at_its_own_answer_cue():
+    """Rows whose options stand under labels, packed into windows, read each question's answer at its
+    row's answer cue, moved with the row: each row's label logits and the backbone's gradients are the
+    row's alone where its window packed it (check 1), the readout the backbone's own logits, whose
+    float64 truth is the float64 backbone's. Each question's answer position is its own row's last
+    token, the cue's, in its window."""
+    objective = objective_for("readout")
+    batch = windows(objective, 2)
+    for window, row in rows_of(batch):
+        last = np.flatnonzero(batch["segments"][window] == row)[-1]
+        assert np.all(batch["readout"][window][owners(batch)[window] == row] == last)
+    assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64),
+                                          objective.model.head), PACKING_SEEDS["readout"])
+
+
 @pytest.mark.gpu(reason="FlashAttention's packed sequences run on CUDA")
 def test_a_bf16_joint_head_on_flash_reads_each_packed_row_alone(without_deterministic_ops):
     """The joint schema head in bf16 on flash: its routing and field layers read the window's tokens
@@ -258,15 +285,17 @@ def rows_alone(decide, batch):
     return np.concatenate(logits), grads
 
 
-PACKING_SEEDS = {"joint": 128, "marker": 256, "parallel": 256, "flash": 8}
+PACKING_SEEDS = {"joint": 256, "marker": 256, "parallel": 256, "flash": 8, "readout": 8}
 """Check 1's declared seeds for each arm's packed window: the most paired sizing (`seeds_for` with the
-packed window as `dew_fn`) gives on any platform the site runs on. An A100 took 128 for the joint arm and
-256 for the marker and parallel arms (node receipts SF-a100-packing-seeds), armada 16, 8 and 8
-(run-tests sf-packing-cpu-sizing-898ec4ac6); the flash arm's is an A100's. The A100's are the head's
-gradients whose float64 truth is zero by symmetry, which both arms err at by 0 to 3 fp32 ulps: the
-marker and parallel arms' scorer_out bias, shared by a question's options, and the joint arm's
-attention key biases (ledger 1548). Twice the rows a draw took the same counts on an A100 (node
-receipts SF-packing-scale2-sizing), each draw twice the work."""
+packed window as `dew_fn`) gives on any platform the site runs on. An H100 took 256 for the joint arm
+and 128 for the marker and parallel arms (node receipts TL-h100-packing-size-*-3), an A100 128 for the
+joint arm and 256 for the marker and parallel arms (SF-a100-packing-seeds), armada 16, 8 and 8 (run-tests
+sf-packing-cpu-sizing-898ec4ac6); the flash arm's is an A100's, and the readout arm's 8 is an A100's
+(SF-readout-sizing), an H100's and armada's. The A100's are the head's gradients whose float64
+truth is zero by symmetry, which both arms err at by 0 to 3 fp32 ulps: the marker and parallel arms'
+scorer_out bias, shared by a question's options, and the joint arm's attention key biases (ledger
+1548). Twice the rows a draw took the same counts on an A100 (node receipts SF-packing-scale2-sizing),
+each draw twice the work."""
 
 
 def assert_rows_decided_alone(objective, wide_modules, seeds: int, held=lambda path: True) -> None:
