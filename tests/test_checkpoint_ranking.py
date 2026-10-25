@@ -179,7 +179,7 @@ def test_a_run_that_ends_off_a_rare_suites_cadence_is_ranked_by_it_at_its_last_s
                     validation={'often': data().val, 'rare': EvalSuite(data().val, (metric,), 3)},
                     best=[Best(lambda scores: scores[('often', metric)], mode='max'),
                           Best(lambda scores: scores[('rare', metric)], mode='max')],
-                    stop=Plateau(metric, evals=3) if end == "plateau" else None)
+                    stop=Plateau(metric, evals=3, split='often') if end == "plateau" else None)
     run.checkpoints.wait()
     assert int(state.step) == 4
     assert run.checkpoints.resolve('best:aggregate:0') == run.checkpoints.resolve('best:aggregate:1') == 4
