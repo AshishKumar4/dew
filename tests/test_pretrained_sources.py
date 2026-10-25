@@ -205,10 +205,10 @@ def test_tier_three_admits_a_causal_lm_alone_and_shrinks_a_config_by_its_own_nam
     with pytest.raises(ValueError):
         source_route(tiny_config("bert", is_decoder=False).to_dict())
     openai = tiny_config("openai-gpt", hidden_size=None, num_attention_heads=None, num_hidden_layers=None,
-                         n_embd=64, n_head=4, n_layer=2).to_dict()
-    assert "hidden_size" not in openai and openai["n_embd"] == 64
+                         num_key_value_heads=None, head_dim=None, n_embd=256, n_head=4, n_layer=2).to_dict()
+    assert "hidden_size" not in openai and openai["n_embd"] == 256
     shrunk = verify.shrink(openai)
-    assert shrunk["n_embd"] < 64 and "hidden_size" not in shrunk
+    assert shrunk["n_embd"] < 256 and "hidden_size" not in shrunk
     assert isinstance(verify.verify_mapping(openai), verify.Unmapped)
 
 
