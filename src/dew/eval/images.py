@@ -23,6 +23,7 @@ import numpy as np
 from jax.typing import ArrayLike
 
 from dew.artifacts import ImageGrid, uint8_pixels
+from dew.data.images import CAPTIONS
 from dew.nn.precision import accumulated
 from dew.nn.text_encoders import DEFAULT_MODEL as CLIP_CHECKPOINT
 from dew.objectives.base import Batch
@@ -101,13 +102,16 @@ def clip_tokens(captions: Sequence[str], *,
 
 def _artifact_cosine(artifact: ImageGrid, batch: Batch, field: str, modelname: str) -> jax.Array:
     """Return the per-image cosine for one sampled grid and its batch's prompts, the host captions in
-    `field` (`EncodeCaptions(keep=True)`) tokenized by CLIP's own tokenizer (`clip_tokens`), whatever
-    tokenizer the model's conditions read. A field of anything but text is refused (ValueError)."""
-    captions = np.asarray(batch[field]) if not isinstance(batch[field], Mapping) else None
-    if captions is None or captions.ndim != 1 or captions.dtype.kind not in "OUS":
+    `field` (`EncodeCaptions(keep=...)`) tokenized by CLIP's own tokenizer (`clip_tokens`), whatever
+    tokenizer the model's conditions read. A field of anything but one string a row is refused
+    (ValueError)."""
+    held = batch[field]
+    captions = None if isinstance(held, Mapping) else np.asarray(held)
+    if (captions is None or captions.ndim != 1 or captions.dtype.kind not in "OU"
+            or not all(isinstance(caption, str) for caption in captions.tolist())):
         raise ValueError(f"CLIP scores the batch's captions as text in {field!r}, which holds "
-                         f"{type(batch[field]).__name__} instead; keep them (EncodeCaptions(keep=True))")
-    input_ids, attention_mask = clip_tokens([str(caption) for caption in captions], modelname=modelname)
+                         f"{type(held).__name__} of other values; keep them (EncodeCaptions(keep=...))")
+    input_ids, attention_mask = clip_tokens(captions.tolist(), modelname=modelname)
     return clip_image_text_cosine(uint8_pixels(artifact.images), input_ids, attention_mask,
                                   modelname=modelname)
 
@@ -119,7 +123,7 @@ class CLIPDistance(ImageMetric):
     report for a new run.
     """
 
-    def __init__(self, modelname: str = CLIP_CHECKPOINT, field: str = "caption"):
+    def __init__(self, modelname: str = CLIP_CHECKPOINT, field: str = CAPTIONS):
         def measure(artifact, batch):
             return 1.0 - _artifact_cosine(artifact, batch, field, modelname)
 
@@ -134,7 +138,7 @@ class CLIPScore(ImageMetric):
     (`clip_tokens`). `modelname` names the CLIP checkpoint.
     """
 
-    def __init__(self, modelname: str = CLIP_CHECKPOINT, field: str = 'caption'):
+    def __init__(self, modelname: str = CLIP_CHECKPOINT, field: str = CAPTIONS):
         def measure(artifact, batch):
             return _clip_score(_artifact_cosine(artifact, batch, field, self.modelname))
         super().__init__(name='clip_score', measure=measure)
