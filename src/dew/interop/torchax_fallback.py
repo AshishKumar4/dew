@@ -106,9 +106,11 @@ def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
     probe's shrunken config with random weights (`verify.scatter_weights`), before any weight
     downloads: transformers builds the type as a causal LM (`AutoModelForCausalLM`); its forward is
     causal, so changing a row's last token leaves every earlier position's logits bit for bit (a
-    decoder configured bidirectionally, BERT's with is_decoder False, is not); and its eager forward
-    runs no operation on the traced values whose output's shape or value those values decide
-    (`_Untraceable`), which torchax could not trace. Each refusal names its cause."""
+    decoder configured bidirectionally, BERT's with is_decoder False, is not); and its inference and
+    training forwards trace as tier 3 traces them (`TorchGraph.traced`), the training one drawing
+    nothing on the host. An operation whose output's shape or value the traced values decide (a
+    `nonzero`, an `item()`) fails that trace with JAX's own error, naming it. Each refusal names its
+    cause."""
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM
     from transformers.models.auto.modeling_auto import MODEL_FOR_CAUSAL_LM_MAPPING_NAMES
@@ -130,21 +132,8 @@ def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
                                              attn_implementation=_PROBE).eval()
     verify.scatter_weights(model)
     ids = torch.from_numpy(verify.probe_ids(int(config.vocab_size)).astype(np.int64))
-    traced = [*model.parameters(), *model.buffers(), ids]
-    found = []
     probe = _Probe()
-    # The training forward too, which tier 3 runs: dropout and any layer drop run only there.
-    for training in (False, True):
-        model.train(training)
-        with torch.no_grad(), _Untraceable(traced) as untraceable, probe.recording():
-            logits = model(input_ids=ids, use_cache=False).logits
-        found.extend(untraceable.found)
-    model.eval()
-    if found:
-        raise ValueError(f"model_type {model_type!r} runs as transformers' own forward only, and that "
-                         f"forward computes {sorted(set(found))} on its inputs or weights, whose "
-                         "output's shape or value they decide, which a traced program cannot hold")
-    with torch.no_grad():
+    with torch.no_grad(), probe.recording():
         logits = model(input_ids=ids, use_cache=False).logits
     changed = ids.clone()
     changed[:, -1] = (changed[:, -1] + 1) % int(config.vocab_size)
@@ -153,14 +142,16 @@ def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
     if not torch.equal(logits[:, :-1], moved[:, :-1]):
         raise ValueError(f"model_type {model_type!r} as configured attends to later tokens (its earlier "
                          "positions' logits move with a row's last token), and tier 3 runs causal LMs")
-    # Its training forward traced as tier 3 traces it: a draw on the host would be fixed for every step.
+    # Its inference and training forwards traced as tier 3 traces them; the training one's dropout and
+    # any layer drop run only there, and a draw on the host would be fixed for every step.
     from torchax.interop import JittableModule, extract_all_buffers
 
     jittable = JittableModule(model)
     params = {name: host_view(leaf, name) for name, leaf in jittable.params.items()}
     buffers = {name: host_view(leaf, name) for name, leaf in extract_all_buffers(model)[1].items()}
-    _, _, draws = TorchGraph(jittable, ()).traced(params, buffers, ids.numpy().astype(np.int32),
-                                                    jax.random.key(0), train=True)
+    graph = TorchGraph(jittable, ())
+    graph.traced(params, buffers, ids.numpy().astype(np.int32), None, train=False)
+    _, _, draws = graph.traced(params, buffers, ids.numpy().astype(np.int32), jax.random.key(0), train=True)
     if draws.host:
         raise ValueError(f"model_type {model_type!r}'s training forward draws on the host ({draws.host} "
                          "draws, BioGPT's layer drop among them), which a traced step would fix for every "
@@ -534,67 +525,6 @@ def _Draws():
             return tensor
 
     return Draws()
-
-
-def _Untraceable(traced):
-    """A torch function mode recording, by name, each call of an operation whose output's shape or
-    value the values it reads decide (`found`), where it reads one of the `traced` tensors or a value
-    computed from them: what torchax, tracing the forward over those tensors, could not hold. A
-    value built from constants alone (`torch.arange` over a length) is concrete in the trace too."""
-    import torch
-    from torch.overrides import TorchFunctionMode
-
-    Tensor = torch.Tensor
-    deciding = {Tensor.item, Tensor.tolist, Tensor.__bool__, Tensor.__int__, Tensor.__float__,
-                Tensor.__index__, torch.nonzero, Tensor.nonzero, torch.argwhere, Tensor.argwhere,
-                torch.masked_select, Tensor.masked_select, torch.unique, Tensor.unique,
-                torch.unique_consecutive, Tensor.unique_consecutive, torch.bincount, Tensor.bincount}
-
-    def tensors(value):
-        if isinstance(value, Tensor):
-            yield value
-        elif isinstance(value, (tuple, list)):
-            for part in value:
-                yield from tensors(part)
-        elif isinstance(value, Mapping):
-            for part in value.values():
-                yield from tensors(part)
-
-    def decides(func, args, kwargs) -> bool:
-        if func in deciding:
-            return True
-        if func is Tensor.__getitem__:
-            # A boolean mask selects as many elements as it holds true.
-            return any(index.dtype == torch.bool for index in tensors(args[1:]))
-        if func is torch.where:
-            return len(args) + len(kwargs) == 1
-        if func in (torch.repeat_interleave, Tensor.repeat_interleave):
-            repeats = args[1] if len(args) > 1 else kwargs.get("repeats")
-            return isinstance(repeats, Tensor) and kwargs.get("output_size") is None
-        return False
-
-    class Untraceable(TorchFunctionMode):
-        def __init__(self):
-            super().__init__()
-            self.found: list[str] = []
-            # Held for the probe's length, so no id is reused by a later tensor.
-            self.kept = list(traced)
-            self.reached = {id(tensor) for tensor in traced}
-
-        def __torch_function__(self, func, types, args=(), kwargs=None):
-            kwargs = kwargs or {}
-            reads = any(id(tensor) in self.reached for tensor in tensors((args, kwargs)))
-            if reads and decides(func, args, kwargs):
-                # Each function `decides` names is torch's own, which names itself.
-                self.found.append(func.__qualname__)
-            output = func(*args, **kwargs)
-            if reads:
-                for tensor in tensors(output):
-                    self.kept.append(tensor)
-                    self.reached.add(id(tensor))
-            return output
-
-    return Untraceable()
 
 
 _OPMATH: Mapping[str, tuple[int, str] | None] = {
