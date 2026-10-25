@@ -50,7 +50,7 @@ def assert_recorded_encoder(directory, name):
     """The checkpoint's encoder as exact as transformers' fp32 one over its recording's seeds (check
     1), both measured from transformers' run in float64, held through Dew's own float64 encoder to the
     recorded truth's sketch (`indexed_recording`)."""
-    path = directory / "seeds.npz"
+    path = directory.parent / f"{directory.name}-seeds.npz"
     seeds = declared_seeds(path)[name]
     encoder = T5Text.from_pretrained(str(directory))
     with jax.enable_x64(new_val=True):
