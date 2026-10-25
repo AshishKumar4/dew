@@ -54,7 +54,7 @@ An example's questions that ask the same thing, one negated, paraphrased or with
 
 ### Averaging runs
 
-`Decide.averaged(runs, step=, ema=, calibrate_on=)` is the task over the runs' `dew.checkpoints.averaged` mean, its calibration the identity, refit on `calibrate_on`, as temperatures belong to one set of weights. A run records where its head started (`DecideSettings.head_identity`: the digest of a head it held, or the trainer key a fresh head was drawn from, with the backbone's source where the head is drawn from its rows); runs that differ in it, in their head, layout, tokenizer, special tokens, processor or context encoder, or that record no head identity, are refused (ValueError). Its `Weights.averaged` records each run's directory, step and average read, and `Decide.save` refuses it, as no one run holds its weights.
+`Decide.averaged(runs, step=, ema=, calibrate_on=)` is the task over the runs' `dew.checkpoints.averaged` mean, its calibration the identity, refit on `calibrate_on`, as temperatures belong to one set of weights. The runs' recorded task settings (`DecideSettings`) must be the same, else the run is refused (ValueError). Its `Weights.averaged` records each run's directory, step and average read, and `Decide.save` refuses it, as no one run holds its weights.
 
 ### Options read at labels
 
@@ -160,7 +160,7 @@ Trainer(objective, opt, key=0,
 - A resumed run skips loading pretrained weights it is about to overwrite, and its first step hits the compile cache.
 - `Keep` decides retention; `where=` sees each checkpoint's real record (kind, step, metrics).
 - The directory is a plain Orbax `CheckpointManager` directory, readable without Dew.
-- `dew.checkpoints.averaged(runs, step=, ema=)` averages runs trained apart from one model, any objective's: each run's model tree as its loaders read it (its average where it keeps one, unless `ema=False`), in fp32, a LoRA run's factors merged into their kernels first, so a LoRA run and a whole fine-tune of one base average. Each floating leaf is a running mean that cannot overflow, float64's mean rounded once for two runs and on par with a stacked fp32 mean for more; an integer or boolean leaf must agree. Runs of another model record (adapters aside) or other leaves are refused. The result carries the mean, the model record it applies to and each run's directory, step and average read.
+- `dew.checkpoints.averaged(runs, step=, ema=)` averages runs trained apart from one start, any objective's: each run's model tree as its loaders read it (its average where it keeps one, unless `ema=False`), in fp32, its frozen leaves back in `params` and a LoRA run's factors merged into their kernels first, so a LoRA run, a partly frozen one and a whole fine-tune of one base average. The mean is taken on the host, one run's tree beside it at a time: each floating leaf a running mean that cannot overflow, float64's mean rounded once for two runs, subnormals included, and on par with a stacked fp32 mean for more; an integer or boolean leaf must agree. Runs of another model record (adapters aside) or other leaves are refused; where each run started is the caller's to know. The result carries the mean, placed as the first run's leaves are, the model record it applies to and each run's directory, step and average read.
 
 ## 6. Compilation
 

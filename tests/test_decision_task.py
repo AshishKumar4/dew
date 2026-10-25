@@ -656,24 +656,13 @@ def test_runs_that_share_a_head_average_as_the_checkpoints_average_them_and_refi
     assert calibrated.calibration == two.calibrated(held_out).calibration
 
 
-def test_runs_whose_heads_started_apart_do_not_average(decide, tmp_path):
-    """A run whose head was drawn from another seed, or that recorded no head identity, does not
-    average with others, nor does a single run."""
-    from dew.decision import DecisionObjective
-    from dew.objectives.base import joined
-
-    runs = trained_runs(decide, tmp_path, 2)
+def test_runs_of_other_task_settings_or_a_single_run_do_not_average(decide, tmp_path):
+    """Runs average where their recorded task settings are one task's: a run laid out otherwise does
+    not average with the others, nor does a single run."""
+    runs = trained_runs(decide, tmp_path, 1)
     with pytest.raises(ValueError):
-        Decide.averaged(runs[:1])
-    backbone = {name: value["backbone"] for name, value in decide.variables.items() if "backbone" in value}
-    drawn = []
-    for seed in (0, 1, None):
-        objective = DecisionObjective(decide.model.backbone, variables=joined({"backbone": backbone}),
-                                      tokenizer=decide.tokenizer, specials=decide.specials,
-                                      layout=decide.layout, head=decide.model.head, head_seed=seed)
-        identity = objective.task_settings().head_identity
-        assert identity == (None if seed is None else {"drawn": seed})
-        drawn.append(identity)
-    held = DecisionObjective(decide).task_settings().head_identity
-    assert isinstance(held, dict) and set(held) == {"held"}
-    assert drawn[0] != drawn[1] and held not in drawn
+        Decide.averaged(runs)
+    other = replace(decide, layout=replace(decide.layout, head_max_len=decide.layout.head_max_len // 2))
+    runs += trained_runs(other, tmp_path, 1, name="other")
+    with pytest.raises(ValueError):
+        Decide.averaged(runs)

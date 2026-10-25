@@ -7,7 +7,7 @@ import io
 import json
 import math
 from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Self, overload
 
@@ -147,12 +147,6 @@ class DecideSettings:
     context_encoder: ContextEncoder = "table"
     """How the model encodes a row's context (`DecisionModel.context_encoder`); a run recorded before
     the choice existed embedded it by its token table."""
-    head_identity: JSON = None
-    """Where the run's head started: `{"drawn": seed}`, a fresh head drawn from its trainer's key (with
-    its backbone's `source` where the head is drawn from the backbone's rows), or `{"held": digest}`, a
-    head it was given, by its variables' digest; None where the run recorded neither, as one from
-    before the field or a trainer given no seed. Runs whose heads started apart do not average
-    (`Decide.averaged`)."""
 
     @staticmethod
     def of(record: Mapping[str, object]) -> "DecideSettings":
@@ -288,40 +282,30 @@ class Decide:
     @classmethod
     def averaged(cls, runs: Sequence[str], *, step: int | str | None = None, ema: bool | None = None,
                  calibrate_on: "Iterable[Example | Mapping[str, object]] | Reader | None" = None) -> Self:
-        """The task over the fp32 mean of `runs`' weights as any runs average (`dew.checkpoints.averaged`:
-        each run's at `step`, its latest where None, and `ema` as `from_run` reads them, a LoRA
+        """The task over `runs`' weights as any runs average (`dew.checkpoints.averaged`: their fp32
+        mean, each run's at `step`, its latest where None, and `ema` as `from_run` reads them, a LoRA
         backbone's factors merged first), its calibration the identity, or refit on `calibrate_on`'s
         held-out answers (`calibrated`): temperatures are fitted to one set of weights.
 
-        The runs are one task trained apart: their heads started alike (each recorded
-        `DecideSettings.head_identity`, the same), with the same head, layout, tokenizer, special
-        tokens, processor and context encoder; a run that differs in any, or that recorded no head
-        identity, is refused (ValueError), naming it. The task's `weights` record each run's directory,
-        step and whether its average was read, so it is no one run's: `save` refuses it, and
-        `save_pretrained` releases it."""
+        The runs are one task's: their recorded settings (`DecideSettings`: head, layout, tokenizer,
+        special tokens, processor and context encoder) the same; a run whose settings differ is
+        refused (ValueError), naming them. The task's `weights` record each run's directory, step and
+        whether its average was read, so it is no one run's: `save` refuses it, and `save_pretrained`
+        releases it."""
         from dew.checkpoints import averaged
         from dew.inference.tasks import run_record
 
-        first = None
-        for directory in runs:
-            record, _ = run_record(directory, step)
-            settings = DecideSettings.of(record)
-            if settings.head_identity is None:
-                raise ValueError(f"the run in {directory} records no head identity (head_identity), so "
-                                 "whether its head started as the others' is unknown; it cannot average")
-            shared = {"head": settings.head, "head_identity": settings.head_identity,
-                      "layout": settings.layout, "tokenizer": settings.tokenizer,
-                      "specials": settings.specials, "processor": settings.processor,
-                      "context_encoder": settings.context_encoder}
-            if first is None:
-                first = record, shared
-            for name, value in shared.items():
-                if value != first[1][name]:
-                    raise ValueError(f"the run in {directory} differs from {runs[0]} in its {name}, so their "
-                                     "weights are not one task's to average")
+        recorded = [run_record(directory, step)[0] for directory in runs]
+        first = DecideSettings.of(recorded[0]) if recorded else None
+        for directory, saved in zip(runs, recorded, strict=True):
+            settings = DecideSettings.of(saved)
+            differing = [entry.name for entry in fields(DecideSettings)
+                         if getattr(settings, entry.name) != getattr(first, entry.name)]
+            if differing:
+                raise ValueError(f"the run in {directory} differs from {runs[0]} in its "
+                                 f"{', '.join(differing)}, so their weights are not one task's to average")
         average = averaged(runs, step=step, ema=ema)
-        assert first is not None, "an average reads two or more runs"
-        task = cls._recorded(runs[0], first[0], average.model.build(), average.variables,
+        task = cls._recorded(runs[0], recorded[0], average.model.build(), average.variables,
                              Weights(average.runs[0][1], ema=False, averaged=average.runs), None)
         return task if calibrate_on is None else task.calibrated(calibrate_on)
 
