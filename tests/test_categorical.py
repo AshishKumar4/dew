@@ -226,21 +226,24 @@ def test_the_divergences_derivative_stays_finite_wherever_its_rows_are():
     """Rows each finite but far apart in offset have the derivative of the distributions they hold, here
     two uniform rows' zero; rows far apart in shape have a finite Hessian, and rows at opposite extrema,
     whose difference less its mean overflows, or so far apart that the difference's rounding lifts a
-    reconstructed log probability above 0, the derivative `p - q` with one; logits -inf where the
+    reconstructed log probability above 0, the derivative `p - q` with one, and a uniform offset whose
+    mean rounds the difference off 0 the derivative 0 with one; logits -inf where the
     reference is not take `p - q` in forward mode as in reverse; and a row whose classes `where`
     excludes entirely has derivative 0 beside a held row's."""
     far = jnp.asarray([[2e38, 2e38]], jnp.float32), jnp.asarray([[-2e38, -2e38]], jnp.float32)
     offset = jax.grad(lambda rows: categorical.kl_divergence(rows, far[1]).sum())(far[0])
     np.testing.assert_array_equal(offset, np.zeros((1, 2), np.float32))
     extrema = jnp.asarray([1e38, -1e38], jnp.float32), jnp.asarray([-1e38, 1e38], jnp.float32)
-    # A difference so large that its rounding (512 at 6.4e9) lifts a reconstructed log probability above 0.
+    # A difference so large that its rounding (512 at 6.4e9) lifts a reconstructed log probability above 0,
+    # and an offset whose mean rounds a uniform difference to -512 rather than 0.
     coarse = jnp.asarray([0.0, 6442450432.0], jnp.float32), jnp.asarray([0.0, -384.0], jnp.float32)
-    for (row, reference), expected in ((extrema, [1.0, -1.0]), (coarse, [-1.0, 1.0])):
+    uniform = jnp.full((7,), 6442450944.0, jnp.float32), jnp.zeros((7,), jnp.float32)
+    for (row, reference), expected in ((extrema, [1.0, -1.0]), (coarse, [-1.0, 1.0]), (uniform, [0.0] * 7)):
         for derivative in (jax.grad, jax.jacfwd):
             np.testing.assert_array_equal(
                 derivative(lambda row, reference=reference: categorical.kl_divergence(row, reference))(row),
                 expected)
-    for row, reference in ((jnp.asarray([200.0, 0.0]), jnp.asarray([-200.0, 0.0])), extrema, coarse):
+    for row, reference in ((jnp.asarray([200.0, 0.0]), jnp.asarray([-200.0, 0.0])), extrema, coarse, uniform):
         def divergence(row, reference=reference):
             return categorical.kl_divergence(row, reference)
 
