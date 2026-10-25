@@ -76,8 +76,9 @@ def soft_cross_entropy(logits: jax.Array, targets: jax.Array, where: jax.Array |
     """`-sum_k t_k log p_k` over the last axis against the distribution `targets`, a class of no target
     mass contributing nothing, whatever its log probability. Its derivative in `logits`, `p T - t` for
     target mass `T`, is `p (T - t) - t (1 - p)`, the most probable class's `1 - p` the other classes'
-    probability summed: a label's confident one-hot target keeps it as `cross_entropy` does
-    (arXiv:2610.31642, eq. 7), where `p - t` rounds to 0."""
+    probability summed, and the class of the most target mass's `T - t` the other classes' targets
+    summed: a label's confident one-hot target keeps it as `cross_entropy` does (arXiv:2610.31642,
+    eq. 7), where `p - t` rounds to 0, and targets as confident as the logits keep its sum 0."""
     return _soft_loss(widened(logits, where), targets)
 
 
@@ -104,7 +105,12 @@ def _soft_loss_tangent(primals, tangents):
     top = jax.nn.one_hot(jnp.argmax(probability, axis=-1), logits.shape[-1], dtype=bool)
     rest = jnp.where(top, jnp.sum(jnp.where(top, 0.0, probability), axis=-1, keepdims=True), 1 - probability)
     mass = jnp.where(targets > 0, targets, 0).astype(probability.dtype)
-    derivative = probability * (mass.sum(axis=-1, keepdims=True) - mass) - mass * rest
+    # `T - t`, the other classes' target mass: summed directly for the class that holds most of it, whose
+    # difference would round, as `rest` is for the most probable class.
+    held = jax.nn.one_hot(jnp.argmax(mass, axis=-1), logits.shape[-1], dtype=bool)
+    beside = jnp.where(held, jnp.sum(jnp.where(held, 0.0, mass), axis=-1, keepdims=True),
+                       mass.sum(axis=-1, keepdims=True) - mass)
+    derivative = probability * beside - mass * rest
     return value, tangent + jnp.sum(derivative * d_logits, axis=-1)
 
 
