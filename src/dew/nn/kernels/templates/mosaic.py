@@ -511,8 +511,9 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     @abc.abstractmethod
     def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
         """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, its value, with `then` issued while the
-        product runs; read once at most `pending` of the role's products issued after it (by `then`) still
-        run, its own retired first (an asynchronous family's; a synchronous one's are done as issued)."""
+        product runs. The value is read once at most `pending` of the role's products issued after it (by
+        `then`) still run: it is valid only once its own group retires, which a count of the products `then`
+        issues keeps (an asynchronous family's, `asynchronous`; a synchronous one's are done as issued)."""
 
     @abc.abstractmethod
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
@@ -534,8 +535,12 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         where `transposed`)."""
 
     @abc.abstractmethod
-    def rescaled_products(self, acc: Accumulator, scale, parts, rhs, interpret: bool) -> Accumulator:
-        """`acc` taken by `scale(value)` in place, then `register_products` of `parts` with `rhs` into it."""
+    def rescaled_products(self, acc: Accumulator, scale, parts, rhs, interpret: bool, *,
+                          pending: int = 0) -> Accumulator:
+        """`acc` taken by `scale(value)` in place, then `register_products` of `parts` with `rhs` into it;
+        its value read once at most `pending` of the role's products issued since its own still run (an
+        asynchronous family's, `product`'s: a product issued after the accumulator's last runs on beside
+        the scaling)."""
 
     @abc.abstractmethod
     def settled(self, pending: int = 0) -> None:
