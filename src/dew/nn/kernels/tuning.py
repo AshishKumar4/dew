@@ -56,7 +56,7 @@ import threading
 import time
 import types
 from collections.abc import Callable, Collection, Hashable, Iterator, Mapping
-from typing import Any, ClassVar
+from typing import ClassVar
 
 import filelock
 import jax
@@ -651,7 +651,7 @@ def materialized(op: KernelOp, ba: tokamax.BoundArguments, arrays: list | None =
 
 
 def measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None, *,
-             arrays: list | None = None, outputs: Callable[[Hashable, Any], None] | None = None,
+             arrays: list | None = None, outputs: Callable[[Hashable, jax.Array], None] | None = None,
              configs: Collection[Hashable] | None = None) -> Timings:
     """Every config of `ba`'s launch (at its key's shapes), each compiled on a
     thread and timed alone: the device time CUPTI reads for the launch's own
