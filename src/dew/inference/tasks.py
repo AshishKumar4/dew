@@ -300,7 +300,7 @@ def run_record(directory: str, step: int | str | None = None, trust: Sequence[st
                          f"{sorted(stray)}")
     if isinstance(record.get("processor"), str):
         # The source identity was an encoded string before typed component references.
-        # Kept once at this pinned boundary until 1.0 (ledger 1637).
+        # Kept once at this pinned boundary until 1.0 (ledger 1641).
         from dew.interop.sources import SourceReference
         from dew.registry import to_record
 
