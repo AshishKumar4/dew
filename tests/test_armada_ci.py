@@ -449,6 +449,42 @@ def test_a_gpu_lane_fetches_the_pinned_fixtures_before_any_file_and_stops_where_
     assert fetched.is_file() and not (tmp_path / "read").exists()
 
 
+def test_a_network_lane_runs_the_network_marked_tests_with_the_hub_open_and_records_them_apart(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """The network lane runs each file's network-marked tests alone, which every other task sets aside,
+    with the Hub open, and records them on a class of their own: the same file's CUDA lane, Hub closed,
+    runs its other tests and is no reuse of the network lane's run, and a second network lane on the same
+    inputs reuses its own (Main, 2026-10-25: no CI run reached the published checkpoints' parity tests)."""
+    url, _, _ = cache_worker
+    gpu_lane_at(tmp_path, monkeypatch, url, 0)
+    interpreter(tmp_path, "3.12")
+    fetcher(tmp_path)
+    (tmp_path / "tests/test_hub.py").write_text(
+        "import os, pytest\nfrom pathlib import Path\n"
+        "@pytest.mark.network\ndef test_reads_the_hub():\n"
+        "    assert not {'HF_HUB_OFFLINE', 'HF_ENDPOINT'} & set(os.environ), 'the Hub is closed'\n"
+        "    Path('hub').write_text('ran')\n"
+        "def test_offline():\n"
+        "    assert os.environ['HF_HUB_OFFLINE'] == '1'\n"
+        "    Path('offline').write_text('ran')\n")
+    out = tmp_path / "verdict.json"
+    hub, offline = tmp_path / "hub", tmp_path / "offline"
+
+    def lane(**network: bool) -> list[tuple[str, int]]:
+        hub.unlink(missing_ok=True)
+        offline.unlink(missing_ok=True)
+        assert ci.gpu_lane("3.12", ["tests/test_hub.py"], out, cache="on", processes=1, deadline=600.0,
+                           **network) == 0
+        return [(row["name"], row["exitCode"]) for row in json.loads(out.read_text())["rows"]]
+
+    assert lane(network=True) == [("3.12:tests/test_hub.py", 0)]
+    assert hub.is_file() and not offline.exists()
+    assert lane() == [("3.12:tests/test_hub.py", 0)]
+    assert offline.is_file() and not hub.exists(), "the CUDA lane's run is its own"
+    assert lane(network=True) == [("3.12:tests/test_hub.py", 0)]
+    assert not hub.exists(), "the network lane reuses its own green run on the same inputs"
+
+
 LANE_TEST = ("import os, subprocess, sys, time\n"
              "from pathlib import Path\n"
              "def test_runs():\n"
