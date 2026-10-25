@@ -15,6 +15,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from learning_gate import assert_learns, within
 from reference_error import assert_as_exact_as_the_reference
 from scipy import stats
 
@@ -90,14 +91,24 @@ class ToyVelocityMLP(nn.Module):
         return nn.Dense(3)(h).reshape(x.shape)
 
 
-def test_flow_matching_learns_a_two_mode_mixture():
+MIXTURE_RUNS = 64
+"""The mixture site's declared training runs (the learning gate's), each its own initialization, data
+and noise: `learning_gate.units_for` over twenty pilots of 168 to 192 runs declared 47 to 58, and the
+site declares more than any of them, since trained together 64 runs cost what 56 did (this file, 95 s
+on armada against 93 s). Each mode's mean
+sat 0.011 to 0.012 inside its center on average, against a margin of 0.04, and moved 0.017 from run to
+run, so one run missed the margin on an axis about one time in twenty-five."""
+
+
+@jax.jit
+def mixture_runs(runs: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """The toy's runs numbered `runs`, trained together: each a velocity network trained by flow matching
+    on the mixture for 1500 steps from keys of its number's own, and 2048 samples of its 64-step Euler
+    walk; with each run's last step's loss."""
     process = presets.Flow()()
     schedule, transform = process.schedule, process.prediction
     model = ToyVelocityMLP()
-    key = jax.random.PRNGKey(0)
-    params = model.init(key, jnp.zeros((1, 1, 1, 3)), jnp.zeros((1,)))
     optimizer = optax.adam(3e-3)
-    opt_state = optimizer.init(params)
 
     def loss_fn(params, x0, noise, steps):
         rates = broadcast_rates(schedule, steps, x0)
@@ -106,9 +117,9 @@ def test_flow_matching_learns_a_two_mode_mixture():
         weights = expand(process.weight(steps), x0)
         return jnp.mean(weights * (preds - target) ** 2)
 
-    @jax.jit
-    def train_step(params, opt_state, key):
-        data_key, noise_key, time_key = jax.random.split(key, 3)
+    def train_step(step, carry, run_key):
+        params, opt_state, _ = carry
+        data_key, noise_key, time_key = jax.random.split(jax.random.fold_in(run_key, step), 3)
         x0 = sample_mixture(data_key, 512)
         noise = jax.random.normal(noise_key, x0.shape)
         steps = schedule.sample_t(time_key, 512)
@@ -116,26 +127,46 @@ def test_flow_matching_learns_a_two_mode_mixture():
         updates, opt_state = optimizer.update(grads, opt_state, params)
         return optax.apply_updates(params, updates), opt_state, loss
 
-    run_key = jax.random.PRNGKey(1)
-    for step in range(1500):
-        params, opt_state, loss = train_step(params, opt_state, jax.random.fold_in(run_key, step))
-    assert float(loss) < 1.0, "flow matching loss did not come down"
+    def one(run):
+        key = jax.random.fold_in(jax.random.PRNGKey(0), run)
+        params = model.init(jax.random.fold_in(key, 0), jnp.zeros((1, 1, 1, 3)), jnp.zeros((1,)))
+        carry = (params, optimizer.init(params), jnp.zeros((), jnp.float32))
+        run_key = jax.random.fold_in(key, 1)
+        params, _, loss = jax.lax.fori_loop(0, 1500, lambda step, carry: train_step(step, carry, run_key),
+                                            carry)
+        denoise = process.denoiser(model, params, {})
+        x_T = process.noise(jax.random.fold_in(key, 2), (2048, 1, 1, 3))
+        samples = sample(denoise, x_T, 64, solver=Euler(), key=jax.random.fold_in(key, 3))
+        return samples.reshape(-1, 3), loss
 
-    denoise = process.denoiser(model, params, {})
-    x_T = process.noise(jax.random.PRNGKey(2), (2048, 1, 1, 3))
-    samples = sample(denoise, x_T, 64, solver=Euler(), key=jax.random.PRNGKey(3)).reshape(-1, 3)
+    return jax.vmap(one)(runs)
 
-    assignment = samples[:, 0] > 0
-    fraction = float(jnp.mean(assignment))
-    assert 0.35 < fraction < 0.65, f"modes not balanced: {fraction:.2f}"
 
-    for mode, center in enumerate(MODE_CENTERS):
-        members = samples[assignment == bool(mode)]
-        assert jnp.max(jnp.abs(jnp.mean(members[:, :2], axis=0) - center)) < 0.04
-        assert abs(float(jnp.std(members[:, :2])) - MODE_STD) < 0.04
-    # The third channel is a single zero-centred gaussian, not a mixture
-    assert abs(float(jnp.mean(samples[:, 2]))) < 0.04
-    assert abs(float(jnp.std(samples[:, 2])) - MODE_STD) < 0.04
+def mixture_contrasts(runs: np.ndarray) -> dict[str, np.ndarray]:
+    """The runs' contrasts (`learning_gate.within`), one a run, for the claims the toy held one run to:
+    its last loss below one, its samples' modes balanced within 0.15 of a half, each mode's mean within
+    0.04 of its center and its spread within 0.04 of MODE_STD, and the third channel one gaussian within
+    0.04 of zero mean and MODE_STD's spread."""
+    samples, losses = (np.asarray(value, np.float64) for value in mixture_runs(jnp.asarray(runs)))
+    assignment = samples[..., 0] > 0
+    contrasts = {"loss below one": 1.0 - losses,
+                 **within("mode share", assignment.mean(axis=1), 0.5, 0.15)}
+    for mode, center in enumerate(np.asarray(MODE_CENTERS, np.float64)):
+        members = [run[side == bool(mode)] for run, side in zip(samples, assignment, strict=True)]
+        for axis in range(2):
+            contrasts |= within(f"mode {mode}'s mean {axis}",
+                                [member[:, axis].mean() for member in members], center[axis], 0.04)
+        contrasts |= within(f"mode {mode}'s spread", [member[:, :2].std() for member in members],
+                            MODE_STD, 0.04)
+    # The third channel is a single zero-centred gaussian, not a mixture.
+    contrasts |= within("third channel's mean", samples[..., 2].mean(axis=1), 0.0, 0.04)
+    return contrasts | within("third channel's spread", samples[..., 2].std(axis=1), MODE_STD, 0.04)
+
+
+def test_flow_matching_learns_a_two_mode_mixture():
+    """Flow matching learns the mixture: over independent training runs, the runs' samples meet the toy's
+    margins on average (the learning gate), each claim's two sides held by the one-sided t."""
+    assert_learns(mixture_contrasts, "two-mode mixture", units=MIXTURE_RUNS)
 
 
 LOSS = np.load(Path(__file__).resolve().parent / "fixtures" / "flow" / "loss.npz")
