@@ -264,3 +264,69 @@ def test_a_windowed_kind_tunes_its_temperature_as_written():
 
     for ours, label in ((full, "tuned windowed layer"), (cached, "tuned windowed layer, cached")):
         assert_as_exact(ours, jax.jit(written), draw, label, seeds=TUNED_SEEDS, truth_fn=truth)
+
+
+def test_a_llama4_of_unrotated_layers_alone_translates_as_llama4():
+    """A Llama 4 config whose every layer carries no rope (`no_rope_layer_interval` 1) is still Llama 4:
+    its record translates its weights by Llama 4's names with no model type stated, so the checkpoint's
+    tensors land where the stated-type translation puts them."""
+    import json
+
+    from dew.interop.hf_decoders import translate_config, translate_weights
+    from dew.interop.safetensors_io import read_weights
+
+    config = json.loads((LLAMA4_CHECKPOINT / "config.json").read_text())
+    config = {**config, "no_rope_layers": [0] * config["num_hidden_layers"]}
+    tensors = read_weights(LLAMA4_CHECKPOINT)
+    record = translate_config(config)
+    assert {kind.split("_")[0] for kind in record["kinds"]} == {"full"}
+    inferred = translate_weights(tensors, record)
+    stated = translate_weights(tensors, record, model_type="llama4_text")
+    assert jax.tree.structure(inferred) == jax.tree.structure(stated)
+    for ours, theirs in zip(jax.tree.leaves(inferred), jax.tree.leaves(stated), strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+
+
+def ngpt_layers(dtype=jnp.float32):
+    """An nGPT attention with the temperature tuned, and the same attention untuned, at `dtype`."""
+    from dew.nn.ngpt import NGPT
+
+    context = MixerContext(emb_features=HIDDEN, num_heads=HEADS, num_kv_heads=KV_HEADS, head_dim=HEAD_DIM,
+                           max_seq_len=32, rope_theta=TUNED_THETA, qk_norm=False,
+                           ngpt=NGPT(std=0.02, alpha=1.0), dtype=dtype)
+    return (AttentionMixer(temperature_tuning=(TUNED_FLOOR, TUNED_SCALE)).build(context)(),
+            AttentionMixer().build(context)())
+
+
+def test_a_tuned_temperature_holds_through_an_ngpt_query():
+    """nGPT puts a rotated query on the unit sphere times its gain squared, so the temperature scales
+    it after that: a tuned nGPT layer's row at place p is the untuned layer's row p with its query gain
+    raised by the square root of p's temperature (each row reads its own query alone), on par against
+    float64 (check 1)."""
+    from dew.nn.mixers.attention import temperature_scale
+
+    tuned, _ = ngpt_layers()
+    length = 12
+
+    def draw(seed):
+        hidden = np.random.default_rng([1615, seed]).standard_normal((2, length, HIDDEN)).astype(np.float32)
+        params = jax.tree.map(np.asarray, tuned.init(jax.random.key(seed), jnp.zeros((1, length, HIDDEN))))
+        return hidden, params
+
+    def regained(dtype):
+        _, untuned = ngpt_layers(dtype)
+
+        def rows(hidden, params):
+            wide = jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype), params)
+            temperature = temperature_scale(jnp.arange(length), TUNED_FLOOR, TUNED_SCALE, dtype=dtype)
+            picked = []
+            for place in range(length):
+                gained = {**wide, "params": {**wide["params"],
+                                             "sqk": wide["params"]["sqk"] * jnp.sqrt(temperature[place])}}
+                picked.append(untuned.apply(gained, jnp.asarray(hidden, dtype))[:, place])
+            return jnp.stack(picked, axis=1)
+        return rows
+
+    ours = jax.jit(lambda hidden, params: tuned.apply(params, hidden))
+    assert_as_exact(ours, jax.jit(regained(jnp.float32)), draw, "tuned nGPT layer", seeds=TUNED_SEEDS,
+                    truth_fn=regained(jnp.float64))

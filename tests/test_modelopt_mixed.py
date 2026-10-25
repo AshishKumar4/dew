@@ -176,13 +176,15 @@ def test_a_modelopt_nvfp4_model_with_experts_is_read_by_its_stored_layers(tmp_pa
     assert np.abs(logits - np.asarray(weights_only.model.apply(weights_only.variables, ids))).max() > 0
 
 
-def fp8(name: str, weight: np.ndarray, input_scale: float) -> dict[str, np.ndarray]:
-    """`weight` as ModelOpt's FP8 exporter stores it: E4M3 codes under one float32 scale (amax/448),
-    beside the static input multiplier it calibrated."""
+def fp8(name: str, weight: np.ndarray, input_scale: float, weight_scale: float | None = None
+        ) -> dict[str, np.ndarray]:
+    """`weight` as ModelOpt's FP8 exporter stores it: E4M3 codes under one float32 scale (amax/448
+    where not given), beside the static input multiplier it calibrated."""
     import ml_dtypes
 
     stem = name.removesuffix('.weight')
-    grid = {stem + '.weight_scale': np.asarray(np.abs(weight).max() / 448, np.float32),
+    scale = np.abs(weight).max() / 448 if weight_scale is None else weight_scale
+    grid = {stem + '.weight_scale': np.asarray(scale, np.float32),
             stem + '.input_scale': np.asarray(input_scale, np.float32),
             name: np.zeros(weight.shape, ml_dtypes.float8_e4m3fn)}
     quantization = {'quant_method': 'modelopt', 'quant_algo': 'FP8'}
@@ -252,3 +254,30 @@ def test_a_modelopt_fp8_model_with_fused_projections_quantizes_every_member_inpu
                                       np.asarray(value, np.float32))
     reloaded = Pretrained.load(tmp_path / 'export', **load)
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)), logits)
+
+
+def test_a_fused_and_a_stored_member_with_unequal_input_scales_are_refused(tmp_path):
+    """A fused tensor beside an equal member stored apart binds that member's Linear twice: with
+    unequal input scales, one calibration would be dropped, so the load is refused."""
+    from dew.interop.safetensors_io import save_hf_layout
+
+    source = FIXTURE.parents[2] / 'hf' / 'phi3-tiny'
+    stored, config = read_weights(source), json.loads((source / 'config.json').read_text())
+    tensors = dict(stored)
+    fused = 'model.layers.0.mlp.gate_up_proj.weight'
+    weight = np.asarray(stored[fused], np.float32)
+    encoded = fp8(fused, weight, 0.07)
+    tensors.update(encoded)
+    # The member under the fused tensor's own weight scale decodes to the fused tensor's half exactly,
+    # so only the input scales differ.
+    member = weight[weight.shape[0] // 2:]
+    shared = float(encoded['model.layers.0.mlp.gate_up_proj.weight_scale'])
+    tensors.update(fp8('model.layers.0.mlp.up_proj.weight', member, 0.03, weight_scale=shared))
+    producer = json.loads((FIXTURE / 'config.json').read_text())['quantization_config']['producer']
+    quantization = {'quant_algo': 'FP8', 'kv_cache_quant_algo': None, 'producer': producer,
+                    'quant_method': 'modelopt'}
+    save_hf_layout(tensors, {**config, 'quantization_config': quantization}, tmp_path)
+    (tmp_path / 'hf_quant_config.json').write_text(json.dumps(
+        {'producer': producer, 'quantization': {'quant_algo': 'FP8', 'kv_cache_quant_algo': None}}))
+    with pytest.raises(ValueError):
+        Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
