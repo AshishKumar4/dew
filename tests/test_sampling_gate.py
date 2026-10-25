@@ -30,7 +30,8 @@ def test_a_share_favoured_by_two_hundredths_fails():
 
 def test_a_site_too_small_to_judge_is_refused():
     """Eight records a seed over two seeds expect less than one of the rarest part: refused, not
-    judged; and counts of another shape, or a chance that is not positive, are refused too."""
+    judged; and counts of another shape, a chance that is not positive or finite, and chances that do not
+    sum to one (a declaration's typo, never repaired), are refused too."""
     with pytest.raises(AssertionError) as raised:
         assert_draws_as_declared(drawn(SHARES, 8), SHARES, "small", seeds=2)
     assert raised.type is AssertionError
@@ -38,6 +39,10 @@ def test_a_site_too_small_to_judge_is_refused():
         assert_draws_as_declared(lambda seed: np.array([1.5, 2, 3]), SHARES, "floats", seeds=1)
     with pytest.raises(ValueError):
         assert_draws_as_declared(drawn(SHARES), (0.95, 0.05, 0.0), "chances", seeds=1)
+    with pytest.raises(ValueError):
+        assert_draws_as_declared(drawn(SHARES), (0.85, float("nan"), 0.1), "nan", seeds=1)
+    with pytest.raises(ValueError):
+        assert_draws_as_declared(drawn(SHARES), (0.80, 0.05, 0.1), "typo", seeds=1)
 
 
 @pytest.mark.parametrize("total, chances", [(100, (0.95, 0.05)), (100, (0.9, 0.05, 0.05)),

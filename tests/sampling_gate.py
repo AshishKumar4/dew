@@ -10,9 +10,9 @@ held to its own law under a fair sampler, NULL_DRAWS multinomial draws at those 
 (`null_statistics`), not to the chi-square law, which at sparse expected counts rejects a fair sampler
 more often than its level: 100 draws at (0.95, 0.05) fail a fair sampler 4.6e-4 of the time by the
 chi-square law at 1e-4. The site fails where the share of null statistics at least its own, counted as
-(1 + exceedances) / (NULL_DRAWS + 1), is below LEVEL, half of FALSE_RED: a valid test at any counts, its
-false-red rate at most FALSE_RED whatever its null draws' spread (tests/test_sampling_gate.py computes it
-exactly at sparse sites)."""
+(1 + exceedances) / (NULL_DRAWS + 1), is below LEVEL, half of FALSE_RED: a valid test at any counts in
+expectation over its null draws, and at the fixed draws a verdict uses, its false-red rate under FALSE_RED
+by about seven of its deviations (tests/test_sampling_gate.py computes it exactly at four sparse sites)."""
 
 import functools
 import math
@@ -35,7 +35,8 @@ LEVEL = FALSE_RED / 2
 """The rarity below which a site fails. A test held to null draws from a fixed seed fails a fair
 sampler at that seed's own rate, which spreads about its level by the draws' count: at FALSE_RED
 itself, (0.5, 0.25, 0.25) over 40 draws failed 1.004e-4 of the time, computed exactly. At half of it
-the rate's spread (about 7e-6 at a million draws) leaves FALSE_RED seven of its deviations away."""
+the rate's spread (about 7e-6 at a million draws) leaves FALSE_RED about seven of its deviations
+away: an overshoot that unlikely, not impossible, and computed absent at the sparse sites tested."""
 
 _CHUNK = 100_000
 """The null draws taken at a time, bounding a verdict's memory at many outcomes."""
@@ -76,16 +77,20 @@ def p_value(statistic: float, total: int, chances: tuple[float, ...]) -> float:
 
 def assert_draws_as_declared(counts_of, chances, label: str, *, seeds: int) -> None:
     """`counts_of(seed)`, the count of each outcome over one seed's draws (a part's records, a member's
-    rows), drawn at `chances` (each a share of their sum) as a fair sampler would, over `seeds` seeds:
+    rows), drawn at `chances` (probabilities summing to one) as a fair sampler would, over `seeds` seeds:
     the pooled counts' statistic is no rarer than LEVEL under a fair sampler (`p_value`).
 
     Raises SamplingFailure naming each outcome's share against its chance; refuses a site whose
     expected counts fall below FEWEST_EXPECTED or whose seeds draw nothing."""
     chances = np.asarray(chances, np.float64)
-    if chances.ndim != 1 or np.any(chances <= 0):
-        raise ValueError(f"{label}: chances must be positive, not {chances.tolist()}")
-    # A split's chances as its shares of their exact sum: 0.85, 0.05 and 0.1 add to one only in decimal.
-    chances = chances / math.fsum(chances.tolist())
+    if chances.ndim != 1 or not np.all(np.isfinite(chances)) or np.any(chances <= 0):
+        raise ValueError(f"{label}: chances must be finite and positive, not {chances.tolist()}")
+    # Chances are probabilities: a declaration whose sum is off one by more than its decimals' rounding
+    # is refused, never repaired (0.85, 0.05 and 0.1 add to one in decimal, to 1 + 2^-52 in binary).
+    total_chance = math.fsum(chances.tolist())
+    if abs(total_chance - 1.0) > chances.size * 2.0 ** -52:
+        raise ValueError(f"{label}: chances must sum to one, not {total_chance!r}")
+    chances = chances / total_chance
     pooled = np.zeros(chances.size, np.int64)
     for seed in range(seeds):
         counts = np.asarray(counts_of(seed))
