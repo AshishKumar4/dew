@@ -998,8 +998,24 @@ _CHAINS = ("data", "validation")
 """A run's fields that hold chains, which its record writes through the data's codec (`_chain_record`)."""
 
 RETIRED = {"trainer": frozenset({"tune_kernels"})}
-"""The fields a record written before their removal may hold, by the run's field they sit in, which a read
-drops: `trainer.tune_kernels`, the opt-in kernel tuner's switch, removed with the tuner."""
+"""The fields a saved run's record written before their removal may hold, by the run's field they sit in,
+which reading the record (`RunConfig.read`) drops, its field's value a plain mapping of fields or a class
+record: `trainer.tune_kernels`, the opt-in kernel tuner's switch, removed with the tuner. The one
+translation of a saved run's record (BIBLE §1), deleted at 1.0."""
+
+
+def _unretired(fields: Mapping[str, object]) -> Mapping[str, object]:
+    """A saved run's fields with each `RETIRED` field dropped from the field holding it."""
+    current = dict(fields)
+    for name, retired in RETIRED.items():
+        held = current.get(name)
+        if not isinstance(held, Mapping):
+            continue
+        named = registry.class_record(held)
+        values = held if named is None else named[1]
+        kept = {field: value for field, value in values.items() if field not in retired}
+        current[name] = kept if named is None else {"class": named[0], "fields": kept}
+    return current
 
 
 def _chain_record(value: Dataset | Mapping[str, Dataset] | None) -> JSON:
@@ -1223,14 +1239,10 @@ class RunConfig:
     @classmethod
     def from_dict(cls, values: Mapping[str, object]) -> Self:
         """Read back what `to_dict` wrote, for subclasses too. A field the
-        record lacks takes its default, one retired since it was written
-        (`RETIRED`) is dropped, and an unknown field raises. A chain
+        record lacks takes its default; an unknown field raises. A chain
         recorded as unrecorded, or a recipe's record written before runs
         recorded chains, is refused by name."""
         rest = {name: value for name, value in values.items() if name not in _CHAINS}
-        for name, retired in RETIRED.items():
-            if isinstance(held := rest.get(name), Mapping):
-                rest[name] = {field: value for field, value in held.items() if field not in retired}
         chains = {name: _read_chain(name, values[name]) for name in _CHAINS if name in values}
         return dataclasses.replace(from_record(cls, rest, dtypes=False), **chains)
 
@@ -1408,7 +1420,8 @@ class RunConfig:
     @classmethod
     def read(cls, record: Mapping[str, object], *, trust: Sequence[str] = ()) -> Self:
         """The run a class record (`record`) names, as its class, which must be
-        this one or derive from it."""
+        this one or derive from it, a field retired since a saved run wrote it
+        dropped (`RETIRED`)."""
         if record.get("rebuildable") is False:
             raise ValueError("this run was defined in Python, so no record rebuilds it; it loads for "
                              "inference through dew.pipeline or a task's from_run")
@@ -1419,7 +1432,7 @@ class RunConfig:
         run_class = registry.runs[named[0]]
         if not (isinstance(run_class, type) and issubclass(run_class, cls)):
             raise ValueError(f"the record names {named[0]}, which is no {cls.__name__}")
-        return run_class.from_dict(named[1])
+        return run_class.from_dict(_unretired(named[1]))
 
     def prepare(self) -> Prepared:
         """Build what this run trains: the objective its record names around
