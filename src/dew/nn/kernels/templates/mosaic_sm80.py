@@ -94,6 +94,8 @@ class Mma(mosaic.Family):
     operands_in_registers = True
     rhs_copies = 4
     most_shared = 163 * 1024  # sm80's and sm87's opt-in block (sm86's and sm89's 99 KiB)
+    reduction_scratch = plgpu.CompilerParams().reduction_scratch_bytes  # its kernels' default parameters
+    column_scratch = 0  # its column sums take its kernels' reduction scratch
 
     def registers(self, consumers: int) -> int:
         del consumers  # one role, at a thread's whole budget
@@ -232,6 +234,17 @@ class Mma(mosaic.Family):
             # lowering (jax 0.11.2).
             raise NotImplementedError("mma.sync's bundle adds into global memory only interpreted")
         view[...] = view[...] + value
+
+    def column_sums(self, value: jax.Array, scratch, interpret: bool) -> jax.Array:
+        # One warpgroup a program: Mosaic GPU's own reduction across its warps, through the scratch its
+        # kernels' parameters reserve (`reduction_scratch`).
+        del scratch, interpret
+        return value.sum(axis=0)
+
+    def published(self) -> None:
+        # Its products read shared memory through ldmatrix, the warpgroup's own loads, which the store's
+        # automatic barriers order.
+        pass
 
     def held(self, ref):
         return plgpu.load(ref, layout=self.lhs, optimized=False)
