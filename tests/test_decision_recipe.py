@@ -90,7 +90,10 @@ def test_a_lora_run_over_a_decision_release_trains_its_factors_and_reloads(tmp_p
     objective, dataset = config.prepare().train("adapted")
     released = Decide.from_pretrained(release, attention_impl="xla")
     assert type(objective.layout) is type(released.layout)
-    assert objective.model.head == released.model.head
+    assert type(objective.model.head) is type(released.model.head)
+    for ours, theirs in zip(jax.tree.leaves(objective.held_variables()["params"]["head"]),
+                            jax.tree.leaves(released.variables["params"]["head"]), strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
     start = objective.init(jax.random.key(0))
     run = tmp_path / "run"
     checkpoints = Checkpoints(str(run), keep=1)
