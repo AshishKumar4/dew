@@ -26,7 +26,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import transformers
-from diffusers_wan_reference import float64
+from torch_precision import float64
 from huggingface_hub import hf_hub_download
 from reference_source import hub_modules
 

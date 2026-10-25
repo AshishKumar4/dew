@@ -51,7 +51,6 @@ included).
     PYTHONPATH=src:tools python tools/joint_checkpoint_reference.py [--fla | --images]
 """
 
-import copy
 import json
 import os
 import sys
@@ -86,8 +85,24 @@ def as_upstream(request: dict) -> dict:
     return {**request, "questions": questions}
 
 
+def float64_twin(model_class, upstream, head, head_config: dict):
+    """The joint model's float64 truth: the backbone read from its fixture and the head built from its
+    config, both inside `float64`, so every table their constructors compute (Qwen 3.5's rotary
+    `inv_freq`) is float64's, where a float32 build cast afterwards keeps float32's; the head's weights
+    `head`'s, loaded strictly. Run it inside `float64` too."""
+    from torch_precision import float64
+    from transformers import Qwen3_5ForConditionalGeneration
+
+    with float64():
+        backbone = Qwen3_5ForConditionalGeneration.from_pretrained(BACKBONE, dtype=torch.float64,
+                                                                   attn_implementation="eager").eval()
+        wide_head = upstream.JointSchemaHead(**head_config).eval()
+    wide_head.load_state_dict(head.state_dict(), strict=True)
+    return model_class(backbone, wide_head).eval()
+
+
 def main() -> None:
-    from diffusers_wan_reference import float64
+    from torch_precision import float64
     from safetensors.torch import save_file
     from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
 
@@ -105,7 +120,7 @@ def main() -> None:
         head.joint_logit_scale.fill_(1.3)
         head.residual_gate.fill_(-0.4)
     model = model_class(backbone, head).eval()
-    exact = copy.deepcopy(model).double()
+    exact = float64_twin(model_class, upstream, head, HEAD)
     OUT.mkdir(parents=True, exist_ok=True)
     (OUT / "joint_head_config.json").write_text(json.dumps(HEAD, indent=1) + "\n")
     save_file({name: tensor.contiguous() for name, tensor in head.state_dict().items()},
@@ -211,7 +226,7 @@ def fla_precision() -> str:
 
 
 def images() -> None:
-    from diffusers_wan_reference import float64
+    from torch_precision import float64
     from PIL import Image
     from safetensors.torch import load_file
     from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
@@ -220,10 +235,11 @@ def images() -> None:
     processor = AutoProcessor.from_pretrained(BACKBONE)
     backbone = Qwen3_5ForConditionalGeneration.from_pretrained(BACKBONE, dtype=torch.float32,
                                                                attn_implementation="eager").eval()
-    head = upstream.JointSchemaHead(**json.loads((OUT / "joint_head_config.json").read_text())).eval()
+    head_config = json.loads((OUT / "joint_head_config.json").read_text())
+    head = upstream.JointSchemaHead(**head_config).eval()
     head.load_state_dict(load_file(OUT / "joint_head.safetensors"), strict=True)
     model = model_class(backbone, head).eval()
-    exact = copy.deepcopy(model).double()
+    exact = float64_twin(model_class, upstream, head, head_config)
     request = json.loads((ROOT / "tests" / "fixtures" / "laya" / "cases.json").read_text())["quickstart"]
     pictures = [Image.fromarray(array) for array in np.load(BACKBONE / "images.npy")]
     encoded = upstream.encode_record(processor.tokenizer, {**as_upstream(request), "images": pictures},

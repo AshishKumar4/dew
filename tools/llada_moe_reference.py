@@ -27,7 +27,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from diffusers_wan_reference import float64
+from torch_precision import float64
 from remote_code_reference import FIXTURES, RELEASES as REGISTERED, released_model
 from safetensors.torch import save_file
 
