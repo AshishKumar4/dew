@@ -241,6 +241,12 @@ class Mma(mosaic.Family):
         del scratch, interpret
         return value.sum(axis=0)
 
+    def stores(self, dtype) -> bool:
+        # Its tiles reach global memory through registers (no TMA): a 16-bit MMA-layout tile's stores
+        # write 16-byte row pieces, partial 32-byte sectors, which JAX 0.12's transfers refuse at every
+        # width (ns-store3: [64, 32] to [64, 256] bf16), staged through shared memory or not.
+        return jnp.dtype(dtype).itemsize >= 4
+
     def published(self) -> None:
         # Its products read shared memory through ldmatrix, the warpgroup's own loads, which the store's
         # automatic barriers order.
