@@ -395,6 +395,11 @@ class Transaction:
         never replays. A general statistics tree reduces only once pooled, so
         its gradient has to be recomputed under the pooled cotangent.
         """
+        if aux.qk_stats is None and clips_qk(state.opt_state):
+            raise ValueError(
+                f"{type(self.objective).__name__} returns no attention logit maxima (Aux.qk_stats) though "
+                "its step asks for them (Step.qk_stats), and the run's optimizer clips by them (a QK-Clip, "
+                "muonclip's): its attention would train unclipped")
         previous = state.accumulation
         fill = state.microstep % self.size
         due = (fill + 1) == self.size

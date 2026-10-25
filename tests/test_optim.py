@@ -399,15 +399,17 @@ def qk_stats(layers=1, heads=4, rows=3, values=None, nope=None, kv_heads=None, h
     return stats
 
 
-def test_muonclip_refuses_an_update_given_no_maxima():
-    """No maxima, no update: a clip that stepped aside would leave the logits it bounds unbounded
-    with no sign of it. Its state marks the optimizer as one that reads them (`clips_qk`), through
+def test_muonclip_without_stats_steps_like_muon():
+    """No maxima, no clip: called without them, as a loop of plain optax calls may, the transform
+    steps aside bitwise. Its state marks the optimizer as one that reads them (`clips_qk`), through
     the chain that composes it, so a run asks its objective for them; Muon's does not."""
     params, grads = qk_tree()
+    muon = muon_solver()
     clipped = muonclip_solver()
-    with pytest.raises(ValueError):
-        clipped.update(grads, clipped.init(params), params)
-    assert clips_qk(clipped.init(params)) and not clips_qk(muon_solver().init(params))
+    expected, _ = muon.update(grads, muon.init(params), params)
+    updates, _ = clipped.update(grads, clipped.init(params), params)
+    assert largest_difference(updates, expected) == 0.0
+    assert clips_qk(clipped.init(params)) and not clips_qk(muon.init(params))
 
 
 def test_a_quiet_clip_steps_like_muon():
