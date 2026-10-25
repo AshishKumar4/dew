@@ -28,10 +28,10 @@ CONFIGURATIONS = {
     "titans": {"network": functools.partial(MLPMemory, widths=(2 * FEATURES, FEATURES)),
                "momentum": Gate(), "retention": Gate(bias=-2.0)},
     # Moneta: the lp bias with p = 3 (Miras Eq 10, 24) and retention. Its gradient grows with the
-    # error's square, so it steps a fiftieth where the others step a tenth.
+    # error's square, so it steps a two-hundredth where the others step a tenth.
     "moneta": {"network": functools.partial(ResidualMemory, hidden=4 * FEATURES),
                "objective": Objective("lp", p=3.0), "retention": Gate(bias=-2.0),
-               "learning_rate": Gate(scale=0.02)},
+               "learning_rate": Gate(scale=0.005)},
     # Yaad: Huber's bias (Miras Eq 13, 26).
     "yaad": {"network": functools.partial(ResidualMemory, hidden=4 * FEATURES),
              "objective": Objective("huber", delta=0.5), "retention": Gate(bias=-2.0)},
