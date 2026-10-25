@@ -252,7 +252,7 @@ A second copy of the algebra written in triton.language is not an acceptable ans
 
 **Boundary tests.**
 1. **Bitwise across mainloops** (a semantics-drift guard): Mosaic GPU interpret mode and Triton interpret mode, at the same tiles, the same key order and the same algebra options. Where product shapes must differ, it falls back to check 1.
-2. **Check 1 per mainloop on GPU,** plus a same-schedule reproducibility test.
+2. **Check 1 per mainloop on GPU,** plus a same-schedule reproducibility test in deterministic mode.
 3. **Zero cost, per scoreboard row:** with no hooks, at a given configuration, the template runs within noise of its named comparator:
    - sm80: jax mha, then FA2;
    - sm90: Tokamax Mosaic, then FA3.
@@ -492,7 +492,7 @@ Questions 1 and 2 as recommended. Question 3: support all of them (§12). Questi
 | # | Variant | Maps to |
 |---|---|---|
 | 50 | check 1 and check 2 for every form and hook, bf16 included | gate |
-| 51 | bitwise reproducible runs | the same-schedule reproducibility test |
+| 51 | bitwise reproducible runs in deterministic mode | the same-schedule reproducibility test |
 
 ### Table 2: consumer → op map
 
