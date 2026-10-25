@@ -931,16 +931,21 @@ def m3_directions(gradients: np.ndarray) -> np.ndarray:
 def test_m3s_directions_are_algorithm_1s_across_its_chunks():
     """`scale_by_m3` over seven updates of a 6 x 4 matrix, two chunks closing: each direction on par with
     Algorithm 1's from float64 (check 1), the slow momentum's reaching the updates from the second chunk
-    on. Within a chunk the slow momentum and its orthogonalization hold still, and each changes once, as
-    the chunk closes; the first chunk's slow direction is zero."""
+    on, its Newton-Schulz products at full float32 as the reference's are (a run's own matmul precision
+    is the run's, as Muon's is). Within a chunk the slow momentum and its orthogonalization hold still,
+    and each changes once, as the chunk closes; the first chunk's slow direction is zero."""
     transform = scale_by_m3(**M3_FACTORS)
 
     @jax.jit
-    def directions(gradients):
+    def scanned(gradients):
         def step(state, gradient):
             direction, state = transform.update(gradient, state)
             return state, direction
         return jax.lax.scan(step, transform.init(gradients[0]), gradients)[1]
+
+    def directions(gradients):
+        with jax.default_matmul_precision("highest"):
+            return scanned(gradients)
 
     def draw(seed):
         return (np.random.default_rng(seed).standard_normal((7, 6, 4)).astype(np.float32),)
