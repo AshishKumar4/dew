@@ -478,6 +478,57 @@ def test_a_training_call_that_drops_attention_needs_a_dropout_rng(tmp_path):
     assert np.all(np.isfinite(np.asarray(trained)))
 
 
+DROPPING_SEEDS = 8
+"""The dropping call's check-1 seeds, sized by `seeds_for` on armada."""
+
+
+def test_a_training_call_that_drops_attention_reads_each_documents_real_tokens(tmp_path):
+    """A training call that drops attention probabilities reads the keys an eval call does: over packed
+    rows with padding among their tokens, Cohere 2's window counts each document's real tokens.
+    Dropping one probability in a billion keeps every one in all but a billionth of draws, so the
+    training call's logits on the real tokens are as exact as transformers' eval of each document's
+    real tokens on its own, from its float64 run (check 1)."""
+    torch.manual_seed(0)
+    model = transformers.Cohere2ForCausalLM(transformers.Cohere2Config(
+        **COHERE, sliding_window=4, layer_types=["sliding_attention", "full_attention"],
+        attention_dropout=1e-9)).eval()
+    model.save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32")
+
+    @jax.jit
+    def trained(ids, segments, valid):
+        logits = loaded.model.apply(loaded.variables, ids, train=True, segment_ids=segments,
+                                    attention_mask=valid, method="logits",
+                                    rngs={"dropout": jax.random.key(5)})
+        return {"logits": jnp.where(valid[..., None], logits, 0)}
+
+    def ours(ids, segments, valid, _):
+        return trained(jnp.asarray(ids), jnp.asarray(segments), jnp.asarray(valid))
+
+    def alone(model, ids, segments, valid):
+        logits = np.zeros((*ids.shape, TINY["vocab_size"]))
+        with torch.no_grad():
+            for row in range(ids.shape[0]):
+                for document in np.unique(segments[row][valid[row]]):
+                    at = np.flatnonzero((segments[row] == document) & valid[row])
+                    run = torch.from_numpy(ids[row, at].astype(np.int64))[None]
+                    logits[row, at] = model(run).logits[0].double()
+        return {"logits": logits}
+
+    with float64():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager").eval()
+        wide.load_state_dict(model.state_dict())
+
+    def truth(ids, segments, valid, _):
+        with float64():
+            return alone(wide, ids, segments, valid)
+
+    assert_as_exact(ours, lambda ids, segments, valid, _: alone(model, ids, segments, valid), packed_rows,
+                    "tier 3 cohere2 dropping call", seeds=DROPPING_SEEDS, truth_fn=truth)
+
+
 def test_a_type_whose_attention_asks_no_interface_runs_its_own_and_reads_no_packing(tmp_path):
     """OpenAI GPT's layers compute their attention in their own code, asking transformers' attention
     interface nothing: tier 3 runs that attention as transformers does, so it names no Dew kernel
