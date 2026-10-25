@@ -285,8 +285,13 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     m, n, k, g = shape
     block_m, block_n, block_k, consumers = tiles.block_m, tiles.block_n, tiles.block_k, tiles.warpgroups
     if not family.bounded_loads:
-        # Its loads read past an operand unpredicated: a last row tile reads rows the padding holds.
+        # Its loads read past an operand unpredicated: a last row tile reads rows the padding holds, the
+        # side operands' rows as the rows' own.
         lhs = jnp.pad(lhs, ((0, -m % block_m), (0, 0)))
+        prologue_operands = tuple(_side_padded(side, axes, block_m)
+                                  for side, axes in zip(prologue_operands, prologue_axes, strict=True))
+        epilogue_operands = tuple(_side_padded(side, axes, block_m)
+                                  for side, axes in zip(epilogue_operands, epilogue_axes, strict=True))
     share = block_m // consumers
     part = (share, block_n)
     side_shapes = [tuple({'rows': part[0], 'columns': part[1]}[axis] for axis in axes)
@@ -321,8 +326,9 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                 row_start = group.block * block_m
                 fixed_refs = [smem.at[wg] for smem in fixed_smems]
                 if active:
-                    mosaic.load_fixed([prologue_gmems[i].at[pl.ds(row_start, block_m)] for i in fixed],
-                                      fixed_refs, fixed_barriers, wg)
+                    family.loaded([(prologue_gmems[i].at[pl.ds(row_start, block_m)], ref, barrier.at[wg])
+                                   for i, ref, barrier in zip(fixed, fixed_refs, fixed_barriers,
+                                                              strict=True)])
                 step = functools.partial(_gmm_step, family=family, prologue=prologue,
                                          prologue_axes=prologue_axes,
                                          fixed_tiles=dict(zip(fixed, fixed_refs, strict=True)),
@@ -446,8 +452,8 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     multiple = 8 if family_of(tiles, lhs.dtype).bounded_loads else math.lcm(8, block_k)
     lhs, rhs = rows_padded(lhs, 0, multiple), rows_padded(rhs, 0, multiple)
     k = lhs.shape[0]
-    prologue_operands = tuple(_side_padded(side, axes) for side, axes in zip(prologue_operands, prologue_axes,
-                                                                               strict=True))
+    prologue_operands = tuple(_side_padded(side, axes, multiple)
+                              for side, axes in zip(prologue_operands, prologue_axes, strict=True))
 
     group_sizes = group_sizes.astype(jnp.int32)
     group_starts, group_ends, group_num_blocks, group_block_starts = _group_blocks(group_sizes, block_k)
@@ -529,8 +535,10 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                 hook = None if prologue is None else (prologue, prologue_axes, stepped, fixed, fixed_refs)
                 group = (starts_gmem[g_i], ends_gmem[g_i], steps, block_k)
                 if active:
-                    mosaic.load_fixed([side_gmems[i].at[tuple(depth for _ in prologue_axes[i])]
-                                       for i in fixed], fixed_refs, fixed_barriers, wg)
+                    family.loaded([(side_gmems[i].at[tuple(depth for _ in prologue_axes[i])], ref,
+                                    barrier.at[wg])
+                                   for i, ref, barrier in zip(fixed, fixed_refs, fixed_barriers,
+                                                              strict=True)])
 
                 def staged_at(index, slots):
                     return _staged_halves(family, [slots[name] for name in names], (index, *group),
@@ -647,6 +655,7 @@ def _group_blocks(group_sizes: jax.Array, block_k: int) -> tuple:
     return group_starts, group_ends, (group_block_ends - group_block_starts) // block_k, group_block_starts
 
 
-def _side_padded(side: jax.Array, axes: tuple) -> jax.Array:
-    """A side operand padded as the rows are along the dimension that follows them, wherever it is."""
-    return rows_padded(side, axes.index('rows'), 8) if 'rows' in axes else side
+def _side_padded(side: jax.Array, axes: tuple, multiple: int = 8) -> jax.Array:
+    """A side operand padded as the rows are along the dimension that follows them, wherever it is: to a
+    multiple of 8 (a TMA descriptor's tiling), or of `multiple` (a family's unpredicated loads)."""
+    return rows_padded(side, axes.index('rows'), multiple) if 'rows' in axes else side

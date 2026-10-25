@@ -671,12 +671,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # Interpreted only in a CPU process: the interpreter's callbacks are ordered effects, which a GPU
         # process's lowering of the platform choice cannot carry in the CPU branch it does not take.
         interpretable = not ba.arguments['interpret'] or jax.default_backend() == 'cpu'
-        # mma.sync's tiles take the plain product alone: its side operands' staging and fixed loads are
-        # TMA's, which an Ampere GPU has none of.
-        hooked = ba.arguments['hooks'] != NO_HOOKS
         return (first == second and jnp.dtype(first).itemsize == 2 and interpretable
                 and _rated(target, first) and self._family(ba, target) is not None
-                and (generation.effective(target).wgmma or not hooked)
                 and self._hooks_lower(ba, first, target)
                 and self._stored(ba, target)
                 and (self.EXACT_SUMS or not ba.arguments.get('exact_sums'))
@@ -795,7 +791,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         launch squeezes and gives back with its dimension of one (`Hooks.prologue_broadcast`) has no
         layout Mosaic's inference finds for the size-one dimension, so a hook taking one does not lower
         there (GMMGATE-h100-8), where Triton's lowering takes it."""
-        del target  # every hooked launch is warpgroup MMA's (`eligible`)
+        # Both bundles lower with warpgroup semantics, whose rules a hook's operations need.
+        del target
         hooks = ba.arguments['hooks']
         if hooks.prologue_broadcast or hooks.epilogue_broadcast:
             return False
@@ -961,12 +958,6 @@ class MosaicTgmm(_Mosaic):
     EXACT_SUMS: ClassVar[bool] = True
     STORES_SERIALLY: ClassVar[bool] = True
 
-    def _families(self, ba) -> tuple[mosaic.Family, ...]:
-        # Warpgroup MMA's alone: a gradient's stage, its neighbouring groups' rows zeroed in shared memory,
-        # is published to its products by Hopper's async-proxy fence, which an Ampere GPU has no
-        # instruction for (GEN2-route-a100: LLVM cannot select `fence.proxy.async.shared_cta` at sm80).
-        return (mosaic_sm90.WGMMA,)
-
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
         # A gradient tile's rows are the tokens' width; its steps run over a group's rows, padded to whole
         # steps (`mosaic_gpu.tgmm`).
@@ -977,14 +968,17 @@ class MosaicTgmm(_Mosaic):
         return rows % config.block_m == 0 and width % config.block_n == 0
 
     def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
-        """`_Mosaic.legal`, and with `exact_sums` its two fp32 accumulators, the running sum and a step's,
-        in each consumer warpgroup's registers (a warpgroup's 128 threads hold its share of the tile's
-        rows; a cooperative consumer has the registers the producer's 40 leave it, 232)."""
+        """`_Mosaic.legal`, and with `exact_sums` a second fp32 accumulator, the running sum beside a
+        step's, in each consumer's live set (`mosaic.tile_registers`) within its family's registers."""
         if not super().legal(ba, config, target):
             return False
-        return (not ba.arguments.get('exact_sums')
-                or 2 * config.block_m * config.block_n // (128 * config.warpgroups)
-                < (mosaic.CONSUMER_REGISTERS if config.warpgroups == 2 else cost.THREAD_REGISTERS))
+        if not ba.arguments.get('exact_sums'):
+            return True
+        dtype = ba.arguments['tokens'].dtype
+        family, block = _bundle(config, dtype), (config.block_m, config.block_n, config.block_k)
+        running = -(-config.block_m * config.block_n // config.warpgroups // mosaic.THREADS)
+        return (mosaic.tile_registers(family, config.warpgroups, block, dtype) + running
+                <= family.registers(config.warpgroups))
 
     @staticmethod
     def extents(tile: mosaic_gpu.Tiles) -> dict:
