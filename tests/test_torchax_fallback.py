@@ -346,11 +346,11 @@ def test_an_unregistered_causal_lm_loads_as_transformers_own_forward(tokens, tmp
                                                              attn_implementation="eager").eval()
         wide.load_state_dict(model.state_dict())
 
-    def truth_fn(ids):
+    def truth_fn(ids, cotangent):
         with float64():
-            return torch_step(wide, ids, torch.float64)
+            return torch_step(wide, ids, cotangent, torch.float64)
 
-    assert_as_exact(dew_fn, lambda ids: torch_step(reference, ids), token_draws(tokens),
+    assert_as_exact(dew_fn, lambda ids, cotangent: torch_step(reference, ids, cotangent), token_draws(tokens),
                     "tier 3 cohere LM step", seeds=UNREGISTERED_SEEDS, truth_fn=truth_fn)
 
 
