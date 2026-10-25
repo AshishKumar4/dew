@@ -117,7 +117,7 @@ def round_to_bf16(state, key, value):
     return jax.lax.bitcast_convert_type(rounded, jnp.float32).astype(jnp.bfloat16)
 
 
-def update(state, query, key, value, decay, write, *, delta: bool):
+def update(state, query, key, value, decay, write, *, delta: bool, in_kernel: bool = False):
     """One token over a state `[..., Dk, Dv]` in its working dtype, `decay` per key dimension `[...,
     Dk]` (`exp(g)`) and `write` the write gate, broadcast against the values `[..., Dv]`: its output
     `[..., Dv]` and the updated state.
@@ -128,11 +128,13 @@ def update(state, query, key, value, decay, write, *, delta: bool):
     against `D`), a reduction a token at a time and the same in the portable rule's batched adjoint
     rounded a last bit apart, which put the portable gradient's cancelled row 4.9 times the token
     recurrence's distance from float64 (test_recurrence_stability's rated site under resets on chunk
-    edges, seed 6)."""
+    edges, seed 6). A kernel's body (`in_kernel`, the fused step's) sums it in its own registers, where
+    Pallas's Triton lowering takes no platform-dependent product."""
     read_query = jnp.sum((query * decay)[..., :, None] * state, axis=-2)
     corrected = value - jnp.sum((key * decay)[..., :, None] * state, axis=-2) if delta else value
     written = corrected * write
-    out = read_query + float32_einsum('...d,...d->...', query, key)[..., None] * written
+    score = (jnp.sum(query * key, axis=-1) if in_kernel else float32_einsum('...d,...d->...', query, key))
+    out = read_query + score[..., None] * written
     return out, state * decay[..., :, None] + key[..., :, None] * written[..., None, :]
 
 
@@ -398,7 +400,7 @@ def _kernel(*refs, hooks: Hooks, group: int, key_heads: int, interpret: bool):
             write_gate = scalar('beta') if hooks.gated_write else jnp.ones((1,), jnp.float32)
         decay = jnp.broadcast_to(decay, key.shape)
         out, updated = update(state_ref[...].astype(jnp.float32), query, key, value, decay, write_gate,
-                              delta=hooks.delta)
+                              delta=hooks.delta, in_kernel=True)
         if hooks.skip:
             out = out + scalar('skip') * value
         if hooks.output is not None:
