@@ -611,7 +611,7 @@ def test_group_norm_activates_its_wide_output_before_its_one_cast(rng, dtype):
     assert held and {leaf.dtype for leaf in held} == {x.dtype}
 
 
-LAYER_NORM_SEEDS = 32
+LAYER_NORM_SEEDS = 64
 """The layer norm's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada."""
 
 
