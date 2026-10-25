@@ -1314,14 +1314,14 @@ class RunConfig:
         """Refuse to resume the run whose record is `saved` as this one where they train different
         things: another class, or a field outside `RESUMABLE` that differs. A changed `rope_theta`
         keeps every shape, so it would otherwise continue the old weights under new semantics. The
-        saved fields are read back as this class reads them (`from_dict`), so a field the record
-        predates takes its default."""
+        saved fields are read back as a saved run's are (`read`), so a field the record predates takes
+        its default and one retired since is dropped."""
         named = registry.class_record(saved)
         if named is None or registry.runs[named[0]] is not type(self):
             raise ValueError(f"the run to resume is no {type(self).__name__}; resume it as the run it "
                              "records, or train under another name")
-        recorded = type(self).from_dict({name: value for name, value in named[1].items()
-                                         if name not in _CHAINS})
+        fields = {name: value for name, value in named[1].items() if name not in _CHAINS}
+        recorded = type(self).read({"class": named[0], "fields": fields})
         before, now = recorded._fields_record(), self._fields_record()
         changed = sorted(name for name in now.keys() | before.keys()
                          if name not in self.RESUMABLE and now.get(name) != before.get(name))
