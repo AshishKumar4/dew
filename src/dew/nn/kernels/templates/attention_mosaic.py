@@ -282,13 +282,11 @@ class MosaicForward(_Mainloop[Tiles]):
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Tiles | None:
         """Its tiles from the facts (`_derived`): each consumer a unit of queries, the key tile the largest
-        its registers and the block hold; three stages where its walk keeps the value slot a step past it (the
-        owed product of an asynchronous family's plain walk, `_consumer`), else two."""
+        its registers and the block hold, two stages."""
         family = self._family(ba, target)
         if family is None:
             return None
         query, key = ba.arguments["query"], ba.arguments["key"]
-        owing = family.asynchronous and not ba.arguments.get("residuals")
 
         def tiles(rows: int, walked: int, consumers: int) -> Tiles:
             return Tiles(rows, walked, 2, consumers, family.name)
@@ -297,7 +295,7 @@ class MosaicForward(_Mainloop[Tiles]):
             return _padded(query.shape[1], key.shape[1], config)[1] // config.block_k
 
         return _derived(family, query.dtype, query.shape[1], key.shape[1], tiles,
-                        lambda config: self.legal(ba, config, target), 3 if owing else 2, steps)
+                        lambda config: self.legal(ba, config, target), 2, steps)
 
     def space(self, ba: tokamax.BoundArguments) -> Sequence[Tiles]:
         """Every tile the forward takes on each family of `BUNDLES` at the call's extents, the configs a test
