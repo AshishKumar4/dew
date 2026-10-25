@@ -1,10 +1,9 @@
 """Inference tasks: native generation with a model and its weights, and clients for external engines."""
 
-from dew.sampling.pipelines import DenoisingInputs, Images, TextToImage
-
 from .banks import CheckpointBanks, HeldBanks, LayerBanks, SafetensorsBanks
 from .clients import Completion, OllamaCompletion, OpenAICompletion, Usage
 from .engine import Engine, Kind, Timed
+from .images import DenoisingInputs, Images, TextToImage
 from .nccl import NCCLPush
 from .pipeline import RunProcessor, pipeline
 from .rollouts import (

@@ -1,4 +1,5 @@
-"""A trained model, rebuilt from its run, that turns prompts into images."""
+"""The text-to-image task: a trained diffusion model, rebuilt from its run, that turns prompts into
+images, beside `TextGeneration`. The reverse walk it runs is `dew.sampling`'s (`walk_and_decode`)."""
 
 from __future__ import annotations
 
@@ -19,7 +20,7 @@ from typing_extensions import TypeVar
 
 from dew.artifacts import uint8_pixels
 from dew.coordination import agreed
-from dew.diffusion.process import Conditioning, Denoiser, Process
+from dew.diffusion.process import Conditioning, Process
 from dew.inputs import InputSpec, encode_conditions, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, local_rows, mesh_of, request_key
@@ -27,8 +28,8 @@ from dew.nn.kernels.options import program
 from dew.objectives.base import OMITTED, Omitted, Variables, thaw
 from dew.records import JSON
 from dew.registry import dtype_name, resolve_dtype
-from dew.sampling.guidance import CFG, Guidance, guidance_modules
-from dew.sampling.sample import sample
+from dew.sampling.guidance import CFG, Guidance
+from dew.sampling.sample import sampling_modules, walk_and_decode
 from dew.sampling.solvers import DDIM, Solver
 from dew.telemetry.profile import region
 
@@ -839,29 +840,6 @@ def _initial(rows: jax.sharding.NamedSharding | None):
     return jax.jit(initial, static_argnums=(0, 1, 2), in_shardings=(rows, None))
 
 
-def sampling_modules(model: nn.Module, guidance: Guidance | None,
-                     autoencoder: AutoEncoder | None) -> tuple[nn.Module, ...]:
-    """Every network a walk of `model` under `guidance` that `autoencoder` decodes runs: the
-    denoiser, an autoguide (`guidance_modules`) and the autoencoder's model, which the program
-    that walks it compiles for (`compiler_options`), a task's and an objective's alike."""
-    return (model, *guidance_modules(guidance), *(() if autoencoder is None else (autoencoder.model,)))
-
-
-def walk_and_decode(denoise: Denoiser, autoencoder: AutoEncoder | None, params, x_T: jax.Array, *,
-                    solver: Solver, guidance: Guidance | None, key: jax.Array, times, final_denoise: bool,
-                    initial=None, decode: bool = True) -> Images:
-    """`denoise`'s reverse walk from `x_T`, and with `decode` the latents it reaches decoded by
-    `autoencoder` (its weights `params["autoencoder"]`) and clipped to [-1, 1]: the one sampling
-    program a task (`TextToImage`) and an objective's evaluation and preview
-    (`DiffusionObjective.evaluate`) run."""
-    latents = sample(denoise, x_T, solver=solver, guidance=guidance, key=key, times=times,
-                     initial=initial, final_denoise=final_denoise)
-    if not decode:
-        return Images(None, latents=latents)
-    images = autoencoder.decode(params["autoencoder"], latents) if autoencoder is not None else latents
-    return Images(jnp.clip(images, -1.0, 1.0), latents=latents)
-
-
 def _walk(model, process, autoencoder, finish, final_denoise, decode,
           solver, guidance, times, initial, params, given, null, x_T, key):
     """The walk over the rows, compiled with the XLA options of its denoiser, its guidance's guide and
@@ -872,8 +850,9 @@ def _walk(model, process, autoencoder, finish, final_denoise, decode,
     `_initial` built from it."""
     variables = {name: value for name, value in params.items() if name not in ("encoders", "autoencoder")}
     denoise = process.denoiser(model, variables, given, None if guidance is None else null)
-    walked = walk_and_decode(denoise, autoencoder, params, x_T, solver=solver, guidance=guidance, key=key,
-                             times=times, final_denoise=final_denoise, initial=initial, decode=decode)
-    if finish is None or walked.images is None:
-        return walked
-    return Images(finish(params, walked.images), latents=walked.latents)
+    images, latents = walk_and_decode(denoise, autoencoder, params, x_T, solver=solver, guidance=guidance,
+                                      key=key, times=times, final_denoise=final_denoise, initial=initial,
+                                      decode=decode)
+    if finish is not None and images is not None:
+        images = finish(params, images)
+    return Images(images, latents=latents)

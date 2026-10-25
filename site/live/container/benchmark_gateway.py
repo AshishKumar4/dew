@@ -231,7 +231,8 @@ def warmed(kernels):
     for _, client, _ in kernels:
         execute(client,
             "import model_client\nmodel_client.install()\n"
-            "from dew.sampling import CFG, DPMSolverMultistep, TextToImage\n"
+            "from dew.inference import TextToImage\n"
+            "from dew.sampling import CFG, DPMSolverMultistep\n"
             "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m')\n"
             "result = pipe(['a lake beneath the northern lights'], key=3, steps=15, "
             "solver=DPMSolverMultistep(), guidance=CFG(6, interval=(0.15, 0.9)))\n"
