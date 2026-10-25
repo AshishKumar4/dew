@@ -286,6 +286,27 @@ def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
     assert copies > 0 and held[0] - held[1] == copies
 
 
+def test_a_step_that_fits_only_without_its_copies_drops_them_before_it_recomputes(monkeypatch):
+    """The narrow copies are the fit ladder's first rung: a step that does not fit with them, two bytes a
+    parameter held for the whole run, drops them before it recomputes or splits, and its plan says so
+    (`narrow`), on the devices' free bytes between its footprints with and without them."""
+    limit = 2 ** 40
+    monkeypatch.setattr(jax.Device, "memory_stats", lambda device: {"bytes_limit": limit, "bytes_in_use": 0})
+
+    def used(*, copies):
+        _, _, trainer = _trained(optax.adam(1e-3), copies=copies, steps=1)
+        return limit - trainer.plan["probes"][0]["headroom"]
+
+    with_copies, without = used(copies=True), used(copies=False)
+    assert without < with_copies
+    limit = (with_copies + without) // 2
+    state, _, trainer = _trained(optax.adam(1e-3), copies=True, steps=1)
+    probes = trainer.plan["probes"]
+    assert [(probe["narrow"], probe["fits"]) for probe in probes] == [(True, False), (False, True)]
+    assert (trainer.plan["narrow"], trainer.plan["remat"], trainer.plan["split"]) == (False, None, 1)
+    assert state.compute is None
+
+
 def test_a_restored_state_drops_its_templates_copies():
     """The copies are of the template's own parameters; a restored state
     starts without and the step rebuilds them from what was restored."""
