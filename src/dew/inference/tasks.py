@@ -506,14 +506,14 @@ def resident(model: nn.Module, variables: Variables) -> Variables:
 def held(variables: Variables) -> Variables:
     """`variables` placed on the device once (`resident`'s placement, its storage as given): each host
     leaf replicated on the mesh the tree's arrays sit on, or committed to this process's default
-    device; a jax.Array stays where it is."""
+    device, one leaf at a time (`placed_leaves`), into a tree of its own; a jax.Array stays where it
+    is."""
+    from dew.training.host import placed_leaves
+
     mesh = mesh_of(variables)
     target = default_placement() if mesh is None else NamedSharding(mesh, P())
-
-    def placed(leaf):
-        return jax.device_put(leaf, target) if isinstance(leaf, (np.ndarray, np.generic)) else leaf
-
-    return jax.tree.map(placed, variables)
+    return placed_leaves(variables, lambda _, leaf: jax.device_put(leaf, target)
+                         if isinstance(leaf, (np.ndarray, np.generic)) else leaf, in_place=False)
 
 
 class _NativeTextTask:

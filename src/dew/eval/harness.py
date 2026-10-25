@@ -39,7 +39,7 @@ from lm_eval.models.utils import handle_stop_sequences, normalize_gen_kwargs, po
 from dew.inference.tasks import TextGeneration, cache_ceiling
 from dew.interop.generation_config import source_decoding
 from dew.nn.inputs import pad_token_rows
-from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.options import program
 from dew.objectives.lm.objective import LMObjective, TokenScorer
 
 DEFAULT_CONTEXT = 2048
@@ -52,17 +52,11 @@ TokenRequest = tuple[tuple[str, str] | None, list[int], list[int]]
 """One `_loglikelihood_tokens` request: the strings, context ids, continuation ids."""
 
 
-@functools.cache
-def _scoring(options: tuple[tuple[str, bool], ...]):
-    """`_scored` compiled with the model's own XLA `options` (`compiler_options`), so a quantized
-    model and another never share it."""
-    return jax.jit(_scored, static_argnums=(0,), compiler_options=dict(options))
-
-
 def _scored(scorer: TokenScorer, variables, rows: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Return the per-target log-probability and whether the target was the argmax, as the scorer
     the language-model losses share scores them (`TokenScorer.token_scores`), through its tiled
-    head, which holds a tile of the vocabulary at a time rather than every row's whole logits.
+    head, which holds a tile of the vocabulary at a time rather than every row's whole logits;
+    compiled with the model's XLA options (`program`).
 
     `rows` is `[B, T]` of token ids; both results are `[B, T - 1]`, entry `i`
     belonging to `rows[:, i + 1]`. Rows are right-padded by the caller, which
@@ -271,7 +265,7 @@ class DewLM(TemplateLM):
         answers: list[tuple[float, bool]] = []
         for batch in _batches(len(rows), self.batch_size):
             tokens, _ = pad_token_rows([rows[index] for index in batch], padding_side="right")
-            scoring = _scoring(tuple(compiler_options(self.task.model).items()))
+            scoring = program(_scored, self.task.model, static_argnums=(0,))
             probabilities, argmax = scoring(self._scorer(tokens.shape[1]), self.task.variables,
                                             jnp.asarray(tokens))
             values, matched = np.asarray(probabilities), np.asarray(argmax)
