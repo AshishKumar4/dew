@@ -560,7 +560,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     shift = shift_ref[...]
     before, state_total = algebra.off_anchor_start(peak, total, maximum, value_ref.shape[-1], shift)
     if split:
-        # The forward took the first pass (`algebra.split_accumulate`).
+        # The forward took the first pass (`algebra.training_step`).
         others_ref, own_ref, others_total_ref, forward_total_ref = split_refs
         prior = forward_total_ref[...]
         anchor, delta, key_index = algebra.split_delta(

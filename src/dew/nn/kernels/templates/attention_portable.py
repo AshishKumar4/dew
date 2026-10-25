@@ -86,7 +86,7 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
     `key` and `value` `[B, Kp, Hk, ...]`, the spans' rows and ids, the hooks' padded parameters, the
     initial state `(m0, total0, acc0)` or None), one query block and head at a time in sequence, its key
     tiles walked as the Triton mainloop walks them: the output, and with `residuals` its training step's
-    (the split sums, `algebra.split_accumulate`) maxima, denominators, anchor keys and split sums, else
+    (the split sums, `algebra.training_step`) maxima, denominators, anchor keys and split sums, else
     its plain step's output and None, so each rounds as the Triton launch it stands for."""
     batch, queries, heads, _ = query.shape
     keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
