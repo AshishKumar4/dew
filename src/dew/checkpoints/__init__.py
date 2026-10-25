@@ -1779,7 +1779,7 @@ class Checkpoints:
                 state_tree['ema'], targets = _plane_template(state_tree['ema'], deltas)
             _refuse_reshaped(state_tree, metadata, where)
             restore_args = jax.tree.map(lambda want: _read(want, want.dtype), state_tree)
-            if 'position' in stored and not isinstance(template, Mapping):
+            if 'position' in stored and not isinstance(template, Mapping) and share is not None:
                 _position_leaves(state_tree, restore_args, metadata, from_local=from_local)
             try:
                 # partial_restore: a key the checkpoint holds and the template

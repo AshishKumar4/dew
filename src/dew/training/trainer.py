@@ -60,6 +60,7 @@ from dew.distributed.batches import (
     batch_layout,
     batch_shardings,
     batch_signature,
+    placed_abstract,
     prefetched_bytes,
     shard_batch,
     split_fields,
@@ -592,7 +593,7 @@ class Trainer(Generic[Loss, Effects]):
         state = jax.eval_shape(self.initial_state)
         if batch is None:
             return self._validated(state, capacity)[1]
-        return self._whole_validated(state, marked(DataPartition(), self._counted_batch)(batch), capacity)
+        return self._fitting(state, marked(DataPartition(), self._counted_batch)(batch), capacity)
 
     def _validated(self, state: TrainState, capacity: int | None = None
                    ) -> tuple[Placement[TrainState], Validation]:
@@ -631,7 +632,7 @@ class Trainer(Generic[Loss, Effects]):
         It returns the state with its shardings and the data position a resume
         continues from.
         """
-        return self._placed(self._started())
+        return self._placed(self._started(), positioned=True)
 
     def _started(self) -> _Start:
         """What placing the state reads before it places anything: the objective's held tree and
@@ -653,9 +654,11 @@ class Trainer(Generic[Loss, Effects]):
         shardings, _ = self._validated(abstract)
         return _Start(initializer, key, abstract, through, resume, shardings)
 
-    def _placed(self, start: _Start) -> tuple[TrainState, Placement[TrainState], bytes | None]:
-        """The state `start` describes on the mesh, fresh or restored, with its shardings and the
-        data position a resume continues from."""
+    def _placed(self, start: _Start, *, positioned: bool
+                ) -> tuple[TrainState, Placement[TrainState], bytes | None]:
+        """The state `start` describes on the mesh, fresh or restored, with its shardings and, where
+        `positioned`, the data position a resume continues from; `fit` reads that alone, before it
+        places the state (`Checkpoints.position`), and restores the state alone."""
         initializer, key, abstract, shardings, resume = (start.initializer, start.key, start.abstract,
                                                          start.shardings, start.resume)
         checkpoints = self.checkpoints
@@ -669,8 +672,8 @@ class Trainer(Generic[Loss, Effects]):
                 **abstract.variables, FROZEN: self._banked_frozen(
                     abstract.variables[FROZEN],
                     lambda rows, path: jax.ShapeDtypeStruct((len(rows), *rows[0].shape), rows[0].dtype))})
-        state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume,
-                                              share=DataPartition.of(self.device_mesh))
+        share = DataPartition.of(self.device_mesh) if positioned else None
+        state, position = checkpoints.restore(placed_shapes(abstract, shardings), resume, share=share)
         if self._config is not None:
             # The rate this run configures, not the one its checkpoint holds.
             state = dataclasses.replace(state, opt_state=with_rate_scales(state.opt_state,
@@ -1588,9 +1591,9 @@ class Trainer(Generic[Loss, Effects]):
         if checkpoints is not None and checkpoints.latest is not None:
             run.stop_control = checkpoints.control(checkpoints.latest)
         if checkpoints is None or start.resume is None:
-            return 0, None, lambda: self._placed(start)[:2], start.abstract
+            return 0, None, lambda: self._placed(start, positioned=False)[:2], start.abstract
         return (start.resume, checkpoints.position(start.resume, DataPartition.of(self.device_mesh)),
-                lambda: self._placed(start)[:2], start.abstract)
+                lambda: self._placed(start, positioned=False)[:2], start.abstract)
 
     def _opened(self, plan: FitPlan, run: FitRun, interval: Interval, current: int, position,
                 placed: Callable[[], tuple[TrainState, Placement[TrainState]]],
@@ -1642,15 +1645,15 @@ class Trainer(Generic[Loss, Effects]):
                                                reads=run.reads, prepare=prepare)
             run.source = None  # Lifetime transferred to the prefetch worker.
             if abstract is not None and self.rollout is None:
-                # Read before the state is placed, and agreed: a process whose read failed stops its peers
-                # before any of them places one. The first step reads it (`FitRun.ahead`).
-                run.ahead = (waited_read(run, interval, agree=True),)
-                if run.ahead[0] is not None:
+                # Read on the host before the state is placed, and agreed: a process whose read failed
+                # stops its peers before any of them places one. The prefetcher places it at the first step.
+                first = waited_read(run, interval, agree=True, peek=True)
+                if first is not None:
+                    placed_first = placed_abstract(mesh, first)
                     # A process whose reader changed a field or a shape is refused by every process, as
                     # a compile refuses it, before the state it would check is traced from that batch.
-                    first = run.ahead[0]
-                    agreed_same("training batch layout", lambda: batch_layout(split_fields(first)[0]))
-                    self._whole_validated(abstract, first)
+                    agreed_same("training batch layout", lambda: batch_layout(split_fields(placed_first)[0]))
+                    self._fitting(abstract, placed_first)
         state, shardings = placed()
         if int(state.step) != current:
             raise ValueError(f"the checkpoint of step {current} holds a state at step {int(state.step)}")
@@ -1681,17 +1684,28 @@ class Trainer(Generic[Loss, Effects]):
             averaged=self.objective.ema is not None and not self.objective.ema_is_reference))
         return state, shardings, False
 
-    def _whole_validated(self, state: TrainState, batch: Batch, capacity: int | None = None) -> Validation:
+    def _whole_validated(self, state: TrainState, batch: Batch, split: int, capacity: int | None
+                         ) -> Validation:
         """`Layout.validate` of the whole state the run's steps keep between them reading `batch`'s
-        shapes (a marked batch, as the stream gives it): `state` with the accumulation its window
-        of microbatches pools and the narrow copies its step builds, read in the split the trainer
-        fixes, else whole. `validate` and `fit` check it before anything is placed."""
+        shapes (a marked batch, as the stream gives it) in `split` microbatches: `state` with the
+        accumulation its window pools and the narrow copies its step builds."""
         device, _ = split_fields(batch)
-        split = self._split or 1
         with self._traced_on(self.device_mesh) as schedule:
             _, _, whole = self._prepared(state, microbatch_shapes(device, split), schedule,
                                          split * self.accumulation)
         return self._validated(whole, capacity)[1]
+
+    def _fitting(self, state: TrainState, batch: Batch, capacity: int | None = None) -> Validation:
+        """The report of the whole state the run's steps keep reading `batch` (`_whole_validated`) in
+        the first of the splits its plan may take (`splits`) whose devices hold it, refused, before
+        anything is placed, where none does: the plan picks among them once the state is placed."""
+        refusals = []
+        for split in splits(self._rows, batch, self.device_mesh, self.microbatches, self._split):
+            try:
+                return self._whole_validated(state, batch, split, capacity)
+            except LayoutRefused as refused:
+                refusals.append(refused)
+        raise refusals[-1]
 
     def _local_devices(self) -> list:
         """This process's devices of the mesh, whose memory the fit check reads."""

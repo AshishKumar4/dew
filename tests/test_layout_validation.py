@@ -7,7 +7,6 @@ a batch's rows split over, and the logical axes no rule names. Each claim is hel
 those bytes overflow is refused, as a CPU mesh standing in for GPUs states it.
 """
 
-import dataclasses
 
 import jax
 import numpy as np
@@ -25,7 +24,7 @@ from dew.distributed.placement import placed_shapes
 from dew.mesh import DEFAULT_RULES, LayoutRefused, mesh_axes
 from dew.objectives.lm import LMObjective
 from dew.registry import models
-from dew.training import Layout, MeshSpec, Observe, Trainer
+from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import STEP_BATCH
 
 pytestmark = pytest.mark.mesh
@@ -132,39 +131,68 @@ def test_a_fine_tune_over_a_devices_capacity_is_refused_before_anything_is_place
         run.validate(step_batch(), steps=8, capacity=whole - 1)
 
 
-@pytest.mark.mesh(devices=8)
-def test_a_fit_whose_whole_state_overflows_its_devices_is_refused_before_it_places_any():
-    """`fit` reads its first batch before it places the state, and checks against it the whole state
-    its steps keep (the accumulator its window pools beside the parameters, optimizer state and EMA):
-    on devices that hold the state alone but not the whole, it is refused before any state is placed,
-    not after the base is."""
-    mesh, layout, accumulation = CASES["fsdp_tensor_accumulating"]
-    whole = max(fine_tune(mesh(), layout, accumulation).validate(step_batch()).device_bytes.values())
+INITIALIZED: list[bool] = []
+"""One entry each time a `Watched` objective's initializer runs on the devices."""
+
+
+class Watched(LMObjective):
+    """An LM objective that notes each time its initializer runs on the devices (`INITIALIZED`), which
+    tracing it for shapes never does."""
+
+    def init(self, key, variables=None):
+        jax.debug.callback(lambda: INITIALIZED.append(True))
+        return super().init(key, variables)
+
+
+def capped(limit: int) -> type[Trainer]:
+    """A trainer class on devices of `limit` bytes each, as a GPU's allocator states its limit."""
 
     class Capped(Trainer):
-        """A trainer on devices of `whole - 1` bytes each, as a GPU's allocator states its limit."""
-
         def _validation(self, state, capacity=None):
-            return super()._validation(state, whole - 1)
+            return super()._validation(state, limit)
 
-    @dataclasses.dataclass
-    class Opened(Observe):
-        """Notes the step each fit opens at with its placed state."""
+    return Capped
 
-        opens: list[int] = dataclasses.field(default_factory=list)
 
-        def opened(self, step, state, *, complete):
-            self.opens.append(step)
-            super().opened(step, state, complete=complete)
-
+@pytest.mark.mesh(devices=8)
+def test_a_fit_whose_whole_state_overflows_its_devices_is_refused_before_it_initializes_any():
+    """`fit` reads its first batch before it places the state, and checks against it the whole state
+    its steps keep (the accumulator its window pools beside the parameters, optimizer state and EMA):
+    on devices that hold the state alone but not the whole, it is refused before the objective's
+    initializer runs, not after the base is placed."""
+    mesh, layout, accumulation = CASES["fsdp_tensor_accumulating"]
+    whole = max(fine_tune(mesh(), layout, accumulation).validate(step_batch()).device_bytes.values())
     model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
-    run = Capped(LMObjective(model, SEQ_LEN, ema_decay=0.999), optax.adam(1e-3), key=jax.random.key(0),
-                 mesh=mesh(), layout=layout, accumulation=accumulation, split=1)
-    observed = Opened(every=1, call=lambda state: state.step)
+    run = capped(whole - 1)(Watched(model, SEQ_LEN, ema_decay=0.999), optax.adam(1e-3),
+                            key=jax.random.key(0), mesh=mesh(), layout=layout, accumulation=accumulation,
+                            split=1)
+    INITIALIZED.clear()
     with pytest.raises(LayoutRefused):
         run.fit(Loader(train=lambda partition: repeated_token_batch(VOCAB, BATCH, SEQ_LEN + 1), val=None,
-                       records=None, batch=BATCH), steps=2 * accumulation, observe=observed)
-    assert observed.opens == []
+                       records=None, batch=BATCH), steps=2 * accumulation)
+    jax.effects_barrier()
+    assert INITIALIZED == []
+
+
+@pytest.mark.mesh(devices=8)
+def test_the_preflight_holds_a_run_whose_plan_may_split_where_its_whole_batch_does_not_fit():
+    """A run that leaves its split to the plan is held by devices whose whole state, accumulator and
+    all, fits read in two microbatches though not whole: the check before placing tries the splits the
+    plan may take (`Trainer.validate`, as `fit` does); a run fixed to one is refused there."""
+    mesh, layout, accumulation = CASES["fsdp_tensor_accumulating"]
+
+    def peak(split: int | None, capacity: int | None = None) -> int:
+        model = models.build("causal_transformer", vocab_size=VOCAB, **TINY_DECODER, num_kv_heads=2)
+        trainer = Trainer(LMObjective(model, SEQ_LEN, ema_decay=0.999), optax.adam(1e-3),
+                          key=jax.random.key(0), mesh=mesh(), layout=layout, accumulation=accumulation,
+                          split=split)
+        return max(trainer.validate(step_batch(), capacity=capacity).device_bytes.values())
+
+    halves = peak(2)
+    assert peak(1) > halves
+    assert peak(None, capacity=halves) == halves
+    with pytest.raises(LayoutRefused):
+        peak(1, capacity=halves)
 
 
 @pytest.mark.mesh(devices=8)
