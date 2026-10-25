@@ -166,7 +166,8 @@ class DecisionRunConfig(RunConfig):
         if self.context_encoder != "table" and self.context_layers is None:
             raise ValueError("--context-encoder says how context layers read a context; set --context-layers")
         # A fresh head is drawn from the trainer's key: runs that share it start their heads alike.
-        derived: dict[str, object] = {"head_seed": self.trainer.key}
+        derived: dict[str, object] = {"head_seed": self.trainer.key, "head_source": str(self.pretrained)
+                                      + ("" if self.revision is None else f"@{self.revision}")}
         if self.context_layers is not None:
             derived["context_encoder"] = self.context_encoder
         if LayaCheckpoint.exists(self.pretrained, subfolder=self.subfolder, revision=self.revision):

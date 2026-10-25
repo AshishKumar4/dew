@@ -204,7 +204,9 @@ class ParseTable:
     option by key, or by index where it is an int; where the options are the
     label column's own values (`by_value`), every label names its option by
     value, an int one included. A `context` column's value is the example's
-    context (`Example.context`), none where the column holds None."""
+    context (`Example.context`), none where the column holds None. A row's
+    `groups` field reaches the example as `Example.of` reads it, so a group
+    over the row's one question is refused as any group of one member is."""
 
     options: tuple[str, ...]
     text: str = "text"
@@ -229,6 +231,7 @@ class ParseTable:
                 {self.question: question},
                 {self.question: str(label) if self.by_value else _label(label)},
                 context=None if context is None or column is None else json_value(context, column),
+                groups=groups_of(json_value(row.get("groups"), "groups")),
             )
         }
 
