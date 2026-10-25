@@ -10,6 +10,8 @@ fails: a share off its chance by more than its draws' spread fails, the more sur
 there are. The seeds are a sampler's independent runs (a holdout's corpora, a mixture's streams), so
 their counts add as one larger draw's. A design note stays in the head that adds it (ledger 1305)."""
 
+import math
+
 import numpy as np
 from scipy import stats
 
@@ -28,14 +30,16 @@ class SamplingFailure(AssertionError):
 
 def assert_draws_as_declared(counts_of, chances, label: str, *, seeds: int) -> None:
     """`counts_of(seed)`, the count of each outcome over one seed's draws (a part's records, a member's
-    rows), drawn at `chances` (summing to one) as a fair sampler would, over `seeds` seeds: Pearson's
-    chi-square of the pooled counts against `chances` times their total passes at FALSE_RED.
+    rows), drawn at `chances` (each a share of their sum) as a fair sampler would, over `seeds` seeds:
+    Pearson's chi-square of the pooled counts against `chances` times their total passes at FALSE_RED.
 
     Raises SamplingFailure naming each outcome's share against its chance; refuses a site whose
     expected counts fall below FEWEST_EXPECTED or whose seeds draw nothing."""
     chances = np.asarray(chances, np.float64)
-    if chances.ndim != 1 or np.any(chances <= 0) or not np.isclose(chances.sum(), 1.0, rtol=0, atol=1e-12):
-        raise ValueError(f"{label}: chances must be positive and sum to one, not {chances.tolist()}")
+    if chances.ndim != 1 or np.any(chances <= 0):
+        raise ValueError(f"{label}: chances must be positive, not {chances.tolist()}")
+    # A split's chances as its shares of their exact sum: 0.85, 0.05 and 0.1 add to one only in decimal.
+    chances = chances / math.fsum(chances.tolist())
     pooled = np.zeros(chances.size, np.int64)
     for seed in range(seeds):
         counts = np.asarray(counts_of(seed))
