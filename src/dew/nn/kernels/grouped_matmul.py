@@ -25,6 +25,7 @@ import dataclasses
 import functools
 import importlib
 import importlib.util
+import itertools
 import math
 from collections.abc import Callable, Hashable, Mapping
 from typing import ClassVar
@@ -103,21 +104,19 @@ def triton_tiles(dtype, roles: Mapping[str, str], extents: Mapping[str, int | No
         extent = extents.get(role)
         spans[role] = _doubling(least[role], resourced[role] if extent is None
                                 else max(called[role], _covering(extent)))
-    fields = {field: spans[role] for field, role in roles.items()}
     tiles = []
-    for block_m in fields['block_m']:
-        for block_n in fields['block_n']:
-            for block_k in reversed(fields['block_k']):
-                of: dict[str, int] = {'block_m': block_m, 'block_n': block_n, 'block_k': block_k}
-                rows, columns, step = (next(of[field] for field, role in roles.items() if role == wanted)
-                                       for wanted in ('rows', 'columns', 'step'))
-                loaded = (rows + columns) * step * size
-                if rows * columns >= held or loaded > shared:
-                    continue
-                deepest = shared // loaded + 1
-                stages = [count for count in (3, *range(4, deepest + 1), 2) if count <= deepest]
-                tiles += [Tile(block_m, block_n, block_k, warp_count, count)
-                          for warp_count in warps for count in stages]
+    # The tie order by role (each field's span in its role's order): the fewest rows, the fewest columns,
+    # the deepest step, whichever field plays each.
+    for rows, columns, step in itertools.product(spans['rows'], spans['columns'], reversed(spans['step'])):
+        of = {'rows': rows, 'columns': columns, 'step': step}
+        block_m, block_n, block_k = (of[roles[field]] for field in ('block_m', 'block_n', 'block_k'))
+        loaded = (rows + columns) * step * size
+        if rows * columns >= held or loaded > shared:
+            continue
+        deepest = shared // loaded + 1
+        stages = [count for count in (3, *range(4, deepest + 1), 2) if count <= deepest]
+        tiles += [Tile(block_m, block_n, block_k, warp_count, count)
+                  for warp_count in warps for count in stages]
     return tuple(tiles)
 
 
