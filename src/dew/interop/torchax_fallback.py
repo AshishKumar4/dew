@@ -221,23 +221,20 @@ class _Probe:
 
 
 def _visible(mask, window: int | None, queries: int, keys: int) -> bool:
-    """Whether transformers' SDPA mask `mask` (None for its causal shortcut, else `[B, 1, Q, K]`
-    booleans) is the causal visibility Dew's attention computes with `window` over `queries` by
-    `keys`, the last query at the last key: a causal LM's (`admitted`)."""
-    import torch
+    """Whether transformers' eager mask `mask` (`[B, 1, Q, K]`, additive: 0 where a key is visible) is
+    the causal visibility Dew's attention computes with `window` (`dew.nn.visibility.visible`) over
+    `queries` by `keys`, the last query at the last key: a causal LM's (`admitted`)."""
+    from dew.nn.visibility import visible
 
-    if mask is None:
-        return window is None
-    rows = torch.arange(queries)[:, None] + (keys - queries)
-    columns = torch.arange(keys)[None, :]
-    expected = columns <= rows
-    if window is not None:
-        expected &= rows - columns < window
-    return bool(torch.equal(mask.to(torch.bool), expected.expand_as(mask)))
+    expected = np.asarray(visible(np.arange(queries)[:, None] + (keys - queries), np.arange(keys)[None, :],
+                                  causal=True, window=window))
+    seen = mask.detach().cpu().numpy() == 0
+    return bool(np.array_equal(seen, np.broadcast_to(expected, seen.shape)))
 
 
 def _probe_attention(module, query, key, value, attention_mask, scaling=None, dropout=0.0, **kwargs):
-    """transformers' SDPA attention, each call recorded by the probe running (`_Probe.called`)."""
+    """transformers' SDPA attention over the eager mask the probe's model is built with, which every
+    attention reads, its own code's too: each call recorded by the probe running (`_Probe.called`)."""
     from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
     probe = _PROBING.get()
@@ -250,12 +247,15 @@ def _probe_attention(module, query, key, value, attention_mask, scaling=None, dr
 @dataclass(frozen=True)
 class _Attending:
     """What Dew's attention reads of the call it runs in (`TorchGraph.traced`): the kernel it names,
-    each token's document (`[B, S]`, 0 for padding, None for one document a row) and the most
-    documents a row holds, and the call's dropout key (None outside training)."""
+    each token's document (`[B, S]`, 0 for padding, None for one document a row), the real tokens
+    (`[B, S]`, None for all) and the most documents a row holds, whether the call trains, and its
+    dropout key (None for none)."""
 
     implementation: str
     documents: jax.Array | None
+    valid: jax.Array | None
     max_segments: int
+    train: bool
     key: jax.Array | None
 
 
@@ -274,26 +274,32 @@ def _attending(call: _Attending):
 
 def _documents(laid: Coordinates | None) -> tuple[jax.Array | None, int]:
     """Each token's document `[B, S]` as Dew's attention keeps them apart, and the most a row holds:
-    the packed documents, numbered from 1, their padding 0, which attends as a document of its own;
-    a row of real tokens and padding is one document and its padding; None for one document a row."""
+    the packed documents, numbered from 1, and every slot the caller's validity drops 0, padding
+    that attends as a document of its own; a row of real tokens and padding is one document and its
+    padding; None for one document a row."""
     if laid is None or (laid.segments is None and laid.valid is None):
         return None, 1
     if laid.segments is None:
         return jnp.asarray(laid.valid, jnp.int32), 1
-    return jnp.asarray(laid.segments, jnp.int32), laid.max_segments
+    segments = jnp.asarray(laid.segments, jnp.int32)
+    if laid.valid is not None:
+        segments = jnp.where(jnp.asarray(laid.valid, bool), segments, 0)
+    return segments, laid.max_segments
 
 
 def _dew_attention(module, query, key, value, attention_mask, scaling=None, dropout=0.0, **kwargs):
     """One layer's attention, as transformers' attention interface calls it, computed by Dew's
     (`dew.nn.attention.scaled_dot_product_attention`): `[B, H, S, D]` queries and `[B, H_kv, S, D]`
     keys and values in, `[B, S, H, D]` out, causal as an admitted model's mask is (`_Probe`),
-    inside the call's documents (`_Attending`). The query
-    carries the ratio of `scaling` to the kernels' own 1/sqrt(D), as Dew's attention layers carry a
-    checkpoint's scale (`dew.nn.precision.scaled`); attention dropout draws from the call's key folded
-    by the layer."""
+    inside the call's documents (`_Attending`). A window counts each document's real tokens, as Dew's
+    windowed attention does (`dew.nn.local_attention.local_attention`), where no dropout draws; the
+    query carries the ratio of `scaling` to the kernels' own 1/sqrt(D), as Dew's attention layers
+    carry a checkpoint's scale (`dew.nn.precision.scaled`); attention dropout draws from the call's
+    key folded by the layer, and a training call that drops with no key is refused."""
     from torchax.interop import jax_view, torch_view
 
     from dew.nn.attention import scaled_dot_product_attention
+    from dew.nn.local_attention import local_attention
 
     call = _ATTENDING.get()
     if call is None:
@@ -306,29 +312,38 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
     if scaling is not None:
         q = scaled(q, scaling * math.sqrt(q.shape[-1]))
     sinks = kwargs.get("s_aux")
-    drawing = call.key
-    drawn = bool(dropout) and drawing is not None
-    out = scaled_dot_product_attention(
-        q, k, v, implementation=call.implementation, causal=True,
-        sliding_window=kwargs.get("sliding_window"), softcap=kwargs.get("softcap"),
-        sinks=None if sinks is None else jax_view(sinks), segment_ids=call.documents,
-        max_segments=call.max_segments if call.documents is not None else None,
-        dropout_rate=float(dropout) if drawn else 0.0,
-        dropout_rng=jax.random.fold_in(drawing, module.layer_idx) if drawing is not None and drawn else None,
-        deterministic=not drawn)
+    sinks = None if sinks is None else jax_view(sinks)
+    window, softcap = kwargs.get("sliding_window"), kwargs.get("softcap")
+    max_segments = call.max_segments if call.documents is not None else None
+    drawn = bool(dropout) and call.train
+    if drawn and call.key is None:
+        raise ValueError("this model's training forward drops attention probabilities (dropout) and was "
+                         "given no 'dropout' rng")
+    if window is not None and not drawn:
+        out = local_attention(q, k, v, window=window, segment_ids=call.documents, max_segments=max_segments,
+                              valid=call.valid, implementation=call.implementation, sinks=sinks,
+                              softcap=softcap)
+    else:
+        out = scaled_dot_product_attention(
+            q, k, v, implementation=call.implementation, causal=True, sliding_window=window,
+            softcap=softcap, sinks=sinks, segment_ids=call.documents, max_segments=max_segments,
+            dropout_rate=float(dropout) if drawn else 0.0,
+            dropout_rng=jax.random.fold_in(call.key, module.layer_idx) if drawn and call.key is not None
+            else None, deterministic=not drawn)
     return torch_view(out.astype(q.dtype)), None
 
 
 @functools.cache
 def _registered() -> None:
-    """Dew's attention (`_dew_attention`) and the probe's (`_probe_attention`, over transformers' SDPA
-    mask) in transformers' attention interfaces, once a process."""
+    """Dew's attention (`_dew_attention`) and the probe's (`_probe_attention`, over transformers' eager
+    mask, additive and always built, which a model computing its own attention adds to its scores) in
+    transformers' attention interfaces, once a process."""
     from transformers import AttentionInterface
-    from transformers.masking_utils import AttentionMaskInterface, sdpa_mask
+    from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, AttentionMaskInterface
 
     AttentionInterface.register(_ATTENTION, _dew_attention)
     AttentionInterface.register(_PROBE, _probe_attention)
-    AttentionMaskInterface.register(_PROBE, sdpa_mask)
+    AttentionMaskInterface.register(_PROBE, ALL_MASK_ATTENTION_FUNCTIONS["eager"])
 
 
 def _position_dependent_rope(config: PretrainedConfig) -> str | None:
@@ -446,7 +461,8 @@ class TorchGraph:
         keeps apart and whose positions transformers' rotary reads."""
         documents, max_segments = _documents(laid)
         positions = None if laid is None else laid.places()
-        arguments = (dict(params), dict(buffers), tokens, key, positions, documents)
+        valid = None if laid is None or laid.valid is None else jnp.asarray(laid.valid, bool)
+        arguments = (dict(params), dict(buffers), tokens, key, positions, documents, valid)
         traced, shapes, draws = self.traced(*arguments, train=train, precision=precision,
                                             max_segments=max_segments)
         logits, hidden = jax.tree.unflatten(jax.tree.structure(shapes),
@@ -463,16 +479,17 @@ class TorchGraph:
     def traced(self, params: Mapping[str, jax.typing.ArrayLike], buffers: Mapping[str, jax.typing.ArrayLike],
                tokens: jax.typing.ArrayLike, key: jax.Array | None,
                positions: jax.typing.ArrayLike | None = None, documents: jax.typing.ArrayLike | None = None,
-               *, train: bool, precision: jax.lax.PrecisionLike = None, max_segments: int = 1):
+               valid: jax.typing.ArrayLike | None = None, *, train: bool,
+               precision: jax.lax.PrecisionLike = None, max_segments: int = 1):
         """The forward over these arguments traced once (`jax.make_jaxpr`), its output shapes, and the
         draws it made (`_Draws`): on torchax's device, a key's, or on the host, fixed by the trace."""
         env = _environment()
         draws = _Draws()
 
-        def forward(params, buffers, tokens, key, positions, documents):
+        def forward(params, buffers, tokens, key, positions, documents, valid):
             arguments = env.j2t_iso((dict(params), dict(buffers), tokens, positions))
             attending = (contextlib.nullcontext() if self.attention_impl is None else _attending(
-                _Attending(self.attention_impl, documents, max_segments, key if train else None)))
+                _Attending(self.attention_impl, documents, valid, max_segments, train, key)))
             self.module.train(train)
             try:
                 with (env, env.override_property(prng=key) if key is not None else contextlib.nullcontext(),
@@ -483,7 +500,7 @@ class TorchGraph:
 
         with configured_precision(precision):
             closed, shapes = jax.make_jaxpr(forward, return_shape=True)(
-                dict(params), dict(buffers), tokens, key, positions, documents)
+                dict(params), dict(buffers), tokens, key, positions, documents, valid)
         return closed, shapes, draws
 
     def export(self, model: nn.Module, variables: Mapping[str, object],
