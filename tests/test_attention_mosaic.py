@@ -627,6 +627,24 @@ def test_the_launches_lower_for_an_h100(call, accurate):
             q, kv, kv, q, residuals).lower(lowering_platforms=("cuda",))
 
 
+@pytest.mark.parametrize(("hooks", "approximated"), [("none", True), ("alibi", True), ("sinks", True),
+                                                     ("temperature", True), ("softcap", False),
+                                                     ("custom-vjp", False), ("softcap-sinks-alibi", False)])
+def test_a_launch_takes_approximate_math_only_where_no_hook_computes_a_transcendental(hooks, approximated):
+    """The hardware's approximate transcendentals (`approx_math`) hold the mainloop's own exponentials on par;
+    a hook's tanh at tanh.approx's 2^-11 does not (a softcap beside an initial state put the state's
+    gradient at 7.04 times the reference's error on an H100, and every hook on par with exact math), so a
+    launch whose score hook or its pullback computes one Mosaic GPU approximates compiles exact math, and
+    every other launch the approximate."""
+    queries = keys = 64
+    score_mod, kinds, draw = score_hooks(SCORE_HOOKS[hooks], queries, keys, 64)
+    params, initial = draw(0)
+    hooked = template.Hooks(score_mod, tuple(map(template.Param, params, kinds)), initial)
+    for differentiated in (False, True):
+        assert attention_mosaic_program.approximate(hooked, (64, 64), 64,
+                                                    differentiated=differentiated) == approximated
+
+
 def _fullest(op, ba, target):
     """The fitting config of `op`'s launch of `ba` on `target` that stages the most shared memory."""
     return max(op.fitting(ba, target), key=lambda config: op.staged_bytes(ba, config, target))
