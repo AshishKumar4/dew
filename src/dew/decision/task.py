@@ -153,15 +153,9 @@ class DecideSettings:
 
     @staticmethod
     def of(record: Mapping[str, object]) -> "DecideSettings":
-        """The settings a run's record holds (`saved_settings`). An earlier run's record names its
-        layout by class name alone, one of `dew.decision.layout`'s, and is read as that class's."""
+        """The settings a run's record holds (`saved_settings`)."""
         from dew.inference.tasks import saved_settings
 
-        laid = record.get("layout")
-        if isinstance(laid, Mapping) and "name" in laid:
-            name = records.text(laid["name"], "layout.name")
-            record = {**record, "layout": {"class": f"dew.decision.layout:{name}",
-                                           "fields": records.json_value(laid.get("fields"), "layout.fields")}}
         return saved_settings(record, DecideSettings)
 
 

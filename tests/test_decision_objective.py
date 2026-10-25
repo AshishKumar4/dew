@@ -493,7 +493,7 @@ def test_a_head_records_the_matmul_precision_it_computes_at(precision):
 @pytest.mark.parametrize("record", [{"features": 32, "layers": 1}, {"name": "DecisionHead", "layers": 1}],
                          ids=["unnamed", "flat"])
 def test_a_head_record_names_its_head_and_holds_its_fields(record):
-    """A run records a head as its name and its fields (`Head.record`); a
+    """A run records a head as a class record, its import path and its fields (`Head.record`); a
     record of another shape is refused rather than read as Laya's head."""
     from dew.decision.head import Head
 

@@ -36,7 +36,7 @@ from dew.nn.mlp import GatedMLP
 from dew.nn.precision import accumulated, at_least_fp32, capped_logits, scaled_logits
 from dew.nn.scatter import DROPPED
 from dew.records import JSON
-from dew.registry import from_record, import_path, imported, record_fields
+from dew.registry import class_record, from_record, import_path, imported, record_fields
 
 
 def _layer_norm(dtype: Dtype | None, name: str) -> nn.Module:
@@ -86,21 +86,20 @@ class Head(nn.Module):
         package the run trusts too."""
         fields = record_fields(self, type(self))
         del fields[self.width_field]
-        return {"name": import_path(type(self)), "fields": fields}
+        return {"class": import_path(type(self)), "fields": fields}
 
     @staticmethod
     def from_record(record: JSON, width: int) -> "Head":
-        """Rebuild the head a run recorded, reading states `width` wide, in the numerics it
-        recorded. A record of an earlier run names its head by class name alone, one of this
-        module's, and is read as that class's path."""
-        held = records.record(record, "head")
-        name = records.text(held.get("name"), "head.name")
-        path = name if ":" in name else f"{__name__}:{name}"
+        """Rebuild the head a run recorded (`dew.registry.class_record`), reading states `width`
+        wide, the one field its record leaves to the backbone, in the numerics it recorded."""
+        held = class_record(records.record(record, "head"))
+        if held is None:
+            raise ValueError("a run's head is a class record, {\"class\": ..., \"fields\": {...}}")
+        path, fields = held
         head = imported(path)
         if not (isinstance(head, type) and issubclass(head, Head)):
             raise ValueError(f"a run's head is a decision head (`Head`), not {path!r}")
-        fields = {**records.record(held.get("fields"), "head.fields"), head.width_field: width}
-        return from_record(head, fields)
+        return from_record(head, {**records.record(fields, "head.fields"), head.width_field: width})
 
 
 class DecisionHead(Head):

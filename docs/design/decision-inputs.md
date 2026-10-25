@@ -10,7 +10,7 @@ the other segments, and the per-question layouts as segment configurations. Owne
 
 ## Today
 
-A layout is one of three classes (`MarkerLayout`, `StateFirstLayout`, `JointLayout` in `src/dew/decision/layout.py`, reloaded through `_LAYOUTS` in `task.py`). Each assembles a row's tokens in a fixed order with fixed text, and each new arrangement needs a new class and a registry entry. A context beside the state (`Example.context`) has one path of its own: the backbone's token table embeds it, and the backbone's cross-attention reads it.
+A layout is one of three classes (`MarkerLayout`, `StateFirstLayout`, `JointLayout` in `src/dew/decision/layout.py`, each recorded, as a decision head is, as a registry class record by import path, `{"class", "fields"}`, an earlier run's `{"name"}` read once at the pinned run boundary). Each assembles a row's tokens in a fixed order with fixed text, and each new arrangement needs a new class and a registry entry. A context beside the state (`Example.context`) has one path of its own: the backbone's token table embeds it, and the backbone's cross-attention reads it.
 
 ## 1. A layout is data: segments
 

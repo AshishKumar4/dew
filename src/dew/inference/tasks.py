@@ -306,7 +306,28 @@ def run_record(directory: str, step: int | str | None = None, trust: Sequence[st
         from dew.registry import to_record
 
         record = {**record, "processor": to_record(SourceReference.parse(processor), SourceReference)}
-    return SavedRun(_earlier_projectors(record), step)
+    return SavedRun(_earlier_projectors(_earlier_decision_classes(record, declared)), step)
+
+
+def _earlier_decision_classes(record: Mapping[str, object], declared: frozenset[str]) -> Mapping[str, object]:
+    """Read an earlier decision run's head and layout once at the pinned run boundary, where they named
+    their class under "name", by import path or, for Dew's own, by class name alone, as a class record.
+
+    Carried until 1.0 (ledger 1239); `Head.from_record` and the registry read class records alone.
+    """
+    homes = {"head": "dew.decision.head", "layout": "dew.decision.layout"}
+    current = dict(record)
+    for key in sorted(homes.keys() & declared):
+        held = record.get(key)
+        if not isinstance(held, Mapping) or "name" not in held:
+            continue
+        if not set(held) <= {"name", "fields"}:
+            raise ValueError(f"an earlier run's {key} names its class and its fields alone, not "
+                             f"{sorted(set(held) - {'name', 'fields'})}")
+        name = named(held["name"], f"{key}.name")
+        current[key] = {"class": name if ":" in name else f"{homes[key]}:{name}",
+                        "fields": named_fields(held.get("fields", {}), f"{key}.fields")}
+    return current
 
 
 def _earlier_projectors(record: Mapping[str, object]) -> Mapping[str, object]:
