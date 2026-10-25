@@ -134,10 +134,10 @@ def unlowered(hooks: Hooks, tile: tuple[int, int], value_width: int) -> str | No
     return None
 
 
-APPROXIMATED = frozenset({"exp", "exp2", "log", "log1p", "tanh", "logistic", "sin", "cos", "sqrt", "rsqrt",
-                          "pow"})
+APPROXIMATED = frozenset({"exp", "exp2", "log", "log2", "log1p", "tanh", "logistic", "sin", "cos", "sqrt",
+                          "rsqrt", "pow"})
 """The operations Mosaic GPU computes in the hardware's approximate forms under `approx_math` (its lowering's
-exp, exp2, log, tanh, sin, cos, sqrt and rsqrt; jax's logistic, log1p and pow lower through them)."""
+exp, exp2, log, log2, tanh, sin, cos, sqrt and rsqrt; jax's logistic, log1p and pow lower through them)."""
 
 
 def approximate(hooks: Hooks, tile: tuple[int, int], value_width: int, *, differentiated: bool) -> bool:
