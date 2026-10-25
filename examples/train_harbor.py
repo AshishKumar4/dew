@@ -44,7 +44,6 @@ import jax.numpy as jnp
 import numpy as np
 import tyro
 
-from dew.config import OptimConfig
 from dew.data import HFTokenizer
 from dew.data.dataset import Loader
 from dew.inference import NativeRolloutServer, Publication, SafetensorsReload, Server, TextGeneration
@@ -55,6 +54,7 @@ from dew.interop.harness import HarnessSource
 from dew.objectives.rl import Asynchronous, GRPOObjective, RolloutScheduler, SchedulerRecord
 from dew.objectives.rl.scheduler import task_ids
 from dew.objectives.rl.sessions import Task
+from dew.optim import OptimConfig
 from dew.sampling import Sampling
 from dew.training import Trainer
 

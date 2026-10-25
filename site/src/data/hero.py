@@ -1,11 +1,10 @@
 """Train a byte decoder on Tiny Shakespeare, evaluate, and generate two samples."""
 from dew import Trainer
-from dew.config import OptimConfig
 from dew.data import ByteTokenizer, Hub, presets
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Perplexity
 from dew.sampling import Sampling, generate
-from dew.optim import Cosine
+from dew.optim import Cosine, OptimConfig
 
 steps = 1000
 

@@ -31,12 +31,12 @@ import tyro
 
 import dew.nn.backbones  # noqa: F401  (registers the kind)
 from dew._records import integer
-from dew.config import OptimConfig
 from dew.data import Loading, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.sources.tokens import TokenFiles
 from dew.objectives.lm import LMObjective
+from dew.optim import OptimConfig
 from dew.registry import models
 from dew.training import MeshSpec, Trainer
 from dew.training.distributed import DevicePrefetchIterator

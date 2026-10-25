@@ -62,7 +62,6 @@ import jax
 import jax.numpy as jnp
 import tyro
 
-from dew.config import OptimConfig
 from dew.data import HFTokenizer, Memory, presets
 from dew.data.compile import compile
 from dew.data.prompts import PromptRecord
@@ -91,6 +90,7 @@ from dew.objectives.rl import (
     Task,
     prompt_tasks,
 )
+from dew.optim import OptimConfig
 from dew.rl.sandbox import ContainerRunner, ProcessRunner, Program, SandboxFleet, SandboxLimits, outputs_match
 from dew.sampling import Sampling
 from dew.training import Trainer

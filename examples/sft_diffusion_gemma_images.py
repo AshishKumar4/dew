@@ -35,14 +35,14 @@ import tyro
 
 import dew
 from dew.batch import VALID_ROWS
-from dew.config import ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
+from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
 from dew.data import ByteTokenizer, Concatenate, Dataset, Files, Hub, Loading, Source, images, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader
 from dew.interop.diffusion_gemma import build
 from dew.nn.inputs import ModelInputs
 from dew.objectives.lm import Perplexity
-from dew.optim import Cosine
+from dew.optim import Cosine, OptimConfig
 from dew.registry import ModelConfig
 from dew.training import MeshSpec, prepare_process
 

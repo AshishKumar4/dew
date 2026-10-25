@@ -18,7 +18,6 @@ import tyro
 
 from dew import Checkpoints, Field, InputSpec, Trainer
 from dew.artifacts import uint8_pixels
-from dew.config import OptimConfig
 from dew.data import Memory, presets
 from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow
@@ -27,6 +26,7 @@ from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective, Perplexity
 from dew.objectives.rl import DPOObjective
+from dew.optim import OptimConfig
 from dew.sampling import Euler, Sampling, generate
 
 

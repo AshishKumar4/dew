@@ -11,12 +11,13 @@ from __future__ import annotations
 import dataclasses
 from typing import ClassVar
 
-from dew.config import ObjectiveConfig, OptimConfig, Prepared, RunConfig, media_field
+from dew.config import ObjectiveConfig, Prepared, RunConfig, media_field
 from dew.data.compile import fitted
 from dew.data.pipeline import ObjectiveData
 from dew.inputs import Field
 from dew.objectives.jepa.masking import MultiBlockMask
 from dew.objectives.jepa.probes import KnnProbe, LinearProbe
+from dew.optim import OptimConfig
 from dew.registry import JsonDict, ModelConfig, models
 
 SHARED_MODEL_KEYS = ("emb_features", "num_heads", "mlp_ratio", "ssm_attention_ratio",

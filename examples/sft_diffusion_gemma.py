@@ -31,12 +31,12 @@ import jax.numpy as jnp
 import tyro
 
 import dew
-from dew.config import OptimConfig
 from dew.data import Dataset, presets
 from dew.data.sources import source as data_source
 from dew.interop import PretrainedBlockDecoder
 from dew.lora import LoRA
 from dew.objectives.diffusion.block import BlockDiffusionObjective
+from dew.optim import OptimConfig
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"

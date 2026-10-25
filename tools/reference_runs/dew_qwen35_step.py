@@ -30,13 +30,12 @@ from qwen35 import MODEL, REVISION, WHOLE_PEAK_SCOPE, inputs, workload
 from reference_source import git_head
 from work import measure
 
-from dew.config import OptimConfig
 from dew.inputs import Field, InputSpec
 from dew.interop import Pretrained
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.multimodal import MultimodalTransformer
 from dew.objectives.base import Objective
-from dew.optim import Cosine
+from dew.optim import Cosine, OptimConfig
 from dew.training import Trainer
 from dew.training.runtime import prepare_process
 

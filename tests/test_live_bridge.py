@@ -444,7 +444,7 @@ def test_a_training_context_caps_the_batch_of_every_way_a_cell_loads_data_and_it
     cell = """
 import numpy as np
 from dew import Trainer
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.data import Memory, presets
 from dew.data.compile import compile as compile_data
 from dew.nn.backbones import CausalTransformer

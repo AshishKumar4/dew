@@ -13,13 +13,13 @@ import tyro
 from PIL import Image
 
 from dew.artifacts import uint8_pixels
-from dew.config import OptimConfig
 from dew.data import TFDS, Dataset, images, presets
 from dew.diffusion.presets import EDM
 from dew.inputs import CLIPText, Condition, Field, InputSpec
 from dew.interop import save_hf_layout
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.diffusion import DiffusionObjective
+from dew.optim import OptimConfig
 from dew.sampling import CFG, Heun
 from dew.training import Checkpoints, MeshSpec, Trainer
 

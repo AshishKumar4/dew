@@ -15,7 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew import Field, InputSpec, Trainer
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow
 from dew.nn.backbones.dit import SimpleDiT
@@ -111,7 +111,7 @@ To fine-tune with a low-rank adapter (LoRA) instead, `pipe.adapt(LoRA(rank=, mod
 ```python
 import jax
 
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.interop import PretrainedPipeline
 from dew.lora import LoRA
 from dew.training import Trainer

@@ -16,7 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew import Trainer
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.data.dataset import Loader
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Perplexity
@@ -187,7 +187,8 @@ The example continues the previous one and reuses `objective`, `data`, `Perplexi
 
 ```python
 from dew import Evaluation, LocalTracker
-from dew.config import OptimConfig, RunConfig, TrainerConfig
+from dew.config import RunConfig, TrainerConfig
+from dew.optim import OptimConfig
 from dew.registry import ModelConfig
 from dew.config.sweep import GridSearch
 
