@@ -18,7 +18,6 @@ an assembly on its shrunken probe before any weight downloads.
 from __future__ import annotations
 
 import ast
-import builtins
 import functools
 import inspect
 import linecache
@@ -219,10 +218,10 @@ _WRAPPED = object()
 
 def _bindings(function: FunctionType, wrapped: FunctionType | None = None) -> Mapping[str, object]:
     """Every name `function` reads free, as it holds them when it runs: its closure's cells, over its
-    module's globals, over the builtins; a wrapper's binding of `wrapped` as `_WRAPPED`."""
+    module's globals, over its own builtins; a wrapper's binding of `wrapped` as `_WRAPPED`."""
     cells = {name: _WRAPPED if cell.cell_contents is wrapped else cell.cell_contents
              for name, cell in zip(function.__code__.co_freevars, function.__closure__ or (), strict=True)}
-    return ChainMap(cells, function.__globals__, dict(vars(builtins)))
+    return ChainMap(cells, function.__globals__, function.__builtins__)
 
 
 def _wrappers(function: FunctionType) -> tuple[list[tuple[FunctionType, FunctionType]], FunctionType]:
