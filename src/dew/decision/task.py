@@ -103,40 +103,6 @@ class Weights:
 
     step: int
     ema: bool
-    averaged: tuple[tuple[str, int, bool], ...] = ()
-    """The runs' checkpoints these weights are the fp32 mean of (`Decide.averaged`): each run's
-    directory, step, and whether its own average was read; none for one run's weights."""
-
-
-def _running_mean(mean, tree, count: int, directory: str, first: str):
-    """`mean`, the fp32 mean of `count - 1` runs' variables, with the `count`th run's `tree` taken in:
-    for a second run each floating leaf `(mean + leaf) / 2` below 2**126, a sum that cannot overflow
-    (and is exact wherever its half could round), and `mean / 2 + leaf / 2` above, exact halves: one
-    rounding either way, so float64's mean rounded to fp32; for a later one
-    `mean + (leaf - mean) / count` where both share a sign, whose difference cannot overflow, and
-    `mean * (1 - 1/count) + leaf / count` where they differ, whose terms cannot. An integer or
-    boolean leaf must equal the mean's. A tree of other variables or shapes is refused."""
-    pairs = list(zip(jax.tree.leaves(mean), jax.tree.leaves(tree), strict=False))
-    if jax.tree.structure(tree) != jax.tree.structure(mean) or any(
-            np.shape(a) != np.shape(b) for a, b in pairs):
-        raise ValueError(f"the run in {directory} holds other variables than {first}")
-
-    def taken(held, leaf):
-        if not jnp.issubdtype(jnp.asarray(held).dtype, jnp.inexact):
-            if not np.array_equal(np.asarray(held), np.asarray(leaf)):
-                raise ValueError(f"an integer or boolean variable of the run in {directory} differs from "
-                                 f"{first}'s, which no mean of their weights reconciles")
-            return held
-        held, leaf = jnp.asarray(held, jnp.float32), jnp.asarray(leaf, jnp.float32)
-        if count == 2:
-            small = jnp.maximum(jnp.abs(held), jnp.abs(leaf)) < 2.0**126
-            return jnp.where(small, (held + leaf) / 2, held / 2 + leaf / 2)
-        same = jnp.sign(held) == jnp.sign(leaf)
-        moved = held + (leaf - jnp.where(same, held, 0.0)) / count
-        weighted = held * ((count - 1) / count) + leaf / count
-        return jnp.where(same, moved, weighted)
-
-    return jax.tree.map(taken, mean, tree)
 
 
 @dataclass(frozen=True)
@@ -178,11 +144,6 @@ class DecideSettings:
     context_encoder: ContextEncoder = "table"
     """How the model encodes a row's context (`DecisionModel.context_encoder`); a run recorded before
     the choice existed embedded it by its token table."""
-    head_identity: JSON = None
-    """Where the run's head started: `{"drawn": seed}`, a fresh head drawn from its trainer's key, or
-    `{"held": digest}`, a head it was given, by its variables' digest; None where the run recorded
-    neither, as one from before the field or a trainer given no seed. Runs whose heads started apart
-    do not average (`Decide.averaged`)."""
 
     @staticmethod
     def of(record: Mapping[str, object]) -> "DecideSettings":
@@ -255,8 +216,7 @@ class Decide:
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: "MeshSpec | Mesh | None" = None, layout: "Placement | None" = None,
-                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
-                 unfitted: bool = False) -> Self:
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> Self:
         """Load the `DecisionObjective` run in `directory` as a task.
 
         The task is rebuilt from the run's record over the latest checkpoint's
@@ -265,13 +225,12 @@ class Decide:
         them. `mesh` and `layout` place the weights as the trainer does, `dtype`
         overrides the compute dtype and `param_dtype` the storage dtype.
         The image processor reloads from its recorded source independently of
-        the tokenizer that lays out the task's text. `unfitted` reads none of a saved calibration,
-        budget or name, as an average of runs starts from none.
+        the tokenizer that lays out the task's text.
         """
         from dew.data.text import tokenizer_for
         from dew.inference.tasks import run_record, saved_model
         from dew.interop.pretrained import load_processor
-        from dew.registry import objectives
+        from dew.registry import from_record, objectives
 
         record, step = run_record(directory, step)
         settings = DecideSettings.of(record)
@@ -296,79 +255,20 @@ class Decide:
         task = cls(model, variables, rows, tokenizer_for(settings.tokenizer), settings.specials,
                    name=str(epath.Path(directory).name), weights=Weights(step, averaged),
                    processor=processor)
-        return task if unfitted else task._fitted_from(directory)
-
-    def _fitted_from(self, directory: str) -> Self:
-        """This task with the calibration, budget and name `save` wrote into the run `directory`, where
-        it was fitted on these weights; as it is where none was saved."""
-        from dew.registry import from_record
-
         saved = epath.Path(directory) / TASK_FILE
         if not saved.exists():
-            return self
-        assert self.weights is not None, "a task read from a run knows the weights it read"
+            return task
         settings = records.record(json.loads(saved.read_text()), TASK_FILE)
         fitted = from_record(Weights, records.json_value(settings["weights"], "weights"))
-        if fitted != self.weights:
+        if fitted != task.weights:
             raise ValueError(
                 f"{TASK_FILE} was fitted on step {fitted.step}'s {'averaged' if fitted.ema else 'live'} "
-                f"weights, and this loads step {self.weights.step}'s "
-                f"{'averaged' if self.weights.ema else 'live'} ones; fit them again with `calibrated` "
-                "and `save`, or load the step it was fitted on")
-        return replace(self, calibration=from_record(Calibration, records.json_value(settings["calibration"],
+                f"weights, and this loads step {step}'s {'averaged' if averaged else 'live'} ones; "
+                "fit them again with `calibrated` and `save`, or load the step it was fitted on")
+        return replace(task, calibration=from_record(Calibration, records.json_value(settings["calibration"],
                                                                                     "calibration")),
                        budget=from_record(Budget, records.json_value(settings["budget"], "budget")),
                        name=records.text(settings["name"], "name"))
-
-    @classmethod
-    def averaged(cls, runs: Sequence[str], *, step: int | str | None = None, ema: bool | None = None,
-                 calibrate_on: "Iterable[Example | Mapping[str, object]] | Reader | None" = None) -> Self:
-        """The task over the fp32 mean of `runs`' weights, each run's at `step` (its latest where None)
-        and `ema` as `from_run` reads them, its calibration the identity, or refit on `calibrate_on`'s
-        held-out answers (`calibrated`): temperatures are fitted to one set of weights.
-
-        Runs average where they are one model trained apart: their heads started alike (each recorded
-        `DecideSettings.head_identity`, the same, and the same head), over the same backbone, layout,
-        tokenizer and special tokens; a run that differs in any is refused (ValueError), naming it, as is
-        one that recorded no head identity. Every floating leaf is the mean of the runs' in fp32, as the
-        sum of each one's share, which no finite weights overflow; an integer or boolean leaf must agree
-        across the runs. The task's `weights` record each run's directory, step and whether its average
-        was read, so it is no one run's: `save` refuses it, and `save_pretrained` releases it."""
-        from dew.inference.tasks import run_record
-
-        if len(runs) < 2:
-            raise ValueError(f"an average is of two or more runs, got {len(runs)}")
-        first = None
-        task = None
-        mean = None
-        provenance = []
-        for count, directory in enumerate(runs, start=1):
-            record, pinned = run_record(directory, step)
-            settings = DecideSettings.of(record)
-            if settings.head_identity is None:
-                raise ValueError(f"the run in {directory} records no head identity (head_identity), so "
-                                 "whether its head started as the others' is unknown; it cannot average")
-            shared = {"model": record["model"], "head": settings.head,
-                      "head_identity": settings.head_identity, "layout": settings.layout,
-                      "tokenizer": settings.tokenizer, "specials": settings.specials,
-                      "processor": settings.processor, "context_encoder": settings.context_encoder}
-            if first is None:
-                first = shared
-            for name, value in shared.items():
-                if value != first[name]:
-                    raise ValueError(f"the run in {directory} differs from {runs[0]} in its {name}, so their "
-                                     "weights are not one model's to average")
-            loaded = cls.from_run(directory, step=pinned, ema=ema, param_dtype=jnp.float32, unfitted=True)
-            assert loaded.weights is not None
-            provenance.append((str(epath.Path(directory)), loaded.weights.step, loaded.weights.ema))
-            if task is None:
-                task, mean = loaded, loaded.variables
-                continue
-            mean = _running_mean(mean, loaded.variables, count, directory, runs[0])
-        assert task is not None and mean is not None
-        task = replace(task, variables=mean, calibration=Calibration(),
-                       weights=Weights(provenance[0][1], ema=False, averaged=tuple(provenance)))
-        return task if calibrate_on is None else task.calibrated(calibrate_on)
 
     def save_pretrained(self, directory: str | Path) -> None:
         """Write this task as a released checkpoint, which `from_pretrained` reads back.
@@ -404,9 +304,6 @@ class Decide:
         if self.weights is None:
             raise ValueError("this task's weights came from no run checkpoint, so a run has no "
                              "calibration of them to hold; save a task from `pipeline` or `from_run`")
-        if self.weights.averaged:
-            raise ValueError("this task's weights are an average of runs, which no one run holds, so its "
-                             "calibration belongs in no run's directory; release it with `save_pretrained`")
         write_atomically(epath.Path(directory) / TASK_FILE, json.dumps({
             "weights": to_record(self.weights, Weights),
             "calibration": to_record(self.calibration, Calibration),
