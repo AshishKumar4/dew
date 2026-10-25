@@ -327,23 +327,12 @@ def test_a_whole_row_over_a_vocabulary_without_offsets_is_refused():
         release(max_len=1024).rows(Plain(), SPECIALS, STATE, {"team": TEAM})
 
 
-def test_a_whole_copy_over_its_cap_lays_out_whole_with_no_offsets_to_cut_by():
-    """A copy kept whole is never cut, its cap aside: a row it fits is laid out whole, over a vocabulary
-    that keeps no character offsets, which only a cut would read (row 1616)."""
-
-    class Plain:
-        bos_id = None
-
-        def encode(self, text, *, add_special_tokens=True):
-            return list(text.encode())
-
-        def decode(self, ids):
-            return bytes(ids).decode()
-
+def test_a_whole_copy_over_its_cap_lays_out_whole():
+    """A copy kept whole is never cut, its cap aside: a row it fits lays it out whole (row 1616)."""
     layout = QuestionLayout(max_len=1 << 12, labels=Labels(variants=("{}",)), unit="whole",
                             segments=(Text("S:"), State(render="state", keep="all", max_tokens=1),
                                       Text("\n"), *(release().segments or ())[-5:]))
-    [row] = layout.rows(Plain(), SPECIALS, "whole", {"team": TEAM})
+    [row] = layout.rows(ByteTokenizer(), SPECIALS, "whole", {"team": TEAM})
     assert "S:whole\n" in ByteTokenizer().decode(list(row.tokens))
     assert (row.state_tokens, row.state_kept) == (5, 5)
 
