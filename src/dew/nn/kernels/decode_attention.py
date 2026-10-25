@@ -117,13 +117,13 @@ power-of-two width from 16 to 256, a capacity of whole blocks and one of its dty
 
 def _spec(scale: float, softcap: float | None, natural: bool, dtype, sinks: bool) -> algebra.Forward:
     """The algebra's facts for a decode launch: each query block's keys its row's span (`spans`), no
-    documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`), and
-    whether a row's sums of `dtype` values need a guard (`algebra.headroom`). A decode
+    documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`), and in
+    either form whether a row's sums of `dtype` values need a guard (`algebra.headroom`). A decode
     block's rows are a key head's query heads and positions (`grouped_query`), so the hook takes no query
     positions."""
     return algebra.Forward("spans", 0, ids=False, scale=scale,
                            score_mod=None if softcap is None else functools.partial(capped, softcap),
-                           natural=natural, headroom=natural and algebra.headroom(dtype),
+                           natural=natural, headroom=algebra.headroom(dtype),
                            initial=sinks)
 
 

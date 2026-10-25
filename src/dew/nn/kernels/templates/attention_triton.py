@@ -338,10 +338,10 @@ class TritonForward(Template[Tiles]):
             per_value = pl.BlockSpec((None, None, block_q, value_width), lambda i, b, h: (b, h, i, 0))
             out_specs += [per_row, per_row, per_row, per_value, per_row, per_row, per_row]
         # A call's own key count, none included; an op built without one counts its launch's keys.
-        # The accurate form alone guards its sums (`algebra.Forward.headroom`); the fold walks as ever.
+        # Every form guards its sums where its values can overflow them (`algebra.Forward.headroom`), as the
+        # plain-JAX and Mosaic mainloops do: the template's production route runs this one on a GPU.
         spec = algebra.Forward(self.form, keys if self.keys is None else self.keys, ids, self.scale,
-                               self.score_mod, self.natural,
-                               self.natural and algebra.headroom(value.dtype), initial)
+                               self.score_mod, self.natural, algebra.headroom(value.dtype), initial)
         kernel = functools.partial(
             _forward_kernel, spec=spec, score_kinds=self.score_kinds, output_kinds=self.output_kinds,
             initial=initial, residuals=residuals, output_mod=self.output_mod, block_k=block_k,
