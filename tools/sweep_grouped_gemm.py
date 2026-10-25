@@ -108,15 +108,16 @@ def main() -> None:
                 ba = launch.bind(*specs, **options)
                 if not launch.eligible(ba, target):
                     continue
-                timings = tuning.measured(launch, ba, arrays=list(call))
+                # Each config's outputs from its first timed run: checked with no compile of their own.
+                outputs: dict = {}
+                timings = tuning.measured(launch, ba, arrays=list(call), results=outputs)
                 times, failures, errors = {}, {}, {}
                 for config, timing in timings.items():
                     if isinstance(timing, Exception):
                         failures[repr(config)] = f"{type(timing).__name__}: {str(timing)[:300]}"
                         continue
                     times[repr(config)] = statistics.median(timing.evaluation_times_ms)
-                    configured = launch.replace(config=config)
-                    got = np.asarray(configured(*call, **options), np.float32)
+                    got = np.asarray(outputs.pop(config), np.float32)
                     errors[repr(config)] = float(np.max(np.abs(got - want)) / np.max(np.abs(want)))
                 record = {"shape": name, "product": product, "implementation": launch.name,
                           "heuristic": repr(launch.estimate(ba, target)[1]), "times": times,
