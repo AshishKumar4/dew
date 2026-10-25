@@ -892,8 +892,9 @@ def test_a_tpu_lowers_xlas_program_for_a_call_no_launch_takes(product):
     assumed, mesh = _on_a_v5e()
     with assumed, mesh, generation.routes() as taken:
         jax.jit(run).trace(x, other).lower(lowering_platforms=("tpu",))
-    [found] = [route for route in taken if route.choice == 'grouped_matmul']
-    assert found.kernel == 'xla' and "widths" in found.refusal.detail
+    # The TPU branch's and the CPU branch's each.
+    found = [route for route in taken if route.choice == 'grouped_matmul']
+    assert found and all(route.kernel == 'xla' and "widths" in route.refusal.detail for route in found)
 
 
 NARROW_GRADIENT_CASES = ("norm and bias", "gated prologue", "cast prologue", "broadcast axes",
