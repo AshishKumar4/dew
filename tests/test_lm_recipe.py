@@ -517,7 +517,7 @@ def test_a_scratch_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
 
 
 def test_the_recipe_balances_a_sparse_run(tmp_path):
-    """--objective.balance-rate reaches the objective: a sparse run moves every
+    """--objective.balance reaches the objective: a sparse run moves every
     router's bias by the rate each step, which the recipe could not ask for
     before, and an unbalanced run leaves it at zero."""
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
@@ -534,7 +534,7 @@ def test_the_recipe_balances_a_sparse_run(tmp_path):
         return np.asarray(state.variables["moe"]["layers_1"]["mlp"]["gate"]
                           ["e_score_correction_bias"])
 
-    balanced = run("balanced", "--objective.balance-rate", "0.01")
+    balanced = run("balanced", "--objective.balance", '{"balance_rate": 0.01}')
     assert np.any(balanced != 0), "the bias never moved"
     np.testing.assert_allclose(np.abs(balanced) / 0.01,
                                np.round(np.abs(balanced) / 0.01), atol=1e-4)
