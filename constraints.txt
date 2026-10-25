@@ -2,9 +2,9 @@
 #
 #     uv pip install -e '.[ci]' -c constraints.txt
 #
-# Dew's JAX build, which pyproject.toml requires: jax 0.11.2 with fixes no
+# Dew's JAX build, which pyproject.toml requires: jax 0.12.0.1 with fixes no
 # release has yet, built from AshishKumar4/jax's branch
-# v0.11.2-cache-key-pool-fingerprints and served by Dew's package index: the
+# v0.12.0.1-cache-key-pool-fingerprints and served by Dew's package index: the
 # multi-process cache key (jax-ml/jax#40940, sent as jax-ml/jax#41776), which a
 # pool across GPUs with and without NVLink needs to keep the persistent
 # compilation cache; a Pallas Triton kernel's key without its source locations
@@ -22,10 +22,11 @@
 # Mosaic GPU's MMA accumulator relaid out to a 16-bit MMA's left operand in
 # registers, and an abstract device's compute capability, which Mosaic GPU
 # lowers for, which the templates' Mosaic kernels need on sm80; and the
-# persistent compilation cache keyed by jax's own build, so two builds over one
-# jaxlib never read each other's programs; and ceil and floor lowered in Mosaic
-# GPU and Pallas Mosaic GPU, which a template's Mosaic kernel rounding a value
-# needs on an H100; and add_any and integer_pow of every integer exponent
+# persistent compilation cache keyed by the host's CPU for a CPU program and by
+# jax's own build for every program, so neither another CPU nor another build
+# over one jaxlib reads a program it cannot run; and ceil and floor lowered in
+# Mosaic GPU and Pallas Mosaic GPU, which a template's Mosaic kernel rounding a
+# value needs on an H100; and add_any and integer_pow of every integer exponent
 # lowered in Pallas Mosaic GPU, which the Mosaic attention backward under a
 # score hook needs; and Splash attention's BlockSizes.delta_from_weights (off by
 # default); and Mosaic GPU's layout inference solving unrelated unknowns apart,
@@ -37,7 +38,7 @@
 # BEGIN package index (site/scripts/gen_install.py)
 --extra-index-url https://pypi.dewml.dev/simple
 # END package index
-jax==0.11.2.post21
+jax==0.12.0.1.post22
 
 # The CA bundle requests, httpx and the Hub verify TLS with: 2026.10.19 dropped emSign ECC Root CA - G3,
 # whose intermediates' private keys were compromised in October 2026 (tests/test_trust_store.py).

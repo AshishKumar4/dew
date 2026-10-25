@@ -15,7 +15,6 @@ from pathlib import Path
 
 import jax
 
-from dew._host import cpu_class
 from dew.devices import deterministic_ops_requested, xla_flag
 
 
@@ -103,17 +102,14 @@ def default_compilation_cache_dir() -> str:
     the codec "zlib" in the key, which says "zstandard" only for the
     zstandard package (`jax._src.compilation_cache.get_cache_key`), so an
     older interpreter sharing the directory would read those bytes with the
-    wrong codec. And CPU classes have separate defaults (`dew._host.cpu_class`):
-    XLA:CPU compiles for the features of the host that compiles, which JAX's
-    key leaves out, so a home directory shared by hosts of two classes would
-    hand one a program that does not link there ("Failed to materialize
-    symbols"), after which that process compiles nothing more. Explicit paths
+    wrong codec. Hosts of every CPU class share it: Dew's JAX build keys a
+    CPU program by the host's CPU (0.12.0.1.post13), which XLA:CPU compiles
+    for, so no host reads a program that does not link there. Explicit paths
     passed to enable_compilation_cache remain unchanged.
     """
     if jax.config.jax_compilation_cache_dir:
         return jax.config.jax_compilation_cache_dir
-    return os.path.join(dew_cache_dir(), 'xla', f"python{sys.version_info.major}.{sys.version_info.minor}",
-                        cpu_class())
+    return os.path.join(dew_cache_dir(), 'xla', f"python{sys.version_info.major}.{sys.version_info.minor}")
 
 
 def enable_compilation_cache(path: str):
