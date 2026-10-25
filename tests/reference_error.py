@@ -648,8 +648,8 @@ def _sign_bits(size: int, seed: int) -> np.ndarray:
 
 
 _BYTE_SIGNS = ((np.arange(256)[:, None] >> np.arange(8)) & 1) * 2.0 - 1
-"""Each byte's eight signs, bit k of the byte sign k (1 for +): `truth_sketch` reads a sign word a byte at
-a time."""
+"""A (256, 8) float64 table whose [byte, k] entry is +1.0 where the byte's bit k is set and -1.0 where it
+is not, least significant bit first."""
 
 
 def truth_sketch(truth, seed: int) -> np.ndarray:
@@ -664,11 +664,10 @@ def truth_sketch(truth, seed: int) -> np.ndarray:
     bits, partials = _sign_bits(flat.size, seed), []
     for start in range(0, flat.size, 1 << 16):
         chunk = flat[start:start + (1 << 16)]
-        # Sign k of an entry is its word's bit k (1 for +): the low four bytes of each word, little-endian,
-        # each looked up whole (`_BYTE_SIGNS`).
+        # Sign k of an entry is its word's bit k: its low four bytes, read little-endian whatever the host's
+        # order, so the first byte holds bits 0 to 7.
         words = bits[start:start + chunk.size].astype("<u8").view(np.uint8).reshape(chunk.size, 8)[:, :4]
         products = np.zeros((chunk.size + -chunk.size % SKETCH_BLOCK, SKETCH))
-        # Each entry times its signs into the padded block (its last block padded with zeros).
         np.multiply(chunk[:, None], _BYTE_SIGNS[words].reshape(chunk.size, SKETCH), out=products[:chunk.size])
         partials.append(products.reshape(-1, SKETCH_BLOCK, SKETCH).sum(axis=1))
     return np.asarray([math.fsum(column) for column in np.concatenate(partials).T.tolist()])
