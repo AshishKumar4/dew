@@ -1312,6 +1312,22 @@ def test_composite_rejection_and_partial_restart_agree_across_processes(tmp_path
 
 
 @pytest.mark.distributed
+def test_a_pool_serves_a_prefix_run_as_one_process_and_refuses_a_short_prompt_together(tmp_path):
+    """A prefix run's task over a request two processes each hold a share of, as one global array, answers
+    the rows one process answers: each prompt's blocks are made of the process's own rows inside the
+    request's agreed check. A prompt too short for the prefix in one rank's share alone is refused on both
+    ranks, neither left waiting on its peer's agreement."""
+    worker_script = Path(__file__).with_name("prefix_worker.py")
+    reports = run_pool("prefix_generation", tmp_path / "pool", 2, script=worker_script, devices=2,
+                       fsdp_size=2, timeout=240)
+    single = run_worker("prefix_generation", tmp_path / "single.json", script=worker_script, fsdp_size=1,
+                        devices=1)
+
+    assert [report["refused"] for report in reports] == [True, True] and single["refused"]
+    assert reports[0]["tokens"] + reports[1]["tokens"] == single["tokens"]
+    assert reports[0]["lengths"] + reports[1]["lengths"] == single["lengths"]
+
+
 def test_a_pool_agrees_on_its_decoding_components_or_refuses_the_request(tmp_path):
     """Two processes resolving the same chain answer the same rows as one, and
     a rank whose components differ only in their values is refused on both

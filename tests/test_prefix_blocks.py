@@ -283,9 +283,10 @@ def test_a_prefix_run_needs_a_trunk_layer_that_reads_blocks():
 
 def test_a_prefix_run_refuses_a_block_that_crosses_an_attention_chunk():
     """A block-reading layer whose chunks cut a block reads it in part, so a target across the cut is
-    invisible to its source while the loss drops it. Refused where no layer reads the block whole: a prompt's
-    block is of any length, so it needs an unchunked layer, and serving refuses the same. A chunk the block
-    fits in, or an unchunked layer beside the chunked one, reads it whole."""
+    invisible to its source while the loss drops it. A training run's batch may carry blocks of its own
+    beside its prefix's, runs of any places of its row, so a prefix run needs a layer reading the whole row's
+    blocks: one with no chunk, or a chunk of the row's places. A chunk the prefix alone fits in is refused
+    too. Serving refuses a chunk its prompt's block crosses."""
     with pytest.raises(ValueError):
         LMObjective(chunked(2), SEQ, prefix=PREFIX)
     with pytest.raises(ValueError):
@@ -293,7 +294,9 @@ def test_a_prefix_run_refuses_a_block_that_crosses_an_attention_chunk():
     decoder = chunked(2).clone(max_seq_len=128)
     with pytest.raises(ValueError):
         TextGeneration(decoder, decoder.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)), prefix=PREFIX)
-    assert LMObjective(chunked(PREFIX), SEQ, prefix=PREFIX).prefix == PREFIX
+    with pytest.raises(ValueError):
+        LMObjective(chunked(PREFIX), SEQ, prefix=PREFIX)
+    assert LMObjective(chunked(SEQ), SEQ, prefix=PREFIX).prefix == PREFIX
     assert LMObjective(chunked(2, unchunked=True), SEQ, prefix=PREFIX).prefix == PREFIX
     assert LMObjective(chunked(SEQ), SEQ, prefix="prompt").prefix == "prompt"
 
