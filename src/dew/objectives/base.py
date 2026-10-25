@@ -996,18 +996,6 @@ class Objective(ABC, Generic[Loss, Effects]):
         """
         return 3 * self.model_flops(model, batch)
 
-    @classmethod
-    def earlier_arguments(cls, arguments: Mapping[str, object]) -> Mapping[str, object]:
-        """An earlier run's recorded constructor arguments as the class takes them now
-        (`dew.config.ObjectiveConfig`): a class that retires an argument reads a record of it here,
-        until the ledger row it names deletes the reading. The default takes them as they are.
-
-        `arguments` holds the record's stated and defaulted arguments together, the stated ones over the
-        defaults, so a reading can fold several retired arguments into one. The config states each argument
-        the reading returns that the stated arguments alone reach, and records the rest as defaults. A fold
-        is therefore stated when any of the arguments it takes is stated."""
-        return arguments
-
     def program_key(self) -> tuple[ProgramModule, ...]:
         """Every module this objective's compiled programs execute, in an order its configuration fixes.
 

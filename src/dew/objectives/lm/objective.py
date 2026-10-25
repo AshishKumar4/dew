@@ -111,7 +111,6 @@ from dew.objectives.lm.chunked import (
 )
 from dew.objectives.lm.head import HeadedObjective
 from dew.objectives.routing import ExpertBalance, RoutedStatistics, apply_routed, reduce_routed
-from dew.registry import from_record, to_record
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
@@ -120,8 +119,6 @@ if TYPE_CHECKING:
 TEXT_KEY = "text"
 """Batch key the token pipeline packs `[B, seq_len + 1]` int32 ids under."""
 
-_RETIRED_BALANCE = ("balance_rate", "aux_loss_alpha", "seq_aux", "router_z_loss")
-"""The four arguments `ExpertBalance` replaced, which an earlier run's record may still hold."""
 
 BLOCKS_KEY = "text_block_groups"
 """Batch key `[B, seq_len + 1]` int32 block ids are read under, written by `dew.data.steps.blocks.Blocks`."""
@@ -497,12 +494,6 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
     scored_fields: ClassVar[tuple[str, ...] | None] = None
     """The batch fields `_evaluation_scores` reads, which alone enter its compiled program (`evaluate`),
     so a batch's other fields (rollouts, rewards) neither enter it nor key it; None passes the batch whole."""
-
-    @classmethod
-    def earlier_arguments(cls, arguments: Mapping[str, object]) -> Mapping[str, object]:
-        """`Objective.earlier_arguments`: `qk_stats` dropped, which a step whose optimizer clips by the
-        attention maxima now asks for (`Step.qk_stats`). Carried until 1.0 (ledger 1626)."""
-        return {name: value for name, value in arguments.items() if name != "qk_stats"}
 
     def evaluate(self, params, batch, step: Step):
         """The base's scores (`Objective.evaluate`) over the `scored_fields` of `batch`."""
@@ -1093,20 +1084,6 @@ class LMObjective(TokenScorer):
     `token_accuracy` reports the argmax accuracy; False skips the pass
     over every logit it costs (0.77 ms of the head's 8.0 on a TPU v6e).
     """
-
-    @classmethod
-    def earlier_arguments(cls, arguments: Mapping[str, object]) -> Mapping[str, object]:
-        """`TokenScorer.earlier_arguments`, and the four balance arguments an earlier run's record may hold,
-        read as one `balance` record: the `ExpertBalance` they make, as the registry writes it, or None where
-        all four are at their defaults. A rate of 0, which moved no bias, reads as none. Carried until 1.0."""
-        values = dict(super().earlier_arguments(arguments))
-        retired = {name: values.pop(name) for name in _RETIRED_BALANCE if name in values}
-        if retired.get("balance_rate") == 0:
-            retired["balance_rate"] = None
-        if retired:
-            balance = from_record(ExpertBalance, retired)
-            values["balance"] = None if balance == ExpertBalance() else to_record(balance, ExpertBalance)
-        return values
 
     def __init__(
         self,

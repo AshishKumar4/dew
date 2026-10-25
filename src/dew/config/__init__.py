@@ -131,9 +131,8 @@ class _Configured(ABC):
     """A registered class, named by an alias or an import path and held as the path, and the arguments a
     run gives it: `fields`, the ones the run states, and `defaults`, every other one the class
     defaults as it defaulted them when the run was first recorded, so the record builds the same
-    thing after a default changes (`arguments`). Each kind names its registry (`_member`), how an
-    earlier run's record of an argument its class retired reads now (`_earlier`), and whether its
-    stated fields are held as their records (`_recorded`)."""
+    thing after a default changes (`arguments`). Each kind names its registry (`_member`) and whether
+    its stated fields are held as their records (`_recorded`)."""
 
     name: str
     fields: JsonDict = dataclasses.field(default_factory=dict)
@@ -148,21 +147,12 @@ class _Configured(ABC):
     def _member(name: str) -> type:
         """The class `name` names, from the kind's registry."""
 
-    @staticmethod
-    def _earlier(member: type, arguments: JsonDict) -> JsonDict:
-        """An earlier run's record of `member`'s arguments as it takes them now; as they are by default.
-        `_migrated` applies it to the stated and the defaulted arguments alike, as one record."""
-        return arguments
-
     def __post_init__(self) -> None:
         member = self._member(self.name)
         object.__setattr__(self, "name", registry.import_path(member))
-        # An earlier run's record of arguments the class has since retired, read as it takes them now.
-        fields, defaults = _migrated(functools.partial(self._earlier, member), self.fields, self.defaults)
         if self._recorded:
-            fields = registry.argument_records(member, fields)
-        object.__setattr__(self, "fields", fields)
-        object.__setattr__(self, "defaults", _defaults(member, fields, defaults))
+            object.__setattr__(self, "fields", registry.argument_records(member, self.fields))
+        object.__setattr__(self, "defaults", _defaults(member, self.fields, self.defaults))
 
     @property
     def arguments(self) -> JsonDict:
@@ -253,10 +243,6 @@ class ObjectiveConfig(_Configured):
     @staticmethod
     def _member(name: str) -> type:
         return objectives[name]
-
-    @staticmethod
-    def _earlier(member: type, arguments: JsonDict) -> JsonDict:
-        return dict(member.earlier_arguments(arguments)) if issubclass(member, Objective) else arguments
 
     def build(self, **derived) -> Objective:
         """Build the objective from its arguments and those the caller
@@ -378,22 +364,6 @@ def _record_of(name: str, declared: Configured, annotation: Annotation) -> JSON:
     record = to_record(declared, annotation)
     json.dumps(record)
     return record
-
-
-def _migrated(earlier: Callable[[JsonDict], JsonDict], fields: JsonDict, defaults: JsonDict
-              ) -> tuple[JsonDict, JsonDict]:
-    """An earlier run's stated `fields` and recorded `defaults`, migrated by `earlier` as one record.
-
-    `earlier` sees the two folded over one another, fields over defaults, so one argument built from
-    several retired ones (`LMObjective`'s balance, from four) takes them all. The config states each
-    migrated argument that the stated fields alone reach, and records the rest as defaults. Stated
-    arguments keep their order.
-    """
-    folded = earlier({**defaults, **fields})
-    stated = earlier(fields)
-    order = [*fields, *(name for name in folded if name not in fields)]
-    return ({name: folded[name] for name in order if name in stated},
-            {name: value for name, value in folded.items() if name not in stated})
 
 
 def _defaults(member: type, stated: Mapping[str, object], recorded: Mapping[str, object]) -> JsonDict:

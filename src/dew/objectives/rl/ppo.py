@@ -134,11 +134,6 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
     _ema_is_reference = True
     _model_part = "policy"
 
-    @classmethod
-    def earlier_arguments(cls, arguments: Mapping[str, object]) -> Mapping[str, object]:
-        """The policy's (`GRPOObjective.earlier_arguments`): its options pass on to the actor."""
-        return GRPOObjective.earlier_arguments(arguments)
-
     def __init__(self, model, seq_len: int, *, critic: nn.Module,
                  value_coefficient: float = .5, value_clip: float = .2,
                  balance: ExpertBalance | None = None, **policy_options):
