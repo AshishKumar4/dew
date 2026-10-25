@@ -13,9 +13,11 @@ their operands bf16 instead (`bf16_dot_general`, which the dot family runs
 for it): an A100 computes the algorithm wrong where a dot has a vector side
 or sits below XLA's GEMM rewrite threshold.
 
-A CPU sums every float32 product of the dot family, dot_general, einsum and matmul, in float64 and
-rounds once (`accumulated`): XLA:CPU chooses its fp32 dot accumulation by shape, instruction set and
-release, and jax 0.12's summed twice numpy's error from float64 where 0.11's summed 0.6 of it.
+Dew's test processes run wide CPU arithmetic (`WIDE_CPU_ARITHMETIC`, which tests/lane_environment.py
+sets): a CPU then sums every float32 product of the dot family, dot_general, einsum and matmul, in
+float64 and rounds once (`accumulated`), since XLA:CPU chooses its fp32 dot accumulation by shape,
+instruction set and release, and jax 0.12's summed twice numpy's error from float64 where 0.11's
+summed 0.6 of it. A library process's products are the plain products on every platform.
 Convolutions, depthwise ones included, keep XLA's fp32 sum on a CPU: no convolution's check 1
 failed there, and XLA:CPU's float64 convolution cost a 3x3 one's training step 44 times (15.5 to
 675 ms on a 4x32x32x128 map), its best rewrite 2 to 4. Should a convolution's check 1 resolve above
@@ -26,6 +28,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import os
 from collections.abc import Callable
 
 import jax
@@ -79,8 +82,8 @@ def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     a bfloat16 bias added to bfloat16 products sums its gradient over every position in bfloat16,
     where torch's addmm sums its in float32: Qwen 2's projection biases, summed over 8192 tokens,
     came out up to 3.75 times further from float64 than torch's own bfloat16 gradients. Broadcast
-    at fp32, the gradient sums at fp32 and rounds once into the bias. A CPU sums it in float64, as
-    it sums a float32 product (`spread`).
+    at fp32, the gradient sums at fp32 and rounds once into the bias. A CPU running Dew's wide
+    arithmetic (`WIDE_CPU_ARITHMETIC`) sums it in float64, as it sums a float32 product (`spread`).
     """
     dtype, wide = jnp.result_type(product, bias), at_least_fp32(bias.dtype)
     # The bias takes the product's rank before the sum, as flax's layers reshape it, so no rank is
@@ -92,10 +95,11 @@ def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
 
 def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
     """`value` broadcast to `shape`, whose transpose, the sum of a cotangent over every position the
-    value spread over (a bias's gradient), a CPU takes in float64 and rounds once, as it sums a
-    float32 product (`accumulated`): there the broadcast is the outer product of ones and the
-    value, whose transpose is a product. Elsewhere, or where `accumulated` leaves a product its
-    own sum, it is the broadcast, whose transpose JAX sums in the value's dtype."""
+    value spread over (a bias's gradient), a CPU running wide arithmetic (`WIDE_CPU_ARITHMETIC`, Dew's
+    tests) takes in float64 and rounds once, as it sums a float32 product (`accumulated`): there the
+    broadcast is the outer product of ones and the value, whose transpose is a product. Elsewhere,
+    or where `accumulated` leaves a product its own sum, it is the broadcast, whose transpose JAX
+    sums in the value's dtype."""
     axes = tuple(axis for axis, (size, total) in enumerate(zip(value.shape, shape, strict=True))
                  if size == 1 and total != 1)
     if not axes or not _sums_in_float64(value):
@@ -199,10 +203,29 @@ precision, the statement that its fp32 products sum as an accelerator sums them,
 honors on a CPU."""
 
 
+WIDE_CPU_ARITHMETIC = "DEW_WIDE_CPU_ARITHMETIC"
+"""The environment variable that, set to 1, has a process's CPU programs take the arithmetic Dew's
+tests hold a CPU to: float32 products summed in float64 and rounded once (`accumulated`, `spread`), a
+loop's running sum of them compensated so it rounds once too (`compensates_loops`), a row's logsumexp
+reduced in levels of short blocks (`dew.objectives.lm.chunked`) and a float64 division divided as
+written (`dew.diffusion.schedules.common.divided`). Read as each program is traced; set by the tests'
+environment (tests/lane_environment.py), never by the library, which without it takes none of these
+forms on any platform. Each such site chooses the wide form by the platform the
+program is lowered for (`platform_dependent`, or for a loop's carry the platform its code is chosen
+for), so a test that lowers for an accelerator keeps the target's."""
+
+
+def wide_cpu_arithmetic() -> bool:
+    """Whether this process runs wide CPU arithmetic (`WIDE_CPU_ARITHMETIC`)."""
+    return os.environ.get(WIDE_CPU_ARITHMETIC) == "1"
+
+
 def _sums_in_float64(*operands) -> bool:
-    """Whether a CPU sums these operands' products in float64 (`accumulated`): float32 arrays, in no
-    scope that states fp32 sums (`FP32_SUMS`), outside a quantized model's trace (`_intercepted`)."""
-    return (jax.config.jax_default_matmul_precision != FP32_SUMS and not _intercepted()
+    """Whether a CPU sums these operands' products in float64 (`accumulated`): in a process running wide
+    CPU arithmetic (`WIDE_CPU_ARITHMETIC`), float32 arrays, in no scope that states fp32 sums
+    (`FP32_SUMS`), outside a quantized model's trace (`_intercepted`)."""
+    return (wide_cpu_arithmetic() and jax.config.jax_default_matmul_precision != FP32_SUMS
+            and not _intercepted()
             and all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
             and products_dtype(*operands) == jnp.dtype(jnp.float32))
 
@@ -210,8 +233,9 @@ def _sums_in_float64(*operands) -> bool:
 def float64_sum(product: Callable[..., jax.Array], *operands, dtype: DTypeLike) -> jax.Array:
     """`product(*operands)`, a sum of products, taken in float64 from its operands widened exactly and
     rounded once to `dtype`, under `jax.enable_x64` for its own trace: the sum `accumulated` takes on a
-    CPU, with no platform of its own to choose. Its products run at HIGHEST precision, whatever fp32
-    algorithm the caller bound, which would narrow float64 operands back to float32."""
+    CPU under Dew's wide arithmetic (`WIDE_CPU_ARITHMETIC`), with no platform of its own to choose.
+    Its products run at HIGHEST precision, whatever fp32 algorithm the caller bound, which would
+    narrow float64 operands back to float32."""
     with jax.enable_x64(new_val=True):
         wide = product(*_widened(operands), precision=jax.lax.Precision.HIGHEST, preferred_element_type=None)
         return wide.astype(dtype)
@@ -227,8 +251,9 @@ def _widened(operands) -> list[jax.Array]:
 def accumulated(product: Callable[..., jax.Array], *operands,
                 preferred_element_type: DTypeLike | None = None) -> jax.Array:
     """`product(*operands, preferred_element_type=...)`, a sum of products of `operands` (a dot, an
-    einsum, a matmul), under Dew's CPU policy: where they multiply in float32 (`products_dtype`), a
-    CPU sums the products in float64 and rounds the sum once to the dtype the product returns.
+    einsum, a matmul): the plain product, but in a process running wide CPU arithmetic
+    (`WIDE_CPU_ARITHMETIC`, Dew's tests), where they multiply in float32 (`products_dtype`) a CPU
+    sums the products in float64 and rounds the sum once to the dtype the product returns.
     Each fp32 product is exact in float64, so the result is within half an fp32 ulp of the float64
     sum at every shape, where XLA's CPU dot chooses its fp32 accumulation by shape, instruction set
     and release (jax 0.12's sums twice numpy's error from float64 at widths where jax 0.11's summed
@@ -244,7 +269,9 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     (a `jax.custom_vjp`, Qwix's when it quantizes a model directly) is left to it whole, its forward
     and its backward, read from the trace that gives the product's dtype (`_own_backward`).
 
-    It is real CPU execution's policy alone, chosen by the platform the program is lowered for
+    The wide sum is Dew's test setting, not a user option: a process without `WIDE_CPU_ARITHMETIC`
+    traces the plain product alone. Under it, it is real CPU execution's policy alone, chosen by the
+    platform the program is lowered for
     (`platform_dependent`), which keys every compiled program: a step a CPU lowers for a GPU target
     (`dew.training.trainer.Trainer.lower_for`, `lowering_platforms=('cuda',)`) takes the target's
     fp32 sum, and a Pallas kernel's body, interpreted on a CPU to stand in for a GPU, never forms its
@@ -652,13 +679,15 @@ def _compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
 def compensates_loops() -> bool:
     """Whether a running sum of float32 products carried across a loop keeps what each addition
     drops (`compensated_add`), so the loop's sum rounds once as one product's does: where a CPU sums
-    each product in float64 (`accumulated`). A carry's shape is fixed when its loop traces, so this
+    each product in float64 (`accumulated`), in a process running Dew's wide CPU arithmetic
+    (`WIDE_CPU_ARITHMETIC`). A carry's shape is fixed when its loop traces, so this
     reads the platform a call's code is chosen for (`dew.nn.kernels.generation.backend`), as a CPU's
     attention routing does; an accelerator's running sum is the plain one, as its products' sums are
     float32's."""
     from dew.nn.kernels.generation import backend
 
-    return backend() == "cpu" and jax.config.jax_default_matmul_precision != FP32_SUMS and not _intercepted()
+    return (wide_cpu_arithmetic() and backend() == "cpu"
+            and jax.config.jax_default_matmul_precision != FP32_SUMS and not _intercepted())
 
 
 def running_sum(shape: tuple[int, ...], dtype: DTypeLike) -> jax.Array:

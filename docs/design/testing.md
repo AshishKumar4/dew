@@ -101,7 +101,7 @@ The accurate form, measured the same way, ties at keys an ulp apart alone: dV in
 
 A failure is a defect in Dew, the reference arm or the gate's derivation. Find which one. Never widen a tolerance, change the reference to one Dew already matches, drop failing positions or gradients, or compare only argmax when logits disagree.
 
-A CPU's float32 products follow Dew's accumulation policy, which `dew.nn.precision` states with its boundary: the dot family sums in float64, convolutions keep XLA's fp32 sum. A program that wants a CPU's fp32 sums, a CPU-hosted sampler or server trading accuracy for speed, runs under `jax.default_matmul_precision("F32_F32_F32")` (`FP32_SUMS`), which takes the fp32 product.
+The suite holds a CPU to wide arithmetic, a test setting and not a user option: `tests/lane_environment.py` sets `DEW_WIDE_CPU_ARITHMETIC=1` (`dew.nn.precision.WIDE_CPU_ARITHMETIC`), under which a CPU's float32 products follow the accumulation policy `dew.nn.precision` states with its boundary (the dot family sums in float64, convolutions keep XLA's fp32 sum), a loop's running sum of those products is compensated so it rounds once, a row's logsumexp reduces in levels of short blocks and a float64 division divides as written. A library process sets nothing and traces the plain products on every platform. Within the suite, a program that wants a CPU's fp32 sums, a reference standing for an accelerator's arithmetic, runs under `jax.default_matmul_precision("F32_F32_F32")` (`FP32_SUMS`), which takes the fp32 product.
 
 The committed generator uses the reference's public interface. Kernel qualification records forward, backward and forward-mode behavior where the consuming objective needs it.
 

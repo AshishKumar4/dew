@@ -3,7 +3,7 @@
 import base64
 import io
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import jax
@@ -13,6 +13,7 @@ from decision_support import decision_rows
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference
 from steady_state import steady_state
 
+from dew.artifacts import Decisions
 from dew.decision import (
     Abstention,
     Binning,
@@ -27,6 +28,7 @@ from dew.decision import (
     Temperatures,
 )
 from dew.decision.calibration import softmax
+from dew.decision.metrics import Answered
 from dew.decision.task import decoded_images
 
 FIXTURES = Path(__file__).parent / "fixtures" / "laya"
@@ -520,3 +522,81 @@ def test_a_released_checkpoint_refuses_what_its_layout_cannot_hold(decide, tmp_p
     gated = decide.gated(0.5)
     with pytest.raises(ValueError):
         gated.save_pretrained(tmp_path)
+
+
+MESH_SEEDS = 8
+"""Check 1's declared seeds for a task's logits on a mesh against one device's."""
+
+
+@dataclass(frozen=True)
+class Recorded:
+    """A metric that records each answered question's probabilities over its real options as a pass
+    evaluates them (`Answered`), in the pass's order, and scores nothing."""
+
+    found: list
+    name = "recorded"
+    reads = Decisions
+
+    def __call__(self, artifact, batch, /) -> float:
+        answered = Answered.of(artifact)
+        self.found.extend(row[real] for row, real in zip(answered.probabilities, answered.options,
+                                                         strict=True))
+        return 0.0
+
+    def merge(self, accumulated: float, contribution: float, /) -> float:
+        return accumulated
+
+    def finalize(self, accumulated: float, /) -> float:
+        return accumulated
+
+
+@pytest.mark.mesh
+def test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh(decide):
+    """A task whose weights are placed on a mesh of every device scores its examples there, its rows
+    split over the mesh's row axes, as a run's validation splits them, rather than handing one device's
+    inputs to weights on several: a pass of three rows, the task's budget, is rounded up to a multiple
+    of the devices the mesh splits rows over. Each answered question's probabilities as its score
+    evaluates them (`Evaluation.run`), and its logits as its calibration reads them (`_scored`), are on
+    par from float64 with the task's on one device (check 1), and its metrics are the ones it scores
+    there."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.training import MeshSpec
+
+    examples = answered()
+    mesh = MeshSpec().build(jax.devices())
+    task = replace(decide, budget=Budget(rows=3))
+    wide = replace(Decide.from_pretrained(TINY, dtype="float64", param_dtype="float64", attention_impl="xla"),
+                   budget=task.budget)
+
+    def evaluated(on: Decide) -> np.ndarray:
+        found: list = []
+        on.score(examples, [Recorded(found)])
+        return np.concatenate(found)
+
+    def held_logits(on: Decide) -> np.ndarray:
+        return np.concatenate([scored.logits for scored in on._scored(on._held(examples, on._mesh))])
+
+    def spread(variables) -> Decide:
+        return replace(task, variables=jax.device_put(variables, NamedSharding(mesh, PartitionSpec())))
+
+    def draw(seed):
+        key = jax.random.key(seed)
+        return (jax.tree.map(lambda leaf: leaf * (1 + 0.05 * jax.random.normal(key, np.shape(leaf))),
+                             decide.variables),)
+
+    def alone(variables) -> np.ndarray:
+        return held_logits(replace(task, variables=variables))
+
+    def truth(variables) -> np.ndarray:
+        return held_logits(replace(wide, variables=variables))
+
+    assert_as_exact(lambda variables: held_logits(spread(variables)), alone, draw, "scored on a mesh",
+                    seeds=MESH_SEEDS, truth_fn=truth)
+    assert_as_exact(lambda variables: evaluated(spread(variables)),
+                    lambda variables: evaluated(replace(task, variables=variables)), draw,
+                    "evaluated on a mesh", seeds=MESH_SEEDS,
+                    truth_fn=lambda variables: evaluated(replace(wide, variables=variables)))
+    alone, scores = task.score(examples), spread(decide.variables).score(examples)
+    assert set(scores) == set(alone) and all(np.isfinite(value) for value in scores.values())
+    assert scores["accuracy"] == alone["accuracy"]

@@ -32,7 +32,6 @@ from dew.nn.sharding import rows_spec
 from dew.objectives.base import (
     EXAMPLE_ROWS,
     EXAMPLE_STREAM,
-    FROZEN,
     Aux,
     Batch,
     Evaluated,
@@ -46,7 +45,7 @@ from dew.objectives.base import (
 )
 from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
-from dew.training.state import Accumulation, TrainState
+from dew.training.state import Accumulation, TrainState, apart, together
 
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)
@@ -173,7 +172,10 @@ def ema_update(ema: optax.Params, params: optax.Params, decay: jax.typing.ArrayL
 def ema_update(ema, params, decay):
     """Update the EMA leaves toward `params`, keeping each leaf's storage dtype.
 
-    Each leaf of `ema` becomes `decay * average + (1 - decay) * live`, where
+    Each leaf of `ema` becomes `decay * average + (1 - decay) * live`, and a
+    leaf the step left as it was keeps its average bit for bit wherever that
+    sum is finite, however a program fuses it (a select, not a difference
+    that finite leaves of opposite signs overflow; a NaN decay stays NaN);
     the live value is the leaf of `params` at the same path; leaves that
     `ema` does not hold are not averaged. The arithmetic runs in fp32 or
     wider, so fp64 leaves keep fp64 precision. A decay of 1 or more returns
@@ -185,7 +187,9 @@ def ema_update(ema, params, decay):
         if average.dtype != dtype or live.dtype != dtype:
             average, live = jax.lax.optimization_barrier((average, live))
         weight = jnp.asarray(decay, dtype)
-        updated = weight * average.astype(dtype) + (1 - weight) * live.astype(dtype)
+        wide, moved = average.astype(dtype), live.astype(dtype)
+        weighted = weight * wide + (1 - weight) * moved
+        updated = jnp.where((moved == wide) & jnp.isfinite(weighted), wide, weighted)
         stored = updated.astype(average.dtype)
         return jnp.where(jnp.asarray(decay) >= 1.0, average, stored)
     return jax.tree.map(step, ema, _project(params, ema))
@@ -750,12 +754,8 @@ class Transaction:
                 aux, pending, gradient = jax.tree.map(
                     jax.lax.optimization_barrier, (realized.aux, pending, gradient))
                 return finish(state, batch, aux, pending, gradient, attempt, tokens)
-            if FROZEN not in state.variables:
-                return finish(state, batch, realized.aux, pending, gradient, attempt, tokens)
-            held = state.variables[FROZEN]
-            moving = {name: tree for name, tree in state.variables.items() if name != FROZEN}
-            advanced, loss, aux, committed = finish(dataclasses.replace(state, variables=moving), batch,
-                                                    realized.aux, pending, gradient, attempt, tokens)
-            return (dataclasses.replace(advanced, variables={**advanced.variables, FROZEN: held}),
-                    loss, aux, committed)
+            moving, held = apart(state)
+            advanced, loss, aux, committed = finish(moving, batch, realized.aux, pending, gradient, attempt,
+                                                    tokens)
+            return together(advanced, held), loss, aux, committed
         return run
