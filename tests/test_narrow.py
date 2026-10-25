@@ -287,24 +287,24 @@ def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
 
 
 def test_a_step_that_fits_only_without_its_copies_drops_them_before_it_recomputes(monkeypatch):
-    """The narrow copies are the fit ladder's first rung. In the geometry of row 1661's run, every block
-    recomputed and a window of two steps, the backward recasts a block's weights as it recomputes it and
-    adds each gradient into the window's sum as it is made, so the copies, two bytes a parameter held all
-    run, are bytes the step gives back: one that does not fit with them drops them before it recomputes
-    more or splits, and its plan says so (`narrow`), on the devices' free bytes between its footprints
-    with and without them."""
-    limit = 2 ** 40
-    monkeypatch.setattr(jax.Device, "memory_stats", lambda device: {"bytes_limit": limit, "bytes_in_use": 0})
+    """The narrow copies are the fit ladder's first rung. In the geometry of row 1661's run, a window of
+    two steps under full recomputation, the backward adds each gradient into the window's sum as it is
+    made, so the copies, two bytes a parameter held all run, are bytes the step gives back: one that
+    does not fit with them drops them before it recomputes more or splits, and its plan says so
+    (`narrow`), on devices whose free bytes lie between its footprints with and without them."""
+    free = 2 ** 39
+    monkeypatch.setattr(jax.Device, "memory_stats",
+                        lambda device: {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - free})
 
     def trained(*, copies):
         return _trained(optax.adam(1e-3), copies=copies, steps=1, accumulation=2, split=1, remat="full")
 
     def used(*, copies):
-        return limit - trained(copies=copies)[2].plan["probes"][0]["headroom"]
+        return free - trained(copies=copies)[2].plan["probes"][0]["headroom"]
 
     with_copies, without = used(copies=True), used(copies=False)
     assert without < with_copies
-    limit = (with_copies + without) // 2
+    free = (with_copies + without) // 2
     state, _, trainer = trained(copies=True)
     probes = trainer.plan["probes"]
     assert [(probe["narrow"], probe["fits"]) for probe in probes] == [(True, False), (False, True)]
@@ -313,27 +313,29 @@ def test_a_step_that_fits_only_without_its_copies_drops_them_before_it_recompute
 
 
 def test_a_plan_a_rung_above_its_dropped_copies_takes_them_back_where_they_fit(monkeypatch):
-    """Where a step fits its own rung neither with its copies nor without, as a window of one step that
-    recomputes nothing may not, the copies the first rung dropped are asked back at the rung and split
-    the plan reaches above it, and kept as that compile, the search's last, fits."""
-    limit = 2 ** 40
-    monkeypatch.setattr(jax.Device, "memory_stats", lambda device: {"bytes_limit": limit, "bytes_in_use": 0})
+    """A window of one step that recomputes nothing holds about as much without its copies as with them:
+    its backward keeps the whole gradient, in float32 where the copies' is bfloat16. Where it fits its
+    own rung neither way, the plan climbs past the rung that dropped them, and at the rung and split it
+    reaches it compiles the step with them once more and keeps them, as they fit there too."""
+    free = 2 ** 39
+    monkeypatch.setattr(jax.Device, "memory_stats",
+                        lambda device: {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - free})
 
     def trained(*, copies):
-        return _trained(optax.adam(1e-3), copies=copies, steps=1, split=1)
+        return _trained(optax.adam(1e-3), copies=copies, steps=1, split=1, rows=64)
 
     base = trained(copies=True)[2].plan["probes"][0]
-    limit -= max(base["headroom"], trained(copies=False)[2].plan["probes"][0]["headroom"]) + 1
+    free -= max(base["headroom"], trained(copies=False)[2].plan["probes"][0]["headroom"]) + 1
     state, _, trainer = trained(copies=True)
     probes, plan = trainer.plan["probes"], trainer.plan
     assert [(probe["narrow"], probe["fits"]) for probe in probes[:2]] == [(True, False), (False, False)]
     rung = ("split", "remat", "head_tile", "head_fused", "xla_defaults")
-    fitted, last = probes[-2], probes[-1]
     planned = {key: plan[key] for key in rung}
+    fitted, last = probes[-2], probes[-1]
     assert planned != {key: base[key] for key in rung}
     assert [{key: probe[key] for key in rung} for probe in (fitted, last)] == [planned, planned]
-    assert (fitted["narrow"], fitted["fits"], last["narrow"]) == (False, True, True)
-    assert plan["narrow"] == last["fits"] and (state.compute is not None) == last["fits"]
+    assert [(probe["narrow"], probe["fits"]) for probe in (fitted, last)] == [(False, True), (True, True)]
+    assert plan["narrow"] and state.compute is not None
 
 
 def test_a_restored_state_drops_its_templates_copies():
