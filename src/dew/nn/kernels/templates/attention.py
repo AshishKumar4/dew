@@ -812,11 +812,6 @@ def differentiable(score_mod: Callable, q_pos, k_pos, params, floating: list[int
     return hooked
 
 
-TRACED_TILE = 16
-"""A launch's `output_width` where it states none (`attention_triton.TritonForward`,
-`attention_mosaic.MosaicForward`)."""
-
-
 class Split(NamedTuple):
     """A training forward's split sums (`attention_algebra.split_accumulate`), residuals the backward
     reads in place of its first pass: the weighted values of every key but each query's anchor key,
@@ -862,7 +857,7 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     `launch` (the Triton one, `attention_triton.backward`; the plain-JAX one,
     `attention_portable.backward`): the call padded to whole `block`s (`padded_call`), `launch(query, key,
     value, dout, peak0, total0, initial_term, maximum, key_index, anchor_value, others, own, others_total,
-    total, start, end, query_ids, key_ids, score_params, *, score_mod, score_kinds, score_dtypes, scale)`
+    total, start, end, query_ids, key_ids, score_params, *, score_mod, score_kinds, scale)`
     giving dQ, the softmax's rows (`D - c`, `c`, `m`, `T`, the keys' mass), each query's anchor key as it
     chose it, the dQ program's hook gradients (`DQ_GRADS`), then dK, dV and the dK/dV program's
     (`DKV_GRADS`); each gradient fp32, then rounded to its input's dtype. D is taken two ways, about 0 and
@@ -902,7 +897,6 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     operands = (call.query, call.key, call.value, padded_dout)
     rows = (call.start, call.end, call.query_ids, call.key_ids, call.score_params)
     kinds = tuple(param.kind for param in hooks.score_params)
-    dtypes = tuple(kept_dtype(param.value.dtype) for param in hooks.score_params)
     maxima, totals, anchors, split = residuals
     key_index = call.rows(anchors.astype(jnp.int32))
     widened = ((0, 0),) * 3 + ((0, call.value.shape[-1] - value_width),)
@@ -915,7 +909,7 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     maximum = call.rows(maxima.astype(jnp.float32))
     outputs = launch(*operands, *(call.rows(start) for start in starts), maximum, key_index, anchor_value,
                      shift, others, own, others_total, call.rows(totals.astype(jnp.float32)), *rows,
-                     score_mod=hooks.score_mod, score_kinds=kinds, score_dtypes=dtypes, scale=scale)
+                     score_mod=hooks.score_mod, score_kinds=kinds, scale=scale)
     dq, softmax = outputs[0], outputs[1:6]
     grads_out = list(outputs[7:])
     dq_grads = [grads_out.pop(0) for kind in kinds if kind in DQ_GRADS]
