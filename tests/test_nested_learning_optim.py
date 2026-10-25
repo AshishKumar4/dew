@@ -35,7 +35,8 @@ def newton_schulz_reference(matrix: np.ndarray, steps: int = 5) -> np.ndarray:
 def test_newton_schulz_orthogonalizes_a_matrix_and_a_stack_as_muons_iteration_does():
     """`newton_schulz` on a tall and a wide matrix, and on a stack of four 6 x 4 matrices whose stack axis
     sits between their reduction and output axes (Muon's dimension numbers), each matrix on par with
-    Muon's quintic iteration in NumPy from float64 (check 1), the stack's matrices each as alone."""
+    Muon's quintic iteration in NumPy from float64 (check 1), the stack's matrices each as alone, batched
+    or one at a time as the backend's products round them."""
     numbers = optax.contrib.MuonDimensionNumbers(reduction_axis=0, output_axis=2)
 
     @jax.jit
