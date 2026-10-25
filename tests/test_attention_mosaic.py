@@ -526,7 +526,7 @@ def test_a_guarded_launchs_own_key_tile_reads_its_spans_in_its_own_units():
 
     def ours(query, key, value, dout):
         del dout
-        with _device(True), _pinned(attention_mosaic.Tiles(64, 128, 2, 2)):
+        with _device(interpret=True), _pinned(attention_mosaic.Tiles(64, 128, 2, 2)):
             return attention_mosaic.forward(query, key, value, spans, interpret=True)
 
     def reference(query, key, value, dout):
