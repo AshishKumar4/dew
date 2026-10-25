@@ -63,8 +63,8 @@ class Wgmma(mosaic.RingFamily):
         return acc
 
     def register_products(self, acc, parts, rhs, interpret: bool):
-        mosaic.unscaled(parts)
-        for part, _ in parts:
+        for formed in parts:
+            part = mosaic.unscaled_part(formed)
             if interpret:
                 acc = acc + jnp.dot(part, rhs[...], preferred_element_type=jnp.float32)
             else:

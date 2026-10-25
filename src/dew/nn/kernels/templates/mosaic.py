@@ -529,7 +529,8 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     @abc.abstractmethod
     def register_products(self, acc: Accumulator, parts, rhs, interpret: bool) -> Accumulator:
         """`acc` with `parts`' products with `rhs` issued into it in place, each part's left operand in
-        registers."""
+        registers, `parts` an iterable that may form each as it is taken
+        (`attention_algebra.formed_parts`)."""
 
     @abc.abstractmethod
     def staged_products(self, acc: Accumulator, parts, rhs, buffers, interpret: bool, *,
@@ -783,3 +784,9 @@ def unscaled(parts) -> None:
     """A product's parts issued in place take no power of two back (bf16's, `cotangent_parts`)."""
     if any(exponent is not None for _, exponent in parts):
         raise NotImplementedError("a scaled part's product is no in-place accumulation (fp16's)")
+
+
+def unscaled_part(part: tuple) -> jax.Array:
+    """`unscaled` of one part taken as it is formed: its operand."""
+    unscaled((part,))
+    return part[0]

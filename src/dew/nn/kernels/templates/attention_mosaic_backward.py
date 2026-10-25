@@ -157,9 +157,12 @@ def _dq_step(walk: _Backward, operands: tuple, stats: tuple, coords_of, params_o
 
     # One walk, its tiles' masks chosen a tile at a time: a walk of two loops into one warpgroup accumulator,
     # the first empty, faults on an H100 under jax 0.11.2's Mosaic GPU lowering.
-    rows, parts, keyed = lax.cond(whole(index), functools.partial(issued, masked=False),
-                                  functools.partial(issued, masked=True))
+    rows, scaled, keyed = lax.cond(whole(index), functools.partial(issued, masked=False),
+                                   functools.partial(issued, masked=True))
     dq_acc, *keyed_accs = accumulators
+    # dQ's parts formed past the choice, as each product is issued (`algebra.formed_parts`): the choice's
+    # branches yield the scaled cotangents alone, not every part.
+    parts = algebra.formed_parts(scaled, k_slot.dtype, accurate=walk.accurate)
     dq_acc = family.register_products(dq_acc, parts, k_slot, walk.interpret)
     if keyed is None:
         return rows, (dq_acc,)
@@ -218,9 +221,8 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, s
             nothing = family.zeros((block_q,))
             operands = family.held(q_smem.at[index]), family.held(do_smem.at[index])
             shape = (block_q, block_k)
-            q_pos, columns = first + family.iota(shape, 0), family.iota(shape, 1)
-            coords_of = functools.partial(_coords, family, spans_of, row, first, shape=shape, q_pos=q_pos,
-                                          columns=columns)
+            # The tile's places formed a step, not held across the walk beside its sums (`_coords`).
+            coords_of = functools.partial(_coords, family, spans_of, row, first, shape=shape)
             params_of = functools.partial(_score_params, family, score_refs, kinds, row, head, first)
             step = functools.partial(_dq_step, walk, operands, stats, coords_of, params_of, whole)
             start = (nothing, nothing, (nothing,) * len(kinds), (nothing,) * len(kinds), nothing,

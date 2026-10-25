@@ -25,7 +25,7 @@ nothing (spans, a score hook) guards its maxima and denominators against an empt
 import dataclasses
 import functools
 import math
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import NamedTuple
 
 import jax
@@ -1347,13 +1347,13 @@ def _dq_rows(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, se
 
 
 def dq_terms(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array | None, *,
-             scale: float, kinds: tuple, summed: tuple, dtype, accurate: bool) -> tuple[DqSums, Parts]:
-    """`dq_step`'s row sums after a tile and dQ's parts (`cotangent_parts`) a mainloop adds to dQ, into its
-    accumulator in place where it can, for keys of `dtype`: the whole of the fast form's step, and the
-    accurate form's with `keyed_terms` where it takes no score hook."""
+             scale: float, kinds: tuple, summed: tuple) -> tuple[DqSums, jax.Array]:
+    """`dq_step`'s row sums after a tile and dQ's score cotangents pulled and scaled, whose parts
+    (`cotangent_parts`, `formed_parts`) a mainloop adds to dQ, into its accumulator in place where it can: the
+    whole of the fast form's step, and the accurate form's with `keyed_terms` where it takes no score
+    hook."""
     terms, _ = _dq_rows(sums, weights, cotangents, slopes, seen, kinds=kinds, summed=summed)
-    pulled_cotangents = pulled(cotangents, slopes, seen, kinds)[0]
-    return terms, cotangent_parts(pulled_cotangents * scale, dtype, accurate=accurate)
+    return terms, pulled(cotangents, slopes, seen, kinds)[0] * scale
 
 
 def keyed_terms(sums: DqSums, weights: jax.Array, prior: jax.Array, *, scale: float, dtype
@@ -1373,23 +1373,24 @@ def keyed_terms(sums: DqSums, weights: jax.Array, prior: jax.Array, *, scale: fl
 
 def dq_issued(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array | None, dtype,
               prior: jax.Array, *, scale: float, kinds: tuple, summed: tuple, accurate: bool
-              ) -> tuple[DqSums, Parts, tuple[jax.Array | None, Parts] | None]:
+              ) -> tuple[DqSums, jax.Array, tuple[jax.Array | None, Parts] | None]:
     """A dQ pass's row sums after a key tile and the products a mainloop issues for it, for keys of `dtype`:
     the sums with their row fields updated (the cotangents' and the weights' sums, the summed parameters'
     pullbacks and, in the accurate form, the keyed mass and exponent); dQ's parts (`cotangent_parts`), whose
     products with the keys join dQ; and in the accurate form the keyed parts (`weights_parts`), whose products
     join the keyed sums behind the row factor `(factor, parts)` the sums take first (None: none); None in the
     fast form. `dq_step` takes these products as the Triton and plain-JAX mainloops do; a mainloop that issues
-    them in place takes the same parts."""
+    them in place takes the same parts. dQ's come as its scaled cotangents, whose parts a mainloop forms
+    (`cotangent_parts`) or forms a part at a time (`formed_parts`)."""
     if not accurate or slopes is None:
         terms, parts = dq_terms(sums, weights, cotangents, slopes, seen, scale=scale, kinds=kinds,
-                                summed=summed, dtype=dtype, accurate=accurate)
+                                summed=summed)
         if not accurate:
             return terms, parts, None
         terms, keyed = keyed_terms(terms, weights, prior, scale=scale, dtype=dtype)
         return terms, parts, (None, keyed)
     terms, pulled_weights = _dq_rows(sums, weights, cotangents, slopes, seen, kinds=kinds, summed=summed)
-    parts = cotangent_parts(pulled(cotangents, slopes, seen, kinds)[0] * scale, dtype, accurate=accurate)
+    parts = pulled(cotangents, slopes, seen, kinds)[0] * scale
     # The tile's coefficients against the keys, `pulled weight · scale / prior`, joined into the running
     # mean as a softmax's sums are joined under a running maximum. Each is held at its row's power of two,
     # never formed whole where it would overflow (a hook's slope near fp32's largest): the row's largest
@@ -1426,7 +1427,7 @@ def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, see
     error at its first D), where dQ's per query is FlashAttention's."""
     terms, parts, keyed = dq_issued(sums, weights, cotangents, slopes, seen, key.dtype, prior, scale=scale,
                                     kinds=kinds, summed=summed, accurate=accurate)
-    terms = terms._replace(dq=sums.dq + summed_products(parts, key, dot))
+    terms = terms._replace(dq=sums.dq + cotangent_product(parts, key, dot, accurate=accurate))
     if keyed is None:
         return terms
     factor, keyed_parts = keyed
@@ -1572,20 +1573,33 @@ def cotangent_parts(cotangents: jax.Array, dtype, *, accurate: bool) -> Parts:
     holds fp32's range, so no part leaves it (measured on the H100: 28% over one product, where a scaled
     bf16-and-fp16 pair cost 3x). An fp16 one takes two fp16 products at power-of-two scales that keep each
     part in its range: the cotangents' largest at 2^14, and what their rounding lost likewise, 21 bits."""
+    return tuple(formed_parts(cotangents, dtype, accurate=accurate))
+
+
+def formed_parts(cotangents: jax.Array, dtype, *, accurate: bool
+                 ) -> Iterator[tuple[jax.Array, jax.Array | None]]:
+    """`cotangent_parts` a part at a time, each formed only as it is taken: a mainloop that retires each
+    part's product before taking the next (`Family.register_products`' `retired`) holds one part's registers
+    beside the cotangents, not every part's."""
     if dtype == jnp.float32:
-        return ((cotangents, None),)
+        yield cotangents, None
+        return
     if dtype == jnp.bfloat16 and not accurate:
-        return ((_bf16(cotangents), None),)
+        yield _bf16(cotangents), None
+        return
     if dtype == jnp.bfloat16:
         high = _bf16(cotangents)
+        yield high, None
         rest = cotangents - high.astype(jnp.float32)
         middle = rest.astype(jnp.bfloat16)
-        low = (rest - middle.astype(jnp.float32)).astype(jnp.bfloat16)
-        return (high, None), (middle, None), (low, None)
+        yield middle, None
+        yield (rest - middle.astype(jnp.float32)).astype(jnp.bfloat16), None
+        return
     scaled, high_exponent = _scaled(cotangents)
     high = scaled.astype(dtype)
+    yield high, high_exponent
     low, low_exponent = _fp16_scaled(scaled - high.astype(jnp.float32))
-    return (high, high_exponent), (low, low_exponent + high_exponent)
+    yield low, low_exponent + high_exponent
 
 
 def cotangent_product(cotangents: jax.Array, operand: jax.Array,
