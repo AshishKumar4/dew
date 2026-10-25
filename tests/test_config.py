@@ -595,3 +595,11 @@ def test_a_run_whose_balance_arguments_are_split_across_stated_and_default_ones_
                                               router_z_loss=0.1)
     saved = json.loads(json.dumps({"fields": config.fields, "defaults": config.defaults}))
     assert ObjectiveConfig("lm", **saved) == config
+
+
+def test_a_run_recorded_balancing_at_rate_zero_reads_as_one_that_moves_no_bias():
+    """A recorded LM run whose `balance_rate` was 0, which moved no bias, reads as one with no bias rate,
+    its other balance terms kept, where `ExpertBalance` refuses a rate that moves nothing."""
+    config = ObjectiveConfig("lm", {"balance_rate": 0.0, "aux_loss_alpha": 0.2})
+    assert config.fields["balance"] == {"balance_rate": None, "aux_loss_alpha": 0.2, "seq_aux": True,
+                                        "router_z_loss": 0.0}
