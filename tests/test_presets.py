@@ -235,7 +235,7 @@ def sft_tokens(marker, targets, *, empty_rows=0):
     return Memory(rows).named(f"sft-{marker}").pack(9, fields=("text", "text_roles")).shuffle(marker).repeat()
 
 
-MIXTURE_SEEDS = 64
+MIXTURE_SEEDS = 256
 """The token mixture's shares' declared draws (`seeds_for`, the drawn rows against themselves)."""
 
 

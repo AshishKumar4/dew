@@ -97,7 +97,7 @@ HOLDOUT_SHARES = (0.85, 0.05, 0.1)
 HOLDOUT_RECORDS = 200
 """The records of each drawn corpus the holdout's shares are read over."""
 
-HOLDOUT_SEEDS = 64
+HOLDOUT_SEEDS = 256
 """The holdout-shares site's declared draws (`seeds_for`, the drawn split against itself)."""
 
 
