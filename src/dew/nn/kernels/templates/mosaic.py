@@ -188,8 +188,18 @@ def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int,
 
 def copied(source, destination) -> None:
     """`source` (in shared memory) to `destination` (in global memory) through registers: a GPU without
-    TMA's `store_rows` copy."""
-    destination[...] = source[...]
+    TMA's `store_rows` copy, in a coalesced layout (each thread a contiguous vector of up to 16 bytes, the
+    widest that divides the copy over a warpgroup) whatever layout `source` was written in, so its global
+    stores cover whole 32-byte sectors, which JAX 0.12's transfers require (an MMA-layout tile's 16-bit
+    stores do not: SilentEel's store probe)."""
+    size, vector = math.prod(source.shape), 16 // jnp.dtype(source.dtype).itemsize
+    while vector > 1 and size % (THREADS * vector):
+        vector //= 2
+    if size % (THREADS * vector):
+        destination[...] = source[...]
+        return
+    destination[...] = plgpu.load(source, layout=plgpu.Layout.WG_STRIDED(source.shape, vec_size=vector),
+                                  optimized=False)
 
 
 @dataclasses.dataclass(frozen=True)
