@@ -533,6 +533,29 @@ def mode_packed_fit(args) -> dict:
     }
 
 
+def mode_averaged(args) -> dict:
+    """Two runs of the small decoder from one start, one step and two, averaged in the pool
+    (`dew.checkpoints.averaged`), its runs read onto the pool's mesh: each process takes the mean of
+    the shards it holds, which every process then gathers whole."""
+    import jax
+
+    from dew.checkpoints import averaged
+
+    runs = []
+    for name, steps in (("one", 1), ("two", 2)):
+        trainer = token_trainer(name, args.run_dir, args.fsdp_size, args.seq_len)
+        trainer.fit(token_data(args, packed=False, loading=Loading(workers=0)), steps=steps, log_every=100,
+                    checkpoint_every=steps)
+        assert trainer.checkpoints is not None
+        trainer.checkpoints.wait()
+        runs.append(trainer.checkpoints.directory)
+    average = averaged(runs, ema=False)
+    dump_params(args.out.with_suffix(".npz"), average.variables)
+    return {"runs": runs, "read": [list(entry) for entry in average.runs],
+            "pool_sharded": any(isinstance(leaf, jax.Array) and not leaf.is_fully_addressable
+                                for leaf in jax.tree.leaves(average.variables))}
+
+
 def restored_state(trainer):
     """The step and this process's data position the trainer would resume
     from, restored the way `fit` restores: onto the mesh, which is the one
@@ -2419,7 +2442,7 @@ MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget,
          "evaluation_clocks": mode_evaluation_clocks,
          "builtin_preview_failures": mode_builtin_preview_failures,
          "profile_failure": mode_profile_failure, "pool_refusals": mode_pool_refusals,
-         "fp8_sites": mode_fp8_sites}
+         "fp8_sites": mode_fp8_sites, "averaged": mode_averaged}
 
 
 def parse_args(argv=None):
