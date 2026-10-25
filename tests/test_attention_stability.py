@@ -55,7 +55,9 @@ class Family:
     1/sqrt(D); the keys each query keeps `[B, 1, Q, K]` and the same keys as the template's spans'
     arguments (`template.spans`); the rows `[B, Q]` that see no key, whose output and gradients are
     zero (`empty`); whether the default form holds it (`folded`), False only for the fold's documented
-    divergences (`algebra.Forward.base2`), which run natural alone; the slices the decode kernel cuts
+    divergences (`algebra.Forward.base2`), which run natural alone; whether its one divergence is its
+    weighted values' sums passing fp32's largest (`overflows`), which a walk guarding its sums' headroom
+    (`algebra.Forward.headroom`) keeps finite in either form; the slices the decode kernel cuts
     each row's keys into (`splits`), whose states it merges; and whether it is a decode step's alone
     (`decode_only`), a shape the template's interpreted mainloops would take too long over, which its
     template twin covers in fewer programs. Its declared seeds are `SEEDS`'."""
@@ -65,6 +67,7 @@ class Family:
     spans: dict = dataclasses.field(default_factory=dict)
     empty: np.ndarray | None = None
     folded: bool = True
+    overflows: bool = False
     dtype: str = "float32"
     splits: int = 1
     decode_only: bool = False
@@ -489,16 +492,18 @@ def _families() -> dict[str, Family]:
         "ties at scale 1/4, cotangents near 2**125": Family(_ties(16, 2.0 ** 125), _kept(1, 2), folded=False),
         # The fold's divergences at extreme inputs, which run in the accurate form alone (docs/design/
         # kernel-templates.md, §3, the exponent's forms): a logit near fp32's largest, whose contracted
-        # weight is 0 or infinite; values near fp32's largest, whose weighted sum overflows; a sink there.
+        # weight is 0 or infinite; values near fp32's largest, whose weighted sum overflows where a walk
+        # does not guard its sums (every mainloop's default does, `overflows`); a sink there.
         "a logit near fp32's largest": Family(_near_max_logit(1), _kept(1, 1), folded=False),
         # Folded at scale 1/4, the backward takes the base-2 maximum back to natural units, which near fp32's
         # largest rounds the key's own weight away from 1, as at logits near 1e30.
         "a logit near fp32's largest at scale 1/4": Family(_near_max_logit(16), _kept(1, 1), folded=False),
-        "values near fp32's largest over 2 equal keys": Family(_large_values(2), _kept(1, 2), folded=False),
+        "values near fp32's largest over 2 equal keys": Family(_large_values(2), _kept(1, 2), folded=False,
+                                                               overflows=True),
         "values near fp32's largest over 64 equal keys": Family(_large_values(64), _kept(1, 64),
-                                                                folded=False),
+                                                                folded=False, overflows=True),
         "values near fp32's largest over 2 equal keys, bfloat16": Family(
-            _large_values(2, top=3.3e38), _kept(1, 2), folded=False, dtype="bfloat16"),
+            _large_values(2, top=3.3e38), _kept(1, 2), folded=False, overflows=True, dtype="bfloat16"),
         # A key at its row's maximum weighs 1 exactly in the accurate form; the fold's contracted weight is
         # 1 within an ulp of its logit's exponent.
         "one key": Family(_drawn(4, 1), _kept(4, 1), folded=False),
@@ -524,28 +529,30 @@ def _families() -> dict[str, Family]:
         "a weight at the exponent's edge on a large value, bfloat16": edge("bfloat16"),
         "a decode step's weight at the exponent's edge on a large value, float32": edge_step("float32"),
         "a decode step's weight at the exponent's edge on a large value, bfloat16": edge_step("bfloat16"),
-        # The headroom is the accurate form's: the fold's sum of those values overflows.
+        # Their one divergence in the default form is their sums passing fp32's largest (`overflows`): the
+        # fold's sum of those values overflows where a walk does not guard its sums.
         "a small column beside an overflowing one": Family(_mixed_columns, np.ones((128, 1, 1, 5), bool),
-                                                           folded=False),
+                                                           folded=False, overflows=True),
         # Its values near 1, so the column's output is near fp32's least normal, a shifted product of
         # which would flush (`algebra.Partial.low`).
         "a column near fp32's least normal beside an overflowing one": Family(
-            functools.partial(_mixed_columns, small=(0.5, 1.0)), np.ones((128, 1, 1, 5), bool), folded=False),
+            functools.partial(_mixed_columns, small=(0.5, 1.0)), np.ones((128, 1, 1, 5), bool), folded=False,
+            overflows=True),
         "a cotangent on a small column beside an overflowing one": Family(
             functools.partial(_mixed_columns, small_cotangent=True), np.ones((128, 1, 1, 5), bool),
-            folded=False),
+            folded=False, overflows=True),
         "a tiny value beside an overflowing column at equal weights": Family(
-            _tiny_beside_large, np.ones((128, 1, 1, 4), bool), folded=False),
+            _tiny_beside_large, np.ones((128, 1, 1, 4), bool), folded=False, overflows=True),
         "an anchor-relative share beside an overflowing column": Family(
-            _anchor_relative, np.ones((64, 1, 1, 33), bool), folded=False),
+            _anchor_relative, np.ones((64, 1, 1, 33), bool), folded=False, overflows=True),
         "a column near fp32's least normal under a large cotangent": Family(
-            _least_normal_column, np.ones((64, 1, 1, 3), bool), folded=False),
+            _least_normal_column, np.ones((64, 1, 1, 3), bool), folded=False, overflows=True),
         # A share whose normalized weight is subnormal, in either dtype (the normalized pass's small
         # weights, `algebra.normalized_terms`).
         "a subnormal share of an overflowing row, float32": Family(
-            _subnormal_share, np.ones((64, 1, 1, 256), bool), folded=False),
+            _subnormal_share, np.ones((64, 1, 1, 256), bool), folded=False, overflows=True),
         "a subnormal share of an overflowing row, bfloat16": Family(
-            _subnormal_share, np.ones((64, 1, 1, 256), bool), folded=False, dtype="bfloat16"),
+            _subnormal_share, np.ones((64, 1, 1, 256), bool), folded=False, overflows=True, dtype="bfloat16"),
         # Every weight but one 1/255, bf16's worst rounding of a weight, beside the subnormal share.
         "keys near fp32's largest at equal logits": Family(_large_keys, _kept(1, 8)),
         "a far maximum in a later key tile": Family(_far_maximum_in_a_later_tile,
@@ -555,7 +562,7 @@ def _families() -> dict[str, Family]:
         "keys an ulp apart, bfloat16": Family(_near_keys("bfloat16"), _kept(1, 2), dtype="bfloat16"),
         "a subnormal share beside 255 equal weights, bfloat16": Family(
             functools.partial(_subnormal_share, equal=True), np.ones((64, 1, 1, 256), bool), folded=False,
-            dtype="bfloat16"),
+            overflows=True, dtype="bfloat16"),
     }
     return {**families, **_structured_families()}
 
@@ -576,18 +583,18 @@ def _structured_families() -> dict[str, Family]:
     documents = np.tile(np.asarray([[1, 1, 2, 2, 2, 2]], np.int32), (ROWS, 1))
     families["a row that overflows beside one that does not"] = Family(
         _beside, documents[:, None, :, None] == documents[:, None, None, :], {"segment_ids": documents},
-        folded=False)
+        folded=False, overflows=True)
 
     families["two finite slices whose merge overflows"] = Family(_slices, _kept(1, 64), splits=2,
-                                                                 folded=False)
+                                                                 folded=False, overflows=True)
 
     families["a resumed state of a large denominator"] = Family(_resumed, np.ones((RESUMED, 1, 1, 2), bool),
                                                                 folded=False)
-    # The headroom is the accurate form's: the fold's sum of those values overflows.
+    # Their one divergence in the default form is their sums passing fp32's largest (`overflows`).
     families["a resumed state beside an overflowing column"] = Family(
-        _resumed_beside_overflow, np.ones((RESUMED, 1, 1, 2), bool), folded=False)
+        _resumed_beside_overflow, np.ones((RESUMED, 1, 1, 2), bool), folded=False, overflows=True)
     families["a resumed state of a denominator near fp32's largest beside an overflowing column"] = Family(
-        _resumed_huge_denominator, np.ones((RESUMED, 1, 1, 3), bool), folded=False)
+        _resumed_huge_denominator, np.ones((RESUMED, 1, 1, 3), bool), folded=False, overflows=True)
     families["fp16 values near their largest beside a state near fp32's largest"] = Family(
         _fp16_beside_a_large_state, np.ones((RESUMED, 1, 1, 2), bool), dtype="float16")
     for low, high, label in ((-3.0, 3.0, ""), (1e38, 3e38, " near fp32's largest")):
@@ -709,26 +716,30 @@ def _differentiated(forward: Callable, backward: Callable) -> Callable:
     return attend
 
 
+def _differentiable(family: Family, forward: Callable, backward: Callable) -> Callable:
+    """A mainloop's `forward` and `backward` as `(query, key, value, extra) -> out` over `family`'s spans,
+    its derivative the mainloop's own backward, the sinks' or resumed state's gradient through the softmax's
+    initial state."""
+    def run(query, key, value, extra):
+        spans, hooks = _spans(family, query, key), _hooks(query, extra)
+
+        def ahead(query, key, value, initial):
+            return forward(query, key, value, spans, template.Hooks(initial=initial))
+
+        def back(query, key, value, initial, dout):
+            return backward(query, key, value, spans, template.Hooks(initial=initial), dout)
+
+        initial = None if hooks is None else hooks.initial
+        return _differentiated(ahead, back)(query, key, value, initial)
+    return run
+
+
 def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
     """Each template mainloop as `(query, key, value, extra) -> out` at the form `options` names (`ACCURATE`,
-    or none for the default), its derivative the mainloop's own backward, the sinks' or resumed state's
-    gradient through the softmax's initial state."""
+    or none for the default), its derivative the mainloop's own backward (`_differentiable`)."""
     forward_options = {name: value for name, value in options.items() if name in ("natural", "scale")}
     tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
-
-    def mainloop(forward: Callable, backward: Callable) -> Callable:
-        def run(query, key, value, extra):
-            spans, hooks = _spans(family, query, key), _hooks(query, extra)
-
-            def ahead(query, key, value, initial):
-                return forward(query, key, value, spans, template.Hooks(initial=initial))
-
-            def back(query, key, value, initial, dout):
-                return backward(query, key, value, spans, template.Hooks(initial=initial), dout)
-
-            initial = None if hooks is None else hooks.initial
-            return _differentiated(ahead, back)(query, key, value, initial)
-        return run
+    mainloop = functools.partial(_differentiable, family)
 
     def triton_forward(*operands):
         with tuning.pinned(PINS):
@@ -843,12 +854,37 @@ def test_the_mosaic_mainloops_default_is_finite_where_the_reference_is_at_fp32s_
     _default_is_finite(family, "mosaic")
 
 
-@pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES if FAMILIES[family].folded])
+@pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES
+                                    if FAMILIES[family].folded or FAMILIES[family].overflows])
 def test_the_frozen_triton_mainloops_default_is_finite_where_the_reference_is_at_fp32s_edges(family):
-    """The Triton mainloop's default form finite over the families the fold holds (`_default_is_finite`):
-    frozen as a reference until its Mosaic mainloop replaces it, no production route, it walks without the
-    default's guards (Main's ruling, 2026-10-23), so the fold's divergences are not its."""
+    """The Triton mainloop's default form finite over the families the fold holds and those whose sums pass
+    fp32's largest (`_default_is_finite`): it guards its sums' headroom in either form, as the template's
+    production route runs it on an sm80 or later GPU. Frozen until its Mosaic mainloop replaces it, it
+    walks without the fold's reach (`algebra.walked`), so the fold's other divergences remain an open
+    defect (ledger 1637)."""
     _default_is_finite(family, "triton")
+
+
+@pytest.mark.parametrize("family", [family for family in TEMPLATE_FAMILIES if FAMILIES[family].overflows])
+def test_the_frozen_triton_backward_reads_a_guarded_forwards_rows_whatever_its_pass(family):
+    """The Triton mainloop's default backward asked for its unsplit first pass (`split=False`) over sums that
+    pass fp32's largest, finite wherever the reference is: a guarded forward's live rows carry normalized
+    split sums, which only the split pass reads, so it takes that pass wherever the values can overflow
+    (`attention_triton.backward`), in either form."""
+    seeds, family_of = SEEDS[family], FAMILIES[family]
+
+    def forward(*operands):
+        with tuning.pinned(PINS):
+            return attention_triton.forward(*operands, interpret=True)
+
+    def backward(*operands):
+        with tuning.pinned(PINS):
+            return attention_triton.backward(*operands, interpret=True, split=False)
+
+    reference = jax.jit(with_gradients(_reference(family_of, anchored=False)))
+    unsplit = jax.jit(with_gradients(_differentiable(family_of, forward, backward)))
+    assert_finite(unsplit, reference, _cast(family_of, family_of.draw), f"triton unsplit {family_of.dtype}",
+                  seeds=seeds)
 
 
 def test_a_resumed_state_of_large_values_under_the_folds_guard_is_finite():
@@ -942,13 +978,12 @@ def _cache(array: jax.Array) -> jax.Array:
     return jnp.pad(array, ((0, 0), (0, slots), (0, 0), (0, 0)))
 
 
-@pytest.mark.parametrize("family, form", DECODED, ids=[f"{family}-{form}" for family, form in DECODED])
-def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, form):
-    """The decode kernel's output, interpreted, each row's keys the first `K` of its cache, check 1 over
-    the family's draws."""
-    seeds, family = SEEDS[family], FAMILIES[family]
-    natural = {} if FORMS[form] is None else {"natural": FORMS[form]}
+def _decoded(family: Family, natural: bool | None) -> tuple[Callable, Callable]:
+    """The decode kernel over `family`'s step, interpreted, each row's keys the first `K` of its cache, in
+    the form `natural` names (None, the default), and the family's draw without its cotangent (a decode step
+    has no backward)."""
     lengths = family.spans.get("lengths")
+    form = {} if natural is None else {"natural": natural}
 
     def decoded(query, key, value, sinks):
         count = np.full(query.shape[0], key.shape[1]) if lengths is None else lengths
@@ -956,15 +991,38 @@ def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, f
         pin = {decode_attention.DecodeAttention: decode_attention.Split(family.splits)}
         with generation.assumed("sm80"), tuning.pinned(pin):
             return decode_attention.attend(query, _cache(key), _cache(value), jnp.asarray(count, jnp.int32),
-                                           sinks=sinks, interpret=True, **natural)
+                                           sinks=sinks, interpret=True, **form)
 
     def forward(seed):
-        # A decode step has no backward: its draw without the cotangent.
         return _cast(family, family.draw)(seed)[:4]
 
+    return decoded, forward
+
+
+@pytest.mark.parametrize("family, form", DECODED, ids=[f"{family}-{form}" for family, form in DECODED])
+def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, form):
+    """The decode kernel's output, interpreted, each row's keys the first `K` of its cache, check 1 over
+    the family's draws."""
+    seeds, family = SEEDS[family], FAMILIES[family]
+    decoded, forward = _decoded(family, FORMS[form])
     assert_as_exact(jax.jit(decoded), jax.jit(_reference(family, anchored=False)), forward,
                     f"decode {form} {family.dtype}", seeds=seeds,
                     truth_fn=_reference(family, anchored=True))
+
+DECODED_OVERFLOWS = list(dict.fromkeys(family for family, _ in DECODED if FAMILIES[family].overflows))
+"""The decode steps (`DECODED`) whose one divergence in the default form is their sums passing fp32's
+largest."""
+
+
+@pytest.mark.parametrize("family", DECODED_OVERFLOWS)
+def test_decodes_default_is_finite_where_its_sums_pass_fp32s_largest(family):
+    """The decode kernel's default form, interpreted, finite wherever the reference is (`assert_finite`)
+    over the families whose weighted values' sums pass fp32's largest: it guards its sums' headroom in
+    either form (`algebra.Forward.headroom`)."""
+    seeds, family = SEEDS[family], FAMILIES[family]
+    decoded, forward = _decoded(family, None)
+    assert_finite(jax.jit(decoded), jax.jit(_reference(family, anchored=False)), forward,
+                  f"decode default {family.dtype}", seeds=seeds)
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])

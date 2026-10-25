@@ -388,7 +388,8 @@ def test_attention_the_decode_kernel_takes_lowers_for_the_gpu_differentiated_in_
                            lambda *arrays: jax.jvp(loss, arrays, arrays)):
         with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
             lowered = jax.jit(differentiated).trace(query, key, key).lower(lowering_platforms=("cuda",))
-        assert triton_kernels(lowered) == {"decode_attention": 1}
+        # The decode kernel, and its guarded launch, which runs only where the plain one overflowed.
+        assert triton_kernels(lowered) == {"decode_attention": 1, "decode_attention_headroom": 1}
 
 
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
@@ -410,7 +411,8 @@ def test_a_grouped_query_in_its_own_layout_reaches_the_decode_kernel(generation)
     mesh = gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), generation)
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(attend).trace(query, key, key).lower(lowering_platforms=("cuda",))
-    assert triton_kernels(lowered) == {"decode_attention": 1}
+    # The decode kernel, and its guarded launch, which runs only where the plain one overflowed.
+    assert triton_kernels(lowered) == {"decode_attention": 1, "decode_attention_headroom": 1}
 
 
 @pytest.mark.parametrize("implementation", ["xla", "reference"])
@@ -649,7 +651,8 @@ def test_a_grouped_query_over_one_key_head_reaches_the_decode_kernel_on_each_ten
     mesh = gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:2]), ("tensor",)), generation)
     with assumed(generation), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(attend).trace(query, key, key).lower(lowering_platforms=("cuda",))
-    assert triton_kernels(lowered) == {"decode_attention": 1}
+    # The decode kernel, and its guarded launch, which runs only where the plain one overflowed.
+    assert triton_kernels(lowered) == {"decode_attention": 1, "decode_attention_headroom": 1}
 
 
 @pytest.mark.gpu(reason="the kernel runs on CUDA")
