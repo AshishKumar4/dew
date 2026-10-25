@@ -362,7 +362,9 @@ def scale_by_m3(*, beta1: float, beta2: float, beta3: float, alpha: float, eps: 
     Each update adds `beta1 g` to the fast momentum `M1` and `beta2 g**2` to the second moment `V`, the
     algorithm's sums, neither decaying, and orthogonalizes `M1` by `ns_steps` Newton-Schulz iterations,
     Muon's (`optax.contrib.scale_by_muon`, its momentum off, shaping each leaf by
-    `weight_dimension_numbers` as Muon does; every leaf is a matrix where they are None). Once every
+    `weight_dimension_numbers` as Muon does; every leaf is a matrix where they are None). Its state is
+    kept in float32 at least (`at_least_fp32`), so a bfloat16 matrix's momenta and gradients sum without
+    rounding to its width, and the directions come back in that dtype. Once every
     `frequency` updates the slow momentum `M2` adds `beta3` times the chunk's gradients and is
     orthogonalized, `O2`, which the next chunk's updates read: the first chunk's is zero. The algorithm's
     sum, over `i = (k-1) f .. k f`, and eq. 75's, over `i = t - C .. t`, each hold f + 1 gradients, the one
@@ -371,18 +373,24 @@ def scale_by_m3(*, beta1: float, beta2: float, beta3: float, alpha: float, eps: 
     """
     if frequency < 1:
         raise ValueError(f"M3 updates its slow momentum once every `frequency` updates, got {frequency}")
+    def every_matrix(tree):
+        # Muon's transform reads one spec a leaf, and its own default holds one array alone.
+        return jax.tree.map(lambda _: optax.contrib.MuonDimensionNumbers(), tree)
+
+    shapes = every_matrix if weight_dimension_numbers is None else weight_dimension_numbers
     orthogonal = optax.contrib.scale_by_muon(ns_steps=ns_steps, beta=0.0, nesterov=False,
-                                             weight_dimension_numbers=weight_dimension_numbers)
+                                             weight_dimension_numbers=shapes)
 
     def orthogonalized(moment):
         return orthogonal.update(moment, orthogonal.init(moment))[0]
 
     def init_fn(params) -> M3State:
-        zeros = optax.tree.zeros_like(params)
+        zeros = jax.tree.map(lambda param: jnp.zeros(param.shape, at_least_fp32(param.dtype)), params)
         return M3State(jnp.zeros([], jnp.int32), zeros, zeros, zeros, zeros, zeros)
 
     def update_fn(updates, state, params=None):
         del params
+        updates = jax.tree.map(lambda gradient, moment: gradient.astype(moment.dtype), updates, state.fast)
         count = jnp.asarray(optax.safe_increment(state.updates))
         fast = jax.tree.map(lambda moment, gradient: moment + beta1 * gradient, state.fast, updates)
         second = jax.tree.map(lambda moment, gradient: moment + beta2 * jnp.square(gradient), state.second,
@@ -435,6 +443,9 @@ def delta_gradient_descent(learning_rate: float | optax.Schedule) -> optax.Gradi
         rate = jnp.asarray(learning_rate(state.updates) if callable(learning_rate) else learning_rate)
 
         def stepped(x, gradient, kernel):
+            # A leaf another transform of an `optax.partition` steps reaches this one masked.
+            if isinstance(gradient, optax.MaskedNode):
+                return gradient
             if x is None:
                 return -rate * gradient
             if x.shape != kernel.shape[:1]:
