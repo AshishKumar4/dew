@@ -631,7 +631,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     @classmethod
     def earlier_arguments(cls, arguments: Mapping[str, object]) -> Mapping[str, object]:
         """`Objective.earlier_arguments`: `qk_stats` dropped, which a step whose optimizer clips by the
-        attention maxima now asks for (`Step.qk_stats`). Carried until 1.0 (ledger 1625)."""
+        attention maxima now asks for (`Step.qk_stats`). Carried until 1.0 (ledger 1626)."""
         return {name: value for name, value in arguments.items() if name != "qk_stats"}
 
     def evaluate(self, params, batch, step: Step):
