@@ -339,12 +339,12 @@ def reference_model(case: Case, directory: Path, dtype=None):
 def reference_logits(case: Case, directory: Path, ids: np.ndarray, *, wide: bool = False) -> np.ndarray:
     """transformers 5.16.1 over the exported directory on the eager path, in
     fp32, or `wide` in float64: the model built and run under
-    `diffusers_wan_reference.float64`, which widens its float32 pins too."""
+    `torch_precision.float64`, which widens its float32 pins too."""
     import contextlib
 
     import torch
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     with float64() if wide else contextlib.nullcontext():
         model, _ = reference_model(case, directory, torch.float64 if wide else torch.float32)
@@ -516,7 +516,7 @@ def _reference_gradients(trip: RoundTrip, *, wide: bool = False):
 
     import torch
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     with float64() if wide else contextlib.nullcontext():
         model, _ = reference_model(trip.case, FIXTURES / trip.case.fixture,
@@ -671,7 +671,7 @@ def v4_training_gradient_parity(trip: RoundTrip) -> dict[str, tuple[np.ndarray, 
 
     from dew.objectives.base import Step
     from tools.deepseek_v4_reference import deepseek_v4_source_name, load_mtp_reference
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     source, case = trip.source, trip.case
     weight = case.mtp_weight

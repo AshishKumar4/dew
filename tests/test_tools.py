@@ -1706,3 +1706,15 @@ def test_the_data_benchmark_counts_a_grain_packing_and_dews_alike_as_the_objecti
     next(pictures)
     assert {key: value for key, value in pictures.counts.get().items() if key != "padded_tokens"} == {
         "rows": 2, "tokens": 2, "model_flops": None}
+
+
+def test_every_remote_code_release_carries_the_fields_its_loader_reads(monkeypatch):
+    """Each remote-code release, the loader's own and those the LLaDA-MoE tool merges into it, is the
+    four fields `released_model` reads: the Hub repo, its commit, the files its code is, and the auto
+    class its model registers as. A record of another shape fails at its first read, a model never
+    built."""
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools"))
+    for tool in ("remote_code_reference", "llada_moe_reference"):
+        for name, (repo, revision, files, auto) in load(tool).RELEASES.items():
+            assert (repo.count("/"), len(revision), auto.startswith("Auto")) == (1, 40, True), name
+            assert files and all(file.endswith(".py") for file in files), name

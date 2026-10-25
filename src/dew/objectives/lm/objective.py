@@ -692,15 +692,6 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                             tokenizer=recorded_tokenizer(self.processor),
                             processor=recorded_processor(self.processor), prefix=self.prefix)
 
-    def build_task(self, variables: Variables, *,
-                   processor: Processor | None | Omitted = OMITTED) -> TextGeneration:
-        """Return the decoder over `variables` as a generation task.
-
-        It samples, and uses the same token budget, as this objective's previews do.
-        """
-        return TextGeneration.from_settings(self.model, variables, self.task_settings(),
-                                            self.processor if processor is OMITTED else processor)
-
     def _refuse_blocks(self, prepared: ModelInputs, depths: bool) -> None:
         """Refuse a batch's blocks where no trunk layer reads them, or where prediction depths would read
         them beyond their source, which `scored_targets` does not account for. A prefix run's blocks were

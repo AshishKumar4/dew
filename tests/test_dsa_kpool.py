@@ -158,7 +158,7 @@ def reference_block_output(block):
 def float64_block(block):
     """The reference block run in float64, every float32 pin widened (`float64`), as a function of a
     widened draw: the truth check 1 measures both sides from."""
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     wide = copy.deepcopy(block).double()
 
@@ -233,7 +233,7 @@ def torch_gradients(block):
     """The gradients of a readout of `block`'s output into its input and every attention parameter, as
     a function of a draw, by name (the input's 'x'); in float64, every float32 pin widened, where the
     block is."""
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     wide = next(block.parameters()).dtype == torch.float64
     named = {name: parameter.detach().numpy() for name, parameter in block.named_parameters()

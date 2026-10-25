@@ -2002,7 +2002,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -2410,7 +2410,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],

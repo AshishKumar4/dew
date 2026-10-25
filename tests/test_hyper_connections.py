@@ -52,7 +52,7 @@ def reference_site(wide: bool):
     from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
     from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextHyperConnection
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     def forward(streams, output, params):
         with float64() if wide else contextlib.nullcontext():
@@ -90,7 +90,7 @@ def reference_head(wide: bool):
     from transformers.models.deepseek_v4.configuration_deepseek_v4 import DeepseekV4Config
     from transformers.models.deepseek_v4.modeling_deepseek_v4 import DeepseekV4HyperHead
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     dtype = torch.float64 if wide else torch.float32
 
