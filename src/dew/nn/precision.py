@@ -81,8 +81,8 @@ def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     a bfloat16 bias added to bfloat16 products sums its gradient over every position in bfloat16,
     where torch's addmm sums its in float32: Qwen 2's projection biases, summed over 8192 tokens,
     came out up to 3.75 times further from float64 than torch's own bfloat16 gradients. Broadcast
-    at fp32, the gradient sums at fp32 and rounds once into the bias. A CPU sums it in float64, as
-    it sums a float32 product (`spread`).
+    at fp32, the gradient sums at fp32 and rounds once into the bias. A CPU running Dew's wide
+    arithmetic (`WIDE_CPU_ARITHMETIC`) sums it in float64, as it sums a float32 product (`spread`).
     """
     dtype, wide = jnp.result_type(product, bias), at_least_fp32(bias.dtype)
     # The bias takes the product's rank before the sum, as flax's layers reshape it, so no rank is
@@ -653,13 +653,15 @@ def _compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
 def compensates_loops() -> bool:
     """Whether a running sum of float32 products carried across a loop keeps what each addition
     drops (`compensated_add`), so the loop's sum rounds once as one product's does: where a CPU sums
-    each product in float64 (`accumulated`). A carry's shape is fixed when its loop traces, so this
+    each product in float64 (`accumulated`), in a process running Dew's wide CPU arithmetic
+    (`WIDE_CPU_ARITHMETIC`). A carry's shape is fixed when its loop traces, so this
     reads the platform a call's code is chosen for (`dew.nn.kernels.generation.backend`), as a CPU's
     attention routing does; an accelerator's running sum is the plain one, as its products' sums are
     float32's."""
     from dew.nn.kernels.generation import backend
 
-    return backend() == "cpu" and jax.config.jax_default_matmul_precision != FP32_SUMS and not _intercepted()
+    return (wide_cpu_arithmetic() and backend() == "cpu"
+            and jax.config.jax_default_matmul_precision != FP32_SUMS and not _intercepted())
 
 
 def running_sum(shape: tuple[int, ...], dtype: DTypeLike) -> jax.Array:

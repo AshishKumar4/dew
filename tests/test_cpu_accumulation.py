@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import with_gradients
+from reference_error import equations, with_gradients
 
 from dew.nn.dense import Dense
 from dew.nn.precision import (
@@ -234,9 +234,11 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
     """Each site of the wide CPU arithmetic, a float32 product and a bias's spread, a row's logsumexp
     and a float64 division, traces a platform choice in a process running Dew's test setting
     (`WIDE_CPU_ARITHMETIC`), and in a library process, which sets nothing, the plain computation:
-    no platform choice and no float64 beside a float32 computation."""
+    no platform choice and no float64 beside a float32 computation. Each is traced afresh, as a
+    process with either setting traces it."""
     from dew.diffusion.schedules.common import divided
-    from dew.objectives.lm.chunked import logits_cross_entropy
+    from dew.nn.protocols import OutputTable
+    from dew.objectives.lm.chunked import chunked_cross_entropy
 
     if wide:
         monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "1")
@@ -245,16 +247,30 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
     lhs, rhs = np.ones((4, 3), np.float32), np.ones((3, 2), np.float32)
     layer = Dense(2)
     variables = layer.init(jax.random.key(0), lhs)
-    logits, targets = np.zeros((2, 5, 7), np.float32), np.zeros((2, 5), np.int32)
-    traced = {
-        "product": jax.make_jaxpr(lambda a, b: float32_dot_general(a, b, (((1,), (0,)), ((), ()))))(lhs, rhs),
-        "bias": jax.make_jaxpr(jax.grad(lambda params: jnp.sum(layer.apply({"params": params}, lhs))))(
-            variables["params"]),
-        "logsumexp": jax.make_jaxpr(lambda logits: logits_cross_entropy(logits, targets))(logits),
+    states, table = np.ones((2, 5, 8), np.float32), np.ones((7, 8), np.float32)
+    targets = np.zeros((2, 5), np.int32)
+
+    def traced(fn, *arguments):
+        """The equations of `fn` traced afresh on `arguments` (a new function, so no trace is reused)."""
+        return list(equations(jax.make_jaxpr(lambda *values: fn(*values))(*arguments)))
+
+    def float64(found) -> bool:
+        return any(var.aval.dtype == jnp.float64 for equation in found
+                   for var in (*equation.invars, *equation.outvars) if hasattr(var, "aval"))
+
+    def chosen(found) -> bool:
+        return any(equation.primitive.name == "platform_index" for equation in found)
+
+    sites = {
+        "product": traced(lambda a, b: float32_dot_general(a, b, (((1,), (0,)), ((), ()))), lhs, rhs),
+        "bias": traced(jax.grad(lambda params: jnp.sum(layer.apply({"params": params}, lhs))),
+                       variables["params"]),
+        "logsumexp": traced(lambda states, table: chunked_cross_entropy(
+            states, OutputTable(table, vocab_major=True), targets, 1, tile=None)[0], states, table),
     }
     with jax.enable_x64(new_val=True):
-        division = jax.make_jaxpr(divided)(np.ones(3, np.float64), np.float64(3.0))
-    for name, jaxpr in traced.items():
-        assert ("platform_index" in str(jaxpr)) == wide, name
-        assert ("f64" in str(jaxpr)) == (wide and name != "logsumexp"), name
-    assert ("platform_index" in str(division)) == wide
+        division = traced(divided, np.ones(3, np.float64), np.float64(3.0))
+    for name, found in sites.items():
+        assert chosen(found) == wide, name
+        assert float64(found) == wide, name
+    assert chosen(division) == wide
