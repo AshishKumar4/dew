@@ -1803,7 +1803,8 @@ class Trainer(Generic[Loss, Effects]):
             # The last step has to land before the wall time is read.
             loss.block_until_ready()
         scores: Mapping[str, float] = {}
-        # A stream that ran out ends a run whose last step may have evaluated every suite already.
+        # A stream that ran out ends a run whose last step may have evaluated some suites already: only
+        # the others are scored now, beside the scores that step reported.
         scored = run.scored if run.evaluation is not None and run.evaluation.step == current else frozenset()
         if (
             (plan.validation or plan.eval_every or plan.best or plan.stop or plan.held_best)
@@ -1811,9 +1812,15 @@ class Trainer(Generic[Loss, Effects]):
             and run.paused is None
             and not run.stopped
         ):
-            if not plan.suites or not scored.issuperset(plan.suites):
+            missing = [name for name in plan.suites if name not in scored]
+            if not plan.suites or len(missing) == len(plan.suites):
                 run.evaluation = self._evaluation(plan, state, shardings, run.training)
                 run.other += run.evaluation.elapsed_seconds
+            elif missing:
+                assert run.evaluation is not None
+                added = self._evaluation(plan, state, shardings, run.training, missing)
+                run.other += added.elapsed_seconds
+                run.evaluation = dataclasses.replace(added, scores={**run.evaluation.scores, **added.scores})
             assert run.evaluation is not None
             scores = run.evaluation.scores
         # A token update may cross the pause and the budget at once, which still saves the whole state.
@@ -1827,10 +1834,13 @@ class Trainer(Generic[Loss, Effects]):
     def _ends_here(self, run: FitRun, interval: Interval) -> bool:
         """Whether a stream that may run out has, so this step is the run's last: its next batch is
         read now, agreed as every such read is, and kept for the step that takes it (`ahead`), the
-        position the step saves taken before it. An endless stream never ends here."""
+        position the step saves taken before it. An endless stream never ends here, and a run whose
+        stream is closed (`_wind_down`) ends on this step without another read."""
         if run.endless:
             return False
         if run.ahead is None:
+            if run.train is None:
+                return True
             run.ahead = (waited_read(run, interval, agree=True),)
         return run.ahead[0] is None
 
