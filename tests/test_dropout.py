@@ -25,13 +25,14 @@ def test_a_float32_run_drops_flaxs_own_units(broadcast_dims):
 def test_a_float64_run_drops_the_float32_runs_units():
     inputs = jax.random.normal(jax.random.key(0), (4, 16, 8))
     narrow = np.asarray(Dropout(0.3).apply({}, inputs, deterministic=False, rngs=RNGS)) != 0
+    drawn = np.asarray(kept(RNGS["dropout"], 0.7, (4, 16, 8)))
     with jax.enable_x64(new_val=True):
         wide = inputs.astype(jnp.float64)
         ours = np.asarray(Dropout(0.3).apply({}, wide, deterministic=False, rngs=RNGS)) != 0
         theirs = np.asarray(nn.Dropout(0.3).apply({}, wide, deterministic=False, rngs=RNGS)) != 0
-        drawn = np.asarray(kept(RNGS["dropout"], 0.7, (4, 16, 8)))
+        drawn_wide = np.asarray(kept(RNGS["dropout"], 0.7, (4, 16, 8)))
     np.testing.assert_array_equal(ours, narrow)
-    np.testing.assert_array_equal(drawn, narrow)
+    np.testing.assert_array_equal(drawn_wide, drawn)
     # Flax's own draws a float64 uniform from other bits there: the units this module keeps the same.
     assert not np.array_equal(theirs, narrow)
 
