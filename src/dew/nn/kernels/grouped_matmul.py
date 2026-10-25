@@ -10,10 +10,9 @@ CUDA GPU from sm80 and on a CPU that interprets them, for a call neither Mosaic 
 CUTLASS's grouped GEMMs (`kernels/cutlass`, the dew-cutlass wheel) where it is installed, a vendored
 kernel a call runs only by name (`generation.chosen`). The grouped selector (`GROUPED`) reads which
 products they compute exactly (the product's declaration, `templates.product.declared`) and which
-launch takes a call. They run only for
-a CUDA lowering, chosen where the call lowers (`jax.lax.platform_dependent`), so a CPU computation on a
-GPU host lowers to `jax.lax.ragged_dot`; an explicit request interprets them on the CPU, as the CPU
-suite checks them.
+launch takes a call. They run only for their target's lowering, CUDA's or a TPU's (`_on_platform`),
+chosen where the call lowers (`jax.lax.platform_dependent`), so a CPU computation on a GPU host lowers
+to `jax.lax.ragged_dot`; an explicit request interprets them on the CPU, as the CPU suite checks them.
 
 Each launch's config is the one it derives for the GPU, or the Triton launches' cost model's fastest
 of their fixed tiles that fits it, the same on every run. JAX's one tile for every shape left a wide
