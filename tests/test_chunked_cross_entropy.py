@@ -1290,6 +1290,23 @@ def test_a_confident_targets_rest_of_the_row_leaves_an_excluded_column_out(path,
     assert np.all(np.asarray(gradient(rows))[:, excluded] == 0)
 
 
+def vocabulary_split(gradient):
+    """`gradient(logits, matrix)` over two devices' vocabulary halves: rows `[B, 8]` split by their
+    columns through an identity head split the same way, at the highest matmul precision."""
+    from jax.sharding import NamedSharding, PartitionSpec as P
+
+    from dew.training import MeshSpec
+
+    mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
+
+    def split(logits):
+        with jax.set_mesh(mesh), jax.default_matmul_precision("highest"):
+            placed = (jax.device_put(logits, NamedSharding(mesh, P("fsdp"))),
+                      jax.device_put(jnp.eye(8), NamedSharding(mesh, P(None, "fsdp"))))
+            return np.asarray(gradient(*placed))
+    return split
+
+
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("excluded", [None, 6], ids=["no column", "column 6 excluded"])
 @pytest.mark.parametrize("tile", [None, (2, 2)], ids=["whole", "tiled"])
@@ -1299,13 +1316,8 @@ def test_a_vocabulary_split_heads_confident_target_gradient_is_eq_7(tile, margin
     the logits is eq. 7 from float64 (check 1), as one device's is, with a column excluded or none. The
     target's shard takes its entry from the rest of the row summed over every shard, not from its share less
     one, and an excluded column, in whichever shard it sits, joins neither the rest nor the mass."""
-    from jax.sharding import NamedSharding, PartitionSpec as P
-
-    from dew.training import MeshSpec
-
     label = 5
     targets = np.full((4,), label, np.int32)
-    mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
 
     def draw(seed):
         (rows,) = confident(margin, seed, label, width=8, count=4)
@@ -1319,12 +1331,6 @@ def test_a_vocabulary_split_heads_confident_target_gradient_is_eq_7(tile, margin
 
     gradient = jax.jit(jax.grad(loss))
 
-    def split(logits):
-        with jax.set_mesh(mesh), jax.default_matmul_precision("highest"):
-            placed = (jax.device_put(logits, NamedSharding(mesh, P("fsdp"))),
-                      jax.device_put(jnp.eye(8), NamedSharding(mesh, P(None, "fsdp"))))
-            return np.asarray(gradient(*placed))
-
     def reference(logits):
         if excluded is None:
             return label_derivative(logits, label)
@@ -1332,6 +1338,7 @@ def test_a_vocabulary_split_heads_confident_target_gradient_is_eq_7(tile, margin
         return np.concatenate([kept[:, :excluded], np.zeros((len(kept), 1), kept.dtype), kept[:, excluded:]],
                               axis=-1)
 
+    split = vocabulary_split(gradient)
     assert_as_exact(split, reference, draw, f"vocabulary-split at margin {margin}, {tile}, {excluded}",
                     seeds=CONFIDENT_SEEDS)
     if excluded is not None:
@@ -1371,9 +1378,10 @@ def test_an_unlikely_targets_log_partition_gradient_is_its_own_probability(path,
 @pytest.mark.parametrize("path", ["tiled", "whole", "fused", "logits"])
 def test_a_dominant_z_loss_keeps_an_unlikely_targets_share(path, margin):
     """A z-loss whose cotangent outweighs the loss's (PaLM's, at a large coefficient) moves an unlikely
-    target by its probability times that cotangent, less the rest of its row: on par with eq. 7 plus the
-    z-loss's `2 z log Z p` in NumPy from float64 (check 1), which a target entry of
-    `d_partition (1 - rest / mass)` loses."""
+    target by its probability times that cotangent, less the rest of its row: the target's entry on par
+    with eq. 7 plus the z-loss's `2 z log Z p` in NumPy from float64 (check 1), which a target entry of
+    `d_partition (1 - rest / mass)` rounds to 0. The entry alone is measured: the lead column's, near the
+    cotangent itself, rounds by more than the target's whole value."""
     lead, target, weight = 0, 5, 1e8
     targets = np.full((3,), target, np.int32)
     head = identity_head()
@@ -1389,9 +1397,14 @@ def test_a_dominant_z_loss_keeps_an_unlikely_targets_share(path, margin):
         return (losses + weight * jnp.square(log_z)).sum()
 
     def reference(rows):
-        return label_derivative(rows, target) + 2 * weight * log_partition(rows) * softmax(rows)
+        return (label_derivative(rows, target) + 2 * weight * log_partition(rows) * softmax(rows))[:, target]
 
-    assert_as_exact(jax.jit(jax.grad(loss)), reference, lambda seed: confident(margin, seed, lead),
+    gradient = jax.jit(jax.grad(loss))
+
+    def entry(rows):
+        return gradient(rows)[:, target]
+
+    assert_as_exact(entry, reference, lambda seed: confident(margin, seed, lead),
                     f"{path} at margin {margin}", seeds=CONFIDENT_SEEDS)
 
 
@@ -1402,13 +1415,8 @@ def test_a_vocabulary_split_heads_unlikely_target_keeps_its_log_partition_share(
     """Split over the vocabulary on a mesh, the log partition's gradient at an unlikely target is on par
     with NumPy's softmax from float64 (check 1), as one device's is: the target's shard, which picks its
     logit, takes the partition's share of it directly, not 1 less the rest of the row."""
-    from jax.sharding import NamedSharding, PartitionSpec as P
-
-    from dew.training import MeshSpec
-
     lead, target = 0, 5
     targets = np.full((4,), target, np.int32)
-    mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
 
     def partition(logits, matrix):
         head = OutputTable(matrix, vocab_major=False, precision=jax.lax.Precision.HIGHEST)
@@ -1416,11 +1424,6 @@ def test_a_vocabulary_split_heads_unlikely_target_keeps_its_log_partition_share(
 
     gradient = jax.jit(jax.grad(partition))
 
-    def split(logits):
-        with jax.set_mesh(mesh), jax.default_matmul_precision("highest"):
-            placed = (jax.device_put(logits, NamedSharding(mesh, P("fsdp"))),
-                      jax.device_put(jnp.eye(8), NamedSharding(mesh, P(None, "fsdp"))))
-            return np.asarray(gradient(*placed))
-
-    assert_as_exact(split, softmax, lambda seed: confident(margin, seed, lead, width=8, count=4),
+    assert_as_exact(vocabulary_split(gradient), softmax,
+                    lambda seed: confident(margin, seed, lead, width=8, count=4),
                     f"vocabulary-split at margin {margin}, {tile}", seeds=CONFIDENT_SEEDS)
