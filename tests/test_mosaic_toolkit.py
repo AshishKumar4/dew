@@ -13,6 +13,7 @@ from generation_support import INTERPRETS
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.sharding import Mesh
+from reference_error import FEWEST_SEEDS, assert_as_exact
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import mosaic, mosaic_sm90
@@ -187,17 +188,28 @@ def _kept_sums(x, *, interpret, consumers: int = 1):
                          grid_names=("sm",), consumers=consumers, interpret=interpret)(x)
 
 
-def _kept_stream(consumers: int):
-    """Small integers in blocks of each consumer's rows, so any tile's sum is exact in fp32."""
+def _kept_stream(consumers: int, seed: int = 0):
+    """Small integers in blocks of each consumer's rows, drawn by `seed`, so any tile's sum is exact in
+    fp32."""
     rows = mosaic_sm90.WGMMA.role_rows * consumers
     shape = (_first_step(TILES) * rows, BLOCK[1])
-    return jax.random.randint(jax.random.key(1), shape, -64, 64).astype(jnp.bfloat16)
+    return jax.random.randint(jax.random.key(seed), shape, -64, 64).astype(jnp.bfloat16)
 
 
-def _kept_expected(x, consumers: int):
-    rows = mosaic_sm90.WGMMA.role_rows * consumers
-    blocks = np.asarray(x, np.float32).reshape(-1, rows, BLOCK[1])
-    return np.stack([blocks[_first_step(tile):_first_step(tile) + tile + 1].sum(0) for tile in range(TILES)])
+def _check_kept(consumers: int, *, interpret) -> None:
+    """Check 1 (`assert_as_exact`) of the kept walk's tile sums against the blocks' sums in fp32: the
+    stream's small integers make every sum exact, so the reference equals float64 and the walk must too."""
+    def kept(x):
+        return _kept_sums(x, interpret=interpret, consumers=consumers)
+
+    def expected(x):
+        rows = mosaic_sm90.WGMMA.role_rows * consumers
+        blocks = x.astype(jnp.promote_types(x.dtype, jnp.float32)).reshape(-1, rows, BLOCK[1])
+        return jnp.stack([blocks[_first_step(tile):_first_step(tile) + tile + 1].sum(0)
+                          for tile in range(TILES)])
+
+    assert_as_exact(jax.jit(kept), jax.jit(expected), lambda seed: (_kept_stream(consumers, seed),),
+                    f"kept walk, {consumers} consumers", seeds=FEWEST_SEEDS)
 
 
 @INTERPRETS
@@ -207,9 +219,7 @@ def test_a_walk_keeps_each_slot_a_step_across_tiles(consumers):
     two slots: each tile sums exactly its own steps' blocks, read a step late from the kept slots, and the
     race detector finds no load overwriting a slot a consumer still reads, so each kept slot goes back once,
     the tile's last at its walk's end, and the ring's counter stays whole across the tiles."""
-    x = _kept_stream(consumers)
-    summed = _kept_sums(x, interpret=RACES, consumers=consumers)
-    np.testing.assert_array_equal(np.asarray(summed), _kept_expected(x, consumers))
+    _check_kept(consumers, interpret=RACES)
 
 
 @pytest.mark.parametrize("consumers", [1, 2])
@@ -241,6 +251,4 @@ def test_a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100(consumers):
 @pytest.mark.parametrize("consumers", [1, 2])
 def test_a_walk_keeps_each_slot_a_step_across_tiles_on_an_h100(consumers):
     """The kept walk's kernel compiled and run on an H100, where the waits and arrivals are real."""
-    x = _kept_stream(consumers)
-    summed = jax.jit(functools.partial(_kept_sums, interpret=False, consumers=consumers))(x)
-    np.testing.assert_array_equal(np.asarray(summed), _kept_expected(x, consumers))
+    _check_kept(consumers, interpret=False)

@@ -42,7 +42,17 @@ class Wgmma(mosaic.RingFamily):
     column_scratch = 4 * 32 * 2
     """A WGMMA tile's columns sum across its four warps, each lane's two entries a register."""
 
-    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0) -> jax.Array:
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None, *, pending: int = 0,
+                interpret: bool = False) -> jax.Array:
+        if interpret:
+            # A dot in the caller's trace, as the interpreter takes a product (its waits no-ops), `then`
+            # beside it: the walk's accumulators are values there, which no scope may take out.
+            value = jnp.dot(lhs if isinstance(lhs, jax.Array) else lhs[...], rhs[...],
+                            preferred_element_type=jnp.float32)
+            if then is not None:
+                then()
+            return value
+
         def scores(acc_ref):
             plgpu.wgmma(acc_ref, lhs, rhs)
             if then is not None:
@@ -52,9 +62,7 @@ class Wgmma(mosaic.RingFamily):
         return pl.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
-        if interpret:
-            return jnp.dot(lhs, rhs[...], preferred_element_type=jnp.float32)
-        return self.product(lhs, rhs, (lhs.shape[0], rhs.shape[1]))
+        return self.product(lhs, rhs, (lhs.shape[0], rhs.shape[1]), interpret=interpret)
 
     def products(self, acc, lhs, rhs, interpret: bool):
         if interpret:
