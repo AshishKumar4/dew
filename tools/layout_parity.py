@@ -700,9 +700,11 @@ def _cache_name(kind: str, case, batch, **parts: object) -> tuple[str, dict[str,
         array = np.ascontiguousarray(leaf)
         digest.update(f"{array.dtype}{array.shape}".encode())
         digest.update(array.tobytes())
+    from dew.nn.precision import wide_cpu_arithmetic
+
     inputs = {"case": dataclasses.asdict(case), "batch": digest.hexdigest(), "jax": jax.__version__,
               "jaxlib": importlib.metadata.version("jaxlib"), "x64": jax.config.jax_enable_x64,
-              "source": source_digest(), **parts}
+              "wide_cpu_arithmetic": wide_cpu_arithmetic(), "source": source_digest(), **parts}
     name = hashlib.sha256(json.dumps(inputs, sort_keys=True, default=str).encode()).hexdigest()[:24]
     return f"{kind}-{name}.npz", inputs
 

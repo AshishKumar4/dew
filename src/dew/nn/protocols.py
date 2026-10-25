@@ -183,6 +183,38 @@ class OutputTable:
                               self.states(hidden), self.matrix, self.precision, compute=self.compute)
         return capped_logits(scaled_logits(logits, self.scale, self.bias), self.softcap, temperature)
 
+    def columns(self, hidden: jax.Array, ids: Sequence[int] | jax.Array, *, temperature: float = 1.0,
+                exact: bool = False) -> jax.Array:
+        """`hidden`'s logits at the vocabulary columns `ids` alone, `[..., len(ids)]`: `logits`
+        restricted to them by construction, the same states (the input quantizer's QDQ), product
+        (`head_product`) at the table's precision and compute, scale and bias at `ids`
+        (`scaled_logits`) and softcap, so a fixed set of a few columns costs no full-vocabulary
+        product. `exact` computes the product in fp32 or wider at fp32 precision, whatever the
+        table's compute, as a readout that reads a label's logit exactly does. (`dew.objectives.lm
+        .chunked`'s support log probabilities restrict each position to its own ids, another
+        contraction.) Static `ids` outside the vocabulary are refused (IndexError); traced ids are
+        the caller's to bound."""
+        if isinstance(ids, jax.Array):
+            index: jax.Array | np.ndarray = ids
+        else:
+            index = np.asarray(ids, np.int64)
+            vocab = self.matrix.shape[0 if self.vocab_major else 1]
+            if index.size and (index.min() < 0 or index.max() >= vocab):
+                raise IndexError(f"columns {index.tolist()} reach past a vocabulary of {vocab}")
+        matrix = jnp.take(self.matrix, index, axis=0 if self.vocab_major else 1)
+        states = self.states(hidden)
+        subscripts = '...d,vd->...v' if self.vocab_major else '...d,dv->...v'
+        if exact:
+            wide = jnp.promote_types(states.dtype, jnp.float32)
+            logits = head_product(subscripts, states.astype(wide),
+                                  matrix.astype(jnp.promote_types(matrix.dtype, jnp.float32)),
+                                  jax.lax.Precision.HIGHEST, compute=wide)
+        else:
+            logits = head_product(subscripts, states, matrix, self.precision, compute=self.compute)
+        scale = None if self.scale is None else jnp.take(self.scale, index)
+        bias = None if self.bias is None else jnp.take(self.bias, index)
+        return capped_logits(scaled_logits(logits, scale, bias), self.softcap, temperature)
+
     def rows(self) -> jax.Array:
         """Each vocabulary token's `[vocab, features]` row: the matrix's, times
         the token's scale, whose dot product with a state is the token's logit
@@ -423,6 +455,17 @@ class AffineHead(Protocol):
     """
 
     def output_table(self) -> OutputTable | None: ...
+
+
+def head_table(model: nn.Module, variables) -> OutputTable | None:
+    """`model`'s head over `variables` as one matrix (`AffineHead.output_table`),
+    or None for a model whose head no matrix alone is, or that names none: the
+    one checked read of a model's output table, which a loss and a readout share."""
+    table = model.apply(variables, method="output_table") if isinstance(model, AffineHead) else None
+    if table is not None and not isinstance(table, OutputTable):
+        raise TypeError(f"{type(model).__name__}.output_table gives a {type(table).__name__}, "
+                        f"not an OutputTable")
+    return table
 
 
 @runtime_checkable
