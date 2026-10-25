@@ -731,11 +731,19 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                                   holds=lambda tile: self.legal(ba, tile, target), grouped=depth is not None)
 
     def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
-        """Whether `config` runs the call on `target` (`Template.legal`): of the launch's family there,
-        its blocks dividing the call's extents, and a one-dimensional side operand's block, copied
-        untiled, at most one copy's extent along its axis (`mosaic.Family.copy_extent`)."""
+        """Whether `config` runs the call on `target` (`Template.legal`): of the launch's family there, in
+        its granularity (whole roles of rows for each consumer, whole column units, one of its depths, at
+        most its consumers, one multiprocessor a tile) with a ring of two stages at least (a walk keeping
+        one step's products in flight holds its slot while the next step's loads fill another), its blocks
+        dividing the call's extents, and a one-dimensional side operand's block, copied untiled, at most
+        one copy's extent along its axis (`mosaic.Family.copy_extent`)."""
         family = self._family(ba, target)
         if family is None or config.family != family.name or not self._divides(ba, config):
+            return False
+        dtype = ba.arguments['tokens'].dtype
+        if (config.warpgroups > family.consumers or config.cluster != 1 or config.stages < 2
+                or config.block_m % (family.role_rows * config.warpgroups)
+                or config.block_n % family.column_unit(dtype) or config.block_k not in family.depths(dtype)):
             return False
         hooks = ba.arguments['hooks']
         axes = {axis for name, axes_of in (('prologue_operands', hooks.prologue_axes),
@@ -1144,15 +1152,17 @@ class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
         """The one block the launch takes on `target` (docs/design/kernel-templates.md §7), from Mosaic
         TPU's facts and the call's extents alone: each axis the widest doubling of a vreg's lanes
         (`mosaic_tpu.LANES`) that divides its extent, the grouped rows' at most a group's rows doubled
-        to cover them (a block a group boundary crosses runs once for each group); then, until its
-        buffers fit the scoped VMEM (`legal`), its largest axis halved, the step's before the output's:
-        the output block as square as the budget leaves it, which reads each operand fewest times.
+        to cover them (a block a group boundary crosses runs once for each group), each at least what
+        its one-dimensional side operands lay out at (`_lays_out`); then, until its buffers fit the
+        scoped VMEM (`legal`), its largest axis halved, the step's before the output's, never below that
+        least: the output block as square as the budget leaves it, which reads each operand fewest times.
         None where no block is legal."""
         spans, groups = self.spans(ba), ba.arguments['sizes'].shape[0]
+        least = self._least_blocks(ba)
         blocks = []
         for axis, extent in enumerate(spans):
             if axis == self.ROW_AXIS:
-                widest = max(_covering(-(-extent // max(groups, 1))), mosaic_tpu.LANES)
+                widest = max(_covering(-(-extent // max(groups, 1))), least[axis])
             else:
                 dividing = [block for block in _doubling(mosaic_tpu.LANES, extent) if extent % block == 0]
                 if not dividing:
@@ -1160,13 +1170,28 @@ class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
                 widest = dividing[-1]
             blocks.append(widest)
         while not self.legal(ba, config := mosaic_tpu.Blocks(*blocks), target):
-            halved = [axis for axis in (2, 0, 1) if blocks[axis] > mosaic_tpu.LANES]
+            halved = [axis for axis in (2, 0, 1) if blocks[axis] // 2 >= least[axis]]
             if not halved:
                 return None
             # Half of a block that divides its extent divides it too.
             axis = max(halved, key=lambda axis: blocks[axis])
             blocks[axis] //= 2
         return config
+
+    def _least_blocks(self, ba) -> list[int]:
+        """The least block of each axis (`block_m`, `block_n`, `block_k`): a vreg's lanes, or the row of
+        128 32-bit lanes a one-dimensional side operand along it lays out at short of its whole extent
+        (`_lays_out`: 256 elements of a 16-bit one)."""
+        least = [mosaic_tpu.LANES] * 3
+        index = self.extents(mosaic_tpu.Blocks(0, 1, 2))
+        hooks = ba.arguments['hooks']
+        for name, axes_of in (('prologue_operands', hooks.prologue_axes),
+                              ('epilogue_operands', hooks.epilogue_axes)):
+            for side, axes in zip(ba.arguments.get(name, ()), axes_of, strict=True):
+                if len(axes) == 1:
+                    axis = index[axes[0]]
+                    least[axis] = max(least[axis], 128 * 4 // jnp.dtype(side.dtype).itemsize)
+        return least
 
     def legal(self, ba, config: mosaic_tpu.Blocks, target) -> bool:
         """Whether `config`'s blocks are whole vregs' lanes dividing their extents (the grouped rows' any),
