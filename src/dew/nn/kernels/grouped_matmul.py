@@ -764,9 +764,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     def staged_bytes(self, ba, config: mosaic_gpu.Tiles, target) -> int:
         # Each allocation a program scopes, rounded up to Mosaic's alignment (`mosaic.allocated`): each
         # stream's stages (both operand blocks and each prologue side's tile), each output's staging (every
-        # output's at once), each epilogue side's two staging copies (`mosaic.staging`), and the barriers:
-        # each stream stage's two and each staged side's two (at a block's edge, a Hopper tile's barriers
-        # alone took it 128 bytes past, the reason they are counted).
+        # output's at once, the columns its family stages at once: `mosaic.Family.output_columns`), each
+        # epilogue side's two staging copies (`mosaic.staging`), and the barriers: each stream stage's two
+        # and each staged side's two (at a block's edge, a Hopper tile's barriers alone took it 128 bytes
+        # past, the reason they are counted).
         size = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
         hooks = ba.arguments['hooks']
         outs = [jnp.dtype(dtype).itemsize for dtype in (hooks.out_dtypes or (ba.arguments['out_dtype'],))]
@@ -776,7 +777,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         streams = [config.block_m * config.block_k * size, config.block_k * config.block_n * size,
                    *(_side_tile_bytes((side,), (axes,), extents)
                      for side, axes in zip(prologue_sides, hooks.prologue_axes, strict=True))]
-        staged = [config.block_m * config.block_n * out for out in outs]
+        family = _bundle(config, ba.arguments['tokens'].dtype)
+        staged = [config.block_m * family.output_columns(config.block_n, (dtype,)) * out
+                  for dtype, out in zip(hooks.out_dtypes or (ba.arguments['out_dtype'],), outs, strict=True)]
         sides = [2 * _side_tile_bytes((side,), (axes,), extents)
                  for side, axes in zip(epilogue_sides, hooks.epilogue_axes, strict=True)]
         barriers = 2 * config.stages * len(streams) + 2 * (len(epilogue_sides) + len(prologue_sides) + 1)
