@@ -12,6 +12,7 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
@@ -316,13 +317,19 @@ class Mma(mosaic.Family):
         if isinstance(lhs, jax.Array):
             return plgpu.mma(acc, self._left(lhs), plgpu.load(rhs, layout=self.rhs))
         # The left operand a step deep, sliced in registers along the depth at its layout's tiles; the
-        # right one a sub-step at a time from the stage (`fragment_depth`).
+        # right one a sub-step at a time from the stage (`fragment_depth`), along its rows' 8-row tiles,
+        # or, a transposed view (whose rows are a swizzled tile's columns, no narrower slice of which
+        # lowers), a step deep and sliced in registers too.
         left, depth = self._left(lhs), self.fragment_depth(rhs.shape[0])
         if depth == rhs.shape[0]:
             return plgpu.mma(acc, left, plgpu.load(rhs, layout=self.rhs))
+        transposed = any(isinstance(transform, state_types.TransposeTransform)
+                         for transform in getattr(rhs, "transforms", ()))
+        right = plgpu.load(rhs, layout=self.rhs) if transposed else None
         for start in range(0, rhs.shape[0], depth):
-            acc = plgpu.mma(acc, left[:, start:start + depth],
-                            plgpu.load(rhs.at[pl.ds(start, depth)], layout=self.rhs))
+            part = (right[start:start + depth] if right is not None
+                    else plgpu.load(rhs.at[pl.ds(start, depth)], layout=self.rhs))
+            acc = plgpu.mma(acc, left[:, start:start + depth], part)
         return acc
 
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
