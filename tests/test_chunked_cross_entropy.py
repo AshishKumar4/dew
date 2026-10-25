@@ -1254,13 +1254,13 @@ def test_a_confident_targets_logit_gradient_is_the_rest_of_the_rows_eq_7(path, m
     assert np.all(np.asarray(gradient(rows))[:, label] < 0)
 
 
-@pytest.mark.parametrize("path", ["tiled", "whole"])
+@pytest.mark.parametrize("path", ["tiled", "whole", "fused", "logits"])
 @pytest.mark.parametrize("margin", [20.0, 40.0, 80.0])
 def test_a_confident_targets_rest_of_the_row_leaves_an_excluded_column_out(path, margin):
     """A masked diffusion model's excluded column (MDLM's mask token) gives no mass, so a confident target's
-    rest of the row leaves it out as the partition does: the gradient is eq. 7 over the other columns from
-    float64 (check 1), and the excluded column takes none. The excluded column scores highest in every row,
-    so a rest of the row that kept it would show."""
+    rest of the row leaves it out as the partition does, in every head: the gradient is eq. 7 over the other
+    columns from float64 (check 1), and the excluded column takes none. The excluded column scores highest in
+    every row, so a rest of the row that kept it would show."""
     excluded, label = 6, 2
     targets = np.full((3,), label, np.int32)
     head = identity_head()
@@ -1271,6 +1271,10 @@ def test_a_confident_targets_rest_of_the_row_leaves_an_excluded_column_out(path,
         return (rows,)
 
     def loss(logits):
+        if path == "logits":
+            return chunked.logits_cross_entropy(logits, targets, excluded=excluded)[0].sum()
+        if path == "fused":
+            return fused_head_loss(logits, head, targets, jnp.ones(targets.shape), excluded=excluded)[0]
         tile = (3, 3) if path == "tiled" else None
         return chunked_cross_entropy(logits, head, targets, 1, tile=tile, excluded=excluded)[0].sum()
 
@@ -1287,12 +1291,14 @@ def test_a_confident_targets_rest_of_the_row_leaves_an_excluded_column_out(path,
 
 
 @pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("excluded", [None, 6], ids=["no column", "column 6 excluded"])
 @pytest.mark.parametrize("tile", [None, (2, 2)], ids=["whole", "tiled"])
 @pytest.mark.parametrize("margin", [20.0, 40.0, 80.0])
-def test_a_vocabulary_split_heads_confident_target_gradient_is_eq_7(tile, margin):
+def test_a_vocabulary_split_heads_confident_target_gradient_is_eq_7(tile, margin, excluded):
     """Split over the vocabulary on a mesh, the head's gradient of a confident target's loss with respect to
-    the logits is eq. 7 from float64 (check 1), as one device's is. The target's shard takes its entry from
-    the rest of the row summed over every shard, not from its share less one."""
+    the logits is eq. 7 from float64 (check 1), as one device's is, with a column excluded or none. The
+    target's shard takes its entry from the rest of the row summed over every shard, not from its share less
+    one, and an excluded column, in whichever shard it sits, joins neither the rest nor the mass."""
     from jax.sharding import NamedSharding, PartitionSpec as P
 
     from dew.training import MeshSpec
@@ -1301,9 +1307,15 @@ def test_a_vocabulary_split_heads_confident_target_gradient_is_eq_7(tile, margin
     targets = np.full((4,), label, np.int32)
     mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
 
+    def draw(seed):
+        (rows,) = confident(margin, seed, label, width=8, count=4)
+        if excluded is not None:
+            rows[:, excluded] = 40.0
+        return (rows,)
+
     def loss(logits, matrix):
         head = OutputTable(matrix, vocab_major=False, precision=jax.lax.Precision.HIGHEST)
-        return chunked_cross_entropy(logits, head, targets, 1, tile=tile)[0].sum()
+        return chunked_cross_entropy(logits, head, targets, 1, tile=tile, excluded=excluded)[0].sum()
 
     gradient = jax.jit(jax.grad(loss))
 
@@ -1313,6 +1325,15 @@ def test_a_vocabulary_split_heads_confident_target_gradient_is_eq_7(tile, margin
                       jax.device_put(jnp.eye(8), NamedSharding(mesh, P(None, "fsdp"))))
             return np.asarray(gradient(*placed))
 
-    assert_as_exact(split, lambda logits: label_derivative(logits, label),
-                    lambda seed: confident(margin, seed, label, width=8, count=4),
-                    f"vocabulary-split at margin {margin}, {tile}", seeds=CONFIDENT_SEEDS)
+    def reference(logits):
+        if excluded is None:
+            return label_derivative(logits, label)
+        kept = label_derivative(np.delete(logits, excluded, axis=-1), label)
+        return np.concatenate([kept[:, :excluded], np.zeros((len(kept), 1), kept.dtype), kept[:, excluded:]],
+                              axis=-1)
+
+    assert_as_exact(split, reference, draw, f"vocabulary-split at margin {margin}, {tile}, {excluded}",
+                    seeds=CONFIDENT_SEEDS)
+    if excluded is not None:
+        (rows,) = draw(0)
+        assert np.all(split(rows)[:, excluded] == 0)
