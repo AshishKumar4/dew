@@ -22,9 +22,9 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+import selection_margins
 from diffusion_stubs import StubText
 from diffusion_support import images_of
-from flax import linen as nn
 from recording import RecordingTracker
 from reference_error import assert_as_exact, assert_computes_the_oracle, chain_roundings, widened
 from residual_orders import permuted, residual_width
@@ -406,169 +406,51 @@ def widened_state(state):
 
 
 LAYOUT_SEEDS: dict[str, int] = {
-    "unet": 128, "uvit": 128, "simple_udit": 64, "simple_dit": 64, "simple_mmdit": 64,
-    "hierarchical_mmdit": 128, "hybrid_dit": 64, "video_dit": 64, "unet_3d": 128, "jepa_encoder": 128,
-    "jepa_video_encoder": 256, "causal_transformer": 64, "causal_transformer+moe": 128,
-    "causal_transformer+gpt_oss": 256, "causal_transformer+deepseek_v2": 256,
-    "causal_transformer+glm4_moe": 256, "causal_transformer+llama4": 256,
-    "causal_transformer+gemma4_moe": 256, "causal_transformer+gemma3n": 128,
-    "causal_transformer+mla": 64, "causal_transformer+qwen35": 8,
+    "unet": 64, "uvit": 8, "simple_udit": 8, "simple_dit": 8, "simple_mmdit": 8,
+    "hierarchical_mmdit": 8, "hybrid_dit": 8, "video_dit": 8, "unet_3d": 32, "jepa_encoder": 128,
+    "jepa_video_encoder": 128, "causal_transformer": 32, "causal_transformer+moe": 32,
+    "causal_transformer+gpt_oss": 256, "causal_transformer+deepseek_v2": 64,
+    "causal_transformer+glm4_moe": 128, "causal_transformer+llama4": 32,
+    "causal_transformer+gemma4_moe": 64, "causal_transformer+gemma3n": 64,
+    "causal_transformer+mla": 32, "causal_transformer+qwen35": 64,
 }
 """Each cell's declared seeds for check 1 (`assert_as_exact`), the most any layout and step count took,
-sized by `seeds_for` on armada. Every cell's arms share their upstream rounding (the same state, batch
-and draws); a cell whose errors are also heavy-tailed across draws is sized paired with the layout's
-arm (`dew_fn`), as testing.md has it: Gemma 3n's and Qwen 3.5's (the four largest of 64 draws hold
-half of a layer's pooled error, LONG_SEQ_LEN), and MLA's, where one draw in 1024 holds all of one
-device's pooled error (seed 247, an indexer selection the draw filter lets through: ledger 1527) and
-the reference compared with itself resolves no momentum within 4096 draws. Every other cell's errors
-are light-tailed (the four largest of 64 draws hold 7 to 12% of an arm's pooled error at the median
-leaf, 6% being uniform), and it is sized by the reference against itself. Every cell is named: one
-added is sized."""
-
-MARGIN = 1e-5
-"""The least selection margin a draw admits (`selection_margin`), relative to the scale of what is
-selected: above the distance float32 rounding moves a selection's inputs from their float64 values,
-so one device, each layout and the float64 run select alike. Gemma 3n's gate, whose inputs carry the
-rounding of the attention and AltUp before it, moved at most 3.7e-6 of its row's deviation over the
-1,200 forwards of 320 draws, a light tail: each draw's largest was 1.6e-6 at the median and 2.5e-6
-at the 99th percentile. A selection is discontinuous: inputs within rounding of a boundary pick other
-keys or units in other runs, a difference no precision bounds."""
-
+sized paired by `seeds_for` (`dew_fn`, the layout's arm) on armada: every cell's arms share their
+upstream rounding (the same state, batch and draws), so the paired ratio the verdict judges resolves in
+the draws it needs, as few as the reference compared with itself needs or up to 16 times fewer
+(testing.md states how paired counts were validated). For three cells it is the only count that
+resolves at all: Gemma 3n's and Qwen 3.5's errors are heavy-tailed across draws (the four largest of
+64 draws hold half of a layer's pooled error, LONG_SEQ_LEN), and MLA's (one draw in 1024 holds all of
+one device's pooled error, seed 247, an indexer selection the draw filter lets through: ledger 1527),
+where the reference compared with itself resolves no momentum within 4096 draws. Every cell is named:
+one added is sized."""
 
 def selects(case: Case) -> bool:
-    """Whether the cell's model selects discontinuously: a lightning indexer's top-k, Gemma 3n's
-    gaussian top-k or a mixture's routing (`selection_margin`)."""
-    fields = case.config.get("mixer", {}).get("fields", {})
-    sparsities = case.config.get("activation_sparsity_pattern", ())
-    return case.is_lm and bool(fields.get("index_topk") or any(sparsities) or routes(case))
-
-
-def routes(case: Case) -> bool:
-    """Whether the cell's mixture routes by its router's scores: hash routing selects by the token
-    alone, which no rounding moves."""
-    mixture = case.config.get("mixture")
-    return mixture is not None and not mixture.get("hash_layers")
+    """Whether the cell's model selects discontinuously (`selection_margins.selects`)."""
+    return case.is_lm and selection_margins.selects(case.config)
 
 
 @functools.cache
 def selections_forward(name: str):
-    """A cell's forward capturing its discontinuous selections (`selection_margin`), compiled once a
-    cell: the lightning indexer's scores from its `scores` method, Gemma 3n's gate from its gated MLP's
-    Dense, a Router's selection scores, group scores and group mask from its own methods, and gpt-oss's
-    and Gemma 4's router logits from their Dense. One compiled forward rather than an op at a time:
-    XLA:CPU's JIT failed to materialize a gather fusion among the many small programs an unjitted
-    capture compiles."""
-    from dew.nn.gemma4_moe import Gemma4TextRouter
-    from dew.nn.gpt_oss import GptOssMLP
-    from dew.nn.mla import SparseIndexer
-    from dew.nn.mlp import GatedMLP
-    from dew.nn.moe import Router
-
+    """A cell's forward capturing its discontinuous selections (`selection_margins.capture`), compiled
+    once a cell."""
     case = next(case for case in CASES if case.name == name)
-    model = models.build(case.architecture, **case.config)
-
-    def selecting(module, method):
-        if isinstance(module, SparseIndexer):
-            return method == "scores"
-        if isinstance(module, Router):
-            return method in ("selection", "group_scores", "group_mask")
-        if isinstance(module, nn.Dense) and method == "__call__" and (
-                (isinstance(module.parent, GptOssMLP) and module.name == "router")
-                or (isinstance(module.parent, Gemma4TextRouter) and module.name == "proj")):
-            return True
-        parent = module.parent
-        gated = isinstance(parent, GatedMLP) and bool(parent.activation_sparsity)
-        return method == "__call__" and isinstance(module, nn.Dense) and module.name == "gate_proj" and gated
-
-    return jax.jit(lambda variables, tokens: model.apply(
-        variables, tokens, capture_intermediates=selecting, mutable=["intermediates"]))
-
-
-def gate_margin(values: np.ndarray, sparsity: float) -> float:
-    """The smallest margin of Gemma 3n's gaussian top-k over gate rows `values`: each unit's distance
-    from its row's cutoff, the mean plus the sparsity's normal quantile times the population
-    deviation, as `dew.nn.mlp.gaussian_topk` forms it, over that deviation; the least kept unit's
-    height over the cutoff and the cutoff's over the greatest dropped one."""
-    from statistics import NormalDist
-
-    values = np.asarray(values, np.float64)
-    deviation = values.std(-1, keepdims=True)
-    cutoff = values.mean(-1, keepdims=True) + NormalDist().inv_cdf(sparsity) * deviation
-    kept = np.min(np.where(values > cutoff, values, np.inf), axis=-1, keepdims=True)
-    dropped = np.max(np.where(values > cutoff, -np.inf, values), axis=-1, keepdims=True)
-    return float(np.min(np.minimum(kept - cutoff, cutoff - dropped) / deviation))
-
-
-def top_margin(values: np.ndarray, kept: int) -> np.ndarray:
-    """Each row's gap between its `kept`-th largest value and the next, over its largest's size: how
-    far a top-`kept` selection over the row's last axis is from flipping. Infinite where the row
-    holds no more than `kept` finite values, which decide nothing."""
-    ranked = -np.sort(-values, axis=-1)
-    chosen, next_best = ranked[..., kept - 1], ranked[..., kept]
-    scale = np.maximum(np.abs(ranked[..., 0]), np.finfo(np.float32).tiny)
-    return np.where(np.isfinite(next_best), (chosen - next_best) / scale, np.inf)
+    return selection_margins.capture(models.build(case.architecture, **case.config))
 
 
 def selection_margin(case: Case, variables, tokens) -> float:
-    """The smallest margin, over the forward of `variables`, of the model's
-    discontinuous selections relative to their scale: the lightning indexer's top-k (the gap between
-    the k-th and the next visible key's score, over the query's largest), Gemma 3n's gaussian top-k
-    (the gate's distance from its cutoff, the row's mean plus the sparsity's normal quantile times its
-    population deviation, over that deviation, as `dew.nn.mlp.gaussian_topk` forms it) and a
-    mixture's routing, read from the router's own operands: a Router's best groups by its group
-    scores and its experts by its selection scores within them (`top_margin` of each), gpt-oss's and
-    Gemma 4's routers, which rank their logits or their softmax by a plain top-k, by their logits'. A
-    query that sees no more keys than its budget, and an exact zero tie of relu'd scores, ordered
-    alike by index in every run, decide nothing."""
-    fields = case.config.get("mixer", {}).get("fields", {})
-    sparsities = case.config.get("activation_sparsity_pattern", ())
-    margin, seen = np.inf, 0
-    mixture = case.config.get("mixture") or {}
-    _, captured = selections_forward(case.name)(variables, jnp.asarray(tokens[:, :-1]))
-    routers: dict[tuple[str, ...], dict[str, np.ndarray]] = {}
-    for path, values in jax.tree_util.tree_flatten_with_path(captured.get("intermediates", {}))[0]:
-        seen += 1
-        names = [str(getattr(part, "key", part)) for part in path]
-        if names[-2] in ("selection", "group_scores", "group_mask"):
-            routers.setdefault(tuple(names[:-2]), {})[names[-2]] = np.asarray(values)
-            continue
-        values = np.asarray(values, np.float64)
-        if "gate_proj" in names:
-            layer = int(next(name for name in names if name.startswith("layers_")).split("_")[1])
-            margin = min(margin, gate_margin(values, sparsities[layer]))
-            continue
-        if names[-3] in ("router", "proj") and names[-2] == "__call__":
-            # gpt-oss ranks its router's logits, Gemma 4's router their softmax: one order, by logit.
-            margin = min(margin, float(np.min(top_margin(values, mixture.get("top_k", 2)))))
-            continue
-        budget, (queries, keys) = fields["index_topk"], values.shape[-2:]
-        if keys <= budget:
-            continue
-        visible = np.tril(np.ones((queries, keys), bool), keys - queries)
-        ranked = -np.sort(-np.where(visible, values, -np.inf), axis=-1)
-        kept, rejected = ranked[..., budget - 1], ranked[..., budget]
-        decided = np.isfinite(rejected) & ~((kept == 0) & (rejected == 0))
-        scale = np.maximum(np.abs(ranked[..., 0]), np.finfo(np.float32).tiny)
-        margin = min(margin, float(np.min(np.where(decided, (kept - rejected) / scale, np.inf))))
-    # A model that selects shows its selections here, or the draw would pass unfiltered.
-    for operands in routers.values():
-        # A Router chooses its best groups by their scores, then its experts among the groups kept.
-        selection = np.asarray(operands["selection"], np.float64)
-        if "group_scores" in operands:
-            groups = np.asarray(operands["group_scores"], np.float64)
-            margin = min(margin, float(np.min(top_margin(groups, mixture.get("groups_per_token", 1)))))
-            selection = np.where(operands["group_mask"], selection, -np.inf)
-        margin = min(margin, float(np.min(top_margin(selection, mixture.get("top_k", 2)))))
-    assert seen, f"{case.name}: no selection was captured"
-    return margin
+    """The smallest margin of the model's discontinuous selections over the forward of `variables` on
+    the batch's input tokens, relative to their scale (`selection_margins.margin`)."""
+    captured = selections_forward(case.name)(variables, jnp.asarray(tokens[:, :-1]))
+    return selection_margins.margin(case.config, captured, case.name)
 
 
 def clears(case: Case, raw, initial, stepped) -> bool:
-    """Whether the selections of each step's forward on the batch `raw` clear MARGIN
+    """Whether the selections of each step's forward on the batch `raw` clear the margin
     (`selection_margin`): the first step's from `initial`, then the second's from the state
     `stepped(raw)` makes, made only once the first's clear."""
-    return (selection_margin(case, initial, raw["text"]) > MARGIN
-            and selection_margin(case, stepped(raw), raw["text"]) > MARGIN)
+    return (selection_margin(case, initial, raw["text"]) > selection_margins.MARGIN
+            and selection_margin(case, stepped(raw), raw["text"]) > selection_margins.MARGIN)
 
 
 def reordered(state, order):
@@ -584,13 +466,54 @@ def reordered(state, order):
     return state.replace(variables=permuted(state.variables, order), ema=ema)
 
 
+def in_identity_order(stepped: dict, order):
+    """A drawn step's variables, optimizer state and EMA (`drawn_steps`) with the residual stream's
+    units taken back out of `order`: each tree that mirrors the parameters (the parameters, the EMA's,
+    the optimizer's momentum) permuted by its inverse, so that every order of one draw is judged against
+    that draw's one truth (`ORBIT`). A permutation moves no leaf's RMS nor any row's, so a cell judged
+    at one order alone keeps its verdict."""
+    if not len(order):
+        return stepped
+    inverse = np.argsort(order)
+    params = jax.tree.structure(stepped["variables"]["params"])
+
+    def mirrors(node) -> bool:
+        return jax.tree.structure(node) == params
+
+    return jax.tree.map(lambda node: permuted({"params": node}, inverse)["params"] if mirrors(node) else node,
+                        stepped, is_leaf=mirrors)
+
+
+ORBIT = 4
+"""The residual orders each draw of a mixture cell runs at (`assert_as_exact`'s `orders`): its own and
+ORBIT - 1 more, each arm's worst row its worst over them. A routed expert's row of a step's momentum
+can nearly cancel on one draw, its rounding then set by the order its few tokens sum in; one order's
+worst row of either arm is then an extreme of that order alone (ledger 1531), where over the same
+orders both arms meet the same cancellation. A mitigation measured, not a bound: over fresh windows of
+the one-step 8x1-data site, the seven mixture cells' own arms failed 2 of 898 verdicts over four orders
+where they failed 12 at the draw's order alone, and every arm scaled 1.6 times or given an independent
+error 2.5 times its own failed at both."""
+
+
+def orbit(width: int):
+    """`ORBIT` orders of each draw (`assert_as_exact`'s `orders`): the draw's own, and its order
+    composed with ORBIT - 1 fixed shuffles of the `width` residual units, each as uniform over the orders
+    as the draw's own."""
+    shuffles = [np.random.default_rng([0x0B17, width, at]).permutation(width) for at in range(1, ORBIT)]
+
+    def orders(inputs):
+        raw, order = inputs
+        return [inputs, *((raw, order[shuffle]) for shuffle in shuffles)]
+    return orders
+
+
 def drawn_steps(case: Case, tmp_path, fsdp, devices, initial, steps: int, *, exact: bool = False):
     """`steps` steps of a layout over the batch a draw gives, from `initial` in the residual order
     it gives (`reordered`), every step on the same rows, as `run_case`'s `fit` takes them, the step
     compiled once for every draw: a function of the raw batch and the order returning the stepped
-    state's variables, optimizer state and EMA. `exact` runs one device in float64 from the state
-    widened, the batch's samples widened (`wide`), built at its first call, so under the caller's
-    float64."""
+    state's variables, optimizer state and EMA taken back to the identity order
+    (`in_identity_order`). `exact` runs one device in float64 from the state widened, the batch's
+    samples widened (`wide`), built at its first call, so under the caller's float64."""
     built = []
 
     def stepped(raw, order):
@@ -608,7 +531,8 @@ def drawn_steps(case: Case, tmp_path, fsdp, devices, initial, steps: int, *, exa
             built.append(trainer.compile(state, batch))
         for _ in range(steps):
             state, *_ = built[1](state, batch)
-        return jax.device_get({name: getattr(state, name) for name in ("variables", "opt_state", "ema")})
+        return in_identity_order(
+            jax.device_get({name: getattr(state, name) for name in ("variables", "opt_state", "ema")}), order)
 
     return stepped
 
@@ -619,10 +543,16 @@ def test_a_residual_order_is_the_same_decoder(case):
     """The residual orders the layout cells draw (`permuted`) reorder sums only: each language cell's
     float64 logits under an order other than the identity are the identity's within float64's
     rounding of their own longest chain (`assert_computes_the_oracle`), so a draw over orders is a
-    draw of roundings and never another model."""
+    draw of roundings and never another model. Every parameter is drawn apart from its initial value,
+    a norm's or a router's scale as uneven as a trained one, so a residual-wide parameter `permuted`
+    leaves in place moves the logits; a step's state, which `in_identity_order` takes back, holds no
+    other."""
     model = models.build(case.architecture, **case.config)
     ids = np.random.default_rng(3).integers(0, LM["vocab_size"], (2, SEQ_LEN)).astype(np.int32)
-    variables = jax.jit(model.init)(jax.random.key(0), ids)
+    initial = jax.jit(model.init)(jax.random.key(0), ids)
+    rng = np.random.default_rng(4)
+    variables = jax.tree.map(lambda leaf: leaf + rng.normal(0, 0.1, leaf.shape).astype(leaf.dtype)
+                             if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, initial)
     width = residual_width(variables)
     with jax.enable_x64(new_val=True):
         wide = widened(variables)
@@ -667,22 +597,24 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
     width = residual_width(initial.variables) if case.is_lm else 0
     one_step = drawn_steps(case, tmp_path, 1, 1, initial, 1)
 
-    def draw(seed):
-        """A batch drawn from the seed and, independently, an order of the residual stream's units
-        (`reordered`), the cell's own batch and the identity at seed 0: the fresh batch varies the
+    def keyed(key):
+        """A batch drawn from the key and, independently, an order of the residual stream's units
+        (`reordered`), the cell's own batch and the identity at key 0: the fresh batch varies the
         values, the order every contraction's summation, and the reference and each layout start
         from the same reordered state, so all are judged in its coordinates. A model with no
-        token embedding has no residual stream to permute, and draws batches alone. A model that
-        selects discontinuously takes the seed's first batch whose selections, in the forward of
-        each step, clear MARGIN (`selection_margin`)."""
-        for attempt in range(64):
-            key = seed if attempt == 0 else 1_000_003 * (attempt + 1) + seed
-            order = (np.arange(width) if key == 0 else np.random.default_rng(key).permutation(width))
-            raw = next(batches(case, encoder, key)())
-            if not selects(case) or clears(case, raw, initial.variables,
-                                           lambda batch: one_step(batch, np.arange(width))["variables"]):
-                return raw, order
-        raise AssertionError(f"no batch of seed {seed} clears the selection margin {MARGIN}")
+        token embedding has no residual stream to permute, and draws batches alone."""
+        order = np.arange(width) if key == 0 else np.random.default_rng(key).permutation(width)
+        return next(batches(case, encoder, key)()), order
+
+    def cleared(inputs):
+        # The selections of each step's forward clear the margin: the first step's from the initial
+        # state, the second's from the state the first makes.
+        return clears(case, inputs[0], initial.variables,
+                      lambda batch: one_step(batch, np.arange(width))["variables"])
+
+    # A model that selects discontinuously takes the seed's first batch whose selections clear
+    # `selection_margins.MARGIN` (`selection_margins.clearing`).
+    draw = selection_margins.clearing(keyed, cleared) if selects(case) else keyed
 
     seeds = LAYOUT_SEEDS[case.name]
     fsdp = LAYOUTS[layout]
@@ -703,8 +635,10 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
                 assert mine.dtype == theirs.dtype and mine.shape == theirs.shape, name
                 assert np.array_equal(mine.view(np.uint8), theirs.view(np.uint8)), name
     truth = drawn_steps(case, tmp_path, 1, 1, initial, steps, exact=True)
+    # A mixture's rows are judged over each draw's orbit of residual orders (`ORBIT`).
+    orders = orbit(width) if case.is_lm and selection_margins.routes(case.config) else None
     assert_as_exact(drawn[layout], drawn["one device"], draw, f"{case.name} {layout}, {steps} step(s)",
-                    seeds=seeds, truth_fn=truth)
+                    seeds=seeds, truth_fn=truth, orders=orders)
     if fsdp == 1:
         assert not fsdp_leaves(state.variables), "nothing may shard on a 1-wide fsdp axis"
         return

@@ -5,6 +5,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A confident target's loss gradient is the rest of its row's probability summed directly, as arXiv:2610.31642's eq. 7 takes it, through every chunked head (the tiled, whole, fused and vocabulary-split heads) and the whole-logits loss (`logits_cross_entropy`). Each took the target's entry as its share less one, which rounds to 0 once the share rounds to 1, so the row's gradient stopped summing to zero by the rest mass, about 2e-9 at a margin of 20 and 4e-18 at 40. The forward pass reduces one more operand per row for it, and the loss values are unchanged.
+- A filtered or packed read resumes on any number of readers once it is prepared: publish its rows (and
+  a terminal pack's plan) as a generation with `dew data publish` and read it by index, and a new run
+  lowers to the global order. A per-share read refused on another topology now says so.
 - `dew.nn.attention.scaled_dot_product_attention(..., dropout_rate=..., dropout_rng=...)` drops attention
   weights on the selector's route (`generation.Route`): the reference path, or the attention template where
   it is named (`implementation='template'` or `generation.chosen(attention='template')`) and its plain-JAX
@@ -47,6 +51,35 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   across a persistent tile loop, so the next tile's loads overlap this one's
   stores; it runs as fast as CUTLASS's grouped kernel gradient at the MoE
   shapes measured. A fused RMS norm's Mosaic GPU forward now lowers on Hopper.
+- A causal attention kind may read blocks whole: `AttentionMixer(bidirectional_blocks=True)` lets
+  each token of a block (`block_groups=`, `AttentionMetadata.block_groups`, `[B, S]`, -1 outside
+  any) see its whole block, whatever its window, as transformers' `block_sequence_ids` does, while
+  `bidirectional_images` keeps Gemma's images, read whole within the window. A kind may read both,
+  and every other kind stays causal. A cached call reads the groups of its own tokens, so no cache
+  keeps them, and a layer that shares another's keys and values reads them too.
+- `dew.nn.categorical.cross_entropy` and `kl_divergence` differentiate by Barron,
+  Gnanapragasam and Tschannen's fix (arXiv:2610.31642): a label whose margin
+  rounds Optax's `p - 1` to 0 keeps its derivative, each row's derivative sums to
+  zero, and a divergence from logits equal to its reference has derivative
+  exactly zero. Their values are unchanged.
+- A joint decision row's user turn is composed of segments, `JointLayout.segments`, a tuple of
+  `Text`, `Media`, `State` and `Schema` in the order the row writes them: the default is the Laya
+  joint release's turn, and another writes the schema before the state, or text of its own
+  between the parts. A run records its layout and head by import path through `dew.registry`,
+  so a layout or head of a package the run trusts reloads; a record of an earlier run, which
+  names its class alone, reloads as before. `dew.decision.HEADS`, the closed table of heads a
+  run could record, is removed.
+- A joint row may read its schema as its context, `Schema(stream="context")`
+  (`DecisionRunConfig.segments`): the backbone reads the schema in a pass of its own, with its own
+  weights, its cross-attention layers read that pass beside the row, and the joint head pools the
+  questions and options from it; the pass counts in `train/flops`.
+- On a CPU, every float32 product a Dew model forms (the dot family, a bias's
+  gradient, attention's reference path, which a CPU's attention now takes in
+  every dtype) sums in float64 and rounds once (`dew.nn.precision.accumulated`),
+  rather than XLA:CPU's float32 sum, whose order its shape and release choose.
+  A CPU forward costs about 1.6 times, a training step 1.4 to 1.9 times;
+  GPU and TPU programs are unchanged, and convolutions keep their float32 sum.
+  `jax.default_matmul_precision("F32_F32_F32")` takes the float32 sum back.
 - A run's W&B display name is its own, `Wandb.name` (`--trainer.wandb.name`), apart from the
   name its checkpoints are kept under; it shows the run's name where none is given.
 - `Checkpoints.committed()` lists a run's committed steps at each call without opening or writing
@@ -65,9 +98,14 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   pass a batch (`Decide.scoring`), and `dew.inference.Engine` serves it and
   generation's `Server` from one thread; `examples/serve_decisions.py` answers
   concurrent requests in batches (`--batch-tokens`, `--batch-rows`) through it.
-- `OptimConfig.rate` is the learning rate, a number or a schedule's record, in
-  place of `learning_rate` and `schedule`; on the command line it is one value,
-  `--optim.rate 3e-4` or a schedule's JSON record.
+- `OptimConfig.learning_rate` is the learning rate, a number or a schedule's
+  record, in place of the former `learning_rate` and `schedule` fields; on the
+  command line it is one value, `--optim.learning-rate 3e-4` or a schedule's
+  JSON record. A `ParamGroup`'s scale and shape of it is its `learning_rate`.
+  The schedules name their rates as optax does: `peak_value`, `init_value` and
+  `end_value` in place of `peak`, `init` and `end` (`Cosine`, `Power` and its
+  `PowerTail`, `Linear`, `OneCycle`, `Exponential`), so a run record or a flag
+  that names the old fields no longer reads.
 - Module moves, each name at one path: the run configurations are
   `dew.config.lm.LMRunConfig`, `dew.config.jepa.JepaRunConfig` and
   `dew.config.diffusion.DiffusionRunConfig` (with `FlowRolloutConfig`); the

@@ -200,11 +200,11 @@ def tile_groups(lengths: jax.Array, tile: int, tiles: int) -> jax.Array:
     ends = jnp.cumsum(lengths)
     starts = ends - lengths
     index = jnp.arange(lengths.shape[0], dtype=jnp.int32)
-    tile = jnp.int32(tile)
+    rows = jnp.int32(tile)
     # A group's tiles are its blocks shifted by its index (one tile per group boundary a block shares),
     # as upstream counted them, its divisions truncating as `lax.div` does.
-    begin = lax.div(starts, tile) + index
-    end = lax.div(ends - 1, tile) + 1 + index
+    begin = lax.div(starts, rows) + index
+    end = lax.div(ends - 1, rows) + 1 + index
     tids = jnp.arange(tiles, dtype=jnp.int32)[:, None]
     ours = (begin[None] <= tids) & (tids < end[None])
     # The last group whose range holds the tile, as upstream's selects let the last match win.
@@ -235,6 +235,16 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
         k2, n = n, k2
     if k != k2 or k % block_k or n % block_n:
         raise ValueError(f"a [{rows}, {k}] x [{g}, {k2}, {n}] product does not take {tiles}")
+    dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
+    if k == 0:
+        # Dew: a product of no depth sums nothing, its rows zeros through the epilogue on whole arrays (its
+        # hooks are a tile's elementwise arithmetic), with no launch: a walk of no steps has no block of the
+        # matrix to view (JAX 0.12 refuses a zero-extent slice).
+        zeros = jnp.zeros((rows, n), jnp.float32)
+        values = (zeros,) if epilogue is None else epilogue(zeros, *epilogue_operands)
+        values = values if isinstance(values, tuple) else (values,)
+        outs = tuple(value.astype(dtype) for value, dtype in zip(values, dtypes, strict=True))
+        return outs if out_dtypes else outs[0]
     # Dew: a TMA descriptor tiles the rows by 8, so they are padded to a multiple of 8, and the rows past
     # the routed ones, the padding among them, are a last group, whose tiles store zeros.
     lhs = rows_padded(lhs, 0, 8)  # the rows a TMA descriptor tiles by
@@ -247,7 +257,6 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
                                                                                strict=True))
     epilogue_operands = tuple(_side_padded(side, axes) for side, axes in zip(epilogue_operands, epilogue_axes,
                                                                                strict=True))
-    dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
     outs = _gmm_mainloop(lhs, rhs, table, (m, n, k, g), tiles=tiles, transpose_rhs=transpose_rhs,
                          dtypes=dtypes, multiprocessors=multiprocessors, interpret=interpret,
                          hooks=(prologue, prologue_axes, epilogue, epilogue_axes),

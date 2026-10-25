@@ -70,6 +70,7 @@ from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.dit import TextContext
 from dew.nn.inputs import ModelInputs
+from dew.nn.precision import FP32_SUMS
 from dew.nn.protocols import IntervalModel, OutputTable, Recomputing, RequiresText, TimeScaled
 from dew.registry import models
 
@@ -427,8 +428,10 @@ def test_a_jepa_encoders_hidden_states_are_its_representation(case):
 
 def test_a_torchax_models_reads_are_its_forward(tmp_path):
     """A tiny random GPT-NeoX through transformers' own forward: the logits
-    read is the call's, its plain head's stored weight contracts to them,
-    it writes no cache, and every field past the tokens is refused by name."""
+    read is the call's, its plain head's stored weight contracts to them
+    where both sum as XLA does (torchax's products are XLA's own; Dew's state
+    those sums, `FP32_SUMS`), it writes no cache, and every field past the
+    tokens is refused by name."""
     import torch
     import transformers
 
@@ -446,7 +449,8 @@ def test_a_torchax_models_reads_are_its_forward(tmp_path):
     table = model.apply(variables, method="output_table")
     assert table is not None
     hidden = model.apply(variables, tokens, method="hidden_states")
-    same(contracted(hidden, table, variables), logits)
+    with jax.default_matmul_precision(FP32_SUMS):
+        same(contracted(hidden, table, variables), logits)
     for method in ("logits", "hidden_states"):
         with pytest.raises(ValueError):
             model.apply(variables, tokens, method=method, positions=tokens)
@@ -560,14 +564,21 @@ def _rungs(model) -> list:
     return rungs
 
 
-def _climbs_and_restores(model, variables, inputs, **apply) -> None:
+RUNG_SHARES = 2
+"""The parts each ladder's rungs are stepped in, every `RUNG_SHARES`-th rung a case: a ladder steps
+one compiled step a rung, and a checkpoint's whole ladder (kimi-k3-tiny's) took 253 s on an A100,
+past a CI task's 240."""
+
+
+def _climbs_and_restores(model, variables, inputs, share: int, **apply) -> None:
     """Each rung holds less than the one below it and steps the same forward,
     bitwise. Its backward recomputes, which can round apart (gemma2-tiny's
     gradients by up to 1.2e-4, kimi-k3-tiny's 8.3e-3 of 10.8; test_decoder_remat.py
     found the same), so the gradients are the model's bits or as exact as them.
     A rung's record restores it from any rung below it and moves no rung
     above it, and the rung runs over the model's variables, every collection
-    where it was."""
+    where it was. `share` steps every `RUNG_SHARES`-th rung above the model from it, so the
+    shares together step each rung once; every share checks the whole ladder's records."""
     rungs = _rungs(model)
     records = [rung.recompute_record() for rung in rungs]
     assert len(rungs) > 1
@@ -582,17 +593,20 @@ def _climbs_and_restores(model, variables, inputs, **apply) -> None:
     truth = functools.cache(
         lambda: _stepped(_float64(model), widened(variables), widened(inputs), **apply)[1])
     written = model.apply(variables, *inputs, mutable=True, **apply)[1]
-    for rung in rungs[1:]:
+    shared = rungs[1 + share::RUNG_SHARES]
+    assert shared or len(rungs) <= 1 + share, records
+    for rung in shared:
         stepped = _stepped(rung, variables, inputs, **apply)
         same(stepped[0], output)
         as_exact(stepped[1], gradient_tree, truth, f"gradient at {rung.recompute_record()}")
         assert rung.apply(variables, *inputs, mutable=True, **apply)[1].keys() == written.keys()
 
 
+@pytest.mark.parametrize("share", range(RUNG_SHARES))
 @pytest.mark.parametrize("name", PATHS)
-def test_a_checkpoints_remat_rungs_step_as_it_does(name):
+def test_a_checkpoints_remat_rungs_step_as_it_does(name, share):
     source, read = loaded(name), reads(name, "float32")
-    _climbs_and_restores(source.model, source.variables, (read.tokens,), method="logits")
+    _climbs_and_restores(source.model, source.variables, (read.tokens,), share, method="logits")
 
 
 RECOMPUTED = [case for case in ARCHITECTURES
@@ -608,13 +622,14 @@ def _inputs(case) -> tuple:
     return sample, jnp.asarray([0.3, 0.7]), TextContext(text, jnp.ones((ROWS, TEXT_TOKENS), bool))
 
 
+@pytest.mark.parametrize("share", range(RUNG_SHARES))
 @pytest.mark.parametrize("case", RECOMPUTED, ids=[case.name for case in RECOMPUTED])
-def test_an_architectures_remat_rungs_step_as_it_does(case):
+def test_an_architectures_remat_rungs_step_as_it_does(case, share):
     """Every architecture test_architectures.py trains that climbs a remat
     ladder, decoders and DiT stacks, at its size there."""
     model = models.build(case.architecture, **case.config)
     inputs = _inputs(case)
-    _climbs_and_restores(model, model.init(jax.random.key(0), *inputs), inputs)
+    _climbs_and_restores(model, model.init(jax.random.key(0), *inputs), inputs, share)
 
 
 def _packed(variables, groups) -> dict:

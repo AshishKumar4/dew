@@ -5,13 +5,23 @@ from dataclasses import dataclass
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype
 
 from dew.decision.head import Head
 from dew.decision.layout import DecisionInputs
-from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs
-from dew.nn.protocols import CrossAttending, HiddenStates, VocabularyRows
+from dew.nn.cross_attention import ContextEncoder, encode_context
+from dew.nn.inputs import CONTEXT, ModelInputs
+from dew.nn.protocols import (
+    CrossAttending,
+    HiddenStates,
+    LogitsFromHidden,
+    OutputTable,
+    TokenModel,
+    VocabularyRows,
+    head_table,
+)
 from dew.nn.visibility import block_ends, block_starts
 from dew.objectives.base import Variables, part, thaw
 
@@ -33,6 +43,10 @@ class DecisionModel:
 
     backbone: nn.Module
     head: Head
+    context_encoder: ContextEncoder = "table"
+    """How a row's context becomes the states its cross-attention reads (`encode_context`): `table`, its
+    tokens through the backbone's own embedding table, or `backbone`, the backbone's final states over
+    it in a pass of its own, as a schema read in context always is."""
 
     def __post_init__(self):
         if not isinstance(self.backbone, HiddenStates):
@@ -47,12 +61,33 @@ class DecisionModel:
         `media` are the backbone's own inputs for images a request's one row
         holds (`Images.inputs`), with which it reads them. Rows that carry a
         context (`DecisionInputs.context`) hand the backbone's cross-attention
-        each row's context tokens embedded by the backbone's own table
-        (`token_embeddings`).
+        each row's context, embedded by the backbone's own table (`token_embeddings`),
+        or, where the context holds the schema (`DecisionInputs.spans_in_context`),
+        the backbone's own final states over it (`encode_context`).
         """
+        return self._read(variables, inputs, media=media, train=train, rngs=rngs)[0]
+
+    def _read(self, variables: Variables, inputs: DecisionInputs, *, media: ModelInputs | None,
+              train: bool, rngs: dict[str, jax.Array] | None) -> tuple[jax.Array, jax.Array | None]:
+        """The row's final states (`states`), and the context's where the questions' spans are in it."""
         backbone = thaw(part(variables, "backbone"))
         laid = inputs.coordinates()
-        conditioning = None if inputs.context is None else self.conditioning(backbone, inputs)
+        # A row in blocks is read by the backbone's attention whole within each block, on the kinds
+        # that read blocks (`AttentionMetadata.block_groups`); a row in order passes none.
+        blocked: dict[str, jax.Array] = {} if inputs.blocks is None else {"block_groups": inputs.blocks}
+        spanned = conditioning = None
+        if inputs.context is not None:
+            if self.context_length is None:
+                raise TypeError(f"rows carry a context, which a {type(self.backbone).__name__} without "
+                                "cross-attention layers does not read")
+            assert inputs.context_lengths is not None, "a row's context comes with its length"
+            # The context's own pass where it holds the schema, whose spans the head pools from that
+            # same pass, else as the model encodes it.
+            conditioning = encode_context(
+                self.backbone, part(variables, "backbone"), inputs.context, inputs.context_lengths,
+                encoder="backbone" if inputs.spans_in_context else self.context_encoder, train=train,
+                rngs=rngs)
+            spanned = conditioning[CONTEXT] if inputs.spans_in_context else None
         if media is not None:
             if inputs.slots is not None:
                 raise ValueError("a row of option positions holds no images")
@@ -63,19 +98,27 @@ class DecisionModel:
                     held = kwargs.get("conditioning", {})
                     assert isinstance(held, Mapping)
                     kwargs["conditioning"] = {**held, **conditioning}
-                return module.hidden_states(rows.tokens, train=train, coordinates=laid, **kwargs)
-            return _array(self.backbone.apply(backbone, inputs, media, rngs=rngs, method=read_media))
+                return module.hidden_states(rows.tokens, train=train, coordinates=laid, **kwargs, **blocked)
+            return _array(self.backbone.apply(backbone, inputs, media, rngs=rngs, method=read_media)), spanned
         if inputs.slots is None:
-            return _array(self.backbone.apply(backbone, inputs.tokens, train=train, coordinates=laid,
-                                              conditioning=conditioning, method="hidden_states", rngs=rngs))
+            def read(module, tokens):
+                return module.hidden_states(tokens, train=train, coordinates=laid, conditioning=conditioning,
+                                            **blocked)
+            return _array(self.backbone.apply(backbone, inputs.tokens, rngs=rngs, method=read)), spanned
+        if blocked:
+            raise ValueError("a row of option positions sets what each token reads, which blocks set too")
         slots, segments = inputs.slots, inputs.segments
         other = (slots[:, :, None] > 0) & (slots[:, None, :] > 0) & (slots[:, :, None] != slots[:, None, :])
         # A token reads its own row's, and the padding its own; an option reads no other option.
         visible = (segments[:, :, None] == segments[:, None, :]) & ~other
+        if isinstance(self.backbone, TokenModel) and self.backbone.causal:
+            # A causal backbone reads each token's own and the earlier ones, the mask its whole visibility.
+            order = jnp.arange(slots.shape[1])
+            visible = visible & (order[None, :, None] >= order[None, None, :])
         return _array(self.backbone.apply(backbone, inputs.tokens, train=train, coordinates=laid,
                                           attention_pairwise_mask=visible,
                                           attention_key_positions=inputs.positions, method="hidden_states",
-                                          conditioning=conditioning, rngs=rngs))
+                                          conditioning=conditioning, rngs=rngs)), spanned
 
     @property
     def context_length(self) -> int | None:
@@ -84,19 +127,6 @@ class DecisionModel:
         if not isinstance(self.backbone, CrossAttending) or self.backbone.cross_attention is None:
             return None
         return self.backbone.cross_attention.context_length
-
-    def conditioning(self, backbone: Variables, inputs: DecisionInputs) -> dict[str, jax.Array]:
-        """The conditioning a backbone's cross-attention reads for rows that carry a context: each
-        row's context tokens embedded by the backbone's own table (`token_embeddings`), at the
-        width and dtype its blocks take them in (`CrossAttending`), and how many are real."""
-        if self.context_length is None:
-            raise TypeError(f"rows carry a context, which a {type(self.backbone).__name__} without "
-                            "cross-attention layers does not read")
-        assert isinstance(self.backbone, CrossAttending)
-        assert inputs.context_lengths is not None, "a row's context comes with its length"
-        context = self.backbone.apply(backbone, inputs.context, method="token_embeddings")
-        return {CONTEXT: jnp.asarray(context, self.backbone.context_dtype),
-                CONTEXT_LENGTHS: inputs.context_lengths}
 
     def table(self, variables: Variables) -> jax.Array:
         """Return the backbone's head as `[V, D]` rows (`VocabularyRows`), which a head may read."""
@@ -125,11 +155,53 @@ class DecisionModel:
     def logits(self, variables: Variables, inputs: DecisionInputs, *, media: ModelInputs | None = None,
                train: bool = False, rngs: dict[str, jax.Array] | None = None) -> jax.Array:
         """Return the `[B, Q, K]` fp32 option logits, with -inf past each question's options."""
-        states = self.states(variables, inputs, media=media, train=train, rngs=rngs)
-        table = self.table(variables) if self.head.reads_table else None
-        logits = _array(self.head.apply(thaw(part(variables, "head")), states, inputs, table, train=train,
-                                        rngs=rngs))
+        states, spanned = self._read(variables, inputs, media=media, train=train, rngs=rngs)
+        head = thaw(part(variables, "head"))
+        if self.head.reads_labels:
+            if spanned is not None:
+                raise TypeError("a readout of labels reads its questions in the row, not in its context")
+            labels = self.head.tied_labels()
+            tied = None if labels is None else self.label_logits(variables, states, inputs, labels)
+            # A head drawn from the vocabulary rows reads no table after its draw.
+            table = None if self.head.draws_from_rows else self.output_table(variables)
+            logits = _array(self.head.apply(head, states, inputs, table, train=train, tied=tied, rngs=rngs))
+        else:
+            table = self.table(variables) if self.head.reads_table else None
+            # The questions' spans are pooled from the pass that holds them: the context's, where it
+            # holds the schema.
+            logits = _array(self.head.apply(head, states, inputs, table, train=train, rngs=rngs)
+                            if spanned is None else
+                            self.head.apply(head, states, inputs, table, train, spanned, rngs=rngs))
         return jnp.where(inputs.options, logits, -jnp.inf)
+
+    def output_table(self, variables: Variables) -> OutputTable | None:
+        """The backbone's head as one matrix (`AffineHead`), or None where no matrix alone is it."""
+        return head_table(self.backbone, thaw(part(variables, "backbone")))
+
+    def label_logits(self, variables: Variables, states: jax.Array, inputs: DecisionInputs,
+                     labels: tuple[tuple[int, ...], ...]) -> jax.Array:
+        """The backbone's own logits `[B, Q, K, V]` at each label's ids of each question's answer
+        state (`DecisionInputs.readout`): its output table at the labels' columns alone, computed in
+        fp32 (`OutputTable.columns`), where one matrix is its head; else its exact head over the
+        answer states, a few rows (`LogitsFromHidden`), the labels' columns taken. No product is
+        rebuilt from the vocabulary's rows, which carry no bias and no softcap."""
+        if inputs.readout is None:
+            raise ValueError("a readout of labels reads rows whose options stand under labels (Labels)")
+        answers = jnp.take_along_axis(states, inputs.readout[..., None], axis=1)
+        ids = np.asarray(labels, np.int64)
+        width = inputs.options.shape[-1]
+        table = self.output_table(variables)
+        if table is not None:
+            return table.columns(answers, ids.reshape(-1).tolist(), exact=True).reshape(
+                *answers.shape[:2], *ids.shape)[:, :, :width]
+        if not isinstance(self.backbone, LogitsFromHidden):
+            raise TypeError(f"a readout of labels reads its backbone's exact head, which a "
+                            f"{type(self.backbone).__name__} does not give (AffineHead, LogitsFromHidden)")
+        full = jnp.asarray(self.backbone.apply(thaw(part(variables, "backbone")), answers,
+                                               method="logits_from_hidden"))
+        picked = jnp.take(full, jnp.asarray(ids.reshape(-1)), axis=-1)
+        return picked.astype(jnp.promote_types(picked.dtype, jnp.float32)).reshape(
+            *answers.shape[:2], *ids.shape)[:, :, :width]
 
 
 def key_runs(slots: jax.Array, segments: jax.Array, options: int, *, causal: bool = False) -> jax.Array:

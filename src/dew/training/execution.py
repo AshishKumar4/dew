@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import math
 import os
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
@@ -33,12 +34,22 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from dew.inference.banks import bank_sharding, bank_sites, entry_tree, in_namespace, narrowed, one_layer
+from dew.inference.banks import (
+    assembled,
+    bank_sharding,
+    bank_sites,
+    entry_tree,
+    in_namespace,
+    narrowed,
+    one_layer,
+)
 from dew.nn.backbones.layer_plan import group_name, layer_index
-from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.options import program
+from dew.nn.sharding import batch_axes
 from dew.objectives.base import FROZEN, merge, select, thaw, without
 from dew.training.distributed import batch_shardings
 from dew.training.host import transfer
+from dew.training.memory import device_tokens, step_compiler_options
 from dew.training.transaction import Realization, placed_as_rows
 
 if TYPE_CHECKING:
@@ -266,15 +277,6 @@ def _forward(loss, primal, frozen, store, batch, execution, *, layout):
     return jax.vjp(evaluate, primal, has_aux=True)
 
 
-@functools.cache
-def _pullback(options: tuple[tuple[str, bool], ...]):
-    """`_trainable_cotangent` compiled with the objective's modules' XLA `options`
-    (`compiler_options`): with an int8 backward (`Quantization.bwd_qtype`) the pullback runs its
-    int8 dots here, apart from the forward's program."""
-    return jax.jit(_trainable_cotangent, static_argnames=("sites", "paths", "layout"),
-                   compiler_options=dict(options))
-
-
 def _trainable_cotangent(back, cotangent, *, sites, paths, layout):
     """Run the pullback, the unstack and the selection as one computation.
 
@@ -307,15 +309,25 @@ class HostExecution:
         self.device = device
         self.unstack = jax.jit(functools.partial(_logical, sites=self.sites))
 
-    @property
-    def forward(self):
-        """The loss and its pullback, compiled for the objective's modules as they are now: the
-        objective owns the program, which its fit ladder replaces with its model. The dataset's
-        device steps run in it, on the accelerator, before the loss, so it holds them (`holds`)."""
+    def forward(self, step: Mapping[str, bool | int]):
+        """The loss and its pullback, compiled for the objective's modules as they are now, under the
+        `step`'s XLA options (`step_options`): the objective owns the program, which its fit ladder
+        replaces with its model. The dataset's device steps run in it, on the accelerator, before the
+        loss, so it holds them (`holds`)."""
         return self.objective.program(
             "host_forward",
             functools.partial(_forward, functools.partial(_after, self.device, self.objective._loss)),
-            static_argnames=("layout",), holds=self.device)
+            static_argnames=("layout",), holds=self.device, step=step)
+
+    def step_options(self, variables, batch) -> dict[str, bool | int]:
+        """The XLA options the resident step compiles under (`step_compiler_options`), which the host
+        step's forward and pullback take too, so the two differ by the host boundary alone: the
+        tokens each accelerator device steps of `batch`, whether the step trains next to frozen
+        weights, and the accelerator's devices."""
+        shards = math.prod(self.accelerator.shape[axis] for axis in batch_axes(self.accelerator))
+        options = step_compiler_options(self.objective, device_tokens(self.objective, batch, shards),
+                                        FROZEN in variables, self.accelerator.devices.size)
+        return dict(options or {})
 
     def snapshot(self, variables):
         """The declared stacks as banks, everything else as it is stored.
@@ -347,32 +359,24 @@ class HostExecution:
         entries = {**{collection: tree for collection, tree in whole.items()
                       if collection != "params"}, **entry_tree(weights, self.sites)}
         store = transfer(entries, narrowed(placement, entries))
-        for site in self.sites:
+
+        def bank(site, first: int, count: int, name: str):
+            """A group's bank from the state: its rows stacked on the CPU into the bank's placement
+            (`_stack_rows`) over the frozen bank the state holds, or its one layer placed as it is."""
             banks = in_namespace(weights, site.namespace)["params"]
-            for (first, count), name in zip(site.view.groups, site.view.bank_names(), strict=True):
-                rows = [one_layer(weights, index, namespace=site.namespace)
-                        for index in range(first, first + count)]
-                held = {"params": banks[name]} if count > 1 and name in banks else {}
-                if not rows[0] and not held:
-                    continue
-                if count == 1:
-                    bank = transfer(rows[0], _bank_shardings(
-                        one_layer(places, first, namespace=site.namespace), self.accelerator, count))
-                elif rows[0]:
-                    spread = _bank_shardings(one_layer(places, first, namespace=site.namespace),
-                                             self.accelerator, count)
-                    bank = jax.tree_util.tree_map_with_path(
-                        lambda path, sharding, *leaves: self._stack_rows(leaves, sharding), spread, *rows)
-                    bank = merge(held, bank)
-                else:
-                    bank = held
-                bank = jax.block_until_ready(bank)
-                for collection, values in bank.items():
-                    branch = store.setdefault(collection, {})
-                    for component in site.namespace:
-                        branch = branch.setdefault(component, {})
-                    branch[name] = values
-        return store
+            rows = [one_layer(weights, index, namespace=site.namespace)
+                    for index in range(first, first + count)]
+            held = {"params": banks[name]} if count > 1 and name in banks else {}
+            if not rows[0]:
+                return held or None
+            spread = _bank_shardings(one_layer(places, first, namespace=site.namespace),
+                                     self.accelerator, count)
+            if count == 1:
+                return transfer(rows[0], spread)
+            return merge(held, jax.tree_util.tree_map_with_path(
+                lambda path, sharding, *leaves: self._stack_rows(leaves, sharding), spread, *rows))
+
+        return merge(store, assembled(self.sites, bank))
 
     def _stack_rows(self, rows, sharding):
         """Stack the rows of one bank leaf into the bank's placement.
@@ -431,13 +435,14 @@ class HostExecution:
         layout = (treedef, held)
         with jax.set_mesh(self.accelerator):
             batch = transfer(batch, batch_shardings(self.accelerator, batch))
+            options = self.step_options(variables, batch)
             # The step crosses whole, so its examples' draws are the resident step's (`Step.sample`);
             # its averaged weights are the snapshot's, and its places the batch's rows'.
             here = self.on_accelerator(step.replace(ema=None)).replace(ema=ema)
             if here.example_index is not None:
                 here = here.replace(example_index=placed_as_rows(here.example_index, batch))
             rest = {name: tree for name, tree in store.items() if name != "params"}
-            stats, back, aux = self.forward(primal, frozen, rest, batch, here, layout=layout)
+            stats, back, aux = self.forward(options)(primal, frozen, rest, batch, here, layout=layout)
         stats, aux = self.on_cpu((stats, aux))
         if aux.variables is not None:
             with jax.set_mesh(self.cpu):
@@ -447,9 +452,12 @@ class HostExecution:
             # A shared owner is one bank input, so native reverse mode already
             # sums every use's contribution into it.
             with jax.set_mesh(self.accelerator):
-                options = compiler_options(*(entry.module for entry in self.objective.program_key()))
-                gradient = _pullback(tuple(options.items()))(
-                    back, self.on_accelerator(cotangent), sites=self.sites, paths=moving,
-                    layout=layout)
+                # The pullback runs its int8 dots here, apart from the forward's program, with an
+                # int8 backward (`Quantization.bwd_qtype`) on the options that ask for it.
+                pulled = program(_trainable_cotangent,
+                                 *(entry.module for entry in self.objective.program_key()), step=options,
+                                 static_argnames=("sites", "paths", "layout"))
+                gradient = pulled(back, self.on_accelerator(cotangent), sites=self.sites, paths=moving,
+                                  layout=layout)
             return self.on_cpu(gradient)
         return Realization(stats, aux, pullback)

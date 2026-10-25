@@ -31,7 +31,7 @@ from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceGrid
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, weighted_total
 from dew.objectives.base import OMITTED, Aux, Batch, Omitted, Ratio, Shown, Step, Variables
 from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.rl.advantage import group_normalised
@@ -222,16 +222,16 @@ class FlowGRPOObjective(DiffusionObjective):
             surrogate, _ = clipped_surrogate_terms((current - previous)[:, None], advantage, keep[:, None],
                                                    epsilon_low=self.clip_range, epsilon_high=self.clip_range,
                                                    dual_clip=None)
-            pg = jnp.where(keep, surrogate[:, 0], 0).sum()
+            pg, mass = weighted_total(surrogate[:, 0], keep)
             ratio = jnp.exp(current - previous)
             kl = jnp.asarray(0.0)
             if reference is not None:
                 # The released scripts/train_sd3.py that the module docstring
                 # compares this KL with is at 879042cf5707f8b90daa98d147d7deac2317c5da.
                 reference_mean = self._transition(reference.at((), index), x, t, s).mean
-                kl = jnp.where(keep, transition.kl(reference_mean) / dimensions, 0).sum()
+                kl, _ = weighted_total(transition.kl(reference_mean) / dimensions, keep)
             clipped_count = (keep & (jnp.abs(ratio - 1) > self.clip_range)).sum()
-            return None, (pg, kl, keep.astype(jnp.float32).sum(), clipped_count)
+            return None, (pg, kl, mass, clipped_count)
 
         _, summed = jax.lax.scan(terms, None, (*(jnp.swapaxes(value, 0, 1) for value in (
             latents, following, times, next_times, old, advantages, mask)), jnp.arange(times.shape[1])))

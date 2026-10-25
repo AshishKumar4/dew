@@ -28,6 +28,7 @@ from dew.nn.documents import (
 )
 from dew.nn.inputs import coordinates, counted_places
 from dew.nn.kernels.templates import attention as template
+from dew.nn.precision import FP32_SUMS
 from dew.nn.visibility import windowed
 
 QUERIES, KEYS = 100, 96
@@ -447,7 +448,8 @@ def test_the_templates_arithmetic_is_on_par_with_dews_reference_attention(case, 
     """`template.reference` over each call form's spans and each hook, on par with Dew's reference path
     (`scaled_dot_product_attention`, 'reference', the same keys as a mask) over the site's draws, both
     measured from float64 (`exact_attention` under that mask); a query that keeps no key reads zero on
-    both."""
+    both. The template sums its fp32 products as the kernels it stands for do, so the reference path
+    sums its own as an accelerator does (`FP32_SUMS`)."""
     mask = jnp.asarray(dews_mask(case))[:, None]
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
@@ -463,14 +465,18 @@ def test_the_templates_arithmetic_is_on_par_with_dews_reference_attention(case, 
         return scaled_dot_product_attention(query, key, value, mask=mask, bias=bias, sinks=sinks,
                                             softcap=softcap, implementation="reference")
 
+    def summed(query, key, value):
+        with jax.default_matmul_precision(FP32_SUMS):
+            return dews(query, key, value)
+
     def exact(query, key, value):
         return exact_attention(query, key, value, None if sinks is None else sinks.astype(query.dtype),
                                softcap=softcap, mask=np.asarray(mask))
 
     # `exact_attention` takes no bias: under ALiBi the truth is Dew's reference path in float64.
-    assert_as_exact(jax.jit(ours), jax.jit(dews), drawing(queries, keys, dtype),
+    assert_as_exact(jax.jit(ours), jax.jit(summed), drawing(queries, keys, dtype),
                     f"template arithmetic {case} {hooks} {jnp.dtype(dtype).name}",
-                    seeds=SEEDS, truth_fn=None if alibi is not None else exact)
+                    seeds=SEEDS, truth_fn=dews if alibi is not None else exact)
 
 
 LAYOUTS = ("causal-documents-window", "cross-causal-lengths-starts")
@@ -509,7 +515,9 @@ def test_every_parameter_layout_and_the_output_hook_are_on_par(case, dtype):
     def dews(query, key, value):
         wide = jnp.promote_types(query.dtype, jnp.float32)
         scaled = (query.astype(wide) * jnp.swapaxes(temperature, 1, 2)[..., None]).astype(query.dtype)
-        bias = (key_bias[:, :, None, :] + dense_bias).astype(query.dtype)
+        # Each bias widened before the sum, as the template widens each parameter: a float64 truth sums
+        # them in float64, not their fp32 sum widened after its rounding.
+        bias = (key_bias[:, :, None, :].astype(wide) + dense_bias.astype(wide)).astype(query.dtype)
         out = scaled_dot_product_attention(scaled, key, value, mask=mask, bias=bias,
                                            implementation="reference")
         return (out.astype(wide) * jax.nn.sigmoid(gate.astype(wide))).astype(query.dtype)

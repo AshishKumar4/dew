@@ -16,8 +16,10 @@ import math
 import re
 import sys
 import threading
-from collections.abc import Iterable
+import traceback
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from typing import ClassVar
 
 import jax
 import numpy as np
@@ -34,24 +36,44 @@ def _cache_event(event: str, **metadata) -> None:
             _cache_counts[event] += 1
 
 
+@dataclass(frozen=True)
+class Program:
+    """One program a block needed: `traced` (its jaxpr) or `compiled` (by the backend, or fetched
+    from the persistent compilation cache), its function's name, its seconds, and where it was asked
+    for, the innermost frame outside JAX's and this module's."""
+
+    kind: str
+    name: str
+    seconds: float
+    where: str
+
+
 class Compiles:
     """Counts the programs jitted functions named `name` need while it is open (every function's with
     None), each compiled or fetched from the persistent compilation cache, as JAX reports them
     (`jax.monitoring`'s backend compile event, which names a function `jit(<name>)`): what a warm-up
-    costs, or a compile a measured run should not have paid. JAX's events have one listener owner,
-    this module.
+    costs, or a compile a measured run should not have paid. `programs` holds every program it
+    heard, the ones traced beside the ones compiled. JAX's events have one listener owner, this
+    module.
 
         with Compiles("_stepped") as compiles:
             server.run()
         assert compiles.count == 0
     """
 
-    EVENT = "/jax/core/compile/backend_compile_duration"
+    EVENTS: ClassVar[Mapping[str, str]] = {"/jax/core/compile/jaxpr_trace_duration": "traced",
+                                           "/jax/core/compile/backend_compile_duration": "compiled"}
+    """The compile events `jax.monitoring` records a duration for, by what each counts."""
 
     def __init__(self, name: str | None) -> None:
-        self.name = None if name is None else f"jit({name})"
-        self.seconds: list[float] = []
-        """Each program's seconds, in the order they were needed."""
+        self.name = name
+        self.programs: list[Program] = []
+        """Each program it heard, in the order they were needed."""
+
+    @property
+    def seconds(self) -> list[float]:
+        """Each compiled program's seconds, in the order they were needed."""
+        return [program.seconds for program in self.programs if program.kind == "compiled"]
 
     @property
     def count(self) -> int:
@@ -65,8 +87,15 @@ class Compiles:
         jax.monitoring.unregister_event_duration_listener(self._heard)
 
     def _heard(self, event: str, duration_secs: float, **metadata: str | int) -> None:
-        if event == self.EVENT and self.name in (None, metadata.get("fun_name")):
-            self.seconds.append(duration_secs)
+        kind = self.EVENTS.get(event)
+        # A trace names its function bare, a backend compile `jit(<name>)`.
+        named = self.name is None or metadata.get("fun_name") in (self.name, f"jit({self.name})")
+        if kind is not None and named:
+            frame = next((frame for frame in reversed(traceback.extract_stack()[:-1])
+                          if "/jax/" not in frame.filename and "/jaxlib/" not in frame.filename
+                          and frame.filename != __file__ and "contextlib" not in frame.filename), None)
+            where = "?" if frame is None else f"{frame.filename}:{frame.lineno}"
+            self.programs.append(Program(kind, str(metadata.get("fun_name")), duration_secs, where))
 
 
 @functools.cache
@@ -115,6 +144,11 @@ _MAC = 2
 _ARRAY = re.compile(r'([a-z][a-z0-9]*)\[([\d,]*)\](\{[^}]*\})?')
 _PACKED = re.compile(r'E\((\d+)\)')
 _BITS = re.compile(r'(\d+)')
+_GROUPED = re.compile(r"(?:replica_groups|source_target_pairs)=(\{\}|\{\{[\d,{}]*\}\}|\[[\d,]+\]<=\[[\d,]+\]"
+                      r"(?:T\([\d,]+\))?|mesh\[[^\]]*\]\s*\{[^}]*\})")
+_NUMBERS = re.compile(r'\d+')
+_SIZED = re.compile(r"'([^']+)'=(\d+)")
+_QUOTED = re.compile(r"'([^']+)'")
 COLLECTIVES = ("all-reduce", "all-gather", "reduce-scatter", "all-to-all", "collective-permute")
 """The HLO ops that move data between devices. XLA runs some as an async
 pair, `<op>-start` and `<op>-done`, and wraps others in `async-start` over a
@@ -125,6 +159,37 @@ def collective(op: str) -> str | None:
     """The collective (`COLLECTIVES`) HLO op `op` is, or runs half of; None for any other."""
     kind = op.removesuffix('-start').removesuffix('-done')
     return kind if kind in COLLECTIVES else None
+
+
+def _groups(attributes: str) -> tuple[tuple[int, ...], ...]:
+    """A collective's device groups, each the positions in the module's device assignment that
+    take part together, from the forms XLA prints them in: its `replica_groups` listed, as an
+    iota (`[4,2]<=[2,4]T(1,0)`, the positions laid out, transposed and cut into rows) or over a
+    mesh's named axes (`mesh['fsdp'=4,'sequence'=2] {'fsdp'}`), or a collective-permute's
+    `source_target_pairs`, a pair a group. Empty where every device takes part together (`{}`)."""
+    found = _GROUPED.search(attributes)
+    if found is None:
+        return ()
+    text = found.group(1)
+    if text.startswith('mesh'):
+        axes, within = text.split(']', 1)
+        sized = [(name, int(size)) for name, size in _SIZED.findall(axes)]
+        taking = set(_QUOTED.findall(within))
+        moved = [index for index, (name, _) in enumerate(sized) if name in taking]
+        kept = [index for index in range(len(sized)) if index not in moved]
+        sizes = [size for _, size in sized]
+        positions = np.arange(math.prod(sizes)).reshape(sizes).transpose(kept + moved)
+        return tuple(map(tuple, positions.reshape(-1, math.prod(sizes[index] for index in moved)).tolist()))
+    if text.startswith('['):
+        shape, source = text.split('<=')
+        laid, _, order = source.partition('T')
+        sizes = [int(size) for size in _NUMBERS.findall(laid)]
+        positions = np.arange(math.prod(sizes)).reshape(sizes)
+        if order:
+            positions = positions.transpose([int(axis) for axis in _NUMBERS.findall(order)])
+        return tuple(map(tuple, positions.reshape([int(size) for size in _NUMBERS.findall(shape)]).tolist()))
+    return tuple(tuple(int(position) for position in _NUMBERS.findall(group))
+                 for group in re.findall(r'\{([\d,]*)\}', text[1:-1]))
 
 
 def _buffers(shape: str) -> tuple[int, ...]:
@@ -169,6 +234,8 @@ class _Instruction:
     """A collective's result, each array's bytes (`_buffers`); empty for any other op."""
     shapes: tuple[tuple[int, ...], ...] = ()
     """A collective's result, each array's dimensions, as `buffers` sizes them; empty for any other op."""
+    groups: tuple[tuple[int, ...], ...] = ()
+    """A collective's device groups (`_groups`); empty for any other op."""
 
 
 @dataclass
@@ -259,7 +326,8 @@ def _parse(text: str | Iterable[str]) -> tuple[dict[str, _Computation], str | No
         shapes = tuple(tuple(int(d) for d in each.split(',') if d)
                        for _, each, _ in _ARRAY.findall(match.group('shape'))) if moved else ()
         computation.instructions[name] = _Instruction(match.group('op'), dims, operands, attributes,
-                                                      recomputed, traced, buffers, shapes)
+                                                      recomputed, traced, buffers, shapes,
+                                                      _groups(attributes) if moved else ())
         if stripped.startswith('ROOT'):
             computation.root = name
         literal = _INTEGER.match(match.group('rest'))
@@ -445,6 +513,9 @@ class HloInstruction:
     what moved, its `-start` what it read as well. Empty for any other op."""
     shapes: tuple[tuple[int, ...], ...]
     """A collective's result, each array's dimensions, as `buffers` sizes them."""
+    groups: tuple[tuple[int, ...], ...]
+    """A collective's device groups, each the positions in the module's device assignment that
+    take part together; empty where every device does, and for any other op (`_groups`)."""
 
 
 def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
@@ -498,7 +569,7 @@ def hlo_instructions(text: str | Iterable[str]) -> dict[str, HloInstruction]:
             found[name] = HloInstruction(instruction.op, target.group(1) if target else '',
                                          tuple(instruction.operands), ops, instruction.recomputed, names,
                                          reads, flops, weights.get(called_as, 0.0), instruction.buffers,
-                                         instruction.shapes)
+                                         instruction.shapes, instruction.groups)
     computations.clear()
     return found
 

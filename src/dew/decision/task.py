@@ -5,8 +5,9 @@ import binascii
 import functools
 import io
 import json
-from collections.abc import Callable, Iterable, Mapping, Sequence
-from dataclasses import dataclass, field, replace
+import math
+from collections.abc import Iterable, Mapping, Sequence
+from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Self, overload
 
@@ -43,9 +44,8 @@ from dew.decision.layout import (
     Layout,
     MarkerLayout,
     Specials,
-    StateFirstLayout,
-    context_tokens,
     render,
+    with_context,
 )
 from dew.decision.model import DecisionModel
 from dew.decision.questions import (
@@ -64,8 +64,10 @@ from dew.files import write_atomically
 from dew.inference import scoring
 from dew.inference.tasks import shape_bucket
 from dew.interop.processors import Processor
+from dew.nn.cross_attention import ContextEncoder
 from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
-from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.options import program
+from dew.nn.sharding import batch_axes
 from dew.objectives.base import Metric, Objective, Variables
 from dew.records import JSON, json_value, record
 
@@ -77,8 +79,6 @@ if TYPE_CHECKING:
 
 TASK_FILE = "decide.json"
 """The file `Decide.save` writes into a run: its calibration, budget and name."""
-_LAYOUTS: Mapping[str, type[Layout]] = {
-    layout.__name__: layout for layout in (MarkerLayout, StateFirstLayout, JointLayout)}
 
 
 @dataclass(frozen=True)
@@ -104,6 +104,9 @@ class Weights:
 
     step: int
     ema: bool
+    averaged: tuple[tuple[str, int, bool], ...] = ()
+    """The runs' checkpoints these weights are the fp32 mean of (`Decide.averaged`): each run's
+    directory, step, and whether its own average was read; none for one run's weights."""
 
 
 @dataclass(frozen=True)
@@ -133,14 +136,31 @@ def usage_of(rows: Sequence[Encoded]) -> Usage:
 @dataclass(frozen=True)
 class DecideSettings:
     """What a decision run records beside its backbone, and its task is built with
-    (`Decide.from_run`): the head's record (`Head.record`), the layout's name and fields, the
-    special tokens, the text tokenizer's name, and an image processor's source, or None."""
+    (`Decide.from_run`): the head's record (`Head.record`), the layout (by import path, its
+    segments with it), the special tokens, the text tokenizer's name, and an image processor's
+    source, or None."""
 
     head: JSON
-    layout: JSON
+    layout: Layout
     specials: Specials
     tokenizer: str | None
     processor: str | None
+    context_encoder: ContextEncoder = "table"
+    """How the model encodes a row's context (`DecisionModel.context_encoder`); a run recorded before
+    the choice existed embedded it by its token table."""
+
+    @staticmethod
+    def of(record: Mapping[str, object]) -> "DecideSettings":
+        """The settings a run's record holds (`saved_settings`). An earlier run's record names its
+        layout by class name alone, one of `dew.decision.layout`'s, and is read as that class's."""
+        from dew.inference.tasks import saved_settings
+
+        laid = record.get("layout")
+        if isinstance(laid, Mapping) and "name" in laid:
+            name = records.text(laid["name"], "layout.name")
+            record = {**record, "layout": {"class": f"dew.decision.layout:{name}",
+                                           "fields": records.json_value(laid.get("fields"), "layout.fields")}}
+        return saved_settings(record, DecideSettings)
 
 
 @dataclass(frozen=True)
@@ -198,6 +218,27 @@ class Decide:
                    checkpoint.specials, Calibration(temperatures), name=label)
 
     @classmethod
+    def _recorded(cls, directory: str, record: Mapping[str, object], backbone, variables: Variables,
+                  weights: Weights, dtype: DTypeLike | None) -> Self:
+        """The task a run's `record` describes over `backbone` and `variables`, the `weights` they are:
+        its head, layout, tokenizer, special tokens and processor as the run recorded them."""
+        from dew.data.text import tokenizer_for
+        from dew.interop.pretrained import load_processor
+
+        settings = DecideSettings.of(record)
+        width, head_dtype = DecisionModel.head_size(backbone)
+        head = Head.from_record(records.json_value(settings.head, "head"), width)
+        # The head computes in the dtype it recorded, or as a fresh head over
+        # the backbone would where the caller overrides the compute dtype.
+        model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype),
+                              settings.context_encoder)
+        if settings.tokenizer is None:
+            raise ValueError("the run records no tokenizer to lay its rows out with")
+        processor = None if settings.processor is None else load_processor(settings.processor, backbone)
+        return cls(model, variables, settings.layout, tokenizer_for(settings.tokenizer), settings.specials,
+                   name=str(epath.Path(directory).name), weights=weights, processor=processor)
+
+    @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: "MeshSpec | Mesh | None" = None, layout: "Placement | None" = None,
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> Self:
@@ -211,26 +252,10 @@ class Decide:
         The image processor reloads from its recorded source independently of
         the tokenizer that lays out the task's text.
         """
-        from dew.data.text import tokenizer_for
-        from dew.inference.tasks import run_record, saved_model, saved_settings
-        from dew.interop.pretrained import load_processor
+        from dew.inference.tasks import run_record, saved_model
         from dew.registry import from_record, objectives
 
         record, step = run_record(directory, step)
-        settings = saved_settings(record, DecideSettings)
-        backbone = saved_model(record, dtype).build()
-        width, head_dtype = DecisionModel.head_size(backbone)
-        head = Head.from_record(records.json_value(settings.head, "head"), width)
-        # The head computes in the dtype it recorded, or as a fresh head over
-        # the backbone would where the caller overrides the compute dtype.
-        model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype))
-        laid = records.record(settings.layout, "layout")
-        # A layout is plain data, its framing's template variables included: no field is a dtype.
-        rows = from_record(_LAYOUTS[records.text(laid["name"], "layout.name")],
-                           records.json_value(laid["fields"], "layout.fields"), dtypes=False)
-        if settings.tokenizer is None:
-            raise ValueError("the run records no tokenizer to lay its rows out with")
-        processor = None if settings.processor is None else load_processor(settings.processor, backbone)
         variables = objectives[records.text(record["objective"], "objective")]._saved_variables(
             directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
         if ema is None:
@@ -238,23 +263,54 @@ class Decide:
                 averaged = checkpoints.stored(step).get("ema") is not None
         else:
             averaged = ema
-        task = cls(model, variables, rows, tokenizer_for(settings.tokenizer), settings.specials,
-                   name=str(epath.Path(directory).name), weights=Weights(step, averaged),
-                   processor=processor)
+        task = cls._recorded(directory, record, saved_model(record, dtype).build(), variables,
+                             Weights(step, averaged), dtype)
         saved = epath.Path(directory) / TASK_FILE
         if not saved.exists():
             return task
         settings = records.record(json.loads(saved.read_text()), TASK_FILE)
         fitted = from_record(Weights, records.json_value(settings["weights"], "weights"))
-        if fitted != task.weights:
+        # An average's own directory names the runs it averages beside the step it holds (`save`).
+        if (fitted.step, fitted.ema) != (step, averaged):
             raise ValueError(
                 f"{TASK_FILE} was fitted on step {fitted.step}'s {'averaged' if fitted.ema else 'live'} "
                 f"weights, and this loads step {step}'s {'averaged' if averaged else 'live'} ones; "
                 "fit them again with `calibrated` and `save`, or load the step it was fitted on")
-        return replace(task, calibration=from_record(Calibration, records.json_value(settings["calibration"],
-                                                                                    "calibration")),
+        return replace(task, weights=fitted,
+                       calibration=from_record(Calibration, records.json_value(settings["calibration"],
+                                                                               "calibration")),
                        budget=from_record(Budget, records.json_value(settings["budget"], "budget")),
                        name=records.text(settings["name"], "name"))
+
+    @classmethod
+    def averaged(cls, runs: Sequence[str], *, step: int | str | None = None, ema: bool | None = None,
+                 calibrate_on: "Iterable[Example | Mapping[str, object]] | Reader | None" = None) -> Self:
+        """The task over `runs`' weights as any runs average (`dew.checkpoints.averaged`: their fp32
+        mean, each run's at `step`, its latest where None, and `ema` as `from_run` reads them, a LoRA
+        backbone's factors merged first), its calibration the identity, or refit on `calibrate_on`'s
+        held-out answers (`calibrated`): temperatures are fitted to one set of weights.
+
+        The runs are one task's: their recorded settings (`DecideSettings`: head, layout, tokenizer,
+        special tokens, processor and context encoder) the same; a run whose settings differ is
+        refused (ValueError), naming them. The task's `weights` record each run's directory, step and
+        whether its average was read, so it is no one run's: `save` writes it to a directory of its own
+        as a run, which `from_run` and `dew.pipeline` then load, whatever its layout."""
+        from dew.checkpoints import averaged
+        from dew.inference.tasks import run_record
+
+        recorded = [run_record(directory, step)[0] for directory in runs]
+        first = DecideSettings.of(recorded[0]) if recorded else None
+        for directory, saved in zip(runs, recorded, strict=True):
+            settings = DecideSettings.of(saved)
+            differing = [entry.name for entry in fields(DecideSettings)
+                         if getattr(settings, entry.name) != getattr(first, entry.name)]
+            if differing:
+                raise ValueError(f"the run in {directory} differs from {runs[0]} in its "
+                                 f"{', '.join(differing)}, so their weights are not one task's to average")
+        average = averaged(runs, step=step, ema=ema)
+        task = cls._recorded(runs[0], recorded[0], average.model.build(), average.variables,
+                             Weights(average.runs[0][1], ema=False, averaged=average.runs), None)
+        return task if calibrate_on is None else task.calibrated(calibrate_on)
 
     def save_pretrained(self, directory: str | Path) -> None:
         """Write this task as a released checkpoint, which `from_pretrained` reads back.
@@ -283,17 +339,72 @@ class Decide:
 
         It also records the checkpoint the weights came from, so `from_run` and
         `dew.pipeline` read the calibration back for that checkpoint. The file is
-        written whole or not at all.
+        written whole or not at all. An average of runs (`averaged`), whose
+        weights no one run holds, is written to a `directory` of its own: a run of
+        one checkpoint of the average, its optimizer state empty, under the record
+        its runs share (`DecisionObjective.inference_record`), its model the base
+        an adapter merged into, which `from_run` and `dew.pipeline` then read as
+        any run's, whatever its layout; a directory holding another run's
+        checkpoints is refused (ValueError).
         """
         from dew.registry import to_record
 
         if self.weights is None:
             raise ValueError("this task's weights came from no run checkpoint, so a run has no "
                              "calibration of them to hold; save a task from `pipeline` or `from_run`")
+        if self.weights.averaged:
+            self._claimed(directory)
+            # A directory of its own, made before its calibration file is written into it.
+            epath.Path(directory).mkdir(parents=True, exist_ok=True)
         write_atomically(epath.Path(directory) / TASK_FILE, json.dumps({
             "weights": to_record(self.weights, Weights),
             "calibration": to_record(self.calibration, Calibration),
             "budget": to_record(self.budget, Budget), "name": self.name}, indent=1) + "\n")
+        if self.weights.averaged:
+            # The calibration file first: a save stopped before its checkpoint lands leaves a directory
+            # that no reader takes for a run, and that a save again completes.
+            self._persisted(directory)
+
+    def _claimed(self, directory: str) -> None:
+        """Refuse `directory` for this average (`save`) where it holds a run's checkpoints its own
+        calibration file does not name as this average's: another run's weights."""
+        from dew.registry import from_record
+
+        assert self.weights is not None
+        with Checkpoints(directory) as checkpoints:
+            if not checkpoints.committed():
+                return
+        saved = epath.Path(directory) / TASK_FILE
+        held = None
+        if saved.exists():
+            fitted = records.record(json.loads(saved.read_text()), TASK_FILE)["weights"]
+            held = from_record(Weights, records.json_value(fitted, "weights"))
+        if held is None or held.averaged != self.weights.averaged:
+            raise ValueError(f"{directory} holds a run's checkpoints other than this average, which its "
+                             "calibration does not describe; save the average to a directory of its own")
+
+    def _persisted(self, directory: str) -> None:
+        """The average's weights written to `directory`, its calibration file already there, as a run of
+        its own (`save`): its state at its weights' step, the optimizer's empty, under its record, where
+        the directory holds no checkpoint yet; one it holds is this average's (`_claimed`). Its counters
+        and key are placed over the task's mesh (`_mesh`), as a pool's save writes them."""
+        import optax
+
+        from dew.decision.objective import DecisionObjective
+        from dew.training.state import TrainState
+
+        assert self.weights is not None
+        with Checkpoints(directory) as checkpoints:
+            if checkpoints.committed():
+                return
+            replicated = jax.sharding.NamedSharding(self._mesh, jax.sharding.PartitionSpec())
+            counter = jax.device_put(jnp.asarray(self.weights.step, jnp.int32), replicated)
+            state = TrainState(step=counter, microstep=counter, updates=counter, variables=self.variables,
+                               opt_state=optax.EmptyState(), ema=None,
+                               key=jax.device_put(jax.random.key(0), replicated), scale=None,
+                               window_size=jax.device_put(jnp.asarray(1, jnp.int32), replicated))
+            checkpoints.save(self.weights.step, state, artifact=DecisionObjective(self).inference_record())
+            checkpoints.wait()
 
     def __call__(self, state: JSON, questions: Mapping[str, Question], *,
                  images: Sequence[Image.Image] = (), context: JSON | None = None) -> dict[str, Answer]:
@@ -389,13 +500,8 @@ class Decide:
 
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
                  media: Sequence[int] = (), *, context: JSON | None = None) -> list[Encoded]:
-        rows = self.layout.rows(self.tokenizer, self.specials, state, questions, media=media)
-        if context is not None:
-            if self.context_length is None:
-                raise ValueError(f"a request's context is read by a backbone's cross-attention, which this "
-                                 f"task's {type(self.model.backbone).__name__} does not have")
-            tokens = tuple(context_tokens(self.tokenizer, context, self.context_length).tolist())
-            rows = [replace(row, context=tokens) for row in rows]
+        rows = with_context(self.layout.rows(self.tokenizer, self.specials, state, questions, media=media),
+                            self.tokenizer, context, self.context_length)
         for row in rows:
             if not self.layout.fits(row):
                 raise ValueError(f"the schema needs {len(row.tokens)} tokens besides the state, more than "
@@ -451,7 +557,8 @@ class Decide:
             inputs, tokens=_widened(inputs.tokens, length, self.specials.pad),
             segments=_widened(inputs.segments, length),
             positions=None if inputs.positions is None else _widened(inputs.positions, length),
-            slots=None if inputs.slots is None else _widened(inputs.slots, length))
+            slots=None if inputs.slots is None else _widened(inputs.slots, length),
+            blocks=None if inputs.blocks is None else _widened(inputs.blocks, length, -1))
         count = shape_bucket(len(rows), 1)
         padded = RowPlan(None, len(rows), count, 0, 1).pad(inputs)
         held = self.variables if variables is None else variables
@@ -460,18 +567,11 @@ class Decide:
 
     def _forward(self, variables: Variables, inputs: DecisionInputs, *,
                  media: ModelInputs | None = None) -> jax.Array:
-        """`model.logits`, compiled once for each set of XLA options the model takes where it runs
-        (`compiler_options`)."""
+        """`model.logits`, compiled with the XLA options its backbone and head take where they run
+        (`program`)."""
         model = self.model
-        options = compiler_options(model.backbone, model.head)
-        key = tuple(options.items())
-        if key not in self._forwards:
-            self._forwards[key] = jax.jit(model.logits, compiler_options=options)
-        return self._forwards[key](variables, inputs, media=media)
-
-    @functools.cached_property
-    def _forwards(self) -> dict[tuple[tuple[str, bool], ...], Callable[..., jax.Array]]:
-        return {}
+        logits = program(type(model).logits, model.backbone, model.head, static_argnums=(0,))
+        return logits(model, variables, inputs, media=media)
 
     def tournament(self, state: JSON, questions: Mapping[str, Question], *,
                    group: int = 16) -> dict[str, Answer]:
@@ -512,7 +612,7 @@ class Decide:
         minimum counts are Laya's: a type's temperature needs `type_minimum` answers
         and a bucket's `bucket_minimum`.
         """
-        scored = self._scored(held_out if callable(held_out) else self._held(held_out))
+        scored = self._scored(held_out if callable(held_out) else self._held(held_out, self._mesh))
         if not scored:
             raise ValueError("calibration needs examples with answers")
         temperatures = Temperatures.fit(scored, type_minimum=type_minimum, bucket_minimum=bucket_minimum)
@@ -529,27 +629,39 @@ class Decide:
         each probability divided by its temperature; a binning map or abstention
         thresholds are not applied. The default metrics are Accuracy, ECE, AURC
         and the log loss. The pass agrees its result across a process pool, so
-        there every process calls it.
+        there every process calls it. It scores on the mesh the task's weights are
+        placed on, its rows split over the mesh's row axes as a run's validation
+        splits them, or on one local device for weights placed on none.
         """
         from dew.decision.scoring import default_metrics
-        from dew.training.distributed import MeshSpec
         from dew.training.evaluation import Evaluation
 
         chosen = list(metrics) or default_metrics()
-        evaluation = Evaluation.run(self._scoring, self.variables, self._held(examples),
-                                    key=0, metrics=chosen, mesh=MeshSpec().build(jax.local_devices()[:1]))
+        evaluation = Evaluation.run(self._scoring, self.variables, self._held(examples, self._mesh),
+                                    key=0, metrics=chosen, mesh=self._mesh)
         return {metric.name: evaluation.scores[f"val/{metric.name}"] for metric in chosen}
 
-    def _held(self, examples: Iterable[Example | Mapping[str, object]]) -> Reader:
+    @property
+    def _mesh(self) -> "Mesh":
+        """The mesh the task's weights are placed on, or one local device for weights placed on none."""
+        from dew.training.distributed import MeshSpec
+
+        placed = mesh_of(self.variables)
+        return MeshSpec().build(jax.local_devices()[:1]) if placed is None else placed
+
+    def _held(self, examples: Iterable[Example | Mapping[str, object]], mesh: "Mesh") -> Reader:
         """`examples` as a validation reader of this task's rows, laid out as
         its objective evaluates them. A batch is one pass within the budget, as
-        `batch` packs its rows, on one device, as an answer is: a short last
-        batch need not divide."""
+        `batch` packs its rows, rounded to a multiple of the rows `mesh` splits a
+        batch over, so every batch divides; a short last batch is filled as a
+        run's validation fills it (`VALID_ROWS`)."""
         from dew.data import Memory
         from dew.data.compile import validation
         from dew.decision.data import decisions
 
+        shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
         rows = max(1, min(self.budget.rows, self.budget.tokens // self.layout.max_len))
+        rows = -(-rows // shards) * shards
         rows_of = [{"example": row} if isinstance(row, Example) else row for row in examples]
         held = decisions(Memory(rows_of))
         return validation(held, batch=rows, objective=self._scoring.data(), read="memory")
@@ -566,9 +678,10 @@ class Decide:
         """Each answered question of `reader`'s rows, with its raw logits and its
         gold distribution in the order the row shows its options."""
         scored = []
-        segments = self.layout.bounds(self.tokenizer, self.specials).segments
+        segments = self.layout.bounds(self.tokenizer, self.specials, self.context_length).segments
         for batch in reader(DataPartition()):
-            inputs = laid_out(batch, segments)
+            inputs = laid_out(batch, segments, spans_in_context=isinstance(self.layout, JointLayout)
+                              and self.layout.schema_in_context)
             logits = np.asarray(self._forward(self.variables, inputs))
             answered = (np.asarray(batch["scored"])
                         & (np.asarray(Objective.row_weights(batch, len(logits))) > 0)[:, None])
@@ -663,9 +776,9 @@ class Decide:
         return held, self.variables
 
     def _read_wire(self, request: Mapping[str, object], *, strict: bool
-                   ) -> tuple[JSON, dict[str, Question], list[Image.Image]]:
-        """A Jev body's state, questions and images (none where `strict`), refused with a ValueError
-        where Jev would refuse it."""
+                   ) -> tuple[JSON, dict[str, Question], list[Image.Image], JSON | None]:
+        """A Jev body's state, questions, images and context (neither where `strict`), refused with a
+        ValueError where Jev would refuse it."""
         unknown = set(request) - {"state", "questions", "model", *EXTENSIONS}
         if unknown:
             raise ValueError(f"a request holds state, questions and model, not {sorted(unknown)}")
@@ -676,7 +789,8 @@ class Decide:
         if not questions:
             raise ValueError("a request needs at least one question")
         state = json_value(request["state"], "state")
-        return state, questions, [] if strict else decoded_images(request.get("images"))
+        context = None if strict or "context" not in request else json_value(request["context"], "context")
+        return state, questions, [] if strict else decoded_images(request.get("images")), context
 
     def _wire_response(self, questions: Mapping[str, Question], answers: Mapping[str, Answer], usage: Usage,
                        *, details: bool) -> dict[str, JSON]:
@@ -692,7 +806,7 @@ class Decide:
                 "usage": reported}
 
 
-EXTENSIONS = ("images",)
+EXTENSIONS = ("images", "context")
 """The request fields `Decide.systemone` reads beyond Jev's, which `strict` drops."""
 
 
@@ -730,12 +844,12 @@ class WireScoring(scoring.Scoring[Mapping[str, object], _Row, _Admitted, np.ndar
 
     def admit(self, request: Mapping[str, object]) -> scoring.Scored[_Row, _Admitted]:
         decide = self.decide
-        state, questions, images = decide._read_wire(request, strict=self.strict)
+        state, questions, images, context = decide._read_wire(request, strict=self.strict)
         if images:
-            row, media = decide._shown(state, questions, images)
+            row, media = decide._shown(state, questions, images, context)
             rows = (_Row(row, media),)
         else:
-            rows = tuple(_Row(row) for row in decide._encoded(state, questions))
+            rows = tuple(_Row(row) for row in decide._encoded(state, questions, context=context))
         usage = usage_of([row.encoded for row in rows])
         if self.whole and (usage.truncated or usage.trimmed):
             cut = "state" if usage.truncated else "instructions or options"
@@ -809,9 +923,11 @@ def _ordered(laid: Laid, logits: np.ndarray) -> np.ndarray:
     return ordered
 
 
-def laid_out(batch: Mapping[str, object], max_segments: int) -> DecisionInputs:
+def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context: bool = False
+             ) -> DecisionInputs:
     """The `DecisionInputs` of a batch of packed windows (`PackedRows`), each
-    holding at most `max_segments` rows."""
+    holding at most `max_segments` rows, the questions' spans in each row's context where
+    `spans_in_context` (`JointLayout.schema_in_context`)."""
     def array(name: str) -> jax.Array:
         return jnp.asarray(batch[name])
 
@@ -824,7 +940,8 @@ def laid_out(batch: Mapping[str, object], max_segments: int) -> DecisionInputs:
                           positions=array("positions"), slots=given("slots"),
                           option_slots=given("option_slots"), slotted=given("slotted"),
                           context=given("context"), context_lengths=given("context_lengths"),
-                          max_segments=max_segments)
+                          readout=given("readout"), blocks=given("blocks"), max_segments=max_segments,
+                          spans_in_context=spans_in_context)
 
 
 def _widened(leaf: jax.Array, length: int, fill: int = 0) -> jax.Array:

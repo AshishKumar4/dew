@@ -4,7 +4,7 @@ compared with itself does not, and a fault still fails at the count they declare
 
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, seeds_for
+from reference_error import GateFailure, assert_as_exact, seeds_for
 
 
 @pytest.fixture(scope="module")
@@ -50,7 +50,35 @@ def test_a_fault_fails_at_the_paired_count(heavy):
 
     with pytest.raises(AssertionError) as raised:
         assert_as_exact(coarse, reference, heavy, "heavy sums", seeds=seeds, truth_fn=_truth)
-    assert raised.type is AssertionError
+    assert raised.type is GateFailure
+
+
+def test_a_sizing_evaluates_each_draw_once_however_many_doublings_it_takes(heavy):
+    """A sizing that doubles past its first count runs each arm and the truth once on each draw it
+    takes, paired (its draws at a count are its predecessor's and the seeds it adds) and the reference
+    against itself (the first half of its draws against the second, the reference once on each)."""
+    import collections
+
+    calls = collections.Counter()
+
+    def counted(name, fn):
+        def run(x):
+            calls[name] += 1
+            return fn(x)
+        return run
+
+    reference, twin = counted("reference", _summed(0)), counted("twin", _summed(1))
+    truth = counted("truth", _truth)
+    seeds = seeds_for(reference, heavy, "heavy sums", truth_fn=truth, dew_fn=twin)
+    assert seeds > 8
+    assert calls == {"reference": seeds, "twin": seeds, "truth": seeds}
+    calls.clear()
+
+    def light(seed):
+        return (np.random.default_rng(seed).standard_normal((32, 128)).astype(np.float32),)
+
+    seeds = seeds_for(reference, light, "light sums", truth_fn=truth)
+    assert calls == {"reference": 2 * seeds, "truth": 2 * seeds}
 
 
 def test_a_recorded_reference_is_refused_a_paired_sizing(heavy):

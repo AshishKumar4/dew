@@ -23,7 +23,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import extract_fixture, packed, unpacked
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference
+from reference_error import (
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    torch_with_gradients,
+    with_gradients,
+)
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux_fields, flux_path, read_transformer
@@ -42,26 +47,23 @@ def source(tmp_path_factory):
 
 
 def flux_walk(source, name: str, grid: tuple[int, int]):
-    """A compiled native forward and every gradient on a draw, with the fixture's weights."""
+    """A compiled native forward on a draw, with the fixture's weights, and the gradients of the packed
+    latent, the context, the pooled embedding and every parameter under the draw's `probe`, its
+    cotangent (`with_gradients`)."""
     config = json.loads((source / name / "transformer" / "config.json").read_text())
     model = FluxTransformer(**flux_fields(config, attention_impl="xla"))
     params, layouts = read_transformer(component_tensors(source / name, "transformer"), flux_path)
 
     @jax.jit
     def walk(inputs):
-        latent = unpacked(inputs["packed"], *grid)
-        probe = unpacked(inputs["probe"], *grid)
         guidance = inputs["guidance"] if config["guidance_embeds"] else None
 
-        def objective(params, latent, context, pooled):
-            output = model.apply({"params": params}, latent, inputs["times"],
-                                 DenoisingCondition(context, pooled, guidance=guidance))
-            return jnp.sum(output * probe), output
+        def forward(latent, context, pooled, params):
+            return packed(model.apply({"params": params}, unpacked(latent, *grid), inputs["times"],
+                                      DenoisingCondition(context, pooled, guidance=guidance)))
 
-        (_, output), gradients = jax.value_and_grad(objective, argnums=(0, 1, 2, 3), has_aux=True)(
-            params, latent, inputs["context"], inputs["pooled"])
-        return {"output": packed(output), "grad_packed": packed(gradients[1]),
-                "grad_context": gradients[2], "grad_pooled": gradients[3], "grad_params": gradients[0]}
+        return with_gradients(forward)(inputs["packed"], inputs["context"], inputs["pooled"], params,
+                                       inputs["probe"])
 
     return walk, {entry.name: entry for entry in layouts}
 
@@ -80,7 +82,7 @@ def test_native_flux_matches_the_source_forward_and_every_gradient(name, source)
     import torch
     from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     record = json.loads((source / "flux_transformer.json").read_text())
     case = record["cases"][name]
@@ -103,7 +105,7 @@ def test_native_flux_matches_the_source_forward_and_every_gradient(name, source)
         """The fixture's inputs at seed 0, else the generator's normal draws at `seed`, with
         each embedded guidance value perturbed by a unit-normal draw."""
         if seed == 0:
-            return (original,)
+            return ({key: np.asarray(value, np.float32) for key, value in original.items()},)
         generator = torch.Generator().manual_seed(24 + seed)
         guidance = (torch.tensor(case["guidance"][:batch], dtype=torch.float32)
                     if config["guidance_embeds"] else torch.zeros(0))
@@ -127,35 +129,35 @@ def test_native_flux_matches_the_source_forward_and_every_gradient(name, source)
     positions[:, 1] = np.repeat(np.arange(rows), columns)
     positions[:, 2] = np.tile(np.arange(columns), rows)
 
-    def reference_walk(model, dtype, drawn):
-        inputs = [torch.tensor(drawn[key], dtype=dtype).requires_grad_()
-                  for key in ("packed", "context", "pooled")]
-        times, guidance, probe = (torch.tensor(drawn[key], dtype=dtype)
-                                  for key in ("times", "guidance", "probe"))
-        named = list(model.named_parameters())
-        output = model(hidden_states=inputs[0], encoder_hidden_states=inputs[1],
-                       pooled_projections=inputs[2], timestep=times / 1000,
-                       guidance=guidance if guidance.numel() else None,
-                       txt_ids=torch.zeros(tokens, 3, dtype=dtype),
-                       img_ids=torch.tensor(positions, dtype=dtype), return_dict=False)[0]
-        gradients = torch.autograd.grad((output * probe).sum(),
-                                        inputs + [value for _, value in named])
-        return {"output": output.detach().numpy(), "grad_packed": gradients[0].numpy(),
-                "grad_context": gradients[1].numpy(), "grad_pooled": gradients[2].numpy(),
-                **{f"grad_param.{key}": gradient.numpy()
-                   for (key, _), gradient in zip(named, gradients[3:], strict=True)}}
+    weights = {model: {key: value.detach().numpy() for key, value in model.named_parameters()}
+               for model in (narrow_model, wide_model)}
+
+    def reference_walk(model, drawn):
+        """The source's forward in the draw's dtype, and the same gradients under the same cotangent
+        as `flux_walk`'s (`torch_with_gradients`)."""
+        dtype = torch.from_numpy(np.asarray(drawn["packed"])).dtype
+        times, guidance = (torch.tensor(drawn[key], dtype=dtype) for key in ("times", "guidance"))
+
+        def forward(latent, context, pooled, params):
+            return torch.func.functional_call(model, params, (), {
+                "hidden_states": latent, "encoder_hidden_states": context, "pooled_projections": pooled,
+                "timestep": times / 1000, "guidance": guidance if guidance.numel() else None,
+                "txt_ids": torch.zeros(tokens, 3, dtype=dtype),
+                "img_ids": torch.tensor(positions, dtype=dtype), "return_dict": False})[0]
+
+        return torch_with_gradients(forward)(drawn["packed"], drawn["context"], drawn["pooled"],
+                                             weights[model], drawn["probe"])
 
     def truth(inputs):
         with float64():
-            return reference_walk(wide_model, torch.float64, inputs)
+            return reference_walk(wide_model, inputs)
 
     def native(inputs):
-        values = walk(inputs)
-        gradients = values.pop("grad_params")
-        return {**values, **{f"grad_param.{tensor}": layout["transformer/" + tensor].export(
-            {"params": gradients}) for tensor in tensors}}
+        *values, gradients = walk(inputs)
+        return (*values, {tensor: layout["transformer/" + tensor].export({"params": gradients})
+                          for tensor in tensors})
 
-    assert_as_exact(native, lambda inputs: reference_walk(narrow_model, torch.float32, inputs), draw,
+    assert_as_exact(native, lambda inputs: reference_walk(narrow_model, inputs), draw,
                     f"Flux {name}", seeds=CASE_SEEDS[name], truth_fn=truth)
 
 

@@ -99,7 +99,7 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 ### Dew's JAX build
 
 <!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
-Dew requires `jax>=0.11.2.post19,<0.11.3`.
+Dew requires `jax>=0.12.0.1.post23,<0.12.1`.
 <!-- END JAX requirement -->
 
 It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves jax alone. Every other package, jaxlib and its CUDA plugins included, comes from PyPI. The fixes:
@@ -111,10 +111,12 @@ It is the JAX release that requirement names, with fixes no JAX release has yet,
 - Pallas Triton divides 16-bit floats and computes `erf_inv` through float32, correctly rounded, which a GEMM template's prologue dividing in bfloat16 needs on CUDA.
 - A `custom_vjp` call (and Mosaic GPU's `custom_jvp` call) in a Pallas Triton or Mosaic GPU kernel lowers as its primal function, which a template's score hook through a `jax.custom_vjp` needs.
 - Mosaic GPU relays an MMA's accumulator out to a 16-bit MMA's left operand in registers, and an abstract device states its compute capability, which Mosaic GPU lowers for: the templates' Mosaic kernels need both on sm80.
-- The persistent compilation cache keys a program by jax's own build as well as jaxlib's, so two builds over one jaxlib never read each other's programs (on GPU nodes that ran several, reads of the other build's entries failed).
+- The persistent compilation cache keys a CPU program by the host's CPU, which XLA:CPU compiles for, and every program by JAX's own build as well as jaxlib's, so neither another CPU nor another build over one jaxlib reads a program it cannot run.
 - Mosaic GPU and Pallas Mosaic GPU lower `ceil` and `floor`, which a template's Mosaic kernel that rounds a value needs on an H100.
-- Pallas Mosaic GPU lowers `add_any` and `integer_pow` of every integer exponent, which a template's Mosaic backward under a score hook needs (a hook's pullback sums its terms, and a temperature's divides).
-- Splash attention's backward can form its delta from the weights, sum_k p · dp, in a pass of its own (`BlockSizes.delta_from_weights`), which a query that reads one key needs for its query gradient's exact zero.
+- Pallas Mosaic GPU lowers `add_any` and `integer_pow` of every integer exponent, which the Mosaic attention backward under a score hook needs: a hook's transposed pullback sums its cotangents, and a temperature's backward raises it to the power -2.
+- Splash attention's `BlockSizes.delta_from_weights` forms its backward's D from the weights, in a dq pass of its own, so a query with one key gets exactly zero gradient; it is off unless a kernel turns it on.
+- Mosaic GPU's layout inference solves groups of unknowns that no constraint relates separately, so sm80's `mma.sync` GEMM tiles find their layouts.
+- A platform-dependent conditional whose lowering keeps one branch lowers that branch inline, so a collective inside it is not a runtime conditional; on the CPU, devices diverged on such a conditional.
 
 Each fix goes from the build once a JAX release has it, and Dew then returns to that release.
 
@@ -132,10 +134,11 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 | `diffusers` | Loading original-format single-file diffusion checkpoints (`Pretrained.load(..., single_file=)`) |
 | `gguf` | Loading GGUF files (`Pretrained.load(..., gguf_file=)`) |
 | `wan` | ftfy, which cleans Wan 2.1's prompts as its pipeline does |
-| `torchax` | `Pretrained.load(fallback="torchax")`, which runs a Transformers PyTorch model lowered to JAX |
+| `torchax` | Tier 3 of `Pretrained.load`, which runs a Transformers PyTorch model lowered to JAX: an unregistered causal LM, or any checkpoint with `fallback="torchax"` |
 | `guided` | Regex and JSON-schema guided decoding (`dew.sampling.guided`) |
 | `streaming` | Hugging Face `datasets` and online sources |
 | `delta` | deltalake, to read Delta tables |
+| `curation` | DataTrove's language, quality, fastText and decontamination filters with spaCy's word splitting (`dew.data.text.Language`, `Quality`, `Classifier`, `Decontaminated`) |
 | `tfds` | Reading prepared TFDS ArrayRecords without TensorFlow |
 | `av` | Video readers (moviepy, with ffmpeg) |
 | `vision` | Hugging Face image processors, run with torchvision on the host |
@@ -203,7 +206,7 @@ CI runs on CPUs, so a JAX bump first runs these on a GPU, on Colab, in one sessi
 
 ## Compilation cache
 
-A run, a recipe's or a library `Trainer.fit`'s, and a loaded task keep JAX's persistent compilation cache on by default, so a restart reads the programs the last run compiled instead of compiling them again. Dew stores compiled executables in `~/.cache/dew/xla/python3.X/<CPU class>`, or `$XDG_CACHE_HOME/dew/xla/python3.X/<CPU class>` when `XDG_CACHE_HOME` is set, and the GPU autotuner's picks beside them for each jaxlib. The CPU class (`AuthenticAMD-25-17`, say) keeps hosts that share a home directory apart: XLA compiles a CPU program for the host that compiles it, and JAX's cache key leaves the host out, so a program from another CPU would not link. A directory named in `JAX_COMPILATION_CACHE_DIR` is used as it is, so give each CPU class its own. `JAX_ENABLE_COMPILATION_CACHE=false` turns the cache off. JAX writes entries from process 0 alone, so a process pool caches only where every process reads the cache directory as one, which Dew checks as the pool forms: a pool on one host, or on hosts that share a home directory, caches by default, and a pool whose hosts each keep their own compiles every run unless it names a directory on storage they share (`compilation_cache_dir`). Caches apart would find a step on one process and compile it on another, which waits for ever for its peers. JAX keeps every entry (`jax_compilation_cache_max_size` is unbounded by default); set it, or clear the directory, to bound its size. Each Python minor version has its own directory because JAX 0.11 on Python 3.14 compresses entries with `compression.zstd` while its cache key still says `zlib`, and an older interpreter cannot read them. A run that passes its own `compilation_cache_dir` uses that path as given, so do not share one explicit directory between Python versions.
+A run, a recipe's or a library `Trainer.fit`'s, and a loaded task keep JAX's persistent compilation cache on by default, so a restart reads the programs the last run compiled instead of compiling them again. Dew stores compiled executables in `~/.cache/dew/xla/python3.X`, or `$XDG_CACHE_HOME/dew/xla/python3.X` when `XDG_CACHE_HOME` is set, and the GPU autotuner's picks beside them for each jaxlib. Hosts that share a home directory share it whatever their CPU: XLA compiles a CPU program for the host that compiles it, and Dew's JAX build keys the program by that host's CPU, so no host reads one that would not link there. A directory named in `JAX_COMPILATION_CACHE_DIR` is used as it is. `JAX_ENABLE_COMPILATION_CACHE=false` turns the cache off. JAX writes entries from process 0 alone, so a process pool caches only where every process reads the cache directory as one, which Dew checks as the pool forms: a pool on one host, or on hosts that share a home directory, caches by default, and a pool whose hosts each keep their own compiles every run unless it names a directory on storage they share (`compilation_cache_dir`). Caches apart would find a step on one process and compile it on another, which waits for ever for its peers. JAX keeps every entry (`jax_compilation_cache_max_size` is unbounded by default); set it, or clear the directory, to bound its size. Each Python minor version has its own directory because JAX 0.11 on Python 3.14 compresses entries with `compression.zstd` while its cache key still says `zlib`, and an older interpreter cannot read them. A run that passes its own `compilation_cache_dir` uses that path as given, so do not share one explicit directory between Python versions.
 
 ## Preparing TFDS data
 

@@ -41,12 +41,20 @@ def gaussian_topk(x, sparsity: float):
     """Zero all but the top `1 - sparsity` fraction of each row, assuming the row is Gaussian.
 
     The cutoff is the row's mean plus `norm.ppf(sparsity)` times its
-    population standard deviation, and a value above the cutoff is kept as
-    its distance above it. The quantile is formed as the reference's icdf of
-    a float32 tensor forms it, erfinv(2 p - 1) sqrt(2), each step in fp32, or
-    in the row's own dtype where that is wider (`at_least_fp32`). `sparsity`
-    must be within (0, 1).
+    population standard deviation (`gaussian_cutoff`), and a value above the
+    cutoff is kept as its distance above it; the rest are the relu of their
+    distance, zero or, where the row holds a NaN, NaN, as relu propagates it.
     """
+    cutoff = gaussian_cutoff(x, sparsity)
+    distance = x - cutoff
+    return jnp.where(x > cutoff, distance, nn.relu(distance))
+
+
+def gaussian_cutoff(x, sparsity: float):
+    """The cutoff of `gaussian_topk` for each row of `x`, `[..., 1]`: the row's mean plus
+    `norm.ppf(sparsity)` times its population standard deviation. The quantile is formed as the
+    reference's icdf of a float32 tensor forms it, erfinv(2 p - 1) sqrt(2), each step in fp32, or in
+    the row's own dtype where that is wider (`at_least_fp32`). `sparsity` must be within (0, 1)."""
     # modeling_gemma3n.py, Gemma3nTextMLP._gaussian_topk. The erfinv is taken on
     # the host in float64 and rounded once: jax's fp32 erfinv lands two ulps from
     # torch's at 0.95, a cutoff the reference never computes. Python's default
@@ -63,7 +71,7 @@ def gaussian_topk(x, sparsity: float):
     # A constant row (a padded row of zeros) has deviation zero, which takes a
     # zero gradient, as torch's std backward gives it.
     std = sqrt_or_zero(jnp.mean(jnp.square(x - mean), axis=-1, keepdims=True))
-    return nn.relu(x - (mean + std * multiplier))
+    return mean + std * multiplier
 
 
 def _erfinv(value: float) -> float:

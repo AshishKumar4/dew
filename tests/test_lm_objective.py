@@ -145,6 +145,31 @@ def test_padded_targets_are_left_out_of_the_average():
     assert abs(masked - unmasked) > 1e-4, "masking made no difference to check"
 
 
+def test_a_padded_target_the_head_gives_no_mass_adds_nothing_to_the_loss_or_its_gradient():
+    """A head that never predicts the pad id (its bias -inf there) gives a padded target an infinite
+    loss, at weight 0: the loss, its gradient and the perplexity metric over the counted targets are
+    each bit for bit those of the same head at a bias so low its pad column's probability is 0 too,
+    where an infinite loss times its zero weight would make every one NaN (row 1481)."""
+    pad_id = 0
+    objective = make_objective(pad_id=pad_id, model=tiny_decoder(head_bias=True))
+    params = objective.init(jax.random.key(0))
+    batch = token_batch(seed=3)
+    assert (np.asarray(batch[TEXT_KEY])[:, 1:] == pad_id).any(), "this batch has no padding to skip"
+
+    def scored(floor):
+        bias = params["params"]["head_bias"].at[pad_id].set(floor)
+        held = {**params, "params": {**params["params"], "head_bias": bias}}
+        scalar = jax.value_and_grad(objective.scalar_loss, has_aux=True)
+        (loss, aux), gradient = scalar(held, batch, step_at())
+        scores = objective.evaluate(held, batch, step_at())
+        return loss, aux.metrics["ce"], gradient, Perplexity()(scores, batch)
+
+    masked, finite = scored(-jnp.inf), scored(-1e30)
+    assert np.isfinite(float(finite[0]))
+    for got, want in zip(jax.tree.leaves(masked), jax.tree.leaves(finite), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
 def test_aux_reports_perplexity_and_token_accuracy():
     objective = make_objective()
     params = objective.init(jax.random.key(0))
@@ -735,16 +760,19 @@ def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
 
 
 def vocabulary_products(jaxpr, vocab: int) -> int:
-    """The products in `jaxpr` and every program inside it that read or write a vocabulary-sized array."""
+    """The products in `jaxpr` and every program inside it that read or write a vocabulary-sized array,
+    a cond counted by the branch with the most, the one a run takes at most (as test_model_flops'
+    `jaxpr_products` counts): a product's platform choice is a cond of both."""
     count = 0
     for eqn in jaxpr.eqns:
         shapes = [getattr(var.aval, "shape", ()) for var in (*eqn.invars, *eqn.outvars)]
         count += eqn.primitive.name == "dot_general" and any(vocab in shape for shape in shapes)
-        for value in jax.tree.leaves(eqn.params, is_leaf=lambda leaf: hasattr(leaf, "eqns")
-                                     or hasattr(getattr(leaf, "jaxpr", None), "eqns")):
-            inner = value if hasattr(value, "eqns") else getattr(value, "jaxpr", None)
-            if hasattr(inner, "eqns"):
-                count += vocabulary_products(inner, vocab)
+        inner = [value if hasattr(value, "eqns") else value.jaxpr
+                 for value in jax.tree.leaves(eqn.params, is_leaf=lambda leaf: hasattr(leaf, "eqns")
+                                              or hasattr(getattr(leaf, "jaxpr", None), "eqns"))
+                 if hasattr(value, "eqns") or hasattr(getattr(value, "jaxpr", None), "eqns")]
+        counts = [vocabulary_products(program, vocab) for program in inner]
+        count += max(counts, default=0) if eqn.primitive.name == "cond" else sum(counts)
     return count
 
 

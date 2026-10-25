@@ -19,9 +19,9 @@ import dataclasses
 import functools
 import json
 import weakref
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, ClassVar, Protocol, TypeGuard
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypeGuard
 
 import jax.numpy as jnp
 import numpy as np
@@ -29,8 +29,10 @@ from flax import struct
 from typing_extensions import get_protocol_members
 
 from dew import records
-from dew.data.text import HFTokenizer, Tokenizer
+from dew.data.text import HFTokenizer, Offsets, Tokenizer
+from dew.data.tokens import share_tokens
 from dew.decision.questions import Choice, Noul, Question, Score, kind_of
+from dew.decision.renderer import Chunk, Rendered, Unit, render as rendered_chunks
 from dew.nn.inputs import Coordinates, coordinates, pad_token_rows
 from dew.records import JSON
 
@@ -159,6 +161,12 @@ class Laid:
     span: tuple[int, int]
     options: tuple[tuple[int, int], ...]
     order: tuple[int, ...]
+    readout: int | None = None
+    """Where a readout of labels reads the question's answer (`Labels`): the position of the row's
+    answer cue's last token, or None where the options are read at their own tokens."""
+    label_ids: tuple[tuple[int, ...], ...] | None = None
+    """Each option slot's label as the token ids a readout reads at `readout`, one a variant
+    (`Labels.variants`), or None where no label stands for the options."""
 
 
 @dataclass(frozen=True)
@@ -183,21 +191,39 @@ class Encoded:
     context: tuple[int, ...] | None = None
     """The tokens of the context the row reads beside its state, through a backbone's
     cross-attention, or None for none."""
+    spans_in_context: bool = False
+    """Whether the questions' spans are positions in the context, which holds the schema
+    (`Schema.stream`), rather than in the row."""
+    blocks: tuple[int, ...] | None = None
+    """Each token's block (`QuestionLayout.blocks`): 0 on the row before its question, 1 from the
+    question to the row's end, which a backbone that reads blocks attends to whole within each
+    (`AttentionMetadata.block_groups`); None for a row read in order."""
 
 
-def question_fields(row: Encoded, count: int, width: int) -> dict[str, np.ndarray]:
+def _blocked(row: Encoded, boundary: int) -> Encoded:
+    """`row` with its tokens before `boundary` block 0 and the rest block 1 (`Encoded.blocks`)."""
+    return dataclasses.replace(row, blocks=(0,) * boundary + (1,) * (len(row.tokens) - boundary))
+
+
+def question_fields(row: Encoded, count: int, width: int, labelled: bool = False) -> dict[str, np.ndarray]:
     """`row`'s questions as fixed-shape arrays, `count` question slots of
     `width` option slots each: `kinds` [Q], `questions` [Q] (the real ones),
     `spans` [Q, 2], `option_spans` [Q, K, 2] and `options` [Q, K] (the real
-    ones). A training row (`Encoding`) and a served batch
+    ones), and where its options stand under labels (`labelled`, `Labels`),
+    `readout` [Q]. A training row (`Encoding`) and a served batch
     (`DecisionInputs.collate`) both read a row through this."""
     fields = {"kinds": np.zeros(count, np.int32), "questions": np.zeros(count, bool),
               "spans": np.zeros((count, 2), np.int32), "option_spans": np.zeros((count, width, 2), np.int32),
               "options": np.zeros((count, width), bool)}
+    if labelled:
+        fields["readout"] = np.zeros(count, np.int32)
     for slot, laid in enumerate(row.questions):
         fields["kinds"][slot], fields["questions"][slot], fields["spans"][slot] = laid.kind, True, laid.span
         fields["option_spans"][slot, : len(laid.options)] = laid.options
         fields["options"][slot, : len(laid.options)] = True
+        if labelled:
+            assert laid.readout is not None, "a labelled row says where its answer is read"
+            fields["readout"][slot] = laid.readout
     return fields
 
 
@@ -211,11 +237,47 @@ def render(value: JSON) -> str:
 
 
 def context_tokens(tokenizer: Tokenizer, context: JSON | None, length: int) -> np.ndarray:
-    """A context's tokens as a row carries them: its text's (`render`), without specials, the first
-    `length` of them, and none for no context."""
+    """A context's tokens as a row carries them: its text's (`render`), without specials, and none for
+    no context. A context of more than `length` tokens, which the cross-attention reads no more of,
+    is refused (ValueError), never cut: a cut would answer from part of what the caller gave."""
     if context is None:
         return np.zeros(0, np.int32)
-    return np.asarray(tokenizer.encode(render(context), add_special_tokens=False)[:length], np.int32)
+    tokens = tokenizer.encode(render(context), add_special_tokens=False)
+    if len(tokens) > length:
+        raise ValueError(f"the context is {len(tokens)} tokens, more than the {length} its cross-attention "
+                         "reads (context_length)")
+    return np.asarray(tokens, np.int32)
+
+
+def with_context(rows: Sequence[Encoded], tokenizer: Tokenizer, context: JSON | None,
+                 length: int | None) -> list[Encoded]:
+    """`rows` with the context a backbone's cross-attention of `length` context tokens reads beside
+    each (None: a backbone with none): a schema laid out as the rows' context (`Schema.stream`), read
+    whole, or else `context`, a request's own, its first `length` tokens (`context_tokens`). The one
+    resolution of a row's context, which a run's encoding and a task's admission both read. Refused
+    (ValueError): a request's context beside a schema read as the context, a context with no
+    cross-attention to read it, and a schema longer than `length`."""
+    if any(row.spans_in_context for row in rows):
+        if context is not None:
+            raise ValueError("a request's context and a schema read as the row's context are one context "
+                             "too many; a layout that reads the schema in context reads no other context")
+        if length is None:
+            raise ValueError("a schema read as the row's context needs a backbone with cross-attention "
+                             "layers to read it (Pretrained.with_cross_attention)")
+        for row in rows:
+            if row.context is None:
+                raise ValueError("a row whose questions are laid out in its context carries no context")
+            if len(row.context) > length:
+                raise ValueError(f"the schema needs {len(row.context)} context tokens, more than the "
+                                 f"{length} the backbone's cross-attention reads")
+        return list(rows)
+    if context is None:
+        return list(rows)
+    if length is None:
+        raise ValueError("a request's context is read by a backbone's cross-attention, which this "
+                         "backbone does not have")
+    tokens = tuple(context_tokens(tokenizer, context, length).tolist())
+    return [dataclasses.replace(row, context=tokens) for row in rows]
 
 def _conversation(state: JSON) -> bool:
     """Whether `state` is a conversation, a list of turns, which keeps its newest turns (Laya's agent)."""
@@ -288,7 +350,7 @@ class Layout:
         counted as unfit, and a task refuses it."""
         return len(row.tokens) <= self.max_len
 
-    def bounds(self, encoder: Tokenizer, specials: Specials) -> Bounds:
+    def bounds(self, encoder: Tokenizer, specials: Specials, context_length: int | None = None) -> Bounds:
         """The most rows, questions and options a window of `max_len` tokens
         packs, from the fewest tokens each takes in this layout: a row of one
         one-option question about an empty state, and what one more option or
@@ -297,26 +359,95 @@ class Layout:
         questions and m options in m rows' tokens, and each further question
         or option takes its own. The packer holds every window to these
         bounds, so a row shorter still starts a new window rather than
-        outgrowing one."""
+        outgrowing one. Where the questions are laid out in the row's context
+        (`Encoded.spans_in_context`), a window holds one row, and the questions
+        and options are those a context of `context_length` tokens holds."""
         roomy = dataclasses.replace(self, max_len=1 << 30)
         empty = self.state(encoder, specials, "")
+        probe = roomy.rows(encoder, specials, "", {"q": Choice("x", ["0"])}, tokens=empty)
+        in_context = probe[0].spans_in_context
+        if in_context and context_length is None:
+            raise ValueError("a layout that reads its questions in the row's context is bounded by the "
+                             "context's length; give its context_length")
+        budget = context_length if in_context and context_length is not None else self.max_len
 
         def size(*options: int) -> int:
             asked = {f"q{index}": Choice("x", [str(option) for option in range(count)])
                      for index, count in enumerate(options)}
-            return sum(len(row.tokens) for row in roomy.rows(encoder, specials, "", asked, tokens=empty))
+            laid = roomy.rows(encoder, specials, "", asked, tokens=empty)
+            return sum(len(row.context or ()) if in_context else len(row.tokens) for row in laid)
 
         row = size(1)
         question, option = size(1, 1) - row, size(2) - row
-        if row > self.max_len:
-            raise ValueError(f"max_len={self.max_len} holds no row of a {type(self).__name__}, whose "
-                             f"shortest is {row} tokens")
+        if row > budget:
+            raise ValueError(f"{'context_length' if in_context else 'max_len'}={budget} holds no row of a "
+                             f"{type(self).__name__}, whose shortest is {row} tokens")
+        if in_context:
+            # One row a window: as many questions and options as its context holds.
+            each = min(option, question)
+            left = budget - row
+            return Bounds(1, 1 + left // question, None if each <= 0 else 1 + left // each)
         rows = range(1, self.max_len // row + 1)
         each = min(option, question)
         options = None if each <= 0 else max(count + int((self.max_len - count * row) // each)
                                              for count in rows)
         return Bounds(len(rows), max(count + (self.max_len - count * row) // question for count in rows),
                       options)
+
+
+LETTERS = tuple(chr(ord("A") + index) for index in range(26))
+
+
+def label_names(count: int) -> tuple[str, ...]:
+    """The first `count` labels: `A` to `Z`, then `AA`, `AB`, ..., as a release's slots name them."""
+    names = list(LETTERS)
+    for first in LETTERS:
+        names.extend(first + second for second in LETTERS)
+    if count > len(names):
+        raise ValueError(f"{count} options outnumber the {len(names)} labels")
+    return tuple(names[:count])
+
+
+@dataclass(frozen=True)
+class Labels:
+    """Options rendered as lettered lines, read at the row's answer cue by a readout of the labels'
+    logits (`dew.decision.head.LabelReadout`, `SlotReadout`): slot s as `{name}. {text}` on a line of
+    its own, its span the whole line, and after the options the `cue`, whose last token the readout
+    reads. Each label is read as the token id of each of `variants`, a template of its name (`{}`): a
+    release's slot is one variant, its name after a space; a readout groups several as one. A variant
+    that spells as other than one token is refused.
+
+    `names` are the labels in slot order, a release's own list where it names its slots otherwise
+    (one that leaves out the pairs its tokenizer spells as two tokens), or `label_names`' where unset;
+    the lines and the ids both read them (`names_for`), and a question with more options than they
+    name is refused."""
+
+    cue: str = "\nAnswer:"
+    variants: tuple[str, ...] = (" {}",)
+    names: tuple[str, ...] | None = None
+
+    def names_for(self, count: int) -> tuple[str, ...]:
+        """The first `count` labels."""
+        if self.names is None:
+            return label_names(count)
+        if count > len(self.names):
+            raise ValueError(f"{count} options outnumber the layout's {len(self.names)} labels")
+        return self.names[:count]
+
+    def ids(self, encoder: Tokenizer, count: int) -> tuple[tuple[int, ...], ...]:
+        """Each of the first `count` labels' ids, one a variant."""
+        same = _same(encoder)
+        found = []
+        for name in self.names_for(count):
+            ids = []
+            for variant in self.variants:
+                spelled = variant.format(name)
+                pieces = _piece(same, spelled)
+                if len(pieces) != 1:
+                    raise ValueError(f"the label {spelled!r} spells as {len(pieces)} tokens, not one")
+                ids.append(pieces[0])
+            found.append(tuple(ids))
+        return tuple(found)
 
 
 @dataclass(frozen=True)
@@ -339,11 +470,36 @@ class QuestionLayout(Layout):
     head_max_len: int = 192
     option_tokens: int = 48
     parallel: bool = False
+    labels: Labels | None = None
+    """Options rendered as lettered lines and read at an answer cue (`Labels`), or None for a marker
+    after each option, read at the marker."""
+    segments: "tuple[QuestionSegment, ...] | None" = None
+    """A row's text as segments of its own (`dew.decision.renderer`), read at its labels' readout at the
+    row's last token, or None for the layout's own text."""
+    unit: Unit = "pieces"
+    """How `segments`' text is encoded: piece by piece, or whole (`dew.decision.renderer`)."""
+    framing: "Framing | None" = None
+    """The conversation `segments`' text is the user's turn of, or None for none."""
+    blocks: bool = False
+    """Whether each row splits into two blocks (`Encoded.blocks`): what comes before its question (a
+    state-first row's state), and its question to the row's end, a published slot release's prefix
+    and suffix (serve.patch `block_ids`); a backbone that reads blocks attends to each whole, and the
+    second to the first in order. Off, every row is read in order."""
 
     def __post_init__(self) -> None:
         super().__post_init__()
         _least("head_max_len", self.head_max_len, 1)
         _least("option_tokens", self.option_tokens, 1)
+        if self.segments is not None:
+            kinds = [type(segment) for segment in self.segments]
+            if kinds.count(Instructions) != 1 or kinds.count(OptionLines) != 1 or kinds.count(AnswerCue) > 1:
+                raise ValueError("a question row's segments hold its instructions and its options once, and "
+                                 f"its cue at most once, not {[kind.__name__ for kind in kinds]}")
+            if self.labels is None or self.parallel:
+                raise ValueError("a question row of segments reads its options under labels (labels=), one "
+                                 "line after another")
+        if self.blocks and self.parallel:
+            raise ValueError("blocks and parallel options each say what a row's tokens read; a row takes one")
 
     def state(self, encoder: Tokenizer, specials: Specials, state: JSON) -> tuple[int, ...]:
         """Return the state's tokens, which every question of a request shares."""
@@ -355,11 +511,197 @@ class QuestionLayout(Layout):
              tokens: Sequence[int] | None = None) -> list[Encoded]:
         if media:
             raise ValueError(f"a {type(self).__name__} row has no place for images")
+        if self.segments is not None:
+            return [self._segmented(encoder, specials, state, question, (orders or {}).get(name), name)
+                    for name, question in questions.items()]
         if tokens is None:
             tokens = self.state(encoder, specials, state)
         return [self.encode(encoder, specials, question, tokens, conversation=_conversation(state),
                             order=(orders or {}).get(name), name=name)
                 for name, question in questions.items()]
+
+    def _segmented(self, encoder: Tokenizer, specials: Specials, state: JSON, question: Question,
+                   order: Sequence[int] | None, name: str) -> Encoded:
+        """A row of `question` written by `self.segments`, framed by `self.framing` and encoded by
+        `self.unit` (`dew.decision.renderer`), read at its last token. A whole row encodes its state
+        with the rest of its text, never the request's state ids alone.
+
+        A row past `max_len` cuts its state as its `State` segment keeps it (`_cut`), or none, and a
+        row that no cut fits is left to `fits`."""
+        assert self.segments is not None and self.labels is not None
+        described = list(zip(question.options, question.descriptions, strict=True))
+        slots = (_slots(len(described), order) if order is not None
+                 else [1, 0] if isinstance(question, Noul) else list(range(len(described))))
+        names = self.labels.names_for(len(slots))
+        chunks: list[Chunk | State] = []
+        for segment in self.segments:
+            if isinstance(segment, Text):
+                chunks.append(Chunk(segment.text))
+            elif isinstance(segment, State):
+                chunks.append(segment)
+            elif isinstance(segment, Instructions):
+                instructions = (rendered(question.instructions, segment.render, specials)
+                                or segment.defaults.get(question.kind, ""))
+                head, tail = segment.headers[question.kind].split("{}")
+                # The question starts at its header: the suffix a release's blocks read from
+                # (serve.patch `suffix_start`).
+                opening = (("suffix", 0),) if self.blocks else ()
+                chunks.extend([Chunk(head, points=opening),
+                               Chunk(instructions, marks=(("question", 0, len(instructions)),)), Chunk(tail)])
+            elif isinstance(segment, OptionLines):
+                for index, (label, slot) in enumerate(zip(names, slots, strict=True)):
+                    key, description = described[slot]
+                    option = (segment.level.format(key) if isinstance(question, Score)
+                              else segment.noul[0 if key == "true" else 1] if isinstance(question, Noul)
+                              else key)
+                    given = (segment.criteria.get(key) if isinstance(question, Noul) and description is None
+                             else description)
+                    text = rendered(given, segment.render, specials)
+                    line = (segment.line if text else segment.bare).format(label=label, name=option,
+                                                                           text=text)
+                    chunks.extend([*([Chunk(segment.join)] if index else []),
+                                   Chunk(line, marks=((("option", index), 0, len(line)),))])
+            else:
+                template = segment.template if len(names) <= segment.at else segment.many
+                chunks.append(Chunk(template.format(labels=segment.join.join(names))))
+        copies = [segment for segment in self.segments if isinstance(segment, State)]
+        texts = [rendered(state, copy.render, specials) for copy in copies]
+
+        def built(kept: Sequence[str | tuple[int, ...]]) -> Rendered:
+            # Under pieces each copy is its own piece, its ids; whole, its text read with the rest.
+            given = iter(kept)
+            pieces = [(lambda own: Chunk(ids=own) if isinstance(own, tuple) else Chunk(own))(next(given))
+                      if isinstance(part, State) else part for part in chunks]
+            return rendered_chunks(self._framed(encoder, pieces), encoder, self.unit)
+
+        laid, (whole, state_kept) = (self._cut_ids(built, texts, copies, encoder) if self.unit == "pieces"
+                                     else self._cut(built, texts, copies, encoder))
+        tokens = laid.tokens
+        row = Laid(name, kind_of(question), laid.marks["question"],
+                   tuple(laid.marks[("option", index)] for index in range(len(slots))), tuple(slots),
+                   readout=len(tokens) - 1, label_ids=self.labels.ids(encoder, len(slots)))
+        encoded = Encoded(tokens, (row,), None, None, whole, state_kept)
+        # The prefix is the tokens that end at or before the suffix's first character (serve.patch
+        # `token_layout`).
+        return _blocked(encoded, laid.points["suffix"]) if self.blocks else encoded
+
+    def _cut_ids(self, built: Callable[[Sequence[tuple[int, ...]]], Rendered], texts: Sequence[str],
+                 copies: "Sequence[State]", encoder: Tokenizer) -> tuple[Rendered, tuple[int, int]]:
+        """The row `built` over each copy of the state, its own text (`texts`) its own piece of ids,
+        each cut to its share of what the rest of the row leaves of `max_len` and to its own budget
+        (`allocated`), keeping its `keep`; and the least-kept copy's tokens and how many it keeps
+        (`_least_kept`): a piece's ids add to the row as they are, so the shares are exact. A copy kept
+        whole is never cut, and a row it leaves too long is `fits`' to refuse."""
+        ids = [tuple(encoder.encode(text, add_special_tokens=False)) if text else () for text in texts]
+        if not copies:
+            return built([]), (0, 0)
+        rest = len(built([()] * len(copies)).tokens)
+        counts = allocated([len(own) for own in ids], copies, self.max_len - rest)
+        kept = [_kept(own, count, copy.keep) for own, count, copy in zip(ids, counts, copies, strict=True)]
+        return built(kept), _least_kept([(len(own), len(held)) for own, held in zip(ids, kept, strict=True)])
+
+    def _cut(self, built: Callable[[Sequence[str]], Rendered], texts: Sequence[str],
+             copies: "Sequence[State]", encoder: Tokenizer) -> tuple[Rendered, tuple[int, int]]:
+        """The row `built` over each copy of the state, its own text (`texts`), encoded whole with the
+        rest, each copy cut to its share of what the rest of the row leaves of `max_len` and its own
+        budget (`allocated`, counted in its own tokens) at one of its token boundaries
+        (`Offsets`), keeping its `keep`; and the least-kept copy's tokens and how many it keeps,
+        encoded alone (`_least_kept`). A merge across a cut can lengthen the row, so while it does not
+        fit the copy that keeps the most steps back one boundary, the row encoded whole again each
+        time, until it fits or no copy keeps any, which `fits` then refuses. A copy kept whole is
+        never cut."""
+        if not copies:
+            return built([]), (0, 0)
+        counts = [len(encoder.encode(text, add_special_tokens=False)) if text else 0 for text in texts]
+        full = built(list(texts))
+        # A copy kept whole is never cut, so its cap sends no row down the cutting path.
+        capped = any(copy.keep != "all" and copy.max_tokens is not None and copy.max_tokens < count
+                     for copy, count in zip(copies, counts, strict=True))
+        if len(full.tokens) <= self.max_len and not capped:
+            return full, _least_kept([(count, count) for count in counts])
+        if not isinstance(encoder, Offsets):
+            raise TypeError(f"a row encoded whole cuts its state at the tokenizer's character offsets, "
+                            f"which a {type(encoder).__name__} does not keep")
+        offsets = [encoder.offsets(text) if text else ([], [], []) for text in texts]
+        rest = len(built([""] * len(copies)).tokens)
+        lengths = [len(own) for own, _, _ in offsets]
+        kept = allocated(lengths, copies, self.max_len - rest)
+
+        def piece(at: int, count: int | None = None) -> str:
+            # A copy's first (or last) `count` tokens, at the character boundary their offsets give.
+            text, (own, starts, ends), copy = texts[at], offsets[at], copies[at]
+            count = kept[at] if count is None else count
+            if count >= len(own):
+                return text
+            if count <= 0:
+                return ""
+            return text[:ends[count - 1]] if copy.keep != "end" else text[starts[len(own) - count]:]
+
+        def own_fits(at: int, count: int) -> bool:
+            # A capped copy's slice, re-encoded alone, holds no more than its cap: a slice at a
+            # character boundary may encode to more tokens than it was counted by.
+            cap = copies[at].max_tokens
+            sliced = piece(at, count)
+            return cap is None or not sliced or len(encoder.encode(sliced, add_special_tokens=False)) <= cap
+
+        for at, copy in enumerate(copies):
+            while copy.keep != "all" and kept[at] > 0 and not own_fits(at, kept[at]):
+                kept[at] -= 1
+        laid = built([piece(at) for at in range(len(copies))])
+        while len(laid.tokens) > self.max_len:
+            movable = [at for at, copy in enumerate(copies) if copy.keep != "all" and kept[at] > 0]
+            if not movable:
+                break
+            kept[max(movable, key=lambda at: kept[at])] -= 1
+            laid = built([piece(at) for at in range(len(copies))])
+        # A merge across a cut may let a longer cut fit than the share counted: each copy takes the
+        # longest that still fits, its own cap and the row's length both held.
+        for at, copy in enumerate(copies):
+            while (len(laid.tokens) <= self.max_len and copy.keep != "all" and kept[at] < lengths[at]
+                   and own_fits(at, kept[at] + 1)):
+                longer = built([piece(other, kept[other] + (other == at)) for other in range(len(copies))])
+                if len(longer.tokens) > self.max_len:
+                    break
+                kept[at] += 1
+                laid = longer
+        alone = [len(encoder.encode(own, add_special_tokens=False)) if (own := piece(at)) else 0
+                 for at in range(len(copies))]
+        return laid, _least_kept(list(zip(counts, alone, strict=True)))
+
+    def _framed(self, encoder: Tokenizer, chunks: list[Chunk]) -> list[Chunk]:
+        """`chunks` as the user's turn of `self.framing`, none without one: under a whole unit the turn
+        rendered with its own content (`dew.data.chat.framed_turn`), its marks carried to where the
+        template holds the content, as written or trimmed; under pieces the content between the turn's
+        two halves (`Framing.around`)."""
+        if self.framing is None:
+            return chunks
+        if self.unit == "pieces":
+            before, after = self.framing.around(encoder)
+            return [Chunk(before), *chunks, Chunk(after)]
+        content, marks, points, at = "", [], [], 0
+        for chunk in chunks:
+            marks.extend((key, at + start, at + end) for key, start, end in chunk.marks)
+            points.extend((key, at + point) for key, point in chunk.points)
+            content += chunk.text
+            at += len(chunk.text)
+        templated = isinstance(encoder, HFTokenizer) and (self.framing.chat_template is not None
+                                                          or bool(encoder.tokenizer.chat_template))
+        if self.framing.template and isinstance(encoder, HFTokenizer) and templated:
+            from dew.data.chat import framed_turn
+
+            text, start, dropped, kept = framed_turn(encoder.tokenizer, self.framing.system, content,
+                                                     where=encoder.name, thinking=self.framing.thinking,
+                                                     chat_template=self.framing.chat_template,
+                                                     options=self.framing.options)
+            moved = tuple((key, start + min(max(first - dropped, 0), kept),
+                           start + min(max(last - dropped, 0), kept)) for key, first, last in marks)
+            # A point the template trims away stands where the content it preceded now starts.
+            placed = tuple((key, start + min(max(point - dropped, 0), kept)) for key, point in points)
+            return [Chunk(text + self.framing.prefill, marks=moved, points=placed)]
+        before, after = self.framing.around(encoder)
+        shifted = tuple((key, len(before) + first, len(before) + last) for key, first, last in marks)
+        return [Chunk(before + content + after, marks=shifted,
+                      points=tuple((key, len(before) + point) for key, point in points))]
 
     def encode(self, encoder: Tokenizer, specials: Specials, question: Question,
                state: Sequence[int], *, conversation: bool = False,
@@ -367,13 +709,24 @@ class QuestionLayout(Layout):
         """Lay out `question` over the state's tokens `state`, with its options in `order`.
 
         Slot s shows option order[s]; None keeps the question's order. A
-        `conversation` keeps the end of the state instead of its start.
+        `conversation` keeps the end of the state instead of its start. A
+        layout in blocks splits the row at its question's head (`blocks`).
         """
+        row = self._encoded(encoder, specials, question, state, conversation=conversation, order=order,
+                            name=name)
+        return _blocked(row, row.questions[0].span[0]) if self.blocks else row
+
+    def _encoded(self, encoder: Tokenizer, specials: Specials, question: Question,
+                 state: Sequence[int], *, conversation: bool, order: Sequence[int] | None,
+                 name: str) -> Encoded:
+        """`encode`'s row, read in order."""
         texts = self.options(question)
         slots = _slots(len(texts), order)
         instructions = render(question.instructions).replace(specials.marker_text, " ")
         same = _same(encoder)
         head = list(_piece(same, f"{question.kind} question: {instructions}"))
+        if self.labels is not None:
+            return self._labelled(encoder, specials, question, head, texts, slots, state, conversation, name)
         whole = [list(_piece(same, " " + texts[slot].replace(specials.marker_text, " "))) for slot in slots]
         options = [option[:self.option_tokens] for option in whole]
         # Each option's budget counts its marker.
@@ -394,6 +747,59 @@ class QuestionLayout(Layout):
             None if positions is None else positions[:self.max_len],
             None if option_slots is None else option_slots[:self.max_len], len(state), kept,
             trimmed=trimmed)
+
+    def _labelled(self, encoder: Tokenizer, specials: Specials, question: Question, head: list[int],
+                  texts: tuple[str, ...], slots: Sequence[int], state: Sequence[int], conversation: bool,
+                  name: str) -> Encoded:
+        """A row of `question` whose options stand under labels (`self.labels`): the state and the
+        question, ordered as the layout orders them (`_state_first`), each option slot a line
+        `{label}. {text}`, its span the whole line, and the answer cue last, at which the labels'
+        readout reads the answer. The lines and the cue share `head_max_len` with the instructions as
+        a marker row's options do: each line cut to `option_tokens`, and every line cut evenly where
+        they leave the instructions fewer than 16 tokens. In the parallel layout every line starts at
+        the first one's position and none attends to another, and the cue, after the longest, reads
+        them all."""
+        assert self.labels is not None
+        same = _same(encoder)
+        names = self.labels.names_for(len(slots))
+        whole = [list(_piece(same, f"\n{label}. " + texts[slot].replace(specials.marker_text, " ")))
+                 for label, slot in zip(names, slots, strict=True)]
+        cue = list(_piece(same, self.labels.cue))
+        lines = [line[:self.option_tokens] for line in whole]
+        budget = self.head_max_len - sum(map(len, lines)) - len(cue)
+        if budget < 16:
+            each = max(4, (self.head_max_len - 16 - len(cue)) // max(1, len(lines)))
+            lines = [line[:each] for line in lines]
+            budget = self.head_max_len - sum(map(len, lines)) - len(cue)
+        kept_head = head[:max(8, budget)]
+        trimmed = len(kept_head) < len(head) or any(
+            len(kept) < len(full) for kept, full in zip(lines, whole, strict=True))
+        begin = _begin(specials)
+        fixed = len(begin) + len(kept_head) + sum(map(len, lines)) + len(cue) + 2
+        kept = self._kept(state, self.max_len - fixed, conversation)
+        if self._state_first:
+            tokens = [*begin, *kept, specials.separator]
+            span = (len(tokens), len(tokens) + len(kept_head))
+            tokens.extend([*kept_head, specials.separator])
+        else:
+            tokens = [*begin, *kept_head, specials.separator]
+            span = (len(begin), len(begin) + len(kept_head))
+        spans = []
+        for line in lines:
+            spans.append((len(tokens), len(tokens) + len(line)))
+            tokens.extend(line)
+        if not self._state_first:
+            tokens.extend([specials.separator, *kept])
+        tokens.extend(cue)
+        # A row past max_len does not fit (`fits`): training leaves it out and a task refuses it.
+        positions, option_slots = (_parallel(spans, len(tokens)) if self.parallel else (None, None))
+        laid = Laid(name, kind_of(question), span, tuple(spans), tuple(slots), readout=len(tokens) - 1,
+                    label_ids=self.labels.ids(encoder, len(slots)))
+        return Encoded(tuple(tokens), (laid,), positions, option_slots, len(state), len(kept),
+                       trimmed=trimmed)
+
+    _state_first: ClassVar[bool] = True
+    """Whether a row starts with the state, before the question; a marker layout puts it after."""
 
     def _row(self, specials: Specials, head: list[int], options: list[list[int]], state: Sequence[int],
              conversation: bool) -> tuple[list[int], tuple[int, int], list[int], list[tuple[int, int]], int]:
@@ -428,6 +834,8 @@ class MarkerLayout(QuestionLayout):
     `parallel` is Laya's `option_layout="parallel"`; the published checkpoints
     are sequential.
     """
+
+    _state_first: ClassVar[bool] = False
 
     def _row(self, specials, head, options, state, conversation):
         tokens = [*_begin(specials), *head, specials.separator]
@@ -547,33 +955,189 @@ JOINT_NOUL = {"true": "The proposition is true or the answer is yes.",
 
 
 @dataclass(frozen=True)
+class Text:
+    """Text a joint row writes as given, at its place in the user's turn. Text beside the turn's
+    markup, or beside other text, is read with it as one piece, as the turn writes it."""
+
+    text: str
+
+
+@dataclass(frozen=True)
+class Media:
+    """Where a joint row places a request's images, each as the backbone's processor writes one
+    (`Processor.image_text`) and expands it; a request without images places nothing here."""
+
+
+type Render = Literal["question", "compact", "entry", "state"]
+"""How a segment writes a value as text (`rendered`)."""
+
+
+@dataclass(frozen=True)
+class State:
+    """The state, as compact JSON with sorted keys, its start kept: cut to its own budget
+    (`max_tokens`, or a joint layout's `max_state_tokens` where it gives none) and to its share of
+    what the rest of the row leaves of its `max_len` (`dew.data.tokens.share_tokens`). A row may hold
+    the state more than once, each copy its own segment, render, budget and `keep`. A
+    question row's segments say how it renders (`render`, `rendered`) and what a cut keeps of it
+    (`keep`: its start, its end, or all of it, a row that it leaves too long then unfit); a joint row
+    renders it compact."""
+
+    render: Render = "compact"
+    keep: Literal["start", "end", "all"] = "start"
+    max_tokens: int | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_tokens is not None:
+            _least("max_tokens", self.max_tokens, 0)
+
+
+def allocated(lengths: Sequence[int], copies: "Sequence[State]", room: int,
+              default_cap: int | None = None) -> list[int]:
+    """How many of its own tokens each copy of the state keeps of `room` (`dew.data.tokens.share_tokens`):
+    a copy kept whole (`keep="all"`) all of its `lengths`, whatever its cap, and the others what is
+    left, each at most its own cap (`max_tokens`, or `default_cap` where it gives none)."""
+    return share_tokens(lengths, room, caps=[default_cap if copy.max_tokens is None else copy.max_tokens
+                                             for copy in copies],
+                        whole=[copy.keep == "all" for copy in copies])
+
+
+def _least_kept(pairs: Sequence[tuple[int, int]]) -> tuple[int, int]:
+    """Of each copy's tokens and how many it keeps, the copy that keeps the least share of its own
+    (the first of equals), so `Encoded.state_kept < state_tokens` says whether any copy was cut;
+    `(0, 0)` for a row of none."""
+    return min(pairs, key=lambda pair: pair[1] / pair[0] if pair[0] else 1.0, default=(0, 0))
+
+
+def _kept(ids: Sequence[int], count: int, keep: Literal["start", "end", "all"]) -> tuple[int, ...]:
+    """`count` of the state's `ids`, its first (or, with `keep` the end, its last)."""
+    return tuple(ids[:count] if keep != "end" else ids[len(ids) - count:])
+
+
+@dataclass(frozen=True)
+class Schema:
+    """Every question of the request as a field of the schema, never cut: its id, type and
+    instructions, then each allowed option, each rendered as compact JSON with sorted keys,
+    `{"description": ..., "option_id": ...}`. The head pools each option's tokens and each
+    question's instructions'.
+
+    `stream` is where the schema is read: in the row (`"row"`), or as the row's context
+    (`"context"`), which the backbone reads in a pass of its own, with its own weights, and its
+    cross-attention layers read beside the row (`DecisionModel.states`), the head pooling the
+    questions and options from that pass."""
+
+    stream: Literal["row", "context"] = "row"
+
+
+type Segment = Text | Media | State | Schema
+"""A part of a joint row's user turn (`JointLayout.segments`)."""
+
+
+@dataclass(frozen=True)
+class Instructions:
+    """A question's instructions under a header of its kind (`headers`, `{}` the rendered
+    instructions), rendered by `render` (`rendered`); `defaults` are a kind's instructions where its
+    question's render empty, as instructions of whitespace alone do under a release's `entry`. The
+    question's span is its instructions'."""
+
+    headers: Mapping[str, str]
+    render: Render = "question"
+    defaults: Mapping[str, str] = dataclasses.field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class OptionLines:
+    """A question's options, one line each under its label (`QuestionLayout.labels`), joined by
+    `join`: `line` filled with the label, the option's name and its description rendered by `render`,
+    `bare` where that renders empty; each option's span is its whole line. A choice's names are its
+    keys, a score's levels `level`, and a noul's `noul`, its true option first, `criteria` its options'
+    descriptions where its question gives none."""
+
+    line: str = "{label}. {name}: {text}"
+    bare: str = "{label}. {name}"
+    join: str = "\n"
+    render: Render = "entry"
+    level: str = "level {}"
+    noul: tuple[str, str] = ("yes", "no")
+    criteria: Mapping[str, str] = dataclasses.field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class AnswerCue:
+    """The cue a readout answers after: `template` filled with the options' labels joined by `join`,
+    `many` past `at` options."""
+
+    template: str = "Answer with one letter: {labels}."
+    many: str = "Answer with one label: {labels}."
+    at: int = 26
+    join: str = ", "
+
+
+type QuestionSegment = Text | State | Instructions | OptionLines | AnswerCue
+"""A part of a question row's text (`QuestionLayout.segments`)."""
+
+
+
+def rendered(value: JSON, policy: Render, specials: Specials) -> str:
+    """`value` as a segment writes it: `question`, a question layout's text (`render`) without the
+    marker's text; `compact`, a joint row's sorted compact JSON; `entry`, a release's entry (a string
+    stripped, any other value indented JSON, None nothing); `state`, a release's state (a string as
+    it is, any other value indented JSON, None nothing)."""
+    if policy == "question":
+        return render(value).replace(specials.marker_text, " ")
+    if policy == "compact":
+        return _compact(value)
+    match value:
+        case None:
+            return ""
+        case str():
+            return value.strip() if policy == "entry" else value
+        case _:
+            return json.dumps(value, ensure_ascii=False, indent=2)
+
+
+JOINT_SEGMENTS: tuple[Segment, ...] = (Text("STATE:\n"), Media(), State(), Schema(), Text("\n"))
+"""The joint row's user turn as the Laya joint release lays it out: the state's heading, the
+images, the state, the schema, and a line break before the turn's end."""
+
+
+@dataclass(frozen=True)
 class JointLayout(Layout):
     """Every question of a request in one row, each option a span of its own.
 
-    The row is a chat prompt: the system prompt (`JOINT_SYSTEM`), the state,
-    then a schema of numbered fields, each with its id, type, instructions and allowed options,
-    and the opening of the assistant's turn. A request's images come before the
-    state, each as the backbone's processor writes one (`Processor.image_text`), and expanded by it.
-    Each option is rendered as compact
-    JSON with sorted keys, `{"description": ..., "option_id": ...}`, and the
-    head pools the tokens of each option and of each question's instructions.
-    A choice's options come in the order of their keys, and a noul's as true,
-    then false, with `JOINT_NOUL`'s descriptions where the question gives none. The
-    state is cut to `max_state_tokens`, and to what the schema leaves of
-    `max_len`; the schema itself is never cut, so a schema longer than
-    `max_len` leaves no state and a row that does not fit (`fits`). The row's
-    conversation markup is the backbone's own chat template's (`framing`).
+    The row is a chat prompt: the system prompt (`JOINT_SYSTEM`), then the user's turn, its
+    `segments` in order (`JOINT_SEGMENTS`: the state's heading, a request's images, the state,
+    then a schema of numbered fields, each with its id, type, instructions and allowed options),
+    and the opening of the assistant's turn. A layout of `segments` of its own writes the turn
+    otherwise: the schema first, or text of its own between the parts; it holds the schema once,
+    the state and the images at most once each. A choice's options come in the order of their
+    keys, and a noul's as true, then false, with `JOINT_NOUL`'s descriptions where the question
+    gives none. The state is cut to `max_state_tokens`, and to what the rest of the row leaves of
+    `max_len`; the schema itself is never cut, so a schema longer than `max_len` leaves no state
+    and a row that does not fit (`fits`). The row's conversation markup is the backbone's own chat
+    template's (`framing`).
     """
 
     max_len: int = 16384
     max_state_tokens: int | None = None
     framing: Framing = Framing()
+    segments: tuple[Segment, ...] = JOINT_SEGMENTS
     joint: ClassVar[bool] = True
 
     def __post_init__(self) -> None:
         super().__post_init__()
         if self.max_state_tokens is not None:
             _least("max_state_tokens", self.max_state_tokens, 0)
+        kinds = [type(segment) for segment in self.segments]
+        if kinds.count(Schema) != 1 or kinds.count(Media) > 1:
+            raise ValueError("a joint row's segments hold the schema once, and the images "
+                             f"at most once each, not {[kind.__name__ for kind in kinds]}")
+        if any(isinstance(segment, State) and segment.render != "compact" for segment in self.segments):
+            raise ValueError("a joint row writes its state as sorted compact JSON (State(render='compact'))")
+
+    @property
+    def schema_in_context(self) -> bool:
+        """Whether the row's schema is its context (`Schema.stream`), its spans the context's."""
+        return any(isinstance(segment, Schema) and segment.stream == "context" for segment in self.segments)
     images: ClassVar[bool] = True
 
     def state(self, encoder: Tokenizer, specials: Specials, state: JSON) -> tuple[int, ...]:
@@ -587,6 +1151,71 @@ class JointLayout(Layout):
         def piece(text: str) -> list[int]:
             return list(_piece(same, text))
 
+        if media and not any(isinstance(segment, Media) for segment in self.segments):
+            raise ValueError("this joint layout's segments have no place for images")
+        schema, laid = self._schema(piece, questions, orders)
+        state_ids = list(self.state(encoder, specials, state) if tokens is None else tokens)
+        whole = len(state_ids)
+        # The turn's markup and the text beside it are read as one piece each, as the turn writes them.
+        before, after = self.framing.around(encoder)
+        parts: list[str | Segment] = [before, *self.segments, after]
+        laid_out: list[tuple[Segment | None, list[int]]] = []
+        index = 0
+        while index < len(parts):
+            part = parts[index]
+            if isinstance(part, (str, Text)):
+                text = ""
+                while index < len(parts):
+                    joined = parts[index]
+                    if isinstance(joined, str):
+                        text += joined
+                    elif isinstance(joined, Text):
+                        text += joined.text
+                    else:
+                        break
+                    index += 1
+                laid_out.append((None, piece(text)))
+                continue
+            in_row = not (isinstance(part, Schema) and part.stream == "context")
+            own = (schema if isinstance(part, Schema) and in_row else list(media) if isinstance(part, Media)
+                   else [])
+            laid_out.append((part, own))
+            index += 1
+        room = self.max_len - sum(len(ids) for segment, ids in laid_out if not isinstance(segment, State))
+        copies = [segment for segment, _ in laid_out if isinstance(segment, State)]
+        counts = allocated([whole] * len(copies), copies, room, self.max_state_tokens)
+        kept_ids = [list(_kept(state_ids, count, copy.keep))
+                    for count, copy in zip(counts, copies, strict=True)]
+        # A row without a state segment keeps none of the state.
+        kept_count = min((len(ids) for ids in kept_ids), default=0)
+        copied = iter(kept_ids)
+        row: list[int] = []
+        offset, place = 0, None
+        for segment, ids in laid_out:
+            if isinstance(segment, State):
+                ids = next(copied)
+            if isinstance(segment, Schema) and not self.schema_in_context:
+                offset = len(row)
+            if isinstance(segment, Media) and media:
+                place = (len(row), len(row) + len(ids))
+            row.extend(ids)
+
+        def moved(span: tuple[int, int]) -> tuple[int, int]:
+            return span[0] + offset, span[1] + offset
+
+        shifted = tuple(Laid(question.name, question.kind, moved(question.span),
+                             tuple(moved(option) for option in question.options), question.order)
+                        for question in laid)
+        if self.schema_in_context:
+            # The schema is the row's context, its spans the context's own positions.
+            return [Encoded(tuple(row), shifted, None, None, whole, kept_count, place,
+                            context=tuple(schema), spans_in_context=True)]
+        return [Encoded(tuple(row), shifted, None, None, whole, kept_count, place)]
+
+    def _schema(self, piece: Callable[[str], list[int]], questions: Mapping[str, Question],
+                orders: Mapping[str, Sequence[int]] | None) -> tuple[list[int], list[Laid]]:
+        """The schema's tokens (`Schema`), and each question laid out in them, its spans the
+        schema's own positions."""
         schema = piece("\n\nSCHEMA FIELDS:\n")
         laid = []
         for index, (name, question) in enumerate(questions.items()):
@@ -612,26 +1241,7 @@ class JointLayout(Layout):
                 schema.extend(piece("\n"))
             schema.extend(piece("END FIELD\n"))
             laid.append(Laid(name, kind_of(question), span, tuple(spans), tuple(slots)))
-        # The user's turn holds the state and the schema, framed as the backbone's template writes a turn.
-        before, after = self.framing.around(encoder)
-        opening = piece(f"{before}STATE:\n")
-        prefix = opening + list(media)
-        suffix = piece(f"\n{after}")
-        state_ids = list(self.state(encoder, specials, state) if tokens is None else tokens)
-        whole = len(state_ids)
-        if self.max_state_tokens is not None:
-            state_ids = state_ids[:self.max_state_tokens]
-        state_ids = state_ids[:max(0, self.max_len - len(prefix) - len(schema) - len(suffix))]
-        offset = len(prefix) + len(state_ids)
-
-        def moved(span: tuple[int, int]) -> tuple[int, int]:
-            return span[0] + offset, span[1] + offset
-
-        shifted = tuple(Laid(question.name, question.kind, moved(question.span),
-                             tuple(moved(option) for option in question.options), question.order)
-                        for question in laid)
-        return [Encoded(tuple(prefix + state_ids + schema + suffix), shifted, None, None, whole,
-                        len(state_ids), (len(opening), len(prefix)) if media else None)]
+        return schema, laid
 
     @staticmethod
     def options(question: Question) -> tuple[tuple[str, JSON], ...]:
@@ -735,7 +1345,16 @@ class DecisionInputs:
     slotted: jnp.ndarray | None = None
     context: jnp.ndarray | None = None
     context_lengths: jnp.ndarray | None = None
+    readout: jnp.ndarray | None = None
+    """`[B, Q]` where a readout of labels reads each question's answer (`Laid.readout`), or None; the
+    labels' ids are the readout head's own (`LabelReadout.label_ids`)."""
+    blocks: jnp.ndarray | None = None
+    """`[B, L]` each token's block in its row (`Encoded.blocks`), -1 on the padding, or None for rows
+    read in order."""
     max_segments: int = struct.field(pytree_node=False, default=1)
+    spans_in_context: bool = struct.field(pytree_node=False, default=False)
+    """Whether the questions' spans are positions in `context`, which holds the schema
+    (`Schema.stream`), rather than in `tokens`."""
 
     @property
     def valid(self) -> jnp.ndarray:
@@ -752,7 +1371,10 @@ class DecisionInputs:
 
     @property
     def question_segments(self) -> jnp.ndarray:
-        """Return the `[B, Q]` row each question belongs to, 0 for a padding slot."""
+        """Return the `[B, Q]` row each question belongs to, 0 for a padding slot: the row its span
+        starts in, or, where the spans are the context's (`spans_in_context`), the window's one row."""
+        if self.spans_in_context:
+            return self.questions.astype(self.segments.dtype)
         return jnp.where(self.questions, jnp.take_along_axis(self.segments, self.spans[..., 0], axis=1), 0)
 
     @property
@@ -777,14 +1399,23 @@ class DecisionInputs:
         parallel = rows[0].positions is not None
         if any((row.positions is not None) != parallel for row in rows):
             raise ValueError("one batch lays its rows out one way, sequential or parallel")
+        in_context = rows[0].spans_in_context
+        if any(row.spans_in_context != in_context for row in rows):
+            raise ValueError("one batch reads its rows' schemas one way, in the row or as its context")
+        blocked = rows[0].blocks is not None
+        if any((row.blocks is not None) != blocked for row in rows):
+            raise ValueError("one batch reads its rows one way, in blocks or in order")
         fields = ({"positions": [row.positions or () for row in rows],
-                   "slots": [row.slots or () for row in rows]} if parallel else None)
+                   "slots": [row.slots or () for row in rows]} if parallel else {})
+        if blocked:
+            fields["blocks"] = [row.blocks or () for row in rows]
         tokens, padded = pad_token_rows([row.tokens for row in rows], pad_id=pad, padding_side="right",
-                                        fields=fields)
+                                        fields=fields or None)
         valid = padded.get("attention_mask", np.ones(tokens.shape, bool))
         count = max(questions or 1, *(len(row.questions) for row in rows))
         width = max(options or 1, *(len(laid.options) for row in rows for laid in row.questions))
-        laid = [question_fields(row, count, width) for row in rows]
+        labelled = labelled_rows(rows)
+        laid = [question_fields(row, count, width, labelled) for row in rows]
         kinds, real, spans, option_spans, real_options = (
             np.stack([fields[name] for fields in laid])
             for name in ("kinds", "questions", "spans", "option_spans", "options"))
@@ -810,7 +1441,20 @@ class DecisionInputs:
                    jnp.asarray(padded["slots"], jnp.int32) if parallel else None,
                    None if indexed is None else jnp.asarray(np.stack([slots for slots, _ in indexed])),
                    None if indexed is None else jnp.asarray(np.stack([real for _, real in indexed])),
-                   context, lengths)
+                   context, lengths,
+                   jnp.asarray(np.stack([fields["readout"] for fields in laid])) if labelled else None,
+                   # The padding is in no block.
+                   jnp.asarray(np.where(valid, padded["blocks"], -1), jnp.int32) if blocked else None,
+                   spans_in_context=in_context)
+
+
+def labelled_rows(rows: Sequence[Encoded]) -> bool:
+    """Whether `rows`' options stand under labels (`Labels`), read at an answer cue; one batch reads
+    its rows' options one way."""
+    labelled = {laid.readout is not None for row in rows for laid in row.questions}
+    if len(labelled) > 1:
+        raise ValueError("one batch reads its rows' options one way, under labels or at their markers")
+    return bool(labelled) and labelled.pop()
 
 
 OPTION_TILE = 128

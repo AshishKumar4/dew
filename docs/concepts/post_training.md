@@ -60,7 +60,7 @@ sft_data = Loader(train=lambda partition: itertools.repeat(sft_batch), val=None,
                    records=8, batch=8)
 sft_objective = LMObjective(model, seq_len=len(row) - 1, variables=base,
                             loss_role=Role.ASSISTANT)
-sft_state = Trainer(sft_objective, OptimConfig(rate=1e-3), key=jax.random.key(1)).fit(
+sft_state = Trainer(sft_objective, OptimConfig(learning_rate=1e-3), key=jax.random.key(1)).fit(
     sft_data, steps=20, log_every=10)
 ```
 
@@ -84,7 +84,7 @@ pair = {"chosen": prompt + response, "rejected": prompt + rejected,
 width = max(len(pair["chosen"]), len(pair["rejected"]))
 pairs = Memory([pair] * 8).repeat().pipe(presets.preferences, seq_len=width, batch=8)
 dpo = DPOObjective(model, seq_len=width - 1, beta=0.1, variables=sft_state.variables)
-dpo_state = Trainer(dpo, OptimConfig(optimizer="adam", rate=1e-3), key=jax.random.key(2)).fit(
+dpo_state = Trainer(dpo, OptimConfig(optimizer="adam", learning_rate=1e-3), key=jax.random.key(2)).fit(
     pairs, steps=10, log_every=5)
 ```
 
@@ -126,7 +126,7 @@ rl_objective = GRPOObjective(model, seq_len=len(story) + 7, beta=0.01,
 rollout = RolloutScheduler.sampled(rl_objective, reward, groups=4, max_new_tokens=8,
                                    sampling=Sampling(temperature=1.0, top_k=40),
                                    decode=tokenizer.decode)
-rl_state = Trainer(rl_objective, OptimConfig(rate=1e-4), key=jax.random.key(3),
+rl_state = Trainer(rl_objective, OptimConfig(learning_rate=1e-4), key=jax.random.key(3),
                    rollout=rollout).fit(rl_data, steps=4, log_every=2)
 print(int(rl_state.updates), "GRPO updates")
 ```
@@ -217,7 +217,7 @@ data = Memory(rows * 4).repeat().pipe(presets.preferences, seq_len=row_width, ba
 model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
                           num_heads=2, mlp_features=32, max_seq_len=row_width)
 objective = DPOObjective(model, seq_len=row_width - 1, beta=0.1)
-trainer = Trainer(objective, OptimConfig(optimizer="adam", rate=1e-3).build(2), key=jax.random.key(0))
+trainer = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=1e-3).build(2), key=jax.random.key(0))
 initial = trainer.initial_state()
 # Copy the snapshot to host memory before training donates device buffers.
 reference = jax.tree.map(lambda x: np.array(x, copy=True), initial.ema)
@@ -301,7 +301,7 @@ Use `GRPOObjective(model, seq_len=P + R - 1)`, and give the decoder enough conte
 | `sequence_mask`, `geometric_mask` | `None` | Chain rejection by summed or mean k1. |
 | `sampling_temperature` | `1.0` | Temperature the sampled IDs are scored at. |
 
-Pass `sampling=Sampling(eos_token_ids=..., temperature=..., top_k=...)`; `eos_id` takes one ID or a tuple. The response mask includes EOS; the text passed to the reward leaves out EOS and padding. The rollout turns `prompt_length` into the standard `ModelInputs` attention mask.
+Pass `sampling=Sampling(eos_token_ids=..., temperature=..., top_k=...)`; `eos_token_ids` takes one ID or a tuple. The response mask includes EOS; the text passed to the reward leaves out EOS and padding. The rollout turns `prompt_length` into the standard `ModelInputs` attention mask.
 
 Generation prefills the padded batch once and packs the real tokens into each row's cache, so prompts of different valid lengths reuse the same compiled shape. After a row hits EOS, later steps leave its cache unchanged. Rescoring reads each chain on its own through its segment IDs and positions. GRPO validation scores prompt perplexity over real next-token transitions; it does not generate answers for a separate reward evaluation.
 
@@ -351,7 +351,7 @@ A native row keeps its own `min_global_steps` and `max_global_steps`, and Dew wr
 
 Live, imported and journal-restored draws all go through the same validation (`Draw`): a nonempty context, nonnegative integer token ids (booleans excluded), aligned finite likelihoods, and a termination flag that agrees with the configured EOS. Tokens after EOS are refused. Checking the upper bound against the vocabulary is left to the caller, which knows the model.
 
-`tools/verl_interop_reference.py` writes the fixtures `tests/test_verl_interop.py` reads from verl revision `12ebe0cb4d300c58449fb6c675379e8700015c51`, run in an isolated environment: four rows of verl's `gsm8k_tool_agent_loop.py` parquet and two `AgentLoopOutput` dumps with their `as_dict()` tensors. One is a tool loop with routed experts. The other is a video turn whose `mm_processor_output` comes from `build_sglang_video_payload`. The test imports and re-exports verl's rows unchanged, and checks that packing matches verl's tensor mapping. `Prompts` reads the verl parquet's `reward_model.ground_truth`, keeps `tools_kwargs` inside `extra_info`, carries `ability` there too, beside them, for the reward, and reads and drops `agent_name`. Dew does not import torch or verl at runtime.
+`tools/verl_interop_reference.py` writes the fixtures `tests/test_verl_interop.py` reads from verl revision `12ebe0cb4d300c58449fb6c675379e8700015c51`, run in an isolated environment: four rows of verl's `gsm8k_tool_agent_loop.py` parquet and two `AgentLoopOutput` dumps with their `as_dict()` tensors. One is a tool loop with routed experts. The other is a video turn whose `mm_processor_output` comes from `build_sglang_video_payload`. The test imports and re-exports verl's rows unchanged, and checks that packing matches verl's tensor mapping. `presets.prompts` reads the verl parquet's `reward_model.ground_truth`, keeps `tools_kwargs` inside `extra_info`, carries `ability` there too, beside them, for the reward, and reads and drops `agent_name`. Dew does not import torch or verl at runtime.
 
 ### Episode journal
 
@@ -663,7 +663,7 @@ def brightness(images, batch):
 rollout = FlowRollout(objective, brightness, groups=4, steps=5, train_steps=2)
 batch = {"image": np.zeros((2, 4, 4, 1), dtype=np.uint8)}
 data = Loader(train=lambda partition: itertools.repeat(batch), val=None, records=2, batch=2)
-trainer = Trainer(objective, OptimConfig(optimizer="adam", rate=1e-3), key=jax.random.key(0), rollout=rollout)
+trainer = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=1e-3), key=jax.random.key(0), rollout=rollout)
 state = trainer.fit(data, steps=2, log_every=1)
 print(int(state.updates))
 ```

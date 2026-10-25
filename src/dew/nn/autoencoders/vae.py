@@ -16,6 +16,7 @@ import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax.typing import Dtype
 
 from dew.interop.weights import ParamTree, indexed_path, translate_parameters
 from dew.nn.attention import GroupNorm, NormalAttention
@@ -32,7 +33,7 @@ class FlaxUpsample2D(nn.Module):
     """Double each spatial axis by nearest-neighbour resize, then a 3x3 conv."""
 
     in_channels: int
-    dtype: jnp.dtype = jnp.float32
+    dtype: Dtype = jnp.float32
 
     @nn.compact
     def __call__(self, hidden_states):
@@ -49,7 +50,7 @@ class FlaxDownsample2D(nn.Module):
     """Halve each spatial axis with a stride-2 3x3 conv, padded on the far side."""
 
     in_channels: int
-    dtype: jnp.dtype = jnp.float32
+    dtype: Dtype = jnp.float32
 
     @nn.compact
     def __call__(self, hidden_states):
@@ -65,7 +66,7 @@ class FlaxResnetBlock2D(nn.Module):
     in_channels: int
     out_channels: int
     groups: int = 32
-    dtype: jnp.dtype = jnp.float32
+    dtype: Dtype = jnp.float32
 
     @nn.compact
     def __call__(self, hidden_states):
@@ -95,7 +96,7 @@ class FlaxAttentionBlock(nn.Module):
 
     channels: int
     num_groups: int = 32
-    dtype: jnp.dtype = jnp.float32
+    dtype: Dtype = jnp.float32
 
     def setup(self):
         self.group_norm = GroupNorm(self.num_groups, dtype=self.dtype)
@@ -117,7 +118,7 @@ class _Level(nn.Module):
     num_layers: int
     groups: int
     resample: Literal["down", "up"] | None
-    dtype: jnp.dtype = jnp.float32
+    dtype: Dtype = jnp.float32
 
     @nn.compact
     def __call__(self, hidden_states):
@@ -138,7 +139,7 @@ class FlaxUNetMidBlock2D(nn.Module):
 
     in_channels: int
     resnet_groups: int = 32
-    dtype: jnp.dtype = jnp.float32
+    dtype: Dtype = jnp.float32
 
     @nn.compact
     def __call__(self, hidden_states):
@@ -162,7 +163,7 @@ class FlaxEncoder(nn.Module):
     block_out_channels: Sequence[int] = (64,)
     layers_per_block: int = 2
     norm_num_groups: int = 32
-    dtype: jnp.dtype = jnp.float32
+    dtype: Dtype = jnp.float32
 
     @nn.compact
     def __call__(self, sample):
@@ -189,7 +190,7 @@ class FlaxDecoder(nn.Module):
     block_out_channels: Sequence[int] = (64,)
     layers_per_block: int = 2
     norm_num_groups: int = 32
-    dtype: jnp.dtype = jnp.float32
+    dtype: Dtype = jnp.float32
 
     @nn.compact
     def __call__(self, sample):

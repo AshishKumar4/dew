@@ -74,6 +74,18 @@ def git_head(path: str | Path) -> str:
                           text=True, check=True).stdout.strip()
 
 
+def dew_revision() -> str:
+    """The commit of the Dew this process imports (`dew._checkout.revision`); an installed Dew has
+    none, so a record of it could not be traced and the run fails at once."""
+    from dew._checkout import revision
+
+    found = revision()
+    if found is None:
+        raise SystemExit("the Dew this process imports is installed, not checked out, so a record cannot "
+                         "name its commit; run from a checkout")
+    return found
+
+
 def recipe_images(recipe: dict):
     """The uint8 images a fixture's recipe names (`{"seed", "shape"}`): NumPy's legacy generator at its
     seed, which a test reproduces from the recipe the fixture records."""
@@ -161,6 +173,8 @@ def _defined(node: ast.stmt) -> set[str]:
         return {node.name}
     if isinstance(node, ast.Assign):
         return {target.id for target in node.targets if isinstance(target, ast.Name)}
+    if isinstance(node, ast.AnnAssign) and node.value is not None and isinstance(node.target, ast.Name):
+        return {node.target.id}
     return set()
 
 

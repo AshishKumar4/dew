@@ -12,7 +12,7 @@ uses the current pool's devices. A just-trained state needs no reload; its objec
 from __future__ import annotations
 
 import json
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
@@ -162,30 +162,17 @@ def place(variables: Variables, mesh: MeshSpec | Mesh | None, layout: Layout | N
 
     The sharding is the one the trainer gives a train state's parameters under
     `layout`; `dew.training.host.stream` places the leaves, updating the
-    dict nodes of `variables` in place. A task holds its variables frozen, and
-    a frozen node can't be updated, so frozen nodes are first rebuilt as
-    dicts over the same leaves.
+    dict nodes of `variables` in place and rebuilding a frozen one, which a
+    task holds, as a dict over the same leaves.
     """
     from dew.training.distributed import Layout as DefaultLayout, MeshSpec as DefaultMesh, device_mesh
     from dew.training.host import stream
 
-    variables = _updatable(variables)
     placed_on = device_mesh(DefaultMesh() if mesh is None else mesh)
     chosen_layout = DefaultLayout() if layout is None else layout
     shardings = chosen_layout.shardings(placed_on, variables)
     chosen_layout.check(variables, shardings, placed_on)
     return stream(variables, shardings)
-
-
-def _updatable(tree: Variables) -> Variables:
-    """`tree` with each node that is not a plain dict (a FrozenDict) rebuilt
-    as one over the same children; its dict nodes stay the same objects, so
-    `stream` still updates them in place."""
-    rebuilt: dict[str, object] = tree if type(tree) is dict else dict(tree)
-    for name, child in rebuilt.items():
-        if isinstance(child, Mapping):
-            rebuilt[name] = _updatable(child)
-    return rebuilt
 
 
 @dataclass(frozen=True)
@@ -215,6 +202,10 @@ class RunProcessor:
         """`text`'s ids from the run's tokenizer, with the special tokens it adds around a sequence
         where `specials`, and none otherwise."""
         return self.tokenizer.encode(text, add_special_tokens=specials)
+
+    def spelling(self, ids: Sequence[int]) -> str:
+        """The text the run's tokenizer decodes `ids` to, its special tokens spelled out."""
+        return self.tokenizer.decode(list(ids))
 
     @property
     def bos_id(self) -> int | None:
