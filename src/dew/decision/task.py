@@ -341,11 +341,11 @@ class Decide:
         `dew.pipeline` read the calibration back for that checkpoint. The file is
         written whole or not at all. An average of runs (`averaged`), whose
         weights no one run holds, is written to a `directory` of its own: a run of
-        one weights-only checkpoint of the average under the record its runs
-        share (`DecisionObjective.inference_record`), its model the base an
-        adapter merged into, which `from_run` and `dew.pipeline` then read as any
-        run's, whatever its layout; a directory holding another run's checkpoints
-        is refused (ValueError).
+        one checkpoint of the average, its optimizer state empty, under the record
+        its runs share (`DecisionObjective.inference_record`), its model the base
+        an adapter merged into, which `from_run` and `dew.pipeline` then read as
+        any run's, whatever its layout; a directory holding another run's
+        checkpoints is refused (ValueError).
         """
         from dew.registry import to_record
 
@@ -353,42 +353,59 @@ class Decide:
             raise ValueError("this task's weights came from no run checkpoint, so a run has no "
                              "calibration of them to hold; save a task from `pipeline` or `from_run`")
         if self.weights.averaged:
-            self._persisted(directory)
+            self._claimed(directory)
         write_atomically(epath.Path(directory) / TASK_FILE, json.dumps({
             "weights": to_record(self.weights, Weights),
             "calibration": to_record(self.calibration, Calibration),
             "budget": to_record(self.budget, Budget), "name": self.name}, indent=1) + "\n")
+        if self.weights.averaged:
+            # The calibration file first: a save stopped before its checkpoint lands leaves a directory
+            # that no reader takes for a run, and that a save again completes.
+            self._persisted(directory)
+
+    def _claimed(self, directory: str) -> None:
+        """Refuse `directory` for this average (`save`) where it holds a run's checkpoints its own
+        calibration file does not name as this average's: another run's weights."""
+        from dew.registry import from_record
+
+        assert self.weights is not None
+        with Checkpoints(directory) as checkpoints:
+            if not checkpoints.committed():
+                return
+        saved = epath.Path(directory) / TASK_FILE
+        held = None
+        if saved.exists():
+            fitted = records.record(json.loads(saved.read_text()), TASK_FILE)["weights"]
+            held = from_record(Weights, records.json_value(fitted, "weights"))
+        if held is None or held.averaged != self.weights.averaged:
+            raise ValueError(f"{directory} holds a run's checkpoints other than this average, which its "
+                             "calibration does not describe; save the average to a directory of its own")
 
     def _persisted(self, directory: str) -> None:
-        """The average's weights written to `directory` as a run of its own (`save`): one weights-only
-        checkpoint at its weights' step under its record, where the directory holds none; where it
-        holds this average already, as a reloaded average's own directory does, it is as it is."""
+        """The average's weights written to `directory`, its calibration file already there, as a run of
+        its own (`save`): its state at its weights' step, the optimizer's empty, under its record, where
+        the directory holds no checkpoint yet; one it holds is this average's (`_claimed`). Every array
+        is placed over the variables' mesh, as a pool's save writes them."""
         import optax
 
         from dew.decision.objective import DecisionObjective
-        from dew.registry import from_record
         from dew.training.state import TrainState
 
         assert self.weights is not None
         with Checkpoints(directory) as checkpoints:
-            if checkpoints.latest is not None:
-                saved = epath.Path(directory) / TASK_FILE
-                held = None
-                if saved.exists():
-                    fitted = records.record(json.loads(saved.read_text()), TASK_FILE)["weights"]
-                    held = from_record(Weights, records.json_value(fitted, "weights"))
-                if (held is None or held.averaged != self.weights.averaged
-                        or checkpoints.latest != self.weights.step):
-                    raise ValueError(f"{directory} holds a run's checkpoints other than this average, which "
-                                     "its calibration does not describe; save the average to a directory "
-                                     "of its own")
+            if checkpoints.committed():
                 return
-            counter = jnp.asarray(self.weights.step, jnp.int32)
+            placed = next((leaf.sharding for leaf in jax.tree.leaves(self.variables)
+                           if isinstance(getattr(leaf, "sharding", None), jax.sharding.NamedSharding)), None)
+            mesh = (placed.mesh if placed is not None
+                    else jax.sharding.Mesh(np.asarray(jax.devices()), ("devices",)))
+            replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+            counter = jax.device_put(jnp.asarray(self.weights.step, jnp.int32), replicated)
             state = TrainState(step=counter, microstep=counter, updates=counter, variables=self.variables,
-                               opt_state=optax.EmptyState(), ema=None, key=jax.random.key(0), scale=None,
-                               window_size=jnp.asarray(1, jnp.int32))
-            checkpoints.save(self.weights.step, state, weights_only=True,
-                             artifact=DecisionObjective(self).inference_record())
+                               opt_state=optax.EmptyState(), ema=None,
+                               key=jax.device_put(jax.random.key(0), replicated), scale=None,
+                               window_size=jax.device_put(jnp.asarray(1, jnp.int32), replicated))
+            checkpoints.save(self.weights.step, state, artifact=DecisionObjective(self).inference_record())
             checkpoints.wait()
 
     def __call__(self, state: JSON, questions: Mapping[str, Question], *,

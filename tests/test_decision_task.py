@@ -673,6 +673,8 @@ def test_an_averaged_task_of_any_layout_saves_reloads_and_serves_as_it_was(decid
     answers, saves to a directory of its own as a run (`save`), which `from_run` reads back with its
     weights, calibration and provenance, answering every case as the task it was. Saving it there
     again keeps it; a run's own directory, which holds other weights, refuses it."""
+    import dataclasses
+
     from dew.decision import StateFirstLayout
 
     other = replace(decide, layout=StateFirstLayout(max_len=decide.layout.max_len,
@@ -690,7 +692,10 @@ def test_an_averaged_task_of_any_layout_saves_reloads_and_serves_as_it_was(decid
         assert np.array_equal(np.asarray(leaf), np.asarray(own))
     for request in CASES.values():
         questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
-        assert reloaded(request["state"], questions) == task(request["state"], questions)
+        found, expected = reloaded(request["state"], questions), task(request["state"], questions)
+        assert found.keys() == expected.keys()
+        for name in expected:
+            np.testing.assert_equal(dataclasses.asdict(found[name]), dataclasses.asdict(expected[name]))
     reloaded.save(directory)
     with pytest.raises(ValueError):
         task.save(runs[0])
