@@ -1215,8 +1215,8 @@ def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
     that produced them still reduced in fp32, which is where the precision
     was needed.
 
-    `equation` is flax's value product, '...hqk,...khd->...qhd'; a CPU sums
-    an fp32 one in float64 and rounds once (`precision.accumulated`).
+    `equation` is flax's value product, '...hqk,...khd->...qhd'; a CPU under
+    Dew's tests sums an fp32 one in float64 and rounds once (`precision.accumulated`).
     """
     if equation != '...hqk,...khd->...qhd':
         raise ValueError(f"weighted_values takes flax's value product, got {equation!r}")
@@ -1730,8 +1730,8 @@ def _xla_kernel_narrows(query) -> bool:
 
 def _xla_kernel_on_cpu() -> bool:
     """Whether jax.nn's xla attention would run this call on a CPU, where 'auto' and 'xla' take the
-    reference path. jax's sums fp32 products in fp32, as XLA:CPU's dot does, where Dew sums a CPU's
-    in float64 (`precision.accumulated`), and it differentiates the softmax through rowsum(dO * O),
+    reference path. jax's sums fp32 products in fp32, as XLA:CPU's dot does, where Dew's tests sum a
+    CPU's in float64 (`precision.accumulated`), and it differentiates the softmax through rowsum(dO * O),
     which leaves a query that reads one key a rounding's gradient where the softmax's own derivative,
     the reference path's, is exactly zero."""
     return generation.backend() == 'cpu'

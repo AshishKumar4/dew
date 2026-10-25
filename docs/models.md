@@ -4,7 +4,7 @@ The tables on this page are generated from Dew's source at build time. `Pretrain
 
 A port counts as supported when a test loads the same weights into Dew and into the reference implementation and compares the outputs in float32. For most families that test runs on a small fixture with the release's own configuration and tensor shapes. The "Checked with" column says when a family was also compared at full size against a released checkpoint. Most families have not been run at full size; memory use and throughput at full size are unmeasured for them.
 
-A checkpoint whose type is not listed can still load. A type that computes the Llama block is verified against transformers at load time. `fallback="torchax"` runs any causal LM that Transformers can build through Transformers' own PyTorch forward, lowered to JAX by torchax, with no Dew kernels, sharding rules or cached generation. GGUF files, `pytorch_model.bin` repositories and mamba_ssm checkpoints load too. [Train language models](concepts/language_models.md#other-weight-formats) explains each of these paths and what it costs.
+A checkpoint whose type is not listed can still load. A type that computes a registered family's block is verified against transformers at load time. Any other causal LM that Transformers can build loads through Transformers' own PyTorch forward, lowered to JAX by torchax, with no Dew kernels, sharding rules, packing or cached generation, and `fallback="torchax"` takes that route for any checkpoint. GGUF files, `pytorch_model.bin` repositories and mamba_ssm checkpoints load too. [Train language models](concepts/language_models.md#other-weight-formats) explains each of these paths and what it costs.
 
 ## Requested families Dew does not load yet
 

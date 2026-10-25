@@ -5,6 +5,7 @@ import binascii
 import functools
 import io
 import json
+import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -43,10 +44,10 @@ from dew.decision.layout import (
     Layout,
     MarkerLayout,
     Specials,
-    context_tokens,
     render,
+    with_context,
 )
-from dew.decision.model import DecisionModel
+from dew.decision.model import ContextEncoder, DecisionModel
 from dew.decision.questions import (
     KINDS,
     Answer,
@@ -65,6 +66,7 @@ from dew.inference.tasks import shape_bucket
 from dew.interop.processors import Processor
 from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
 from dew.nn.kernels.options import program
+from dew.nn.sharding import batch_axes
 from dew.objectives.base import Metric, Objective, Variables
 from dew.records import JSON, json_value, record
 
@@ -139,6 +141,9 @@ class DecideSettings:
     specials: Specials
     tokenizer: str | None
     processor: str | None
+    context_encoder: ContextEncoder = "table"
+    """How the model encodes a row's context (`DecisionModel.context_encoder`); a run recorded before
+    the choice existed embedded it by its token table."""
 
     @staticmethod
     def of(record: Mapping[str, object]) -> "DecideSettings":
@@ -234,7 +239,8 @@ class Decide:
         head = Head.from_record(records.json_value(settings.head, "head"), width)
         # The head computes in the dtype it recorded, or as a fresh head over
         # the backbone would where the caller overrides the compute dtype.
-        model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype))
+        model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype),
+                              settings.context_encoder)
         rows = settings.layout
         if settings.tokenizer is None:
             raise ValueError("the run records no tokenizer to lay its rows out with")
@@ -397,25 +403,8 @@ class Decide:
 
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
                  media: Sequence[int] = (), *, context: JSON | None = None) -> list[Encoded]:
-        rows = self.layout.rows(self.tokenizer, self.specials, state, questions, media=media)
-        if any(row.spans_in_context for row in rows):
-            # The row's context is its schema (`Schema.stream`), read whole by the cross-attention.
-            if context is not None:
-                raise ValueError("this task reads each request's schema as its context, so it reads no "
-                                 "context of the request's own")
-            if self.context_length is None:
-                raise ValueError("a schema read as the row's context needs a backbone with cross-attention "
-                                 "layers to read it (Pretrained.with_cross_attention)")
-            for row in rows:
-                if len(row.context or ()) > self.context_length:
-                    raise ValueError(f"the schema needs {len(row.context or ())} context tokens, more than "
-                                     f"the {self.context_length} the backbone's cross-attention reads")
-        elif context is not None:
-            if self.context_length is None:
-                raise ValueError(f"a request's context is read by a backbone's cross-attention, which this "
-                                 f"task's {type(self.model.backbone).__name__} does not have")
-            tokens = tuple(context_tokens(self.tokenizer, context, self.context_length).tolist())
-            rows = [replace(row, context=tokens) for row in rows]
+        rows = with_context(self.layout.rows(self.tokenizer, self.specials, state, questions, media=media),
+                            self.tokenizer, context, self.context_length)
         for row in rows:
             if not self.layout.fits(row):
                 raise ValueError(f"the schema needs {len(row.tokens)} tokens besides the state, more than "
@@ -471,7 +460,8 @@ class Decide:
             inputs, tokens=_widened(inputs.tokens, length, self.specials.pad),
             segments=_widened(inputs.segments, length),
             positions=None if inputs.positions is None else _widened(inputs.positions, length),
-            slots=None if inputs.slots is None else _widened(inputs.slots, length))
+            slots=None if inputs.slots is None else _widened(inputs.slots, length),
+            blocks=None if inputs.blocks is None else _widened(inputs.blocks, length, -1))
         count = shape_bucket(len(rows), 1)
         padded = RowPlan(None, len(rows), count, 0, 1).pad(inputs)
         held = self.variables if variables is None else variables
@@ -525,7 +515,7 @@ class Decide:
         minimum counts are Laya's: a type's temperature needs `type_minimum` answers
         and a bucket's `bucket_minimum`.
         """
-        scored = self._scored(held_out if callable(held_out) else self._held(held_out))
+        scored = self._scored(held_out if callable(held_out) else self._held(held_out, self._mesh))
         if not scored:
             raise ValueError("calibration needs examples with answers")
         temperatures = Temperatures.fit(scored, type_minimum=type_minimum, bucket_minimum=bucket_minimum)
@@ -542,27 +532,39 @@ class Decide:
         each probability divided by its temperature; a binning map or abstention
         thresholds are not applied. The default metrics are Accuracy, ECE, AURC
         and the log loss. The pass agrees its result across a process pool, so
-        there every process calls it.
+        there every process calls it. It scores on the mesh the task's weights are
+        placed on, its rows split over the mesh's row axes as a run's validation
+        splits them, or on one local device for weights placed on none.
         """
         from dew.decision.scoring import default_metrics
-        from dew.training.distributed import MeshSpec
         from dew.training.evaluation import Evaluation
 
         chosen = list(metrics) or default_metrics()
-        evaluation = Evaluation.run(self._scoring, self.variables, self._held(examples),
-                                    key=0, metrics=chosen, mesh=MeshSpec().build(jax.local_devices()[:1]))
+        evaluation = Evaluation.run(self._scoring, self.variables, self._held(examples, self._mesh),
+                                    key=0, metrics=chosen, mesh=self._mesh)
         return {metric.name: evaluation.scores[f"val/{metric.name}"] for metric in chosen}
 
-    def _held(self, examples: Iterable[Example | Mapping[str, object]]) -> Reader:
+    @property
+    def _mesh(self) -> "Mesh":
+        """The mesh the task's weights are placed on, or one local device for weights placed on none."""
+        from dew.training.distributed import MeshSpec
+
+        placed = mesh_of(self.variables)
+        return MeshSpec().build(jax.local_devices()[:1]) if placed is None else placed
+
+    def _held(self, examples: Iterable[Example | Mapping[str, object]], mesh: "Mesh") -> Reader:
         """`examples` as a validation reader of this task's rows, laid out as
         its objective evaluates them. A batch is one pass within the budget, as
-        `batch` packs its rows, on one device, as an answer is: a short last
-        batch need not divide."""
+        `batch` packs its rows, rounded to a multiple of the rows `mesh` splits a
+        batch over, so every batch divides; a short last batch is filled as a
+        run's validation fills it (`VALID_ROWS`)."""
         from dew.data import Memory
         from dew.data.compile import validation
         from dew.decision.data import decisions
 
+        shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
         rows = max(1, min(self.budget.rows, self.budget.tokens // self.layout.max_len))
+        rows = -(-rows // shards) * shards
         rows_of = [{"example": row} if isinstance(row, Example) else row for row in examples]
         held = decisions(Memory(rows_of))
         return validation(held, batch=rows, objective=self._scoring.data(), read="memory")
@@ -677,9 +679,9 @@ class Decide:
         return held, self.variables
 
     def _read_wire(self, request: Mapping[str, object], *, strict: bool
-                   ) -> tuple[JSON, dict[str, Question], list[Image.Image]]:
-        """A Jev body's state, questions and images (none where `strict`), refused with a ValueError
-        where Jev would refuse it."""
+                   ) -> tuple[JSON, dict[str, Question], list[Image.Image], JSON | None]:
+        """A Jev body's state, questions, images and context (neither where `strict`), refused with a
+        ValueError where Jev would refuse it."""
         unknown = set(request) - {"state", "questions", "model", *EXTENSIONS}
         if unknown:
             raise ValueError(f"a request holds state, questions and model, not {sorted(unknown)}")
@@ -690,7 +692,8 @@ class Decide:
         if not questions:
             raise ValueError("a request needs at least one question")
         state = json_value(request["state"], "state")
-        return state, questions, [] if strict else decoded_images(request.get("images"))
+        context = None if strict or "context" not in request else json_value(request["context"], "context")
+        return state, questions, [] if strict else decoded_images(request.get("images")), context
 
     def _wire_response(self, questions: Mapping[str, Question], answers: Mapping[str, Answer], usage: Usage,
                        *, details: bool) -> dict[str, JSON]:
@@ -706,7 +709,7 @@ class Decide:
                 "usage": reported}
 
 
-EXTENSIONS = ("images",)
+EXTENSIONS = ("images", "context")
 """The request fields `Decide.systemone` reads beyond Jev's, which `strict` drops."""
 
 
@@ -744,12 +747,12 @@ class WireScoring(scoring.Scoring[Mapping[str, object], _Row, _Admitted, np.ndar
 
     def admit(self, request: Mapping[str, object]) -> scoring.Scored[_Row, _Admitted]:
         decide = self.decide
-        state, questions, images = decide._read_wire(request, strict=self.strict)
+        state, questions, images, context = decide._read_wire(request, strict=self.strict)
         if images:
-            row, media = decide._shown(state, questions, images)
+            row, media = decide._shown(state, questions, images, context)
             rows = (_Row(row, media),)
         else:
-            rows = tuple(_Row(row) for row in decide._encoded(state, questions))
+            rows = tuple(_Row(row) for row in decide._encoded(state, questions, context=context))
         usage = usage_of([row.encoded for row in rows])
         if self.whole and (usage.truncated or usage.trimmed):
             cut = "state" if usage.truncated else "instructions or options"
@@ -840,7 +843,8 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
                           positions=array("positions"), slots=given("slots"),
                           option_slots=given("option_slots"), slotted=given("slotted"),
                           context=given("context"), context_lengths=given("context_lengths"),
-                          max_segments=max_segments, spans_in_context=spans_in_context)
+                          readout=given("readout"), blocks=given("blocks"), max_segments=max_segments,
+                          spans_in_context=spans_in_context)
 
 
 def _widened(leaf: jax.Array, length: int, fill: int = 0) -> jax.Array:

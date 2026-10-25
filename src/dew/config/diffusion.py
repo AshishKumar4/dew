@@ -463,12 +463,15 @@ class DiffusionRunConfig(RunConfig):
 
         assert self.pretrained is not None
         name, revision = split_revision(self.pretrained)
+        # An adapter keeps the pipeline's weights as they are: they load where the start keeps them.
+        # The pipeline reads its weights on a resume too, which binds the checkpoint over them.
+        placement = self.trainer.source_placement(frozen=self.lora is not None)
         return load_diffusion_source(
             name, revision=revision, dtype=self._compute or "bfloat16",
             param_dtype=self.pretrained_param_dtype,
             attention_impl=str(self.model.fields.get("attention_impl", "auto")),
             size=self.sample_field().shape[:-1],
-            variables=variables)
+            variables=variables, mesh=placement.get("mesh"), layout=placement.get("layout"))
 
     def _process(self, convention: Process | None) -> Process:
         """The preset's process, which must be of the kind the pretrained
