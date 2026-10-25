@@ -217,3 +217,27 @@ def test_every_stored_spelling_of_a_media_tensor_writes_back_from_its_one_leaf(t
     np.testing.assert_array_equal(written[spelled], tensors[spelled] + 0.25)
     np.testing.assert_array_equal(written[spelled.removeprefix("model.")], written[spelled])
     Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
+
+
+@pytest.mark.parametrize(("fixture", "dropped"), [
+    ("qwen35-native-tiny", "model.visual.patch_embed.proj.weight"),
+    ("qwen35-native-tiny", "model.visual.merger.linear_fc1.weight"),
+    ("qwen38-dense-tiny", "mtp.layers.0.mlp.down_proj.weight"),
+], ids=["tower", "projector", "prediction_depth"])
+def test_a_wrapper_missing_a_tensor_of_a_component_it_builds_is_refused(tmp_path, fixture, dropped):
+    """A wrapper checkpoint lacking one tensor of its tower, its projector, or a prediction depth it
+    holds the rest of is refused at load, rather than loading that component without it."""
+    import shutil
+
+    from safetensors.numpy import save_file
+
+    from dew.interop import Pretrained
+
+    target = tmp_path / fixture
+    shutil.copytree(FIXTURES / fixture, target)
+    tensors = load_file(target / "model.safetensors")
+    assert dropped in tensors
+    kept = {name: array for name, array in tensors.items() if name != dropped}
+    save_file(kept, target / "model.safetensors", metadata={"format": "pt"})
+    with pytest.raises(ValueError):
+        Pretrained.load(target, dtype="float32", attention_impl="reference")
