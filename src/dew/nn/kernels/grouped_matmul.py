@@ -847,7 +847,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # the stage of `lhs` and its side tiles and writes the stage back before the MMA may read it
         # (a commit to shared memory): serial with the MMAs, not beside them
         # (GMMSB-h100-main: a gated prologue at 3.7x the Triton launch's time).
-        family = _FAMILIES[config.family]
+        family = _bundle(config, tokens.dtype)
         # A step's stage written (its rows' and columns' blocks), and read by the products: each of the
         # family's instructions spans `rows` output rows and the tile's columns, reading its rows' slice
         # and the columns' whole block, so the columns' block is read once a `rows` of the tile (an H100's
@@ -863,7 +863,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             # warpgroup MMA reads the stage itself beside its products (an A100 ran mma.sync's tiles at
             # 1.2 to 1.5 times Triton's time, an L4 at 0.5 to 0.9, GEN4-route-a100, GEN6-route-l4).
             step = (config.block_m + config.block_n) * config.block_k * size
-            fragments = steps * (config.block_m + family.rhs_copies * config.block_n) * config.block_k * size
+            fragments = steps * (family.lhs_copies * config.block_m
+                                 + family.rhs_copies * config.block_n) * config.block_k * size
         rewritten = 0.0
         if hooks.prologue is not None:
             rewritten = steps * (2 * math.prod(lhs) * size
@@ -1471,14 +1472,12 @@ GPU's launch keeps the place main's chooser gave it on an H100, where it measure
 (test_gemm_template's HOOKED_RECEIPTS: 5.9 ms against 10.2 at Llama 3 8B's gate projection)."""
 
 
-_FAMILIES = {mosaic_sm90.WGMMA.name: mosaic_sm90.WGMMA, mosaic_sm80.Mma.name: mosaic_sm80.Mma}
 """The bundles by name, as a tile names its (`mosaic_gpu.Tiles.family`), for their class-wide facts."""
 
 
 def _bundle(config: mosaic_gpu.Tiles, dtype) -> mosaic.Family:
-    """The bundle `config` runs on, for operands of `dtype`."""
-    family = _FAMILIES[config.family]
-    return family(jnp.dtype(dtype)) if isinstance(family, type) else family
+    """The bundle `config` runs on, for operands of `dtype` (`mosaic_gpu.family_of`)."""
+    return mosaic_gpu.family_of(config, dtype)
 
 
 def _families(dtype, *, interpreted: bool) -> tuple[mosaic.Family, ...]:

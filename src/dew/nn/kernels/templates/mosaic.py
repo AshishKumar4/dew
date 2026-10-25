@@ -302,10 +302,11 @@ def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int]
     """The registers a consumer thread holds at a `(rows, columns, depth)` GEMM tile of `consumers` roles
     of `family` (`live_registers`): its share of the fp32 accumulator carried, and a step's operand
     fragments where its products read registers (`Family.operands_in_registers`; the right operand's in
-    each of its `rhs_copies` warps whole)."""
+    each of its replicating warps: `lhs_copies`, `rhs_copies`), a sub-step's where it loads them so
+    (`Family.fragment_depth`)."""
     rows, columns, depth = block
-    share = rows // consumers
-    fragments = ([(share, depth, dtype), (depth, columns * family.rhs_copies, dtype)]
+    share, depth = rows // consumers, family.fragment_depth(depth)
+    fragments = ([(share * family.lhs_copies, depth, dtype), (depth, columns * family.rhs_copies, dtype)]
                  if family.operands_in_registers else [])
     return live_registers(family, [(share, columns, jnp.float32)], fragments)
 
@@ -439,9 +440,24 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     operands_in_registers: bool
     """Whether a product reads its operands from registers a consumer loads them into (mma.sync's), where
     warpgroup MMA reads both from shared memory."""
-    rhs_copies: int = 1
-    """The warps of a role each holding the right operand's whole fragment (mma.sync's four warps along
-    the rows each hold every column's, JAX's `MMALayouts`' `rhs` replicated over its warps)."""
+    @property
+    def lhs_copies(self) -> int:
+        """The warps of a role each holding the left operand's fragment for the same rows (mma.sync's warps
+        along a tile's columns, JAX's `MMALayouts`' `lhs` replicated over them): one, unless replicated."""
+        return 1
+
+    @property
+    def rhs_copies(self) -> int:
+        """The warps of a role each holding the right operand's fragment for the same columns (mma.sync's
+        warps along a tile's rows, JAX's `MMALayouts`' `rhs` replicated over them): one, unless
+        replicated."""
+        return 1
+
+    def fragment_depth(self, depth: int) -> int:
+        """The depth of a step's operand fragments a consumer holds at once, where its products read
+        registers (`operands_in_registers`): the step's, unless the family loads them a sub-step at a
+        time."""
+        return depth
     widest_product: int | None = None
     """The most columns one product spans (warpgroup MMA's 256, wgmma's widest N), which a tile's columns
     are at most; None where a tile's columns are many products' (mma.sync's 8 each), held by its
