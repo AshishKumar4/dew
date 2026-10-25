@@ -21,7 +21,7 @@ from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop import Pretrained
-from tools.diffusers_wan_reference import float64
+from tools.torch_precision import float64
 
 PUBLISHED = ("DDUF/tiny-flux-dev-pipe-dduf", "fluxpipeline.dduf", "4fa81aa2c667f7f09ea7f2913be771e6f927dcd9")
 
