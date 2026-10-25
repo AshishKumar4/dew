@@ -1,7 +1,8 @@
 """The grouped launches' cost model against every tile measured on an A100 and H100s
-(tests/fixtures/gemm_sweeps, one a device: tools/sweep_grouped_gemm.py over seven MoE shapes, each product,
-costed on the device's facts): the config it picks runs within 10% of the measured best, or the case is a known miss whose missing term `MISSES`
-names. A miss the model comes to rank fails too, so the table only shrinks."""
+(tests/fixtures/gemm_sweeps, one a device: tools/sweep_grouped_gemm.py over seven MoE shapes, each
+product, costed on the device's facts): the config it picks runs within 10% of the measured best, or the
+case is a known miss whose missing term `MISSES` names. A miss the model comes to rank fails too, so the
+table only shrinks."""
 
 import dataclasses
 import json
