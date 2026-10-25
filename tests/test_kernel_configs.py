@@ -158,13 +158,15 @@ def test_the_shared_dot_preserves_narrow_products_with_fp32_accumulation():
     np.testing.assert_array_equal(np.asarray(got), np.asarray(expected))
 
 
+@pytest.mark.parametrize("dtype", ["bfloat16", "float32"])
 @pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
-def test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_block(target):
-    """Each declared config at each declared shape, lowered as on the GPU and compiled by XLA's CUDA backend
-    for a compile-only device on this CPU (tests/kernel_compile.py): it compiles, to no more shared memory
-    than its GPU's block holds. A kernel that does not compile (a two-result inline asm, a mixed-dtype
-    dot) fails here and never reaches a GPU."""
-    found = compile_kernels(support.kernel_cases(target), target)
+def test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_block(target, dtype):
+    """Each declared config at each declared shape, of each dtype apart (one test of both outlasted a CI
+    task's 240 seconds), lowered as on the GPU and compiled by XLA's CUDA backend for a compile-only device
+    on this CPU (tests/kernel_compile.py): it compiles, to no more shared memory than its GPU's block
+    holds. A kernel that does not compile (a two-result inline asm, a mixed-dtype dot) fails here and never
+    reaches a GPU."""
+    found = compile_kernels(support.kernel_cases(target, (dtype,)), target)
     assert found, "the compile gate must not be vacuous"
     assert not failures(found), "\n".join(failures(found))
 
