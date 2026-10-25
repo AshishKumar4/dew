@@ -277,7 +277,8 @@ def test_a_llama4_of_unrotated_layers_alone_translates_as_llama4():
     from dew.interop.safetensors_io import read_weights
 
     config = json.loads((LLAMA4_CHECKPOINT / "config.json").read_text())
-    config = {**config, "no_rope_layers": [0] * config["num_hidden_layers"]}
+    config = {**{field: value for field, value in config.items() if field != "layer_types"},
+              "no_rope_layers": [0] * config["num_hidden_layers"]}
     tensors = read_weights(LLAMA4_CHECKPOINT)
     record = translate_config(config)
     assert {kind.split("_")[0] for kind in record["kinds"]} == {"full"}
