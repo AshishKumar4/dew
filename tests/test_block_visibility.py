@@ -12,8 +12,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from block_support import VOCAB, block_causal, model
-from model_support import TINY_DECODER, model_draw
+from block_support import VOCAB, block_causal, model, wrapped
+from model_support import model_draw
 from reference_error import assert_as_exact
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -231,16 +231,6 @@ def test_a_multimodal_wrappers_cached_rollout_reads_its_blocks_as_its_full_pass_
     """A multimodal wrapper hands its language model the call's groups (`MultimodalTransformer`): text alone
     through its cache, a prefill, a cached call and single steps, with blocks inside each call, on par with
     its full pass over the same groups from float64 (check 1)."""
-    from dew.nn.multimodal import MultimodalTransformer
-    from dew.nn.vision import GemmaProjector, SiglipVision
-
-    def wrapped(decoder):
-        return MultimodalTransformer(
-            decoder, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
-                                  image_size=8, patch_size=4),
-            GemmaProjector(text_width=TINY_DECODER["emb_features"], patches_per_side=2, tokens_per_side=1),
-            family="gemma3", image_token_id=1)
-
     decoder = model(full_attention={"mixer": AttentionMixer(bidirectional_blocks=True)})
     wrapper = wrapped(decoder)
     groups = jnp.asarray(CACHED_BLOCKS)
