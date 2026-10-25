@@ -38,7 +38,6 @@ from typing import NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
-from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
 from dew.nn.categorical import rescaled, segment_log_partition, target_loss
@@ -57,8 +56,17 @@ from dew.nn.precision import (
     running_sum,
     running_total,
     scaled_logits,
+    wide_cpu_arithmetic,
 )
-from dew.nn.protocols import AffineHead, HiddenStates, Lacks, Logits, LogitsFromHidden, OutputTable
+from dew.nn.protocols import (
+    AffineHead,
+    HiddenStates,
+    Lacks,
+    Logits,
+    LogitsFromHidden,
+    OutputTable,
+    head_table,
+)
 from dew.nn.sharding import logical_spec, mesh_axes
 
 
@@ -95,16 +103,6 @@ def _logits_cotangent(cotangent, precision: jax.lax.PrecisionLike):
     that one copy. Otherwise it stays in its own dtype, fp32 or wider. The
     cast is round-to-nearest-even, as `bf16_dot_general` rounds its operands."""
     return cotangent.astype(jnp.bfloat16) if precision is BF16 else cotangent
-
-
-def head_table(model: nn.Module, variables) -> OutputTable | None:
-    """`model`'s head over `variables` as one matrix (`AffineHead.output_table`),
-    or None for a model whose head no matrix alone is, or that names none."""
-    table = model.apply(variables, method="output_table") if isinstance(model, AffineHead) else None
-    if table is not None and not isinstance(table, OutputTable):
-        raise TypeError(f"{type(model).__name__}.output_table gives a {type(table).__name__}, "
-                        f"not an OutputTable")
-    return table
 
 
 def reads_states(model) -> bool:
@@ -219,7 +217,8 @@ def _row_terms(logits, predict: bool) -> tuple[
     logits of 4096 x 151936 took 3.9 ms against `jax.nn.logsumexp` and
     `jnp.argmax`'s 7.6, and 8192 x 50304 2.6 against 5.0.
 
-    On CPU the row reduces in levels of `ROW_BLOCK` columns, each level's
+    In a process running wide CPU arithmetic (`dew.nn.precision.WIDE_CPU_ARITHMETIC`,
+    Dew's test setting), on a CPU the row reduces in levels of `ROW_BLOCK` columns, each level's
     blocks' terms the next level's row, until one block is left
     (`_row_blocks`): XLA's CPU compiler runs a reduction with a combine of
     its own as one loop over the row, whose sum of exponentials rescales its
@@ -260,7 +259,8 @@ def _row_terms(logits, predict: bool) -> tuple[
             row = [jnp.concatenate([first[index] for first in firsts], axis=-1) for index in range(len(row))]
         return reduced(*row)
 
-    terms = jax.lax.platform_dependent(*operands, cpu=blocked, default=reduced)
+    terms = (jax.lax.platform_dependent(*operands, cpu=blocked, default=reduced) if wide_cpu_arithmetic()
+             else reduced(*operands))
     return terms[0] + jnp.log(terms[1]), ((terms[0], terms[2]) if predict else None), terms[:2]
 
 
@@ -708,9 +708,10 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     block: both passes walk tokens in the first and columns in the second
     or a chunk, whichever is narrower, and the backward holds nothing
     wider, so it is the only knob on the backward's temporaries. On a CPU
-    the backward's running sums of the state and head gradients keep what
-    each tile's addition drops (`dew.nn.precision.running_sum`), three
-    times their bytes, so they round once as the whole head's products do.
+    under Dew's wide arithmetic (`dew.nn.precision.WIDE_CPU_ARITHMETIC`, its
+    test setting) the backward's running sums of the state and head gradients
+    keep what each tile's addition drops (`dew.nn.precision.running_sum`),
+    three times their bytes, so they round once as the whole head's products do.
     The default is measured; a tile wider than the input is one
     tile. A `tile` of None keeps the whole fp32 logits for the backward
     instead of recomputing them, which is faster wherever they fit: on one

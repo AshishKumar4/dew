@@ -450,6 +450,28 @@ def framed(tokenizer: PreTrainedTokenizerBase, system: str, *, where: str, think
     return before, after
 
 
+def framed_turn(tokenizer: PreTrainedTokenizerBase, system: str, content: str, *, where: str,
+                thinking: bool | None = None, chat_template: str | None = None,
+                options: Mapping[str, JSON] | None = None) -> tuple[str, int, int, int]:
+    """One user turn's `content` rendered by `tokenizer`'s chat template as `framed` renders the turn
+    around it, its own content in place, so the template's transformations of it are its own: the
+    rendered text, where in it the content stands, how many of its leading characters the template
+    left out, and how many it holds. The template holds the content as written or trimmed (`|trim`,
+    `str.strip`), once; a template that changes it otherwise has no character map to the content's
+    spans, and is refused (ValueError)."""
+    rows = [{"role": "system", "content": system}, {"role": "user", "content": content}]
+    text = _rendered(tokenizer, rows, (), generation_prompt=True, where=where, thinking=thinking,
+                     tokenize=False, chat_template=chat_template, options=options)
+    if not isinstance(text, str):
+        raise ValueError(f"{where}: the chat template renders no text")
+    kept = content.strip()
+    for held, dropped in ((content, 0), (kept, len(content) - len(content.lstrip()))):
+        if text.count(held) == 1:
+            return text, text.index(held), dropped, len(held)
+    raise ValueError(f"{where}: the chat template does not hold a user turn's content once, as written or "
+                     "trimmed")
+
+
 def image_text(processor, *, where: str) -> str:
     """The text one image stands as in a user's turn, as `processor`'s own chat template writes an
     image part: the turn rendered with an image before its text, less the same turn without it.
