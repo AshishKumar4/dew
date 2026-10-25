@@ -199,6 +199,8 @@ def _intra_solve_kernel(chunk_ref, aqkd_ref, akkd_ref, aqk_ref, akk_ref, *, chun
 class IntraSolve(_Launch):
     """`intra_solve`'s launch (tuning.KernelOp)."""
 
+    revision: int = 2
+
     NAME = "intra_solve"
     KEYS, VALUES = "aqk", None
     PICKS = _picks(Tiles(0, 0, 1, 1), small=Tiles(0, 0, 2, 1))

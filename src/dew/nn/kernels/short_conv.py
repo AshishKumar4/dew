@@ -389,12 +389,23 @@ def _params(warps: int):
     return plgpu.CompilerParams(num_warps=warps, num_stages=1)
 
 
+class _ConvLaunch(tuning.KernelOp):
+    """A launch of the conv, timed on rows whose every token is real (`valid` int8 ones) and in one
+    document (`documents` int32 zeros)."""
+
+    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
+        return [jnp.ones(spec.shape, spec.dtype) if spec.dtype == jnp.int8 else array
+                for spec, array in zip(specs, super().operands(specs, seed), strict=True)]
+
+
 @dataclasses.dataclass(frozen=True)
-class ConvForward(tuning.KernelOp):
+class ConvForward(_ConvLaunch):
     """Every piece's forward in one launch (`_forward_kernel`): at one decoding row the conv's cost is
     its launches. A program takes a `Tile`, `TILE`."""
 
     config_cls: ClassVar[type[Tile]] = Tile
+
+    ROWS: ClassVar[tuple[str, ...]] = ('x', 'valid', 'documents')
 
     def _fwd(self, x: jax.Array, taps: jax.Array, bias: jax.Array | None, valid: jax.Array | None,
              documents: jax.Array | None, *, parts: tuple[tuple[int, int | None], ...], activation: bool,
@@ -423,12 +434,14 @@ class ConvForward(tuning.KernelOp):
 
 
 @dataclasses.dataclass(frozen=True)
-class ConvBackward(tuning.KernelOp):
+class ConvBackward(_ConvLaunch):
     """One piece's backward (`_backward_kernel`): the projection's gradient at the piece's columns,
     written into the gradient the piece before wrote (`before`, aliased) where there is one, and each
     tile's tap and bias gradients. A program walks a `Walk`, `WALK` at the call's length (`_walk`)."""
 
     config_cls: ClassVar[type[Walk]] = Walk
+
+    ROWS: ClassVar[tuple[str, ...]] = ('x', 'valid', 'documents', 'before', 'dy')
 
     def _fwd(self, x: jax.Array, taps: jax.Array, bias: jax.Array | None, valid: jax.Array | None,
              documents: jax.Array | None, before: jax.Array | None, dy: jax.Array, *, first: int,
