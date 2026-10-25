@@ -23,6 +23,43 @@ type ParamTree = Tree[np.ndarray]
 type TensorPath = Callable[[str], tuple[str, ...] | None]
 
 
+def in_params(path: TensorPath) -> TensorPath:
+    """`path`, whose leaves are parameters, rooted at `params`."""
+    def rooted(name: str) -> tuple[str, ...] | None:
+        leaf = path(name)
+        return None if leaf is None else ("params", *leaf)
+    return rooted
+
+
+def check_shapes[PathT](loaded: Iterable[tuple[PathT, tuple[int, ...]]],
+                        expected: Mapping[PathT, tuple[int, ...]]) -> None:
+    """Check every supplied shape against its native slot, including multiple source aliases.
+    Missing, unexpected and mismatched entries are reported together before parameters are read."""
+    seen: set[PathT] = set()
+    mismatched = []
+    for path, shape in loaded:
+        seen.add(path)
+        if path in expected and shape != expected[path]:
+            mismatched.append(f"{path} is {shape}, the module takes {expected[path]}")
+    missing = sorted(set(expected) - seen, key=str)
+    unexpected = sorted(seen - set(expected), key=str)
+    if missing or unexpected or mismatched:
+        raise ValueError(
+            f"the checkpoint does not fit the model: missing {missing}, "
+            f"unexpected {unexpected}, mismatched {sorted(mismatched)}")
+
+
+def check_tree(variables: Mapping[str, object], module: nn.Module, *inputs) -> None:
+    """Check every collection against the module's abstract initialization, without another
+    copy of its parameters. Inputs may be arrays or jax.ShapeDtypeStruct values."""
+    def shapes(tree) -> dict[str, tuple[int, ...]]:
+        return {jax.tree_util.keystr(path, simple=True, separator="."): np.shape(leaf)
+                for path, leaf in jax.tree_util.tree_leaves_with_path(tree)}
+
+    expected = shapes(jax.eval_shape(module.init, jax.random.key(0), *inputs))
+    check_shapes(shapes(dict(variables)).items(), expected)
+
+
 AUTO = "auto"
 """The param_dtype that stores a checkpoint's parameters in its own dtype."""
 
@@ -194,6 +231,12 @@ def _orders(path: tuple[str, ...], rank: int) -> tuple[tuple[int, ...] | None, t
         return None, None
     order = (*range(2, rank), 1, 0)
     return order, tuple(int(axis) for axis in np.argsort(order))
+
+
+def native_shape(path: tuple[str, ...], shape: tuple[int, ...]) -> tuple[int, ...]:
+    """The native shape at `path` under the same source-axis permutation the parameter reader uses."""
+    order, _ = _orders(path, len(shape))
+    return shape if order is None else tuple(shape[axis] for axis in order)
 
 
 def _stored_shape(path: tuple[str, ...], shape: tuple[int, ...]) -> tuple[int, ...]:

@@ -269,8 +269,8 @@ def text_to_image(directory: str | os.PathLike, config: Mapping[str, object], *,
     """
     from dew.diffusion.presets import EDM
     from dew.inputs import Field, InputSpec
+    from dew.interop.weights import check_tree
     from dew.nn.dit import TextContext
-    from dew.nn.text_encoders import check_tree
     from dew.registry import models, resolve_dtype
     from dew.sampling import CFG, EulerAncestral, TextToImage
 

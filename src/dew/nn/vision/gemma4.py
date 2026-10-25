@@ -74,9 +74,9 @@ class Gemma4ClippableLinear(Dense):
 
     use_clipped_linears: bool = False
 
-    @nn.compact
-    def __call__(self, inputs):
-        return clipped_linear(self, super().__call__, inputs, self.use_clipped_linears)
+    @nn.nowrap
+    def _envelope(self, linear, inputs):
+        return clipped_linear(self, linear, inputs, self.use_clipped_linears)
 
 
 class Gemma4VisionTransformer(nn.Module):
@@ -221,7 +221,7 @@ class Gemma4Vision(TowerBase):
         return TowerGeometry(patch_size=self.patch_size, block_size=self.pooling_kernel_size)
 
 
-class Gemma4ProjectorModule(nn.Module):
+class Gemma4Projector(ProjectorBase):
     """Soft tokens to text width: a scale-free RMS norm, then the map.
 
     The reference keeps this beside the tower (modeling_gemma4.py,
@@ -243,17 +243,6 @@ class Gemma4ProjectorModule(nn.Module):
 
     def __call__(self, image_features) -> jax.Array:
         return self.projection(self.pre_norm(image_features))
-
-
-@dataclasses.dataclass(frozen=True)
-class Gemma4Projector(ProjectorBase):
-    """Gemma 4's projector fields: the decoder width and the norm epsilon."""
-
-    text_width: int
-    norm_eps: float = 1e-6
-
-    def build(self) -> nn.Module:
-        return Gemma4ProjectorModule(text_width=self.text_width, norm_eps=self.norm_eps)
 
 
 _GEMMA4_VISION_TENSORS = {

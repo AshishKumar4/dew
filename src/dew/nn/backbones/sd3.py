@@ -175,8 +175,8 @@ class SD3Transformer(TextStream, nn.Module):
 
         times = sinusoidal_time(time, TIME_FEATURES, dtype=at_least_fp32(self.dtype))
         times = times.astype(conditioning.pooled.dtype)
-        conditioned = (embedding(times, self.features, "timestep_embedder", **dense)
-                       + embedding(conditioning.pooled, self.features, "text_embedder", **dense))
+        conditioned = (embedding(self, times, self.features, "timestep_embedder", **dense)
+                       + embedding(self, conditioning.pooled, self.features, "text_embedder", **dense))
 
         context = Dense(self.caption_projection_dim, name="context_embedder", **dense,
                         dot_general=float32_dot_general)(

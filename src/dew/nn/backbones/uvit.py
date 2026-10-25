@@ -27,6 +27,7 @@ from ..dit import (
     remat_block,
 )
 from ..flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
+from ..mlp import GatedMLP
 from ..precision import at_least_fp32, float32_dot_general
 from ..rope import rotary_freqs
 from ..scan_orders import unscanned
@@ -146,7 +147,10 @@ class UViT(_TransformerOptions):
         self.pos_embed = self.param("pos_embed", nn.initializers.truncated_normal(0.02),
                                     (1, 1 + self.text_tokens + patches, self.emb_features))
         if self.mlp_time_embed:
-            self.time_mlp = [dense("time_embed_0"), dense("time_embed_2")]
+            self.time_mlp = GatedMLP(4 * self.emb_features, self.emb_features, activation=nn.silu,
+                                      use_bias=True, names=("time_embed_0", "time_embed_2"),
+                                      dtype=self.dtype, precision=self.precision)
+            nn.share_scope(self, self.time_mlp)
         self.context_embed = dense("context_embed")
         block = partial(ModulatedBlock, features=self.emb_features, num_heads=self.num_heads, modulated=False,
                         qkv_bias=False, gelu_approximate=False, **self._block_options())
@@ -176,7 +180,7 @@ class UViT(_TransformerOptions):
         wide = at_least_fp32(self.dtype)
         time = sinusoidal_time(jnp.asarray(temb, wide) * self.time_scale, self.emb_features, dtype=wide)
         if self.mlp_time_embed:
-            time = self.time_mlp[1](nn.silu(self.time_mlp[0](time.astype(self.dtype))))
+            time = self.time_mlp(time.astype(self.dtype))
         tokens = [time.astype(patches.dtype)[:, None]]
         positions = [self.pos_embed[:, :1]]
         if textcontext is not None:
