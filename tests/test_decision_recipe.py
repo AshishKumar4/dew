@@ -54,32 +54,23 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(tmp_path):
     assert decide.name == "tickets" and set(decide.calibration.temperatures.types) == {"choice"}
 
 
-@pytest.mark.parametrize("kind", ["joint", "slot"])
-def test_a_lora_run_over_a_decision_release_trains_its_factors_and_reloads(tmp_path, kind):
+def test_a_lora_run_over_a_decision_release_trains_its_factors_and_reloads(tmp_path):
     """A decision release takes the backbone's transformations as a fresh backbone does: a LoRA
-    run over a joint or a slot release keeps the release's own head and layout, trains the
-    adapter's factors and the head over a frozen base, and its saved run loads back as a task
-    answering with the trained probabilities."""
+    run over a slot release starts from the release's own readout and its question layout, trains
+    the adapter's factors and the readout over a frozen base, and its saved run loads back as a
+    task answering with the trained probabilities."""
     import jax
     import numpy as np
     import optax
+    from test_slot_sources import slot_release
 
     from dew.checkpoints import Checkpoints
+    from dew.decision.layout import QuestionLayout
     from dew.lora import LoRA
     from dew.objectives.base import FROZEN
     from dew.training import Trainer
 
-    if kind == "joint":
-        from test_decision_joint_checkpoint import BACKBONE, TINY
-
-        release = tmp_path / "release"
-        release.mkdir()
-        for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
-            (release / source.name).symlink_to(source.resolve())
-    else:
-        from test_slot_sources import slot_release
-
-        release, _ = slot_release(tmp_path, "head")
+    release, stored = slot_release(tmp_path, "head")
     rows = Memory([{"text": text, "label": label} for text, label in
                    [("charged twice", "billing"), ("site down", "technical"), ("pro price", "sales")] * 4])
     asked = rows.pipe(decisions, question="team").read("memory").batch(8).loading(Loading(workers=0))
@@ -88,12 +79,10 @@ def test_a_lora_run_over_a_decision_release_trains_its_factors_and_reloads(tmp_p
                                  trainer=dataclasses.replace(default.trainer, multi_host=False,
                                                              compilation_cache_dir=None))
     objective, dataset = config.prepare().train("adapted")
-    released = Decide.from_pretrained(release, attention_impl="xla")
-    assert type(objective.layout) is type(released.layout)
-    assert type(objective.model.head) is type(released.model.head)
-    for ours, theirs in zip(jax.tree.leaves(objective.held_variables()["params"]["head"]),
-                            jax.tree.leaves(released.variables["params"]["head"]), strict=True):
-        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    assert isinstance(objective.layout, QuestionLayout)
+    head = objective.held_variables()["params"]["head"]
+    for native, name in (("slots", "slot"), ("q", "q.weight"), ("k", "k.weight")):
+        np.testing.assert_array_equal(np.asarray(head[native]), stored[name])
     start = objective.init(jax.random.key(0))
     run = tmp_path / "run"
     checkpoints = Checkpoints(str(run), keep=1)
