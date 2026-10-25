@@ -751,6 +751,8 @@ def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix():
     task = TextGeneration(model, host, sampling=Sampling(temperature=0))
     served = task.quantized(spec)
     assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(served.variables))
+    # The weights its generations read are placed once, a quantized kernel's buffers included.
+    assert all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(served.placed))
     reference = quantize_with(model, qwix.PtqProvider([
         qwix.QuantizationRule(module_path=".*_proj", weight_qtype=jnp.int8,
                               op_names=("dot_general", "einsum", "dot"))]),
