@@ -1049,8 +1049,8 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
         residuals = maxima, totals, anchors, sums
     initial = hooks is not None and hooks.initial is not None
     # A guarded forward's live rows carry normalized split sums (`algebra.split_residuals`), which the first
-    # pass cannot recompute without the forward's denominator: D comes from them.
-    split = split or (natural and algebra.headroom(value.dtype))
+    # pass cannot recompute without the forward's denominator: D comes from them, in either form.
+    split = split or algebra.headroom(value.dtype)
     launch = functools.partial(_launch, split=split, natural=natural, accurate=accurate, initial=initial,
                                interpret=interpret)
     return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=BLOCK, scale=scale)
