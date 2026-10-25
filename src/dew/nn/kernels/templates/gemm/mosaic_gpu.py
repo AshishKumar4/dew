@@ -92,12 +92,13 @@ class Tiles:
         if self.warpgroups not in (1, 2) or self.cluster not in (1, 2) or paired:
             raise ValueError(f"{self}: one warpgroup alone, or two in a cluster of one or two "
                              "multiprocessors")
-        if self.family not in ('wgmma', 'mma.sync') or (self.family == 'mma.sync' and self.warpgroups != 1):
-            raise ValueError(f"{self}: Hopper's warpgroup MMA, or Ampere's mma.sync on one warpgroup")
-        if self.warpgroups == 2 and (self.block_m % 128 or self.block_n > 256):
-            # Each consumer's half of the rows is warpgroup MMAs', a multiple of 64 rows by at most 256
-            # columns.
-            raise ValueError(f"{self}: two warpgroups halve the tile's rows into warpgroup MMAs")
+        if self.family not in ('wgmma', 'mma.sync') or (self.family == 'mma.sync' and self.cluster != 1):
+            raise ValueError(f"{self}: Hopper's warpgroup MMA, or Ampere's mma.sync on one multiprocessor")
+        wide = self.family == 'wgmma' and self.block_n > 256
+        if self.warpgroups == 2 and (self.block_m % 128 or wide):
+            # Each consumer's half of the rows is a role's, a multiple of 64 rows, and on warpgroup MMA at
+            # most 256 columns.
+            raise ValueError(f"{self}: two warpgroups halve the tile's rows into whole roles")
         if self.warpgroups == 2 and self.stages < 2:
             # A stage is released a step late (an MMA in flight), so one stage would wait on itself.
             raise ValueError(f"{self}: two warpgroups stream at least two stages")
