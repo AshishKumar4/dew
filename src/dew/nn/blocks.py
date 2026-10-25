@@ -209,7 +209,7 @@ def sinusoidal_time(time, features: int, *, dtype: DTypeLike, shift: float = 0, 
 class TimeProjection(nn.Module):
     """Two dense layers with the activation after each."""
     features: int
-    activation: Callable = jax.nn.gelu
+    activation: Callable = activations.gelu_tanh
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 

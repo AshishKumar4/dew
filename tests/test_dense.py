@@ -150,6 +150,11 @@ def test_a_batched_kernel_draws_its_members_where_its_names_place_them():
                                   np.asarray(layer.init(jax.random.key(0), x)["params"]["kernel"].value))
 
 
+BIAS_SEEDS = 64
+"""Check 1's declared seeds for a bias summed over every position, sized by `seeds_for` on armada: the
+most any layer took."""
+
+
 @pytest.mark.parametrize(("layer", "shape"), [
     (Dense(16, dtype=jnp.bfloat16, param_dtype=jnp.bfloat16), (8192, 12)),
     (DenseGeneral((2, 8), dtype=jnp.bfloat16, param_dtype=jnp.bfloat16), (8192, 12)),
@@ -162,21 +167,30 @@ def test_a_bias_sums_its_gradient_over_every_position_at_fp32(layer, shape):
     taken at fp32 and rounded once into the bfloat16 bias, as torch's addmm and convolution sum
     it, where a bfloat16 sum, which JAX gives a broadcast's transpose (jax-ml/jax#30310), lands
     several times further from float64."""
-    rng = np.random.default_rng(1)
-    x = jnp.asarray(rng.standard_normal(shape), jnp.bfloat16)
-    variables = layer.init(jax.random.key(0), x)
-    shape = jax.eval_shape(layer.apply, variables, x).shape
-    cotangent = jnp.asarray(rng.standard_normal(shape), jnp.bfloat16)
+    variables = layer.init(jax.random.key(0), jnp.zeros(shape, jnp.bfloat16))
+    out = jax.eval_shape(layer.apply, variables, jnp.zeros(shape, jnp.bfloat16)).shape
 
-    def loss(params):
-        return jnp.sum(layer.apply({"params": params}, x).astype(jnp.float32) * cotangent.astype(jnp.float32))
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.standard_normal(shape), jnp.bfloat16),
+                jnp.asarray(rng.standard_normal(out), jnp.float32).astype(jnp.bfloat16).astype(jnp.float32))
 
-    got = np.asarray(jax.grad(loss)(variables["params"])["bias"], np.float64)
-    terms = np.asarray(cotangent, np.float64).reshape(8192, -1)
-    assert terms.shape[1] == got.size
-    truth = terms.sum(0).reshape(got.shape)
-    reference = np.asarray(jnp.asarray(terms.astype(np.float32).sum(0), jnp.bfloat16), np.float64)
-    assert_as_exact_as_the_reference(got, reference.reshape(got.shape), truth, "bias gradient")
+    @jax.jit
+    def dew(x, cotangent):
+        forward = with_gradients(lambda params: layer.apply({"params": params}, x).astype(jnp.float32))
+        return {"bias": forward(variables["params"], cotangent)[1]["bias"]}
+
+    def summed(cotangent, dtype):
+        """The cotangents' sum over every position in `dtype`, as torch's addmm sums a bias's."""
+        terms = np.asarray(cotangent, dtype).reshape(8192, -1)
+        return terms.sum(0).reshape(variables["params"]["bias"].shape)
+
+    def reference(x, cotangent):
+        # torch sums at fp32 and rounds once into the bfloat16 bias.
+        return {"bias": np.asarray(jnp.asarray(summed(cotangent, np.float32), jnp.bfloat16), np.float64)}
+
+    assert_as_exact(dew, reference, draw, f"{layer.__class__.__name__} bias gradient", seeds=BIAS_SEEDS,
+                    truth_fn=lambda x, cotangent: {"bias": summed(cotangent, np.float64)})
 
 
 SPLIT = {"conv": (Conv(3, (3, 3)), (8, 32, 32, 4), 256), "dense": (Dense(3), (8, 32, 32, 4), 256)}

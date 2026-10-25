@@ -207,6 +207,44 @@ def test_a_mixed_product_converts_its_operands_as_the_product_does():
     assert float(accumulated(jnp.dot, 2.0, 3.0, preferred_element_type=jnp.float32)) == 6.0
 
 
+def doubling(kind: str):
+    """A dot stating its own derivative, twice the dot's: as a `jax.custom_jvp` or a `jax.custom_vjp`
+    (Qwix's kind, when it quantizes a model directly)."""
+    def dot(x, y, preferred_element_type=None):
+        return jnp.dot(x, y, preferred_element_type=preferred_element_type)
+
+    if kind == "custom_jvp":
+        doubled = jax.custom_jvp(dot, nondiff_argnums=(2,))
+
+        @doubled.defjvp
+        def _(preferred_element_type, primals, tangents):
+            (x, y), (dx, dy) = primals, tangents
+            return dot(x, y), 2 * (jnp.dot(dx, y) + jnp.dot(x, dy))
+        return doubled
+    doubled = jax.custom_vjp(dot, nondiff_argnums=(2,))
+
+    def forward(x, y, preferred_element_type):
+        return dot(x, y), (x, y)
+
+    def backward(preferred_element_type, saved, cotangent):
+        x, y = saved
+        return 2 * jnp.dot(cotangent, y.T), 2 * jnp.dot(x.T, cotangent)
+
+    doubled.defvjp(forward, backward)
+    return doubled
+
+
+@pytest.mark.parametrize("kind", ["custom_jvp", "custom_vjp"])
+def test_a_product_that_states_its_own_derivative_keeps_it(kind):
+    """A product with a derivative of its own (a `jax.custom_jvp`, or a `jax.custom_vjp` as Qwix's
+    are when it quantizes a model directly) is its library's: `accumulated`'s gradient through it is
+    its own, twice the dot's here, where a transpose of its primal would give the dot's."""
+    doubled = doubling(kind)
+    lhs, rhs = CANCELLING[None], np.ones((3, 1), np.float32)
+    gradient = jax.jit(jax.grad(lambda rhs: jnp.sum(accumulated(doubled, lhs, rhs))))(rhs)
+    assert np.asarray(gradient).tolist() == [[2.0 ** 25], [2.0], [-(2.0 ** 25)]]
+
+
 def test_a_portable_recurrence_product_sums_in_float64():
     """The recurrence's portable products (`recurrence_algebra.portable` and the weighed `paired`)
     are real CPU execution's, and sum in float64: 1 exactly over the cancelling terms."""
