@@ -24,10 +24,13 @@ from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
 from dew.interop import Pretrained
 from dew.interop.diffusion_gemma import translate_weights
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import FROZEN, Step, freeze, select
-from dew.objectives.diffusion.block import BlockDiffusionObjective
-from dew.objectives.lm.chunked import chunked_tile
+from dew.objectives.base import FROZEN, Step, freeze, model_rngs, select, thaw
+from dew.objectives.diffusion.block import BlockDiffusionObjective, _cache_geometry
+from dew.objectives.lm.chunked import chunked_tile, model_logits
+from dew.optim import scale_by_qk_clip
 from dew.training import MeshSpec
 from dew.training.transaction import example_fields
 
@@ -560,3 +563,113 @@ def test_a_canvas_rows_context_reads_an_id_its_vocabulary_also_pads_with(source)
     for left, right in zip(jax.tree.leaves(loss(variables, marked)), jax.tree.leaves(loss(variables, stated)),
                            strict=True):
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
+
+
+def merged(passes):
+    """The objective's maxima over its passes: each head's largest logit in any of them, elementwise."""
+    return jax.tree.map(jnp.maximum, *passes)
+
+
+def peaks(tree):
+    """The per-layer `[rows, heads]` maxima of a `qk` tree, past the layers' geometry scalars."""
+    return [leaf for leaf in jax.tree.leaves(tree) if leaf.ndim == 2]
+
+
+def sown_passes(obj, variables, batch, step):
+    """The attention logit maxima of the encoder's pass and of both denoising passes, each computed by
+    calling the training model on the step's own draws as `BlockDiffusionObjective` runs them: the encoder
+    over the clean row, the first denoising pass with no self-conditioning signal, and the second with the
+    first's logits where the row's draw conditions it. Returns the three `qk` trees, the encoder's first."""
+    prepared, tokens, response, _, full_valid, canvas_mask, _ = obj._row(batch)
+    noisy, selected, use_sc = obj._corrupted(response, canvas_mask, step)
+    fields = prepared.token_fields
+    positions, encoder_mask, encoder_keys, decoder_mask, decoder_keys = _cache_geometry(
+        full_valid, selected, obj.prompt_length, obj.canvas_size, fields.get("positions"),
+        fields.get("image_groups"))
+    model, params = obj.training_model, thaw(variables)
+    rngs = model_rngs(step.key, training=step.training)
+    cache = model.apply(params, tokens.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
+    encoder_kwargs = prepared.kwargs()
+    encoder_kwargs.update(positions=positions, attention_mask=full_valid)
+    _, encoded = model.apply(
+        {**params, "cache": cache}, tokens, **encoder_kwargs, attention_pairwise_mask=encoder_mask,
+        attention_key_positions=encoder_keys, method=model.encode, train=step.training, states=True,
+        mutable=["cache", "qk"], rngs=rngs, capture_intermediates=False)
+
+    def denoise(sc_logits):
+        states, sown = model.apply(
+            {**params, "cache": encoded["cache"]}, noisy, self_conditioning_logits=sc_logits,
+            train=step.training, rngs=rngs, positions=positions[:, obj.prompt_length:],
+            attention_pairwise_mask=decoder_mask, attention_key_positions=decoder_keys, states=True,
+            mutable=["qk"])
+        return states, sown["qk"]
+
+    zero = jnp.zeros((*response.shape, model.vocab_size), jnp.float32)
+    first_states, first = denoise(zero)
+    first_logits = model_logits(model, params, first_states)
+    _, second = denoise(jnp.where(use_sc[:, None, None], first_logits, zero))
+    return encoded["qk"], first, second
+
+
+def test_the_block_objective_observes_the_maxima_of_its_three_passes(source):
+    """The fixture's model norms its queries and keys, so QK-Clip refuses it at any threshold (`dew.optim`).
+    What the objective owes a clipping step is the observation: `Aux.qk_stats` is the elementwise maximum of
+    the encoder's pass and of both denoising passes' own maxima, which the same draws give when those passes
+    are called directly."""
+    loaded, batch, step, _ = source
+    obj = objective(loaded)
+    variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
+    _, aux = obj.scalar_loss(variables, batch, step.replace(qk_stats=True))
+    assert aux.qk_stats is not None
+    expected = merged(sown_passes(obj, variables, batch, step))
+    jax.tree.map(np.testing.assert_array_equal, jax.tree.map(np.asarray, aux.qk_stats),
+                 jax.tree.map(np.asarray, expected))
+
+
+def unnormed_objective(**options):
+    """A small DiffusionGemma whose queries and keys are not normed, so QK-Clip may rescale them."""
+    text = CausalTransformer(vocab_size=16, emb_features=8, num_layers=2, num_heads=2, mlp_features=16,
+                             max_seq_len=8, qk_norm=False, layer_scalar="trainable")
+    return BlockDiffusionObjective(DiffusionGemma(text=text, canvas_length=4), prompt_length=4, **options)
+
+
+def test_a_block_run_clips_its_attention_at_its_passes_maxima():
+    """An optimizer holding a QK-Clip has the run ask the block objective for its maxima, and its update is
+    `scale_by_qk_clip`'s at the maxima of its three passes, bit for bit (its own update is zero). Every
+    row conditions the second denoising pass, so it differs from the first, and the first's maxima must
+    be the strongest somewhere for the merge to matter. A threshold no head reaches moves nothing."""
+    threshold = 0.05
+    obj = unnormed_objective(self_cond_prob=1.0)
+    rows = 8 * jax.device_count()
+    batch = {"text": jnp.asarray(np.random.default_rng(5).integers(1, 16, size=(rows, 8)), jnp.int32)}
+
+    def clip(limit):
+        return optax.chain(optax.sgd(0.0), scale_by_qk_clip(limit))
+
+    def stepped(limit):
+        train = Trainer(obj, clip(limit), key=jax.random.PRNGKey(3), split=1)
+        initial = train.initial_state()
+        step = Step(jnp.asarray(0, jnp.int32), jax.random.fold_in(initial.key, 0), None,
+                    **example_fields(initial, 0, 1, batch))
+        # The step consumes the state: what the expectation reads of it is taken first.
+        start = jax.tree.map(np.asarray, initial.variables)
+        opt_state = jax.tree.map(np.asarray, initial.opt_state)
+        passes = sown_passes(obj, jax.tree.map(jnp.asarray, start), batch, step)
+        final, *_ = train.compile(initial, batch)(initial, batch)
+        return start, opt_state, passes, jax.tree.map(np.asarray, final.variables), int(final.updates)
+
+    start, opt_state, passes, final, updates = stepped(threshold)
+    assert updates == 1
+    encoder, first, second = passes
+    maxima = jax.tree.map(np.asarray, merged(passes))
+    assert max(float(np.max(peak)) for peak in peaks(maxima)) > threshold
+    assert any(np.any(own > np.maximum(before, after)) for own, before, after in
+               zip(peaks(first), peaks(encoder), peaks(second), strict=True))
+    zero = jax.tree.map(np.zeros_like, start["params"])
+    applied, _ = jax.jit(clip(threshold).update)(zero, opt_state, start["params"], qk_stats=maxima)
+    expected = jax.tree.map(np.asarray, optax.apply_updates(start["params"], applied))
+    jax.tree.map(np.testing.assert_array_equal, final["params"], expected)
+    assert any(not np.array_equal(after, before) for after, before in
+               zip(jax.tree.leaves(final["params"]), jax.tree.leaves(start["params"]), strict=True))
+    _, _, _, unclipped, _ = stepped(1e30)
+    jax.tree.map(np.testing.assert_array_equal, unclipped["params"], start["params"])
