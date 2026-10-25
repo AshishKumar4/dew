@@ -55,7 +55,6 @@ import datetime
 import hashlib
 import json
 import math
-import os
 from collections.abc import Callable, Mapping, Sequence
 from types import TracebackType
 from typing import TYPE_CHECKING, Literal, Protocol, overload, runtime_checkable
@@ -70,10 +69,11 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy as preserva
 
 from dew import position, records
 from dew.cleanup import attempted
-from dew.coordination import broadcast_from_process_zero, from_every_process
+from dew.coordination import broadcast_from_process_zero, from_every_process, seen_by_every_process
 from dew.files import write_atomically
 from dew.hashing import fmix32
 from dew.nn import sharding
+from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import LogicalAxes
 from dew.objectives.base import PARAMETER_ROOTS, Variables
 from dew.records import JSON, duration, json_value
@@ -411,15 +411,7 @@ def _check_shared(directory: str) -> None:
     """
     if jax.process_count() == 1 or is_uri(directory):
         return
-    marker = epath.Path(directory) / f".shared-{broadcast_from_process_zero(os.urandom(8).hex())}"
-    if jax.process_index() == 0:
-        marker.parent.mkdir(parents=True, exist_ok=True)
-        marker.write_text("")
-    from_every_process(None)  # process 0 has written it
-    seen = from_every_process(marker.exists())
-    if jax.process_index() == 0:
-        marker.unlink()
-    blind = [index for index, saw in enumerate(seen) if not saw]
+    blind = [index for index, saw in enumerate(seen_by_every_process(directory)) if not saw]
     if blind:
         raise ValueError(
             f"The checkpoint directory {directory} is not shared: process(es) {blind} of "
@@ -493,9 +485,7 @@ def read_position(table: dict, where: str, share: DataPartition) -> bytes:
             f"{sorted(set(held))} (index, count), and this reader reads share "
             f"{share.index} of {share.count}. A position is where one share of "
             f"the data stopped and cannot be translated to another share, so "
-            f"resume it on a mesh whose processes read those shares; a stream "
-            f"that reads its records globally, as every dataset compiled to a global "
-            f"order does, saves a position that resumes on any partition.")
+            f"resume it on a mesh whose processes read those shares: {position.PER_SHARE}.")
     if any(row != mine[0] for row in mine[1:]):
         raise ValueError(
             f"The checkpoint at {where} holds positions for share {share.index} "
@@ -1483,7 +1473,7 @@ class Checkpoints:
                     dtypes = jax.tree.map(lambda leaf: leaf.dtype, average)
                     total = jax.tree.map(
                         lambda leaf, weight=weight: weight
-                        * leaf.astype(np.promote_types(leaf.dtype, np.float32)),
+                        * leaf.astype(at_least_fp32(leaf.dtype)),
                         average,
                     )
                 else:
