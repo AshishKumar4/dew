@@ -125,9 +125,9 @@ def main(config: Config) -> Path:
         data=data, validation=validation, tokenizer=config.tokenizer,
         objective=ObjectiveConfig("masked_diffusion", {
             "steps": config.sample_steps, "ema_decay": 0.9 if config.smoke else 0.999}),
-        optim=OptimConfig(weight_decay=0.03, clip_grads=1.0, rate=Cosine(
-            peak=config.learning_rate, warmup_steps=config.warmup_steps,
-            end=config.learning_rate / 10)),
+        optim=OptimConfig(weight_decay=0.03, clip_grads=1.0, learning_rate=Cosine(
+            peak_value=config.learning_rate, warmup_steps=config.warmup_steps,
+            end_value=config.learning_rate / 10)),
         trainer=replace(trainer, compilation_cache_dir=None) if config.smoke else trainer)
     started = time.perf_counter()
     run.run()
