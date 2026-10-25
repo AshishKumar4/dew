@@ -24,7 +24,6 @@ import pytest
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference, chain_roundings
 from test_chunked_cross_entropy import EXERCISED, eighths
 from test_moe import OUTPUT_TOLERANCE, ROUTER_TOLERANCE
-from test_t5_encoders import TOLERANCE as T5_TOLERANCE
 from test_text_encoders import transformers_clip
 from test_vae_16ch import TOLERANCE as VAE_TOLERANCE
 from tool_support import FIXTURES, REPO_ROOT, load
@@ -32,9 +31,9 @@ from tool_support import FIXTURES, REPO_ROOT, load
 CLAIMS = json.loads((FIXTURES / "provenance.json").read_text())["references"]
 
 # The family parity contracts, read from the tests that hold Dew to these fixtures, not bounds fitted
-# to a CI CPU: test_moe.py (routers and expert sums), test_t5_encoders.py (tiny hidden states),
-# test_vae_16ch.py (raw encode/decode). The CLIP towers' outputs are held as their own test holds
-# them, to the reference's float64 run (`transformers_clip`).
+# to a CI CPU: test_moe.py (routers and expert sums), test_vae_16ch.py (raw encode/decode). The CLIP
+# towers' outputs are held as their own test holds them, to the reference's float64 run
+# (`transformers_clip`).
 MOE_OUTPUTS = {
     "mixtral.npz": {"router_weights": ROUTER_TOLERANCE, "block_output": OUTPUT_TOLERANCE},
     "deepseek.npz": {"router_weights": ROUTER_TOLERANCE, "block_output": OUTPUT_TOLERANCE},
@@ -42,7 +41,6 @@ MOE_OUTPUTS = {
     "deepseek_v4.npz": {"router_weights": ROUTER_TOLERANCE, "experts_output": OUTPUT_TOLERANCE},
 }
 CLIP_OUTPUTS = ("last_hidden_state", "pooler_output", "text_embeds", "image_embeds")
-T5_OUTPUTS = {"last_hidden_state": T5_TOLERANCE}
 VAE_OUTPUTS = {"latent": VAE_TOLERANCE, "decoded": VAE_TOLERANCE}
 
 
@@ -165,9 +163,10 @@ def assert_generated_fixture(tool: str, written: Path, committed: Path, weights:
 
 
 def test_t5_tiny_fixture_is_what_the_generator_writes(tmp_path):
-    """Exact checkpoint, config, tokenizer and tokens; fp32 encoder parity."""
+    """Exact checkpoint, config, tokenizer and tokens; the encoder's parity is its recording's
+    (tests/test_t5_encoders.py)."""
     assert_generated_fixture("t5_reference", tmp_path / "tiny", FIXTURES / "t5" / "tiny", "model.safetensors",
-                             T5_OUTPUTS)
+                             {})
 
 
 # ---------------------------------------------------------------------------

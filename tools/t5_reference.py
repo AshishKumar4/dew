@@ -22,14 +22,23 @@ What lands in tests/fixtures/t5:
   (config.json + model.safetensors holding the full T5 state dict, so the
   loader proves it reads past the decoder and lm_head), a tokenizer over an
   explicit ASCII vocabulary (transformers 5 builds the T5 tokenizer from a
-  vocab list, no SentencePiece model involved), the prompts and the fp32
-  last hidden states of the reference in eval mode. The config uses
+  vocab list, no SentencePiece model involved), and the prompts with the
+  reference tokenizer's ids and mask. The config uses
   gated-gelu, the T5 v1.1 feed-forward SD3.5 and Flux run, which the t5-small
   network test cannot cover (v1.0 is plain relu). Small enough to live in
   git, so the parity tests need no network.
 - tiny-umt5/: the same for a random-weight UMT5 encoder (`UMT5EncoderModel`,
   three layers), whose every layer holds its own relative bias table, as
   Wan 2.1's umt5-xxl text encoder does.
+
+`seeds` records each checkpoint's encoder over check 1's seeds instead
+(`record_case`), as `<checkpoint>-seeds.npz` beside the checkpoint it reads,
+which it leaves as it is:
+the reference's fp32 last hidden state and its float64 truth on each seed's
+drawn ids (tests/test_t5_encoders.py's `t5_draw`), kept as the evidence check
+1 reads (`summary`), the count planned on Dew's own encoder:
+
+    /tmp/t5ref/bin/python tools/t5_reference.py seeds
 """
 
 import argparse
@@ -103,13 +112,6 @@ def write_tiny(tiny: Path, build=tiny_model) -> None:
     tokenizer.save_pretrained(tiny)
 
     tokens = tokenizer(TINY_PROMPTS, padding=True, return_tensors="pt")
-    model.eval()
-    with torch.no_grad():
-        outputs = model(input_ids=tokens["input_ids"],
-                        attention_mask=tokens["attention_mask"])
-    hidden = outputs.last_hidden_state.float().numpy()
-    if not np.all(np.isfinite(hidden)):
-        raise ValueError("the reference encoder produced a non-finite hidden state")
 
     # Full state dict on purpose: decoder and lm_head ride along so the
     # loader proves it reads past them. The shared embedding is stored twice
@@ -123,16 +125,72 @@ def write_tiny(tiny: Path, build=tiny_model) -> None:
         indent=2) + "\n")
     np.savez(tiny / "reference.npz",
              input_ids=tokens["input_ids"].numpy().astype(np.int32),
-             attention_mask=tokens["attention_mask"].numpy().astype(np.int32),
-             last_hidden_state=hidden)
+             attention_mask=tokens["attention_mask"].numpy().astype(np.int32))
     size_mb = sum(p.stat().st_size for p in tiny.iterdir()) / 2 ** 20
-    print(f"wrote {tiny} ({size_mb:.1f} MB): hidden {hidden.shape}, ids {tuple(tokens['input_ids'].shape)}")
+    print(f"wrote {tiny} ({size_mb:.1f} MB): ids {tuple(tokens['input_ids'].shape)}")
+
+
+def write_seeds(directory: Path, name: str, reader) -> None:
+    """`directory`'s checkpoint recorded over check 1's seeds as `<directory>-seeds.npz` beside it
+    (`record_case`): the
+    reference's fp32 encoder and its float64 truth, built and run inside `torch_precision.float64`, on
+    each seed's drawn ids, the count planned on Dew's own encoder against its float64 run."""
+    import sys
+
+    import jax
+
+    sys.path[:0] = [str(FIXTURES.parents[1]), str(Path(__file__).resolve().parent)]
+    from recorded_references import provenance, record_case, save
+    from test_t5_encoders import t5_draw
+    from torch_precision import float64
+
+    from dew.inputs import T5Text
+
+    torch.set_num_threads(1)
+    model = reader.from_pretrained(directory, dtype=torch.float32).eval()
+    with float64():
+        wide = reader.from_pretrained(directory, dtype=torch.float64).eval()
+
+    def evaluate(inputs):
+        ids = torch.from_numpy(inputs["input_ids"]).long()
+        mask = torch.from_numpy(inputs["attention_mask"]).long()
+        with torch.no_grad():
+            reference = model(input_ids=ids, attention_mask=mask).last_hidden_state.numpy()
+            with float64():
+                truth = wide(input_ids=ids, attention_mask=mask).last_hidden_state.numpy()
+        return {"last_hidden_state": reference}, {"last_hidden_state": truth}
+
+    encoder = T5Text.from_pretrained(str(directory))
+    with jax.enable_x64(new_val=True):
+        wide_encoder = T5Text.from_pretrained(str(directory), dtype="float64", param_dtype="float64")
+
+    def proxy(inputs):
+        return {"last_hidden_state": encoder.encode(encoder.params, inputs).hidden}
+
+    def truth_proxy(inputs):
+        return {"last_hidden_state": wide_encoder.encode(wide_encoder.params, inputs).hidden}
+
+    arrays = record_case(name, lambda seed: t5_draw(seed, model.config.vocab_size), evaluate, proxy,
+                         truth_proxy=truth_proxy, store_inputs=False, summary=True)
+    import transformers
+
+    arrays[f"{name}.provenance"] = provenance("transformers", transformers.__version__, "cpu",
+                                              "python tools/t5_reference.py seeds", torch=torch.__version__)
+    print(save(directory.parent / f"{directory.name}-seeds.npz", arrays,
+               reference=f"transformers {transformers.__version__}",
+               license="Apache-2.0"), flush=True)
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser()
+    parser.add_argument("what", nargs="?", choices=("checkpoints", "seeds"), default="checkpoints")
     parser.add_argument("--out", type=Path, default=FIXTURES)
-    out = parser.parse_args(argv).out
+    arguments = parser.parse_args(argv)
+    out = arguments.out
+    if arguments.what == "seeds":
+        write_seeds(out / "tiny", "t5", T5EncoderModel)
+        write_seeds(out / "tiny-umt5", "umt5", UMT5EncoderModel)
+        return
     write_tiny(out / "tiny")
     write_tiny(out / "tiny-umt5", tiny_umt5)
 
