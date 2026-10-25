@@ -656,16 +656,19 @@ def truth_sketch(truth, seed: int) -> np.ndarray:
     flat = np.asarray(truth, np.float64).reshape(-1)
     if not flat.size:
         return np.zeros(SKETCH)
-    bits, shifts, partials = _sign_bits(flat.size, seed), np.arange(SKETCH, dtype=np.uint64), []
+    bits, partials = _sign_bits(flat.size, seed), []
     for start in range(0, flat.size, 1 << 16):
         chunk = flat[start:start + (1 << 16)]
-        signs = ((bits[start:start + chunk.size, None] >> shifts) & 1).astype(np.float64) * 2 - 1
-        products = chunk[:, None] * signs
-        padded = -chunk.size % SKETCH_BLOCK
-        products = np.concatenate([products, np.zeros((padded, SKETCH))])
+        # Sign k of an entry is its word's bit k (1 for +), each word's bytes read little-endian first.
+        words = bits[start:start + chunk.size].astype("<u8").view(np.uint8).reshape(chunk.size, 8)
+        minus = np.unpackbits(words, axis=1, bitorder="little")[:, :SKETCH] == 0
+        # Each entry times its signs, negated rather than multiplied (the same values, signed zeros
+        # included), its block padded with +0.
+        products = np.zeros((chunk.size + -chunk.size % SKETCH_BLOCK, SKETCH))
+        products[:chunk.size] = chunk[:, None]
+        np.negative(products[:chunk.size], out=products[:chunk.size], where=minus)
         partials.append(products.reshape(-1, SKETCH_BLOCK, SKETCH).sum(axis=1))
-    stacked = np.concatenate(partials)
-    return np.asarray([math.fsum(stacked[:, index].tolist()) for index in range(SKETCH)])
+    return np.asarray([math.fsum(column) for column in np.concatenate(partials).T.tolist()])
 
 
 def sketch_rounding(magnitude: float) -> float:
