@@ -260,8 +260,10 @@ def published_config(model: DiffusionGemma) -> Mapping[str, object]:
         tower, projection = model.conditioner.vision, model.conditioner.projection
         # transformers builds the tower from vision_config and the projector
         # from the tower's epsilon and the text width.
-        if not (isinstance(tower, Gemma4Vision) and projection == Gemma4Projector(
-                text_width=model.text.emb_features, norm_eps=tower.rms_norm_eps)):
+        expected = Gemma4Projector(text_width=model.text.emb_features,
+                                   norm_eps=tower.rms_norm_eps if isinstance(tower, Gemma4Vision) else 1e-6)
+        if not (isinstance(tower, Gemma4Vision)
+                and projection.clone(parent=None, name=None, dtype=None, precision=None) == expected):
             raise ValueError("DiffusionGemma's vision_config describes a Gemma 4 tower and its projector, "
                              f"not {tower!r} with {projection!r}")
         config["vision_config"] = export_gemma4_vision_config(tower)

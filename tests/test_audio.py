@@ -21,7 +21,7 @@ from reference_error import assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 
 from dew.nn.audio import AudioLinear, Gemma3nAudio, audio_config, audio_weight_path, audio_weights
-from dew.nn.vision import Gemma3nProjectorModule, Gemma4ProjectorModule
+from dew.nn.vision import Gemma3nProjector, Gemma4Projector
 from dew.nn.vision.gemma3n import translate_gemma3n_projector_weights
 from dew.nn.vision.gemma4 import translate_gemma4_projector_weights
 from dew.registry import towers
@@ -39,13 +39,13 @@ def _audio(kind):
     model = config.build().clone(precision=jax.lax.Precision.HIGHEST)
     tensors = load_file(str(path / "projector.safetensors"))
     if kind == "gemma3n":
-        projector = Gemma3nProjectorModule(config.hidden_size, 32, vocab_size=record["vocab_size"],
+        projector = Gemma3nProjector(config.hidden_size, 32, vocab_size=record["vocab_size"],
                                            vocab_offset=record["vocab_offset"], norm_eps=config.rms_norm_eps,
                                            precision=jax.lax.Precision.HIGHEST)
         method = projector.soft_embeddings
         projector_variables = {"params": translate_gemma3n_projector_weights(tensors)[0]}
     else:
-        projector = Gemma4ProjectorModule(text_width=32, norm_eps=config.rms_norm_eps,
+        projector = Gemma4Projector(text_width=32, norm_eps=config.rms_norm_eps,
                                           precision=jax.lax.Precision.HIGHEST)
         method = projector.__call__
         projector_variables = {"params": translate_gemma4_projector_weights(tensors)[0]}
@@ -99,25 +99,21 @@ def test_a_gemma4_tower_runs_any_activation_the_shared_table_computes_as_the_ref
     reference's block with the tower's own weights: in fp32, as exact as the
     reference's fp32 block from its float64 run. The whole reference tower pins
     its attention to float32, so the blocks run alone."""
-    import functools
-
     import torch
-    from flax import linen as nn
     from transformers.models.gemma4.modeling_gemma4 import Gemma4AudioModel
 
-    from dew.nn.audio import AudioFeedForward, AudioLightConv
-    from tools.audio_reference import audio_config as reference_config, perturb
+    from dew.nn.audio import AudioFeedForward, AudioLightConv, _clippable
+    from tools import audio_reference
 
-    config = reference_config("gemma4")
+    config = audio_reference.audio_config("gemma4")
     config.hidden_act = "quick_gelu"
     torch.manual_seed(314)
     reference = Gemma4AudioModel(config).eval()
-    perturb(reference)
+    audio_reference.perturb(reference)
     ours = audio_config(config.to_dict())
     tensors = {name: tensor.numpy().copy() for name, tensor in reference.state_dict().items()}
     tree, _ = audio_weights(tensors, ours)
-    linear = functools.partial(AudioLinear, dense=functools.partial(nn.Dense, use_bias=False),
-                               use_clipped_linears=ours.use_clipped_linears)
+    linear = _clippable(ours, None, None)
     feed_forward = AudioFeedForward(ours.hidden_size, ours.residual_weight, ours.gradient_clipping, linear,
                                     ours.hidden_act)
     light_conv = AudioLightConv(ours.hidden_size, ours.conv_kernel_size, ours.rms_norm_eps,
@@ -208,6 +204,9 @@ def test_audio_weight_loading_refuses_unknown_or_missing_computation(audio):
         audio_weights(incomplete, config)
     with pytest.raises(ValueError):
         audio_weights({**tensors, "imaginary_projection.weight": np.ones((4, 4), np.float32)}, config)
+    projection = next(name for name, tensor in tensors.items() if tensor.ndim >= 2)
+    with pytest.raises(ValueError):
+        audio_weights({**tensors, projection: tensors[projection][:-1]}, config)
     record = json.loads((path / "config.json").read_text())
     with pytest.raises(ValueError):
         audio_config({**record, "extra_computational_field": True})

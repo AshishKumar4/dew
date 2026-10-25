@@ -126,15 +126,9 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout 
 
 def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
                  dtype: str | None, param_dtype: str | None,
-                 revision: str | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
+                 revision: str | None) -> SavedTask:
     from dew.inference.projections import packed_owned
-    from dew.interop import (
-        Pretrained,
-        PretrainedBlockDecoder,
-        PretrainedDecoder,
-        PretrainedMaskedDecoder,
-        PretrainedPipeline,
-    )
+    from dew.interop import Pretrained
     from dew.training.distributed import MeshSpec as DefaultMesh
 
     storage = "auto" if param_dtype is None else param_dtype
@@ -143,17 +137,10 @@ def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | 
               if dtype is None else
               Pretrained.load(source, revision=revision, dtype=dtype, param_dtype=storage, mesh=placement,
                               layout=layout))
-    if not isinstance(loaded, PretrainedPipeline):
-        # The task owns the weights it loaded: their projections pack once, where they were placed.
-        loaded = replace(loaded, variables=packed_owned(loaded.model, loaded.variables))
-    match loaded:
-        case PretrainedPipeline():
-            return loaded.text_to_image()
-        case PretrainedBlockDecoder():
-            return loaded.block_generation()
-        case PretrainedDecoder() | PretrainedMaskedDecoder():
-            return loaded.text_generation()
-    raise TypeError(f"{source} loaded as {type(loaded).__name__}, which has no generation task")
+    # This loader owns its fresh bundle exclusively. Public bundle.pipeline borrows weights;
+    # packing here may relinquish the unpacked device buffers without invalidating a caller's tree.
+    loaded = replace(loaded, variables=packed_owned(loaded.model, loaded.variables))
+    return loaded.pipeline()
 
 
 def place(variables: Variables, mesh: MeshSpec | Mesh | None, layout: Layout | None) -> Variables:

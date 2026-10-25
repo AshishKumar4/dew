@@ -211,6 +211,11 @@ cache would hand a later plain call of the same shapes, and a plain trace a
 quantized call. In this context their traces are kept apart."""
 
 
+INTERCEPTED = jax.make_user_context(default_value=False)
+"""Whether Dew installed a layer interceptor in this trace: adapters, input QDQ and Qwix retain
+their individual projection calls. This is independent of Qwix's arithmetic trace key above."""
+
+
 def keeps_picks() -> bool:
     """Whether this process reads and stores GPU picks, XLA's and the
     kernels' alike: not under `--xla_gpu_deterministic_ops`, whose kernels

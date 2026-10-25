@@ -50,6 +50,12 @@ class Fusion:
     media: jax.Array | None
 
 
+def _conditioner_modules(tower: TowerBase, projector: ProjectorBase, dtype, precision):
+    """A media tower and native projector in the conditioner's compute policy."""
+    return (tower.build().clone(dtype=dtype, precision=precision),
+            projector.clone(dtype=dtype, precision=precision))
+
+
 class VisionConditioner(nn.Module):
     """An image encoder and projector with row-aligned media inputs.
 
@@ -66,8 +72,8 @@ class VisionConditioner(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        self.tower = self.vision.build().clone(dtype=self.dtype, precision=self.precision)
-        self.projector = self.projection.build().clone(dtype=self.dtype, precision=self.precision)
+        self.tower, self.projector = _conditioner_modules(self.vision, self.projection,
+                                                         self.dtype, self.precision)
 
     def __call__(self, conditioning: Mapping[str, jax.Array], train: bool = False) -> jax.Array:
         pixels = conditioning["pixel_values"]
@@ -134,9 +140,8 @@ class AudioConditioner(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        # Named for the shared root scope beside the vision tower and projector.
-        self.audio_tower = self.audio.build().clone(dtype=self.dtype, precision=self.precision)
-        self.audio_projector = self.projection.build().clone(dtype=self.dtype, precision=self.precision)
+        self.audio_tower, self.audio_projector = _conditioner_modules(
+            self.audio, self.projection, self.dtype, self.precision)
 
     def __call__(self, conditioning: Mapping[str, jax.Array]) -> jax.Array:
         features = conditioning["input_features"]
