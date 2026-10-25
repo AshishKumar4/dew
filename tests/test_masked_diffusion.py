@@ -20,7 +20,7 @@ import optax
 import pytest
 from flax import linen as nn
 from model_support import flat_tree
-from reference_error import assert_as_exact, float64_replay
+from reference_error import assert_as_exact, widened
 
 from dew.checkpoints import Checkpoints
 from dew.data import ByteTokenizer
@@ -451,9 +451,13 @@ def test_a_masked_task_packs_its_projections_as_a_decoder_does(masked_source, tm
     def apart(tokens):
         return source.model.apply(source.variables, tokens)
 
+    def exact(tokens):
+        """The unpacked model in float64, its weights widened exactly."""
+        return source.model.clone(dtype=jnp.float64).apply(widened(source.variables), tokens)
+
     assert_as_exact(jax.jit(lambda tokens: task.model.apply(task.variables, tokens)), jax.jit(apart),
                     masked_draw(source.model), "packed masked logits", seeds=PACKED_SEEDS,
-                    truth_fn=float64_replay(apart))
+                    truth_fn=exact)
     held_apart = replace(task, variables=source.variables)
     np.testing.assert_array_equal(task(prompt, 8, key=7, steps=4).host().tokens,
                                   held_apart(prompt, 8, key=7, steps=4).host().tokens)
