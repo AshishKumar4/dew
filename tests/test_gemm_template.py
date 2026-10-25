@@ -1082,7 +1082,8 @@ def test_a_cooperative_tiles_exact_sums_add_as_its_plain_sum_does():
     rng = np.random.default_rng(5)
     x = jnp.asarray(rng.normal(size=(ROWS, DEPTH)), jnp.bfloat16)
     dy = jnp.asarray(rng.normal(size=(ROWS, WIDTH)), jnp.bfloat16)
-    with generation.assumed("sm90"), tuning.pinned({grouped_matmul.MosaicTgmm: COOPERATIVE}):
+    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"),
+          tuning.pinned({grouped_matmul.MosaicTgmm: COOPERATIVE})):
         exact, default = (jax.jit(functools.partial(template.gemm_t, out_dtype=jnp.float32,
                                                     precision=precision, interpret_on_cpu=True))(
             x, dy, jnp.asarray(SIZES)) for precision in ("highest", "default"))
