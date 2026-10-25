@@ -3,6 +3,7 @@ the short conv's kernels at their training shapes, compiles for its GPU within t
 memory, and the port's dots refuse mixed dtypes. None runs a kernel, so the GPU tier, whose kernel tests
 are the verdict, runs none of them: the file carries no `kernel` mark."""
 
+import functools
 import tempfile
 from pathlib import Path
 
@@ -13,10 +14,20 @@ import numpy as np
 import pytest
 import tokamax
 from fla_gdn_support import CONV_SHAPES, conv_config_cases, conv_training_cases, kda_training_cases
-from generation_support import lowers
+from generation_support import generations, lowers
 from kernel_compile import compile_kernels, failures
 
-from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurrence, short_conv, tuning
+from dew.nn.kernels import (
+    chunked_launch,
+    fla_gdn,
+    fla_kda,
+    generation,
+    grouped_matmul,
+    recurrence,
+    short_conv,
+    tuning,
+)
+from dew.nn.kernels.templates import mosaic_sm80
 
 LAUNCHES = {launch for module in (fla_gdn, fla_kda, recurrence) for launch in vars(module).values()
             if isinstance(launch, chunked_launch._Launch)}
@@ -214,6 +225,120 @@ def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources
                                     case(mosaic_gpu.Tiles(128, 256, 64, 3, 1, warpgroups=2))], "sm90")
     assert len(found) == 2 and all(record.get("kernels") for record in found), found
     assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+GEMM_ROWS, GEMM_DEPTH, GEMM_WIDTH, GEMM_GROUPS = 4096, 2048, 1536, 8
+"""A grouped projection's extents for the GEMM mainloops' compile gate: a Qwen3 MoE gate-up's widths, rows
+a few tiles a group (the kernels' resources do not grow with them)."""
+
+
+def _gemm_mainloop_cases(generation_name: str) -> list:
+    """Each GEMM Mosaic mainloop a `generation_name` GPU runs, at the config its launch picks on the
+    generation's facts and at its fitting config staging the most shared memory: the forward and the input
+    gradient (`MosaicGmm`), the kernel gradient (`MosaicTgmm`) in bf16 and in fp32 with exact sums, and on
+    warpgroup MMA the forward with an RMS norm's prologue and a bias epilogue and the kernel gradient with the
+    prologue; each a family's mainloop only where it takes the call (`Template.eligible`)."""
+    from test_gemm_template import biased, normed
+
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
+    sizes = jax.ShapeDtypeStruct((GEMM_GROUPS,), jnp.int32)
+    rows, depth, width, groups = GEMM_ROWS, GEMM_DEPTH, GEMM_WIDTH, GEMM_GROUPS
+    norm = grouped_matmul.Hooks(normed, (("rows",), ("depth",)))
+    norm_bias = grouped_matmul.Hooks(normed, (("rows",), ("depth",)), biased, (("columns",),))
+    plain = {"interpret": False}
+    calls = [
+        ("forward", grouped_matmul.MosaicGmm(), (bf16((rows, depth)), bf16((groups, depth, width)), sizes),
+         {**plain, "out_dtype": "bfloat16", "trans_rhs": False}),
+        ("input gradient", grouped_matmul.MosaicGmm(),
+         (bf16((rows, width)), bf16((groups, depth, width)), sizes),
+         {**plain, "out_dtype": "bfloat16", "trans_rhs": True}),
+        ("kernel gradient", grouped_matmul.MosaicTgmm(), (bf16((rows, depth)), bf16((rows, width)), sizes),
+         {**plain, "out_dtype": "bfloat16"}),
+        ("kernel gradient exact fp32", grouped_matmul.MosaicTgmm(),
+         (bf16((rows, depth)), bf16((rows, width)), sizes),
+         {**plain, "out_dtype": "float32", "exact_sums": True}),
+        ("normed biased forward", grouped_matmul.MosaicGmm(),
+         (bf16((rows, depth)), bf16((groups, depth, width)), sizes, (f32((rows,)), f32((depth,))),
+          (f32((width,)),)), {**plain, "out_dtype": "bfloat16", "trans_rhs": False, "hooks": norm_bias}),
+        ("normed kernel gradient", grouped_matmul.MosaicTgmm(),
+         (bf16((rows, depth)), bf16((rows, width)), sizes, (f32((rows,)), f32((depth,)))),
+         {**plain, "out_dtype": "float32", "hooks": norm}),
+    ]
+    cases = []
+    with generation.assumed(generation_name):
+        target = generation.gpu_target()
+        for name, launch, args, options in calls:
+            ba = launch.bind(*args, **options)
+            if not launch.eligible(ba, target):
+                continue
+            fits = launch.fitting(ba, target)
+            picked = launch.estimate(ba, target)[1]
+            largest = max(fits, key=lambda config, ba=ba: launch.staged_bytes(ba, config, target))
+            for role, config in (("picked", picked), ("largest", largest)):
+                configured = functools.partial(launch.replace(config=config), **options)
+                cases.append(support.KernelCase(f"{name} {role} {config}",
+                                                lambda configured=configured, args=args: (configured, args)))
+    return cases
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm86", "sm89", "sm90"))
+def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(generation_name):
+    """Every GEMM Mosaic GPU mainloop a generation runs (`_gemm_mainloop_cases`: warpgroup MMA's forward,
+    input and kernel gradients and hooked forms on an H100; mma.sync's forward and input gradient on an
+    A100, an A10 and an L4 where this JAX's layout inference places its tiles), at its launch's pick on the
+    generation's facts and at its fitting config staging the most, compiled by Mosaic for a compile-only
+    device of the generation on this CPU through ptxas: within the block's shared memory, no register
+    spilled."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    if not generation.gpu_target(generation_name).wgmma and not mosaic_sm80.staging_solved():
+        # A CPU interprets mma.sync's tiles at any JAX; lowered for the GPU, they need its layout inference.
+        pytest.skip("this JAX's layout inference places no mma.sync tile but its 128x256 (STAGING_SOLVED)")
+    cases = _gemm_mainloop_cases(generation_name)
+    found = compile_mosaic_kernels(cases, generation_name)
+    assert len(found) == len(cases) and all(record.get("kernels") for record in found), found
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+@pytest.mark.parametrize("tpu", ["v5e", "v6e"])
+def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
+    """The GEMM template's TPU mainloops (`MosaicTpuGmm` forward and input gradient, `MosaicTpuTgmm`),
+    at their launch's pick on the TPU's facts and at the fitting block staging the most, compiled by
+    libtpu for a compile-only TPU of the generation on this CPU; a generation whose scoped VMEM no
+    measurement states takes none of them (`MosaicTpuGmm.eligible`)."""
+    from kernel_compile import compile_tpu_kernels
+
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((GEMM_GROUPS,), jnp.int32)
+    rows, depth, width, groups = GEMM_ROWS, GEMM_DEPTH, GEMM_WIDTH, GEMM_GROUPS
+    calls = [("forward", grouped_matmul.MosaicTpuGmm(),
+              (bf16((rows, depth)), bf16((groups, depth, width)), sizes),
+              {"out_dtype": "bfloat16", "trans_rhs": False}),
+             ("input gradient", grouped_matmul.MosaicTpuGmm(),
+              (bf16((rows, width)), bf16((groups, depth, width)), sizes),
+              {"out_dtype": "bfloat16", "trans_rhs": True}),
+             ("kernel gradient", grouped_matmul.MosaicTpuTgmm(),
+              (bf16((rows, depth)), bf16((rows, width)), sizes), {"out_dtype": "bfloat16"})]
+    cases = []
+    with generation.assumed(tpu):
+        target = generation.gpu_target()
+        for name, launch, args, options in calls:
+            ba = launch.bind(*args, interpret=False, **options)
+            if not launch.eligible(ba, target):
+                continue
+            picked = launch.estimate(ba, target)[1]
+            fits = launch.fitting(ba, target)
+            largest = max(fits, key=lambda config, ba=ba: launch.staged_bytes(ba, config, target))
+            for role, config in (("picked", picked), ("largest", largest)):
+                configured = functools.partial(launch.replace(config=config), interpret=False, **options)
+                cases.append(support.KernelCase(f"{name} {role} {config}",
+                                                lambda configured=configured, args=args: (configured, args)))
+    if not cases:
+        assert generation.gpu_target(tpu).scoped_vmem is None
+        pytest.skip(f"no measurement states {tpu}'s scoped VMEM, which the TPU launches fit their blocks to")
+    found = compile_tpu_kernels(cases, tpu)
+    assert not [record for record in found if "error" in record], found
 
 
 def test_the_resource_gate_refuses_a_spilling_mosaic_kernel():
