@@ -64,7 +64,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.cache import QUANTIZED_TRACE
 from dew.nn.kernels.generation import backend
-from dew.nn.precision import accumulated, correctly_rounded_divide
+from dew.nn.precision import accumulated, bf16_dot_general, correctly_rounded_divide
 
 if TYPE_CHECKING:
     from qwix import QArray, QuantizationProvider
@@ -335,19 +335,22 @@ def frozen_fp8_kernel(leaves: Mapping[str, jax.typing.ArrayLike]) -> jax.Array:
 
 def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.Array:
     """`values @ rows.T`, `[M, K]` by E4M3 `[N, K]`, in float32: `values`'
-    rows cast by the FP8 block cast, the codes widened in the dot and both
-    rows' scales applied after it, the form XLA's GPU compiler rewrites to an
-    FP8 GEMM (cuBLASLt). The dot states its highest precision: at the default,
-    its forward product on an H100 lay 568 times the dequantized float32
-    product's distance from float64, as cuBLASLt's fast FP8 accumulation
-    would."""
+    rows cast by the FP8 block cast, both sides' codes multiplied exactly and
+    summed in fp32 (`dew.nn.precision.bf16_dot_general`: an E4M3 code is a
+    bf16 value) and both rows' scales applied after. The widened codes are
+    held apart from the product (an optimization barrier), so XLA's GPU
+    compiler does not rewrite it to an FP8 GEMM: Hopper's FP8 tensor cores
+    keep a narrower running sum, and at 512 x 4096 x 4096 on an H100 that
+    GEMM lay 291 times the dequantized float32 product's distance from
+    float64 at the highest precision and 3011 times at the default, where
+    this product lies at 0.53 times it, in 1.7 times the FP8 GEMM's time
+    (receipts ig-fp8-probe3, 4 and 5). The FP8 GEMM returns with a kernel
+    whose sum keeps float32's accuracy (ledger 1625)."""
     from dew.interop.codecs import fp8_block_cast
 
     codes, scales = fp8_block_cast(values, (1, values.shape[1]))
-    product = accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((1,), (1,)), ((), ())),
-                                            precision=jax.lax.Precision.HIGHEST),
-                          codes.astype(jnp.float32), rows.astype(jnp.float32),
-                          preferred_element_type=jnp.float32)
+    held = jax.lax.optimization_barrier((codes.astype(jnp.bfloat16), rows.astype(jnp.bfloat16)))
+    product = bf16_dot_general(*held, (((1,), (1,)), ((), ())))
     return product * scales * row_scales.T
 
 
@@ -756,9 +759,9 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
     stored tree, `/`-joined) is timed both ways, forward and input
     gradient, by `dew.telemetry.benchmark.samples` on a GPU the process holds
     alone: bf16 operands as a bf16 Dense multiplies them, and the FP8
-    products `frozen_fp8_dense` runs. On an H100 FP8 won from about 2048
-    inputs and outputs and lost below: 0.70x at 1024 by 1024, 1.10x at 4096
-    by 4096, 1.47x at 4096 by 12288 (docs/performance.md). The record names
+    products `frozen_fp8_dense` runs. Those multiply the codes as bf16 values
+    (`_fp8_rows`), slower than a bf16 Dense, so no site measures faster until
+    an FP8 kernel keeps fp32's sums (ledger 1625; docs/performance.md). The record names
     the sites and the generation, so a run reproduces the choice; a GPU
     without FP8 tensor cores is refused by name.
 

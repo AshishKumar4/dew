@@ -555,17 +555,15 @@ own process from measuring (`dew.cache.keeps_picks`)."""
 
 @pytest.mark.gpu(reason="FP8 tensor cores and cuBLASLt's FP8 GEMM")
 @pytest.mark.skipif(not FP8_CORES, reason="this GPU has no FP8 tensor cores")
-def test_a_wide_site_measures_faster_in_fp8_and_compiles_to_an_fp8_gemm(tmp_path):
-    """On a GPU with FP8 tensor cores the wide projection measures faster in
-    FP8 and the narrow one does not (H100: 1.47x and 0.70x), and the frozen
-    product's forward and input gradient compile to cuBLASLt FP8 GEMMs at
-    that width. The packed leaves and the gradient are the step's arguments,
-    as a train state's are: XLA folds widened constant codes into a float32
-    GEMM. It runs in a process without the suite's deterministic ops, as a
-    run that measures does; a GPU shared with other work (`READ_ONLY`)
-    measures nothing, fairly, and skips."""
+def test_a_frozen_sites_products_take_no_fp8_gemm_whose_sum_is_narrower(tmp_path):
+    """On a GPU with FP8 tensor cores the frozen product's forward and input gradient compile to no
+    cuBLASLt FP8 GEMM, whose running sum on Hopper is narrower than fp32's (`_fp8_rows`), even at the
+    wide projection, and the measurement records the sites it took on this generation. The packed
+    leaves and the gradient are the step's arguments, as a train state's are. It runs in a process
+    without the suite's deterministic ops, as a run that measures does; a GPU shared with other work
+    (`READ_ONLY`) measures nothing, fairly, and skips."""
     found = fresh(QUALIFY, cache_dir=tmp_path, flags=keeping_picks())
     if found is None:
         pytest.skip("this GPU is shared with other work (gpu-run -n 0.5), where no process measures")
-    assert found["sites"] == ["wide"] and found["measured_on"] == found["generation"]
-    assert found["fp8_gemms"] == 2
+    assert set(found["sites"]) <= {"wide", "narrow"} and found["measured_on"] == found["generation"]
+    assert found["fp8_gemms"] == 0
