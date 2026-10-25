@@ -331,22 +331,17 @@ def plan_step[LossT, EffectsT](
         xla_defaults: bool, narrow: bool, base: tuple[int, int] | None, resumed: JSON,
         frontier: bool) -> tuple[list[Planned], tuple[Probe, ...]]:
     """The first of `candidates` (`splits`) and the objective's rungs to fit the devices (`planned`), each
-    lowered by `lower` at the objective's current rung and `narrow` once, and compiled under its
-    `options`, or under XLA's defaults and `compiler_options` on the half rung above, the head returning
-    to the run's own tile `base` at each remat rung (`recompute_more`). Where a split does not fit at a
-    rung whose models have a half rung above it (`remat_half`, a decoder's delta rule recomputing its
-    memory alone), the same split is compiled there, and the plan stays there where it fits: no plan
-    splits the batch further at a rung where the half rung fits it whole, and climbing and the frontier
-    pass every half rung asked (`onward`). What each compile measured (`Forecast`) orders the splits
-    asked. `resumed`, the rung a checkpoint trained the shape on, is warned of where it does not fit.
-    Where nothing fits, it raises with the closest candidate's numbers. Beside the plans come every
-    compile the search made, the frontier's too.
-
-    Where that plan splits the batch and `frontier` asks, the frontier's other point follows, one compile
-    more: the batch in `candidates[0]` microbatches one remat rung up (`remat_more`) with the head tiled
-    and unfused, the most memory one rung frees, where that fits. Which runs faster is measured, not
-    ranked (docs/performance.md). The objective is left at the last plan's rung, each plan holding its own
-    (`Planned`)."""
+    lowered by `lower` at the objective's rung and `narrow` once and compiled under its `options`, or
+    XLA's defaults on the half rung above, the head back at the run's own tile `base` at each remat rung
+    (`recompute_more`). The first rung drops the narrow copies, which a plan above it takes back where its
+    rung and split fit with them. A split that misses at a rung with a half rung above (`remat_half`) is
+    compiled there, the plan staying where it fits; climbing and the frontier pass every half rung asked
+    (`onward`). What each compile measured (`Forecast`) orders the splits asked. `resumed`, the rung a
+    checkpoint trained the shape on, is warned of where it does not fit. Where nothing fits, it raises
+    with the closest candidate's numbers. Beside the plans come every compile the search made. Where the
+    plan splits the batch and `frontier` asks, the frontier's other point follows: the batch in
+    `candidates[0]` microbatches a remat rung up (`remat_more`), the head tiled and unfused, where it fits
+    (docs/performance.md). The objective is left at the last plan's rung, each plan holding its own."""
     probes: list[Probe] = []
     refusals: list[RuntimeError] = []
     lowered: dict[tuple[int, str], Candidate] = {}
@@ -354,6 +349,7 @@ def plan_step[LossT, EffectsT](
     forecast, factor = Forecast(), temporaries_factor(mesh)
     chosen: jax.stages.CompilerOptions | None = None
     fitted: tuple[Candidate, jax.stages.Compiled] | None = None
+    dropped: str | None = None  # the rung (`rung`) the narrow copies were dropped at
     # Every rung keeps, XLA's defaults' included, the options the modules need to compute right.
     required = compiler_options(*(entry.module for entry in objective.program_key())) or None
 
@@ -367,8 +363,7 @@ def plan_step[LossT, EffectsT](
         return json.dumps(recompute_record(objective), sort_keys=True)
 
     def onward(step: Callable[[], bool]) -> bool:
-        """`step` the objective up its ladder, past every half rung the search has asked: each split
-        tried there missed, so a rung above it is the next to ask."""
+        """`step` the objective up its ladder past every half rung the search has asked, each missed."""
         moved = step()
         while moved and remat_rung() in halves:
             moved = step()
@@ -408,10 +403,11 @@ def plan_step[LossT, EffectsT](
         return fit
 
     def climb() -> bool:
-        nonlocal xla_defaults, narrow
+        nonlocal xla_defaults, narrow, dropped
         # The first rung drops the narrow copies, two bytes a parameter held all run for 1-2% of a step.
         if narrow and any(candidate.copies for candidate in lowered.values()):
             narrow = False
+            dropped = rung()
             lowered.clear()
             return True
         # XLA's default options, but `required`, are the half rung above the step's own where those
@@ -432,6 +428,11 @@ def plan_step[LossT, EffectsT](
     split = planned(candidates, first, fits, climb, lambda split: forecast.likely(rung(), split))
     if split is None or fitted is None:
         raise RuntimeError(unplanned(probes)) from (refusals[-1] if refusals else None)
+    if dropped not in (None, rung()):
+        # A rung above the copies' may recompute the casts they save: the plan keeps them where it fits so.
+        kept, narrow = fitted, True
+        if not fits_here(split):
+            fitted, narrow = kept, False
     plans = [found(split)]
     if frontier and split != candidates[0] and onward(lambda: remat_more(objective)):
         objective.tile_head()
