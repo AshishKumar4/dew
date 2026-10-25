@@ -203,6 +203,23 @@ def near_reference(seed: int) -> tuple[np.ndarray, np.ndarray]:
             reference.astype(np.float32))
 
 
+def test_a_confident_soft_targets_derivative_keeps_its_shift_invariance():
+    """Soft targets as confident as the logits, `[1, a]` against logits `[20, 0]` whose second probability
+    is `a`, and the logits' own distribution: the derivative's entries sum to exactly 0, its derivative
+    along all-ones, which shift invariance makes 0, and against its own distribution it is exactly 0,
+    where the dominant class's other target mass taken as `T - t` rounds its entry to `-a`."""
+    logits = jnp.asarray([20.0, 0.0], jnp.float32)
+    own = jax.nn.softmax(logits)
+    for targets in (jnp.asarray([1.0, own[1]]), own):
+        def loss(row, targets=targets):
+            return categorical.soft_cross_entropy(row, targets)
+
+        _, along = jax.jvp(loss, (logits,), (jnp.ones(2, jnp.float32),))
+        assert float(along) == 0.0
+    np.testing.assert_array_equal(jax.grad(lambda row: categorical.soft_cross_entropy(row, own))(logits),
+                                  np.zeros(2, np.float32))
+
+
 def divergence_derivative(logits: np.ndarray, reference: np.ndarray) -> np.ndarray:
     """`KL(q || p)`'s derivative in `logits` by arXiv:2610.31642's eq. 9 in NumPy, in the inputs' own
     dtype, its `p` the reference's softmax and its `q` the logits'."""
@@ -229,16 +246,32 @@ def test_the_divergences_derivative_near_its_reference_keeps_the_differences_pre
 
 def test_the_divergences_derivative_stays_finite_wherever_its_rows_are():
     """Rows each finite but far apart in offset have the derivative of the distributions they hold, here
-    two uniform rows' zero; rows far apart in shape have a finite Hessian; logits -inf where the
+    two uniform rows' zero; rows far apart in shape have a finite Hessian, and rows at opposite extrema,
+    whose difference less its mean overflows, or so far apart that the difference's rounding lifts a
+    reconstructed log probability above 0, the derivative `p - q` with one, and a uniform offset whose
+    mean rounds the difference off 0 the derivative 0 with one; logits -inf where the
     reference is not take `p - q` in forward mode as in reverse; and a row whose classes `where`
     excludes entirely has derivative 0 beside a held row's."""
     far = jnp.asarray([[2e38, 2e38]], jnp.float32), jnp.asarray([[-2e38, -2e38]], jnp.float32)
     offset = jax.grad(lambda rows: categorical.kl_divergence(rows, far[1]).sum())(far[0])
     np.testing.assert_array_equal(offset, np.zeros((1, 2), np.float32))
-    apart = jnp.asarray([200.0, 0.0]), jnp.asarray([-200.0, 0.0])
-    for hessian in (jax.hessian, lambda f: jax.jacfwd(jax.jacrev(f)), lambda f: jax.jacrev(jax.jacrev(f))):
-        held = hessian(lambda row: categorical.kl_divergence(row, apart[1]))(apart[0])
-        assert np.all(np.isfinite(np.asarray(held)))
+    extrema = jnp.asarray([1e38, -1e38], jnp.float32), jnp.asarray([-1e38, 1e38], jnp.float32)
+    # A difference so large that its rounding (512 at 6.4e9) lifts a reconstructed log probability above 0,
+    # and a uniform offset of 26 classes whose mean under q rounds the difference off 0.
+    coarse = jnp.asarray([0.0, 6442450432.0], jnp.float32), jnp.asarray([0.0, -384.0], jnp.float32)
+    uniform = jnp.full((26,), 2.0 ** 26, jnp.float32), jnp.zeros((26,), jnp.float32)
+    for (row, reference), expected in ((extrema, [1.0, -1.0]), (coarse, [-1.0, 1.0]), (uniform, [0.0] * 26)):
+        for derivative in (jax.grad, jax.jacfwd):
+            np.testing.assert_array_equal(
+                derivative(lambda row, reference=reference: categorical.kl_divergence(row, reference))(row),
+                expected)
+    for row, reference in ((jnp.asarray([200.0, 0.0]), jnp.asarray([-200.0, 0.0])), extrema, coarse, uniform):
+        def divergence(row, reference=reference):
+            return categorical.kl_divergence(row, reference)
+
+        for hessian in (jax.hessian, lambda f: jax.jacfwd(jax.jacrev(f)),
+                        lambda f: jax.jacrev(jax.jacrev(f))):
+            assert np.all(np.isfinite(np.asarray(hessian(divergence)(row))))
     student, reference = jnp.asarray([-jnp.inf, 0.0]), jnp.asarray([0.0, 0.0])
     _, forward = jax.jvp(lambda row: categorical.kl_divergence(row, reference), (student,),
                          (jnp.asarray([0.0, 1.0]),))
