@@ -389,10 +389,18 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     rhs_copies: int = 1
     """The warps of a role each holding the right operand's whole fragment (mma.sync's four warps along
     the rows each hold every column's, JAX's `MMALayouts`' `rhs` replicated over its warps)."""
-    block_extent: int = 256
-    """The longest axis a generated tile spans: warpgroup MMA's widest product (256 columns), and the most
-    rows a sweep has measured, past which the cost model is uncalibrated (a TMA box bounds a load's
-    transformed extents, which the tiles' 8-row tiling keeps far below it)."""
+    widest_product: int | None = None
+    """The most columns one product spans (warpgroup MMA's 256, wgmma's widest N), which a tile's columns
+    are at most; None where a tile's columns are many products' (mma.sync's 8 each), held by its
+    registers alone (`tile_registers`)."""
+    copy_extent: int | None = None
+    """The most elements one asynchronous copy moves along a dimension (TMA's box, 256), which a tile's
+    rows and columns, each loaded by one, are at most; None where cp.async moves a block (mma.sync's),
+    whose tiles registers bound alone."""
+    most_shared: int
+    """The most shared memory a block of any GPU of the family holds (CUDA's opt-in limit), which bounds
+    the stages a generated tile takes; a GPU's own (`generation.shared_budget`) bounds the tiles its
+    launches keep."""
 
     @abc.abstractmethod
     def registers(self, consumers: int) -> int:
@@ -610,6 +618,7 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     bounded_loads = True
     operands_in_registers = False
     asynchronous = True
+    copy_extent = 256
 
     def registers(self, consumers: int) -> int:
         return consumer_registers(consumers)

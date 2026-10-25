@@ -62,11 +62,14 @@ from dew.nn.kernels.templates.base import Template
 def _extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
     """A tile axis's extents on `family`, largest first: whole multiples of the rows a consumer's products
     cover (`Family.role_rows`) and of its swizzled rows (`Family.column_unit`; a tile's keys are its weights'
-    product's depth, its queries the dK/dV launch's), at most a load's block (`Family.block_extent`) and the
-    call's `extent` in whole multiples (a longer tile holds padding alone)."""
+    product's depth, its queries the dK/dV launch's), at most what one copy moves (`Family.copy_extent`,
+    where the family's copies bound it; else registers bound them, `fits`) and the call's `extent` in whole
+    multiples (a longer tile holds padding alone)."""
     unit = math.lcm(family.role_rows, family.column_unit(dtype))
-    top = min(family.block_extent // unit, -(-max(extent, 1) // unit)) * unit
-    return tuple(range(top, 0, -unit))
+    top = -(-max(extent, 1) // unit)
+    if family.copy_extent is not None:
+        top = min(top, family.copy_extent // unit)
+    return tuple(range(top * unit, 0, -unit))
 
 
 def _stages(steps: int, staged) -> tuple[int, ...]:
