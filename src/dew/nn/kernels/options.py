@@ -9,7 +9,7 @@ facts with the run's own XLA flags.
 from __future__ import annotations
 
 import functools
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from typing import TYPE_CHECKING, ClassVar, Protocol, TypedDict, Unpack, runtime_checkable
 
 import jax
@@ -78,17 +78,20 @@ class JitArguments(TypedDict, total=False):
 
 
 def program[**P, R](function: Callable[P, R], *models: nn.Module,
+                    step: Mapping[str, bool | int] | None = None,
                     **arguments: Unpack[JitArguments]) -> jax.stages.Wrapped:
     """`function` jitted with the XLA options a program over `models` compiles with
-    (`compiler_options`) and the rest of `jax.jit`'s `arguments` (its static arguments, its
-    shardings): one program for each function, options and arguments, which every call with the same
-    reuses, so a quantized model and another never share one. Every program Dew compiles over a task's
-    model, an autoencoder or an objective's modules outside an objective's own (`Objective.program`)
-    is one of these."""
-    return _program(function, tuple(sorted(compiler_options(*models).items())), **arguments)
+    (`compiler_options`), and, where it is part of a training step, the step's own beside them
+    (`step`, `dew.training.memory.step_compiler_options`), with the rest of `jax.jit`'s `arguments`
+    (its static arguments, its shardings): one program for each function, options and arguments,
+    which every call with the same reuses, so a quantized model and another never share one. Every
+    program Dew compiles over a task's model, an autoencoder or an objective's modules outside an
+    objective's own (`Objective.program`) is one of these."""
+    options = {**compiler_options(*models), **(step or {})}
+    return _program(function, tuple(sorted(options.items())), **arguments)
 
 
 @functools.cache
-def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, bool], ...],
+def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, bool | int], ...],
                      **arguments: Unpack[JitArguments]) -> jax.stages.Wrapped:
     return jax.jit(function, compiler_options=dict(options), **arguments)
