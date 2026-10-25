@@ -84,7 +84,8 @@ def test_m3s_directions_are_algorithm_1s_across_its_chunks():
         def step(state, gradient):
             direction, state = transform.update(gradient, state)
             return state, direction
-        return jax.lax.scan(step, transform.init(gradients[0]), gradients)[1]
+        first = jax.tree.map(lambda sequence: sequence[0], gradients)
+        return jax.lax.scan(step, transform.init(first), gradients)[1]
 
     def draw(seed):
         rng = np.random.default_rng(seed)
