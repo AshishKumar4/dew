@@ -115,10 +115,11 @@ def _head(index: int, leaf):
 def drawn(module: InContextMemory):
     """A seed's stream and its own weights for `module`: each draw a fresh model, so no one draw of
     the weights is shared by every seed's error."""
+    init = jax.jit(lambda key: module.init(key, jnp.zeros((1, LENGTH, WIDTH))))
+
     def draw(seed: int) -> tuple[np.ndarray, dict]:
         x = np.random.default_rng([1645, seed]).standard_normal((ROWS, LENGTH, WIDTH)).astype(np.float32)
-        params = module.init(jax.random.key(seed), jnp.zeros((1, LENGTH, WIDTH)))
-        return x, jax.tree.map(np.asarray, params)
+        return x, jax.tree.map(np.asarray, init(jax.random.key(seed)))
     return draw
 
 
