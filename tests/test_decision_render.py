@@ -15,19 +15,9 @@ import pytest
 from dew._records import JSON
 from dew.data.text import ByteTokenizer, HFTokenizer
 from dew.decision import Choice, Noul, Question, Score
-from dew.decision.layout import (
-    LETTERS,
-    AnswerCue,
-    Framing,
-    Instructions,
-    Labels,
-    OptionLines,
-    QuestionLayout,
-    Specials,
-    State,
-    Text,
-)
+from dew.decision.layout import LETTERS, AnswerCue, Framing, Labels, QuestionLayout, Specials, State, Text
 from dew.decision.renderer import Chunk, render
+from dew.decision.slot_source import SLOT_LABELS, SLOT_SYSTEM, SlotSource
 
 QWEN = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
 """Qwen3.5's ChatML template, with its thinking switch, over a tiny vocabulary of bytes and Qwen's
@@ -37,37 +27,11 @@ LAYA = Path(__file__).parent / "fixtures" / "laya" / "tiny" / "tokenizer"
 ELEPHANT, ELEPHANT_REVISION = "baselabs/elephant-1", "b3f8a93462fb1051a9de031e94a7ff380e254072"
 """The slot release whose tokenizer spells every one of its labels as one token."""
 
-SLOT_SYSTEM = ("Apply the question to the state. Choose exactly one of the listed options. Respond with only "
-               "its uppercase letter, with no explanation or reasoning.")
-NOT_ONE_TOKEN = frozenset(["BQ", "BZ", "CJ", "CQ", "CZ", "DQ", "DZ", "EJ", "EY", "FJ", "FQ", "FV", "FZ",
-                           "GJ", "GK", "GQ", "GZ", "HJ", "IY", "JF", "JG", "JH", "JL", "JN", "JQ"])
-SLOT_LABELS = (*LETTERS, *[first + second for first in LETTERS for second in LETTERS
-                           if first + second not in NOT_ONE_TOKEN][:256 - 26])
-"""The release's 256 labels (qev/prompt.py `SLOT_LABELS`): A to Z, then the pairs its tokenizer spells
-as one token."""
-
-
 RELEASE_LABELS = Labels(variants=("{}",), names=SLOT_LABELS)
 """The release's labels, each read as its bare self (OneJev engine.py `_verify_slots`)."""
 
 
-def release(*, max_len: int = 32768, keep: Literal["start", "end", "all"] = "all") -> QuestionLayout:
-    """The slot release's prompt, as values: its system message, a tagged state, the question under its
-    kind's header, its options as lettered lines, and its cue, framed with thinking off, encoded whole."""
-    return QuestionLayout(
-        max_len=max_len, labels=RELEASE_LABELS, unit="whole",
-        framing=Framing(system=SLOT_SYSTEM, prefill="", thinking=False),
-        segments=(Text("<state>\n"), State(render="state", keep=keep), Text("\n</state>\n\n"),
-                  Instructions({"choice": "Question: {}", "noul": "Question: {}",
-                                "score": "Rate the state: {}"}, render="entry",
-                               defaults={"choice": "Which option applies to the state?",
-                                         "score": "Which level describes the state?",
-                                         "noul": ("Is the statement true, or is the answer to the question "
-                                                  "yes?")}),
-                  Text("\n\nOptions:\n"),
-                  OptionLines(criteria={"true": "the statement is true / the answer is yes",
-                                        "false": "the statement is false / the answer is no"}),
-                  Text("\n\n"), AnswerCue()))
+release = SlotSource.layout
 
 
 SPECIALS = Specials(begin=None, separator=0, marker=1, marker_text="\x01", pad=0)

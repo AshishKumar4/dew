@@ -214,15 +214,23 @@ class TimeProjection(nn.Module):
     precision: PrecisionLike = None
 
     @nn.nowrap
+    def _mlp(self, input_features: int):
+        from .mlp import GatedMLP  # mlp reads this module's initializers
+
+        return GatedMLP(self.features, self.features, in_features=input_features,
+                        activation=self.activation, activation_after=True, use_bias=True,
+                        names=("DenseGeneral_0", "DenseGeneral_1"), dtype=self.dtype,
+                        precision=self.precision)
+
+    @nn.nowrap
     def model_flops(self, lengths, input_features: int) -> float:
-        return projection_flops(lengths, input_features + self.features, self.features)
+        return self._mlp(input_features).model_flops(lengths)
 
     @nn.compact
     def __call__(self, x):
-        dense = partial(DenseGeneral, self.features,
-                        dtype=self.dtype, precision=self.precision, dot_general=float32_dot_general)
-        x = self.activation(dense()(x))
-        return self.activation(dense()(x))
+        mlp = self._mlp(x.shape[-1])
+        nn.share_scope(self, mlp)
+        return mlp(x)
 
 
 def torch_nearest_resize(x, height: int, width: int):

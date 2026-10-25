@@ -466,7 +466,7 @@ def test_a_saved_run_retains_vision_tower_and_projector_outputs(tmp_path):
     import jax
 
     run = VisionRun()
-    tower, projector = run.vision["tower"].build(), run.vision["projector"].build()
+    tower, projector = run.vision["tower"].build(), run.vision["projector"]
     pixels = jnp.arange(12, dtype=jnp.float32).reshape(1, 3, 2, 2)
     tower_params = tower.init(jax.random.key(2), pixels)
     encoded = tower.apply(tower_params, pixels)
@@ -474,7 +474,7 @@ def test_a_saved_run_retains_vision_tower_and_projector_outputs(tmp_path):
     expected = projector.apply(projector_params, encoded)
     run.save(str(tmp_path))
     restored = VisionRun.load(str(tmp_path))
-    actual = projectors.from_record(restored.vision["projector"]).build().apply(
+    actual = projectors.from_record(restored.vision["projector"]).apply(
         projector_params, towers.from_record(restored.vision["tower"]).build().apply(
             tower_params, pixels))
     assert jnp.array_equal(actual, expected)

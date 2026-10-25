@@ -62,7 +62,8 @@ import numpy as np
 from flax import core, linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 
-from dew.cache import QUANTIZED_TRACE
+from dew.cache import INTERCEPTED, QUANTIZED_TRACE
+from dew.nn.dense import _contractions, _linear_site
 from dew.nn.kernels.generation import backend
 from dew.nn.precision import accumulated, correctly_rounded_divide
 
@@ -259,7 +260,7 @@ def _keyed[**Arguments, Result](method: Callable[Arguments, Result],
     """`method` run under `key` in `QUANTIZED_TRACE`."""
     @functools.wraps(method)
     def keyed(*args: Arguments.args, **kwargs: Arguments.kwargs) -> Result:
-        with QUANTIZED_TRACE(key):
+        with QUANTIZED_TRACE(key), INTERCEPTED(new_value=True):
             return method(*args, **kwargs)
     return keyed
 
@@ -673,14 +674,17 @@ class InputQuantization:
                 child = getattr(module, name)
                 return next_fun(*args, **kwargs) or (record.quantizer(child) is not None
                                                      or child.has_variable(QUANTIZATION, FROZEN_FP8[0]))
-            calls = context.method_name == "__call__"
+            calls = context.method_name in ("__call__", "_linear")
             quantizer = record.quantizer(module) if calls else None
             frozen = calls and module.has_variable(QUANTIZATION, FROZEN_FP8[0])
             if quantizer is None and not frozen:
                 return next_fun(*args, **kwargs)
+            if not _linear_site(context, "/".join(module.path)):
+                return next_fun(*args, **kwargs)
             # A Linear's input arrives first or by its parameter's name.
             inputs = args[0] if args else kwargs["inputs"]
-            if not _trailing_contraction(module, inputs.ndim):
+            contracted, batch_dims = _contractions(module, inputs.ndim)
+            if batch_dims or contracted != (inputs.ndim - 1,):
                 raise ValueError(f"{'/'.join(module.path)} holds an input scale or a frozen FP8 kernel, "
                                  "which a Linear contracting its input's trailing axis alone reads")
             if quantizer is not None:
@@ -705,7 +709,7 @@ class InputQuantization:
                 return record.quantizer(module)
 
             def apply(self, variables, *args, **kwargs):
-                with nn.intercept_methods(quantize_inputs):
+                with INTERCEPTED(new_value=True), nn.intercept_methods(quantize_inputs):
                     return super().apply(variables, *args, **kwargs)
 
             def init_with_output(self, *args, **kwargs):
@@ -809,17 +813,6 @@ def _fp8_faster(shape: tuple[int, ...], tokens: int) -> bool:
                for fn, args in ((bf16, (x, kernel.astype(jnp.bfloat16), cotangent)),
                                 (fp8, (x, cotangent, leaves)))]
     return timings[1] < timings[0]
-
-
-def _trailing_contraction(module: nn.Module, ndim: int) -> bool:
-    """Whether `module` is a Linear that contracts its rank-`ndim` input's trailing axis alone."""
-    match module:
-        case nn.Dense():
-            return True
-        case nn.DenseGeneral(axis=axis, batch_dims=batch_dims):
-            axes = (axis,) if isinstance(axis, int) else tuple(axis)
-            return not batch_dims and sorted(a % ndim for a in axes) == [ndim - 1]
-    return False
 
 
 def _qtype(dtype: QuantizedDtype) -> jax.typing.DTypeLike:
