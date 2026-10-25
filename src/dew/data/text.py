@@ -22,10 +22,10 @@ from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import grain.python as grain
 import numpy as np
-from filelock import FileLock
 
 from dew.data.pipeline import TOKEN_FIELDS
 from dew.data.tokens import chunk_table
+from dew.files import published
 
 if TYPE_CHECKING:
     from jax.typing import ArrayLike
@@ -367,11 +367,9 @@ def tokenizer_name(tokenizer: str | SavedTokenizer) -> str:
         for path in sorted(path for path in staging.rglob("*") if path.is_file()):
             digest.update(str(path.relative_to(staging)).encode() + b"\0" + path.read_bytes())
         directory = root / digest.hexdigest()
-        # One publisher at a time: another process saving the same tokenizer writes the same
-        # files, and whichever comes second finds the directory there.
-        with FileLock(str(directory) + ".lock"):
-            if not directory.is_dir():
-                staging.rename(directory)
+        # Another process saving the same tokenizer writes the same files; whichever renames second
+        # finds the directory there.
+        published(staging, directory)
     finally:
         shutil.rmtree(staging, ignore_errors=True)
     return str(directory)

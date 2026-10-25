@@ -9,8 +9,9 @@ loop is an implicit transfer, and a device-to-host one also waits on every
 step dispatched before it, so the host stops running ahead of the device.
 
 `steady_state` checks both over a block. It counts the programs JAX traces
-and compiles inside it (jax.monitoring's `/jax/core/compile` events; a
-persistent-cache hit still counts as a compile), and runs it under
+and compiles inside it (`dew.telemetry.instrumentation.Compiles`, over
+jax.monitoring's `/jax/core/compile` events; a persistent-cache hit still
+counts as a compile), and runs it under
 `jax.transfer_guard("disallow")`, which refuses implicit transfers and lets
 explicit ones through.
 
@@ -27,14 +28,11 @@ memory with an explicit `jax.device_put` and reads that (a save under
 """
 
 import contextlib
-import traceback
 from collections.abc import Iterator, Sequence
 
 import jax
 
-_COMPILE_EVENTS = {"/jax/core/compile/jaxpr_trace_duration": "traced",
-                   "/jax/core/compile/backend_compile_duration": "compiled"}
-"""The compile events `jax.monitoring` records a duration for, by what each counts."""
+from dew.telemetry.instrumentation import Compiles
 
 
 @contextlib.contextmanager
@@ -56,25 +54,11 @@ def steady_state(compiles: int = 0, allow: Sequence[str] = ()) -> Iterator[None]
     """Run the block as a hot path's steady state: `guarded`, and tracing
     and compiling no program, or exactly `compiles` where the block brings a
     new shape bucket. Fails naming each program and where it was asked for."""
-    seen: list[tuple[str, str, str]] = []
-
-    def listen(event: str, seconds: float, **kwargs) -> None:
-        if event in _COMPILE_EVENTS:
-            frame = next((frame for frame in reversed(traceback.extract_stack()[:-1])
-                          if "/jax/" not in frame.filename and "/jaxlib/" not in frame.filename
-                          and frame.filename != __file__ and "contextlib" not in frame.filename), None)
-            where = "?" if frame is None else f"{frame.filename}:{frame.lineno}"
-            seen.append((_COMPILE_EVENTS[event], str(kwargs.get("fun_name")), where))
-
-    jax.monitoring.register_event_duration_secs_listener(listen)
-    try:
-        with guarded(allow):
-            yield
-    finally:
-        jax.monitoring.unregister_event_duration_listener(listen)
-    compiled = [entry for entry in seen if entry[0] == "compiled"]
-    unexpected = seen if compiles == 0 else compiled
+    with Compiles(None) as heard, guarded(allow):
+        yield
+    seen = heard.programs
+    unexpected = seen if compiles == 0 else [program for program in seen if program.kind == "compiled"]
     assert len(unexpected) == compiles, (
         f"the steady state {'traced or ' if compiles == 0 else ''}compiled {len(unexpected)} "
         f"program(s), {compiles} expected:\n" + "\n".join(
-            f"  {kind} {name} at {where}" for kind, name, where in seen))
+            f"  {program.kind} {program.name} at {program.where}" for program in seen))
