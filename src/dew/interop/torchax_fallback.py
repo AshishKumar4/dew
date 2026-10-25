@@ -25,10 +25,12 @@ This module imports neither torch nor torchax until a load asks for them.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import fnmatch
 import functools
 import importlib.metadata
 import json
+import math
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -47,7 +49,8 @@ from dew.interop.generation_config import read_generation_config
 from dew.interop.pickles import host_dtype, host_view
 from dew.interop.pretrained import PretrainedFallback, source_processor
 from dew.interop.weights import AUTO
-from dew.nn.precision import at_least_fp32, configured_precision, float32_products
+from dew.nn.inputs import COORDINATES_FIELD, VALIDITY_FIELD, Coordinates, coordinates
+from dew.nn.precision import at_least_fp32, configured_precision, float32_products, scaled
 from dew.nn.protocols import Lacks, OutputTable
 from dew.nn.sharding import LogicalAxes, Suffix, parameter_path
 from dew.registry import resolve_dtype
@@ -87,10 +90,15 @@ def _summary(reasons: Mapping[str, str], shown: int = 3) -> str:
 @dataclass(frozen=True)
 class TorchAdmission:
     """An unregistered causal LM no registered convention computes that tier 3 runs (`admitted`):
-    its model_type, and why each convention did not compute it (`verify.Unmapped.reasons`)."""
+    its model_type, why each convention did not compute it (`verify.Unmapped.reasons`), and whether
+    its every decoder layer attends through transformers' attention interface with visibility Dew's
+    attention computes (`attends`, `_Probe`), which runs them on Dew's attention, packing included;
+    `why` says what kept it otherwise."""
 
     model_type: str
     reasons: Mapping[str, str]
+    attends: bool = False
+    why: str = ""
 
 
 def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
@@ -119,10 +127,13 @@ def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
         raise ValueError(f"model_type {model_type!r} rotates by rope_type {moving!r}, whose tables "
                          "transformers recomputes from each call's positions, which a traced program "
                          "cannot branch on (ledger 1493, H5)")
-    model = AutoModelForCausalLM.from_config(config, trust_remote_code=False, dtype=torch.float32).eval()
+    _registered()
+    model = AutoModelForCausalLM.from_config(config, trust_remote_code=False, dtype=torch.float32,
+                                             attn_implementation=_PROBE).eval()
     verify.scatter_weights(model)
     ids = torch.from_numpy(verify.probe_ids(int(config.vocab_size)).astype(np.int64))
-    with torch.no_grad():
+    probe = _Probe()
+    with torch.no_grad(), probe.recording():
         logits = model(input_ids=ids, use_cache=False).logits
     changed = ids.clone()
     changed[:, -1] = (changed[:, -1] + 1) % int(config.vocab_size)
@@ -145,7 +156,214 @@ def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
         raise ValueError(f"model_type {model_type!r}'s training forward draws on the host ({draws.host} "
                          "draws, BioGPT's layer drop among them), which a traced step would fix for every "
                          "step, and tier 3 trains the models it loads")
-    return TorchAdmission(model_type, dict(unmapped.reasons))
+    why = probe.kept_from_dew(int(config.num_hidden_layers))
+    return TorchAdmission(model_type, dict(unmapped.reasons), attends=not why, why=why)
+
+
+_ATTENTION = "dew"
+"""The name Dew's attention is registered under in transformers' attention interface (`_registered`):
+a model built with it computes each layer's attention with `dew.nn.attention`, given no mask, as
+transformers gives an attention it has no mask function for none."""
+
+_PROBE = "dew_probe"
+"""The name of the attention `admitted` builds its probe with: transformers' SDPA over its own SDPA
+mask, recording what each call asks (`_Probe`)."""
+
+_PLUMBING = frozenset({"position_ids", "cache_position", "position_embeddings", "use_cache",
+                       "output_attentions", "past_key_values", "past_key_value", "layer_idx", "is_causal"})
+"""Keywords transformers' attention modules pass beside the computation's own, which name nothing the
+attention computes: positions are already in the rotated queries and keys, and tier 3 runs no cache."""
+
+_COMPUTED = frozenset({"sliding_window", "softcap", "s_aux"})
+"""The keywords Dew's attention computes (`_dew_attention`): a window over the most recent keys, a
+tanh cap on the logits, and one value-free logit a head (sinks)."""
+
+_PROBING: contextvars.ContextVar[_Probe | None] = contextvars.ContextVar("dew_probe", default=None)
+
+
+class _Probe:
+    """What each attention call of a probed forward asks (`recording`): the module, the keywords it
+    passes past `_PLUMBING`, and whether the mask transformers built for it is the visibility Dew's
+    attention computes from the module's causality and those keywords (`_visible`)."""
+
+    def __init__(self):
+        self.modules: set[int] = set()
+        self.unknown: set[str] = set()
+        self.unmatched = 0
+
+    @contextlib.contextmanager
+    def recording(self):
+        token = _PROBING.set(self)
+        try:
+            yield self
+        finally:
+            _PROBING.reset(token)
+
+    def called(self, module, query, key, attention_mask, scaling, kwargs) -> None:
+        self.modules.add(id(module))
+        self.unknown |= set(kwargs) - _PLUMBING - _COMPUTED
+        seen = _seen(module, query, key, attention_mask, scaling, kwargs)
+        if not _visible(seen, kwargs.get("sliding_window")):
+            self.unmatched += 1
+
+    def kept_from_dew(self, layers: int) -> str:
+        """Why the probed model cannot run on Dew's attention, or "" where it can: every one of its
+        `layers` decoder layers attended through the interface, passing only keywords Dew computes,
+        with a mask Dew's visibility reproduces."""
+        if len(self.modules) != layers:
+            return (f"{len(self.modules)} of its {layers} decoder layers attend through transformers' "
+                    "attention interface")
+        if self.unknown:
+            return f"its attention takes {sorted(self.unknown)}, which Dew's attention does not compute"
+        if self.unmatched:
+            return (f"{self.unmatched} of its attention calls mask other keys than causality and its "
+                    "window name")
+        return ""
+
+
+def _seen(module, query, key, attention_mask, scaling, kwargs) -> np.ndarray:
+    """Which keys each query of a call reads in transformers' SDPA attention as the probe runs it,
+    `[B, Q, H, K]`: its attention weights over one-hot values, nonzero where a key is read. Read from
+    the attention itself, so a mask transformers builds or one it leaves to the attention's causal
+    flag (None) alike."""
+    import torch
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    batch, heads, keys, _ = key.shape
+    identity = torch.eye(keys, dtype=query.dtype).expand(batch, heads, keys, keys)
+    weights, _ = ALL_ATTENTION_FUNCTIONS["sdpa"](module, query, key, identity, attention_mask,
+                                               scaling=scaling, dropout=0.0, **kwargs)
+    return weights.detach().cpu().numpy() > 0
+
+
+def _visible(seen: np.ndarray, window: int | None) -> bool:
+    """Whether the keys a call's queries read (`_seen`, `[B, Q, H, K]`) are the causal visibility Dew's
+    attention computes with `window` (`dew.nn.visibility.visible`), the last query at the last key: a
+    causal LM's (`admitted`)."""
+    from dew.nn.visibility import visible
+
+    queries, keys = seen.shape[1], seen.shape[3]
+    expected = np.asarray(visible(np.arange(queries)[:, None] + (keys - queries), np.arange(keys)[None, :],
+                                  causal=True, window=window))
+    return bool(np.array_equal(seen, np.broadcast_to(expected[None, :, None, :], seen.shape)))
+
+
+def _probe_attention(module, query, key, value, attention_mask, scaling=None, dropout=0.0, **kwargs):
+    """transformers' SDPA attention over the eager mask the probe's model is built with, which every
+    attention reads, its own code's too: each call recorded by the probe running (`_Probe.called`)."""
+    from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
+
+    probe = _PROBING.get()
+    if probe is not None:
+        probe.called(module, query, key, attention_mask, scaling, kwargs)
+    return ALL_ATTENTION_FUNCTIONS["sdpa"](module, query, key, value, attention_mask, scaling=scaling,
+                                         dropout=dropout, **kwargs)
+
+
+@dataclass(frozen=True)
+class _Attending:
+    """What Dew's attention reads of the call it runs in (`TorchGraph.traced`): the kernel it names,
+    each token's document (`[B, S]`, 0 for padding, None for one document a row), the real tokens
+    (`[B, S]`, None for all) and the most documents a row holds, whether the call trains, and its
+    dropout key (None for none)."""
+
+    implementation: str
+    documents: jax.Array | None
+    valid: jax.Array | None
+    max_segments: int
+    train: bool
+    key: jax.Array | None
+
+
+_ATTENDING: contextvars.ContextVar[_Attending | None] = contextvars.ContextVar("dew_attending", default=None)
+
+
+@contextlib.contextmanager
+def _attending(call: _Attending):
+    """`call` as what Dew's attention reads (`_dew_attention`) while the forward traces."""
+    token = _ATTENDING.set(call)
+    try:
+        yield call
+    finally:
+        _ATTENDING.reset(token)
+
+
+def _documents(laid: Coordinates | None) -> tuple[jax.Array | None, int]:
+    """Each token's document `[B, S]` as Dew's attention keeps them apart, and the most a row holds:
+    the packed documents, numbered from 1, and every slot the caller's validity drops 0, padding
+    that attends as a document of its own; a row of real tokens and padding is one document and its
+    padding; None for one document a row."""
+    if laid is None or (laid.segments is None and laid.valid is None):
+        return None, 1
+    if laid.segments is None:
+        return jnp.asarray(laid.valid, jnp.int32), 1
+    segments = jnp.asarray(laid.segments, jnp.int32)
+    if laid.valid is not None:
+        segments = jnp.where(jnp.asarray(laid.valid, bool), segments, 0)
+    return segments, laid.max_segments
+
+
+def _dew_attention(module, query, key, value, attention_mask, scaling=None, dropout=0.0, **kwargs):
+    """One layer's attention, as transformers' attention interface calls it, computed by Dew's
+    (`dew.nn.attention.scaled_dot_product_attention`): `[B, H, S, D]` queries and `[B, H_kv, S, D]`
+    keys and values in, `[B, S, H, D]` out, causal as an admitted model's mask is (`_Probe`),
+    inside the call's documents (`_Attending`). A row with padding among its tokens attends over its
+    real tokens moved to its front (`dew.nn.local_attention.compacted`), so each document is one run
+    of slots and a window counts its real tokens, whichever kernel runs, dropout's included; the
+    query carries the ratio of `scaling` to the kernels' own 1/sqrt(D), as Dew's attention layers
+    carry a checkpoint's scale (`dew.nn.precision.scaled`); attention dropout draws from the call's
+    key folded by the layer, and a training call that drops with no key is refused."""
+    from torchax.interop import jax_view, torch_view
+
+    from dew.nn.attention import scaled_dot_product_attention
+    from dew.nn.local_attention import compacted
+
+    call = _ATTENDING.get()
+    if call is None:
+        raise ValueError("Dew's attention runs inside a tier-3 model's traced call")
+    unknown = sorted(set(kwargs) - _PLUMBING - _COMPUTED)
+    if unknown:
+        # `admitted` runs a model on Dew's attention only where its probe passed no such keyword.
+        raise ValueError(f"Dew's attention does not compute {unknown}, which this call passes")
+    q, k, v = (jnp.swapaxes(jax_view(tensor), 1, 2) for tensor in (query, key, value))
+    if scaling is not None:
+        q = scaled(q, scaling * math.sqrt(q.shape[-1]))
+    sinks = kwargs.get("s_aux")
+    sinks = None if sinks is None else jax_view(sinks)
+    window, softcap = kwargs.get("sliding_window"), kwargs.get("softcap")
+    max_segments = call.max_segments if call.documents is not None else None
+    drawn = bool(dropout) and call.train
+    if drawn and call.key is None:
+        raise ValueError("this model's training forward drops attention probabilities (dropout) and was "
+                         "given no 'dropout' rng")
+
+    def attend(q, k, v, *, places, segment_ids, valid):
+        del places, valid  # the documents hold the padding apart, as 0
+        return scaled_dot_product_attention(
+            q, k, v, implementation=call.implementation, causal=True, sliding_window=window,
+            softcap=softcap, sinks=sinks, segment_ids=segment_ids, max_segments=max_segments,
+            dropout_rate=float(dropout) if drawn else 0.0,
+            dropout_rng=jax.random.fold_in(call.key, module.layer_idx) if drawn and call.key is not None
+            else None, deterministic=not drawn)
+
+    if call.valid is None:
+        out = attend(q, k, v, places=None, segment_ids=call.documents, valid=None)
+    else:
+        out = compacted(attend, q, k, v, None, call.documents, call.valid)
+    return torch_view(out.astype(q.dtype)), None
+
+
+@functools.cache
+def _registered() -> None:
+    """Dew's attention (`_dew_attention`) and the probe's (`_probe_attention`, over transformers' eager
+    mask, additive and always built, which a model computing its own attention adds to its scores) in
+    transformers' attention interfaces, once a process."""
+    from transformers import AttentionInterface
+    from transformers.masking_utils import ALL_MASK_ATTENTION_FUNCTIONS, AttentionMaskInterface
+
+    AttentionInterface.register(_ATTENTION, _dew_attention)
+    AttentionInterface.register(_PROBE, _probe_attention)
+    AttentionMaskInterface.register(_PROBE, ALL_MASK_ATTENTION_FUNCTIONS["eager"])
 
 
 def _position_dependent_rope(config: PretrainedConfig) -> str | None:
@@ -242,22 +460,31 @@ class TorchGraph:
     forward runs the module's own training forward, its dropout and other
     draws taking `key` as torchax's random key; one that draws on the host
     instead (OPT's layer drop, `torch.rand([])`) is decided once at trace
-    time, and is refused.
+    time, and is refused. `attention_impl` is the Dew attention kernel a module
+    built with Dew's attention (`_ATTENTION`) runs, None for one that runs
+    transformers' own.
     """
 
     module: JittableModule
     persistent: tuple[str, ...]
+    attention_impl: str | None = None
 
     def __call__(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array],
                  tokens: jax.Array, *, train: bool, key: jax.Array | None = None,
-                 precision: jax.lax.PrecisionLike = None) -> tuple[jax.Array, jax.Array]:
+                 precision: jax.lax.PrecisionLike = None,
+                 laid: Coordinates | None = None) -> tuple[jax.Array, jax.Array]:
         """The logits and the output head's input states for `tokens`, in Dew's torchax
         environment (`_environment`), every product at `precision` (`configured_precision`):
         torch's operators state none. Each broadcast of a value narrower than fp32 sums
         its gradient in fp32 (`_accumulating`), as torch's reduction of a broadcast's
-        gradient does."""
-        arguments = (dict(params), dict(buffers), tokens, key)
-        traced, shapes, draws = self.traced(*arguments, train=train, precision=precision)
+        gradient does. `laid` places the tokens in their documents, which Dew's attention
+        keeps apart and whose positions transformers' rotary reads."""
+        documents, max_segments = _documents(laid)
+        positions = None if laid is None else laid.places()
+        valid = None if laid is None or laid.valid is None else jnp.asarray(laid.valid, bool)
+        arguments = (dict(params), dict(buffers), tokens, key, positions, documents, valid)
+        traced, shapes, draws = self.traced(*arguments, train=train, precision=precision,
+                                            max_segments=max_segments)
         logits, hidden = jax.tree.unflatten(jax.tree.structure(shapes),
                                             _accumulating(traced, *jax.tree.leaves(arguments)))
         if draws.host:
@@ -270,26 +497,30 @@ class TorchGraph:
         return logits, hidden
 
     def traced(self, params: Mapping[str, jax.typing.ArrayLike], buffers: Mapping[str, jax.typing.ArrayLike],
-               tokens: jax.typing.ArrayLike, key: jax.Array | None, *, train: bool,
-               precision: jax.lax.PrecisionLike = None):
+               tokens: jax.typing.ArrayLike, key: jax.Array | None,
+               positions: jax.typing.ArrayLike | None = None, documents: jax.typing.ArrayLike | None = None,
+               valid: jax.typing.ArrayLike | None = None, *, train: bool,
+               precision: jax.lax.PrecisionLike = None, max_segments: int = 1):
         """The forward over these arguments traced once (`jax.make_jaxpr`), its output shapes, and the
         draws it made (`_Draws`): on torchax's device, a key's, or on the host, fixed by the trace."""
         env = _environment()
         draws = _Draws()
 
-        def forward(params, buffers, tokens, key):
-            arguments = env.j2t_iso((dict(params), dict(buffers), tokens))
+        def forward(params, buffers, tokens, key, positions, documents, valid):
+            arguments = env.j2t_iso((dict(params), dict(buffers), tokens, positions))
+            attending = (contextlib.nullcontext() if self.attention_impl is None else _attending(
+                _Attending(self.attention_impl, documents, valid, max_segments, train, key)))
             self.module.train(train)
             try:
                 with (env, env.override_property(prng=key) if key is not None else contextlib.nullcontext(),
-                      draws):
+                      draws, attending):
                     return env.t2j_iso(self.module.functional_call(_forward, *arguments))
             finally:
                 self.module.eval()
 
         with configured_precision(precision):
             closed, shapes = jax.make_jaxpr(forward, return_shape=True)(
-                dict(params), dict(buffers), tokens, key)
+                dict(params), dict(buffers), tokens, key, positions, documents, valid)
         return closed, shapes, draws
 
     def export(self, model: nn.Module, variables: Mapping[str, object],
@@ -472,8 +703,10 @@ def _accumulated_backward(shape, dimensions, value, cotangent):
 _accumulated.defvjp(_accumulated_forward, _accumulated_backward)
 
 
-def _forward(model: PreTrainedModel, tokens: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    """Run `model` over `tokens`, keeping what its output head reads."""
+def _forward(model: PreTrainedModel, tokens: torch.Tensor,
+             positions: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Run `model` over `tokens` at `positions` (each token's index where None), keeping what its
+    output head reads."""
     import torch
 
     states: list[torch.Tensor] = []
@@ -482,7 +715,7 @@ def _forward(model: PreTrainedModel, tokens: torch.Tensor) -> tuple[torch.Tensor
         raise ValueError(f"{type(model).__name__} has no output embeddings for a causal LM's logits")
     hook = head.register_forward_pre_hook(lambda _, inputs: states.append(inputs[0]))
     try:
-        logits = model(input_ids=tokens, use_cache=False).logits
+        logits = model(input_ids=tokens, position_ids=positions, use_cache=False).logits
     finally:
         hook.remove()
     return logits, states[0]
@@ -502,9 +735,13 @@ class TorchCausalLM(nn.Module):
 
     A loss scores its whole logits (`Logits`). A model whose logits are the
     plain head product loads as `TorchTableLM` instead, which `LMObjective`
-    scores through its head input and head weight. The reads take plain
-    token rows: transformers' forward runs with no packing columns and no
-    cache, so a packing field is refused by name and there is no cached decode.
+    scores through its head input and head weight. A model whose attention
+    runs on Dew's (`TorchGraph.attention_impl`) reads packed and padded rows:
+    their `Coordinates`, or the `segment_ids`, `positions` and validity they
+    are built from, keep each document's attention to itself and give
+    transformers' rotary each token's place in its document (`_laid`); one on
+    transformers' own attention reads plain token rows, refusing a packing
+    field by name. Neither has a cached decode.
     """
 
     graph: TorchGraph
@@ -535,10 +772,30 @@ class TorchCausalLM(nn.Module):
     def logits(self, tokens, *, train: bool = False, **packing) -> jax.Array:
         """The logits of the whole rows, as `__call__` returns them: in at least float32
         (`at_least_fp32`), so a float64 model's are float64, as its output table's are."""
-        _refuse_packing(packing)
-        return self(tokens, train=train)
+        logits, _ = self._run(tokens, train, self._laid(tokens, packing))
+        return logits.astype(at_least_fp32(logits.dtype))
 
-    def _run(self, tokens, train: bool) -> tuple[jax.Array, jax.Array]:
+    def _laid(self, tokens, packing: Mapping[str, object]) -> Coordinates | None:
+        """The rows' `Coordinates` from their packing fields, None for none: a model on Dew's attention
+        reads `coordinates`, else `segment_ids`, `positions` and the validity field; one on
+        transformers' own refuses them (`_refuse_packing`)."""
+        if self.graph.attention_impl is None:
+            _refuse_packing(packing)
+            return None
+        unknown = sorted(set(packing) - {COORDINATES_FIELD, VALIDITY_FIELD, "segment_ids", "positions"})
+        if unknown:
+            raise Lacks("packing", f"a tier-3 model reads its rows' documents, positions and validity, "
+                                   f"not {unknown}")
+        if not packing:
+            return None
+        laid = packing.get(COORDINATES_FIELD)
+        if isinstance(laid, Coordinates):
+            return laid
+        batch, length = jnp.shape(tokens)[:2]
+        return coordinates((batch, length), segments=packing.get("segment_ids"),
+                           valid=packing.get(VALIDITY_FIELD), positions=packing.get("positions"))
+
+    def _run(self, tokens, train: bool, laid: Coordinates | None = None) -> tuple[jax.Array, jax.Array]:
         if self.is_initializing():
             raise ValueError(
                 "a torchax model has no initializer; apply it to the variables "
@@ -552,7 +809,7 @@ class TorchCausalLM(nn.Module):
         compute = self.dtype or jnp.result_type(*[leaf for leaf in params.values()
                                                   if jnp.issubdtype(leaf.dtype, jnp.floating)])
         return self.graph(params, buffers, jnp.asarray(tokens), train=train, key=key,
-                          precision=float32_products(compute, self.precision))
+                          precision=float32_products(compute, self.precision), laid=laid)
 
     def _compute(self, leaf) -> jax.Array:
         value = jnp.asarray(leaf)
@@ -571,8 +828,7 @@ class TorchTableLM(TorchCausalLM):
 
     def hidden_states(self, tokens, train: bool = False, **packing) -> jax.Array:
         """The states the output head reads, `[B, S, features]`."""
-        _refuse_packing(packing)
-        _, hidden = self._run(tokens, train)
+        _, hidden = self._run(tokens, train, self._laid(tokens, packing))
         return hidden
 
     def output_table(self) -> OutputTable:
@@ -611,10 +867,12 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     weight read, and its variables are their shapes and dtypes alone
     (`jax.ShapeDtypeStruct`).
     """
-    if attention_impl != "auto":
+    attends = admission is not None and admission.attends
+    if attention_impl != "auto" and not attends:
         raise ValueError(
-            f"attention_impl={attention_impl!r} selects a Dew kernel, and tier 3 runs "
-            "transformers' own attention; leave attention_impl at 'auto'")
+            f"attention_impl={attention_impl!r} selects a Dew kernel, and this source runs "
+            f"transformers' own attention ({'fallback=torchax' if admission is None else admission.why}); "
+            "leave attention_impl at 'auto'")
     if max_seq_len is not None:
         raise ValueError(
             "max_seq_len sizes Dew's decode cache and rotary table, which tier 3 "
@@ -661,6 +919,10 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     # values, which some forwards do.
     if head_name is not None and not (_plain_head(model, head) if weights else _shrunk_plain_head(config)):
         head_name = None
+    if attends:
+        # After the head's eager check: Dew's attention runs only inside the traced forward.
+        _registered()
+        model.set_attn_implementation(_ATTENTION)
     # Host views of torch's storage: nothing reaches a device before the
     # caller's placement. Without the weights, their shapes and dtypes.
     def held(leaf, name):
@@ -675,7 +937,7 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     vocab = int(head_weight.shape[0])
     # Torch's copies are no longer read: the forward runs on the arrays above.
     torch.nn.Module.to(model, "meta")
-    graph = TorchGraph(jittable, persistent)
+    graph = TorchGraph(jittable, persistent, attention_impl=attention_impl if attends else None)
     module = (TorchCausalLM(graph, vocab, dtype=resolve_dtype(dtype)) if head_name is None
               else TorchTableLM(graph, vocab, dtype=resolve_dtype(dtype), head=head_name))
     source = str(name_or_dir) if revision is None else f"{name_or_dir}@{revision}"
@@ -687,9 +949,11 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     warnings.warn(
         f"{name_or_dir} loads as tier 3 ({why}): transformers {versions['transformers']}'s "
         f"PyTorch forward lowered by torchax {versions['torchax']}, pinned to torch "
-        f"{versions['torch']}; no Dew kernels, sharding rules beyond TorchLayout's name table, "
-        f"packing or KV-cache generation; the load holds the torch model on the host, at least 2x "
-        f"the checkpoint", TransformersTierWarning, stacklevel=3)
+        f"{versions['torch']}; "
+        + ("its attention on Dew's, packed rows included; " if attends
+           else "its attention transformers' own, no packing; ")
+        + "no sharding rules beyond TorchLayout's name table or KV-cache generation; the load holds the "
+        "torch model on the host, at least 2x the checkpoint", TransformersTierWarning, stacklevel=3)
     built = {**config, "dtype": dtype, "fallback": "torchax", **versions}
     return PretrainedFallback(module, {"params": params, "buffers": buffers}, processor, config, directory,
                               built, generation_config, export_adapter=graph.export, revision=revision)
