@@ -378,6 +378,61 @@ def test_a_load_without_weights_reads_none_and_states_their_shapes(route, tmp_pa
     assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(shapes.variables))
 
 
+_SHAPES = """
+import json
+import sys
+import warnings
+import jax
+from dew.interop import Pretrained
+warnings.simplefilter("ignore")
+loaded = Pretrained.load("dew/tiny-cohere", dtype="float32", fallback="torchax", weights=False)
+print(json.dumps(jax.tree.map(lambda leaf: [list(leaf.shape), str(leaf.dtype)], loaded.variables)))
+"""
+
+
+def test_a_shapes_only_fallback_load_reads_no_weights_from_the_hub(tmp_path):
+    """`fallback='torchax'` without weights reads metadata alone: from a Hub cache holding the
+    commit's metadata and not its weight files, offline, it states every leaf's shape and dtype
+    as the load with weights holds it, as a run resuming from its own checkpoint needs."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    from interop_support import hub_cache
+
+    torch.manual_seed(0)
+    transformers.CohereForCausalLM(transformers.CohereConfig(**COHERE)).save_pretrained(tmp_path / "whole")
+    with pytest.warns(TransformersTierWarning):
+        whole = Pretrained.load(tmp_path / "whole", dtype="float32", fallback="torchax")
+    hub_cache(tmp_path / "hub", "dew/tiny-cohere", tmp_path / "whole")
+    for weights in (tmp_path / "hub").rglob("*.safetensors"):
+        weights.unlink()
+    env = {**os.environ, "HF_HUB_CACHE": str(tmp_path / "hub"), "HF_HUB_OFFLINE": "1", "JAX_PLATFORMS": "cpu"}
+    run = subprocess.run([sys.executable, "-c", _SHAPES], capture_output=True, text=True, env=env)
+    assert run.returncode == 0, run.stderr[-2000:]
+    assert json.loads(run.stdout.splitlines()[-1]) == jax.tree.map(
+        lambda leaf: [list(leaf.shape), str(jnp.dtype(leaf.dtype))], whole.variables)
+
+
+@pytest.mark.parametrize("route", ["tier 3", "fallback"])
+def test_a_selected_folder_loads_its_own_model_through_tier_3(route, tmp_path):
+    """A causal LM stored in a folder below the source's root, selected by `subfolder`, loads the
+    folder's own weights through tier 3, whichever route takes it: the logits are the folder
+    model's as loaded from the folder itself."""
+    torch.manual_seed(0)
+    model = transformers.CohereForCausalLM(transformers.CohereConfig(**COHERE))
+    model.save_pretrained(tmp_path / "root" / "lm")
+    options = {"fallback": "torchax"} if route == "fallback" else {}
+    with pytest.warns(TransformersTierWarning):
+        selected = Pretrained.load(tmp_path / "root", subfolder="lm", dtype="float32", **options)
+    with pytest.warns(TransformersTierWarning):
+        direct = Pretrained.load(tmp_path / "root" / "lm", dtype="float32", **options)
+    ids = jnp.asarray(np.random.default_rng(0).integers(0, COHERE["vocab_size"], (2, 8)), jnp.int32)
+    np.testing.assert_array_equal(selected.model.apply(selected.variables, ids),
+                                  direct.model.apply(direct.variables, ids))
+
+
 @pytest.mark.parametrize("family", ["llama", "neox"])
 def test_bf16_compute_gradients_are_as_exact_as_torchs_bf16(family, tokens, tmp_path):
     """A bf16 checkpoint computing in bf16: LMObjective's loss and its gradient of every parameter

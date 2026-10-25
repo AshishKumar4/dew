@@ -253,6 +253,32 @@ def test_a_joint_release_answers_as_its_own_model(tmp_path):
                                      "the joint head over Dew's Qwen 3.5")
 
 
+def test_a_joint_release_saves_as_the_release_it_was_read_from(tmp_path):
+    """A loaded joint-head release writes its own format back: the head's sizes, and every head
+    tensor under the release's name, shape and dtype with its stored values, beside the backbone.
+    The written release loads to the same task, every variable and answer the read one's."""
+    release = tmp_path / "release"
+    release.mkdir()
+    for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
+        (release / source.name).symlink_to(source.resolve())
+    bundle = Pretrained.load(release, dtype="float32", attention_impl="xla")
+    bundle.save(tmp_path / "saved")
+    assert json.loads((tmp_path / "saved" / "joint_head_config.json").read_text()) == json.loads(
+        (TINY / "joint_head_config.json").read_text())
+    written, stored = (load_file(path / "joint_head.safetensors") for path in (tmp_path / "saved", TINY))
+    assert written.keys() == stored.keys()
+    for name, tensor in stored.items():
+        assert written[name].dtype == tensor.dtype, name
+        np.testing.assert_array_equal(written[name], tensor, err_msg=name, strict=True)
+    restored = Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="xla")
+    for actual, expected in zip(jax.tree.leaves((restored.variables, restored.head_variables)),
+                                jax.tree.leaves((bundle.variables, bundle.head_variables)), strict=True):
+        np.testing.assert_array_equal(actual, expected)
+    request = CASES["quickstart"]
+    assert Decide.of(restored, name="release").systemone(request) == Decide.of(
+        bundle, name="release").systemone(request)
+
+
 def test_a_joint_release_fine_tunes_and_reloads_from_the_run(tmp_path):
     """A joint-head release is a whole task to fine-tune: its Qwen 3.5 backbone,
     joint head and layout train together on rows of several questions, and
