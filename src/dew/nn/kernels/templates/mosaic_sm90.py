@@ -71,6 +71,18 @@ class Wgmma(mosaic.RingFamily):
                 plgpu.wgmma(acc, part, rhs)
         return acc
 
+    def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
+        """`Family.summed` into a scoped warpgroup accumulator: reading it (`acc_ref[...]`) waits on the
+        products `issue` issued into it, so the value is theirs once they are done."""
+        if interpret:
+            return issue(self.zeros(shape))
+
+        def run(acc_ref):
+            issue(acc_ref)
+            return acc_ref[...]
+
+        return pl.run_scoped(run, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
+
     def staged_products(self, acc, parts, rhs, buffers, interpret: bool, *, transposed: bool = False):
         mosaic.unscaled(parts)
         for place, (part, _) in enumerate(parts):
