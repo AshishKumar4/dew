@@ -36,8 +36,9 @@ PER_SHARE = ("a per-share read resumes only on the shares, workers and cycle len
              "resume this checkpoint there. A new run resumes on any partition when it reads a global "
              "order: publish its filtered or packed prefix (with a terminal pack's plan) once, by "
              "`dew data publish` or `publish(chain, Cache(url))`, and read it by index with "
-             "`.cache(generation)`; provisioning a source's index (`dew data provision`) makes a read "
-             "global only where no step after it filters or packs online")
+             "`.cache(generation)`; provisioning a source's index (`dew data provision`) lets it be read by "
+             "index, which is global only where every later step keeps a global order (no filter, flat "
+             "map, windows, online packing or workers before the batch)")
 """What a refusal of a per-share position on another topology tells its reader (docs/design/data.md §10,
 the provisioned lowering)."""
 
