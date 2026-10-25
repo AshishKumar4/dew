@@ -1052,7 +1052,8 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
     loop, piped = runner(MeshSpec(fsdp=8)), runner(MeshSpec(fsdp=4, stage=2), 2)
     loss, grads = piped(*draw(0))
     assert np.isfinite(loss) and all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(grads))
-    assert_as_exact(lambda *inputs: {"loss": piped(*inputs)[0]}, lambda *inputs: {"loss": loop(*inputs)[0]},
+    assert_as_exact(as_given(lambda *inputs: {"loss": piped(*inputs)[0]}),
+                    as_given(lambda *inputs: {"loss": loop(*inputs)[0]}),
                     draw, "quantized pipeline loss", seeds=PIPELINE_SEEDS,
                     truth_fn=lambda variables, rows, cotangent: {"loss": np.asarray(unquantized(
                         variables["params"], variables, {"text": rows}, cotangent)[0])})

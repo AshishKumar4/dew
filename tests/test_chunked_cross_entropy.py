@@ -379,6 +379,7 @@ def test_a_vocabulary_split_head_takes_every_gradient_under_the_float64_rule(til
     specs = (P('fsdp'), P(None, 'fsdp'), P('fsdp'), P('fsdp'), P(), P())
     drawn = with_cotangent(draw, whole)
 
+    @as_given
     def split(*terms):
         with jax.set_mesh(mesh), jax.default_matmul_precision('highest'):
             placed = [jax.device_put(term, NamedSharding(mesh, spec)) for term, spec in
@@ -459,6 +460,7 @@ def split_scores(model, wide_model, shape, vocab: int, objective_of, adjusted, l
     def placed(variables, tokens):
         return jax.device_put(variables, shardings), shard_batch(mesh, {'text': np.asarray(tokens)})['text']
 
+    @as_given
     def split(variables, tokens):
         with jax.set_mesh(mesh):
             return scored(*placed(variables, tokens))
@@ -467,7 +469,7 @@ def split_scores(model, wide_model, shape, vocab: int, objective_of, adjusted, l
         wider = jax.tree.leaves(variables)[0].dtype == np.float64
         return (wide if wider else objective).token_scores(variables, tokens)
 
-    assert_as_exact(lambda *drawn: split(*drawn).losses, jax.jit(lambda *drawn: alone(*drawn).losses), draw,
+    assert_as_exact(as_given(lambda *drawn: split(*drawn).losses), lambda *drawn: alone(*drawn).losses, draw,
                     label, seeds=seeds)
     np.testing.assert_array_equal(split(*draw(0)).correct, alone(*draw(0)).correct)
     return mesh, *placed(*draw(0))
@@ -1305,6 +1307,7 @@ def vocabulary_split(gradient):
 
     mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
 
+    @as_given
     def split(logits):
         with jax.set_mesh(mesh), jax.default_matmul_precision("highest"):
             placed = (jax.device_put(logits, NamedSharding(mesh, P("fsdp"))),
