@@ -10,6 +10,7 @@ import pytest
 import torch
 from reference_error import (
     FACTOR,
+    PARITY,
     REDRAW,
     GateFailure,
     Inconclusive,
@@ -461,6 +462,16 @@ def test_check_one_fails_a_sum_that_differs_rather_than_rounds(wrong):
     with pytest.raises(AssertionError) as raised:
         assert_as_exact(wrong, _product, _draw, "wrong", seeds=seeds_for(_product, _draw, "product"))
     assert raised.type is GateFailure
+
+
+def test_a_failing_site_raises_its_findings_as_data():
+    """A lost term fails check 1's pooled ratio: its finding names the leaf, the rule and a measure past
+    PARITY, and the failure's message is its findings', one a line."""
+    with pytest.raises(GateFailure) as raised:
+        assert_as_exact(_lost_term, _product, _draw, "lost", seeds=seeds_for(_product, _draw, "product"))
+    assert str(raised.value) == "\n".join(map(str, raised.value.findings))
+    pooled = [finding for finding in raised.value.findings if finding.rule == "pooled"]
+    assert pooled and all(finding.leaf.startswith("lost") and finding.measure > PARITY for finding in pooled)
 
 
 def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
