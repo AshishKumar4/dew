@@ -127,19 +127,6 @@ def _staged(allocations) -> int:
     return mosaic.allocated(*arrays) + mosaic.BARRIER_BYTES * barriers
 
 
-def _registers(family: mosaic.Family, carried, *phases) -> int:
-    """The registers a consumer thread of `family` holds at a step's peak: its share (`mosaic.THREADS`) of the
-    tiles its walk carries (`carried`: accumulators, kept rows) and of the step's largest phase (`phases`: the
-    tiles alive at once between two of its products), each tile `(rows, columns, dtype)`, and what it holds
-    beside them (`Family.held_registers`: addresses, indices, the carried rows' statistics). A hook
-    parameter's tile is not counted. On an H100 at D 128, a forward consumer of 64 queries over 128 keys
-    holds 200 of its 232 and runs fastest, one of 128 queries 264 and spills (2.9 to 4.6 ms against 0.49)."""
-    def words(tiles) -> int:
-        return sum(rows * columns * jnp.dtype(dtype).itemsize for rows, columns, dtype in tiles) // 4
-
-    return (words(carried) + max(map(words, phases), default=0)) // mosaic.THREADS + family.held_registers
-
-
 def _walked(causal: bool, consumers: int, block_q: int, block_k: int, programs: int,
             keys: int) -> tuple[int, int]:
     """The key tiles a forward's or dQ launch's `programs` query programs walk: every consumer's summed, and
@@ -377,17 +364,17 @@ class MosaicForward(_Mainloop[Tiles]):
 
 
 def _forward_registers(family: mosaic.Family, tiles: Tiles, value_width: int, dtype, residuals: bool) -> int:
-    """`_registers` of a forward consumer at `tiles`: its weighted values' sums `[bq, Dv]` fp32 carried, and
-    a step's logits fp32 beside its weights in the operands' dtype; a training forward's anchor value row
-    carried too (`_trained`, in the operands' dtype), and its one-hot weights beside the product picking
-    the row, fp32."""
+    """The registers a forward consumer holds at `tiles` (`mosaic.live_registers`): its weighted values' sums
+    `[bq, Dv]` fp32 carried, and a step's logits fp32 beside its weights in the operands' dtype; a training
+    forward's anchor value row carried too (`_trained`, in the operands' dtype), and its one-hot weights
+    beside the product picking the row, fp32."""
     block_q, block_k = tiles.block_q, tiles.block_k
     carried = [(block_q, value_width, jnp.float32)]
     phases = [[(block_q, block_k, jnp.float32), (block_q, block_k, dtype)]]
     if residuals:
         carried.append((block_q, value_width, dtype))
         phases.append([(block_q, block_k, dtype), (block_q, value_width, jnp.float32)])
-    return _registers(family, carried, *phases)
+    return mosaic.live_registers(family, carried, *phases)
 
 
 @overload
@@ -446,19 +433,20 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
 
 def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
                         accurate: bool, dq: bool) -> int:
-    """`_registers` of a backward launch's consumer at `config`: a dQ consumer's dQ sums `[bq, D]` fp32
-    carried (and the accurate form's keyed sums), beside a step's logits and output cotangents' products
-    fp32, then its score cotangents fp32 and their parts in the operands' dtype; a dK/dV consumer's dK and dV
-    sums `[bk, D]`, `[bk, Dv]` fp32 carried, beside a step's two products, and a fused launch's dQ tile
-    `[bq, D]` fp32."""
+    """The registers a backward launch's consumer holds at `config` (`mosaic.live_registers`): a dQ consumer's
+    dQ sums `[bq, D]` fp32 carried (and the accurate form's keyed sums), beside a step's logits and output
+    cotangents' products fp32, then its score cotangents fp32 and their parts in the operands' dtype; a dK/dV
+    consumer's dK and dV sums `[bk, D]`, `[bk, Dv]` fp32 carried, beside a step's two products, and a fused
+    launch's dQ tile `[bq, D]` fp32."""
     block_q, block_k = config.block_q, config.block_k
     products = [(block_q, block_k, jnp.float32)] * 2
     if dq:
         carried = [(block_q, width, jnp.float32)] * (2 if accurate else 1)
         cotangents = [(block_q, block_k, jnp.float32), *[(block_q, block_k, dtype)] * _parts(accurate, dtype)]
-        return _registers(family, carried, products, cotangents)
+        return mosaic.live_registers(family, carried, products, cotangents)
     carried = [(block_k, width, jnp.float32), (block_k, value_width, jnp.float32)]
-    return _registers(family, carried, products, [(block_q, width, jnp.float32)] if config.fused else [])
+    fused = [(block_q, width, jnp.float32)] if config.fused else []
+    return mosaic.live_registers(family, carried, products, fused)
 
 
 @dataclasses.dataclass(frozen=True)
