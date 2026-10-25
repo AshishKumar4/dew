@@ -56,7 +56,7 @@ import threading
 import time
 import types
 from collections.abc import Callable, Collection, Hashable, Iterator, Mapping
-from typing import ClassVar
+from typing import Any, ClassVar
 
 import filelock
 import jax
@@ -651,7 +651,7 @@ def materialized(op: KernelOp, ba: tokamax.BoundArguments, arrays: list | None =
 
 
 def measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None, *,
-             arrays: list | None = None, outputs: dict | None = None,
+             arrays: list | None = None, outputs: Callable[[Hashable, Any], None] | None = None,
              configs: Collection[Hashable] | None = None) -> Timings:
     """Every config of `ba`'s launch (at its key's shapes), each compiled on a
     thread and timed alone: the device time CUPTI reads for the launch's own
@@ -659,9 +659,11 @@ def measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None, *,
     with its operands out of cache. `profiler` is Mosaic GPU's, whose `Cupti`
     reads the times, or a stand-in with its `Cupti`; `arrays`, a caller's own
     draw of the launch's operands (`materialized`), else the tuner's; `outputs`,
-    where given, takes each timed config's outputs from its first run, so a
-    caller checking them compiles nothing more; `configs`, the configs to time
-    where not every one (a sweep's sample of them)."""
+    where given, is called with each timed config and its outputs from its
+    first run, which it reads before the next config runs (they are freed
+    after), so a caller checking them compiles nothing more and holds one
+    config's outputs at a time; `configs`, the configs to time where not every
+    one (a sweep's sample of them)."""
     if profiler is None:
         from jax.experimental.mosaic.gpu import profiler
 
@@ -702,7 +704,7 @@ def measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None, *,
                 executable, lowering, compiling = future.result()
                 (_, launched), first = cupti.measure(executable, aggregate=False)(flush, arrays)
                 if outputs is not None:
-                    outputs[config] = launched
+                    outputs(config, launched)
                 del launched
                 runs = [first if isinstance(first, list) else [],
                         *(_kernel_times(cupti, executable, flush, arrays) for _ in range(REPEATS - 1))]
