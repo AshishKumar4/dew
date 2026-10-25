@@ -102,22 +102,30 @@ NESTED = re.compile(r"^(?:-r|-c|--requirements?|--constraints?)(?:=|\s+)?(.+)$")
 operand quoted as a shell word, `${NAME}` taken from the environment, as pip and uv read it."""
 
 
-def filed(path: Path, seen: frozenset[Path] = frozenset()) -> str:
+def filed(path: Path, seen: frozenset[Path] = frozenset()) -> str | list:
     """The lines of file `path`, and, where it reads others (`NESTED`), however deep, each once along a path
-    of reads, its lines and theirs each apart: what installing from it reads, so a changed pin in an included
-    file names a new environment, and a pin moved between a file and one it reads is a change too
-    (OrganicMouse: a reference's override read another, whose change reused a stale environment). A file
-    reading none is its lines alone, as it was named before."""
+    of reads, its lines and theirs each apart, a list `reference` encodes whole: what installing from it
+    reads, so a changed pin in an included file names a new environment, and a pin moved between a file and
+    one it reads is a change too (OrganicMouse: a reference's override read another, whose change reused a
+    stale environment). A file reading none is its lines alone, as it was named before."""
     text = path.read_text()
     reads = []
     for line in text.splitlines():
-        if (found := NESTED.match(line.strip())) and (words := shlex.split(found[1], comments=True)):
-            operand = re.sub(r"\$\{(\w+)\}", lambda name: os.environ.get(name[1], name[0]), words[0])
-            if "://" not in operand:
-                reads.append(path.parent / operand)
+        if not (found := NESTED.match(line.strip())):
+            continue
+        # As uv reads an operand: a shell word, or as written where it is none (a name holding one quote).
+        try:
+            words = shlex.split(found[1], comments=True)
+        except ValueError:
+            words = [found[1].strip()]
+        if not words:
+            continue
+        operand = re.sub(r"\$\{(\w+)\}", lambda name: os.environ.get(name[1], name[0]), words[0])
+        if "://" not in operand:
+            reads.append(path.parent / operand)
     seen |= {path.resolve()}
     nested = [filed(read, seen) for read in reads if read.resolve() not in seen]
-    return json.dumps([text, *nested]) if nested else text
+    return [text, *nested] if nested else text
 
 
 def reference(name: str, install: list[str], python: str = "3.12", cache: Path = CACHE) -> Path:

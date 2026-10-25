@@ -122,7 +122,13 @@ def test_a_file_a_references_file_reads_names_it_too(tmp_path, monkeypatch):
     quoted = environments.reference("torch", arguments, cache=cache)
     (tmp_path / "locks/selected.txt").write_text("triton==3.5\n")
     assert environments.reference("torch", arguments, cache=cache) != quoted
-    assert len(installs(asked)) == 6
+    # A name holding a lone quote is read as written, as uv reads it.
+    (tmp_path / "locks/pins'2026.txt").write_text("tokenizers==0.22\n")
+    override.write_text("-r pins'2026.txt\n")
+    literal = environments.reference("torch", arguments, cache=cache)
+    (tmp_path / "locks/pins'2026.txt").write_text("tokenizers==0.23\n")
+    assert environments.reference("torch", arguments, cache=cache) != literal
+    assert len(installs(asked)) == 8
 
 
 def test_the_command_line_takes_a_references_installation_whole_after_the_separator(tmp_path):
