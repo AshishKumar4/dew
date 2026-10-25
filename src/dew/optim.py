@@ -20,7 +20,6 @@ from __future__ import annotations
 
 import dataclasses
 import fnmatch
-import functools
 import inspect
 import math
 from collections.abc import Callable, Mapping, Sequence
@@ -176,17 +175,18 @@ def _clip_scale(s_max: jax.Array, tau: float) -> jax.Array:
     return jnp.where(s_max > 0, jnp.minimum(1.0, tau / (s_max + 1e-6)), 1.0)
 
 
-def _rescaled_update(update: jax.Array, param: jax.Array, gamma: jax.Array,
-                     split: int) -> jax.Array:
-    """Rescale one update so that applying it rescales the weights by `gamma`.
+def _columns(gamma: jax.Array, split: int, last: int) -> jax.Array:
+    """`gamma` over `split` heads of a leaf's last axis, `last` wide, as one factor a column: the
+    `[last]` vector a step's rescale holds, the same shape however the clip groups the heads."""
+    return jnp.broadcast_to(jnp.asarray(gamma, jnp.float32).reshape(split, -1),
+                            (split, last // split)).reshape(last)
 
-    That update is `(gamma - 1) * param + gamma * update`, taken over
-    `split` heads."""
-    width = param.shape[-1] // split
-    shape = (*param.shape[:-1], split, width)
-    gamma = jnp.asarray(gamma, update.dtype)
-    out = (gamma - 1) * param.reshape(shape) + gamma * update.reshape(shape)
-    return out.reshape(param.shape)
+
+def _rescaled(stepped: jax.Array, columns: jax.Array) -> jax.Array:
+    """`stepped`, a leaf after its step, rescaled by its float32 `columns` factors along its last axis:
+    the product formed at float32 or wider and rounded to the leaf's dtype once, the paper's
+    `gamma * (W + update)` (Megatron Core's `clip_qk`, MaxText's `_clip_mla_weight`)."""
+    return (stepped.astype(at_least_fp32(stepped.dtype)) * columns).astype(stepped.dtype)
 
 
 def _mla_query_gamma(scale: jax.Array, nope: jax.Array, width: int) -> jax.Array:
@@ -223,13 +223,13 @@ def _qk_normed(params) -> set[tuple[str, ...]]:
 
 
 def _clip_leaf(qk_stats, tau: float, normed: set[tuple[str, ...]], path: jax.tree_util.KeyPath,
-               update: jax.Array, param: jax.Array) -> jax.Array:
-    """Fold QK-Clip's post-step weight rescale into one leaf's update.
+               param: jax.Array) -> jax.Array:
+    """QK-Clip's post-step rescale of one query or key leaf (`_rescales` picks them), a factor a
+    column of its last axis (`_columns`).
 
-    The clip acts on the weights after the step, `gamma * (W + update)`.
-    Written as an update that is `(gamma - 1) * W + gamma * update`, so the
-    optimizer chain can apply it after Muon and land on the same weights
-    MaxText's post-step rescale writes.
+    The clip acts on the weights after the step, `gamma * (W + update)`, and the step applies it
+    there (`stepped`): an update that would land on it, `(gamma - 1) * W + gamma * update`, rounds at
+    `W`'s scale twice where the product rounds once (ledger 1659).
 
     A projection's kernel and its bias rescale together, column for column, so
     a biased projection's queries and keys scale as an unbiased one's do.
@@ -252,8 +252,6 @@ def _clip_leaf(qk_stats, tau: float, normed: set[tuple[str, ...]], path: jax.tre
     attention rescales per head instead, the rope slice of its query by the
     full gamma."""
     names = _dict_names(path)
-    if len(names) < 2 or names[-1] not in ('kernel', 'bias') or names[-2] not in QK_PROJECTIONS:
-        return update
     if names[:-2] in normed:
         raise ValueError(
             f"QK-Clip reaches {'.'.join(names)}, whose layer norms its queries and keys: the "
@@ -281,15 +279,13 @@ def _clip_leaf(qk_stats, tau: float, normed: set[tuple[str, ...]], path: jax.tre
     proj = names[-2]
     nope = _sown(node, 'qk_nope')
     if proj in ('q_proj', 'q_b_proj') and nope is not None:
-        return _rescaled_update(
-            update, param, _mla_query_gamma(scale, nope, last // heads), heads)
+        return _columns(_mla_query_gamma(scale, nope, last // heads), heads, last)
     if proj == 'kv_b_proj':
         if nope is None:
             raise ValueError(
                 f"QK-Clip reaches {'.'.join(names)} with no nope width sowed; "
                 "a latent key projection needs its layer's 'qk_nope'")
-        return _rescaled_update(
-            update, param, _mla_key_gamma(scale, nope, last // heads), heads)
+        return _columns(_mla_key_gamma(scale, nope, last // heads), heads, last)
     kv_heads, head_dim = _sown(node, 'kv_heads'), _sown(node, 'head_dim')
     if kv_heads is None or head_dim is None:
         raise ValueError(
@@ -303,9 +299,17 @@ def _clip_leaf(qk_stats, tau: float, normed: set[tuple[str, ...]], path: jax.tre
     if proj in ('q_proj', 'q_b_proj'):
         query = jnp.arange(last // heads)[None, :] < head_dim
         gamma = jnp.where(query, jnp.sqrt(grouped[groups])[:, None], jnp.ones((), scale.dtype))
-        return _rescaled_update(update, param, gamma, heads)
+        return _columns(gamma, heads, last)
     columns = jnp.arange(last) // (last // kv_heads)
-    return _rescaled_update(update, param, jnp.sqrt(grouped[columns])[None], 1)
+    return jnp.sqrt(grouped[columns]).astype(jnp.float32)
+
+
+class QKClipState(NamedTuple):
+    """The rescale QK-Clip leaves for the stepped weights (`stepped`): each query and key leaf's factor
+    a column of its last axis by its path, every factor one before the first update or where no
+    maxima were sown, so the state keeps one structure."""
+
+    rescales: Mapping[str, jax.Array]
 
 
 def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArgs:
@@ -313,6 +317,9 @@ def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArg
 
     This is Kimi K2's MuonClip (arXiv 2507.20534), applied after the update,
     per query group under grouped-query attention as Megatron Core clips it.
+    The update passes through unchanged and the rescale rides the state
+    (`QKClipState`), which `stepped` applies to the weights the update moved:
+    one rounding of `gamma * (W + update)`, the paper's.
 
     The per-head maxima arrive as `qk_stats`, the `qk` collection the model
     sowed, which the trainer forwards from the loss's `Aux`. Without them
@@ -321,18 +328,53 @@ def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArg
     if tau <= 0:
         raise ValueError(f"the clip threshold bounds positive logits, got {tau}")
 
-    def init_fn(params) -> optax.EmptyState:
-        del params
-        return optax.EmptyState()
+    def init_fn(params) -> QKClipState:
+        return QKClipState(_rescales(params, None, tau))
 
     def update_fn(updates, state, params=None, qk_stats=None):
-        if qk_stats is None or params is None:
+        if params is None:
             return updates, state
-        clipped = jax.tree_util.tree_map_with_path(
-            functools.partial(_clip_leaf, qk_stats, tau, _qk_normed(params)), updates, params)
-        return clipped, state
+        return updates, QKClipState(_rescales(params, qk_stats, tau))
 
     return optax.GradientTransformationExtraArgs(init_fn, update_fn)
+
+
+def _rescales(params, qk_stats, tau: float) -> dict[str, jax.Array]:
+    """Each query and key leaf's factor a column by its path (`_clip_leaf`), every factor one where no
+    maxima were sown, so the state has one structure from its first step to its last."""
+    normed = _qk_normed(params) if qk_stats is not None else set()
+    held = {}
+    for path, param in jax.tree_util.tree_leaves_with_path(params):
+        names = _dict_names(path)
+        if len(names) < 2 or names[-1] not in ('kernel', 'bias') or names[-2] not in QK_PROJECTIONS:
+            continue
+        held[jax.tree_util.keystr(path)] = (jnp.ones(param.shape[-1], jnp.float32) if qk_stats is None
+                                             else _clip_leaf(qk_stats, tau, normed, path, param))
+    return held
+
+
+def stepped(params, updates, opt_state):
+    """`params` moved by `updates`, then each leaf the optimizer's state holds a post-step rescale for
+    (`QKClipState`, anywhere in a chain's state) rescaled once: the weights a step stores, and the
+    only way to form them (the trainer's transaction, `power_profiles`' averages)."""
+    moved = optax.apply_updates(params, updates)
+    rescales: dict[str, jax.Array] = {}
+    for held in jax.tree_util.tree_leaves(opt_state, is_leaf=lambda node: isinstance(node, QKClipState)):
+        if isinstance(held, QKClipState):
+            rescales.update(held.rescales)
+    if not rescales:
+        return moved
+    lacking = rescales.keys() - {jax.tree_util.keystr(path)
+                                 for path, _ in jax.tree_util.tree_leaves_with_path(moved)}
+    if lacking:
+        raise ValueError(f"the optimizer's state rescales {sorted(lacking)}, which the stepped "
+                         "parameters lack: step the tree the optimizer was updated with")
+
+    def rescaled(path, leaf):
+        key = jax.tree_util.keystr(path)
+        return _rescaled(leaf, rescales[key]) if key in rescales else leaf
+
+    return jax.tree_util.tree_map_with_path(rescaled, moved)
 
 
 def _muonclip_groups(learning_rate, qk_clip_threshold: float = 100.0, **opts):
@@ -566,7 +608,7 @@ def power_profiles(solver: optax.GradientTransformation,
         if params is None:
             raise ValueError("power_profiles averages the parameters, so its update needs them")
         updates, inner = solver.update(updates, state.inner, params, **extra_args)
-        produced = optax.apply_updates(params, updates)
+        produced = stepped(params, updates, inner)
         averages = tuple(ema_update(average, produced, powered_decay(state.powers[index])(state.updates))
                          for index, average in enumerate(state.averages))
         return updates, PowerProfilesState(state.updates + 1, state.stds, state.powers, averages, inner)
@@ -1105,4 +1147,4 @@ class Exponential(ScheduleBase):
 
 
 __all__ = ["Cosine", "Exponential", "Linear", "OneCycle", "ParamGroup", "Power", "PowerProfilesState",
-           "PowerTail", "ScheduleBase"]
+           "PowerTail", "QKClipState", "ScheduleBase", "stepped"]
