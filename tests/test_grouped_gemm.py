@@ -585,8 +585,8 @@ def test_an_ampere_gpu_runs_mosaics_launch_first(sizes, out_dtype):
 
 @pytest.mark.skipif(not AMPERE_CLASS, reason="no mma.sync kernel this GPU and JAX lower")
 def test_an_mma_sync_forward_of_no_depth_is_zero():
-    """A product of no depth through mma.sync's tile, named on an Ampere GPU, is zero: its walk takes no
-    step."""
+    """A product of no depth through mma.sync's tile, named on an Ampere GPU, is zero: it sums nothing,
+    and no launch runs."""
     lhs, rhs = jnp.zeros((128, 0), jnp.bfloat16), jnp.zeros((1, 0, 256), jnp.bfloat16)
     with ampere(), generation.chosen(grouped_matmul="mosaic_gpu"):
         got = jax.jit(lambda x, w: template.gemm(x, w, jnp.asarray([128], jnp.int32), out_dtype=jnp.float32,

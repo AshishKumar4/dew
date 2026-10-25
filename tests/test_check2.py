@@ -1,26 +1,30 @@
 """Check 2 as a gate (tests/certified.py `certified`, `assert_certified`): a computation run one
-primitive at a time, natively, each equation held to its own operation's contract, as the CPU lane
-computes (its subnormals flushed), and a primitive without a contract refused."""
+primitive at a time, natively, each equation held to its own operation's contract, as the lane
+computes (`lane`, measured on it), and a primitive without a contract refused."""
 
 import certified as ct
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 import op_certificates as oc
 import pytest
 
-SUBNORMAL = np.float32(2.0 ** -140)
 
-
-def test_the_lane_flushes_subnormal_operands_and_results():
-    """XLA on the CPU lane reads a subnormal operand as zero and flushes a subnormal result, jitted and
-    eager, with YNNPACK's fusions and without (`FLUSHES`, which every contract reads)."""
+@pytest.mark.parametrize("dtype, subnormal, halves", [
+    (np.float32, 2.0 ** -140, 2.0 ** -70), (ml_dtypes.bfloat16, 2.0 ** -130, 2.0 ** -66)])
+def test_the_lane_flushes_operands_and_results_alike_however_it_compiles(dtype, subnormal, halves):
+    """In float32 and in bfloat16, the lane reads a subnormal operand as zero exactly where it flushes a
+    subnormal product (of two `halves`) and where a comparison reads it as zero, jitted and eager, with
+    YNNPACK's fusions and without: the one fact of subnormals its measure takes (`Lane.flushes`), which
+    every contract reads."""
     from reference_error import without_ynn
 
+    flushes, tiny, half = ct.lane().flushes, dtype(subnormal), dtype(halves)
     for run in (jax.jit, lambda fn: fn, without_ynn):
-        assert float(run(lambda x: jnp.multiply(x, np.float32(2.0 ** 100)))(SUBNORMAL)) == 0.0
-        assert float(run(jnp.multiply)(np.float32(2.0 ** -70), np.float32(2.0 ** -70))) == 0.0
-    assert ct.FLUSHES
+        assert (float(run(lambda x: jnp.multiply(x, dtype(2.0 ** 100)))(tiny)) == 0.0) == flushes
+        assert (float(run(jnp.multiply)(half, half)) == 0.0) == flushes
+        assert bool(run(jnp.equal)(tiny, dtype(0))) == flushes
 
 
 @pytest.mark.parametrize("name, fn, operands", [
@@ -28,8 +32,10 @@ def test_the_lane_flushes_subnormal_operands_and_results():
     ("sqrt", jnp.sqrt, 1), ("log", jnp.log, 1), ("exp", jnp.exp, 1)])
 def test_each_contract_holds_the_lanes_own_operation_and_refuses_a_step_off_it(name, fn, operands):
     """The lane's own result of each operation on random float32 operands, subnormal products and
-    quotients included, holds its contract; the same result one step of float32 off at an element
-    breaks it there and nowhere else."""
+    quotients included, holds its contract at the lane's measured reach; the same result moved past
+    that reach at an element (twice the reach's steps, past both neighbours of the exact value and every
+    step the reach allows beyond them) breaks it there and nowhere else, and one step off breaks a
+    correctly rounded operation's."""
     rng = np.random.default_rng(1)
     values = [np.float32(rng.uniform(0.01, 4, 256) * rng.choice([1, 2.0 ** -70], 256))
               for _ in range(operands)]
@@ -38,12 +44,14 @@ def test_each_contract_holds_the_lanes_own_operation_and_refuses_a_step_off_it(n
     result = np.asarray(jax.jit(fn)(*values))
     contract = ct.CONTRACTS[name]
     assert np.all(contract({}, values, result, oc.FLOAT32))
+    reach = ct.lane().reach[name, "float32"]
     stepped = result.copy()
     stepped[3] = np.nextafter(stepped[3], np.float32(np.inf)) if stepped[3] else np.float32(1e-30)
-    stepped[7] = np.nextafter(np.nextafter(stepped[7], np.float32(-np.inf)), np.float32(-np.inf))
+    for _ in range(2 * max(reach, 1)):
+        stepped[7] = np.nextafter(stepped[7], np.float32(-np.inf))
     held = contract({}, values, stepped, oc.FLOAT32)
     assert not held[7] and np.all(np.delete(held, [3, 7]))
-    if name not in ("log", "exp"):
+    if reach == 0:
         assert not held[3]
 
 
@@ -94,64 +102,103 @@ def test_a_computation_is_certified_through_its_calls_and_a_primitive_without_a_
         ct.assert_certified(lambda x: jnp.sin(x), lambda seed: (x,), "sine", seeds=1)
 
 
-def test_the_lanes_unfaithful_operations_are_findings_with_their_paths():
-    """A transcendental more than its two neighbours from the exact value breaks its contract whatever
-    its vendor documents (erf_inv as the lane computes it, inside `jax.random.normal`), and so does a
-    division by a constant, which XLA computes as a product with the constant's reciprocal, not the
-    correctly rounded quotient; a division by a value the program is given is correctly rounded."""
-    rng = np.random.default_rng(4)
-    u = np.float32(rng.uniform(-0.99, 0.99, 512))
-    _, findings = ct.certified(jax.lax.erf_inv, u)
-    assert len(findings) == 1 and findings[0].startswith("erf_inv#0")
-    x = np.float32(rng.uniform(0.1, 3, 512))
-    _, findings = ct.certified(lambda x: x / 3, x)
-    assert len(findings) == 1 and findings[0].startswith("div#0")
+def test_an_equation_past_the_lanes_reach_is_a_finding_by_its_path():
+    """A division by a literal, which XLA may compute as a product with the literal's rounded reciprocal
+    (ledger 1402), is held to the lane's own division's reach: it is a finding, named by its equation,
+    exactly where its results' levels pass that reach; a division by a value the program is given is the
+    lane's own division and holds."""
+    x = np.float32(np.random.default_rng(4).uniform(0.1, 3, 512))
+    outputs, findings = ct.certified(lambda x: x / 3, x)
+    levels = ct.LEVELS["div"]([x, np.float32(3)], outputs, oc.FLOAT32, ct.lane().flushes)
+    past = int(np.count_nonzero(levels > ct.lane().reach["div", "float32"]))
+    assert len(findings) == (1 if past else 0)
+    named = f"div#0: {past} of 512 elements break the contract"
+    assert all(finding.startswith(named) for finding in findings)
     assert ct.certified(jnp.divide, x, np.float32(np.full(512, 3)))[1] == []
 
 
-def test_the_lane_detects_tininess_after_rounding_and_keeps_subnormals_in_moves_and_casts():
-    """A product exactly 2^-126 - 2^-172 rounds to the least normal at an unbounded exponent, and the lane
-    keeps it (tininess after rounding); a reshape, a negation and a cast between bf16 and float32 keep a
-    subnormal; a comparison reads it as zero; a float32 past int32's range saturates and NaN casts to 0."""
-    import ml_dtypes
+def test_a_sum_loses_a_subnormal_only_where_the_lane_flushes_it():
+    """A sum of one subnormal returned as zero holds its contract where the lane flushes (its operand
+    reads as zero) and breaks it where the lane keeps subnormals, whose sums lose nothing to underflow;
+    the lane's own sum holds either way."""
+    terms, params = np.float32([2.0 ** -140]), {"axes": (0,)}
+    lost = ct.CONTRACTS["reduce_sum"](params, [terms], np.float32(0), oc.FLOAT32)
+    assert bool(lost) == ct.lane().flushes
+    assert ct.CONTRACTS["reduce_sum"](params, [terms], np.asarray(jnp.sum(terms)), oc.FLOAT32)
 
+
+def test_the_lane_detects_tininess_after_rounding_and_keeps_subnormals_in_moves_and_casts():
+    """A product exactly 2^-126 - 2^-172 rounds to the least normal, at an unbounded exponent and on the
+    gradual grid alike, and the lane keeps it (tininess after rounding); a subnormal product holds the
+    contract as the lane rounds it, zero where it flushes and the subnormal where it keeps them, and the
+    other breaks it; a reshape, a negation and a cast between bf16 and float32 keep a subnormal; a
+    float32 past int32's range saturates and NaN casts to 0."""
     a, b = np.float32(1 - 2.0 ** -23), np.float32(2.0 ** -126 + 2.0 ** -149)
     native = np.asarray(jax.jit(jnp.multiply)(a, b))
     assert float(native) == 2.0 ** -126
     assert np.all(ct.CONTRACTS["mul"]({}, [a, b], native, oc.FLOAT32))
     assert not np.all(ct.CONTRACTS["mul"]({}, [a, b], np.float32(0), oc.FLOAT32))
-    flushed = [np.float32(2.0 ** -70)] * 2
-    assert not np.all(ct.CONTRACTS["mul"]({}, flushed, np.float32(2.0 ** -140), oc.FLOAT32))
+    tiny_product = [np.float32(2.0 ** -70)] * 2
+    flushed, kept = np.float32(0), np.float32(2.0 ** -140)
+    own, other = (flushed, kept) if ct.lane().flushes else (kept, flushed)
+    assert np.all(ct.CONTRACTS["mul"]({}, tiny_product, own, oc.FLOAT32))
+    assert not np.any(ct.CONTRACTS["mul"]({}, tiny_product, other, oc.FLOAT32))
     tiny = np.float32([2.0 ** -140, -(2.0 ** -130)])
     assert np.array_equal(np.asarray(jax.jit(lambda x: -x.reshape(2, 1))(tiny)).ravel(), -tiny)
     assert np.all(ct.CONTRACTS["neg"]({}, [tiny], -tiny, oc.FLOAT32))
     narrow = np.array([2.0 ** -130], ml_dtypes.bfloat16)
     assert float(jax.jit(lambda x: x.astype(jnp.float32))(narrow)[0]) == 2.0 ** -130
     assert float(jax.jit(lambda x: x.astype(jnp.bfloat16))(np.float32(2.0 ** -130))) == 2.0 ** -130
-    assert bool(jax.jit(jnp.equal)(np.float32(2.0 ** -140), np.float32(0)))
     saturated = jax.jit(lambda x: x.astype(jnp.int32))(np.float32([2.0 ** 31, -(2.0 ** 32), np.nan]))
     assert np.array_equal(saturated, [2 ** 31 - 1, -(2 ** 31), 0])
     beyond = np.float32([2.0 ** 31, -(2.0 ** 32), np.nan, 2.7])
     assert ct.certified(lambda x: x.astype(jnp.int32), beyond)[1] == []
 
 
-def test_a_faithful_result_is_one_of_its_two_neighbours_on_the_lanes_grid():
-    """exp(-2^-25) lies between 1 - 2^-24 and 1: both are faithful, and 1 - 2^-23, the value below the
-    next binade's spacing, is not; a tiny exact value's neighbours on the flushing grid are zero and the
-    least normal; specials are their limits."""
-    x = np.float32([-(2.0 ** -25)])
-    assert np.all(ct.CONTRACTS["exp"]({}, [x], np.float32([1 - 2.0 ** -24]), oc.FLOAT32))
-    assert np.all(ct.CONTRACTS["exp"]({}, [x], np.float32([1.0]), oc.FLOAT32))
-    assert not np.any(ct.CONTRACTS["exp"]({}, [x], np.float32([1 - 2.0 ** -23]), oc.FLOAT32))
-    deep = np.float32([-100.0])
-    assert np.all(ct.CONTRACTS["exp"]({}, [deep], np.float32([0.0]), oc.FLOAT32))
-    assert np.all(ct.CONTRACTS["exp"]({}, [deep], np.float32([2.0 ** -126]), oc.FLOAT32))
+@pytest.mark.parametrize("flushes", [True, False])
+def test_a_results_level_counts_its_grid_steps_past_the_exact_values_neighbours(flushes):
+    """exp(-2^-25) lies between 1 - 2^-24 and 1: both are level 1 (faithful) and 1 - 2^-23, a step
+    below, is level 2, on either grid; exp(-100)'s neighbours are zero and the least normal on the
+    flushing grid, and two subnormals on the gradual one, where zero is a step past for each subnormal
+    below them; a special at its limit is level 0 and at any other value no reach admits it."""
+    exp = ct.LEVELS["exp"]
+    x = np.float32([-(2.0 ** -25)] * 3)
+    around = np.float32([1 - 2.0 ** -24, 1.0, 1 - 2.0 ** -23])
+    assert exp([x], around, oc.FLOAT32, flushes).tolist() == [1, 1, 2]
+    deep = exp([np.float32([-100.0])], np.float32([0.0]), oc.FLOAT32, flushes)
+    below = int(np.exp(-100.0) / 2.0 ** -149)
+    assert deep.tolist() == ([1] if flushes else [1 + below])
+    if flushes:
+        assert exp([np.float32([-100.0])], np.float32([2.0 ** -126]), oc.FLOAT32, flushes).tolist() == [1]
     specials = np.float32([np.inf, -np.inf, np.nan])
-    assert np.all(ct.CONTRACTS["exp"]({}, [specials], np.float32([np.inf, 0.0, np.nan]), oc.FLOAT32))
+    assert exp([specials], np.float32([np.inf, 0.0, np.nan]), oc.FLOAT32, flushes).tolist() == [0, 0, 0]
+    assert np.all(exp([specials], np.float32([0.0, np.inf, 1.0]), oc.FLOAT32, flushes) == ct.UNREACHED)
     limits = np.float32([-np.inf, np.inf, np.nan])
-    assert np.all(ct.CONTRACTS["log"]({}, [np.float32([0.0, np.inf, -1.0])], limits, oc.FLOAT32))
+    log = ct.LEVELS["log"]([np.float32([0.0, np.inf, -1.0])], limits, oc.FLOAT32, flushes)
+    assert log.tolist() == [0, 0, 0]
     poles = np.float32([np.inf, -np.inf])
-    assert np.all(ct.CONTRACTS["erf_inv"]({}, [np.float32([1.0, -1.0])], poles, oc.FLOAT32))
+    assert ct.LEVELS["erf_inv"]([np.float32([1.0, -1.0])], poles, oc.FLOAT32, flushes).tolist() == [0, 0]
+
+
+@pytest.mark.parametrize("flushes", [True, False])
+@pytest.mark.parametrize("fmt", [oc.FLOAT32, oc.BFLOAT16], ids=["float32", "bfloat16"])
+def test_a_zero_of_the_wrong_sign_or_a_missed_exact_value_is_no_rounding(flushes, fmt):
+    """exp(-1000) is positive and under the least value past zero: +0 is level 1, and -0 no rounding of
+    it; sqrt(-0) is -0 exactly and +0 no rounding of it; exp(±0) is 1 and log(1) is +0 exactly, so a step
+    of the grid off either, which a measured reach would otherwise admit, is no rounding either."""
+    dtype = ct.VALUES[fmt.name]
+
+    def at(values):
+        return np.asarray(values, np.float64).astype(dtype)
+
+    exp, log, sqrt = ct.LEVELS["exp"], ct.LEVELS["log"], ct.LEVELS["sqrt"]
+    assert exp([at([-1000.0, -1000.0])], at([0.0, -0.0]), fmt, flushes).tolist() == [1, ct.UNREACHED]
+    assert sqrt([at([-0.0, -0.0])], at([-0.0, 0.0]), fmt, flushes).tolist() == [0, ct.UNREACHED]
+    above_one = float(np.nextafter(dtype(1), dtype(2)))
+    ones = exp([at([0.0, -0.0, 0.0])], at([1.0, 1.0, above_one]), fmt, flushes)
+    assert ones.tolist() == [0, 0, ct.UNREACHED]
+    least = 2.0 ** fmt.emin if flushes else 2.0 ** (fmt.emin - fmt.precision + 1)
+    assert log([at([1.0, 1.0])], at([0.0, least]), fmt, flushes).tolist() == [0, ct.UNREACHED]
 
 
 def test_each_equation_runs_under_its_own_context():
@@ -222,12 +269,14 @@ def test_extrema_order_zeros_and_propagate_nan_as_the_lane_does():
 
 
 def test_an_exp_past_its_range_is_held_at_its_neighbours_however_far():
-    """Past `EXP_RANGE` every exp lies between the same two neighbours of the lane's grid: a finite fp32
-    as far as ±1e30 or ±3e38 certifies as exp(±100) does, with no enclosure of its exponent, and the
-    largest finite value is as faithful above as inf, the least normal below as zero."""
+    """Past `EXP_RANGE` every exp lies between the same two neighbours of the grid: a finite fp32 as far
+    as ±1e30 or ±3e38 certifies as exp(±100) does, with no enclosure of its exponent, and the largest
+    finite value is as faithful above as inf, and below the least value past zero on the grid (the least
+    normal where the lane flushes, the least subnormal where it does not) as zero."""
     far = np.float32([1e30, -1e30, 3e38, -3e38, 1000.0, -1000.0])
     assert ct.certified(jnp.exp, far)[1] == []
-    biggest, least = np.finfo(np.float32).max, np.finfo(np.float32).tiny
-    for native in (np.float32([np.inf, 0.0] * 3), np.float32([biggest, least] * 3)):
-        assert np.all(ct.CONTRACTS["exp"]({}, [far], native, oc.FLOAT32))
+    biggest = np.finfo(np.float32).max
+    for flushes, least in ((True, np.finfo(np.float32).tiny), (False, np.float32(2.0 ** -149))):
+        for native in (np.float32([np.inf, 0.0] * 3), np.float32([biggest, least] * 3)):
+            assert ct.LEVELS["exp"]([far], native, oc.FLOAT32, flushes).tolist() == [1] * 6
     assert not np.any(ct.CONTRACTS["exp"]({}, [far], np.float32([1.0] * 6), oc.FLOAT32))

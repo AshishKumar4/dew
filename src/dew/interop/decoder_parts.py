@@ -22,7 +22,7 @@ from flax.traverse_util import flatten_dict
 from dew import records
 from dew._model_types import SANDWICH_NORMS
 from dew.interop.config_records import NativeFields, native_fields
-from dew.interop.safetensors_io import LazyTensors
+from dew.interop.safetensors_io import LazyTensors, tensor_specs
 from dew.interop.streaming import WeightLayout
 from dew.nn.activations import GatedActivation, Situ
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -32,6 +32,7 @@ from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers import AttentionMixer, MixerBase
 from dew.nn.rope import RopeScaling, YarnScaling
 from dew.nn.text_encoders import check_tree
+from dew.registry import from_record, record_fields
 
 # The KV cache is allocated at the full decode length, so a 128k-context
 # checkpoint would allocate one of those whether the caller asked or not.
@@ -217,7 +218,7 @@ class DrafterRefused(ValueError):
     """
 
 
-def _refuse_drafter(hf_config: Mapping[str, object]) -> None:
+def refuse_drafter(hf_config: Mapping[str, object]) -> None:
     """Refuse a SpecForge DFlash drafter, DSpark's among them, by the
     `num_target_layers` it places its target layers by (dflash.py:256-298 in
     RadixArk/Kimi-K3-DSpark at 3c5bac3). DFlashDraftModel, DFlash2DraftModel,
@@ -818,7 +819,7 @@ def softmax_top_k(hf_config: Mapping[str, object], used: set[str]) -> int:
 def translated(hf_config: Mapping[str, object], family: "DecoderFamily") -> DecoderFields:
     """Translate a config as `family` reads it, refusing a drafter and any
     setting Dew does not compute."""
-    _refuse_drafter(hf_config)
+    refuse_drafter(hf_config)
     config, unknown = translate_family_config(hf_config, family)
     if unknown:
         refuse(f"config fields {sorted(unknown)}",
@@ -852,8 +853,42 @@ def translate_family_config(hf_config: Mapping[str, object],
             spelled[canonical] = value
             used.add(alias)
     config = family.translate_config({**(family.defaults if own else {}), **spelled}, used)
+    modeling_overrides(hf_config, config, used)
 
     return config, _unread(hf_config, used)
+
+
+def modeling_overrides(source: Mapping[str, object], config: DecoderFields, used: set[str]) -> None:
+    """Apply the source's per-kind attention overrides without replacing its other mixer fields.
+    Recurrent kinds retain their causal recurrence; a block-bidirectional override needs attention."""
+    if "modeling_overrides" not in source:
+        return
+    used.add("modeling_overrides")
+    overrides = records.record(source["modeling_overrides"], "modeling_overrides")
+    if set(overrides) - {"attention"}:
+        refuse("modeling_overrides", "only its attention record is supported")
+    attention = records.record(overrides.get("attention", {}), "modeling_overrides.attention")
+    kinds = kinds_of(config)
+    declared = config.get("layer_types")
+    declared = ("full_attention",) if declared is None else records.strings(declared, "layer_types")
+    for name, mode in attention.items():
+        if name not in declared:
+            refuse(f"attention override for {name}", "the decoder has no such layer kind")
+        if mode not in ("causal", "block_bidirectional"):
+            refuse(f"attention override {mode!r}", "the supported modes are causal and block_bidirectional")
+        kind = kinds.get(name, native_fields(LayerKind)())
+        specified = kind.get("mixer", config.get("mixer"))
+        if mode == "causal" and specified is None:
+            continue
+        mixer = AttentionMixer() if specified is None else from_record(MixerBase, specified)
+        if not isinstance(mixer, AttentionMixer):
+            if mode != "causal":
+                refuse(f"block-bidirectional {name}", "a recurrent kind remains causal")
+            continue
+        fields = record_fields(mixer, AttentionMixer)
+        fields["bidirectional_blocks"] = mode == "block_bidirectional"
+        kind["mixer"] = {"class": "attention", "fields": fields}
+        kinds[name] = kind
 
 
 # Every wrapper record carries the audio fields; families without an audio
@@ -1389,8 +1424,7 @@ def layout_tensors(layouts: Mapping[str, WeightLayout], variables: Mapping[str, 
     """The layouts' tensors and `retained` beside them, each built when it is
     read, so a sharded writer holds one shard of the export, not all of it."""
     kept = retained or {}
-    specs = {**{name: jax.ShapeDtypeStruct(np.shape(value), np.asarray(value).dtype)
-                for name, value in kept.items()},
+    specs = {**tensor_specs(kept),
              **{name: jax.ShapeDtypeStruct(layout.shape, layout.stored_dtype(variables, scalar_mode))
                 for name, layout in layouts.items()}}
     return LazyTensors(specs, lambda name: (

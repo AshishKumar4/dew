@@ -1,7 +1,9 @@
 """Dew's dense and convolution layers: flax's, with the bias's gradient summed at fp32.
 
 Every configuration a layer takes initializes and computes what flax's own
-layer does, bit for bit. The gradient of a bias, summed over the positions it
+layer does, bit for bit, where its fp32 sums are XLA's (`FP32_SUMS`): a CPU's own
+are Dew's product policy's (`dew.nn.precision.accumulated`, tests/test_cpu_accumulation.py).
+The gradient of a bias, summed over the positions it
 is broadcast over, is the fp32 sum torch's addmm and convolution take, and a
 biased bf16 projection's output is as close to float64 as torch's.
 """
@@ -11,11 +13,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, with_gradients
 
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense, DenseGeneral
-from dew.nn.precision import fp32_result_dot_general
+from dew.nn.precision import FP32_SUMS, fp32_result_dot_general
 from dew.quantization import Quantization, quantize_for_serving
 
 PARTITIONED = nn.with_partitioning(nn.initializers.lecun_normal(), (None, None))
@@ -69,17 +71,88 @@ CASES = ([(name, Dense, nn.Dense, *case) for name, case in LAYERS.items()]
 @pytest.mark.parametrize(("ours", "flaxs", "build", "dtype", "shape"), [case[1:] for case in CASES],
                          ids=[case[0] for case in CASES])
 def test_a_layer_initializes_and_computes_what_flaxs_does(ours, flaxs, build, dtype, shape):
-    """Flax's parameters bit for bit, and with them, its biases zero, flax's output."""
+    """Flax's parameters bit for bit, but for a batched kernel, which draws each batch member alone
+    (`test_a_batched_kernel_draws_each_member_at_its_own_fan_in`), and with flax's parameters, its
+    biases zero, flax's output where both sum their fp32 products as XLA does (`FP32_SUMS`)."""
     x = jnp.asarray(np.random.default_rng(0).standard_normal(shape), dtype)
     mine, theirs = build(ours), build(flaxs)
     variables = theirs.init(jax.random.key(0), x)
-    jax.tree.map(np.testing.assert_array_equal, mine.init(jax.random.key(0), x), variables)
+    drawn = mine.init(jax.random.key(0), x)
+    if getattr(theirs, "batch_dims", ()):
+        # The kernel draws a member at a time; its structure, shape, dtype and box are flax's, and
+        # every other leaf flax's bit for bit.
+        assert jax.tree.structure(drawn) == jax.tree.structure(variables)
+        for path, leaf in jax.tree_util.tree_leaves_with_path(drawn):
+            other = dict(jax.tree_util.tree_leaves_with_path(variables))[path]
+            if jax.tree_util.keystr(path).endswith("['kernel']"):
+                assert (leaf.shape, leaf.dtype) == (other.shape, other.dtype)
+            else:
+                np.testing.assert_array_equal(leaf, other)
+    else:
+        jax.tree.map(np.testing.assert_array_equal, drawn, variables)
     if dtype == jnp.bfloat16:  # variables restored at a dtype other than the one declared
         variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), nn.unbox(variables))
-    expected = theirs.apply(variables, x)
-    got = mine.apply(variables, x)
+    with jax.default_matmul_precision(FP32_SUMS):
+        expected = theirs.apply(variables, x)
+        got = mine.apply(variables, x)
     assert got.dtype == expected.dtype
     np.testing.assert_array_equal(np.asarray(got, np.float32), np.asarray(expected, np.float32))
+
+
+def test_a_batched_kernel_draws_each_member_at_its_own_fan_in():
+    """A DenseGeneral batched over 8 groups of 512 inputs draws each group's kernel as a layer of 512
+    inputs draws its own, at lecun's variance 1 / 512, where flax counts the groups as inputs too and
+    draws at 1 / 4096; DeepSeek V4's grouped output projection is such a layer. Each group's 32,768
+    entries pass the chi-square test of variance 1 / 512 at one in a billion each side (a normal's
+    bounds; lecun's truncated normal varies its sample variance less), which flax's draw fails by
+    far, the groups apart, and a partitioned initializer keeps its box."""
+    from scipy import stats
+
+    x = jnp.zeros((8, 2, 512))
+    layer = DenseGeneral(64, batch_dims=(0,), use_bias=False)
+    kernel = layer.init(jax.random.key(0), x)["params"]["kernel"]
+    entries = kernel[0].size
+    statistics = (entries - 1) * 512 * np.var(np.asarray(kernel, np.float64), axis=(1, 2), ddof=1)
+    low, high = stats.chi2.ppf([1e-9, 1 - 1e-9], entries - 1)
+    assert np.all((low < statistics) & (statistics < high)), (statistics, low, high)
+    assert len({np.asarray(member).tobytes() for member in kernel}) == 8
+    np.testing.assert_array_equal(layer.init(jax.random.key(0), x)["params"]["kernel"], kernel)
+    boxed = DenseGeneral(64, batch_dims=(0,), use_bias=False, kernel_init=PARTITIONED).init(
+        jax.random.key(0), x)["params"]["kernel"]
+    assert isinstance(boxed, nn.Partitioned) and boxed.value.shape == (8, 512, 64)
+    np.testing.assert_array_equal(boxed.value, kernel)
+
+
+@pytest.mark.parametrize("kernel_init", [nn.initializers.lecun_normal(), PARTITIONED], ids=["plain", "boxed"])
+def test_a_batched_kernel_of_no_members_is_empty(kernel_init):
+    """A batch axis of size zero draws an empty kernel, as flax's does, and computes an empty output."""
+    layer = DenseGeneral(64, batch_dims=(0,), use_bias=False, kernel_init=kernel_init)
+    x = jnp.zeros((0, 2, 512))
+    variables = layer.init(jax.random.key(0), x)
+    assert nn.unbox(variables)["params"]["kernel"].shape == (0, 512, 64)
+    assert layer.apply(variables, x).shape == (0, 2, 64)
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_batched_kernel_draws_its_members_where_its_names_place_them():
+    """A partitioned batched kernel drawn under a mesh by `jax.jit(init, out_shardings=...)` lands
+    split as its names say and holds the members a single device draws."""
+    from jax.sharding import Mesh, PartitionSpec
+
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ("model",))
+    init = nn.with_partitioning(nn.initializers.lecun_normal(), (None, None, "model"))
+    layer = DenseGeneral(64, batch_dims=(0,), use_bias=False, kernel_init=init)
+    x = jnp.zeros((8, 2, 512))
+    shardings = nn.get_sharding(jax.eval_shape(layer.init, jax.random.key(0), x), mesh)
+    placed = jax.jit(layer.init, out_shardings=shardings)(jax.random.key(0), x)["params"]["kernel"]
+    assert placed.value.sharding.spec == PartitionSpec(None, None, "model")
+    np.testing.assert_array_equal(np.asarray(placed.value),
+                                  np.asarray(layer.init(jax.random.key(0), x)["params"]["kernel"].value))
+
+
+BIAS_SEEDS = 64
+"""Check 1's declared seeds for a bias summed over every position, sized by `seeds_for` on armada: the
+most any layer took."""
 
 
 @pytest.mark.parametrize(("layer", "shape"), [
@@ -94,21 +167,68 @@ def test_a_bias_sums_its_gradient_over_every_position_at_fp32(layer, shape):
     taken at fp32 and rounded once into the bfloat16 bias, as torch's addmm and convolution sum
     it, where a bfloat16 sum, which JAX gives a broadcast's transpose (jax-ml/jax#30310), lands
     several times further from float64."""
-    rng = np.random.default_rng(1)
-    x = jnp.asarray(rng.standard_normal(shape), jnp.bfloat16)
-    variables = layer.init(jax.random.key(0), x)
-    shape = jax.eval_shape(layer.apply, variables, x).shape
-    cotangent = jnp.asarray(rng.standard_normal(shape), jnp.bfloat16)
+    variables = layer.init(jax.random.key(0), jnp.zeros(shape, jnp.bfloat16))
+    out = jax.eval_shape(layer.apply, variables, jnp.zeros(shape, jnp.bfloat16)).shape
 
-    def loss(params):
-        return jnp.sum(layer.apply({"params": params}, x).astype(jnp.float32) * cotangent.astype(jnp.float32))
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.standard_normal(shape), jnp.bfloat16),
+                jnp.asarray(rng.standard_normal(out), jnp.float32).astype(jnp.bfloat16).astype(jnp.float32))
 
-    got = np.asarray(jax.grad(loss)(variables["params"])["bias"], np.float64)
-    terms = np.asarray(cotangent, np.float64).reshape(8192, -1)
-    assert terms.shape[1] == got.size
-    truth = terms.sum(0).reshape(got.shape)
-    reference = np.asarray(jnp.asarray(terms.astype(np.float32).sum(0), jnp.bfloat16), np.float64)
-    assert_as_exact_as_the_reference(got, reference.reshape(got.shape), truth, "bias gradient")
+    @jax.jit
+    def dew(x, cotangent):
+        forward = with_gradients(lambda params: layer.apply({"params": params}, x).astype(jnp.float32))
+        return {"bias": forward(variables["params"], cotangent)[1]["bias"]}
+
+    def summed(cotangent, dtype):
+        """The cotangents' sum over every position in `dtype`, as torch's addmm sums a bias's."""
+        terms = np.asarray(cotangent, dtype).reshape(8192, -1)
+        return terms.sum(0).reshape(variables["params"]["bias"].shape)
+
+    def reference(x, cotangent):
+        # torch sums at fp32 and rounds once into the bfloat16 bias.
+        return {"bias": np.asarray(jnp.asarray(summed(cotangent, np.float32), jnp.bfloat16), np.float64)}
+
+    assert_as_exact(dew, reference, draw, f"{layer.__class__.__name__} bias gradient", seeds=BIAS_SEEDS,
+                    truth_fn=lambda x, cotangent: {"bias": summed(cotangent, np.float64)})
+
+
+SPLIT = {"conv": (Conv(3, (3, 3)), (8, 32, 32, 4), 256), "dense": (Dense(3), (8, 32, 32, 4), 256)}
+"""Each split bias gradient's layer, input shape and declared seeds for check 1 (`assert_as_exact`),
+sized by `seeds_for` on armada: a U-ViT's output convolution, and a projection over the same positions.
+Three elements a draw take 256 draws to resolve the factor."""
+
+
+@pytest.mark.mesh(devices=8)
+@pytest.mark.parametrize("site", sorted(SPLIT))
+def test_a_bias_gradient_is_as_exact_however_its_positions_are_split(site):
+    """A bias's gradient sums its cotangents over every position, and is as exact with the batch
+    split over eight devices as on one: check 1 over the site's seeds, truth the cotangents' float64
+    sum. A CPU sums each shard's in float64 and their total before it rounds (`precision.spread`);
+    a plain sum of each device's shard was 5.7 times as far from float64 (ledger 833)."""
+    layer, shape, seeds = SPLIT[site]
+    variables = layer.init(jax.random.key(0), jnp.zeros(shape, jnp.float32))
+    out = jax.eval_shape(layer.apply, variables, jnp.zeros(shape, jnp.float32)).shape
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:8]), ("batch",))
+    rows = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("batch"))
+    whole = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
+
+    def gradient(x, cotangent):
+        forward = with_gradients(lambda params: layer.apply({"params": params}, x))
+        _, grads = forward(variables["params"], cotangent)
+        return {"bias": grads["bias"]}
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return rng.standard_normal(shape).astype(np.float32), rng.standard_normal(out).astype(np.float32)
+
+    split = jax.jit(gradient, in_shardings=(rows, rows), out_shardings=whole)
+    alone = jax.jit(gradient)
+
+    def truth(x, cotangent):
+        return {"bias": np.asarray(cotangent, np.float64).reshape(-1, out[-1]).sum(0)}
+
+    assert_as_exact(split, alone, draw, f"{site} bias gradient", seeds=seeds, truth_fn=truth)
 
 
 @pytest.mark.parametrize("layer", [

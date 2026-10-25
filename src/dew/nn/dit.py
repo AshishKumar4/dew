@@ -29,7 +29,7 @@ from .blocks import FourierEmbedding, TimeProjection, modulation
 from .conv import Conv
 from .flops import MissingFlopsCount, counted_flops, projection_flops, real_lengths
 from .mlp import GatedMLP
-from .precision import at_least_fp32, float32_dot_general, fp32_result_dot_general
+from .precision import at_least_fp32, float32_dot_general, fp32_result_dot_general, weighted_total
 from .rope import rotary_freqs
 from .scan_orders import (
     ScanOrder,
@@ -60,8 +60,8 @@ def masked_mean(x, mask):
     `[B, L]` marks; a padded row moves nothing, and a row with no real
     tokens at all contributes zero."""
     weights = jnp.asarray(mask, x.dtype)[:, :, None]
-    counted = jnp.sum(weights, axis=1)
-    return jnp.sum(x * weights, axis=1) / jnp.maximum(counted, 1)
+    total, counted = weighted_total(x, weights, axis=1)
+    return total / jnp.maximum(counted, 1)
 
 
 def scan_indices(scan_order: str, H_P: int, W_P: int):

@@ -29,6 +29,7 @@ figure. The full head gradient is an output of every variant, not a saving.
 """
 
 import argparse
+import functools
 import inspect
 import json
 import statistics
@@ -39,6 +40,7 @@ from dataclasses import dataclass, replace
 import jax
 import jax.numpy as jnp
 
+from dew.nn.precision import added_to, running_sum, running_total
 from dew.nn.protocols import OutputTable
 from dew.objectives.lm.chunked import chunked_cross_entropy, fused_head_loss, tile_columns
 from dew.telemetry.benchmark import samples
@@ -98,7 +100,8 @@ def bounded(states, table, targets, variant: Variant):
 
 
 def fused(states, table, targets, variant: Variant):
-    """The gradient-in-forward head (`fused_head_loss`), at most `--token-tile` tokens a chunk (`fused_tokens`)."""
+    """The gradient-in-forward head (`fused_head_loss`), at most `--token-tile` tokens a chunk
+    (`fused_tokens`)."""
     total, (_, predicted, _) = fused_head_loss(
         states, OutputTable(table.T, vocab_major=False, softcap=variant.softcap), targets,
         jnp.ones(targets.shape, jnp.float32), z_loss=variant.z_loss, tile=variant.tile,
@@ -108,12 +111,39 @@ def fused(states, table, targets, variant: Variant):
     return total / targets.size, accuracy
 
 
+@functools.partial(jax.custom_vjp, nondiff_argnums=(1,))
+def _read_by_tiles(states, tiles: int):
+    """`states` once for each of `tiles` vocabulary tiles, their cotangents summed as Dew sums a
+    loop's terms (`added_to`): in one rounding on a CPU under Dew's wide arithmetic
+    (`dew.nn.precision.WIDE_CPU_ARITHMETIC`), where the whole head's one product is."""
+    return (states,) * tiles
+
+
+def _read_by_tiles_fwd(states, tiles: int):
+    return (states,) * tiles, None
+
+
+def _read_by_tiles_bwd(tiles: int, saved, cotangents):
+    del tiles, saved
+    running = running_sum(cotangents[0].shape, cotangents[0].dtype)
+    for cotangent in cotangents:
+        running = added_to(running, cotangent)
+    return (running_total(running),)
+
+
+_read_by_tiles.defvjp(_read_by_tiles_fwd, _read_by_tiles_bwd)
+
+
 def retained(states, table, targets, variant: Variant):
     """The pre-bounded vocabulary loop, held here so the baseline does not
-    move when the shipped kernel does; `remat` is it under `jax.checkpoint`."""
+    move when the shipped kernel does; `remat` is it under `jax.checkpoint`.
+    Its tiles' log partitions combine in one logsumexp after the loop, and
+    the states' gradient sums the tiles' as a loop's terms (`_read_by_tiles`),
+    so it rounds as the whole head does, where a chain of logaddexps and fp32
+    sums left its fp32 gradients 2.4 times as far from float64 on a CPU."""
     flat = states.reshape(-1, states.shape[-1])
     labels = targets.reshape(-1)
-    total = jnp.full(labels.shape, -jnp.inf, jnp.float32)
+    partitions = []
     target_logit = jnp.zeros(labels.shape, jnp.float32)
     best = jnp.full(labels.shape, -jnp.inf, jnp.float32)
     predicted = jnp.zeros(labels.shape, jnp.int32)
@@ -131,18 +161,20 @@ def retained(states, table, targets, variant: Variant):
     if variant.head == "remat":
         tile = jax.checkpoint(tile)
     width = tile_columns(table.shape[0], variant.chunks, table.shape[0])
-    for start in range(0, table.shape[0], width):
+    starts = range(0, table.shape[0], width)
+    for start, read in zip(starts, _read_by_tiles(flat, len(starts)), strict=True):
         stop = min(start + width, table.shape[0])
         inside = (labels >= start) & (labels < stop)
         column = jnp.clip(labels - start, 0, stop - start - 1)
         chunk_z, picked, chunk_best, chunk_column = tile(
-            flat, table[start:stop].T, column
+            read, table[start:stop].T, column
         )
-        total = jnp.logaddexp(total, chunk_z)
+        partitions.append(chunk_z)
         target_logit = target_logit + jnp.where(inside, picked, 0.0)
         better = chunk_best > best
         best = jnp.where(better, chunk_best, best)
         predicted = jnp.where(better, chunk_column + start, predicted)
+    total = jax.nn.logsumexp(jnp.stack(partitions), axis=0)
     return finish(
         (total - target_logit).reshape(targets.shape),
         predicted.reshape(targets.shape),

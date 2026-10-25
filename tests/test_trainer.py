@@ -95,10 +95,10 @@ def test_a_token_budget_and_step_cap_stop_at_the_first_reached():
     assert int(state.step) == 2
 
 
-@pytest.mark.parametrize("schedule", [None, Power(peak=.1, warmup_steps=2, a=.1, b=0),
-                                       Cosine(peak=.1, warmup_steps=1, decay_steps=8)])
+@pytest.mark.parametrize("schedule", [None, Power(peak_value=.1, warmup_steps=2, a=.1, b=0),
+                                       Cosine(peak_value=.1, warmup_steps=1, decay_steps=8)])
 def test_a_token_only_run_uses_the_schedules_own_horizon(schedule):
-    config = OptimConfig() if schedule is None else OptimConfig(rate=schedule)
+    config = OptimConfig() if schedule is None else OptimConfig(learning_rate=schedule)
     state = make_trainer(objective=TokenRegression(), optimizer=config).fit(dataset(), tokens=30)
     assert int(state.step) == 3
 
@@ -816,7 +816,7 @@ enable_compilation_cache(root + "/cache")
 
 def fit(peak, steps, path):
     groups = (ParamGroup("kernel", ("*kernel",), learning_rate_multiplier=0.5), ParamGroup("rest", ("*",)))
-    config = OptimConfig(rate=Cosine(peak=peak, warmup_steps=1, decay_steps=8),
+    config = OptimConfig(learning_rate=Cosine(peak_value=peak, warmup_steps=1, decay_steps=8),
                          param_groups=groups if grouped else ())
     sink = RecordingTracker()
     trainer = Trainer(Regression(), config, key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),

@@ -346,8 +346,8 @@ prevent a head that reaches parity from qualifying. A slower pair is
 unmeasured. Ordinary base-versus-head rows keep their existing rule, and the
 battery can still report its other rows on unsupported hardware. Per-probe JSON
 evidence is retained beside the gate file. `qwen35_pair.py --smoke` runs both
-tiny CPU steps from identical exported weights and checks loss agreement;
-it cannot qualify a performance claim.
+tiny CPU steps from identical exported weights; it judges no accuracy (check
+1's, at the tests) and cannot qualify a performance claim.
 
 A row that one tree cannot run is reported as not compared, not gated. The
 serving tool, for example, needs a newer PRNG API than main had on 2026-09-30.
@@ -3481,7 +3481,7 @@ I also timed one bf16 `ExpertMLP` layer forward plus backward under `MeshSpec(fs
 
 ### Rematerialization: the trainer's ladder
 
-A model's `remat` is where its step starts, and the trainer moves it up one rung whenever the compiled step does not fit its devices' memory. A decoder goes from none to `'minimal_with_conv'` (MaxText's `'minimal'` and a linear-attention or SSM layer's short conv output kept; a decoder without such layers skips it, as it would compile the same step) to `'minimal'` (every projection output kept) to `'full'`, and a diffusion backbone from `False` to `'dots'` (matmul outputs and the attention forward kept) to `'full'`. At each rung the head keeps its whole logits first and is tiled second. Each rung is slower and smaller, so the first that fits is the fastest that runs at that batch.
+A model's `remat` is where its step starts, and the trainer moves it up one rung whenever the compiled step does not fit its devices' memory. A decoder goes from none to `'minimal_with_scan_and_conv'` (MaxText's `'minimal'` with a recurrence's scan output kept, an SSM's or a delta rule's, and its short conv output) to `'minimal_with_conv'` (the conv alone; a decoder without such layers skips both, as it would compile `'minimal'`'s step) to `'minimal'` (every projection output kept) to `'full'`, and a diffusion backbone from `False` to `'dots'` (matmul outputs and the attention forward kept) to `'full'`. At each rung the head keeps its whole logits first and is tiled second. Each rung is slower and smaller, so the first that fits is the fastest that runs at that batch. On an A100-80GB, an 8-layer Mamba-2 decoder 1024 wide (32 heads of 64, a state of 128) took 129.9 ms a bf16 AdamW step over one row of 16,384 tokens without remat, at a 14.6 GB peak, 145.6 ms at `'minimal_with_scan_and_conv'` (7.8 GB), 149.4 ms at `'minimal_with_conv'` (6.6 GB), 149.5 ms at `'minimal'` (6.0 GB) and 159.1 ms at `'full'` (4.4 GB): the rung that keeps the scan saved 2.5% of the step for 1.1 GB (`python tools/benchmark_decoder_remat.py --mixer mamba2 --width 1024 --depth 8 --length 16384 --batch 1 --dtype bfloat16 --vocab 32000 --heads 16 --kv-heads 4 --mlp 4096 --steps 10 --remat <rung>`, jax 0.11.2.post16, one fresh process a rung).
 
 The trainer also plans the batch (`dew.training.planning`). Unless the run fixes `--trainer.split`, a step that does not fit whole is read in microbatches, every split-th row so no row leaves its device, with a window that pools them into the same update. The search compiles the batch whole, then the largest split at each rung until one fits, then halves toward the fewest microbatches at that rung. When the plan splits, `fit` also compiles the batch whole one remat rung up with the head tiled, times both for 10 steps after 2 of warmup, and keeps the faster one. Fewer rows do not always win. On an A100-40, Qwen3.5-0.8B's full fine-tune at 8 x 3072 ran 1205.6 ms a step in four microbatches without remat and 1174.1 ms whole under `'minimal'`. The plan, every compile it made and both times are in `StepCompiled.plan`, and the choice is recorded beside the compilation cache.
 

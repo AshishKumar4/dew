@@ -34,6 +34,7 @@ from jax.typing import ArrayLike
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.kl import posterior_moments
 from dew.nn.conv import Conv
+from dew.nn.precision import at_least_fp32
 from dew.objectives.base import Batch, Objective, Variables
 
 AUTOENCODER = "autoencoder"
@@ -306,7 +307,7 @@ class EndToEnd:
             return Objective.row_mean(values, batch).mean()[0]
 
         # At least float32, and a float64 run stays float64.
-        dtype = jnp.promote_types(jnp.result_type(moments, reconstruction), jnp.float32)
+        dtype = at_least_fp32(jnp.result_type(moments, reconstruction))
         mean, log_variance = posterior_moments(moments.astype(dtype))
         axes = tuple(range(1, mean.ndim))
         kl = mean_of(0.5 * jnp.sum(jnp.square(mean) + jnp.exp(log_variance) - 1.0 - log_variance, axis=axes))

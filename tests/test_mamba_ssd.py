@@ -7,14 +7,22 @@ Triton kernels. The port's distance from float64 against mamba_ssm's own at trai
 gate (docs/performance.md, "The Mamba-2 SSD scan").
 """
 
-import functools
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import PRECISION, assert_as_exact, declared_seeds, indexed_recording, recording, widened
+from reference_error import (
+    PRECISION,
+    assert_as_exact,
+    declared_seeds,
+    indexed_recording,
+    recording,
+    widened,
+    with_gradients,
+    without_ynn,
+)
 from sharded import assert_runs_per_shard
 from ssd_support import mamba_ssd_draw, mamba_ssd_operands, mamba_ssd_xla, ssd_value_and_grad
 from tool_support import load
@@ -144,33 +152,47 @@ def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
                         seeds=seeds, truth_fn=truth)
 
 
-@pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 5e-2)])
-def test_a_mamba2_layer_on_the_port_matches_it_on_xla(dtype, bound):
-    """The layer on the port, packed documents and all, hands the scan its compute dtype: its output
-    and every parameter's gradient the XLA scan's, within fp32 rounding of the chunked algebra in
-    float32 and within bf16 operands' rounding in bfloat16, mamba_ssm's numbers."""
+LAYER_SEEDS = {"float32": 256, "bfloat16": 32}
+"""The layer site's declared draws in each dtype (`seeds_for`, paired: the port and the XLA scan read
+the same rounded projections, so their upstream rounding is shared)."""
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_a_mamba2_layer_on_the_port_matches_it_on_xla(dtype):
+    """The layer on the port, packed documents and all, hands the scan its compute dtype: over drawn
+    inputs and cotangents, its output and every parameter's and input's gradient on par with the XLA
+    scan's, both from the layer's float64 run (check 1)."""
     layer = Mamba2(emb_features=64, num_heads=4, head_dim=16, state_size=16, n_groups=2, chunk_size=32,
                    dtype=dtype)
-    x = jax.random.normal(jax.random.key(3), (2, 72, 64)).astype(dtype)
-    params = layer.init(jax.random.key(5), x)
+    params = layer.init(jax.random.key(5), jnp.zeros((2, 72, 64), dtype))
     segments = jnp.asarray(np.repeat([[1, 2, 3]], [30, 2, 40], axis=1).repeat(2, axis=0), jnp.int32)
     metadata = AttentionMetadata(coordinates=coordinates(segments=segments))
 
-    def loss(params):
-        out = jnp.asarray(layer.apply(params, x, MixerCall(metadata)))
-        return jnp.sum(out.astype(jnp.float32) ** 2), out
+    def forward(layer):
+        return with_gradients(lambda params, x: jnp.asarray(layer.apply(params, x, MixerCall(metadata))))
 
-    with row_names_port(port=False):
-        (_, want), want_grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(params)
-    with row_names_port():
-        (_, got), got_grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(params)
-    assert got.dtype == want.dtype == dtype
-    scale = float(jnp.max(jnp.abs(want.astype(jnp.float32))))
-    assert float(jnp.max(jnp.abs(got.astype(jnp.float32) - want))) < bound * scale
-    for path, mine in jax.tree_util.tree_leaves_with_path(got_grads):
-        theirs = functools.reduce(lambda node, key: node[key.key], path, want_grads)
-        size = float(jnp.max(jnp.abs(theirs)))
-        assert float(jnp.max(jnp.abs(mine - theirs))) < bound * size, jax.tree_util.keystr(path)
+    def on(*, port):
+        def run(params, x, cotangent):
+            with row_names_port(port=port):
+                return forward(layer)(params, x, cotangent)
+        return without_ynn(run)
+
+    ported, xla = on(port=True), on(port=False)
+
+    wide = jax.jit(forward(layer.clone(dtype=jnp.float64)))
+
+    def truth(params, x, cotangent):
+        with jax.enable_x64(new_val=True), row_names_port(port=False):
+            return wide(*widened((params, x, cotangent)))
+
+    def draw(seed):
+        inputs, cotangent = jax.random.split(jax.random.key(seed))
+        return (params, jax.random.normal(inputs, (2, 72, 64)).astype(dtype),
+                jax.random.normal(cotangent, (2, 72, 64)).astype(dtype))
+
+    assert ported(*draw(0))[0].dtype == xla(*draw(0))[0].dtype == dtype
+    assert_as_exact(ported, xla, draw, f"Mamba-2 layer on the port, {jnp.dtype(dtype).name}",
+                    seeds=LAYER_SEEDS[jnp.dtype(dtype).name], truth_fn=truth)
 
 
 @pytest.mark.mesh(devices=2)

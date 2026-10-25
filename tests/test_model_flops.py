@@ -422,8 +422,20 @@ def forward_products(function, *operands, state_mac: bool = False):
     return float(jaxpr_products(traced, state_mac=state_mac))
 
 
+def executed(cond) -> list:
+    """The branches of `cond` a run may take: of a platform choice (`jax.lax.platform_dependent`), the
+    one an accelerator runs."""
+    platforms = cond.params.get("branches_platforms")
+    if platforms is None:
+        return list(cond.params["branches"])
+    return [cond.params["branches"][next(index for index, names in enumerate(platforms)
+                                         if names is None or "cuda" in names)]]
+
+
 def jaxpr_products(graph, *, state_mac=False):
-    """Count a scan body once per iteration, and one executed cond branch."""
+    """Count a scan body once per iteration, and one executed cond branch: of a platform choice
+    (`jax.lax.platform_dependent`), the branch an accelerator runs, the model's own products, where a
+    CPU's sums them in float64 and spreads a bias by a product (`dew.nn.precision`)."""
     if isinstance(graph, dict):
         return sum(jaxpr_products(part, state_mac=state_mac) for part in graph.values())
     if isinstance(graph, tuple | list):
@@ -443,8 +455,7 @@ def jaxpr_products(graph, *, state_mac=False):
         if primitive == "scan":
             total += equation.params["length"] * jaxpr_products(equation.params["jaxpr"], state_mac=state_mac)
         elif primitive == "cond":
-            total += max(jaxpr_products(branch, state_mac=state_mac)
-                         for branch in equation.params["branches"])
+            total += max(jaxpr_products(branch, state_mac=state_mac) for branch in executed(equation))
         elif primitive == "dot_general":
             left = equation.invars[0].aval.shape
             contracted = equation.params["dimension_numbers"][0][0]

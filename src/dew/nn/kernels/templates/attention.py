@@ -766,16 +766,6 @@ stability suite holds to check 1 at extreme inputs, where the default holds to f
 ruling, 2026-10-23). Every backward's default reads it."""
 
 
-def natural_exp(x: jax.Array) -> jax.Array:
-    """The natural form's forward exponential (`attention_algebra.Forward.power`): `exp(x)` as the
-    hardware's base-2 exponential of `x * log2(e)`, the logits staying natural, a difference of the
-    reference's own logits converted only after it is taken, so no logit the reference keeps finite
-    passes fp32's largest and none it keeps apart ties (the stability invariant). Its conversion rounds
-    once more than `jnp.exp`, about `|x|` fp32 ulps of the result, so the backward's weights and every
-    factor that carries a state (whose size may be any) take `jnp.exp`, as the reference does."""
-    return jnp.exp2(x * LOG2E)
-
-
 def kernel_dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
     """`a @ b` accumulated in fp32 as a template's Triton kernels issue it: bf16's and fp16's own product,
     IEEE fp32 for fp32 operands; interpreted, the template's CPU product (`interpreted_dot`)."""

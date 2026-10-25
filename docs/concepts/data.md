@@ -186,7 +186,7 @@ A chain's stages run where written. Use `map`, `random_map`, `filter`, `filter_m
 
 `export(pipeline, url, format="parquet" | "array_record")` writes committed shards. Reads follow fsspec URLs. Transactional publication supports local files, memory, S3 and the S3-compatible endpoints that honour its conditional PUTs, GCS, Hub repositories, and any fsspec filesystem that supplies its own conditional writes through a `put_conditional` method (`dew.data.storage.Store`). It refuses other write protocols rather than putting a partial publication. Producer manifests and indexes are the indexed reader's authority. Transport caches use URL chaining such as `dewcache::s3://bucket/path` and are separate from transformed artifacts.
 
-A storage profile names a filesystem and its options once. Profiles live in `~/.config/dew/storage.toml`, or the file `DEW_STORAGE_CONFIG` names, as one table per profile with the `base` protocol it extends. A value written `env:NAME` or `file:PATH` is read from that environment variable or file when the filesystem opens. Cloudflare R2, for example, is an S3 endpoint:
+A storage profile names a filesystem and its options once. Profiles live in `storage.toml` in Dew's configuration directory (`$DEW_CONFIG_DIR`, else `$XDG_CONFIG_HOME/dew`, else `~/.config/dew`), or the file `DEW_STORAGE_CONFIG` names, as one table per profile with the `base` protocol it extends. A value written `env:NAME` or `file:PATH` is read from that environment variable or file when the filesystem opens. Cloudflare R2, for example, is an S3 endpoint:
 
 ```toml
 [r2]

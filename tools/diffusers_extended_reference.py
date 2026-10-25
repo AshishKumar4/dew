@@ -7,7 +7,7 @@ TASK: xl-img2img, xl-inpaint, refiner, safety. BASE_XL comes from
  diffusers_pipeline_reference.py (use its SD output for safety).
 
 `truth ROOT OUTPUT` reruns each saved task under ROOT in float64, the truth its float32 reference is
-measured from (`diffusers_wan_reference.float64`), every noise the call draws the float32 draw widened
+measured from (`torch_precision.float64`), every noise the call draws the float32 draw widened
 so the draws are the reference's own, and adds them as `{task}/{name}` to the npz OUTPUT
 (tests/fixtures/tiny_diffusers_f64.npz, which `diffusers_pipeline_reference.py truth` writes first).
 """
@@ -144,7 +144,8 @@ def truth(root, destination):
     from unittest.mock import patch
 
     from diffusers.utils import torch_utils
-    from diffusers_wan_reference import float64
+    from diffusers_wan_reference import float64_scheduler
+    from torch_precision import float64
 
     require("diffusers-pipelines")
     torch.set_num_threads(2)
@@ -164,6 +165,8 @@ def truth(root, destination):
                      "diffusers.schedulers.scheduling_ddim"):
             scope.enter_context(patch.object(importlib.import_module(name), "randn_tensor", narrow_draw))
         scope.enter_context(float64())
+        # The DDIM scheduler's tables are its module's own, built and set at every call inside it.
+        scope.enter_context(float64_scheduler(importlib.import_module("diffusers.schedulers.scheduling_ddim")))
         for task in ("xl-img2img", "xl-inpaint", "refiner", "safety"):
             directory = Path(root) / task
             reference = np.load(directory / "reference.npz")

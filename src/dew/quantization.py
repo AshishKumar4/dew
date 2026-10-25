@@ -64,7 +64,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.cache import QUANTIZED_TRACE
 from dew.nn.kernels.generation import backend
-from dew.nn.precision import correctly_rounded_divide
+from dew.nn.precision import accumulated, correctly_rounded_divide
 
 if TYPE_CHECKING:
     from qwix import QArray, QuantizationProvider
@@ -232,11 +232,23 @@ def _quantized(model: nn.Module, provider: QuantizationProvider, spec: Quantizat
     """`model` with the matmuls of its `entry_methods` under Qwix's `provider`, in the class Qwix
     makes for the call, a `QuantizedClass` of `spec`,
     each method tracing what it calls under the key `QUANTIZED_TRACE` gives the provider."""
-    methods = entry_methods(model)
+    quantized = quantize_with(model, provider, methods=entry_methods(model),
+                              key=(type(provider).__name__, spec))
+    layer: Any = type(quantized)
+    layer._dew_quantization = spec
+    return quantized
+
+
+def quantize_with(model: nn.Module, provider: QuantizationProvider, *,
+                  methods: Sequence[str] = ("__call__",), key: Hashable | None = None) -> nn.Module:
+    """Qwix's `quantize_model(model, provider, methods=methods)`, each of `methods` tracing what it
+    calls under `key` in `QUANTIZED_TRACE` (by default the provider's kind and the provider): the
+    way Dew runs a model Qwix quantizes with a provider of its own, so Qwix owns the products the
+    thread tracing it forms (`dew.nn.precision.accumulated`) and no other thread's, and its traces
+    stay apart from the plain model's."""
     quantized = _qwix().quantize_model(model, provider, methods=methods)
     layer = type(quantized)
-    layer._dew_quantization = spec
-    key = (type(provider).__name__, spec)
+    key = (type(provider).__name__, provider) if key is None else key
     for name in methods:
         setattr(layer, name, _keyed(getattr(layer, name), key))
     return quantized
@@ -287,23 +299,28 @@ codes for the forward product, `[out, in]`, and for the input gradient,
 `[in, out]`, each beside one float32 scale a row (`frozen_fp8_leaves`)."""
 
 
-def frozen_fp8_leaves(kernel: jax.typing.ArrayLike) -> dict[str, np.ndarray]:
+def frozen_fp8_leaves(kernel: jax.typing.ArrayLike) -> dict[str, jax.Array | np.ndarray]:
     """A frozen `[in, out]` kernel packed once for both products it takes part
     in, each direction's rows scaled on their own by the one FP8 block cast
-    (`dew.interop.codecs.quantize_fp8_blocks` over `(1, width)` blocks): the
+    (`dew.interop.codecs.fp8_block_cast` over `(1, width)` blocks), on the
+    kernel's resident devices without a host gather; a host input stays on the host: the
     forward's `[out, in]` rows contract the input, the input gradient's
     `[in, out]` rows the output's cotangent. A forward row's scale is a
     contracting-axis scale of the other direction, so the two are quantized
     apart. The two E4M3 copies replace the kernel in the train state
     (`frozen_fp8_kernel` decodes it back), two bytes a parameter, a bf16
     kernel's, so the gain over a bf16 base is the products' rate."""
-    from dew.interop.codecs import quantize_fp8_blocks
+    from jax import core
 
-    kernel = np.asarray(kernel, np.float32)
+    from dew.interop.codecs import fp8_block_cast, quantize_fp8_blocks
+
+    resident = isinstance(kernel, (jax.Array, core.Tracer))
+    kernel = jnp.asarray(kernel, jnp.float32) if resident else np.asarray(kernel, np.float32)
     if kernel.ndim != 2:
         raise ValueError(f"a frozen FP8 site packs a two-axis [in, out] kernel, got shape {kernel.shape}")
-    forward, forward_scale = quantize_fp8_blocks(kernel.T, (1, kernel.shape[0]))
-    dgrad, dgrad_scale = quantize_fp8_blocks(kernel, (1, kernel.shape[1]))
+    cast = fp8_block_cast if resident else quantize_fp8_blocks
+    forward, forward_scale = cast(kernel.T, (1, kernel.shape[0]))
+    dgrad, dgrad_scale = cast(kernel, (1, kernel.shape[1]))
     return dict(zip(FROZEN_FP8, (forward, forward_scale, dgrad, dgrad_scale), strict=True))
 
 
@@ -324,8 +341,9 @@ def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.
     from dew.interop.codecs import fp8_block_cast
 
     codes, scales = fp8_block_cast(values, (1, values.shape[1]))
-    product = jax.lax.dot_general(codes.astype(jnp.float32), rows.astype(jnp.float32),
-                                  (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
+    product = accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((1,), (1,)), ((), ()))),
+                          codes.astype(jnp.float32), rows.astype(jnp.float32),
+                          preferred_element_type=jnp.float32)
     return product * scales * row_scales.T
 
 
@@ -1387,4 +1405,4 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     return served, {**variables, "params": parameters}
 
 
-__all__ = ["InputQuantization", "Quantization", "split_columns"]
+__all__ = ["InputQuantization", "Quantization", "quantize_with", "split_columns"]

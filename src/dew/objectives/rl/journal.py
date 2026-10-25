@@ -12,6 +12,7 @@ from pathlib import Path
 import jax
 import numpy as np
 
+from dew.hashing import array_fingerprint
 from dew.inference.rollouts import Draw
 from dew.objectives.base import Variables
 
@@ -29,8 +30,9 @@ def policy_digest(variables: Variables) -> str:
         if not shards:
             values = [("local", np.asarray(leaf))]
         for index, value in values:
-            digest.update(repr((index, value.shape, value.dtype.str)).encode())
-            digest.update(np.ascontiguousarray(value).tobytes())
+            digest.update(index.encode())
+            # Each shard by its named dtype, shape and bytes, so a float8 variant's equal bytes differ.
+            array_fingerprint(digest, value)
     return digest.hexdigest()
 
 

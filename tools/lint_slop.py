@@ -1366,11 +1366,13 @@ def authorities(module: Module) -> Iterator[Finding]:
 EXTERNAL = ("subprocess.", "socket.", "ssl.", "select.", "urllib.", "http.", "requests.", "httpx.",
             "aiohttp.", "grpc.", "huggingface_hub.", "fsspec.", "gcsfs.", "google.", "boto3.", "botocore.",
             "filelock.", "multiprocessing.", "concurrent.futures.ProcessPoolExecutor.", "os.kill.",
-            "os.killpg.", "os.waitpid.", "os.fork.", "os.posix_spawn.", "jax.distributed.",
+            "os.killpg.", "os.waitpid.", "os.waitid.", "os.fork.", "os.posix_spawn.", "jax.distributed.",
+            "dew.cleanup.signal_group.", "dew.cleanup.exit_code.", "dew.cleanup.groups_ended.",
+            "dew.cleanup.end_group.", "dew.cleanup.process_group.",
             "IPython.display.display.", "IPython.display.update_display.", "IPython.display.clear_output.")
 """What leaves the process: a subprocess, the network, a remote service, another process (a
 notebook's frontend, which IPython's display functions publish to over the kernel's socket; its
-representations, such as `HTML`, are built in the process)."""
+representations, such as `HTML`, are built in the process; a process group `dew.cleanup` signals)."""
 
 
 WAITS = {"wait", "wait_for", "join", "get", "put", "acquire"}
@@ -1770,11 +1772,18 @@ def detections(module: Module) -> Iterator[Finding]:
 GATE = frozenset({"tests/reference_error.py", "tests/op_certificates.py", "tests/certified.py",
                   "tools/op_certificates_swiglu.py",
                   "tests/reference_graph.py", "tests/reference_trees.py", "tests/residual_orders.py",
+                  "tests/selection_margins.py", "tests/test_selection_margins.py",
                   "tests/test_reference_error.py", "tests/test_op_certificates.py",
                   "tests/test_reference_orders.py", "tests/test_reference_graph.py",
-                  "tests/test_gate_calibration.py", "tests/test_float64_terms.py"})
+                  "tests/test_gate_calibration.py", "tests/test_float64_terms.py",
+                  "tests/sampling_gate.py", "tests/test_sampling_gate.py",
+                  "tests/learning_gate.py", "tests/test_learning_gate.py"})
 """The gate's modules and the tests of the gate itself, the one place a float is compared within a
-bound: every other comparison goes through its assertion."""
+bound: every other comparison goes through its assertion; the sampling gate (tests/sampling_gate.py)
+compares a statistic's rarity with its level, and the learning gate (tests/learning_gate.py) a claim's t
+over its runs with its threshold, each its verdict. The selection margins
+(tests/selection_margins.py) are the gate's preconditions for check 1 on a model that selects: their
+bounds hold a draw's discrete choices to float64's, and live with it."""
 INVENTORY = "tools/tolerance_inventory.json"
 RULE = "tools/lint_tolerances.py"
 """SLOP020's reading of a file (`tolerance_rules`), whose change may grow what the inventory holds."""

@@ -73,6 +73,7 @@ from dew.nn.protocols import (
     LayerStates,
     OutputTable,
     TokenModel,
+    head_table,
 )
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
@@ -102,7 +103,6 @@ from dew.objectives.lm.chunked import (
     final_read,
     fused_head_loss,
     head_cross_entropy,
-    head_table,
     logits_cross_entropy,
     logits_support_log_probs,
     model_logits,
@@ -449,7 +449,7 @@ def router_z_terms(routing: Variables, weight: float, batch: Batch, queries: jax
     for _, node in _sown_nodes(routing, "log_z"):
         (log_z,) = node["log_z"]
         valid = _router_queries(log_z.shape, queries, documents)
-        dtype = jnp.promote_types(log_z.dtype, jnp.float32)
+        dtype = at_least_fp32(log_z.dtype)
         total = Objective.row_mean(jnp.where(valid, jnp.square(log_z.astype(dtype)), 0), batch).total
         mass = Objective.row_mean(valid.astype(dtype), batch).total
         terms.append(Ratio(weight * total, mass))
@@ -464,7 +464,7 @@ def router_moments(scores: jax.Array, indices: jax.Array, batch: Batch,
     position chose, `[rows, positions, top_k]`.
     """
     experts = scores.shape[-1]
-    dtype = jnp.promote_types(scores.dtype, jnp.float32)
+    dtype = at_least_fp32(scores.dtype)
     valid = _router_queries(scores.shape[:2], queries, documents)
     # These counts enter a floating loss, unlike the exact integer bias effects.
     summed = Objective.row_mean(jnp.where(valid[..., None], scores.astype(dtype), 0), batch, axis=(0, 1))
@@ -830,15 +830,6 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
                             tokenizer=recorded_tokenizer(self.processor),
                             processor=recorded_processor(self.processor))
 
-    def build_task(self, variables: Variables, *,
-                   processor: Processor | None | Omitted = OMITTED) -> TextGeneration:
-        """Return the decoder over `variables` as a generation task.
-
-        It samples, and uses the same token budget, as this objective's previews do.
-        """
-        return TextGeneration.from_settings(self.model, variables, self.task_settings(),
-                                            self.processor if processor is OMITTED else processor)
-
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      segment_ids=None, positions=None, routing: bool = False,
                      depths: bool = False, roles=None, qk_stats: bool = False,
@@ -910,7 +901,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         kept = tuple(self._layer_states().layer_state(gathered, index) for index in layers)
         predict = self.token_accuracy if predict is None else predict
         table = self._fused_head(params) if z_loss is not None else None
-        dtype = jnp.promote_types(hidden.dtype, jnp.float32)
+        dtype = at_least_fp32(hidden.dtype)
         weights = self._row_weights(prepared, roles, dtype)
         total = None
         whole = model_logits(self.model, params, hidden) if logits else None
@@ -1343,7 +1334,7 @@ class LMObjective(TokenScorer):
         width = at_least_fp32(jnp.result_type(*kls))
         weights = self._query_weights(prepared, width)
         total = jnp.sum(jnp.stack([
-            self.row_mean(kl.astype(width) * weights[:, :kl.shape[1]], batch).total for kl in kls]))
+            self.row_mean(kl.astype(width), batch, weights=weights[:, :kl.shape[1]]).total for kl in kls]))
         mass = jax.lax.stop_gradient(self.row_mean(weights, batch).total)
         return total / len(kls), mass
 
@@ -1448,7 +1439,7 @@ class LMObjective(TokenScorer):
             z_loss=self.z_loss if summed else None, logits=logits, predict=predict)
         losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums, _ = scores
         mass = jax.lax.stop_gradient(self.row_mean(weights, batch).total)
-        prediction = Ratio(self.row_mean(losses * weights, batch).total, mass)
+        prediction = Ratio(self.row_mean(losses, batch, weights=weights).total, mass)
         ce, _ = prediction.mean()
         reported = {"ce": ce, "perplexity": jnp.exp(ce)}
         if correct is not None:
@@ -1456,7 +1447,7 @@ class LMObjective(TokenScorer):
         if self.z_loss:
             # PaLM's auxiliary over the same counted targets as the cross
             # entropy, so one Ratio carries both.
-            z_total = self.z_loss * self.row_mean(jnp.square(log_z) * weights, batch).total
+            z_total = self.z_loss * self.row_mean(jnp.square(log_z), batch, weights=weights).total
             reported["z_loss"] = z_total / jnp.where(mass > 0, mass, 1)
             prediction = Ratio(prediction.total + z_total, mass)
         if sums is not None:
@@ -1465,7 +1456,8 @@ class LMObjective(TokenScorer):
         if self.mtp_weight is not None:
             # Depths retain the main target denominator and configured depth average.
             mtp_total = jnp.mean(jnp.stack([
-                self.row_mean(depth_losses * depth_weights, batch).total if depth_sum is None else depth_sum
+                self.row_mean(depth_losses, batch, weights=depth_weights).total if depth_sum is None
+                else depth_sum
                 for depth_losses, depth_weights, depth_sum in depths]))
             reported["mtp_ce"], _ = Ratio(mtp_total, mass).mean()
             prediction = Ratio(prediction.total + self.mtp_weight * mtp_total, mass)
@@ -1624,7 +1616,9 @@ class Perplexity:
         assert isinstance(artifact, TokenScores), "the trainer hands a metric the artifact it reads"
         weights = np.asarray(artifact.weights, dtype=np.float64)
         losses = np.asarray(artifact.losses, dtype=np.float64)
-        return float(np.sum(losses * weights)), float(np.sum(weights))
+        # A target of no weight is selected away before its product, so a padded target's infinite
+        # loss adds nothing (`Objective.row_mean`'s `weights`).
+        return float(np.sum(np.where(weights != 0, losses, 0.0) * weights)), float(np.sum(weights))
 
     merge = staticmethod(merge_totals)
 

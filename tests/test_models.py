@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from flax.core import freeze, unfreeze
-from reference_error import assert_as_exact_as_the_reference, float64_terms, widened
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, float64_terms, widened
 
 from dew.nn.attention import GroupNorm, LayerNorm, Stage
 from dew.nn.autoencoders.vae import FlaxEncoder, translate_vae_weights
@@ -557,22 +557,41 @@ def test_a_stage_without_dtype_computes_in_the_models_dtype(dtype, rng):
     np.testing.assert_array_equal(output, explicit.apply(variables, x))
 
 
+GROUP_NORM_SEEDS = 32
+"""The group norm's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada."""
+
+
 @pytest.mark.parametrize("dtype", [None, jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("shape", [(2, 6, 16), (2, 4, 5, 16)])
-def test_group_norm_matches_flax_bit_for_bit(rng, dtype, shape):
+def test_group_norm_is_flax_s(rng, dtype, shape):
     """Without an activation, `dew.nn.attention.GroupNorm` is flax's
-    `nn.GroupNorm` op for op, with its parameter tree: its statistics in the
-    module's dtype, else the input's, at least fp32, and its result cast by
-    flax's dtype rule."""
-    x = jax.random.normal(rng, shape, jnp.float32) * 3 + 1
-    x = x.astype(jnp.bfloat16) if dtype is jnp.bfloat16 else x
+    `nn.GroupNorm`, with its parameter tree: its statistics in the module's
+    dtype, else the input's, at least fp32, and its result cast by flax's dtype
+    rule, as near float64 over drawn inputs and parameters as flax's (check 1,
+    `assert_as_exact`)."""
     ours, reference = GroupNorm(4, epsilon=1e-5, dtype=dtype), nn.GroupNorm(4, epsilon=1e-5, dtype=dtype)
+    x = jax.random.normal(rng, shape, jnp.float32)
     params, flax_params = ours.init(rng, x), reference.init(rng, x)
     assert jax.tree_util.tree_structure(params) == jax.tree_util.tree_structure(flax_params)
-    params = jax.tree.map(lambda leaf: leaf + 0.1 * jax.random.normal(rng, leaf.shape), params)
-    found, expected = ours.apply(params, x), reference.apply(params, x)
-    assert found.dtype == expected.dtype
-    assert jnp.array_equal(found, expected)
+    assert ours.apply(params, x.astype(dtype or jnp.float32)).dtype == reference.apply(
+        params, x.astype(dtype or jnp.float32)).dtype
+
+    def draw(seed):
+        """Inputs about 1 apart from zero at a spread of 3, in the module's dtype, and parameters
+        drawn about flax's initial ones."""
+        keys = jax.random.split(jax.random.key(seed), 3)
+        drawn = (jax.random.normal(keys[0], shape, jnp.float32) * 3 + 1).astype(dtype or jnp.float32)
+        leaves, tree = jax.tree.flatten(params)
+        moved = [leaf + 0.1 * jax.random.normal(key, leaf.shape) for leaf, key
+                 in zip(leaves, jax.random.split(keys[1], len(leaves)), strict=True)]
+        return np.asarray(drawn), jax.tree.unflatten(tree, [np.asarray(leaf) for leaf in moved])
+
+    def truth(drawn, moved):
+        return nn.GroupNorm(4, epsilon=1e-5, dtype=jnp.float64).apply(moved, drawn)
+
+    assert_as_exact(jax.jit(lambda drawn, moved: ours.apply(moved, drawn)),
+                    jax.jit(lambda drawn, moved: reference.apply(moved, drawn)), draw,
+                    f"group norm {dtype} {shape}", seeds=GROUP_NORM_SEEDS, truth_fn=truth)
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])

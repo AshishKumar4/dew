@@ -13,6 +13,9 @@ bf16 to the tolerance the Splash tests hold bf16 to. A row whose own key is
 cut but whose block runs on reads its block's later keys (`block_groups`).
 """
 
+import contextlib
+
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -29,6 +32,7 @@ from reference_error import assert_as_exact_as_the_reference
 from test_attention_splash import TOLERANCE
 
 from dew.nn.attention import scaled_dot_product_attention
+from dew.nn.precision import FP32_SUMS
 
 
 def masked():
@@ -77,7 +81,10 @@ def run(implementation, case, dtype):
 @pytest.mark.parametrize("implementation, case", CPU, ids=[f"{i}-{c}" for i, c in CPU])
 def test_a_row_that_sees_no_key_reads_nothing(implementation, case):
     query, key, value, structure, found, truth = run(implementation, case, jnp.float32)
-    expected = reference(query, key, value, **structure)
+    # The 'tpu' row interprets the TPU kernel on this CPU: its reference sums as the target does (fp32),
+    # not as the CPU's policy does.
+    with jax.default_matmul_precision(FP32_SUMS) if implementation == "tpu" else contextlib.nullcontext():
+        expected = reference(query, key, value, **structure)
     # The loss is the outputs' squares, so the cotangent is twice the output.
     keep = kept(query.shape[1], key.shape[1], **structure)
     terms = attention_terms(query, key, value, 2 * truth[0], keep)

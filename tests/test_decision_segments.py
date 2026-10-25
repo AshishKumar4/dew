@@ -1,0 +1,191 @@
+"""A joint row's user turn is composed of segments (`dew.decision.layout.JointLayout.segments`): the
+default composition writes what the Laya joint release lays out
+(tests/test_decision_joint_checkpoint.py::test_the_joint_layout_lays_out_what_the_release_does), and
+another writes the schema before the state, or text of its own between the parts, its spans and its
+cut where its parts are. A layout and a head are recorded by import path (`dew.registry`), so one of a
+package of a run's own reloads, and a record of an earlier run, which names its class alone, reloads
+too."""
+
+import dataclasses
+
+import pytest
+
+from dew.data.text import ByteTokenizer
+from dew.decision import Choice, JointLayout, Layout, Media, Noul, Schema, State, Text
+from dew.decision.head import Head, JointSchemaHead
+from dew.decision.layout import JOINT_SEGMENTS, Specials
+from dew.records import JSON
+from dew.registry import from_record, to_record
+
+QUESTIONS = {"pick": Choice("Which one?", ["a", "b", "c"]), "holds": Noul("Does it hold?")}
+SPECIALS = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
+TOKENIZER = ByteTokenizer()
+SCHEMA_FIRST = (Schema(), Text("\n\nSTATE:\n"), Media(), State(), Text("\n"))
+
+
+def text(tokens) -> str:
+    return TOKENIZER.decode(list(tokens))
+
+
+def test_the_default_segments_lay_out_the_release_rows_and_another_order_moves_the_schema_first():
+    """The default segments are the release's turn, so a layout naming them lays out what the default
+    does. Schema first, the schema's spans are where its questions are in the row, before the state,
+    the state after it, the parts in the order the segments name them."""
+    state: JSON = {"text": "one two three"}
+    [default] = JointLayout().rows(TOKENIZER, SPECIALS, state, QUESTIONS)
+    assert JointLayout(segments=JOINT_SEGMENTS).rows(TOKENIZER, SPECIALS, state, QUESTIONS) == [default]
+    [first] = JointLayout(segments=SCHEMA_FIRST).rows(TOKENIZER, SPECIALS, state, QUESTIONS)
+    written = text(first.tokens)
+    assert written.index("SCHEMA FIELDS") < written.index("STATE:") < written.index("one two three")
+    for laid, question in zip(first.questions, QUESTIONS.values(), strict=True):
+        start, end = laid.span
+        assert text(first.tokens[start:end]) == question.instructions
+        assert end < written.index("STATE:")
+    def options(row) -> list[str]:
+        return sorted(text(row.tokens[start:end]) for laid in row.questions for start, end in laid.options)
+
+    assert options(first) == options(default)
+    assert (first.state_tokens, first.state_kept) == (default.state_tokens, default.state_kept)
+
+
+def test_the_state_takes_what_the_rest_of_the_row_leaves_wherever_it_stands():
+    """The schema is never cut and the state takes what the other parts leave of `max_len`,
+    whichever order the segments name: a row one token too short for the whole state keeps all but
+    its last token, the schema first as after."""
+    state = "one two three four five six"
+    for segments in (JOINT_SEGMENTS, SCHEMA_FIRST):
+        roomy = JointLayout(max_len=1 << 20, segments=segments)
+        [whole] = roomy.rows(TOKENIZER, SPECIALS, state, QUESTIONS)
+        [cut] = dataclasses.replace(roomy, max_len=len(whole.tokens) - 1).rows(TOKENIZER, SPECIALS, state,
+                                                                             QUESTIONS)
+        assert cut.state_kept == whole.state_kept - 1 and len(cut.tokens) == len(whole.tokens) - 1
+        assert [laid.span[1] - laid.span[0] for laid in cut.questions] == [
+            laid.span[1] - laid.span[0] for laid in whole.questions]
+
+
+def test_a_row_holds_the_schema_once_and_the_images_at_most_once():
+    """Segments without the schema, or with two places for images, are refused when the layout is
+    built, and two states are not; images given to segments with no place for them are refused when a
+    row is laid out."""
+    refused = ((State(),), (Schema(), Schema()), (Schema(), Media(), Media()))
+    JointLayout(segments=(Schema(), State(), State()))
+    for segments in refused:
+        with pytest.raises(ValueError):
+            JointLayout(segments=segments)
+    with pytest.raises(ValueError):
+        JointLayout(segments=(Text("STATE:\n"), State(), Schema())).rows(TOKENIZER, SPECIALS, "s", QUESTIONS,
+                                                                         media=(1, 2))
+
+
+@dataclasses.dataclass(frozen=True)
+class FramedLayout(JointLayout):
+    """A layout of a run's own package: a joint layout under another name."""
+
+
+class WiderHead(JointSchemaHead):
+    """A head of a run's own package: a joint head under another name."""
+
+
+def test_a_layout_and_a_head_of_a_runs_own_reload_by_import_path_and_an_earlier_runs_record_too():
+    """A layout's record names its class by import path, its segments with it, so a layout class of a
+    package of the run's own reloads, as does a head's; a record of an earlier run names a class of
+    Dew's by name alone, and reloads as that class."""
+    layout = FramedLayout(segments=SCHEMA_FIRST, max_state_tokens=7)
+    assert from_record(Layout, to_record(layout, Layout), dtypes=False) == layout
+    head = WiderHead(hidden_size=8)
+    assert Head.from_record(head.record(), 8) == head
+    recorded = JointSchemaHead(hidden_size=8).record()
+    assert isinstance(recorded, dict) and recorded["name"] == "dew.decision.head:JointSchemaHead"
+    earlier = {"name": "JointSchemaHead", "fields": recorded["fields"]}
+    assert Head.from_record(earlier, 8) == JointSchemaHead(hidden_size=8)
+
+
+def test_a_row_without_a_state_segment_keeps_none_of_the_state():
+    """Segments without the state write none of it, and the row says so: none of the state kept, so
+    a request whose state the row leaves out reads as cut."""
+    [row] = JointLayout(segments=(Schema(),)).rows(TOKENIZER, SPECIALS, "abc", QUESTIONS)
+    assert (row.state_tokens, row.state_kept) == (3, 0)
+    assert "abc" not in text(row.tokens)
+
+
+def test_a_saved_run_reloads_its_segments_and_an_earlier_runs_record_reads_as_before(tmp_path):
+    """A run of a joint layout of segments of its own reloads them from its record, its task answering
+    as the live one does; an earlier run's record, which names its layout and head by class name alone
+    and holds no segments, reads as the default composition."""
+    import jax
+    import numpy as np
+    from test_decision_objective import EXAMPLES, INTENT, saved_and_reloaded, tiny_backbone
+
+    from dew.decision import Decide, DecisionObjective
+    from dew.decision.task import DecideSettings
+
+    layout = JointLayout(max_len=1024, segments=SCHEMA_FIRST)
+    head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
+    base = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
+                             specials=SPECIALS, layout=layout, head=head)
+    task = Decide(base.model, base.init(jax.random.key(0)), layout, TOKENIZER, SPECIALS)
+    _, live, reloaded = saved_and_reloaded(task, tmp_path / "run")
+    assert reloaded.layout == layout
+    asked = {"team": INTENT}
+    np.testing.assert_array_equal(reloaded(EXAMPLES[0].state, asked)["team"].probabilities,
+                                  live(EXAMPLES[0].state, asked)["team"].probabilities)
+    fields = to_record(JointLayout(max_len=1024), JointLayout)
+    assert isinstance(fields, dict)
+    earlier = {name: value for name, value in fields.items() if name not in ("segments", "framing")}
+    settings = DecideSettings.of({"head": {"name": "JointSchemaHead", "fields": {}},
+                                  "layout": {"name": "JointLayout", "fields": earlier},
+                                  "specials": to_record(SPECIALS, Specials), "tokenizer": "byte",
+                                  "processor": None})
+    assert settings.layout == JointLayout(max_len=1024)
+
+
+def test_a_whole_request_whose_row_leaves_its_state_out_is_refused():
+    """A layout whose segments write no state keeps none of it, so a scoring task that answers only
+    whole requests refuses a request with a state, as it refuses one whose state the row cut."""
+    import jax
+    from test_decision_objective import tiny_backbone
+
+    from dew.decision import Decide, DecisionObjective
+
+    layout = JointLayout(max_len=1024, segments=(Schema(),))
+    head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
+    base = DecisionObjective(tiny_backbone().clone(max_seq_len=layout.max_len), tokenizer=TOKENIZER,
+                             specials=SPECIALS, layout=layout, head=head)
+    task = Decide(base.model, base.init(jax.random.key(0)), layout, TOKENIZER, SPECIALS)
+    scoring, _ = task.scoring(whole=True)
+    asked = {name: question.wire() for name, question in QUESTIONS.items()}
+    body = {"state": "one two three", "questions": asked}
+    with pytest.raises(ValueError):
+        scoring.admit(body)
+
+
+def test_copies_of_the_state_share_the_room_as_any_rows_segments_do():
+    """A row's copies of the state share its room as any row's segments do (`share_tokens`): each its
+    cap, its own or the joint layout's, a whole copy all it holds (row 1616)."""
+    from dew.data.tokens import share_tokens
+    from dew.decision.layout import allocated
+
+    copies = [State(max_tokens=4), State(keep="all", max_tokens=2), State()]
+    assert allocated([10, 6, 10], copies, 12, default_cap=5) == share_tokens(
+        [10, 6, 10], 12, caps=[4, 2, 5], whole=[False, True, False]) == [3, 6, 3]
+
+
+def test_a_joint_row_holds_the_state_twice_each_copy_cut_to_its_own_budget():
+    """A joint row may hold the state more than once: each copy cut from the whole state to its own
+    budget and keeping its own end, the row's kept count its least-kept copy's; a layout of one state
+    lays its rows out as it did, and its record reloads it."""
+    state = "one two three four five six seven"
+    twice = (Text("FIRST:"), State(max_tokens=5), Text("\nLAST:"), State(keep="end", max_tokens=9), Schema())
+    layout = JointLayout(max_len=1 << 20, segments=twice)
+    [row] = layout.rows(TOKENIZER, SPECIALS, state, QUESTIONS)
+    written = text(row.tokens)
+    # A string state is its own compact text (`_compact`), each byte a token of the byte vocabulary.
+    assert ("FIRST:" + state[:5] + "\nLAST:" + state[-9:]) in written
+    assert (row.state_tokens, row.state_kept) == (len(state), 5)
+    assert from_record(Layout, to_record(layout, Layout), dtypes=False) == layout
+    once = JointLayout(max_len=1 << 20, segments=(State(), Schema()))
+    again = JointLayout(max_len=1 << 20, segments=(State(max_tokens=None), Schema()))
+    assert (once.rows(TOKENIZER, SPECIALS, state, QUESTIONS)
+            == again.rows(TOKENIZER, SPECIALS, state, QUESTIONS))
+    with pytest.raises(ValueError):
+        JointLayout(segments=(State(render="state"), Schema()))

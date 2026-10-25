@@ -75,61 +75,12 @@ def collect(client, message, timeout=30):
 
 # A cell's caps hold from the cell after the one that installs them (live_training.install).
 CAPS = "import live_training\nlive_training.install()"
-TRAINING_PROBE = OOM_PROBE + """import urllib.request
-from pathlib import Path
-try:
-    urllib.request.urlopen("https://huggingface.co", timeout=5)
-except OSError:
-    pass
-else:
-    raise AssertionError("a training context reached the network")
-# The prepared cache is an overlay of the context's own (gateway_manager.py); training() checks
-# from outside that this write stayed in it. The overlay holds no more than 64 MiB: files of
-# 20 MiB, under the 32 MiB a file may be (guest_limits.py), fill it until a write finds no space.
-import errno
-Path("/opt/train/escape").write_text("x")
-written = 0
-try:
-    for k in range(5):
-        Path(f"/opt/train/fill{k}").write_bytes(bytes(20 * 1024 * 1024))
-        written += 20
-except OSError as error:
-    assert error.errno == errno.ENOSPC, f"filling the overlay failed otherwise than for space: {error}"
-else:
-    raise AssertionError("a training context wrote 100 MiB into its 64 MiB overlay")
-assert 40 <= written <= 64, f"the overlay took {written} MiB"
-for k in range(5):
-    Path(f"/opt/train/fill{k}").unlink(missing_ok=True)
-for path in ("/opt/live/escape", "/work/../escape"):
-    try:
-        Path(path).write_text("x")
-    except OSError:
-        pass
-    else:
-        raise AssertionError(f"a training context wrote {path}")
-Path("/tmp/inside").write_text("x")
-try:
-    bytearray(7 * 1024 * 1024 * 1024)
-except MemoryError:
-    pass
-else:
-    raise AssertionError("a training context exceeded its memory allowance")
-from dew import Trainer
-from dew.config import OptimConfig
-from dew.data import Hub, presets
-from dew.nn.backbones import CausalTransformer
-from dew.objectives.lm import LMObjective
-# The lm cell's corpus, which the preparation compiled (prepare-cells.py), read with the Hub offline.
-data = Hub("winglian/tiny-shakespeare").pipe(presets.lm, "byte", seq_len=64, batch=64)
-model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
-                          mlp_features=64, max_seq_len=128)
-state = Trainer(LMObjective(model, seq_len=64), OptimConfig(rate=1e-3), key=0).fit(data, steps=1000)
-assert int(state.step) == 20
-from dew.interop import PretrainedDecoder
-from dew.sampling import Sampling
-model = PretrainedDecoder.load("HuggingFaceTB/SmolLM2-135M-Instruct", dtype="float32", max_seq_len=256)
-assert model.text_generation(sampling=Sampling(temperature=0))("ROMEO:", 4, key=0).text[0]
-"""
+def guest_program(name):
+    """A program a guest context runs, from its file beside this one."""
+    return pathlib.Path(__file__).with_name(name).read_text()
+
+
+TRAINING_PROBE = OOM_PROBE + guest_program("training-probe.py")
 
 
 def training():
@@ -240,57 +191,15 @@ def isolated(kernels):
         assert client.get_stdin_msg(timeout=30)['msg_type'] == 'input_request'
         client.input('private stdin probe')
         assert collect(client, message).strip() == 'private stdin probe'
-        execute(client,
-            "import errno, os, resource, socket\n"
-            "for proc in Path('/proc').glob('[0-9]*'):\n"
-            " try:\n  uid = next(line for line in (proc / 'status').read_text().splitlines() "
-            "if line.startswith('Uid:')).split()[1]\n"
-            " except (OSError, StopIteration):\n  continue\n"
-            " assert int(uid) == os.getuid(), 'guest saw a foreign process'\n"
-            "links = {line.split(':')[0].strip() for line in "
-            "Path('/proc/net/dev').read_text().splitlines()[2:]}\nassert links == {'lo'}\n"
-
-            "status = Path('/proc/self/status').read_text().splitlines()\n"
-            "assert all(line.split(':')[1].strip() == '0000000000000000' "
-            "for line in status if line.startswith('Cap'))\n"
-            "assert next(line for line in status if line.startswith('NoNewPrivs:')).split()[1] == '1'\n"
-            "try:\n socket.create_connection(('127.0.0.1', 8890), timeout=1)\n"
-            "except OSError:\n pass\nelse:\n raise AssertionError('guest reached gateway TCP')\n"
-            "try:\n bytearray(1024 * 1024 * 1024)\n"
-            "except MemoryError:\n pass\nelse:\n"
-            " raise AssertionError('guest exceeded memory allowance')\n"
-            "try:\n resource.setrlimit(resource.RLIMIT_AS, "
-            "(resource.RLIM_INFINITY, resource.RLIM_INFINITY))\n"
-            "except (PermissionError, ValueError):\n pass\n"
-            "else:\n raise AssertionError('guest raised hard memory limit')\n"
-            "try:\n pid = os.fork()\n"
-            "except PermissionError:\n pass\nelse:\n"
-            " if pid == 0: os._exit(0)\n os.waitpid(pid, 0)\n raise AssertionError('guest forked')")
+        execute(client, guest_program("isolation-probe.py"))
         if foreign != identifier:
-            execute(client,
-                f"for path in ['/sessions/connections/kernel-{foreign}.json', "
-                f"'/sessions/ipc/kernel-{foreign}/kernel-1']:\n"
-                " try:\n  Path(path).read_bytes()\n"
-                " except PermissionError:\n  pass\n"
-                " else:\n  raise AssertionError('guest read another context')\n"
-                "sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)\n"
-                f"try:\n sock.connect('/sessions/ipc/kernel-{foreign}/kernel-1')\n"
-                "except PermissionError:\n pass\n"
-                "else:\n raise AssertionError('guest connected to another context')\n"
-                "finally:\n sock.close()")
+            execute(client, guest_program("foreign-probe.py") + f"\nreach({foreign!r})")
 
 
 def warmed(kernels):
     """Each context samples an image through the shared model, without importing JAX."""
     for _, client, _ in kernels:
-        execute(client,
-            "import model_client\nmodel_client.install()\n"
-            "from dew.sampling import CFG, DPMSolverMultistep, TextToImage\n"
-            "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m')\n"
-            "result = pipe(['a lake beneath the northern lights'], key=3, steps=15, "
-            "solver=DPMSolverMultistep(), guidance=CFG(6, interval=(0.15, 0.9)))\n"
-            "assert result.pil()[0].size == (256, 256)\n"
-            "import sys\nassert 'jax' not in sys.modules\n")
+        execute(client, guest_program("warm-image.py"))
 
 
 def measured(kernels, count):
@@ -305,16 +214,7 @@ def measured(kernels, count):
             stdout = execute(client,
                 f"assert __measurement == {identifier!r}\n"
                 f"assert Path('/work/context').read_text() == {identifier!r}\n"
-                "from dew.interop import PretrainedDecoder\nfrom dew.sampling import Sampling\n"
-                "model = PretrainedDecoder.load('HuggingFaceTB/SmolLM2-135M-Instruct', "
-                "dtype='float32', max_seq_len=256)\n"
-                "assert model.text_generation(sampling=Sampling(temperature=0))("
-                "'The capital of France is', 24, key=0).text[0]\n"
-                "import json, os\nfrom pathlib import Path\n"
-                "pss = next(line for line in Path('/proc/self/smaps_rollup').read_text().splitlines() "
-                "if line.startswith('Pss:'))\n"
-                "print(json.dumps({'uid': os.getuid(), 'fds': len(os.listdir('/proc/self/fd')), "
-                "'pss_bytes': int(pss.split()[1]) * 1024}))")
+                + guest_program("measure-text.py"))
             usage = json.loads(stdout)
             assert usage['uid'] in GUEST_UIDS
             rows.append({"request": index, "execute_seconds": time.perf_counter() - started,

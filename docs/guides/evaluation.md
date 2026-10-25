@@ -29,7 +29,7 @@ model = CausalTransformer(vocab_size=4, emb_features=16, num_layers=1,
                           num_heads=2, mlp_features=32, max_seq_len=16,
                           dtype=jnp.float32, attention_impl="xla")
 objective = LMObjective(model, seq_len=8)
-trainer = Trainer(objective, OptimConfig(optimizer="adam", rate=0.01), key=0)
+trainer = Trainer(objective, OptimConfig(optimizer="adam", learning_rate=0.01), key=0)
 state = trainer.fit(data, steps=10, log_every=5, eval_every=5,
                     metrics=(Perplexity(),))
 assert int(state.step) == 10
@@ -97,7 +97,7 @@ accuracy = Mean(
 language_model = LMObjective(model, seq_len=8, ema_decay=None)
 accuracy_train = Memory({"text": train_tokens}).repeat().batch(8)
 accuracy_val = Memory({"text": val_tokens}).batch(8)
-run = Trainer(language_model, OptimConfig(optimizer="adam", rate=0.01), key=jax.random.key(0),
+run = Trainer(language_model, OptimConfig(optimizer="adam", learning_rate=0.01), key=jax.random.key(0),
               checkpoints=Checkpoints("runs/lm-accuracy"))
 state = run.fit(
     accuracy_train, validation=accuracy_val, steps=10, eval_every=5, metrics=[accuracy], best=accuracy,
@@ -209,7 +209,7 @@ def trial(run: RunConfig) -> float:
 
 
 with LocalTracker("runs/sweep/tracking") as tracker:
-    trials = config.sweep({"optim.rate": [0.01, 0.003]}, train=trial, trials=2,
+    trials = config.sweep({"optim.learning_rate": [0.01, 0.003]}, train=trial, trials=2,
                           ledger="runs/sweep/ledger.json", tracker=tracker, search=GridSearch())
 print(min(trials, key=lambda trial: trial.value).overrides)
 ```
@@ -225,7 +225,7 @@ Local tracking: /tmp/dew-docs/docs_guides_evaluation.md/runs/sweep/lm-rate/trial
 Training CausalTransformer from step 0 to 10: 2,688 parameters, on 1 × cpu, batch 8, float32
 Trained 10 steps in 0:00:01: first step after 0.68 s, then 2683.2 step/s
 0.4% of the wall time in steps, final loss 0.6440
-{'optim.rate': 0.01}
+{'optim.learning_rate': 0.01}
 ```
 
 The two trials train under `runs/sweep/lm-rate/trial-0` and `runs/sweep/lm-rate/trial-1`, and each one's `run.json` records the learning rate it used. `sweep` returns the trials from the ledger. `trial.value` is the score the entry point returned, and `trial.overrides` is the point the trial trained. A second run of the script reads the ledger and trains nothing.

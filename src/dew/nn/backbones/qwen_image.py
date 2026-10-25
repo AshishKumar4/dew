@@ -29,6 +29,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.activations import gelu_tanh
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
 from dew.nn.blocks import sinusoidal_time
 from dew.nn.dense import Dense
@@ -328,7 +329,7 @@ class _TextIn(nn.Module):
     @nn.compact
     def __call__(self, x):
         x = RMSNorm(epsilon=self.eps, scale_offset=True, dtype=self.dtype, name="text_norm")(x)
-        x = nn.gelu(_dense(self.features, "in_layer", self.dtype, self.precision)(x), approximate=True)
+        x = gelu_tanh(_dense(self.features, "in_layer", self.dtype, self.precision)(x))
         return _dense(self.features, "out_layer", self.dtype, self.precision)(x)
 
 

@@ -35,6 +35,7 @@ from dew.nn.attention import l2_normalized
 from dew.nn.blocks import sinusoidal_time
 from dew.nn.conv import convolution
 from dew.nn.dit import TextContext, masked_mean
+from dew.nn.precision import accumulated
 from dew.nn.protocols import Lacks
 from dew.nn.sharding import rows_taken
 from dew.objectives.base import TEACHER, Aux, Batch, Objective, Step, Variables
@@ -65,9 +66,9 @@ class SpectralConv(nn.Module):
         # torch's [out, in, kh, kw] flattened per output channel.
         matrix = jnp.transpose(kernel, (3, 2, 0, 1)).reshape(self.features, -1)
         held = jax.lax.stop_gradient(matrix)
-        v = l2_normalized(held.T @ u.value)
-        following = l2_normalized(held @ v)
-        sigma = following @ (matrix @ v)
+        v = l2_normalized(accumulated(jnp.matmul, held.T, u.value))
+        following = l2_normalized(accumulated(jnp.matmul, held, v))
+        sigma = accumulated(jnp.matmul, following, accumulated(jnp.matmul, matrix, v))
         if update and not self.is_initializing():
             u.value = following
         pad = [(size // 2, size // 2) for size in self.kernel_size]
@@ -134,7 +135,7 @@ class Head(nn.Module):
         weight = self.param("cmapper_weight", nn.initializers.normal(1.0),
                             (condition.shape[-1], self.cmap_dim))
         cmap_bias = self.param("cmapper_bias", nn.initializers.zeros, (self.cmap_dim,))
-        cmap = condition @ (weight / math.sqrt(condition.shape[-1])) + cmap_bias
+        cmap = accumulated(jnp.matmul, condition, weight / math.sqrt(condition.shape[-1])) + cmap_bias
         return jnp.sum(out * cmap[:, None, None, :], axis=-1) / math.sqrt(self.cmap_dim)
 
 

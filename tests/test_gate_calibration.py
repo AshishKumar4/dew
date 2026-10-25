@@ -131,8 +131,11 @@ def test_a_hundredfold_error_on_a_thousandth_of_a_row_fails():
 
 
 def test_a_hundredfold_error_where_the_ensemble_raises_the_bar_most_fails():
-    """The same fault at the element whose bar the members raise most over the reference's own, measured
-    over the first batch before Dew is injected: the ensemble's widest allowance still fails it."""
+    """A fault at the element whose bar the members raise most over the reference's own, measured over
+    the first batch before Dew is injected: a hundred times the widest member's error there fails. The
+    fault is the widest member's, not the reference's: where the native sum rounds an element nearly
+    exactly, the members raise its bar furthest (436 times on an A100's sum), and a hundred times the
+    native error there is a rounding the widest member makes."""
     shape = (8, 1024)
     base = norm_draw(xla_sum, shape)
     sums = {}
@@ -143,11 +146,12 @@ def test_a_hundredfold_error_where_the_ensemble_raises_the_bar_most_fails():
     native, widest = sums[REFERENCE], np.max(np.stack(list(sums.values())), axis=0)
     raised = np.where(native > 0, widest / np.where(native > 0, native, 1), 0)
     at = np.unravel_index(int(np.argmax(raised)), shape)
+    member = max(sums, key=lambda name: sums[name][at])
 
     def draw(order):
         dew, members, truth = base(order)
         output = dew["output"].copy()
-        output[at] = truth["output"][at] + 100 * (output[at] - truth["output"][at])
+        output[at] = truth["output"][at] + 100 * (members[member]["output"][at] - truth["output"][at])
         return {"output": output}, members, truth
 
     with pytest.raises(AssertionError):

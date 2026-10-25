@@ -4,6 +4,7 @@ import dataclasses
 import json
 from pathlib import Path
 
+import grain.python as grain
 import jax
 import numpy as np
 import optax
@@ -238,7 +239,9 @@ def sft_tokens(marker, targets, *, empty_rows=0):
 @pytest.mark.parametrize("empty_rows", [0, 32])
 @pytest.mark.parametrize("projected", [False, True])
 def test_sft_token_mixture_weighs_final_assistant_targets_and_resumes(weights, empty_rows, projected):
-    """One versus seven assistant targets per packed row get the requested scored-token shares."""
+    """One versus seven assistant targets per packed row get the requested scored-token shares: the
+    rows come member for member as Grain's proportional mix weighs them, a row of each the weight of
+    its member's tokens."""
     model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2,
                               mlp_features=16, max_seq_len=8)
     policy = LMObjective(model, seq_len=8, loss_role=Role.ASSISTANT).data()
@@ -251,19 +254,26 @@ def test_sft_token_mixture_weighs_final_assistant_targets_and_resumes(weights, e
     data = compile(train.batch(8), objective=policy, read="memory", loading=Loading(workers=0))
     reader = data.train(DataPartition())
     targets = ValidTargets(field=field, role=int(Role.ASSISTANT), measured=False)
-    delivered = {1: 0, 2: 0}
+    delivered, picked = {1: 0, 2: 0}, []
     try:
         for _ in range(64):
             batch = next(reader)
             for index, marker in enumerate(batch[field][:, 0]):
                 row = jax.tree.map(lambda values, index=index: values[index], batch)
                 delivered[int(marker)] += targets(row)
+                picked.append(int(marker))
         saved = reader.get_state()
         remaining = [next(reader)[field].tolist() for _ in range(3)]
     finally:
         reader.close()
-    assert [delivered[marker] / sum(delivered.values()) for marker in (1, 2)] == pytest.approx(weights,
-                                                                                          abs=0.01)
+    # The member each delivered row comes from, row for row, is Grain's proportional mix of the two at
+    # the token weights over the targets a row of each holds: one and seven. Its token shares then are
+    # the requested ones to within a row of each.
+    proportions = [weight / held for weight, held in zip(weights, (1, 7), strict=True)]
+    grains = grain.MapDataset.mix([grain.MapDataset.source([marker]).repeat() for marker in (1, 2)],
+                                  weights=proportions)
+    assert picked == [grains[index] for index in range(len(picked))]
+    assert delivered == {1: picked.count(1), 2: 7 * picked.count(2)}
     assert data.counts["sft-1"].accepted == 64 - empty_rows
     assert data.counts["sft-1"].rejected["zero_targets"] == empty_rows
     resumed = compile(train.batch(8), objective=policy, read="memory",

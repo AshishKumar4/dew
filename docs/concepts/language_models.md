@@ -54,7 +54,7 @@ model = CausalTransformer(vocab_size=tokenizer.vocab_size,
                           emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
                           max_seq_len=128)
 objective = LMObjective(model, seq_len=64)
-lm_state = Trainer(objective, OptimConfig(rate=3e-3), key=jax.random.key(0)).fit(
+lm_state = Trainer(objective, OptimConfig(learning_rate=3e-3), key=jax.random.key(0)).fit(
     data, validation=held, steps=300, log_every=100, eval_every=300, metrics=(Perplexity(),))
 continuation = generate(model, lm_state.variables, [tokenizer.encode("One day, Lily")],
                         max_new_tokens=40, key=jax.random.key(1),
@@ -109,7 +109,7 @@ The measured run changes these settings from the example:
 | Tokenizer | `HFTokenizer("gpt2")` |
 | Data | `TokenFiles("data/tinystories/train")` and `TokenFiles("data/tinystories/val")`, each through `presets.token_windows` with `seq_len=256, batch=32` |
 | Model | `emb_features=256, num_layers=4, num_heads=4, max_seq_len=256, dtype=jnp.bfloat16` |
-| Optimizer | `OptimConfig(rate=1e-3)` |
+| Optimizer | `OptimConfig(learning_rate=1e-3)` |
 | Objective | `LMObjective(model, seq_len=256, ema_decay=0.999)` |
 | Run | `steps=2000, log_every=500, eval_every=1000` |
 | Prompt | `"Once upon a time"`, 40 new tokens, `temperature=0.0` |
@@ -215,7 +215,7 @@ With gradient accumulation, the cross-entropy and multi-token-prediction (MTP) l
 
 ## Pretrained checkpoints
 
-`Pretrained.load(name_or_dir)` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle that holds the native Flax model, its variables, the checkpoint's processor or tokenizer, the source config and the generation defaults. The bundle's class depends on the kind of source it read, and each class has the methods that work for that kind: `PretrainedDecoder` (text generation), `PretrainedMaskedDecoder` (LLaDA, Dream), `PretrainedBlockDecoder` (DiffusionGemma), `PretrainedPipeline` (latent diffusion, `text_to_image`) and `PretrainedFallback` (`fallback="torchax"`, training only). Every kind can take an adapter (`adapt`), and you can pass any of them in place of the model to the objective that trains it. Calling `load` on a specifi…
+`Pretrained.load(name_or_dir)` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle that holds the native Flax model, its variables, the checkpoint's processor or tokenizer, the source config and the generation defaults. The bundle's class depends on the kind of source it read, and each class has the methods that work for that kind: `PretrainedDecoder` (text generation), `PretrainedMaskedDecoder` (LLaDA, Dream), `PretrainedBlockDecoder` (DiffusionGemma), `PretrainedPipeline` (latent diffusion, `text_to_image`) and `PretrainedFallback` (tier 3, transformers' own forward, training only). Every kind can take an adapter (`adapt`), and you can pass any of them in place of the model to the objective that trains it. Calling `load` on a specifi…
 
 `LMObjective(bundle, seq_len, **options)` trains a decoder bundle from its loaded weights. With token files prepared using the checkpoint's tokenizer (`dew data export ... --tokenizer Qwen/Qwen3-0.6B`), fine-tuning uses the same trainer as training from scratch:
 
@@ -228,7 +228,7 @@ from dew.interop import PretrainedDecoder
 data = TokenFiles("data/qwen3-tokens").shuffle(seed=0).repeat().pipe(presets.token_windows, seq_len=512, batch=4)
 bundle = PretrainedDecoder.load("Qwen/Qwen3-0.6B", max_seq_len=512)
 objective = LMObjective(bundle, seq_len=512)
-state = Trainer(objective, OptimConfig(rate=1e-5), key=jax.random.key(0)).fit(data, steps=100)
+state = Trainer(objective, OptimConfig(learning_rate=1e-5), key=jax.random.key(0)).fit(data, steps=100)
 ```
 
 This downloads the Hub weights and needs memory for the model, gradients and optimizer. The bundle supplies the model, the initial variables and its processor, so `objective.pipeline(state)` takes text prompts. Passing `variables=` or `processor=` as well overrides that part of the bundle.
@@ -241,7 +241,7 @@ from dew.lora import LoRA
 
 tuned = bundle.adapt(LoRA(rank=8, modules=("q_proj", "v_proj")), key=0)
 objective = LMObjective(tuned, seq_len=512)
-state = Trainer(objective, OptimConfig(rate=1e-4), key=0).fit(data, steps=100)
+state = Trainer(objective, OptimConfig(learning_rate=1e-4), key=0).fit(data, steps=100)
 tuned.adapter.save(state.variables, "qwen3-adapter")
 tuned.save("qwen3-merged", variables=state.variables)
 print(objective.pipeline(state)("The capital of France is", 8, key=0).text[0])
@@ -302,8 +302,8 @@ The base checkpoints used below are not instruction-tuned chat models. With an i
 Loading works in three tiers.
 
 1. **Native family.** The model type is registered, and a test pins its numbers against transformers. It gets Dew's attention kernels, sharding rules, cached generation and export.
-2. **Verified mapping.** Some unregistered model types compute a registered family's model under their own name: CWM is the Llama block, Seed-OSS is Qwen2's, GLM-4.7-Flash is DeepSeek V3's. Before downloading the weights, `Pretrained.load` builds transformers' own class for that type from the same config at a much smaller size, with random weights, loads it through each registered family whose mapping reads the config (Llama's first) and compares the logits in float32. The load goes ahead as a native Dew model through the first family that matches, and emits one `VerifiedMappingWarning` that names tier 2, the family, the transformers version and the measured error. The model saves under the type's own config and tensor names. The check needs torch (`uv pip install 'dewml[torch]'`); without torch the load is refused and the refusal names that extra. A type that computes something else is refused with each family's reason, for example SmolLM3 (layers without rotary positions), Granite (multipliers) or Phi-3 (fused projections).
-3. **Generic, opt-in.** `Pretrained.load(repo, fallback="torchax")` builds transformers' PyTorch model on the host and runs its forward through torchax. It compiles, differentiates and trains through `Trainer` and `LMObjective`. The variables keep the source's torch names and are split into `params`, which the optimizer updates, and `buffers`, which it never touches. `TorchLayout` places them on a mesh by name. This tier has no Dew kernels and no cached generation (`text_generation` refuses), and reads float weights only. It pins the torch version (`uv pip install 'dewml[torchax]'`), and the load keeps the torch model in host memory too, so plan for at least twice the checkpoint size. The load warns and names the tier. Train it in float32 compute (`dtype="float32"`, with weights stored at any `param_dtype`): in bfloat16 compute, JAX's autodiff sums the gradient of a parameter broadcast over positions, a norm weight or a bias, in bfloat16 ([jax-ml/jax#30310](https://github.com/jax-ml/jax/issues/30310)), and those gradients land about 2.5 times further from float64 than torch's own bfloat16 training. Dew's native layers sum them at float32.
+2. **Verified mapping.** Some unregistered model types compute a registered family's model under their own name: CWM is the Llama block, Seed-OSS is Qwen2's, GLM-4.7-Flash is DeepSeek V3's. Before downloading the weights, `Pretrained.load` builds transformers' own class for that type from the same config at a much smaller size, with random weights, loads it through each registered family whose mapping reads the config (Llama's first) and compares the logits in float32. The load goes ahead as a native Dew model through the first family that matches, and emits one `VerifiedMappingWarning` that names tier 2, the family, the transformers version and the measured error. The model saves under the type's own config and tensor names. The check needs torch (`uv pip install 'dewml[torch]'`); without torch the load is refused and the refusal names that extra. A type that computes something else, for example SmolLM3 (layers without rotary positions) or Granite (multipliers), goes to tier 3 with each family's reason.
+3. **Transformers' own forward.** An unregistered type that no registered family's mapping computes loads through transformers' PyTorch model, run by torchax, when it is a causal LM: before any weight downloads, the same small random instance must give each position logits that the later tokens leave unchanged, and its forward must use no operation whose output's shape or value depends on its inputs (a `nonzero`, an `item()`), which a traced program cannot hold. The load emits one `TransformersTierWarning` that names tier 3 and why no mapping matched. A type whose small instance cannot be built or run is refused (`ProbeUnavailable`). `Pretrained.load(repo, fallback="torchax")` takes this tier for any source, a registered one included. The tier builds transformers' PyTorch model on the host and runs its forward through torchax. It compiles, differentiates and trains through `Trainer` and `LMObjective`. The variables keep the source's torch names and are split into `params`, which the optimizer updates, and `buffers`, which it never touches. `TorchLayout` places them on a mesh by name. Where every decoder layer of the type asks transformers' attention interface for its attention, with a mask Dew's causal and windowed visibility reproduces (observed on the same small instance), the layers' attention is Dew's: `attention_impl` picks its kernel, and packed rows train each document within itself, rotated from its own first token. A type whose layers compute their own attention keeps transformers', with no packing. Either way the tier has no cached generation (`text_generation` refuses) and reads float weights only. It pins the torch version (`uv pip install 'dewml[torchax]'`), and the load keeps the torch model in host memory too, so plan for at least twice the checkpoint size. The load warns and names the tier. Train it in float32 compute (`dtype="float32"`, with weights stored at any `param_dtype`): in bfloat16 compute, JAX's autodiff sums the gradient of a parameter broadcast over positions, a norm weight or a bias, in bfloat16 ([jax-ml/jax#30310](https://github.com/jax-ml/jax/issues/30310)), and those gradients land about 2.5 times further from float64 than torch's own bfloat16 training. Dew's native layers sum them at float32.
 
 ### Multimodal checkpoints
 
@@ -402,7 +402,7 @@ masked_model = CausalTransformer(vocab_size=mask_id + 1,
                                  emb_features=64, num_layers=2, num_heads=2,
                                  mlp_features=256, max_seq_len=64, causal=False)
 masked_objective = MaskedDiffusionObjective(masked_model, process, seq_len=64)
-masked_state = Trainer(masked_objective, OptimConfig(rate=3e-3), key=jax.random.key(4)).fit(
+masked_state = Trainer(masked_objective, OptimConfig(learning_rate=3e-3), key=jax.random.key(4)).fit(
     masked_data, steps=1000, log_every=500)
 drawn = process.generate(masked_model, masked_state.variables,
                          [tokenizer.encode("One day, Lily")], 24, key=jax.random.key(5))
@@ -519,7 +519,7 @@ python recipes/lm/train.py --set data.source.url=data/diffusion-token-windows \
     --set data.token_windows.seq_len=511 --objective block_diffusion --objective.prompt-length 256 \
     --pretrained google/diffusiongemma-26B-A4B-it \
     --tokenizer google/diffusiongemma-26B-A4B-it \
-    --max-new-tokens 0 --optim.rate 0.00015
+    --max-new-tokens 0 --optim.learning-rate 0.00015
 ```
 
 The token files must use the checkpoint's tokenizer and hold the clean prompt prefix followed by the response canvases you intend. Trainer checkpoints keep the optimizer and iterator state, and `Pretrained.save` writes a complete inference checkpoint in the source format.

@@ -20,7 +20,8 @@ from dew.nn.dense import Dense
 
 from .conv import Conv
 from .flops import conv_flops, projection_flops
-from .precision import at_least_fp32, float32_dot_general, float32_products
+from .inputs import sequence_blocks
+from .precision import at_least_fp32, float32_dot_general, float32_einsum
 
 
 def affine_spans(left, right, multiply=operator.mul, add=operator.add):
@@ -107,17 +108,17 @@ def diagonal_recurrence(pole: jax.Array, inputs: jax.Array, chunk: int = SCAN_CH
     chunks = -(-steps // length)
     highest = jax.lax.Precision.HIGHEST
     powers = _powers(pole, length)
-    blocks = jnp.pad(inputs, ((0, 0), (0, chunks * length - steps), (0, 0)))
-    blocks = blocks.reshape(batch, chunks, length, 2, states).transpose(0, 1, 3, 2, 4)
+    blocks = sequence_blocks(inputs, length).reshape(batch, chunks, length, 2, states)
+    blocks = blocks.transpose(0, 1, 3, 2, 4)
     # Entry (k, j) is pole^(k - j) where k >= j, and zero above the diagonal:
     # a one-hot product, exact at full precision, whose transpose is a
     # product too rather than a scatter or a stack of shifted copies.
     lag = np.arange(length)[:, None] - np.arange(length)[None, :]
     picks = (lag[..., None] == np.arange(length)).astype(np.float32)
-    within_re, within_im = (jnp.einsum("kjt,tn->kjn", picks, part, precision=highest)
+    within_re, within_im = (float32_einsum("kjt,tn->kjn", picks, part, precision=highest)
                             for part in (powers[:length].real, powers[:length].imag))
-    local = jnp.einsum("kjn,bcjn->bckn", _complex_blocks(within_re, within_im),
-                       blocks.reshape(batch, chunks, 2 * length, states), precision=highest)
+    local = float32_einsum("kjn,bcjn->bckn", _complex_blocks(within_re, within_im),
+                           blocks.reshape(batch, chunks, 2 * length, states), precision=highest)
     local = local.reshape(batch, chunks, 2, length, states)
     if chunks > 1:
         carry = _carried(powers[-1], local[:, :, :, -1].transpose(0, 2, 1, 3))[:, :, :, None]
@@ -236,15 +237,14 @@ def _chunked_directions(u: jax.Array, operators, reversed_: tuple[bool, ...], dt
     u = u.astype(compute_dtype(dtype))
     width = 2 * operators[0][0].shape[0]
     stacked = jnp.concatenate([jnp.concatenate([b.real, b.imag]) for _, b, _, _ in operators])
-    projected = jnp.einsum('bsf,nf->bsn', u, stacked, precision=float32_products(u.dtype))
+    projected = float32_einsum('bsf,nf->bsn', u, stacked)
     out = []
     for index, ((pole, _, c, d), backwards) in enumerate(zip(operators, reversed_, strict=True)):
         v = projected[..., index * width:(index + 1) * width]
         x = (jnp.flip(diagonal_recurrence(pole, jnp.flip(v, axis=1)), axis=1) if backwards
              else diagonal_recurrence(pole, v))
         # The k-th output is Re(C x_k), the real form's [C_re, -C_im] product.
-        y = jnp.einsum('bsn,fn->bsf', x, jnp.concatenate([c.real, -c.imag], -1),
-                       precision=float32_products(x.dtype)) + d * u
+        y = float32_einsum('bsn,fn->bsf', x, jnp.concatenate([c.real, -c.imag], -1)) + d * u
         out.append(y.astype(dtype))
     return out
 

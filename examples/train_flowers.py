@@ -67,7 +67,7 @@ def main(config: Config, data: Dataset | Loader | None = None):
     )
     trainer = Trainer(
         objective,
-        OptimConfig(rate=2e-4),
+        OptimConfig(learning_rate=2e-4),
         key=jax.random.key(0),
         checkpoints=Checkpoints(str(config.output / "checkpoints")),
         profile=(ProfileWindow(str(config.output / "profile"), steps=config.profile)

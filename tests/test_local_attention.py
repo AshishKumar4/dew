@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as splash
 from model_support import model_draw
-from reference_error import FEWEST_SEEDS, assert_as_exact
+from reference_error import FEWEST_SEEDS, assert_as_exact, with_gradients
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -172,8 +172,8 @@ def test_chunks_count_tokens_from_the_place_a_caller_gives_their_first(given, le
 
 @pytest.mark.parametrize("span", [{"window": 6}, {"chunk": 8}])
 def test_gradients_match_the_dense_masked_kernel(span):
-    """The band's gradients of a drawn readout, for the query, key and value, on par with the dense
-    masked kernel's (check 1)."""
+    """The band's output and its gradients under a drawn readout, its cotangent, for the query, key and
+    value, on par with the dense masked kernel's (check 1)."""
     length = 40
     rows = np.arange(length)
     keep = rows[None, :] <= rows[:, None]
@@ -188,10 +188,7 @@ def test_gradients_match_the_dense_masked_kernel(span):
         return query, key, value, readout
 
     def gradients(fn):
-        def run(q, k, v, cotangent):
-            pulled = jax.grad(lambda q, k, v: jnp.sum(fn(q, k, v) * cotangent), argnums=(0, 1, 2))(q, k, v)
-            return dict(zip(("query", "key", "value"), pulled, strict=True))
-        return jax.jit(run)
+        return jax.jit(with_gradients(fn))
 
     assert_as_exact(gradients(lambda q, k, v: local_attention(q, k, v, **span, implementation="xla")),
                     gradients(masked(np.broadcast_to(keep, (2, length, length)))), draw, f"{span} gradients",
