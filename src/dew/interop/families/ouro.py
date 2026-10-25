@@ -25,6 +25,7 @@ from dew.interop.decoder_parts import (
     Leaves,
     Renames,
     base_config,
+    read_rope,
     refuse,
     renamed_name,
     renamed_path,
@@ -56,7 +57,12 @@ def _ouro_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     # OuroConfig drops the window unless use_sliding_window is set, and
     # derives layer_types with Qwen2's rule when none are stated.
     windowed = {**hf, 'sliding_window': hf.get('sliding_window') if hf.get('use_sliding_window') else None}
-    config = base_config(windowed, used, rope=PLAIN_SPELLING, layer_types=qwen_layer_types(windowed, used),
+    # The release's own OuroRotaryEmbedding builds its table through ROPE_INIT_FUNCTIONS
+    # (modeling_ouro.py:445-459 of ByteDance/Ouro-1.4B), as transformers' classes do; no check
+    # holds a YaRN record against that remote code yet, so its ramps stay the plain table's and
+    # Llama 3.1's.
+    rope = read_rope(windowed, used, PLAIN_SPELLING, ramps=('llama3',))
+    config = base_config(windowed, used, rope=rope, layer_types=qwen_layer_types(windowed, used),
                          reads=frozenset({'layer_types', 'sliding_window'}))
     config.update(sandwich_norms=True, loop={'steps': steps, 'exit_gate': True})
     return config
