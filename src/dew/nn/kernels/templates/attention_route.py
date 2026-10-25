@@ -46,12 +46,26 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     if hooks.output_mod is not None:
         raise ValueError("the attention route takes score hooks and the initial state; its backward takes "
                          "the output before an output hook, so the caller applies `output_mod` to the result")
+    if hooks.drop is not None and not drops():
+        raise NotImplementedError(DROPS_NOT)
     return _attend(scale, query, key, value, spans, hooks)
 
 
 def _on_gpu() -> bool:
     """Whether calls run on a GPU of sm80 or later, where the Triton mainloop runs (`bf16_dot_runs`)."""
     return generation.gpu_placed() and generation.bf16_dot_runs()
+
+
+DROPS_NOT = ("the template's GPU mainloops take no probability dropout yet: the Triton mainloop is frozen, "
+             "and Mosaic's takes the weights hook next (ledger row 1521)")
+"""Why the route refuses a dropping call on a GPU (`drops`)."""
+
+
+def drops() -> bool:
+    """Whether the route's mainloops here take probability dropout: the plain-JAX mainloop's, where it runs
+    every call (off a GPU, or on one before sm80, where the GPU mainloops do not run, `_on_gpu`). On an sm80
+    or later GPU the route's mainloops are Triton's and Mosaic's, which take none yet (`DROPS_NOT`)."""
+    return not _on_gpu()
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(0,))

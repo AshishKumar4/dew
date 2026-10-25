@@ -135,15 +135,29 @@ def pulled(implementation: str, case: dict):
     return run
 
 
+SINK_SITES = {"sinks-softcap": {"float32": 16, "bfloat16": 32},
+              "cache-call-blocks-starts": {"float32": 64, "bfloat16": 128},
+              "cache-call-valid": {"float32": 16, "bfloat16": 32}}
+"""The seeds of each case with sinks at `SINK_HEADS`, sized by `seeds_for` there (the reference against
+itself): a head's sink gradient is one value a draw, so at the site's `HEADS` the cache calls' did not
+resolve within 512 seeds (bf16) and needed 256 to 512 elsewhere; the other cases resolve at `SEEDS`."""
+SINK_HEADS = (32, 8)
+"""The query and key heads of a case with sinks: enough sink gradients a draw to resolve in few seeds."""
+
+
 @pytest.mark.parametrize("dtype", DTYPES, ids=lambda dtype: jnp.dtype(dtype).name)
-@pytest.mark.parametrize("case", CASES.values(), ids=list(CASES))
-def test_a_named_template_route_is_on_par_with_the_reference_path_forward_and_backward(case, dtype):
+@pytest.mark.parametrize("name", CASES)
+def test_a_named_template_route_is_on_par_with_the_reference_path_forward_and_backward(name, dtype):
     """The route's output and its gradients of the query, key, value and sinks, on par with the reference
-    path (`implementation='reference'`) measured from float64 over the site's draws (check 1)."""
+    path (`implementation='reference'`) measured from float64 over the site's draws (check 1); a case with
+    sinks at `SINK_HEADS` over its own seeds (`SINK_SITES`)."""
+    case = CASES[name]
     queries, keys = geometry(case)
-    assert_as_exact(jax.jit(pulled("template", case)), jax.jit(pulled("reference", case)),
-                    drawing(queries, keys, dtype, sinks=bool(case.get("sinks"))),
-                    f"template route {case} {jnp.dtype(dtype).name}", seeds=SEEDS)
+    heads, kv_heads = SINK_HEADS if name in SINK_SITES else (HEADS, KV_HEADS)
+    seeds = SINK_SITES[name][jnp.dtype(dtype).name] if name in SINK_SITES else SEEDS
+    draw = drawing(queries, keys, dtype, sinks=bool(case.get("sinks")), heads=heads, kv_heads=kv_heads)
+    assert_as_exact(jax.jit(pulled("template", case)), jax.jit(pulled("reference", case)), draw,
+                    f"template route {case} {jnp.dtype(dtype).name}", seeds=seeds)
 
 
 MESH_CASES = {
