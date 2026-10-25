@@ -540,7 +540,8 @@ def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
         dataclasses.replace(task, max_new_tokens=None)("the ", key=2)
 
 
-def test_an_lm_run_over_a_sources_own_processor_reloads_that_processor(tmp_path):
+@pytest.mark.parametrize("earlier", [False, True])
+def test_an_lm_run_over_a_sources_own_processor_reloads_that_processor(tmp_path, earlier):
     """A decoder fine-tuned from a checkpoint encodes text with the processor the
     checkpoint ships; its run records that processor's source, so the reloaded task
     encodes as the trained one does rather than loading as weights that take ids."""
@@ -556,9 +557,13 @@ def test_an_lm_run_over_a_sources_own_processor_reloads_that_processor(tmp_path)
     run = tmp_path / "run"
     checkpoints = Checkpoints(str(run), keep=1)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0), checkpoints=checkpoints)
-    trainer.fit(Loader(train=lambda partition: Replaying(lambda position: batch), val=None, records=None,
-                       batch=8), steps=1, log_every=100, checkpoint_every=1)
+    state = trainer.fit(Loader(train=lambda partition: Replaying(lambda position: batch), val=None, records=None,
+                               batch=8), steps=1, log_every=100, checkpoint_every=1)
     checkpoints.wait()
+    if earlier:
+        record = {**objective.inference_record(), "processor": str(source)}
+        checkpoints.save(int(state.step) + 1, state, artifact=record)
+        checkpoints.wait()
 
     task = dew.pipeline(str(run))
     assert loaded.text_processor is not None and task.processor is not None
