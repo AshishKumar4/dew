@@ -305,11 +305,11 @@ def _Untraceable(traced):
         if isinstance(value, Tensor):
             yield value
         elif isinstance(value, (tuple, list)):
-            for item in value:
-                yield from tensors(item)
+            for part in value:
+                yield from tensors(part)
         elif isinstance(value, Mapping):
-            for item in value.values():
-                yield from tensors(item)
+            for part in value.values():
+                yield from tensors(part)
 
     def decides(func, args, kwargs) -> bool:
         if func in deciding:
@@ -336,7 +336,8 @@ def _Untraceable(traced):
             kwargs = kwargs or {}
             reads = any(id(tensor) in self.reached for tensor in tensors((args, kwargs)))
             if reads and decides(func, args, kwargs):
-                self.found.append(getattr(func, "__qualname__", getattr(func, "__name__", repr(func))))
+                # Each function `decides` names is torch's own, which names itself.
+                self.found.append(func.__qualname__)
             output = func(*args, **kwargs)
             if reads:
                 for tensor in tensors(output):
