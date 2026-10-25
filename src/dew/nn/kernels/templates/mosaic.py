@@ -117,17 +117,20 @@ def streamed(rings: tuple, views, lo, hi) -> None:
         ring.drain(hi - lo)
 
 
-def passed(rings: tuple, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
+def passed(rings: tuple, lo, hi, *, first: jax.Array | int = 0, before=None) -> None:
     """A consumer's steps `lo` to `hi` of `rings` it reads none of (another consumer's), each ring's load
     awaited and its slot released as a reading consumer's are (counted from `first`): a wait takes its
-    barrier's next phase, so every consumer waits on every load; `between()` after each step."""
+    barrier's next phase, so every consumer waits on every load; `before()` at each step, ahead of its
+    waits. A step's own syncs with the other consumers (their turns) go first: a load's slot may be held by
+    a consumer until past its own turn at that step (a walk keeping a stream's slot a step, `Family.walk`'s
+    `kept`), so a wait ahead of the turn would wait on a release the turn holds back."""
     @pl.loop(lo, hi)
     def _(index):
+        if before is not None:
+            before()
         for ring in rings:
             ring.acquire(index - first)
             ring.release(index - first)
-        if between is not None:
-            between()
 
 
 def loaded(copies) -> None:
@@ -493,9 +496,9 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         Returns the carry and the accumulators' values."""
 
     @abc.abstractmethod
-    def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
+    def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, before=None) -> None:
         """A consumer's steps `lo` to `hi` it reads none of, each load awaited and released as a reading
-        consumer's (counted from `first`); `between()` after each step."""
+        consumer's (counted from `first`); `before()` at each step, ahead of its waits (`passed`)."""
 
     @abc.abstractmethod
     def loaded(self, copies) -> None:
@@ -783,8 +786,8 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         """A walk of `segments`, `step(index, carry, accumulators)`, with the family's accumulators of
         `shapes` held across it from their `initial` values (`walk`)."""
 
-    def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
-        passed(tuple(streams.values()), lo, hi, first=first, between=between)
+    def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, before=None) -> None:
+        passed(tuple(streams.values()), lo, hi, first=first, before=before)
 
     def loaded(self, copies) -> None:
         loaded(copies)

@@ -217,8 +217,8 @@ class Mma(mosaic.Family):
                                         init_carry=carry)(*(streams.views[name][0] for name in names))
         return carry
 
-    def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
-        del streams, lo, hi, first, between
+    def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, before=None) -> None:
+        del streams, lo, hi, first, before
 
     def loaded(self, copies) -> None:
         for view, ref, _ in copies:
