@@ -815,6 +815,10 @@ class Objective(ABC, Generic[Loss, Effects]):
     # the model under in every collection, as PPO nests its policy beside the
     # critic; None when the saved tree is the model's.
     _model_part: ClassVar[str | None] = None
+    # The name the model's tree nests its recorded model (`recorded_model`) under, beside parts its record
+    # leaves out, as a decision model nests its backbone beside its head; None when the model's tree is
+    # the recorded model's. A LoRA record's factors merge there (`dew.checkpoints.averaged`).
+    _recorded_part: ClassVar[str | None] = None
     shown: Mapping[str, Shown] = {}
     """How the display shows the metrics `loss` reports, keyed by the names it reports them under.
 

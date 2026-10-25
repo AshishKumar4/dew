@@ -83,6 +83,7 @@ if TYPE_CHECKING:
     import optax
     from flax.training.dynamic_scale import DynamicScale
 
+    from dew.config import ModelConfig
     from dew.data.dataset import DataPartition
     from dew.training.state import Accumulation, TrainState
 
@@ -1903,3 +1904,104 @@ class Checkpoints:
             attempted([("Checkpoint wait", writer.wait_until_finished)
                         for writer in (self._manager, self._local_manager) if writer is not None])
             self._pending = None
+
+
+@dataclasses.dataclass(frozen=True)
+class Averaged:
+    """The fp32 mean of runs' weights (`averaged`).
+
+    `variables` is the tree their model applies with, `model` the runs' model record with any LoRA
+    adapter merged away, which builds the model the mean applies to, and `runs` each run's directory,
+    step and whether its average (EMA) was read."""
+
+    variables: Variables
+    model: ModelConfig
+    runs: tuple[tuple[str, int, bool], ...]
+
+
+def averaged(runs: Sequence[str | os.PathLike[str]], *, step: int | str | None = None,
+             ema: bool | None = None, trust: Sequence[str] = ()) -> Averaged:
+    """The fp32 mean of `runs`' effective weights, each run's at `step` (its latest where None) and
+    `ema` as its loaders read them (its average where None and it keeps one): a model soup of runs
+    trained apart from one model, any objective's.
+
+    A run's weights are its model's tree (`Objective._saved_variables`) in fp32, a LoRA run's factors
+    merged into their kernels first (`Adapter.merge`), as the mean of two runs' factors is not the
+    mean of the weights they make; a LoRA run and a whole fine-tune of one base average. The runs are
+    of one model: their model records, adapters aside, the same, and their trees of the same leaves
+    and shapes; any other run is refused (ValueError), naming it. Each floating leaf is streamed
+    into a running mean (`_running_mean`), so one run's tree is held beside the mean at a time, and
+    an integer or boolean leaf must agree across the runs. `trust` is as `run_record` takes it."""
+    from dew.config import ModelConfig
+    from dew.inference.tasks import run_record
+    from dew.lora import Adapter, AdapterRecord
+    from dew.objectives.base import joined, part
+    from dew.registry import objectives
+
+    if len(runs) < 2:
+        raise ValueError(f"an average is of two or more runs, got {len(runs)}")
+    mean, model, read = None, None, []
+    for count, run in enumerate(runs, start=1):
+        directory = str(epath.Path(run))
+        declaration, pinned = run_record(directory, step, trust)
+        objective = objectives[records.text(declaration["objective"], "objective")]
+        config = ModelConfig.from_dict(records.record(declaration["model"], "model"))
+        base = dataclasses.replace(config, wrappers=tuple(
+            wrapper for wrapper in config.wrappers if not isinstance(wrapper, AdapterRecord)))
+        if model is not None and base != model:
+            raise ValueError(f"the run in {directory} trains another model than {read[0][0]}'s, so their "
+                             "weights are not one model's to average")
+        model = base
+        tree = objective._saved_variables(directory, step=pinned, ema=ema, param_dtype=jnp.float32)
+        if config.adapter is not None:
+            # The factors merge where the recorded model's tree is, beside any part its record leaves out.
+            name = objective._recorded_part
+            own = tree if name is None else part(tree, name)
+            merged = Adapter.recorded(config.build(), own, config.adapter).merge(own)
+            if name is None:
+                tree = merged
+            else:
+                others = {key for collection in tree.values() for key in collection} - {name}
+                tree = joined({name: merged, **{other: part(tree, other) for other in sorted(others)}})
+        with Checkpoints(directory) as checkpoints:
+            kept = checkpoints.stored(pinned).get("ema") is not None
+        read.append((directory, pinned, not objective._ema_is_reference and (kept if ema is None else ema)))
+        mean = tree if mean is None else _running_mean(mean, tree, count, directory, read[0][0])
+    assert mean is not None and model is not None
+
+    def widened(leaf):
+        floating = jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.inexact)
+        return jnp.asarray(leaf, jnp.float32) if floating else leaf
+
+    return Averaged(jax.tree.map(widened, mean), model, tuple(read))
+
+
+def _running_mean(mean, tree, count: int, directory: str, first: str):
+    """`mean`, the fp32 mean of `count - 1` runs' variables, with the `count`th run's `tree` taken in:
+    for a second run each floating leaf `(mean + leaf) / 2` below 2**126, a sum that cannot overflow
+    (and is exact wherever its half could round), and `mean / 2 + leaf / 2` above, exact halves: one
+    rounding either way, so float64's mean rounded to fp32; for a later one
+    `mean + (leaf - mean) / count` where both share a sign, whose difference cannot overflow, and
+    `mean * (1 - 1/count) + leaf / count` where they differ, whose terms cannot. An integer or
+    boolean leaf must equal the mean's. A tree of other variables or shapes is refused."""
+    pairs = list(zip(jax.tree.leaves(mean), jax.tree.leaves(tree), strict=False))
+    if jax.tree.structure(tree) != jax.tree.structure(mean) or any(
+            np.shape(a) != np.shape(b) for a, b in pairs):
+        raise ValueError(f"the run in {directory} holds other variables than {first}")
+
+    def taken(held, leaf):
+        if not jnp.issubdtype(jnp.asarray(held).dtype, jnp.inexact):
+            if not np.array_equal(np.asarray(held), np.asarray(leaf)):
+                raise ValueError(f"an integer or boolean variable of the run in {directory} differs from "
+                                 f"{first}'s, which no mean of their weights reconciles")
+            return held
+        held, leaf = jnp.asarray(held, jnp.float32), jnp.asarray(leaf, jnp.float32)
+        if count == 2:
+            small = jnp.maximum(jnp.abs(held), jnp.abs(leaf)) < 2.0**126
+            return jnp.where(small, (held + leaf) / 2, held / 2 + leaf / 2)
+        same = jnp.sign(held) == jnp.sign(leaf)
+        moved = held + (leaf - jnp.where(same, held, 0.0)) / count
+        weighted = held * ((count - 1) / count) + leaf / count
+        return jnp.where(same, moved, weighted)
+
+    return jax.tree.map(taken, mean, tree)

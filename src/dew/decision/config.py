@@ -165,7 +165,9 @@ class DecisionRunConfig(RunConfig):
                              "--context-layers")
         if self.context_encoder != "table" and self.context_layers is None:
             raise ValueError("--context-encoder says how context layers read a context; set --context-layers")
-        derived = {}
+        # A fresh head is drawn from the trainer's key: runs that share it start their heads alike.
+        derived: dict[str, object] = {"head_seed": self.trainer.key, "head_source": str(self.pretrained)
+                                      + ("" if self.revision is None else f"@{self.revision}")}
         if self.context_layers is not None:
             derived["context_encoder"] = self.context_encoder
         if LayaCheckpoint.exists(self.pretrained, subfolder=self.subfolder, revision=self.revision):
@@ -200,11 +202,11 @@ class DecisionRunConfig(RunConfig):
             # The tokenizer of the commit the weights come from.
             root = sources.snapshot(self.pretrained, self.revision, weights=False)
             derived["tokenizer"] = HFTokenizer(str(root), local_files_only=root != Path(self.pretrained))
+            head: type[DecisionHead] | JointSchemaHead = DecisionHead
             if self.head is not None:
                 width, head_dtype = DecisionModel.head_size(start.model)
-                derived["head"] = JointSchemaHead(hidden_size=width, dtype=head_dtype,
-                                                  **dataclasses.asdict(self.head))
-            head = derived.get("head", DecisionHead)
+                head = derived["head"] = JointSchemaHead(hidden_size=width, dtype=head_dtype,
+                                                         **dataclasses.asdict(self.head))
             derived["layout"] = _fresh_layout(start.model.causal, head.one_question, budgets)
         objective = self.objective.build(backbone=start, **derived)
         assert isinstance(objective, DecisionObjective), "a decision run's objective is a DecisionObjective"
