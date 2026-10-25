@@ -8,7 +8,8 @@ from pathlib import Path
 
 for proc in Path('/proc').glob('[0-9]*'):
     try:
-        uid = next(line for line in (proc / 'status').read_text().splitlines() if line.startswith('Uid:')).split()[1]
+        uid = next(line for line in (proc / 'status').read_text().splitlines()
+                   if line.startswith('Uid:')).split()[1]
     except (OSError, StopIteration):
         continue
     assert int(uid) == os.getuid(), 'guest saw a foreign process'
