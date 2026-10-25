@@ -1,7 +1,9 @@
-"""Dew's CPU policy for float32 products (`dew.nn.precision.accumulated`): a CPU sums them in float64
-and rounds once, through every product a layer forms, its gradient's and tangent's included, and a
-bias's gradient (`dew.nn.precision.spread`), with x64 off; 16-bit products and other backends keep their
-own arithmetic."""
+"""Dew's CPU policy for float32 products (`dew.nn.precision.accumulated`) in the suite's wide CPU
+arithmetic (`dew.nn.precision.WIDE_CPU_ARITHMETIC`, which tests/lane_environment.py sets): a CPU sums
+them in float64 and rounds once, through every product a layer forms, its gradient's and tangent's
+included, and a bias's gradient (`dew.nn.precision.spread`), with x64 off; 16-bit products and other
+backends keep their own arithmetic. A library process, without the setting, traces the plain
+products."""
 
 import contextlib
 
@@ -12,7 +14,14 @@ import pytest
 from reference_error import with_gradients
 
 from dew.nn.dense import Dense
-from dew.nn.precision import FP32_SUMS, accumulated, float32_dot_general, float32_einsum, float32_matmul
+from dew.nn.precision import (
+    FP32_SUMS,
+    WIDE_CPU_ARITHMETIC,
+    accumulated,
+    float32_dot_general,
+    float32_einsum,
+    float32_matmul,
+)
 
 pytestmark = pytest.mark.skipif(jax.default_backend() != "cpu", reason="the policy is the CPU's")
 
@@ -218,3 +227,34 @@ def test_a_portable_recurrence_product_sums_in_float64():
     decay = np.ones((1, 1, 3), np.float32)
     weighed = jax.jit(lambda *operands: paired("product", *operands))(left, right, decay)
     assert np.asarray(weighed).tolist() == [[1.0]]
+
+
+@pytest.mark.parametrize("wide", [True, False], ids=["test setting", "library"])
+def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
+    """Each site of the wide CPU arithmetic, a float32 product and a bias's spread, a row's logsumexp
+    and a float64 division, traces a platform choice in a process running Dew's test setting
+    (`WIDE_CPU_ARITHMETIC`), and in a library process, which sets nothing, the plain computation:
+    no platform choice and no float64 beside a float32 computation."""
+    from dew.diffusion.schedules.common import divided
+    from dew.objectives.lm.chunked import logits_cross_entropy
+
+    if wide:
+        monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "1")
+    else:
+        monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
+    lhs, rhs = np.ones((4, 3), np.float32), np.ones((3, 2), np.float32)
+    layer = Dense(2)
+    variables = layer.init(jax.random.key(0), lhs)
+    logits, targets = np.zeros((2, 5, 7), np.float32), np.zeros((2, 5), np.int32)
+    traced = {
+        "product": jax.make_jaxpr(lambda a, b: float32_dot_general(a, b, (((1,), (0,)), ((), ()))))(lhs, rhs),
+        "bias": jax.make_jaxpr(jax.grad(lambda params: jnp.sum(layer.apply({"params": params}, lhs))))(
+            variables["params"]),
+        "logsumexp": jax.make_jaxpr(lambda logits: logits_cross_entropy(logits, targets))(logits),
+    }
+    with jax.enable_x64(new_val=True):
+        division = jax.make_jaxpr(divided)(np.ones(3, np.float64), np.float64(3.0))
+    for name, jaxpr in traced.items():
+        assert ("platform_index" in str(jaxpr)) == wide, name
+        assert ("f64" in str(jaxpr)) == (wide and name != "logsumexp"), name
+    assert ("platform_index" in str(division)) == wide

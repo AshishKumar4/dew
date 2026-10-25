@@ -10,9 +10,11 @@ fp32 accumulation, whatever the storage), and jax carries `precision` into
 the transpose rules, so the backward follows; jax's own xla attention sets it
 for this reason (jax-ml/jax#24047).
 
-A CPU sums every float32 product of the dot family, dot_general, einsum and matmul, in float64 and
-rounds once (`accumulated`): XLA:CPU chooses its fp32 dot accumulation by shape, instruction set and
-release, and jax 0.12's summed twice numpy's error from float64 where 0.11's summed 0.6 of it.
+Dew's test processes run wide CPU arithmetic (`WIDE_CPU_ARITHMETIC`, which tests/lane_environment.py
+sets): a CPU then sums every float32 product of the dot family, dot_general, einsum and matmul, in
+float64 and rounds once (`accumulated`), since XLA:CPU chooses its fp32 dot accumulation by shape,
+instruction set and release, and jax 0.12's summed twice numpy's error from float64 where 0.11's
+summed 0.6 of it. A library process's products are the plain products on every platform.
 Convolutions, depthwise ones included, keep XLA's fp32 sum on a CPU: no convolution's check 1
 failed there, and XLA:CPU's float64 convolution cost a 3x3 one's training step 44 times (15.5 to
 675 ms on a 4x32x32x128 map), its best rewrite 2 to 4. Should a convolution's check 1 resolve above
@@ -23,6 +25,7 @@ from __future__ import annotations
 
 import contextlib
 import functools
+import os
 from collections.abc import Callable
 
 import jax
@@ -87,10 +90,11 @@ def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
 
 def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
     """`value` broadcast to `shape`, whose transpose, the sum of a cotangent over every position the
-    value spread over (a bias's gradient), a CPU takes in float64 and rounds once, as it sums a
-    float32 product (`accumulated`): there the broadcast is the outer product of ones and the
-    value, whose transpose is a product. Elsewhere, or where `accumulated` leaves a product its
-    own sum, it is the broadcast, whose transpose JAX sums in the value's dtype."""
+    value spread over (a bias's gradient), a CPU running wide arithmetic (`WIDE_CPU_ARITHMETIC`, Dew's
+    tests) takes in float64 and rounds once, as it sums a float32 product (`accumulated`): there the
+    broadcast is the outer product of ones and the value, whose transpose is a product. Elsewhere,
+    or where `accumulated` leaves a product its own sum, it is the broadcast, whose transpose JAX
+    sums in the value's dtype."""
     axes = tuple(axis for axis, (size, total) in enumerate(zip(value.shape, shape, strict=True))
                  if size == 1 and total != 1)
     if not axes or not _sums_in_float64(value):
@@ -181,10 +185,27 @@ precision, the statement that its fp32 products sum as an accelerator sums them,
 honors on a CPU."""
 
 
+WIDE_CPU_ARITHMETIC = "DEW_WIDE_CPU_ARITHMETIC"
+"""The environment variable that, set to 1, has a process's CPU programs take the arithmetic Dew's
+tests hold a CPU to: float32 products summed in float64 and rounded once (`accumulated`, `spread`), a
+row's logsumexp reduced in two levels (`dew.objectives.lm.chunked`) and a float64 division divided
+as written (`dew.diffusion.schedules.common.divided`). Read as each program is traced; set by the
+tests' environment (tests/lane_environment.py), never by the library, whose products are the plain
+products on every platform. Each such site chooses the wide form by the platform the program is
+lowered for (`platform_dependent`), so a test that lowers for an accelerator keeps the target's."""
+
+
+def wide_cpu_arithmetic() -> bool:
+    """Whether this process runs wide CPU arithmetic (`WIDE_CPU_ARITHMETIC`)."""
+    return os.environ.get(WIDE_CPU_ARITHMETIC) == "1"
+
+
 def _sums_in_float64(*operands) -> bool:
-    """Whether a CPU sums these operands' products in float64 (`accumulated`): float32 arrays, in no
-    scope that states fp32 sums (`FP32_SUMS`), outside a quantized model's trace (`_intercepted`)."""
-    return (jax.config.jax_default_matmul_precision != FP32_SUMS and not _intercepted()
+    """Whether a CPU sums these operands' products in float64 (`accumulated`): in a process running wide
+    CPU arithmetic (`WIDE_CPU_ARITHMETIC`), float32 arrays, in no scope that states fp32 sums
+    (`FP32_SUMS`), outside a quantized model's trace (`_intercepted`)."""
+    return (wide_cpu_arithmetic() and jax.config.jax_default_matmul_precision != FP32_SUMS
+            and not _intercepted()
             and all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
             and products_dtype(*operands) == jnp.dtype(jnp.float32))
 
@@ -209,8 +230,9 @@ def _widened(operands) -> list[jax.Array]:
 def accumulated(product: Callable[..., jax.Array], *operands,
                 preferred_element_type: DTypeLike | None = None) -> jax.Array:
     """`product(*operands, preferred_element_type=...)`, a sum of products of `operands` (a dot, an
-    einsum, a matmul), under Dew's CPU policy: where they multiply in float32 (`products_dtype`), a
-    CPU sums the products in float64 and rounds the sum once to the dtype the product returns.
+    einsum, a matmul): the plain product, but in a process running wide CPU arithmetic
+    (`WIDE_CPU_ARITHMETIC`, Dew's tests), where they multiply in float32 (`products_dtype`) a CPU
+    sums the products in float64 and rounds the sum once to the dtype the product returns.
     Each fp32 product is exact in float64, so the result is within half an fp32 ulp of the float64
     sum at every shape, where XLA's CPU dot chooses its fp32 accumulation by shape, instruction set
     and release (jax 0.12's sums twice numpy's error from float64 at widths where jax 0.11's summed
@@ -224,7 +246,9 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     A library that swaps JAX's products for its own while a model runs (Qwix, quantizing) owns them:
     the product is its, as flax's own layers' would be.
 
-    It is real CPU execution's policy alone, chosen by the platform the program is lowered for
+    The wide sum is Dew's test setting, not a user option: a process without `WIDE_CPU_ARITHMETIC`
+    traces the plain product alone. Under it, it is real CPU execution's policy alone, chosen by the
+    platform the program is lowered for
     (`platform_dependent`), which keys every compiled program: a step a CPU lowers for a GPU target
     (`dew.training.trainer.Trainer.lower_for`, `lowering_platforms=('cuda',)`) takes the target's
     fp32 sum, and a Pallas kernel's body, interpreted on a CPU to stand in for a GPU, never forms its
