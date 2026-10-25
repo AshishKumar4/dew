@@ -7,6 +7,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import dataset
+from learning_gate import assert_learns
 from recording import RecordingTracker
 from reference_error import assert_as_exact, widened
 from steady_state import steady_state
@@ -321,14 +322,6 @@ def context_errors(objective, params, ema, data, mask, rng, draws=8):
     return tuple(np.mean(errors, axis=0).reshape(n // 2, 2).mean(axis=1) for errors in (own, other))
 
 
-def paired_statistic(differences) -> float:
-    """Student's t statistic of paired differences, their mean over its standard error: over 64
-    independent pairs, 7.0 is past scipy.stats.t.isf(1e-9, 63), so a mean of zero clears it once in a
-    billion."""
-    differences = np.asarray(differences, np.float64)
-    return float(differences.mean() / (differences.std(ddof=1) / np.sqrt(differences.size)))
-
-
 def test_a_video_objective_steps_on_an_explicit_data_axis(mask):
     """Each row's masks are its example's own draws, placed as the row is: under an Explicit data axis
     (`MeshSpec.explicit`) the video encoder repeats each row's token indices over its frames where
@@ -354,10 +347,10 @@ def test_training_makes_the_prediction_depend_on_the_context(mask):
     """The loss can be driven down by predicting the average target while
     ignoring the context entirely, which would teach the encoder nothing.
     Over 64 held-out pairs of images, each pair's errors averaged over 8 mask
-    draws, by paired tests (`paired_statistic`): a fresh predictor's error
-    from the other image's context stays under 1.5 times its own, and
-    training at least halves its own and makes the other's over five times
-    it."""
+    draws, a unit each of one verdict (the learning gate's paired contrasts):
+    a fresh predictor's error from the other image's context stays under 1.5
+    times its own, and training at least halves its own and makes the
+    other's over five times it."""
     rs = np.random.RandomState(0)
     train_x, test_x = solid_colour_images(rs, 128), solid_colour_images(rs, 128)
     normalized_test = (test_x - 127.5) / 127.5
@@ -368,8 +361,6 @@ def test_training_makes_the_prediction_depend_on_the_context(mask):
     initial = trainer.initial_state()
     before = context_errors(objective, initial.variables, initial.ema,
                               normalized_test, mask, jax.random.PRNGKey(9))
-    fresh = paired_statistic(1.5 * before[0] - before[1])
-    assert fresh > 7.0, f"a fresh predictor favours its own context (t = {fresh:.1f})"
 
     def batches():
         while True:
@@ -390,10 +381,11 @@ def test_training_makes_the_prediction_depend_on_the_context(mask):
 
     after = context_errors(objective, state.variables, state.ema,
                              normalized_test, mask, jax.random.PRNGKey(9))
-    halved = paired_statistic(before[0] - 2 * after[0])
-    assert halved > 7.0, f"held-out prediction error did not halve (t = {halved:.1f})"
-    cost = paired_statistic(after[1] - 5 * after[0])
-    assert cost > 7.0, f"the predictor still ignores its context (t = {cost:.1f})"
+    contrasts = {"a fresh predictor favours no context": 1.5 * before[0] - before[1],
+                 "held-out error halves": before[0] - 2 * after[0],
+                 "the predictor reads its context": after[1] - 5 * after[0]}
+    assert_learns(lambda pairs: {claim: values[pairs] for claim, values in contrasts.items()},
+                  "context dependence", units=before[0].size)
 
 
 
