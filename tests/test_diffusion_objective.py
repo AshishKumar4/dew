@@ -318,7 +318,7 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
     rows, images and prompts, its weights moved from the fixture's, and its step's key, which draws
     the times, the noise and the dropped rows. The two routes are two programs, which round
     otherwise."""
-    from reference_error import assert_as_exact, widened, without_ynn
+    from reference_error import as_given, assert_as_exact, widened, without_ynn
 
     source, variables, _, step = conditional_mmdit
     dropped = DiffusionObjective(source.model, source.process, source.inputs,
@@ -394,7 +394,7 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
                                       variables=widened(variables))
             return trained(through(wide, widened(values), tokens, at))
 
-    assert_as_exact(dew, reference, draw, f"null dropout at {probability}",
+    assert_as_exact(as_given(dew), as_given(reference), draw, f"null dropout at {probability}",
                     seeds=NULL_DROPOUT_SEEDS[probability], truth_fn=truth)
 
 

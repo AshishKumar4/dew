@@ -162,6 +162,39 @@ def test_a_without_ynn_arm_runs_over_windows():
     np.testing.assert_array_equal(over_windows(without_ynn(lambda x: x * 2))(x), x * 2)
 
 
+def test_the_gate_compiles_two_dew_arms_without_ynnpack_and_one_beside_a_given_arm_as_users_run_it():
+    """Check 1 compiles its arms itself (`_arms`): two Dew paths each `without_ynn`, one function as
+    both arms once, a window loop's arm within it, an arm compiled so already as it is; beside an arm
+    run `as_given` (torch, NumPy, a program of its own), which it never traces, the Dew arm with the
+    fusions, as users run it. A NumPy arm passes `as_given`, and the verdict holds."""
+    from reference_error import _arms, _Windowed, as_given, assert_as_exact, over_windows, without_ynn
+
+    def dew(x):
+        return x * 2
+
+    def written(x):
+        return x + x
+
+    mine, theirs = _arms(dew, written)
+    assert mine.without_ynn and theirs.without_ynn
+    np.testing.assert_array_equal(mine(np.ones(3, np.float32)), 2 * np.ones(3, np.float32))
+    same, again = _arms(dew, dew)
+    assert same is again and same.without_ynn
+    compiled = without_ynn(dew)
+    assert _arms(compiled, written)[0] is compiled
+    windowed, _ = _arms(over_windows(dew), written)
+    assert isinstance(windowed, _Windowed) and windowed.fn.without_ynn
+
+    host = as_given(lambda x: np.asarray(x) + np.asarray(x))
+    mine, theirs = _arms(dew, host)
+    assert theirs is host and not getattr(mine, "without_ynn", False)
+    np.testing.assert_array_equal(mine(np.ones(3, np.float32)), 2 * np.ones(3, np.float32))
+    def draw(seed):
+        return (np.random.default_rng(seed).standard_normal(8).astype(np.float32),)
+
+    assert_as_exact(dew, host, draw, "a NumPy arm as given", seeds=8)
+
+
 def test_a_torch_arm_pulls_back_the_cotangent_it_is_given():
     """`torch_with_gradients` gives, bit for bit, a torch function's output and the gradients torch's
     autograd pulls back from the cotangent passed last, cast to the output's dtype, at float32 and at

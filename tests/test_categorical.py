@@ -10,7 +10,7 @@ import numpy as np
 import optax
 import pytest
 from confident_support import confident, label_derivative, log_softmax
-from reference_error import assert_as_exact, with_gradients, without_ynn
+from reference_error import assert_as_exact, with_gradients
 
 from dew.nn import categorical
 from dew.objectives.base import token_log_probs
@@ -97,8 +97,12 @@ def test_a_masked_class_adds_no_term_in_value_or_gradient(form):
     as it holds an excluded one."""
     held = jnp.arange(7) < 4
     of = FORMS[form]
-    masked = without_ynn(lambda rows: of(rows, held))
-    alone = without_ynn(lambda rows: of(rows[:, :4], None))
+    def masked(rows):
+        return of(rows, held)
+
+    def alone(rows):
+        return of(rows[:, :4], None)
+
     assert_as_exact(masked, alone, lambda seed: (logits(jnp.float32, seed=seed),), form, seeds=MASKED_SEEDS)
     rows = logits(jnp.float32)
     gradient = np.asarray(jax.grad(lambda rows: of(rows, held).sum())(rows))
@@ -122,7 +126,7 @@ def test_a_ragged_rows_segments_each_normalize_as_the_segment_alone():
         return jnp.stack([jax.nn.logsumexp(row[jnp.asarray([0, 2, 6])]),
                           jax.nn.logsumexp(row[jnp.asarray([1, 4, 5])])])
 
-    assert_as_exact(without_ynn(partition), without_ynn(alone),
+    assert_as_exact(partition, alone,
                     lambda seed: (logits(jnp.float32, (7,), seed),), "segment log partition",
                     seeds=MASKED_SEEDS)
     log_z, present = categorical.segment_log_partition(logits(jnp.float32, (7,)), segments, 4)
@@ -166,9 +170,8 @@ def test_a_confident_rows_probabilities_differentiate_as_the_softmax_written_out
         (rows,) = confident(margin, seed)
         return rows, np.random.default_rng([margin, seed]).standard_normal(rows.shape).astype(np.float32)
 
-    assert_as_exact(without_ynn(with_gradients(categorical.probabilities)),
-                    without_ynn(with_gradients(written_softmax)), draw, f"probabilities at margin {margin}",
-                    seeds=COLLAPSE_SEEDS[margin])
+    assert_as_exact(with_gradients(categorical.probabilities), with_gradients(written_softmax), draw,
+                    f"probabilities at margin {margin}", seeds=COLLAPSE_SEEDS[margin])
 
 
 def near_reference(seed: int) -> tuple[np.ndarray, np.ndarray]:
@@ -312,7 +315,7 @@ def test_the_group_divergence_is_its_groups_jensen_shannon_divergence():
         return with_gradients(lambda logits: written_out(logits, options, groups, canonical))(
             logits, cotangent)
 
-    assert_as_exact(without_ynn(dew), without_ynn(reference), drawn, "group divergence",
+    assert_as_exact(dew, reference, drawn, "group divergence",
                     seeds=GROUP_SEEDS)
     logits, options, groups, canonical, _ = drawn(0)
     divergence, members = (np.asarray(value) for value in categorical.group_divergence(logits, groups,
@@ -345,7 +348,7 @@ def test_members_that_agree_have_no_divergence_and_extreme_logits_stay_finite():
     """Members that give one answer over the canonical options, in other slot orders, have a divergence
     whose float64 truth is zero, met on par (check 1); logits of a thousand keep the divergence and its
     gradient finite."""
-    assert_as_exact(without_ynn(divergence_of), without_ynn(written_out), agreeing,
+    assert_as_exact(divergence_of, written_out, agreeing,
                     "agreeing members", seeds=GROUP_SEEDS)
     logits, options, groups, canonical = agreeing(0)
     apart = canonical.at[0, 1].set(jnp.arange(4))
