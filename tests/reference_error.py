@@ -647,6 +647,11 @@ def _sign_bits(size: int, seed: int) -> np.ndarray:
     return np.random.default_rng([0x5E7C4, size, seed]).integers(0, 1 << SKETCH, size, dtype=np.uint64)
 
 
+_BYTE_SIGNS = ((np.arange(256)[:, None] >> np.arange(8)) & 1) * 2.0 - 1
+"""A (256, 8) float64 table whose [byte, k] entry is +1.0 where the byte's bit k is set and -1.0 where it
+is not, least significant bit first."""
+
+
 def truth_sketch(truth, seed: int) -> np.ndarray:
     """A float64 truth leaf's sketch `[SKETCH]` at a recorded seed: its entries summed under SKETCH random
     signs of that seed's own (`_sign_bits`), each sign's
@@ -656,16 +661,16 @@ def truth_sketch(truth, seed: int) -> np.ndarray:
     flat = np.asarray(truth, np.float64).reshape(-1)
     if not flat.size:
         return np.zeros(SKETCH)
-    bits, shifts, partials = _sign_bits(flat.size, seed), np.arange(SKETCH, dtype=np.uint64), []
+    bits, partials = _sign_bits(flat.size, seed), []
     for start in range(0, flat.size, 1 << 16):
         chunk = flat[start:start + (1 << 16)]
-        signs = ((bits[start:start + chunk.size, None] >> shifts) & 1).astype(np.float64) * 2 - 1
-        products = chunk[:, None] * signs
-        padded = -chunk.size % SKETCH_BLOCK
-        products = np.concatenate([products, np.zeros((padded, SKETCH))])
+        # Sign k of an entry is its word's bit k: its low four bytes, read little-endian whatever the host's
+        # order, so the first byte holds bits 0 to 7.
+        words = bits[start:start + chunk.size].astype("<u8").view(np.uint8).reshape(chunk.size, 8)[:, :4]
+        products = np.zeros((chunk.size + -chunk.size % SKETCH_BLOCK, SKETCH))
+        np.multiply(chunk[:, None], _BYTE_SIGNS[words].reshape(chunk.size, SKETCH), out=products[:chunk.size])
         partials.append(products.reshape(-1, SKETCH_BLOCK, SKETCH).sum(axis=1))
-    stacked = np.concatenate(partials)
-    return np.asarray([math.fsum(stacked[:, index].tolist()) for index in range(SKETCH)])
+    return np.asarray([math.fsum(column) for column in np.concatenate(partials).T.tolist()])
 
 
 def sketch_rounding(magnitude: float) -> float:
