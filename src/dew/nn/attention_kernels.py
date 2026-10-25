@@ -24,6 +24,7 @@ from .kernels.generation import (
     measured_kernel,
 )
 from .kernels.selection import Kernel, Op, Requirement
+from .kernels.templates import attention_route
 from .kernels.templates.attention_triton import DTYPES as TEMPLATE_DTYPES
 
 CUDNN_DTYPES = (jnp.bfloat16, jnp.float16)
@@ -134,6 +135,7 @@ class AttentionCase:
     arithmetic: bool
     narrows: bool
     folds: bool
+    dropout: bool
     splash_mask: bool
     shards: int
 
@@ -238,6 +240,9 @@ FLASH_SUPPORTS = (
     _Need('deterministic', lambda case: not deterministic_ops_requested(),
                 "--xla_gpu_deterministic_ops is set, which its backward's atomic sum of the query gradient "
                 "does not keep", row=INHERENT),
+    _Need('dropout', lambda case: not case.dropout,
+          "the call drops attention weights, which FlashAttention's path here does not take",
+          row='roadmap: attention dropout in FlashAttention'),
     _ARITHMETIC,
     _Need('not_installed', _flash_installed, "dew_flash_attn is not installed", row=INHERENT),
     _Need('binary_arch', _flash_built,
@@ -283,6 +288,9 @@ CUDNN_SUPPORTS = (
     _Need('deterministic', lambda case: not deterministic_ops_requested(),
                 "--xla_gpu_deterministic_ops is set, under which XLA's cuDNN attention backward crashes "
                 "(openxla/xla#46500)", row=INHERENT),
+    _Need('dropout', lambda case: not case.dropout,
+          "the call drops attention weights, which cuDNN's fused path here does not take",
+          row='roadmap: attention dropout in cuDNN'),
     _ARITHMETIC,
 )
 """cuDNN's fused attention's requirements (`cudnn_attention`): a GPU of sm80 or later (cuDNN refuses
@@ -315,6 +323,8 @@ TRITON_SUPPORTS = (
         ('key_lengths', lambda case: not case.lengths, "the call ends its keys by lengths"),
         ('key_starts', lambda case: not case.starts, "the call starts its keys by starts"),
     )),
+    _Need('dropout', lambda case: not case.dropout, "tokamax's Triton kernel takes no probability dropout",
+          row=INHERENT),
     _ARITHMETIC,
 )
 """tokamax's Triton flash kernel's requirements (`triton_attention`): a GPU of sm80 or later, heads at
@@ -352,6 +362,7 @@ TPU_SUPPORTS = (
                                 and case.splash_mask),
          "splash's blocking does not tile the lengths, or its descriptor cannot describe the mask"),
     )),
+    _Need('dropout', lambda case: not case.dropout, "splash takes no probability dropout", row=INHERENT),
     _ARITHMETIC,
 )
 """Splash's requirements (`tpu_attention`): a TPU, no bias, block groups or key lengths, one of its two
@@ -371,6 +382,8 @@ XLA_SUPPORTS = (
     _Need('arithmetic', lambda case: not case.arithmetic,
                 "the call asks for arithmetic only the reference path computes (`reference_only`)",
                 row=INHERENT, kind='handoff'),
+    _Need('dropout', lambda case: not case.dropout, "jax.nn's attention takes no probability dropout",
+          row=INHERENT, kind='handoff'),
 )
 """jax.nn's xla attention's requirements: the generic kernel, which hands what it cannot honour to
 the reference path."""
@@ -389,14 +402,16 @@ TEMPLATE_SUPPORTS = (
     _Need('shards', lambda case: case.shards == 1,
           "an automatic sequence axis gathers the keys, and a pallas call would gather the queries back",
           row=INHERENT),
+    _Need('dropout', lambda case: not case.dropout or attention_route.drops(),
+          attention_route.DROPS_NOT, row='1521'),
     _ARITHMETIC,
 )
 """The attention template's requirements (`attention_route.attend`, the 'template' kernel): one dtype of fp32,
 bf16 and fp16 on the queries and keys alike, no arbitrary mask and no bias, no sharded sequence axis, and the
 call's default arithmetic. It takes every other call form: causality, windows, documents, key lengths and
-starts, block groups, sinks and a softcap. The target's measured row prefers it for block calls
-(`attention_blocks`, `_attention_preferred`); elsewhere it runs where a call names it
-(`implementation='template'`, or `generation.chosen(attention='template')`)."""
+starts, block groups, sinks, a softcap, and probability dropout off a GPU (`attention_route.drops`). The
+target's measured row prefers it for block calls (`attention_blocks`, `_attention_preferred`); elsewhere it
+runs where a call names it (`implementation='template'`, or `generation.chosen(attention='template')`)."""
 
 
 def _attention_preferred(case: AttentionCase) -> str:
@@ -468,11 +483,11 @@ kernel (`decode_attention.attend`) and the folded xla attention (`folded_attenti
 
 def decodes(case: AttentionCase) -> bool:
     """Whether a call is the decode selector's (`DECODE`): a few query positions over key lengths, with
-    no mask, key validity, bias, causality, window or documents. Plain, they are the keys' own heads,
-    which the folded attention reads (`decode_geometry.folds`) and differentiates; with sinks or a softcap,
-    which the decode kernel applies itself, any query heads that group over the key heads on a GPU, which
-    the reference path differentiates."""
-    if not (case.lengths and case.queries <= decode_attention.QUERIES
+    no mask, key validity, bias, causality, window, documents or dropout. Plain, they are the keys' own
+    heads, which the folded attention reads (`decode_geometry.folds`) and differentiates; with sinks or a
+    softcap, which the decode kernel applies itself, any query heads that group over the key heads on a GPU,
+    which the reference path differentiates."""
+    if case.dropout or not (case.lengths and case.queries <= decode_attention.QUERIES
             and not (case.mask or case.spans_only or case.bias or case.causal) and case.window is None
             and case.documents is None):
         return False

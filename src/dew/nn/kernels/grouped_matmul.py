@@ -742,8 +742,17 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                  {'grid_block_n': max(1, band // 2)}, {'grid_block_n': band * 2},
                  {'block_n': config.block_n - unit}, {'block_n': config.block_n + unit},
                  {'block_m': config.block_m - role}, {'block_m': config.block_m + role}]
-        return tuple(dataclasses.replace(config, **move) for move in moves
-                     if min(move.values()) > 0 and dataclasses.replace(config, **move) != config)
+        found = []
+        for move in moves:
+            if min(move.values()) <= 0:
+                continue
+            try:
+                moved = dataclasses.replace(config, **move)
+            except ValueError:
+                continue  # a shape no Mosaic tile takes (`Tiles.__post_init__`)
+            if moved != config:
+                found.append(moved)
+        return tuple(found)
 
     def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         """Whether `config` runs the call on `target` (`Template.legal`): of the launch's family there, in

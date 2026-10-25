@@ -21,13 +21,11 @@ from jax.typing import DTypeLike
 from dew.nn.attention import (
     RMSNorm,
     alibi_bias,
-    cached_validity,
     causal_attention_mask,
     chunk_mask,
     cudnn_takes_mask,
     kernel_for_materialized_mask,
     max_attention_logits,
-    open_kv_cache,
     reference_only,
     scaled_dot_product_attention,
     visibility_mask,
@@ -47,7 +45,18 @@ from dew.nn.inputs import (
     document_reach,
 )
 from dew.nn.kernels.selection import select
-from dew.nn.kv_cache import PAGED, PLACES, TABLE, Append, KVCache, KVStore, filled_slots, rotated
+from dew.nn.kv_cache import (
+    PAGED,
+    PLACES,
+    TABLE,
+    Append,
+    KVCache,
+    KVStore,
+    cached_validity,
+    filled_slots,
+    open_kv_cache,
+    rotated,
+)
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import QKV_RESIDUALS, MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain
