@@ -48,61 +48,63 @@ def layer(name: str, dtype=jnp.float32) -> InContextMemory:
     return InContextMemory(heads=HEADS, head_features=FEATURES, dtype=dtype, **fields)
 
 
-def written(module: InContextMemory, params: dict, x: np.ndarray, *, dtype, segments=None) -> np.ndarray:
-    """The paper's update, token by token, in `dtype` (float64 for the truth): the views and gates from
-    the layer's projections, the state in at least float32, each gradient at its chunk's start counted
-    from its document's first token, and the readout at `dtype`."""
+def written(module: InContextMemory, params: dict, *, dtype, segments=None):
+    """The paper's update as a function of the stream, token by token, in `dtype` (float64 for the
+    truth): the views and gates from the layer's projections, the state in at least float32, each
+    gradient at its chunk's start counted from its document's first token (`segments` `[S]`, one
+    document where None), and the readout at `dtype`."""
     wide = jnp.promote_types(dtype, jnp.float32)
     p = jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype), params["params"])
-    x = jnp.asarray(x, dtype)
-    batch, length, _ = x.shape
-    views = {name: (x @ p[f"{name}_proj"]["kernel"]).reshape(batch, length, HEADS, FEATURES)
-             for name in ("q", "k", "v")}
+    grad_net, read_net = module.network(dtype=wide), module.network(dtype=dtype)
+    initial = jax.tree.map(lambda leaf: jnp.asarray(leaf, wide), params["params"]["initial"])
+    firsts = np.ones(LENGTH, bool) if segments is None else np.r_[True, segments[1:] != segments[:-1]]
 
-    def gate(name, spec):
+    def gate(name, spec, x):
         if spec is None:
             return None
         if spec.value is not None:
-            return jnp.full((batch, length, HEADS), spec.value, wide)
-        logit = x @ p[name]["kernel"] + p[name]["bias"]
-        return spec.scale * jax.nn.sigmoid(logit.astype(wide))
+            return jnp.full((x.shape[0], HEADS), spec.value, wide)
+        return spec.scale * jax.nn.sigmoid((x @ p[name]["kernel"] + p[name]["bias"]).astype(wide))
 
-    theta = gate("learning_rate", module.learning_rate)
-    mu = gate("momentum", module.momentum)
-    alpha = gate("retention", module.retention)
-    grad_net, read_net = module.network(dtype=wide), module.network(dtype=dtype)
-    initial = jax.tree.map(lambda leaf: jnp.asarray(leaf, wide), params["params"]["initial"])
-    segments = np.ones((batch, length), int) if segments is None else segments
-    out = np.zeros((batch, length, HEADS, FEATURES), np.float64)
+    def one_head(head0, q, k, v, theta, mu, alpha):
+        """One row's and head's tokens `[S, F]`, `[S]`, scanned token by token."""
+        def token(carry, step):
+            state, momentum, start, place = carry
+            q_t, k_t, v_t, theta_t, mu_t, alpha_t, first = step
+            state, momentum, start, place = jax.tree.map(
+                lambda fresh, held: jnp.where(first, fresh, held),
+                (head0, jax.tree.map(jnp.zeros_like, head0), head0, 0), (state, momentum, start, place))
+            start = jax.tree.map(lambda w, s: jnp.where(place % module.chunk == 0, w, s), state, start)
+            target = v_t if module.target == "given" else grad_net.apply({"params": start}, v_t)
+            g = jax.grad(lambda held: module.objective(grad_net.apply({"params": held}, k_t), target))(start)
+            momentum = jax.tree.map(lambda s, gl: mu_t * s - theta_t * gl, momentum, g)
+            state = jax.tree.map(lambda w, s: (1 - alpha_t) * w + s, state, momentum)
+            cast = jax.tree.map(lambda leaf: leaf.astype(dtype), state)
+            return (state, momentum, start, place + 1), read_net.apply({"params": cast}, q_t)
 
-    def gradient(start, k, target):
-        return jax.grad(lambda held: module.objective(grad_net.apply({"params": held}, k), target))(start)
+        carry = (head0, jax.tree.map(jnp.zeros_like, head0), head0, 0)
+        return jax.lax.scan(token, carry, (q, k, v, theta, mu, alpha, jnp.asarray(firsts)))[1]
 
-    def stepped(momentum, g, kept, rate):
-        return jax.tree.map(lambda s, gl: kept * s - rate * gl, momentum, g)
+    @jax.jit
+    def run(x):
+        x = jnp.asarray(x, dtype)
+        batch = x.shape[0]
+        q, k, v = ((x @ p[f"{name}_proj"]["kernel"]).reshape(batch, LENGTH, HEADS, FEATURES).astype(
+            wide if name != "q" else dtype) for name in ("q", "k", "v"))
 
-    def retained(state, momentum, a):
-        return jax.tree.map(lambda w, s: a * w + s, state, momentum)
+        def gates(row):
+            theta = gate("learning_rate", module.learning_rate, row)
+            mu = gate("momentum", module.momentum, row)
+            alpha = gate("retention", module.retention, row)
+            zeros = jnp.zeros_like(theta)
+            return theta, zeros if mu is None else mu, zeros if alpha is None else alpha
 
-    for b in range(batch):
-        for h in range(HEADS):
-            head0 = jax.tree.map(functools.partial(_head, h), initial)
-            place = 0
-            for t in range(length):
-                if t == 0 or segments[b, t] != segments[b, t - 1]:
-                    state, momentum, place = head0, jax.tree.map(jnp.zeros_like, head0), 0
-                if place % module.chunk == 0:
-                    start = state
-                k, v = (views[name][b, t, h].astype(wide) for name in ("k", "v"))
-                target = v if module.target == "given" else grad_net.apply({"params": start}, v)
-                momentum = stepped(momentum, gradient(start, k, target), 0.0 if mu is None else mu[b, t, h],
-                                   theta[b, t, h])
-                state = retained(state, momentum, 1.0 if alpha is None else 1 - alpha[b, t, h])
-                cast = jax.tree.map(lambda leaf: leaf.astype(dtype), state)
-                out[b, t, h] = np.asarray(read_net.apply({"params": cast}, views["q"][b, t, h]), np.float64)
-                place += 1
-    read = jnp.asarray(out.reshape(batch, length, -1), dtype)
-    return np.asarray(read @ p["o_proj"]["kernel"])
+        theta, mu, alpha = jax.vmap(gates)(x)
+        per_head = jax.vmap(one_head, in_axes=(0, 1, 1, 1, 1, 1, 1), out_axes=1)
+        reads = jax.vmap(per_head, in_axes=(None, 0, 0, 0, 0, 0, 0))(initial, q, k, v, theta, mu, alpha)
+        return reads.reshape(batch, LENGTH, -1) @ p["o_proj"]["kernel"]
+
+    return run
 
 
 def _head(index: int, leaf):
@@ -119,10 +121,9 @@ def test_a_memory_follows_its_papers_update(name):
     with that written-out update in float32, against float64 (check 1)."""
     module = layer(name)
     params = module.init(jax.random.key(0), jnp.zeros((1, LENGTH, WIDTH)))
-    assert_as_exact(jax.jit(lambda x: module.apply(params, x)),
-                    lambda x: written(module, params, x, dtype=jnp.float32), draw,
-                    f"{name} memory", seeds=MEMORY_SEEDS,
-                    truth_fn=lambda x: written(module, params, x, dtype=jnp.float64))
+    assert_as_exact(jax.jit(lambda x: module.apply(params, x)), written(module, params, dtype=jnp.float32),
+                    draw, f"{name} memory", seeds=MEMORY_SEEDS,
+                    truth_fn=written(module, params, dtype=jnp.float64))
 
 
 def packed(segments: np.ndarray) -> MixerCall:
@@ -140,7 +141,7 @@ def test_the_chunk_parallel_memory_is_the_token_by_token_one(name):
     one = np.ones((2, LENGTH), np.int32)
     stepped = jax.jit(lambda x: module.apply(params, x, packed(one)))
     assert_as_exact(jax.jit(lambda x: module.apply(params, x)), stepped, draw, f"{name} chunked",
-                    seeds=MEMORY_SEEDS, truth_fn=lambda x: written(module, params, x, dtype=jnp.float64))
+                    seeds=MEMORY_SEEDS, truth_fn=written(module, params, dtype=jnp.float64))
 
 
 def test_packed_documents_read_as_each_alone():
