@@ -309,10 +309,10 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
             per_value = pl.BlockSpec((None, None, block_q, value_width), lambda i, b, h: (b, h, i, 0))
             out_specs += [per_row, per_row, per_row, per_value, per_row, per_row, per_row]
         # A call's own key count, none included; an op built without one counts its launch's keys.
-        # The accurate form alone guards its sums (`algebra.Forward.headroom`); the fold walks as ever.
+        # Every form guards its sums where its values can overflow them (`algebra.Forward.headroom`), as the
+        # plain-JAX and Mosaic mainloops do: the template's production route runs this one on a GPU.
         spec = algebra.Forward(self.form, keys if self.keys is None else self.keys, ids, self.scale,
-                               self.score_mod, self.natural,
-                               self.natural and algebra.headroom(value.dtype), initial)
+                               self.score_mod, self.natural, algebra.headroom(value.dtype), initial)
         kernel = functools.partial(
             _forward_kernel, spec=spec, score_kinds=self.score_kinds, output_kinds=self.output_kinds,
             initial=initial, residuals=residuals, output_mod=self.output_mod, block_k=block_k,
@@ -324,18 +324,24 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
             out = launch(functools.partial(kernel, guard="none"), in_specs=in_specs, out_specs=out_specs,
                          out_shape=out_shape, name="attention_forward")(*arrays)
             return (tuple(out) if residuals else out[0]), None
-        # The plain launch writes which rows overflowed; the second walks again only the programs with one,
-        # its outputs the plain launch's (`_forward_kernel`).
+        # The plain launch writes which rows overflowed; the second, issued only where one did, walks again
+        # only the programs with one, its outputs the plain launch's (`_forward_kernel`): ordinary inputs
+        # take the one launch and a check.
         per_row = pl.BlockSpec((None, None, block_q), lambda i, b, h: (b, h, i))
         flagged = jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)
         *out, flags = launch(functools.partial(kernel, guard="flag"), in_specs=in_specs,
                              out_specs=[*out_specs, per_row], out_shape=[*out_shape, flagged],
                              name="attention_forward")(*arrays)
         first = len(arrays) + 1
-        out = launch(functools.partial(kernel, guard="rewalk"), in_specs=[*in_specs, per_row, *out_specs],
-                     out_specs=out_specs, out_shape=out_shape, name="attention_forward_headroom",
-                     input_output_aliases={first + index: index for index in range(len(out))},
-                     )(*arrays, flags, *out)
+
+        def rewalked(out):
+            return tuple(launch(functools.partial(kernel, guard="rewalk"),
+                                in_specs=[*in_specs, per_row, *out_specs], out_specs=out_specs,
+                                out_shape=out_shape, name="attention_forward_headroom",
+                                input_output_aliases={first + index: index for index in range(len(out))},
+                                )(*arrays, flags, *out))
+
+        out = jax.lax.cond(jnp.max(flags) > 0, rewalked, lambda out: out, tuple(out))
         return (tuple(out) if residuals else out[0]), None
 
     def space(self, ba: tokamax.BoundArguments) -> Sequence[Tiles]:
@@ -1015,8 +1021,8 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
         residuals = maxima, totals, anchors, sums
     initial = hooks is not None and hooks.initial is not None
     # A guarded forward's live rows carry normalized split sums (`algebra.split_residuals`), which the first
-    # pass cannot recompute without the forward's denominator: D comes from them.
-    split = split or (natural and algebra.headroom(value.dtype))
+    # pass cannot recompute without the forward's denominator: D comes from them, in either form.
+    split = split or algebra.headroom(value.dtype)
     launch = functools.partial(_launch, split=split, natural=natural, accurate=accurate, initial=initial,
                                interpret=interpret)
     return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=BLOCK, scale=scale)
