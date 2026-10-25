@@ -309,7 +309,10 @@ def test_trainable_layer_scalars_read_the_frozen_tree_moved_without_a_copy(name)
     """The published SFT's model reads each layer's scalar as a parameter,
     where a frozen source keeps it among the constants: the same arrays,
     each scalar moved under its layer's params and every other leaf where
-    it was, give the same logits, and the scalars then take a gradient."""
+    it was, give the same logits, and the scalars then take a gradient. The
+    last layer's scalar scales the stream the final norm divides back out, so
+    its gradient is the norm's epsilon term alone, which float32 rounds to
+    noise (on an A100, exactly zero); it is taken in float64, which resolves it."""
     source, read = loaded(name), reads(name, "float32")
     model, variables = source.model, source.variables
     trainable = model.with_trainable_layer_scalars()
@@ -322,7 +325,9 @@ def test_trainable_layer_scalars_read_the_frozen_tree_moved_without_a_copy(name)
     assert after.keys() == expected.keys()
     assert all(after[path] is leaf for path, leaf in expected.items())
     same(trainable.apply(moved, read.tokens, method="logits"), read.logits)
-    learned = gradient(trainable, moved, read.tokens, _cotangent(read.logits), method="logits")
+    with jax.enable_x64(new_val=True):
+        learned = gradient(_float64(trainable), widened(moved), read.tokens,
+                           np.asarray(_cotangent(read.logits), np.float64), method="logits")
     assert all(np.any(np.asarray(learned[path[1:]])) for path in scalars)
     assert trainable.trainable_variables(moved) is moved
 
