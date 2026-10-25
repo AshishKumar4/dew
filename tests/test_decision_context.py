@@ -318,6 +318,7 @@ def test_a_backbone_encoded_context_is_the_backbones_own_pass_over_it():
     that conditioning, exactly; they differ from the table encoder's, both read the same weights, and
     the encoder rides the task's settings, so a reload reads its context the same way."""
     from dew.decision.task import DecideSettings
+    from dew.inference.tasks import saved_settings
     from dew.nn.cross_attention import encode_context
     from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS
 
@@ -343,9 +344,9 @@ def test_a_backbone_encoded_context_is_the_backbones_own_pass_over_it():
     assert settings.context_encoder == "backbone"
     record = {name: getattr(settings, name) for name in ("head", "layout", "specials", "tokenizer",
                                                           "processor", "context_encoder")}
-    assert DecideSettings.of(record).context_encoder == "backbone"
+    assert saved_settings(record, DecideSettings).context_encoder == "backbone"
     del record["context_encoder"]
-    assert DecideSettings.of(record).context_encoder == "table"
+    assert saved_settings(record, DecideSettings).context_encoder == "table"
     assert DecisionObjective(tasks[1]).model.context_encoder == "backbone"
 
 
