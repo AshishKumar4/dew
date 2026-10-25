@@ -506,6 +506,36 @@ def test_every_tuning_variant_is_on_par_interpreted(launch):
                            training=launch == "training", target=target)
 
 
+@INTERPRETS
+def test_a_guarded_launchs_own_key_tile_reads_its_spans_in_its_own_units():
+    """A spans call (documents over 256 keys) whose weighted values pass fp32's largest, at forward tiles of
+    128 keys, a consumer's registers holding the guarded launch's live set over 64 (`_guarded_tiles`): the
+    guarded launch walks each block's keys from its own block map, not the plain launch's 128-key one, so
+    every row's output is the reference's, finite (bf16 values near their largest, equal logits)."""
+    rows, queries, heads, kv_heads = 1, 256, 2, 1
+    spans = template.spans(queries, queries, rows,
+                           segment_ids=jnp.repeat(jnp.arange(4, dtype=jnp.int32), queries // 4)[None])
+
+    def draw(seed):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        query = jnp.zeros((rows, queries, heads, 128), jnp.bfloat16)
+        key = jnp.zeros((rows, queries, kv_heads, 128), jnp.bfloat16)
+        value = jax.random.uniform(streams[2], (rows, queries, kv_heads, 128), jnp.float32, 2.9e38,
+                                   3.3e38).astype(jnp.bfloat16)
+        return query, key, value, jnp.zeros_like(query)
+
+    def ours(query, key, value, dout):
+        del dout
+        with _device(True), _pinned(attention_mosaic.Tiles(64, 128, 2, 2)):
+            return attention_mosaic.forward(query, key, value, spans, interpret=True)
+
+    def reference(query, key, value, dout):
+        del dout
+        return template.reference(query, key, value, spans)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "mosaic guarded spans forward", seeds=SEEDS)
+
+
 @pytest.mark.parametrize("unseen", UNSEEN)
 def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give(unseen):
     """On a GPU no row measured the forward's and the backward's tiles come from the family's facts and the
