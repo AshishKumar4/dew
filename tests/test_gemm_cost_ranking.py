@@ -1,4 +1,4 @@
-"""The grouped launches' cost model against every tile measured on an A100 and H100s
+"""The grouped launches' cost model against the tiles measured on an A100, an L4 and an H100 PCIe
 (tests/fixtures/gemm_sweeps, one a device: tools/sweep_grouped_gemm.py over seven MoE shapes, each
 product, costed on the device's facts): the config it picks runs within 10% of the measured best, or the
 case is a known miss whose missing term `MISSES` names. A miss the model comes to rank fails too, so the
@@ -28,36 +28,40 @@ LOADED_LATENCY = "the load latency under load, the waiting term's being unloaded
 TRANSPOSED_READS = "the kernel gradient's transposed-operand shared-memory reads, which cost 8 warps more"
 L2_REUSE = "the L2's reuse of a few experts' weights, which the device-byte term counts as rereads"
 MISSES = {
-    ("sm80", "triton", "qwen3-30b-a3b gate_up", "kernel_gradient"): TRANSPOSED_READS,
-    ("sm80", "triton", "kimi-linear gate_up", "kernel_gradient"): TRANSPOSED_READS,
-    ("sm80", "triton", "kimi-linear down", "kernel_gradient"): TRANSPOSED_READS,
-    ("sm80", "triton", "targets-comment", "kernel_gradient"): TRANSPOSED_READS,
-    ("sm80", "triton", "targets-comment", "kernel_gradient_fp32"): TRANSPOSED_READS,
-    ("sm80", "triton", "mixtral up", "kernel_gradient"): TRANSPOSED_READS,
-    ("sm80", "triton", "mixtral up", "kernel_gradient_fp32"): TRANSPOSED_READS,
-    ("sm80", "triton", "mixtral down", "kernel_gradient"): TRANSPOSED_READS,
-    ("sm80", "triton", "mixtral down", "kernel_gradient_fp32"): TRANSPOSED_READS,
-    ("sm80", "triton", "targets-comment", "forward"): LOADED_LATENCY,
-    ("sm80", "triton", "targets-comment", "input_gradient"): LOADED_LATENCY,
-    ("sm80", "triton", "mixtral up", "forward"): L2_REUSE,
+    ("sm80", "mosaic_gpu", "mixtral down", "forward"): L2_REUSE,
+    ("sm80", "mosaic_gpu", "mixtral down", "input_gradient"): L2_REUSE,
+    ("sm80", "mosaic_gpu", "mixtral up", "input_gradient"): L2_REUSE,
+    ("sm80", "triton", "kimi-linear down", "kernel_gradient_fp32"): LOADED_LATENCY,
     ("sm80", "triton", "mixtral up", "input_gradient"): L2_REUSE,
-    ("sm80", "triton", "mixtral down", "forward"): L2_REUSE,
-    ("sm90", "triton", "kimi-linear gate_up", "kernel_gradient"): TRANSPOSED_READS,
-    ("sm90", "triton", "kimi-linear gate_up", "kernel_gradient_fp32"): TRANSPOSED_READS,
-    ("sm90", "triton", "kimi-linear down", "kernel_gradient"): TRANSPOSED_READS,
-    ("sm90", "triton", "targets-comment", "kernel_gradient"): TRANSPOSED_READS,
-    ("sm90", "triton", "targets-comment", "forward"): LOADED_LATENCY,
-    ("sm90", "triton", "targets-comment", "input_gradient"): LOADED_LATENCY,
-    ("sm90", "mosaic_gpu", "mixtral up", "forward"): L2_REUSE,
-    ("sm90", "triton", "mixtral up", "forward"): L2_REUSE,
-    ("sm90", "triton", "mixtral up", "input_gradient"): L2_REUSE,
-    ("sm90", "triton", "mixtral down", "forward"): L2_REUSE,
+    ("sm89", "mosaic_gpu", "mixtral up", "input_gradient"): L2_REUSE,
+    ("sm89", "triton", "mixtral down", "forward"): L2_REUSE,
+    ("sm89", "triton", "mixtral down", "input_gradient"): L2_REUSE,
+    ("sm89", "triton", "mixtral up", "input_gradient"): L2_REUSE,
+    ("sm89", "triton", "mixtral up", "kernel_gradient"): L2_REUSE,
+    ("sm89", "triton", "mixtral up", "kernel_gradient_fp32"): L2_REUSE,
+    ("sm89", "triton", "qwen3-30b-a3b gate_up", "kernel_gradient"): LOADED_LATENCY,
+    ("sm89", "triton", "targets-comment", "input_gradient"): LOADED_LATENCY,
+    ("sm90", "mosaic_gpu", "kimi-linear down", "input_gradient"): LOADED_LATENCY,
+    ("sm90", "mosaic_gpu", "kimi-linear down", "kernel_gradient_fp32"): LOADED_LATENCY,
+    ("sm90", "mosaic_gpu", "kimi-linear gate_up", "kernel_gradient"): LOADED_LATENCY,
+    ("sm90", "mosaic_gpu", "kimi-linear gate_up", "kernel_gradient_fp32"): LOADED_LATENCY,
+    ("sm90", "mosaic_gpu", "mixtral down", "forward"): L2_REUSE,
     ("sm90", "mosaic_gpu", "mixtral down", "input_gradient"): L2_REUSE,
+    ("sm90", "mosaic_gpu", "mixtral up", "forward"): L2_REUSE,
+    ("sm90", "mosaic_gpu", "mixtral up", "input_gradient"): L2_REUSE,
+    ("sm90", "mosaic_gpu", "mixtral up", "kernel_gradient_fp32"): L2_REUSE,
+    ("sm90", "mosaic_gpu", "qwen3-30b-a3b down", "kernel_gradient"): LOADED_LATENCY,
+    ("sm90", "mosaic_gpu", "targets-comment", "forward"): LOADED_LATENCY,
+    ("sm90", "mosaic_gpu", "targets-comment", "input_gradient"): LOADED_LATENCY,
+    ("sm90", "triton", "kimi-linear down", "kernel_gradient"): LOADED_LATENCY,
     ("sm90", "triton", "mixtral down", "input_gradient"): L2_REUSE,
+    ("sm90", "triton", "mixtral up", "forward"): L2_REUSE,
+    ("sm90", "triton", "targets-comment", "input_gradient"): LOADED_LATENCY,
+    ("sm90", "triton", "targets-comment", "kernel_gradient"): LOADED_LATENCY,
 }
 """Each case whose pick runs past 10% of the best, by sweep, implementation, shape and product, with
-the term the model lacks: 26 of the 84 swept (2026-10-25; GMMT-a100, GMMCOOP-h100, whose sweep times the
-cooperative tiles)."""
+the term the model lacks: 30 of the 140 swept (2026-10-25; R1/R3 sampled sweeps on an A100, an L4 and an
+H100 PCIe, each record the model's 24 best configs and 24 spread over the rest, `--sample 24`)."""
 
 
 def _launch(record):
