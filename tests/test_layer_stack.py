@@ -771,7 +771,9 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
     balancing biases off zero, two calls and a decode through the cache they allocate
     and reuse give the resident stack's state, its routing exactly, and its logits, scores
     and cache as exact as the resident's own, both measured from the resident stack in
-    float64 (tests/reference_error.py), the two paths compiling the same layers apart."""
+    float64 (tests/reference_error.py), the two paths compiling the same layers apart. Its
+    draws clear the routers' margin (`SCAN_MARGIN`), so every run routes alike: a draw within
+    rounding of a tie routes the two float32 programs apart, which no precision bounds."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.decoder_block import Mixture
 
@@ -790,11 +792,16 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
     on_host = {**variables, "params": {**variables["params"], **layers}}
     opened = ["moe", "router"]
 
-    def draw(seed):
+    def drawn(seed):
         """The fixed tokens at seed 0, else tokens drawn uniformly from the vocabulary."""
         if seed == 0:
             return (tokens,)
         return (np.random.default_rng(seed).integers(0, model.vocab_size, tokens.shape).astype(np.int32),)
+
+    config = {"mixture": dataclasses.asdict(model.mixture)}
+    selected = selection_margins.capture(model)
+    draw = selection_margins.clearing(drawn, lambda inputs: selection_margins.margin(
+        config, selected(variables, jnp.asarray(inputs[0])), "host-resident scanned stack") > SCAN_MARGIN)
 
     def run(model, tree, tokens):
         calls = []
