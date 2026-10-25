@@ -227,3 +227,22 @@ def test_audio_weight_paths_round_trip_every_checkpoint_tensor(audio):
         if tensor.ndim > 1:
             restored = restored.transpose(restored.ndim - 1, restored.ndim - 2, *range(restored.ndim - 2))
         np.testing.assert_array_equal(restored, tensor)
+
+
+@pytest.mark.parametrize("config", [
+    Gemma3nAudio(),
+    Gemma3nAudio(conf_reduction_factor=2, input_feat_size=16, hidden_size=32, conf_num_attention_heads=2,
+                 conf_num_hidden_layers=1, sscp_conv_channel_size=(8, 4)),
+], ids=["released", "reduction_2"])
+def test_a_gemma3n_tower_encodes_its_stated_frames_per_token_into_one_token(config):
+    """A Gemma 3n tower encodes `frames_per_token` input frames a token, as its geometry states, which
+    a token-only init sizes its fixed audio slots by: the released config (strides 2 x 2, reduction 4)
+    and a tower reducing by 2 each encode three tokens' frames into three tokens."""
+    per_token = config.geometry().frames_per_token
+    frames = 3 * per_token
+    encoder = config.build()
+    features = jax.ShapeDtypeStruct((1, frames, config.input_feat_size), jnp.float32)
+    mask = jax.ShapeDtypeStruct((1, frames), jnp.bool_)
+    variables = jax.eval_shape(encoder.init, jax.random.key(0), features, mask)
+    encoded = jax.eval_shape(encoder.apply, variables, features, mask)
+    assert encoded.features.shape[1] == 3
