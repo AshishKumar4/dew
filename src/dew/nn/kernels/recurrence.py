@@ -729,8 +729,9 @@ def cumulated(g, *, chunk: int = 64, scale: float | None = None, reverse: bool =
     per key dimension, cumulated within each chunk of `chunk` tokens of each sequence (`spans`, the
     rows where None), fp32: fla's `chunk_local_cumsum`
     (cumsum.py:262-341), `scale` RCP_LN2 for the forward's base-2 decay, `reverse` for its gradient.
-    Forward is fla's plain prefix, whose difference between two positions every kernel takes as a
-    range's exponent; `reverse` the sums from the end, each rounded once. fla autotunes only
+    Forward is the prefix summed and scaled in float64 and rounded once (fla's is plain fp32), whose
+    difference between two positions every kernel takes as a range's exponent; `reverse` the sums from
+    the end, each rounded once. fla autotunes only
     `num_warps` over 1, 2, 4 and 8 here."""
     batch, length = g.shape[:2]
     spans = chunked_launch.sequences(batch, length, chunk=chunk) if spans is None else spans

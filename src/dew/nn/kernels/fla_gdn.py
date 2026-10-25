@@ -1027,9 +1027,9 @@ def _o_kernel(chunk_ref, q_ref, k_ref, v_ref, h_ref, g_ref, o_ref, *, chunk: int
     `BV` value columns: `o = scale * ((q h) exp2(g) + tril((q k^T) exp2(g_s - g_t)) v)`, the key
     columns walked `bk` at a time into fp32 accumulators, `A` cast to the values' dtype for its
     product, as fla does. fp32 products are IEEE here (`_dot`'s `ieee`), where the other kernels take
-    TF32x3: the output reads them directly, and at TF32x3 a Qwen3.5 hybrid's fp32 scores on an H100
-    sat 2.03 times their fp32 reference's distance from float64, 1.17 at IEEE. The memory the chunk
-    enters is read at its slot (`Sequences`)."""
+    BF16x6: the output reads them directly, and at TF32x3, the others' products before, a Qwen3.5
+    hybrid's fp32 scores on an H100 sat 2.03 times their fp32 reference's distance from float64, 1.17
+    at IEEE. The memory the chunk enters is read at its slot (`Sequences`)."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
     entered = chunk_ref[2]
 
