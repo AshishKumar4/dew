@@ -12,8 +12,8 @@ one environment; a caller runs each checkout's own code with its `src` first on
 PYTHONPATH, ahead of the Dew the environment holds. The second prints the
 Python of a reference environment (torch's, an engine's): INSTALL, uv pip
 install's arguments, installed into CACHE/NAME-<digest of INSTALL, the lines
-of each file it reads (requirements, constraints, overrides) in place of its
-path> (`reference`).
+of each file it reads (requirements, constraints, overrides, and the files they
+read) in place of its path> (`reference`).
 
 The standard library alone, so it runs on a machine that holds no environment
 yet: tools/perf_gate.py builds each tree's with it, and so do GPU sessions.
@@ -25,6 +25,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -95,16 +96,30 @@ def environment(tree: Path, lock: str, cache: Path = CACHE) -> Path:
 
 FILED = ("-r", "--requirements", "-c", "--constraint", "--constraints", "--override", "--overrides")
 """uv pip install's options whose argument is a file it reads: a reference is named by those files' lines."""
+NESTED = re.compile(r"^(?:-r|-c|--requirements?|--constraints?)(?:=|\s+)?(\S+)")
+"""A line of a requirements, constraints or overrides file that reads another file, relative to its own."""
+
+
+def filed(path: Path, seen: frozenset[Path] = frozenset()) -> str:
+    """The lines of file `path`, then those of each file it reads (`NESTED`), however deep, each once along a
+    path of reads: what installing from it reads, so a changed pin in an included file names a new environment
+    (OrganicMouse: a reference's override read another, whose change reused a stale environment)."""
+    text = path.read_text()
+    reads = [path.parent / found[1] for line in text.splitlines() if (found := NESTED.match(line.strip()))
+             and "://" not in found[1]]
+    seen |= {path.resolve()}
+    return text + "".join(filed(read, seen) for read in reads if read.resolve() not in seen)
 
 
 def reference(name: str, install: list[str], python: str = "3.12", cache: Path = CACHE) -> Path:
     """The Python of the reference environment CACHE/`name`-<installation> (`built`): `install`, uv pip
     install's arguments, at Python `python`. The installation's digest (its arguments, the lines of each file
-    it reads in place of its path (`FILED`: a requirements, constraints or overrides file, so a changed
-    override builds anew as a changed requirement does), and its Python where that is not 3.12, whose names
+    it reads in place of its path (`FILED`: a requirements, constraints or overrides file, and every file that
+    reads in turn, `filed`, so a changed override builds anew as a changed requirement does, included or
+    named), and its Python where that is not 3.12, whose names
     predate the choice) names it, so a changed installation is built anew beside the old one, which a
     running job may hold."""
-    named = [Path(argument).read_text() if previous in FILED else argument
+    named = [filed(Path(argument)) if previous in FILED else argument
              for previous, argument in zip(["", *install], install, strict=False)]
     named += [] if python == "3.12" else [f"python {python}"]
     digest = hashlib.sha256(json.dumps(named).encode()).hexdigest()[:12]
