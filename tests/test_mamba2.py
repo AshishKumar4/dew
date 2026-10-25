@@ -334,6 +334,37 @@ def test_a_layer_split_over_the_sequence_runs_padded_and_packed_rows_as_whole_on
     assert not np.any(np.asarray(split)[:, ~valid])
 
 
+@pytest.mark.mesh
+@pytest.mark.parametrize("masked", [False, True], ids=["whole rows", "valid rows"])
+def test_a_layer_split_over_the_sequence_names_its_scan_for_remat(reference, geometry, masked):
+    """Under a sequence axis of 4, the layer's scan output carries both names a remat policy keeps it by,
+    a mixer's 'context' and a recurrence's 'scan', with or without the rows' validity, as on one device
+    (`Mamba2.residuals`): a checkpoint saving either name alone holds more residuals for its backward
+    (the pullback's arrays, traced) than one saving nothing."""
+    from dew.nn.backbones.decoder_block import RematPolicy
+
+    module = layer(geometry)
+    variables = layer_params(reference)
+    fields = {"valid": jnp.ones((2, 32), bool)} if masked else {}
+    call = MixerCall(AttentionMetadata(coordinates=coordinates((2, 32), **fields)))
+    drawn = np.random.default_rng(0).standard_normal((2, 32, geometry["hidden_size"]))
+    hidden = jnp.asarray(drawn, jnp.float32)
+    mesh = MeshSpec(sequence=4).build(jax.devices()[:4])
+
+    def loss(params):
+        return jnp.sum(module.apply(params, hidden, call) ** 2)
+
+    def kept(names) -> int:
+        """The residual arrays the pullback holds under a policy saving `names`, traced, not run."""
+        checkpointed = jax.checkpoint(loss, policy=RematPolicy(save=names).checkpoint_policy())
+        with jax.set_mesh(mesh):
+            pull = jax.eval_shape(lambda params: jax.vjp(checkpointed, params)[1], variables)
+        return len(jax.tree.leaves(pull))
+
+    nothing = kept(())
+    assert [name for name in ("context", "scan") if kept((name,)) <= nothing] == []
+
+
 def test_packed_documents_run_as_if_each_ran_alone(reference, geometry):
     """A row of packed documents computes, for each document, what that
     document computes alone: neither the SSM state nor the conv's taps

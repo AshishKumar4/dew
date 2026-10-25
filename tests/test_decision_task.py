@@ -600,3 +600,69 @@ def test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh(decide):
     alone, scores = task.score(examples), spread(decide.variables).score(examples)
     assert set(scores) == set(alone) and all(np.isfinite(value) for value in scores.values())
     assert scores["accuracy"] == alone["accuracy"]
+
+
+def trained_runs(decide, tmp_path, count: int, *, name: str = "run") -> list[str]:
+    """`count` runs of the task trained apart, one more step each, from one head (the task's own, held):
+    each a checkpoint of its own, as averaging reads them."""
+    import optax
+
+    from dew.checkpoints import Checkpoints
+    from dew.decision import DecisionObjective
+    from dew.training.trainer import Trainer
+
+    runs = []
+    for index in range(count):
+        objective = DecisionObjective(decide)
+        data = decision_rows(answered() * 2, 8, answered(), objective=objective.data())
+        directory = str(tmp_path / f"{name}{index}")
+        checkpoints = Checkpoints(directory, keep=1)
+        Trainer(objective, optax.adam(1e-3), key=index, checkpoints=checkpoints).fit(
+            data, steps=index + 1, log_every=100, checkpoint_every=index + 1, eval_every=100)
+        checkpoints.wait()
+        runs.append(directory)
+    return runs
+
+
+def test_runs_that_share_a_head_average_as_the_checkpoints_average_them_and_refit_their_temperatures(
+        decide, tmp_path):
+    """Runs trained apart from one held head average: the task's weights are the runs' fp32 mean as
+    any run's average takes it (`dew.checkpoints.averaged`), each floating leaf float64's mean of the
+    two rounded to fp32; the task's weights record every run's step and read, so no one run's
+    directory may hold its calibration (`save` refuses), and `calibrate_on` refits it as the average's
+    own calibration."""
+    from etils import epath
+
+    from dew.checkpoints import averaged
+
+    runs = trained_runs(decide, tmp_path, 2)
+    tasks = [Decide.from_run(run) for run in runs]
+    two = Decide.averaged(runs)
+    trees = (two.variables, averaged(runs).variables, tasks[0].variables, tasks[1].variables)
+    for leaf, general, one, other in zip(*(jax.tree.leaves(tree) for tree in trees), strict=True):
+        assert np.array_equal(np.asarray(leaf), np.asarray(general))
+        if np.issubdtype(np.asarray(leaf).dtype, np.floating):
+            halves = (np.asarray(one, np.float64) + np.asarray(other, np.float64)) / 2
+            assert np.array_equal(np.asarray(leaf), halves.astype(np.float32))
+    assert two.weights is not None
+    assert [entry[0] for entry in two.weights.averaged] == [str(epath.Path(run)) for run in runs]
+    assert two.calibration == Calibration()
+    with pytest.raises(ValueError):
+        two.save(runs[0])
+    # Enough held-out answers that every question kind clears its calibration minimum (TYPE_MINIMUM).
+    held_out = answered() * 10
+    calibrated = Decide.averaged(runs, calibrate_on=held_out)
+    assert calibrated.calibration != Calibration()
+    assert calibrated.calibration == two.calibrated(held_out).calibration
+
+
+def test_runs_of_other_task_settings_or_a_single_run_do_not_average(decide, tmp_path):
+    """Runs average where their recorded task settings are one task's: a run laid out otherwise does
+    not average with the others, nor does a single run."""
+    runs = trained_runs(decide, tmp_path, 1)
+    with pytest.raises(ValueError):
+        Decide.averaged(runs)
+    other = replace(decide, layout=replace(decide.layout, head_max_len=decide.layout.head_max_len // 2))
+    runs += trained_runs(other, tmp_path, 1, name="other")
+    with pytest.raises(ValueError):
+        Decide.averaged(runs)
