@@ -18,12 +18,11 @@ routed ones sums nothing, so `gemm(..., epilogue=e)` is `e` of the plain product
 `jax.experimental.pallas.fuser` hands over keeps its value (`fused`).
 
 Each call runs the first of the implementations that takes it, in a fixed order
-(`grouped_matmul.GROUPED`: its Mosaic GPU launches, then Triton's; CUTLASS's only by name) where it
-lowers for CUDA, interpreted on the CPU where `interpret_on_cpu` asks (an assumed TPU's, the TPU
-launches on Megablox's schedule), and XLA's ragged dot with the hooks applied around it everywhere
-else, a TPU's own lowering included until a scoreboard row measures its launches, and for a product
-no launch takes (the route says why), or where `generation.chosen` names XLA; a launch it names that
-does not take the call raises (`selection.KernelRefused`).
+(`grouped_matmul.GROUPED`: its Mosaic GPU launches, the TPU's on Megablox's schedule, then Triton's;
+CUTLASS's only by name) where it lowers for its target's platform, interpreted on the CPU where
+`interpret_on_cpu` asks, and XLA's ragged dot with the hooks applied around it everywhere else, for a
+product no launch takes (the route says why), or where `generation.chosen` names XLA; a launch it
+names that does not take the call raises (`selection.KernelRefused`).
 `gemm` is differentiable at every order (`generation.linear_tangent`): its reverse mode runs the
 template's own launches with the arithmetic of the portable program's derivative, the products'
 cotangents through `gemm` and `gemm_t` and the hooks' through their VJPs in XLA, recomputing the
