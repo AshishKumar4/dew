@@ -490,7 +490,7 @@ def _cuda_device() -> type:
 
     @dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
     class CudaDevice(AbstractDevice):
-        compute_capability: str
+        compute_capability: str | None = None
 
     return CudaDevice
 
