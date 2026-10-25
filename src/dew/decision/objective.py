@@ -31,6 +31,7 @@ from dew.decision.layout import (
     default_layout,
     labelled_rows,
     question_fields,
+    question_owners,
     with_context,
 )
 from dew.decision.model import DecisionModel
@@ -422,12 +423,9 @@ def packing(layout: Layout, bounds: Bounds, context_length: int | None = None, g
 
 def _rows(batch: Batch, spans_in_context: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Each packed row's tokens, questions and options, window by window: a question the row its span
-    starts in, or, where the spans are the context's (`DecisionInputs.spans_in_context`), the window's
-    one row."""
+    starts in, or, where the spans are the context's, the window's one row (`question_owners`)."""
     segments = np.asarray(batch["segments"])
-    starts = np.asarray(batch["spans"])[..., 0]
-    owners = (np.asarray(batch["questions"], segments.dtype) if spans_in_context else
-              np.where(batch["questions"], np.take_along_axis(segments, starts, axis=1), 0))
+    owners = question_owners(segments, batch["spans"], np.asarray(batch["questions"]), spans_in_context)
     options = np.sum(np.asarray(batch["options"], bool), axis=-1)
     counted = []
     for window, owner, option in zip(segments, owners, options, strict=True):

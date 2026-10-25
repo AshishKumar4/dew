@@ -1304,6 +1304,17 @@ def _parallel(spans: list[tuple[int, int]], length: int) -> tuple[tuple[int, ...
     return tuple(positions), tuple(slots)
 
 
+def question_owners(segments, spans, questions, spans_in_context: bool, xp=np):
+    """The `[B, Q]` row each question of packed windows belongs to, 0 for a padding slot: the row its
+    span starts in, or, where the spans are the context's (`DecisionInputs.spans_in_context`), the
+    window's one row. `xp` is the array namespace, NumPy for host geometry and `jax.numpy` in a trace,
+    so the model's question grouping and the counted FLOPs read one owner."""
+    if spans_in_context:
+        return xp.asarray(questions).astype(segments.dtype)
+    starts = xp.asarray(spans)[..., 0]
+    return xp.where(questions, xp.take_along_axis(segments, starts, axis=1), 0)
+
+
 @struct.dataclass
 class DecisionInputs:
     """A batch of laid-out rows: packed windows of whole rows, or rows padded to the longest.
@@ -1371,11 +1382,8 @@ class DecisionInputs:
 
     @property
     def question_segments(self) -> jnp.ndarray:
-        """Return the `[B, Q]` row each question belongs to, 0 for a padding slot: the row its span
-        starts in, or, where the spans are the context's (`spans_in_context`), the window's one row."""
-        if self.spans_in_context:
-            return self.questions.astype(self.segments.dtype)
-        return jnp.where(self.questions, jnp.take_along_axis(self.segments, self.spans[..., 0], axis=1), 0)
+        """Return the `[B, Q]` row each question belongs to, 0 for a padding slot (`question_owners`)."""
+        return question_owners(self.segments, self.spans, self.questions, self.spans_in_context, jnp)
 
     @property
     def markers(self) -> jnp.ndarray:
