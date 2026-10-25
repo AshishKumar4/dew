@@ -375,6 +375,17 @@ def test_an_ema_of_finite_leaves_of_opposite_signs_stays_their_finite_average():
     assert np.array_equal(np.asarray(updated), np.zeros(3, np.float32))
 
 
+def test_an_ema_of_a_leaf_the_step_left_alone_is_nan_at_a_nan_decay():
+    """`ema_update` at a NaN decay returns NaN, a leaf the step left as it was among them, as the weighted
+    sum does: the resulting state's finiteness check sees the bad decay, rather than a select that keeps the
+    leaf hiding it."""
+    from dew.training.transaction import ema_update
+
+    leaf = jnp.asarray([1.0, -2.0], jnp.float32)
+    updated = jax.jit(ema_update)({"w": leaf}, {"w": leaf}, jnp.float32(np.nan))["w"]
+    assert np.isnan(np.asarray(updated)).all()
+
+
 @pytest.mark.parametrize("parameter_kind", ["bfloat16", "mixed", "float64", "mixed64"])
 def test_ema_storage_dtype_and_precision_survive_real_updates_and_restart(tmp_path, parameter_kind):
     with jax.enable_x64():
