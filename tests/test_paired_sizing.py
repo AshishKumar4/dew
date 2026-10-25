@@ -46,6 +46,7 @@ def test_a_fault_fails_at_the_paired_count(heavy):
     reference, twin = _summed(0), _summed(1)
     seeds = seeds_for(reference, heavy, "heavy sums", truth_fn=_truth, dew_fn=twin)
 
+    @as_given
     def coarse(x):
         return twin(np.asarray(x).astype(ml_dtypes.bfloat16).astype(np.float32))
 

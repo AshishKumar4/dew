@@ -154,7 +154,7 @@ def call(valid):
 def dew_block(variables, **overrides):
     """Dew's block over `variables` as a function of a draw: its output on the valid rows."""
     run = jax.jit(lambda hidden, valid: module(**overrides).apply(variables, hidden, call(valid)))
-    return lambda hidden, valid: {'output': on_valid_rows(run(hidden, valid), valid)}
+    return as_given(lambda hidden, valid: {'output': on_valid_rows(run(hidden, valid), valid)})
 
 
 def reference_block_output(block):
@@ -266,6 +266,7 @@ def dew_gradients(variables, names):
             x, variables, readout)
         return grad_x, grads
 
+    @as_given
     def run(hidden, valid, readout):
         grad_x, grads = pulled(hidden, variables, valid, readout)
         ours = {'.'.join(str(key.key) for key in path): leaf

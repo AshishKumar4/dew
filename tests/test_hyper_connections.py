@@ -94,6 +94,7 @@ def reference_head(wide: bool):
 
     dtype = torch.float64 if wide else torch.float32
 
+    @as_given
     def run(streams, params):
         with float64() if wide else contextlib.nullcontext(), torch.no_grad():
             config = DeepseekV4Config(hidden_size=D, hc_mult=H, hc_eps=SPEC.hc_eps, rms_norm_eps=1e-5)

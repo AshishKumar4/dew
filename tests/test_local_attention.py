@@ -417,6 +417,7 @@ def test_a_row_with_padding_among_its_tokens_counts_its_tokens_over_a_sequence_a
     mesh = MeshSpec(sequence=2, explicit=("sequence",) if explicit else ()).build(jax.devices()[:2])
     run = jax.jit(attend)
 
+    @as_given
     def split(q, k, v):
         with jax.set_mesh(mesh):
             placed = [jax.device_put(x, NamedSharding(mesh, PartitionSpec(None, "sequence")))

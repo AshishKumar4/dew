@@ -173,6 +173,7 @@ def test_sqrt_schedule_is_diffusion_lms_table(steps):
         # Step k's time (k + 1) / T, rounded once to the arms' float32.
         return ((step + 1) / steps).astype(np.float32)
 
+    @as_given
     def theirs(step):
         def alpha_bar(t):
             return 1 - np.sqrt(t + 0.0001)
@@ -435,7 +436,7 @@ def test_edm_preset_samples_on_the_karras_grid():
     def sigmas(seed):
         return (np.exp(drawn(seed, 6).uniform(np.log(0.01), np.log(40.0), ROWS)).astype(np.float32),)
 
-    assert_as_exact(process.schedule.t_of_sigma, lambda sigma: (np.log(sigma) + 1.2) / 1.2, sigmas,
+    assert_as_exact(process.schedule.t_of_sigma, as_given(lambda sigma: (np.log(sigma) + 1.2) / 1.2), sigmas,
                     "edm time", seeds=SEEDS['edm time'])
 
 

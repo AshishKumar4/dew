@@ -252,7 +252,7 @@ def test_complex_weights_descend_and_resume_where_the_whole_run_lands(tmp_path, 
         return weight
 
     assert_as_exact(as_given(lambda target: parts(fit(4, target).variables['params']['weight'])),
-                    lambda target: parts(optax_descent(target)), complex_target, "complex descent",
+                    as_given(lambda target: parts(optax_descent(target))), complex_target, "complex descent",
                     seeds=COMPLEX_SEEDS,
                     truth_fn=lambda target: parts(np.asarray(target, np.complex128) * (1 - 0.8 ** 4)))
     norms = {step: scalars['train/grad_norm'] for step, scalars in sink.scalars

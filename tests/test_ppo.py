@@ -231,7 +231,7 @@ def test_whitened_advantages_of_rewards_far_above_the_values_are_as_exact_as_the
         return np.concatenate(advantages), rewards, values
 
     def equations(dtype):
-        return lambda seed: {"advantages": whitened(*drawn(int(seed))[1:], 1., 1., dtype)}
+        return as_given(lambda seed: {"advantages": whitened(*drawn(int(seed))[1:], 1., 1., dtype)})
 
     assert_as_exact(as_given(lambda seed: {"advantages": drawn(int(seed))[0]}), equations(np.float32),
                     lambda seed: (np.int32(seed),), "whitened advantages of shifted rewards",

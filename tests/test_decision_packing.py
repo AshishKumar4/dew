@@ -335,6 +335,7 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, held=lambda p
         logits, grads = decide(variables, batch)
         return asked(batch, logits), kept(grads)
 
+    @as_given
     def alone(variables):
         logits, grads = rows_alone(lambda one: decide(variables, one), batch)
         return logits, kept(grads)

@@ -304,6 +304,7 @@ def test_replay_under_a_pipeline_scores_as_on_one_stage():
     def scored(spec, microbatches=None):
         mesh = spec.build()
 
+        @as_given
         def score(params, tokens, routed):
             with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
                 return np.asarray(run(params, tokens, routed))

@@ -23,6 +23,7 @@ from diffusion_support import (
     objective_gradient,
 )
 from flax import linen as nn
+from reference_error import as_given
 
 from dew.data.dataset import Loader
 from dew.diffusion import broadcast_rates, expand, presets
@@ -514,6 +515,7 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
     info = Step(jnp.asarray(0), jax.random.fold_in(initial.key, 0), None, **fields)
     twin = float64_twin(objective)
 
+    @as_given
     def pooled(variables):
         # The step donates its state: each draw steps a copy of the untouched template.
         state = jax.tree.map(jnp.copy, template).replace(variables=jax.tree.map(jnp.asarray, variables))

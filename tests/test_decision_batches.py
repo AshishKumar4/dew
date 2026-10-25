@@ -125,7 +125,7 @@ def test_a_batchs_probabilities_are_each_bodys_alone(decide):
         return (np.int64(seed),)
 
     assert_as_exact(as_given(lambda seed: scored(decide, seed, together=True)),
-                    lambda seed: scored(decide, seed, together=False), draw,
+                    as_given(lambda seed: scored(decide, seed, together=False)), draw,
                     "batched probabilities", seeds=BATCH_SEEDS, truth_fn=truth)
 
 
@@ -262,6 +262,7 @@ def test_two_requests_of_alike_images_join_one_pass_each_scored_as_alone(tmp_pat
             decide.processor, [(row.encoded, row.media) for row in rows])))
         return [scores[index, :len(row.questions)] for index, row in enumerate(encoded)]
 
+    @as_given
     def scored(reading, held, seed, *, together: bool) -> np.ndarray:
         rows = rows_of(reading, seed)
         outputs = joined(reading, held, rows) if together else [
@@ -287,6 +288,6 @@ def test_two_requests_of_alike_images_join_one_pass_each_scored_as_alone(tmp_pat
             return scored(reading, held, seed, together=False)
 
     assert_as_exact(as_given(lambda seed: scored(task, variables, seed, together=True)),
-                    lambda seed: scored(task, variables, seed, together=False),
+                    as_given(lambda seed: scored(task, variables, seed, together=False)),
                     lambda seed: (np.int64(seed),), "two requests of images in one pass", seeds=IMAGE_SEEDS,
                     truth_fn=truth)

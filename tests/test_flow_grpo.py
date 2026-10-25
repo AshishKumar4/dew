@@ -143,7 +143,7 @@ def test_recorded_trajectory_rescores_under_shifted_guided_process():
         return guided_density(walked_in_float32(walk, start, offset), offset, np.float64)
 
     assert_as_exact(lambda start, offset: walk(start, offset).log_probs,
-                    lambda start, offset: guided_density(walk(start, offset), offset, np.float32),
+                    as_given(lambda start, offset: guided_density(walk(start, offset), offset, np.float32)),
                     drawn_rows((2,), (1,)), "guided walk", seeds=SEEDS['guided walk'], truth_fn=truth)
     deterministic = FlowSDE(0).trajectory(denoiser(offset), x, 5, key=key)
     assert np.isnan(deterministic.log_probs).all()
@@ -201,7 +201,7 @@ def test_flow_objective_uses_converted_predictions(prediction):
         return {"recorded": density, "rescored": density}
 
     assert_as_exact(recorded_and_rescored(walk, rescore, variables),
-                    lambda start: rectified(walk(start), np.float32), drawn_rows((2,)),
+                    as_given(lambda start: rectified(walk(start), np.float32)), drawn_rows((2,)),
                     f"{prediction} converted", seeds=SEEDS['converted'],
                     truth_fn=lambda start: rectified(walked_in_float32(walk, start), np.float64))
     trajectory = walk(jnp.asarray([[0.2, -0.5], [-0.1, 0.7]]))
@@ -740,6 +740,7 @@ def test_flow_evaluation_and_preview_use_live_policy_with_frozen_reference():
         keys = jax.random.split(jax.random.fold_in(jax.random.key(52), seed))
         return jax.random.uniform(keys[0], (), minval=0.2, maxval=0.9), jax.random.key_data(keys[1])
 
+    @as_given
     def sampled(speed, key):
         step = Step(jnp.asarray(0), jax.random.wrap_key_data(key), reference)
         live = {**reference, "params": {"speed": speed}}
