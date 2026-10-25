@@ -512,18 +512,25 @@ def consistency_divergence(logits: jax.Array, options: jax.Array, groups: jax.Ar
     # A question of no mapped slot (in no group, or padding) normalizes over nothing: it reads zeros
     # instead, which its answer then takes no part of, so neither its value nor its gradient is NaN.
     any_mapped = jnp.any(mapped, axis=-1, keepdims=True)
-    log_p = categorical.log_probs(jnp.where(any_mapped, logits, 0.0), mapped | ~any_mapped)
+    safe, held_slots = jnp.where(any_mapped, logits, 0.0), mapped | ~any_mapped
+    log_p = categorical.log_probs(safe, held_slots)
     slots = jnp.where(mapped, canonical, width)
 
     def answer(row_logits, row_slots):
         return categorical.segment_log_partition(row_logits, row_slots, width)
 
+    def summed(row_probabilities, row_slots):
+        return jax.ops.segment_sum(row_probabilities, row_slots, num_segments=width + 1)[:width]
+
     log_answer, present = jax.vmap(jax.vmap(answer))(log_p, slots)
+    # The answer's probabilities from the softmax itself, not the exponent of its logarithm, whose
+    # rounding grows with the logarithm's size and would set each term's weight less exactly.
+    probability = jax.vmap(jax.vmap(summed))(categorical.probabilities(safe, held_slots), slots)
     member = groups >= 0
     count = groups.shape[-1]
     ids = jnp.where(member, groups, count)
 
-    def window(log_answer, present, ids, member):
+    def window(log_answer, probability, present, ids, member):
         sizes = jax.ops.segment_sum(member.astype(log_answer.dtype), ids, num_segments=count + 1)[:count]
         held = jnp.where(present & member[:, None], ids[:, None], count)
 
@@ -534,12 +541,12 @@ def consistency_divergence(logits: jax.Array, options: jax.Array, groups: jax.Ar
         log_mean = jax.vmap(mean_of, in_axes=(1, 1), out_axes=1)(given, held)
         log_mean = log_mean - jnp.log(jnp.maximum(sizes, 1.0))[:, None]
         theirs = log_mean[jnp.minimum(ids, count - 1)]
-        each = jnp.sum(jnp.where(present, jnp.exp(log_answer) * (log_answer - theirs), 0.0), axis=-1)
+        each = jnp.sum(jnp.where(present, probability * (log_answer - theirs), 0.0), axis=-1)
         size = sizes[jnp.minimum(ids, count - 1)]
         return (jnp.where(member, each / jnp.maximum(size, 1.0), 0.0),
                 jnp.where(member, 1.0 / jnp.maximum(size, 1.0), 0.0))
 
-    return jax.vmap(window)(log_answer, present, ids, member)
+    return jax.vmap(window)(log_answer, probability, present, ids, member)
 
 
 @struct.dataclass

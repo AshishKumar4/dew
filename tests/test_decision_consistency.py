@@ -15,7 +15,16 @@ from reference_error import assert_as_exact, with_gradients, without_ynn
 from test_decision_objective import SPECIALS, TOKENIZER, tiny_backbone
 
 from dew.data.dataset import DataPartition
-from dew.decision import Choice, DecisionObjective, Example, Group, JointLayout, Noul, StateFirstLayout
+from dew.decision import (
+    Choice,
+    DecisionObjective,
+    Example,
+    Group,
+    JointLayout,
+    JointSchemaHead,
+    Noul,
+    StateFirstLayout,
+)
 from dew.decision.objective import DecisionStatistics, Encoding, Fit, _window_groups, consistency_divergence
 from dew.objectives.base import Ratio, Step
 
@@ -158,8 +167,9 @@ def test_a_weight_of_zero_reads_no_groups_and_a_weight_adds_the_term_beside_the_
     the label loss is unchanged to the bit, the term rides beside it, and the objective's value is
     their weighted sum."""
     backbone = tiny_backbone().clone(max_seq_len=LAYOUT.max_len)
-    plain = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
-    weighted = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT,
+    head = JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
+    plain = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT, head=head)
+    weighted = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT, head=head,
                                  consistency=0.5)
     zero = Encoding(LAYOUT, TOKENIZER, SPECIALS, 3, shuffle=False)
     assert "groups" not in zero(NEGATED, list(NEGATED.questions), None)
