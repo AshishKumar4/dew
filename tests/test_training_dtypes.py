@@ -351,6 +351,41 @@ def test_optimizer_dtype_overflow_backs_off_and_drops_its_window():
     compare(rejected.variables, prefix_params, exact=True)
 
 
+@pytest.mark.parametrize("decay", [0.5, 0.999, 0.9999])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_an_ema_leaf_the_step_left_alone_keeps_its_average_bit_for_bit(dtype, decay):
+    """`ema_update` of a leaf whose live value is its average returns that average bit for bit, at any
+    decay, however its program fuses the update: a parameter no gradient moved keeps its EMA as it was."""
+    from dew.training.transaction import ema_update
+
+    average = jnp.asarray(np.random.default_rng(0).standard_normal(4096), dtype)
+    kept = jax.jit(ema_update)({"w": average}, {"w": average}, decay)["w"]
+    assert kept.dtype == average.dtype and np.array_equal(np.asarray(kept), np.asarray(average))
+
+
+def test_an_ema_of_finite_leaves_of_opposite_signs_stays_their_finite_average():
+    """`ema_update` between finite leaves returns their weighted average wherever it is finite, at the ends
+    of fp32's range too: an average of 2**127 and a live value of -(2**127) at decay 0.5 average to exactly 0,
+    where their difference alone overflows."""
+    from dew.training.transaction import ema_update
+
+    average = jnp.asarray([2.0 ** 127, -(2.0 ** 127), 3e38], jnp.float32)
+    live = jnp.asarray([-(2.0 ** 127), 2.0 ** 127, -3e38], jnp.float32)
+    updated = jax.jit(ema_update)({"w": average}, {"w": live}, 0.5)["w"]
+    assert np.array_equal(np.asarray(updated), np.zeros(3, np.float32))
+
+
+def test_an_ema_of_a_leaf_the_step_left_alone_is_nan_at_a_nan_decay():
+    """`ema_update` at a NaN decay returns NaN, a leaf the step left as it was among them, as the weighted
+    sum does: the resulting state's finiteness check sees the bad decay, rather than a select that keeps the
+    leaf hiding it."""
+    from dew.training.transaction import ema_update
+
+    leaf = jnp.asarray([1.0, -2.0], jnp.float32)
+    updated = jax.jit(ema_update)({"w": leaf}, {"w": leaf}, jnp.float32(np.nan))["w"]
+    assert np.isnan(np.asarray(updated)).all()
+
+
 @pytest.mark.parametrize("parameter_kind", ["bfloat16", "mixed", "float64", "mixed64"])
 def test_ema_storage_dtype_and_precision_survive_real_updates_and_restart(tmp_path, parameter_kind):
     with jax.enable_x64():

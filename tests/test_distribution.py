@@ -25,7 +25,6 @@ import numpy as np
 import pytest
 from lane_environment import outside_any_cluster
 
-from dew._host import cpu_class
 from dew.training import MeshSpec
 from dew.training.distributed import parameter_axes
 
@@ -120,7 +119,7 @@ def test_a_pool_caches_by_default_only_where_its_processes_share_the_directory(t
     assert done.returncode == 0, done.stdout + done.stderr
     directories = [json.loads(path.read_text()) for path in sorted(out.iterdir())]
     minor = f"python{sys.version_info.major}.{sys.version_info.minor}"
-    expected = str(tmp_path / "home" / "dew" / "xla" / minor / cpu_class()) if shared else None
+    expected = str(tmp_path / "home" / "dew" / "xla" / minor) if shared else None
     assert directories == [expected] * 2
 
 
