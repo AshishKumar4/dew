@@ -96,18 +96,19 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     rows), so one consumer's softmax runs under its partner's products as FlashAttention-3's does; the tile
     it walks the largest unit multiple of the `walked` extent whose live set a consumer's registers hold and
     whose stages the block holds (`fits`); its stages the ring's busy depth (`depth`: two, one more where a
-    walk keeps a slot or a product past its step), at most the walk's `steps` and two at the least.
-    `tiles(rows, walked, consumers)` builds the config at two stages. None where no tile fits."""
+    walk keeps a slot or a product past its step), at most the walk's `steps` and two at the least; fewer
+    consumers where no tile of the family's count holds the block (a GPU of a smaller one). `tiles(rows,
+    walked, consumers)` builds the config at two stages. None where no tile fits."""
     rows = _extents(family, dtype, held)[-1]
-    consumers = max(1, min(family.consumers, -(-held // rows)))
-    for extent in _extents(family, dtype, walked):
-        config = tiles(rows, extent, consumers)
-        if not fits(config):
-            continue
-        for stages in range(max(2, min(depth, steps(config))), 1, -1):
-            staged = dataclasses.replace(config, stages=stages)
-            if fits(staged):
-                return staged
+    for consumers in range(max(1, min(family.consumers, -(-held // rows))), 0, -1):
+        for extent in _extents(family, dtype, walked):
+            config = tiles(rows, extent, consumers)
+            if not fits(config):
+                continue
+            for stages in range(max(2, min(depth, steps(config))), 1, -1):
+                staged = dataclasses.replace(config, stages=stages)
+                if fits(staged):
+                    return staged
     return None
 
 
@@ -240,6 +241,9 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
 
     def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> Config:
         target = generation.gpu_target()
+        family = BUNDLES.get(generation.family(target.generation) or "")
+        if family is not None and (reason := self.refusal(ba, family)):
+            raise NotImplementedError(reason)
         config = self.derived(ba, target)
         if config is None:
             raise Unfitted(type(self).__name__, None, generation.shared_budget(target), target.generation)
