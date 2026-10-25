@@ -761,7 +761,7 @@ def _registry_decoder():
     return config, model, model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
 
 
-REGISTRY_SEEDS = 8
+REGISTRY_SEEDS = 16
 """The fresh adapter's check-1 seeds, sized paired by `seeds_for` on an A100, where XLA merges the
 adapter's product with the base's."""
 

@@ -617,19 +617,18 @@ def _climbs_and_restores(model, variables, inputs, share: int, **apply) -> None:
     written = model.apply(variables, *inputs, mutable=True, **apply)[1]
     shared = rungs[1 + share::RUNG_SHARES]
     assert shared or len(rungs) <= 1 + share, records
-    base = jax.jit(lambda inputs: _call(model, variables, inputs, **apply))
-    wide = jax.jit(lambda inputs: _call(_float64(model), widened(variables), inputs, **apply))
-
+    # Applied as the step applies them: some models read their ids on the host.
     def forward_truth(*inputs):
         with jax.enable_x64(new_val=True):
-            return np.asarray(wide(widened(inputs)), np.float64)
+            wide = _call(_float64(model), widened(variables), widened(inputs), **apply)
+            return np.asarray(wide, np.float64)
 
     for rung in shared:
         stepped = _stepped(rung, variables, inputs, **apply)
-        forward = jax.jit(lambda inputs, rung=rung: _call(rung, variables, inputs, **apply))
-        assert_as_exact(lambda *inputs, forward=forward: np.asarray(forward(inputs)),
-                        lambda *inputs: np.asarray(base(inputs)), lambda seed: _redrawn(inputs, seed),
-                        f"forward at {rung.recompute_record()}", seeds=RUNG_SEEDS, truth_fn=forward_truth)
+        assert_as_exact(lambda *inputs, rung=rung: np.asarray(_call(rung, variables, inputs, **apply)),
+                        lambda *inputs: np.asarray(_call(model, variables, inputs, **apply)),
+                        lambda seed: _redrawn(inputs, seed), f"forward at {rung.recompute_record()}",
+                        seeds=RUNG_SEEDS, truth_fn=forward_truth)
         as_exact(stepped[1], gradient_tree, truth, f"gradient at {rung.recompute_record()}")
         assert rung.apply(variables, *inputs, mutable=True, **apply)[1].keys() == written.keys()
 
