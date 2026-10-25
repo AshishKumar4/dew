@@ -43,6 +43,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn.dense import Dense
+from dew.optim import newton_schulz
 
 from .attention import LayerNorm
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places, valid_order
@@ -171,6 +172,10 @@ class InContextMemory(nn.Module):
     momentum: Gate | None = None
     retention: Gate | None = None
     chunk: int = 16
+    orthogonalize: int = 0
+    """Newton-Schulz steps orthogonalizing each matrix of a token's gradient before its step (`dew.optim.
+    newton_schulz`, Nested Learning Sec 4.2's Muon-style inner update); 0 steps the gradient as it is.
+    Vectors (biases, norm scales) step as they are."""
     project_query: bool = True
     project_key: bool = True
     project_value: bool = True
@@ -184,6 +189,8 @@ class InContextMemory(nn.Module):
     def __post_init__(self):
         if self.chunk < 1:
             raise ValueError(f"a memory updates every chunk of one token or more, got {self.chunk}")
+        if self.orthogonalize < 0:
+            raise ValueError(f"orthogonalize counts Newton-Schulz steps, got {self.orthogonalize}")
         if self.target not in ("given", "self_generated"):
             raise ValueError(f"a memory's target is given or self_generated, not {self.target!r}")
         if self.heads > 1 and not (self.project_query and self.project_key and self.project_value):
@@ -276,8 +283,13 @@ class InContextMemory(nn.Module):
         return out
 
     def _gradient(self, state: dict, key: jax.Array, target: jax.Array) -> dict:
-        """One head's gradient of the objective at `state` for one token, in the state's precision."""
-        return jax.grad(lambda held: self.objective(self._applied(held, key, wide=True), target))(state)
+        """One head's gradient of the objective at `state` for one token, in the state's precision, each
+        matrix orthogonalized where `orthogonalize` asks."""
+        gradient = jax.grad(lambda held: self.objective(self._applied(held, key, wide=True), target))(state)
+        if not self.orthogonalize:
+            return gradient
+        return jax.tree.map(lambda leaf: newton_schulz(leaf, self.orthogonalize) if leaf.ndim == 2 else leaf,
+                            gradient)
 
     def _target(self, state: dict, value: jax.Array) -> jax.Array:
         """A token's target: its value view, or the network's image of it at `state` (Nested Learning
