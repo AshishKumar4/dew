@@ -109,13 +109,25 @@ fuser, and Tokamax. Then what the best kernels choose on each family, cited per 
     A100's 166,912 B block.
   - CUTLASS's 64x64 warp tiles split N too: eight warps as 2 x 4. In Mosaic that is the MMA layouts'
     `m_warps` parameter (warps along M, the rest along N).
-- So the bundle gains:
-  - a warp-arrangement Family fact, warps along M and N, which `held_rows`/`tile_registers` read so each
-    warp's accumulator and right fragments shrink with its share of N;
-  - mma.sync's sub-tiled output staging (`Family.output_columns`), as on wgmma.
-  - The derivation then sees 128x256 at 64 accumulator registers a thread and 32 right-fragment ones, about
-    150 with the rest, and stages it 3 deep within the block. That is CUTLASS's choice, derived and not set.
-  - If Mosaic's mma lowering refuses `m_warps` splits, the fork adds it, with a compile probe first.
+- The accumulator is (a warpgroup's rows x the tile's width) / 128 threads whatever the arrangement: 128
+  registers for 64 x 256. What shrinks are the operand fragments, by their lifetime and their arrangement.
+  Mosaic's `MMALayouts(dtype, m_warps)` (`jax/experimental/mosaic/gpu/mma.py:35`) places `m_warps` of a
+  warpgroup's 4 warps along M and the rest along N. The left fragment is replicated over the N warps, the
+  right one over the M warps. So the bundle gains:
+  - **Fragments a sub-step at a time.** Each product loads its fragments one MMA depth at a time (k = 16 for
+    16-bit operands; `MMALayouts`' `k`), not a whole 64-deep step: CUTLASS's warp-level k-iterations.
+  - **The arrangement as a Family fact derived per tile.** `m_warps` is the one of (1, 2, 4) whose accumulator
+    atom divides the tile (`MMALayouts.for_shape`'s rule) and whose replicated fragments are fewest.
+    `tile_registers` counts each fragment at its replication.
+  - At 64 x 256 per warpgroup with `m_warps = 1`, a thread holds 128 accumulator registers, 16 left (all 64
+    rows by 16 deep, over 32 lanes) and 16 right (16 deep by its 64 columns), and 40 held: 200 within 255.
+    With `m_warps = 4` and whole steps it holds 440.
+  - **Sub-tiled output staging** (`Family.output_columns`), as on wgmma. Three bf16 stages at 128 x 256 x 64
+    are 147,456 B, and two 128-byte chunk buffers of 128 rows are 65,536 B less a whole tile's, within the
+    A100's 166,912 B.
+  - The derivation then holds 128 x 256 x 64 at 3 stages on two consumers, CUTLASS's choice, derived and not
+    set. Whether Mosaic lowers a 16-deep slice of a swizzled operand tile, and `m_warps = 1` products, is a
+    compile probe (the sm80 ptxas gate) before the GPU round. The fork adds what it refuses.
 
 ## 5. Hooks and the kernel gradient on mma.sync
 
