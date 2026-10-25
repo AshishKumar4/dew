@@ -198,7 +198,8 @@ a few tiles a group (the kernels' resources do not grow with them)."""
 
 def _gemm_mainloop_cases(generation_name: str) -> list:
     """Each GEMM Mosaic mainloop a `generation_name` GPU runs, at the one tile its launch derives from the
-    generation's facts (`Template.derived`): the forward and the input gradient (`MosaicGmm`), the kernel
+    generation's facts (`Template.derived`): the forward and the input gradient (`MosaicGmm`, fp32 outputs,
+    which every family stores: `mosaic.Family.stores`), the kernel
     gradient (`MosaicTgmm`) in bf16 and in fp32 with exact sums, and on warpgroup MMA the forward with an
     RMS norm's prologue and a bias epilogue and the kernel gradient with the prologue; each a family's
     mainloop only where it takes the call (`Template.eligible`)."""
@@ -213,10 +214,10 @@ def _gemm_mainloop_cases(generation_name: str) -> list:
     plain = {"interpret": False}
     calls = [
         ("forward", grouped_matmul.MosaicGmm(), (bf16((rows, depth)), bf16((groups, depth, width)), sizes),
-         {**plain, "out_dtype": "bfloat16", "trans_rhs": False}),
+         {**plain, "out_dtype": "float32", "trans_rhs": False}),
         ("input gradient", grouped_matmul.MosaicGmm(),
          (bf16((rows, width)), bf16((groups, depth, width)), sizes),
-         {**plain, "out_dtype": "bfloat16", "trans_rhs": True}),
+         {**plain, "out_dtype": "float32", "trans_rhs": True}),
         ("kernel gradient", grouped_matmul.MosaicTgmm(), (bf16((rows, depth)), bf16((rows, width)), sizes),
          {**plain, "out_dtype": "bfloat16"}),
         ("kernel gradient exact fp32", grouped_matmul.MosaicTgmm(),
