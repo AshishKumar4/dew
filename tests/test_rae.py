@@ -74,7 +74,8 @@ def test_a_ninety_six_wide_encoder_imports_its_full_source_projections(tmp_path)
         with float64():
             return observed(exact, images)
 
-    reference = lambda images: observed(source, images)
+    def reference(images):
+        return observed(source, images)
 
     @jax.jit
     def ours(images):
