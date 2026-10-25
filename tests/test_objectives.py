@@ -262,10 +262,12 @@ def test_an_objective_whose_saved_task_builds_from_its_settings_builds_its_task_
     variables = model.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
     task = Decoding().build_task(variables)
     assert isinstance(task, TextGeneration) and task.model is model
-    # The task holds the variables' own arrays, in a mapping of its own.
-    def leaves(tree):
-        return {jax.tree_util.keystr(path): id(leaf) for path, leaf in jax.tree_util.tree_leaves_with_path(tree)}
 
+    def leaves(tree):
+        return {jax.tree_util.keystr(path): id(leaf)
+                for path, leaf in jax.tree_util.tree_leaves_with_path(tree)}
+
+    # The task holds the variables' own arrays, in a mapping of its own.
     assert leaves(task.variables) == leaves(variables)
     assert task.max_new_tokens == 3 and task.processor is None
 
