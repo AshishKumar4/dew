@@ -757,8 +757,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         most its consumers, one multiprocessor a tile) with a ring of two stages at least (a walk keeping
         one step's products in flight holds its slot while the next step's loads fill another), its blocks
         dividing the call's extents, and a one-dimensional side operand's block, copied untiled, at most
-        one copy's extent along its axis and a whole number of its units (`mosaic.Family.copy_extent`,
-        `copy_unit`)."""
+        one copy's extent along its axis (`mosaic.Family.copy_extent`)."""
         family = self._family(ba, target)
         if family is None or config.family != family.name or not self._divides(ba, config):
             return False
@@ -772,10 +771,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                                            ('epilogue_operands', hooks.epilogue_axes))
                 for _, side_axes in zip(ba.arguments.get(name, ()), axes_of, strict=True)
                 if len(side_axes) == 1 for axis in side_axes}
-        # Each consumer copies its share of a block where a family's consumers share its copies.
-        extent, unit = family.copy_extent, family.copy_unit * config.warpgroups
-        copied = all((extent is None or self.extents(config)[axis] <= extent)
-                     and self.extents(config)[axis] % unit == 0 for axis in axes)
+        extent = family.copy_extent
+        copied = extent is None or all(self.extents(config)[axis] <= extent for axis in axes)
         return copied and super().legal(ba, config, target)
 
     @abc.abstractmethod

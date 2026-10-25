@@ -297,9 +297,12 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
     part = (share, block_n)
     side_shapes = [tuple({'rows': part[0], 'columns': part[1]}[axis] for axis in axes)
                    for axes in epilogue_axes]
-    # A stream for each operand that follows the steps: a prologue side operand without depth is loaded
-    # once a tile.
-    stepped = tuple(i for i, axes in enumerate(prologue_axes) if 'depth' in axes)
+    # A stream for each operand that follows the steps, but a vector a family does not copy, which its
+    # step reads from global memory (`mosaic.Family.copies_vectors`); a prologue side operand without
+    # depth is loaded once a tile.
+    stepped = tuple(i for i, axes in enumerate(prologue_axes)
+                    if 'depth' in axes and (len(axes) > 1 or family.copies_vectors))
+    read = tuple(i for i, axes in enumerate(prologue_axes) if 'depth' in axes and i not in stepped)
     fixed = tuple(i for i, axes in enumerate(prologue_axes) if 'depth' not in axes)
     extent = {'rows': block_m, 'depth': block_k}
     steps = k // block_k
@@ -333,6 +336,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
                 step = functools.partial(_gmm_step, family=family, prologue=prologue,
                                          prologue_axes=prologue_axes,
                                          fixed_tiles=dict(zip(fixed, fixed_refs, strict=True)),
+                                         read_tiles={i: prologue_gmems[i] for i in read},
                                          mine_rows=pl.ds(wg * share, share), transpose_rhs=transpose_rhs,
                                          interpret=bool(interpret))
                 # The unrouted rows, and a slot past the last tile, multiply nothing: zeros.
@@ -382,16 +386,19 @@ def _gmm_views(lhs_gmem, rhs_gmem, prologue_gmems, group, column_tile, *, tiles:
                for i, axes in axes_of.items()}}
 
 
-def _gmm_step(_, slots, nothing, accumulators, *, family: mosaic.Family, prologue, prologue_axes: tuple,
-              fixed_tiles: dict, mine_rows, transpose_rhs: bool, interpret: bool):
+def _gmm_step(index, slots, nothing, accumulators, *, family: mosaic.Family, prologue, prologue_axes: tuple,
+              fixed_tiles: dict, read_tiles: dict, mine_rows, transpose_rhs: bool, interpret: bool):
     """Dew: a consumer's step of the cooperative `gmm` (`mosaic.Family.walk`): its half of the rows' slot,
-    rewritten by the prologue on its side tiles (the streamed ones' slots, the fixed ones' `fixed_tiles`),
+    rewritten by the prologue on its side tiles (the streamed ones' slots, the fixed ones' `fixed_tiles`,
+    a depth vector the family does not copy read at step `index` from global memory: `read_tiles`),
     times the matrix's slot into its accumulator."""
     stage = slots['rows']
     if prologue is not None:
         # This warpgroup's half of the rows, the only half its MMA reads.
-        tiles_of = {i: fixed_tiles[i] if i in fixed_tiles else slots[f'side_{i}']
-                    for i in range(len(prologue_axes))}
+        depth = stage.shape[1]
+        tiles_of = {i: fixed_tiles[i] if i in fixed_tiles
+                    else read_tiles[i].at[pl.ds(index * depth, depth)] if i in read_tiles
+                    else slots[f'side_{i}'] for i in range(len(prologue_axes))}
         _rewritten(prologue, prologue_axes, stage.at[mine_rows], tiles_of, 'rows', mine_rows)
         family.published()
     matrix = slots['matrix'].transpose((1, 0)) if transpose_rhs else slots['matrix']
@@ -491,7 +498,11 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
     atoms_each = -(-(block_n // atom) // consumers)
     part = (depth_half, block_n)
     grid = (m // block_m, n // block_n)
-    stepped = tuple(i for i, axes in enumerate(prologue_axes) if 'rows' in axes)
+    # A stream for each side operand with rows, but a vector a family does not copy, which its step reads
+    # from global memory (`mosaic.Family.copies_vectors`).
+    stepped = tuple(i for i, axes in enumerate(prologue_axes)
+                    if 'rows' in axes and (len(axes) > 1 or family.copies_vectors))
+    read = tuple(i for i, axes in enumerate(prologue_axes) if 'rows' in axes and i not in stepped)
     fixed = tuple(i for i, axes in enumerate(prologue_axes) if 'rows' not in axes)
     extent = {'rows': block_k, 'depth': block_m}
 
@@ -533,8 +544,8 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                 mine_depth = pl.ds(wg * depth_half, depth_half)
                 mine_columns = (wg * atoms_each, atoms_each, atoms_each * consumers > block_n // atom)
                 fixed_refs = [smem.at[wg] for smem in fixed_smems]
-                hook = None if prologue is None else (prologue, prologue_axes, stepped, fixed, fixed_refs)
                 group = (starts_gmem[g_i], ends_gmem[g_i], steps, block_k)
+                first = pl.multiple_of(block_starts_gmem[g_i], block_k) // block_k
                 if active:
                     family.loaded([(side_gmems[i].at[tuple(depth for _ in prologue_axes[i])], ref,
                                     barrier.at[wg])
@@ -542,6 +553,10 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
                                                               strict=True)])
 
                 def staged_at(index, slots):
+                    # A vector read from global memory at the step's row block (`read`).
+                    read_refs = {i: side_gmems[i].at[pl.ds((first + index) * block_k, block_k)] for i in read}
+                    hook = (None if prologue is None
+                            else (prologue, prologue_axes, stepped, fixed, fixed_refs, read_refs))
                     return _staged_halves(family, [slots[name] for name in names], (index, *group),
                                           (mine_depth, mine_columns), hook,
                                           halves if consumers == 2 else None)
@@ -570,18 +585,20 @@ def _tgmm_streamed(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles
 def _staged_halves(family: mosaic.Family, stages: list, group: tuple, mine: tuple, hook, halves) -> tuple:
     """Dew: a streamed kernel gradient step's operands for one consumer warpgroup, from its `stages` (the
     rows', the cotangent's, then each side operand's with rows): its depth half of the rows, rewritten by
-    the prologue (`hook`: it, its operands' axes, which are stepped and which fixed, and the fixed ones'
-    tiles), and the whole cotangent, the neighbouring groups' rows zeroed in its shares of both (`group`:
-    the step, the group's first and last row, its steps, the rows a step takes; `mine`: its depth half,
-    and its first swizzled row of the cotangent's, how many, and whether the last consumer's share runs
-    short of them), the other's share awaited at `halves`
+    the prologue (`hook`: it, its operands' axes, which are stepped and which fixed, the fixed ones' tiles
+    and the vectors read from global memory, by operand), and the whole cotangent, the neighbouring
+    groups' rows zeroed in its shares of both (`group`: the step, the group's first and last row, its
+    steps, the rows a step takes; `mine`: its depth half, and its first swizzled row of the cotangent's,
+    how many, and whether the last consumer's share runs short of them), the other's share awaited at
+    `halves`
     where it zeroed any. Both consumers' MMAs read the whole cotangent stage, so each zeroes its share of
     it and they meet where a group boundary falls in the step, the kernel's one exchange between them."""
     rows_stage, cotangent_stage, *side_stages = stages
     mine_depth, (first_atom, atoms_each, short) = mine
     if hook is not None:
-        prologue, axes_of, stepped, fixed, fixed_refs = hook
-        tiles_of = dict(zip(stepped, side_stages, strict=True)) | dict(zip(fixed, fixed_refs, strict=True))
+        prologue, axes_of, stepped, fixed, fixed_refs, read_refs = hook
+        tiles_of = (dict(zip(stepped, side_stages, strict=True)) | dict(zip(fixed, fixed_refs, strict=True))
+                    | read_refs)
         _rewritten(prologue, axes_of, rows_stage.at[:, mine_depth], tiles_of, 'depth', mine_depth)
     atom = mosaic.SWIZZLE_BYTES // jnp.dtype(cotangent_stage.dtype).itemsize
     atoms = cotangent_stage.shape[1] // atom

@@ -474,11 +474,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     """Whether its products take fp32 operands, as TF32 (warpgroup MMA's kind::tf32: Mosaic's wgmma issues
     fp32 shared-memory operands so); where not (mma.sync, whose Mosaic lowering takes 16-bit, fp8, int
     and f64 operands), a template splits fp32 operands into bf16 parts instead."""
-    copy_unit: int = 1
-    """The elements a copy of an untiled block moves a multiple of: one where TMA moves it, a warpgroup's
-    threads' (128) where cp.async does (Mosaic GPU spreads a copy over its threads, an element each at
-    least: 'CP_ASYNC requires the number of elements to be a multiple of 128', R9-gpu-a100), which a
-    one-dimensional side operand's block along its axis is (`grouped_matmul._Mosaic.legal`)."""
+    copies_vectors: bool = True
+    """Whether its copies move a one-dimensional block untiled (TMA's), where cp.async spreads a copy over a
+    warpgroup's threads, 128 elements at least ('CP_ASYNC requires the number of elements to be a multiple
+    of 128', R9-gpu-a100): a step reads a side vector it does not copy from global memory instead."""
     most_shared: int
     """The most shared memory a block of any GPU of the family holds (CUDA's opt-in limit), which bounds
     the stages a generated tile takes; a GPU's own (`generation.shared_budget`) bounds the tiles its
