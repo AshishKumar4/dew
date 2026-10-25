@@ -306,7 +306,8 @@ def max_attention_logits(query: jax.Array, key: jax.Array, *, causal: bool = Fal
                          sliding_window: int | None = None,
                          mask: jax.Array | None = None,
                          bias: jax.Array | None = None) -> jax.Array:
-    """Return the largest pre-softmax logit per query head: `[batch, heads]`, fp32.
+    """Return the largest pre-softmax logit per query head: `[batch, heads]`, at least fp32
+    (`at_least_fp32` of the operands'), so a float64 model's maxima are float64.
 
     The logits are the scaled dot products the kernels softmax. Masked
     positions read -inf, so causality and packing never trip the maximum.
@@ -318,11 +319,12 @@ def max_attention_logits(query: jax.Array, key: jax.Array, *, causal: bool = Fal
     heads = query.shape[-2]
     key = repeat_kv_heads(key, heads)
     scale = 1.0 / math.sqrt(query.shape[-1])
+    wide = at_least_fp32(jnp.result_type(query.dtype, key.dtype))
     logits = float32_einsum('...qhd,...khd->...hqk',
-                            query.astype(jnp.float32) * jnp.asarray(scale, jnp.float32),
-                            key.astype(jnp.float32), precision=operand_precision(jnp.float32))
+                            query.astype(wide) * jnp.asarray(scale, wide),
+                            key.astype(wide), precision=operand_precision(wide))
     if bias is not None:
-        logits = logits + bias.astype(jnp.float32)
+        logits = logits + bias.astype(wide)
     combined = combined_attention_mask(
         query.shape[-3], key.shape[-3], causal, sliding_window, mask)
     if combined is not None:
