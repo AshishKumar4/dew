@@ -601,29 +601,6 @@ def relu(x, weight):
     return (jax.nn.relu(_wide(x)) * weight).astype(x.dtype)
 
 
-def test_a_fused_producers_launch_keys_its_picks_by_what_its_prologue_computes():
-    """A fused producer's launches store and read back as a step's plan records them (`tuning.tune`'s
-    launches), their prologue keyed by what it computes: the same producer traced twice keys alike, another
-    producer apart."""
-    sizes = jnp.asarray(SIZES, jnp.int32)
-    rng = np.random.default_rng(3)
-    x = jnp.asarray(rng.normal(size=(ROWS, DEPTH)), jnp.bfloat16)
-    w = jnp.asarray(rng.normal(size=(len(SIZES), DEPTH, WIDTH)), jnp.bfloat16)
-    weight = jnp.asarray(rng.normal(size=(DEPTH,)), jnp.float32)
-
-    def keys(producer):
-        def fusing(x, w, weight):
-            return fused.fusible_gemm(producer(x, weight), w, sizes, interpret_on_cpu=True)
-
-        with generation.assumed("sm90"), tuning.seen() as launches:
-            jax.jit(fuser.fuse(fusing)).lower(x, w, weight)
-        text = tuning.dumps_launches([ba for _, ba in launches])
-        assert len(tuning.loads_launches(text)) == len(launches)
-        return text
-
-    assert keys(rms_norm) == keys(rms_norm) != keys(relu)
-
-
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_a_normed_operand_runs_in_the_prologue_with_the_programs_value(generation_name):
     """Under `fuser.fuse`, an RMS norm producing the product's left operand runs in the kernels' prologue
@@ -981,23 +958,6 @@ def test_the_hooked_dense_launches_lower_for_cuda(launch, trans_rhs, generation_
             assert name in lowered.as_text()
 
 
-def test_a_keyed_launch_buckets_its_side_operands_rows_with_its_tokens():
-    """The launch a key measures covers its side operands' rows as it covers the tokens': both at the
-    rows' power of two, wherever the rows are among a side operand's dimensions."""
-    rows = 307
-    hooks = grouped_matmul.Hooks(shifted, (("depth", "rows"),), biased, (("columns",),))
-    ba = grouped_matmul.Gmm().bind(jax.ShapeDtypeStruct((rows, DEPTH), jnp.bfloat16),
-                                   jax.ShapeDtypeStruct((2, DEPTH, WIDTH), jnp.bfloat16),
-                                   jax.ShapeDtypeStruct((2,), jnp.int32),
-                                   (jax.ShapeDtypeStruct((DEPTH, rows), jnp.float32),),
-                                   (jax.ShapeDtypeStruct((WIDTH,), jnp.float32),),
-                                   out_dtype="bfloat16", trans_rhs=False, hooks=hooks, interpret=False)
-    keyed = grouped_matmul.Gmm().keyed(ba)
-    assert keyed.arguments["tokens"].shape == (512, DEPTH)
-    assert keyed.arguments["prologue_operands"][0].shape == (DEPTH, 512)
-    assert keyed.arguments["epilogue_operands"][0].shape == (WIDTH,)
-
-
 def test_mosaic_takes_only_the_hooks_its_lowering_has_rules_for():
     """Mosaic GPU's warpgroup lowering has no transpose: a hook that transposes a side tile leaves the
     Hopper launch to Triton's, which takes it; a hook of elementwise arithmetic stays Mosaic's."""
@@ -1285,30 +1245,6 @@ def test_mosaic_reads_a_hooks_primitives_at_any_depth():
                          hooks=grouped_matmul.Hooks(transposed_twice_nested, (("depth", "rows"),)),
                          interpret=False)
         assert not launch.eligible(ba, generation.gpu_target())
-
-
-@runs("sm80")
-def test_a_broadcast_hooks_launch_stores_and_reads_back():
-    """A launch whose side operand has a dimension of one keeps its module-level hook and the dimension's
-    place as data: the launches a trace records store as JSON and read back."""
-    x, w, ms, nw, b, u, s, ct = _draw(7)
-    with generation.assumed("sm80"), tuning.seen() as launches:
-        jax.jit(_drop(_dew(CASES["broadcast axes"], interpret_on_cpu=True))).lower(x, w, ms, nw, b, u, s, ct)
-    hooked = [ba for _, ba in launches
-              if ba.arguments.get("hooks", grouped_matmul.NO_HOOKS).prologue is not None]
-    assert hooked
-    assert tuning.loads_launches(tuning.dumps_launches(hooked))
-
-
-def test_a_measured_launch_draws_its_integer_side_operands_as_operands():
-    """Measuring a launch draws group sizes for its group sizes alone: an integer side operand keeps its
-    own shape."""
-    bf16, int32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16), functools.partial(
-        jax.ShapeDtypeStruct, dtype=jnp.int32)
-    specs = [bf16((128, 64)), bf16((2, 64, 64)), int32((2,)), int32((128,))]
-    arrays = grouped_matmul.Gmm().operands(specs, seed=0)
-    assert [a.shape for a in arrays] == [spec.shape for spec in specs]
-    assert int(jnp.sum(arrays[2])) == 128
 
 
 @runs("sm80")

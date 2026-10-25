@@ -1,6 +1,7 @@
 """dew.nn.kernels.templates.base: a template's configs are the ones a block of the device holds, its
-heuristic its cost model's fastest of them, and a call's implementation, as a selector over them ranks
-it (`dew.nn.kernels.selection`), the one estimated fastest."""
+heuristic its cost model's fastest of them (a fixed space's, as the Triton launches keep), and a call's
+implementation, as a selector over them takes it (`dew.nn.kernels.selection`), the first in its order
+that runs the call."""
 
 import dataclasses
 from typing import ClassVar
@@ -24,7 +25,6 @@ class Doubling(Template):
     """A launch over `x [rows, width]` whose program stages `rows` of fp32 rows and costs `seconds`."""
 
     config_cls: ClassVar[type[Block]] = Block
-    ROWS: ClassVar[tuple[str, ...]] = ("x",)
     name: ClassVar[str] = "doubling"
     seconds: dict = dataclasses.field(default_factory=dict, hash=False, compare=False)
 
@@ -49,9 +49,9 @@ def test_a_templates_configs_are_the_ones_a_block_of_the_device_holds():
     """At 512 fp32 columns 64 rows stage 128 KiB: past an A10's 99 KiB block, within an A100's 163."""
     op = Doubling()
     with generation.assumed("sm86"):
-        assert op._get_autotuning_configs(bound(op)) == {Block(8), Block(16), Block(32)}
+        assert op.fitting(bound(op), generation.gpu_target()) == (Block(8), Block(16), Block(32))
     with generation.assumed("sm80"):
-        assert op._get_autotuning_configs(bound(op)) == {Block(8), Block(16), Block(32), Block(64)}
+        assert op.fitting(bound(op), generation.gpu_target()) == (Block(8), Block(16), Block(32), Block(64))
 
 
 def test_a_templates_heuristic_is_its_fastest_fitting_config_the_first_of_equals():
@@ -124,24 +124,22 @@ class Unpriced(Doubling):
 
 def choose(implementations, x) -> Template:
     """The implementation of `implementations` a selector over them runs for a call on `x`: each its
-    kernel where it runs the call (`Template.eligible`), costed by its estimate (`Call.seconds`)."""
+    kernel where it runs the call (`Template.eligible`), in their order."""
     op = Op("decode", tuple(Kernel(
         implementation.name,
         (Requirement[Call]("eligible", lambda case, name=implementation.name: case.eligible(name),
-                           "it does not run the call here", row=generation.INHERENT),),
-        cost=lambda case, name=implementation.name: case.seconds(name))
+                           "it does not run the call here", row=generation.INHERENT),))
         for implementation in implementations))
     bound = call(implementations, x)
     return bound.implementation(select(op, bound).kernel)
 
 
-def test_a_call_runs_the_implementation_estimated_fastest_on_the_device_or_the_one_chosen():
-    """Among the implementations that run the call on the device, the one whose fastest fitting
-    config is estimated fewest seconds, reported as the call's route; `generation.chosen` names
-    another, and one that does not run the call there is refused, naming why. Hopper's runs bf16 on sm90
-    alone."""
+def test_a_call_runs_the_first_implementation_that_runs_it_on_the_device_or_the_one_chosen():
+    """Among the implementations that run the call on the device, the first in their order, reported
+    as the call's route, whatever their estimates; `generation.chosen` names another, and one that does
+    not run the call there is refused, naming why. Hopper's runs bf16 on sm90 alone."""
     x = jax.ShapeDtypeStruct((4096, 512), jnp.float32)
-    implementations = [Slow(), Doubling(), Hopper()]
+    implementations = [Hopper(), Doubling(), Slow()]
     with generation.assumed("sm80"), generation.routes() as found:
         assert type(choose(implementations, x)) is Doubling
         with generation.chosen(decode="slow"):
@@ -151,44 +149,36 @@ def test_a_call_runs_the_implementation_estimated_fastest_on_the_device_or_the_o
     assert [refusal.code for refusal in refused.value.refusals] == ["eligible"]
     assert [(route.kernel, route.preferred) for route in found] == [
         ("doubling", "doubling"), ("slow", "slow")]
-    with generation.assumed("sm80"), generation.chosen(decode="doubling"):
-        # A chosen implementation estimates no other: one whose cost needs facts the target lacks, or
-        # whose programs fit no block of it, leaves the chosen one its call.
-        assert type(choose([Unpriced(), Doubling()], x)) is Doubling
-        assert type(choose([Unfitting(), Doubling()], x)) is Doubling
+    with generation.assumed("sm80"):
+        # The selector estimates none: one whose cost needs facts the target lacks takes its call.
+        assert type(choose([Unpriced(), Doubling()], x)) is Unpriced
     with generation.assumed("sm90"):
         assert type(choose(implementations, x)) is Doubling
-        assert type(choose([Unpriced()], x)) is Unpriced
         assert type(choose(implementations, x.update(dtype=jnp.bfloat16))) is Hopper
 
 
-def _ranked(costs: dict, generic: dict | None = None, named: str | None = None) -> str:
-    """The kernel a selector over kernels of `costs` (each taking the call; None states no cost) runs,
-    the `generic` ones (name to cost) after them, `named` as `generation.chosen` names it."""
-    takes = (Requirement[None]("takes", lambda case: True, "", row=generation.INHERENT),)
+def _selected(kernels: dict, generic: tuple = (), named: str | None = None) -> str:
+    """The kernel a selector over `kernels` (name to whether it takes the call), the `generic` ones
+    (taking every call) after them, runs, `named` as `generation.chosen` names it; a kernel `None`
+    names takes no call but by name, as CUTLASS's grouped GEMM (`grouped_matmul.NAMED`)."""
+    def requirement(takes):
+        if takes is None:
+            return Requirement[None]("named", lambda case: False, "", row=generation.INHERENT,
+                                     kind="measured")
+        return Requirement[None]("takes", lambda case: takes, "", row=generation.INHERENT)
 
-    def priced(cost):
-        return None if cost is None else (lambda case: cost)
-
-    kernels = [Kernel[None](name, takes, cost=priced(cost)) for name, cost in costs.items()]
-    kernels += [Kernel[None](name, takes, generic=True, cost=priced(cost))
-                for name, cost in (generic or {}).items()]
+    ops = [Kernel[None](name, (requirement(takes),)) for name, takes in kernels.items()]
+    ops += [Kernel[None](name, (), generic=True) for name in generic]
     with generation.assumed("sm90"), generation.chosen(decode=named):
-        return select(Op("decode", tuple(kernels)), None).kernel
+        return select(Op("decode", tuple(ops)), None).kernel
 
 
-def test_a_selector_ranks_every_costed_kernel_and_runs_an_unqualified_one_only_by_name():
-    """Where each kernel that takes the call states a cost, the selector runs the cheapest, a generic
-    kernel stating one among them (XLA's program beating a launch); a kernel costing no finite seconds,
-    which no measurement qualified, runs only where named, the call handed to the generic kernel where no
-    other qualifies and refused where no generic kernel takes it; an op whose kernels do not all state
-    costs keeps its declared order whole."""
-    assert _ranked({"a": 2.0, "b": 1.0}) == "b"
-    assert _ranked({"a": 2.0, "b": 1.0}, {"xla": 0.5}) == "xla"
-    assert _ranked({"a": 2.0, "b": 2.0}) == "a"
-    assert _ranked({"a": float("inf"), "b": 3.0}, {"xla": None}) == "b"
-    assert _ranked({"a": float("inf"), "b": float("inf")}, {"xla": None}) == "xla"
-    with pytest.raises(ValueError):
-        _ranked({"a": float("inf"), "b": float("inf")})
-    assert _ranked({"a": float("inf"), "b": 3.0}, named="a") == "a"
-    assert _ranked({"a": None, "b": 1.0}, {"xla": 0.5}) == "a"
+def test_a_selector_runs_the_first_kernel_that_takes_the_call_and_a_named_one_only_by_name():
+    """The selector runs the first of its kernels that takes the call, in its fixed order, a generic one
+    only where no other does; a kernel kept off every call runs only where named."""
+    assert _selected({"a": True, "b": True}) == "a"
+    assert _selected({"a": False, "b": True}, ("xla",)) == "b"
+    assert _selected({"a": False, "b": False}, ("xla",)) == "xla"
+    assert _selected({"named": None, "b": True}, ("xla",)) == "b"
+    assert _selected({"named": None}, ("xla",)) == "xla"
+    assert _selected({"named": None, "b": True}, ("xla",), named="named") == "named"

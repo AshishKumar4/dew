@@ -18,7 +18,6 @@ from reference_error import PRECISION, assert_as_exact, declared_seeds, indexed_
 from sharded import assert_runs_per_shard
 from ssd_support import mamba_ssd_draw, mamba_ssd_operands, mamba_ssd_xla, ssd_value_and_grad
 from tool_support import load
-from tuned import each_config
 
 from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
 from dew.nn.kernels import generation, mamba_ssd, tuning
@@ -140,7 +139,6 @@ def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
         pins = {mamba_ssd.ChunkStateBwdDb: mamba_ssd.Tiles(rows, state, 0, 4, 3, heads),
                 mamba_ssd.ChunkScanBwdDc: mamba_ssd.Tiles(rows, state, 0, 4, 3, heads),
                 mamba_ssd.ChunkScanBwdDcb: mamba_ssd.Tiles(rows, min(32, chunk), 0, 4, 3, heads)}
-        assert all(pin in each_config(kernel, run, *draw(0)) for kernel, pin in pins.items())
     with tuning.pinned(pins):
         assert_as_exact(jax.jit(run), reference, draw, f"mamba_ssm {case}, heads={heads}",
                         seeds=seeds, truth_fn=truth)
