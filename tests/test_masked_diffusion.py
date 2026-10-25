@@ -20,7 +20,7 @@ import optax
 import pytest
 from flax import linen as nn
 from model_support import flat_tree
-from reference_error import assert_as_exact, float64_terms
+from reference_error import assert_as_exact, float64_replay
 
 from dew.checkpoints import Checkpoints
 from dew.data import ByteTokenizer
@@ -453,7 +453,7 @@ def test_a_masked_task_packs_its_projections_as_a_decoder_does(masked_source, tm
 
     assert_as_exact(jax.jit(lambda tokens: task.model.apply(task.variables, tokens)), jax.jit(apart),
                     masked_draw(source.model), "packed masked logits", seeds=PACKED_SEEDS,
-                    truth_fn=float64_terms(apart))
+                    truth_fn=float64_replay(apart))
     held_apart = replace(task, variables=source.variables)
     np.testing.assert_array_equal(task(prompt, 8, key=7, steps=4).host().tokens,
                                   held_apart(prompt, 8, key=7, steps=4).host().tokens)
