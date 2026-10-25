@@ -15,10 +15,9 @@ set either flag yourself in XLA_FLAGS, your value is kept. If the JAX
 backend has already opened, the flags cannot take effect, and Dew logs a
 warning.
 
-`import dew` also makes the JAX user contexts the kernel autotuner and kernel
-choices key traces on (`dew.cache.KERNEL_TUNES`, `KERNEL_PINS`,
-`KERNEL_CHOICES`): JAX makes one only beside no other JAX call, so before any
-thread starts.
+`import dew` also makes the JAX user contexts kernel pins and kernel choices
+key traces on (`dew.cache.KERNEL_PINS`, `KERNEL_CHOICES`): JAX makes one only
+beside no other JAX call, so before any thread starts.
 
 `import dew` leaves the process's loggers alone and asks nothing of its
 hardware. Dew's log handler, and the refusal of a machine with an NVIDIA GPU

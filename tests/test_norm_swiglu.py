@@ -34,12 +34,12 @@ from reference_error import (
     widened,
     with_gradients,
 )
-from tuned import each_config
+from tuned import taken
 
 from dew.nn import attention
 from dew.nn.activations import gated_product, packed_gated_product
 from dew.nn.attention import RMSNorm, gated_rms_normalized, rms_normalized, stream_rms_normalized
-from dew.nn.kernels import norm_swiglu, tuning
+from dew.nn.kernels import norm_swiglu
 
 pytestmark = pytest.mark.kernel
 
@@ -333,49 +333,42 @@ def full_step(dtype, draw: int = 0):
 @pytest.mark.parametrize("kernel", [norm_swiglu.RmsForward, norm_swiglu.RmsBackward])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("operands", ["full step", "wide rows", "narrow rows"])
-def test_every_config_of_the_norm_kernels_holds_the_float64_gate(kernel, dtype, operands):
-    """Each config the tuner may pick, at a step's rows, at rows wider than
-    a tile holds two of, and at rows narrow enough for its tallest tiles:
-    the space declares only configs proven here."""
+def test_the_norm_kernels_configs_hold_the_float64_gate(kernel, dtype, operands):
+    """The config each launch takes, at a step's rows, at rows wider than a
+    tile holds two of, and at rows narrow enough for its tallest tiles."""
     (x, scale), seed = {"full step": lambda: full_step(dtype),
                         "wide rows": lambda: norm_operands((7, 4096), dtype, jnp.float32),
                         "narrow rows": lambda: norm_operands((4099, 256), dtype, jnp.float32)}[operands]()
     functions = norm_functions(dtype, offset=True, after_cast=True)
     reference, (truth, terms) = oracles(functions, (x, scale), seed)
-    configs = each_config(kernel, functools.partial(evaluated, functions[1]), (x, scale), seed)
-    assert len(configs) > 1
-    for config in configs:
-        with tuning.pinned({kernel: config}):
-            actual = jax.jit(functools.partial(evaluated, functions[1]))((x, scale), seed)
-            # The factors this config's forward rounded, which its weight gradient sums.
-            coefficient = scale_coefficient(x, dtype, after_cast=True)
-        try:
-            gated(("y", "x", "scale"), actual, reference, truth, terms, seed, coefficient)
-        except AssertionError as error:
-            error.add_note(f"{kernel.__name__} at {config}")
-            raise
+    configs = taken(kernel, functools.partial(evaluated, functions[1]), (x, scale), seed)
+    actual = jax.jit(functools.partial(evaluated, functions[1]))((x, scale), seed)
+    # The factors the forward rounded, which its weight gradient sums.
+    coefficient = scale_coefficient(x, dtype, after_cast=True)
+    try:
+        gated(("y", "x", "scale"), actual, reference, truth, terms, seed, coefficient)
+    except AssertionError as error:
+        error.add_note(f"{kernel.__name__} at {configs}")
+        raise
 
 
 @pytest.mark.gpu
 @pytest.mark.parametrize("kernel", [norm_swiglu.SwigluForward, norm_swiglu.SwigluBackward])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
-def test_every_config_of_the_swiglu_kernels_holds_the_float64_gate(kernel, dtype):
-    """Each block and warp count, over a ragged tail of elements."""
+def test_the_swiglu_kernels_configs_hold_the_float64_gate(kernel, dtype):
+    """The block and warp count each launch takes, over a ragged tail of elements."""
     shape = (3, 257, 17)
     operands = tuple(jax.random.normal(jax.random.key(index), shape).astype(dtype) for index in (31, 32))
     seed = jax.random.normal(jax.random.key(33), shape).astype(dtype)
     xla, pallas = (gated_product("swiglu", implementation=name) for name in ("xla", "pallas"))
     reference, (truth, terms) = oracles((xla, pallas, xla), operands, seed)
-    configs = each_config(kernel, functools.partial(evaluated, pallas), operands, seed)
-    assert len(configs) > 1
-    for config in configs:
-        with tuning.pinned({kernel: config}):
-            actual = jax.jit(functools.partial(evaluated, pallas))(operands, seed)
-        try:
-            gated(("y", "gate", "up"), actual, reference, truth, terms, seed, None)
-        except AssertionError as error:
-            error.add_note(f"{kernel.__name__} at {config}")
-            raise
+    configs = taken(kernel, functools.partial(evaluated, pallas), operands, seed)
+    actual = jax.jit(functools.partial(evaluated, pallas))(operands, seed)
+    try:
+        gated(("y", "gate", "up"), actual, reference, truth, terms, seed, None)
+    except AssertionError as error:
+        error.add_note(f"{kernel.__name__} at {configs}")
+        raise
 
 
 def test_random_bf16_gradients_keep_fp32_intermediates_near_float64():

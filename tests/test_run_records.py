@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from dew.config import ObjectiveConfig, RunConfig
+from dew.config import RETIRED, ObjectiveConfig, RunConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.config.jepa import JepaRunConfig
 from dew.config.lm import LMRunConfig
@@ -67,10 +67,11 @@ def changed(written, held, at: str = "") -> list[str]:
 def test_the_published_run_reads_back_as_it_was_written(live):
     """dewml/hybrid-dit-176m's run.json, as the revision the live image pins
     publishes it, is a current record: every field it states loads and writes
-    back as it states it. A field added since is written beside them; a
-    rename, a removal or a rewrite fails here, and the fix is to re-export the
-    published run in the same change, since the site, the quick start and the
-    live sampler all load it."""
+    back as it states it. A field added since is written beside them, and one
+    retired since (`dew.config.RETIRED`) reads and is not written back; a
+    rename, another removal or a rewrite fails here, and the fix is to
+    re-export the published run in the same change, since the site, the quick
+    start and the live sampler all load it."""
     held = json.loads(PUBLISHED.read_text())
     if live:
         from huggingface_hub import hf_hub_download
@@ -78,7 +79,11 @@ def test_the_published_run_reads_back_as_it_was_written(live):
         repo, revision = LIVE_PIN.read_text().strip().split("@")
         published = Path(hf_hub_download(repo, "run.json", revision=revision))
         assert json.loads(published.read_text()) == held
-    assert changed(json.loads(json.dumps(RunConfig.read(held).record())), held) == []
+    current = json.loads(json.dumps(held))
+    for name, fields in RETIRED.items():
+        current["fields"][name] = {field: value for field, value in current["fields"][name].items()
+                                   if field not in fields}
+    assert changed(json.loads(json.dumps(RunConfig.read(held).record())), current) == []
     stated = held["fields"]["objective"]["fields"]
     built = RunConfig.read(held).objective.arguments
     assert (built["guidance"], built["steps"]) == (stated["guidance"], stated["steps"])

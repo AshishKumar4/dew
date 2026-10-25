@@ -35,10 +35,10 @@ from reference_error import (
     widened,
 )
 from sharded import assert_runs_per_shard, boundary_copies
-from tuned import each_config
+from tuned import taken
 
 from dew.nn.kda import KimiDeltaAttention
-from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurrence_chunk, tuning
+from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurrence_chunk
 from dew.nn.kernels.recurrence import ChunkLocalCumsum, cumulated
 from dew.nn.kernels.recurrence_chunk import fla_rule
 from dew.nn.kernels.selection import KernelRefused
@@ -62,16 +62,10 @@ def relative(got, want) -> float:
 
 
 def tiled(kernel, call, *operands) -> list:
-    """`call(*operands)` at each of `kernel`'s tiles the tuner may pick on this GPU (tests/tuned.py's
-    `each_config`), or at its unmeasured tiles where the kernels interpret: a kernel's gate holds at
-    every config of its space."""
-    if INTERPRETED:
-        return [call(*operands)]
-    found = []
-    for tiles in each_config(kernel, call, *operands):
-        with tuning.pinned({kernel: tiles}):
-            found.append(call(*operands))
-    return found
+    """`call(*operands)`, which launches `kernel`, at the tiles its launch takes (tests/tuned.py's
+    `taken`): a kernel's gate holds there."""
+    assert taken(kernel, call, *operands), f"{kernel.__name__} takes no part in the call"
+    return [call(*operands)]
 
 
 def cumulated_decay(key, batch, length, value_heads, width=None):
@@ -1103,48 +1097,3 @@ def test_an_fp32_port_dot_names_its_products_whatever_the_global_precision():
         return jnp.dot(a, b, preferred_element_type=jnp.float32)
 
     assert _lowered_dot(unnamed, "default") != _lowered_dot(unnamed, "highest")
-
-
-@pytest.mark.parametrize("packed", [True, False], ids=["packed", "own rows"])
-@pytest.mark.parametrize("read", ["chunks", "spans", "both"])
-def test_a_timed_launch_draws_the_descriptors_it_reads(read, packed):
-    """The tuner times a launch on operands it draws (`_Launch.operands`): a launch that reads only
-    chunk descriptors, only sequence ones, or both, packed or over the rows' own spans, gets
-    descriptors of its own shapes, as a step's measurement (`tuning.tune(measure=True)`,
-    tools/kernel_picks.py) hands it some of them, and valid ones: sequences covering every token in
-    order, none crossing a row, each chunk at most 64 of one sequence's tokens; and the decay cumulated
-    over the drawn chunks bitwise each chunk's run as a row of its own."""
-    batch, length = 2, 150
-    cuts = jnp.asarray([0, 60, 150, 200, 260, 300], jnp.int32)
-    given = chunked_launch.sequences(batch, length, cuts if packed else None)
-    query = jax.ShapeDtypeStruct((batch, length, 2, 64), jnp.bfloat16)
-    descriptors = {"chunks": [given.chunks], "spans": [given.spans],
-                   "both": [given.chunks, given.spans]}[read]
-    specs = [query, *(jax.ShapeDtypeStruct(array.shape, array.dtype) for array in descriptors)]
-    drawn = fla_gdn.ChunkFwdH().operands(specs, 0)
-    assert [array.shape for array in drawn] == [spec.shape for spec in specs]
-    assert all(array.dtype == spec.dtype for array, spec in zip(drawn, specs, strict=True))
-    count = given.spans.shape[0]
-    chunks = len(given.chunks)
-    # The descriptors drawn whichever the launch reads: those it reads are these, of these shapes.
-    full = fla_gdn.ChunkFwdH().operands([query, jax.ShapeDtypeStruct((chunks, 4), jnp.int32),
-                                         jax.ShapeDtypeStruct((count, 5), jnp.int32)], 0)
-    for array in drawn[1:]:
-        np.testing.assert_array_equal(np.asarray(array), np.asarray(full[1 if array.shape[-1] == 4 else 2]))
-    spans, chunked = np.asarray(full[2]), np.asarray(full[1])
-    first, lengths = spans[:, 0], spans[:, 1]
-    np.testing.assert_array_equal(first, np.concatenate([[0], np.cumsum(lengths)[:-1]]))
-    assert lengths.sum() == batch * length and (lengths > 0).all()
-    assert (first // length == (first + lengths - 1) // length).all(), "a sequence crosses a row"
-    start, taken = chunked[:, 0], chunked[:, 1]
-    assert ((taken >= 0) & (taken <= 64)).all() and taken.sum() == batch * length
-    owner = np.searchsorted(first, start, side="right") - 1
-    real = taken > 0
-    assert (start[real] + taken[real] <= (first + lengths)[owner[real]]).all(), "a chunk crosses a sequence"
-    g = jax.random.normal(jax.random.key(0), (batch, length, 2))
-    described = chunked_launch.Sequences(jnp.asarray(chunked), jnp.asarray(spans))
-    found = np.asarray(cumulated(g, spans=described, interpret=True)).reshape(-1, 2)
-    flat = g.reshape(1, batch * length, 2)
-    for begin, size in zip(start[real], taken[real], strict=True):
-        alone = cumulated(flat[:, begin:begin + size], interpret=True)
-        np.testing.assert_array_equal(found[begin:begin + size], np.asarray(alone)[0], err_msg=f"at {begin}")
