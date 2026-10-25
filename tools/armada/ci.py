@@ -509,10 +509,10 @@ def policy(base: str) -> str:
 
 
 def borrowed(timings: dict, python: str) -> dict:
-    """`timings` with each file's and row's time `python` has none of taken from another Python's (the most of
-    theirs): 3.14 runs every file only on the daily run, and a file weighed by its tests' least recorded times
-    instead is dispatched late by armada's longest-first order (train 143: 3.14 tasks of 500-800 s started 550-760 s
-    into the run)."""
+    """`timings` with each file's and row's time `python` has none of taken from another Python's
+    (the most of theirs): 3.14 runs every file only on the daily run, and a file weighed by its
+    tests' least recorded times instead is dispatched late by armada's longest-first order (train
+    143: 3.14 tasks of 500-800 s started 550-760 s into the run)."""
     def filled(times: dict) -> dict:
         others: dict[str, float] = {}
         for name, seconds in times.items():
