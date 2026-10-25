@@ -217,8 +217,8 @@ def formats():
     import jax.numpy as jnp
 
     from dew.interop import PretrainedDecoder
-    from dew.quantization import Quantization
     from dew.sampling import Sampling
+    from dew.quantization import Quantization
 
     bundle = PretrainedDecoder.load("Qwen/Qwen3-0.6B", dtype=jnp.bfloat16, param_dtype=jnp.bfloat16,
                                     max_seq_len=128)
