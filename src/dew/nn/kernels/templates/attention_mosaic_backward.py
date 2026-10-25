@@ -455,7 +455,7 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
 
 def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maximum, key_index, anchor_value,
                      shift, others, own, others_total, forward_total, start, end, query_ids, key_ids,
-                     score_params, *, score_mod, score_kinds, scale: float,
+                     score_params, *, score_mod, score_kinds, score_dtypes, scale: float,
                      spec: algebra.Forward, accurate: bool, tiles: BackwardTiles, family: mosaic.Family,
                      interpret: bool):
     """`gradients`' launch on this mainloop: D from the forward's split sums, each query's anchor key as the
