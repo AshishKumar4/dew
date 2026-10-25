@@ -167,9 +167,10 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         return nelbo, scores
 
     def _scored(self, params, batch, step: Step, *, train: bool) -> tuple[Ratio, Aux, TokenScores]:
-        """The negative ELBO, its reports and the per-token scores, from one corruption of the batch."""
-        tokens, losses, weights, counted, predicted, real = self._token_losses(params, batch, step,
-                                                                               train=train)
+        """The negative ELBO, its reports and the per-token scores, from one corruption of the batch,
+        with the attention logit maxima of its forward where the step asks for them (`Step.qk_stats`)."""
+        tokens, losses, weights, counted, predicted, real, qk = self._token_losses(params, batch, step,
+                                                                                   train=train)
         nelbo = Ratio(self.row_mean(losses * weights, batch).total,
                       self.row_mean(real.astype(jnp.float32), batch).total)
         correct = predicted == tokens
@@ -177,7 +178,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         return nelbo, Aux(metrics={
             "masked_accuracy": accuracy,
             "masked_fraction": jnp.sum(counted) / jnp.maximum(jnp.sum(real, dtype=losses.dtype), 1.0),
-        }), TokenScores(losses * weights, real.astype(losses.dtype), correct)
+        }, qk_stats=qk), TokenScores(losses * weights, real.astype(losses.dtype), correct)
 
     def _token_losses(self, params, batch, step: Step, *, train: bool):
         """Corrupt the batch once, each row's noise level and mask its example's own (`Step.sample`),
@@ -185,7 +186,8 @@ class MaskedDiffusionObjective(Objective[Ratio]):
 
         Returns the rows, their per-token cross entropies under that
         corruption, the time weight of each masked token, the mask itself,
-        the argmax prediction, and which slots hold text.
+        the argmax prediction, which slots hold text, and the `qk` collection
+        the forward sowed where the step asks for it (`Step.qk_stats`), else None.
 
         The model reads every field the batch's `ModelInputs` carries, and a
         model that takes no such field refuses it. A packed batch
@@ -223,9 +225,12 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         masked = jnp.where(is_masked, self.process.mask_id, tokens)
 
         # Each position's prediction, as the checkpoint's logits line up with its inputs.
-        read = aligned(self.model, final_read(self.model, params, masked, train=train,
-                                              rngs=model_rngs(dropout_key, training=train), mutable=False,
-                                              capture_intermediates=False, **prepared.kwargs()), fields)
+        observed = final_read(self.model, params, masked, train=train,
+                              rngs=model_rngs(dropout_key, training=train),
+                              mutable=["qk"] if step.qk_stats else False, capture_intermediates=False,
+                              **prepared.kwargs())
+        read, sown = observed if step.qk_stats else (observed, {})
+        read = aligned(self.model, read, fields)
         # MDLM's SUBS parameterization gives the mask token no mass: it is
         # never a target, so the partition and the prediction leave it out.
         mask_id = self.process.mask_id
@@ -236,7 +241,8 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         losses = jnp.where(real, losses, 0.0)
         counted = is_masked.astype(losses.dtype)
         weights = step.boundary("loss weights", self.process.weight(t))
-        return tokens, losses, counted * weights[:, None], counted, predicted, real
+        return (tokens, losses, counted * weights[:, None], counted, predicted, real,
+                sown.get("qk", {}) if step.qk_stats else None)
 
     def _sample_impl(self, params, key, *, count: int):
         """`count` rows sampled from noise, and whether a position stayed masked, its scores holding

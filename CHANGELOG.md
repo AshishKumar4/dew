@@ -5,6 +5,12 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- MuonClip clips the attention of whatever objective a run trains, or refuses it: a run whose optimizer
+  holds a QK-Clip (`dew.optim.clips_qk`, its state a `QKClipState`) asks its objective for the step's
+  attention logit maxima (`Step.qk_stats`), so a masked-diffusion run clips as an LM, RL or preference
+  run does, and the clip refuses an update given none, where a decision or block-diffusion run trained
+  unclipped with no sign of it. `LMObjective`'s, `TokenScorer`'s and the RL objectives' `qk_stats`
+  argument is removed: the run asks for them.
 - A filtered or packed read resumes on any number of readers once it is prepared: publish its rows (and
   a terminal pack's plan) as a generation with `dew data publish` and read it by index, and a new run
   lowers to the global order. A per-share read refused on another topology now says so.

@@ -182,7 +182,7 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
     objective = LMObjective(model, 10, head_chunks=1, mtp_weight=.3,
                             loss_role=Role.ASSISTANT, balance_rate=.02,
                             aux_loss_alpha=None if auxiliary is None else .2,
-                            seq_aux=auxiliary != "global", qk_stats=True)
+                            seq_aux=auxiliary != "global")
     optimizer = optax.chain(optax.clip_by_global_norm(.5), optax.sgd(.03), scale_by_qk_clip(.05))
     train = Trainer(objective, optimizer, key=jax.random.PRNGKey(7), accumulation=2,
                     dynamic_scale=True)
@@ -208,7 +208,7 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
     actual, actual_loss, _, _, accepted, _ = run(partial, data[1])
     assert bool(accepted) and int(actual.updates) == 1
     combined = jax.tree.map(lambda a, b: jnp.concatenate((a, b)), *data)
-    info = Step(jnp.array(0), jax.random.fold_in(key, 0), start)
+    info = Step(jnp.array(0), jax.random.fold_in(key, 0), start, qk_stats=True)
     (expected_loss, aux), gradient = jax.value_and_grad(
         lambda p: objective.scalar_loss({**start, "params": p}, combined, info),
         has_aux=True)(start["params"])
@@ -230,6 +230,68 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
         for depth, (losses, _, _) in enumerate(scores.depths, 1):
             numerator += .3 / 2 * jnp.sum(losses * roles[:, depth + 1:])
         np.testing.assert_allclose(expected_loss, numerator / jnp.sum(roles[:, 1:]), rtol=1e-6)
+
+
+def test_a_masked_diffusion_run_clips_its_attention_by_its_own_maxima():
+    """An optimizer that holds a QK-Clip, composed however it is (`clips_qk`), has the run ask its
+    objective for the attention logit maxima (`Step.qk_stats`), a masked-diffusion objective's as an
+    LM's: the window pools them from its first microbatch on, and at the update the clip rescales
+    the query and key kernels of the heads past its threshold and nothing else, where a threshold
+    none reaches leaves every weight as it was (the step's own update is zero)."""
+    from dew.diffusion.discrete import MDLM
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.diffusion.masked import MaskedDiffusionObjective
+    from dew.optim import scale_by_qk_clip
+    from dew.training.transaction import compact_qk
+
+    # QK-Clip bounds logits only where no QK-norm divides the kernels' scale back out.
+    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=8, causal=False, qk_norm=False)
+    objective = MaskedDiffusionObjective(model, MDLM(mask_id=15)(), seq_len=8, head_chunks=1,
+                                         ema_decay=None)
+    rng = np.random.default_rng(6)
+    data = [{"text": jnp.asarray(rng.integers(0, 15, size=(jax.device_count(), 8)), jnp.int32)}
+            for _ in range(2)]
+
+    def trained(threshold):
+        train = Trainer(objective, optax.chain(optax.sgd(0.), scale_by_qk_clip(threshold)),
+                        key=jax.random.PRNGKey(3), accumulation=2)
+        initial = train.initial_state()
+        start = jax.tree.map(np.asarray, initial.variables["params"])
+        run = train.compile(initial, data[0])
+        partial, *_ = run(initial, data[0])
+        pooled = jax.tree.map(np.asarray, compact_qk(partial.accumulation.qk_stats))
+        final, *_ = run(partial, data[1])
+        assert int(final.updates) == 1
+        return start, pooled, jax.tree.map(np.asarray, final.variables["params"])
+
+    start, pooled, final = trained(.05)
+    peaks = pooled["layers_0"]["self_attn"]["max_logits"][0]
+    assert np.all(np.isfinite(peaks)) and np.max(peaks) > .05
+    moved = jax.tree_util.tree_flatten_with_path(final)[0]
+    for (path, before), (_, after) in zip(jax.tree_util.tree_flatten_with_path(start)[0], moved, strict=True):
+        if tuple(key.key for key in path[-2:]) in {("q_proj", "kernel"), ("k_proj", "kernel")}:
+            assert np.linalg.norm(after) < np.linalg.norm(before)
+        else:
+            np.testing.assert_array_equal(after, before)
+    start, _, final = trained(1e30)
+    jax.tree.map(np.testing.assert_array_equal, final, start)
+
+
+def test_a_run_whose_objective_returns_no_maxima_is_refused_under_a_qk_clip():
+    """An optimizer that clips by the attention logit maxima is refused a step whose objective
+    returns none (`Aux.qk_stats`), which the same run without the clip takes: the clip would leave
+    the logits it bounds unbounded with no sign of it, as a decision run's did."""
+    from dew.optim import scale_by_qk_clip
+
+    def stepped(optimizer):
+        train = Trainer(Tiny(), optimizer, key=jax.random.PRNGKey(0))
+        initial = train.initial_state()
+        return train.compile(initial, batches()[0])(initial, batches()[0])
+
+    stepped(optax.sgd(.1))
+    with pytest.raises(ValueError):
+        stepped(optax.chain(optax.sgd(.1), scale_by_qk_clip(1.)))
 
 
 def test_replay_preserves_half_precision_cotangents_and_integer_support():

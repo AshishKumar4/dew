@@ -176,7 +176,6 @@ export([{"text": ids[:held]}], "data/corpus-byte/val", format="array_record",
 | `router_z_loss` | `0.0` | ST-MoE router z-loss coefficient. |
 | `mtp_weight` | `None` | Weight of DeepSeek V3's multi-token prediction loss. |
 | `z_loss` | `0.0` | PaLM's squared log-partition auxiliary. |
-| `qk_stats` | `False` | Report per-head attention logit maxima, the key-head count and the head width for `muonclip`, which clips per query group as Megatron Core does and leaves an output gate's weights alone. |
 | `token_accuracy` | `True` | Report argmax accuracy. |
 
 The step reports `ce`, `perplexity` and `token_accuracy`. `LMObjective` refuses a model built with `causal=False`.

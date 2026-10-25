@@ -86,7 +86,7 @@ from dew.objectives.base import (
     select,
     taken_record,
 )
-from dew.optim import learning_rate, with_rate_scales
+from dew.optim import clips_qk, learning_rate, with_rate_scales
 from dew.records import JSON, boolean, json_value, record
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import (
@@ -1009,8 +1009,9 @@ class Trainer(Generic[Loss, Effects]):
         params = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
 
         def loss(params, batch, microstep, key, step, ema):
-            return self.objective._loss(
-                params, batch, Step(microstep, jax.random.fold_in(key, step), with_ema(params, ema)))
+            return self.objective._loss(params, batch, Step(microstep, jax.random.fold_in(key, step),
+                                                            with_ema(params, ema),
+                                                            qk_stats=clips_qk(state.opt_state)))
 
         return jax.eval_shape(loss, params, batch, state.microstep, state.key, state.step, state.ema)
 
@@ -1363,7 +1364,8 @@ class Trainer(Generic[Loss, Effects]):
             variables = {**rest, "params": params}
             return self.objective._loss(
                 variables, self._model_batch(batch),
-                Step(microstep, jax.random.fold_in(key, step), with_ema(variables, ema)))
+                Step(microstep, jax.random.fold_in(key, step), with_ema(variables, ema),
+                     qk_stats=clips_qk(state.opt_state)))
 
         rest = {name: tree for name, tree in variables.items() if name != "params"}
         return narrowed_paths(loss, variables["params"], rest, batch, state.microstep, state.key, state.step,

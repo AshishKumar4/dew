@@ -65,7 +65,7 @@ def batch():
 
 def objective_for(model):
     sparse = model.mixture is not None
-    return LMObjective(model, 8, qk_stats=True,
+    return LMObjective(model, 8,
                        balance_rate=0.01 if sparse else None,
                        aux_loss_alpha=0.001 if sparse else None,
                        mtp_weight=0.2 if model.num_nextn_predict_layers else None)
@@ -78,7 +78,7 @@ def training_step(model):
     optimizer = optax.sgd(1e-3, momentum=0.9)
 
     def step(variables, state, tokens, key):
-        info = Step(jnp.zeros((), jnp.int32), key, None)
+        info = Step(jnp.zeros((), jnp.int32), key, None, qk_stats=True)
         (loss, aux), grads = jax.value_and_grad(
             lambda params: objective.scalar_loss({**variables, "params": params},
                                        tokens, info),
@@ -228,7 +228,7 @@ def gradient_step(model, variables, key):
     objective = objective_for(model)
 
     def loss(params):
-        info = Step(jnp.zeros((), jnp.int32), key, None)
+        info = Step(jnp.zeros((), jnp.int32), key, None, qk_stats=True)
         return objective.scalar_loss({**variables, "params": params}, batch(), info)
 
     return jax.jit(jax.value_and_grad(loss, has_aux=True))(variables["params"])
