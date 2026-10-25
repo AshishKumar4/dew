@@ -280,6 +280,9 @@ def allocated(*sizes: int) -> int:
 SWIZZLE_BYTES = 128
 """The widest swizzle a shared-memory block's rows are staged at, which an MMA reads conflict-free."""
 
+NARROWEST_SWIZZLE_BYTES = 32
+"""The narrowest swizzle Mosaic GPU stages a block's rows at (`plgpu.find_swizzle`'s least)."""
+
 
 def live_registers(family: "Family", carried, *phases) -> int:
     """The registers a consumer thread of `family` holds over a live set: the tiles it carries across its
@@ -466,6 +469,13 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     def depths(self, dtype) -> tuple[int, ...]:
         """The depths a step may take for operands of `dtype`, widest first: the swizzles its products
         read a block's rows at."""
+
+    def narrowest_columns(self, dtype) -> int:
+        """The fewest columns a staged operand block of `dtype` takes: a row of the narrowest swizzle
+        (`NARROWEST_SWIZZLE_BYTES`), 16 bf16 columns, which both families' products read (wgmma's N in
+        eights, mma.sync's n of 8 twice through ldmatrix). A template splitting its columns finer than its
+        stores' `column_unit` to fill the multiprocessors (the recurrence's value blocks) steps by it."""
+        return NARROWEST_SWIZZLE_BYTES // jnp.dtype(dtype).itemsize
 
     @property
     @abc.abstractmethod
