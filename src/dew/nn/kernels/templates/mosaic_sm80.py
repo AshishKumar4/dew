@@ -194,7 +194,10 @@ class Mma(mosaic.Family):
                             interpret=mosaic.interpreted(interpret), kernel_name=name)
 
     def scoped(self, body, *allocations, streams) -> None:
-        collective = {} if streams.consumers == 1 else {"collective_axes": "wg"}
+        # Collective where any of its pipelines (`streams`, one or a tree of them) runs on two consumers.
+        pipelines = jax.tree.leaves(streams, is_leaf=lambda leaf: isinstance(leaf, Pipeline))
+        shared = max(pipeline.consumers for pipeline in pipelines) > 1
+        collective = {"collective_axes": "wg"} if shared else {}
         pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations, **collective)
 
     def roles(self, consumers: int, consumer, producer) -> None:
