@@ -9,8 +9,8 @@ set (`legal`): no table, no sweep, no space ranked. A GPU nobody measured of a f
 import dataclasses
 import functools
 import math
-from collections.abc import Callable
-from typing import Literal, overload
+from collections.abc import Callable, Sequence
+from typing import ClassVar, Literal, overload
 
 import jax
 import jax.numpy as jnp
@@ -189,6 +189,24 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](Template[Config]):
         """The target's family's bundle where the launch takes the call there, else None."""
         family = BUNDLES.get(generation.family(target.generation) or "")
         return None if family is None or self.refusal(ba, family) is not None else family
+
+    WALKED: ClassVar[str] = "block_k"
+    """The config's field naming the tile its consumers walk (a forward's keys, a backward's queries)."""
+
+    def neighbours(self, ba: tokamax.BoundArguments, config: Config) -> Sequence[Config]:
+        """The configs next to the derived `config` an opt-in tuning run times beside it (`variants`): the
+        walked tile one unit size either side (`_extents`), a stage fewer and more, a consumer fewer and
+        more, each alone; `variants` keeps the legal ones."""
+        family, query = BUNDLES[config.family], ba.arguments["query"]
+        walked = getattr(config, self.WALKED)
+        extents = _extents(family, query.dtype, max(walked * 2, query.shape[1], ba.arguments["key"].shape[1]))
+        sizes = [size for size in extents if size in (walked // 2, walked * 2)]
+        changes = [*({self.WALKED: size} for size in sizes),
+                   {"stages": config.stages - 1}, {"stages": config.stages + 1},
+                   {"consumers": config.consumers - 1}, {"consumers": config.consumers + 1}]
+        return tuple(dataclasses.replace(config, **change) for change in changes
+                     if all(value > 0 for value in change.values())
+                     and change.get("stages", 2) >= 2 and change.get("consumers", 1) <= family.consumers)
 
     def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> Config:
         target = generation.gpu_target()
@@ -405,6 +423,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     its predicted time."""
 
     config_cls = BackwardTiles
+    WALKED = "block_q"
     accurate: bool = ACCURATE
 
     def _fwd(self, query, key, value, dout, start, end, query_ids, key_ids, score_params, initial, residuals,

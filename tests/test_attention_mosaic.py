@@ -241,15 +241,16 @@ def _check_call_form(case: str, *, interpret: bool, backward: bool = False, form
 
 
 def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys: int | None = None,
-                    residuals_from=None, target: generation.GpuTarget | None = None):
-    """The backward in the form `form` names (`BACKWARD_FORMS`; None, the default form at the cost model's
-    pick) over the call form `call` of `shape` (its keys `keys`) on `target` (`_device`), from the training
-    forward's residuals at its pick: this mainloop's, or `residuals_from`'s
-    (another mainloop's `forward`, as the route feeds the Triton mainloop's)."""
+                    residuals_from=None, target: generation.GpuTarget | None = None,
+                    config: attention_mosaic.BackwardTiles | None = None):
+    """The backward in the form `form` names (`BACKWARD_FORMS`; None, the default form at `config`, else its
+    derived one) over the call form `call` of `shape` (its keys `keys`) on `target` (`_device`), from the
+    training forward's residuals at its pick: this mainloop's, or `residuals_from`'s (another mainloop's
+    `forward`, as the route feeds the Triton mainloop's)."""
     keys = shape[1] if keys is None else keys
     spans = template.spans(shape[1], keys, shape[0], **CALLS[call])
     draw = _drawn(shape, jnp.bfloat16, keys=keys)
-    accurate, config = (False, None) if form is None else BACKWARD_FORMS[form]
+    accurate, config = (False, config) if form is None else BACKWARD_FORMS[form]
     trained = attention_mosaic.forward if residuals_from is None else residuals_from
 
     def ours(query, key, value, dout):
@@ -465,6 +466,43 @@ def test_the_derived_tiles_stage_within_a_hoppers_block(width, value_width, resi
     assert (derived is not None) == (value_width < 256 or not residuals)
     if (width, value_width) == (128, 128):
         assert derived == attention_mosaic.Tiles(64, 64 if residuals else 128, 2, 2)
+
+
+def _backward_call(shape, width: int, accurate: bool):
+    """A causal backward's op and bound arguments over `shape`'s operands, its heads `width` wide, with a
+    training forward's residuals."""
+    rows, tokens, heads, kv_heads = shape
+    spans = template.spans(tokens, tokens, rows, causal=True)
+    query = jax.ShapeDtypeStruct((rows, tokens, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, tokens, kv_heads, width), jnp.bfloat16)
+    stats = jax.ShapeDtypeStruct((rows, heads, tokens), jnp.float32)
+    residuals = (stats, stats, jax.ShapeDtypeStruct((rows, heads, tokens), jnp.int32),
+                 template.Split(jax.ShapeDtypeStruct((rows, heads, tokens, width), jnp.float32), stats, stats,
+                                stats))
+    op = attention_mosaic.MosaicBackward(form="causal", keys=tokens, scale=width ** -0.5, accurate=accurate)
+    return op, _bound(op, query, key, key, query, spans.start, spans.end, None, None, (), None, residuals)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("launch", ["forward", "training", "backward"])
+def test_every_tuning_variant_is_on_par_interpreted(launch):
+    """Each config an opt-in tuning run may time on an H100 (`Template.variants`: the derived one and its
+    legal neighbours, `_Mainloop.neighbours`) holds check 1 on the interpreted causal call: a tuner picks
+    among kernels the gate already holds."""
+    shape = SHAPES["interpreted"]
+    with generation.assumed("sm90"):
+        if launch == "backward":
+            op, ba = _backward_call(shape, 128, accurate=False)
+        else:
+            op, ba = _forward_call(shape, 128, 128, residuals=launch == "training")
+        variants = op.variants(ba)
+    assert len(variants) > 1
+    for config in variants:
+        if launch == "backward":
+            _check_backward("causal", shape, form=None, interpret=True, config=config)
+        else:
+            _check_forward("causal", jnp.bfloat16, shape, natural=False, interpret=True, tiles=config,
+                           training=launch == "training", target=generation.gpu_target())
 
 
 @pytest.mark.parametrize("unseen", UNSEEN)
