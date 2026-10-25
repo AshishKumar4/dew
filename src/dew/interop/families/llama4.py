@@ -24,7 +24,6 @@ from dew.interop.decoder_parts import (
     Renames,
     RopeSpelling,
     base_config,
-    kind_mixers,
     read_rope,
     refuse,
     renamed_path,
@@ -120,23 +119,20 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
 def _llama4_export(model: CausalTransformer) -> Mapping[str, object]:
     """The config fields Llama 4's kinds go back out under: the rotated layers' one
     `attention_chunk_size` and their norm (`use_qk_norm`), each layer's `no_rope_layers` entry, and
-    the global layers' temperature tuning."""
+    the global layers' temperature tuning. A kind these fields cannot state (per-kind norms or
+    tunings, half-pair rotation) is refused by the export's round trip (`refuse_lossy_export`)."""
     chunks = {kind.chunk for kind in (model.kinds or {}).values() if kind.chunk is not None}
     if len(chunks) > 1:
         raise ValueError(
             f"the kinds chunk at {sorted(chunks)}, and Llama 4's config carries one "
             "attention_chunk_size")
     types = model.per_layer_types
-    rotated = [_mixer(model, name) for name in sorted(set(types)) if not _mixer(model, name).nope]
-    norms = {model.kind_of(name).qk_norm for name in set(types) if not _mixer(model, name).nope}
-    tunings = {_mixer(model, name).temperature_tuning for name in set(types) if _mixer(model, name).nope}
-    if len(norms) > 1 or len(tunings) > 1 or any(mixer.rotary_pairs != 'adjacent' for mixer in rotated):
-        raise ValueError("Llama 4's config states one norm for its rotated layers, which turn adjacent "
-                         "pairs, and one temperature tuning for the rest")
-    tuning = tunings.pop() if tunings else None
+    rotated = [name for name in types if not _mixer(model, name).nope]
+    unrotated = [name for name in types if _mixer(model, name).nope]
+    tuning = _mixer(model, unrotated[0]).temperature_tuning if unrotated else None
     return {'attention_chunk_size': chunks.pop() if chunks else None,
             'no_rope_layers': [int(not _mixer(model, name).nope) for name in types],
-            'use_qk_norm': norms.pop() if norms else False,
+            'use_qk_norm': bool(rotated) and model.kind_of(rotated[0]).qk_norm,
             'attn_temperature_tuning': tuning is not None,
             **({} if tuning is None else {'floor_scale': tuning[0], 'attn_scale': tuning[1]})}
 
@@ -175,9 +171,9 @@ _LLAMA4_EXPERTS: Leaves = {f'mlp.experts.{projection}': ('mlp', 'experts', proje
 LLAMA4_TEXT = DecoderFamily(
     ('llama4_text',),
     _llama4_config,
-    # Llama 4's text layers are the decoders' only ones turning adjacent rotary pairs.
-    lambda fields: any(isinstance(mixer, AttentionMixer) and mixer.rotary_pairs == 'adjacent'
-                       for mixer in kind_mixers(fields)),
+    # Llama 4 alone scales its routed experts' inputs by their routing weight, whatever its layers'
+    # positions: a model of only NoPE layers is as much Llama 4 as one with rotated ones.
+    lambda fields: bool(fields.mixture is not None and fields.mixture.scale_inputs),
     'llama4_text',
     'Llama4ForCausalLM',
     _llama4_export,
