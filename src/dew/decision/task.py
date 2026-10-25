@@ -75,7 +75,7 @@ if TYPE_CHECKING:
     from jax.sharding import Mesh
 
     from dew.decision.objective import DecisionObjective
-    from dew.training.distributed import Layout as Placement, MeshSpec
+    from dew.distributed.placement import Layout as Placement, MeshSpec
 
 TASK_FILE = "decide.json"
 """The file `Decide.save` writes into a run: its calibration, budget and name."""
@@ -541,7 +541,7 @@ class Decide:
     @property
     def _mesh(self) -> "Mesh":
         """The mesh the task's weights are placed on, or one local device for weights placed on none."""
-        from dew.training.distributed import MeshSpec
+        from dew.distributed.placement import MeshSpec
 
         placed = mesh_of(self.variables)
         return MeshSpec().build(jax.local_devices()[:1]) if placed is None else placed

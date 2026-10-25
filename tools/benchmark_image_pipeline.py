@@ -39,7 +39,7 @@ from dew.data.dataset import DataPartition
 from dew.data.image_augmentation import ImageParameters, apply_device, apply_host
 from dew.data.image_codec import decode_image
 from dew.data.images import resize_image
-from dew.training.distributed import split_fields
+from dew.distributed.batches import split_fields
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import peak_memory
@@ -211,11 +211,11 @@ def training_timing(config, backend):
     import optax
 
     from dew.diffusion.presets import EDM
+    from dew.distributed.batches import DevicePrefetchIterator
     from dew.inputs import Field, InputSpec
     from dew.nn.backbones import SimpleDiT
     from dew.objectives.diffusion import DiffusionObjective
     from dew.training import Trainer
-    from dew.training.distributed import DevicePrefetchIterator
 
     model = SimpleDiT(patch_size=16, emb_features=32, num_layers=1, num_heads=4,
                       dtype=jnp.float32, precision=jax.lax.Precision.HIGHEST, attention_impl="reference")

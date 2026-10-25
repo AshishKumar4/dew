@@ -20,7 +20,7 @@ from jax.experimental.layout import Format
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, Sharding, SingleDeviceSharding
 
 from dew.batch import Variables
-from dew.training.distributed import Placement
+from dew.distributed.placement import Placement
 
 
 def companion_mesh(accelerator: Mesh, devices=None) -> Mesh:
