@@ -345,7 +345,8 @@ class Pretrained:
              revision: str | None = None, subfolder: str | None = None, gguf_file: str | None = None,
              single_file: str | None = None, dduf_file: str | None = None,
              mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-             fallback: str | None = None, weights: bool = True, on_host: bool = False) -> Self:
+             fallback: str | None = None, weights: bool = True, on_host: bool = False,
+             modeling_overrides: Mapping[str, object] | None = None) -> Self:
         """Load a source as a native Flax model with explicit parameter trees, as the kind of source it is.
 
         `name_or_dir` is a local HF directory or a Hub model ID. Decoder, tower and
@@ -397,6 +398,13 @@ class Pretrained:
         translation: what a run that resumes from its own checkpoint builds its state
         around (`TrainerConfig.resumes`), as MaxText loads its base parameters only
         for a run with no checkpoint.
+
+        `modeling_overrides` is a record of the form a release's config states under
+        that key, read through the same reader over the release's own, kind by kind:
+        `{"attention": {"full_attention": "block_bidirectional"}}` lets that layer kind's
+        tokens read their whole block (`AttentionMixer.bidirectional_blocks`, a call's
+        `block_groups`) on any decoder or wrapper this loads natively, and "causal"
+        turns a release's back off. A saved model states it in its own config.
         """
         selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
                                      dduf_file=dduf_file)
@@ -416,32 +424,11 @@ class Pretrained:
         # The reference refuses a folder outside the source before anything is fetched.
         directory, reference, composite = _source_metadata(
             sources.SourceReference(str(name_or_dir), revision, subfolder), selected, fallback)
-        if composite is not None:
-            loaded = _load_composite_source(reference, directory, composite,
-                                            placed=placed, streaming=streaming or not weights, dtype=dtype,
-                                            param_dtype=param_dtype, attention_impl=attention_impl,
-                                            max_seq_len=max_seq_len, weights=weights)
-        elif fallback is not None:
-            from dew.interop import torchax_fallback
-
-            loaded = torchax_fallback.load(reference, directory, dtype=dtype, param_dtype=param_dtype,
-                                           attention_impl=attention_impl, max_seq_len=max_seq_len,
-                                           weights=weights)
-            loaded = replace(loaded, variables=placed(loaded.variables))
-        elif gguf_file is None:
-            # A selected GGUF file is a decoder, whatever pipeline index the repo also ships.
-            loaded = _pipeline_source(reference, directory, single_file, dduf_file, placed,
-                                      dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
-                                      streaming=streaming or not weights)
-        else:
-            loaded = None
-        if loaded is None:
-            # Without its weights, a decoder's leaves are translated as streaming translates them, each
-            # a view of its stored tensor that nothing reads.
-            loaded = _load_native_source(reference, directory, gguf_file=gguf_file, placed=placed,
-                                         streaming=streaming or not weights, dtype=dtype,
-                                         param_dtype=param_dtype, attention_impl=attention_impl,
-                                         max_seq_len=max_seq_len, weights=weights)
+        loaded = _loaded_kind(reference, directory, composite, fallback=fallback, gguf_file=gguf_file,
+                              single_file=single_file, dduf_file=dduf_file, placed=placed,
+                              streaming=streaming or not weights, weights=weights, dtype=dtype,
+                              param_dtype=param_dtype, attention_impl=attention_impl,
+                              max_seq_len=max_seq_len, overrides=modeling_overrides)
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
@@ -1091,6 +1078,68 @@ def _names_a_model(directory: Path) -> bool:
     return path.is_file() and "model_type" in _records.record(json.loads(path.read_text()), "config.json")
 
 
+def _loaded_kind(reference: sources.SourceReference, directory: Path, composite: CompositeSource | None, *,
+                 fallback: str | None, gguf_file: str | None, single_file: str | None,
+                 dduf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
+                 weights: bool, dtype: str, param_dtype: str, attention_impl: str,
+                 max_seq_len: int | None, overrides: Mapping[str, object] | None) -> Pretrained:
+    """The source `Pretrained.load` resolved, loaded as its kind loads: a composite release, the
+    transformers forward it asks for, a diffusion pipeline, or a natively translated model."""
+    if composite is not None:
+        loaded = _load_composite_source(reference, directory, composite,
+                                        placed=placed, streaming=streaming, dtype=dtype,
+                                        param_dtype=param_dtype, attention_impl=attention_impl,
+                                        max_seq_len=max_seq_len, weights=weights,
+                                        overrides=overrides)
+    elif fallback is not None:
+        from dew.interop import torchax_fallback
+
+        _unread_overrides(overrides, "the transformers forward")
+        loaded = torchax_fallback.load(reference, directory, dtype=dtype, param_dtype=param_dtype,
+                                       attention_impl=attention_impl, max_seq_len=max_seq_len,
+                                       weights=weights)
+        loaded = replace(loaded, variables=placed(loaded.variables))
+    elif gguf_file is None:
+        # A selected GGUF file is a decoder, whatever pipeline index the repo also ships.
+        loaded = _pipeline_source(reference, directory, single_file, dduf_file, placed,
+                                  dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
+                                  streaming=streaming)
+        if loaded is not None:
+            _unread_overrides(overrides, "a diffusion pipeline")
+    else:
+        loaded = None
+    if loaded is None:
+        # Without its weights, a decoder's leaves are translated as streaming translates them, each
+        # a view of its stored tensor that nothing reads.
+        loaded = _load_native_source(reference, directory, gguf_file=gguf_file, placed=placed,
+                                     streaming=streaming, dtype=dtype,
+                                     param_dtype=param_dtype, attention_impl=attention_impl,
+                                     max_seq_len=max_seq_len, weights=weights,
+                                     overrides=overrides)
+    return loaded
+
+
+def _overridden(config: Mapping[str, object], overrides: Mapping[str, object] | None) -> Mapping[str, object]:
+    """`config` with `overrides`, a `modeling_overrides` record, over the source's own: each attention
+    kind it names takes its mode, the others keep the source's. The decoder translation reads and
+    checks the result (`decoder_parts.modeling_overrides`)."""
+    if overrides is None:
+        return config
+    own = records.record(config.get("modeling_overrides", {}), "modeling_overrides")
+    given = records.record(overrides, "modeling_overrides")
+    merged = {**own, **given}
+    if "attention" in own and "attention" in given:
+        merged["attention"] = {**records.record(own["attention"], "modeling_overrides.attention"),
+                               **records.record(given["attention"], "modeling_overrides.attention")}
+    return {**config, "modeling_overrides": merged}
+
+
+def _unread_overrides(overrides: Mapping[str, object] | None, route: str) -> None:
+    """Refuse `overrides` on a route whose model no override reaches, rather than load without them."""
+    if overrides is not None:
+        raise ValueError(f"modeling_overrides reach a model Dew translates; {route} reads none")
+
+
 def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
                    gguf_path: Path | None) -> tuple[Mapping[str, object], Mapping[str, np.ndarray] | None]:
     """The decoder's config, and its tensors where the config came with them
@@ -1401,7 +1450,8 @@ def _composite_description(directory: Path) -> CompositeSource | None:
 def _load_composite_source(source: sources.SourceReference, root: Path,
                            description: CompositeSource, *, placed: Callable[[Variables], Variables],
                            streaming: bool, dtype: str, param_dtype: str, attention_impl: str,
-                           max_seq_len: int | None, weights: bool) -> Pretrained:
+                           max_seq_len: int | None, weights: bool,
+                           overrides: Mapping[str, object] | None = None) -> Pretrained:
     """Materialize the described components through the native backbone and tensor-map owners.
     All Hub paths remain relative to the resolved snapshot root, including a selected subfolder."""
     from dew.interop.streaming import materialize
@@ -1437,7 +1487,9 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
             source, root,
             gguf_file=None, component=component, tensors=tensors,
             placed=placed, streaming=streaming, dtype=dtype, param_dtype=param_dtype,
-            attention_impl=attention_impl, max_seq_len=max_seq_len, weights=weights)
+            attention_impl=attention_impl, max_seq_len=max_seq_len, weights=weights, overrides=overrides)
+    else:
+        _unread_overrides(overrides, "a release without a native backbone")
     missing = False
     if head_source.weight_file is None:
         head_tensors = {name: tensor for name, tensor in shared.items() if not name.startswith(prefix)}
@@ -1487,12 +1539,14 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
                         dtype: str, param_dtype: str, attention_impl: str,
                         max_seq_len: int | None, weights: bool = True,
                         component: NativeComponent | None = None,
-                        tensors: Mapping[str, np.ndarray] | None = None) -> Pretrained:
+                        tensors: Mapping[str, np.ndarray] | None = None,
+                        overrides: Mapping[str, object] | None = None) -> Pretrained:
     """Decode native source weights and bind their processors and export layout.
 
     Diffusers pipelines and the explicit torchax fallback have already taken
     their own routes; this boundary handles native decoders and media wrappers,
     and hands an unregistered causal LM tier 3 runs (`TorchRoute`) to it.
+    `overrides` (`Pretrained.load`'s `modeling_overrides`) join the source's own.
     """
     name_or_dir, commit = source.name, source.revision
     directory = source.directory(root)
@@ -1505,10 +1559,14 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     mamba_ssm = mamba2.is_mamba_ssm(config)
     if mamba_ssm:
         config = mamba2.config_from_mamba_ssm(config)
+    config = _overridden(config, overrides)
     family = config.get("model_type")
     # Before any weight downloads, on the config alone: a format the codec cannot read, a family's
     # refusal, an unregistered decoder checked against transformers (tiers 2 and 3).
     route = source_route(config)
+    if isinstance(route, TorchRoute | DiffusionGemmaRoute):
+        _unread_overrides(overrides, "the transformers forward" if isinstance(route, TorchRoute)
+                          else "a diffusion Gemma's text tower")
     if isinstance(route, TorchRoute):
         from dew.interop import torchax_fallback
         selected = source if component is None else source.component(component.config_folder)

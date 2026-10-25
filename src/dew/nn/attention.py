@@ -2024,6 +2024,12 @@ class QKNorm:
     scale_after_cast: bool = False
 
 
+CROSS_KEY = "cross_key"
+"""The cache variable of a cached call's context keys, `[rows, context_length, kv_heads, head_dim]`."""
+CROSS_VALUE = "cross_value"
+"""The cache variable of a cached call's context values, shaped as its keys."""
+
+
 @logical_axes({
     ("to_q",): ("embed", "heads", "head_dim"),
     ("to_k",): ("embed", "heads", "head_dim"),
@@ -2052,6 +2058,12 @@ class NormalAttention(nn.Module):
     query to its packed document's keys, `key_segment_ids` `[B, S_context]`
     numbering the context's (`CrossDocuments`), at most `max_segments` a
     row, which a fused kernel runs as packed sequences rather than a mask.
+
+    It is every cross-attention's attention, the diffusion blocks' and Wan's
+    and a decoder's gated block's alike (`dew.nn.cross_attention`): `kv_heads`
+    groups the queries over fewer key-value heads, and with `cache_length` a
+    `cached` call keeps a context's keys and values (`CROSS_KEY`,
+    `CROSS_VALUE`), so a decode step without the context reads them.
     """
     query_dim: int
     heads: int = 4
@@ -2066,13 +2078,22 @@ class NormalAttention(nn.Module):
     flat: bool = False
     names: tuple[str, str, str, str] = ("to_q", "to_k", "to_v", "to_out_0")
     rotary_pairs: Literal["half", "adjacent"] = "half"
+    kv_heads: int | None = None
+    """The keys' and values' heads, which the query heads share in equal groups; None gives each
+    query head its own."""
+    cache_length: int | None = None
+    """The most context tokens a row's cached call keeps the keys and values of; None keeps none."""
+
+    @property
+    def key_heads(self) -> int:
+        return self.heads if self.kv_heads is None else self.kv_heads
 
     @nn.nowrap
     def projections(self, context_features: int | None = None) -> dict[str, tuple[int, int]]:
-        inner = self.heads * self.dim_head
+        inner, keys = self.heads * self.dim_head, self.key_heads * self.dim_head
         context = self.query_dim if context_features is None else context_features
         query, key, value, output = self.names
-        return {query: (self.query_dim, inner), key: (context, inner), value: (context, inner),
+        return {query: (self.query_dim, inner), key: (context, keys), value: (context, keys),
                 output: (inner, self.query_dim)}
 
     @nn.nowrap
@@ -2089,35 +2110,75 @@ class NormalAttention(nn.Module):
                 + sum(projection_flops(context_lengths, *maps[name]) for name in (key, value))
                 + cross_attention_flops(lengths, context_lengths, self.heads, self.dim_head, self.dim_head))
 
-    def _heads(self, name: str, x, norm: str | None = None):
+    def _heads(self, name: str, x, norm: str | None = None, *, keyed: bool = False):
+        """`x` projected to `[B, S, heads, head_dim]`, the key-value heads where `keyed`."""
         normed = self.qk_norm if norm is not None else None
         rms = None if normed is None else RMSNorm(
             epsilon=normed.epsilon, scale_after_cast=normed.scale_after_cast, dtype=self.dtype, name=norm)
         projected = projected_heads(
-            x, name, self.heads, self.dim_head, flat=self.flat,
+            x, name, self.key_heads if keyed else self.heads, self.dim_head, flat=self.flat,
             bias=self.use_bias if self.qkv_bias is None else self.qkv_bias, dtype=self.dtype,
             precision=self.precision, across_heads=normed is not None and normed.across_heads, norm=rms)
-        return constrain(projected, HEADS)
+        return constrain(projected, KV_HEADS if keyed and self.kv_heads is not None else HEADS)
+
+    def _keys_values(self, context):
+        """The context's keys and values, its positions split over a sequence axis where its link
+        pays for it (`split_positions`)."""
+        _, k_name, v_name, _ = self.names
+        k_norm = self.qk_norm.names[1] if self.qk_norm is not None else None
+        return split_positions(context, (self.key_heads, self.dim_head),
+                               lambda tokens: (self._heads(k_name, tokens, k_norm, keyed=True),
+                                               self._heads(v_name, tokens, keyed=True)))
+
+    def _cached(self, rows: int, dtype, context):
+        """The keys and values a cached call reads. A call that carries a context computes them
+        from it and, once the cache is allocated, keeps them; a call without one reads what the
+        cache keeps. As with a decoder's own cache, the first cached call allocates the cache and
+        writes nothing. The call reads the keys and values as the cache keeps them, in `dtype`."""
+        if self.cache_length is None:
+            raise ValueError("a cached call keeps a context's keys and values, which this attention has "
+                             "no cache_length for")
+        allocated = self.has_variable("cache", CROSS_KEY)
+        shape = (rows, self.cache_length, self.key_heads, self.dim_head)
+        keys = self.variable("cache", CROSS_KEY, jnp.zeros, shape, dtype)
+        values = self.variable("cache", CROSS_VALUE, jnp.zeros, shape, dtype)
+        if context is None:
+            return keys.value, values.value
+        width = context.shape[1]
+        if width > self.cache_length:
+            raise ValueError(f"a cached call keeps at most {self.cache_length} context tokens a row "
+                             f"(CrossAttention.context_length), got {width}")
+        key, value = (projected.astype(dtype) for projected in self._keys_values(context))
+        if allocated:
+            padding = ((0, 0), (0, self.cache_length - width), (0, 0), (0, 0))
+            keys.value = jnp.pad(key, padding)
+            values.value = jnp.pad(value, padding)
+        return key, value
 
     @nn.compact
     def __call__(self, x, context=None, freqs_cis=None, mask=None, key_value_seq_lengths=None,
-                 segment_ids=None, key_segment_ids=None, max_segments=None):
+                 segment_ids=None, key_segment_ids=None, max_segments=None, *, cached: bool = False,
+                 cache_dtype=None):
+        """`cached` reads and keeps the context's keys and values in the cache (`_cached`), in
+        `cache_dtype` (the module's dtype by default); the context is then None on a step that reads
+        the keys and values its prefill kept."""
         orig_x_shape = x.shape
         if len(x.shape) == 4:
             x = x.reshape((x.shape[0], x.shape[1] * x.shape[2], x.shape[3]))
-        context = x if context is None else context
-        if len(context.shape) == 4:
+        if not cached:
+            context = x if context is None else context
+        if context is not None and len(context.shape) == 4:
             context = context.reshape(
                 (context.shape[0], context.shape[1] * context.shape[2], context.shape[3]))
-        # [B, S, heads, head_dim], column-parallel under a tensor axis; a
-        # context's positions split over a sequence axis where its link pays
-        # for it (`split_positions`).
-        q_name, k_name, v_name, out_name = self.names
-        q_norm, k_norm = self.qk_norm.names if self.qk_norm is not None else (None, None)
+        # [B, S, heads, head_dim], column-parallel under a tensor axis.
+        q_name, _, _, out_name = self.names
+        q_norm = self.qk_norm.names[0] if self.qk_norm is not None else None
         query = self._heads(q_name, x, q_norm)
-        key, value = split_positions(context, (self.heads, self.dim_head),
-                                     lambda tokens: (self._heads(k_name, tokens, k_norm),
-                                                     self._heads(v_name, tokens)))
+        if cached:
+            dtype = cache_dtype or self.dtype or x.dtype
+            key, value = self._cached(x.shape[0], dtype, context)
+        else:
+            key, value = self._keys_values(context)
         if freqs_cis is not None:
             query, key = (rotate(part, *freqs_cis, pairs=self.rotary_pairs) for part in (query, key))
 

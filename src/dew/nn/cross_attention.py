@@ -13,6 +13,11 @@ computes its own function until the gates train. The pretrained weights stay
 frozen while the block trains (`dew.interop.Pretrained.with_cross_attention`).
 The reference layer is IDEFICS's `IdeficsGatedCrossAttentionLayer`
 (transformers' modeling_idefics.py), and its names are the names used here.
+Its attention is the one every cross-attention runs, a diffusion block's and
+Wan's alike (`dew.nn.attention.NormalAttention`), held in the block's own
+scope, over the decoder's grouped key-value heads and keeping a cached call's
+keys and values; the gates, the feed-forward and the residual join are the
+block's.
 
 A decoder call carries the sequence in its conditioning
 (`dew.nn.inputs.CONTEXT`), with each row's count of real tokens
@@ -50,19 +55,14 @@ from flax.typing import Dtype, PrecisionLike
 from dew.batch import coordinates
 
 from .activations import GatedActivation
-from .attention import projected_heads, projected_output, scaled_dot_product_attention
-from .flops import counted_flops, cross_attention_flops, projection_flops
+from .attention import CROSS_KEY, CROSS_VALUE, NormalAttention
+from .flops import counted_flops
 from .inputs import CONTEXT, CONTEXT_LENGTHS, CrossContext
 from .precision import L2NORM_EPS, at_least_fp32, float32_dot_general, l2norm, sqrt_or_zero
-from .sharding import HEADS, KV_HEADS, constrain
 
 NAME = "cross_attention"
 """The module name of a decoder layer's cross-attention block, in every collection."""
 
-CROSS_KEY = "cross_key"
-"""The cache variable of a cached call's context keys, `[rows, context_length, kv_heads, head_dim]`."""
-CROSS_VALUE = "cross_value"
-"""The cache variable of a cached call's context values, shaped as its keys."""
 CROSS_LENGTHS = "cross_lengths"
 """The cache variable of each row's real context tokens, `[rows]`."""
 CROSS_CACHE = frozenset({CROSS_KEY, CROSS_VALUE, CROSS_LENGTHS})
@@ -187,22 +187,29 @@ class GatedCrossAttention(nn.Module):
     precision: PrecisionLike = None
 
     @nn.nowrap
+    def attention(self, **parent) -> NormalAttention:
+        """The block's attention over its context: the attention every cross-attention runs
+        (`NormalAttention`), its projections flat under the decoder's names, grouped over the
+        decoder's key-value heads, keeping a cached call's keys and values. `parent` is flax's: None for
+        the unbound description its maps and work are read from."""
+        return NormalAttention(self.emb_features, self.heads, self.head_dim, dtype=self.dtype,
+                               precision=self.precision, use_bias=False,
+                               force_fp32_for_softmax=self.force_fp32_for_softmax,
+                               attention_impl=self.attention_impl, flat=True,
+                               names=("q_proj", "k_proj", "v_proj", "o_proj"), kv_heads=self.kv_heads,
+                               cache_length=self.context_length, **parent)
+
+    @nn.nowrap
     def projections(self) -> dict[str, tuple[int, int]]:
         """The attention's maps as `{name: (inputs, outputs)}`."""
-        queries, keys = self.heads * self.head_dim, self.kv_heads * self.head_dim
-        return {"q_proj": (self.emb_features, queries), "k_proj": (self.context_features, keys),
-                "v_proj": (self.context_features, keys), "o_proj": (queries, self.emb_features)}
+        return self.attention(parent=None).projections(self.context_features)
 
     @nn.nowrap
     def cross_flops(self, lengths, context_lengths) -> float:
         """The block's work over rows of `lengths` tokens reading contexts of
-        `context_lengths`: queries, output and feed-forward per token, keys and
-        values per context token, and each row's query-by-context products."""
-        maps = self.projections()
-        return (projection_flops(lengths, *maps["q_proj"]) + projection_flops(lengths, *maps["o_proj"])
-                + projection_flops(context_lengths, *maps["k_proj"])
-                + projection_flops(context_lengths, *maps["v_proj"])
-                + cross_attention_flops(lengths, context_lengths, self.heads, self.head_dim, self.head_dim)
+        `context_lengths`: the attention's (`NormalAttention.cross_flops`) and
+        the feed-forward's per token."""
+        return (self.attention(parent=None).cross_flops(lengths, context_lengths, self.context_features)
                 + counted_flops(self.feedforward(parent=None), lengths))
 
     @nn.compact
@@ -218,24 +225,23 @@ class GatedCrossAttention(nn.Module):
             # Without a context the key and value maps never run, and init would declare none of theirs.
             context = CrossContext(jnp.zeros((x.shape[0], 1, self.context_features), x.dtype),
                                    jnp.ones(x.shape[:1], jnp.int32))
+        if context is not None and context.embeddings.shape[-1] != self.context_features:
+            raise ValueError(f"this cross-attention reads {self.context_features}-wide context tokens, "
+                             f"got {context.embeddings.shape[-1]}")
         if decode:
-            key, value, lengths = self._cached(x, context)
+            lengths = self._cached_lengths(x, context)
         elif context is None:
             return stream
         else:
-            key, value = self._keys_values(context.embeddings)
             lengths = context.lengths
-        query = constrain(projected_heads(self._normed("input_layernorm", x), "q_proj", self.heads,
-                                          self.head_dim, flat=True, bias=False, dtype=self.dtype,
-                                          precision=self.precision), HEADS)
+        attention = self.attention()
+        nn.share_scope(self, attention)
         # A row without context reads its first slot, so its softmax stays finite: one over no keys
         # would be NaN, which the select below drops forward but not from the gradients.
-        attended = scaled_dot_product_attention(
-            query, key, value, dtype=self.dtype, precision=self.precision,
-            force_fp32_for_softmax=self.force_fp32_for_softmax, implementation=self.attention_impl,
-            key_value_seq_lengths=jnp.maximum(lengths, 1))
-        output = projected_output(constrain(attended, HEADS), "o_proj", self.emb_features, flat=True,
-                                  bias=False, dtype=self.dtype, precision=self.precision)
+        embeddings = None if context is None else context.embeddings
+        output = attention(self._normed("input_layernorm", x), embeddings,
+                           key_value_seq_lengths=jnp.maximum(lengths, 1), cached=decode,
+                           cache_dtype=x.dtype if self.dtype is None else self.dtype)
         present = (lengths > 0).reshape((-1,) + (1,) * (stream.ndim - 1))
         dropout = nn.Dropout(rate=self.dropout_rate)
 
@@ -254,45 +260,17 @@ class GatedCrossAttention(nn.Module):
     def _normed(self, name: str, x: jax.Array) -> jax.Array:
         return x if self.norm is None else self.norm(name=name)(x)
 
-    def _keys_values(self, embeddings: jax.Array) -> tuple[jax.Array, jax.Array]:
-        """The context's keys and values, `[B, C, kv_heads, head_dim]` each."""
-        if embeddings.shape[-1] != self.context_features:
-            raise ValueError(f"this cross-attention reads {self.context_features}-wide context tokens, "
-                             f"got {embeddings.shape[-1]}")
-
-        def heads(name: str) -> jax.Array:
-            projected = projected_heads(embeddings, name, self.kv_heads, self.head_dim, flat=True,
-                                        bias=False, dtype=self.dtype, precision=self.precision)
-            return constrain(projected, KV_HEADS)
-
-        return heads("k_proj"), heads("v_proj")
-
-    def _cached(self, x: jax.Array, context: CrossContext | None
-                ) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """The keys, values and lengths a cached call reads. A call that carries a context
-        computes them from it and, once the cache is allocated, keeps them; a call without
-        one reads what the cache keeps. As with the decoder's own cache, the first cached
-        call allocates the cache and writes nothing."""
-        allocated = self.has_variable("cache", CROSS_KEY)
-        dtype = x.dtype if self.dtype is None else self.dtype
-        shape = (x.shape[0], self.context_length, self.kv_heads, self.head_dim)
-        keys = self.variable("cache", CROSS_KEY, jnp.zeros, shape, dtype)
-        values = self.variable("cache", CROSS_VALUE, jnp.zeros, shape, dtype)
-        lengths = self.variable("cache", CROSS_LENGTHS, jnp.zeros, shape[:1], jnp.int32)
+    def _cached_lengths(self, x: jax.Array, context: CrossContext | None) -> jax.Array:
+        """Each row's real context tokens a cached call reads: a call that carries a context keeps
+        them once the cache is allocated, as its attention keeps the keys and values
+        (`NormalAttention.cached`); a call without one reads what the cache keeps."""
+        allocated = self.has_variable("cache", CROSS_LENGTHS)
+        lengths = self.variable("cache", CROSS_LENGTHS, jnp.zeros, x.shape[:1], jnp.int32)
         if context is None:
-            return keys.value, values.value, lengths.value
-        width = context.embeddings.shape[1]
-        if width > self.context_length:
-            raise ValueError(f"a cached call keeps at most {self.context_length} context tokens a row "
-                             f"(CrossAttention.context_length), got {width}")
-        # The prefill reads the keys and values as the cache keeps them, so its steps read the same.
-        key, value = (projected.astype(dtype) for projected in self._keys_values(context.embeddings))
+            return lengths.value
         if allocated:
-            padding = ((0, 0), (0, self.context_length - width), (0, 0), (0, 0))
-            keys.value = jnp.pad(key, padding)
-            values.value = jnp.pad(value, padding)
             lengths.value = context.lengths
-        return key, value, context.lengths
+        return context.lengths
 
 
 def gated_join(stream: jax.Array, branch: jax.Array, gate: jax.Array, *, ngpt: bool = False,
