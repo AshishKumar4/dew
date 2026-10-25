@@ -158,9 +158,10 @@ def test_an_aggregate_reads_a_split_on_its_own_cadence_as_nan_where_it_was_not_s
 @pytest.mark.parametrize("end", ["stream", "plateau"])
 def test_a_run_that_ends_off_a_rare_suites_cadence_is_ranked_by_it_at_its_last_step(tmp_path, end):
     """Whatever ends a run, its last step is scored by every suite before its checkpoint is saved: a
-    training stream that runs out after four batches, or a plateau that stops the run at step 4. The
-    rare suite, scored every third step, rises as training does, so its best is the last step, which a
-    checkpoint saved before that suite scored it would never rank."""
+    training stream that runs out after four batches, or a plateau that stops the run at step 4. Both
+    suites rise as training does, so each one's best is the last step, which the frequent suite ranks
+    there; the rare suite, scored every third step, would never rank it from a checkpoint saved before
+    that suite scored it."""
     from dew.training import EvalSuite
 
     metric = Value('value', Shown(better='lower'))
@@ -174,13 +175,14 @@ def test_a_run_that_ends_off_a_rare_suites_cadence_is_ranked_by_it_at_its_last_s
 
     loaded = dataclasses.replace(data(), train=lambda partition: Ending()) if end == "stream" else data()
     run = trainer(tmp_path / 'run')
-    state = run.fit(loaded, steps=10, log_every=1, eval_every=1, checkpoint_every=1, metrics=[metric],
+    state = run.fit(loaded, steps=10, log_every=1, eval_every=1, metrics=[metric],
                     validation={'often': data().val, 'rare': EvalSuite(data().val, (metric,), 3)},
-                    best=Best(lambda scores: scores[('rare', metric)], mode='max'),
-                    stop=Plateau(('often', metric), evals=3) if end == "plateau" else None)
+                    best=[Best(lambda scores: scores[('often', metric)], mode='max'),
+                          Best(lambda scores: scores[('rare', metric)], mode='max')],
+                    stop=Plateau(metric, evals=3) if end == "plateau" else None)
     run.checkpoints.wait()
     assert int(state.step) == 4
-    assert run.checkpoints.resolve('best:aggregate:0') == 4
+    assert run.checkpoints.resolve('best:aggregate:0') == run.checkpoints.resolve('best:aggregate:1') == 4
 
 
 def test_an_aggregate_reads_a_training_scalar_whose_name_has_parts(tmp_path):
