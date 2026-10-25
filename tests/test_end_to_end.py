@@ -653,7 +653,7 @@ def test_only_the_kl_autoencoders_with_a_posterior_reach_end_to_end_tuning():
 def test_the_running_statistics_start_by_normalizing_as_the_autoencoder_does():
     """REPA-E's start, `normalized` by `initial_statistics` of the autoencoder's shift and scale with
     the batch norm's epsilon at zero, normalizes a posterior's latents as `encode` does
-    (`LatentNormalization.normalized`, which `encode` applies to its draw): neither the identity nor
+    (`AutoEncoder.latent_affine`, which `encode` applies to its draw): neither the identity nor
     twice."""
     autoencoder = objective(EndToEnd()).autoencoder
     tuning = EndToEnd(epsilon=0.0)
@@ -666,8 +666,10 @@ def test_the_running_statistics_start_by_normalizing_as_the_autoencoder_does():
     def started(latents):
         return tuning.normalized(latents, jax.tree.map(lambda value: value.astype(latents.dtype), statistics))
 
-    assert_as_exact(jax.jit(started), jax.jit(autoencoder.normalization.normalized), draw,
-                    "end-to-end start", seeds=8)
+    def encoded(latents):
+        return autoencoder.latent_affine(autoencoder.params, latents.dtype).normalized(latents)
+
+    assert_as_exact(jax.jit(started), jax.jit(encoded), draw, "end-to-end start", seeds=8)
 
 
 def test_a_tuned_autoencoder_has_no_fixed_normalization_to_read_or_replace():
