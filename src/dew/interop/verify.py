@@ -109,9 +109,9 @@ _ROUNDING = 6.46
 # backward the source's forward does not show (a hook, a custom autograd function) orders of magnitude
 # apart.
 # Twice the largest tools/gradient_parity.py measured over the types and compositions that assemble
-# from parts: 1.112 (gemma; llama 0.962, mistral 0.962, mixtral 1.033, qwen2 0.932, qwen3 0.883,
-# qwen3_moe 0.902, Llama's attention with Mixtral's experts and Gemma's norms 0.973), transformers 5.16.1.
-_GRADIENT_PARITY = 2.23
+# from parts: 1.261 (gemma; llama 1.047, mistral 1.047, mixtral 1.116, qwen2 1.155, qwen3 1.142,
+# qwen3_moe 1.081, Llama's attention with Mixtral's experts and Gemma's norms 1.164), transformers 5.16.1.
+_GRADIENT_PARITY = 2.53
 
 
 _REMOTE_CLASSES = ('AutoConfig', 'AutoModelForCausalLM')
