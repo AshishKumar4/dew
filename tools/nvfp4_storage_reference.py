@@ -8,7 +8,7 @@ QDQ leaves that forward bit for bit unchanged. A second fp32 reader keeps
 dense checkpoint tensors in fp32; only its decoded bf16 Linear weights need
 promotion before the fp32 forward. FP8 is read and run directly in fp32.
 The truth is those decoded weights run in float64, including the norm,
-RoPE and softmax pins widened by diffusers_wan_reference.float64. NVFP4's
+RoPE and softmax pins widened by torch_precision.float64. NVFP4's
 unrounded fp32 dequantize is recorded too, and its bf16 rounding must equal
 the published decoder. There are no activation quantizers in these files.
 
@@ -35,8 +35,8 @@ from compressed_tensors.compressors.nvfp4.helpers import unpack_fp4_from_uint8
 from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme, QuantizationStatus
 from compressed_tensors.quantization.lifecycle.forward import dequantize, set_forward_quantized
 from compressed_tensors.quantization.utils.helpers import calculate_qparams, generate_gparam
-from diffusers_wan_reference import float64
 from safetensors.torch import save_file
+from torch_precision import float64, float64_twin
 from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
 
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "codecs" / "storage"
@@ -123,8 +123,14 @@ def checkpoint(kind: str) -> None:
                                    global_scale=tensors[stem + ".weight_global_scale"], dtype=torch.float32)
             np.testing.assert_array_equal(unrounded.bfloat16().float().numpy(), decoded[name])
             decoded[name + "/unrounded"] = unrounded.numpy()
+    # The float64 truth read from the same files inside `float64` (`float64_twin`), so its rotary table is
+    # float64's (the float32 read cast afterwards keeps float32's), the float32 read's values in it.
+    exact = float64_twin(loaded, lambda: AutoModelForCausalLM.from_pretrained(
+        directory, dtype=torch.float64, attn_implementation="eager"))
+    for module in exact.modules():
+        module.quantization_enabled = False
     with float64(), torch.no_grad():
-        truth = torch.nn.Module.double(loaded)(ids, use_cache=False).logits.numpy()
+        truth = exact(ids, use_cache=False).logits.numpy()
     np.savez(directory / "reference.npz", ids=ids.numpy(), logits=reference, logits_f64=truth,
              published_logits=published, **decoded)
     print(kind, "reference RMS from float64", float(np.sqrt(np.mean((reference - truth) ** 2))))

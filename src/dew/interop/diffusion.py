@@ -239,12 +239,9 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
                            ) -> tuple[LazyTree, tuple[WeightLayout, ...]]:
     """Map UNet tensors into a parameter tree and the layouts that invert it.
 
-    Each leaf is cast to `param_dtype` before its transpose. Attention kernels
-    are also reshaped to per-head axes, which is why this does not go through
-    `weights.record_layouts`. Read eagerly, a transposed kernel is a view of the
-    stored tensor. With `lazy` every other linear kernel and every
-    untransposed leaf is a `SourceLeaf`, read when it is placed; a reshaped
-    attention kernel and a convolution are read whole either way.
+    Attention kernels split their input or output axes into heads. With `lazy`, linear and
+    untransposed leaves retain source views through those reshapes and read only when placed;
+    convolutions are read whole. Eager kernels cast before transposing and splitting their axes.
     """
     from dew.interop.streaming import SourceLeaf
     parameters: LazyTree = {}
@@ -256,20 +253,20 @@ def translate_unet_weights(tensors: Mapping[str, np.ndarray], model: UNet2DCondi
         dtype = checkpoint_dtype(stored.dtype, param_dtype)
         kernel = path[-1] == "kernel"
         attention = "Attention1" in path or "Attention2" in path
-        if lazy and not (kernel and (stored.ndim == 4 or attention)):
-            if owners[path] == name:
-                # Equal source aliases add export names without another leaf.
-                insert(parameters, path, SourceLeaf((stored,), dtype, transposed=kernel), name)
-            continue
-        value = stored.astype(dtype, copy=False)
-        if kernel:
-            value = value.transpose(2, 3, 1, 0) if value.ndim == 4 else value.T
-            if attention:
-                stage = _unet_stage(model, path)
-                value = (value.reshape(value.shape[0], stage.heads, stage.features // stage.heads)
-                         if path[-2] in ("to_q", "to_k", "to_v")
-                         else value.reshape(stage.heads, stage.features // stage.heads, stage.features))
-        insert(parameters, path, value, name)
+        if lazy and not (kernel and stored.ndim == 4):
+            value = SourceLeaf((stored,), dtype, transposed=kernel)
+        else:
+            value = stored.astype(dtype, copy=False)
+            if kernel:
+                value = value.transpose(2, 3, 1, 0) if value.ndim == 4 else value.T
+        if kernel and attention:
+            stage = _unet_stage(model, path)
+            shape = ((value.shape[0], stage.heads, stage.features // stage.heads)
+                     if path[-2] in ("to_q", "to_k", "to_v")
+                     else (stage.heads, stage.features // stage.heads, stage.features))
+            value = value.reshape(shape)
+        if owners[path] == name:
+            insert(parameters, path, value, name)
     return parameters, unet_layouts({name: tensor.shape for name, tensor in tensors.items()}, model)
 
 

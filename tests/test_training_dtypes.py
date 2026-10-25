@@ -49,6 +49,34 @@ def test_repeated_token_gradients_accumulate_in_master_precision(dtype):
     np.testing.assert_array_equal(gradient, expected)
 
 
+@pytest.mark.parametrize("vocab, padding_idx", [(5, 0), (5, 4), (5, -1), (5, -5), (1, 0), (1, -1)])
+def test_a_padding_rows_lookups_train_it_no_more_than_torchs(vocab, padding_idx):
+    """`padding_idx` leaves the row its id names untrained by every lookup of it, as torch's
+    `nn.Embedding(padding_idx=...)` does, a negative id counted from the table's end and a table of
+    one row alike: the gradient under a drawn cotangent of small integers is torch's to the bit, each
+    row the sum of its lookups' cotangents, exact in float32 in any order. An id outside the table is
+    refused."""
+    import torch
+
+    ids = np.asarray([[0, vocab - 1, 0], [vocab - 1, 0, vocab - 1]])
+    cotangent = np.random.default_rng(7).integers(-8, 8, (*ids.shape, 3)).astype(np.float32)
+    model = TokenEmbedding(vocab, 3, padding_idx=padding_idx)
+    variables = model.init(jax.random.key(4), jnp.asarray(ids, jnp.int32))
+
+    def loss(parameters):
+        return jnp.sum(model.apply({"params": parameters}, jnp.asarray(ids, jnp.int32)) * cotangent)
+
+    ours = jax.grad(loss)(variables["params"])["embedding"]
+    reference = torch.nn.Embedding(vocab, 3, padding_idx=padding_idx)
+    with torch.no_grad():
+        reference.weight.copy_(torch.from_numpy(np.asarray(variables["params"]["embedding"])))
+    (reference(torch.from_numpy(ids)) * torch.from_numpy(cotangent)).sum().backward()
+    np.testing.assert_array_equal(np.asarray(ours), reference.weight.grad.numpy())
+    assert not np.any(np.asarray(ours)[padding_idx])
+    with pytest.raises(ValueError):
+        TokenEmbedding(vocab, 3, padding_idx=vocab).init(jax.random.key(4), jnp.asarray(ids, jnp.int32))
+
+
 @pytest.mark.parametrize("family", ["clip-token", "clip-position", "clip-vision", "siglip",
                                     "gemma3n", "decision", "joint"])
 def test_family_embedding_gradients_sum_repeated_ids_in_master_precision(family):
@@ -56,8 +84,8 @@ def test_family_embedding_gradients_sum_repeated_ids_in_master_precision(family)
     cotangents. Its fp32 master retains contributions lost by accumulation in bf16."""
     from dew.decision.head import DecisionHead, JointSchemaHead
     from dew.nn.text_encoders import CLIPTextTransformer, CLIPVisionTransformer
-    from dew.nn.vision.gemma3n import Gemma3nProjectorModule
-    from dew.nn.vision.siglip import SiglipVision, SiglipVisionTransformer
+    from dew.nn.vision.gemma3n import Gemma3nProjector
+    from dew.nn.vision.siglip import SiglipVision
 
     dtype = jnp.bfloat16
     clip = CLIPTextTransformer(vocab_size=3, hidden_size=2, num_layers=0, num_heads=1,
@@ -67,11 +95,11 @@ def test_family_embedding_gradients_sum_repeated_ids_in_master_precision(family)
         "clip-position": (clip, lambda module, ids: module.position_embedding(ids), "position_embedding"),
         "clip-vision": (CLIPVisionTransformer(hidden_size=2, num_layers=0, num_heads=1,
                                              image_size=2, patch_size=1, dtype=dtype),
-                        lambda module, ids: module.position_embedding(ids), "position_embedding"),
-        "siglip": (SiglipVisionTransformer(SiglipVision(hidden_size=2, num_layers=0, num_heads=1,
-                                                        image_size=2, patch_size=1), dtype=dtype),
-                   lambda module, ids: module.position_embedding(ids), "position_embedding"),
-        "gemma3n": (Gemma3nProjectorModule(2, 2, vocab_size=3, dtype=dtype),
+                        lambda module, ids: module.trunk.position_table(ids), "position_table"),
+        "siglip": (SiglipVision(hidden_size=2, num_layers=0, num_heads=1,
+                                image_size=2, patch_size=1).build().clone(dtype=dtype),
+                   lambda module, ids: module.position_table(ids), "position_table"),
+        "gemma3n": (Gemma3nProjector(2, 2, vocab_size=3, dtype=dtype),
                     lambda module, ids: module.embedding(ids), "embedding"),
         "decision": (DecisionHead(2, layers=0, dtype=dtype),
                      lambda module, ids: module.type_embedding(ids), "type_embedding"),
@@ -321,6 +349,41 @@ def test_optimizer_dtype_overflow_backs_off_and_drops_its_window():
     assert float(rejected.scale.scale) == .5
     assert all(not np.any(np.asarray(leaf)) for leaf in rejected.accumulation.statistics)
     compare(rejected.variables, prefix_params, exact=True)
+
+
+@pytest.mark.parametrize("decay", [0.5, 0.999, 0.9999])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_an_ema_leaf_the_step_left_alone_keeps_its_average_bit_for_bit(dtype, decay):
+    """`ema_update` of a leaf whose live value is its average returns that average bit for bit, at any
+    decay, however its program fuses the update: a parameter no gradient moved keeps its EMA as it was."""
+    from dew.training.transaction import ema_update
+
+    average = jnp.asarray(np.random.default_rng(0).standard_normal(4096), dtype)
+    kept = jax.jit(ema_update)({"w": average}, {"w": average}, decay)["w"]
+    assert kept.dtype == average.dtype and np.array_equal(np.asarray(kept), np.asarray(average))
+
+
+def test_an_ema_of_finite_leaves_of_opposite_signs_stays_their_finite_average():
+    """`ema_update` between finite leaves returns their weighted average wherever it is finite, at the ends
+    of fp32's range too: an average of 2**127 and a live value of -(2**127) at decay 0.5 average to exactly 0,
+    where their difference alone overflows."""
+    from dew.training.transaction import ema_update
+
+    average = jnp.asarray([2.0 ** 127, -(2.0 ** 127), 3e38], jnp.float32)
+    live = jnp.asarray([-(2.0 ** 127), 2.0 ** 127, -3e38], jnp.float32)
+    updated = jax.jit(ema_update)({"w": average}, {"w": live}, 0.5)["w"]
+    assert np.array_equal(np.asarray(updated), np.zeros(3, np.float32))
+
+
+def test_an_ema_of_a_leaf_the_step_left_alone_is_nan_at_a_nan_decay():
+    """`ema_update` at a NaN decay returns NaN, a leaf the step left as it was among them, as the weighted
+    sum does: the resulting state's finiteness check sees the bad decay, rather than a select that keeps the
+    leaf hiding it."""
+    from dew.training.transaction import ema_update
+
+    leaf = jnp.asarray([1.0, -2.0], jnp.float32)
+    updated = jax.jit(ema_update)({"w": leaf}, {"w": leaf}, jnp.float32(np.nan))["w"]
+    assert np.isnan(np.asarray(updated)).all()
 
 
 @pytest.mark.parametrize("parameter_kind", ["bfloat16", "mixed", "float64", "mixed64"])

@@ -390,6 +390,41 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16, fields=N
     return objective, state
 
 
+@pytest.mark.parametrize("family", ["qwen3_5", "mimo"])
+def test_an_earlier_projector_record_reloads_its_saved_image_model(tmp_path, family):
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.multimodal import MultimodalTransformer
+    from dew.nn.vision import MiMoProjector, Qwen35Projector, SiglipVision
+    from dew.objectives.lm import LMObjective
+
+    projector = {"qwen3_5": Qwen35Projector, "mimo": MiMoProjector}[family](
+        hidden_size=4, spatial_merge_size=2, width=16, out_width=8, bias=family == "qwen3_5")
+    model = MultimodalTransformer(
+        CausalTransformer(vocab_size=32, emb_features=8, num_layers=1, num_heads=2,
+                          mlp_features=16, max_seq_len=16, attention_impl="reference"),
+        SiglipVision(hidden_size=4, intermediate_size=8, num_layers=1, num_heads=1,
+                      image_size=4, patch_size=2), projector, family, 30)
+    objective = LMObjective(model, 4, ema_decay=None)
+    state = Trainer(objective, optax.sgd(0.01), key=3).initial_state()
+    record = objective.inference_record()
+    projection = record["model"]["fields"]["projection"]
+    projection["fields"] = {"vision_width": 4, "merge_size": 2, "out_width": 8}
+    with Checkpoints(str(tmp_path), keep=2) as checkpoints:
+        checkpoints.save(0, state, artifact=record)
+        checkpoints.wait()
+        checkpoints.save(1, state, artifact=objective.inference_record())
+        checkpoints.wait()
+    restored = TextGeneration.from_run(str(tmp_path), step=0)
+    pixels = jnp.arange(48, dtype=jnp.float32).reshape(1, 1, 3, 4, 4) / 48
+    tokens = jnp.asarray([[1, 30, 4, 5]], jnp.int32)
+    conditioning = {"pixel_values": pixels, "image_lengths": jnp.asarray([[1]], jnp.int32)}
+    images = jnp.asarray([[-1, 0, -1, -1]], jnp.int32)
+    expected = model.apply(state.variables, tokens, conditioning=conditioning, image_indices=images)
+    actual = restored.model.apply(restored.variables, tokens, conditioning=conditioning,
+                                  image_indices=images)
+    np.testing.assert_array_equal(actual, expected)
+
+
 def test_every_route_generates_through_the_same_packed_projections(tmp_path):
     """A run's task and a source's hold their query/key/value and gate/up packed, packed once at
     their load from the weights they own; a live objective's task keeps the trainer's own arrays,
@@ -578,7 +613,8 @@ def test_pipeline_answers_an_lm_run_with_its_tokenizer_and_budget(tmp_path):
         dataclasses.replace(task, max_new_tokens=None)("the ", key=2)
 
 
-def test_an_lm_run_over_a_sources_own_processor_reloads_that_processor(tmp_path):
+@pytest.mark.parametrize("earlier", [False, True])
+def test_an_lm_run_over_a_sources_own_processor_reloads_that_processor(tmp_path, earlier):
     """A decoder fine-tuned from a checkpoint encodes text with the processor the
     checkpoint ships; its run records that processor's source, so the reloaded task
     encodes as the trained one does rather than loading as weights that take ids."""
@@ -594,9 +630,14 @@ def test_an_lm_run_over_a_sources_own_processor_reloads_that_processor(tmp_path)
     run = tmp_path / "run"
     checkpoints = Checkpoints(str(run), keep=1)
     trainer = Trainer(objective, optax.adam(1e-3), key=jax.random.PRNGKey(0), checkpoints=checkpoints)
-    trainer.fit(Loader(train=lambda partition: Replaying(lambda position: batch), val=None, records=None,
-                       batch=8), steps=1, log_every=100, checkpoint_every=1)
+    state = trainer.fit(Loader(train=lambda partition: Replaying(lambda position: batch),
+                               val=None, records=None, batch=8),
+                        steps=1, log_every=100, checkpoint_every=1)
     checkpoints.wait()
+    if earlier:
+        record = {**objective.inference_record(), "processor": str(source)}
+        checkpoints.save(int(state.step) + 1, state, artifact=record)
+        checkpoints.wait()
 
     task = dew.pipeline(str(run))
     assert loaded.text_processor is not None and task.processor is not None

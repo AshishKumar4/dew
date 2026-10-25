@@ -34,6 +34,7 @@ from dew.cache import persist_compilations
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_causal
 from dew.inference.projections import packed_owned
+from dew.interop.sources import SourceReference
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel
@@ -349,9 +350,11 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     """A run's record with its components in the shapes Dew writes now, every earlier shape read here
     and nowhere else (`SavedRun.pinned`), so no component keeps two readers: a decision head's
     `{"name"}` record, its class by import path or by class name alone in `dew.decision.head`, a
-    built-in autoencoder's by its name with its module's bare fields (`_EARLIER_AUTOENCODERS`), and a
-    decision layout's by class name in `dew.decision.layout`, each read as the registry's class record.
-    A record in today's shapes passes as it is. Carried to 1.0, when it is deleted (ledger 1552)."""
+    built-in autoencoder's by its name with its module's bare fields (`_EARLIER_AUTOENCODERS`), a
+    decision layout's by class name in `dew.decision.layout`, each read as the registry's class record,
+    a processor's source as its encoded string (ledger 1641), and a Qwen or MiMo projector's earlier
+    fields (`_earlier_projectors`, ledger 1622). A record in today's shapes passes as it is. Carried to
+    1.0, when it is deleted (ledger 1552)."""
     current = dict(record)
     head = record.get("head")
     if isinstance(head, Mapping) and "name" in head and "class" not in head:
@@ -371,7 +374,38 @@ def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
     if isinstance(layout, Mapping) and "name" in layout and "class" not in layout:
         current["layout"] = {"class": f"dew.decision.layout:{named(layout['name'], 'layout.name')}",
                              "fields": named_fields(layout.get("fields", {}), "layout.fields")}
+    processor = record.get("processor")
+    if isinstance(processor, str):
+        # A source's identity was an encoded string before typed component references (ledger 1641).
+        from dew.interop.sources import SourceReference
+        from dew.registry import to_record
+
+        current["processor"] = to_record(SourceReference.parse(processor), SourceReference)
+    if "model" in current:
+        current = _earlier_projectors(current)
     return current
+
+
+def _earlier_projectors(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A record's earlier Qwen or MiMo projector fields read as today's (`earlier_shapes`), wherever the
+    model nests the projector through another recorded wrapper. Carried until 1.0 (ledger 1622);
+    current constructors and source codecs accept only their current schema."""
+    def current(value):
+        if isinstance(value, Mapping):
+            component = {key: current(field) for key, field in value.items()}
+            name, fields = component.get("class"), component.get("fields")
+            if name in ("dew.nn.vision.qwen35:Qwen35Projector", "dew.nn.vision.mimo:MiMoProjector") \
+                    and isinstance(fields, dict) and "vision_width" in fields:
+                width, merge = fields.pop("vision_width"), fields.pop("merge_size")
+                component["fields"] = {**fields, "hidden_size": width, "spatial_merge_size": merge,
+                                     "width": width * merge ** 2,
+                                     "bias": name == "dew.nn.vision.qwen35:Qwen35Projector"}
+            return component
+        if isinstance(value, list | tuple):
+            return [current(field) for field in value]
+        return value
+
+    return {**record, "model": current(record["model"])}
 
 
 def settings_fields(settings: type) -> frozenset[str]:
@@ -399,7 +433,7 @@ class TaskSettings:
     seq_len: int
     max_new_tokens: int
     tokenizer: str | None
-    processor: str | None
+    processor: SourceReference | None
 
     def __post_init__(self) -> None:
         if type(self.max_new_tokens) is not int or self.max_new_tokens < 0:
@@ -471,7 +505,7 @@ def recorded_tokenizer(processor: Processor | None) -> str | None:
     return None
 
 
-def recorded_processor(processor: Processor | None) -> str | None:
+def recorded_processor(processor: Processor | None) -> SourceReference | None:
     """The source a run's record keeps for a checkpoint's own processor
     (`dew.interop.processors.Processor.source`), which `_saved_processor`
     reloads from its files; any other processor records none here."""

@@ -18,9 +18,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from diffusers_wan_reference import float64
 from huggingface_hub import hf_hub_download
 from reference_source import hub_modules
+from torch_precision import float64, float64_twin
 
 from dew.interop.verify import probe_ids, scatter_weights
 
@@ -72,11 +72,10 @@ def write_tiny(modeling) -> None:
     with torch.no_grad():
         arrays['generated'] = model.generate(torch.from_numpy(ids[:, :4]).long(), do_sample=False,
                                              max_new_tokens=6, eos_token_id=None, pad_token_id=0).numpy()
+    # Its float64 twin (`float64_twin`): built inside the widening, so the rotary table is computed in
+    # float64 rather than widened from fp32; the weights are the same.
+    truth = float64_twin(model, lambda: modeling.K2HorizonForCausalLM(config))
     with float64():
-        # Built inside the widening, so the rotary table is computed in
-        # float64 rather than widened from fp32; the weights are the same.
-        truth = modeling.K2HorizonForCausalLM(config).double().eval()
-        truth.load_state_dict(model.state_dict())
         arrays['logits_f64'] = logits(truth, ids)
         arrays['padded_logits_f64'] = logits(truth, padded, mask, positions)
     for name, array in arrays.items():

@@ -15,6 +15,7 @@ import numpy as np
 from dew import _records
 from dew._model_types import QWEN35_TYPES
 from dew._records import JSON
+from dew.interop.sources import SourceReference
 from dew.nn import audio as audio_nn
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.registry import towers
@@ -200,7 +201,7 @@ class Processor:
     algorithms. Calling it with text, and optionally `images`, `audio` or
     `videos`, returns `ModelInputs`.
 
-    `source` is the local directory or `repo@commit` its files came from.
+    `source` records the directory or repository, revision and subfolder its files came from.
     That identity reloads the processor (`load_processor`), and a media
     processor's geometry from the source config, independently of a task's
     text tokenizer. Only a media processor reads files from `directory`.
@@ -210,7 +211,7 @@ class Processor:
     config: Mapping[str, object]
     record: Mapping[str, object]
     vocab_size: int
-    source: str | None = None
+    source: SourceReference | None = None
     directory: Path | None = None
     """Where this process reads the files. Only `source` records their identity."""
 
@@ -244,7 +245,7 @@ class Processor:
         an image part (`dew.data.chat.image_text`), which `media` expands to the image's tokens."""
         from dew.data.chat import image_text
 
-        return image_text(self._media_reference, where=self.source or str(self.directory))
+        return image_text(self._media_reference, where=str(self.directory))
 
     def __call__(self, text: str | Sequence[str], *, images: Media | None = None,
                  audio: Media | None = None, videos: Media | None = None,
@@ -565,7 +566,7 @@ class Processor:
         default of 2 included."""
         projector = _records.record(_records.record(self.record["projector"], "projector")["fields"],
                                    "projector fields")
-        return _records.integer(projector["merge_size"], "merge_size")
+        return _records.integer(projector["spatial_merge_size"], "spatial_merge_size")
 
     def _qwen_frames(self, values: Mapping[str, object], tokens: np.ndarray, runs):
         """Return views of packed image/video patches in text order, one item per frame.

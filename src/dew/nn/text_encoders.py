@@ -46,9 +46,7 @@ from dew.interop.weights import ParamTree, translate_parameters
 from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.blocks import TokenEmbedding
-from dew.nn.conv import Conv
 from dew.nn.dense import Dense
-from dew.nn.flops import matching_lengths, patch_lengths
 from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
@@ -80,17 +78,6 @@ TOWER_ACTIVATIONS = {"quick_gelu": "quick_gelu", "gelu_pytorch_tanh": "gelu", "g
 (`dew.nn.activations.UNGATED`): torch's erf GELU for 'gelu'."""
 
 
-def checked_image(pixel_values, channels: int, size: int) -> jax.Array:
-    """NCHW `pixel_values` as an array, refused unless they are the `channels` x `size` x `size`
-    images a fixed-size tower's checkpoint was trained with."""
-    pixel_values = jnp.asarray(pixel_values)
-    expected = (channels, size, size)
-    if pixel_values.ndim != 4 or pixel_values.shape[1:] != expected:
-        raise ValueError(f"pixel_values of {'x'.join(map(str, pixel_values.shape[1:]))} are not the "
-                         f"{'x'.join(map(str, expected))} this checkpoint was trained with")
-    return pixel_values
-
-
 def tower_activation(hidden_act: str) -> str:
     """The feed-forward activation a tower's `hidden_act` names (`TOWER_ACTIVATIONS`); any other
     name is refused."""
@@ -101,11 +88,13 @@ def tower_activation(hidden_act: str) -> str:
 
 
 def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: bool = False,
-               activation: str = "quick_gelu", eps: float = 1e-5, rotary_axes: tuple[int, ...] | None = None,
+               activation: str | Callable[[jax.Array], jax.Array] = "quick_gelu", eps: float = 1e-5,
+               rotary_axes: tuple[int, ...] | None = None,
                rotary_pairs: Literal["half", "adjacent"] = "half", rope_theta: float = 10000.0,
                packed: bool = False, kv_heads: int | None = None, head_dim: int | None = None,
                norm_type: Literal["rms", "layer", "fast_layer"] = "fast_layer", norm_bias: bool = True,
                mlp_bias: bool = True, mlp_packed: bool = False, window: int | None = None,
+               branch_scale: float | None = None,
                dtype: Dtype | None = None, precision: PrecisionLike = None,
                name: str | None = None) -> DecoderBlock:
     """One encoder layer of a text or vision tower as the decoder block runs it: CLIP's, SigLIP's,
@@ -135,7 +124,8 @@ def clip_layer(width: int, heads: int, hidden: int, positions: int, *, causal: b
         nope=rotary_axes is None, rotary_axes=rotary_axes, rotary_pairs=rotary_pairs, packed=packed)
     mlp = functools.partial(GatedMLP, hidden_features=hidden, out_features=width, activation=activation,
                             use_bias=mlp_bias, packed=mlp_packed, dtype=dtype, precision=precision)
-    return DecoderBlock(attention, mlp, width, BlockWiring(), norm_eps=eps, norm_type=norm_type,
+    return DecoderBlock(attention, mlp, width, BlockWiring(branch_scale=branch_scale),
+                        norm_eps=eps, norm_type=norm_type,
                         norm_bias=norm_bias, dtype=dtype, precision=precision, name=name)
 
 
@@ -218,7 +208,6 @@ class CLIPTextTransformer(nn.Module):
         return CLIPTowerOutput(hidden_states, hidden_states[jnp.arange(batch), index], tuple(states))
 
 
-@logical_axes({("patch_embedding",): (None, None, None, "embed"), ("position_embedding",): (None, "embed")})
 class CLIPVisionTransformer(nn.Module):
     """The vision tower of CLIP, param layout and defaults of `CLIPVisionConfig`.
 
@@ -241,60 +230,46 @@ class CLIPVisionTransformer(nn.Module):
     activation: str = "quick_gelu"
 
     @nn.nowrap
-    def _layer(self, name=None):
-        patches = (self.image_size // self.patch_size) ** 2
-        return clip_layer(self.hidden_size, self.num_heads, self.intermediate_size, patches + 1,
-                          activation=tower_activation(self.activation), eps=self.layer_norm_eps,
-                          dtype=self.dtype, precision=self.precision, name=name)
+    def layout(self):
+        from dew.nn.vision.vit import LearnedPositions, SpecialTokens, ViTLayout
+
+        return ViTLayout(
+            depth=self.num_layers, hidden_size=self.hidden_size, num_heads=self.num_heads,
+            num_kv_heads=self.num_heads, head_dim=self.hidden_size // self.num_heads,
+            intermediate_size=self.intermediate_size, activation=tower_activation(self.activation),
+            in_channels=self.num_channels, patch_size=self.patch_size, temporal_patch_size=1,
+            spatial_merge_size=1, norm_type="fast_layer", norm_eps=self.layer_norm_eps, norm_bias=True,
+            mlp_bias=True, packed=False, patch_bias=False, attention=("full",) * self.num_layers,
+            order=("patches",) * self.num_layers, sinks=(False,) * self.num_layers,
+            positions=LearnedPositions(self.image_size // self.patch_size, "fixed"),
+            special_tokens=SpecialTokens("first", initializer=nn.initializers.normal(
+                self.hidden_size ** -0.5)),
+            patch_projection="conv", image_size=self.image_size, rotary=None, pre_norm=True,
+            post_norm="layer", post_norm_scope="class", outer_norm_eps=self.layer_norm_eps,
+            merge_blocks=False)
 
     @nn.nowrap
-    def _patch_embedding(self, **scope):
-        return Conv(self.hidden_size, (self.patch_size, self.patch_size),
-                    strides=(self.patch_size, self.patch_size), padding="VALID", use_bias=False,
-                    dtype=self.dtype, precision=self.precision, **scope)
+    def _trunk(self):
+        from dew.nn.vision.vit import VisionTransformer
+
+        return VisionTransformer(self.layout(), dtype=self.dtype, precision=self.precision)
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """The patch map and full-attention layers over patches and the class token."""
-        length, = matching_lengths(lengths)
-        return (self._patch_embedding(parent=None).model_flops(lengths, self.num_channels)
-                + self.num_layers * self._layer().model_flops((length + 1).astype(np.int64)))
+        return self._trunk().model_flops(lengths)
 
     @nn.nowrap
     def image_lengths(self, sample_shape: tuple[int, ...], rows: int) -> np.ndarray:
-        return patch_lengths(sample_shape, (self.patch_size, self.patch_size), rows)
+        return self._trunk().image_lengths(sample_shape, rows)
 
     def setup(self):
-        patches = (self.image_size // self.patch_size) ** 2
-        self.class_embedding = self.param(
-            "class_embedding", nn.initializers.normal(self.hidden_size ** -0.5),
-            (self.hidden_size,))
-        self.patch_embedding = self._patch_embedding(name="patch_embedding")
-        self.position_embedding = TokenEmbedding(patches + 1, self.hidden_size,
-                                           dtype=self.dtype, name="position_embedding")
-        norm = functools.partial(LayerNorm, epsilon=self.layer_norm_eps,
-                                 dtype=self.dtype)
-        self.pre_layernorm = norm(name="pre_layernorm")
-        self.layers = [
-            self._layer(name=f"layers_{index}")
-            for index in range(self.num_layers)]
-        self.post_layernorm = norm(name="post_layernorm")
+        self.trunk = self._trunk()
+        nn.share_scope(self, self.trunk)
 
     def __call__(self, pixel_values) -> CLIPTowerOutput:
-        pixel_values = checked_image(pixel_values, self.num_channels, self.image_size)
-        batch = pixel_values.shape[0]
-        # torch convolves channels first; Conv takes them last.
-        patches = self.patch_embedding(jnp.transpose(pixel_values, (0, 2, 3, 1)))
-        patches = patches.reshape(batch, -1, self.hidden_size)
-        class_token = jnp.broadcast_to(self.class_embedding.astype(patches.dtype),
-                                       (batch, 1, self.hidden_size))
-        hidden_states = jnp.concatenate([class_token, patches], axis=1)
-        hidden_states = hidden_states + self.position_embedding(
-            jnp.arange(hidden_states.shape[1]))
-        hidden_states = self.pre_layernorm(hidden_states)
-        for layer in self.layers:
-            hidden_states = layer(hidden_states)
-        return CLIPTowerOutput(hidden_states, self.post_layernorm(hidden_states[:, 0]))
+        sequence, pooled = self.trunk.sequence_and_pool(pixel_values)
+        return CLIPTowerOutput(sequence, pooled)
 
 
 @logical_axes({("text_projection",): ("embed", "output"), ("visual_projection",): ("embed", "output")})
@@ -413,15 +388,15 @@ _TEXT_TENSORS = {
     "final_layer_norm.bias": ("final_layer_norm", "bias"),
 }
 _VISION_TENSORS = {
-    "embeddings.class_embedding": ("class_embedding",),
-    "embeddings.patch_embedding.weight": ("patch_embedding", "kernel"),
-    "embeddings.position_embedding.weight": ("position_embedding", "embedding"),
-    "pre_layrnorm.weight": ("pre_layernorm", "scale"),
-    "pre_layrnorm.bias": ("pre_layernorm", "bias"),
-    "post_layernorm.weight": ("post_layernorm", "scale"),
-    "post_layernorm.bias": ("post_layernorm", "bias"),
+    "embeddings.class_embedding": ("class_token",),
+    "embeddings.patch_embedding.weight": ("patch_embed", "kernel"),
+    "embeddings.position_embedding.weight": ("position_table", "embedding"),
+    "pre_layrnorm.weight": ("pre_norm", "scale"),
+    "pre_layrnorm.bias": ("pre_norm", "bias"),
+    "post_layernorm.weight": ("post_norm", "scale"),
+    "post_layernorm.bias": ("post_norm", "bias"),
 }
-_TOWERS = {"text_model": _TEXT_TENSORS, "vision_model": _VISION_TENSORS}
+_TOWERS = {"text_model": (_TEXT_TENSORS, "layers"), "vision_model": (_VISION_TENSORS, "blocks")}
 _HEADS = {
     "text_projection.weight": ("text_projection", "kernel"),
     "visual_projection.weight": ("visual_projection", "kernel"),
@@ -432,7 +407,8 @@ _BESIDE_THE_TEXT_TOWER = ("vision_model.", "visual_projection.", "text_projectio
 
 
 def _encoder_layer_path(parts, root: str, norms: Mapping[str, str] = _NORMS,
-                        projections: Mapping[str, str] = _PROJECTIONS) -> tuple[str, ...] | None:
+                        projections: Mapping[str, str] = _PROJECTIONS, *,
+                        block: str = "layers") -> tuple[str, ...] | None:
     """`<root>.layers.N...` into the path of a `clip_layer` (`block_tensor_path`): two layer norms,
     biased attention maps and a biased fc1/fc2 MLP, each source name mapped by `norms` or
     `projections` (CLIP's by default) or onto the MLP's up and down maps."""
@@ -440,11 +416,11 @@ def _encoder_layer_path(parts, root: str, norms: Mapping[str, str] = _NORMS,
 
     maps = {**{("self_attn", source): ("self_attn", name) for source, name in projections.items()},
             **{("mlp", source): ("mlp", name) for source, name in _MLP.items()}}
-    return block_tensor_path(parts, maps, prefix=f"{root}.layers", block="layers", norms=norms)
+    return block_tensor_path(parts, maps, prefix=f"{root}.layers", block=block, norms=norms)
 
 
 def _tower_path(hf_name: str, prefix: str,
-                tensors: Mapping[str, tuple[str, ...]]) -> tuple[str, ...] | None:
+                tensors: Mapping[str, tuple[str, ...]], block: str = "layers") -> tuple[str, ...] | None:
     """`hf_name`, a tensor of the tower nested under `prefix`, into its path in
     that tower's tree.
 
@@ -455,7 +431,7 @@ def _tower_path(hf_name: str, prefix: str,
     name = hf_name.removeprefix(prefix)
     if name == "embeddings.position_ids":
         return None
-    path = tensors.get(name) or _encoder_layer_path(name.split("."), "encoder")
+    path = tensors.get(name) or _encoder_layer_path(name.split("."), "encoder", block=block)
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
     return path
@@ -480,9 +456,9 @@ def _clip_path(hf_name: str) -> tuple[str, ...] | None:
     The logit scale is the contrastive temperature, which no forward pass here
     reads.
     """
-    for tower, tensors in _TOWERS.items():
+    for tower, (tensors, block) in _TOWERS.items():
         if hf_name.startswith(tower + "."):
-            path = _tower_path(hf_name, tower + ".", tensors)
+            path = _tower_path(hf_name, tower + ".", tensors, block)
             return None if path is None else (tower, *path)
     if hf_name in _HEADS:
         return _HEADS[hf_name]
@@ -505,33 +481,6 @@ def translate_clip_weights(
     """Full CLIP parameters, with FP32 storage unless explicitly requested otherwise."""
     return translate_parameters(hf_tensors, _clip_path, param_dtype)
 
-
-def check_tree(variables: Mapping[str, object], module: nn.Module, *inputs) -> None:
-    """Refuse variables the module would not accept, naming what is off.
-
-    Every collection `init` returns is held to account, so a routed model
-    whose checkpoint lacks its balancing bias fails here too. `inputs` are
-    what `init` is called with, arrays or `jax.ShapeDtypeStruct`s;
-    `jax.eval_shape` builds the template from shapes alone, so checking a
-    checkpoint costs no second copy of its weights.
-    """
-    def shapes(tree) -> dict[str, tuple[int, ...]]:
-        return {jax.tree_util.keystr(path, simple=True, separator="."): np.shape(leaf)
-                for path, leaf in jax.tree_util.tree_leaves_with_path(tree)}
-
-    expected = shapes(jax.eval_shape(module.init, jax.random.key(0), *inputs))
-    loaded = shapes(dict(variables))
-
-    missing = sorted(set(expected) - set(loaded))
-    unexpected = sorted(set(loaded) - set(expected))
-    mismatched = sorted(
-        f"{name} is {loaded[name]}, the module takes {shape}"
-        for name, shape in expected.items()
-        if name in loaded and loaded[name] != shape)
-    if missing or unexpected or mismatched:
-        raise ValueError(
-            f"the checkpoint does not fit the model: missing {missing}, "
-            f"unexpected {unexpected}, mismatched {mismatched}")
 
 
 def bind_text_tower[Tower: nn.Module](

@@ -49,13 +49,6 @@ class TowerLayout:
         return self.read(hf_tensors, self.path, param_dtype)
 
 
-def in_params(path: Callable[[str], tuple[str, ...] | None]) -> Callable[[str], tuple[str, ...] | None]:
-    """`path`, whose leaves are parameters, rooted at `params`."""
-    def rooted(name: str) -> tuple[str, ...] | None:
-        leaf = path(name)
-        return None if leaf is None else ("params", *leaf)
-    return rooted
-
 
 @dataclasses.dataclass(frozen=True)
 class ProjectorLayout:
@@ -88,22 +81,11 @@ PIXEL_VALUES_KEY = "pixel_values"
 """The batch field carrying images as the checkpoint's processor emitted them."""
 
 
-class ProjectorBase:
-    """One projector kind's value: its fields, and how it builds its module.
-
-    Each kind is a frozen dataclass of the reference's field names, with an
-    alias in `dew.registry.projectors` (`"gemma"`). `build` turns the value
-    into the Flax module, and `checkpoint` says where its tensors sit. A
-    record that names no known kind raises.
-    """
+class ProjectorBase(nn.Module):
+    """A native projector module whose constructor is its record schema. The registry names
+    its kind and `checkpoint` locates the tensors it consumes."""
 
     checkpoint: ClassVar[ProjectorLayout | None] = None
-
-    def build(self) -> nn.Module:
-        """The Flax module for this value."""
-        raise NotImplementedError(
-            f"{type(self).__name__} names a projector kind but builds no module")
-
 
 def head_width(hidden_size: int, num_heads: int) -> int:
     """Each head's width where `num_heads` split a tower's `hidden_size`
@@ -201,7 +183,8 @@ def _vision_section(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     return _records.record(hf_config.get("vision_config", hf_config), "vision_config")
 
 
-def merger_projector(hf_config: Mapping[str, object], text_width: int, kind: str) -> Record:
+def merger_projector(hf_config: Mapping[str, object], text_width: int, kind: str, *,
+                     bias: bool = True) -> Record:
     """The `kind` projector record of a wrapper whose vision tower ends in its own merger
     (`out_hidden_size`, `spatial_merge_size`), as Qwen 3.5's and MiMo-V2's do: the merged
     features enter the text embeddings as they are, so a merger width beside the decoder width
@@ -211,11 +194,10 @@ def merger_projector(hf_config: Mapping[str, object], text_width: int, kind: str
     if merged != int(text_width):
         raise ValueError(f"out_hidden_size ({merged}) is not the decoder width ({text_width}), "
                          "the merger output enters the text embeddings as it is")
-    return {"class": kind, "fields": {
-        "vision_width": _records.integer(vision["hidden_size"], "hidden_size"),
-        "merge_size": _records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
-        "out_width": merged,
-    }}
+    width = _records.integer(vision["hidden_size"], "hidden_size")
+    merge = _records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size")
+    return {"class": kind, "fields": {"hidden_size": width, "spatial_merge_size": merge,
+                                      "width": width * merge ** 2, "out_width": merged, "bias": bias}}
 
 
 def _side(value: object, field: str) -> int:

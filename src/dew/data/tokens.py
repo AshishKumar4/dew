@@ -1,4 +1,4 @@
-"""Document chunk tables, packed windows and first-fit plans."""
+"""Document chunk tables, packed windows, first-fit plans and a row's shares of its room."""
 
 from __future__ import annotations
 
@@ -9,6 +9,38 @@ import grain.python as pygrain
 import numpy as np
 
 from dew.batch import Batch
+
+
+def share_tokens(lengths: Sequence[int], room: int, *, caps: Sequence[int | None] | None = None,
+                 whole: Sequence[bool] | None = None) -> list[int]:
+    """How many of its own tokens each segment of a row keeps of the row's `room`: the one allocation
+    segments that share a row read, as a decision row's copies of its state do.
+
+    A segment kept whole (`whole`) takes all of its `lengths`, past the room too, which the row's own
+    check then judges. The others share what that leaves, never below zero, each wanting its length
+    up to its cap (`caps`, None for none). Where their wants exceed it, the share is max-min within one
+    token: in a stable ascending order of want, each takes the least of its want and an equal split of
+    what is left, floored, so a floor's remainder goes to the later segments in that order ([10, 10]
+    into 7 keeps [3, 4], [100, 10, 10] into 4 keeps [2, 1, 1]). No share is below zero, the cut ones
+    sum to at most what they share, and none of it is left while a segment wants more."""
+    count = len(lengths)
+    caps = [None] * count if caps is None else list(caps)
+    whole = [False] * count if whole is None else list(whole)
+    if len(caps) != count or len(whole) != count:
+        raise ValueError(f"a cap and a whole flag for each of {count} segments, got {len(caps)} and "
+                         f"{len(whole)}")
+    cut = [at for at in range(count) if not whole[at]]
+    wants = {at: lengths[at] if (cap := caps[at]) is None else min(cap, lengths[at]) for at in cut}
+    left = max(0, room - sum(length for length, kept in zip(lengths, whole, strict=True) if kept))
+    if sum(wants.values()) <= left:
+        return [lengths[at] if whole[at] else wants[at] for at in range(count)]
+    shares = [lengths[at] if whole[at] else 0 for at in range(count)]
+    remaining = len(cut)
+    for at in sorted(cut, key=lambda at: wants[at]):
+        shares[at] = min(wants[at], left // remaining)
+        left -= shares[at]
+        remaining -= 1
+    return shares
 
 
 def chunk_table(lengths, chunk_len: int, overlap: int) -> tuple[np.ndarray, np.ndarray]:

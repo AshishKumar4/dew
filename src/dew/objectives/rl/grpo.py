@@ -362,8 +362,7 @@ class GRPOObjective(TokenScorer):
     def _validation_scores(self, params, batch, step):
         """The prompts' NLL with the per-token scores it is the mean of."""
         scores = self._evaluation_scores(params, batch, step)
-        return Ratio(self.row_mean(scores.losses * scores.weights, batch).total,
-                     self.row_mean(scores.weights, batch).total), scores
+        return self.row_mean(scores.losses, batch, weights=scores.weights), scores
 
     def _evaluation_scores(self, params, batch, step) -> TokenScores:
         """The prompts' per-token scores.

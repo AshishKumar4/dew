@@ -5,27 +5,19 @@ token across two marks both's; and a published slot release's prompt as a layout
 81ce62f, rendered as its engine renders them), its options' spans the lines its runtime pools, its
 answer at its last token, and its state cut only where its segments say."""
 
+import dataclasses
 import json
 from pathlib import Path
 from typing import Literal
 
 import pytest
 
+from dew._records import JSON
 from dew.data.text import ByteTokenizer, HFTokenizer
 from dew.decision import Choice, Noul, Question, Score
-from dew.decision.layout import (
-    LETTERS,
-    AnswerCue,
-    Framing,
-    Instructions,
-    Labels,
-    OptionLines,
-    QuestionLayout,
-    Specials,
-    State,
-    Text,
-)
+from dew.decision.layout import LETTERS, AnswerCue, Framing, Labels, QuestionLayout, Specials, State, Text
 from dew.decision.renderer import Chunk, render
+from dew.decision.slot_source import SLOT_LABELS, SLOT_SYSTEM, SlotSource
 
 QWEN = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
 """Qwen3.5's ChatML template, with its thinking switch, over a tiny vocabulary of bytes and Qwen's
@@ -35,37 +27,11 @@ LAYA = Path(__file__).parent / "fixtures" / "laya" / "tiny" / "tokenizer"
 ELEPHANT, ELEPHANT_REVISION = "baselabs/elephant-1", "b3f8a93462fb1051a9de031e94a7ff380e254072"
 """The slot release whose tokenizer spells every one of its labels as one token."""
 
-SLOT_SYSTEM = ("Apply the question to the state. Choose exactly one of the listed options. Respond with only "
-               "its uppercase letter, with no explanation or reasoning.")
-NOT_ONE_TOKEN = frozenset(["BQ", "BZ", "CJ", "CQ", "CZ", "DQ", "DZ", "EJ", "EY", "FJ", "FQ", "FV", "FZ",
-                           "GJ", "GK", "GQ", "GZ", "HJ", "IY", "JF", "JG", "JH", "JL", "JN", "JQ"])
-SLOT_LABELS = (*LETTERS, *[first + second for first in LETTERS for second in LETTERS
-                           if first + second not in NOT_ONE_TOKEN][:256 - 26])
-"""The release's 256 labels (qev/prompt.py `SLOT_LABELS`): A to Z, then the pairs its tokenizer spells
-as one token."""
-
-
 RELEASE_LABELS = Labels(variants=("{}",), names=SLOT_LABELS)
 """The release's labels, each read as its bare self (OneJev engine.py `_verify_slots`)."""
 
 
-def release(*, max_len: int = 32768, keep: Literal["start", "end", "all"] = "all") -> QuestionLayout:
-    """The slot release's prompt, as values: its system message, a tagged state, the question under its
-    kind's header, its options as lettered lines, and its cue, framed with thinking off, encoded whole."""
-    return QuestionLayout(
-        max_len=max_len, labels=RELEASE_LABELS, unit="whole",
-        framing=Framing(system=SLOT_SYSTEM, prefill="", thinking=False),
-        segments=(Text("<state>\n"), State(render="state", keep=keep), Text("\n</state>\n\n"),
-                  Instructions({"choice": "Question: {}", "noul": "Question: {}",
-                                "score": "Rate the state: {}"}, render="entry",
-                               defaults={"choice": "Which option applies to the state?",
-                                         "score": "Which level describes the state?",
-                                         "noul": ("Is the statement true, or is the answer to the question "
-                                                  "yes?")}),
-                  Text("\n\nOptions:\n"),
-                  OptionLines(criteria={"true": "the statement is true / the answer is yes",
-                                        "false": "the statement is false / the answer is no"}),
-                  Text("\n\n"), AnswerCue()))
+release = SlotSource.layout
 
 
 SPECIALS = Specials(begin=None, separator=0, marker=1, marker_text="\x01", pad=0)
@@ -323,3 +289,60 @@ def test_a_whole_row_over_a_vocabulary_without_offsets_is_refused():
 
     with pytest.raises(TypeError):
         release(max_len=1024).rows(Plain(), SPECIALS, STATE, {"team": TEAM})
+
+
+def test_a_whole_copy_over_its_cap_lays_out_whole():
+    """A copy kept whole is never cut, its cap aside: a row it fits lays it out whole (row 1616)."""
+    layout = QuestionLayout(max_len=1 << 12, labels=Labels(variants=("{}",)), unit="whole",
+                            segments=(Text("S:"), State(render="state", keep="all", max_tokens=1),
+                                      Text("\n"), *(release().segments or ())[-5:]))
+    [row] = layout.rows(ByteTokenizer(), SPECIALS, "whole", {"team": TEAM})
+    assert "S:whole\n" in ByteTokenizer().decode(list(row.tokens))
+    assert (row.state_tokens, row.state_kept) == (5, 5)
+
+
+@pytest.mark.parametrize("unit", ["pieces", "whole"])
+def test_a_question_row_holds_the_state_twice_each_copy_its_own_render_and_budget(qwen, unit):
+    """A question row may hold the state more than once, each copy rendered and cut on its own: one its
+    text's first 12 tokens, one its compact JSON's last 9, the row's kept count its least-kept copy's
+    share, under either unit."""
+    layout = release()
+    state: JSON = {"note": "charged twice this month"}
+    segments = (Text("<state>\n"), State(render="state", max_tokens=12), Text("\n</state>\n<tail>"),
+                State(render="compact", keep="end", max_tokens=9), Text("</tail>\n\n"),
+                *(segment for segment in layout.segments or () if not isinstance(segment, (State, Text))))
+    segments = (*segments[:5], segments[5], Text("\n\nOptions:\n"), segments[6], Text("\n\n"), segments[7])
+    twice = QuestionLayout(max_len=1 << 16, labels=layout.labels, unit=unit, framing=layout.framing,
+                           segments=segments)
+    [row] = twice.rows(qwen, SPECIALS, state, {"team": TEAM})
+    text = qwen.decode(list(row.tokens))
+    indented = json.dumps(state, ensure_ascii=False, indent=2)
+    compact = json.dumps(state, ensure_ascii=False, separators=(",", ":"), sort_keys=True)
+    assert "<state>\n" + indented[:12] + "\n</state>" in text
+    assert "<tail>" + compact[-9:] + "</tail>" in text
+    shares = [(len(indented), 12), (len(compact), 9)]
+    assert (row.state_tokens, row.state_kept) == min(shares, key=lambda pair: pair[1] / pair[0])
+
+
+@pytest.mark.parametrize("keep", ["start", "end"])
+def test_a_capped_copy_keeps_whole_characters_within_its_cap(keep):
+    """Encoded whole, a copy cut inside a character of several tokens keeps the character whole or not
+    at all, its own encoding within its cap: a cap of one byte keeps no two-byte character."""
+    layout = QuestionLayout(max_len=1 << 12, labels=Labels(variants=("{}",)), unit="whole",
+                            segments=(Text("S:"), State(render="state", keep=keep, max_tokens=1),
+                                      Text("\n"), *(release().segments or ())[-5:]))
+    [row] = layout.rows(ByteTokenizer(), SPECIALS, "éé", {"team": TEAM})
+    text = ByteTokenizer().decode(list(row.tokens))
+    assert "S:\n" in text and (row.state_tokens, row.state_kept) == (4, 0)
+
+
+def test_a_cut_takes_the_longest_state_a_merge_lets_fit():
+    """Encoded whole, a cut keeps the longest state that fits, past the share counted: where a state
+    token merges with the text before it, keeping it costs the row no token, and the cut keeps it."""
+    laya = HFTokenizer(str(LAYA), local_files_only=True)
+    segments = (Text("n"), State(render="state"), Text("\n"), *(release().segments or ())[-5:])
+    empty = QuestionLayout(max_len=1 << 12, labels=Labels(variants=("{}",)), unit="whole", segments=segments)
+    [bare] = empty.rows(laya, SPECIALS, "", {"team": TEAM})
+    tight = dataclasses.replace(empty, max_len=len(bare.tokens))
+    [row] = tight.rows(laya, SPECIALS, "ta", {"team": TEAM})
+    assert tight.fits(row) and row.state_kept >= 1

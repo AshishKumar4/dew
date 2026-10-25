@@ -10,7 +10,7 @@ the `xl` reference's noise, and returns its latents. The
 StableDiffusionXLImg2ImgPipeline refiner takes those latents as `image`
 with `denoising_start=0.5`, which adds no noise and walks the steps below
 the same cutoff, and returns its latents and its decoded images. Both run
-in float32 and in float64 (`diffusers_wan_reference.float64` for the
+in float32 and in float64 (`torch_precision.float64` for the
 models, `diffusers_wan_reference.float64_scheduler` for the DDIM
 tables, built in float64).
 
@@ -31,7 +31,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tools.diffusers_reference_helpers import restore_transformers_names
-from tools.diffusers_wan_reference import float64, float64_scheduler
+from tools.diffusers_wan_reference import float64_scheduler
+from tools.torch_precision import float64
 
 restore_transformers_names()
 

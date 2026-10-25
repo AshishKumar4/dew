@@ -395,7 +395,7 @@ class JointSchemaHead(Head):
                  train: bool = False, spanned: jax.Array | None = None) -> jax.Array:
         """The `[B, Q, K]` logits of each question's options over the row's final `states`. Where the
         questions' spans are in the row's context (`DecisionInputs.spans_in_context`), `spanned` are
-        the backbone's final states over the context (`DecisionModel.context_states`), which the
+        the backbone's final states over the context (`dew.nn.cross_attention.encode_context`), which the
         questions and options are pooled from, their tokens the context's; the memory every option
         and field reads, and the readout, are the row's either way."""
         if table is None:
@@ -594,14 +594,14 @@ class SlotReadout(Head):
         if held < labels:
             raise ValueError(f"{held} slot rows hold fewer than the {labels} labels")
         real = min(width, labels)
-        ids = jnp.asarray(self.label_ids, jnp.int32)
+        ids = np.asarray(self.label_ids, np.int32)
         drawn_dtype = _wide(jnp.float32 if table is None else table.dtype, self.dtype)
 
         def drawn(key):
             if table is None:
                 rows = jax.random.normal(key, (labels, self.features), drawn_dtype) * self.features ** -0.5
             else:
-                rows = jnp.take(table, ids, axis=0).astype(drawn_dtype)
+                rows = table.take(ids, axis=0).astype(drawn_dtype)
             return jnp.pad(rows, ((0, held - labels), (0, 0)))
 
         slots = self.param("slots", drawn)

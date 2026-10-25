@@ -50,8 +50,6 @@ def _inner(eqn, index: int):
     operand itself; else None."""
     name = eqn.primitive.name
     inner = eqn.params.get("jaxpr", eqn.params.get("call_jaxpr"))
-    if isinstance(inner, core.ClosedJaxpr):
-        inner = inner.jaxpr
     if inner is None or name not in (*_PASSED_THROUGH, "scan") or index >= len(inner.invars):
         return None
     # A scan's constants and carries are read by every iteration, whose

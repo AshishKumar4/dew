@@ -19,7 +19,7 @@ computes for a clip's frames, each encoded as its own image:
 Every draw is the standard normal JAX's `jax.random.normal` gives Dew's
 encoder for the same key and shape (KEY, channels last), handed to
 Diffusers through its `randn_tensor`, so the two sample from one draw. Each
-is recorded in float32 and float64 (`diffusers_wan_reference.widened`), the
+is recorded in float32 and float64 (`torch_precision.widened`), the
 truth tests/reference_error.py measures both from.
 
 Run with the Dew test environment's torch, diffusers and jax, on CPU:
@@ -36,8 +36,8 @@ import numpy as np
 import torch
 from diffusers import AutoencoderKL
 from diffusers.models.autoencoders import vae as diffusers_vae
-from diffusers_wan_reference import widened
 from reference_source import saved_fixture
+from torch_precision import widened
 
 ROOT = Path(__file__).resolve().parents[1]
 TINY = ROOT / "tests" / "fixtures" / "vae" / "sd3-tiny"

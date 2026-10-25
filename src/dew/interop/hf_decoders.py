@@ -40,7 +40,7 @@ from dew import _records
 from dew._model_types import QWEN35_TEXT_TYPES, QWEN35_TYPES
 from dew.batch import Variables
 from dew.files import write_atomically
-from dew.interop.config_records import NativeFields
+from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_families import ENTRIES
 from dew.interop.decoder_parts import (
     NO_AUDIO,
@@ -49,7 +49,6 @@ from dew.interop.decoder_parts import (
     DecoderFields,
     Reading,
     WrapperFields,
-    _refuse_drafter,
     _unread,
     held_parts,
     hf_activation,
@@ -57,6 +56,7 @@ from dew.interop.decoder_parts import (
     record_float,
     record_int,
     refuse,
+    refuse_drafter,
     translated,
 )
 from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
@@ -85,7 +85,7 @@ type AttentionResidualsFields = NativeFields[AttentionResiduals]
 def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
     """Translate one registered family's config, refusing any setting Dew does not compute."""
 
-    _refuse_drafter(hf_config)
+    refuse_drafter(hf_config)
     model_type = hf_config.get('model_type')
     # A multimodal repo's config.json is a wrapper whose model_type names the
     # whole model and whose text_config holds the decoder;
@@ -211,10 +211,11 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
         slots = _records.integer(hf_config.get("audio_soft_tokens_per_image"), "audio_soft_tokens_per_image")
         if slots < 1:
             refuse("audio_soft_tokens_per_image", "Gemma 3n audio needs its fixed slot count per clip")
-        projector = {"class": "gemma3n", "fields": {**asdict(from_record(vision_nn.Gemma3nProjector, {
-            "vision_width": encoder.hidden_size, "text_width": text_width,
-            "vocab_size": audio.get("vocab_size", 128), "vocab_offset": audio.get("vocab_offset", 262272),
-            "norm_eps": encoder.rms_norm_eps}))}}
+        projector = {"class": "gemma3n", "fields": native_fields(vision_nn.Gemma3nProjector)(
+            vision_width=encoder.hidden_size, text_width=text_width,
+            vocab_size=_records.integer(audio.get("vocab_size", 128), "vocab_size"),
+            vocab_offset=_records.integer(audio.get("vocab_offset", 262272), "vocab_offset"),
+            norm_eps=encoder.rms_norm_eps)}
     return {"audio": {"class": _records.text(audio["model_type"], "audio_config model_type"), "fields": {
                       **asdict(encoder)}},
             "audio_token_id": _wrapper_token_id(hf_config, used, "audio_token_id"),

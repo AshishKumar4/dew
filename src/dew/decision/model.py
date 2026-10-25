@@ -1,7 +1,7 @@
 """A backbone and a decision head, applied as two modules over one variables tree."""
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 import jax
 import jax.numpy as jnp
@@ -9,11 +9,11 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype
 
-from dew.batch import Variables, coordinates, part, thaw
+from dew.batch import Variables, part, thaw
 from dew.decision.head import Head
 from dew.decision.layout import DecisionInputs
-from dew.nn.cross_attention import crosses_alone
-from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs
+from dew.nn.cross_attention import ContextEncoder, encode_context
+from dew.nn.inputs import CONTEXT, ModelInputs
 from dew.nn.protocols import (
     CrossAttending,
     HiddenStates,
@@ -23,6 +23,7 @@ from dew.nn.protocols import (
     VocabularyRows,
     head_table,
 )
+from dew.objectives.base import joined
 
 
 @dataclass(frozen=True)
@@ -42,11 +43,45 @@ class DecisionModel:
 
     backbone: nn.Module
     head: Head
+    context_encoder: ContextEncoder = "table"
+    """How a row's context becomes the states its cross-attention reads (`encode_context`): `table`, its
+    tokens through the backbone's own embedding table, or `backbone`, the backbone's final states over
+    it in a pass of its own, as a schema read in context always is."""
 
     def __post_init__(self):
         if not isinstance(self.backbone, HiddenStates):
             raise TypeError(f"a decision head reads its backbone's final states (`HiddenStates`), "
                             f"which a {type(self.backbone).__name__} does not give")
+
+    def initialize_head(self, key: jax.Array, backbone: Variables, tokens: jax.Array) -> Variables:
+        """Draw the head over a held backbone, at `tokens`' shape, without running the backbone.
+
+        Readouts draw from its output table or vocabulary rows as their own contract declares;
+        a tied readout has no local parameters. The token values are only initialization geometry.
+        """
+        head = self.head
+        states = jnp.zeros((*tokens.shape, getattr(head, head.width_field)), jnp.float32)
+        one = jnp.ones((tokens.shape[0], 1), bool)
+        inputs = DecisionInputs(
+            tokens=tokens,
+            segments=jnp.ones_like(tokens),
+            kinds=jnp.zeros((tokens.shape[0], 1), jnp.int32),
+            questions=one,
+            spans=jnp.broadcast_to(jnp.asarray([[[0, 1]]]), (*one.shape, 2)),
+            option_spans=jnp.broadcast_to(jnp.asarray([[[[0, 1]]]]), (*one.shape, 1, 2)),
+            options=one[..., None],
+        )
+        variables = joined({"backbone": backbone})
+        if head.reads_labels:
+            inputs = replace(inputs, readout=jnp.zeros(one.shape, jnp.int32))
+            gives_rows = isinstance(self.backbone, VocabularyRows)
+            table = (self.output_table(variables) if not head.draws_from_rows
+                     else self.table(variables) if gives_rows else None)
+            labels = head.tied_labels()
+            tied = None if labels is None else jnp.zeros((*one.shape, 1, len(labels[0])), jnp.float32)
+            return head.init(key, states, inputs, table, tied=tied)
+        table = self.table(variables) if head.reads_table else None
+        return head.init(key, states, inputs, table)
 
     def states(self, variables: Variables, inputs: DecisionInputs, *, media: ModelInputs | None = None,
                train: bool = False, rngs: dict[str, jax.Array] | None = None) -> jax.Array:
@@ -58,7 +93,7 @@ class DecisionModel:
         context (`DecisionInputs.context`) hand the backbone's cross-attention
         each row's context, embedded by the backbone's own table (`token_embeddings`),
         or, where the context holds the schema (`DecisionInputs.spans_in_context`),
-        the backbone's own final states over it (`context_states`).
+        the backbone's own final states over it (`encode_context`).
         """
         return self._read(variables, inputs, media=media, train=train, rngs=rngs)[0]
 
@@ -72,10 +107,17 @@ class DecisionModel:
         blocked: dict[str, jax.Array] = {} if inputs.blocks is None else {"block_groups": inputs.blocks}
         spanned = conditioning = None
         if inputs.context is not None:
-            # The context's own pass where it holds the schema, else the backbone's token table.
-            spanned = (self.context_states(variables, inputs, train=train, rngs=rngs)
-                       if inputs.spans_in_context else None)
-            conditioning = self.conditioning(backbone, inputs, spanned)
+            if self.context_length is None:
+                raise TypeError(f"rows carry a context, which a {type(self.backbone).__name__} without "
+                                "cross-attention layers does not read")
+            assert inputs.context_lengths is not None, "a row's context comes with its length"
+            # The context's own pass where it holds the schema, whose spans the head pools from that
+            # same pass, else as the model encodes it.
+            conditioning = encode_context(
+                self.backbone, part(variables, "backbone"), inputs.context, inputs.context_lengths,
+                encoder="backbone" if inputs.spans_in_context else self.context_encoder, train=train,
+                rngs=rngs)
+            spanned = conditioning[CONTEXT] if inputs.spans_in_context else None
         if media is not None:
             if inputs.slots is not None:
                 raise ValueError("a row of option positions holds no images")
@@ -108,24 +150,6 @@ class DecisionModel:
                                           attention_key_positions=inputs.positions, method="hidden_states",
                                           conditioning=conditioning, rngs=rngs)), spanned
 
-    def context_states(self, variables: Variables, inputs: DecisionInputs, *, train: bool = False,
-                       rngs: dict[str, jax.Array] | None = None) -> jax.Array:
-        """The backbone's `[B, C, features]` final states over each row's context, its real tokens a
-        document of their own: the same backbone and weights as the row's pass, an adapter's
-        included, read without a context of its own. Where the backbone trains nothing but its
-        cross-attention blocks, which a pass without a context runs none of, the pass trains
-        nothing, and its gradient is not taken."""
-        backbone = thaw(part(variables, "backbone"))
-        assert inputs.context is not None and inputs.context_lengths is not None
-        real = jnp.arange(inputs.context.shape[1])[None, :] < inputs.context_lengths[:, None]
-        laid = coordinates(segments=real.astype(jnp.int32), max_segments=1, right_padded=True)
-        states = _array(self.backbone.apply(backbone, inputs.context, train=train, coordinates=laid,
-                                            method="hidden_states", rngs=rngs))
-        trained = variables.get("params", {}).get("backbone", {})
-        return jax.lax.stop_gradient(states) if crosses_alone(trained) else states
-
-
-
     @property
     def context_length(self) -> int | None:
         """The most context tokens a row carries: the backbone's cross-attention's (`CrossAttending`),
@@ -134,28 +158,15 @@ class DecisionModel:
             return None
         return self.backbone.cross_attention.context_length
 
-    def conditioning(self, backbone: Variables, inputs: DecisionInputs,
-                     states: jax.Array | None = None) -> dict[str, jax.Array]:
-        """The conditioning a backbone's cross-attention reads for rows that carry a context: each
-        row's context as `states`, its own pass's where given (`context_states`), else its tokens
-        embedded by the backbone's own table (`token_embeddings`), at the width and dtype its blocks
-        take them in (`CrossAttending`), and how many are real."""
-        if self.context_length is None:
-            raise TypeError(f"rows carry a context, which a {type(self.backbone).__name__} without "
-                            "cross-attention layers does not read")
-        assert isinstance(self.backbone, CrossAttending)
-        assert inputs.context_lengths is not None, "a row's context comes with its length"
-        context = (self.backbone.apply(backbone, inputs.context, method="token_embeddings") if states is None
-                   else states)
-        return {CONTEXT: jnp.asarray(context, self.backbone.context_dtype),
-                CONTEXT_LENGTHS: inputs.context_lengths}
-
-    def table(self, variables: Variables) -> jax.Array:
+    def table(self, variables: Variables) -> jax.Array | np.ndarray:
         """Return the backbone's head as `[V, D]` rows (`VocabularyRows`), which a head may read."""
         if not isinstance(self.backbone, VocabularyRows):
             raise TypeError(f"the head reads its backbone's vocabulary rows (`VocabularyRows`), which a "
                             f"{type(self.backbone).__name__} does not give")
-        return jnp.asarray(self.backbone.apply(thaw(part(variables, "backbone")), method="vocabulary_rows"))
+        rows = self.backbone.apply(thaw(part(variables, "backbone")), method="vocabulary_rows")
+        if not isinstance(rows, (jax.Array, np.ndarray)):
+            raise TypeError(f"vocabulary_rows must return an array, got {type(rows).__name__}")
+        return rows
 
     @staticmethod
     def head_size(backbone: nn.Module) -> tuple[int, Dtype | None]:

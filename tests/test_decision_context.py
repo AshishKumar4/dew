@@ -27,7 +27,7 @@ from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.questions import ChoiceAnswer
 from dew.interop import Pretrained
-from dew.nn.cross_attention import CrossAttention, crossing
+from dew.nn.cross_attention import ContextEncoder, CrossAttention, crossing
 from dew.nn.multimodal import MultimodalTransformer
 from dew.training import Trainer
 
@@ -35,14 +35,14 @@ pytestmark = pytest.mark.mesh
 
 LLAMA = Path(__file__).parent / "fixtures" / "hf" / "llama-tiny"
 
-ROWS = [("one two three", "a", "a first note, longer than a short context holds"),
+ROWS = [("one two three", "a", "a first note, longer than most"),
         ("four five", "b", None),
         ("six seven eight nine", "c", "a second note of some length"),
         ("ten eleven", "a", "third"),
         ("twelve thirteen", "b", "a fourth note"),
         ("fourteen", "c", None)] * 4
-"""States, their option, and a note a decision may read beside the state: none for some, and some
-longer than a short context holds."""
+"""States, their option, and a note a decision may read beside the state: none for some, each within
+`conditioned`'s context."""
 
 
 SPECIALS = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
@@ -57,12 +57,13 @@ CONTEXT_SEEDS = 8
 with the batch as `dew_fn`, 2026-10-23 on armada, both arms without YNNPACK's fusions)."""
 
 
-def conditioned(length: int = 16, layers: tuple[int, ...] = (0, 1)) -> DecisionObjective:
+def conditioned(length: int = 32, layers: tuple[int, ...] = (0, 1),
+                encoder: ContextEncoder = "table") -> DecisionObjective:
     """A decision over the tiny Llama with fresh cross-attention before `layers`, its context up to
-    `length` tokens, its rows laid out by bytes."""
+    `length` tokens and encoded as `encoder` says, its rows laid out by bytes."""
     source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
     return DecisionObjective(source.with_cross_attention(CrossAttention(layers, length), key=0),
-                             tokenizer=ByteTokenizer(), specials=SPECIALS)
+                             tokenizer=ByteTokenizer(), specials=SPECIALS, context_encoder=encoder)
 
 
 def examples() -> list[Example]:
@@ -133,8 +134,8 @@ def test_a_backbone_with_fresh_context_layers_scores_every_row_as_its_source_doe
     frozen."""
     source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
     plain = DecisionObjective(source, tokenizer=ByteTokenizer(), specials=SPECIALS)
-    crossed = conditioned(8, (0,))
-    assert crossed.context_length == 8 and plain.context_length is None
+    crossed = conditioned(32, (0,))
+    assert crossed.context_length == 32 and plain.context_length is None
     assert crossed.variables is not None
     trained = jax.tree_util.tree_leaves_with_path(crossed.variables["params"]["backbone"])
     assert trained and all(crossing(tuple(entry.key for entry in path)) for path, _ in trained)
@@ -222,7 +223,7 @@ def test_a_batch_answers_each_request_from_its_own_context():
     scores), each request's rows exactly its lone call's; and in one pass of four, each request's every
     option logit is on par from float64 with its pass alone (check 1), so each row reads its own
     context and not a neighbour's."""
-    objective = conditioned(16, (0, 1))
+    objective = conditioned(32, (0, 1))
     variables = opened(objective.init(jax.random.key(0)))
     task = Decide(objective.model, variables, objective.layout, objective.tokenizer, objective.specials)
     answers = [task("one two three", QUESTION, context=context)["pick"]
@@ -285,7 +286,7 @@ def test_a_request_with_images_reads_its_context_beside_them():
     source = Pretrained.load(directory, dtype="float32", attention_impl="xla")
     tokenizer = HFTokenizer(str(directory), local_files_only=True)
     layout = JointLayout(max_len=1024)
-    objective = DecisionObjective(source.with_cross_attention(CrossAttention((0,), 16), key=0),
+    objective = DecisionObjective(source.with_cross_attention(CrossAttention((0,), 32), key=0),
                                   tokenizer=tokenizer, layout=layout)
     variables = objective.init(jax.random.key(0))
     images = [Image.fromarray(array) for array in np.load(directory / "images.npy")]
@@ -309,3 +310,86 @@ def test_a_request_with_images_reads_its_context_beside_them():
     reading = task(opened(variables))
     assert not np.array_equal(scored(reading, [("one two three", "a first note")], images),
                               scored(reading, [("one two three", "ten")], images))
+
+
+def test_a_backbone_encoded_context_is_the_backbones_own_pass_over_it():
+    """With `context_encoder="backbone"` the cross-attention reads the backbone's final states over the
+    context, its own pass (`encode_context`): the decision states are the backbone's over the row with
+    that conditioning, exactly; they differ from the table encoder's, both read the same weights, and
+    the encoder rides the task's settings, so a reload reads its context the same way."""
+    from dew.decision.task import DecideSettings
+    from dew.inference.tasks import saved_settings
+    from dew.nn.cross_attention import encode_context
+    from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS
+
+    table, encoded = conditioned(32, (0, 1)), conditioned(32, (0, 1), "backbone")
+    assert encoded.model.context_encoder == "backbone" and table.model.context_encoder == "table"
+    variables = opened(encoded.init(jax.random.key(0)))
+    tasks = [Decide(objective.model, variables, objective.layout, objective.tokenizer, objective.specials)
+             for objective in (table, encoded)]
+    rows = tasks[1].rows([("one two three", QUESTION)], contexts=["a first note"])[0]
+    inputs = DecisionInputs.collate(rows, SPECIALS.pad, context_length=32)
+    states = [np.asarray(task.model.states(variables, inputs)) for task in tasks]
+    model = encoded.model
+    backbone = {name: value["backbone"] for name, value in variables.items() if "backbone" in value}
+    context = encode_context(model.backbone, backbone, inputs.context, inputs.context_lengths,
+                             encoder="backbone")[CONTEXT]
+    direct = model.backbone.apply(backbone, inputs.tokens, coordinates=inputs.coordinates(),
+                                  conditioning={CONTEXT: context.astype(model.backbone.context_dtype),
+                                                CONTEXT_LENGTHS: inputs.context_lengths},
+                                  method="hidden_states")
+    np.testing.assert_array_equal(states[1], np.asarray(direct))
+    assert not np.array_equal(states[0], states[1])
+    settings = encoded.task_settings()
+    assert settings.context_encoder == "backbone"
+    record = {name: getattr(settings, name) for name in ("head", "layout", "specials", "tokenizer",
+                                                          "processor", "context_encoder")}
+    assert saved_settings(record, DecideSettings).context_encoder == "backbone"
+    del record["context_encoder"]
+    assert saved_settings(record, DecideSettings).context_encoder == "table"
+    assert DecisionObjective(tasks[1]).model.context_encoder == "backbone"
+
+
+def test_a_context_its_cross_attention_cannot_hold_is_refused_never_cut():
+    """A context of more tokens than the cross-attention reads is refused, by a task and over the wire
+    (ValueError, which a server turns into the request's own refusal), and refuses a run's data where
+    its fitting reads the record; one of exactly that many is read whole."""
+    from dew.decision.objective import Fit
+
+    objective = conditioned(16, (0,))
+    task = Decide(objective.model, objective.init(jax.random.key(0)), objective.layout, objective.tokenizer,
+                  objective.specials)
+    exact, over = "x" * 16, "x" * 17
+    [row] = task._encoded("one two", QUESTION, context=exact)
+    assert row.context is not None and len(row.context) == 16
+    with pytest.raises(ValueError):
+        task("one two", QUESTION, context=over)
+    wire = {"pick": {"type": "choice", "instructions": "Which one?", "criteria": ["a", "b", "c"]}}
+    [refused] = task.systemone([{"state": "one two", "questions": wire, "context": over}])
+    assert isinstance(refused, ValueError)
+    fit = Fit(objective.layout, objective.tokenizer, objective.specials, objective.model.head,
+              objective.context_length)
+    assert not isinstance(fit.map({"example": Example("one two", QUESTION, {"pick": "a"}, context=exact)}),
+                          type(None))
+    with pytest.raises(ValueError):
+        fit.map({"example": Example("one two", QUESTION, {"pick": "a"}, context=over)})
+
+
+def test_the_batched_engine_reads_a_requests_context():
+    """The batched engine (`WireScoring`) reads a request's context, as `Decide` does: each answer's
+    probabilities those of the task's own call with that context, to the bit, the one program; under
+    `strict` the context is dropped, as Jev's fields alone are read."""
+    objective = conditioned(32, (0, 1))
+    variables = opened(objective.init(jax.random.key(0)))
+    task = Decide(objective.model, variables, objective.layout, objective.tokenizer, objective.specials)
+    wire = {"pick": {"type": "choice", "instructions": "Which one?", "criteria": ["a", "b", "c"]}}
+    bodies = [{"state": "one two three", "questions": wire, "context": "a first note"},
+              {"state": "one two three", "questions": wire}]
+    answers = task.systemone(bodies)
+    for body, answer in zip(bodies, answers, strict=True):
+        alone = task.systemone(body)
+        assert isinstance(answer, dict) and answer["answers"] == alone["answers"]
+    with_context, without = answers
+    assert isinstance(with_context, dict) and isinstance(without, dict)
+    assert with_context["answers"] != without["answers"]
+    assert task._read_wire(bodies[0], strict=True)[3] is None

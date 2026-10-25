@@ -145,7 +145,7 @@ their names in tools/mla_reference.py."""
 def reference_block(name: str, wide: bool = False):
     """The fixture's transformers block and rotary embedding, its weights the fixture's; built in
     float64, every float32 pin widened (`float64`), where `wide`."""
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     fields, config, block, rotary = (getattr(GENERATOR, part) for part in REFERENCE[name])
     weights = {key: torch.from_numpy(value) for key, value in fixture(name).items()
@@ -161,7 +161,7 @@ def reference_walk(name: str, wide: bool = False):
     """The reference block as a function of a draw `(hidden, cotangent)`, run in float32, or in
     float64 where `wide` (the truth): its output and the hidden states' gradient under the drawn
     cotangent (`torch_with_gradients`)."""
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     block, rotary = reference_block(name, wide)
 
@@ -241,7 +241,7 @@ def test_yarn_matches_the_reference_derivation():
     frequencies, the cos/sin amplitude and the query scale exactly (as computed, the same float32 and
     Python arithmetic), and cos and sin at drawn positions on par with the reference's float32 from
     its float64 run (check 1)."""
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     yarn = yarn_of(CONFIG["v3"])
     _, rotary = reference_block("mla_v3")
@@ -270,14 +270,20 @@ def test_yarn_matches_the_reference_derivation():
                     truth_fn=lambda positions: reference(positions, wide_run=True))
 
 
-def test_yarn_rotates_whole_heads_and_refuses_a_partial_rotary():
-    """YaRN ramps a whole head's frequencies, so the rope refuses a narrower rotated width beside it
-    under either partial convention."""
+def test_yarn_over_a_partial_rotary_ramps_the_rotated_width_and_refuses_a_proportional_one():
+    """YaRN ramps the rotated width: a 'default' partial rotary of 8 of a head's 16 dims rotates as a
+    whole head of 8 does, the reference's `dim = head_dim * partial_rotary_factor`, bit for bit, while
+    a proportional one, which has no YaRN form, is refused."""
     yarn = yarn_of(CONFIG["v3"])
-    for convention in ("proportional", "default"):
-        with pytest.raises(ValueError):
-            rotary_freqs(jnp.arange(4), 8, 10000.0, rot_dim=4, partial_rotary_type=convention,
-                         rope_scaling=yarn, dtype=np.float32)
+    positions = jnp.arange(0, 4096 * 40, 997)
+    whole = rotary_freqs(positions, 8, 10000.0, rope_scaling=yarn, dtype=np.float32)
+    partial = rotary_freqs(positions, 16, 10000.0, rot_dim=8, partial_rotary_type="default",
+                           rope_scaling=yarn, dtype=np.float32)
+    for ours, theirs in zip(partial, whole, strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    with pytest.raises(ValueError):
+        rotary_freqs(positions, 16, 10000.0, rot_dim=8, partial_rotary_type="proportional",
+                     rope_scaling=yarn, dtype=np.float32)
 
 
 def decode_loop(module, variables, tokens):

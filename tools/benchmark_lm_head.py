@@ -114,7 +114,8 @@ def fused(states, table, targets, variant: Variant):
 @functools.partial(jax.custom_vjp, nondiff_argnums=(1,))
 def _read_by_tiles(states, tiles: int):
     """`states` once for each of `tiles` vocabulary tiles, their cotangents summed as Dew sums a
-    loop's terms (`added_to`): in one rounding on a CPU, where the whole head's one product is."""
+    loop's terms (`added_to`): in one rounding on a CPU under Dew's wide arithmetic
+    (`dew.nn.precision.WIDE_CPU_ARITHMETIC`), where the whole head's one product is."""
     return (states,) * tiles
 
 

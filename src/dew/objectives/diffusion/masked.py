@@ -139,13 +139,6 @@ class MaskedDiffusionObjective(Objective[Ratio]):
                               tokenizer=recorded_tokenizer(self.processor),
                               processor=recorded_processor(self.processor))
 
-    def build_task(self, variables: Variables, *,
-                   processor: Processor | None | Omitted = OMITTED) -> MaskedGeneration:
-        """Return the model over `variables` as a full-response MDLM task, with this
-        objective's solver, steps and row length as its budget, as `task_settings` saves them."""
-        return MaskedGeneration.from_settings(self.model, variables, self.task_settings(),
-                                              self.processor if processor is OMITTED else processor)
-
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
 
@@ -172,7 +165,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         """The negative ELBO, its reports and the per-token scores, from one corruption of the batch."""
         tokens, losses, weights, counted, predicted, real = self._token_losses(params, batch, step,
                                                                                train=train)
-        nelbo = Ratio(self.row_mean(losses * weights, batch).total,
+        nelbo = Ratio(self.row_mean(losses, batch, weights=weights).total,
                       self.row_mean(real.astype(jnp.float32), batch).total)
         correct = predicted == tokens
         accuracy, _ = self.accuracy(correct.astype(losses.dtype), batch, counted).mean()

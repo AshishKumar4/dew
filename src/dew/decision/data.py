@@ -19,6 +19,17 @@ from dew.decision.questions import Choice, Question
 
 
 @dataclass(frozen=True)
+class Group:
+    """Questions of one example that ask the same thing (negated, paraphrased, its options re-ordered),
+    named `name`: `members` maps each one's every option key onto a canonical key the members share,
+    so a consistency term (`DecisionObjective.consistency`) can hold their answers to one distribution
+    over the canonical keys."""
+
+    name: str
+    members: Mapping[str, Mapping[str, str]]
+
+
+@dataclass(frozen=True)
 class Example:
     """One state, its questions, and the right answer to some of them.
 
@@ -31,6 +42,9 @@ class Example:
     `context` is a sequence the decision reads beside its state, through the
     backbone's cross-attention layers (`DecisionObjective`'s context), rendered
     as text; None, or a backbone without those layers, reads none.
+
+    `groups` name questions that ask the same thing (`Group`), each question in
+    one at most; an objective without a consistency term reads none.
     """
 
     state: JSON
@@ -38,6 +52,7 @@ class Example:
     answers: Mapping[str, str | int] = field(default_factory=dict)
     targets: Mapping[str, tuple[float, ...]] = field(default_factory=dict)
     context: JSON | None = None
+    groups: tuple[Group, ...] = ()
 
     def __post_init__(self):
         _asked(self.questions, [*self.answers, *self.targets])
@@ -53,6 +68,25 @@ class Example:
                     f"targets.{name} is a distribution over the question's {count} options, "
                     f"got {list(target)}"
                 )
+        grouped: set[str] = set()
+        for group in self.groups:
+            _asked(self.questions, list(group.members))
+            if len(group.members) < 2:
+                raise ValueError(f"group {group.name!r} holds {len(group.members)} question; a group "
+                                 "holds two or more")
+            if grouped & set(group.members):
+                raise ValueError(f"questions {sorted(grouped & set(group.members))} stand in two groups")
+            grouped |= set(group.members)
+            canonical = None
+            for name, mapped in group.members.items():
+                if set(mapped) != set(self.questions[name].options):
+                    raise ValueError(f"group {group.name!r} maps question {name!r}'s options "
+                                     f"{sorted(mapped)}, not its {list(self.questions[name].options)}")
+                keys = set(mapped.values())
+                if canonical is not None and keys != canonical:
+                    raise ValueError(f"group {group.name!r}'s members map onto other canonical keys: "
+                                     f"{sorted(canonical)} and {sorted(keys)}")
+                canonical = keys
 
     @classmethod
     def of(cls, row: "Example | Mapping[str, object]") -> "Example":
@@ -82,7 +116,13 @@ class Example:
             targets[name] = _distribution(questions[name], json_value(target, where), where)
         context = row.get("context")
         return cls(json_value(row.get("state"), "state"), questions, answers, targets,
-                   None if context is None else json_value(context, "context"))
+                   None if context is None else json_value(context, "context"),
+                   groups_of(json_value(row.get("groups"), "groups")))
+
+    def group_of(self, name: str) -> tuple[int, Group] | None:
+        """The index and group question `name` stands in, or None."""
+        return next(((index, group) for index, group in enumerate(self.groups) if name in group.members),
+                    None)
 
     def labels(self) -> dict[str, int]:
         """Return each answered question's right option, as an index: a target's most likely one."""
@@ -99,6 +139,20 @@ class Example:
             return target / target.sum()
         return np.eye(len(self.questions[name].options))[self.labels()[name]]
 
+
+def groups_of(value: JSON) -> tuple[Group, ...]:
+    """A row's `groups`, as `Example.groups` holds them: a mapping of each group's name to its members,
+    each member's option keys mapped to canonical keys, or None for none."""
+    if value is None:
+        return ()
+    groups = []
+    for name, members in record(value, "groups").items():
+        mapped = {}
+        for question, options in record(members, f"groups.{name}").items():
+            mapped[question] = {key: _records.text(canonical, f"groups.{name}.{question}.{key}")
+                                for key, canonical in record(options, f"groups.{name}.{question}").items()}
+        groups.append(Group(name, mapped))
+    return tuple(groups)
 
 def _asked(questions: Mapping[str, Question], named: Iterable[str]) -> None:
     """Refuse an answer or a target to a question the example does not ask."""
@@ -150,7 +204,9 @@ class ParseTable:
     option by key, or by index where it is an int; where the options are the
     label column's own values (`by_value`), every label names its option by
     value, an int one included. A `context` column's value is the example's
-    context (`Example.context`), none where the column holds None."""
+    context (`Example.context`), none where the column holds None. A row's
+    `groups` field reaches the example as `Example.of` reads it, so a group
+    over the row's one question is refused as any group of one member is."""
 
     options: tuple[str, ...]
     text: str = "text"
@@ -175,6 +231,7 @@ class ParseTable:
                 {self.question: question},
                 {self.question: str(label) if self.by_value else _label(label)},
                 context=None if context is None or column is None else json_value(context, column),
+                groups=groups_of(json_value(row.get("groups"), "groups")),
             )
         }
 
