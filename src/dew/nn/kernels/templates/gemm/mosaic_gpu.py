@@ -113,7 +113,7 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
       call's width in its column unit, which reads its rows' slice fewest times a FLOP (each instruction
       reads the columns' block whole) and writes its output in the longest runs.
     - Consumers: as many roles as the family has (`Family.consumers`), a warpgroup each, or one where
-      rows a tile must divide (not grouped) take no whole role for each.
+      rows a tile must divide (not grouped) take no whole role for each, or where no tile of them holds.
     - Rows: the most, in whole roles of its consumers, its consumers' registers hold
       (`mosaic.held_rows`, `mosaic.tile_registers`), and no more than the call's rows rounded up to a
       role's or, where grouped, half a group's in whole roles, at least one role (each group takes a
@@ -132,29 +132,35 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
     widest = min(width, family.widest_product or width)
     columns = [block_n for block_n in range(widest - widest % unit, 0, -unit) if width % block_n == 0]
     steps = [step for step in family.depths(dtype) if depth is None or depth % step == 0]
-    # Rows a tile divides (a kernel gradient's) that take no whole role for each consumer take one.
-    consumers = family.consumers if grouped or rows % (family.role_rows * family.consumers) == 0 else 1
-    role = family.role_rows * consumers
-    most_rows = max(role, rows // 2 // role * role if grouped else -(-rows // role) * role)
     busy = 2 + (0 if family.operands_in_registers else _IN_FLIGHT)
-    fallback = None
-    for block_n in columns:
-        for block_m in range(min(most_rows, mosaic.held_rows(family, consumers, block_n)), 0, -role):
-            band = mosaic.band(multiprocessors, block_m, block_n, width // block_n,
-                               -(-rows // block_m) if grouped else None)
-            # More rows before a deeper step: each reads the columns' block fewer times a FLOP, where a
-            # step's depth only sets how many steps a tile takes (and, in registers, its fragments').
-            for step in steps:
-                tile = mosaic.deepest(
-                    lambda stages, block_m=block_m, block_n=block_n, step=step, band=band: Tiles(
-                        block_m, block_n, step, stages, band, warpgroups=consumers, family=family.name),
-                    holds, family.most_shared // ((block_m + block_n) * step))
-                if tile is None:
-                    continue
-                if tile.stages >= busy:
-                    return tile
-                fallback = fallback or tile
-    return fallback
+
+    def tiled(consumers: int) -> Tiles | None:
+        role = family.role_rows * consumers
+        most_rows = max(role, rows // 2 // role * role if grouped else -(-rows // role) * role)
+        fallback = None
+        for block_n in columns:
+            for block_m in range(min(most_rows, mosaic.held_rows(family, consumers, block_n)), 0, -role):
+                band = mosaic.band(multiprocessors, block_m, block_n, width // block_n,
+                                   -(-rows // block_m) if grouped else None)
+                # More rows before a deeper step: each reads the columns' block fewer times a FLOP, where
+                # a step's depth only sets how many steps a tile takes (and, in registers, its fragments').
+                for step in steps:
+                    tile = mosaic.deepest(
+                        lambda stages, block_m=block_m, block_n=block_n, step=step, band=band: Tiles(
+                            block_m, block_n, step, stages, band, warpgroups=consumers, family=family.name),
+                        holds, family.most_shared // ((block_m + block_n) * step))
+                    if tile is None:
+                        continue
+                    if tile.stages >= busy:
+                        return tile
+                    fallback = fallback or tile
+        return fallback
+
+    # Rows a tile divides (a kernel gradient's) that take no whole role for each consumer take one, as
+    # does a call no cooperative tile holds (a wide epilogue's outputs past a block).
+    whole = grouped or rows % (family.role_rows * family.consumers) == 0
+    return next((tile for consumers in dict.fromkeys((family.consumers if whole else 1, 1))
+                 if (tile := tiled(consumers)) is not None), None)
 
 
 @dataclasses.dataclass(frozen=True)

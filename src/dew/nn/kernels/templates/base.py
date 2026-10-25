@@ -96,8 +96,17 @@ class Template[Config: Hashable](tuning.KernelOp):
         return tuple(config for config in self.space(ba) if self.legal(ba, config, target))
 
     def pinnable(self, ba: tokamax.BoundArguments, config: Hashable) -> bool:
-        # Any legal config of the launch's type: a pin is the caller's, its legality the template's.
-        return self._typed(config) and self.legal(ba, config, generation.gpu_target())
+        # A generating launch's pin may name any legal config of its type; a fixed space's, one of the
+        # configs it keeps (`fitting`), whose space and fitting state what its legality alone does not.
+        target = generation.gpu_target()
+        if not self._typed(config):
+            return False
+        if self.GENERATES:
+            return self.legal(ba, config, target)
+        try:
+            return config in self.fitting(ba, target)
+        except Unfitted:
+            return False
 
     def _typed(self, config: Hashable) -> TypeGuard[Config]:
         """Whether `config` is of the launch's config type (`config_cls`)."""
@@ -121,8 +130,9 @@ class Template[Config: Hashable](tuning.KernelOp):
         return fits
 
     def unpinnable(self, ba: tokamax.BoundArguments, config: Hashable) -> str:
-        """Why `config` is not legal for `ba` (`legal`): holding more registers than a thread does, or
-        staging more shared memory than a block of the GPU holds, or no config of the launch's type."""
+        """Why `config` is no pin for `ba` (`pinnable`): no config of the launch's type, holding more
+        registers than a thread does, staging more shared memory than a block of the GPU holds, or
+        outside what the launch's kernel takes (its legality's other rules, or a fixed space)."""
         if not self._typed(config):
             return f"it is no {self.config_cls.__name__}"
         registers, budget = self.registers(ba, config) or 0, self.register_budget(config)
@@ -130,8 +140,10 @@ class Template[Config: Hashable](tuning.KernelOp):
             return f"its threads hold {registers} registers live, past the {budget} a thread has"
         target = generation.gpu_target()
         staged = self.staged_bytes(ba, config, target)
-        return (f"its programs stage {staged} bytes of shared memory, past the "
-                f"{generation.shared_budget(target)} a block of {target.generation} holds")
+        if staged > generation.shared_budget(target):
+            return (f"its programs stage {staged} bytes of shared memory, past the "
+                    f"{generation.shared_budget(target)} a block of {target.generation} holds")
+        return "its blocks, ring or schedule are not ones the launch's kernel takes for this call"
 
     def estimate(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[float, Config]:
         """The seconds `cost` estimates for the launch on `target` and its config: its generated one

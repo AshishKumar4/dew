@@ -256,6 +256,13 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
         # A CPU interprets mma.sync's tiles at any JAX; lowered for the GPU, they need its layout inference.
         pytest.skip("this JAX's layout inference places no mma.sync tile but its 128x256 (STAGING_SOLVED)")
     cases = _gemm_mainloop_cases(generation_name)
+    # Every form the generation's family runs derives a tile at these shapes: an eligibility regression
+    # fails here rather than leaving the gate fewer cases.
+    forms = {"forward", "input gradient"}
+    if generation.gpu_target(generation_name).wgmma:
+        forms |= {"kernel gradient", "kernel gradient exact fp32", "normed biased forward",
+                  "normed kernel gradient"}
+    assert {case.name.split(" Tiles(")[0] for case in cases} == forms
     found = compile_mosaic_kernels(cases, generation_name)
     unreported = [record["name"] for record in found if not record.get("kernels")]
     assert len(found) == len(cases) and not unreported, unreported
@@ -305,6 +312,8 @@ def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
     if not cases:
         assert generation.gpu_target(tpu).scoped_vmem is None
         pytest.skip(f"no measurement states {tpu}'s scoped VMEM, which the TPU launches fit their blocks to")
+    forms = {"forward", "input gradient", "kernel gradient"}
+    assert {case.name.split(" Blocks(")[0] for case in cases} == forms
     found = compile_tpu_kernels(cases, tpu)
     failed = [f"{record['name']}: {record['error']}" for record in found if "error" in record]
     assert not failed, "\n".join(failed)
