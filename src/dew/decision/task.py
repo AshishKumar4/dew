@@ -73,7 +73,7 @@ if TYPE_CHECKING:
     from jax.sharding import Mesh
 
     from dew.decision.objective import DecisionObjective
-    from dew.training.distributed import Layout as Placement, MeshSpec
+    from dew.distributed.placement import Layout as Placement, MeshSpec
 
 TASK_FILE = "decide.json"
 """The file `Decide.save` writes into a run: its calibration, budget and name."""
@@ -543,7 +543,7 @@ class Decide:
         there every process calls it.
         """
         from dew.decision.scoring import default_metrics
-        from dew.training.distributed import MeshSpec
+        from dew.distributed.placement import MeshSpec
         from dew.training.evaluation import Evaluation
 
         chosen = list(metrics) or default_metrics()

@@ -343,7 +343,7 @@ def placed(batch, mesh):
     import jax
     import numpy as np
 
-    from dew.training.distributed import batch_shardings
+    from dew.distributed.placement import batch_shardings
 
     def put(leaf, sharding):
         array = np.asarray(leaf)

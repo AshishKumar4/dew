@@ -29,13 +29,13 @@ import pytest
 from model_support import largest_difference
 
 from dew.checkpoints import Checkpoints
+from dew.distributed.placement import Layout, MeshSpec, shard_batch
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.state import TrainState
-from dew.training.distributed import Layout, MeshSpec, shard_batch
 from dew.training.transaction import write_back
 
 SHAPES = {

@@ -27,8 +27,9 @@ from dew.data import Loading, Rejected, from_grain, mix
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader, mapped
 from dew.data.readers import _Host
+from dew.distributed.placement import DevicePrefetchIterator, batch_signature, shard_batch
 from dew.training import Checkpoints, MeshSpec, Trainer
-from dew.training.distributed import DevicePrefetchIterator, batch_signature, shard_batch, step_reads
+from dew.training.distributed import step_reads
 
 
 class Source:

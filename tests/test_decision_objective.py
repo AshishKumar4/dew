@@ -161,8 +161,8 @@ def test_a_held_pass_packs_its_rows_and_scores_every_row_once():
     and the pass's log loss is the mean of its questions'."""
     from test_decision_packing import alone, owners, rows_of
 
+    from dew.distributed.placement import MeshSpec
     from dew.objectives.base import Step
-    from dew.training.distributed import MeshSpec
     from dew.training.evaluation import Evaluation
 
     layout = replace(LAYOUT, max_len=192)

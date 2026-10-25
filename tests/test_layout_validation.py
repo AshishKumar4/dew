@@ -19,11 +19,12 @@ from token_support import repeated_token_batch, token_rows
 
 from dew.config import OptimConfig
 from dew.data.dataset import Loader
+from dew.distributed.placement import placed_shapes
 from dew.mesh import DEFAULT_RULES, LayoutRefused, mesh_axes
 from dew.objectives.lm import LMObjective
 from dew.registry import models
 from dew.training import Layout, MeshSpec, Trainer
-from dew.training.distributed import STEP_BATCH, placed_shapes
+from dew.training.distributed import STEP_BATCH
 
 pytestmark = pytest.mark.mesh
 
