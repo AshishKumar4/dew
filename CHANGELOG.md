@@ -5,6 +5,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- Every token objective runs its vocabulary head by one policy (`dew.objectives.lm.head.HeadedObjective`):
+  the masked- and block-diffusion objectives take `head_chunks` and `head_tile` as an LM's, keep the whole
+  logits where they fit, and the fit ladder tiles them where they do not, where they scored a fixed
+  1024 x 8192 tile before; GRPO's evaluation scores at its own tile. `head_cross_entropy` takes the tile it
+  scores in, with no default.
 - MuonClip clips the attention of whatever objective a run trains, or refuses it: a run whose optimizer
   holds a QK-Clip (`dew.optim.clips_qk`, its state a `QKClipState`) asks its objective for the step's
   attention logit maxima (`Step.qk_stats`), so a masked-diffusion run clips as an LM, RL or preference

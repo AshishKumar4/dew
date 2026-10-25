@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import math
 from collections.abc import Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import jax
 import jax.numpy as jnp
@@ -46,7 +46,8 @@ from dew.objectives.base import (
     model_rngs,
     thaw,
 )
-from dew.objectives.lm.chunked import head_cross_entropy, model_logits
+from dew.objectives.lm.chunked import model_logits
+from dew.objectives.lm.head import HeadedObjective
 
 if TYPE_CHECKING:
     from dew.inference.tasks import Processor
@@ -119,7 +120,7 @@ def _row_losses(losses: jax.Array, mask: jax.Array, batch: Batch) -> Ratio:
                               batch)
 
 
-class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
+class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
     """Fine-tunes DiffusionGemma on clean ``text`` rows split into a prompt and canvases.
 
     A row has ``prompt_length + canvas_size * num_canvases`` tokens. ``text``
@@ -137,13 +138,14 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
     `model` may be the loaded SFT source, and `variables` and `processor`
     override its own (`Objective.bind_model`).
 
-    Both cross entropies score the final states through the bounded head
-    (`dew.objectives.lm.chunked.head_cross_entropy`), `head_chunks`
-    vocabulary tiles at a time. The backward pass therefore never holds
-    vocabulary-sized fp32 logits or the softmax of a whole row, unless an
-    adapter on the head leaves no matrix to tile. The one place a full row
-    of logits always exists is the first denoising pass, whose logits
-    condition the second pass and receive no gradient.
+    Both cross entropies score the final states through the head by the one
+    policy every token objective takes (`dew.objectives.lm.head`, `head_chunks`
+    and `head_tile` as an LM's): its whole logits kept where they fit, and
+    tiled where the fit ladder moves it, whose backward then holds no
+    vocabulary-sized fp32 logits, unless an adapter on the head leaves no
+    matrix to tile. The one place a full row of logits always exists is the
+    first denoising pass, whose logits condition the second pass and receive
+    no gradient.
     """
 
     saved_task = BlockGeneration
@@ -156,6 +158,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                  stop_gradient_from_denoiser_to_encoder: bool = False,
                  encoder_loss_weight: float = 1.0, decoder_loss_weight: float = 1.0,
                  ema_decay: float | None = None, head_chunks: int = 4,
+                 head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
                  processor: Processor | None | Omitted = OMITTED):
         model = self.bind_model(model, variables=variables, processor=processor)
         if not (isinstance(model, BlockDenoiser) and isinstance(model, LayerScalars)):
@@ -198,7 +201,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         self.decoder_loss_weight = decoder_loss_weight
         self.inputs = InputSpec(sample=Field("text", (self.sequence_length,)))
         self.ema = EMASpec.constant(ema_decay)
-        self.head_chunks = head_chunks
+        self.use_head(head_chunks, head_tile)
 
     def data(self, tokenizer=None):
         from dew.data.pipeline import ObjectiveData
@@ -258,8 +261,8 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         return {**moved, "params": pretrained["params"], FROZEN: moved["params"]}
 
     def program_key(self) -> tuple[ProgramModule, ...]:
-        """The model the losses run, sized to the SFT sequence, trained."""
-        return (ProgramModule(self.training_model, None, trained=True),)
+        """The model the losses run, sized to the SFT sequence, trained, with its head."""
+        return (self.head_program(self.training_model),)
 
     def substitute(self, modules: Sequence[nn.Module]) -> None:
         (trained,) = modules
@@ -455,11 +458,9 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         target_mask = canvas_mask & chosen
         if text_slots is not None:
             target_mask &= text_slots[:, self.prompt_length:]
-        canvas_losses, predicted, _ = head_cross_entropy(model, params, states, response, self.head_chunks,
-                                                         predict=not train)
+        canvas_losses, predicted, _ = self.head_terms(model, params, states, response, predict=not train)
         shifted, encoder_target_mask = self._encoder_targets(batch, tokens, validity, full_valid, text_slots)
-        encoder_losses, _, _ = head_cross_entropy(model, params, encoder_states, shifted, self.head_chunks,
-                                                  predict=False)
+        encoder_losses, _, _ = self.head_terms(model, params, encoder_states, shifted, predict=False)
         correct = None if predicted is None else predicted == response
         return canvas_losses, target_mask, encoder_losses, encoder_target_mask, correct
 

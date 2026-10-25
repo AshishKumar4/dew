@@ -27,6 +27,7 @@ from dew.interop.diffusion_gemma import translate_weights
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import FROZEN, Step, freeze, select
 from dew.objectives.diffusion.block import BlockDiffusionObjective
+from dew.objectives.lm.chunked import chunked_tile
 from dew.training import MeshSpec
 from dew.training.transaction import example_fields
 
@@ -61,6 +62,19 @@ def objective(loaded, *, variables=None, **kwargs):
     values = loaded.variables if variables is None else variables
     return BlockDiffusionObjective(loaded.model, prompt_length=4, num_canvases=2,
                                    variables=values, **kwargs)
+
+
+def test_the_block_objectives_head_takes_the_fit_ladders_tile():
+    """The block objective runs its head by the policy every token objective takes
+    (`dew.objectives.lm.head`): it keeps the whole logits until the fit ladder tiles it, and its program
+    reports the tile, which a resumed run restores."""
+    loaded, *_ = loaded_source()
+    built = objective(loaded)
+    assert built.program_key()[0].head_tile is None
+    assert built.tile_head() is not None and built.program_key()[0].head_tile == chunked_tile()
+    resumed = objective(loaded)
+    resumed.restore_head(chunked_tile(), fused=False)
+    assert [module[1:] for module in resumed.program_key()] == [module[1:] for module in built.program_key()]
 
 
 def reference_variables(loaded, name):

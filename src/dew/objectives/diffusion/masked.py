@@ -8,8 +8,9 @@ is the cross entropy at the masked positions, under a distribution that
 gives the mask token no mass (MDLM's SUBS parameterization), weighted by
 the process's NELBO weight and averaged over every position of the batch.
 That average is the continuous-time negative ELBO the paper trains. The
-cross entropy is the LM objective's chunked one, which holds one vocabulary
-slice of logits at a time where the head is a matrix.
+cross entropy runs the head by the one policy every token objective takes
+(`dew.objectives.lm.head`): its whole logits kept where they fit, tiled where
+the fit ladder moves it.
 
 Evaluation scores every row's corruption loss as `TokenScores`, so
 perplexity-style metrics read the negative ELBO; the preview hook alone
@@ -24,7 +25,7 @@ compilation rather than a constant embedded in the executable.
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Literal
 
 import jax
 import jax.numpy as jnp
@@ -40,7 +41,6 @@ from dew.objectives.base import (
     OMITTED,
     Aux,
     EMASpec,
-    Objective,
     Omitted,
     Ratio,
     Shown,
@@ -50,7 +50,8 @@ from dew.objectives.base import (
     model_rngs,
     thaw,
 )
-from dew.objectives.lm.chunked import final_read, head_cross_entropy, refuse_without_logits
+from dew.objectives.lm.chunked import final_read, refuse_without_logits
+from dew.objectives.lm.head import HeadedObjective
 from dew.objectives.lm.objective import TEXT_KEY, batch_text, text_preview
 from dew.sampling.sample import sample
 
@@ -60,11 +61,13 @@ if TYPE_CHECKING:
 _DEFAULT_SOLVER = Unmask()
 
 
-class MaskedDiffusionObjective(Objective[Ratio]):
+class MaskedDiffusionObjective(HeadedObjective[Ratio]):
     """Trains a masked diffusion model on the MDLM negative ELBO.
 
     A batch holds `[B, seq_len]` token ids under `batch["text"]`, and packed
     windows also their `text_coordinates` (`dew.nn.inputs.Coordinates`).
+    `head_chunks` and `head_tile` set how the head is scored, as an LM's
+    (`LMObjective`).
     """
 
     saved_task = MaskedGeneration
@@ -79,6 +82,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         seq_len: int,
         *,
         head_chunks: int = 4,
+        head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
         ema_decay: float | None = 0.999,
         solver: Unmask = _DEFAULT_SOLVER,
         steps: int = MDLM_STEPS,
@@ -110,7 +114,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         self.model = model
         self.process = process
         self.seq_len = seq_len
-        self.head_chunks = head_chunks
+        self.use_head(head_chunks, head_tile)
         self.solver = solver
         self.steps = steps
         self.samples = samples
@@ -234,8 +238,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         # MDLM's SUBS parameterization gives the mask token no mass: it is
         # never a target, so the partition and the prediction leave it out.
         mask_id = self.process.mask_id
-        losses, predicted, _ = head_cross_entropy(self.model, params, read, tokens, self.head_chunks,
-                                                  excluded=mask_id)
+        losses, predicted, _ = self.head_terms(self.model, params, read, tokens, excluded=mask_id)
         # A slot that holds no text scores nothing: its token may be the mask's, which the partition
         # leaves out, and its +inf times a zero weight would be NaN.
         losses = jnp.where(real, losses, 0.0)

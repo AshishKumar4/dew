@@ -167,7 +167,7 @@ export([{"text": ids[:held]}], "data/corpus-byte/val", format="array_record",
 | `ema_decay` | `None` | Decay of an EMA copy, which evaluation and previews then read. `None` keeps no copy. |
 | `pad_id` | `None` | Token ID whose targets carry no loss. |
 | `head_chunks` | `4` | Vocabulary slices the tiled head scores in. `1` is the full pass. |
-| `head_tile` | `None` | Backward tile of the head, or `'whole'` / `'tiled'`. `None` keeps the whole logits where they fit. |
+| `head_tile` | `None` | Backward tile of the head, or `'whole'` / `'tiled'`. `None` keeps the whole logits where they fit, and the fit ladder tiles them where they do not. The masked- and block-diffusion objectives take `head_chunks` and `head_tile` too: every token objective runs its head by this one policy (`dew.objectives.lm.head`). |
 | `samples` | `None` | `Samples` configuration for generated previews at evaluation. |
 | `variables` | `None` | The tree to start from instead of a fresh init, whole or split by `freeze` or an adapter. A split tree stays split, so its `params` train and its `frozen` part does not change. |
 | `loss_role` | `None` | Count only targets whose `text_roles` entry equals this `Role` (SFT). |
