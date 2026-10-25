@@ -11,7 +11,7 @@ from test_model_flops import forward_products
 
 from dew.diffusion import presets
 from dew.diffusion.process import DenoisingCondition
-from dew.distributed.placement import shard_batch
+from dew.distributed.batches import shard_batch
 from dew.inputs import Condition, Field, InputSpec
 from dew.inputs.diffusion import DiffusionConditioner, T5Segment
 from dew.inputs.encoders import CharTable, ConditionWork, T5Text

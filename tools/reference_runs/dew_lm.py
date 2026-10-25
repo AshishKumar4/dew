@@ -121,7 +121,7 @@ def build(args: argparse.Namespace) -> Run:
 
     from dew.batch import coordinates
     from dew.config import OptimConfig
-    from dew.distributed.placement import batch_shardings
+    from dew.distributed.batches import batch_shardings
     from dew.interop import Pretrained
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.multimodal import MultimodalTransformer

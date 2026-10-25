@@ -223,7 +223,7 @@ def main() -> None:
     from jax.experimental import multihost_utils
 
     from dew.data.dataset import DataPartition
-    from dew.distributed.placement import shard_batch
+    from dew.distributed.batches import shard_batch
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
     from dew.training import Layout, MeshSpec, Trainer

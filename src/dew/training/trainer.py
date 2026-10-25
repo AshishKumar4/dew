@@ -53,24 +53,27 @@ from dew.data.dataset import (
     stream_identity,
 )
 from dew.data.pipeline import Dataset, DeviceStep
-from dew.distributed.placement import (
+from dew.distributed.batches import (
     PREFETCH_DEPTH,
     DevicePrefetchIterator,
-    Layout,
-    MeshSpec,
-    Placement,
     Signature,
-    Validation,
     batch_layout,
     batch_shardings,
     batch_signature,
-    device_mesh,
-    explicit_axes,
-    placed_bytes,
-    placed_shapes,
     prefetched_bytes,
     shard_batch,
     split_fields,
+)
+from dew.distributed.placement import (
+    Layout,
+    MeshSpec,
+    Placement,
+    Validation,
+    device_mesh,
+    explicit_axes,
+    link_topology,
+    placed_bytes,
+    placed_shapes,
 )
 from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, LogicalAxes, batch_axes
 from dew.nn.flops import MissingFlopsCount
@@ -124,7 +127,6 @@ from dew.training.distributed import (
     check_stream,
     link_bandwidth,
     link_figures,
-    link_topology,
     marked,
     microbatch,
     microbatch_shapes,

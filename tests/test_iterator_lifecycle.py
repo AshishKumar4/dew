@@ -27,7 +27,7 @@ from dew.data import Loading, Rejected, from_grain, mix
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader, mapped
 from dew.data.readers import _Host
-from dew.distributed.placement import DevicePrefetchIterator, batch_signature, shard_batch
+from dew.distributed.batches import DevicePrefetchIterator, batch_signature, shard_batch
 from dew.training import Checkpoints, MeshSpec, Trainer
 from dew.training.distributed import step_reads
 
@@ -745,7 +745,7 @@ def test_a_program_that_ends_without_closing_its_prefetcher_exits_cleanly():
     program = (
         "import numpy as np\n"
         "from dew.training import MeshSpec\n"
-        "from dew.training.distributed import DevicePrefetchIterator\n"
+        "from dew.distributed.batches import DevicePrefetchIterator\n"
         "batch = {'x': np.ones((2048, 4096), np.float32)}\n"
         "def endless():\n"
         "    while True:\n"

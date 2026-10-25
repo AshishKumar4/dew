@@ -25,7 +25,7 @@ def main() -> None:
     from dew.artifacts import ImageGrid
     from dew.data.dataset import Loader
     from dew.diffusion import FlowMatchingScheduler, FlowMatchPredictionTransform, Process
-    from dew.distributed.placement import shard_batch
+    from dew.distributed.batches import shard_batch
     from dew.inputs import CharTable, Condition, Field, InputSpec
     from dew.nn.backbones.dit import SimpleDiT
     from dew.objectives.rl import FlowGRPOObjective, FlowRollout

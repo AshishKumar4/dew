@@ -11,7 +11,7 @@ from flax import linen as nn, struct
 
 from dew._coordination import agreed, from_every_process
 from dew.batch import Variables, part
-from dew.distributed.placement import shard_batch
+from dew.distributed.batches import shard_batch
 from dew.inference.tasks import Processor, TextGeneration, TextSettings
 from dew.nn.dense import Dense
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of

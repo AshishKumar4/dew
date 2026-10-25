@@ -44,7 +44,7 @@ from dew.config import OptimConfig
 from dew.data import ByteTokenizer, Memory, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
-from dew.distributed.placement import DevicePrefetchIterator, batch_shardings
+from dew.distributed.batches import DevicePrefetchIterator, batch_shardings
 from dew.inference import RunProcessor, TextGeneration
 from dew.inference.serving import Server
 from dew.mesh import logical_spec

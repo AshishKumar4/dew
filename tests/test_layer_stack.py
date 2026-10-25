@@ -24,7 +24,7 @@ from reference_error import assert_as_exact, widened, without_ynn
 from sharded import assert_sharded
 from token_support import token_rows
 
-from dew.distributed.placement import shard_batch
+from dew.distributed.batches import shard_batch
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
 from dew.nn.mlp import gaussian_cutoff

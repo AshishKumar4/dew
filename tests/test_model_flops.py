@@ -26,7 +26,7 @@ from dew.decision.head import DecisionHead, JointSchemaHead
 from dew.decision.layout import DecisionInputs, Specials, StateFirstLayout
 from dew.decision.objective import DecisionObjective
 from dew.diffusion import presets
-from dew.distributed.placement import DevicePrefetchIterator
+from dew.distributed.batches import DevicePrefetchIterator
 from dew.inputs import Field, InputSpec
 from dew.interop.hf_decoders import translate_config
 from dew.lora import LoRA

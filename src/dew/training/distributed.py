@@ -23,7 +23,8 @@ from dew._coordination import from_every_process
 from dew._records import JSON, number, record
 from dew.batch import EXAMPLE_ROWS, Batch, Variables
 from dew.data.dataset import Checkpointable, DataPartition, RampedStream, rows_of, stream_identity
-from dew.distributed.placement import Layout, Placement, Signature, device_slice
+from dew.distributed.batches import Signature
+from dew.distributed.placement import Layout, Placement, link_topology
 from dew.files import write_atomically
 from dew.mesh import STAGE_AXIS, LayoutRefused, batch_axes
 from dew.nn.sharding import microbatched
@@ -108,17 +109,6 @@ def link_bandwidth(mesh: Mesh, axis: str, size: int = 1 << 28) -> float:
         record.parent.mkdir(parents=True, exist_ok=True)
         write_atomically(record, json.dumps({"topology": topology, "bytes_per_second": received}))
     return received
-
-
-def link_topology(mesh: Mesh, axis: str) -> str:
-    """What a figure of `mesh`'s `axis` is a figure of: the axis, the mesh's axes and their widths in
-    order, and its devices in the mesh's order, each by id, process, kind and slice. A device's id is
-    its place in its system, so two meshes of one shape over other devices, or over the same devices
-    grouped otherwise along the axis, are other links; one built again over the same placement is the
-    same."""
-    devices = [[device.id, device.process_index, device.device_kind, device_slice(device)]
-               for device in mesh.devices.flat]
-    return json.dumps([axis, [[name, width] for name, width in mesh.shape.items()], devices])
 
 
 def link_figures(bandwidths: Mapping[tuple[Mesh, str], float | None]) -> dict[str, JSON]:

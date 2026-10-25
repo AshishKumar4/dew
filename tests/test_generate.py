@@ -336,7 +336,7 @@ def test_the_sampled_rows_keep_their_sharding_and_host_reads_them_back(rng):
     did not compute, and `host()` hands back the rows a process owns in
     order. Without the pinned output layout the placement would be the
     compiler's choice."""
-    from dew.distributed.placement import batch_shardings
+    from dew.distributed.batches import batch_shardings
     from dew.nn.inputs import request_axes
     from dew.training import Layout, MeshSpec
 
