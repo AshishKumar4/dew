@@ -54,12 +54,10 @@ def written(module: InContextMemory, params: dict, *, dtype, segments=None):
     gradient at its chunk's start counted from its document's first token (`segments` `[S]`, one
     document where None), and the readout at `dtype`."""
     wide = jnp.promote_types(dtype, jnp.float32)
-    p = jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype), params["params"])
     grad_net, read_net = module.network(dtype=wide), module.network(dtype=dtype)
-    initial = jax.tree.map(lambda leaf: jnp.asarray(leaf, wide), params["params"]["initial"])
     firsts = np.ones(LENGTH, bool) if segments is None else np.r_[True, segments[1:] != segments[:-1]]
 
-    def gate(name, spec, x):
+    def gate(name, spec, x, p):
         if spec is None:
             return None
         if spec.value is not None:
@@ -87,15 +85,18 @@ def written(module: InContextMemory, params: dict, *, dtype, segments=None):
 
     @jax.jit
     def run(x):
+        # Cast here, under the caller's float64 mode where the truth runs.
+        p = jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype), params["params"])
+        initial = jax.tree.map(lambda leaf: jnp.asarray(leaf, wide), params["params"]["initial"])
         x = jnp.asarray(x, dtype)
         batch = x.shape[0]
         q, k, v = ((x @ p[f"{name}_proj"]["kernel"]).reshape(batch, LENGTH, HEADS, FEATURES).astype(
             wide if name != "q" else dtype) for name in ("q", "k", "v"))
 
         def gates(row):
-            theta = gate("learning_rate", module.learning_rate, row)
-            mu = gate("momentum", module.momentum, row)
-            alpha = gate("retention", module.retention, row)
+            theta = gate("learning_rate", module.learning_rate, row, p)
+            mu = gate("momentum", module.momentum, row, p)
+            alpha = gate("retention", module.retention, row, p)
             zeros = jnp.zeros_like(theta)
             return theta, zeros if mu is None else mu, zeros if alpha is None else alpha
 
@@ -159,21 +160,25 @@ def test_packed_documents_read_as_each_alone():
 
 
 def test_a_decode_continues_the_full_pass():
-    """A prefill and then one token a call, through the cache, reads each token as the full pass
-    token by token does, bit for bit, momentum and chunk boundaries carried across the calls."""
+    """A prefill and then one token a call, through the cache, reads each token as the full pass does,
+    momentum and chunk boundaries carried across the calls: on par against float64 (check 1)."""
     module = layer("titans")
     params = module.init(jax.random.key(0), jnp.zeros((1, LENGTH, WIDTH)))
-    x = draw(1)[0]
-    full = np.asarray(module.apply(params, x, packed(np.ones((2, LENGTH), np.int32))))
-    _, cache = module.apply(params, x[:, :1], MixerCall(decode=True), mutable=["cache"])
-    reads = []
-    prefill, cache = module.apply({**params, **cache}, x[:, :6], MixerCall(decode=True), mutable=["cache"])
-    reads.append(np.asarray(prefill))
-    for t in range(6, LENGTH):
-        token, cache = module.apply({**params, **cache}, x[:, t:t + 1], MixerCall(decode=True),
-                                    mutable=["cache"])
-        reads.append(np.asarray(token))
-    np.testing.assert_array_equal(np.concatenate(reads, axis=1), full)
+    decode = MixerCall(decode=True)
+
+    @jax.jit
+    def decoded(x):
+        _, cache = module.apply(params, x[:, :1], decode, mutable=["cache"])
+        prefill, cache = module.apply({**params, **cache}, x[:, :6], decode, mutable=["cache"])
+        reads = [prefill]
+        for t in range(6, LENGTH):
+            token, cache = module.apply({**params, **cache}, x[:, t:t + 1], decode, mutable=["cache"])
+            reads.append(token)
+        return jnp.concatenate(reads, axis=1)
+
+    full = jax.jit(lambda x: module.apply(params, x, packed(np.ones((2, LENGTH), np.int32))))
+    assert_as_exact(decoded, full, draw, "decoded memory", seeds=MEMORY_SEEDS,
+                    truth_fn=written(module, params, dtype=jnp.float64))
 
 
 def test_a_zero_step_reads_the_initial_network():
