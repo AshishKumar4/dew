@@ -485,6 +485,16 @@ def test_a_network_lane_runs_the_network_marked_tests_with_the_hub_open_and_reco
     assert not hub.exists(), "the network lane reuses its own green run on the same inputs"
 
 
+def test_a_gpu_lane_names_its_files_but_with_network(ci, monkeypatch):
+    """`gpu-lane` without --tests is the network lane's alone, which runs every file holding a network-marked
+    test: a CUDA lane names its files, and one that names none is refused, not run over the network files'
+    offline tests (train 137's review)."""
+    monkeypatch.setattr(sys, "argv", ["ci.py", "gpu-lane", "--out=rows.json", "--cache=on", "--processes=1"])
+    with pytest.raises(SystemExit) as refused:
+        ci.main()
+    assert refused.value.code == 2
+
+
 LANE_TEST = ("import os, subprocess, sys, time\n"
              "from pathlib import Path\n"
              "def test_runs():\n"
