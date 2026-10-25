@@ -1033,48 +1033,67 @@ def test_a_configured_optimizer_is_optaxs_own_at_the_rate_its_state_holds(optimi
         params = optax.apply_updates(params, updates)
 
 
-def optax_schedule(name: str, multiplier: float, steps: int = 10) -> optax.Schedule:
-    """`SCHEDULES[name]` over `steps`, its rates times `multiplier`, as optax's own schedules build it,
-    the reference a scheduled rate is held to: optax's builders, and for the two schedules optax has
-    none of, lm-engine's power law and torch's one-cycle, their published formulas in optax's pieces
-    (`optax.join_schedules`). The count is the default float, float32 for the reference and float64
-    for its truth."""
+def rate_fields(name: str, multiplier: float) -> dict[str, float]:
+    """`SCHEDULES[name]`'s rate-valued fields times `multiplier`, the products in double: the values a
+    run injects, one-cycle's derived init and end resolved as torch derives them."""
     schedule, m = SCHEDULES[name], multiplier
     if isinstance(schedule, Cosine):
-        return optax.warmup_cosine_decay_schedule(schedule.init_value * m, schedule.peak_value * m,
-                                                  schedule.warmup_steps, steps, schedule.end_value * m)
+        return {"init": schedule.init_value * m, "peak": schedule.peak_value * m}
     if isinstance(schedule, Linear):
-        peak, end, start = schedule.peak_value * m, schedule.end_value * m, schedule.decay_start
-        return optax.join_schedules([optax.linear_schedule(0.0, peak, schedule.warmup_steps),
-                                     optax.constant_schedule(peak),
-                                     optax.linear_schedule(peak, end, steps - start)],
-                                    [schedule.warmup_steps, start])
+        return {"peak": schedule.peak_value * m, "end": schedule.end_value * m}
     if isinstance(schedule, Exponential):
-        decay = optax.exponential_decay(schedule.init_value * m, steps,
-                                        schedule.end_value / schedule.init_value,
-                                        end_value=schedule.end_value * m)
-        return lambda count: schedule.offset * m + decay(count)
+        return {"init": schedule.init_value * m, "end": schedule.end_value * m, "offset": schedule.offset * m}
     if isinstance(schedule, Power):
         assert schedule.tail is not None
-        peak, a = schedule.peak_value * m, schedule.a * m
-        warmup, start, tail = schedule.warmup_steps, schedule.tail.start, schedule.tail.end_value * m
+        return {"peak": schedule.peak_value * m, "a": schedule.a * m, "tail": schedule.tail.end_value * m}
+    peak = schedule.peak_value * m
+    return {"peak": peak, "init": peak / 25, "end": peak / 25 / 1e4}
+
+
+def optax_schedule(name: str, fields, steps: int = 10) -> optax.Schedule:
+    """`SCHEDULES[name]` over `steps` at the rate `fields` (`rate_fields`), as optax's own pieces build
+    it: Python floats for a float64 truth, or a run's injected values. What optax's builders branch on
+    (a cosine's floor, a decay's rate) is a ratio of the configured rates, which a multiplier leaves as
+    it is, so it stays a constant; and for the two schedules optax has none of, lm-engine's power law
+    and torch's one-cycle, their published formulas in optax's pieces (`optax.join_schedules`). The
+    count is the default float, float32 for the reference and float64 for its truth."""
+    schedule, f = SCHEDULES[name], fields
+    if isinstance(schedule, Cosine):
+        # `optax.warmup_cosine_decay_schedule`, its floor the configured fields' ratio.
+        floor = schedule.end_value / schedule.peak_value
+        return optax.join_schedules([optax.linear_schedule(f["init"], f["peak"], schedule.warmup_steps),
+                                     optax.cosine_decay_schedule(f["peak"], steps - schedule.warmup_steps,
+                                                                 alpha=floor)], [schedule.warmup_steps])
+    if isinstance(schedule, Linear):
+        start = schedule.decay_start
+        return optax.join_schedules([optax.linear_schedule(0.0, f["peak"], schedule.warmup_steps),
+                                     optax.constant_schedule(f["peak"]),
+                                     optax.linear_schedule(f["peak"], f["end"], steps - start)],
+                                    [schedule.warmup_steps, start])
+    if isinstance(schedule, Exponential):
+        decay = optax.exponential_decay(f["init"], steps, schedule.end_value / schedule.init_value,
+                                        end_value=f["end"])
+        return lambda count: f["offset"] + decay(count)
+    if isinstance(schedule, Power):
+        assert schedule.tail is not None
+        warmup, start = schedule.warmup_steps, schedule.tail.start
 
         def law(step):
             counted = jnp.asarray(step, jnp.result_type(float))
-            return jnp.minimum(peak, a * (counted * schedule.c) ** schedule.b)
-        warm = jnp.minimum(peak, a * (warmup * schedule.c) ** schedule.b)
+            return jnp.minimum(f["peak"], f["a"] * (counted * schedule.c) ** schedule.b)
+        warm = jnp.minimum(f["peak"], f["a"] * (warmup * schedule.c) ** schedule.b)
         return optax.join_schedules([optax.linear_schedule(0.0, warm, warmup),
                                      lambda count: law(count + warmup),
-                                     optax.linear_schedule(law(start), tail, steps - start)],
+                                     optax.linear_schedule(law(start), f["tail"], steps - start)],
                                     [warmup, start])
     # torch's two half cosines (`OneCycle`) as optax's cosine decays, from `init` up to the peak at
     # `rise` and down to `end` at the run's last step, where this run's phase ends fall on steps.
-    peak = schedule.peak_value * m
-    init = peak / 25
-    end = init / 1e4
     rise, last = round(schedule.warmup_fraction * steps - 1), steps - 1
-    return optax.join_schedules([optax.cosine_decay_schedule(init, rise, alpha=peak / init),
-                                 optax.cosine_decay_schedule(peak, last - rise, alpha=end / peak)], [rise])
+    configured = rate_fields(name, 1.0)
+    return optax.join_schedules([
+        optax.cosine_decay_schedule(f["init"], rise, alpha=configured["peak"] / configured["init"]),
+        optax.cosine_decay_schedule(f["peak"], last - rise, alpha=configured["end"] / configured["peak"]),
+    ], [rise])
 
 
 RATE_SEEDS = 8
@@ -1086,43 +1105,68 @@ RATE_MULTIPLIERS = 64
 
 @pytest.mark.parametrize("name", sorted(SCHEDULES))
 def test_a_scheduled_rate_is_as_near_float64_as_optaxs(name):
-    """The rate a configured optimizer reports at each of a ten-step run's updates, a group's
-    multiplier on its schedule, is on par with optax's own float32 schedule of the multiplied rates
-    (check 1, `optax_schedule`), the truth that schedule in float64: Dew holds the rate fields as
-    operands, each rounded once as optax's are, where a scale times the schedule's ratios to it
-    rounded three times and overflowed where two rates are far apart (ledger 1660). Each step's rate
-    is a leaf, over a draw's multipliers: every multiplier's state holds its group's fields
-    (`rates_of`, as a `ParamGroup`'s multiplier sets them) and steps through the one compiled update,
-    which the fields being operands makes possible."""
-    schedule, params = SCHEDULES[name], {"w": jnp.ones(3)}
+    """The rate a configured optimizer reports at each of a ten-step run's updates, its schedule's
+    rates times a multiplier, is on par with the rate optax's own form for rates set at run time
+    steps at (check 1): the rates injected as hyperparameters (`optax.inject_hyperparams`), the
+    schedule built from their values at each update (`optax_schedule`) and read as the update of a
+    unit gradient (`optax.scale_by_learning_rate`), the truth that schedule in float64. Dew holds the
+    rate fields as operands, each rounded once as optax's injected values are, where a scale times
+    the schedule's ratios to it rounded three times and overflowed where two rates are far apart
+    (ledger 1660). Against optax's schedule of Python floats, whose constants fold in double, both
+    forms sit further from float64, the cosine's 2.4 times and the linear decay's 3.5 times at worst:
+    a float32 schedule's own arithmetic on values a run sets, which every one-executable form shares
+    (the owner's exception to the gate's reference, ledger 1660). Each step's rate is a leaf over a
+    draw's multipliers; every multiplier's state holds its fields (`rates_of`, as a `ParamGroup`'s
+    multiplier sets them) and steps through the one compiled update, which the fields being operands
+    makes possible."""
+    schedule, params, unit = SCHEDULES[name], {"w": jnp.ones(3)}, {"w": jnp.ones(())}
     solver = OptimConfig(optimizer="adam", learning_rate=schedule, clip_grads=0).build(10)
     initial = solver.init(params)
     update = jax.jit(jax.vmap(solver.update, in_axes=(None, 0, None)))
 
+    def factory(init=None, peak=None, end=None, offset=None, a=None, tail=None):
+        held = {"init": init, "peak": peak, "end": end, "offset": offset, "a": a, "tail": tail}
+        return optax.scale_by_learning_rate(optax_schedule(name, {key: value for key, value in held.items()
+                                                                   if value is not None}), flip_sign=False)
+
+    injected = optax.inject_hyperparams(factory, hyperparam_dtype=jnp.float32)(**rate_fields(name, 1.0))
+    injected_state = injected.init(unit)
+    injected_update = jax.jit(jax.vmap(injected.update, in_axes=(None, 0)))
+
     def draw(seed):
         return (np.exp(np.random.default_rng(seed).uniform(-3.0, 3.0, RATE_MULTIPLIERS)),)
 
+    def batched(state, fields, held):
+        """`state` once for each multiplier, its rate fields at `fields`' values where `held` names them."""
+        def at(path, leaf):
+            name_at = held(path)
+            if name_at is not None:
+                return jnp.asarray([values[name_at] for values in fields], leaf.dtype)
+            return jnp.broadcast_to(leaf, (len(fields), *jnp.shape(leaf)))
+        return jax.tree_util.tree_map_with_path(at, state)
+
     def dew(multipliers):
         fields = [rates_of(schedule, float(multiplier)) for multiplier in multipliers]
-
-        def at(path, leaf):
-            if len(path) >= 2 and path[-2] == jax.tree_util.GetAttrKey("rates"):
-                return jnp.asarray([held[path[-1].key] for held in fields], leaf.dtype)
-            return jnp.broadcast_to(leaf, (len(fields), *jnp.shape(leaf)))
-
-        state, rates = jax.tree_util.tree_map_with_path(at, initial), {}
+        state = batched(initial, fields, lambda path: path[-1].key if len(path) >= 2 and path[-2] == (
+            jax.tree_util.GetAttrKey("rates")) else None)
+        rates = {}
         for step in range(10):
             _, state = update({"w": jnp.ones(3)}, state, params)
             rates[f"step {step}"] = jnp.asarray(learning_rate(state))
         return rates
 
     def optax_rates(multipliers):
-        built = [optax_schedule(name, float(multiplier)) for multiplier in multipliers]
-        return {f"step {step}": jnp.stack([jnp.asarray(values(step), jnp.float32) for values in built])
-                for step in range(10)}
+        fields = [rate_fields(name, float(multiplier)) for multiplier in multipliers]
+        state = batched(injected_state, fields, lambda path: path[-1].key if len(path) >= 2 and path[-2] == (
+            jax.tree_util.GetAttrKey("hyperparams")) else None)
+        rates = {}
+        for step in range(10):
+            stepped_rate, state = injected_update(unit, state)
+            rates[f"step {step}"] = stepped_rate["w"]
+        return rates
 
     def truth(multipliers):
-        built = [optax_schedule(name, float(multiplier)) for multiplier in multipliers]
+        built = [optax_schedule(name, rate_fields(name, float(multiplier))) for multiplier in multipliers]
         # optax counts in int32, which divides to float32: a float64 count keeps the schedule float64.
         return {f"step {step}": jnp.stack([values(jnp.asarray(step, jnp.float64)) for values in built])
                 for step in range(10)}
