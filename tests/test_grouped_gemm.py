@@ -127,11 +127,11 @@ def test_the_kernel_gradient_keeps_a_neighbours_non_finite_rows_out(tiles):
                                               (grouped_matmul.MosaicGmm(), True),
                                               (grouped_matmul.MosaicTgmm(), None)],
                          ids=["MosaicGmm", "MosaicGmm-transposed", "MosaicTgmm"])
-def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch, trans_rhs):
-    """The tiles the Mosaic GPU launches may pick at an expert layer's shapes lower for an H100 on the
-    CPU, as a GPU session's compile would, over rows no multiple of 8: every block shape and every
-    schedule among those that fit an H100's block (`Template.fitting`). The interpreter takes kernels
-    Mosaic GPU's layout inference and TMA descriptors refuse; the GPU's tile gate runs each one
+def test_the_hopper_grouped_matmuls_lower_for_an_h100_at_their_tile_and_a_narrow_pin(launch, trans_rhs):
+    """The tile each Mosaic GPU launch derives at an expert layer's shapes (`Template.derived`), and the
+    narrowest cooperative tile a pin may name there, of another block shape and schedule, lower for an
+    H100 on the CPU, as a GPU session's compile would, over rows no multiple of 8. The interpreter takes
+    kernels Mosaic GPU's layout inference and TMA descriptors refuse; the GPU's tile gate runs each one
     (test_moe_precision)."""
     # Rows not a multiple of 8, which a TMA descriptor tiles by.
     rows, depth, width, groups = 2044, 768, 1536, 8
@@ -146,16 +146,10 @@ def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch, tra
     options = {"out_dtype": "bfloat16", **options, "interpret": False}
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        fits = launch.fitting(launch.bind(*args, **options), generation.gpu_target())
-        # A fitting tile of every block shape and of every schedule: what the lowering depends on
-        # (shared memory, the snake's index arithmetic), each value once.
-        covering = set({(c.block_m, c.block_n): c for c in reversed(fits)}.values())
-        covering |= set({(c.stages, c.grid_block_n): c for c in reversed(fits)}.values())
-        covering |= set({(c.warpgroups, c.cluster, c.block_n): c for c in reversed(fits)}.values())
-        assert {(c.block_m, c.block_n) for c in covering} == {(c.block_m, c.block_n) for c in fits}
-        assert {(c.stages, c.grid_block_n) for c in covering} == {(c.stages, c.grid_block_n) for c in fits}
-        assert {(c.warpgroups, c.cluster) for c in covering} == {(c.warpgroups, c.cluster) for c in fits}
-        for config in sorted(covering, key=repr):
+        ba, target = launch.bind(*args, **options), generation.gpu_target()
+        derived, narrow = launch.derived(ba, target), mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2)
+        assert launch.legal(ba, narrow, target) and derived != narrow
+        for config in (derived, narrow):
             jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
                 lowering_platforms=("cuda",))
 
@@ -558,7 +552,7 @@ def ampere(generation_name: str = "sm80"):
 @pytest.mark.parametrize("out_dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("sizes", [name for name in SIZES if any(SIZES[name])])
 def test_an_ampere_gpu_runs_the_launch_its_facts_rank_first(sizes, out_dtype):
-    """Without warpgroup MMA, the Mosaic GPU forward's mma.sync tiles (`mosaic_gpu.generated`) and Triton's
+    """Without warpgroup MMA, the Mosaic GPU forward's mma.sync tile (`mosaic_gpu.derived`) and Triton's
     launch are ranked by the cost model on the GPU's own facts (its family's single-warp issue among them):
     unnamed, the call runs the one estimated faster; named, each is as exact as XLA's ragged dot rounded to
     its output dtype from float64, unrouted rows and empty groups included."""

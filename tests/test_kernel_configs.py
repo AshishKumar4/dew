@@ -235,13 +235,12 @@ GEMM_ROWS, GEMM_DEPTH, GEMM_WIDTH, GEMM_GROUPS = 4096, 2048, 1536, 8
 a few tiles a group (the kernels' resources do not grow with them)."""
 
 
-def _gemm_mainloop_cases(generation_name: str) -> tuple[list, set[str]]:
-    """Each GEMM Mosaic mainloop a `generation_name` GPU runs, at the config its launch picks on the
-    generation's facts and at its fitting config staging the most shared memory: the forward and the input
-    gradient (`MosaicGmm`), the kernel gradient (`MosaicTgmm`) in bf16 and in fp32 with exact sums, and on
-    warpgroup MMA the forward with an RMS norm's prologue and a bias epilogue and the kernel gradient with the
-    prologue; each a family's mainloop only where it takes the call (`Template.eligible`); with the names of
-    the cases whose register estimate passes its budget (a spill the cost model prices)."""
+def _gemm_mainloop_cases(generation_name: str) -> list:
+    """Each GEMM Mosaic mainloop a `generation_name` GPU runs, at the one tile its launch derives from the
+    generation's facts (`Template.derived`): the forward and the input gradient (`MosaicGmm`), the kernel
+    gradient (`MosaicTgmm`) in bf16 and in fp32 with exact sums, and on warpgroup MMA the forward with an
+    RMS norm's prologue and a bias epilogue and the kernel gradient with the prologue; each a family's
+    mainloop only where it takes the call (`Template.eligible`)."""
     from test_gemm_template import biased, normed
 
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
@@ -269,54 +268,51 @@ def _gemm_mainloop_cases(generation_name: str) -> tuple[list, set[str]]:
          (bf16((rows, depth)), bf16((rows, width)), sizes, (f32((rows,)), f32((depth,)))),
          {**plain, "out_dtype": "float32", "hooks": norm}),
     ]
-    cases, predicted = [], set()
+    cases = []
     with generation.assumed(generation_name):
         target = generation.gpu_target()
         for name, launch, args, options in calls:
             ba = launch.bind(*args, **options)
             if not launch.eligible(ba, target):
                 continue
-            fits = launch.fitting(ba, target)
-            roles = {"picked": launch.estimate(ba, target)[1],
-                     "largest": max(fits, key=lambda config, ba=ba: launch.staged_bytes(ba, config, target)),
-                     "most registers": max(fits, key=lambda config, ba=ba: launch.registers(ba, config))}
-            # Each config once: a second compile of one program is the first's, which reports no kernels.
-            for config in dict.fromkeys(roles.values()):
-                role = " and ".join(role for role, chosen in roles.items() if chosen == config)
-                configured = functools.partial(launch.replace(config=config), **options)
-                cases.append(support.KernelCase(f"{name} {role} {config}",
-                                                lambda configured=configured, args=args: (configured, args)))
-                if launch.registers(ba, config) > launch.register_budget(config):
-                    predicted.add(cases[-1].name)
-    return cases, predicted
+            config = launch.derived(ba, target)
+            configured = functools.partial(launch.replace(config=config), **options)
+            cases.append(support.KernelCase(f"{name} {config}",
+                                            lambda configured=configured, args=args: (configured, args)))
+    return cases
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm86", "sm89", "sm90"))
 def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(generation_name):
     """Every GEMM Mosaic GPU mainloop a generation runs (`_gemm_mainloop_cases`: warpgroup MMA's forward,
     input and kernel gradients and hooked forms on an H100; mma.sync's forward and input gradient on an
-    A100, an A10 and an L4 where this JAX's layout inference places its tiles), at its launch's pick on the
-    generation's facts, its fitting config staging the most and the one holding the most registers,
-    compiled by Mosaic for a compile-only device of the generation on this CPU through ptxas: within the
-    block's shared memory, spilling only where the launch's register estimate passes its budget."""
+    A100, an A10 and an L4 where this JAX's layout inference places its tiles), at the tile its launch
+    derives from the generation's facts, compiled by Mosaic for a compile-only device of the generation on
+    this CPU through ptxas: within the block's shared memory, spilling nothing (a derived tile holds its
+    registers: `Template.legal`)."""
     from kernel_compile import compile_mosaic_kernels
 
     if not generation.gpu_target(generation_name).wgmma and not mosaic_sm80.staging_solved():
         # A CPU interprets mma.sync's tiles at any JAX; lowered for the GPU, they need its layout inference.
         pytest.skip("this JAX's layout inference places no mma.sync tile but its 128x256 (STAGING_SOLVED)")
-    cases, predicted = _gemm_mainloop_cases(generation_name)
+    cases = _gemm_mainloop_cases(generation_name)
+    # Every form the generation's family runs derives a tile at these shapes: an eligibility regression
+    # fails here rather than leaving the gate fewer cases.
+    forms = {"forward", "input gradient"}
+    if generation.gpu_target(generation_name).wgmma:
+        forms |= {"kernel gradient", "kernel gradient exact fp32", "normed biased forward",
+                  "normed kernel gradient"}
+    assert {case.name.split(" Tiles(")[0] for case in cases} == forms
     found = compile_mosaic_kernels(cases, generation_name)
     unreported = [record["name"] for record in found if not record.get("kernels")]
     assert len(found) == len(cases) and not unreported, unreported
-    # A kernel may spill only where its launch's register estimate passes the budget, which the cost
-    # model prices (`Template.spilled`): ptxas's spills are the estimate's evidence.
+    # A spill is the register estimate's defect: the tile was derived to hold them.
     failed = failures([record for record in found
                        if "error" in record or record["shared"] > record["limit"]])
     for record in found:
         for kernel in record.get("kernels", ()):
             outside = kernel["shared"] > record["limit"] or kernel["tmem"] > record["tmem_limit"]
-            unpredicted = kernel["spilled"] > 0 and record["name"] not in predicted
-            if kernel["unread"] or outside or unpredicted:
+            if kernel["unread"] or outside or kernel["spilled"] > 0:
                 failed.append(f"{record['name']} {kernel['kernel']}: {kernel['shared']} shared bytes (limit "
                               f"{record['limit']}), {kernel['spilled']} bytes spilled, "
                               f"unread {kernel['unread']}")
@@ -326,9 +322,9 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
 @pytest.mark.parametrize("tpu", ["v5e", "v6e"])
 def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
     """The GEMM template's TPU mainloops (`MosaicTpuGmm` forward and input gradient, `MosaicTpuTgmm`),
-    at their launch's pick on the TPU's facts and at the fitting block staging the most, compiled by
-    libtpu for a compile-only TPU of the generation on this CPU; a generation whose scoped VMEM no
-    measurement states takes none of them (`MosaicTpuGmm.eligible`)."""
+    at the block their launch derives from the TPU's facts, compiled by libtpu for a compile-only TPU of
+    the generation on this CPU; a generation whose scoped VMEM no measurement states takes none of them
+    (`MosaicTpuGmm.eligible`)."""
     from kernel_compile import compile_tpu_kernels
 
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
@@ -349,17 +345,15 @@ def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
             ba = launch.bind(*args, interpret=False, **options)
             if not launch.eligible(ba, target):
                 continue
-            fits = launch.fitting(ba, target)
-            roles = {"picked": launch.estimate(ba, target)[1],
-                     "largest": max(fits, key=lambda config, ba=ba: launch.staged_bytes(ba, config, target))}
-            for config in dict.fromkeys(roles.values()):
-                role = " and ".join(role for role, chosen in roles.items() if chosen == config)
-                configured = functools.partial(launch.replace(config=config), interpret=False, **options)
-                cases.append(support.KernelCase(f"{name} {role} {config}",
-                                                lambda configured=configured, args=args: (configured, args)))
+            config = launch.derived(ba, target)
+            configured = functools.partial(launch.replace(config=config), interpret=False, **options)
+            cases.append(support.KernelCase(f"{name} {config}",
+                                            lambda configured=configured, args=args: (configured, args)))
     if not cases:
         assert generation.gpu_target(tpu).scoped_vmem is None
         pytest.skip(f"no measurement states {tpu}'s scoped VMEM, which the TPU launches fit their blocks to")
+    forms = {"forward", "input gradient", "kernel gradient"}
+    assert {case.name.split(" Blocks(")[0] for case in cases} == forms
     found = compile_tpu_kernels(cases, tpu)
     failed = [f"{record['name']}: {record['error']}" for record in found if "error" in record]
     assert not failed, "\n".join(failed)
