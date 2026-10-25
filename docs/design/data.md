@@ -242,17 +242,16 @@ Each stage runs for its committed valid target tokens, the same clock as `fit(to
 
 ### Offline preparation, published once
 
-This sketch includes the language, deduplication and decontamination stages tracked in the [roadmap](../roadmap.md#data).
+The language, quality, classifier and decontamination steps run DataTrove's filters, with the `curation` extra: `text.Language`, `text.Quality` (Gopher's, C4's or FineWeb's rules), `text.Classifier` (a fastText model) and `text.Decontaminated` (n-grams shared with evaluation texts). Each drops a record with the reason its filter names, and each is keyed in the plan by its rules and its model. A snapshot that deduplicates (`text.NearDuplicates`, FineWeb's MinHash rule by default) runs DataTrove's four MinHash stages over the one pass it seals, and its manifest records the rule and the records removed.
 
 ```python
-(Files("s3://raw/dclm/**/*.jsonl")
-   .filter(text.language("en", min_score=0.65))
-   .pipe(text.dedup_minhash(threshold=0.8))        # DataTrove's phases
-   .pipe(text.decontaminate(against=EVAL_SETS))
-   .map(text.tokenize(tok, eos=True))
-   .snapshot("s3://tokens/v3/web/"))               # a sealed generation
+cleaned = (Files("s3://raw/dclm/**/*.jsonl")
+   .filter_map(text.Language(("en",), min_score=0.65), text.Quality("fineweb"),
+               text.Decontaminated(against=EVAL_TEXTS)))
+cleaned.snapshot("s3://text/v3/web/", deduplicate=text.NearDuplicates())   # a sealed generation
 
-web = Files("s3://tokens/v3/web/")                 # training reads it back
+web = (Files("s3://text/v3/web/")                  # tokenized as training reads it back
+   .map(text.tokenize(tok, eos=True)))
 ```
 
 ### Aligned video and audio
@@ -472,7 +471,7 @@ The chain is analyzed once before readers open. Its plan chooses the lowering an
 |---|---|---|
 | Global | Indexed or memory reads whose order is known globally; one global record count | The same global order can be divided among a different number of readers. |
 | Per share | Streams and online count-changing stages; Grain's iterator state for each share | Share, worker and interleave topology stay as recorded. |
-| Canonical-stream design | A fixed set of disjoint streams, assembled in a canonical global order | The target for per-share elastic resume: reader ownership changes without changing that order, within the stream plan's divisibility constraints. |
+| Provisioned | A filtered or packed read whose rows, and a terminal pack's plan, are published once as a generation (`dew data publish`) and read back by index (`.cache(generation)`); a source whose index is provisioned (`dew data provision`) read by index, where every later step keeps a global order (no filter, flat map, windows, online packing or workers before the batch): it lowers to the global order | A new run resumes on any number of readers, as the global order does; a checkpoint a per-share read saved still resumes only on its own topology, and its refusal names this preparation. Resuming an unprepared per-share read on other readers is ledger row 1597, not built. |
 
 A streamed file source exposes physical shards with immutable identities. The manifest is the sliceable root; readers and Grain workers take disjoint slices and interleave their shard readers. JSONL ranges start at line boundaries. CSV shards are whole files because a quoted field may contain a newline; indexed CSV uses a parser-built index. Parquet uses footer and row-group metadata. A pinned Hub revision names the bytes actually read; resolving a converted branch records that branch's revision.
 
@@ -506,7 +505,7 @@ The spool, downloaded-file mirror and retained local generations have separate b
 
 ### Storage and native integrations
 
-Sources, cache roots, manifests and sinks take fsspec URLs. Native ArrayRecord and Arrow readers are used where they support the scheme; other schemes use fsspec. Connection setup is resolved at first use. Dew reads storage profiles from `~/.config/dew/storage.toml` (or `$DEW_STORAGE_CONFIG`) on the first `Store.resolve` and registers each named protocol once; a malformed file fails that resolution. Profile URLs work with native fsspec after that. A profile whose environment variable is unset is refused when a URL first uses it, naming the variable. Records also hold the non-secret options (endpoint, region) and never the key. Importing a module does not read storage configuration.
+Sources, cache roots, manifests and sinks take fsspec URLs. Native ArrayRecord and Arrow readers are used where they support the scheme; other schemes use fsspec. Connection setup is resolved at first use. Dew reads storage profiles from `storage.toml` in its configuration directory (`dew.cache.dew_config_dir`), or `$DEW_STORAGE_CONFIG`, on the first `Store.resolve` and registers each named protocol once; a malformed file fails that resolution. Profile URLs work with native fsspec after that. A profile whose environment variable is unset is refused when a URL first uses it, naming the variable. Records also hold the non-secret options (endpoint, region) and never the key. Importing a module does not read storage configuration.
 
 Transport caches use fsspec URL chaining, such as `filecache::s3://example/data/` or `blockcache::hf://datasets/example/data/`. Dew's `dewcache::` adds byte-bounded eviction, reader pins and single-flight downloads. This disposable file cache is separate from transformed artifacts and their dependency manifests.
 
