@@ -171,7 +171,7 @@ def torch_rule(reference: dict, rule: str, inputs: dict, dtype) -> dict:
 def main(destination: Path) -> None:
     import jax
     import torch
-    from diffusers_wan_reference import float64
+    from torch_precision import float64
     from recorded_references import provenance, record_case, save
 
     torch.set_num_threads(1)

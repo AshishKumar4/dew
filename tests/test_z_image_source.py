@@ -106,7 +106,7 @@ def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, nam
     import torch
     from diffusers import ZImageTransformer2DModel
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     model, params, layouts = load(source, name)
     # Each draw holds the case's rows ROWS times over and its images HEIGHT times as tall, so a
@@ -212,7 +212,7 @@ def source_pipelines(source):
     import torch
     from diffusers import ZImagePipeline
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     def loaded(dtype):
         return ZImagePipeline.from_pretrained(source / "pipeline", torch_dtype=dtype, local_files_only=True)
@@ -240,7 +240,7 @@ def widened_schedulers():
 
 def widened_call(pipe, run):
     """`run(pipe)` with the source's float32 pins widened, as its float64 truth runs."""
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     with float64(), widened_schedulers():
         return run(pipe)
