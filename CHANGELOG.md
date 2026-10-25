@@ -8,6 +8,15 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 - A filtered or packed read resumes on any number of readers once it is prepared: publish its rows (and
   a terminal pack's plan) as a generation with `dew data publish` and read it by index, and a new run
   lowers to the global order. A per-share read refused on another topology now says so.
+- `dew.nn.attention.scaled_dot_product_attention(..., dropout_rate=..., dropout_rng=...)` drops attention
+  weights on the selector's route (`generation.Route`): the reference path, or the attention template where
+  it is named (`implementation='template'` or `generation.chosen(attention='template')`) and its plain-JAX
+  mainloop runs the call: off a GPU, or on one before sm80. On an sm80 or later GPU the template's mainloops
+  (the frozen Triton one and Mosaic's, whose weights hook comes next) take no dropout, so a dropping call
+  takes the reference path there and a named template refuses it. The draw is the reference's mask, one hash
+  of the call's seed and each weight's global batch row, query head, query and key
+  (`dew.nn.kernels.templates.attention.Dropout`). A dropping call on a sharded sequence axis, or on an
+  explicit fused kernel, is refused.
 - A causal attention kind may read blocks whole: `AttentionMixer(bidirectional_blocks=True)` lets
   each token of a block (`block_groups=`, `AttentionMetadata.block_groups`, `[B, S]`, -1 outside
   any) see its whole block, whatever its window, as transformers' `block_sequence_ids` does, while

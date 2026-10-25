@@ -81,6 +81,17 @@ def _eligible(ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
             and (query.dtype != jnp.bfloat16 or 10 * capability[0] + capability[1] >= generation.BF16_GPU))
 
 
+def refused(spans: KeySpans, hooks: Hooks | None = None) -> str | None:
+    """Why this mainloop takes no call over `spans` under `hooks`, or None: probability dropout
+    (`Hooks.drop`), which the frozen mainloop does not draw (ledger row 1521); the plain-JAX mainloop takes
+    it."""
+    del spans
+    if hooks is not None and hooks.drop is not None:
+        return ("the Triton mainloop is frozen and takes no probability dropout (the route runs a dropping "
+                "call on the reference path, ledger row 1521)")
+    return None
+
+
 def _mode(dtype) -> str:
     """The arithmetic a launch's products take (`_dot`): IEEE fp32 for fp32 operands, else 16-bit
     products summed in fp32."""
@@ -483,7 +494,9 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     denominators `[B, H, Q]` too, and each query's anchor key `[B, H, Q]` int32 (`backward` reads them
     all). The operands pad to whole blocks of the largest tile and to power-of-two
     head widths (`padded_call`). `natural` keeps the logits natural (`algebra.Forward.base2`).
-    `interpret` runs it on the CPU."""
+    `interpret` runs it on the CPU. A call under dropout is refused (`refused`)."""
+    if reason := refused(spans, hooks):
+        raise NotImplementedError(reason)
     hooks = Hooks() if hooks is None else hooks
     call = padded_call(query, key, value, spans, hooks, BLOCK)
     queries, value_width = call.queries, value.shape[-1]
@@ -1041,7 +1054,10 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     `residuals`: its maxima, denominators, anchor keys and split sums (`forward`'s, which it takes again
     where None). With `split`, D comes from the split sums; without, the dQ launch takes its own first pass
     over the keys (`algebra.off_anchor`). `natural` keeps the forward's logits natural; `accurate` takes
-    the backward's accurate form (`ACCURATE`). `interpret` runs it on the CPU."""
+    the backward's accurate form (`ACCURATE`). `interpret` runs it on the CPU. A call under dropout is refused
+    (`refused`)."""
+    if reason := refused(spans, hooks):
+        raise NotImplementedError(reason)
     if residuals is None:
         plain = Hooks() if hooks is None else Hooks(hooks.score_mod, hooks.score_params, hooks.initial)
         _, maxima, totals, anchors, sums = forward(query, key, value, spans, plain, scale=scale,
