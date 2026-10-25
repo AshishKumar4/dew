@@ -225,6 +225,10 @@ def _gemma3n_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
                  'num_kv_shared_layers', 'final_logit_softcapping'))
     # PreTrainedConfig serializes this field; Gemma3nTextMLP never reads it.
     used.add('chunk_size_feed_forward')
+    # Both scaled embeddings are nn.Embedding(padding_idx=pad_token_id), 0 by default
+    # (modeling_gemma3n.py:1608-1629, configuration_gemma3n.py:110).
+    used.add('pad_token_id')
+    pad = hf_config.get('pad_token_id', 0)
     clip = hf_config.get('altup_coef_clip', 120.0)
     # AltUp's own checks name the reference's fields, so a config out of
     # their range is refused here; that is why the value is built before its
@@ -251,8 +255,13 @@ def _gemma3n_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
         final_logit_softcap=records.number(
             hf_config.get("final_logit_softcapping", 30.0), "final_logit_softcapping"
         ),
+        padding_idx=None if pad is None else records.integer(pad, "pad_token_id"),
     )
     return config
+
+
+def _gemma3n_export(model: CausalTransformer) -> Mapping[str, object]:
+    return {**_gemma3_export(model), 'pad_token_id': model.padding_idx}
 
 
 def _gemma3n_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
@@ -575,7 +584,7 @@ GEMMA3N_TEXT = DecoderFamily(
     lambda fields: fields.altup is not None,
     'gemma3n_text',
     'Gemma3nForCausalLM',
-    _gemma3_export,
+    _gemma3n_export,
     sandwich_norms=True,
     weight_path=_gemma3n_path,
     preserve_source_layout=True,
