@@ -30,6 +30,7 @@ from reference_error import assert_as_exact, assert_as_exact_as_the_reference, e
 from dew.data.dataset import Loader
 from dew.interop import Pretrained
 from dew.interop.torchax_fallback import TorchLayout, TransformersTierWarning
+from dew.nn.protocols import Lacks
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec, Trainer
@@ -307,16 +308,24 @@ UNREGISTERED_SEEDS = 256
 """The unregistered type's check-1 seeds, sized by `seeds_for` on armada."""
 
 
-def test_an_unregistered_causal_lm_loads_as_transformers_own_forward(tokens, tmp_path):
-    """A causal model_type Dew registers no family for, which no registered family's convention
-    computes, loads without `fallback` as tier 3, warning so (`TransformersTierWarning`): its LM
-    loss and the gradient of every parameter are as exact as transformers' own over the same
-    stored weights, measured from transformers in float64 (check 1)."""
+def saved_cohere(directory):
+    """A tiny Cohere saved to `directory`, and the torch model it holds."""
     torch.manual_seed(0)
     model = transformers.CohereForCausalLM(transformers.CohereConfig(**COHERE)).eval()
-    model.save_pretrained(tmp_path)
+    model.save_pretrained(directory)
+    return model
+
+
+def test_an_unregistered_causal_lm_loads_as_transformers_own_forward(tokens, tmp_path):
+    """A causal model_type Dew registers no family for, which no registered family's convention
+    computes, loads without `fallback` as tier 3, warning so (`TransformersTierWarning`), its every
+    layer's attention computed by Dew's, as its layers all ask transformers' attention interface:
+    its LM loss and the gradient of every parameter are as exact as transformers' own over the same
+    stored weights, measured from transformers in float64 (check 1)."""
+    model = saved_cohere(tmp_path)
     with pytest.warns(TransformersTierWarning):
         loaded = Pretrained.load(tmp_path, dtype="float32")
+    assert loaded.model.graph.attention_impl == "auto"
 
     dew_fn = loss_and_gradients(loaded, model, {name: jnp.asarray(leaf)
                                                 for name, leaf in loaded.variables["params"].items()})
@@ -332,6 +341,90 @@ def test_an_unregistered_causal_lm_loads_as_transformers_own_forward(tokens, tmp
 
     assert_as_exact(dew_fn, lambda ids: torch_step(reference, ids), token_draws(tokens),
                     "tier 3 cohere LM step", seeds=UNREGISTERED_SEEDS, truth_fn=truth_fn)
+
+
+PACKED_SEEDS = 8
+"""The packed rows' check-1 seeds, sized by `seeds_for` on armada."""
+
+
+def packed_rows(seed):
+    """Two rows of SEQ token ids, each two documents cut at a drawn place, and their documents."""
+    rng = np.random.default_rng([0xBAC, seed])
+    ids = rng.integers(0, TINY["vocab_size"], (2, SEQ)).astype(np.int32)
+    cuts = rng.integers(3, SEQ - 3, 2)
+    return ids, np.where(np.arange(SEQ)[None, :] < cuts[:, None], 1, 2).astype(np.int32)
+
+
+def documents_alone(model, ids, segments):
+    """transformers' run of each document of the rows on its own: the logits laid back where the
+    document sits, the summed next-token loss within the documents, and each parameter's gradient."""
+    model.zero_grad()
+    logits, total = torch.zeros((*ids.shape, TINY["vocab_size"]), dtype=torch.float64), 0
+    for row in range(ids.shape[0]):
+        for document in np.unique(segments[row]):
+            at = np.flatnonzero(segments[row] == document)
+            run = torch.from_numpy(ids[row, at].astype(np.int64))[None]
+            out = model(run).logits
+            logits[row, at] = out[0].detach().double()
+            total = total + torch.nn.functional.cross_entropy(out[0, :-1], run[0, 1:], reduction="sum")
+    total.backward()
+    return {"logits": logits.numpy(), "loss": np.asarray([total.item()])} | {
+        name: parameter.grad.double().numpy() for name, parameter in model.named_parameters()}
+
+
+def test_a_packed_row_trains_each_document_as_transformers_runs_it_alone(tmp_path):
+    """On Dew's attention a tier-3 model reads packed rows: each document attends within itself and
+    rotates from its own first token, so the packed rows' logits, their next-token loss within the
+    documents and every parameter's gradient are as exact as transformers' run of each document on
+    its own, measured from that run in float64 (check 1)."""
+    model = saved_cohere(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32")
+    names = [name for name, _ in model.named_parameters()]
+
+    @jax.jit
+    def stepped(params, ids, segments):
+        def loss(params):
+            logits = loaded.model.apply({**loaded.variables, "params": params}, ids, segment_ids=segments,
+                                        method="logits")
+            chosen = jnp.take_along_axis(jax.nn.log_softmax(logits[:, :-1]), ids[:, 1:, None], -1)[..., 0]
+            return -jnp.sum(jnp.where(segments[:, 1:] == segments[:, :-1], chosen, 0)), logits
+        (value, logits), gradients = jax.value_and_grad(loss, has_aux=True)(params)
+        return {"logits": logits, "loss": value[None]} | {name: gradients[name] for name in names}
+
+    def ours(ids, segments):
+        return stepped(loaded.variables["params"], jnp.asarray(ids), jnp.asarray(segments))
+
+    with float64():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager")
+        wide.load_state_dict(model.state_dict())
+
+    def truth(ids, segments):
+        with float64():
+            return documents_alone(wide, ids, segments)
+
+    assert_as_exact(ours, lambda ids, segments: documents_alone(model, ids, segments), packed_rows,
+                    "tier 3 cohere packed rows", seeds=PACKED_SEEDS, truth_fn=truth)
+
+
+def test_a_type_whose_attention_asks_no_interface_runs_its_own_and_reads_no_packing(tmp_path):
+    """OpenAI GPT's layers compute their attention in their own code, asking transformers' attention
+    interface nothing: tier 3 runs that attention as transformers does, so it names no Dew kernel
+    (`attention_impl`) and reads no packed rows (`Lacks`)."""
+    torch.manual_seed(0)
+    config = transformers.OpenAIGPTConfig(n_embd=64, n_layer=2, n_head=4, vocab_size=TINY["vocab_size"],
+                                          n_positions=64)
+    transformers.OpenAIGPTLMHeadModel(config).save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32")
+    assert loaded.model.graph.attention_impl is None
+    ids, segments = packed_rows(0)
+    with pytest.raises(Lacks):
+        loaded.model.apply(loaded.variables, jnp.asarray(ids), segment_ids=jnp.asarray(segments),
+                           method="logits")
+    with pytest.raises(ValueError), pytest.warns(TransformersTierWarning):
+        Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
 
 
 @pytest.mark.parametrize("family", ["llama", "neox"])
