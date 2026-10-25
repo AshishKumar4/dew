@@ -9,7 +9,7 @@ from typing import Self
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import linen as nn
+from flax import linen as nn, struct
 
 from dew.objectives.base import Variables
 
@@ -65,13 +65,28 @@ class LatentNormalization:
         """The factor a normalized latent is the shifted one times."""
         return _frozen(np.asarray(np.float32(1.0) / self.factor)) if self.divides else self.factor
 
+    def affine(self, dtype) -> LatentAffine:
+        """The map this normalization applies, its shift and factor in `dtype`."""
+        return LatentAffine(jnp.asarray(self.shift, dtype), jnp.asarray(self.factor, dtype), self.divides)
+
+
+@struct.dataclass
+class LatentAffine:
+    """The affine map an autoencoder's latents are normalized by, as the arrays a trace holds
+    (`AutoEncoder.latent_affine`): `(z - shift) * factor` and back as `z / factor + shift`, or, one that
+    `divides`, `(z - shift) / factor` and back as `z * factor + shift`. A configured normalization gives
+    its host values (`LatentNormalization.affine`); a tuned run, the running statistics each call's
+    variables hold. `divides` is static, so the map crosses a jit boundary as its two arrays."""
+    shift: jax.Array
+    factor: jax.Array
+    divides: bool = struct.field(pytree_node=False, default=False)
+
     def normalized(self, latent: jnp.ndarray) -> jnp.ndarray:
-        shift, factor = (jnp.asarray(value, latent.dtype) for value in (self.shift, self.factor))
-        return (latent - shift) / factor if self.divides else (latent - shift) * factor
+        shifted = latent - self.shift
+        return shifted / self.factor if self.divides else shifted * self.factor
 
     def restored(self, z: jnp.ndarray) -> jnp.ndarray:
-        shift, factor = (jnp.asarray(value, z.dtype) for value in (self.shift, self.factor))
-        return z * factor + shift if self.divides else z / factor + shift
+        return z * self.factor + self.shift if self.divides else z / self.factor + self.shift
 
 
 class _Record(Mapping[str, RecordValue]):
@@ -254,17 +269,25 @@ class AutoEncoder(ABC):
         decoded = self.decode_batch(params, z.reshape(-1, height, width, channels))
         return decoded.reshape(batch_size, seq_len, *decoded.shape[1:])
 
+    def latent_affine(self, params, dtype) -> LatentAffine:
+        """The map `encode` normalizes latents by and `decode` restores them by, in `dtype`, for the
+        weights `params`: this autoencoder's configured normalization (`normalization`), whatever the
+        weights. A subclass whose normalization is data the variables hold reads it from `params`."""
+        del params
+        return self.normalization.affine(dtype)
+
     def encode(self, params, x: jnp.ndarray, key: jax.Array | None = None,
                noise: jnp.ndarray | None = None) -> jnp.ndarray:
         """Encode images `[B, H, W, C]` or video `[B, T, H, W, C]` to normalized latents, a stochastic
-        encoder's sample drawn from `key` or read off `noise` (`encode_batch`)."""
+        encoder's sample drawn from `key` or read off `noise` (`encode_batch`), by `latent_affine`."""
         latent = (self.encode_video(params, x, key, noise) if x.ndim == 5
                   else self.encode_batch(params, x, key=key, noise=noise))
-        return self.normalization.normalized(latent)
+        return self.latent_affine(params, latent.dtype).normalized(latent)
 
     def decode(self, params, z: jnp.ndarray) -> jnp.ndarray:
-        """Decode normalized latents `[B, h, w, c]` or `[B, t, h, w, c]` back to images or video."""
-        z = self.normalization.restored(z)
+        """Decode normalized latents `[B, h, w, c]` or `[B, t, h, w, c]` back to images or video, by
+        `latent_affine`."""
+        z = self.latent_affine(params, z.dtype).restored(z)
         return self.decode_video(params, z) if z.ndim == 5 else self.decode_batch(params, z)
 
     def __call__(self, params, x: jnp.ndarray,
