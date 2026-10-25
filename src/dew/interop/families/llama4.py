@@ -29,11 +29,10 @@ from dew.interop.decoder_parts import (
     refuse,
     renamed_path,
 )
-from dew.nn import llama4 as llama4_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
-from dew.nn.llama4 import Llama4Mixer
+from dew.nn.mixers.attention import AttentionMixer
 
 # Llama4TextConfig's default_theta (configuration_llama4.py:111), the base an omitted rope_theta means.
 _LLAMA4_SPELLING = RopeSpelling(theta=500000.0)
@@ -49,12 +48,12 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     no_rope = hf_config.get('no_rope_layers') or None
     if no_rope is None:
-        no_rope = llama4_nn.default_no_rope_layers(
+        no_rope = _default_no_rope_layers(
             layers, records.integer(hf_config.get('no_rope_layer_interval', 4), 'no_rope_layer_interval'))
     no_rope = records.integers(no_rope, 'no_rope_layers')
     if len(no_rope) != layers or set(no_rope) - {0, 1}:
         refuse(f"no_rope_layers {list(no_rope)!r}", f"it names a flag per layer of {layers}")
-    layer_types = llama4_nn.rope_layer_types(no_rope)
+    layer_types = _rope_layer_types(no_rope)
     stated = hf_config.get('layer_types')
     if stated is not None and records.strings(stated, 'layer_types') != layer_types:
         refuse(f"layer_types {list(records.strings(stated, 'layer_types'))!r}",
@@ -63,8 +62,8 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     # rope_scaling); a config transformers wrote nests both. Either way the
     # ramp is the model's, and every rotated layer applies it.
     used.update(('no_rope_layers', 'no_rope_layer_interval', 'layer_types'))
-    # Llama4TextRotaryEmbedding builds any rope_type, but the llama4 mixer rotates by Llama 3.1's
-    # ramp alone (`dew.nn.llama4`), so a YaRN record is refused here.
+    # Llama4TextRotaryEmbedding builds any rope_type; the family reads Llama 3.1's ramp alone, the
+    # one its releases state, so a YaRN record is refused here.
     rope = read_rope(hf_config, used, _LLAMA4_SPELLING, ramps=('llama3',))
     config = base_config(hf_config, used, layer_types=layer_types,
                           rope=dataclasses.replace(rope, local_theta=None))
@@ -76,19 +75,19 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
                  'intermediate_size_mlp', 'num_local_experts', 'num_experts_per_tok',
                  'moe_layers', 'interleave_moe_layer_step', 'attention_chunk_size',
                  'use_qk_norm', 'attn_temperature_tuning', 'floor_scale', 'attn_scale'))
-    rule = {
-        'use_qk_norm': bool(hf_config['use_qk_norm']),
-        'attn_temperature_tuning': bool(hf_config['attn_temperature_tuning']),
-        'floor_scale': records.number(hf_config['floor_scale'], 'floor_scale'),
-        'attn_scale': records.number(hf_config['attn_scale'], 'attn_scale'),
-    }
+    # Llama4TextAttention's two layers as ordinary kinds: the rotated, chunked one turns adjacent
+    # pairs under a weightless L2 norm (`use_qk_norm`); the global one carries no positions and scales
+    # each query by its position (`attn_temperature_tuning`).
+    tuning = ((records.number(hf_config['floor_scale'], 'floor_scale'),
+               records.number(hf_config['attn_scale'], 'attn_scale'))
+              if hf_config['attn_temperature_tuning'] else None)
     chunk = hf_config.get('attention_chunk_size')
-    full = native_fields(LayerKind)(mixer=None)
-    full['mixer'] = {'class': 'llama4', 'fields': {**rule, 'use_rope': False}}
-    chunked = native_fields(LayerKind)(chunk=None if chunk is None else records.integer(chunk,
-                                                                                    'attention_chunk_size'),
-                                      mixer=None)
-    chunked['mixer'] = {'class': 'llama4', 'fields': {**rule, 'use_rope': True}}
+    full = native_fields(LayerKind)(qk_norm=False, mixer=None)
+    full['mixer'] = {'class': 'attention', 'fields': {'nope': True, 'temperature_tuning': tuning}}
+    chunked = native_fields(LayerKind)(
+        chunk=None if chunk is None else records.integer(chunk, 'attention_chunk_size'),
+        qk_norm=bool(hf_config['use_qk_norm']), mixer=None)
+    chunked['mixer'] = {'class': 'attention', 'fields': {'rotary_pairs': 'adjacent', 'qk_norm_weight': False}}
     kinds: dict[str, KindFields] = {'full_attention': full, 'chunked_attention': chunked}
     moe_layers = hf_config.get('moe_layers')
     step = records.integer(hf_config.get('interleave_moe_layer_step', 1), 'interleave_moe_layer_step')
@@ -119,14 +118,44 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
 
 
 def _llama4_export(model: CausalTransformer) -> Mapping[str, object]:
-    """The config field the rotated layers' chunk goes back out under: every
-    chunked kind shares Llama 4's one `attention_chunk_size`."""
+    """The config fields Llama 4's kinds go back out under: the rotated layers' one
+    `attention_chunk_size` and their norm (`use_qk_norm`), each layer's `no_rope_layers` entry, and
+    the global layers' temperature tuning."""
     chunks = {kind.chunk for kind in (model.kinds or {}).values() if kind.chunk is not None}
     if len(chunks) > 1:
         raise ValueError(
             f"the kinds chunk at {sorted(chunks)}, and Llama 4's config carries one "
             "attention_chunk_size")
-    return {'attention_chunk_size': chunks.pop() if chunks else None}
+    types = model.per_layer_types
+    rotated = [_mixer(model, name) for name in sorted(set(types)) if not _mixer(model, name).nope]
+    norms = {model.kind_of(name).qk_norm for name in set(types) if not _mixer(model, name).nope}
+    tunings = {_mixer(model, name).temperature_tuning for name in set(types) if _mixer(model, name).nope}
+    if len(norms) > 1 or len(tunings) > 1 or any(mixer.rotary_pairs != 'adjacent' for mixer in rotated):
+        raise ValueError("Llama 4's config states one norm for its rotated layers, which turn adjacent "
+                         "pairs, and one temperature tuning for the rest")
+    tuning = tunings.pop() if tunings else None
+    return {'attention_chunk_size': chunks.pop() if chunks else None,
+            'no_rope_layers': [int(not _mixer(model, name).nope) for name in types],
+            'use_qk_norm': norms.pop() if norms else False,
+            'attn_temperature_tuning': tuning is not None,
+            **({} if tuning is None else {'floor_scale': tuning[0], 'attn_scale': tuning[1]})}
+
+
+def _mixer(model: CausalTransformer, layer_type: str) -> AttentionMixer:
+    mixer = model.kind_of(layer_type).mixer or model.mixer or AttentionMixer()
+    if not isinstance(mixer, AttentionMixer):
+        raise ValueError(f"Llama 4's layers attend; the {layer_type} kind mixes by {type(mixer).__name__}")
+    return mixer
+
+
+def _default_no_rope_layers(num_layers: int, interval: int) -> tuple[int, ...]:
+    """`Llama4TextConfig`'s pattern: every `interval`th layer carries no rope."""
+    return tuple(int((index + 1) % interval != 0) for index in range(num_layers))
+
+
+def _rope_layer_types(no_rope_layers) -> tuple[str, ...]:
+    """The config's layer pattern: rotated layers chunk, the rest attend whole."""
+    return tuple('chunked_attention' if rope else 'full_attention' for rope in no_rope_layers)
 
 
 # `Llama4TextExperts` holds `[E, hidden, 2 * expert]` with the gate in the
@@ -146,7 +175,9 @@ _LLAMA4_EXPERTS: Leaves = {f'mlp.experts.{projection}': ('mlp', 'experts', proje
 LLAMA4_TEXT = DecoderFamily(
     ('llama4_text',),
     _llama4_config,
-    lambda fields: any(isinstance(mixer, Llama4Mixer) for mixer in kind_mixers(fields)),
+    # Llama 4's text layers are the decoders' only ones turning adjacent rotary pairs.
+    lambda fields: any(isinstance(mixer, AttentionMixer) and mixer.rotary_pairs == 'adjacent'
+                       for mixer in kind_mixers(fields)),
     'llama4_text',
     'Llama4ForCausalLM',
     _llama4_export,
