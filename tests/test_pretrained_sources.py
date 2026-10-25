@@ -160,11 +160,13 @@ def test_a_source_is_routed_on_its_config_alone_as_the_loader_reads_it():
     """`source_route` is the loader's decision before any weight downloads, which a census of configs
     reads too: a registered family's config is its decoder, translated; a media wrapper's is the
     wrapper; DiffusionGemma's its own; an unregistered model_type a registered family's convention
-    computes is verified against transformers (tier 2), and one transformers has no class for is
-    refused, as are a storage format the codecs cannot decode and a family's refusal."""
+    computes is verified against transformers (tier 2), an unregistered causal LM none computes runs
+    as transformers' own forward (tier 3), and one transformers has no class for is refused, as are a
+    storage format the codecs cannot decode and a family's refusal."""
     from dew.interop.pretrained import (
         DecoderRoute,
         DiffusionGemmaRoute,
+        TorchRoute,
         VerifiedRoute,
         WrapperRoute,
         source_route,
@@ -177,6 +179,8 @@ def test_a_source_is_routed_on_its_config_alone_as_the_loader_reads_it():
     assert isinstance(source_route(fixture_config("diffusion-gemma-sft")), DiffusionGemmaRoute)
     verified = source_route(tier_two_config())
     assert isinstance(verified, VerifiedRoute) and verified.verified.error <= verified.verified.bound
+    torch_route = source_route(tiny_config("biogpt").to_dict())
+    assert isinstance(torch_route, TorchRoute) and torch_route.admitted.model_type == "biogpt"
     llama = fixture_config("llama-tiny")
     for refused in ({**llama, "model_type": "an_unregistered_decoder"},
                     {**llama, "quantization_config": {"quant_method": "mlx", "bits": 4, "group_size": 64,
@@ -187,12 +191,34 @@ def test_a_source_is_routed_on_its_config_alone_as_the_loader_reads_it():
             source_route(refused)
 
 
+def test_tier_three_admits_a_causal_lm_alone_and_shrinks_a_config_by_its_own_names():
+    """Tier 3 runs an unregistered type's forward only where it is a causal LM: BERT configured as a
+    decoder (`is_decoder`) is one, each position reading the tokens before it, and configured as an
+    encoder it reads the later tokens too and is refused. The probe reads a config's sizes under its
+    own names (OpenAI-GPT's `n_embd`, `n_head`, `n_layer`), so such a config is probed rather than
+    refused for want of `hidden_size`."""
+    from dew.interop import verify
+    from dew.interop.pretrained import TorchRoute, source_route
+
+    decoder = source_route(tiny_config("bert", is_decoder=True).to_dict())
+    assert isinstance(decoder, TorchRoute)
+    with pytest.raises(ValueError):
+        source_route(tiny_config("bert", is_decoder=False).to_dict())
+    openai = tiny_config("openai-gpt", hidden_size=None, num_attention_heads=None, num_hidden_layers=None,
+                         n_embd=64, n_head=4, n_layer=2).to_dict()
+    assert "hidden_size" not in openai and openai["n_embd"] == 64
+    shrunk = verify.shrink(openai)
+    assert shrunk["n_embd"] < 64 and "hidden_size" not in shrunk
+    assert isinstance(verify.verify_mapping(openai), verify.Unmapped)
+
+
 def test_the_hub_census_routes_a_config_as_the_loader_does(tmp_path):
     """tools/hf_coverage.py classifies a census of configs by the loader's own route (`source_route`),
     with the real verifier: a storage format the codecs refuse is refused before transformers is
     asked about the type, as is one a codec's own reader refuses (GPTQ at three bits); a type
     transformers has no class for, asked only after those, is remote code; a registered family's
-    config is tier 1; and a type a registered convention computes, verified, is tier 2."""
+    config is tier 1; a type a registered convention computes, verified, is tier 2; and an unregistered
+    causal LM none computes is tier 3."""
     from tool_support import load
 
     census = load("hf_coverage")
@@ -204,6 +230,7 @@ def test_the_hub_census_routes_a_config_as_the_loader_does(tmp_path):
         "custom": {**llama, "model_type": "a_custom_decoder"},
         "llama": llama,
         "cwm": tier_two_config(),
+        "biogpt": tiny_config("biogpt").to_dict(),
     }
     rows = [{"id": name, "model_type": config["model_type"], "downloads": len(configs) - index,
              "config": config} for index, (name, config) in enumerate(configs.items())]
@@ -212,7 +239,7 @@ def test_the_hub_census_routes_a_config_as_the_loader_does(tmp_path):
     routes = {model["id"]: model["route"]
               for model in json.loads((tmp_path / "coverage.json").read_text())["models"]}
     assert routes == {"storage": "refused", "gptq": "refused", "custom": "remote code", "llama": "tier 1",
-                      "cwm": "tier 2"}
+                      "cwm": "tier 2", "biogpt": "tier 3"}
 
 
 

@@ -11,9 +11,11 @@ architectures, or why no config was read (gated, missing). `classify`
 sorts every model into the route that loads it: a registered family (tier
 1, `hf_decoders.translate_config` or the wrapper table), a registered
 family's verified convention (tier 2, `verify.verify_mapping` on the shrunk
-config, no weights; run once per model_type), a GGUF repo's stub config, a
-refusal with its reason, or a refusal by design (`DrafterRefused`, a
-speculative drafter that is no model on its own). Types
+config, no weights; run once per model_type), transformers' own forward run
+by torchax (tier 3, `torchax_fallback.admitted` on the same shrunk config,
+once per model_type), a GGUF repo's stub config, a refusal with its reason,
+or a refusal by design (`DrafterRefused`, a speculative drafter that is no
+model on its own). Types
 transformers does not know (remote code only) have no reference to verify
 against and are counted apart. The shares are of downloads, over all types
 and over the most downloaded 200 and 50. Writes coverage.json.
@@ -28,7 +30,8 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from dew.interop.verify import VerifiedMapping
+    from dew.interop.torchax_fallback import Admitted
+    from dew.interop.verify import Unmapped, VerifiedMapping
 
 
 def census(out: Path, limit: int) -> None:
@@ -59,14 +62,16 @@ class NoReference(ValueError):
     against (`classify`'s verifier): a repo of remote code."""
 
 
-def _route(config: dict, verified) -> tuple[str, str]:
+def _route(config: dict, verified, admitted) -> tuple[str, str]:
     """The census route of `config`: the loader's own decision on the config alone
     (`dew.interop.pretrained.source_route`), and for a refusal, the refusal's own words. `verified`
-    checks an unregistered model_type against transformers, once per type (`classify`)."""
+    checks an unregistered model_type against transformers, and `admitted` decides whether tier 3 runs
+    one it leaves unmapped, each once per type (`classify`)."""
     from dew.interop import decoder_parts
     from dew.interop.pretrained import (
         DecoderRoute,
         DiffusionGemmaRoute,
+        TorchRoute,
         VerifiedRoute,
         WrapperRoute,
         source_route,
@@ -77,7 +82,7 @@ def _route(config: dict, verified) -> tuple[str, str]:
         # from the GGUF file `gguf_file=` names, which the census does not fetch.
         return "gguf", "a stub config.json beside GGUF files"
     try:
-        route = source_route(config, verified=verified)
+        route = source_route(config, verified=verified, admitted=admitted)
     except decoder_parts.DrafterRefused as error:
         return "by design", str(error)[:300]
     except NoReference:
@@ -98,6 +103,8 @@ def _route(config: dict, verified) -> tuple[str, str]:
             except ValueError as error:
                 return "refused", str(error)[:300]
             return "tier 2", f"{verified.family} {verified.error:.2e} <= {verified.bound:.2e}"
+        case TorchRoute():
+            return "tier 3", "transformers' own forward, run by torchax"
 
 
 def classify(out: Path) -> None:
@@ -107,9 +114,26 @@ def classify(out: Path) -> None:
 
     from dew.interop import verify
 
-    probed: dict[str, VerifiedMapping | tuple[type[Exception], tuple]] = {}
+    probed: dict[str, VerifiedMapping | Unmapped | tuple[type[Exception], tuple]] = {}
+    admissions: dict[str, Admitted | tuple[type[Exception], tuple]] = {}
 
-    def verified(config: dict) -> VerifiedMapping:
+    def admitted(unmapped: Unmapped) -> Admitted:
+        """`torchax_fallback.admitted`, once per model_type, its decision or its refusal reused after
+        as `verified` reuses its own."""
+        from dew.interop import torchax_fallback
+
+        if unmapped.model_type not in admissions:
+            try:
+                admissions[unmapped.model_type] = torchax_fallback.admitted(unmapped)
+            except (KeyError, ValueError, TypeError) as error:
+                admissions[unmapped.model_type] = (type(error), error.args)
+        found = admissions[unmapped.model_type]
+        if isinstance(found, tuple):
+            kind, arguments = found
+            raise kind(*arguments)
+        return found
+
+    def verified(config: dict) -> VerifiedMapping | Unmapped:
         """`verify.verify_mapping`, run once per model_type on its most downloaded model that no
         registered family reads (the rows come ranked), its mapping or its refusal reused after; a
         refusal is kept as its type and arguments, not the probe's frames, and raised afresh."""
@@ -130,7 +154,7 @@ def classify(out: Path) -> None:
 
     models = []
     for row in rows:
-        route, detail = _route(row["config"], verified)
+        route, detail = _route(row["config"], verified, admitted)
         models.append({"id": row["id"], "model_type": row["model_type"], "downloads": row["downloads"],
                        "route": route, "detail": detail})
     types: dict[str, dict] = defaultdict(lambda: {"downloads": 0, "models": 0, "routes": defaultdict(int)})
