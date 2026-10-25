@@ -24,7 +24,7 @@ import ml_dtypes
 import numpy as np
 import optax
 import pytest
-from confident_support import confident, label_derivative
+from confident_support import confident, label_derivative, log_partition, log_softmax
 from reference_error import assert_as_exact, with_gradients
 from residual_orders import order
 from sharded import collectives
@@ -1339,26 +1339,17 @@ def test_a_vocabulary_split_heads_confident_target_gradient_is_eq_7(tile, margin
         assert np.all(split(rows)[:, excluded] == 0)
 
 
-def softmax64(rows: np.ndarray) -> np.ndarray:
-    """The rows' probabilities in float64."""
-    wide = np.asarray(rows, np.float64)
-    shifted = np.exp(wide - wide.max(axis=-1, keepdims=True))
-    return shifted / shifted.sum(axis=-1, keepdims=True)
-
-
-def log_partition64(rows: np.ndarray) -> np.ndarray:
-    """The rows' log partitions in float64, one a row, kept as a column."""
-    wide = np.asarray(rows, np.float64)
-    peak = wide.max(axis=-1, keepdims=True)
-    return peak + np.log(np.exp(wide - peak).sum(axis=-1, keepdims=True))
+def softmax(rows: np.ndarray) -> np.ndarray:
+    """NumPy's softmax over the last axis, in the rows' own dtype (`log_softmax`)."""
+    return np.exp(log_softmax(rows))
 
 
 @pytest.mark.parametrize("margin", [20.0, 40.0, 80.0])
 @pytest.mark.parametrize("path", ["tiled", "whole", "logits"])
 def test_an_unlikely_targets_log_partition_gradient_is_its_own_probability(path, margin):
     """The log partition's gradient is each column's probability, the target's included, whatever the
-    target: at a target `margin` below the row's lead, its probability, about exp(-margin), from float64
-    (check 1), where 1 less the rest of the row's share cancels it to 0."""
+    target: at a target `margin` below the row's lead, its probability, about exp(-margin), on par with
+    NumPy's softmax from float64 (check 1), where 1 less the rest of the row's share cancels it to 0."""
     lead, target = 0, 5
     targets = np.full((3,), target, np.int32)
     head = identity_head()
@@ -1370,7 +1361,7 @@ def test_an_unlikely_targets_log_partition_gradient_is_its_own_probability(path,
         return chunked_cross_entropy(logits, head, targets, 1, tile=tile)[2].sum()
 
     gradient = jax.jit(jax.grad(partition))
-    assert_as_exact(gradient, softmax64, lambda seed: confident(margin, seed, lead),
+    assert_as_exact(gradient, softmax, lambda seed: confident(margin, seed, lead),
                     f"{path} at margin {margin}", seeds=CONFIDENT_SEEDS)
     (rows,) = confident(margin, 0, lead)
     assert np.all(np.asarray(gradient(rows))[:, target] > 0)
@@ -1380,8 +1371,9 @@ def test_an_unlikely_targets_log_partition_gradient_is_its_own_probability(path,
 @pytest.mark.parametrize("path", ["tiled", "whole", "fused", "logits"])
 def test_a_dominant_z_loss_keeps_an_unlikely_targets_share(path, margin):
     """A z-loss whose cotangent outweighs the loss's (PaLM's, at a large coefficient) moves an unlikely
-    target by its probability times that cotangent, less the rest of its row: eq. 7 plus the z-loss's
-    `2 z log Z p` from float64 (check 1), which a target entry of `d_partition (1 - rest / mass)` loses."""
+    target by its probability times that cotangent, less the rest of its row: on par with eq. 7 plus the
+    z-loss's `2 z log Z p` in NumPy from float64 (check 1), which a target entry of
+    `d_partition (1 - rest / mass)` loses."""
     lead, target, weight = 0, 5, 1e8
     targets = np.full((3,), target, np.int32)
     head = identity_head()
@@ -1397,7 +1389,7 @@ def test_a_dominant_z_loss_keeps_an_unlikely_targets_share(path, margin):
         return (losses + weight * jnp.square(log_z)).sum()
 
     def reference(rows):
-        return label_derivative(rows, target) + 2 * weight * log_partition64(rows) * softmax64(rows)
+        return label_derivative(rows, target) + 2 * weight * log_partition(rows) * softmax(rows)
 
     assert_as_exact(jax.jit(jax.grad(loss)), reference, lambda seed: confident(margin, seed, lead),
                     f"{path} at margin {margin}", seeds=CONFIDENT_SEEDS)
@@ -1407,9 +1399,9 @@ def test_a_dominant_z_loss_keeps_an_unlikely_targets_share(path, margin):
 @pytest.mark.parametrize("tile", [None, (2, 2)], ids=["whole", "tiled"])
 @pytest.mark.parametrize("margin", [20.0, 40.0])
 def test_a_vocabulary_split_heads_unlikely_target_keeps_its_log_partition_share(tile, margin):
-    """Split over the vocabulary on a mesh, the log partition's gradient at an unlikely target is its own
-    probability from float64 (check 1), as one device's is: the target's shard, which picks its logit,
-    takes the partition's share of it directly, not 1 less the rest of the row."""
+    """Split over the vocabulary on a mesh, the log partition's gradient at an unlikely target is on par
+    with NumPy's softmax from float64 (check 1), as one device's is: the target's shard, which picks its
+    logit, takes the partition's share of it directly, not 1 less the rest of the row."""
     from jax.sharding import NamedSharding, PartitionSpec as P
 
     from dew.training import MeshSpec
@@ -1430,5 +1422,5 @@ def test_a_vocabulary_split_heads_unlikely_target_keeps_its_log_partition_share(
                       jax.device_put(jnp.eye(8), NamedSharding(mesh, P(None, "fsdp"))))
             return np.asarray(gradient(*placed))
 
-    assert_as_exact(split, softmax64, lambda seed: confident(margin, seed, lead, width=8, count=4),
+    assert_as_exact(split, softmax, lambda seed: confident(margin, seed, lead, width=8, count=4),
                     f"vocabulary-split at margin {margin}, {tile}", seeds=CONFIDENT_SEEDS)

@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from confident_support import confident, label_derivative
+from confident_support import confident, label_derivative, log_softmax
 from reference_error import assert_as_exact, with_gradients, without_ynn
 
 from dew.nn import categorical
@@ -128,12 +128,6 @@ def test_a_ragged_rows_segments_each_normalize_as_the_segment_alone():
     log_z, present = categorical.segment_log_partition(logits(jnp.float32, (7,)), segments, 4)
     np.testing.assert_array_equal(present, [True, False, True, False])
     np.testing.assert_array_equal(np.asarray(log_z)[[1, 3]], 0)
-
-
-def log_softmax(rows: np.ndarray) -> np.ndarray:
-    """NumPy's log softmax over the last axis, in the rows' own dtype."""
-    peak = rows.max(axis=-1, keepdims=True)
-    return rows - peak - np.log(np.exp(rows - peak).sum(axis=-1, keepdims=True))
 
 
 @pytest.mark.parametrize("margin", sorted(COLLAPSE_SEEDS))
