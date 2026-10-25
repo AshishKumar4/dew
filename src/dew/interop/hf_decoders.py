@@ -112,15 +112,22 @@ def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
 def _wrapper_text(hf_config: Mapping[str, object], used: set, *,
                   declared_type: str | None = None) -> DecoderFields:
     """Translate the wrapper's text_config as the decoder it is."""
+    used.update(("text_config", "tie_word_embeddings"))
+    return translate_config(_text_config(hf_config, declared_type))
+
+
+def _text_config(hf_config: Mapping[str, object], declared_type: str | None) -> Mapping[str, object]:
+    """The decoder config a wrapper's language model is: its text_config, typed `declared_type` where it
+    names no type, with the wrapper's own head policy."""
     text = hf_config.get("text_config")
     if not isinstance(text, Mapping):
         refuse("text_config",
                 f"a wrapper carries its decoder under text_config, got {text!r}")
-    used.add("text_config")
+    text = dict(text)
     if declared_type is not None and 'model_type' not in text:
         # The wrapper config class supplies its declared nested class when
         # reading a raw dict. Checkpoint copies need not repeat that tag.
-        text = {**text, 'model_type': declared_type}
+        text['model_type'] = declared_type
     if hf_config.get("model_type") != "llama4":
         # These conditional models own their lm_head at wrapper scope; the
         # nested text model has no head. Llama4 nests a complete causal LM.
@@ -128,9 +135,8 @@ def _wrapper_text(hf_config: Mapping[str, object], used: set, *,
         tied = hf_config.get("tie_word_embeddings", default_tied)
         if tied is not None and not isinstance(tied, bool):
             refuse("tie_word_embeddings", "the wrapper head takes a boolean tying policy")
-        text = {**text, "tie_word_embeddings": bool(tied)}
-        used.add("tie_word_embeddings")
-    return translate_config(text)
+        text["tie_word_embeddings"] = bool(tied)
+    return text
 
 
 def _wrapper_token_id(hf_config: Mapping[str, object], used: set, *names: str) -> int:
@@ -387,6 +393,35 @@ def _wrapper_sources(names: Collection[str], read: Callable[[str], np.ndarray], 
             aliases.append((previous, name))
         sources[group][local] = name
     return sources, tuple(aliases)
+
+
+def language_model_config(hf_config: Mapping[str, object], record: WrapperFields) -> Mapping[str, object]:
+    """The config a wrapper's language model states as its text family's own checkpoint: the text_config
+    typed as the wrapper's text model, with the wrapper's head policy, the dtype the wrapper states for
+    it, and its family's causal-LM class where it names none. What the wrapper declares at its own
+    scope governs its language model over the text_config: its modeling overrides (as
+    `translate_wrapper_config` applies them), and the token ids generation reads at wrapper scope
+    before the text config's (`generation_config`)."""
+    text = dict(_text_config(hf_config, record["text_model_type"]))
+    for field in ("torch_dtype", "dtype"):
+        if field in hf_config and field not in text:
+            text[field] = hf_config[field]
+    for field in ("modeling_overrides", "eos_token_id", "pad_token_id", "bos_token_id"):
+        if hf_config.get(field) is not None:
+            text[field] = hf_config[field]
+    family = families().get(records.text(text["model_type"], "model_type"))
+    if family is not None and "architectures" not in text:
+        text["architectures"] = [family.architecture]
+    return text
+
+
+def language_model_names(names: Collection[str], read: Callable[[str], np.ndarray], record: WrapperFields,
+                         checked: Checked = NOTHING_CHECKED) -> dict[str, str]:
+    """Each tensor name of a wrapper's language model, as its text family reads it, to the wrapper's
+    name of it (`wrapper_route`). The media towers' names are not among them, nor read: only the
+    language model's spellings of one tensor are compared."""
+    own = [name for name in names if wrapper_route(name, record)[0] == "language_model"]
+    return _wrapper_sources(own, read, record, checked)[0]["language_model"]
 
 
 def _text_aliases(names: Collection[str], read: Callable[[str], np.ndarray], config,
