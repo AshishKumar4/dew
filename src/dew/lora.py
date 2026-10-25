@@ -83,7 +83,7 @@ from dew.nn.protocols import (
     CountedVideo,
 )
 from dew.nn.sharding import LOW_RANK_FACTORS
-from dew.objectives.base import FROZEN, Path, Variables, freeze, merge as overlay, select, thaw
+from dew.objectives.base import FROZEN, Path, Variables, freeze, merge as overlay, part, select, thaw
 from dew.quantization import (
     FROZEN_FP8,
     QUANTIZATION,
@@ -337,8 +337,10 @@ class Adapter:
 
         It holds the adapted model, the checkpoint's variables and the bindings the
         run recorded, so `save` writes the factors under the source's names without
-        the source at hand. A recorded binding whose shapes do not fit the restored
-        factors is refused by name. `trust` is as `TextGeneration.from_run` takes it.
+        the source at hand: the recorded model's own part of a tree that nests it
+        beside others (`Objective._recorded_part`, a decision's backbone). A recorded
+        binding whose shapes do not fit the restored factors is refused by name.
+        `trust` is as `TextGeneration.from_run` takes it.
         """
         from dew.config import ModelConfig
         from dew.inference.tasks import run_record
@@ -349,8 +351,11 @@ class Adapter:
         config = ModelConfig.from_dict(record(declaration['model'], 'model'))
         if config.adapter is None:
             raise ValueError(f"{directory} trained no adapter")
-        variables = objectives[text(declaration['objective'], 'objective')]._saved_variables(
-            str(directory), step=step, ema=ema)
+        objective = objectives[text(declaration['objective'], 'objective')]
+        variables = objective._saved_variables(str(directory), step=step, ema=ema)
+        # The recorded model's own tree, where the objective's nests it beside parts the record leaves out.
+        if objective._recorded_part is not None:
+            variables = part(variables, objective._recorded_part)
         return cls.recorded(config.build(), variables, config.adapter)
 
     @classmethod

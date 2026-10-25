@@ -1,7 +1,7 @@
-"""One renderer of decision rows (docs/design/decision-render.md): a row is a sequence of chunks, text
-with character marks or ids (a special token, a request's media) with marks of whole ids, its chunks'
-boundaries those of the pieces a release's reference encodes. `render` encodes them by the layout's
-unit and gives each mark its tokens:
+"""One renderer of decision rows (docs/design/decision-inputs.md, "A layout is data: segments"): a row
+is a sequence of chunks, text with character marks or ids (a special token, a request's media) with
+marks of whole ids, its chunks' boundaries those of the pieces a release's reference encodes.
+`render` encodes them by the layout's unit and gives each mark its tokens:
 
 - `pieces` encodes each text chunk alone, as a release that encodes its prompt piece by piece does
   (Laya's, the joint release's); a mark then covers whole chunks;
