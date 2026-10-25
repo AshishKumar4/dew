@@ -36,7 +36,7 @@ from dew.nn.mlp import GatedMLP
 from dew.nn.precision import accumulated, at_least_fp32, capped_logits, scaled_logits
 from dew.nn.scatter import DROPPED
 from dew.records import JSON
-from dew.registry import class_record, from_record, import_path, imported, record_fields
+from dew.registry import Record, class_record, from_record, import_path, imported, record_fields
 
 
 def _layer_norm(dtype: Dtype | None, name: str) -> nn.Module:
@@ -80,7 +80,7 @@ class Head(nn.Module):
             raise ValueError("this head reads one question a row; lay the rows out with a "
                              "QuestionLayout or use a joint head")
 
-    def record(self) -> dict[str, object]:
+    def record(self) -> Record:
         """Return the head as a run records it: its class by import path (`dew.registry`) and its
         fields but the width, which the backbone it reads gives, so any head reloads, one of a
         package the run trusts too."""
