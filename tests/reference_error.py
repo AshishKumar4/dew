@@ -576,6 +576,16 @@ def log_sum(values) -> float:
     return math.log(largest) + math.log(float(np.sum(values / largest)))
 
 
+def root_mean(values) -> float:
+    """The root of the mean of nonnegative values (each seed's mean squared error), scaled by their
+    largest first, so no sum of finite values overflows on the way: finite wherever they are."""
+    values = np.asarray(values, np.float64)
+    largest = float(np.max(values)) if values.size else 0.0
+    if not largest > 0:
+        return 0.0
+    return math.sqrt(largest) * math.sqrt(float(np.mean(values / largest)))
+
+
 def log_ratio(mine, theirs) -> float:
     """A ratio rule's measure: the natural log of Dew's error over the reference's, the largest over its
     elements, each log exact for every positive error (`_logs`). Finite at every finite error and
@@ -955,7 +965,7 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
             # No ratio to judge, but rows over an orbit's other orders still are; Dew's own RMS error is
             # what a change can make worse.
             if np.sum(a) > 0:
-                over.append(Finding(leaf, "exact reference", float(np.sqrt(np.mean(a))),
+                over.append(Finding(leaf, "exact reference", root_mean(a),
                                     f"{leaf}: the reference equals float64 on every seed and dew does not"))
         else:
             ratio, low, high = _judged(draws, index, tails)
