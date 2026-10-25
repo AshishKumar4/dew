@@ -185,10 +185,6 @@ def untrained(batch, kind):
     return {**batch, mark: np.zeros_like(batch[mark])}
 
 
-def leaves(tree):
-    return jax.tree.leaves(tree)
-
-
 @pytest.mark.parametrize("kind", KINDS)
 def test_a_policy_run_moves_each_balancing_bias_by_its_pooled_load_once_per_committed_update(kind):
     """Two microbatches make one committed update, which moves each router's bias by one
@@ -214,14 +210,14 @@ def test_a_policy_run_moves_each_balancing_bias_by_its_pooled_load_once_per_comm
         reference = jax.tree.map(np.asarray, state.variables)
         partial, *_ = run(state, designed(kind, FIRST, rows))
         assert int(partial.updates) == commit
-        (before,) = leaves(reference["moe"])
-        (unmoved,) = leaves(partial.variables["moe"])
+        (before,) = jax.tree.leaves(reference["moe"])
+        (unmoved,) = jax.tree.leaves(partial.variables["moe"])
         np.testing.assert_array_equal(unmoved, before)
-        (accumulated,) = leaves(partial.accumulation.effects)
+        (accumulated,) = jax.tree.leaves(partial.accumulation.effects)
         np.testing.assert_array_equal(accumulated, booked)
         state, *_ = run(partial, designed(kind, SECOND, rows))
         assert int(state.updates) == commit + 1
-        (after,) = leaves(state.variables["moe"])
+        (after,) = jax.tree.leaves(state.variables["moe"])
         np.testing.assert_array_equal(after, before + step_direction)
 
 
@@ -242,16 +238,17 @@ def test_tokens_that_train_nothing_add_nothing_to_a_policy_runs_router_counts(ki
         other, other_objective = untrained(plain, kind), obj
     _, other_aux = other_objective.scalar_loss(variables, other, step_for(variables))
     if change == "padding":
-        for before, after in zip(leaves(plain_aux.effects), leaves(other_aux.effects), strict=True):
+        for before, after in zip(jax.tree.leaves(plain_aux.effects), jax.tree.leaves(other_aux.effects),
+                                 strict=True):
             assert jnp.issubdtype(before.dtype, jnp.integer)
             np.testing.assert_array_equal(before, after)
         expected = obj.apply_effects(variables, plain_aux.effects)["moe"]
     else:
-        for count in leaves(other_aux.effects):
+        for count in jax.tree.leaves(other_aux.effects):
             np.testing.assert_array_equal(count, 0)
         expected = variables["moe"]
     actual = other_objective.apply_effects(variables, other_aux.effects)["moe"]
-    for want, got in zip(leaves(expected), leaves(actual), strict=True):
+    for want, got in zip(jax.tree.leaves(expected), jax.tree.leaves(actual), strict=True):
         np.testing.assert_array_equal(got, want)
 
 

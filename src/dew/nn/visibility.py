@@ -8,6 +8,7 @@ from typing import Literal
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 
 def windowed(query, key, window: int, *, causal: bool):
@@ -58,6 +59,17 @@ def prompt_blocks(valid, prefix: int | Literal["prompt"], *, xp=jnp):
     if prefix == "prompt":
         return xp.where(valid, 1, -1).astype(xp.int32)
     return prefix_blocks(valid.astype(xp.int32), xp.cumsum(valid, axis=1, dtype=xp.int32) - 1, prefix, xp=xp)
+
+
+def served_blocks(real, prefix: int | Literal["prompt"]):
+    """The blocks a server makes of the prompts whose real tokens are `real` `[B, S]` under a prefix run
+    (`prompt_blocks`), counted on the host, which every serving path reads (`generate`'s request check and
+    `Server`'s admission): a prompt shorter than an int `prefix` is refused, since its trained block would
+    cover tokens it lacks."""
+    real = np.asarray(real, bool)
+    if prefix != "prompt" and (real.sum(axis=1) < prefix).any():
+        raise ValueError(f"a prompt under prefix {prefix} needs {prefix} real tokens in every row")
+    return prompt_blocks(real, prefix, xp=np)
 
 
 def block_starts(groups):

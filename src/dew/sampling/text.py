@@ -21,7 +21,7 @@ import hashlib
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Generic, get_args
+from typing import Generic, Literal, get_args
 
 import jax
 import jax.numpy as jnp
@@ -35,6 +35,7 @@ from typing_extensions import TypeVar
 from dew.hashing import array_fingerprint
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import (
+    BLOCKS_FIELD,
     ModelInputs,
     PredictionPhase,
     Request,
@@ -62,6 +63,7 @@ from dew.nn.protocols import (
     Selective,
     Serving,
 )
+from dew.nn.visibility import served_blocks
 from dew.objectives.base import Variables
 from dew.records import finite
 from dew.sampling import decoding, strategies
@@ -795,17 +797,22 @@ def _digest(components: Components) -> tuple[Identity, str]:
 
 def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tokens: int, trips: int,
            sampling: Sampling, n: int, logits: Transforms | None, stopping: Criteria | None,
-           strategy: Strategy | None, pooled: bool) -> tuple[ModelInputs, tuple, Components]:
+           strategy: Strategy | None, prefix: int | Literal["prompt"] | None,
+           pooled: bool) -> tuple[ModelInputs, tuple, Components]:
     """This process's validated request, the controls a pool compares, and
     the decoding components.
 
     The component digest is raised from here with the rest, so a pool agrees
     on the failure before any rank enters a collective. A single process
     never digests: refusing a component only a pool could disagree about
-    would cost it nothing.
+    would cost it nothing. A prefix run's blocks are made here of this
+    process's own rows, and a prompt too short for them refused, so a pool
+    refuses it together.
     """
     ids = local_rows(inputs.tokens)
     fields = {name: jax.tree.map(local_rows, value) for name, value in inputs.token_fields.items()}
+    if prefix is not None and BLOCKS_FIELD not in fields:
+        fields = {**fields, BLOCKS_FIELD: served_blocks(real_slots(fields, ids.shape, xp=np), prefix)}
     conditioning = {name: local_rows(value, host=False) for name, value in inputs.conditioning.items()}
     if "params" not in params:
         raise ValueError("generate takes the full variables dict ({'params': ...})")
@@ -853,7 +860,7 @@ def generate(model: nn.Module, params: Variables,
              *, key: int | jax.Array,
              sampling: Sampling = _DEFAULT_SAMPLING, n: int = 1, logits: Transforms | None = None,
              stopping: Criteria | None = None, strategy: Strategy | None = None,
-             trips: int | None = None) -> Generation:
+             trips: int | None = None, prefix: int | Literal["prompt"] | None = None) -> Generation:
     """Generate continuations from model inputs, or from token ids for a text-only prompt.
 
     ``params`` is the full variables dict, ``{'params': ...}``.
@@ -893,6 +900,13 @@ def generate(model: nn.Module, params: Variables,
     them); the budget still bounds what the request draws as far as a
     transform or a search reads it (``ForcedEOS``, ``Beam``), and the
     columns past it come back for the caller to cut.
+
+    ``prefix`` serves a prefix run (``LMObjective``'s): each prompt that
+    carries no blocks of its own reads its first ``prefix`` real tokens, or
+    with ``"prompt"`` all of them, as one block (``served_blocks``). They are
+    made of each process's own rows inside the request's agreed check, and a
+    prompt with fewer real tokens than an int ``prefix`` is refused there, by
+    every process of a pool together.
     """
     if sampling.stop:
         raise ValueError("stop strings compile against a tokenizer's vocabulary, which generate does not "
@@ -902,7 +916,7 @@ def generate(model: nn.Module, params: Variables,
     request, components = Request.prepare(
         inputs, key, mesh_of(params),
         lambda canonical, pooled: _check(model, params, canonical, max_new_tokens, scanned, sampling, n,
-                                         logits, stopping, strategy, pooled),
+                                         logits, stopping, strategy, prefix, pooled),
         phase="generation")
     plan = request.plan
     capacity = model.max_seq_len if isinstance(model, Bounded) else None
