@@ -896,13 +896,23 @@ def learning_rate(opt_state: optax.OptState) -> jax.typing.ArrayLike | None:
     """Return the learning rate stored in `opt_state`, if the optimizer stores one.
 
     An OptimConfig's solver holds the rate it stepped at last (`dew.optim.scheduled_solver`), and an
-    Optax optimizer can inject `learning_rate` itself (`optax.inject_hyperparams`). The result is None
+    Optax optimizer can inject `learning_rate` itself (`optax.inject_hyperparams`); an injected
+    wrapper of other hyperparameters is read through to the optimizer it holds. The result is None
     when the optimizer closes over the rate, or when parameter groups hold several rates.
     """
     injected = (optax.InjectHyperparamsState, optax.InjectStatefulHyperparamsState)
-    rates = [node.hyperparams["learning_rate"]
-             for node in jax.tree.leaves(opt_state, is_leaf=lambda node: isinstance(node, injected))
-             if isinstance(node, injected) and "learning_rate" in node.hyperparams]
+    rates = []
+
+    def read(tree):
+        for node in jax.tree.leaves(tree, is_leaf=lambda node: isinstance(node, injected)):
+            if not isinstance(node, injected):
+                continue
+            if "learning_rate" in node.hyperparams:
+                rates.append(node.hyperparams["learning_rate"])
+            else:
+                read(node.inner_state)
+
+    read(opt_state)
     return rates[0] if len(rates) == 1 else None
 
 
@@ -1340,22 +1350,18 @@ class OneCycle(ScheduleBase):
         if not 0 < rise < last:
             raise ValueError(f"a one-cycle schedule over {steps} steps with warmup fraction "
                              f"{self.warmup_fraction} has no rise or no fall; give it more steps")
-        # Each half cosine is optax's cosine decay (`optax.cosine_decay_schedule`) from its start to its
-        # stop, the stop its start's multiple, the configured fields' ratio, which a group's multiplier
-        # leaves as it is. optax's decay counts whole steps, and torch keeps its phase ends as floats, so
-        # its form is written here. It lands on its start exactly, where torch's form,
-        # `stop + (start - stop) / 2 * (cos + 1)`, rounds the difference of the two in float32.
-        configured = self.rates()
-        up = configured['peak_value'] / configured['init_value']
-        down = configured['end_value'] / configured['peak_value']
-
-        def anneal(start: jax.Array | float, ratio: float, done: jax.Array) -> jax.Array:
-            return start * ((1 - ratio) * (0.5 * (1 + jnp.cos(jnp.pi * done))) + ratio)
+        # Each half cosine weighs its two ends by the cosine's halves, `start * c + stop * (1 - c)`, so it
+        # lands on each end exactly and takes any two rates, a zero start or ends far apart; torch's
+        # form, `stop + (start - stop) / 2 * (cos + 1)`, rounds the difference of the ends in float32,
+        # which put the run's first rate 25 times further from float64 than optax's cosine decay.
+        def anneal(start: jax.Array | float, stop: jax.Array | float, done: jax.Array) -> jax.Array:
+            turned = jnp.cos(jnp.pi * done)
+            return start * (0.5 * (1 + turned)) + stop * (0.5 * (1 - turned))
 
         def value(count) -> jax.Array:
             step = jnp.minimum(jnp.asarray(count, jnp.float32), last)
-            return jnp.where(step <= rise, anneal(rates['init_value'], up, step / rise),
-                             anneal(rates['peak_value'], down, (step - rise) / (last - rise)))
+            return jnp.where(step <= rise, anneal(rates['init_value'], rates['peak_value'], step / rise),
+                             anneal(rates['peak_value'], rates['end_value'], (step - rise) / (last - rise)))
 
         return value
 
