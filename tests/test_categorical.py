@@ -229,16 +229,24 @@ def test_the_divergences_derivative_near_its_reference_keeps_the_differences_pre
 
 def test_the_divergences_derivative_stays_finite_wherever_its_rows_are():
     """Rows each finite but far apart in offset have the derivative of the distributions they hold, here
-    two uniform rows' zero; rows far apart in shape have a finite Hessian; logits -inf where the
+    two uniform rows' zero; rows far apart in shape have a finite Hessian, and rows at opposite extrema,
+    whose difference less its mean overflows, the derivative `p - q` with one; logits -inf where the
     reference is not take `p - q` in forward mode as in reverse; and a row whose classes `where`
     excludes entirely has derivative 0 beside a held row's."""
     far = jnp.asarray([[2e38, 2e38]], jnp.float32), jnp.asarray([[-2e38, -2e38]], jnp.float32)
     offset = jax.grad(lambda rows: categorical.kl_divergence(rows, far[1]).sum())(far[0])
     np.testing.assert_array_equal(offset, np.zeros((1, 2), np.float32))
-    apart = jnp.asarray([200.0, 0.0]), jnp.asarray([-200.0, 0.0])
-    for hessian in (jax.hessian, lambda f: jax.jacfwd(jax.jacrev(f)), lambda f: jax.jacrev(jax.jacrev(f))):
-        held = hessian(lambda row: categorical.kl_divergence(row, apart[1]))(apart[0])
-        assert np.all(np.isfinite(np.asarray(held)))
+    extrema = jnp.asarray([1e38, -1e38], jnp.float32), jnp.asarray([-1e38, 1e38], jnp.float32)
+    for derivative in (jax.grad, jax.jacfwd):
+        np.testing.assert_array_equal(
+            derivative(lambda row: categorical.kl_divergence(row, extrema[1]))(extrema[0]), [1.0, -1.0])
+    for row, reference in ((jnp.asarray([200.0, 0.0]), jnp.asarray([-200.0, 0.0])), extrema):
+        def divergence(row, reference=reference):
+            return categorical.kl_divergence(row, reference)
+
+        for hessian in (jax.hessian, lambda f: jax.jacfwd(jax.jacrev(f)),
+                        lambda f: jax.jacrev(jax.jacrev(f))):
+            assert np.all(np.isfinite(np.asarray(hessian(divergence)(row))))
     student, reference = jnp.asarray([-jnp.inf, 0.0]), jnp.asarray([0.0, 0.0])
     _, forward = jax.jvp(lambda row: categorical.kl_divergence(row, reference), (student,),
                          (jnp.asarray([0.0, 1.0]),))
