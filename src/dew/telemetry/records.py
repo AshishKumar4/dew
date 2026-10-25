@@ -16,9 +16,9 @@ import subprocess
 import traceback
 import typing
 from collections.abc import Mapping, Sequence
-from pathlib import Path
 from typing import Literal
 
+from dew import _checkout
 from dew.pool import PREEMPTED_EXIT
 from dew.records import JSON
 
@@ -82,16 +82,11 @@ def checkout_revision() -> str | None:
     so both files and directories are accepted. Git unavailable or unable
     to read this checkout leaves the revision unknown and reports why.
     """
-    root = Path(__file__).resolve().parents[3]
-    if not (root / '.git').exists():
-        return None
     try:
-        revision = subprocess.run(['git', '-C', str(root), 'rev-parse', 'HEAD'],
-                                  capture_output=True, text=True, check=True)
+        return _checkout.revision()
     except (OSError, subprocess.CalledProcessError) as error:
         _log.warning("Cannot read Dew's checkout revision: %s", error)
         return None
-    return revision.stdout.strip()
 
 
 @dataclasses.dataclass(frozen=True)
