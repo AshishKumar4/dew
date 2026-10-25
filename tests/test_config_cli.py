@@ -125,16 +125,16 @@ def test_a_run_trainer_fit_trains_directly_says_why_no_record_rebuilds_it(tmp_pa
     seed. `RunConfig.load` refuses it, saying each."""
     import jax
     import optax
-    from autoencoder_experiment import run
+    from test_run_budgets import OptimConfig, Pulled, chain, records
 
     from dew.checkpoints import Checkpoints
     from dew.training import Trainer
 
-    experiment = run()
-    objective = experiment.objective.build(model=experiment.model.build())
-    optimizer, key = (optax.adam(1e-2), jax.random.key(0)) if built == "in Python" else (experiment.optim, 0)
-    Trainer(objective, optimizer, key=key, checkpoints=Checkpoints(str(tmp_path))).fit(
-        experiment.data, steps=1, checkpoint_every=1)
+    (x,) = records(0)
+    optimizer, key = ((optax.adam(0.1), jax.random.key(0)) if built == "in Python"
+                      else (OptimConfig(optimizer="adam", learning_rate=0.1), 0))
+    Trainer(Pulled(), optimizer, key=key, checkpoints=Checkpoints(str(tmp_path))).fit(
+        chain(x), steps=1, checkpoint_every=1)
     record = json.loads((tmp_path / "run.json").read_text())
     assert record["rebuildable"] is False
     assert len(record["reasons"]) == (3 if built == "in Python" else 1)
