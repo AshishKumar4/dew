@@ -12,21 +12,10 @@ from shared_bridge import DEADLINE_HEADER, OOM_PROBE, available, load, processes
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 
-TEXT = ("from dew.interop import PretrainedDecoder\nfrom dew.sampling import Sampling\n"
-        "model = PretrainedDecoder.load('HuggingFaceTB/SmolLM2-135M-Instruct', dtype='float32', "
-        "max_seq_len=256)\n"
-        "task = model.text_generation(sampling=Sampling(temperature=0))\n"
-        "print(task('The capital of France is', 24, key=0).text[0])")
+TEXT = Path(__file__).with_name("page-text.py").read_text()
 # Fill memory 128 MiB at a time until the context's own limit refuses more, having first
 # tried to make itself the last choice of the OOM killer.
-FILL = OOM_PROBE + """import numpy as np
-blocks = []
-try:
-    while True:
-        blocks.append(np.ones(16 << 20))
-except MemoryError:
-    print(f"held {len(blocks) * 128} MiB")
-"""
+FILL = OOM_PROBE + Path(__file__).with_name("fill-memory.py").read_text()
 
 
 def model_process():
@@ -150,11 +139,7 @@ async def main():
         # The page's cells, as Dew code the context's model_client stands in for.
         cells = [
             TEXT,
-            "from dew.inference import TextToImage\n"
-            "from dew.sampling import CFG, DPMSolverMultistep\n"
-            "pipe = TextToImage.from_pretrained('dewml/hybrid-dit-176m')\n"
-            "pipe(['a lake beneath the northern lights'], key=3, steps=15, "
-            "solver=DPMSolverMultistep(), guidance=CFG(6, interval=(0.15, 0.9))).pil()[0]",
+            Path(__file__).with_name("page-image.py").read_text(),
         ]
         for index, code in enumerate(cells):
             step(f"page cell {index}")
