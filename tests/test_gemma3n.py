@@ -641,6 +641,14 @@ def test_the_sparse_mlp_takes_the_references_cutoff_at_the_ends_of_its_domain(sp
         np.testing.assert_array_equal(np.asarray(dew, np.float32), reference(torch_dtype)["output"])
 
 
+def test_gaussian_topk_carries_a_nan_row_as_relu_does():
+    """A gate row holding a NaN has a NaN cutoff, so it keeps no value and every value is NaN, as relu of
+    its distance from the cutoff is; a finite row beside it is untouched."""
+    rows = jnp.asarray([[0.5, np.nan, -1.0, 2.0], [0.5, 1.0, -1.0, 2.0]], jnp.float32)
+    out = np.asarray(jax.jit(gaussian_topk, static_argnums=1)(rows, 0.5))
+    assert np.all(np.isnan(out[0])) and np.all(np.isfinite(out[1]))
+
+
 @pytest.mark.parametrize("sparsity", [0.5, 0.95])
 def test_gaussian_topk_has_the_population_cutoff_jacobian(sparsity):
     # Both active and inactive coordinates, separated from the cutoff.

@@ -7,8 +7,8 @@ gathered row to produce what the prompt it came from produces on its own.
 Every mixer keeps different state, so each one is exercised: dense attention
 scanned and unscanned, a gated delta net's convolution and recurrent summary,
 latent attention's compressed cache and the sparse indexer's keys beside it,
-an image-aware attention's cached groups, and a multimodal wrapper's next
-position.
+an image-aware attention, whose cached calls read their own groups beside the
+cache, and a multimodal wrapper's next position.
 """
 
 import jax
@@ -49,7 +49,7 @@ def sparse_mla():
 
 
 def image_aware():
-    """Attention that makes image blocks bidirectional: its cache adds the groups."""
+    """Attention that makes image blocks bidirectional: a cached call reads its own tokens' groups."""
     from dew.nn.mixers.attention import AttentionMixer
 
     return CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=1, num_heads=2,
