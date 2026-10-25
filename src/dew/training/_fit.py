@@ -11,9 +11,9 @@ from collections.abc import Iterator, Mapping, Sequence
 import jax
 
 from dew._coordination import agreed_next
+from dew.batch import Batch
 from dew.data.dataset import Loader
 from dew.objectives.base import Metric
-from dew.batch import Batch
 from dew.telemetry.profile import region
 from dew.training.budget import Plateau
 from dew.training.distributed import DevicePrefetchIterator, Signature
