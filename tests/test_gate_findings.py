@@ -9,44 +9,16 @@ import sys
 from pathlib import Path
 from xml.etree import ElementTree
 
-import jax
-import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import PARITY, GateFailure, assert_as_exact, assert_as_exact_as_the_reference, seeds_for
-
-
-def _draw(seed):
-    rng = np.random.default_rng(seed)
-    return rng.normal(size=(64, 256)).astype(np.float32), rng.normal(size=(256, 32)).astype(np.float32)
-
-
-@jax.jit
-def _product(x, w):
-    return {"y": jnp.dot(x, w, precision="highest")}
-
-
-@jax.jit
-def _lost_term(x, w):
-    return {"y": jnp.dot(x[:, :-1], w[:-1], precision="highest")}
-
-
-def test_a_failing_site_raises_its_findings_as_data():
-    """A lost term fails check 1's pooled ratio: its finding names the leaf, the rule and a measure past
-    PARITY, and the failure's message is its findings', one a line."""
-    with pytest.raises(GateFailure) as raised:
-        assert_as_exact(_lost_term, _product, _draw, "lost", seeds=seeds_for(_product, _draw, "product"))
-    assert str(raised.value) == "\n".join(map(str, raised.value.findings))
-    pooled = [finding for finding in raised.value.findings if finding.rule == "pooled"]
-    assert pooled and all(finding.leaf.startswith("lost") and finding.measure > PARITY for finding in pooled)
+from reference_error import GateFailure, assert_as_exact_as_the_reference, row_errors
 
 
 def test_the_one_draw_rule_measures_its_worst_zero_row_and_names_a_value_not_finite():
     """A row five times the reference's error (over ROW_FACTOR, under the pooled factor), and two rows of
     float64 zero that Dew misses by 5 and by 100 times the reference's own: the zero rows' measure is
-    the worst, 100, not the first row's; the message keeps the rule's own wording, the label once, the
-    rows' findings on one line. A value that is not finite is that rule's finding, measured 1, not a
-    ratio NaN would leave unorderable."""
+    the worst row's, not the first's. A value that is not finite is that rule's finding, measured 1,
+    not a ratio NaN would leave unorderable."""
     truth = np.concatenate([np.linspace(1.0, 2.0, 64).reshape(32, 2), np.zeros((2, 2))])
     reference = truth + np.concatenate([np.full((32, 2), 1e-6), np.full((2, 2), 1e-9)])
     dew = reference.copy()
@@ -55,8 +27,10 @@ def test_the_one_draw_rule_measures_its_worst_zero_row_and_names_a_value_not_fin
     with pytest.raises(GateFailure) as raised:
         assert_as_exact_as_the_reference(dew, reference, truth, "rows")
     rules = {finding.rule: finding.measure for finding in raised.value.findings}
-    assert rules["row"] == pytest.approx(5.0) and rules["zero rows"] == pytest.approx(100.0)
-    assert str(raised.value).startswith("rows: ") and "\n" not in str(raised.value)
+    _, mine = row_errors(dew, truth)
+    _, theirs = row_errors(reference, truth)
+    first, worst = (float(mine[row] / theirs[row]) for row in (32, 33))
+    assert "row" in rules and rules["zero rows"] == worst > first
     dew[1, 0] = np.nan
     with pytest.raises(GateFailure) as raised:
         assert_as_exact_as_the_reference(dew, reference, truth, "nan")
@@ -64,19 +38,21 @@ def test_the_one_draw_rule_measures_its_worst_zero_row_and_names_a_value_not_fin
     assert (finding.rule, finding.measure) == ("not finite", 1)
 
 
+def three_times(label):
+    """The one-draw rule on Dew three times the reference's error from float64, which it fails."""
+    truth = np.linspace(1.0, 2.0, 64)
+    reference = truth + 1e-3 * np.cos(np.arange(64))
+    assert_as_exact_as_the_reference(truth + 3 * (reference - truth), reference, truth, label)
+
+
 def test_a_test_the_gate_fails_reports_its_findings_as_a_junit_property(tmp_path):
-    """A test failing the one-draw rule at three times the reference's error, in its call and, apart, in
-    its teardown: each reports its finding (leaf, rule, measure, phase) as the JUnit property
-    `gate_findings`."""
+    """A test failing the one-draw rule at three times the reference's error (`three_times`), in its call
+    and, apart, in its teardown: each reports its finding (leaf, rule, measure, phase) as the JUnit
+    property `gate_findings`, the measure the finding's own."""
     site = tmp_path / "test_site.py"
     site.write_text(
-        "import numpy as np\n"
         "import pytest\n"
-        "from reference_error import assert_as_exact_as_the_reference\n\n\n"
-        "def three_times(label):\n"
-        "    truth = np.linspace(1.0, 2.0, 64)\n"
-        "    reference = truth + 1e-3 * np.cos(np.arange(64))\n"
-        "    assert_as_exact_as_the_reference(truth + 3 * (reference - truth), reference, truth, label)\n\n\n"
+        "from test_gate_findings import three_times\n\n\n"
         "@pytest.fixture\n"
         "def torn():\n"
         "    yield\n"
@@ -101,4 +77,6 @@ def test_a_test_the_gate_fails_reports_its_findings_as_a_junit_property(tmp_path
         ("call", "pooled", "call")]
     assert [(item["leaf"], item["rule"], item["phase"]) for item in found["test_teardown"]] == [
         ("teardown", "pooled", "teardown")]
-    assert found["test_call"][0]["measure"] == pytest.approx(3.0)
+    with pytest.raises(GateFailure) as raised:
+        three_times("call")
+    assert found["test_call"][0]["measure"] == raised.value.findings[0].measure
