@@ -11,6 +11,7 @@ import optax
 import pytest
 from affine_run import raw_leaf
 from flax import struct
+from reference_error import assert_as_exact
 
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition
@@ -348,8 +349,6 @@ def test_a_clipped_run_stores_its_stepped_kernels_times_the_clip():
     arm steps by the same `W + update` and the clip alone sets the kernels apart; the threshold sits
     below every head's logits, so each head clips. Folding the rescale into an update,
     `(gamma - 1) W + gamma u`, rounded at `W`'s scale twice (ledger 1659)."""
-    from reference_error import assert_as_exact
-
     from dew.data.chat import Role
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives import Step
