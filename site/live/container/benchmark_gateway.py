@@ -193,7 +193,7 @@ def isolated(kernels):
         assert collect(client, message).strip() == 'private stdin probe'
         execute(client, guest_program("isolation-probe.py"))
         if foreign != identifier:
-            execute(client, f"foreign = {foreign!r}\n" + guest_program("foreign-probe.py"))
+            execute(client, guest_program("foreign-probe.py") + f"\nreach({foreign!r})")
 
 
 def warmed(kernels):
