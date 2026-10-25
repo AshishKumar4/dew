@@ -26,6 +26,7 @@ import importlib.util
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -96,19 +97,27 @@ def environment(tree: Path, lock: str, cache: Path = CACHE) -> Path:
 
 FILED = ("-r", "--requirements", "-c", "--constraint", "--constraints", "--override", "--overrides")
 """uv pip install's options whose argument is a file it reads: a reference is named by those files' lines."""
-NESTED = re.compile(r"^(?:-r|-c|--requirements?|--constraints?)(?:=|\s+)?(\S+)")
-"""A line of a requirements, constraints or overrides file that reads another file, relative to its own."""
+NESTED = re.compile(r"^(?:-r|-c|--requirements?|--constraints?)(?:=|\s+)?(.+)$")
+"""A line of a requirements, constraints or overrides file that reads another file, relative to its own: its
+operand quoted as a shell word, `${NAME}` taken from the environment, as pip and uv read it."""
 
 
 def filed(path: Path, seen: frozenset[Path] = frozenset()) -> str:
-    """The lines of file `path`, then those of each file it reads (`NESTED`), however deep, each once along a
-    path of reads: what installing from it reads, so a changed pin in an included file names a new environment
-    (OrganicMouse: a reference's override read another, whose change reused a stale environment)."""
+    """The lines of file `path`, and, where it reads others (`NESTED`), however deep, each once along a path
+    of reads, its lines and theirs each apart: what installing from it reads, so a changed pin in an included
+    file names a new environment, and a pin moved between a file and one it reads is a change too
+    (OrganicMouse: a reference's override read another, whose change reused a stale environment). A file
+    reading none is its lines alone, as it was named before."""
     text = path.read_text()
-    reads = [path.parent / found[1] for line in text.splitlines() if (found := NESTED.match(line.strip()))
-             and "://" not in found[1]]
+    reads = []
+    for line in text.splitlines():
+        if (found := NESTED.match(line.strip())) and (words := shlex.split(found[1], comments=True)):
+            operand = re.sub(r"\$\{(\w+)\}", lambda name: os.environ.get(name[1], name[0]), words[0])
+            if "://" not in operand:
+                reads.append(path.parent / operand)
     seen |= {path.resolve()}
-    return text + "".join(filed(read, seen) for read in reads if read.resolve() not in seen)
+    nested = [filed(read, seen) for read in reads if read.resolve() not in seen]
+    return json.dumps([text, *nested]) if nested else text
 
 
 def reference(name: str, install: list[str], python: str = "3.12", cache: Path = CACHE) -> Path:
