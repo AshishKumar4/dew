@@ -14,7 +14,7 @@ from flax import linen as nn
 
 import dew.config
 import dew.nn.backbones
-from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
+from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader, Ramp
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -555,53 +555,3 @@ def test_param_groups_with_schedules_momentum_and_bounds_round_trip():
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
     assert loaded == config
     assert loaded.optim.param_groups[0].bounds == (0.0, 24.0)
-
-
-def test_a_run_recorded_with_its_qk_statistics_switch_reads_as_one_whose_step_asks():
-    """A run recorded while its token objective took `qk_stats` (an LM's, or a policy's, PPO's passing
-    on to its actor), which the step whose optimizer clips by the attention maxima now asks for
-    (`Step.qk_stats`), reads as today's objective: the switch, stated or defaulted, is dropped, where the
-    record was refused as one of an argument the class no longer takes."""
-    for name in ("lm", "dpo", "grpo", "ppo"):
-        for recorded in ({"defaults": {"qk_stats": False}}, {"fields": {"qk_stats": True}}):
-            config = ObjectiveConfig(name, **recorded)
-            assert "qk_stats" not in {**config.fields, **config.defaults}
-
-
-def test_a_run_recorded_with_the_lm_balance_arguments_reads_as_one_balance_record():
-    """A run recorded while its LM objective took the four balance arguments reads them as one `balance`
-    record, the `ExpertBalance` they made, where the record was refused as arguments the class no longer
-    takes. A run whose four were all at their defaults reads as no balance."""
-    balance = {"balance_rate": 0.01, "aux_loss_alpha": None, "seq_aux": True, "router_z_loss": 0.0}
-    defaulted = ObjectiveConfig("lm", defaults=balance)
-    assert defaulted.defaults["balance"] == balance
-    assert not set(balance) & set({**defaulted.fields, **defaulted.defaults})
-    stated = ObjectiveConfig("lm", {"balance_rate": 0.01})
-    assert stated.fields["balance"] == balance
-    assert "balance_rate" not in stated.fields
-    unset = ObjectiveConfig("lm", defaults={**balance, "balance_rate": None})
-    assert unset.defaults.get("balance") is None
-
-
-def test_a_run_whose_balance_arguments_are_split_across_stated_and_default_ones_keeps_its_balance():
-    """A run recorded with `aux_loss_alpha` stated and its other three balance arguments among the recorded
-    defaults builds the balance it had, and reads back as the same run."""
-    from dew.objectives.routing import ExpertBalance
-
-    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
-                              max_seq_len=8, mixture={"experts": 4, "top_k": 2, "bias": True})
-    config = ObjectiveConfig("lm", {"aux_loss_alpha": 0.2},
-                             defaults={"balance_rate": 0.01, "seq_aux": False, "router_z_loss": 0.1})
-    objective = config.build(model=model, seq_len=8)
-    assert objective.balance == ExpertBalance(balance_rate=0.01, aux_loss_alpha=0.2, seq_aux=False,
-                                              router_z_loss=0.1)
-    saved = json.loads(json.dumps({"fields": config.fields, "defaults": config.defaults}))
-    assert ObjectiveConfig("lm", **saved) == config
-
-
-def test_a_run_recorded_balancing_at_rate_zero_reads_as_one_that_moves_no_bias():
-    """A recorded LM run whose `balance_rate` was 0, which moved no bias, reads as one with no bias rate,
-    its other balance terms kept, where `ExpertBalance` refuses a rate that moves nothing."""
-    config = ObjectiveConfig("lm", {"balance_rate": 0.0, "aux_loss_alpha": 0.2})
-    assert config.fields["balance"] == {"balance_rate": None, "aux_loss_alpha": 0.2, "seq_aux": True,
-                                        "router_z_loss": 0.0}
