@@ -158,8 +158,8 @@ class Mma(mosaic.Family):
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, consumer: Callable, *,
                 consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0) -> None:
         # Each tile's pipeline is its own (`emit_pipeline` fills and drains it), its step count static; an
-        # output is staged after it, in the shared memory its stages held, and stored through registers
-        # (no TMA before Hopper).
+        # output is staged after it, scoped apart from its stages though Mosaic reserves both at once
+        # (`grouped_matmul._Mosaic.staged_bytes`), and stored through registers (no TMA before Hopper).
         _one(consumers)
         del in_flight
 

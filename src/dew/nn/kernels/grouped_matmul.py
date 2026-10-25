@@ -26,7 +26,7 @@ import functools
 import importlib
 import importlib.util
 import math
-from collections.abc import Callable, Hashable
+from collections.abc import Callable, Hashable, Mapping
 from typing import ClassVar
 
 import jax
@@ -68,37 +68,51 @@ def _doubling(least: int, most: int) -> tuple[int, ...]:
                  if least << power <= most)
 
 
-def triton_tiles(dtype, depth: int, width: int) -> tuple[Tile, ...]:
-    """Every tile a Triton launch may take for operands of `dtype` at a call whose step and column axes
-    span `depth` and `width` (`_Triton._dense_extents`), from the MMA's facts and Triton's alone (no table
-    of tiles): each axis a power of two (`tl.arange`'s extents are); rows from one warpgroup's MMA rows
-    (`mosaic.Family.role_rows`: wgmma's 64, four warps of mma.sync's 16) and columns from a swizzled row's
-    elements (`mosaic.SWIZZLE_BYTES`) to the call's `width` (Triton masks a block past it), while a
-    thread's share of the fp32 accumulator stays within its registers at the most warps
-    (`cost.THREAD_REGISTERS`); a step from half a swizzled row to the call's `depth`; one warpgroup a
-    program or as many as warpgroup MMA's consumer roles
-    (`mosaic.Family.consumers`), over which Triton spreads a dot; and stages from two to as many steps as
-    a block of the roomiest family holds (`mosaic.Family.most_shared`). A target's launch keeps those that
-    fit it (`_Triton.fitting`) and ranks those its cost model is calibrated over (`_Triton.calibrated`).
-    Where the model ties (it charges a compute-bound tile's work alike), the first wins: the fewest rows,
-    which a group's boundary tile computes past its group's; the deeper step, which synchronizes its
+def triton_tiles(dtype, roles: Mapping[str, str], extents: Mapping[str, int | None]) -> tuple[Tile, ...]:
+    """Every tile a Triton launch may take for operands of `dtype`, from the MMA's facts and Triton's alone
+    (no table of tiles), its fields playing the launch's `roles` (each of `block_m`, `block_n` and
+    `block_k` its output's 'rows' or 'columns', or its contraction's 'step') over the call's `extents` by
+    role (None where the call's rows set it, padded): each a power of two (`tl.arange`'s extents are);
+    rows from mma.sync's 16 (`mosaic_sm80.Mma.rows`) to the call's, at least a warpgroup MMA's
+    (`mosaic.Family.role_rows`); columns from a swizzled row's elements (`mosaic.SWIZZLE_BYTES`) to the
+    call's (Triton masks a block past it); a step from the narrowest swizzle mma.sync stages a step at
+    (`mosaic_sm80.Mma.depths`) to the call's; an output a thread's share of whose fp32 accumulator stays
+    within its registers at the most warps (`cost.THREAD_REGISTERS`) and a step's blocks a block of the
+    roomiest family holds (`mosaic.Family.most_shared`); one warpgroup a program or as many as warpgroup
+    MMA's consumer roles (`mosaic.Family.consumers`), over which Triton spreads a dot; and stages from two
+    to as many steps as that block holds. A target's launch keeps those that fit it (`_Triton.fitting`)
+    and ranks those its cost model is calibrated over (`_Triton.calibrated`). Where the model ties (it
+    charges a compute-bound tile's work alike), the first wins: the fewest `block_m` and `block_n`, which
+    a group's boundary tile computes past its group's; the deepest `block_k`, which synchronizes its
     pipeline fewer times a tile (at 128 x 256 on an H100, a step of 64 took 1.56 ms where 32 took 1.78,
-    GMM-h100-2); the more warps; and three stages, then deeper, then two: three ran the fastest of a tile's
-    stage counts most often in the sweeps (30 of their 56 records, GMMT-a100 and GMM-h100-2)."""
-    family = mosaic_sm90.WGMMA
-    size = jnp.dtype(dtype).itemsize
-    row = mosaic.SWIZZLE_BYTES // size
+    GMM-h100-2); the more warps; and three stages, then deeper, then two: three ran the fastest of a
+    tile's stage counts most often in the sweeps (30 of their 56 records, GMMT-a100 and GMM-h100-2)."""
+    family, size = mosaic_sm90.WGMMA, jnp.dtype(dtype).itemsize
     warps = [mosaic.THREADS // 32 * consumers for consumers in range(family.consumers, 0, -1)]
     held = max(warps) * 32 * cost.THREAD_REGISTERS
+    shared = max(mosaic_sm90.WGMMA.most_shared, mosaic_sm80.Mma.most_shared)
+    least = {'rows': mosaic_sm80.Mma.rows, 'columns': mosaic.SWIZZLE_BYTES // size,
+             'step': min(mosaic_sm80.Mma(jnp.dtype(dtype)).depths(dtype))}
+    called = {'rows': family.role_rows, 'columns': least['columns'], 'step': least['step']}
+    # The most each role spans: the call's extent where it sets one, else what registers (an output's
+    # rows) or shared memory (a step over rows) leave beside the other roles' least.
+    resourced = {'rows': held // least['columns'], 'columns': held // least['rows'],
+                 'step': shared // ((least['rows'] + least['columns']) * size)}
+    spans = {role: _doubling(least[role], resourced[role] if extents.get(role) is None
+                             else max(called[role], _covering(extents[role])))
+             for role in least}
+    fields = {field: spans[role] for field, role in roles.items()}
     tiles = []
-    for block_m in _doubling(family.role_rows, held // row):
-        for block_n in _doubling(row, max(row, min(_covering(width), held // block_m))):
-            if block_m * block_n >= held:
-                continue
-            for block_k in reversed(_doubling(row // 2, max(row // 2, _covering(depth)))):
-                # A step's blocks, a product's (`Gmm.loaded`) or a kernel gradient's (`Tgmm.loaded`).
-                step = min((block_m + block_n) * block_k, block_m * (block_k + block_n)) * size
-                deepest = max(mosaic_sm90.WGMMA.most_shared, mosaic_sm80.Mma.most_shared) // step + 1
+    for block_m in fields['block_m']:
+        for block_n in fields['block_n']:
+            for block_k in reversed(fields['block_k']):
+                of = dict(zip(('block_m', 'block_n', 'block_k'), (block_m, block_n, block_k), strict=True))
+                rows, columns, step = (next(of[field] for field, role in roles.items() if role == wanted)
+                                       for wanted in ('rows', 'columns', 'step'))
+                loaded = (rows + columns) * step * size
+                if rows * columns >= held or loaded > shared:
+                    continue
+                deepest = shared // loaded + 1
                 stages = [count for count in (3, *range(4, deepest + 1), 2) if count <= deepest]
                 tiles += [Tile(block_m, block_n, block_k, warp_count, count)
                           for warp_count in warps for count in stages]
@@ -417,8 +431,16 @@ class _Triton(_GroupedLaunch[Tile]):
     def _dense_extents(ba) -> tuple[int, int]:
         """The depth and width a dense call's tiles divide."""
 
+    ROLES: ClassVar[Mapping[str, str]]
+    """What each tile field spans (`triton_tiles`): its output's 'rows' or 'columns', or its contraction's
+    'step'."""
+
     def space(self, ba) -> tuple[Tile, ...]:
-        return triton_tiles(ba.arguments['tokens'].dtype, *self._dense_extents(ba))
+        depth, width = self._dense_extents(ba)
+        # The call's depth is a product's step and a kernel gradient's output rows; its rows (None) are
+        # a product's output rows and a kernel gradient's steps, padded to the tile.
+        extents = {'columns': width, ('step' if self.ROLES['block_k'] == 'step' else 'rows'): depth}
+        return triton_tiles(ba.arguments['tokens'].dtype, self.ROLES, extents)
 
     def calibrated(self, config: Tile) -> bool:
         return all(least <= getattr(config, axis) <= most
@@ -501,6 +523,7 @@ class Gmm(_Triton):
     `kernel` `[groups, in, out]`, or of its transpose with `trans_rhs`."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
+    ROLES: ClassVar[Mapping[str, str]] = {'block_m': 'rows', 'block_n': 'columns', 'block_k': 'step'}
 
     @staticmethod
     def _dense_extents(ba) -> tuple[int, int]:
@@ -602,6 +625,7 @@ class Tgmm(_Triton):
     kernel gradient `[groups, in, out]`."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
+    ROLES: ClassVar[Mapping[str, str]] = {'block_m': 'step', 'block_n': 'columns', 'block_k': 'rows'}
 
     @staticmethod
     def _dense_extents(ba) -> tuple[int, int]:
@@ -722,7 +746,19 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         return tuple(tile for tile in tiles if tile.family == family)
 
     def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
-        return self._family_tiles(super().fitting(ba, target), target)
+        # A one-dimensional side operand's block is copied untiled, at most one copy's extent along its
+        # axis (`mosaic.Family.copy_extent`).
+        hooks = ba.arguments['hooks']
+        axes = {axis for name, axes_of in (('prologue_operands', hooks.prologue_axes),
+                                           ('epilogue_operands', hooks.epilogue_axes))
+                for _, side_axes in zip(ba.arguments.get(name, ()), axes_of, strict=True)
+                if len(side_axes) == 1 for axis in side_axes}
+
+        def copied(tile: mosaic_gpu.Tiles) -> bool:
+            extent = _FAMILIES[tile.family].copy_extent
+            return extent is None or all(self.extents(tile)[axis] <= extent for axis in axes)
+
+        return tuple(tile for tile in self._family_tiles(super().fitting(ba, target), target) if copied(tile))
 
     @staticmethod
     def _hooks_lower(ba, dtype, target) -> bool:
@@ -1343,6 +1379,10 @@ def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]
         lambda case: f"the {name} launches take no call of these dtypes, widths, side operands or hooks on "
                      f"{case.call.target.generation}", row='ledger 1295'), *measured),
         cost=lambda case: case.call.seconds(name))
+
+
+_FAMILIES = {mosaic_sm90.WGMMA.name: mosaic_sm90.WGMMA, mosaic_sm80.Mma.name: mosaic_sm80.Mma}
+"""The bundles by name, as a tile names its (`mosaic_gpu.Tiles.family`), for their class-wide facts."""
 
 
 def _families(dtype) -> tuple[mosaic.Family, ...]:

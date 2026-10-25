@@ -412,6 +412,8 @@ class KernelOp(tokamax.Op):
             if (collected := cache.KERNEL_SEEN.value) is not None:
                 collected.found.append((self, keyed))
             config = self._chosen(ba, keyed)
+            if collected is not None:
+                collected.found.taken.append(config)
         if cache.KERNEL_LAUNCHES.value:
             # Dew chose the launch for this GPU (`generation`); tokamax's device check would ask
             # each traced array for its devices (`keyed`).
@@ -859,19 +861,30 @@ def launches() -> Iterator[None]:
         yield
 
 
-class _Seen:
-    """The launches a lowering traced under `seen`, each its op and keyed
-    arguments; hashed by identity, as `dew.cache.KERNEL_SEEN` keys on it."""
+class Seen(list[Launch]):
+    """The launches traced under `seen`, each its op and keyed arguments, in the order they traced, and
+    `taken`, the config each took as it traced (`KernelOp._chosen`: a pin, a pick, the nearest pick or
+    its heuristic), in the same order."""
 
     def __init__(self) -> None:
-        self.found: list[Launch] = []
+        super().__init__()
+        self.taken: list[Hashable] = []
+
+
+class _Seen:
+    """The launches a lowering traced under `seen` (`Seen`); hashed by identity, as
+    `dew.cache.KERNEL_SEEN` keys on it."""
+
+    def __init__(self) -> None:
+        self.found = Seen()
 
 
 @contextlib.contextmanager
-def seen() -> Iterator[list[Launch]]:
+def seen() -> Iterator[Seen]:
     """Each kernel launch traced within whose config is read from picks, its
-    op and keyed arguments (`KernelOp.keyed`), recorded as it traces: a fresh
-    collection each time, so a trace cached before traces again."""
+    op and keyed arguments (`KernelOp.keyed`) and the config it took
+    (`Seen.taken`), recorded as it traces: a fresh collection each time, so
+    a trace cached before traces again."""
     collected = _Seen()
     with cache.KERNEL_SEEN(collected):
         yield collected.found
