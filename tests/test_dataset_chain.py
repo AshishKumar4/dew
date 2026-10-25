@@ -9,6 +9,7 @@ from dataclasses import dataclass
 import grain.python as grain
 import numpy as np
 import pytest
+from reference_error import assert_as_exact
 
 from dew.data import Dataset, Files, Loading, Memory, from_grain, from_hf, from_iter, mix, text
 from dew.data.cache import Cache
@@ -90,10 +91,41 @@ def test_filtered_memory_roots_compact_before_global_counts_and_share_cuts(grain
             reader.close()
 
 
+HOLDOUT_SHARES = (0.85, 0.05, 0.1)
+"""The 3-way holdout's requested shares: train, validation and test."""
+
+HOLDOUT_RECORDS = 200
+"""The records of each drawn corpus the holdout's shares are read over."""
+
+HOLDOUT_SEEDS = 64
+"""The holdout-shares site's declared draws (`seeds_for`, the drawn split against itself)."""
+
+
+def test_a_holdouts_parts_take_their_shares_as_independently_drawn_parts_would():
+    """Over drawn corpora (their identities a seed's own), a 3-way holdout's parts take shares on par
+    with each record's part drawn independently from the requested shares (check 1), both measured
+    from the requested shares themselves: a record's identity hashes it into its part as a uniform
+    draw would, so no part is favoured nor its count spread wider."""
+
+    def split(seed):
+        corpus = Memory(rows(f"s{int(seed)}", HOLDOUT_RECORDS))
+        parts = corpus.holdout(val=HOLDOUT_SHARES[1], test=HOLDOUT_SHARES[2])
+        counts = [sum(1 for _ in iterate(part, read="memory", loading=READ)) for part in parts]
+        return {"shares": np.asarray(counts, np.float64) / HOLDOUT_RECORDS}
+
+    def drawn(seed):
+        counts = np.random.default_rng([0x5A11, int(seed)]).multinomial(HOLDOUT_RECORDS, HOLDOUT_SHARES)
+        return {"shares": counts / HOLDOUT_RECORDS}
+
+    assert_as_exact(split, drawn, lambda seed: (np.int64(seed),), "holdout shares", seeds=HOLDOUT_SEEDS,
+                    truth_fn=lambda seed: {"shares": np.asarray(HOLDOUT_SHARES, np.float64)})
+
+
 def test_holdout_puts_each_record_in_one_part_by_its_identity_the_same_in_every_read():
-    """A 3-way holdout: the parts are disjoint and together every record, each about its share,
-    the same whether the store is read whole or streamed, with the steps replayed on each."""
-    corpus = Memory(rows("a", 4000)).map(lambda row: {**row, "seen": True})
+    """A 3-way holdout: the parts are disjoint and together every record, the same whether the store
+    is read whole or streamed, with the steps replayed on each (their shares,
+    `test_a_holdouts_parts_take_their_shares_as_independently_drawn_parts_would`)."""
+    corpus = Memory(rows("a", 400)).map(lambda row: {**row, "seen": True})
     train, val, test = corpus.holdout(val=0.05, test=0.1)
 
     def keys(part, read):
@@ -102,10 +134,9 @@ def test_holdout_puts_each_record_in_one_part_by_its_identity_the_same_in_every_
 
     parts = [keys(part, "memory") for part in (train, val, test)]
     assert [keys(part, "streamed") for part in (train, val, test)] == parts
-    assert sum(map(len, parts)) == len(set().union(*parts)) == 4000
-    assert [len(part) / 4000 for part in parts] == pytest.approx([0.85, 0.05, 0.1], abs=0.02)
+    assert sum(map(len, parts)) == len(set().union(*parts)) == 400
     # With a key, a document's other versions land in its part: the split follows "i" alone.
-    revised = Memory([{**row, "origin": "a2"} for row in rows("a", 4000)])
+    revised = Memory([{**row, "origin": "a2"} for row in rows("a", 400)])
     revised = revised.map(lambda row: {**row, "seen": True})
     by_key = [{i for _, i in keys(part, "memory")} for part in corpus.holdout(0.1, key="i")]
     assert by_key == [{i for _, i in keys(part, "memory")} for part in revised.holdout(0.1, key="i")]
