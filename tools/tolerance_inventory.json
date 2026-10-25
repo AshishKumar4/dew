@@ -101,10 +101,6 @@
    "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_data_av.py": {
-   "comparisons": 2,
-   "lane": "Data"
-  },
   "tests/test_data_mixtures.py": {
    "comparisons": 4,
    "lane": "Training"
@@ -212,10 +208,6 @@
   "tests/test_edm2.py": {
    "comparisons": 2,
    "lane": "Models, Serving & RL"
-  },
-  "tests/test_encoders.py": {
-   "comparisons": 3,
-   "lane": "Data"
   },
   "tests/test_end_to_end.py": {
    "comparisons": 8,
@@ -336,10 +328,6 @@
   "tests/test_image_metrics.py": {
    "comparisons": 5,
    "lane": "Training"
-  },
-  "tests/test_image_stages.py": {
-   "comparisons": 1,
-   "lane": "Data"
   },
   "tests/test_inference.py": {
    "comparisons": 10,
