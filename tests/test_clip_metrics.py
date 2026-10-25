@@ -24,7 +24,7 @@ def clip_fixture():
     images = np.random.RandomState(recipe["seed"]).randint(
         0, 256, tuple(recipe["shape"]), dtype=np.uint8)
     generated = jnp.asarray(images, jnp.float32) / 127.5 - 1.0
-    batch = {"caption": np.asarray(recorded["prompts"])}
+    batch = {"captions": np.asarray(recorded["prompts"])}
     image = reference["image_embeds"].astype(np.float64)
     text = reference["text_embeds"].astype(np.float64)
     cosine = ((image * text).sum(-1)
@@ -114,8 +114,9 @@ def test_a_validation_batch_scores_its_captions_by_clips_tokenizer_whatever_its_
     """A diffusion objective's validation batch (`data().evaluate_batch`) holds its conditions' own
     tokens, a character table's here, and its captions beside them as host text: CLIP scores the
     captions through its own tokenizer, as it scores the captions alone, held to the reference's
-    cosines, and never the conditions' ids. A batch whose caption field holds anything but text is
-    refused."""
+    cosines, and never the conditions' ids. A caption field of anything but one string a row, a
+    condition's tokens or an object array of records, is refused, as are captions kept under a field
+    a condition encodes."""
     from dew.diffusion import presets
     from dew.inputs import CharTable, Condition, Field, InputSpec
     from dew.nn.backbones import SimpleDiT
@@ -130,10 +131,15 @@ def test_a_validation_batch_scores_its_captions_by_clips_tokenizer_whatever_its_
     batch = {"caption": list(prompts)}
     for step in objective.data().evaluate_batch:
         batch = step(batch)
-    assert "text" in batch and list(batch["caption"]) == prompts
+    assert "text" in batch and list(batch["captions"]) == prompts
     metric = CLIPDistance(modelname=str(CLIP_TINY))
     # The captions alone, which the reference's cosines are held to (above), score the same.
     assert metric.finalize(metric(ImageGrid(generated), batch)) == metric.finalize(
         metric(ImageGrid(generated), captioned))
+    for unread in (batch["text"], np.asarray([{"caption": prompt} for prompt in prompts], dtype=object)):
+        with pytest.raises(ValueError):
+            metric(ImageGrid(generated), {"captions": unread})
+    # Captions kept under a field a condition encodes would overwrite one or the other.
+    from dew.data.images import EncodeCaptions
     with pytest.raises(ValueError):
-        metric(ImageGrid(generated), {"caption": batch["text"]})
+        EncodeCaptions(lambda captions: {"text": captions}, keep="text")({"caption": list(prompts)})

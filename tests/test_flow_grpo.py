@@ -667,14 +667,14 @@ def test_a_clip_reward_scores_each_sample_against_its_prompts_caption():
 
     def reward(images, context):
         seen["images"] = np.asarray(images)
-        seen["captions"] = [str(caption) for caption in context["caption"]]
+        seen["captions"] = [str(caption) for caption in context["captions"]]
         return np.asarray(clip.fn(ImageGrid(images), context), np.float64)
 
     captions = ["red", "blue"]
-    prompts = {**inputs.tokenize(captions), "caption": np.asarray(captions)}
+    prompts = {**inputs.tokenize(captions), "captions": np.asarray(captions)}
     batch = FlowRollout(objective, reward, groups=2, steps=3)(state, prompts, jax.random.key(3))
     assert seen["captions"] == ["red", "red", "blue", "blue"]
-    scored = np.asarray(clip.fn(ImageGrid(seen["images"]), {"caption": np.asarray(seen["captions"])}))
+    scored = np.asarray(clip.fn(ImageGrid(seen["images"]), {"captions": np.asarray(seen["captions"])}))
     np.testing.assert_array_equal(np.asarray(batch["rewards"]), scored.astype(np.float32))
 
 
