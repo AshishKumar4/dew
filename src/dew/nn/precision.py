@@ -195,8 +195,8 @@ tests hold a CPU to: float32 products summed in float64 and rounded once (`accum
 loop's running sum of them compensated so it rounds once too (`compensates_loops`), a row's logsumexp
 reduced in levels of short blocks (`dew.objectives.lm.chunked`) and a float64 division divided as
 written (`dew.diffusion.schedules.common.divided`). Read as each program is traced; set by the tests'
-environment (tests/lane_environment.py), never by the library, whose products, sums and divisions
-are the plain ones on every platform. Each such site chooses the wide form by the platform the
+environment (tests/lane_environment.py), never by the library, which without it takes none of these
+forms on any platform. Each such site chooses the wide form by the platform the
 program is lowered for (`platform_dependent`, or for a loop's carry the platform its code is chosen
 for), so a test that lowers for an accelerator keeps the target's."""
 
