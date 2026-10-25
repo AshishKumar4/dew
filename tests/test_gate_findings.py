@@ -12,7 +12,7 @@ from xml.etree import ElementTree
 
 import numpy as np
 import pytest
-from reference_error import GateFailure, assert_as_exact_as_the_reference, row_errors
+from reference_error import GateFailure, assert_as_exact, assert_as_exact_as_the_reference, row_errors
 
 
 def test_the_one_draw_rule_measures_its_worst_zero_row_and_names_a_value_not_finite():
@@ -82,6 +82,44 @@ def test_a_zero_reference_row_measures_dews_error_on_it_finitely_and_a_worse_one
         [zero] = [finding for finding in raised.value.findings if finding.rule == "zero rows"]
         assert math.isfinite(zero.measure)
         measures.append(zero.measure)
+    assert measures[0] < measures[1]
+
+
+def test_a_subnormal_row_error_and_an_overflowing_sum_still_measure_a_worse_candidate_larger():
+    """A row error of 2^-1030 and one of 2^-1029 over a reference row error of zero (the row normalized by
+    a size of 2^500) measure apart, the larger larger, where flooring them at the least normal would
+    measure both alike; and a check-1 site whose per-seed squared errors are finite but sum past
+    float64's range measures its pooled ratio finitely, a farther Dew larger."""
+    truth = np.array([[2.0 ** 500, 0.0], [0.0, 0.0]])
+    reference = np.array([[2.0 ** 500, 0.0], [2.0 ** -520, 2.0 ** -520]])
+    measures = []
+    for off in (2.0 ** -530, 2.0 ** -529):
+        dew = reference.copy()
+        dew[0, 1] = off
+        with pytest.raises(GateFailure) as raised:
+            assert_as_exact_as_the_reference(dew, reference, truth, "subnormal")
+        [row] = [finding for finding in raised.value.findings if finding.rule == "row"]
+        measures.append(row.measure)
+    assert measures[0] < measures[1]
+
+    def draw(seed):
+        return (np.zeros(1),)
+
+    def reference_fn(x):
+        return {"y": x + 1.0}
+
+    def truth_fn(x):
+        return {"y": x}
+
+    measures = []
+    for far in (1e154, 1.2e154):
+        with pytest.raises(GateFailure) as raised:
+            assert_as_exact(lambda x, far=far: {"y": x + far}, reference_fn, draw, "far", seeds=8,
+                            truth_fn=truth_fn)
+        [pooled] = [finding for finding in raised.value.findings
+                    if finding.rule in ("pooled", "inconclusive")]
+        assert math.isfinite(pooled.measure)
+        measures.append(pooled.measure)
     assert measures[0] < measures[1]
 
 
