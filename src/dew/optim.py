@@ -1354,14 +1354,17 @@ class OneCycle(ScheduleBase):
         # lands on each end exactly and takes any two rates, a zero start or ends far apart; torch's
         # form, `stop + (start - stop) / 2 * (cos + 1)`, rounds the difference of the ends in float32,
         # which put the run's first rate 25 times further from float64 than optax's cosine decay.
-        def anneal(start: jax.Array | float, stop: jax.Array | float, done: jax.Array) -> jax.Array:
-            turned = jnp.cos(jnp.pi * done)
+        # The phase's angle is optax's cosine decay's, `pi * elapsed / span`, in that order: near a
+        # phase's end the cosine's halves cancel, so the angle's rounding is most of the rate's.
+        def anneal(start: jax.Array | float, stop: jax.Array | float, elapsed: jax.Array,
+                   span: float) -> jax.Array:
+            turned = jnp.cos(jnp.pi * elapsed / span)
             return start * (0.5 * (1 + turned)) + stop * (0.5 * (1 - turned))
 
         def value(count) -> jax.Array:
             step = jnp.minimum(jnp.asarray(count, jnp.float32), last)
-            return jnp.where(step <= rise, anneal(rates['init_value'], rates['peak_value'], step / rise),
-                             anneal(rates['peak_value'], rates['end_value'], (step - rise) / (last - rise)))
+            return jnp.where(step <= rise, anneal(rates['init_value'], rates['peak_value'], step, rise),
+                             anneal(rates['peak_value'], rates['end_value'], step - rise, last - rise))
 
         return value
 
