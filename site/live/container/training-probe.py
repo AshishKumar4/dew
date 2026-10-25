@@ -1,12 +1,11 @@
 # What a training context may and may not do, run in one after the OOM probe (shared_bridge.py) by
 # benchmark_gateway.py's training(), which checks what it prints and what it left outside.
+import contextlib
 import urllib.request
 from pathlib import Path
-try:
+# Each attempt below must be refused: the AssertionError after it runs only if it went through.
+with contextlib.suppress(OSError):
     urllib.request.urlopen("https://huggingface.co", timeout=5)
-except OSError:
-    pass
-else:
     raise AssertionError("a training context reached the network")
 # The prepared cache is an overlay of the context's own (gateway_manager.py); training() checks
 # from outside that this write stayed in it. The overlay holds no more than 64 MiB: files of
@@ -26,18 +25,12 @@ assert 40 <= written <= 64, f"the overlay took {written} MiB"
 for k in range(5):
     Path(f"/opt/train/fill{k}").unlink(missing_ok=True)
 for path in ("/opt/live/escape", "/work/../escape"):
-    try:
+    with contextlib.suppress(OSError):
         Path(path).write_text("x")
-    except OSError:
-        pass
-    else:
         raise AssertionError(f"a training context wrote {path}")
 Path("/tmp/inside").write_text("x")
-try:
+with contextlib.suppress(MemoryError):
     bytearray(7 * 1024 * 1024 * 1024)
-except MemoryError:
-    pass
-else:
     raise AssertionError("a training context exceeded its memory allowance")
 from dew import Trainer
 from dew.config import OptimConfig
