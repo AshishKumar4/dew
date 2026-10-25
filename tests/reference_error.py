@@ -449,7 +449,7 @@ def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[tup
         their_row = float(np.max(theirs[sized] / sizes[sized]))
         allowed = max(their_row, floor)
         if not within(row, ROW_FACTOR * allowed):
-            over.append(("row", row / allowed if allowed else math.inf, f"the worst row is {row:.3e} from "
+            over.append(("row", row / max(allowed, TINIEST), f"the worst row is {row:.3e} from "
                          f"float64 over its size, the reference's {their_row:.3e}, allowed "
                          f"{ROW_FACTOR * allowed:.3e}"))
     zero = ~sized & ~(mine <= ROW_FACTOR * theirs)
@@ -472,17 +472,23 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms
                                    f"float64 is not finite (dew {mine:.3e} and the reference {theirs:.3e} "
                                    f"from float64)")])
     if not theirs > 0:
-        raise GateFailure([Finding(label, "exact reference", math.inf,
-                                   f"{label}: the reference equals float64, so it measures nothing")])
+        # No measure: Dew's own distance from float64 is what a change can make worse, and none at all
+        # is a site that cannot be judged (`no measure`), never a pass.
+        if mine > 0:
+            raise GateFailure([Finding(label, "exact reference", mine, f"{label}: the reference equals "
+                                       f"float64 and dew is {mine:.3e} from it (rms)")])
+        raise GateFailure([Finding(label, "no measure", 0.0, f"{label}: the reference and dew both equal "
+                                   f"float64, so the site measures nothing")])
+    found = []
     if not within(mine, FACTOR * theirs):
-        raise GateFailure([Finding(label, "pooled", mine / theirs,
-                                   f"{label}: dew is {mine:.3e} from float64 (rms), the reference "
-                                   f"{theirs:.3e} (ratio {mine / theirs:.2f}, allowed {FACTOR})")])
-    over = rows_over(dew, reference, truth, terms)
-    if over:
+        found.append(("pooled", mine / theirs, f"dew is {mine:.3e} from float64 (rms), the reference "
+                      f"{theirs:.3e} (ratio {mine / theirs:.2f}, allowed {FACTOR})"))
+    # Every rule's findings at once, so a change that eases one rule and breaks another shows both.
+    found += rows_over(dew, reference, truth, terms)
+    if found:
         raise GateFailure([Finding(label, rule, measure, f"{label}: {message}")
-                           for rule, measure, message in over],
-                          f"{label}: " + "; ".join(message for _, _, message in over))
+                           for rule, measure, message in found],
+                          f"{label}: " + "; ".join(message for _, _, message in found))
 
 
 
@@ -519,9 +525,10 @@ REDRAW = 4
 class Finding:
     """One finding of the gate as data, beside its message: the leaf it names (the site's label and the
     leaf's path), the rule it fails (RULES), and its measure, larger worse: Dew's error over the
-    reference's for a ratio's rule, the seeds a value is not finite on, infinite where the reference is
-    exact and Dew is not. What a train matches a candidate's failures to its parent's by: the same leaf
-    and rule, a measure no larger."""
+    reference's for a ratio's rule, the seeds a value is not finite on, Dew's own distance from float64
+    where the reference is exactly float64, and for too few seeds the fewest over the given. What a train
+    matches a candidate's failures to its parent's by: the same leaf and rule, a measure no larger, so
+    no measure is infinite on both sides."""
     leaf: str
     rule: str
     measure: float
@@ -531,18 +538,23 @@ class Finding:
         return self.message
 
 
-RULES = frozenset({"pooled", "row", "zero rows", "not finite", "exact reference", "inconclusive"})
+RULES = frozenset({"pooled", "row", "zero rows", "not finite", "exact reference", "no measure",
+                   "inconclusive"})
 """The rules a finding names: the pooled RMS ratio over its factor, the worst row over its factor, a row
 of float64 zero further from it than the reference's, a value not finite, a reference exactly float64
-where Dew is not, and a leaf its seeds leave undecided."""
+where Dew is not (measured by Dew's own distance from it), a site where both are (nothing to measure,
+measured 0), and a leaf its seeds leave undecided."""
+
+
+TINIEST = float(np.finfo(np.float64).tiny)
+"""What a finding's ratio divides by where the reference's error is zero: an order among findings, so a
+candidate that errs further measures larger, never a bound any verdict reads."""
 
 
 def _worst_ratio(mine: np.ndarray, theirs: np.ndarray) -> float:
-    """The largest of Dew's errors over the reference's, infinite where the reference's is zero and
-    Dew's is not: a finding's measure over rows."""
-    with np.errstate(divide="ignore", invalid="ignore"):
-        ratios = np.where(theirs > 0, mine / np.where(theirs > 0, theirs, 1), np.where(mine > 0, np.inf, 0))
-    return float(np.max(ratios))
+    """The largest of Dew's errors over the reference's (TINIEST where the reference's is zero): a
+    finding's measure over rows."""
+    return float(np.max(mine / np.maximum(theirs, TINIEST)))
 
 
 class GateFailure(AssertionError):
@@ -912,9 +924,10 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
                                 f"{leaf}: a value is not finite on {nonfinite} of {count} seeds"))
             continue
         if np.sum(b) == 0:
-            # No ratio to judge, but rows over an orbit's other orders still are.
+            # No ratio to judge, but rows over an orbit's other orders still are; Dew's own RMS error is
+            # what a change can make worse.
             if np.sum(a) > 0:
-                over.append(Finding(leaf, "exact reference", math.inf,
+                over.append(Finding(leaf, "exact reference", float(np.sqrt(np.mean(a))),
                                     f"{leaf}: the reference equals float64 on every seed and dew does not"))
         else:
             ratio, low, high = _judged(draws, index, tails)
@@ -931,7 +944,7 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
         my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
         factor = NARROW_FACTORS.get(draws.widths[index], ROW_FACTOR)
         if not within(my_row, factor * their_row):
-            over.append(Finding(leaf, "row", my_row / their_row if their_row else math.inf,
+            over.append(Finding(leaf, "row", my_row / max(their_row, TINIEST),
                                 f"{leaf}: the worst row over {count} seeds is {my_row:.3e} from float64 "
                                 f"over its size, the reference's {their_row:.3e}, allowed "
                                 f"{factor * their_row:.3e} ({factor} times it)"))
@@ -1062,8 +1075,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     law: "never wrong" is check 2's, each element within its operation's certified bound
     (tests/certified.py)."""
     if seeds < FEWEST_SEEDS:
-        raise Inconclusive([Finding(label, "inconclusive", math.inf, f"{label}: {seeds} seeds cannot be "
-                                    f"judged; check 1 takes at least {FEWEST_SEEDS} (`seeds_for`)")])
+        raise Inconclusive([Finding(label, "inconclusive", FEWEST_SEEDS / max(seeds, 1), f"{label}: {seeds} "
+                                    f"seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
+                                    f"(`seeds_for`)")])
     narrow_leaves: list[str] = []
 
     def drawn(start, stop):
@@ -1118,8 +1132,9 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
     structural and the alternative is bitwise identity (another seed, another mask), exact inequality
     says enough and this is not needed."""
     if seeds < FEWEST_SEEDS:
-        raise Inconclusive([Finding(label, "inconclusive", math.inf, f"{label}: {seeds} seeds cannot be "
-                                    f"judged; check 1 takes at least {FEWEST_SEEDS} (`seeds_for`)")])
+        raise Inconclusive([Finding(label, "inconclusive", FEWEST_SEEDS / max(seeds, 1), f"{label}: {seeds} "
+                                    f"seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
+                                    f"(`seeds_for`)")])
     draws = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn)
     moved, kept, unresolved = _moved(draws, 1)
     if not moved:
@@ -1129,7 +1144,7 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
     if not moved:
         found = (f"{label}: the change moves no leaf beyond rounding over {len(draws.mine)} seeds:\n"
                  + "\n".join(kept))
-        raise (Inconclusive([Finding(label, "inconclusive", math.inf, found)]) if unresolved
+        raise (Inconclusive([Finding(label, "inconclusive", 1.0, found)]) if unresolved
                else AssertionError(found))
 
 

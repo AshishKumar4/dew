@@ -38,6 +38,36 @@ def test_the_one_draw_rule_measures_its_worst_zero_row_and_names_a_value_not_fin
     assert (finding.rule, finding.measure) == ("not finite", 1)
 
 
+def test_the_one_draw_rule_reports_every_rule_a_result_fails_at_once():
+    """A result over the pooled factor and, at one row, over the row factor reports both findings, so a
+    change that eases the pooled ratio while breaking a row is no smaller failure than its parent's."""
+    truth = np.ones((32, 2))
+    reference = truth + 2.0 ** -10
+    dew = reference.copy()
+    dew[0] = truth[0] + 12 * 2.0 ** -10
+    with pytest.raises(GateFailure) as raised:
+        assert_as_exact_as_the_reference(dew, reference, truth, "both")
+    assert {finding.rule for finding in raised.value.findings} == {"pooled", "row"}
+
+
+def test_an_exact_reference_measures_dew_by_its_own_distance_and_two_exact_arms_measure_nothing():
+    """Where the reference equals float64, a Dew that does not is measured by its own distance from it,
+    a farther one larger, so a worse candidate is no match for its parent; where both equal it the site
+    measures nothing, a finding of its own rule."""
+    truth = np.linspace(1.0, 2.0, 64)
+    with pytest.raises(GateFailure) as raised:
+        assert_as_exact_as_the_reference(truth.copy(), truth.copy(), truth, "exact")
+    assert [finding.rule for finding in raised.value.findings] == ["no measure"]
+    measures = []
+    for off in (1e-9, 1e-6):
+        with pytest.raises(GateFailure) as raised:
+            assert_as_exact_as_the_reference(truth + off, truth.copy(), truth, "exact")
+        [finding] = raised.value.findings
+        assert finding.rule == "exact reference"
+        measures.append(finding.measure)
+    assert measures[0] < measures[1]
+
+
 def three_times(label):
     """The one-draw rule on Dew three times the reference's error from float64, which it fails."""
     truth = np.linspace(1.0, 2.0, 64)
