@@ -349,8 +349,9 @@ def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.
     from dew.interop.codecs import fp8_block_cast
 
     codes, scales = fp8_block_cast(values, (1, values.shape[1]))
-    held = jax.lax.optimization_barrier((codes.astype(jnp.bfloat16), rows.astype(jnp.bfloat16)))
-    product = bf16_dot_general(*held, (((1,), (1,)), ((), ())))
+    held_codes, held_rows = jax.lax.optimization_barrier(
+        (codes.astype(jnp.bfloat16), rows.astype(jnp.bfloat16)))
+    product = bf16_dot_general(held_codes, held_rows, (((1,), (1,)), ((), ())))
     return product * scales * row_scales.T
 
 
