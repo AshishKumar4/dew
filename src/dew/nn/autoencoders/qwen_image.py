@@ -29,6 +29,7 @@ from dew.interop.components import bind_component
 from dew.interop.weights import indexed_path
 from dew.objectives.base import Variables
 
+from ..activations import silu
 from .api import LatentNormalization, ModuleAutoEncoder, published_source
 from .kl import posterior_latent
 from .vae import FlaxDownsample2D, FlaxUpsample2D
@@ -163,7 +164,7 @@ class _Encoder(nn.Module):
                            index != last and self.temporal_downsample[index], index != last,
                            self.dtype, name=f"down_blocks_{index}")(x)
         x = WanMidBlock(widths[-1], self.dtype, name="mid_block")(x)
-        x = nn.silu(WanRMSNorm(widths[-1], 4, self.dtype, name="norm_out")(x))
+        x = silu(WanRMSNorm(widths[-1], 4, self.dtype, name="norm_out")(x))
         return _conv(self.moments, 3, self.dtype, "conv_out")(x)
 
 
@@ -185,7 +186,7 @@ class _Decoder(nn.Module):
             x = _UpBlock(widths[index], widths[index + 1], self.num_res_blocks,
                          index != last and self.temporal_upsample[index], index != last,
                          self.dtype, name=f"up_blocks_{index}")(x)
-        x = nn.silu(WanRMSNorm(widths[-1], 4, self.dtype, name="norm_out")(x))
+        x = silu(WanRMSNorm(widths[-1], 4, self.dtype, name="norm_out")(x))
         return _conv(self.image_channels, 3, self.dtype, "conv_out")(x)
 
 
