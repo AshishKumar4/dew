@@ -51,7 +51,7 @@ def test_a_shared_mask_counts_every_row_in_a_weighted_mean(axis, weights):
 # Text pooling reads the mask (T23)
 ############################################################################################################
 
-PROJECTED_SEEDS = 16
+PROJECTED_SEEDS = 64
 """The pooled-projection site's declared draws (`seeds_for`)."""
 
 
