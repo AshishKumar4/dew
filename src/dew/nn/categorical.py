@@ -156,9 +156,10 @@ def _divergence_derivative(logits: jax.Array, reference: jax.Array) -> jax.Array
     reads; `d`, `delta` less its mean under `q`; `s = log(p / q)`, `d` less the log of `q`'s mean
     of `exp(d)`, through `log1p` of the mean of `expm1(d)` where every `d` is small and as a log-sum-exp
     where one is not; `u = q expm1(s)`; and `u` less `p` times its sum, which makes the derivative sum to
-    zero. A row whose `delta` or `d` overflows, its rows at opposite extrema, holds distributions too far
-    apart for a subtraction of their softmaxes to cancel, and takes `p - q`; the centring reads it as 0,
-    so no derivative of it meets the overflow."""
+    zero. A row whose `delta` or `d` overflows, its rows at opposite extrema, or whose `s` rounds a class's
+    `log q + s`, its `log p`, above 0, holds distributions too far apart for a subtraction of their
+    softmaxes to cancel, and takes `p - q`; the centring reads such a `delta` as 0 and holds such an
+    exponent at 0, so no derivative of either meets the overflow."""
     empty = jnp.all(jnp.isneginf(logits) & jnp.isneginf(reference), axis=-1, keepdims=True)
     logits, reference = jnp.where(empty, 0.0, logits), jnp.where(empty, 0.0, reference)
     both = jnp.isfinite(logits) & jnp.isfinite(reference)
@@ -187,17 +188,22 @@ def _divergence_derivative(logits: jax.Array, reference: jax.Array) -> jax.Array
     small, large = jnp.where(near, d, 0.0), jnp.where(near, 0.0, d)
     normalizer = jnp.where(near, jnp.log1p(jnp.sum(q * jnp.expm1(small), axis=-1, keepdims=True)),
                            jax.nn.logsumexp(log_q + large, axis=-1, keepdims=True))
-    u = _scaled_expm1(q, log_q, d - normalizer)
-    return jnp.where(alike & centred, u - p * jnp.sum(u, axis=-1, keepdims=True), p - q)
+    s = d - normalizer
+    # `log q + s` is `log p`, at most 0; a class past it is one whose difference rounded by more than its
+    # whole log probability, which only rows far apart reach, and its row takes `p - q`.
+    rounded = jnp.any((s >= 1) & (log_q + s > 0), axis=-1, keepdims=True)
+    u = _scaled_expm1(q, log_q, s)
+    return jnp.where(alike & centred & ~rounded, u - p * jnp.sum(u, axis=-1, keepdims=True), p - q)
 
 
 def _scaled_expm1(q: jax.Array, log_q: jax.Array, x: jax.Array) -> jax.Array:
     """`q expm1(x)`: through `expm1` where `x` is small, whose precision is the point, and as
-    `exp(log q + x) - q` where it is large, so a class whose `q` underflowed meets no `0 * inf`. Each
-    branch reads `x` only where it is taken, so neither's derivative meets the other's overflow."""
+    `exp(log q + x) - q` where it is large, so a class whose `q` underflowed meets no `0 * inf`, its
+    exponent, the log of a probability, held at most 0, which rounding may overshoot. Each branch reads
+    `x` only where it is taken, so neither's derivative meets the other's overflow."""
     small = x < 1
     return jnp.where(small, q * jnp.expm1(jnp.where(small, x, 0.0)),
-                     jnp.exp(log_q + jnp.where(small, 0.0, x)) - q)
+                     jnp.exp(jnp.minimum(log_q + jnp.where(small, 0.0, x), 0.0)) - q)
 
 
 def entropy(logits: jax.Array, where: jax.Array | None = None) -> jax.Array:
