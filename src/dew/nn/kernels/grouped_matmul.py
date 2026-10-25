@@ -635,8 +635,8 @@ class _Mosaic(base.Template[mosaic_gpu.Tiles]):
         return next((family for family in self._families(ba) if family.name == wanted), None)
 
     def _families(self, ba) -> tuple[mosaic.Family, ...]:
-        """The bundles the launch takes at its operands' dtype (`_families`)."""
-        return _families(ba.arguments['tokens'].dtype)
+        """The bundles the launch takes at its operands' dtype, interpreted or lowered (`_families`)."""
+        return _families(ba.arguments['tokens'].dtype, interpreted=bool(ba.arguments['interpret']))
 
     @abc.abstractmethod
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
@@ -653,6 +653,21 @@ class _Mosaic(base.Template[mosaic_gpu.Tiles]):
                                   dtype=ba.arguments['tokens'].dtype,
                                   multiprocessors=_multiprocessors(generation.effective(target)),
                                   holds=lambda tile: self.legal(ba, tile, target), grouped=depth is not None)
+
+    def neighbours(self, ba, config: mosaic_gpu.Tiles) -> tuple[mosaic_gpu.Tiles, ...]:
+        # The derived tile with one of its choices moved a step either way: a stage more or fewer, the
+        # band halved or doubled, the columns or the rows the next block either side (a column unit, a
+        # role of rows).
+        family = _bundle(config, ba.arguments['tokens'].dtype)
+        unit = family.column_unit(ba.arguments['tokens'].dtype)
+        role = family.role_rows * config.warpgroups
+        band = config.grid_block_n
+        moves = [{'stages': config.stages - 1}, {'stages': config.stages + 1},
+                 {'grid_block_n': max(1, band // 2)}, {'grid_block_n': band * 2},
+                 {'block_n': config.block_n - unit}, {'block_n': config.block_n + unit},
+                 {'block_m': config.block_m - role}, {'block_m': config.block_m + role}]
+        return tuple(dataclasses.replace(config, **move) for move in moves
+                     if min(move.values()) > 0 and dataclasses.replace(config, **move) != config)
 
     def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
         """Whether `config` runs the call on `target` (`Template.legal`): of the launch's family there, in
@@ -1052,6 +1067,12 @@ class _MosaicTpu(base.Template[mosaic_tpu.Blocks]):
             blocks[axis] //= 2
         return config
 
+    def neighbours(self, ba, config: mosaic_tpu.Blocks) -> tuple[mosaic_tpu.Blocks, ...]:
+        # The derived blocks with one axis halved or doubled.
+        return tuple(dataclasses.replace(config, **{name: value})
+                     for name in ('block_m', 'block_n', 'block_k')
+                     for value in (getattr(config, name) // 2, getattr(config, name) * 2) if value > 0)
+
     def _least_blocks(self, ba) -> list[int]:
         """The least block of each axis (`block_m`, `block_n`, `block_k`): a vreg's lanes, or the row of
         128 32-bit lanes a one-dimensional side operand along it lays out at short of its whole extent
@@ -1352,12 +1373,13 @@ def _bundle(config: mosaic_gpu.Tiles, dtype) -> mosaic.Family:
     return family(jnp.dtype(dtype)) if isinstance(family, type) else family
 
 
-def _families(dtype) -> tuple[mosaic.Family, ...]:
+def _families(dtype, *, interpreted: bool) -> tuple[mosaic.Family, ...]:
     """The bundles the Mosaic GPU launches generate tiles for at operands of `dtype`: Hopper's warpgroup
-    MMA's, and Ampere's mma.sync's in a CPU process (which interprets them, or lowers them for an assumed
-    GPU only where asked) or where this JAX's layout inference places its tiles
-    (`mosaic_sm80.staging_solved`); a launch derives its tile on its target's (`_Mosaic._family`)."""
-    ampere = mosaic_sm80.staging_solved() or jax.default_backend() == 'cpu'
+    MMA's, and Ampere's mma.sync's where this JAX's layout inference places its tiles
+    (`mosaic_sm80.staging_solved`), or `interpreted` in a CPU process, whose interpreter takes them at
+    any JAX (a CPU's lowering for an assumed Ampere GPU takes them only where the GPU's own would); a
+    launch derives its tile on its target's (`_Mosaic._family`)."""
+    ampere = mosaic_sm80.staging_solved() or (interpreted and jax.default_backend() == 'cpu')
     return mosaic_sm90.WGMMA, *((mosaic_sm80.Mma(jnp.dtype(dtype)),) if ampere else ())
 
 
@@ -1384,10 +1406,16 @@ def launched(launches, arguments, options, *, product: Product, whole: bool):
     """The launch of `launches` that runs the call (`arguments`, `options`) as `GROUPED` selects it,
     ready to call, or None where XLA's program takes it. A GPU process's CPU branch, which never runs,
     interprets Triton's, the one launch that interprets there (`_Mosaic.eligible`), as the call's own
-    preference: a chosen implementation names the GPU's launch, the branch the call takes."""
+    preference: a chosen implementation names the GPU's launch, the branch the call takes. A CPU
+    process's GPU branch, which runs only where a lowering for the GPU takes it, takes a chosen
+    implementation where it can and the order's next launch where it cannot (mma.sync's where this JAX
+    lowers none: `_families`), the CPU branch, which runs, insisting on it."""
     case = grouped_case(launches, arguments, options, product=product, whole=whole)
-    stand_in = options['interpret'] and jax.default_backend() != 'cpu'
-    route = selection.select(GROUPED, case, 'triton' if stand_in else None, insist=not stand_in)
+    cpu = jax.default_backend() == 'cpu'
+    stand_in = options['interpret'] and not cpu
+    unrun = not options['interpret'] and cpu
+    named = 'triton' if stand_in else selection.forced(GROUPED.choice) if unrun else None
+    route = selection.select(GROUPED, case, named, insist=not (stand_in or unrun))
     if route.kernel == 'xla':
         return None
     return functools.partial(case.call.implementation(route.kernel), *arguments, **options)

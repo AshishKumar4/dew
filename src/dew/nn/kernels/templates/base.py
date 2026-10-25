@@ -157,6 +157,22 @@ class Template[Config: Hashable](tuning.KernelOp):
     def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> Config:
         return self.estimate(ba, generation.gpu_target())[1]
 
+    def neighbours(self, ba: tokamax.BoundArguments, config: Config) -> Sequence[Config]:
+        """The configs next to a generating launch's derived `config` an opt-in tuning run may time beside
+        it (`variants`): none unless the launch states them; the legal ones are kept."""
+        del ba, config
+        return ()
+
+    def variants(self, ba: tokamax.BoundArguments) -> tuple[Config, ...]:
+        # A generating launch's derived config, then its legal neighbours; a fixed space's (the frozen
+        # Triton launches') heuristic alone, which no tuning extends.
+        first = ba.heuristics_config
+        if not self.GENERATES:
+            return (first,)
+        target = generation.gpu_target()
+        return tuple(dict.fromkeys((first, *(config for config in self.neighbours(ba, first)
+                                             if self.legal(ba, config, target)))))
+
 
 def dividing[C](configs: Sequence[C], extents: tuple[int, ...],
                 blocks: Callable[[C], tuple[int, ...]]) -> tuple[C, ...]:

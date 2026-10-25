@@ -24,6 +24,7 @@ from dew.inference.tasks import cache_sized
 from dew.nn.cross_attention import CROSS_KEY, CROSS_VALUE
 from dew.nn.inputs import Admitted, ModelInputs, default_placement
 from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.tuning import tune
 from dew.nn.kv_cache import POOLED, ROW_CURSORS, TABLE, as_words, from_words, grouped, is_paged, leaf_name
 from dew.nn.protocols import Serving
 from dew.nn.scatter import DROPPED
@@ -506,6 +507,7 @@ def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement
     program = _compiled(automatic(resident), automatic(carried), rows, compiler_options(model) or None)
     arguments = (model, params, pad_id, placement, steps, resident, carried, None, transforms, stopping,
                  grammar)
+    tune(lambda: program.lower(*arguments))
     compiled = program.lower(*arguments).compile()
     formats = joined(*compiled.output_formats[1][:2])
     return formats, _reusable(compiled, formats)
