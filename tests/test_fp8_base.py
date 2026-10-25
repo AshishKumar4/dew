@@ -268,7 +268,8 @@ def test_the_frozen_products_backward_keeps_its_packed_leaves_and_not_its_input(
     saved = jax.tree.leaves(pullback)
     assert saved
     kept = [(leaf.shape, leaf.dtype) for leaf in saved]
-    assert (x.shape, x.dtype) not in kept and all((held.shape, held.dtype) in kept for held in leaves[2:]), kept
+    assert (x.shape, x.dtype) not in kept, kept
+    assert all((held.shape, held.dtype) in kept for held in leaves[2:]), kept
 
 
 def test_meanflow_trains_an_adapter_over_an_fp8_base():
