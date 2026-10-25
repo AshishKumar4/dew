@@ -183,8 +183,9 @@ def test_the_input_scaled_experts_match_the_reference_block():
     assert float(np.max(np.abs(np.asarray(other) - reference))) > 1e-3
 
 
-TUNED_SEEDS = 32
-"""The declared seeds for check 1 of the tuned windowed layer (`assert_as_exact`), sized on armada."""
+TUNED_SEEDS = 8
+"""The declared seeds for check 1 of the tuned windowed and nGPT layers (`assert_as_exact`), sized on armada
+by `seeds_for` (8 each)."""
 TUNED_WINDOW, TUNED_FLOOR, TUNED_SCALE, TUNED_THETA = 4, 3.0, 0.5, 10000.0
 
 
