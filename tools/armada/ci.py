@@ -30,7 +30,7 @@ with CI's selection, and writes a verdict row for each. A row is red on a
 failed or erroring test, on a test skipped because its import failed (a file
 CI would never have run), or when pytest left no report of it. A task still
 running at its deadline, short of armada's own timeout, is interrupted and
-every row it holds is red, so a hang is graded with its stack dump rather
+every row it holds is red, so a hang is graded with its traceback rather
 than leaving the task without a verdict. Each row also carries its tests' own
 times, which `durations` folds into tests/test_durations.json from main's CI
 (`armada verdict <sha> --json`): a file whose record no longer cuts it as it
@@ -566,13 +566,6 @@ def red_as(kind: str, nodes: list[str]) -> dict:
     return {"kind": kind, "failed": nodes}
 
 
-def shown(output: str) -> str:
-    """The end of a task's output, and the stack faulthandler printed for a test that hung, if one did."""
-    stack = output.rfind("Timeout (")
-    hung = output[stack:stack + 6000] + "\n...\n" if 0 <= stack < len(output) - 4000 else ""
-    return hung + output[-4000:]
-
-
 def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
     """Import `tests` under `python` without running them and write one verdict row a file: red
     where collecting it errs or skips on a missing import, which running it would have."""
@@ -723,7 +716,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         # armada times a file at the sum of its rows' timings, a split file's groups together, each
         # Python's apart.
         ran.append({"name": row(python, name, split), "exitCode": 1 if red else 0, "seconds": seconds,
-                     "output": "\n".join(red + ([shown(output)] if red else [])),
+                     "output": "\n".join(red + ([output[-4000:]] if red else [])),
                      # Its first failed test's exception as pytest gave it ("RuntimeError: ..."), which
                      # `exhausted` reads.
                      **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
