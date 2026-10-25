@@ -611,25 +611,60 @@ def test_group_norm_activates_its_wide_output_before_its_one_cast(rng, dtype):
     assert held and {leaf.dtype for leaf in held} == {x.dtype}
 
 
+LAYER_NORM_SEEDS = 32
+"""The layer norm's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada."""
+
+
 @pytest.mark.parametrize('use_scale,use_bias', [(False, False), (True, False), (True, True)])
 @pytest.mark.parametrize('dtype', [None, jnp.bfloat16, jnp.float32])
-def test_layer_norm_matches_flax_bit_for_bit(rng, use_scale, use_bias, dtype):
-    """`dew.nn.attention.LayerNorm` exists to change which values the backward
-    pass keeps, not which values the forward pass produces, so it computes
-    flax's `nn.LayerNorm` op for op: E[x] and E[x^2] in fp32, the variance
-    from the pair and clipped at zero, the weight folded into the inverse
-    deviation before it meets the centered activations, the result cast by
-    flax's own dtype rule. A flax release that changes any of those moves a
-    checkpoint's outputs, and this is where that shows."""
+def test_layer_norm_is_flax_s_keeping_only_its_input_for_the_backward(rng, use_scale, use_bias, dtype):
+    """`dew.nn.attention.LayerNorm` is flax's `nn.LayerNorm` under `nn.remat` saving nothing: the
+    same parameter tree and auto-named scope; its output and the gradients of its input and
+    parameters as near float64 over drawn inputs and parameters as flax's own (check 1); and its
+    pullback holds the input as it arrived, no wider copy of the activations."""
     x = jax.random.normal(rng, (2, 6, 16), jnp.float32)
     x = x.astype(jnp.bfloat16) if dtype is jnp.bfloat16 else x
     fields = {"epsilon": 1e-5, "use_scale": use_scale, "use_bias": use_bias, "dtype": dtype}
     ours, reference = LayerNorm(**fields), nn.LayerNorm(**fields)
     params, flax_params = ours.init(rng, x), reference.init(rng, x)
+    assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), params) == jax.tree.map(
+        lambda leaf: (leaf.shape, leaf.dtype), flax_params)
 
-    assert jax.tree_util.tree_structure(params) == jax.tree_util.tree_structure(flax_params)
-    for a, b in zip(jax.tree.leaves(params), jax.tree.leaves(flax_params), strict=True):
-        assert a.shape == b.shape and a.dtype == b.dtype
-    found, expected = ours.apply(params, x), reference.apply(flax_params, x)
-    assert found.dtype == expected.dtype
-    assert jnp.array_equal(found, expected)
+    class Named(nn.Module):
+        norm: type[nn.Module]
+
+        @nn.compact
+        def __call__(self, x):
+            return self.norm(**fields)(x)
+
+    assert jax.tree.structure(Named(LayerNorm).init(rng, x)) == jax.tree.structure(
+        Named(nn.LayerNorm).init(rng, x))
+
+    def draw(seed):
+        """Inputs about 1 apart from zero at a spread of 3, in the input's dtype, flax's initial
+        parameters moved about them, and a cotangent for the output."""
+        keys = jax.random.split(jax.random.key(seed), 3)
+        drawn = (jax.random.normal(keys[0], x.shape, jnp.float32) * 3 + 1).astype(x.dtype)
+        leaves, tree = jax.tree.flatten(params)
+        moved = [leaf + 0.1 * jax.random.normal(key, leaf.shape) for leaf, key
+                 in zip(leaves, jax.random.split(keys[1], len(leaves)), strict=True)]
+        cotangent = jax.random.normal(keys[2], x.shape, jnp.float32)
+        return np.asarray(drawn), jax.tree.unflatten(tree, [np.asarray(leaf) for leaf in moved]), \
+            np.asarray(cotangent)
+
+    def observed(module):
+        def step(drawn, moved, cotangent):
+            output, pull = jax.vjp(lambda value, variables: module.apply(variables, value), drawn, moved)
+            gradient, parameters = pull(cotangent.astype(output.dtype))
+            return {"output": output, "input": gradient, **{
+                f"parameter.{jax.tree_util.keystr(path)}": leaf
+                for path, leaf in jax.tree_util.tree_leaves_with_path(parameters)}}
+        return step
+
+    wide = nn.LayerNorm(**{**fields, "dtype": jnp.float64})
+    assert_as_exact(jax.jit(observed(ours)), jax.jit(observed(reference)), draw,
+                    f"layer norm {dtype} scale={use_scale} bias={use_bias}", seeds=LAYER_NORM_SEEDS,
+                    truth_fn=observed(wide))
+    _, pullback = jax.vjp(lambda value: ours.apply(params, value), x)
+    held = [leaf for leaf in jax.tree.leaves(pullback) if np.size(leaf) == x.size]
+    assert held and {leaf.dtype for leaf in held} == {x.dtype}
