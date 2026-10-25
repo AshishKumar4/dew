@@ -183,13 +183,13 @@ their inputs from their float64 values over 48 draws of both parameter sets, 4.9
 that selects otherwise, Gemma 3n's gaussian top-k, admits `selection_margins.MARGIN`: a unit every run
 keeps just above its cutoff holds an activation, its gate less the cutoff, that is mostly float32's
 rounding of either, so a draw near that tie measures which run rounded it worse."""
-SCAN_SEEDS = {"gemma4": 64, "gemma3n": 256, "deepseek": 8, "deepseek_widths": 8}
-"""Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada: Gemma 3n's
-by the plain loop against itself; the others' paired with the scanned stack, whose arms share every
-upstream rounding (the same weights, rows and arithmetic, the DeepSeek shapes' bit for bit on a CPU) and
-whose errors are heavy-tailed across draws: the four largest of 1024 draws hold up to 40% of a Gemma 4
-leaf's pooled error, of 64 up to 43% of a DeepSeek one's, which the plain loop against itself resolves
-within no 512 draws."""
+SCAN_SEEDS = {"gemma4": 64, "gemma3n": 128, "deepseek": 8, "deepseek_widths": 8}
+"""Each shape's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` paired with the scanned
+stack, whose arms share every upstream rounding (the same weights, rows and arithmetic, the DeepSeek
+shapes' bit for bit on a CPU), the most any platform gives: Gemma 3n's 128 on an A100 over its draws past
+the selection margin (8 on armada); the others' on armada, whose errors are heavy-tailed across draws: the
+four largest of 1024 draws hold up to 40% of a Gemma 4 leaf's pooled error, of 64 up to 43% of a DeepSeek
+one's, which the plain loop against itself resolves within no 512 draws."""
 def same_metrics(left: dict, right: dict, relative: float = 1e-5) -> bool:
     """Every metric within `relative` of the other run's; perplexity is exp
     of the cross entropy, so an absolute bound would say nothing about it."""
