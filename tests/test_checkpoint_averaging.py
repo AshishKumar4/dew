@@ -1,6 +1,7 @@
 """Averaged runs (row 1505): runs trained apart from one model average their effective weights in fp32,
-any run's (`dew.checkpoints.averaged`): a LoRA run's factors merged into its kernels first, two runs'
-mean float64's rounded once, a longer running mean on par with a stacked fp32 mean from float64
+any run's (`dew.checkpoints.averaged`): a LoRA run's factors merged into its kernels first and a
+partly frozen run's frozen leaves back in its params, two runs' mean float64's rounded once at every
+magnitude, subnormals included, a longer running mean on par with a stacked fp32 mean from float64
 (check 1) and exact where its runs agree, each run's directory, step and average read recorded, and
 runs of another model refused."""
 
@@ -19,6 +20,7 @@ from dew.data import Loading, Memory
 from dew.data.compile import compile
 from dew.lora import Adapter, LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.objectives.base import freeze, thaw
 from dew.objectives.lm import LMObjective
 from dew.training import Trainer
 
@@ -35,11 +37,14 @@ def model(mlp_features: int = 64) -> CausalTransformer:
 
 
 def trained(directory, steps: int, *, adapted: bool, key: int = 0, ema_decay: float | None = None,
-            mlp_features: int = 64) -> str:
-    """A run of `steps` steps from one base's weights, fine-tuned whole or through a LoRA adapter whose
-    factors start alike, its trainer drawing from `key`, its last step checkpointed."""
+            mlp_features: int = 64, frozen: bool = False) -> str:
+    """A run of `steps` steps from one base's weights, fine-tuned whole, with its first layer frozen, or
+    through a LoRA adapter whose factors start alike, its trainer drawing from `key`, its last step
+    checkpointed."""
     base = model(mlp_features)
     variables = base.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
+    if frozen:
+        variables = freeze(variables, lambda path: "layers_0" not in path)
     if adapted:
         adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(base, variables, key=1)
         base, variables = adapter.model, adapter.variables
@@ -62,17 +67,19 @@ def weights(run: str, *, ema: bool | None = None):
 
     declaration, step = run_record(run)
     if ModelConfig.from_dict(record(declaration["model"], "model")).adapter is None:
-        return LMObjective._saved_variables(run, step=step, ema=ema)
+        return thaw(LMObjective._saved_variables(run, step=step, ema=ema))
     adapter = Adapter.from_run(run, ema=ema)
     return adapter.merge(adapter.variables)
 
 
-def test_a_lora_run_and_a_whole_one_average_their_merged_weights_as_float64_does(tmp_path):
-    """A LoRA run and a whole fine-tune of one base average: the LoRA run's factors merged into its
-    kernels first, each floating leaf float64's mean of the two rounded to fp32, the model record
-    the base's, adapter aside, which applies to the mean; each run's directory, step and average read
-    recorded."""
-    runs = [trained(tmp_path / "lora", 2, adapted=True, key=1), trained(tmp_path / "whole", 1, adapted=False)]
+@pytest.mark.parametrize("other", ["whole", "frozen"])
+def test_a_lora_run_and_a_fine_tune_average_their_effective_weights_as_float64_does(tmp_path, other):
+    """A LoRA run and a whole or partly frozen fine-tune of one base average: the LoRA run's factors
+    merged into its kernels first and the frozen leaves back in params, each floating leaf float64's
+    mean of the two rounded to fp32, the model record the base's, adapter aside, which applies to the
+    mean; each run's directory, step and average read recorded."""
+    runs = [trained(tmp_path / "lora", 2, adapted=True, key=1),
+            trained(tmp_path / other, 1, adapted=False, frozen=other == "frozen")]
     average = averaged(runs)
     merged = [weights(run) for run in runs]
     assert jax.tree.structure(average.variables) == jax.tree.structure(merged[1])
@@ -101,34 +108,45 @@ def test_runs_that_agree_average_to_their_own_weights_and_a_runs_average_is_read
         assert [read for _, _, read in average.runs] == [ema is None] * 3
 
 
+def running(*leaves) -> np.ndarray:
+    """The leaves' running mean as `averaged` takes it, one run after another."""
+    from dew.checkpoints import _taken
+
+    mean = np.asarray(leaves[0], np.float32)
+    for count, leaf in enumerate(leaves[1:], start=2):
+        mean = _taken(mean, np.asarray(leaf, np.float32), count, "run", "first")
+    return mean
+
+
 def test_a_running_mean_is_on_par_with_a_stacked_one_and_exact_at_the_extremes():
     """Three runs' running mean is on par from float64 with an fp32 stacked mean (check 1) over leaves
     of both signs across six orders of magnitude; repeated maxima stay the maximum and opposite
     extremes meet at zero, where a sum would overflow."""
-    from dew.checkpoints import _running_mean
-
     def draw(seed):
         rng = np.random.default_rng([0xA7, seed])
         return tuple(rng.standard_normal(64).astype(np.float32) * np.float32(10.0 ** rng.integers(-3, 4))
                      for _ in range(3))
-
-    def running(*leaves):
-        mean = {"w": jnp.asarray(leaves[0], jnp.float32)}
-        for count, leaf in enumerate(leaves[1:], start=2):
-            mean = _running_mean(mean, {"w": leaf}, count, "run", "first")
-        return mean["w"]
 
     def stacked(*leaves):
         return jnp.mean(jnp.stack([jnp.asarray(leaf) for leaf in leaves]), axis=0)
 
     assert_as_exact(running, stacked, draw, "three runs' mean", seeds=AVERAGE_SEEDS)
     biggest = np.float32(np.finfo(np.float32).max)
-    mean = {"w": jnp.full(4, biggest)}
-    for count in range(2, 26):
-        mean = _running_mean(mean, {"w": jnp.full(4, biggest)}, count, "run", "first")
-    assert np.array_equal(np.asarray(mean["w"]), np.full(4, biggest))
-    opposite = _running_mean({"w": jnp.full(4, -biggest)}, {"w": jnp.full(4, biggest)}, 2, "run", "first")
-    assert np.array_equal(np.asarray(opposite["w"]), np.zeros(4, np.float32))
+    assert np.array_equal(running(*[np.full(4, biggest)] * 25), np.full(4, biggest))
+    assert np.array_equal(running(np.full(4, -biggest), np.full(4, biggest)), np.zeros(4, np.float32))
+
+
+def test_two_runs_subnormal_leaves_average_as_float64_rounds_them():
+    """Subnormal leaves average as float64's mean rounds them, which a device that flushes subnormals
+    would not: two runs' equal leaves to themselves, a pair to its midpoint, and three equal ones to
+    themselves."""
+    tiny = np.float32(2.0**-140)
+    pairs = ((tiny, tiny), (tiny, np.float32(2.0**-139)), (-tiny, np.float32(2.0**-138)),
+             (np.float32(2.0**-149), np.float32(0)))
+    for one, other in pairs:
+        expected = np.float32((np.float64(one) + np.float64(other)) / 2)
+        assert running(np.full(3, one), np.full(3, other)).tolist() == [expected] * 3
+    assert running(*[np.full(3, tiny)] * 3).tolist() == [tiny] * 3
 
 
 def test_one_run_or_runs_of_other_models_do_not_average(tmp_path):
