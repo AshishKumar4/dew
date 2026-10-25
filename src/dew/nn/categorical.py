@@ -162,10 +162,11 @@ def _divergence_derivative(logits: jax.Array, reference: jax.Array) -> jax.Array
     reads, less its value at `q`'s most probable class; `d`, `delta` less its mean under `q`;
     `s = log(p / q)`, `d` less the log of `q`'s mean of `exp(d)`, through `log1p` of the mean of
     `expm1(d)` where every `d` is within 1 of 0 and as a log-sum-exp where one is not; `u = q expm1(s)`;
-    and `u` less `p` times its sum, which makes the derivative sum to zero. A row whose `delta` or `d` overflows, its rows at opposite extrema, or whose `s` rounds a class's
-    `log q + s`, its `log p`, above 0, holds distributions too far apart for a subtraction of their
-    softmaxes to cancel, and takes `p - q`; the centring reads such a `delta` as 0 and holds such an
-    exponent at 0, so no derivative of either meets the overflow."""
+    and `u` less `p` times its sum, which makes the derivative sum to zero. A row whose `delta` or `d`
+    overflows, its rows at opposite extrema, or whose `s` rounds a class's `log q + s`, its `log p`,
+    above 0, holds distributions too far apart for a subtraction of their softmaxes to cancel, and takes
+    `p - q`; the centring reads such a `delta` as 0 and holds such an exponent at 0, so no derivative of
+    either meets the overflow."""
     empty = jnp.all(jnp.isneginf(logits) & jnp.isneginf(reference), axis=-1, keepdims=True)
     logits, reference = jnp.where(empty, 0.0, logits), jnp.where(empty, 0.0, reference)
     both = jnp.isfinite(logits) & jnp.isfinite(reference)
