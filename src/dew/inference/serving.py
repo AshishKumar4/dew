@@ -71,6 +71,7 @@ import time
 from collections import deque
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
+from typing import Literal
 
 import jax
 import jax.numpy as jnp
@@ -112,6 +113,7 @@ from dew.inference.tasks import (
 )
 from dew.nn.cross_attention import CROSS_CACHE, CrossAttention
 from dew.nn.inputs import (
+    BLOCKS_FIELD,
     CONTEXT,
     CONTEXT_LENGTHS,
     CrossContext,
@@ -124,6 +126,7 @@ from dew.nn.kernels.options import compiler_options
 from dew.nn.kv_cache import POOLED, ROW_CURSORS, TABLE, KVCache, is_paged, leaf_name
 from dew.nn.protocols import CrossAttending, Layered, ProjectionGroup, Serving
 from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
+from dew.nn.visibility import prompt_blocks
 from dew.objectives.base import Variables
 from dew.sampling.decoding import Finishing, LogitsTransform, StopStrings
 from dew.sampling.guided import Grammar
@@ -258,6 +261,9 @@ class _Row:
     salt: bytes = b""
     """What the prompt's keys depend on beside its tokens, its context's digest, under which its
     prefix pages are named (`dew.inference.pages`); empty for none."""
+    groups: np.ndarray | None = None
+    """The blocks of the prompt's tokens under the server's prefix run (`prompt_blocks`), None where it runs
+    causally."""
 
 
 def _seated_in(group: int, free: list[list[int]], taken: list[int], row: _Row) -> tuple[int, _Row]:
@@ -447,7 +453,8 @@ class Server:
     def __init__(self, model: nn.Module, variables: Variables, processor: Processor | None, *,
                  sampling: Sampling, transforms: tuple[LogitsTransform, ...], stopping: Finishing,
                  grammar: Grammar | None, rows: Rows, slots: int, capacity: int, admission: int,
-                 default_budget: int | None, max_length: int | None, decode_steps: int) -> None:
+                 default_budget: int | None, max_length: int | None, decode_steps: int,
+                 prefix: int | Literal["prompt"] | None = None) -> None:
         if type(slots) is not int or slots < 1:
             raise ValueError("slots must be a positive number of resident rows")
         if type(admission) is not int or not 1 <= admission <= slots:
@@ -485,6 +492,7 @@ class Server:
         self.admission = admission
         self.default_budget = default_budget
         self.max_length = max_length
+        self.prefix: int | Literal["prompt"] | None = prefix
         self.decode_steps = decode_steps
         self.steps = 0
         self._queue: deque[_Row] = deque()
@@ -662,7 +670,7 @@ class Server:
             ),
             default_budget=task.max_new_tokens,
             max_length=task.max_length,
-            decode_steps=decode_steps,
+            decode_steps=decode_steps, prefix=task.prefix,
         )
 
     @property
@@ -761,14 +769,33 @@ class Server:
                 positions[valid], (np.cumsum(valid, axis=1) - 1)[valid])):
             raise ValueError("a served prompt cannot carry noncanonical positions")
         self.rows.refuse(int(valid[0].sum()), budget)
+        tokens = ids[0][valid[0]].astype(np.int32)
+        groups = self._blocks_of(tokens)
         salt = b""
-        if context is not None:
-            # The context's dtype too, so equal bytes of another dtype salt apart.
+        if context is not None or groups is not None:
             hasher = hashlib.blake2b(digest_size=16)
-            array_fingerprint(hasher, np.asarray(context))
+            if context is not None:
+                # The context's dtype too, so equal bytes of another dtype salt apart.
+                array_fingerprint(hasher, np.asarray(context))
+            if groups is not None:
+                # A block's keys depend on the whole block, so its prefix pages are shared only with a prompt
+                # whose block holds the same tokens.
+                hasher.update(tokens[groups >= 0].tobytes())
             salt = hasher.digest()
-        return _Row(ids[0][valid[0]].astype(np.int32), budget, seed, fold, Ticket(), context=context,
-                    salt=salt)
+        return _Row(tokens, budget, seed, fold, Ticket(), context=context, salt=salt, groups=groups)
+
+    def _blocks_of(self, prompt: np.ndarray) -> np.ndarray | None:
+        """The blocks a request's prompt makes under the prefix run (`prompt_blocks`), None where the server
+        runs causally. A block a layer reads whole is prefilled in one piece, so a server that prefills
+        in pieces of `chunk` tokens refuses a longer block."""
+        if self.prefix is None:
+            return None
+        block = len(prompt) if self.prefix == "prompt" else self.prefix
+        if self.rows.chunk is not None and block > self.rows.chunk:
+            raise ValueError(f"a prefix block of {block} tokens would be prefilled in pieces of at most "
+                             f"{self.rows.chunk} tokens, which split it; serve it without chunk, or with a "
+                             "chunk at least as long as the block")
+        return prompt_blocks(np.ones((1, len(prompt)), bool), self.prefix, xp=np)[0]
 
     def _request_context(self, embeddings: ArrayLike, lengths: ArrayLike | None) -> np.ndarray:
         """A request's context as its real tokens on the host, `[length, features]`, in the dtype
@@ -902,10 +929,13 @@ class Server:
             cross[0].context_length, cross[1], cross[2])
         contexts = np.zeros((count, context_length, features), dtype)
         context_lengths = np.zeros((count,), np.int32)
+        blocks = None if self.prefix is None else np.full((count, width), -1, np.int32)
         for index, slot, row in chosen:
             piece = row.prompt[row.prefilled:row.prefilled + width]
             tokens[index, width - len(piece):] = piece
             valid[index, width - len(piece):] = True
+            if blocks is not None and row.groups is not None:
+                blocks[index, width - len(piece):] = row.groups[row.prefilled:row.prefilled + len(piece)]
             slots[index], budgets[index], folds[index] = slot % size, row.budget, row.fold
             if isinstance(row.seed, int):
                 seeds[index], seeded[index] = row.seed, True
@@ -936,11 +966,13 @@ class Server:
                 history,
                 history_valid,
                 *([] if cross is None else [contexts, context_lengths]),
+                *([] if blocks is None else [blocks]),
             ],
             self._admitted,
         )
         conditioning = {} if cross is None else {CONTEXT: placed[10], CONTEXT_LENGTHS: placed[11]}
-        return Admission(ModelInputs(placed[0], {"attention_mask": placed[1]}, conditioning), *placed[2:10])
+        fields = {"attention_mask": placed[1], **({} if blocks is None else {BLOCKS_FIELD: placed[-1]})}
+        return Admission(ModelInputs(placed[0], fields, conditioning), *placed[2:10])
 
     def _settle(self) -> None:
         """Read the previous call's draws into their rows, iteration by

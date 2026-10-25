@@ -54,10 +54,12 @@ class ValidTargets:
         from dew.objectives.lm.objective import scored_targets
 
         segments = element.get(f"{self.field}_segment_ids")
+        blocks = element.get(f"{self.field}_block_groups")
         roles = None if self.role is None else np.asarray(element[f"{self.field}_roles"])[None]
         return int(scored_targets(np, np.asarray(element[self.field])[None], self.pad_id, None,
                                   None if segments is None else np.asarray(segments)[None],
-                                  roles=roles, role=self.role).sum())
+                                  roles=roles, role=self.role,
+                                  blocks=None if blocks is None else np.asarray(blocks)[None]).sum())
 
 
 @dataclasses.dataclass(frozen=True)
@@ -87,7 +89,7 @@ _RULE = ("_dew_target_role", "_dew_target_pad")
 """The fields a counted record carries its count's rule in, each where the rule sets it."""
 
 
-_COUNTED = ("text", "text_segment_ids", "text_roles")
+_COUNTED = ("text", "text_segment_ids", "text_roles", "text_block_groups")
 """The fields a record's targets are counted from (`ValidTargets`), as they are first named."""
 
 _BOUND = "_dew_target_fields"
@@ -139,10 +141,10 @@ def recounted(given: Batch, output: Batch) -> Batch:
         output = {**output, **{name: given[name] for name in _CARRIED if name in given}}
     if not targets_changed(given, output):
         return output
-    return {**output, "_dew_valid_targets": _scored(output)}
+    return {**output, "_dew_valid_targets": counted_by_rule(output)}
 
 
-def _scored(row: Batch) -> int:
+def counted_by_rule(row: Batch) -> int:
     """The targets of a counted `row` by the rule it carries, from the fields as they are named now."""
     view = {counted: row[name] for counted, name in zip(_COUNTED, _bound(row), strict=True) if name in row}
     rule = ValidTargets(role=row.get("_dew_target_role"), pad_id=row.get("_dew_target_pad"), measured=False)
@@ -179,8 +181,9 @@ class CountRule:
                 f"drop the roles {self.roles!r}; keep them among the stage's fields")
         rule = {name: value for name, value in zip(_RULE, (self.role, self.pad_id), strict=True)
                 if value is not None}
-        held = {**window, **rule, _BOUND: (field, f"{field}_segment_ids", self.roles or f"{field}_roles")}
-        return {**held, "_dew_valid_targets": _scored(held)}
+        held = {**window, **rule, _BOUND: (field, f"{field}_segment_ids", self.roles or f"{field}_roles",
+                                          f"{field}_block_groups")}
+        return {**held, "_dew_valid_targets": counted_by_rule(held)}
 
 
 def count_rules(rows: Iterable[Batch | bytes | None]) -> list[list[int | None]]:

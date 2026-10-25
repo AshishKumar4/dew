@@ -4,8 +4,11 @@ Dew's attention masks and banded layouts compare positions by. The coordinates a
 caller's layout counts, slots, places in a document or banded rows, so a caller keeps its layout and
 builds no global mask to ask. An asymmetric window (Gemma's audio blocks) states its own sides."""
 
+from typing import Literal
+
 import jax
 import jax.numpy as jnp
+import numpy as np
 
 
 def windowed(query, key, window: int, *, causal: bool):
@@ -36,6 +39,27 @@ def same_group(query_groups, key_groups):
     """Whether a key is in the query's block (broadcast): both carry one group id, -1 being none, as an
     image's tokens (`AttentionMetadata.image_groups`) or a prompt's blocks (`block_groups`) do."""
     return (query_groups == key_groups) & (query_groups >= 0)
+
+
+def prefix_blocks(segments, places, prefix: int, *, xp=jnp):
+    """The block each token of a row is under a prefix run of `prefix` tokens: the first `prefix` places of
+    each document, numbered by the document's segment id, -1 for the rest and for padding (segment 0). The
+    `[B, S]` `segments` number a row's documents from 1, and `places` is each token's place in its document.
+    The data stage `Blocks` and a served prompt (`prompt_blocks`) read this one rule."""
+    return xp.where((segments > 0) & (places < prefix), segments, -1).astype(xp.int32)
+
+
+def prompt_blocks(valid, prefix: int | Literal["prompt"], *, xp=jnp):
+    """The blocks a served prompt's real tokens `valid` `[B, S]` make under a prefix run, as a training row's
+    do (`prefix_blocks`): the first `prefix` tokens under an int, the whole prompt under "prompt". Each row is
+    one document of its own. A row with fewer than `prefix` real tokens is refused, since the training block
+    would cover tokens the prompt lacks."""
+    valid = xp.asarray(valid, bool)
+    if prefix == "prompt":
+        return xp.where(valid, 1, -1).astype(xp.int32)
+    if (np.asarray(valid).sum(axis=1) < prefix).any():
+        raise ValueError(f"a prompt under prefix {prefix} needs at least {prefix} real tokens in every row")
+    return prefix_blocks(valid.astype(xp.int32), xp.cumsum(valid, axis=1, dtype=xp.int32) - 1, prefix, xp=xp)
 
 
 def block_starts(groups):
