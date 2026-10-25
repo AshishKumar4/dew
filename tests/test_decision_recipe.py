@@ -64,10 +64,10 @@ def test_a_lora_run_over_a_decision_release_trains_its_factors_and_reloads(tmp_p
     import optax
     from test_slot_sources import slot_release
 
+    from dew.batch import FROZEN
     from dew.checkpoints import Checkpoints
     from dew.decision.layout import QuestionLayout
     from dew.lora import LoRA
-    from dew.objectives.base import FROZEN
     from dew.training import Trainer
 
     release, stored = slot_release(tmp_path, "head")
