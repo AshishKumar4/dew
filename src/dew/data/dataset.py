@@ -406,7 +406,10 @@ class Loading:
         cpus = host.cpus - 1 if self.max_workers is None else min(self.max_workers, host.cpus - 1)
         read_buffer = min(self.read_buffer, budget // read)
         held = WORKER_PROCESS_BYTES + self.worker_buffer * batch + read_buffer * read
-        return dataclasses.replace(self, workers=max(0, min(cpus, budget // held)), read_buffer=read_buffer)
+        workers = max(0, min(cpus, budget // held))
+        _log.info("automatic loading reads in %d workers holding %d reads ahead, sized for %d CPUs and "
+                  "%.2f GiB", workers, read_buffer, host.cpus, budget / 2**30)
+        return dataclasses.replace(self, workers=workers, read_buffer=read_buffer)
 
     @property
     def worker_count(self) -> int:
