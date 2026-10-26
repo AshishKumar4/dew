@@ -25,7 +25,7 @@ from dew.training import Checkpoints, Trainer
 VOCAB = 16
 FEATURES = 8
 LENGTH = 12
-ROWS = 8
+ROWS = 16
 LEVEL = ContinuumLevel(hidden=4)
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 
@@ -58,11 +58,12 @@ MODEL = decoder()
 
 
 def drawn_variables(seed: int, model: CausalTransformer = MODEL):
-    """`model`'s variables drawn at 0.5 N(0, 1), its level's `up` among them, so the level moves the
-    states from its first window."""
+    """`model`'s variables drawn at 0.25 N(0, 1), its level's `up` among them, so the level moves the
+    states from its first window, and a step of a half moves it without amplifying a rounding past
+    what a draw resolves."""
     rng = np.random.default_rng(seed)
     shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, LENGTH), jnp.int32)))
-    return jax.tree.map(lambda leaf: (0.5 * rng.standard_normal(leaf.shape)).astype(np.float32), shapes)
+    return jax.tree.map(lambda leaf: (0.25 * rng.standard_normal(leaf.shape)).astype(np.float32), shapes)
 
 
 def equation_71(model, variables, hidden, targets, weights, layout, adaptation: ChunkAdaptation):
