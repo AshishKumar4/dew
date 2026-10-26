@@ -136,15 +136,19 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mainloop.Tiles | None:
         """The call's tiles on `target`, from its shape and the device's and its bundle's facts
         (docs/design/kernel-templates.md §7), each rule naming the fact it reads:
-        - value block: the widest dividing the padded values in steps of the narrowest a staged operand
-          block takes (`Family.narrowest_columns`) that is legal (`legal`: every launch's shared memory
-          within a block of the device and its registers within a thread's, `registers`) and whose states
+        - value block: of those dividing the padded values in steps of the narrowest a staged operand block
+          takes (`Family.narrowest_columns`) and legal (`legal`: every launch's shared memory within a
+          block of the device and its registers within a thread's, `registers`), and of those at which the
+          call's fast backward holds where it holds at any (`_backward_holds`: its launches take the states
+          launch's block, an H100's reverse launch 328 registers 64 wide), the narrowest whose states
           launch, a program a value block, sequence and value head walking its sequence's chunks in turn,
-          has as many programs as the device has multiprocessors (fla's chunk_fwd_h runs the 27B gated
-          delta net's 192 programs a 32-wide block on an A100's 108, where 64 wide its 96 left twelve
-          idle the whole walk, SE-rx-ncu-b106b18d8); the narrowest legal where none fills them; of
-          those at which the call's fast backward holds where it holds at any (`_backward_holds`: its
-          launches take the states launch's block, an H100's reverse launch 328 registers 64 wide);
+          runs in the fewest waves of the programs the device's multiprocessors hold at once
+          (`states_held`): a wave's time is its walk's, whose steps wait on their loads, about as long a
+          program 16 wide as 32 (an H100's 114 us a wave 16 wide against 95 32 wide, the 27B's and
+          Qwen3-Next's, SE-family-h100-b0980aaff), so the fewest waves and the most programs in them (fla's
+          chunk_fwd_h runs the 27B gated delta net's 192 programs a 32-wide block on an A100's 108, where
+          64 wide its 96 left twelve idle the whole walk, SE-rx-ncu-b106b18d8); the widest where the
+          device's multiprocessors are unknown;
         - output block: the widest legal beside it (`_staged`), the output launch's registers apart from the
           states launch's: on an A100 the output launch holds 264 registers 32 wide, where the states
           launch's 384 programs 16 wide took two waves of 593 us (SE-family-a100-0c8018352);
@@ -164,9 +168,16 @@ class Mosaic(base.Template[mainloop.Tiles]):
         batch, length, heads, _ = arguments["value"].shape
         sequences = batch * (1 if arguments.get("starts") is None
                              else arguments.get("max_segments") or length)
-        filling = [tiles for tiles in legal if target.multiprocessors is None
-                   or columns // tiles.block_v * sequences * heads >= target.multiprocessors]
-        return filling[0] if filling else legal[-1]
+        if target.multiprocessors is None:
+            return legal[0]
+        multiprocessors = target.multiprocessors
+
+        def waves(tiles: mainloop.Tiles) -> int:
+            programs = columns // tiles.block_v * sequences * heads
+            return -(-programs // (multiprocessors * self.states_held(ba, tiles, target)))
+
+        fewest = min(map(waves, legal))
+        return [tiles for tiles in legal if waves(tiles) == fewest][-1]
 
     def _backward_holds(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles,
                         target: generation.GpuTarget) -> bool:
