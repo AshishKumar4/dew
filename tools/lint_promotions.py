@@ -13,8 +13,9 @@ a base), a library's reader (`from_pretrained`, `from_config`, `from_single_file
 module, a module-preserving call on one (`eval()`, `cpu()`, `to(device)`), a function of the file that
 returns one, and a name or attribute chain bound to any of these until it is bound to something else.
 A forward's result, an attribute of a module (a tensor or a submodule) and an item of one are not, nor
-is a module built inside `float64` or `widened` (or a context a condition picks from them, whose branch
-the promotion's own condition is read to share), or at float64 by its `dtype`. Blind spots: a module
+is a module built inside `float64` or `widened` (entered by a `with`, or on a stack of contexts, or a
+context a condition picks from them, whose branch the promotion's own condition is read to share), or
+at float64 by its `dtype`. Blind spots: a module
 the file receives (a parameter, a factory it is passed, an attribute another method set), a loop's
 target, and a submodule promoted by its attribute.
 """
@@ -54,8 +55,7 @@ class _File:
     def __init__(self, tree: ast.Module, parent: Sequence[str]):
         self.tables = {id(node): table for node, table in scopes.scoped(tree.body, {}, list(parent))}
         self.wide = {id(node) for block in ast.walk(tree) if isinstance(block, ast.With | ast.AsyncWith)
-                     and any(self._wide(item.context_expr) for item in block.items)
-                     for statement in block.body for node in ast.walk(statement)}
+                     for statement in self._widened(block) for node in ast.walk(statement)}
         classes = [node for node in ast.walk(tree) if isinstance(node, ast.ClassDef)]
         self.classes: set[str] = set()
         functions = {node.name: node for node in ast.walk(tree)
@@ -76,6 +76,19 @@ class _File:
 
     def resolved(self, node: ast.expr) -> str:
         return scopes.resolved(node, self.tables.get(id(node), {}))
+
+    def _widened(self, block: ast.With | ast.AsyncWith) -> list[ast.stmt]:
+        """The statements of a `with` block that run inside a float64 context: all of them where one
+        of its items is one, else those after a statement entering one on a stack of contexts
+        (`scope.enter_context(float64())`)."""
+        if any(self._wide(item.context_expr) for item in block.items):
+            return block.body
+        for at, statement in enumerate(block.body):
+            if any(isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                   and node.func.attr == "enter_context" and node.args and self._wide(node.args[0])
+                   for node in ast.walk(statement)):
+                return block.body[at + 1:]
+        return []
 
     def _wide(self, node: ast.expr) -> bool:
         """Whether a `with` item is a float64 context (WIDE), or one where a condition picks it, as

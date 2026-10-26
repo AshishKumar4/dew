@@ -71,6 +71,16 @@ PROMOTIONS = {
         "    with float64() if wide else contextlib.nullcontext():\n"
         "        model = torch.nn.Linear(4, 4)\n"
         "        model = model.to(torch.float64) if wide else model", 0),
+    "a module read inside float64 entered on a stack": (
+        "import contextlib\nimport torch\nfrom tools.torch_precision import float64\n"
+        "from diffusers import StableDiffusionPipeline\nwith contextlib.ExitStack() as scope:\n"
+        "    scope.enter_context(float64())\n    pipe = StableDiffusionPipeline.from_pretrained(root)\n"
+        "    pipe = pipe.to(torch.float64)", 0),
+    "a module read before a stack enters float64": (
+        "import contextlib\nimport torch\nfrom tools.torch_precision import float64\n"
+        "from diffusers import StableDiffusionPipeline\nwith contextlib.ExitStack() as scope:\n"
+        "    pipe = StableDiffusionPipeline.from_pretrained(root)\n    scope.enter_context(float64())\n"
+        "    pipe = pipe.to(torch.float64)", 1),
     "a module built at float64": ("import torch\nmodel = torch.nn.Linear(4, 4, dtype=torch.float64)\n"
                                   "model.double()", 0),
     "a factory it is passed": ("def twin(build):\n    model = build()\n    model.double()", 0),
