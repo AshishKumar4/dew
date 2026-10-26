@@ -129,11 +129,13 @@ class Forward:
 
     def carry(self, x: jax.Array) -> jax.Array:
         """The factor a softmax state takes from one maximum to another `x` below it: exp2 folded, and
-        natural, `jnp.exp`, the reference's own, whose state (a resumed partial, a sink) may be any size, so
-        `natural_exp`'s extra rounding of `x * log2(e)`, about `|x|` ulps, would reach it."""
+        natural `natural_exp`, as exact as the reference's `jnp.exp` on every backend, whose state (a resumed
+        partial, a sink) may be any size: a Mosaic launch of approximate math lowers `jnp.exp` to the
+        hardware's base-2 exponential of `x * log2(e)` rounded, about `|x|` ulps off for a state carried
+        far, where `natural_exp` keeps that product's residual."""
         if self.base2:
             return jnp.exp2(x)
-        return jnp.exp(x * self.scale) if self.raw else jnp.exp(x)
+        return natural_exp(x, self.scale) if self.raw else natural_exp(x)
 
     def naturalized(self, m: jax.Array) -> jax.Array:
         """A maximum in the logits' units taken to natural ones: from base 2 folded, from raw products
@@ -423,8 +425,9 @@ def natural_exp(x: jax.Array, scale: float = 1.0) -> jax.Array:
     (`power2` the integral one), so the conversion's rounding does not reach a large value under a small
     weight: one rounding more than `jnp.exp` no longer, where XLA had folded `exp2(x * log2(e))` back to
     `exp(x)` until JAX 0.12 stopped reassociating constant products (jax-ml/jax 2d3744395). The residual is
-    about an fp32 ulp of the exponent, whose square is below the exponential's rounding. The backward's
-    weights and the factors that carry a state keep `jnp.exp`, as the reference does."""
+    about an fp32 ulp of the exponent, whose square is below the exponential's rounding. The factors that
+    carry a state take it too (`Forward.carry`); the backward's weights keep `jnp.exp`, as the reference
+    does."""
     # Normalize the factor before splitting: at a tiny raw scale its residual would be subnormal.
     factor, exponent = np.frexp(scale * LOG2E)
     x = x * np.float32(2.0 ** int(exponent))
@@ -711,7 +714,7 @@ def carried(spec: Forward, m: jax.Array, safe: jax.Array) -> jax.Array:
     alpha = spec.carry(difference)
     if spec.raw:
         product, rounding = two_product(difference, np.float32(spec.scale), bit_split=True)
-        alpha = jnp.exp(product)
+        alpha = natural_exp(product)
         error = rounding + error * spec.scale
     corrected = alpha * (1.0 + error)
     return jnp.where(finite(corrected), corrected, spec.carry(difference))

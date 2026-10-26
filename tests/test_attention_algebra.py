@@ -297,10 +297,10 @@ def test_a_resumed_state_carried_far_is_as_exact_as_the_references(natural):
     """fp32, one query over one key whose logit is 40 to 87 above a resumed state's maximum (0), the
     state's weighted values 2^60 to 2^100 times a normal draw and its denominator 1, the key's value a
     normal draw: the output is the state's share carried over that distance. The factor the state takes
-    to the key's maximum is the reference's `exp` (`Forward.carry`), so each mainloop holds check 1
-    against the reference; `exp2(x * log2(e))`, the natural form's key-weight exponential, rounds its
-    argument about `|x|` ulps away on a GPU (`natural_exp`). The Triton mainloop compiles on a GPU, whose
-    exp2 is the hardware's own; XLA's CPU computes exp2 through exp."""
+    to the key's maximum keeps the residual of its exponent's conversion to base 2 (`Forward.carry`,
+    `natural_exp`), so each mainloop holds check 1 against the reference's `exp`, where the hardware's base-2
+    exponential of `x * log2(e)` rounded is about `|x|` ulps off. The Triton mainloop compiles on a GPU,
+    whose exp2 is the hardware's own; XLA's CPU computes exp2 through exp."""
     spans = template.spans(1, 1, 4)
 
     def draw(seed: int):
