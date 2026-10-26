@@ -20,7 +20,8 @@ import jax
 import jax.numpy as jnp
 from jax.typing import ArrayLike
 
-from dew.diffusion.schedules import NoiseScheduler, divided, expand
+from dew.diffusion.schedules import NoiseScheduler, expand
+from dew.nn.precision import divided
 
 
 def from_clean(x_t, prediction, rates) -> tuple[jax.Array, jax.Array]:

@@ -203,19 +203,23 @@ def test_a_window_with_no_target_is_left_out_whatever_the_read(read):
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
-@pytest.mark.parametrize("policy", ["concat", "first-fit"])
+@pytest.mark.parametrize("policy", ["concat", "first-fit", "windows"])
 def test_a_record_whose_packed_fields_differ_in_length_is_refused(read, policy):
-    """A packed record's fields hold one entry a token. One whose fields differ in length is refused
-    by every read and policy: packed, each field would be cut at other places (where Grain's
-    concatenating packer loses a token of the shorter field's remainder), its windows holding one
-    field's tokens beside another's from elsewhere. Records whose fields agree pack them alike."""
+    """A packed or windowed record's fields hold one entry a token. One whose fields differ in length
+    is refused by every read, packer and window reader: each field would be cut at other places
+    (where Grain's concatenating packer loses a token of the shorter field's remainder), its windows
+    holding one field's tokens beside another's from elsewhere. Records whose fields agree are read
+    alike."""
     def records(others: tuple[int, int]) -> Memory:
         return Memory([{"text": np.arange(start, start + length, dtype=np.int32),
                         "other": np.arange(100 + start, 100 + start + other, dtype=np.int32)}
                        for start, length, other in zip((10, 20), (3, 4), others, strict=True)])
 
     def windows(source: Memory) -> list[tuple[list[int], list[int]]]:
-        chain = Pipeline(source).pack(4, fields=("text", "other"), policy=policy).batch(1)
+        pipeline = Pipeline(source)
+        laid = (pipeline.windows(3, fields=("text", "other")) if policy == "windows"
+                else pipeline.pack(4, fields=("text", "other"), policy=policy))
+        chain = laid.batch(1)
         stream = compile(chain, read=read, loading=Loading(workers=0, threads=1)).train(DataPartition())
         try:
             return [(batch["text"][0].tolist(), batch["other"][0].tolist())

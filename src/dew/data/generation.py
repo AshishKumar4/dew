@@ -22,10 +22,10 @@ from dew.data.pipeline import Record, Rejected
 from dew.data.plan import array_digest
 from dew.data.retention import LocalRetention
 from dew.data.sources.base import Read, Shard, ShardManifest, Source, _indexed_manifest, _uncounted, url_label
-from dew.data.sources.codec import decode, fingerprint
+from dew.data.sources.codec import decode, encode, encoded_fingerprint, fingerprint
 from dew.data.sources.index import ArrayIndex
 from dew.data.sources.records import ArrayRecords
-from dew.data.storage import Store, Versioned
+from dew.data.storage import Store, Versioned, local
 
 if TYPE_CHECKING:
     from dew.data.cache import Cache
@@ -316,12 +316,16 @@ def completion_facts(row_id: str, payload: bytes) -> Mapping[str, object]:
     checks every one against the record it reads (`_completion`)."""
     outputs = _decode_outputs(payload)
     accepted = _accepted(outputs)
+    # Each output encoded once for both digests (`encoded_fingerprint`).
+    encoded = [encode(value) for value in outputs]
+    kept = [each for value, each in zip(outputs, encoded, strict=True)
+            if value is not None and not isinstance(value, Rejected)]
     return {
         "id": row_id,
         "fanout": len(accepted),
         "outputs": [[row_id, index] for index in range(len(accepted))],
-        "sha256": fingerprint(accepted),
-        "payload_sha256": fingerprint(outputs),
+        "sha256": encoded_fingerprint(kept),
+        "payload_sha256": encoded_fingerprint(encoded),
         "lengths": [_fact(value, "_dew_length") for value in accepted],
         "valid_targets": [_fact(value, "_dew_valid_targets") for value in accepted],
         "rules": [_rule(value) for value in accepted],
@@ -440,9 +444,15 @@ class Generation:
 
     @cached_property
     def _page(self):
-        @lru_cache(maxsize=4)
-        def opened(page: str) -> dict:
-            return json.loads(_checked(Store(self.url, self.storage_options), self.manifest["pages"][page]))
+        # Every page of the input index, as where each input's record stands: inputs are paged by their
+        # key's digest, so a read in any order visits each page all the time, which a few pages held
+        # would read and check again each time. Publication reads the pages' other facts itself.
+        @lru_cache(maxsize=256)
+        def opened(page: str) -> dict[str, tuple[str, int, str]]:
+            entries = json.loads(_checked(Store(self.url, self.storage_options),
+                                          self.manifest["pages"][page]))
+            return {key: (entry["shard"], entry["record"], entry["payload_sha256"])
+                    for key, entry in entries.items()}
 
         return opened
 
@@ -458,14 +468,25 @@ class Generation:
 
     @cached_property
     def _shard(self):
-        @lru_cache(maxsize=2)
+        # A shuffled read visits every shard all the time: each is checked whole (its size and digest)
+        # as it is opened, which stands for every record its reader reads (`outputs`), and many readers
+        # are kept open, so a shard is checked again only once its reader has been closed.
+        @lru_cache(maxsize=64)
         def opened(path: str) -> ArrayRecords:
             root = Store(self.manifest["root"], self.storage_options)
-            mirrored = root.cached()
-            _checked(mirrored, self.manifest["shards"][path])
+            if self._local:
+                # Checked in place, the file its reader reads.
+                _checked(root, self.manifest["shards"][path])
             return ArrayRecords((root.child(path).url,), self.storage_options)
 
         return opened
+
+    @cached_property
+    def _local(self) -> bool:
+        """Whether its shards are local files, which a reader reads as they were checked whole as it
+        opened them (`_shard`); a remote shard's reader reads an object the check did not, so each
+        record it reads is checked against its digest (`outputs`)."""
+        return local(Store(self.manifest["root"], self.storage_options).resolve()[0])
 
     def __getstate__(self) -> Mapping[str, object]:
         return {"url": self.url, "storage_options": self.storage_options, "_definition": self._definition,
@@ -518,12 +539,12 @@ class Generation:
 
     def outputs(self, row_id: RowId) -> Outputs:
         row_key = _row_key(row_id)
-        entry = self._page(input_page(row_key))[row_key]
-        payload = self._shard(entry["shard"])[entry["record"]]
+        shard, place, digest = self._page(input_page(row_key))[row_key]
+        payload = self._shard(shard)[place]
         if not isinstance(payload, bytes):
             raise ValueError(f"committed cache record is not bytes: {self.url}")
         values = _decode_outputs(payload)
-        if fingerprint(values) != entry["payload_sha256"]:
+        if not self._local and fingerprint(values) != digest:
             raise ValueError(f"committed cache completion is corrupt for {row_key}")
         return values
 
