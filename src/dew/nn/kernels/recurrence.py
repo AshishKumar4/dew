@@ -25,7 +25,14 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from dew.nn.precision import L2NORM_EPS, at_least_fp32, compensated_add, float32_einsum, l2norm
+from dew.nn.precision import (
+    L2NORM_EPS,
+    at_least_fp32,
+    compensated_add,
+    float32_einsum,
+    l2norm,
+    stochastic_bf16,
+)
 
 from . import chunked_launch, norm_swiglu, short_conv, tuning
 from .generation import triton_runs
@@ -108,16 +115,14 @@ def round_to_bf16(state, key, value):
     smaller than half a bf16 step still moves the state on average, where
     rounding to nearest would hold it. The noise is a hash of the value's
     bits and the token's `key` `[..., Dk]` and `value` `[..., Dv]`, so it is
-    deterministic and differs from token to token."""
+    deterministic and differs from token to token (`precision.stochastic_bf16`, its rounding)."""
     bits = jax.lax.bitcast_convert_type(state, jnp.uint32)
     salt = (jax.lax.bitcast_convert_type(key, jnp.uint32)[..., :, None] * jnp.uint32(0x9E3779B1)
             + jax.lax.bitcast_convert_type(value, jnp.uint32)[..., None, :] * jnp.uint32(0x85EBCA77))
     mixed = bits ^ salt
     mixed = (mixed ^ (mixed >> 16)) * jnp.uint32(0x7FEB352D)
     mixed = (mixed ^ (mixed >> 15)) * jnp.uint32(0x846CA68B)
-    mixed = mixed ^ (mixed >> 16)
-    rounded = (bits + (mixed & jnp.uint32(0xFFFF))) & jnp.uint32(0xFFFF0000)
-    return jax.lax.bitcast_convert_type(rounded, jnp.float32).astype(jnp.bfloat16)
+    return stochastic_bf16(state, mixed ^ (mixed >> 16))
 
 
 def update(state, query, key, value, decay, write, *, delta: bool, in_kernel: bool = False):
