@@ -53,7 +53,7 @@ from .joined import joined_dense, joins
 from .kernels import generation
 from .kernels.generation import INHERENT, Refusal, triton_runs
 from .kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule, kernel_routed, recurrent_delta_rule
-from .kernels.selection import Kernel, Op, Requirement, select
+from .kernels.selection import Kernel, Op, Requirement, forced, select
 from .precision import L2NORM_EPS, asks_default_precision, at_least_fp32, float32_dot_general, l2norm
 from .sharding import (
     HEADS,
@@ -507,11 +507,13 @@ DELTA_DECODE: Op[DecodeCase] = Op('delta_decode', (
                                            "to take; its token runs the step alone", row=INHERENT,
                                            kind='handoff'))),
     Kernel('step', _LAUNCH),
-    Kernel('xla', (), generic=True)), lambda case: 'step')
+    Kernel('xla', (), generic=True)), lambda case: 'xla' if forced('gated_delta_rule') == 'xla' else 'step')
 """The decode selector of both recurrence callers (a gated delta net's layer, `decode_step`'s), by what each
 kernel takes (no table of GPUs): the step (`recurrence.step` alone, `decode_gated_delta_rule`) between a
 caller's own conv and norm on any GPU Dew's Triton kernels run on, its preference (the fused step won at
-one row alone, 0.157 ms against 0.165 on an H100, and lost at 32 and 128 rows, SE-decode-h100-d5e0ebadb);
+one row alone, 0.157 ms against 0.165 on an H100, and lost at 32 and 128 rows, SE-decode-h100-d5e0ebadb),
+or the portable recurrence where a caller names the rule's math (`generation.chosen`), so a reference
+decodes unfused;
 the fused step (`recurrence.step` with the layer's conv, gates and norm) where a call names it; else the
 portable recurrence ('xla'), a kernel the token does not take handing it to the next. Both kernels update
 the state in place, which JAX's Pallas gives no tangent."""
