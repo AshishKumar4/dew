@@ -95,7 +95,8 @@ def test_mxfp4_decodes_into_its_kept_dtype_as_float32_then_a_cast_does(param_dty
     reference = codecs.decode_e2m1(blocks.reshape(3, 5, 4 * codecs.GROUP // 2), scales).swapaxes(1, 2)
     decoded = codecs.MXFP4.dequantize({"w_blocks": blocks, "w_scales": scales}, param_dtype=param_dtype)["w"]
     assert decoded.dtype == np.dtype(kept) and decoded.flags.c_contiguous
-    np.testing.assert_array_equal(decoded.view(np.uint8), reference.astype(kept).view(np.uint8))
+    expected = np.ascontiguousarray(reference.astype(kept))
+    np.testing.assert_array_equal(decoded.view(np.uint8), expected.view(np.uint8))
 
 
 def test_a_group_rounding_past_the_largest_power_of_two_is_refused():
