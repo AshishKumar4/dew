@@ -55,6 +55,13 @@ def row_draw(keys: jax.Array, scores: jax.Array, where: jax.Array | None = None,
     first key's stream."""
     held = wellformed(scores)
     checkify.debug_check(jnp.all(held if where is None else held | ~where), message)
-    if jax.random.key_impl(keys) != "threefry2x32":
-        keys = jax.lax.map(counter_key, keys)
-    return jax.vmap(jax.random.categorical)(keys, scores).astype(jnp.int32)
+    return jax.vmap(jax.random.categorical)(counted(keys), scores).astype(jnp.int32)
+
+
+def counted(keys: jax.Array) -> jax.Array:
+    """Row keys a mapped draw reads one each, as each row drawn by itself reads its own: keys of
+    another implementation than threefry2x32 made counter-based a key at a time (`counter_key`), as
+    `vmap` would draw every RBG row from the first key's stream; threefry keys as given."""
+    if jax.random.key_impl(keys) == "threefry2x32":
+        return keys
+    return jax.lax.map(counter_key, keys)

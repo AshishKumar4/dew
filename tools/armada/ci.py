@@ -269,10 +269,10 @@ def inputs(name: str, depends: list[str]) -> list[str]:
 
 
 def cpu_class() -> str:
-    """This host's CPU microarchitecture, the one class the records, Dew's compilation cache and the
-    shared XLA bundles key it by (src/dew/_host.py, loaded by its path, as this file puts nothing on
-    sys.path)."""
-    spec = importlib.util.spec_from_file_location("dew_host", REPO / "src" / "dew" / "_host.py")
+    """This host's CPU microarchitecture, the one class the records, the tests' compilation cache and
+    the shared XLA bundles key it by (host.py beside this file, loaded by its path, as this file puts
+    nothing on sys.path)."""
+    spec = importlib.util.spec_from_file_location("dew_host", Path(__file__).with_name("host.py"))
     assert spec is not None and spec.loader is not None
     host = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(host)

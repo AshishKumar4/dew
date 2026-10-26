@@ -436,7 +436,8 @@ class Pretrained:
         param_dtype = AUTO if param_dtype == AUTO else dtype_name(param_dtype)
         # The reference refuses a folder outside the source before anything is fetched.
         directory, reference, composite = _source_metadata(
-            sources.SourceReference(str(name_or_dir), revision, subfolder), selected, fallback)
+            sources.SourceReference(str(name_or_dir), revision, subfolder), selected, fallback,
+            modeling_overrides)
         loaded, extracted = _loaded_kind(
             reference, directory, composite, fallback=fallback, gguf_file=gguf_file,
             single_file=single_file, dduf_file=dduf_file, placed=placed, streaming=streaming or not weights,
@@ -1130,12 +1131,19 @@ def _loaded_kind(reference: sources.SourceReference, directory: Path, composite:
         kind = "diffusion pipeline" if pipeline else "composite release"
         raise ValueError(f"{reference.name} is a {kind}, which has no wrapper's language model for "
                          "text_only to take")
+    def code() -> Path | None:
+        """The snapshot holding the source's own modules, which tier 2 reads where the load opted into
+        running them, fetched for a loader that reads them alone: a native decoder's at its folder, a
+        composite release's backbone's at its component's."""
+        return sources.remote_code(reference.name, directory) if trust_remote_code else None
+
     if composite is not None:
         loaded = _load_composite_source(reference, directory, composite,
                                         placed=placed, streaming=streaming, dtype=dtype,
                                         param_dtype=param_dtype, attention_impl=attention_impl,
                                         max_seq_len=max_seq_len, weights=weights,
-                                        overrides=overrides)
+                                        overrides=overrides,
+                                        code=None if composite.backbone is None else code())
     elif fallback is not None:
         from dew.interop import torchax_fallback
 
@@ -1156,19 +1164,22 @@ def _loaded_kind(reference: sources.SourceReference, directory: Path, composite:
     if loaded is None:
         # Without its weights, a decoder's leaves are translated as streaming translates them, each
         # a view of its stored tensor that nothing reads.
-        remote = (reference.directory(sources.remote_code(reference.name, directory)) if trust_remote_code
-                  else None)
+        remote = code()
         return _load_native_source(reference, directory, gguf_file=gguf_file, placed=placed,
                                    streaming=streaming, dtype=dtype, param_dtype=param_dtype,
                                    attention_impl=attention_impl, max_seq_len=max_seq_len, weights=weights,
-                                   overrides=overrides, remote=remote, text_only=text_only)
+                                   overrides=overrides,
+                                   remote=None if remote is None else reference.directory(remote),
+                                   text_only=text_only)
     return loaded, False
 
 
-def _overridden(config: Mapping[str, object], overrides: Mapping[str, object] | None) -> Mapping[str, object]:
+def with_overrides(config: Mapping[str, object],
+                   overrides: Mapping[str, object] | None) -> Mapping[str, object]:
     """`config` with `overrides`, a `modeling_overrides` record, over the source's own: each attention
     kind it names takes its mode, the others keep the source's. The decoder translation reads and
-    checks the result (`decoder_parts.modeling_overrides`)."""
+    checks the result (`decoder_parts.modeling_overrides`), and a composite's description what it
+    derives from it (`SourceKind.describe`)."""
     if overrides is None:
         return config
     own = _records.record(config.get("modeling_overrides", {}), "modeling_overrides")
@@ -1510,26 +1521,29 @@ def _selected_payload(fallback: str | None, **files: str | None) -> list[str]:
 
 
 
-def _source_metadata(requested: sources.SourceReference, selected: list, fallback: str | None
+def _source_metadata(requested: sources.SourceReference, selected: list, fallback: str | None,
+                     overrides: Mapping[str, object] | None
                      ) -> tuple[Path, sources.SourceReference, CompositeSource | None]:
     """Resolve one metadata snapshot of `requested` before any component's weights are read: the
     snapshot, the reference pinned to its commit (none for a local directory), and the composite
-    release its selected folder describes. Explicit payload/fallback selections take precedence over
-    composite metadata."""
+    release its selected folder describes under the load's `overrides`. Explicit payload/fallback
+    selections take precedence over composite metadata."""
     directory = sources.snapshot(requested.name, requested.revision, weights=False)
     commit = None if os.path.isdir(requested.name) else directory.name
     reference = replace(requested, revision=commit, subfolder=requested.subfolder or None)
     composite = (None if selected or fallback is not None
-                 else _composite_description(reference.directory(directory)))
+                 else _composite_description(reference.directory(directory), overrides))
     return directory, reference, composite
 
 
-def _composite_description(directory: Path) -> CompositeSource | None:
-    """A registered composite's metadata, without reading or placing its weights."""
+def _composite_description(directory: Path,
+                           overrides: Mapping[str, object] | None = None) -> CompositeSource | None:
+    """A registered composite's metadata under the load's `overrides`, without reading or placing its
+    weights."""
     from dew.registry import source_kinds
 
     for provider in source_kinds.values():
-        description = provider.describe(directory)
+        description = provider.describe(directory, overrides)
         if description is not None:
             return description
     return None
@@ -1539,9 +1553,12 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
                            description: CompositeSource, *, placed: Callable[[Variables], Variables],
                            streaming: bool, dtype: str, param_dtype: str, attention_impl: str,
                            max_seq_len: int | None, weights: bool,
-                           overrides: Mapping[str, object] | None = None) -> Pretrained:
+                           overrides: Mapping[str, object] | None = None,
+                           code: Path | None = None) -> Pretrained:
     """Materialize the described components through the native backbone and tensor-map owners.
-    All Hub paths remain relative to the resolved snapshot root, including a selected subfolder."""
+    All Hub paths remain relative to the resolved snapshot root, including a selected subfolder. `code`
+    is the snapshot holding the source's own modules where the load runs them (`trust_remote_code`),
+    which the backbone's route and load read at its component's folder, as a decoder alone reads its."""
     from dew.interop.streaming import materialize
     from dew.interop.weights import record_layouts
 
@@ -1558,7 +1575,8 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
         # in it, but its weights' snapshot is resolved and pinned here whenever it reads weights.
         routed = (mamba2.config_from_mamba_ssm(component.config) if mamba2.is_mamba_ssm(component.config)
                   else component.config)
-        forwarded = isinstance(source_route(routed), TorchRoute)
+        remote = None if code is None else source.component(component.config_folder).directory(code)
+        forwarded = isinstance(source_route(routed, remote=remote), TorchRoute)
         reads_shared = not forwarded or bool(head_source.weight_file is None and prefix)
         if weights or reads_shared:
             weight_source = source.component(component.weights_folder)
@@ -1575,7 +1593,8 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
             source, root,
             gguf_file=None, component=component, tensors=tensors,
             placed=placed, streaming=streaming, dtype=dtype, param_dtype=param_dtype,
-            attention_impl=attention_impl, max_seq_len=max_seq_len, weights=weights, overrides=overrides)
+            attention_impl=attention_impl, max_seq_len=max_seq_len, weights=weights, overrides=overrides,
+            remote=remote)
     else:
         _unread_overrides(overrides, "a release without a native backbone")
     missing = False
@@ -1678,7 +1697,7 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     mamba_ssm = mamba2.is_mamba_ssm(config)
     if mamba_ssm:
         config = mamba2.config_from_mamba_ssm(config)
-    config = _overridden(config, overrides)
+    config = with_overrides(config, overrides)
     family = config.get("model_type")
     config, route, language = _routed(config, remote=remote, text_only=text_only, overrides=overrides)
     if isinstance(route, TorchRoute):

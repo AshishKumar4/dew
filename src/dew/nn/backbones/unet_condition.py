@@ -15,9 +15,9 @@ from dew.nn.conv import Conv
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
 from dew.nn.flops import MissingFlopsCount, projection_flops
-from dew.nn.mlp import GatedMLP
 from dew.nn.precision import at_least_fp32, float32_dot_general
 
+from .joint import embedding, embedding_flops
 from .spatial import SpatialCount, SpatialForward, SpatialShape
 
 if TYPE_CHECKING:
@@ -39,27 +39,6 @@ class UNetStage:
     depth: int = 1
     cross_attention: bool = True
     cross_only: bool = False
-
-
-class _TimeMLP(nn.Module):
-    """Project a time embedding through two dense layers with a silu between."""
-
-    features: int
-    dtype: Dtype
-    precision: PrecisionLike = None
-
-    @nn.nowrap
-    def model_flops(self, lengths, input_features: int) -> float:
-        return GatedMLP(self.features, self.features, activation=nn.silu, in_features=input_features,
-                        parent=None).model_flops(lengths)
-
-    @nn.compact
-    def __call__(self, x):
-        mlp = GatedMLP(self.features, self.features, activation=nn.silu, use_bias=True,
-                        in_features=x.shape[-1], names=("in_proj", "out_proj"), dtype=self.dtype,
-                        precision=self.precision)
-        nn.share_scope(self, mlp)
-        return mlp(x)
 
 
 class _SpatialAttention(nn.Module):
@@ -261,12 +240,11 @@ class UNet2DCondition(nn.Module):
         height, width, _ = sample_shape
         first = self.stages[0].features
         row = np.ones((rows,), np.int64)
-        time = _TimeMLP(self.time_features, self.dtype, parent=None)
-        count = time.model_flops(row, first)
+        count = embedding_flops(row, first, self.time_features)
         if self.additional_time_features:
             if additional_features is None:
                 raise MissingFlopsCount("UNet2DCondition needs pooled width plus sinusoidal time-id width")
-            count += time.model_flops(row, additional_features)
+            count += embedding_flops(row, additional_features, self.time_features)
         operations = SpatialCount(context_lengths, text_features)
         operations.flops = count
         self.spatial_walk(SpatialShape((rows, height, width, self.in_channels)),
@@ -291,7 +269,7 @@ class UNet2DCondition(nn.Module):
         first = self.stages[0].features
         time = sinusoidal_time(time, first, dtype=at_least_fp32(self.dtype), shift=self.frequency_shift,
                                cosine_first=self.cosine_first)
-        time = _TimeMLP(self.time_features, self.dtype, self.precision, name="time")(time)
+        time = embedding(self, time, self.time_features, "time", dtype=self.dtype, precision=self.precision)
         if self.additional_time_features:
             if conditioning.pooled is None or conditioning.time_ids is None:
                 raise ValueError("This UNet needs pooled text and size/aesthetic conditioning")
@@ -299,8 +277,8 @@ class UNet2DCondition(nn.Module):
                                   dtype=at_least_fp32(self.dtype), shift=self.frequency_shift,
                                   cosine_first=self.cosine_first)
             extra = jnp.concatenate([conditioning.pooled, ids.reshape(x.shape[0], -1)], axis=-1)
-            time = time + _TimeMLP(self.time_features, self.dtype, self.precision,
-                                   name="additional_time")(extra)
+            time = time + embedding(self, extra, self.time_features, "additional_time", dtype=self.dtype,
+                                    precision=self.precision)
         return self.spatial_walk(x, time, conditioning.context, train=train, operations=SpatialForward())
 
     @nn.nowrap
