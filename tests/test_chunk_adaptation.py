@@ -26,7 +26,7 @@ VOCAB = 16
 FEATURES = 8
 LENGTH = 12
 ROWS = 16
-LEVEL = ContinuumLevel(hidden=16)
+LEVEL = ContinuumLevel(hidden=4)
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 
 ADAPTATION_SEEDS = 8
@@ -35,6 +35,9 @@ ADAPTATION_SEEDS = 8
 
 SELECTED_SEEDS = 256
 """Check 1's declared seeds for a level whose `up` alone steps, sized paired by `seeds_for` on armada."""
+
+GRADIENT_ROWS = 64
+"""The rows a draw of the gradient site holds over one document a row."""
 
 GRADIENT_SEEDS = {("documents", 0.1): 8, ("documents", 0.5): 8, ("packed", 0.1): 8, ("packed", 0.5): 8,
                   ("padded", 0.1): 8, ("padded", 0.5): 8}
@@ -92,26 +95,31 @@ def equation_71(model, variables, hidden, targets, weights, layout, adaptation: 
     def zeros():
         return jax.tree.map(jnp.zeros_like, start)
 
-    out = []
-    for row in range(rows):
+    def row_losses(row_hidden, row_targets, row_weights, row_valid, row_documents):
         level, summed, losses = start, zeros(), []
         document, count, opened, begun = None, 0, -1, False
         for slot in range(length):
-            real = valid is None or bool(valid[row][slot])
-            here = None if documents is None else int(documents[row][slot])
+            real = row_valid is None or bool(row_valid[slot])
+            here = None if row_documents is None else int(row_documents[slot])
             if real and (not begun or here != document):
                 level, summed, count, opened, document, begun = start, zeros(), 0, 0, here, True
             if real and count // adaptation.window != opened:
                 level, summed, opened = step(level, summed), zeros(), count // adaptation.window
-            loss, pull = jax.vjp(
-                lambda at, row=row, slot=slot: token_loss(at, hidden[row, slot], targets[row, slot]), level)
+            loss, pull = jax.vjp(lambda at, slot=slot: token_loss(at, row_hidden[slot], row_targets[slot]),
+                                 level)
             if real:
-                (gradient,) = pull(weights[row, slot].astype(loss.dtype))
+                (gradient,) = pull(row_weights[slot].astype(loss.dtype))
                 summed = jax.tree.map(jnp.add, summed, gradient)
                 count += 1
             losses.append(loss)
-        out.append(jnp.stack(losses))
-    return jnp.stack(out)
+        return jnp.stack(losses)
+
+    if valid is None and documents is None:
+        # Every row reads alike, one document and no padding: the rows run as one.
+        return jax.vmap(lambda h, t, w: row_losses(h, t, w, None, None))(hidden, targets, weights)
+    return jnp.stack([row_losses(hidden[row], targets[row], weights[row],
+                                 None if valid is None else valid[row],
+                                 None if documents is None else documents[row]) for row in range(rows)])
 
 
 LAYOUTS = ("documents", "packed", "padded")
@@ -139,13 +147,13 @@ def layout_of(kind: str) -> tuple[np.ndarray | None, np.ndarray | None]:
     return valid, np.where(valid, documents, 0)
 
 
-def draw(seed: int):
-    """A draw's variables, final states, targets and weights, one of them zero."""
+def draw(seed: int, rows: int = ROWS):
+    """A draw's variables, final states, targets and weights over `rows` rows, one weight zero."""
     rng = np.random.default_rng(seed)
-    weights = rng.uniform(0.5, 1.5, (ROWS, LENGTH)).astype(np.float32)
+    weights = rng.uniform(0.5, 1.5, (rows, LENGTH)).astype(np.float32)
     weights[0, 3] = weights[5, 0] = 0.0
-    return (drawn_variables(seed), rng.standard_normal((ROWS, LENGTH, FEATURES)).astype(np.float32),
-            rng.integers(0, VOCAB, (ROWS, LENGTH)).astype(np.int32), weights)
+    return (drawn_variables(seed), rng.standard_normal((rows, LENGTH, FEATURES)).astype(np.float32),
+            rng.integers(0, VOCAB, (rows, LENGTH)).astype(np.int32), weights)
 
 
 @pytest.mark.parametrize("kind", LAYOUTS)
@@ -198,7 +206,9 @@ def test_training_differentiates_through_every_step(kind, rate):
     held = tuple(None if part is None else jnp.asarray(part) for part in layout)
 
     def gradient_draw(seed):
-        variables, hidden, targets, weights = draw(seed)
+        # One document a row runs its rows as one, so it draws more of them, which a draw's heavier
+        # tail through three steps of a half needs to resolve.
+        variables, hidden, targets, weights = draw(seed, GRADIENT_ROWS if kind == "documents" else ROWS)
         return variables, hidden, targets, weights, np.float32(1.0)
 
     def dew(variables, hidden, targets, weights):
