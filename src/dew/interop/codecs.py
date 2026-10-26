@@ -58,7 +58,7 @@ import math
 import re
 from collections.abc import Callable, Collection, Iterable, Mapping
 from dataclasses import dataclass
-from functools import partial
+from functools import cache, partial
 from types import MappingProxyType
 from typing import Literal
 
@@ -167,8 +167,17 @@ def _mxfp4_arrays(blocks: ArrayLike, scales: ArrayLike) -> tuple[np.ndarray, np.
     return blocks, scales
 
 
-_EXACT_E2M1 = (np.dtype(np.float32), np.dtype(ml_dtypes.bfloat16))
-"""The dtypes that hold every E2M1 value times every E8M0 scale exactly, the subnormal 2 ** -128 included."""
+_EXACT_E2M1 = {np.dtype(np.float32): np.uint32, np.dtype(ml_dtypes.bfloat16): np.uint16}
+"""The dtypes that hold every E2M1 value times every E8M0 scale exactly, the subnormal 2 ** -128 included,
+each with the unsigned integer of its width its decoded words are copied as."""
+
+
+@cache
+def _scaled_e2m1(dtype: np.dtype) -> np.ndarray:
+    """Each exponent byte's scale times the two values each code byte holds, `[256 * 256, 2]` words of
+    `dtype` (`_EXACT_E2M1`), row `exponent * 256 + code`: a group decodes by one lookup, no multiply."""
+    products = _E2M1_BYTES[None] * e8m0_scales(np.arange(256, dtype=np.uint8))[:, None, None]
+    return products.astype(dtype).view(_EXACT_E2M1[dtype]).reshape(256 * 256, 2)
 
 
 def dequantize_mxfp4(blocks: ArrayLike, scales: ArrayLike, dtype: DTypeLike = np.float32) -> np.ndarray:
@@ -176,23 +185,28 @@ def dequantize_mxfp4(blocks: ArrayLike, scales: ArrayLike, dtype: DTypeLike = np
 
     transformers' `convert_moe_packed_tensors`: the low nibble precedes the
     high nibble, and every value is exact in the bf16 it decodes to. Each
-    expert decodes on its own, straight into `dtype` where it holds every
-    value (`_EXACT_E2M1`), else in float32 and rounded once as a cast does,
-    and is laid out transposed into one contiguous array: no float32 copy of
-    the whole weight, nor a strided cast of it.
+    expert decodes on its own by one lookup of each group's scaled values
+    (`_scaled_e2m1`), straight into `dtype` where it holds every value
+    (`_EXACT_E2M1`), else in float32 and rounded once as a cast does, and is
+    laid out transposed into one contiguous array: no float32 copy of the
+    whole weight, no multiply, nor a strided cast of it.
     """
     blocks, scales = _mxfp4_arrays(blocks, scales)
     codes = _bytes(blocks, _CODE_DTYPES)
+    exponents = _bytes(scales, (np.dtype(np.uint8), np.dtype(ml_dtypes.float8_e8m0fnu)))
     kept = np.dtype(dtype)
     work = kept if kept in _EXACT_E2M1 else np.dtype(np.float32)
-    table = _E2M1_BYTES.astype(work)
+    table = _scaled_e2m1(work)
     experts, outputs, groups, _ = codes.shape
     decoded = np.empty((experts, groups * GROUP, outputs), kept)
+    words = decoded.view(_EXACT_E2M1[work]) if work == kept else None
     for expert in range(experts):
-        values = table[codes[expert]].reshape(outputs, groups, GROUP)
-        values *= e8m0_scales(scales[expert]).astype(work)[..., None]
-        decoded[expert] = values.reshape(outputs, groups * GROUP).T
-    return decoded
+        rows = (exponents[expert].astype(np.intp)[..., None] << 8) | codes[expert]
+        values = np.take(table, rows, axis=0).reshape(outputs, groups * GROUP).T
+        if words is not None:
+            words[expert] = values
+        else:
+            decoded[expert] = values.view(work)
 
 
 def quantize_mxfp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
