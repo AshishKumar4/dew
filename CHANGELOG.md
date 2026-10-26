@@ -84,9 +84,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   calibration error, risk-coverage area and log loss, a JEPA run's probes, an image run's CLIP.
   `DiffusionRunConfig.build_eval_metrics` is `validation_metrics(validates=...)`.
 - A run weighs its splits' scores into named summaries, a board's weighted index (`--val-summaries`,
-  `Trainer.fit(summaries=)`, `dew.training.evaluation.Summary`): each formed once an evaluation, only
-  where it scored every split the summary weighs, logged as `summary/<name>`, and ranked by `Best`
-  (`--trainer.best summary/<name>`) and `Plateau`.
+  `Trainer.fit(summaries=)`, `dew.training.evaluation.Summary`): each formed once a step, only where
+  the step scored every split the summary weighs, logged as `evaluation/summary/<name>`, a namespace
+  no split can take, and ranked by `Best` (`--trainer.best evaluation/summary/<name>`) and `Plateau`.
+  A metric's name, like a split's, holds no '/'.
 - A language-model run loops a `--pretrained` decoder as a decision run does: `--loop-steps`,
   `--loop-layers`, `--loop-backprop-steps` and `--loop-remat` are both runs' (`DecoderRunConfig`), and
   `looping` is `dew.config.looping`.
