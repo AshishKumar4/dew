@@ -1259,8 +1259,11 @@ def test_a_share_of_a_token_budget_falls_where_the_committed_tokens_pass_its_mul
     committed tokens past 24, 48, 72 and 96, as a run logging every step counts them."""
     every = RecordingTracker()
     make_trainer(objective=TokenRegression(), tracker=every).fit(dataset(), tokens=96, log_every=1)
-    committed = {step: scalars["train/tokens"] for step, scalars in every.scalars
-                 if "train/tokens" in scalars}
+    # A log every step reports the tokens that step committed; the run's are their running sum.
+    each = sorted((step, scalars["train/tokens"]) for step, scalars in every.scalars
+                  if "train/tokens" in scalars)
+    committed = dict(zip((step for step, _ in each), itertools.accumulate(tokens for _, tokens in each),
+                         strict=True))
     passing = sorted(step for step, tokens in committed.items()
                      if tokens // 24 > committed.get(step - 1, 0) // 24)
     shared = RecordingTracker()
