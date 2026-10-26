@@ -679,7 +679,6 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                 and _rated(target, first) and self._family(ba, target) is not None
                 and (generation.effective(target).wgmma or not special)
                 and self._hooks_lower(ba, first, target)
-                and self._stored(ba, target)
                 and (self.EXACT_SUMS or not ba.arguments.get('exact_sums'))
                 and self.derived(ba, target) is not None)
 
@@ -787,12 +786,6 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     @abc.abstractmethod
     def _divides(self, ba, config: mosaic_gpu.Tiles) -> bool:
         """Whether `config`'s blocks divide the call's extents as the kernel requires."""
-
-    def _stored(self, ba, target) -> bool:
-        """Whether the launch's family stores each of the call's outputs (`mosaic.Family.stores`)."""
-        family = self._family(ba, target)
-        dtypes = ba.arguments['hooks'].out_dtypes or (ba.arguments['out_dtype'],)
-        return family is not None and all(family.stores(dtype) for dtype in dtypes)
 
     @staticmethod
     def _hooks_lower(ba, dtype, target) -> bool:
