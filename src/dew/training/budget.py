@@ -13,8 +13,8 @@ from typing import Literal
 from dew._records import JSON, is_share, recorded_duration, share
 from dew.data.dataset import Loader
 from dew.objectives.base import Metric, TrainingScalar
+from dew.training.cadence import Cadence, Tokens
 from dew.training.evaluation import Summary
-from dew.training.interval import Cadence, Tokens
 
 
 def run_length(steps: int | None, epochs: int | None, tokens: int | None, examples: int | None = None, *,
