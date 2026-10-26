@@ -1162,8 +1162,6 @@ DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
                     "MoE rows (worst 1.54x, kimi-linear gate_up)"),
     ('wgmma', 'grouped input_gradient'):
         ('cutlass', "R7B: 1.237x CUTLASS's time, geomean of 7 grouped rows (worst 1.74x)"),
-    ('wgmma', 'grouped kernel_gradient exact'):
-        ('triton', "R7B: 1.069x Triton's time, geomean of 6 grouped rows (0.948x CUTLASS's)"),
     ('wgmma', 'dense forward'):
         ('xla', "DENSE1 (H100, 2d1bbd051): Mosaic 1.067x and Triton 1.616x XLA's dot (cuBLAS), geomean of "
                 "10 projections at 8192 tokens"),
