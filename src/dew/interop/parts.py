@@ -376,7 +376,7 @@ class Ambiguous(ValueError):
     """A part the source's code does not let tier 2 read, which leaves the decoder to tier 3."""
 
 
-def _activation(module: torch.nn.Module) -> str:
+def gated_activation(module: torch.nn.Module) -> str:
     """The gated MLP Dew computes for the activation module a source part holds: the `hidden_act` name
     transformers' ACT2FN builds that same module for, read back by its class and state."""
     from transformers.activations import ACT2FN
@@ -501,7 +501,7 @@ def _read_qk_norm_attention(view: PartView) -> Mapping[str, object]:
 
 
 def _read_mlp(view: PartView) -> Mapping[str, object]:
-    return {'mlp': _activation(view.act_fn), 'mlp_features': view.gate_proj.out_features,
+    return {'mlp': gated_activation(view.act_fn), 'mlp_features': view.gate_proj.out_features,
             'mlp_bias': _biased(view.gate_proj, view.up_proj, view.down_proj)}
 
 
@@ -517,7 +517,7 @@ def _read_router(view: PartView, *, normalized: bool | None) -> Mapping[str, obj
 
 
 def _read_experts(view: PartView) -> Mapping[str, object]:
-    return {'mlp': _activation(view.act_fn), _LAYER: {'expert_features': int(view.intermediate_dim)}}
+    return {'mlp': gated_activation(view.act_fn), _LAYER: {'expert_features': int(view.intermediate_dim)}}
 
 
 def _read_rms_norm(view: PartView) -> Mapping[str, object]:
