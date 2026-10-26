@@ -373,7 +373,7 @@ def _source_sampling(config: Mapping[str, object], generation_config: Mapping[st
 
 def _token_list(value: JSON, name: str) -> list[int]:
     """A source field holding one token id or a nonempty list of them, read by the one law of ids."""
-    return token_ids(value if isinstance(value, (list, tuple)) else [value], where=name)
+    return token_ids(value if isinstance(value, list) else [value], where=name)
 
 
 def _as_decay(value: object) -> tuple[int, float]:
