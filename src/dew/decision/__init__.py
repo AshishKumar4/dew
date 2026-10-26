@@ -18,7 +18,7 @@ reads.
 """
 
 from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures, bucket
-from dew.decision.data import Example, Group, corpus, decisions, mixture
+from dew.decision.data import Example, Group, GroupedExamples, corpus, decisions, mixture
 from dew.decision.head import DecisionHead, Head, JointSchemaHead, LabelReadout, SlotReadout
 from dew.decision.joint_checkpoint import JointCheckpoint, StoredJointHead
 from dew.decision.laya import LayaCheckpoint
@@ -97,6 +97,7 @@ __all__ = [
     "Example",
     "Framing",
     "Group",
+    "GroupedExamples",
     "Head",
     "Instructions",
     "JevConfidence",
