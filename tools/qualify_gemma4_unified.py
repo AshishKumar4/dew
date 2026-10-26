@@ -175,14 +175,14 @@ def main():
     sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
     import numpy as np
     import torch
-    from reference_error import FEWEST_SEEDS, seeds_for
+    from reference_error import FEWEST_SEEDS, MOST_SEEDS, seeds_for
     from reference_source import git_head
 
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("site", choices=("forward", "long", "bfloat16", "backward", "cached",
                                          "text", "vision", "audio", "equal"))
     parser.add_argument("--start", type=int, default=FEWEST_SEEDS)
-    parser.add_argument("--most", type=int, default=512)
+    parser.add_argument("--most", type=int, default=MOST_SEEDS)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--device", choices=("cpu", "cuda"), default="cpu")
     parser.add_argument("--record", action="store_true")
