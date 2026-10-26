@@ -16,7 +16,6 @@ import contextlib
 import dataclasses
 import datetime
 import functools
-import json
 import logging
 import math
 import sys
@@ -154,7 +153,9 @@ from dew.training.interval import Interval, held, throughput
 from dew.training.memory import (
     climb_to,
     device_tokens,
+    first_run,
     head_tile_of,
+    local_devices,
     memory_record,
     peak_memory_gib,
     recompute_record,
@@ -990,7 +991,8 @@ class Trainer(Generic[Loss, Effects]):
             self._split = split
             self._shape_rungs[batch_layout(batch)] = self._rung()
             self.step_flops = flops and split * flops
-            self.memory = memory_record(self.executable, self._local_devices(), candidate.held, fits=True)
+            devices = local_devices(self.device_mesh)
+            self.memory = memory_record(self.executable, devices, candidate.held, fits=True)
             self.links = links
         return self._runner(planned, mesh)
 
@@ -1470,7 +1472,7 @@ class Trainer(Generic[Loss, Effects]):
                     # outputs, the loss counters, so a newly compiled step's first run is awaited here,
                     # where its failure can be named.
                     self._unproven = False
-                    self._await_first_run(loss, run.current)
+                    first_run(loss, run.current, self.memory, self.device_mesh)
                 run.loss = loss
                 assert run.train is not None
                 position = run.train.source_state
@@ -1579,7 +1581,8 @@ class Trainer(Generic[Loss, Effects]):
                 "checkpointer; pass Checkpoints(directory) to write any")
         # A cooldown a preemption cut short, which a resume from its step runs first, as every process
         # agrees it, its last step's too (`_cooled`).
-        kept = None if checkpoints is None else checkpoints.cooldown(current)
+        kept = None if checkpoints is None else agreed(
+            "cooldown record", lambda: checkpoints.cooldown(current) if jax.process_index() == 0 else None)
         run.cooling = broadcast_from_process_zero(kept)
         pending = run.cooling is not None
         complete = (plan.ended(current, interval.real_tokens) and checkpoints is not None
@@ -1708,25 +1711,6 @@ class Trainer(Generic[Loss, Effects]):
         run.train = self._prefetched(plan, run, source, state)
         run.source = None  # Lifetime transferred to the prefetch worker.
 
-    def _local_devices(self) -> list:
-        """This process's devices of the mesh, whose memory the fit check reads."""
-        process = jax.process_index()
-        return [device for device in self.device_mesh.devices.flat if device.process_index == process]
-
-    def _await_first_run(self, loss: jax.Array, step: int) -> None:
-        """Wait for a newly compiled step's first run, and raise its failure
-        on the devices as the step's, with the check that said it fits
-        (`memory_record`) and what the devices hold now."""
-        try:
-            loss.block_until_ready()
-        except jax.errors.JaxRuntimeError as error:
-            now = [{"id": device.id, **{key: value for key, value in (device.memory_stats() or {}).items()
-                                        if key in ('bytes_in_use', 'pool_bytes', 'largest_free_block_bytes')}}
-                   for device in self._local_devices()]
-            raise RuntimeError(
-                f"the training step compiled for step {step} failed on its first run. It was checked to "
-                f"fit: {json.dumps(self.memory)}; the devices now hold {json.dumps(now)}") from error
-
     def _between_steps(self, plan: FitPlan, run: FitRun, interval: Interval, state: TrainState,
                        shardings: Placement[TrainState], position, loss: jax.Array,
                        aux: dict[str, jax.Array], accepted: jax.Array) -> tuple[bool, TrainState]:
@@ -1784,6 +1768,9 @@ class Trainer(Generic[Loss, Effects]):
         # decay, so those due together are one branch.
         due = next((branch for branch in plan.branches if branch.due(current, real, before)), None)
         branch = None if due is None else due.pending(current, self.accumulation)
+        if ending and branch is not None and checkpoints is not None:
+            # Kept before the step's final save makes the run look complete (`Checkpoints.cooldown`).
+            checkpoints.cooling(branch)
         if ending:
             run.cooling, branch = branch, None
         state, cut = (state, False) if branch is None else self._cooled(plan, run, state, shardings, position,
@@ -1956,7 +1943,8 @@ class Trainer(Generic[Loss, Effects]):
         profile, checkpoints, current, loss = self.profile, self.checkpoints, run.current, run.loss
         self._take(plan, run, interval, state, unlogged=True)
         self._read_taken(run)
-        if run.notice is not None:
+        if run.notice is not None and run.cooling is None:
+            # A last step's cooldown asks the notice between its steps; `_closed` closes it then.
             run.notice.close()
         paused = time.perf_counter()
         if run.train is not None:
@@ -2009,6 +1997,10 @@ class Trainer(Generic[Loss, Effects]):
             # The last step's branch, its main model scored and saved first, which a resume from the
             # step runs again where a preemption cuts it short.
             state, cut = self._cooled(plan, run, state, shardings, position, run.cooling)
+            if cut and checkpoints is not None and interval.last_saved != current:
+                # Whatever the final-save policy, the step the branch resumes from is written whole.
+                run.other += self._saved_checkpoint(checkpoints, current, state, position, interval,
+                                                    training_best=False, control=run.stop_control)
             run.preempted = current if cut else None
         if plan.observe:
             plan.observe.last(current, state)
