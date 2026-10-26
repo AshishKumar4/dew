@@ -437,6 +437,39 @@ def test_the_headroom_guard_leaves_ordinary_inputs_bitwise_unchanged(causal):
     np.testing.assert_array_equal(walked(headroom=True), walked(headroom=False))
 
 
+def test_a_padded_calls_padding_rows_stay_finite_and_flag_no_overflow():
+    """A full bf16 call walked past its queries (`Forward.queries`, a mainloop's padding to whole tiles),
+    whose padding rows see no key (`seen`): its plain and anchored training walks leave those rows' sums
+    finite and flag no row overflowed, so a mainloop that reruns overflowed rows (`walked_launches`) takes
+    its one plain launch, and the padding rows' output is 0."""
+    queries, rows, keys, width = 20, 32, 32, 16
+    spec = algebra.Forward("full", keys, ids=False, scale=width ** -0.5,
+                           headroom=algebra.headroom(jnp.bfloat16), queries=queries)
+    streams = jax.random.split(jax.random.key(0), 3)
+    query, key, value = (jax.random.normal(stream, (count, width), jnp.float32).astype(jnp.bfloat16)
+                         for stream, count in zip(streams, (rows, keys, keys), strict=True))
+    coords = algebra.Coords(jnp.arange(rows)[:, None], jnp.arange(keys)[None, :])
+    logits, products = algebra.logits_of(spec, jnp.matmul(query, key.T, preferred_element_type=jnp.float32),
+                                         coords)
+
+    def dot(a, b):
+        return jnp.matmul(a, b, preferred_element_type=jnp.float32)
+
+    def accumulate(acc, scale, parts, value):
+        return acc + algebra.summed_products(parts, value, dot)
+
+    keys_of = algebra.Keys(coords, logits, lambda: value, dot, products=products)
+    state = algebra.plain_step(spec, algebra.started(spec, None, rows, width, None), keys_of)
+    arg = algebra.argmax(algebra.no_argmax(rows), logits, coords.k_pos)
+    start = algebra.anchored(spec, algebra.started(spec, None, rows, width, None), arg)
+    anchored = algebra.anchored_step(spec, start, keys_of._replace(accumulate=accumulate))[0]
+    for walked in (state, anchored):
+        assert not np.any(np.asarray(algebra.overflowed(walked.acc)))
+        out = np.asarray(algebra.finish(spec, walked, initial=False)[0])
+        assert np.isfinite(out).all()
+        np.testing.assert_array_equal(out[queries:], 0.0)
+
+
 ANCHORED_SEEDS = 8
 """The anchored training walk's site's declared draws (check 1)."""
 
