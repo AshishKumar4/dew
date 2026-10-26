@@ -260,7 +260,8 @@ def test_a_run_trains_the_level_and_resumes_as_it_ran(tmp_path):
 
     whole = trainer(tmp_path / "whole").fit(dataset(rows), steps=4, log_every=1, checkpoint_every=2)
     trainer(tmp_path / "halves").fit(dataset(rows), steps=2, log_every=1, checkpoint_every=2)
-    resumed = trainer(tmp_path / "halves").fit(dataset(rows), steps=4, log_every=1, checkpoint_every=2)
+    resumed = trainer(tmp_path / "halves").fit(dataset(rows), steps=4, log_every=1,
+                                               checkpoint_every=2)
     start = objective.init(jax.random.key(0))["params"]["continuum"]
     assert not np.array_equal(np.asarray(whole.variables["params"]["continuum"]["up"]["kernel"]),
                               np.asarray(start["up"]["kernel"]))
