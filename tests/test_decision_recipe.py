@@ -360,6 +360,48 @@ def test_a_decision_run_builds_its_source_as_its_source_options_say():
     assert paths and not any("mtp_" in path or "vision" in path or "visual" in path for path in paths)
 
 
+def test_a_decision_run_reads_letters_as_its_letter_readout():
+    """`--head:letters` reads each option as the fresh backbone's own logit at its label's token, at the
+    answer cue of a row lettered as its labels letter it, as a slot release reads it: the run's head
+    is the letter readout of the labels' token ids, and its rows a question to a row, lettered."""
+    from dew.decision.config import Letters
+    from dew.decision.head import LabelReadout
+    from dew.decision.layout import Labels, QuestionLayout
+    from dew.decision.objective import tokenizer_of
+    from dew.interop import Pretrained
+
+    default = Fitted(data=TICKETS)
+    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
+    run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, head=Letters(count=4))
+    objective, _ = run.prepare().train("x")
+    head, layout = objective.model.head, objective.layout
+    tokenizer = tokenizer_of(Pretrained.load(str(QWEN), dtype="float32").text_processor)
+    assert tokenizer is not None
+    assert isinstance(head, LabelReadout) and head.label_ids == Labels().ids(tokenizer, 4)
+    assert isinstance(layout, QuestionLayout) and layout.labels == Labels()
+
+
+def test_a_decision_run_lays_its_rows_in_blocks_its_source_reads_whole():
+    """`--source.attention full_attention block_bidirectional` loads the backbone's full-attention
+    layers reading blocks (`Pretrained.load`'s `modeling_overrides`), and the run's rows lie in blocks
+    for them to read; a joint row of every question lies in none, and is refused."""
+    from dew.config import SourceOptions
+    from dew.decision.config import JointShape
+
+    default = Fitted(data=TICKETS)
+    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
+    source = SourceOptions(text_only=True, attention={"full_attention": "block_bidirectional"})
+    run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, source=source)
+    objective, _ = run.prepare().train("x")
+    assert objective.model.backbone.kind_of("full_attention").mixer.bidirectional_blocks
+    assert objective.layout.blocks
+    plain, _ = dataclasses.replace(run, source=SourceOptions(text_only=True)).prepare().train("x")
+    assert not plain.model.backbone.kind_of("full_attention").mixer.bidirectional_blocks
+    assert not plain.layout.blocks
+    with pytest.raises(ValueError):
+        dataclasses.replace(run, head=JointShape()).prepare()
+
+
 def test_a_lora_decision_runs_source_loads_onto_its_trainers_mesh():
     """A decision run that trains an adapter over a source reads the source onto its trainer's mesh
     (`TrainerConfig.source_placement`), as an LM run does: its objective's frozen base is device

@@ -604,8 +604,9 @@ def test_every_kind_of_run_scores_its_own_metrics_unless_it_names_each_splits():
 
 @pytest.mark.parametrize("kind", ["lm", "decision", "diffusion"])
 def test_every_run_kind_reads_its_source_options_from_the_command_line(kind):
-    """`--source.text-only` and `--source.prediction-depths` are every run kind's, and its source's
-    load reads them beside where it reads the source (`RunConfig.source_keywords`)."""
+    """`--source.text-only`, `--source.prediction-depths` and `--source.attention` are every run kind's,
+    and its source's load reads them beside where it reads the source (`RunConfig.source_keywords`):
+    the attention as the load's `modeling_overrides`."""
     from dew.config import SourceOptions
     from dew.config.diffusion import DiffusionRunConfig
     from dew.config.lm import LMRunConfig
@@ -613,17 +614,26 @@ def test_every_run_kind_reads_its_source_options_from_the_command_line(kind):
 
     kinds = {"lm": LMRunConfig, "decision": DecisionRunConfig, "diffusion": DiffusionRunConfig}
     run = kinds[kind].cli(["--source.text-only", "--source.prediction-depths", "0",
+                           "--source.attention", "full_attention", "block_bidirectional",
                            "--trainer.multi-host", "False"])
-    assert run.source == SourceOptions(text_only=True, prediction_depths=0)
+    assert run.source == SourceOptions(text_only=True, prediction_depths=0,
+                                       attention={"full_attention": "block_bidirectional"})
     keywords = run.source_keywords(frozen=False)
     assert keywords["text_only"] is True and keywords["prediction_depths"] == 0 and keywords["on_host"]
+    assert keywords["modeling_overrides"] == {"attention": {"full_attention": "block_bidirectional"}}
+    assert type(run).from_dict(run.to_dict()).source == run.source
 
 
-def test_a_diffusion_source_has_no_language_model_for_text_only_to_take():
+@pytest.mark.parametrize("options", [{"text_only": True},
+                                     {"modeling_overrides": {"attention": {"full_attention": "causal"}}}],
+                         ids=["text-only", "overrides"])
+def test_a_diffusion_source_has_no_language_model_for_text_only_to_take(options):
+    """A diffusion pipeline has no wrapper's language model for `text_only` to take, and no component
+    an override reaches: each is refused before anything is read."""
     from dew.interop.pretrained import load_diffusion_source
 
     with pytest.raises(ValueError):
-        load_diffusion_source("unused/pipeline", text_only=True)
+        load_diffusion_source("unused/pipeline", **options)
 
 
 def test_a_trainers_cadences_may_be_shares_of_the_run_on_the_command_line():

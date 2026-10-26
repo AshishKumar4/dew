@@ -868,7 +868,8 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
                           size: tuple[int, ...] | None = None, variables: Variables | None = None,
                           mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                           text: bool = True, text_only: bool = False,
-                          prediction_depths: int | None = None) -> PretrainedPipeline:
+                          prediction_depths: int | None = None,
+                          modeling_overrides: Mapping[str, object] | None = None) -> PretrainedPipeline:
     """A published diffusion pipeline, to train from its own weights.
 
     `size` is the (height, width) in pixels the pipeline runs at instead of
@@ -889,10 +890,12 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     (`TextToImage.prepare(conditions=...)`), and a prompt, training or
     `save`, which read the text encoder, are refused.
 
-    `text_only` and `prediction_depths` read as `Pretrained.load`'s do: a
-    pipeline has no wrapper's language model for `text_only` to take, and
-    its components hold no prediction depths, so any count keeps them all.
+    `text_only`, `prediction_depths` and `modeling_overrides` read as
+    `Pretrained.load`'s do: a pipeline has no wrapper's language model for
+    `text_only` to take, its components hold no prediction depths, so any
+    count keeps them all, and none reads overrides, which are refused.
     """
+    _unread_overrides(modeling_overrides, "a diffusion pipeline")
     if text_only:
         _no_language_model(checkpoint, "diffusion pipeline")
     directory = sources.snapshot(checkpoint, revision, weights=False)

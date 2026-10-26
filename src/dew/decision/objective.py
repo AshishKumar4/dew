@@ -59,7 +59,7 @@ if TYPE_CHECKING:
 _SCORE = KINDS.index(Score)
 
 
-def _tokenizer_of(processor: TaskProcessor | None) -> Tokenizer | None:
+def tokenizer_of(processor: TaskProcessor | None) -> Tokenizer | None:
     """The tokenizer a loaded model's text processor encodes with: a run's
     own, or a checkpoint's Hugging Face tokenizer, alone or inside a
     multimodal processor, read from the directory it was loaded from, at the
@@ -242,7 +242,7 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
             case Adapter() | Source():
                 module, held = backbone.model, joined({"backbone": backbone.variables})
                 if isinstance(backbone, Source):
-                    tokenizer = tokenizer or _tokenizer_of(backbone.text_processor)
+                    tokenizer = tokenizer or tokenizer_of(backbone.text_processor)
             case _:
                 module = backbone
         if variables is not OMITTED:

@@ -26,11 +26,11 @@ import jax
 
 from dew._records import number, record
 from dew.config import DecoderRunConfig, MetricConfig, ObjectiveConfig, Prepared
-from dew.decision.head import DecisionHead, JointSchemaHead
+from dew.decision.head import DecisionHead, JointSchemaHead, LabelReadout
 from dew.decision.laya import LAYA
-from dew.decision.layout import Framing, Layout, Schema, Segment, default_layout
+from dew.decision.layout import Framing, Labels, Layout, QuestionLayout, Schema, Segment, default_layout
 from dew.decision.model import DecisionModel
-from dew.decision.objective import DecisionObjective
+from dew.decision.objective import DecisionObjective, tokenizer_of
 from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
 from dew.nn.backbones.decoder_block import remat_policy
@@ -59,6 +59,19 @@ class JointShape:
 
 
 @dataclasses.dataclass(frozen=True)
+class Letters:
+    """The letter readout (`LabelReadout`): each option scored by the backbone's own logit at its
+    label's token, read at the row's answer cue, as a slot release reads it; its rows lettered as
+    `labels` letter them, a question of up to `count` options, each label one token of the
+    backbone's tokenizer. `untied` gives each label a trainable output row of its own, drawn from the
+    backbone's."""
+
+    labels: Labels = dataclasses.field(default_factory=Labels)
+    count: int = 26
+    untied: bool = False
+
+
+@dataclasses.dataclass(frozen=True)
 class DecisionRunConfig(DecoderRunConfig):
     """A run, plus the decision objective's own knobs."""
 
@@ -82,9 +95,10 @@ class DecisionRunConfig(DecoderRunConfig):
     """A `REMAT_POLICIES` name for the loaded backbone's layers, applied before
     looping and LoRA. The trainer's fitting ladder starts here; a policy
     outside `DECODER_REMAT` cannot climb. None keeps the checkpoint's policy."""
-    head: JointShape | None = None
-    """The joint schema head over a fresh backbone, which then reads the
-    joint layout; None draws Laya's head."""
+    head: JointShape | Letters | None = None
+    """The head over a fresh backbone: the joint schema head, which then reads the joint layout, or
+    the letter readout of the backbone's own logits (`Letters`), over lettered rows; None draws
+    Laya's head."""
     calibrate: bool = True
     """Fit the task's temperatures on the held-out rows after training."""
     max_len: int | None = None
@@ -177,16 +191,26 @@ class DecisionRunConfig(DecoderRunConfig):
             start = start.with_cross_attention(blocks, key=jax.random.fold_in(
                 jax.random.key(self.trainer.key), 1))
         start = start if self.lora is None else start.adapt(self.lora, key=self.trainer.key)
+        labels = self.head.labels if isinstance(self.head, Letters) else None
         if isinstance(start, PretrainedDecision):
             start = Decide.of(start)
-            derived["layout"] = _budgeted(start.layout, budgets)
+            derived["layout"] = _laid(_budgeted(start.layout, budgets), self.source.blocked, labels)
         else:
-            if self.head is not None:
-                width, head_dtype = DecisionModel.head_size(start.model)
+            width, head_dtype = DecisionModel.head_size(start.model)
+            if isinstance(self.head, JointShape):
                 derived["head"] = JointSchemaHead(hidden_size=width, dtype=head_dtype,
                                                   **dataclasses.asdict(self.head))
+            elif isinstance(self.head, Letters):
+                tokenizer = tokenizer_of(start.text_processor)
+                if tokenizer is None:
+                    raise ValueError(f"the letter readout reads its labels' tokens, and {self.pretrained} "
+                                     "has no tokenizer")
+                derived["head"] = LabelReadout(features=width, label_ids=self.head.labels.ids(
+                    tokenizer, self.head.count), untied=self.head.untied, dtype=head_dtype)
             head = derived.get("head", DecisionHead)
-            derived["layout"] = _fresh_layout(start.model.causal, head.one_question, budgets)
+            # Lettered rows lie one question to a row, as the backbone's order asks.
+            layout = _fresh_layout(start.model.causal, head.one_question or labels is not None, budgets)
+            derived["layout"] = _laid(layout, self.source.blocked, labels)
         objective = self.objective.build(backbone=start, **derived)
         assert isinstance(objective, DecisionObjective), "a decision run's objective is a DecisionObjective"
         summary: dict[str, object] = {"pretrained": self.pretrained}
@@ -238,6 +262,18 @@ def _fresh_layout(causal: bool, one_question: bool, budgets: Budgets) -> Layout:
     return _budgeted(default_layout(causal, one_question), budgets)
 
 
+def _laid(layout: Layout, blocked: bool, labels: Labels | None) -> Layout:
+    """`layout` with its rows in blocks where the run's source reads them whole (`SourceOptions.blocked`)
+    and lettered by `labels` where the run reads letters; a layout whose rows can do neither, a joint
+    row of every question, is refused."""
+    stated = {**({"blocks": True} if blocked else {}), **({} if labels is None else {"labels": labels})}
+    if stated and not isinstance(layout, QuestionLayout):
+        raise ValueError(f"{type(layout).__name__} lays every question in one row, which lies in no blocks "
+                         "and carries no labels; a block_bidirectional --source.attention and the letter "
+                         "readout read a question to a row")
+    return dataclasses.replace(layout, **stated)
+
+
 def _budgeted(layout: Layout, budgets: Budgets) -> Layout:
     """`layout` with the `budgets` the run states, each but those left None, which keep the
     layout's own; zero is a budget too (a joint row of no state). A budget the layout has no
@@ -251,4 +287,4 @@ def _budgeted(layout: Layout, budgets: Budgets) -> Layout:
     return dataclasses.replace(layout, **stated)
 
 
-__all__ = ["DecisionRunConfig", "JointShape"]
+__all__ = ["DecisionRunConfig", "JointShape", "Letters"]
