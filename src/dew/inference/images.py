@@ -1,4 +1,5 @@
-"""A trained model, rebuilt from its run, that turns prompts into images."""
+"""The text-to-image task: a trained diffusion model, rebuilt from its run, that turns prompts into
+images, beside `TextGeneration`. The reverse walk it runs is `dew.sampling`'s (`walk_and_decode`)."""
 
 from __future__ import annotations
 
@@ -19,16 +20,16 @@ from typing_extensions import TypeVar
 
 from dew.artifacts import uint8_pixels
 from dew.coordination import agreed
-from dew.diffusion.process import Conditioning, Denoiser, Process
+from dew.diffusion.process import Conditioning, Process
 from dew.inputs import InputSpec, encode_conditions, unit_range
 from dew.nn.autoencoders import AutoEncoder
-from dew.nn.inputs import RowPlan, generation_signature, local_rows, mesh_of, request_key
+from dew.nn.inputs import RowPlan, generation_signature, host_rows, local_rows, mesh_of, request_key
 from dew.nn.kernels.options import program
 from dew.objectives.base import OMITTED, Omitted, Variables, thaw
 from dew.records import JSON
 from dew.registry import dtype_name, resolve_dtype
-from dew.sampling.guidance import CFG, Guidance, guidance_modules
-from dew.sampling.sample import sample
+from dew.sampling.guidance import CFG, Guidance
+from dew.sampling.sample import sampling_modules, walk_and_decode
 from dew.sampling.solvers import DDIM, Solver
 from dew.telemetry.profile import region
 
@@ -106,7 +107,7 @@ class Images(Generic[ArrayT]):
 
     def host(self) -> Images[np.ndarray]:
         """Return this process's real rows as host arrays, without the padding added to fill the devices."""
-        return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
+        return jax.tree.map(lambda leaf: host_rows(leaf, self.rows), self)
 
     def pil(self) -> list[PILImage]:
         """Return this process's real rows of an NHWC image batch as PIL images.
@@ -122,7 +123,7 @@ class Images(Generic[ArrayT]):
         if self.images.ndim != 4 or self.images.shape[-1] not in (1, 3):
             raise ValueError(f"pil() takes [N, H, W, 3] or [N, H, W, 1] images, not samples of shape "
                              f"{self.images.shape}")
-        pixels = uint8_pixels(local_rows(self.images)[:self.rows])
+        pixels = uint8_pixels(host_rows(self.images, self.rows))
         return [Image.fromarray(row[..., 0] if row.shape[-1] == 1 else row) for row in pixels]
 
 
@@ -410,22 +411,28 @@ class TextToImage:
         mesh = mesh_of(self.variables)
 
         def resolve() -> _Resolved:
-            return self._resolved(mesh, prompts, conditions, key=key, steps=steps,
-                                  unconditional=unconditional, image=image,
-                                  image_latents=image_latents, mask=mask, noise=noise,
-                                  initial=initial, times=times, encode_key=encode_key)
+            count = self.steps if steps is None else steps
+            process, source_times = self.prepared_process(count)
+            return self._resolved(mesh, prompts, conditions, request=request_key(key), count=count,
+                                  process=process,
+                                  selected=_time_grid(times) if times is not None else source_times,
+                                  unconditional=unconditional, image=image, image_latents=image_latents,
+                                  mask=mask, noise=noise, initial=initial, encode_key=encode_key)
 
         settled = (agreed("image input preparation", resolve) if mesh is not None else resolve())
-        plan, process, count, selected = settled.plan, settled.process, settled.count, settled.times
-        if plan.processes > 1:
+        if settled.plan.processes > 1:
             multihost_utils.assert_equal(settled.signature,
                                          "image input shapes and sampling must agree across processes")
+        return self._inputs(settled, owns_grid=self.grid is not None or times is not None)
+
+    def _inputs(self, settled: _Resolved, *, owns_grid: bool) -> DenoisingInputs:
+        """The conditions encoded and the initial state built for `settled`, placed for its rows. A grid
+        the task or the caller chose (`owns_grid`) travels with them."""
         with region("inference.image.prepare"):
             given, null, initial_state = self._encoded(settled)
-        owns_grid = self.grid is not None or times is not None
-        return DenoisingInputs(initial_state, given, null, rows=plan.rows,
-                               grid_steps=count if owns_grid else None,
-                               process=process if owns_grid else None, times=selected)
+        return DenoisingInputs(initial_state, given, null, rows=settled.plan.rows,
+                               grid_steps=settled.count if owns_grid else None,
+                               process=settled.process if owns_grid else None, times=settled.times)
 
     def _settings(self, mesh, prompts, *, steps, guidance, solver, key, decode):
         """Everything one call settles on the host before it runs the model.
@@ -492,9 +499,10 @@ class TextToImage:
                 raise ValueError("prepared conditions must match the noise batch")
         return prepared
 
-    def _resolved(self, mesh, prompts, conditions, *, key, steps, unconditional, image,
-                  image_latents, mask, noise, initial, times, encode_key) -> _Resolved:
-        """Everything `prepare` settles on the host, in one value.
+    def _resolved(self, mesh, prompts, conditions, *, request, count, process, selected, unconditional,
+                  image, image_latents, mask, noise, initial, encode_key) -> _Resolved:
+        """Everything `prepare` settles on the host, in one value, over the request key, step count,
+        process and grid its caller resolved once.
 
         This is the half a pool has to agree on: every refusal a caller can
         earn is raised here, and the signature at the end is what the ranks
@@ -510,10 +518,6 @@ class TextToImage:
             given, samples_count = conditions, _encoded_rows(conditions)
         else:
             raise ValueError("pass the prompts or their encoded conditions, one of the two")
-        request = request_key(key)
-        count = self.steps if steps is None else steps
-        process, source_times = self.prepared_process(count)
-        selected = _time_grid(times) if times is not None else source_times
         plan = RowPlan.over(mesh, samples_count)
         tokens, null_tokens, encoded = self._branches(given, unconditional, samples_count)
         shape = self.latent_shape
@@ -683,16 +687,28 @@ class TextToImage:
         mesh = mesh_of(self.variables)
 
         def resolve():
-            return self._settings(mesh, prompts, steps=steps, guidance=guidance,
-                                  solver=solver, key=key, decode=decode)
+            settings = self._settings(mesh, prompts, steps=steps, guidance=guidance,
+                                      solver=solver, key=key, decode=decode)
+            prepared, request, count, process, times = settings[:5]
+            # Prompts are prepared over the request, count, process and grid just resolved.
+            settled = None if prepared is not None else self._resolved(
+                mesh, prompts, None, request=request, count=count, process=process, selected=times,
+                unconditional=None, image=None, image_latents=None, mask=None, noise=None, initial=None,
+                encode_key=None)
+            return settings, settled
 
-        settings = (agreed("image sampling setup", resolve) if mesh is not None else resolve())
+        settings, settled = (agreed("image sampling setup", resolve) if mesh is not None else resolve())
         prepared, request, count, process, times, solver, chosen, signature = settings
         if mesh is not None and jax.process_count() > 1:
+            # The controls carry the request's kind, so once they agree every rank enters the same
+            # collectives: the prompts' preparation is compared only where every rank resolved one.
             multihost_utils.assert_equal(signature, "image execution controls must agree across processes")
+            if settled is not None:
+                multihost_utils.assert_equal(settled.signature,
+                                             "image input shapes and sampling must agree across processes")
         if prepared is None:
-            assert not isinstance(prompts, DenoisingInputs)
-            prepared = self.prepare(prompts, key=request, steps=count)
+            assert settled is not None, "prompts are resolved in the agreement above"
+            prepared = self._inputs(settled, owns_grid=self.grid is not None)
         with region("inference.image"):
             assert prepared.rows is not None
             plan = RowPlan.over(mesh, prepared.rows)
@@ -839,29 +855,6 @@ def _initial(rows: jax.sharding.NamedSharding | None):
     return jax.jit(initial, static_argnums=(0, 1, 2), in_shardings=(rows, None))
 
 
-def sampling_modules(model: nn.Module, guidance: Guidance | None,
-                     autoencoder: AutoEncoder | None) -> tuple[nn.Module, ...]:
-    """Every network a walk of `model` under `guidance` that `autoencoder` decodes runs: the
-    denoiser, an autoguide (`guidance_modules`) and the autoencoder's model, which the program
-    that walks it compiles for (`compiler_options`), a task's and an objective's alike."""
-    return (model, *guidance_modules(guidance), *(() if autoencoder is None else (autoencoder.model,)))
-
-
-def walk_and_decode(denoise: Denoiser, autoencoder: AutoEncoder | None, params, x_T: jax.Array, *,
-                    solver: Solver, guidance: Guidance | None, key: jax.Array, times, final_denoise: bool,
-                    initial=None, decode: bool = True) -> Images:
-    """`denoise`'s reverse walk from `x_T`, and with `decode` the latents it reaches decoded by
-    `autoencoder` (its weights `params["autoencoder"]`) and clipped to [-1, 1]: the one sampling
-    program a task (`TextToImage`) and an objective's evaluation and preview
-    (`DiffusionObjective.evaluate`) run."""
-    latents = sample(denoise, x_T, solver=solver, guidance=guidance, key=key, times=times,
-                     initial=initial, final_denoise=final_denoise)
-    if not decode:
-        return Images(None, latents=latents)
-    images = autoencoder.decode(params["autoencoder"], latents) if autoencoder is not None else latents
-    return Images(jnp.clip(images, -1.0, 1.0), latents=latents)
-
-
 def _walk(model, process, autoencoder, finish, final_denoise, decode,
           solver, guidance, times, initial, params, given, null, x_T, key):
     """The walk over the rows, compiled with the XLA options of its denoiser, its guidance's guide and
@@ -872,8 +865,9 @@ def _walk(model, process, autoencoder, finish, final_denoise, decode,
     `_initial` built from it."""
     variables = {name: value for name, value in params.items() if name not in ("encoders", "autoencoder")}
     denoise = process.denoiser(model, variables, given, None if guidance is None else null)
-    walked = walk_and_decode(denoise, autoencoder, params, x_T, solver=solver, guidance=guidance, key=key,
-                             times=times, final_denoise=final_denoise, initial=initial, decode=decode)
-    if finish is None or walked.images is None:
-        return walked
-    return Images(finish(params, walked.images), latents=walked.latents)
+    images, latents = walk_and_decode(denoise, autoencoder, params, x_T, solver=solver, guidance=guidance,
+                                      key=key, times=times, final_denoise=final_denoise, initial=initial,
+                                      decode=decode)
+    if finish is not None and images is not None:
+        images = finish(params, images)
+    return Images(images, latents=latents)

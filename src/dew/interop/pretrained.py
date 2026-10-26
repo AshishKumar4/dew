@@ -31,7 +31,8 @@ from dew._model_types import QWEN35_TYPES
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
-from dew.inference.pipeline import place
+from dew.inference.images import TextToImage
+from dew.inference.loading import place
 from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import InputSpec
 from dew.interop import decoder_parts, gguf, hf_decoders as decoders, mamba2, sources, verify
@@ -69,7 +70,6 @@ from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer
 from dew.objectives.base import Variables
 from dew.registry import dtype_name, from_record, projectors, record_fields, resolve_dtype, towers
-from dew.sampling.pipelines import TextToImage
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
@@ -240,7 +240,7 @@ class Pretrained:
         if self.processor is not None or not isinstance(self.tokenizer, str):
             return self.processor
         from dew.data.text import tokenizer_for
-        from dew.inference.pipeline import RunProcessor
+        from dew.inference.loading import RunProcessor
         return RunProcessor(tokenizer_for(self.tokenizer, local_files_only=True))
 
     @classmethod

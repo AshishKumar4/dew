@@ -736,6 +736,29 @@ def _plane_template(ema, deltas):
     return jax.tree_util.tree_map_with_path(planes, ema), targets
 
 
+RETIRED_RATE = ("learning_rate_scale", "learning_rate_shape")
+"""The hyperparameters Dew's optimizer injected before it held a schedule's own rate fields
+(`dew.optim.RateState`): a rate's scale and its schedule's shape, two scalars side by side in an
+injected state's hyperparameters, which a resume refuses by name rather than as a mismatched tree."""
+
+
+INJECTED_STATE = ("count", "hyperparams", "inner_state")
+"""The fields of Optax's injected state (`optax.inject_hyperparams`), which a checkpoint's metadata
+holds as a mapping's keys, as Orbax names a NamedTuple's."""
+
+
+def _retired_rate(tree) -> bool:
+    """Whether a checkpoint's optimizer-state metadata `tree` holds the retired rate: an injected
+    state (`INJECTED_STATE`) whose hyperparameters hold both of `RETIRED_RATE`, and not a param group
+    or a parameter of either name, which sits in a group's states or a parameter's moments."""
+    if isinstance(tree, Mapping):
+        held = tree.get("hyperparams") if set(INJECTED_STATE) <= tree.keys() else None
+        if isinstance(held, Mapping) and set(RETIRED_RATE) <= held.keys():
+            return True
+        return any(_retired_rate(value) for value in tree.values())
+    return isinstance(tree, list | tuple) and any(_retired_rate(value) for value in tree)
+
+
 def _check_template(template, metadata, stored, *, mapping: bool) -> None:
     """Refuse a train-state template the checkpoint at hand cannot fill.
 
@@ -750,6 +773,12 @@ def _check_template(template, metadata, stored, *, mapping: bool) -> None:
     if mapping:
         raise ValueError("the checkpoint holds a mapping saved in place of a train state; restore it "
                          "through a mapping template, or with none")
+    if _retired_rate(metadata.get("opt_state")):
+        raise ValueError(
+            "the checkpoint's optimizer state holds its rate as a scale times a schedule's shape "
+            f"({' and '.join(RETIRED_RATE)}), which Dew's optimizer no longer forms: it holds the "
+            "schedule's own rate fields (dew.optim.RateState), so a run cannot resume it. Resume it "
+            "with the Dew that wrote it, or start a fresh run from its weights in a directory of its own.")
     from dew.training.state import CHECKPOINTED
     missing = set(CHECKPOINTED).difference(stored)
     if missing:

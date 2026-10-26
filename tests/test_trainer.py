@@ -901,6 +901,58 @@ def test_restore_preserves_the_optimizer_state_the_ema_and_the_key(tmp_path):
     assert json.loads(position)["index"] == 3
 
 
+def test_a_checkpoint_of_the_retired_rate_scale_and_shape_is_refused(tmp_path):
+    """Before 1.0 a configured rate was held as a scale times a schedule's shape, under
+    `learning_rate_scale` and `learning_rate_shape` in the optimizer's state, where Dew now holds the
+    schedule's own fields (`dew.optim.RateState`). Resuming such a checkpoint is refused (ValueError),
+    even by a run whose state has the same tree, rather than stepping at a rate it no longer forms."""
+    def factory(learning_rate_scale, learning_rate_shape):
+        return optax.sgd(learning_rate_scale * learning_rate_shape)
+
+    retired = optax.inject_hyperparams(factory)(learning_rate_scale=0.1, learning_rate_shape=1.0)
+    make_trainer(tmp_path, optimizer=retired).fit(dataset(), steps=1, log_every=1)
+    with pytest.raises(ValueError):
+        make_trainer(tmp_path, optimizer=retired).place()
+
+
+def test_a_param_group_named_as_the_retired_rate_resumes(tmp_path):
+    """The retired rate is refused by its structure, a scale and a shape side by side as an injected
+    state's scalars: a run of today's optimizer whose param group takes one of those names writes a
+    checkpoint its resume reads back."""
+    from dew.optim import ParamGroup
+
+    config = OptimConfig(optimizer="adam", learning_rate=0.1, clip_grads=0,
+                         param_groups=(ParamGroup("learning_rate_scale", ("*",)),))
+    make_trainer(tmp_path, optimizer=config).fit(dataset(), steps=1, log_every=1)
+    # An OptimConfig is built over the run's length, which the resumed fit gives.
+    resumed = make_trainer(tmp_path, optimizer=config).fit(dataset(), steps=2, log_every=1)
+    assert int(resumed.step) == 2
+
+
+def test_a_model_whose_parameters_are_named_as_the_retired_rate_resumes(tmp_path):
+    """A model may name two scalar parameters as the retired rate's scale and shape: Adam's moments then
+    hold the pair side by side, which is not an injected state's hyperparameters, so the checkpoint its
+    run writes resumes."""
+    from dew.checkpoints import RETIRED_RATE as RETIRED_NAMES
+
+    class Named(Regression):
+        def fresh_variables(self, key, held):
+            return {"params": {name: jnp.zeros(()) for name in RETIRED_NAMES}}
+
+        def loss(self, variables, batch, step):
+            weights = variables["params"]
+            return jnp.mean((batch["x"][:, 0] * weights["learning_rate_scale"]
+                             + weights["learning_rate_shape"] - batch["y"][:, 0]) ** 2), Aux({})
+
+    def run(steps):
+        return make_trainer(tmp_path, objective=Named(), optimizer=optax.adam(0.1)).fit(
+            dataset(), steps=steps, log_every=1)
+
+    run(1)
+    resumed = run(2)
+    assert int(resumed.step) == 2
+
+
 def _rewrite_position(trainer, step, rows, shares):
     """Save `step` again with `rows` as the checkpoint's position table, each
     row read for the share `shares` names."""

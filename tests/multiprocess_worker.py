@@ -1608,7 +1608,7 @@ def mode_continuations(args) -> dict:
     from jax.experimental import multihost_utils
 
     from dew.inference import TextGeneration
-    from dew.inference.pipeline import place
+    from dew.inference.loading import place
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.inputs import ModelInputs
     from dew.sampling import Sampling
@@ -1833,7 +1833,7 @@ def mode_decoding_components(args) -> dict:
     from jax.experimental import multihost_utils
 
     from dew.inference import TextGeneration
-    from dew.inference.pipeline import place
+    from dew.inference.loading import place
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.inputs import ModelInputs
     from dew.sampling import Sampling, decoding
@@ -2008,7 +2008,7 @@ def mode_masked_generation(args) -> dict:
     import jax.numpy as jnp
     from jax.experimental import multihost_utils
 
-    from dew.inference.pipeline import place
+    from dew.inference.loading import place
     from dew.interop import Pretrained
     from dew.nn.inputs import ModelInputs
     from dew.training import Layout, MeshSpec
