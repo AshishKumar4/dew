@@ -55,7 +55,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   new modules; the old ones no longer hold them.
 - A Hub split's shards are the files `datasets` resolves to it from the repository's listing, by its own
   default patterns (`dew.data.sources.hub.split_files`): `dev` and `valid` are `validation`'s, a sharded
-  name's split is its own and a lone file is `train`'s, where a name match missed them.
+  name's split is its own and a lone file is `train`'s, where a name match missed them. A listing of no
+  file gives none. Every Hub call holds tqdm's bar lock first, so streamed sources discovered at once no
+  longer delete it under each other's bars.
 - An immutable upload's `retries` (`Cache.retry`) re-read only an object it created that reads back
   otherwise; a failed transfer raises after its transport's own retries, not Dew's on top of them.
 - A decision run's calibration takes its probabilities through SciPy's `softmax` and fits each
