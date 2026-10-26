@@ -23,6 +23,7 @@ from reference_error import FEWEST_SEEDS, GateFailure, assert_as_exact, widened,
 from sharded import assert_sharded
 from token_support import token_rows
 
+from dew.distributed.batches import shard_batch
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
 from dew.nn.sharding import pipeline_microbatches
@@ -31,7 +32,6 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
 from dew.registry import models
 from dew.training import Layout, MeshSpec
-from dew.training.distributed import shard_batch
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
 VOCAB = 64

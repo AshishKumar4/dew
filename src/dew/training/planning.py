@@ -16,6 +16,7 @@ import json
 import logging
 import os
 from collections.abc import Callable, Mapping, Sequence
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
@@ -25,13 +26,14 @@ from dew._coordination import from_every_process
 from dew._records import JSON
 from dew.batch import Batch
 from dew.data.dataset import rows_of
+from dew.distributed.host import snapshot
+from dew.distributed.placement import Layout, MeshSpec, Placement, explicit_axes
 from dew.mesh import LayoutRefused
 from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import RECORD, Objective
 from dew.state import TrainState, apart, together
 from dew.telemetry.benchmark import samples
-from dew.training.distributed import Placement, batch_divisor
-from dew.training.host import snapshot
+from dew.training.distributed import batch_divisor
 from dew.training.memory import (
     compiled_if_it_fits,
     head_fused_of,
@@ -45,7 +47,34 @@ from dew.training.memory import (
     temporaries_factor,
 )
 
+if TYPE_CHECKING:
+    from dew.training.trainer import Rollout, StepFn
+
 _log = logging.getLogger(__name__)
+
+
+def read_whole(accumulation: int, split: int | None, step: Callable[..., StepFn] | None, layout: Layout,
+               rollout: Rollout | None, mesh: MeshSpec | Mesh) -> str | None:
+    """Why every step of a trainer reads its batch whole, or None where a plan may split it (`splits`):
+    a custom `step`, a layout that keeps the variables on the host, a `rollout` or an Explicit mesh
+    axis. Refuses the arguments no Trainer takes together."""
+    if accumulation < 1:
+        raise ValueError(f"accumulation must be at least 1, got {accumulation}")
+    # Split under an Explicit axis, a step met a cotangent the split typed
+    # float32[16@data,16,16] against its forward's float32[16,16,16].
+    whole = ("a custom step owns its execution" if step is not None else
+             "the layout keeps the variables on the host" if "variables" in layout.host else
+             "a rollout writes a batch of its own" if rollout is not None else
+             "an Explicit mesh axis types the step's rows" if explicit_axes(mesh) else None)
+    if split is not None and (split < 1 or (whole is not None and split > 1)):
+        raise ValueError(f"split reads each step's batch in that many microbatches, at least 1, and "
+                         f"only 1 where {whole}; got {split}")
+    if step is not None and "variables" in layout.host:
+        raise ValueError(
+            "Parameter-streamed training requires the trainer objective transaction; "
+            "custom steps own their execution"
+        )
+    return whole
 
 
 def splits(rows: Sequence[int] | None, batch: Batch, mesh: Mesh | AbstractMesh, microbatches: int,

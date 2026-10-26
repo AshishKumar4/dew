@@ -114,10 +114,13 @@ Python holds `PYTHON_RUN`, which its first checkpoint writes."""
 
 PYTHON_RUN: dict[str, JSON] = {
     "rebuildable": False,
-    "defined": "in Python: each checkpoint records the inference declaration it loads by, and no record "
-               "rebuilds the run",
+    "defined": "in Python, without a recorded RunConfig: each checkpoint records the inference "
+               "declaration it loads by, and no record rebuilds the run. A run built as a "
+               "dew.config.RunConfig in Python, and trained by its run(), writes a run.json that rebuilds it "
+               "(docs/recipes.md, Python experiments)",
 }
-"""The root record of a run defined in Python (`RUN_FILE`)."""
+"""The root record of a run defined in Python (`RUN_FILE`), beside which the trainer's checkpoints say
+why its record cannot rebuild it (`Checkpoints.python_run`)."""
 
 
 def _is_profiles(node) -> bool:
@@ -954,6 +957,8 @@ class Checkpoints:
         self._staged: dict[int, dict] = {}
         self.local_directory = None if local_directory is None else str(location(local_directory))
         self.local_every = local_every
+        # Why the run these checkpoints keep has no record that rebuilds it (`python_run`).
+        self._reasons: tuple[str, ...] = ()
         self._manager = None
         self._local_manager = None
         self._profile_snapshots: set[int] = set()
@@ -1028,13 +1033,21 @@ class Checkpoints:
             retained.append(_kept(step, *self._committed[step]))
         return retained
 
+    def python_run(self, reasons: Sequence[str]) -> None:
+        """Why no record rebuilds the run these checkpoints keep, each part of it a run's record cannot
+        state, which `PYTHON_RUN` carries where a run defined in Python first saves (`Trainer.fit`
+        names them from its own fields) and `RunConfig.read` shows."""
+        self._reasons = tuple(reasons)
+
     def _identify_run(self) -> None:
-        """Write `PYTHON_RUN` at the run's root unless a run record is already there
-        (`RUN_FILE`), as a config's run writes its own before it trains."""
+        """Write `PYTHON_RUN`, with why the run is not rebuildable (`python_run`), at the run's root
+        unless a run record is already there (`RUN_FILE`), as a config's run writes its own before it
+        trains."""
         root = epath.Path(self.directory)
         if jax.process_index() == 0 and not (root / RUN_FILE).exists():
             root.mkdir(parents=True, exist_ok=True)
-            write_atomically(root / RUN_FILE, json.dumps(PYTHON_RUN, indent=2, sort_keys=True))
+            record = {**PYTHON_RUN, "reasons": list(self._reasons)}
+            write_atomically(root / RUN_FILE, json.dumps(record, indent=2, sort_keys=True))
 
     def artifact(self, step: int | str | None = None) -> JSON:
         """Return the selected step's inference declaration.
@@ -1610,12 +1623,12 @@ class Checkpoints:
         (`dew.objectives.base.UNREAD`).
         """
         from dew.batch import FROZEN, without
-        from dew.inference.banks import banked_placement, placed_rows, shape_rows, spread
-        from dew.training.distributed import (
+        from dew.distributed.placement import (
             Layout as DefaultLayout,
             MeshSpec as DefaultMesh,
             device_mesh as resolve_mesh,
         )
+        from dew.inference.banks import banked_placement, placed_rows, shape_rows, spread
 
         step = self.pinned(step)
         stored = self.stored(step)
@@ -1713,6 +1726,26 @@ class Checkpoints:
         arrays["effects"] = tuple(arrays["effects"])
         return Accumulation(**arrays)
 
+    def position(self, step: int, share: DataPartition) -> bytes | None:
+        """The data position the reader of `share` resumes from at `step` (`read_position`), read
+        alone, before any state is restored: a run opens its data there and reads its first batch
+        while its state is still unplaced (`Trainer.fit`). None where the step saved no position."""
+        from_local = step == self._local_latest()
+        snapshot = self._step_metadata(step, local=from_local)
+        metadata = _item_metadata(snapshot)
+        if 'position' not in metadata or (snapshot.custom_metadata or {}).get('tree'):
+            return None
+        checkpointer = self._open_local() if from_local else self._open()
+        # A local checkpoint holds the table as a device array, replicated, which one device reads.
+        read = (ocp.ArrayRestoreArgs(sharding=jax.sharding.SingleDeviceSharding(jax.local_devices()[0]))
+                if from_local else ocp.ArrayRestoreArgs(restore_type=np.ndarray))
+        wanted = {'position': jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype),
+                                           dict(metadata['position']))}
+        restored = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
+            item=wanted, partial_restore=True, restore_args=jax.tree.map(lambda _: read, wanted)))
+        table = jax.tree.map(np.asarray, dict(restored['position']))
+        return read_position(table, self.local_path if from_local else self.path(step), share)
+
     @overload
     def restore[StateT](self, template: StateT, step: int | str | None = None, *,
                         share: DataPartition | None = None) -> tuple[StateT, bytes | None]: ...
@@ -1790,7 +1823,7 @@ class Checkpoints:
                 state_tree['ema'], targets = _plane_template(state_tree['ema'], deltas)
             _refuse_reshaped(state_tree, metadata, where)
             restore_args = jax.tree.map(lambda want: _read(want, want.dtype), state_tree)
-            if 'position' in stored and not isinstance(template, Mapping):
+            if 'position' in stored and not isinstance(template, Mapping) and share is not None:
                 _position_leaves(state_tree, restore_args, metadata, from_local=from_local)
             try:
                 # partial_restore: a key the checkpoint holds and the template
@@ -1962,7 +1995,7 @@ def averaged(runs: Sequence[str | os.PathLike[str]], *, step: int | str | None =
     if len(runs) < 2:
         raise ValueError(f"an average is of two or more runs, got {len(runs)}")
     from dew._coordination import agreed
-    from dew.training.host import place_leaf
+    from dew.distributed.host import place_leaf
 
     means: list = []
     structure, firsts, model, read = None, [], None, []
@@ -2012,9 +2045,9 @@ def _taken_in(means: list, leaves: list, firsts: list, count: int, directory: st
 
 def _held(leaf, sharding):
     """`leaf`, placed as the first run's (`averaged` places it), on the host as the shards this process
-    holds of it (`dew.training.host.Held`, which holds a replicated block once), a floating one in fp32;
+    holds of it (`dew.distributed.host.Held`, which holds a replicated block once), a floating one in fp32;
     a host leaf whole. It reads this process's shards alone, no collective."""
-    from dew.training.host import Held
+    from dew.distributed.host import Held
 
     if sharding is None:
         return _on_host(leaf)

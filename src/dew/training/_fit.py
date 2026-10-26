@@ -1,5 +1,6 @@
-"""One `Trainer.fit` call's records: what it was asked for (`FitPlan`), what its loop carries from step
-to step (`FitRun`), and how the loop reads its training stream (`waited_read`)."""
+"""One `Trainer.fit` call's records: what it was asked for (`FitPlan`, its validation splits resolved by
+`validation_suites`), what its loop carries from step to step (`FitRun`), and how the loop reads its
+training stream (`waited_read`)."""
 
 from __future__ import annotations
 
@@ -9,18 +10,44 @@ import time
 from collections.abc import Iterator, Mapping, Sequence
 
 import jax
+from jax.sharding import Mesh
 
 from dew._coordination import agreed_next
-from dew.data.dataset import Loader
-from dew.objectives.base import Batch, Metric
+from dew._records import JSON
+from dew.batch import Batch
+from dew.data.dataset import Loader, Reader
+from dew.data.pipeline import Dataset
+from dew.distributed.batches import DevicePrefetchIterator, Signature
+from dew.distributed.placement import MeshSpec
+from dew.objectives.base import Metric
+from dew.optim import OptimConfig
 from dew.telemetry.profile import region
-from dew.training.budget import Plateau
-from dew.training.distributed import DevicePrefetchIterator, Signature
+from dew.training.budget import Plateau, every_step, recorded
 from dew.training.evaluation import EvalSuite, Evaluation, Summary
 from dew.training.interval import Cadence, Interval, Taken, Tokens
 from dew.training.observe import Observe
 from dew.training.runtime import PreemptionNotice
 from dew.training.selection import Best, HeldBest
+
+
+def validation_suites(dataset: Loader, validation: Mapping[str, Reader | EvalSuite] | None,
+                      metrics: Sequence[Metric], eval_every: Cadence) -> dict[str, EvalSuite]:
+    """Every split `fit` validates, by name, with its metrics and cadence
+    resolved: `dataset.val` alone is the one suite `val`."""
+    if validation is None:
+        if metrics and dataset.val is None:
+            # Else the metrics would never be scored, and the run would not say so.
+            raise ValueError("metrics score validation data: give the dataset a val split, or validation=")
+        # `val` is read only when a pass is scheduled; a dataset need not hold one.
+        validation = {"val": dataset.val} if (eval_every or metrics) and dataset.val is not None else {}
+    elif not validation:
+        raise ValueError("validation must contain a split")
+    suites = {}
+    for name, entry in validation.items():
+        suite = entry if isinstance(entry, EvalSuite) else EvalSuite(entry)
+        suites[name] = EvalSuite(suite.data, tuple(suite.metrics) or tuple(metrics),
+                                 eval_every if suite.every is None else suite.every)
+    return suites
 
 
 def split_metrics(suites: Mapping[str, EvalSuite]) -> dict[str, tuple[Metric, ...]]:
@@ -30,22 +57,21 @@ def split_metrics(suites: Mapping[str, EvalSuite]) -> dict[str, tuple[Metric, ..
 
 
 def declarations(suites: Mapping[str, EvalSuite], metrics: Sequence[Metric],
-                 summaries: Sequence[Summary]) -> dict[str, tuple[Metric | Summary, ...]]:
+                 summaries: Sequence[Summary], *, loss: bool) -> dict[str, tuple[Metric | Summary, ...]]:
     """Every score a fit declares, by split: each suite's metrics (fit's own `metrics` as `val` where it
     validates no suite) and the summaries under theirs (`Summary.SPLIT`). Its selections resolve against
-    this and its rankings read their aggregates' scores off it, one declaration for both."""
+    this and its rankings read their aggregates' scores off it, one declaration for both. A summary is
+    refused where it repeats another's name or weighs a score no evaluation records (`Summary.check`,
+    the objective's validation loss only where it defines one, `loss`)."""
+    names = [summary.name for summary in summaries]
+    if len(names) != len(set(names)):
+        raise ValueError(f"summaries are named apart, and {names} repeats one")
+    for summary in summaries:
+        summary.check(suites, loss)
     declared: dict[str, tuple[Metric | Summary, ...]] = {**(split_metrics(suites) or {'val': tuple(metrics)})}
     if summaries:
         declared[Summary.SPLIT] = tuple(summaries)
     return declared
-
-
-def falls(every: Cadence | str | datetime.timedelta, step: int, real: int, before: int) -> bool:
-    """Whether a cadence of steps (`int`) or of committed tokens (`Tokens`, the step having brought them
-    from `before` to `real`) falls on `step`; a duration or none never does here."""
-    if isinstance(every, Tokens):
-        return every.due(real, before)
-    return isinstance(every, int) and bool(every) and step % every == 0
 
 
 @dataclasses.dataclass(frozen=True)
@@ -123,10 +149,55 @@ class FitPlan:
         return any(map(before_end, cadences)) or bool(
             (self.validation or self.best or self.stop) and before_end(self.checkpoint_every))
 
+    @staticmethod
+    def falls(every: Cadence | str | datetime.timedelta, step: int, real: int, before: int) -> bool:
+        """Whether a cadence of steps (`int`) or of committed tokens (`Tokens`, the step having brought them
+        from `before` to `real`) falls on `step`; a duration or none never does here."""
+        if isinstance(every, Tokens):
+            return every.due(real, before)
+        return isinstance(every, int) and bool(every) and step % every == 0
+
+    @staticmethod
+    def cadences(loader: Loader, validation: Mapping[str, Reader | EvalSuite] | None,
+                 metrics: Sequence[Metric], steps: int | None, tokens: int | None, accumulation: int,
+                 written: tuple[int | str, int | str | None, int | str | datetime.timedelta | None]
+                 ) -> tuple[int | Tokens, Cadence, Cadence | datetime.timedelta, dict[str, EvalSuite]]:
+        """`fit`'s log, validation and checkpoint cadences and its suites' (`validation_suites`), each
+        written as steps, a duration or a share of the run such as "5%", resolved once against its planned
+        length: the whole updates nearest that share of its `steps` microsteps, `accumulation` an update,
+        at least one; of a budget of `tokens` alone, each time the committed tokens pass a multiple of that
+        share of them (`dew.training.budget.every_step`). A schedule's warmup may be a share too
+        (`dew.optim.Cosine.warmup_steps`), and the start records what each resolved to
+        (`recorded`)."""
+        def cadence(value, name: str) -> Cadence:
+            return every_step(value, steps, tokens, accumulation, name=name)
+
+        log_every, eval_every, checkpoint_every = written
+        logged, evaluated = cadence(log_every, "log_every"), cadence(eval_every, "eval_every")
+        if not logged:
+            raise ValueError(f"log_every must be a positive cadence, got {log_every!r}")
+        saved = checkpoint_every if isinstance(checkpoint_every, datetime.timedelta) else cadence(
+            checkpoint_every, "checkpoint_every")
+        suites = {name: dataclasses.replace(suite, every=cadence(suite.every, f"{name}'s every"))
+                  for name, suite in validation_suites(loader, validation, metrics, evaluated).items()}
+        return logged, evaluated, saved, suites
+
+    def recorded(self, config: OptimConfig | None, accumulation: int) -> dict[str, JSON]:
+        """The cadences this plan resolved and the warmups of `config`'s schedules over its updates,
+        `accumulation` microsteps each, as the run's start records them (`dew.telemetry.FitStarted`)."""
+        warmups = {} if config is None else config.warmups(
+            None if self.steps is None else self.steps // accumulation)
+        suites = {f"{name}.every": recorded(suite.every) for name, suite in self.suites.items()
+                  if suite.every != self.eval_every}
+        return {"log_every": recorded(self.log_every), "eval_every": recorded(self.eval_every),
+                "checkpoint_every": recorded(self.checkpoint_every), **suites,
+                **{f"warmup_steps.{name}": value for name, value in warmups.items()}}
+
     def due(self, step: int, real: int = 0, before: int = 0) -> tuple[str, ...]:
         """The suites whose own cadence falls on `step`, which brought the committed tokens from
         `before` to `real` (`falls`)."""
-        return tuple(name for name, suite in self.suites.items() if falls(suite.every, step, real, before))
+        return tuple(name for name, suite in self.suites.items()
+                     if self.falls(suite.every, step, real, before))
 
 
 @dataclasses.dataclass
@@ -179,20 +250,47 @@ class FitRun:
         return next(self.train)
 
 
-def waited_read(run: FitRun, interval: Interval, *, agree: bool) -> Batch | None:
+def waited_read(run: FitRun, interval: Interval, *, agree: bool, peek: bool = False) -> Batch | None:
     """The training stream's next batch, its wait counted in `interval`, or None where it has run out
     on every process, which ends the run as its length would. Where `agree`, the read is agreed
     (`agreed_next`): one that fails, or runs out on some processes only, stops every process, as
     does a stream with no batch for a run at step 0. An endless stream's later reads are not agreed,
-    as it never runs out. A batch read ahead (`FitRun.ahead`) is this read's."""
+    as it never runs out. A batch read ahead (`FitRun.ahead`) is this read's. Where `peek`, an agreed
+    read of the stream's first batch as its source gives it, on the host, placed at the run's first
+    read (`DevicePrefetchIterator.peek`)."""
     if run.ahead is not None:
         (batch,), run.ahead = run.ahead, None
         return batch
     assert run.train is not None
+    # The prefetcher's peek, as a stream of one batch that ends where the source holds none.
+    stream = iter(run.train.peek, None) if peek else run.train
     with region("input.wait"):
         asked = time.perf_counter()
-        batch = agreed_next("training read", run.train) if agree else run.read()
+        batch = agreed_next("training read", stream) if agree or peek else run.read()
         interval.waited += time.perf_counter() - asked
     if batch is None and not run.current:
         raise ValueError("the training data holds no batch to train on")
     return batch
+
+
+def unrecorded_parts(objective: str, dataset: Dataset | Loader, *, optimized: bool, seeded: bool,
+                     mesh: MeshSpec | Mesh | None, given: Mapping[str, object]) -> list[str]:
+    """Why a run's record cannot rebuild a trainer's run on `dataset`, each a part a
+    `dew.config.RunConfig` states otherwise, read from the trainer's own fields
+    (`Checkpoints.python_run`): an objective, of the class `objective` names, built in Python, an optax
+    optimizer (not `optimized` from an OptimConfig), a JAX key (no integer seed), a native mesh, a
+    compiled Loader, and each part `given` to the trainer that a run's record does not state. A run
+    built as a RunConfig writes its own record, which rebuilds it, before it trains."""
+    reasons = [f"the objective, {objective}, was built in Python; a run's record names it "
+               f"by an ObjectiveConfig over a ModelConfig"]
+    if not optimized:
+        reasons.append("the optimizer is an optax transformation; a run's record states an OptimConfig")
+    if not seeded:
+        reasons.append("the key is a JAX key; a run's record states an integer seed")
+    if isinstance(mesh, Mesh):
+        reasons.append("the mesh is a jax.sharding.Mesh; a run's record states a MeshSpec")
+    if isinstance(dataset, Loader):
+        reasons.append("the data is a compiled Loader; a run's record states its chain")
+    reasons += [f"{name} is given to the trainer, which a run's record does not state"
+                for name, part in given.items() if part is not None]
+    return reasons

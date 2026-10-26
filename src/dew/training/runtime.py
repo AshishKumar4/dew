@@ -81,7 +81,7 @@ def prepare_process(wandb: Wandb | None = None,
     library without a recipe, set XLA_FLAGS in the environment yourself.
     A state kept on the CPU (`Layout(host=("variables",))`) needs one CPU
     device per local accelerator, which the trainer checks on its own mesh
-    (`dew.training.host.companion_mesh`).
+    (`dew.distributed.host.companion_mesh`).
     """
     _set_environment(wandb, xla_flags, compilation_cache_dir)
     _raise_limits()
