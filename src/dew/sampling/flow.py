@@ -144,12 +144,22 @@ Split = tuple[jax.Array, jax.Array]
 """A value as a quotient and the power of two it is restored by (`_quotient`)."""
 
 
+def _shift(top: jax.Array, headroom: int = 0) -> jax.Array:
+    """The power of two values whose largest exponent is `top` are taken down by so their arithmetic
+    stays in float32's normal range, `headroom` exponents above it kept for growth: down only by what
+    overflow requires where they reach float32's largest, so every value a plain computation keeps is
+    kept; up to their largest's own exponent where they lie below 2**-63, so what a plain computation
+    would flush is kept, and nothing it keeps is lost; and none in between, where the computation is
+    the plain one."""
+    return jnp.where(top + headroom > 126, top + headroom - 126, jnp.where(top < -63, top, 0))
+
+
 def _differences(left: jax.Array, right: jax.Array) -> tuple[jax.Array, jax.Array]:
     """`left - right` per coordinate as values and shifts, `(left - right) = values * 2**shifts`: the
-    plain subtraction, a coordinate's two operands taken down first only by what keeps it below
-    float32's largest (`2**127 - -2**127`), so every coordinate a plain subtraction holds is that
-    subtraction and no other coordinate moves."""
-    shift = jnp.maximum(jnp.maximum(_exponent(left), _exponent(right)) - 126, 0)
+    plain subtraction, a coordinate's two operands shifted first as `_shift` asks (`2**127 - -2**127`,
+    two neighbouring tiny values), so every coordinate a plain subtraction holds is that subtraction
+    and no other coordinate moves."""
+    shift = _shift(jnp.maximum(_exponent(left), _exponent(right)))
     return _scaled(left, -shift) - _scaled(right, -shift), shift
 
 
@@ -157,8 +167,8 @@ def _summed_products(left: jax.Array, left_shift: jax.Array, right: jax.Array,
                      right_shift: jax.Array) -> tuple[jax.Array, jax.Array]:
     """`sum(left * 2**left_shift * right * 2**right_shift)` over each row as a value and a power: each
     product the plain product of the two values (their significands', `_split`, which rounds as it
-    does), the row's products taken down together only by what keeps its largest product and the sum
-    below float32's largest, summed plainly: every term a plain float32 sum keeps, it keeps
+    does), the row's products shifted together as `_shift` asks for its largest and their sum,
+    summed plainly: every term a plain float32 sum keeps, it keeps
     (`[2**120, -2**120, 2**-100]` sums to `2**-100`), and a row no product of which overflows is the
     plain sum."""
     (left_part, left_power), (right_part, right_power) = _split(left), _split(right)
@@ -166,7 +176,7 @@ def _summed_products(left: jax.Array, left_shift: jax.Array, right: jax.Array,
     powers = jnp.where(products != 0, left_power + right_power + left_shift + right_shift, FLOOR)
     count = math.prod(left.shape[1:])
     top = jnp.max(powers, axis=tuple(range(1, left.ndim)))
-    excess = jnp.maximum(top + 2 + math.ceil(math.log2(max(count, 1))) - 127, 0)
+    excess = _shift(top, 2 + math.ceil(math.log2(max(count, 1))))
     return _scaled(products, powers - expand(excess, powers)).sum(axis=tuple(range(1, left.ndim))), excess
 
 
@@ -180,12 +190,12 @@ def _quotient(numerator: jax.Array, power: jax.Array, divisor: jax.Array) -> Spl
 
 def _sum(left: Split, right: Split) -> jax.Array:
     """`left + right`, two values given as quotients and powers (`_quotient`), the plain sum of the two
-    restored values, both taken down first only by what keeps them and their sum below float32's
-    largest, and restored once."""
+    restored values, both shifted first as `_shift` asks for the larger and their sum, and restored
+    once."""
     (left_value, left_power), (right_value, right_power) = left, right
     top = jnp.maximum(jnp.where(left_value != 0, left_power + _exponent(left_value), FLOOR),
                       jnp.where(right_value != 0, right_power + _exponent(right_value), FLOOR))
-    shift = jnp.maximum(top - 126, 0)
+    shift = _shift(top, 1)
     return _scaled(_scaled(left_value, left_power - shift) + _scaled(right_value, right_power - shift), shift)
 
 
@@ -202,8 +212,9 @@ def _divergence(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> j
     stays below float32's largest, bit for bit in a normal result, and elsewhere the same arithmetic
     with its operands taken down by only what keeps it in range and the power restored once at the
     end (`_scaled`): a squared difference past float32's largest over a variance as wide, or a
-    variance whose double overflows. It keeps every term the plain formula keeps, and flushes what
-    the plain formula flushes. Its derivatives are `_gaussian_kl`'s."""
+    variance whose double overflows; and taken up where every value lies below 2**-63, so it keeps
+    what the plain formula would flush (`_shift`). It keeps every term the plain formula keeps. Its
+    derivatives are `_gaussian_kl`'s."""
     *_, (quotient, power) = _divergence_parts(mean, reference, variance)
     return _scaled(quotient, power)
 
