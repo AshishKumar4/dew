@@ -362,8 +362,8 @@ def decoded_frozen_fp8(variables: Variables) -> Variables:
     sites = {path[:-1] for path in held if path[-1] == FROZEN_FP8[0]}
     if not sites:
         return variables
-    kernels = {(*site, "kernel"): frozen_fp8_kernel({leaf: held[(*site, leaf)] for leaf in FROZEN_FP8})
-               for site in sites}
+    kernels = {(*site, "kernel"): frozen_fp8_kernel({leaf: jnp.asarray(held[(*site, leaf)])
+                                                     for leaf in FROZEN_FP8}) for site in sites}
     rest = {path: leaf for path, leaf in held.items() if not (path[:-1] in sites and path[-1] in FROZEN_FP8)}
     decoded = {name: tree for name, tree in variables.items() if name != QUANTIZATION}
     decoded["params"] = unflatten_dict({**flatten_dict(dict(variables.get("params", {}))), **kernels})
