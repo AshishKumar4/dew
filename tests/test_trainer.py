@@ -1255,12 +1255,18 @@ def test_the_run_start_records_the_cadences_and_warmups_it_resolved(tmp_path):
 
 def test_a_share_of_a_token_budget_falls_where_the_committed_tokens_pass_its_multiples():
     """A cadence written as a share of a token budget alone falls at each step whose commit passes a
-    multiple of that share of the budget's tokens: rows of 1 to 4 tokens commit 24 a step, so 25% of
-    96 logs at every step past 24, 48, 72 and 96."""
-    tracker = RecordingTracker()
-    trainer = make_trainer(objective=TokenRegression(), tracker=tracker)
-    trainer.fit(dataset(), tokens=96, log_every="25%")
-    assert sorted({step for step, scalars in tracker.scalars if "train/tokens" in scalars}) == [1, 2, 3, 4]
+    multiple of that share of the budget's tokens: 25% of 96 logs at the steps that bring the
+    committed tokens past 24, 48, 72 and 96, as a run logging every step counts them."""
+    every = RecordingTracker()
+    make_trainer(objective=TokenRegression(), tracker=every).fit(dataset(), tokens=96, log_every=1)
+    committed = {step: scalars["train/tokens"] for step, scalars in every.scalars
+                 if "train/tokens" in scalars}
+    passing = sorted(step for step, tokens in committed.items()
+                     if tokens // 24 > committed.get(step - 1, 0) // 24)
+    shared = RecordingTracker()
+    make_trainer(objective=TokenRegression(), tracker=shared).fit(dataset(), tokens=96, log_every="25%")
+    logged = sorted({step for step, scalars in shared.scalars if "train/tokens" in scalars})
+    assert passing and logged == passing
 
 
 @pytest.mark.parametrize("written", ["5", "0%", "150%", "five%"])
