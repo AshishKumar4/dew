@@ -94,8 +94,9 @@ INDEXER_COLLECTION = 'indexer'
 when a caller opens it, as the LM objective does to train the indexer."""
 
 SELECTIONS = 'selections'
-"""The collection a lightning indexer sows its heads' agreements before their relu under when a caller
-opens it (`IndexerFront.scored`), as a selection's margin does to read how near a tie each key sits."""
+"""The collection V3.2's lightning indexer sows its scores and its heads' agreements before their relu
+under when a caller opens it (`SparseIndexer.scores`), as a selection's margin does to read how near a
+tie each key sits; never at initialization, so no variable tree holds it."""
 
 INDEXER_EPS = 1e-8
 """MaxText's `EPS` (src/maxtext/utils/globals.py at 538fe7a3), which its
@@ -180,15 +181,15 @@ class IndexerFront:
         batch, length = q_resid.shape[:2]
         return self.wq_b(jax.lax.stop_gradient(q_resid)).reshape(batch, length, self.n_heads, self.head_dim)
 
-    def scored(self, query, keys, hidden):
-        """`query`'s scores against `keys` `[B, S, T]`, its heads' agreements (`index_agreements`)
-        weighted by `weights_proj` of the detached `hidden` (`index_scores`). The agreements are sown
-        into the `selections` collection, which only a caller that asks for it keeps: how near zero a
-        key every head disagrees with sits, which a selection's margin reads."""
-        agreements = index_agreements(query, keys, self.precision)
-        self.sow(SELECTIONS, "agreements", agreements)
+    def weighed(self, agreements, hidden):
+        """Scores `[B, S, T]` of the heads' `agreements` (`index_agreements`), weighted by
+        `weights_proj` of the detached `hidden` (`index_scores`)."""
         return index_scores(agreements, self.weights_proj(jax.lax.stop_gradient(hidden)), self.head_dim,
                             self.precision)
+
+    def scored(self, query, keys, hidden):
+        """`query`'s scores against `keys` `[B, S, T]` (`weighed`)."""
+        return self.weighed(index_agreements(query, keys, self.precision), hidden)
 
 
 @logical_axes({
@@ -257,7 +258,13 @@ class SparseIndexer(IndexerFront, nn.Module):
         q_rot, q_pass = jnp.split(self.queries(q_resid), [self.rope_head_dim], axis=-1)
         query = jnp.concatenate(
             [_rotate(self.rope_interleave, q_rot, freqs_cos, freqs_sin), q_pass], axis=-1)
-        return self.scored(query, keys, hidden)
+        agreements = index_agreements(query, keys, self.precision)
+        scores = self.weighed(agreements, hidden)
+        if not self.is_initializing():
+            # Kept only where a caller opens the collection, as a selection's margin does.
+            self.sow(SELECTIONS, "scores", scores)
+            self.sow(SELECTIONS, "agreements", agreements)
+        return scores
 
     def select(self, scores, keep):
         """The top-k keys of each query among those `keep` allows, as
