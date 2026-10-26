@@ -289,6 +289,51 @@ WORKER_BUFFER = 2
 """The batches each worker process reads ahead where none is asked for (`Loading`, `Pipeline.workers`)."""
 
 
+WORKER_PROCESS_BYTES = 219 * 2**20
+"""The memory a loading worker's process takes before it holds a batch: each imports the program
+again. 32 workers of a 100-record pipeline held 7.07 GiB resident against 0.23 GiB with none, on
+two cores of a shared workstation (`Loading`), 219 MiB each."""
+
+
+SAMPLED_BATCHES = 5
+"""The batches automatic loading measures to size its buffers (`Loading.resolved`), as many as
+Grain's own pick samples."""
+
+
+@dataclasses.dataclass(frozen=True)
+class Host:
+    """What automatic loading sizes its workers and buffers by (`Loading.resolved`): the CPUs this
+    process may run on, its CPU affinity bounded by its cgroup's quota, and the bytes of memory it
+    may still take, the host's available memory bounded by what its cgroup's limit leaves, so a
+    container's limits size it, not the machine's."""
+
+    cpus: int
+    memory: int
+
+    @classmethod
+    def current(cls) -> Host:
+        import psutil
+
+        cpus = len(os.sched_getaffinity(0))
+        quota = Path("/sys/fs/cgroup/cpu.max")
+        if quota.is_file():
+            limit, period = quota.read_text().split()
+            if limit != "max":
+                cpus = min(cpus, math.ceil(int(limit) / int(period)))
+        memory = psutil.virtual_memory().available
+        maximum, current = Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory.current")
+        if maximum.is_file() and current.is_file():
+            limit = maximum.read_text().strip()
+            if limit != "max":
+                memory = min(memory, max(0, int(limit) - int(current.read_text())))
+        return cls(cpus, memory)
+
+
+def batch_bytes(batch: Batch) -> int:
+    """The bytes of a batch's leaves, as arrays hold them."""
+    return sum(np.asarray(leaf).nbytes for leaf in jax.tree_util.tree_leaves(batch))
+
+
 @dataclasses.dataclass(frozen=True)
 class Loading:
     """Read throughput settings, as Grain's four knobs.
@@ -335,35 +380,33 @@ class Loading:
     ram_budget_mb: int | None = None
     max_workers: int | None = None
 
-    def resolved(self, records: pygrain.IterDataset) -> Loading:
-        """Ask Grain to size workers and buffers within the host's RAM limit."""
+    def resolved(self, records: pygrain.IterDataset, *, reads: int, host: Host | None = None) -> Loading:
+        """These settings with automatic workers and read buffer sized for `host` (this process's
+        by default) from its CPUs and its memory together, as tf.data's autotuning budgets both.
+        Grain's own pick (`pick_performance_config`) reads memory alone, takes the machine's CPU
+        count where a container may run on a few of them, and counts one batch for each worker.
+
+        A worker for each CPU but one, which the reading process keeps to batch, place and drive
+        the step, at most `max_workers`; and no more of them than half the memory the process may
+        still take holds (`ram_budget_mb` where given), each a process of its own
+        (`WORKER_PROCESS_BYTES`) holding its `worker_buffer` batches and `read_buffer` reads, the
+        read buffer itself no more reads than that half holds. `records` are the batches the
+        read makes without workers, `SAMPLED_BATCHES` of which are measured; `reads` is how many
+        reads make one: one where the order is read by batch, its rows where it streams records.
+        A read that makes no batch reads without workers."""
         if self.workers != "auto":
             return self
-        import grain.experimental as gx
-        import psutil
-
-        available = psutil.virtual_memory().available
-        maximum, current = Path("/sys/fs/cgroup/memory.max"), Path("/sys/fs/cgroup/memory.current")
-        if maximum.is_file() and current.is_file():
-            limit = maximum.read_text().strip()
-            if limit != "max":
-                available = min(available, max(0, int(limit) - int(current.read_text())))
-        budget = self.ram_budget_mb if self.ram_budget_mb is not None else max(1, available // (2 * 1024**2))
-        try:
-            picked = gx.pick_performance_config(
-                records,
-                ram_budget_mb=budget,
-                max_workers=self.max_workers or os.cpu_count() or 1,
-                max_buffer_size=self.read_buffer,
-            )
-        except StopIteration:
-            _log.warning("Grain autotune found no element; using explicit Loading fallback (0 workers)")
+        sampled = list(itertools.islice(records, SAMPLED_BATCHES))
+        if not sampled:
             return dataclasses.replace(self, workers=0)
-        workers = 0 if picked.multiprocessing_options is None else picked.multiprocessing_options.num_workers
-        buffers = (
-            self.read_buffer if picked.read_options is None else picked.read_options.prefetch_buffer_size
-        )
-        return dataclasses.replace(self, workers=workers, read_buffer=buffers)
+        host = Host.current() if host is None else host
+        batch = max(1, sum(batch_bytes(value) for value in sampled) // len(sampled))
+        read = max(1, batch // reads)
+        budget = host.memory // 2 if self.ram_budget_mb is None else self.ram_budget_mb * 2**20
+        cpus = host.cpus - 1 if self.max_workers is None else min(self.max_workers, host.cpus - 1)
+        read_buffer = min(self.read_buffer, budget // read)
+        held = WORKER_PROCESS_BYTES + self.worker_buffer * batch + read_buffer * read
+        return dataclasses.replace(self, workers=max(0, min(cpus, budget // held)), read_buffer=read_buffer)
 
     @property
     def worker_count(self) -> int:
@@ -384,7 +427,7 @@ class Loading:
         # The 5.1 to 7.4 s stop was examples/sft_gemma4.py's four workers.
         return float(
             GRAIN_KILL_SECONDS
-            * (1 + (self.max_workers or os.cpu_count() or 1) if self.workers == "auto" else 1 + self.workers)
+            * (1 + (self.max_workers or Host.current().cpus) if self.workers == "auto" else 1 + self.workers)
         )
 
     @contextlib.contextmanager

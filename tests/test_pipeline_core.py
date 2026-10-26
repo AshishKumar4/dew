@@ -24,7 +24,7 @@ from dew import position
 from dew.batch import VALID_ROWS
 from dew.data.cache import Cache
 from dew.data.compile import compile, iterate, validation
-from dew.data.dataset import DataPartition, Loading
+from dew.data.dataset import GRAIN_KILL_SECONDS, WORKER_PROCESS_BYTES, DataPartition, Host, Loading
 from dew.data.mixing import TokenDeficit, token_weights
 from dew.data.pipeline import Configured, Pipeline, Rejected, mix
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
@@ -760,24 +760,44 @@ def test_worker_processes_read_a_global_order_in_the_batches_one_process_reads()
     assert batches(2) == batches(0)
 
 
-def test_automatic_loading_sizes_an_indexed_read_buffer_by_the_batches_it_holds(monkeypatch):
-    """An indexed order's read buffer holds whole batches, so automatic
-    loading sizes it by a batch: 2 MiB holds four batches of eight 64 KiB
-    rows, where sized by a row it would hold sixteen."""
-    import grain.experimental as gx
+@pytest.mark.parametrize("bound", ["cpus", "memory"])
+def test_automatic_loading_starts_no_more_workers_than_the_hosts_cpus_and_memory_hold(monkeypatch, bound):
+    """Automatic loading sizes its workers from the CPUs this process may run on and the memory it
+    may take, together. On two CPUs of a 64-core machine it reads in at most one worker, the other
+    CPU left to the reading process; in 512 MiB, at most two, each a process of its own that
+    imports the program again. Grain's pick read every core the machine has and counted a worker's
+    memory as one batch, so it started 64 workers in both."""
+    monkeypatch.setattr(os, "cpu_count", lambda: 64)
+    monkeypatch.setattr(os, "sched_getaffinity", lambda pid: set(range(2 if bound == "cpus" else 16)))
+    budget = {"cpus": 4096, "memory": 512}[bound]
+    loading = Loading(workers="auto", ram_budget_mb=budget)
+    data = compile(Pipeline(source(64)).repeat().batch(8), loading=loading)
+    reader = data.train(DataPartition())
+    try:
+        workers = reader.stop_seconds / GRAIN_KILL_SECONDS - 1
+    finally:
+        reader.close()
+    assert workers <= {"cpus": 1, "memory": 2}[bound]
 
-    chosen = []
-    pick = gx.pick_performance_config
 
-    def recorded(*args, **kwargs):
-        config = pick(*args, **kwargs)
-        chosen.append(config.read_options.prefetch_buffer_size)
-        return config
-
-    monkeypatch.setattr(gx, "pick_performance_config", recorded)
-    rows = Memory(tuple({"x": np.zeros(16384, np.float32)} for _ in range(64)))
-    compile(Pipeline(rows).repeat().batch(8), loading=Loading(workers="auto", ram_budget_mb=2, max_workers=1))
-    assert chosen == [4]
+def test_automatic_loading_holds_its_reads_and_each_workers_batches_within_half_the_memory():
+    """Each worker holds its `worker_buffer` batches and its `read_buffer` reads in a process of its
+    own, within half the memory the process may take; a read is a batch where the order is read by
+    batch, a record where it streams. Eight 64 KiB rows make a 512 KiB batch: 2 MiB holds four reads
+    of a batch and no worker, and half a host's memory that holds two and a half workers holds two,
+    reading by the batch or by the record. Workers take each CPU but one, at most `max_workers`."""
+    rows = grain.MapDataset.source([{"x": np.zeros((8, 16384), np.float32)}] * 6).to_iter_dataset()
+    auto = Loading(workers="auto", worker_buffer=2)
+    small = dataclasses.replace(auto, ram_budget_mb=2).resolved(rows, reads=1, host=Host(8, 2**40))
+    assert (small.workers, small.read_buffer) == (0, 4)
+    held = WORKER_PROCESS_BYTES + 2 * 2**19 + 16 * 2**19
+    roomy = auto.resolved(rows, reads=1, host=Host(8, 2 * (2 * held + held // 2)))
+    assert (roomy.workers, roomy.read_buffer) == (2, 16)
+    streamed = auto.resolved(rows, reads=8, host=Host(8, 2 * (2 * held + held // 2)))
+    assert streamed.workers == 2 and streamed.read_buffer == 16
+    assert auto.resolved(rows, reads=1, host=Host(3, 2**40)).workers == 2
+    assert auto.resolved(rows, reads=1, host=Host(1, 2**40)).workers == 0
+    assert dataclasses.replace(auto, max_workers=1).resolved(rows, reads=1, host=Host(8, 2**40)).workers == 1
 
 
 def test_a_validation_pass_starts_at_most_one_worker_per_batch(monkeypatch):

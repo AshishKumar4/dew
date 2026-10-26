@@ -1540,22 +1540,22 @@ class _Build:
         return iter(self.after_batch(stream, after, pipeline, partition))
 
     def tuned(self, pipeline: Pipeline) -> _Build:
-        """This build with automatic loading resolved on the whole order
-        (`Loading.resolved`), and at most one worker per batch of a pass that
-        ends where its rows are indexed. Grain sizes workers by memory alone,
-        and a validation pass read with training's workers, so a pass of five
-        batches had one per core, 26 on an H100 host. Each worker past the
-        last batch reads nothing, yet starts a process that imports the
-        program and keeps about six pipes open until the reader is collected."""
+        """This build with automatic loading resolved on the whole order from the host's CPUs and
+        memory (`Loading.resolved`), and at most one worker per batch of a pass that ends where
+        its rows are indexed. A validation pass is read with training's workers, so a pass of
+        five batches had one per core, 26 on an H100 host. Each worker past the last batch reads
+        nothing, yet starts a process that imports the program and keeps about six pipes open
+        until the reader is collected."""
         loading = self.loading
         bare = dataclasses.replace(self, loading=dataclasses.replace(loading, workers=0))
+        size = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
         if loading.workers == "auto":
+            # A global order is read by the batch, any other order by the record (`batch_order`).
             with _closing(bare.batched(pipeline, DataPartition())[0]) as sampled:
-                loading = loading.resolved(sampled)
+                loading = loading.resolved(sampled, reads=1 if self.global_order else size)
         if loading.worker_count and (not self.training or not self.lowering.endless):
             with _closing(bare.records(pipeline, DataPartition())) as rows:
                 if isinstance(rows, pygrain.MapDataset):
-                    size = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
                     batches = -(-len(rows) // size)
                     loading = dataclasses.replace(loading, workers=min(loading.worker_count, batches))
         return dataclasses.replace(self, loading=loading)
