@@ -202,15 +202,16 @@ CASES = [
                     "bias": True, "expert_features": 16, "shared_features": 16},
         "num_nextn_predict_layers": 1,
     }, seq_len=SEQ_LEN, label="glm4_moe"),
-    # Llama 4's stack at toy width: chunked rotated layers around a global
-    # layer under the llama4 kind, the routed layers scaling their inputs.
+    # Llama 4's stack at toy width: chunked rotated layers, adjacent pairs under the weightless L2
+    # norm, around a global layer without positions tuning its temperature; the routed layers scale
+    # their inputs.
     Case("causal_transformer", {
         **LM, "head_dim": 8, "qk_norm": False,
         "layer_types": ("chunked_attention", "full_attention"),
-        "kinds": {"chunked_attention": {"chunk": 4, "mixer": {
-                      "class": "llama4", "fields": {"use_rope": True, "floor_scale": 4.0}}},
-                  "full_attention": {"mixer": {"class": "llama4", "fields": {"use_rope": False,
-                                               "floor_scale": 4.0}}}},
+        "kinds": {"chunked_attention": {"chunk": 4, "qk_norm": True, "mixer": {
+                      "class": "attention", "fields": {"rotary_pairs": "adjacent", "qk_norm_weight": False}}},
+                  "full_attention": {"mixer": {"class": "attention", "fields": {
+                      "nope": True, "temperature_tuning": (4.0, 0.1)}}}},
         "mixture": {"experts": 8, "top_k": 1, "layers": (1,), "score_function": "sigmoid",
                     "norm_topk_prob": False, "scale_inputs": True, "expert_features": 16,
                     "shared_features": 16},
