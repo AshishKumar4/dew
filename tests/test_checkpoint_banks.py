@@ -10,7 +10,7 @@ from steady_state import steady_state
 from dew.batch import FROZEN
 from dew.checkpoints import Checkpoints
 from dew.data import Loading, Memory
-from dew.inference.banks import CheckpointBanks, spread
+from dew.inference.banks import CheckpointBanks, bank_sites, banked, spread
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.layer_plan import group_layers
@@ -38,6 +38,29 @@ def trained(directory, objective, layout):
     state = trainer.fit(data, steps=1, checkpoint_every=1, log_every=100)
     checkpoints.wait()
     return state
+
+
+def test_a_trees_banks_spread_back_into_its_rows():
+    """`banked` moves each scanned run's leaves its rows all hold into one bank under the run's name,
+    a leaf only some rows hold kept per layer, and tells `release` each row leaf it replaced; `spread`
+    reads the tree back row for row: the one pair a host layout's frozen collection, its placement and
+    a checkpoint's template take."""
+    model = decoder(bank_layers=2)
+    variables = jax.device_get(model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)))["params"]
+    tree = {name: dict(value) if name.startswith("layers_") else value for name, value in variables.items()}
+    # A leaf one row holds alone, as a frozen collection under a partial freeze does.
+    tree["layers_1"] = {**tree["layers_1"], "extra": np.ones(3, np.float32)}
+    released = []
+    packed = banked(tree, bank_sites(model), lambda rows, path: np.stack(rows),
+                    lambda namespace, index, keys, bank: released.append((index, keys)))
+    groups = {name: layers for name in packed
+              if (layers := group_layers(name)) is not None and len(layers) > 1}
+    assert groups and packed["layers_1"] == {"extra": tree["layers_1"]["extra"]}
+    assert {index for index, _ in released} == {index for layers in groups.values() for index in layers}
+    back = spread(packed)
+    assert jax.tree.structure(back) == jax.tree.structure(tree)
+    for actual, expected in zip(jax.tree.leaves(back), jax.tree.leaves(tree), strict=True):
+        np.testing.assert_array_equal(actual, expected)
 
 
 def test_a_run_places_bank_by_bank_and_again_on_the_programs_it_compiled(tmp_path):

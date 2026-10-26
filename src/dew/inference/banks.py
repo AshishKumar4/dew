@@ -38,7 +38,7 @@ from jax.experimental.layout import Format, Layout as DeviceLayout
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
 from jax.typing import DTypeLike
 
-from dew.batch import Variables, merge
+from dew.batch import Variables, merge, without
 from dew.nn.backbones.decoder_stack import DecoderBank, stack_layers
 from dew.nn.backbones.layer_plan import group_layers, layer_index
 from dew.nn.hyper_connections import Carried
@@ -541,7 +541,7 @@ def spread(tree: Mapping, rows=lambda leaf, count: [leaf[offset] for offset in r
     goes and the base is held twice for one leaf at most.
 
     A CPU-owned training run stores its frozen collection banked
-    (`dew.training.execution.banked`); this is the layer view every reader
+    (`banked`, its inverse); this is the layer view every reader
     keyed by `layers_N`, a placement or a model, takes of it.
     """
     spread_tree = {}
@@ -558,6 +558,121 @@ def spread(tree: Mapping, rows=lambda leaf, count: [leaf[offset] for offset in r
                                is_leaf=lambda node: isinstance(node, tuple))
             spread_tree[f"layers_{index}"] = merge(spread_tree.get(f"layers_{index}", {}), row)
     return spread_tree
+
+
+def banked(tree, sites, stack, release=None):
+    """Replace a scanned run's per-layer rows with one stacked bank: `spread`'s inverse, over the view's
+    own runs and bank names (`StackView.bank_names`), as `assembled` reads them.
+
+    `tree` is a frozen collection keyed per layer. Every leaf that all rows
+    of a run hold moves under the run's bank name, stacked by
+    `stack(rows, path)`. Arrays stack into one bank, shapes into one shape,
+    shardings into the bank's. A leaf only some rows hold stays per layer, as
+    does every run of one, and `run_stack` stacks those with the moving rows
+    at each snapshot.
+
+    `stack` is called with the rows and `path`, the bank leaf's keys from the
+    root, so a caller can place each bank as it makes it. A frozen bank then
+    exists once, from the moment it is placed, rather than as its rows in
+    pinned memory and a stacked copy beside them, which for a stack that
+    fills the host is the second copy that does not fit.
+
+    `release(namespace, index, keys, bank)` is told each row leaf the bank
+    replaced, and the bank itself. The tree the rows came from can then hold
+    the bank where the row was and let the row go.
+    """
+    tree = dict(tree)
+    for site in sites:
+        local = tree
+        for component in site.namespace:
+            if not isinstance(local.get(component), Mapping):
+                local = None
+                break
+            local[component] = dict(local[component])
+            local = local[component]
+        if local is None:
+            continue
+        for (first, count), name in zip(site.view.groups, site.view.bank_names(), strict=True):
+            if count == 1:
+                continue
+            held = [local.get(f"layers_{first + offset}") for offset in range(count)]
+            if not all(isinstance(row, Mapping) for row in held):
+                continue
+            rows = [dict(row) for row in held if isinstance(row, Mapping)]
+            leaves = [{tuple(entry.key for entry in path): leaf
+                       for path, leaf in jax.tree_util.tree_leaves_with_path(row)} for row in rows]
+            shared = set(leaves[0]).intersection(*leaves[1:])
+            if not shared:
+                continue
+            bank = local.setdefault(name, {})
+            for keys in sorted(shared):
+                node = bank
+                for key in keys[:-1]:
+                    node = node.setdefault(key, {})
+                node[keys[-1]] = stack([held[keys] for held in leaves], (*site.namespace, name, *keys))
+                for offset, row in enumerate(rows):
+                    _dropped(row, keys)
+                    if release is not None:
+                        release(site.namespace, first + offset, keys, node[keys[-1]])
+            for offset, row in enumerate(rows):
+                layer = f"layers_{first + offset}"
+                if row:
+                    local[layer] = row
+                else:
+                    del local[layer]
+    return tree
+
+
+def without_banks(variables, sites):
+    """Return `variables` without the banks a scanned run stores under its name."""
+    banks = [(*site.namespace, name) for site in sites
+             for (first, count), name in zip(site.view.groups, site.view.bank_names(), strict=True)
+             if count > 1]
+    return {collection: without(tree, banks) for collection, tree in variables.items()}
+
+
+def _dropped(tree, keys):
+    """Delete the leaf at `keys` from `tree`, and any node that emptied with it."""
+    node, parents = tree, []
+    for key in keys[:-1]:
+        parents.append((node, key))
+        # The copy is written into the parent before the walk moves on; a
+        # chained assignment would bind `node` first and write into the copy.
+        child = dict(node[key])
+        node[key] = child
+        node = child
+    del node[keys[-1]]
+    for parent, key in reversed(parents):
+        if parent[key]:
+            break
+        del parent[key]
+
+
+def _replaced(tree, namespace, subtrees):
+    """`tree` with each collection's namespace subtree replaced, spines copied."""
+    replaced = dict(tree)
+    for collection, subtree in subtrees.items():
+        if not namespace:
+            replaced[collection] = subtree
+            continue
+        spine = dict(replaced[collection])
+        replaced[collection] = spine
+        node = spine
+        for name in namespace[:-1]:
+            node[name] = dict(node[name])
+            node = node[name]
+        node[namespace[-1]] = subtree
+    return replaced
+
+
+def logical(tree, sites):
+    """Put every declared stack's banks back under their stored `layers_N` paths (`StackView.unstack`):
+    a host step's gradient read in the store's own layout."""
+    for site in sites:
+        local = in_namespace(tree, site.namespace)
+        if local:
+            tree = _replaced(tree, site.namespace, site.view.unstack(local))
+    return tree
 
 
 def shape_rows(leaf: jax.ShapeDtypeStruct, count: int) -> list[jax.ShapeDtypeStruct]:
