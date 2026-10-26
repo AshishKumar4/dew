@@ -311,6 +311,11 @@ TRITON_SUPPORTS = (
     _Need('dtype', lambda case: case.dtype in CUDNN_DTYPES,
                 lambda case: f"the query is {case.dtype}, where it was measured on bf16 and fp16 alone",
                 row='measured: tokamax Triton attention (docs/performance.md)', kind='measured'),
+    _Need('fp16', lambda case: case.dtype != np.dtype(np.float16),
+                "the query is float16, whose dQ tokamax's backward narrows before the scale the route "
+                "applies outside it (`triton_attention`), so a finite gradient's store can overflow; the "
+                "Mosaic template takes the call once it replaces this route",
+                row='ledger 1676'),
     _Need('narrow', lambda case: case.head_dim <= 64,
                 lambda case: f"the heads are {case.head_dim} wide, where it measured no faster than "
                              "cuDNN (`attention_narrow`)",
@@ -335,10 +340,11 @@ TRITON_SUPPORTS = (
           row=INHERENT),
     _ARITHMETIC,
 )
-"""tokamax's Triton flash kernel's requirements (`triton_attention`): a GPU of sm80 or later, heads at
-least `TRITON_NARROWEST` wide and at most 64 wide where it was measured faster (an RTX 4080's SimpleDiT-B
-attention 5.62 to 4.33 ms, its causal 3-layer decoder's 1.82 to 1.24; Qwen3-0.6B's 128-wide 9.13 to
-9.24), and no window, mask, block groups, bias, sinks, softcap, documents or key lengths or starts."""
+"""tokamax's Triton flash kernel's requirements (`triton_attention`): a GPU of sm80 or later, bf16 (its
+fp16 dQ store a declared gap, ledger 1676), heads at least `TRITON_NARROWEST` wide and at most 64 wide
+where it was measured faster (an RTX 4080's SimpleDiT-B attention 5.62 to 4.33 ms, its causal 3-layer
+decoder's 1.82 to 1.24; Qwen3-0.6B's 128-wide 9.13 to 9.24), and no window, mask, block groups, bias,
+sinks, softcap, documents or key lengths or starts."""
 
 TPU_BACKEND = _Need('backend', lambda case: generation.backend() == 'tpu', "it runs on a TPU", row=INHERENT,
                     kind='measured')
