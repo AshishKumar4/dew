@@ -818,12 +818,14 @@ DECODE_SEEDS = {"cohere": 8, "cohere2": 8}
 """Each family's declared check-1 seeds for its cached logits, sized by `seeds_for` on armada."""
 
 
+@pytest.mark.parametrize("stated", ["mask", "segments"])
 @pytest.mark.parametrize("family", sorted(PACKED_MODELS))
-def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_prefix(family, tmp_path):
+def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_prefix(family, stated, tmp_path):
     """A tier-3 model on Dew's attention decodes through Dew's cache: a padded prompt fills its row's
     slots and each next token one more, and every decoded step's logits hold check 1 against
     transformers' full forward of that row's prefix (its float64 twin's the truth), Cohere 2's window
-    included; its greedy generation's tokens are the full forward's argmax at each step."""
+    included, the padding stated by a validity mask or as the document 0 of the row's segments; its
+    greedy generation's tokens are the full forward's argmax at each step."""
     from dew.inference import TextGeneration
     from dew.sampling import Sampling
 
@@ -845,8 +847,10 @@ def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_pre
     @jax.jit
     def decoded(variables, prompt, valid, continued):
         cache = loaded.model.apply(variables, prompt.shape[0], method="init_cache", mutable=["cache"])[1]
-        logits, state = loaded.model.apply({**variables, **cache}, prompt, decode=True, attention_mask=valid,
-                                           mutable=["cache"])
+        padding = ({"attention_mask": valid} if stated == "mask"
+                   else {"segment_ids": valid.astype(jnp.int32)})
+        logits, state = loaded.model.apply({**variables, **cache}, prompt, decode=True, mutable=["cache"],
+                                           **padding)
         stepped = [logits[:, -1]]
         for step in range(steps):
             logits, state = loaded.model.apply({**variables, **state}, continued[:, step:step + 1],
@@ -877,8 +881,8 @@ def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_pre
             return np.stack(rows)
         return run
 
-    assert_as_exact(ours, theirs(reference), draw, f"{family} cached logits", seeds=DECODE_SEEDS[family],
-                    truth_fn=theirs(wide, float64))
+    assert_as_exact(ours, theirs(reference), draw, f"{family} cached logits ({stated})",
+                    seeds=DECODE_SEEDS[family], truth_fn=theirs(wide, float64))
 
     # The rows' coordinates state the same validity and positions as their separate fields.
     prompt, valid, _ = draw(0)
