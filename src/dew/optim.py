@@ -815,18 +815,20 @@ def quantized(moment: jax.Array, block: int, *, signed: bool) -> tuple[jax.Array
     axis scaled by its largest magnitude (at least 1e-12), and each value coded by the nearest value of
     `dynamic_map(signed=signed)`, a value halfway between two taking the larger, as torchao's
     `quantize_8bit_with_qmap` does. The code below each value is found among the `CODE_WINDOW` around
-    its estimate (`_estimated_codes`), compared at once: a search of the whole map ran its eight halvings
-    one after another, five times fp32 state's update on an A100 (docs/performance.md)."""
+    its estimate (`_estimated_codes`), each compared apart from the others: a search of the whole map
+    ran its eight halvings one after another (docs/performance.md)."""
     values = jnp.asarray(dynamic_map(signed=signed))
     last = values.shape[0] - 1
     blocked = moment.reshape(*moment.shape[:-1], -1, block)
     scales = jnp.maximum(jnp.max(jnp.abs(blocked), axis=-1), 1e-12)
     fractions = (blocked / scales[..., None]).reshape(moment.shape)
+    # The codes at most each value: those of the window's that are, past the codes below it. One code at
+    # a time, the comparisons fuse with the coding; a window axis held six of each value's at once.
     first = _estimated_codes(fractions, signed=signed) - CODE_WINDOW // 2 - 1
-    window = first[..., None] + jnp.arange(1, CODE_WINDOW + 1)
-    # The codes at most each value: those of the window's that are, past the codes below it.
-    held = (window < 0) | ((window <= last) & (values[jnp.clip(window, 0, last)] <= fractions[..., None]))
-    below = jnp.clip(first + jnp.sum(held, axis=-1, dtype=jnp.int32), 0, last)
+    below = first
+    for code in (first + offset for offset in range(1, CODE_WINDOW + 1)):
+        below = below + ((code < 0) | ((code <= last) & (values[jnp.clip(code, 0, last)] <= fractions)))
+    below = jnp.clip(below, 0, last)
     above = jnp.minimum(below + 1, last)
     nearest = jnp.where(fractions - values[below] >= (values[above] - values[below]) * 0.5, above, below)
     return nearest.astype(jnp.uint8), scales
