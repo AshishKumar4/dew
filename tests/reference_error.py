@@ -496,13 +496,8 @@ def row_errors(value, truth, terms=None) -> tuple[np.ndarray, np.ndarray]:
     if truth.ndim < 2:
         return np.zeros(0), np.zeros(0)
 
-    def rms(rows):
-        # Each row scaled by its largest first, so a row of finite values near float64's largest squares
-        # in range (row 1628).
-        rows = np.abs(np.asarray(rows, np.float64).reshape(-1, truth.shape[-1]))
-        largest = np.max(rows, axis=1, keepdims=True) if rows.shape[1] else np.zeros((len(rows), 1))
-        scale = np.where(largest > 0, largest, 1.0)
-        return scale[:, 0] * np.sqrt(np.mean(np.square(rows / scale), axis=1))
+    def rms(values):
+        return _scaled_rms(np.reshape(values, (-1, truth.shape[-1])))
 
     sizes = rms(truth) if terms is None else np.maximum(rms(truth), rms(terms))
     leaf = max(distance(truth, 0), 0.0 if terms is None else distance(terms, 0))
@@ -524,13 +519,14 @@ def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[tup
     sized = sizes > 0
     over = []
     if sized.any():
-        row = float(np.max(_over(mine[sized], sizes[sized])))
-        their_row = float(np.max(_over(theirs[sized], sizes[sized])))
-        allowed = max(their_row, floor)
-        if not within(row, ROW_FACTOR * allowed):
-            over.append(("row", log_ratio(row, allowed), f"the worst row is {row:.3e} from "
-                         f"float64 over its size, the reference's {their_row:.3e}, allowed "
-                         f"{ROW_FACTOR * allowed:.3e}"))
+        # Compared by their logs, so a row's error over its size orders where the quotient overflows.
+        row = float(np.max(_log_over(mine[sized], sizes[sized])))
+        their_row = float(np.max(_log_over(theirs[sized], sizes[sized])))
+        allowed = max(their_row, float(_log_over(floor, 1.0)))
+        if not row <= math.log(ROW_FACTOR) + allowed:
+            over.append(("row", row - allowed, f"the worst row is {_shown(row)} from float64 over its size, "
+                         f"the reference's {_shown(their_row)}, allowed "
+                         f"{_shown(math.log(ROW_FACTOR) + allowed)}"))
     zero = ~sized & ~(mine <= ROW_FACTOR * theirs)
     if zero.any():
         at = int(np.flatnonzero(zero)[0])
@@ -641,25 +637,38 @@ def _logs(values) -> np.ndarray:
 
 
 LOG_LARGEST = math.log(np.finfo(np.float64).max)
-"""The log of float64's largest value: a quotient of finite evidence past it is held there (`_over`)."""
+"""The log of float64's largest value: a quotient of finite evidence past it is held there where it is
+recorded or shown (`_over`), never where it is judged (`_log_over`)."""
+
+
+def _log_over(numerators, denominators) -> np.ndarray:
+    """The log of each nonnegative numerator over its positive denominator (`_logs`), exact and finite for
+    every finite pair, so a quotient past float64's range (an error of 1e154 over a row of 1e-160) keeps
+    its order against every other; LOG_ZERO for a zero numerator, and not a number for one that is not."""
+    numerators = np.asarray(numerators, np.float64)
+    logs = np.where(numerators > 0, _logs(numerators) - _logs(denominators), LOG_ZERO)
+    return np.where(np.isnan(numerators), np.nan, logs)
 
 
 def _over(numerators, denominators) -> np.ndarray:
-    """Each nonnegative finite numerator over its positive denominator, from their logs (`_logs`) and held
-    at float64's largest, so a quotient of finite evidence (an error of 1e154 over a row of 1e-160) is
-    finite and keeps its order against every quotient float64 holds; zero over anything is zero."""
-    numerators, denominators = np.asarray(numerators, np.float64), np.asarray(denominators, np.float64)
-    quotient = np.exp(np.minimum(_logs(numerators) - _logs(denominators), LOG_LARGEST))
-    return np.where(numerators > 0, quotient, 0.0)
+    """Each quotient of `_log_over` as a value, held at float64's largest: a recorded reference's worst
+    row (`RecordedLeaf.worst`) and a message's figure; zero over anything is zero."""
+    quotient = np.exp(np.minimum(_log_over(numerators, denominators), LOG_LARGEST))
+    return np.where(np.asarray(numerators, np.float64) > 0, quotient, 0.0)
 
 
-def _root_mean_square(values) -> float:
-    """The root mean square of finite values, scaled by their largest first, so no square overflows."""
-    values = np.abs(np.asarray(values, np.float64))
-    largest = float(np.max(values)) if values.size else 0.0
-    if not largest > 0:
-        return 0.0
-    return largest * math.sqrt(float(np.mean(np.square(values / largest))))
+def _shown(log: float) -> str:
+    """A log quotient as a message shows it, held at float64's largest."""
+    return f"{float(np.exp(np.minimum(log, LOG_LARGEST))):.3e}"
+
+
+def _scaled_rms(rows) -> np.ndarray:
+    """Each row's root mean square of finite values, the row scaled by its largest first, so no square
+    overflows (row 1628): zero for a row of zeros."""
+    rows = np.abs(np.asarray(rows, np.float64))
+    largest = np.max(rows, axis=1, keepdims=True) if rows.shape[1] else np.zeros((len(rows), 1))
+    scale = np.where(largest > 0, largest, 1.0)
+    return scale[:, 0] * np.sqrt(np.mean(np.square(rows / scale), axis=1))
 
 
 def log_sum(values) -> float:
@@ -768,7 +777,8 @@ NO_ZERO_ROWS: ZeroRows = (np.zeros(0, np.int64), np.zeros(0), np.zeros(0))
 @dataclasses.dataclass
 class _Draws:
     """Each leaf's errors over a run of seeds: Dew's and the reference's mean squared error from
-    float64 (seed by leaf), each seed's worst sized row over its size (Dew's, the reference's), each
+    float64 (seed by leaf), the log of each seed's worst sized row over its size (Dew's, the
+    reference's; `_log_over`), each
     seed's rows of float64 zero with Dew's and the reference's errors on them (`ZeroRows`, seed by leaf;
     `pooled_zero_rows`), whether every value of the leaf was finite on every seed, and each leaf's row
     width (its last axis's length, 0 for a leaf of no rows; NARROW_FACTORS)."""
@@ -833,7 +843,8 @@ def pooled_zero_rows(evidence: list[ZeroRows]) -> list[tuple[int, float, float]]
             theirs.setdefault(row, []).append(their_error)
     # Each row's errors pooled as a scaled root mean square and compared by their logs, so errors near
     # float64's largest pool and order without a square or a product overflowing.
-    pooled = [(row, _root_mean_square(mine[row]), _root_mean_square(theirs[row])) for row in sorted(mine)]
+    pooled = [(row, float(_scaled_rms([mine[row]])[0]), float(_scaled_rms([theirs[row]])[0]))
+              for row in sorted(mine)]
     return [(row, my_rms, their_rms) for row, my_rms, their_rms in pooled
             if not _logs(my_rms) <= math.log(ROW_FACTOR) + _logs(their_rms)]
 
@@ -911,6 +922,13 @@ class RecordedLeaf:
     finite: bool
     dtype: str
     zero_sizes: np.ndarray | None = None
+    worst_log: float | None = None
+
+    @property
+    def log_worst(self) -> float:
+        """The log of `worst`, exact where this leaf was read here (`leaf_summary`), which keeps its
+        order past float64's range; a recording's, from the value it holds."""
+        return self.worst_log if self.worst_log is not None else float(_log_over(self.worst, 1.0))
 
 
 def leaf_summary(reference, truth) -> RecordedLeaf:
@@ -926,14 +944,16 @@ def leaf_summary(reference, truth) -> RecordedLeaf:
     sized = sizes > 0
     own = (np.sqrt(np.mean(np.square(truth.reshape(-1, truth.shape[-1])), axis=1)) if truth.ndim >= 2
            else np.zeros(0))
+    logged = float(np.max(_log_over(rows[sized], sizes[sized]))) if sized.any() else LOG_ZERO
     return RecordedLeaf(float(np.mean(np.square(reference - truth))),
                         float(np.max(_over(rows[sized], sizes[sized]))) if sized.any() else 0.0,
                         np.flatnonzero(~sized), rows[~sized],
                         finite=bool(np.isfinite(reference).all() and np.isfinite(truth).all()), dtype=dtype,
-                        zero_sizes=own[~sized])
+                        zero_sizes=own[~sized], worst_log=logged)
 
 
-def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None) -> _Draws:
+def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None,
+           library_fn=None, library_leaves: Sequence[str] = ()) -> _Draws:
     """Every leaf's errors (`_Draws`) over `seeds`: both functions run on `draw(seed)`'s inputs, truth
     `truth_fn` on them (by default `reference_fn` on them widened to float64). With `reference_seeds`,
     the reference runs on those draws instead, each held to its own draw's truth (`null_runs`), and a
@@ -941,10 +961,14 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     With `orders`, each arm also runs at every other order of its own draw (`orders(inputs)` past its
     first, the draw itself), held to that draw's one truth: each arm's worst row is its worst over the
     orders, measured rows of float64 zero included, and its values finite at every one; its errors and
-    its rows of float64 zero are the draw's own order's."""
+    its rows of float64 zero are the draw's own order's. With `library_fn`, the library arm runs beside
+    the reference on Dew's own inputs, held to Dew's truth, and the draws are judged against the larger
+    of the two on `library_leaves` (`_Draws.against_larger`), Dew and the truth evaluated once."""
     if orders is not None and getattr(reference_fn, "recorded", False):
         raise ValueError("a recorded reference holds its recorded draws alone, never another order of them")
-    mine, theirs, worst, zero_rows, finite, names, widths = [], [], [], [], [], None, None
+    arms = [reference_fn] + ([] if library_fn is None else [library_fn])
+    mine, theirs, worst, zero_rows, finite, names, widths = [], [[] for _ in arms], [[] for _ in arms], \
+        [[] for _ in arms], [[] for _ in arms], None, None
 
     def truth_of(inputs):
         with jax.enable_x64(new_val=True):
@@ -964,26 +988,33 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
             ordered = list(zip(orders(inputs), orders(their_inputs), strict=True))
             if len(ordered) < 2:
                 raise ValueError(f"orders of {len(ordered)}; an orbit holds the draw's own and another")
-        row = None
+        rows = [None for _ in arms]
         for mine_at, theirs_at in ordered:
             dew = dew_fn(*mine_at)
             names = names or [jax.tree_util.keystr(path)
                               for path, _ in jax.tree_util.tree_leaves_with_path(dew)]
             widths = widths or tuple(int(np.shape(leaf)[-1]) if np.ndim(leaf) >= 2 else 0
                                      for leaf in jax.tree.leaves(dew))
-            # The reference against itself on the same inputs is one evaluation (`seeds_for`'s sizing).
-            reference = dew if dew_fn is reference_fn and theirs_at is mine_at else reference_fn(*theirs_at)
-            evidence = _evidence(dew, reference, truth, their_truth)
-            row = evidence if row is None else [
-                (first[0], first[1], float(np.fmax(first[2], other[2])), float(np.fmax(first[3], other[3])),
-                 first[4], first[5] and other[5]) for first, other in zip(row, evidence, strict=True)]
-        mine.append([entry[0] for entry in row])
-        theirs.append([entry[1] for entry in row])
-        worst.append([(entry[2], entry[3]) for entry in row])
-        zero_rows.append([entry[4] for entry in row])
-        finite.append([entry[5] for entry in row])
-    return _Draws(names, np.asarray(mine), np.asarray(theirs), np.asarray(worst).reshape(len(mine), -1, 2),
-                  zero_rows, np.asarray(finite), widths)
+            for at_arm, arm in enumerate(arms):
+                # The reference against itself on the same inputs is one evaluation (`seeds_for`'s
+                # sizing); the library arm runs on Dew's own inputs.
+                here, true_here = (theirs_at, their_truth) if arm is reference_fn else (mine_at, truth)
+                other = dew if dew_fn is arm and here is mine_at else arm(*here)
+                evidence = _evidence(dew, other, truth, true_here)
+                rows[at_arm] = evidence if rows[at_arm] is None else [
+                    (first[0], first[1], float(np.fmax(first[2], later[2])),
+                     float(np.fmax(first[3], later[3])), first[4], first[5] and later[5])
+                    for first, later in zip(rows[at_arm], evidence, strict=True)]
+        mine.append([entry[0] for entry in rows[0]])
+        for at_arm, row in enumerate(rows):
+            theirs[at_arm].append([entry[1] for entry in row])
+            worst[at_arm].append([(entry[2], entry[3]) for entry in row])
+            zero_rows[at_arm].append([entry[4] for entry in row])
+            finite[at_arm].append([entry[5] for entry in row])
+    drawn = [_Draws(names, np.asarray(mine), np.asarray(theirs[at_arm]),
+                    np.asarray(worst[at_arm]).reshape(len(mine), -1, 2), zero_rows[at_arm],
+                    np.asarray(finite[at_arm]), widths) for at_arm in range(len(arms))]
+    return drawn[0] if library_fn is None else drawn[0].against_larger(drawn[1], library_leaves)
 
 
 def _leaf_paths(tree) -> list[str]:
@@ -1018,7 +1049,7 @@ def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
             # adds no error and resolves nothing.
             kept = str(jnp.dtype(leaf.dtype))
             assert kept == their.dtype, (jax.tree_util.keystr(path), kept, their.dtype)
-            row.append((0.0, 0.0, 0.0, 0.0, NO_ZERO_ROWS, True))
+            row.append((0.0, 0.0, LOG_ZERO, LOG_ZERO, NO_ZERO_ROWS, True))
             continue
         # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
         paired = (recorded or their_truth is truth
@@ -1044,7 +1075,8 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     in Dew's truth the reference's lacks (a recorded truth recomputed otherwise) is refused. Not
     `paired`, the two held to truths of their own draws (`null_runs`), no row is paired."""
     if not paired:
-        return mine.mse, theirs.mse, mine.worst, theirs.worst, NO_ZERO_ROWS, mine.finite and theirs.finite
+        return (mine.mse, theirs.mse, mine.log_worst, theirs.log_worst, NO_ZERO_ROWS,
+                mine.finite and theirs.finite)
     at_zero = dict(zip(theirs.zero_rows.tolist(), theirs.zero_errors.tolist(), strict=True))
     unrecorded = [at for at in mine.zero_rows.tolist() if at not in at_zero]
     if unrecorded:
@@ -1052,12 +1084,12 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
                              f"{unrecorded[:4]}")
     sizes = (dict(zip(theirs.zero_rows.tolist(), theirs.zero_sizes.tolist(), strict=True))
              if theirs.zero_sizes is not None else {})
-    worst, their_worst, zero = mine.worst, theirs.worst, []
+    worst, their_worst, zero = mine.log_worst, theirs.log_worst, []
     for at, error in zip(mine.zero_rows.tolist(), mine.zero_errors.tolist(), strict=True):
         size = sizes.get(at, 0.0)
         if at_zero[at] < size:
-            worst = max(worst, float(_over(error, size)))
-            their_worst = max(their_worst, float(_over(at_zero[at], size)))
+            worst = max(worst, float(_log_over(error, size)))
+            their_worst = max(their_worst, float(_log_over(at_zero[at], size)))
         else:
             zero.append((at, error, at_zero[at]))
     rows, errors, their_errors = (np.asarray(column, dtype) for column, dtype in zip(
@@ -1108,11 +1140,11 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
                                     f"[{low:.3f}, {high:.3f}] (allowed {PARITY})"))
         my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
         factor = NARROW_FACTORS.get(draws.widths[index], ROW_FACTOR)
-        if not within(my_row, factor * their_row):
-            over.append(Finding(leaf, "row", log_ratio(my_row, their_row),
-                                f"{leaf}: the worst row over {count} seeds is {my_row:.3e} from float64 "
-                                f"over its size, the reference's {their_row:.3e}, allowed "
-                                f"{factor * their_row:.3e} ({factor} times it)"))
+        if not my_row <= math.log(factor) + their_row:
+            over.append(Finding(leaf, "row", my_row - their_row,
+                                f"{leaf}: the worst row over {count} seeds is {_shown(my_row)} from float64 "
+                                f"over its size, the reference's {_shown(their_row)}, allowed "
+                                f"{_shown(math.log(factor) + their_row)} ({factor} times it)"))
         zero = pooled_zero_rows([seed[index] for seed in draws.zero_rows])
         if zero:
             # The measure is the worst of them, the first the example.
@@ -1257,17 +1289,14 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     if (library_fn is None) != (library_row is None) or (library_fn is None) != (not library_leaves):
         raise ValueError(f"{label}: a library arm is the owner's exception, named with its ledger row and "
                          f"the leaves it covers")
-    _refuse_numpy_arms(draw, dew_fn, reference_fn)
+    _refuse_numpy_arms(draw, dew_fn, reference_fn, *([] if library_fn is None else [library_fn]))
     dew_fn, reference_fn = _arms(dew_fn, reference_fn)
     library_fn = None if library_fn is None else _arms(library_fn, library_fn)[1]
     truth_fn = _truth_program(truth_fn)
 
     def drawn(start, stop):
-        draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders)
-        if library_fn is not None:
-            # The truth is the site's own, so both arms are measured from the same float64 values.
-            draws = draws.against_larger(_drawn(dew_fn, library_fn, draw, range(start, stop),
-                                                truth_fn or reference_fn, orders=orders), library_leaves)
+        draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders,
+                       library_fn=library_fn, library_leaves=library_leaves)
         narrow_leaves[:] = [name for name, width in zip(draws.names, draws.widths, strict=True)
                             if width in NARROW_FACTORS]
         return draws
@@ -1497,14 +1526,10 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
         base = run * 2 * span
 
         def drawn(start, stop, base=base):
-            draws = _drawn(dew_fn or reference_fn, reference_fn, draw, range(base + start, base + stop),
-                           truth_fn, orders=orders,
-                           reference_seeds=None if paired else range(base + span + start, base + span + stop))
-            if library_fn is not None:
-                seeds_here = range(base + start, base + stop)
-                draws = draws.against_larger(_drawn(dew_fn or reference_fn, library_fn, draw, seeds_here,
-                                                    truth_fn or reference_fn, orders=orders), library_leaves)
-            return draws
+            return _drawn(dew_fn or reference_fn, reference_fn, draw, range(base + start, base + stop),
+                          truth_fn, orders=orders,
+                          reference_seeds=None if paired else range(base + span + start, base + span + stop),
+                          library_fn=library_fn, library_leaves=library_leaves)
 
         over, unresolved, stage = _staged(drawn, seeds, label, two_stage=two_stage)
         verdicts.append((_verdict(over, unresolved), stage, [str(finding) for finding in over + unresolved]))

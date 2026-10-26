@@ -232,7 +232,8 @@ def test_a_library_arm_holds_dew_to_the_larger_of_its_error_and_the_references()
     reference's error and the library arm's, seed by seed, on the leaves the exception covers: a Dew
     1.7 times the reference's error passes beside a library arm 1.8 times it, fails without it, fails
     at 3 times (past the library arm's own by 1.67), and fails on a leaf the exception does not cover;
-    a library arm without its ledger row or its leaves is refused. Null runs judge as the site does."""
+    a library arm without its ledger row or its leaves is refused, as is one in NumPy the gate would
+    compile. Null runs judge as the site does."""
     from reference_error import null_runs
 
     def draw(seed):
@@ -267,6 +268,10 @@ def test_a_library_arm_holds_dew_to_the_larger_of_its_error_and_the_references()
         with pytest.raises(ValueError):
             assert_as_exact(arm(1.7, "mine"), reference, draw, "unrecorded", seeds=16, truth_fn=truth,
                             library_fn=library, **unnamed)
+    with pytest.raises(TypeError):
+        assert_as_exact(arm(1.7, "mine"), reference, draw, "a NumPy library arm", seeds=16, truth_fn=truth,
+                        library_fn=lambda x, *_: {"covered": np.asarray(x), "other": np.asarray(x)},
+                        library_row=1543, library_leaves=both)
     verdicts = null_runs(reference, draw, "library arm", seeds=16, runs=2, truth_fn=truth,
                          dew_fn=arm(1.7, "mine"), paired=True, library_fn=library, library_leaves=both)
     assert [(verdict, stage) for verdict, stage, _ in verdicts] == [("pass", 1), ("pass", 1)], verdicts
