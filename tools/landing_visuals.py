@@ -211,7 +211,7 @@ class Scorer:
 def load_pipe(experiment):
     from huggingface_hub import snapshot_download
 
-    from dew.sampling import TextToImage
+    from dew.inference import TextToImage
 
     directory = snapshot_download(repo_id=experiment.model, revision=experiment.revision)
     return TextToImage.from_run(directory), directory
@@ -224,7 +224,7 @@ def provenance(experiment, pipe, directory):
     return {
         "model": experiment.model,
         "revision": experiment.revision,
-        "loaded_with": "dew.sampling.TextToImage.from_run(huggingface_hub.snapshot_download("
+        "loaded_with": "dew.inference.TextToImage.from_run(huggingface_hub.snapshot_download("
         f"{experiment.model!r}, revision=...)), the run from_pretrained loads",
         "checkpoint_step": experiment.checkpoint_step,
         "parameters": int(sum(math.prod(leaf.shape) for leaf in jax.tree.leaves(pipe.variables["params"]))),

@@ -48,8 +48,9 @@ import tyro
 from jax.typing import ArrayLike
 
 from dew.artifacts import uint8_pixels
+from dew.inference import TextToImage
 from dew.quantization import Quantization
-from dew.sampling import CFG, DPMSolverMultistep, TextToImage
+from dew.sampling import CFG, DPMSolverMultistep
 from dew.telemetry.benchmark import samples
 
 PROMPTS = (

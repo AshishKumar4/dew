@@ -21,6 +21,7 @@ from reference_error import (
     with_gradients,
 )
 from safetensors.numpy import load_file
+from sampling_gate import assert_draws_as_declared
 
 from dew import lora
 from dew.interop.pretrained import Pretrained
@@ -178,12 +179,17 @@ def test_a_dropout_adapter_trains_as_peft_trains_it_on_the_masks_peft_ran_on(tmp
     assert_trains_as_peft(adapter, reference, "dropout", tmp_path, masks)
 
 
+DROPOUT_SEEDS = 4
+"""The dropout site's declared training steps (the sampling gate's): a kept share off 1 - p by six of one
+step's standard deviations, the bound the site held before the gate, fails."""
+
+
 def test_a_training_step_drops_each_branch_input_at_the_adapters_rate():
     """A training step draws a dropout of its own on each of the six targets'
-    branch inputs at the adapter's rate: the kept count within six standard
-    deviations of (1 - p) n, which a dropout at rate p misses about once in
-    5e8 draws, each target's mask its own and each step's its own, and the
-    same step the same masks."""
+    branch inputs at the adapter's rate: each nonzero input entry kept at
+    1 - p as a fair draw would (the sampling gate, over DROPOUT_SEEDS steps),
+    each target's mask its own and each step's its own, and the same step the
+    same masks."""
     from tools.lora_peft_reference import branch_draws
 
     adapter, reference = adapted("dropout")
@@ -191,15 +197,20 @@ def test_a_training_step_drops_each_branch_input_at_the_adapters_rate():
     first, again = branch_draws(adapter, tokens, STEP), branch_draws(adapter, tokens, STEP)
     later = branch_draws(adapter, tokens, Step(step=jnp.int32(1), key=jax.random.key(2), ema=None))
     assert len(first) == 6
-    kept, entries = 0, 0
     for name, (x, output) in first.items():
         mask = output != 0
         # A zero input would hide whether the dropout kept it.
         assert np.all(x != 0), name
         np.testing.assert_array_equal(again[name][1], output, err_msg=name)
         assert not np.array_equal(later[name][1] != 0, mask), name
-        kept, entries = kept + int(mask.sum()), entries + mask.size
-    assert abs(kept - (1 - rate) * entries) <= 6 * np.sqrt(rate * (1 - rate) * entries)
+
+    def counts(seed):
+        # A zero input is dropped or kept alike, so only the nonzero entries are draws.
+        drawn = branch_draws(adapter, tokens, Step(step=jnp.int32(seed), key=jax.random.key(seed), ema=None))
+        kept = sum(int(np.count_nonzero(output)) for _, output in drawn.values())
+        return np.asarray([kept, sum(int(np.count_nonzero(x)) for x, _ in drawn.values()) - kept])
+
+    assert_draws_as_declared(counts, (1 - rate, rate), "branch dropout", seeds=DROPOUT_SEEDS)
     masks = [output != 0 for _, output in first.values()]
     for one, other in itertools.combinations(masks, 2):
         assert one.shape != other.shape or not np.array_equal(one, other)

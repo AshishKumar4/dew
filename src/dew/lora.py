@@ -57,6 +57,7 @@ from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.dense import Dense, DenseGeneral
+from dew.nn.dropout import Dropout
 from dew.nn.flops import (
     MissingFlopsCount,
     counted_flops,
@@ -185,7 +186,10 @@ class LoRA:
         `fp8_base` (`fp8_base`'s measurement) runs its frozen sites' products in
         FP8: their kernels are packed from the base this adapter freezes, and the
         model computes them under the record, inside the adapter's branch. FP8
-        changes the function, by about E4M3's rounding of each operand.
+        changes the function, by about E4M3's rounding of each operand. Until an
+        FP8 product keeps fp32's sums (ledger 1625) it saves neither memory nor
+        time: its codes take two bytes a parameter, as bf16's do, and multiply as
+        bf16 values (`dew.quantization.frozen_fp8_product`).
         """
         from dew.nn.inputs import request_key
 
@@ -214,7 +218,8 @@ class LoRA:
         """Measure which projections of the base this adapter freezes run
         faster in FP8 at `tokens` rows a step, on process 0's GPU for the
         whole pool, and return the record `apply` takes as its `fp8_base`
-        (`measured_fp8_sites`).
+        (`measured_fp8_sites`): none until an FP8 product keeps fp32's sums
+        (ledger 1625), which saves neither memory nor time before then.
 
         `modules` names the projections as `modules` does (this adapter's own
         when None) and `layouts` resolves them as `apply` does. The
@@ -589,7 +594,7 @@ class _Branch:
         # dropout stream, which is how a training forward is marked; an
         # evaluation forward carries none.
         if self.dropout and module.has_rng("dropout"):
-            x = nn.Dropout(self.dropout, deterministic=False)(x)
+            x = Dropout(self.dropout, deterministic=False)(x)
         x, a, b = promote_dtype(x, a, b, dtype=module.dtype)
         hidden = float32_dot_general(x, a, ((axes, tuple(range(len(axes)))), ((), ())),
                                      precision=module.precision)

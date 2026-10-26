@@ -68,7 +68,7 @@ def test_public_pipeline_source_storage_and_saved_block_compute_are_independent(
 
     import dew
     from dew.inference import BlockGeneration
-    from dew.inference.pipeline import place
+    from dew.inference.loading import place
     from dew.nn.diffusion_gemma import DiffusionGemma
     from dew.objectives.base import FROZEN
     from dew.objectives.diffusion.block import BlockDiffusionObjective

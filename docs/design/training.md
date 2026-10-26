@@ -54,7 +54,7 @@ An example's questions that ask the same thing, one negated, paraphrased or with
 
 ### Averaging runs
 
-`Decide.averaged(runs, step=, ema=, calibrate_on=)` is the task over the runs' `dew.checkpoints.averaged` mean, its calibration the identity, refit on `calibrate_on`, as temperatures belong to one set of weights. The runs' recorded task settings (`DecideSettings`) must be the same, else the run is refused (ValueError). Its `Weights.averaged` records each run's directory, step and average read, and `Decide.save` refuses it, as no one run holds its weights.
+`Decide.averaged(runs, step=, ema=, calibrate_on=)` is the task over the runs' `dew.checkpoints.averaged` mean, its calibration the identity, refit on `calibrate_on`, as temperatures belong to one set of weights. The runs' recorded task settings (`DecideSettings`) must be the same, else the run is refused (ValueError). Its `Weights.averaged` records each run's directory, step and average read. As no one run holds its weights, `Decide.save(directory)` writes the average to a directory of its own as a run: its calibration, then one checkpoint of the average (its optimizer state empty) under the record its runs share, its model the base an adapter merged into, and its calibration, which `Decide.from_run` and `dew.pipeline` read back for any layout; a directory holding another run's checkpoints is refused.
 
 ### Options read at labels
 
@@ -135,7 +135,10 @@ state = trainer.fit(
 )
 ```
 
-- One budget: `steps=`, `epochs=` or `tokens=` (committed valid target tokens, the same clock the data `schedule` reads). A run's tokens grow only at a committed update. `fit` checks the budget between steps, so after a rejected microbatch a split step can reach it at a commit and keep a later partial window; ending at that commit is not built yet.
+- One budget: `steps=`, `epochs=`, `examples=` or `tokens=` (committed valid target tokens, the same clock the data `schedule` reads). A run's tokens grow only at a committed update. `fit` checks the budget between steps, so after a rejected microbatch a split step can reach it at a commit and keep a later partial window; ending at that commit is not built yet.
+- `examples=N` trains on the chain's first N records as they reach its packing, or its batch where nothing packs, each read once: the chain reads on past its end where they span passes, its last batch is kept short and marked, and the run takes the steps the data plan counts for them, which size the schedule as `steps=` does. A global order's plan counts them ahead; an order read in its own share, as a pack that runs as rows arrive makes, is counted by one pass over the bounded stream. The steps must make whole updates, and the run is one process's: a pool's processes would split the short batch unevenly and end at steps of their own, which is not built yet.
+- `stop=` ends a run before its budget: `Plateau` when validation stops improving, `Pause(fraction)` at that fraction of the budget, between its first update and its end. A pause writes the whole state and the data position, and the budget still sizes the schedule, so the run resumed without the pause trains on as one that never paused.
+- A finite stream that runs out ends the run as its budget would, with its final checkpoint and a completed outcome, on every host at the same step; a stream that runs out on some hosts and not the others is refused on all of them.
 - `validation` is one chain or a dict of named chains, each reported separately.
 - `fit` returns the final `TrainState`. `state=` supplies initial state rather than a continuation; checkpoint restore also restores the data position.
 

@@ -105,7 +105,6 @@ from dew.inference.tasks import (
     TextGeneration,
     cache_ceiling,
     cache_sized,
-    decoded_rows,
     generation_budget,
     prepared_inputs,
     resident,
@@ -131,7 +130,7 @@ from dew.objectives.base import Variables
 from dew.sampling.decoding import Finishing, LogitsTransform, StopStrings
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import Sample
-from dew.sampling.text import Generation, Sampling, check_inputs, rebuild_position, resolve
+from dew.sampling.text import Generation, Sampling, check_inputs, decoded_rows, rebuild_position, resolve
 
 Prompt = str | Sequence[int] | ArrayLike | ModelInputs
 """One request: text for the processor, one row of token ids, or one prepared row."""

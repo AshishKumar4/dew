@@ -12,14 +12,24 @@ sampler runs in test_lm_recipe.
 """
 
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+import selection_margins
 from affine_run import dataset
 from recording import RecordingTracker
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened
+from reference_error import (
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    over_windows,
+    widened,
+    windows,
+    without_ynn,
+)
 from token_support import token_batch_of
 
 from dew.artifacts import TokenScores
@@ -31,7 +41,6 @@ from dew.objectives.lm import TEXT_KEY, LMObjective, Perplexity, Samples
 from dew.objectives.routing import ExpertBalance
 from dew.sampling import Sampling
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
-from dew.training.memory import climb_to
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.
 pytestmark = pytest.mark.mesh
@@ -81,69 +90,143 @@ def cycle_batches(batch=BATCH, seq=SEQ, seed=0):
         yield {TEXT_KEY: ((offsets + positions) % VOCAB).astype(np.int32)}
 
 
-def reference_cross_entropy(logits, targets, pad_id=None, weights=None):
-    """Shifted cross entropy in numpy, from the model's own logits."""
-    logits = np.asarray(logits, np.float64)
-    largest = logits.max(axis=-1, keepdims=True)
-    log_probs = logits - largest - np.log(np.exp(logits - largest).sum(axis=-1, keepdims=True))
-    picked = -np.take_along_axis(log_probs, targets[..., None], axis=-1)[..., 0]
-    if weights is None:
-        weights = np.ones_like(picked) if pad_id is None else (targets != pad_id).astype(np.float64)
-    return float((picked * weights).sum() / weights.sum())
+def written_losses(model, shift=1):
+    """Each target's cross entropy written from `model`'s own logits of every token but the last, in
+    their dtype: the target `shift` tokens on, its negative log probability. The reference arm of the
+    per-target checks 1, and on the model in float64 their truth."""
+    def losses(params, tokens):
+        logits = model.apply(params, tokens[:, :-1])
+        targets = tokens[:, shift:tokens.shape[1] - 1 + shift]
+        return -jnp.take_along_axis(jax.nn.log_softmax(logits, axis=-1), targets[..., None], axis=-1)[..., 0]
+    return losses
+
+
+def written_cross_entropy(model, counted=None, shift=1):
+    """`written_losses` averaged over the targets `counted(tokens, *given)` keeps (every one where it
+    is None): the reference arm of the loss's check 1, and on the model in float64 its truth."""
+    per_target = written_losses(model, shift)
+
+    def loss(params, tokens, *given):
+        picked = per_target(params, tokens)
+        weights = jnp.ones_like(picked) if counted is None else jnp.broadcast_to(
+            counted(tokens, *given), picked.shape).astype(picked.dtype)
+        return jnp.sum(picked * weights) / jnp.sum(weights)
+    return loss
+
+
+INSTANCES = 64
+"""The independent decoders and batches each draw of a scalar loss's check 1 holds: one a draw, a
+scalar's error is one value a seed, and these sites took 256 to 512 seeds to resolve (`seeds_for`, paired)."""
+
+
+def assert_as_exact_over_instances(dew, reference, draw, label, *, seeds, truth_fn):
+    """Check 1 of a scalar `dew` against `reference` and `truth_fn`, each draw INSTANCES of `draw`'s
+    (`reference_error.windows`), every arm run window by window as one draw's program (`over_windows`)."""
+    assert_as_exact(over_windows(without_ynn(dew)), over_windows(without_ynn(reference)),
+                    windows(draw, INSTANCES), label, seeds=seeds, truth_fn=over_windows(jax.jit(truth_fn)))
+
+
+def assert_scores_the_written_cross_entropy(dew, draw, label, *, seeds, counted=None, model=None):
+    """Check 1: `dew(params, tokens, *given)` on par with the cross entropy written from the decoder's
+    logits (`written_cross_entropy`), both from that cross entropy's float64 run, over `draw`'s
+    parameters, tokens and what each draw gives beside them, INSTANCES of them a draw."""
+    model = model or tiny_decoder()
+    assert_as_exact_over_instances(dew, written_cross_entropy(model, counted), draw, label, seeds=seeds,
+                                   truth_fn=written_cross_entropy(model.clone(dtype=jnp.float64), counted))
+
+
+@functools.cache
+def decoder_init():
+    """The test decoder's initialization, compiled once for every draw."""
+    return jax.jit(make_objective().init)
+
+
+def drawn_tokens(**options):
+    """Each seed's draw: the decoder's parameters and a batch of its tokens (`token_batch`'s, of
+    `options`)."""
+    def draw(seed):
+        return decoder_init()(jax.random.key(seed)), token_batch(seed=seed, **options)[TEXT_KEY]
+    return draw
+
+
+SHIFTED_SEEDS = 8
+"""Check 1's declared seeds for the loss against the written shifted cross entropy (`seeds_for`, paired)."""
 
 
 # --- the loss --------------------------------------------------------------
 
 def test_loss_is_the_cross_entropy_of_the_shifted_sequence():
+    """Over drawn decoders and tokens, the loss on par with the cross entropy of each token's next
+    (check 1), which differs from the unshifted one, the mistake this guards."""
     objective = make_objective()
-    params = objective.init(jax.random.key(0))
-    batch = token_batch()
-    tokens = np.asarray(batch[TEXT_KEY])
 
-    loss, _ = objective.scalar_loss(params, batch, step_at())
+    def loss(params, tokens):
+        return objective.scalar_loss(params, {TEXT_KEY: tokens}, step_at())[0]
 
-    logits = objective.model.apply(params, jnp.asarray(tokens[:, :-1], jnp.int32))
-    expected = reference_cross_entropy(logits, tokens[:, 1:])
-    assert float(loss) == pytest.approx(expected, rel=1e-5)
-    # Not the unshifted cross entropy, which is the mistake this guards
-    unshifted = reference_cross_entropy(logits, tokens[:, :-1])
-    assert abs(expected - unshifted) > 1e-3
+    assert_scores_the_written_cross_entropy(loss, drawn_tokens(), "the shifted cross entropy",
+                                            seeds=SHIFTED_SEEDS)
+    params, tokens = drawn_tokens()(0)
+    unshifted = written_cross_entropy(objective.model, shift=0)(params, tokens)
+    assert written_cross_entropy(objective.model)(params, tokens) != unshifted
+
+
+VALID_SEEDS = 8
+"""Check 1's declared seeds for the loss of rows whose last token is invalid (`seeds_for`, paired)."""
 
 
 @pytest.mark.parametrize("given", ["attention_mask", "coordinates"])
 def test_the_validity_the_decoder_reads_decides_which_targets_count(given):
-    """Three tokens whose last is marked invalid, by the attention mask or
-    by the coordinates' validity the decoder reads: the loss is the cross
-    entropy of the one target between valid tokens, which the model gives
-    the row of its first token alone."""
+    """Rows of three tokens whose last is marked invalid, by the attention
+    mask or by the coordinates' validity the decoder reads: over drawn
+    decoders and rows, the loss on par with the cross entropy of each row's
+    one target between valid tokens, which the model gives the row of its
+    first token alone (check 1)."""
     objective = make_objective(seq=2)
-    params = objective.init(jax.random.key(0))
-    ids = jnp.asarray([[3, 5, 7]], jnp.int32)
-    valid = jnp.asarray([[True, True, False]])
-    batch = ({TEXT_KEY: ModelInputs(ids, {"attention_mask": valid})} if given == "attention_mask"
-             else {TEXT_KEY: ids, "text_coordinates": coordinates(valid=valid)})
 
-    loss, _ = objective.scalar_loss(params, batch, step_at())
+    def loss(params, ids):
+        valid = jnp.broadcast_to(jnp.asarray([True, True, False]), ids.shape)
+        batch = ({TEXT_KEY: ModelInputs(ids, {"attention_mask": valid})} if given == "attention_mask"
+                 else {TEXT_KEY: ids, "text_coordinates": coordinates(valid=valid)})
+        return objective.scalar_loss(params, batch, step_at())[0]
 
-    logits = objective.model.apply(params, ids[:, :1])
-    assert float(loss) == pytest.approx(reference_cross_entropy(logits, np.asarray(ids[:, 1:2])), rel=1e-5)
+    # The reference forwards the first token alone and scores its one target, the second token.
+    first = written_cross_entropy(objective.model)
+    wide = written_cross_entropy(objective.model.clone(dtype=jnp.float64))
+    assert_as_exact_over_instances(loss, lambda params, ids: first(params, ids[:, :2]),
+                                   drawn_tokens(batch=16, seq=2), f"the valid target, by {given}",
+                                   seeds=VALID_SEEDS, truth_fn=lambda params, ids: wide(params, ids[:, :2]))
+
+
+def counted_share(right, counted=None):
+    """The share of the counted answers that are `right`, as the objective reports it: two exact counts
+    and one float32 division."""
+    counted = np.ones_like(right) if counted is None else counted
+    return np.float32((right & counted).sum()) / np.float32(counted.sum())
+
+
+def unpadded(tokens, *_):
+    """The targets a pad id of zero leaves counted."""
+    return tokens[:, 1:] != 0
+
+
+PADDED_SEEDS = 8
+"""Check 1's declared seeds for the loss with its padded targets left out (`seeds_for`, paired)."""
 
 
 def test_padded_targets_are_left_out_of_the_average():
-    pad_id = 0
-    objective = make_objective(pad_id=pad_id)
-    params = objective.init(jax.random.key(0))
-    batch = token_batch(seed=3)
-    tokens = np.asarray(batch[TEXT_KEY])
-    assert (tokens[:, 1:] == pad_id).any(), "this batch has no padding to skip"
+    """Over drawn decoders and tokens, some of them the pad id, the loss on par with the cross entropy of
+    the targets that are not (check 1), which differs from every target's."""
+    objective = make_objective(pad_id=0)
 
-    loss, _ = objective.scalar_loss(params, batch, step_at())
+    def loss(params, tokens):
+        return objective.scalar_loss(params, {TEXT_KEY: tokens}, step_at())[0]
 
-    logits = objective.model.apply(params, jnp.asarray(tokens[:, :-1], jnp.int32))
-    masked = reference_cross_entropy(logits, tokens[:, 1:], pad_id=pad_id)
-    unmasked = reference_cross_entropy(logits, tokens[:, 1:])
-    assert float(loss) == pytest.approx(masked, rel=1e-5)
-    assert abs(masked - unmasked) > 1e-4, "masking made no difference to check"
+    assert_scores_the_written_cross_entropy(loss, drawn_tokens(), "the unpadded targets",
+                                            seeds=PADDED_SEEDS, counted=unpadded)
+    params, tokens = drawn_tokens()(0)
+    assert np.any(~unpadded(tokens)), "this batch has no padding to skip"
+    masked = written_cross_entropy(objective.model, unpadded)(params, tokens)
+    assert masked != written_cross_entropy(objective.model)(params, tokens), "masking made no difference"
 
 
 def test_a_padded_target_the_head_gives_no_mass_adds_nothing_to_the_loss_or_its_gradient():
@@ -180,13 +263,13 @@ def test_aux_reports_perplexity_and_token_accuracy():
 
     assert set(aux.metrics) == {"ce", "perplexity", "token_accuracy"}
     assert aux.variables is None
-    assert float(aux.metrics["ce"]) == pytest.approx(float(loss))
-    assert float(aux.metrics["perplexity"]) == pytest.approx(float(jnp.exp(loss)), rel=1e-5)
+    # The cross entropy is the loss, and the perplexity its exponential, each the value itself.
+    np.testing.assert_array_equal(aux.metrics["ce"], loss)
+    np.testing.assert_array_equal(aux.metrics["perplexity"], jnp.exp(loss))
 
     logits = objective.model.apply(params, batch[TEXT_KEY][:, :-1])
-    predicted = np.argmax(np.asarray(logits), axis=-1)
-    accuracy = (predicted == np.asarray(batch[TEXT_KEY][:, 1:])).mean()
-    assert float(aux.metrics["token_accuracy"]) == pytest.approx(accuracy)
+    right = np.argmax(np.asarray(logits), axis=-1) == np.asarray(batch[TEXT_KEY][:, 1:])
+    np.testing.assert_array_equal(aux.metrics["token_accuracy"], counted_share(right))
 
 
 def test_dropout_runs_on_the_step_key():
@@ -200,8 +283,9 @@ def test_dropout_runs_on_the_step_key():
     again, _ = objective.scalar_loss(params, batch, step_at(key=1))
     other, _ = objective.scalar_loss(params, batch, step_at(key=2))
 
-    assert float(first) == pytest.approx(float(again))
-    assert float(first) != pytest.approx(float(other))
+    assert np.all(np.isfinite([first, again, other]))
+    np.testing.assert_array_equal(first, again)
+    assert first != other
 
 
 def test_padded_tokens_are_left_out_of_the_accuracy_too():
@@ -214,9 +298,8 @@ def test_padded_tokens_are_left_out_of_the_accuracy_too():
     _, aux = objective.scalar_loss(params, batch, step_at())
 
     logits = np.asarray(objective.model.apply(params, batch[TEXT_KEY][:, :-1]))
-    kept = targets != 0
-    expected = ((np.argmax(logits, axis=-1) == targets) & kept).sum() / kept.sum()
-    assert float(aux.metrics["token_accuracy"]) == pytest.approx(expected)
+    np.testing.assert_array_equal(aux.metrics["token_accuracy"],
+                                  counted_share(np.argmax(logits, axis=-1) == targets, targets != 0))
 
 
 # --- what the trainer needs ------------------------------------------------
@@ -286,46 +369,65 @@ def test_evaluation_correctness_is_the_same_full_forward_argmax():
     assert scores.correct.shape == scores.losses.shape == scores.weights.shape
 
 
+EVALUATED_SEEDS = 8
+"""Check 1's declared seeds for evaluation's per-target losses against the written cross entropy
+(`seeds_for`, paired)."""
+
+
 def test_evaluation_scores_every_target_of_the_batch():
+    """Evaluation scores each target at weight one, and over drawn decoders and tokens the targets'
+    mean loss on par with their written cross entropy (check 1)."""
     objective = make_objective()
     params = objective.init(jax.random.key(0))
-    batch = token_batch()
-
-    scores = objective.evaluate(params, batch, step_at())
-
+    scores = objective.evaluate(params, token_batch(), step_at())
     assert scores.losses.shape == scores.weights.shape == (4, SEQ)
     np.testing.assert_array_equal(scores.weights, 1.0)
-    logits = objective.model.apply(params, batch[TEXT_KEY][:, :-1])
-    expected = reference_cross_entropy(logits, np.asarray(batch[TEXT_KEY][:, 1:]))
-    assert float(jnp.mean(scores.losses)) == pytest.approx(expected, rel=1e-5)
+
+    def mean_loss(params, tokens):
+        return jnp.mean(objective.evaluate(params, {TEXT_KEY: tokens}, step_at()).losses)
+
+    assert_scores_the_written_cross_entropy(mean_loss, drawn_tokens(), "evaluation's losses",
+                                            seeds=EVALUATED_SEEDS)
 
 
 def test_evaluation_reads_the_ema_copy():
+    """Over drawn live and averaged decoders and tokens, evaluation's mean loss on par with the written
+    cross entropy of the averaged copy (check 1), and not the live one's."""
     objective = make_objective()
-    params = objective.init(jax.random.key(0))
-    ema = jax.tree.map(lambda leaf: leaf + 1, params)
-    batch = token_batch()
+    initialized = jax.jit(objective.init)
+    tokens = drawn_tokens()
 
-    live = objective.evaluate(params, batch, step_at())
-    averaged = objective.evaluate(params, batch, step_at(ema=ema))
+    def draw(seed):
+        params, ids = tokens(seed)
+        return params, ids, initialized(jax.random.key(seed + (1 << 20)))
 
-    logits = objective.model.apply(ema, batch[TEXT_KEY][:, :-1])
-    expected = reference_cross_entropy(logits, np.asarray(batch[TEXT_KEY][:, 1:]))
-    assert float(jnp.mean(averaged.losses)) == pytest.approx(expected, rel=1e-4)
-    assert float(jnp.mean(live.losses)) != pytest.approx(expected)
+    def averaged(params, ids, ema):
+        return jnp.mean(objective.evaluate(params, {TEXT_KEY: ids}, step_at(ema=ema)).losses)
+
+    written = written_cross_entropy(objective.model)
+    wide = written_cross_entropy(objective.model.clone(dtype=jnp.float64))
+    assert_as_exact_over_instances(averaged, lambda params, ids, ema: written(ema, ids), draw,
+                    "evaluation of the averaged copy", seeds=EVALUATED_SEEDS,
+                    truth_fn=lambda params, ids, ema: wide(ema, ids))
+    params, ids, ema = draw(0)
+    live = jnp.mean(objective.evaluate(params, {TEXT_KEY: ids}, step_at()).losses)
+    assert live != averaged(params, ids, ema)
 
 
 def test_scoring_with_samples_configured_does_not_decode():
     def fail_decode(ids):
         raise AssertionError("scoring decoded a preview")
 
-    objective = make_objective(samples=Samples(prompt=[1, 2, 3], max_new_tokens=2,
-                                              decode=fail_decode))
-    params = objective.init(jax.random.key(0))
-    scores = objective.evaluate(params, token_batch(), step_at())
-    expected = objective.token_scores(params, token_batch()[TEXT_KEY])
-    # Jitted scoring and eager scoring differ by <= 4.8e-7 in float32 on CPU.
-    np.testing.assert_allclose(scores.losses, expected.losses, rtol=1e-6, atol=1e-6)
+    objective = make_objective(samples=Samples(prompt=[1, 2, 3], max_new_tokens=2, decode=fail_decode))
+
+    def scored(params, tokens):
+        return objective.evaluate(params, {TEXT_KEY: tokens}, step_at()).losses
+
+    # Evaluation's per-target losses, scored without a preview, on par with each target's cross entropy
+    # written from the decoder's logits (check 1).
+    assert_as_exact(without_ynn(scored), without_ynn(written_losses(objective.model)), drawn_tokens(),
+                    "scoring beside samples", seeds=EVALUATED_SEEDS,
+                    truth_fn=written_losses(objective.model.clone(dtype=jnp.float64)))
 
 
 def test_preview_generates_reproducible_text_from_ema():
@@ -396,8 +498,9 @@ def test_perplexity_weighs_every_batch_by_its_counted_targets():
 
     score = metric.finalize(metric.merge(metric(heavy, None), metric(light, None)))
 
-    assert score == pytest.approx(np.exp((4 * 1.0 + 1 * 3.0) / 5))
-    assert score != pytest.approx(np.exp(np.mean([1.0, 3.0])))
+    # The metric's float64 sums of these values are exact, so the score is this exponential itself.
+    assert score == np.exp((4 * 1.0 + 1 * 3.0) / 5)
+    assert score != np.exp(np.mean([1.0, 3.0]))
 
 
 def test_perplexity_is_exp_of_the_mean_cross_entropy_not_the_mean_of_exps():
@@ -415,30 +518,77 @@ def test_perplexity_is_exp_of_the_mean_cross_entropy_not_the_mean_of_exps():
     ]
     expected = np.exp(np.mean([0.0, 2.0]))
     wrong = np.mean(np.exp([0.0, 2.0]))
-    assert expected != pytest.approx(wrong)
-    assert metric.finalize(metric.merge(*values)) == pytest.approx(expected)
+    assert expected != wrong
+    assert metric.finalize(metric.merge(*values)) == expected
+
+
+PASS_SEEDS = 8
+"""Check 1's declared seeds for the validation pass's scores against evaluation of the weights the step
+left (`seeds_for`, paired: both arms score one state's forward)."""
+
+
+class ScoresRead(Perplexity):
+    """Perplexity, keeping each artifact the loop hands it: the pass's own per-target scores."""
+
+    name = "scores read"
+
+    def __init__(self):
+        self.read = []
+
+    def __call__(self, artifact, batch, /):
+        self.read.append(jax.tree.map(np.asarray, artifact))
+        return super().__call__(artifact, batch)
 
 
 def test_the_validation_pass_scores_perplexity_per_token_and_logs_it():
     """Objective artifacts through the trainer's loop and into the metric:
-    two batches of different padding weigh by their counted targets."""
+    two batches of different padding weigh by their counted targets. The
+    loop logs the perplexity of its pass's own per-target scores, the
+    metric's float64 sums of them exactly; those scores are evaluation's
+    (`test_evaluation_scores_every_target_of_the_batch`), and the metric's
+    weighing is `test_perplexity_weighs_every_batch_by_its_counted_targets`'s."""
     padded = {TEXT_KEY: jnp.asarray(np.where(np.arange(SEQ + 1) < 9, token_batch(BATCH)[TEXT_KEY], 0))}
     batches = [token_batch(BATCH, seed=1), padded]
     tracker = RecordingTracker()
     trainer = make_trainer(pad_id=0, tracker=tracker)
-    state = trainer.fit(dataset(cycle_batches, val=lambda: iter(batches)), steps=1, log_every=1,
-                        eval_every=1, metrics=(Perplexity(),))
-
-    total, count = 0.0, 0.0
-    for batch in batches:
-        scores = trainer.objective.evaluate(state.variables, batch, step_at())
-        total += float(jnp.sum(scores.losses * scores.weights))
-        count += float(jnp.sum(scores.weights))
+    read = ScoresRead()
+    trainer.fit(dataset(cycle_batches, val=lambda: iter(batches)), steps=1, log_every=1, eval_every=1,
+                metrics=(Perplexity(), read))
     logged = [s["val/perplexity"] for _, s in tracker.scalars if "val/perplexity" in s]
-    assert len(logged) == 1
-    # The pass scores the weights the step left, so it matches them.
-    assert 0 < count < 2 * BATCH * SEQ
-    assert logged[0] == pytest.approx(np.exp(total / count), rel=1e-6)
+    assert len(read.read) == len(batches)
+    counted = sum(float(np.sum(scores.weights)) for scores in read.read)
+    assert 0 < counted < 2 * BATCH * SEQ
+    metric = Perplexity()
+    totals = [metric(scores, batch) for scores, batch in zip(read.read, batches, strict=True)]
+    assert logged == [metric.finalize(metric.merge(*totals))]
+
+    # The pass reads the weights the step left: over drawn validation batches, its per-target scores on
+    # par with evaluation of the state the run returns (check 1), the truth that evaluation on the
+    # state in float64. Each run starts from the trainer's own initial state and steps on the same
+    # batch, so its state is the first run's, exactly.
+    def run(val):
+        scores = ScoresRead()
+        state = trainer.fit(dataset(cycle_batches, val=lambda: iter(val)), steps=1, log_every=1,
+                            eval_every=1, metrics=(scores,))
+        return jax.device_get(state.variables), scores.read
+
+    variables, _ = run(batches)
+
+    def passed(given, tokens):
+        after, (scores,) = run([{TEXT_KEY: tokens}])
+        jax.tree.map(np.testing.assert_array_equal, after, given)
+        return scores.losses * scores.weights
+
+    def evaluated(of):
+        def scores(variables, tokens):
+            scored = of.evaluate(variables, {TEXT_KEY: tokens}, step_at())
+            return scored.losses * scored.weights
+        return scores
+
+    wide = make_objective(model=tiny_decoder().clone(dtype=jnp.float64), pad_id=0)
+    assert_as_exact(passed, without_ynn(evaluated(trainer.objective)),
+                    lambda seed: (variables, token_batch(BATCH, seed=seed + 2)[TEXT_KEY]),
+                    "the pass's scores", seeds=PASS_SEEDS, truth_fn=evaluated(wide))
 
 
 # --- packed batches --------------------------------------------------------
@@ -447,9 +597,9 @@ def packed_objective(seq=SEQ, **kwargs):
     return LMObjective(tiny_decoder(), seq, **kwargs)
 
 
-def documents(first=7, second=3, seq=SEQ):
+def documents(first=7, second=3, seq=SEQ, seed=11):
     """A packed row of two documents, plus the padding that follows them."""
-    rs = np.random.RandomState(11)
+    rs = np.random.RandomState(seed)
     doc_a = rs.randint(1, VOCAB, first)
     doc_b = rs.randint(1, VOCAB, second)
     pad = np.zeros(seq + 1 - first - second, np.int64)
@@ -473,30 +623,50 @@ def only_document(document, seq=SEQ):
 
 
 def counted_losses(objective, params, tokens, segment_ids, positions):
-    """Per-token losses and the weight the objective gives each of them."""
+    """Per-token losses written from the model's logits, in their dtype, and the weight the objective
+    gives each of them."""
     inputs, targets = tokens[:, :-1], tokens[:, 1:]
     logits = objective.model.apply(params, inputs, positions=positions[:, :-1],
                                    segment_ids=segment_ids[:, :-1])
-    losses = optax.softmax_cross_entropy_with_integer_labels(
-        logits.astype(jnp.float32), targets)
+    losses = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
     weights = ((segment_ids[:, 1:] == segment_ids[:, :-1])
                & (segment_ids[:, 1:] != 0)).astype(losses.dtype)
-    return np.asarray(losses[0]), np.asarray(weights[0])
+    return losses[0], weights[0]
 
 
 def weighted_mean(losses, weights):
-    return float(jnp.sum(losses * weights) / jnp.sum(weights))
+    return jnp.sum(losses * weights) / jnp.sum(weights)
+
+
+PACKED_SEEDS = 8
+"""Check 1's declared seeds for a packed row's loss against its documents' (`seeds_for`, paired)."""
+
+
+def drawn_documents(seed):
+    """A seed's decoder parameters, a packed row of two documents of its own and the two documents in
+    rows of their own (`documents`, `only_document`)."""
+    tokens, segment_ids, positions, documents_drawn = documents(seed=seed)
+    alone = [piece for document in documents_drawn for piece in only_document(document)]
+    return decoder_init()(jax.random.key(seed)), tokens, segment_ids, positions, *alone
+
+
+def float64_packed():
+    """The packed objective on its decoder in float64, for the truths of the packed rows' check 1."""
+    return LMObjective(tiny_decoder().clone(dtype=jnp.float64), SEQ)
 
 
 def test_a_packed_batch_ignores_the_boundary_and_the_padding():
+    """A packed row trains on every transition inside a document and on none across the boundary or
+    into the padding, and over drawn decoders and documents its loss is on par with the cross entropy
+    written from the model's logits of the packed row (check 1)."""
     objective = packed_objective()
     params = objective.init(jax.random.key(0))
     tokens, segment_ids, positions, (doc_a, _) = documents()
 
-    scored_losses, scored_weights = objective.token_scores(
-        params, tokens, segment_ids=segment_ids, positions=positions)[:2]
+    scored_weights = objective.token_scores(params, tokens, segment_ids=segment_ids, positions=positions)[1]
 
-    losses, weights = counted_losses(objective, params, tokens, segment_ids, positions)
+    _, weights = (np.asarray(value) for value in counted_losses(objective, params, tokens, segment_ids,
+                                                                  positions))
     # The last token of the first document predicts the first of the second,
     # which is the one transition a packed row must not train on.
     boundary = len(doc_a) - 1
@@ -504,59 +674,85 @@ def test_a_packed_batch_ignores_the_boundary_and_the_padding():
     assert weights[:boundary].all() and weights[boundary + 1] == 1
     assert weights[len(doc_a) + 2:].sum() == 0, "padding was trained on"
     np.testing.assert_array_equal(np.asarray(scored_weights[0]), weights)
-    assert weighted_mean(scored_losses, scored_weights) == pytest.approx(
-        float((losses * weights).sum() / weights.sum()), rel=1e-6)
+
+    def scored(params, tokens, segment_ids, positions, *_):
+        return weighted_mean(*objective.token_scores(params, tokens, segment_ids=segment_ids,
+                                                     positions=positions)[:2])
+
+    def written(of):
+        return lambda params, tokens, segment_ids, positions, *_: weighted_mean(
+            *counted_losses(of, params, tokens, segment_ids, positions))
+
+    assert_as_exact_over_instances(scored, written(objective), drawn_documents,
+                    "a packed row's written loss", seeds=PACKED_SEEDS, truth_fn=written(float64_packed()))
 
 
 def test_a_packed_batch_scores_like_its_documents_alone():
-    """Packing is only a layout: the two documents' losses have to be the ones
-    they get on their own, from the whole logits and through the same chunked
-    head, and the boundary target is dropped on both sides."""
+    """Packing is only a layout: over drawn decoders and documents, a packed
+    row's loss is on par with the two documents' on their own, from the whole
+    logits and through the same chunked head (check 1; the packed row's own
+    written loss is the test before's), and the boundary target is dropped on
+    both sides."""
     objective = packed_objective()
     params = objective.init(jax.random.key(0))
     tokens, segment_ids, positions, (doc_a, doc_b) = documents()
-
-    losses, weights = objective.token_scores(
-        params, tokens, segment_ids=segment_ids, positions=positions)[:2]
-    ce = weighted_mean(losses, weights)
-
-    total, chunked, count = 0.0, 0.0, 0.0
     for document in (doc_a, doc_b):
-        alone_tokens, alone_segments, alone_positions = alone = only_document(document)
-        alone_losses, alone_weights = counted_losses(objective, params, *alone)
-        total += float((alone_losses * alone_weights).sum())
-        count += float(alone_weights.sum())
-        head_losses, head_weights = objective.token_scores(
-            params, alone_tokens, segment_ids=alone_segments, positions=alone_positions)[:2]
+        alone_tokens, alone_segments, alone_positions = only_document(document)
+        head_weights = objective.token_scores(params, alone_tokens, segment_ids=alone_segments,
+                                              positions=alone_positions)[1]
         # Every transition inside the document; its last target is padding.
         assert float(jnp.sum(head_weights)) == len(document) - 1
-        chunked += weighted_mean(head_losses, head_weights) * (len(document) - 1)
+    _, packed_weights = counted_losses(objective, params, tokens, segment_ids, positions)
+    assert float(jnp.sum(packed_weights)) == len(doc_a) + len(doc_b) - 2
 
-    packed_losses, packed_weights = counted_losses(
-        objective, params, tokens, segment_ids, positions)
-    assert count == packed_weights.sum() == len(doc_a) + len(doc_b) - 2
-    assert ce == pytest.approx(total / count, rel=1e-5)
-    assert ce == pytest.approx(float((packed_losses * packed_weights).sum() / count), rel=1e-6)
-    # Largest relative difference observed on CPU: 7.1e-08.
-    assert ce == pytest.approx(chunked / count, rel=1e-6)
+    def scored(params, tokens, segment_ids, positions, *_):
+        return weighted_mean(*objective.token_scores(params, tokens, segment_ids=segment_ids,
+                                                     positions=positions)[:2])
+
+    def alone(score):
+        def mean(params, tokens, segment_ids, positions, *pieces):
+            parts = [score(params, *pieces[index:index + 3]) for index in (0, 3)]
+            return sum(jnp.sum(losses * weights) for losses, weights in parts) / sum(
+                jnp.sum(weights) for _, weights in parts)
+        return mean
+
+    def written(of):
+        return alone(lambda params, *row: counted_losses(of, params, *row))
+
+    def chunked(of):
+        return alone(lambda params, tokens, segment_ids, positions: of.token_scores(
+            params, tokens, segment_ids=segment_ids, positions=positions)[:2])
+
+    wide = float64_packed()
+    assert_as_exact_over_instances(scored, written(objective), drawn_documents,
+                    "the documents' written losses", seeds=PACKED_SEEDS, truth_fn=written(wide))
+    assert_as_exact_over_instances(scored, chunked(objective), drawn_documents,
+                    "the documents' chunked losses", seeds=PACKED_SEEDS, truth_fn=chunked(wide))
 
 
 def test_a_packed_batch_reaches_the_objective_through_the_batch_dict():
+    """Over drawn decoders and documents, the loss of a batch whose packing comes as `text_coordinates`
+    on par with the per-token scores of the packed row (check 1), and not the loss of the same row
+    unpacked."""
     objective = packed_objective()
-    params = objective.init(jax.random.key(0))
-    tokens, segment_ids, positions, _ = documents()
-    batch = {TEXT_KEY: tokens, "text_coordinates": coordinates(
-        segments=segment_ids, positions=positions, max_segments=tokens.shape[1],
-        right_padded=True, xp=np)}
 
-    packed, _ = objective.scalar_loss(params, batch, step_at())
+    def batch_of(tokens, segment_ids, positions):
+        return {TEXT_KEY: tokens, "text_coordinates": coordinates(
+            segments=segment_ids, positions=positions, max_segments=tokens.shape[1], right_padded=True)}
+
+    def packed(params, tokens, segment_ids, positions, *_):
+        return objective.scalar_loss(params, batch_of(tokens, segment_ids, positions), step_at())[0]
+
+    def scored(of):
+        return lambda params, tokens, segment_ids, positions, *_: weighted_mean(*of.token_scores(
+            params, tokens, train=True, rngs={"dropout": jax.random.key(1)}, segment_ids=segment_ids,
+            positions=positions)[:2])
+
+    assert_as_exact_over_instances(packed, scored(objective), drawn_documents,
+                    "a packed batch's loss", seeds=PACKED_SEEDS, truth_fn=scored(float64_packed()))
+    params, tokens, segment_ids, positions, *_ = drawn_documents(0)
     unpacked, _ = objective.scalar_loss(params, {TEXT_KEY: tokens}, step_at())
-
-    losses, weights = objective.token_scores(
-        params, tokens, train=True, rngs={"dropout": jax.random.key(1)},
-        segment_ids=segment_ids, positions=positions)[:2]
-    assert float(packed) == pytest.approx(weighted_mean(losses, weights))
-    assert abs(float(packed) - float(unpacked)) > 1e-3, (
+    assert packed(params, tokens, segment_ids, positions) != unpacked, (
         "the packed keys made no difference to the loss")
 
 
@@ -591,39 +787,54 @@ def assistant_batch(every=2, batch=4, seq=SEQ, seed=0):
     return batch_dict
 
 
+ROLES_SEEDS = 8
+"""Check 1's declared seeds for the loss of a batch with a roles column (`seeds_for`, paired)."""
+
+
+def drawn_roles(seed):
+    """A seed's decoder parameters, its tokens and the roles column marking every second target."""
+    batch = assistant_batch(seed=seed)
+    return decoder_init()(jax.random.key(seed)), batch[TEXT_KEY], batch[ROLES_KEY]
+
+
+def assistant_targets(tokens, roles):
+    """The targets whose role is the assistant's."""
+    return roles[:, 1:] == Role.ASSISTANT
+
+
 def test_loss_role_counts_only_assistant_targets():
-    """With loss_role set, the loss is the cross entropy over the targets
-    whose role matches, and the reported accuracy counts the same targets."""
+    """With loss_role set, over drawn decoders and tokens the loss is on par
+    with the cross entropy over the targets whose role matches (check 1),
+    which differs from every target's, and the reported accuracy counts the
+    same targets."""
     objective = make_objective(loss_role=Role.ASSISTANT)
-    params = objective.init(jax.random.key(0))
-    batch = assistant_batch()
-    tokens = np.asarray(batch[TEXT_KEY])
 
-    loss, aux = objective.scalar_loss(params, batch, step_at())
+    def loss(params, tokens, roles):
+        return objective.scalar_loss(params, {TEXT_KEY: tokens, ROLES_KEY: roles}, step_at())[0]
 
-    logits = objective.model.apply(params, batch[TEXT_KEY][:, :-1])
-    kept = np.asarray(batch[ROLES_KEY])[:, 1:] == Role.ASSISTANT
+    assert_scores_the_written_cross_entropy(loss, drawn_roles, "the assistant's targets", seeds=ROLES_SEEDS,
+                                            counted=assistant_targets)
+    params, tokens, roles = drawn_roles(0)
+    kept = np.asarray(assistant_targets(tokens, roles))
     assert kept.sum() > 0 and (~kept).sum() > 0, "the batch counts nothing out"
-    expected = reference_cross_entropy(logits, tokens[:, 1:], weights=kept)
-    assert float(loss) == pytest.approx(expected, rel=1e-5)
-    full = reference_cross_entropy(logits, tokens[:, 1:])
-    assert abs(expected - full) > 1e-4, "the role mask made no difference to check"
-    accuracy = ((np.argmax(np.asarray(logits), axis=-1) == tokens[:, 1:]) & kept).sum() / kept.sum()
-    assert float(aux.metrics["token_accuracy"]) == pytest.approx(accuracy)
+    masked = written_cross_entropy(objective.model, assistant_targets)(params, tokens, roles)
+    assert masked != written_cross_entropy(objective.model)(params, tokens), "the mask made no difference"
+    _, aux = objective.scalar_loss(params, {TEXT_KEY: tokens, ROLES_KEY: roles}, step_at())
+    logits = np.asarray(objective.model.apply(params, tokens[:, :-1]))
+    right = np.argmax(logits, axis=-1) == np.asarray(tokens[:, 1:])
+    np.testing.assert_array_equal(aux.metrics["token_accuracy"], counted_share(right, kept))
 
 
 def test_a_roles_column_is_ignored_without_loss_role():
-    """The same packed SFT batch trains every target under a plain
-    LMObjective: the column only matters when a role is asked for."""
+    """The same SFT batch trains every target under a plain LMObjective: over
+    drawn decoders and tokens its loss is on par with every target's cross
+    entropy (check 1); the column only matters when a role is asked for."""
     objective = make_objective()
-    params = objective.init(jax.random.key(0))
-    batch = assistant_batch()
 
-    loss, _ = objective.scalar_loss(params, batch, step_at())
+    def loss(params, tokens, roles):
+        return objective.scalar_loss(params, {TEXT_KEY: tokens, ROLES_KEY: roles}, step_at())[0]
 
-    logits = objective.model.apply(params, batch[TEXT_KEY][:, :-1])
-    expected = reference_cross_entropy(logits, np.asarray(batch[TEXT_KEY][:, 1:]))
-    assert float(loss) == pytest.approx(expected, rel=1e-5)
+    assert_scores_the_written_cross_entropy(loss, drawn_roles, "every target beside roles", seeds=ROLES_SEEDS)
 
 
 def test_evaluation_weights_follow_loss_role():
@@ -671,14 +882,16 @@ def test_z_loss_adds_the_squared_log_partition_of_the_counted_targets():
                                          (aux.metrics["z_loss"], rounded_z, z_term, "z term")):
         assert_as_exact_as_the_reference(np.atleast_1d(np.float64(dew)), np.atleast_1d(reference),
                                          np.atleast_1d(truth), label)
-    assert float(aux.metrics["ce"]) == pytest.approx(float(plain_aux.metrics["ce"]))
+    # The term leaves the cross entropy the plain objective's, which is the padded targets' own
+    # (`test_padded_targets_are_left_out_of_the_average`), and adds to the loss.
+    np.testing.assert_array_equal(aux.metrics["ce"], plain_aux.metrics["ce"])
     assert "z_loss" not in plain_aux.metrics
-    assert float(without) == pytest.approx(reference_cross_entropy(logits, tokens[:, 1:], pad_id))
-    assert abs(float(loss) - float(without)) > 1e-4, "the term made no difference to check"
+    assert loss != without, "the term made no difference to check"
 
 
-Z_LOSS_SEEDS = 256
-"""Check 1's declared seeds for the z-loss gradient, sized by `seeds_for` (2026-10-21, on armada)."""
+Z_LOSS_SEEDS = 32
+"""Check 1's declared seeds for the z-loss gradient (`seeds_for`, paired: both arms pull back through
+one model)."""
 
 
 def test_z_loss_gradient_carries_the_reference_factor():
@@ -729,187 +942,58 @@ def test_z_loss_gradient_carries_the_reference_factor():
     assert_as_exact(dew, reference, draw, "z-loss gradient", seeds=Z_LOSS_SEEDS)
 
 
+ROUTER_SEEDS = 8
+"""Check 1's declared seeds for the router z-loss against its recomputed oracle (`seeds_for`, paired)."""
+
+
 def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
     """The term is the coefficient times each router's squared logsumexp of
     its gate logits, averaged over the positions it routed and summed over
-    routers, beside the cross entropy and not inside its token mean."""
+    routers, beside the cross entropy and not inside its token mean: over
+    drawn decoders and tokens, the loss on par with the plain loss plus that
+    term, and the term it reports on par with the term (check 1), the oracle
+    each layer's gate logits recomputed from its kernel and the normed input
+    the router saw, captured by flax's intermediates."""
     from dew.nn.backbones.decoder_block import Mixture
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=2,
                               max_seq_len=8, mixture=Mixture(experts=4, top_k=2, expert_features=16))
-    tokens = jax.random.randint(jax.random.key(1), (2, 9), 0, 64)
-    plain = LMObjective(model, 8, ema_decay=None)
     zed = LMObjective(model, 8, ema_decay=None, balance=ExpertBalance(router_z_loss=0.3))
-    params = plain.init(jax.random.key(0))
-    base, _ = plain.reduce_loss(plain.loss(params, {TEXT_KEY: tokens}, step_at())[0])
-    stats, aux = zed.loss(params, {TEXT_KEY: tokens}, step_at())
-    total, _ = zed.reduce_loss(stats)
+    initialized = jax.jit(zed.init)
+    captured = selection_margins.capture(model)
+    config = {"mixture": {"experts": 4, "top_k": 2}}
 
-    # The oracle: each layer's gate logits recomputed from its kernel and
-    # the normed input the router saw, captured by flax's intermediates.
-    # The block's norm owns its residual seam, which returns the stream beside the normed input.
-    _, state = model.apply(params, tokens[:, :-1], mutable=["intermediates"],
-                           capture_intermediates=lambda module, method: method == "seam")
-    expected = 0.0
-    for index in range(2):
-        layer = state["intermediates"][f"layers_{index}"]
-        normed = layer["post_attention_layernorm"]["seam"][0][1]
-        kernel = params["params"][f"layers_{index}"]["mlp"]["gate"]["kernel"]
-        logits = normed.astype(jnp.float32) @ kernel
-        expected += 0.3 * float(jnp.mean(jnp.square(jax.nn.logsumexp(logits, -1))))
-    np.testing.assert_allclose(float(total - base), expected, rtol=1e-5)
-    np.testing.assert_allclose(float(aux.metrics["router_z_loss"]), expected, rtol=1e-5)
+    def keyed(seed):
+        return initialized(jax.random.key(seed)), jax.random.randint(jax.random.key(seed + (1 << 20)),
+                                                                     (8, 9), 0, 64)
 
+    def clears(inputs):
+        # Each router's top two of four experts clear the margin, so every float32 run and the float64
+        # run route alike; routing near a tie is the routers' own tests' (tests/test_moe*.py).
+        params, tokens = inputs
+        return selection_margins.margin(config, captured(params, tokens[:, :-1]), "router z-loss") \
+            >= selection_margins.MARGIN
 
-def vocabulary_products(jaxpr, vocab: int) -> int:
-    """The products in `jaxpr` and every program inside it that read or write a vocabulary-sized array,
-    a cond counted by the branch with the most, the one a run takes at most (as test_model_flops'
-    `jaxpr_products` counts): a product's platform choice is a cond of both."""
-    count = 0
-    for eqn in jaxpr.eqns:
-        shapes = [getattr(var.aval, "shape", ()) for var in (*eqn.invars, *eqn.outvars)]
-        count += eqn.primitive.name == "dot_general" and any(vocab in shape for shape in shapes)
-        inner = [value if hasattr(value, "eqns") else value.jaxpr
-                 for value in jax.tree.leaves(eqn.params, is_leaf=lambda leaf: hasattr(leaf, "eqns")
-                                              or hasattr(getattr(leaf, "jaxpr", None), "eqns"))
-                 if hasattr(value, "eqns") or hasattr(getattr(value, "jaxpr", None), "eqns")]
-        counts = [vocabulary_products(program, vocab) for program in inner]
-        count += max(counts, default=0) if eqn.primitive.name == "cond" else sum(counts)
-    return count
+    draw = selection_margins.clearing(keyed, clears)
 
+    def scored(params, tokens):
+        stats, aux = zed.loss(params, {TEXT_KEY: tokens}, step_at())
+        return zed.reduce_loss(stats)[0], aux.metrics["router_z_loss"]
 
-def head_scored(vocab: int, **options):
-    """A two-layer decoder whose untied head spans `vocab` columns, and two
-    9-token rows of its ids, for the tests that count the head's products."""
-    model = CausalTransformer(vocab_size=vocab, emb_features=24, num_layers=2, num_heads=2, mlp_features=32,
-                              max_seq_len=8, tie_embeddings=False, qk_norm=False, attention_impl="reference",
-                              **options)
-    return model, jax.random.randint(jax.random.key(1), (2, 9), 0, vocab)
+    def oracle(of):
+        plain = LMObjective(of, 8, ema_decay=None)
 
+        def recomputed(params, tokens):
+            # The block's norm owns its residual seam, which returns the stream beside the normed input.
+            _, state = of.apply(params, tokens[:, :-1], mutable=["intermediates"],
+                                capture_intermediates=lambda module, method: method == "seam")
+            term = 0.0
+            for index in range(2):
+                normed = state["intermediates"][f"layers_{index}"]["post_attention_layernorm"]["seam"][0][1]
+                kernel = params["params"][f"layers_{index}"]["mlp"]["gate"]["kernel"]
+                term += 0.3 * jnp.mean(jnp.square(jax.nn.logsumexp(normed @ kernel, -1)))
+            base, _ = plain.reduce_loss(plain.loss(params, {TEXT_KEY: tokens}, step_at())[0])
+            return base + term, term
+        return recomputed
 
-def test_a_head_that_is_no_matrix_is_never_fused():
-    """A head past a nonlinear transform is no one matrix (`chunked.head_table`), so a training step
-    tiles it unfused, its program says so once traced, and the fit ladder has no rung to unfuse."""
-    vocab = 61
-    model, tokens = head_scored(vocab, head_transform="gelu")
-    objective = LMObjective(model, 8, ema_decay=None, pad_id=0, head_tile=(4, 16))
-    params = objective.init(jax.random.key(0))
-    step = Step(jnp.asarray(0), jax.random.key(1), None, training=True)
-    jax.make_jaxpr(lambda params: objective.scalar_loss(params, {TEXT_KEY: tokens}, step)[0])(params)
-    assert not objective.program_key()[0].head_fused
-    assert objective.unfuse_head() is None
-
-
-def test_a_head_put_back_unfused_stays_so_whatever_decoder_was_traced_before():
-    """A record's unfused rung, put back (`climb_to`) on a decoder the objective has not traced,
-    holds once the decoder's head turns out to be one matrix: a head whose transform was traced, then
-    the decoder replaced by one with a matrix head, as a run's substitution does."""
-    vocab = 61
-    model, tokens = head_scored(vocab, head_transform="gelu")
-    objective = LMObjective(model, 8, ema_decay=None, pad_id=0, head_tile=(4, 16))
-    step = Step(jnp.asarray(0), jax.random.key(1), None, training=True)
-
-    def trace():
-        params = objective.init(jax.random.key(0))
-        jax.make_jaxpr(lambda params: objective.scalar_loss(params, {TEXT_KEY: tokens}, step)[0])(params)
-
-    trace()
-    objective.substitute([model.clone(head_transform=None)])
-    climb_to(objective, {"head_tile": [4, 16], "head_fused": False, "remat": None})
-    trace()
-    assert not objective.program_key()[0].head_fused and objective.unfuse_head() is None
-
-
-def test_a_decoder_put_back_keeps_what_its_trace_found_of_its_head():
-    """Each decoder a loss traced keeps what that trace found of its head, so a decoder put back
-    after another was traced, as a half-rung probe that missed puts its decoder back, is still no
-    fused head where its head is no matrix."""
-    vocab = 61
-    model, tokens = head_scored(vocab, head_transform="gelu")
-    objective = LMObjective(model, 8, ema_decay=None, pad_id=0, head_tile=(4, 16))
-    step = Step(jnp.asarray(0), jax.random.key(1), None, training=True)
-    params = objective.init(jax.random.key(0))
-
-    def trace():
-        jax.make_jaxpr(lambda params: objective.scalar_loss(params, {TEXT_KEY: tokens}, step)[0])(params)
-
-    trace()
-    objective.substitute([model.clone(remat="full")])
-    trace()
-    objective.substitute([model])
-    assert not objective.program_key()[0].head_fused and objective.unfuse_head() is None
-
-
-def test_a_prediction_applies_the_head_once_and_scores_the_logits_it_returns():
-    """A teacher's or a student's prediction (`LMObjective.predict`) holds the
-    whole logits, and scores its losses from them: its forward contracts the
-    vocabulary once and its gradient three times, and its losses and logits
-    are the tiled head's and the model's own. A padding id past the
-    vocabulary as the last target picks no column, as the tiled head's, so
-    every loss stays finite."""
-    from dew.objectives.lm.chunked import model_logits
-    vocab = 61
-    model, tokens = head_scored(vocab)
-    tokens = tokens.at[:, -1].set(vocab)
-    objective = LMObjective(model, 8, ema_decay=None, pad_id=vocab, head_tile=(4, 16))
-    params = objective.init(jax.random.key(0))
-    step = Step(jnp.asarray(0), jax.random.key(1), None, training=False)
-
-    def predicted(params):
-        return objective.predict(params, {TEXT_KEY: tokens}, step, train=False)[2]
-
-    def pulled(params):
-        prediction = predicted(params)
-        return jnp.sum(prediction.logits * 0.5) + jnp.sum(prediction.losses * prediction.weights)
-
-    assert vocabulary_products(jax.make_jaxpr(predicted)(params).jaxpr, vocab) == 1
-    assert vocabulary_products(jax.make_jaxpr(jax.grad(pulled))(params).jaxpr, vocab) == 3
-    with jax.default_matmul_precision("highest"):
-        prediction = predicted(params)
-        scores = objective.token_scores(params, tokens)
-        whole = model_logits(model, params, scores.hidden)
-    assert np.all(np.isfinite(prediction.losses))
-    np.testing.assert_allclose(prediction.losses, scores.losses, rtol=1e-5, atol=1e-6)
-    np.testing.assert_allclose(prediction.logits, whole, rtol=1e-6, atol=1e-6)
-
-
-@pytest.mark.parametrize("tile_tokens", [4, 16])
-def test_a_training_steps_tiled_head_contracts_the_vocabulary_three_times_and_matches_the_tiled_head(
-        tile_tokens):
-    """A training step whose head is tiled takes the head's gradient in the
-    forward (`fused_head_loss`), a tile's tokens a chunk, all 16 in one where
-    the tile holds them: beside blocks recomputed in the backward, the step
-    contracts the whole vocabulary three times, the logits, the states'
-    gradient and the head's, none again, and its loss and gradients are the
-    per-token tiled head's, z-loss and padding included. Unfused
-    (`unfuse_head`, the fit ladder's rung for a fused chunk that does not
-    fit), the step takes the tiled head's gradient in its backward, a tile
-    of the vocabulary at a time, to the same loss and gradients."""
-    vocab = 61
-    model, tokens = head_scored(vocab, remat="full")
-    tokens = tokens.at[1, 6:].set(0)
-    fused = LMObjective(model, 8, ema_decay=None, z_loss=1e-3, pad_id=0, head_tile=(tile_tokens, 16))
-    unfused = LMObjective(model, 8, ema_decay=None, z_loss=1e-3, pad_id=0, head_tile=(tile_tokens, 16))
-    assert unfused.unfuse_head() is not None and unfused.unfuse_head() is None
-    params = fused.init(jax.random.key(0))
-
-    def loss(objective, *, training):
-        step = Step(jnp.asarray(0), jax.random.key(1), None, training=training)
-
-        def scalar(params):
-            stats, _ = objective.loss(params, {TEXT_KEY: tokens}, step)
-            return objective.reduce_loss(stats)[0]
-        return scalar
-
-    def step_products(objective) -> int:
-        program = jax.make_jaxpr(jax.grad(loss(objective, training=True)))(params)
-        return vocabulary_products(program.jaxpr, vocab)
-
-    assert step_products(fused) == 3
-    # The tiled head contracts the vocabulary a tile of its columns at a time, so no product spans it.
-    assert step_products(unfused) == 0
-    with jax.default_matmul_precision("highest"):
-        theirs = jax.value_and_grad(loss(fused, training=False))(params)
-        for objective in (fused, unfused):
-            mine = jax.value_and_grad(loss(objective, training=True))(params)
-            for left, right in zip(jax.tree.leaves(mine), jax.tree.leaves(theirs), strict=True):
-                np.testing.assert_allclose(left, right, rtol=2e-5, atol=2e-6)
+    assert_as_exact_over_instances(scored, oracle(model), draw, "router z-loss",
+                                   seeds=ROUTER_SEEDS, truth_fn=oracle(model.clone(dtype=jnp.float64)))

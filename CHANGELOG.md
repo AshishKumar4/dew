@@ -27,7 +27,30 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   run does, and the run refuses a step whose objective returns none, where a decision run trained unclipped
   with no sign of it. `LMObjective`'s, `TokenScorer`'s and the RL objectives' `qk_stats`
   argument is removed: the run asks for them.
+- `Trainer.fit(examples=N)` and `--trainer.examples N` bound a run to the chain's
+  first N records, counted before packing and each read once, its steps (and so
+  its schedule) the ones the data plan counts for them. `Pause(fraction)`, as
+  `stop=` or `--trainer.stop.fraction`, ends a run at that fraction of its
+  budget, to resume as one that never paused. A training stream that runs out
+  ends the run with its final checkpoint, on every process at the same step,
+  instead of raising `StopIteration`.
+- A JEPA run's target momentum ramps over its optimizer updates, the steps
+  over its accumulation, where it ramped over its steps; its `--lora` adapts
+  the encoder, which the run used to record and ignore. An LM run bounded by
+  `--trainer.tokens` alone trains over data with no epoch length.
+- `Plateau` counts an improvement as Flax's `EarlyStopping` does, which now runs its count: the best less the value must exceed `min_delta`. Its own test, the value below the best less `min_delta`, rounds that bound, so a best of 1 and a value of 1 - 2**-24 under a `min_delta` of 2**-24 - 2**-60 counted no improvement.
+- A row drawn under its own key (text sampling's draw, masked diffusion's reveal) draws the same whatever rows it is drawn beside with an RBG key implementation (`rbg`, `unsafe_rbg`) too: `vmap` drew every row from the first key's stream, so each row key is made counter-based first, a key at a time. Threefry keys draw as before.
+- A checkpoint ranking's best steps are Orbax's `BestN` over the steps it scored, and TensorBoard's text summaries are its own `text_pb`'s, each the same as before.
 - A confident target's loss gradient is the rest of its row's probability summed directly, as arXiv:2610.31642's eq. 7 takes it, through every chunked head (the tiled, whole, fused and vocabulary-split heads) and the whole-logits loss (`logits_cross_entropy`). Each took the target's entry as its share less one, which rounds to 0 once the share rounds to 1, so the row's gradient stopped summing to zero by the rest mass, about 2e-9 at a margin of 20 and 4e-18 at 40. The forward pass reduces one more operand per row for it, and the loss values are unchanged.
+- An autoencoder's latent normalization is one traced map, `dew.nn.autoencoders.LatentAffine`, which
+  `AutoEncoder.encode` and `decode` apply through one hook, `latent_affine(params, dtype)`: a configured
+  autoencoder's comes from its `LatentNormalization` (`affine`), a tuned REPA-E run's from its running
+  statistics. `LatentNormalization.normalized`/`restored` and `TunedAutoEncoder.running_normalization` are
+  gone: `latent_affine(...).normalized`/`restored` replace them.
+- Two optimizers from Nested Learning (arXiv 2512.24695) as Optax transforms: `dew.optim.scale_by_m3`, M3's
+  Muon over Adam's second moment with a slow momentum gathered once per chunk, and
+  `dew.optim.delta_gradient_descent`, the step to eq. 56's minimizer given each kernel's input. M3
+  orthogonalizes through `dew.optim.newton_schulz`, Muon's quintic iteration on each matrix alone.
 - A filtered or packed read resumes on any number of readers once it is prepared: publish its rows (and
   a terminal pack's plan) as a generation with `dew data publish` and read it by index, and a new run
   lowers to the global order. A per-share read refused on another topology now says so.

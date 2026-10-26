@@ -50,6 +50,7 @@ and `tiny_inputs`, which that file's registry-wide parametrization needs.
 import dataclasses
 import functools
 import json
+from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 
@@ -59,7 +60,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
-from reference_error import assert_as_exact_as_the_reference, widened
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened
 from test_architectures import CASES as ARCHITECTURES, MASK, TEXT_FEATURES, TEXT_TOKENS, VOCAB
 from tiny_models import build_model, tiny_inputs
 
@@ -309,7 +310,10 @@ def test_trainable_layer_scalars_read_the_frozen_tree_moved_without_a_copy(name)
     """The published SFT's model reads each layer's scalar as a parameter,
     where a frozen source keeps it among the constants: the same arrays,
     each scalar moved under its layer's params and every other leaf where
-    it was, give the same logits, and the scalars then take a gradient."""
+    it was, give the same logits, and the scalars then take a gradient. The
+    last layer's scalar scales the stream the final norm divides back out, so
+    its gradient is the norm's epsilon term alone, which float32 rounds to
+    noise (on an A100, exactly zero); it is taken in float64, which resolves it."""
     source, read = loaded(name), reads(name, "float32")
     model, variables = source.model, source.variables
     trainable = model.with_trainable_layer_scalars()
@@ -322,7 +326,9 @@ def test_trainable_layer_scalars_read_the_frozen_tree_moved_without_a_copy(name)
     assert after.keys() == expected.keys()
     assert all(after[path] is leaf for path, leaf in expected.items())
     same(trainable.apply(moved, read.tokens, method="logits"), read.logits)
-    learned = gradient(trainable, moved, read.tokens, _cotangent(read.logits), method="logits")
+    with jax.enable_x64(new_val=True):
+        learned = gradient(_float64(trainable), widened(moved), read.tokens,
+                           np.asarray(_cotangent(read.logits), np.float64), method="logits")
     assert all(np.any(np.asarray(learned[path[1:]])) for path in scalars)
     assert trainable.trainable_variables(moved) is moved
 
@@ -564,15 +570,61 @@ def _rungs(model) -> list:
     return rungs
 
 
-RUNG_SHARES = 2
+RUNG_SHARES = 3
 """The parts each ladder's rungs are stepped in, every `RUNG_SHARES`-th rung a case: a ladder steps
 one compiled step a rung, and a checkpoint's whole ladder (kimi-k3-tiny's) took 253 s on an A100,
-past a CI task's 240."""
+past a CI task's 240; at two shares deepseek-v41-tiny's first share took 223 s on armada."""
 
 
-def _climbs_and_restores(model, variables, inputs, share: int, **apply) -> None:
-    """Each rung holds less than the one below it and steps the same forward,
-    bitwise. Its backward recomputes, which can round apart (gemma2-tiny's
+RUNG_SEEDS = 8
+"""Check 1's declared seeds for a rung's forward against the model's, sized paired by `seeds_for` on
+an A100, where a rung's checkpoint barriers change the forward program."""
+
+
+def _redrawn(inputs, seed: int):
+    """`inputs` drawn afresh at `seed` with their shapes and kinds: integer ids below the largest given
+    (a token model's ids stay in its vocabulary), floats from a normal, the rest as given."""
+    rng = np.random.default_rng([0x2A, seed])
+
+    def leaf(value):
+        value = np.asarray(value)
+        if np.issubdtype(value.dtype, np.integer):
+            return rng.integers(0, int(value.max()) + 1, value.shape).astype(value.dtype)
+        if np.issubdtype(value.dtype, np.floating):
+            return rng.standard_normal(value.shape).astype(value.dtype)
+        return value
+    return jax.tree.map(leaf, inputs)
+
+
+class _Base(NamedTuple):
+    """What every share of one model's ladder compares its rungs with (`_based`)."""
+
+    gradient: dict
+    written: frozenset
+    truth: Callable[[], dict]
+
+
+_BASES: dict[str, _Base] = {}
+"""Each ladder's base by its case, computed once for all its shares in a process."""
+
+
+def _based(key: str, model, variables, inputs, **apply) -> _Base:
+    """The model's own gradient, the collections it writes and its float64 twin's gradient (computed
+    where a rung's bits differ), each computed once a ladder (`_BASES`)."""
+    if key not in _BASES:
+        _, gradient_tree = _stepped(model, variables, inputs, **apply)
+        written = frozenset(model.apply(variables, *inputs, mutable=True, **apply)[1].keys())
+        truth = functools.cache(
+            lambda: _stepped(_float64(model), widened(variables), widened(inputs), **apply)[1])
+        _BASES[key] = _Base(gradient_tree, written, truth)
+    return _BASES[key]
+
+
+def _climbs_and_restores(key: str, model, variables, inputs, share: int, **apply) -> None:
+    """Each rung holds less than the one below it and steps the forward the
+    model does: a rung's checkpoint makes its forward another program, which
+    check 1 holds against the model's from the model's float64 twin over drawn
+    inputs. Its backward recomputes, which can round apart (gemma2-tiny's
     gradients by up to 1.2e-4, kimi-k3-tiny's 8.3e-3 of 10.8; test_decoder_remat.py
     found the same), so the gradients are the model's bits or as exact as them.
     A rung's record restores it from any rung below it and moves no rung
@@ -589,24 +641,30 @@ def _climbs_and_restores(model, variables, inputs, share: int, **apply) -> None:
             assert restored == records[max(low, high)], (records[low], records[high], restored)
     assert all(rung.restore_recompute("no rung").recompute_record() == record
                for rung, record in zip(rungs, records, strict=True))
-    output, gradient_tree = _stepped(model, variables, inputs, **apply)
-    truth = functools.cache(
-        lambda: _stepped(_float64(model), widened(variables), widened(inputs), **apply)[1])
-    written = model.apply(variables, *inputs, mutable=True, **apply)[1]
+    base = _based(key, model, variables, inputs, **apply)
     shared = rungs[1 + share::RUNG_SHARES]
     assert shared or len(rungs) <= 1 + share, records
+    # Applied as the step applies them: some models read their ids on the host.
+    def forward_truth(*inputs):
+        with jax.enable_x64(new_val=True):
+            wide = _call(_float64(model), widened(variables), widened(inputs), **apply)
+            return np.asarray(wide, np.float64)
+
     for rung in shared:
         stepped = _stepped(rung, variables, inputs, **apply)
-        same(stepped[0], output)
-        as_exact(stepped[1], gradient_tree, truth, f"gradient at {rung.recompute_record()}")
-        assert rung.apply(variables, *inputs, mutable=True, **apply)[1].keys() == written.keys()
+        assert_as_exact(lambda *inputs, rung=rung: np.asarray(_call(rung, variables, inputs, **apply)),
+                        lambda *inputs: np.asarray(_call(model, variables, inputs, **apply)),
+                        lambda seed: _redrawn(inputs, seed), f"forward at {rung.recompute_record()}",
+                        seeds=RUNG_SEEDS, truth_fn=forward_truth)
+        as_exact(stepped[1], base.gradient, base.truth, f"gradient at {rung.recompute_record()}")
+        assert rung.apply(variables, *inputs, mutable=True, **apply)[1].keys() == base.written
 
 
 @pytest.mark.parametrize("share", range(RUNG_SHARES))
 @pytest.mark.parametrize("name", PATHS)
 def test_a_checkpoints_remat_rungs_step_as_it_does(name, share):
     source, read = loaded(name), reads(name, "float32")
-    _climbs_and_restores(source.model, source.variables, (read.tokens,), share, method="logits")
+    _climbs_and_restores(name, source.model, source.variables, (read.tokens,), share, method="logits")
 
 
 RECOMPUTED = [case for case in ARCHITECTURES
@@ -629,7 +687,7 @@ def test_an_architectures_remat_rungs_step_as_it_does(case, share):
     ladder, decoders and DiT stacks, at its size there."""
     model = models.build(case.architecture, **case.config)
     inputs = _inputs(case)
-    _climbs_and_restores(model, model.init(jax.random.key(0), *inputs), inputs, share)
+    _climbs_and_restores(case.name, model, model.init(jax.random.key(0), *inputs), inputs, share)
 
 
 def _packed(variables, groups) -> dict:
