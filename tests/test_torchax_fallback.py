@@ -891,8 +891,8 @@ def test_a_tier_3_source_generates_through_the_pipeline_loader_as_its_bundle_doe
         loaded = Pretrained.load(tmp_path, dtype="float32")
     prompts, greedy = [[3, 5, 7, 2], [9, 4, 6, 8]], Sampling(temperature=0.0)
     np.testing.assert_array_equal(
-        np.asarray(task(prompts, 3, key=0, n=1, sampling=greedy).tokens),
-        np.asarray(loaded.text_generation()(prompts, 3, key=0, n=1, sampling=greedy).tokens))
+        task(prompts, 3, key=0, n=1, sampling=greedy).host().tokens,
+        loaded.text_generation()(prompts, 3, key=0, n=1, sampling=greedy).host().tokens)
 
 
 @pytest.mark.parametrize("stated", ["mask", "segments"])
