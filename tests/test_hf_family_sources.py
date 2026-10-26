@@ -116,12 +116,13 @@ def _fixture_config(name: str) -> dict:
 def _written(config: dict, directory: Path) -> dict:
     """`config` written at `directory` as its source builds from it, a head_dim its class leaves None
     stated: the source reads a stated one (MinistralAttention, `_compute_yarn_parameters`), which
-    MixtralConfig and MinistralConfig leave None where the width divides evenly."""
+    MixtralConfig and MinistralConfig leave None where the width divides evenly. The class's fields are
+    read as it serializes them, since Gemma 4's refuses a read of its per-layer head_dim."""
     from transformers import AutoConfig
 
     directory.mkdir(parents=True)
     (directory / "config.json").write_text(json.dumps(config))
-    if getattr(AutoConfig.from_pretrained(directory), "head_dim", 0) is None:
+    if AutoConfig.from_pretrained(directory).to_dict().get("head_dim", 0) is None:
         config = {**config, "head_dim": config["hidden_size"] // config["num_attention_heads"]}
         (directory / "config.json").write_text(json.dumps(config))
     return config
