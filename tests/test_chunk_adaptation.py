@@ -280,7 +280,8 @@ def test_what_the_adaptation_cannot_serve_is_refused():
     with pytest.raises(ValueError):
         ChunkAdaptation(rate=-1.0)
     with pytest.raises(ValueError):
-        LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(), samples=Samples(prompt=[1, 2], max_new_tokens=2))
+        LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(),
+                    samples=Samples(prompt=[1, 2], max_new_tokens=2))
     objective = LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(select=("sideways",)))
     variables = objective.init(jax.random.key(0))
     with pytest.raises(ValueError):
