@@ -25,6 +25,7 @@ from flax import linen as nn
 from recording import RecordingTracker
 from reference_error import (
     assert_as_exact,
+    assert_as_exact_as_the_reference,
     declared_seeds,
     indexed_recording,
     recording,
@@ -973,3 +974,39 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     assert logged["evaluation/records"] == count * 2
     previews = [value for _, value in tracker.artifacts if not isinstance(value, RECORD_TYPES)]
     assert previews[0].images.shape == (min(4, count), 4, 4, 1)
+
+
+def test_a_transitions_density_and_kl_hold_at_float32s_largest_variances():
+    """A transition's density and KL stay finite and on SciPy's float64 values at a variance near float32's
+    largest, where `2 pi` or 2 times it overflowed to infinity, and its KL at one near its least, where
+    an error over it overflows and half the quotient fits: the density of a state at its mean under a
+    variance of 1e38 is `-n / 2 (log 2 pi + log 1e38)` (JAX's isotropic `multivariate_normal.logpdf`), and
+    the KL to a mean `d` away is `d**2 / (2 variance)`."""
+    from scipy.stats import multivariate_normal as reference
+
+    from dew.sampling.flow import GaussianTransition
+
+    variance = np.asarray([1e38, 2.5e38], np.float32)
+    mean = np.zeros((2, 3, 4), np.float32)
+    transition = GaussianTransition(jnp.asarray(mean), jnp.asarray(variance))
+    density = np.asarray(transition.log_prob(jnp.asarray(mean)))
+    assert np.all(np.isfinite(density))
+    half_log = np.float32(6) * (np.log(np.float32(2 * math.pi)) + np.log(variance))
+    truth = [reference.logpdf(np.zeros(12), np.zeros(12), float(value)) for value in variance]
+    assert_as_exact_as_the_reference(density, -half_log, np.asarray(truth), "a wide transition's density")
+    away = np.full_like(mean, 1e18)
+    kl = np.asarray(transition.kl(jnp.asarray(away)))
+    assert np.all(np.isfinite(kl))
+    error = np.float32(12) * np.float32(1e18) ** 2
+    assert_as_exact_as_the_reference(kl, error / np.float32(2) / variance,
+                                     12 * 1e36 / (2 * variance.astype(np.float64)), "a wide transition's KL")
+    # A variance near float32's least: the KL, about 2e38, fits, where its twice the quotient would not.
+    narrow = np.asarray([2e-38, 3e-38], np.float32)
+    near = GaussianTransition(jnp.asarray(mean), jnp.asarray(narrow))
+    step = np.float32(np.sqrt(8 / 12))
+    kl = np.asarray(near.kl(jnp.full_like(jnp.asarray(mean), step)))
+    assert np.all(np.isfinite(kl))
+    error = np.sum(np.full(12, step) ** 2, dtype=np.float32)
+    assert_as_exact_as_the_reference(kl, error / np.float32(2) / narrow,
+                                     12 * float(step) ** 2 / (2 * narrow.astype(np.float64)),
+                                     "a narrow transition's KL")
