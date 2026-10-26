@@ -87,7 +87,7 @@ from dew.objectives.base import (
     select,
     taken_record,
 )
-from dew.optim import learning_rate, with_rate_scales
+from dew.optim import learning_rate, with_rates
 from dew.records import JSON, boolean, json_value, record
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import (
@@ -278,6 +278,14 @@ _DEFAULT_MESH = MeshSpec()
 _DEFAULT_LAYOUT = Layout()
 
 
+def loss_scale(dynamic_scale: bool | dynamic_scale_lib.DynamicScale) -> dynamic_scale_lib.DynamicScale | None:
+    """The dynamic loss scale a trainer's `dynamic_scale` asks for: Flax's at its defaults for True,
+    the one given (its growth interval and factors), or none."""
+    if isinstance(dynamic_scale, dynamic_scale_lib.DynamicScale):
+        return dynamic_scale
+    return dynamic_scale_lib.DynamicScale() if dynamic_scale else None
+
+
 class Trainer(Generic[Loss, Effects]):
     """Runs an `Objective`: gradients, sharding, EMA, checkpoints and logging."""
 
@@ -292,7 +300,7 @@ class Trainer(Generic[Loss, Effects]):
         microbatches: int | None = None,
         accumulation: int = 1,
         split: int | None = None,
-        dynamic_scale: bool = False,
+        dynamic_scale: bool | dynamic_scale_lib.DynamicScale = False,
         checkpoints: Checkpoints | None = None,
         tracker: Tracker | None = None,
         step: Callable[[Objective[Loss, Effects], optax.GradientTransformation], StepFn] | None = None,
@@ -338,7 +346,8 @@ class Trainer(Generic[Loss, Effects]):
         self._microbatches = microbatches
         self.accumulation = accumulation
         self.split = split
-        self.dynamic_scale = dynamic_scale
+        self._loss_scale = loss_scale(dynamic_scale)
+        self.dynamic_scale = self._loss_scale is not None
         self.checkpoints = checkpoints
         self.tracker = tracker
         self.step = step
@@ -456,8 +465,9 @@ class Trainer(Generic[Loss, Effects]):
             step=jnp.zeros((), jnp.int32),
             microstep=jnp.zeros((), jnp.int32),
             updates=jnp.zeros((), jnp.int32),
-            scale=(jax.tree.map(jnp.asarray, dynamic_scale_lib.DynamicScale())
-                   if self.dynamic_scale else None),
+            # A state of its own, the given scale's leaves copied: the step donates the state.
+            scale=None if self._loss_scale is None else jax.tree.map(
+                lambda leaf: jnp.array(leaf, copy=True), self._loss_scale),
             window_size=jnp.asarray(self.accumulation, jnp.int32),
             variables=params,
             opt_state=self._boxed_init(initialized, params["params"]),
@@ -653,8 +663,7 @@ class Trainer(Generic[Loss, Effects]):
                                               share=DataPartition.of(self.device_mesh))
         if self._config is not None:
             # The rate this run configures, not the one its checkpoint holds.
-            state = dataclasses.replace(state, opt_state=with_rate_scales(state.opt_state,
-                                                                          self._config.rate_scales()))
+            state = dataclasses.replace(state, opt_state=with_rates(state.opt_state, self._config.rates()))
         self._resume_rung(checkpoints.rung(resume))
         from dew.nn.inputs import request_key
         state = dataclasses.replace(state, key=jax.device_put(request_key(state.key), shardings.key))
@@ -995,8 +1004,8 @@ class Trainer(Generic[Loss, Effects]):
         transaction, a window pooling `split` x `accumulation`. Every batch of
         a run is split alike, as its first compile planned or its pooling
         state's window holds; later shapes climb the ladder alone. A plan that
-        splits, left open and unrecorded, is timed by `timed` (`fit`) against
-        the batch whole a rung up, and the faster kept.
+        splits or spans devices, left open and unrecorded, is timed by `timed`
+        (`fit`) against the batch whole a rung up, and the faster kept.
         """
         if self.lower_for is not None:
             # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`).

@@ -10,14 +10,14 @@ import optax
 import pytest
 from reference_error import assert_as_exact, seeds_for
 
-from dew.optim import delta_gradient_descent, newton_schulz, scale_by_m3
+from dew.optim import NEWTON_SCHULZ, delta_gradient_descent, scale_by_m3
 
 M3_FACTORS = {"beta1": 0.9, "beta2": 0.99, "beta3": 0.5, "alpha": 0.3, "eps": 1e-2, "frequency": 3}
 """M3's factors in the proofs below: three updates a chunk, so seven updates close two chunks. An `eps`
 of 1e-2 keeps an entry whose early gradients are near zero from dividing its direction by a near-zero
 root, which would let one entry's rounding stand for a draw's whole error."""
 NESTED_SEEDS = 8
-"""Check 1's declared seeds for M3's directions and delta gradient descent's step."""
+"""Check 1's declared seeds for delta gradient descent's step."""
 
 
 def newton_schulz_reference(matrix: np.ndarray, steps: int = 5) -> np.ndarray:
@@ -34,44 +34,32 @@ def newton_schulz_reference(matrix: np.ndarray, steps: int = 5) -> np.ndarray:
     return wide.T if tall else wide
 
 
-def test_newton_schulz_orthogonalizes_a_matrix_and_a_stack_as_muons_iteration_does():
-    """`newton_schulz` on a tall and a wide matrix, and on a stack of four 6 x 4 matrices whose stack axis
-    sits between their reduction and output axes (Muon's dimension numbers), each matrix on par with
-    Muon's quintic iteration in NumPy from float64 (check 1), the stack's matrices each as alone, batched
-    or one at a time as the backend's products round them."""
-    numbers = optax.contrib.MuonDimensionNumbers(reduction_axis=0, output_axis=2)
-
-    @jax.jit
-    def orthogonalized(tall, wide, stacked):
-        return newton_schulz(tall), newton_schulz(wide), newton_schulz(stacked, dimension_numbers=numbers)
-
-    def reference(tall, wide, stacked):
-        return (newton_schulz_reference(tall), newton_schulz_reference(wide),
-                np.stack([newton_schulz_reference(stacked[:, index]) for index in range(4)], axis=1))
-
-    def draw(seed):
-        rng = np.random.default_rng(seed)
-        return tuple(rng.standard_normal(shape).astype(np.float32) for shape in ((6, 4), (4, 6), (6, 4, 4)))
-
-    assert_as_exact(orthogonalized, reference, draw, "Newton-Schulz", seeds=NESTED_SEEDS)
+@jax.jit
+def muon_orthogonalized(matrix):
+    """One matrix orthogonalized by optax's Muon iteration, the reference arm's: its Muon transform with no
+    momentum, which hands back the matrix orthogonalized. It batches even one matrix, so its products round
+    as M3's do on every backend."""
+    muon = optax.contrib.scale_by_muon(NEWTON_SCHULZ, beta=0.0, nesterov=False,
+                                       weight_dimension_numbers=optax.contrib.MuonDimensionNumbers())
+    return muon.update(matrix, muon.init(matrix))[0]
 
 
-def m3_directions(gradients: np.ndarray) -> np.ndarray:
+def m3_directions(gradients: np.ndarray, orthogonalized=newton_schulz_reference) -> np.ndarray:
     """Algorithm 1 of arXiv 2512.24695 in NumPy, in the gradients' own dtype: each update's
     `(NS(M1) + alpha O2) / sqrt(V + eps)`, `M1` and `V` summing `beta1 g` and `beta2 g**2`, and `O2`
     the slow momentum orthogonalized when the chunk before closed, `M2` summing `beta3` times each closed
-    chunk's gradients."""
+    chunk's gradients, each `NS` by `orthogonalized`."""
     beta1, beta2, beta3, alpha, eps, frequency = (M3_FACTORS[name] for name in (
         "beta1", "beta2", "beta3", "alpha", "eps", "frequency"))
     fast, second, slow, chunk, slow_direction = (np.zeros_like(gradients[0]) for _ in range(5))
     directions = []
     for update, gradient in enumerate(gradients, 1):
         fast, second = fast + beta1 * gradient, second + beta2 * gradient * gradient
-        directions.append((newton_schulz_reference(fast) + alpha * slow_direction) / np.sqrt(second + eps))
+        directions.append((orthogonalized(fast) + alpha * slow_direction) / np.sqrt(second + eps))
         chunk = chunk + gradient
         if update % frequency == 0:
             slow, chunk = slow + beta3 * chunk, np.zeros_like(chunk)
-            slow_direction = newton_schulz_reference(slow)
+            slow_direction = orthogonalized(slow)
     return np.stack(directions)
 
 
@@ -79,9 +67,11 @@ def test_m3s_directions_are_algorithm_1s_across_its_chunks():
     """`scale_by_m3` over seven updates of a tree of matrices, one tall and one wide, two chunks closing:
     each direction on par with Algorithm 1's from float64 (check 1), the slow momentum's reaching the
     updates from the second chunk on, its products at full float32 as the reference's are (a GPU's
-    default float32 matmul is TF32; a run's precision is its own). Within a chunk the slow momentum and
-    its orthogonalization hold still, and each changes once, as the chunk closes; the first chunk's slow
-    direction is zero."""
+    default float32 matmul is TF32; a run's precision is its own). The reference orthogonalizes by
+    optax's Muon iteration (`muon_orthogonalized`), as M3 does, so both round its batched products alike
+    (ledger 1650: XLA:CPU's are ten times further from float64 than one matrix's, an A100's are not), and
+    the truth by NumPy's in float64. Within a chunk the slow momentum and its orthogonalization hold still,
+    and each changes once, as the chunk closes; the first chunk's slow direction is zero."""
     transform = scale_by_m3(**M3_FACTORS)
 
     @jax.jit
@@ -101,11 +91,18 @@ def test_m3s_directions_are_algorithm_1s_across_its_chunks():
         return ({"attention": {"kernel": rng.standard_normal((7, 16, 12)).astype(np.float32)},
                  "head": rng.standard_normal((7, 12, 16)).astype(np.float32)},)
 
+    def orthogonalized(matrix):
+        with jax.default_matmul_precision("highest"):
+            return np.asarray(muon_orthogonalized(jnp.asarray(matrix)))
+
     def reference(gradients):
+        return jax.tree.map(lambda leaf: m3_directions(leaf, orthogonalized), gradients)
+
+    def truth(gradients):
         return jax.tree.map(m3_directions, gradients)
 
-    seeds = seeds_for(reference, draw, "M3 directions")
-    assert_as_exact(directions, reference, draw, "M3 directions", seeds=seeds)
+    seeds = seeds_for(reference, draw, "M3 directions", truth_fn=truth, dew_fn=directions)
+    assert_as_exact(directions, reference, draw, "M3 directions", seeds=seeds, truth_fn=truth)
     (gradients,) = draw(0)
     gradients = gradients["head"]
     state, held = transform.init(gradients[0]), []

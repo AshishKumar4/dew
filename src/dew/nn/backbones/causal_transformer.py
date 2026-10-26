@@ -834,7 +834,7 @@ class CausalTransformer(nn.Module):
             copies = (self.mtp_hyper_connections.hc_mult
                       if relative[1] == 'h_proj' and self.mtp_hyper_connections is not None else 1)
             return rows[depth][0] * copies
-        if relative[0] in ('lm_head', 'head_dense'):
+        if relative[0] in ('lm_head', 'head_dense', 'continuum'):
             return np.concatenate([np.empty((0,), np.int64), *(outputs for _, outputs in rows)])
         return np.zeros_like(lengths)
 
@@ -844,7 +844,8 @@ class CausalTransformer(nn.Module):
         relative = path[1:] if path and path[0] == 'params' else path
         if not relative:
             raise MissingFlopsCount("CausalTransformer adapter matrix has no native scope")
-        head = relative[0] in ('lm_head', 'head_dense')
+        # The continuum level stands before the head, which every head read takes it through.
+        head = relative[0] in ('lm_head', 'head_dense', 'continuum')
         if head != logits or relative[0].startswith(('mtp_', 'dspark_')):
             return np.zeros(np.shape(lengths), np.int64)
         passes = 1
@@ -1285,6 +1286,21 @@ class CausalTransformer(nn.Module):
         """The shared fp32 head over `x`: what `__call__` and every MTP depth score with, the continuum
         level first where the model has one."""
         return self.head_logits(x if self.continuum is None else self.continuum_level(x))
+
+    @property
+    def in_context(self) -> bool:
+        """Whether the model holds a continuum level an objective steps in context (`SteppedInContext`)."""
+        return self.continuum is not None
+
+    @nn.nowrap
+    def in_context_level(self, variables):
+        """The continuum level's parameters in `variables`, None without a level (`SteppedInContext`)."""
+        return None if self.continuum is None else variables["params"]["continuum"]
+
+    @nn.nowrap
+    def with_in_context_level(self, variables, level):
+        """`variables` holding `level` as the continuum level's parameters (`SteppedInContext`)."""
+        return {**variables, "params": {**variables["params"], "continuum": level}}
 
     def continuum_states(self, hidden):
         """Final states `hidden` past the continuum level, the states its head reads (`head_logits`):

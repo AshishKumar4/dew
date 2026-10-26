@@ -5,6 +5,18 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- Test-time training over the task loss: a decoder's continuum level (`CausalTransformer(continuum=ContinuumLevel(hidden))`) is stepped in context by the LM loss every `window` tokens of a document (`LMObjective(adaptation=ChunkAdaptation(...))`), Nested Learning's equation 71, each document from the trained start, training through every step.
+- A label's cross-entropy derivative in its own logit is `p - 1` while the label holds at most half its row and minus the rest of the row past it (`dew.nn.categorical.label_entry`), for the whole-logits head and the tiled, fused and vocabulary-split heads alike; the rest alone sat two to three times as far from float64 on unconfident rows.
+- 8-bit Adam state codes each moment value among the six codes around its estimate, its decade by its
+  logarithm, instead of searching the whole map: on an A100, lm-dense's update takes 27.32 ms against
+  60.39, its full-remat step 167.9 against 196.3 ms and compiles in 82.3 against 209.8 s, the codes
+  the search's (`dew.optim.quantized`).
+- `OptimConfig(state_dtype='int8')` stores adam's and adamw's moments blockwise in 8 bits
+  (`dew.optim.int8_moments`, bitsandbytes' and torchao's 8-bit Adam): a quarter of float32's state, the
+  update computed from the moments dequantized to fp32. On an A100, lm-dense's full-remat step peaks at
+  5.88 GB against fp32 state's 8.09 and takes 196.3 ms against 151.7 (`tools/benchmark_kernels.py
+  step --state-dtype int8`). bf16 and 8-bit Adam share one leafwise transform, and an 8-bit moment's
+  codes and scales are placed by their parameters' axes.
 - `Trainer.fit(examples=N)` and `--trainer.examples N` bound a run to the chain's
   first N records, counted before packing and each read once, its steps (and so
   its schedule) the ones the data plan counts for them. `Pause(fraction)`, as
@@ -28,7 +40,7 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 - Two optimizers from Nested Learning (arXiv 2512.24695) as Optax transforms: `dew.optim.scale_by_m3`, M3's
   Muon over Adam's second moment with a slow momentum gathered once per chunk, and
   `dew.optim.delta_gradient_descent`, the step to eq. 56's minimizer given each kernel's input. M3
-  orthogonalizes through `dew.optim.newton_schulz`, Muon's quintic iteration on each matrix alone.
+  orthogonalizes through optax's own Muon iteration (`optax.contrib.scale_by_muon` with no momentum).
 - A filtered or packed read resumes on any number of readers once it is prepared: publish its rows (and
   a terminal pack's plan) as a generation with `dew data publish` and read it by index, and a new run
   lowers to the global order. A per-share read refused on another topology now says so.

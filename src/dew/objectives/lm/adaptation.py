@@ -15,11 +15,14 @@ head (`continuum_states`, `head_logits`); the next-token losses there are the ob
 gradient, weighted as the objective weights its targets, steps the level for the next window. The
 outer loss differentiates through every step, the second-order meta-gradient of the level's start.
 
-Each row adapts by itself, and each document of a packed row by itself: its windows are counted from
-its first token (`counted_places`), and its first window reads the level's start, so a packed
-document reads as it would alone. The row is cut into blocks of `C` slots, which a document's windows
-straddle where its start falls inside one: a block's slots read the window open from the block before,
-the document's next window, or a new document's first, so the scan carries one window per row.
+Each row adapts by itself, and each document of a packed row by itself: a run of a document's
+real tokens, padding inside it read through and a document number used again after another's a run
+of its own, counts its windows from its first real token, and its first window reads the level's
+start, so a packed document reads as it would alone. A padding slot weighs nothing and belongs to the
+window open at it. The row is cut into blocks of `C` slots (`sequence_blocks`), which a run's windows
+straddle where its start or padding falls inside one: a block's slots read the window open from the
+block before, the run's next window, or a new run's first, so the scan carries one window per row.
+A row with no padding and one document has every window a block, and its blocks read one level.
 """
 
 from __future__ import annotations
@@ -30,8 +33,10 @@ from collections.abc import Mapping
 
 import jax
 import jax.numpy as jnp
+from flax import linen as nn
 
-from dew.nn.inputs import counted_places
+from dew.nn.inputs import real_slots, sequence_blocks, token_layout
+from dew.nn.protocols import SteppedInContext
 
 
 @dataclasses.dataclass(frozen=True)
@@ -76,11 +81,23 @@ def _stepped_mask(level: Mapping, select: tuple[str, ...]) -> Mapping:
             for name, part in level.items()}
 
 
-def _blocks(value: jax.Array, window: int, blocks: int, fill) -> jax.Array:
-    """`value` `[B, S, ...]` padded with `fill` to `blocks * window` slots, as `[blocks, B, window, ...]`."""
-    padding = blocks * window - value.shape[1]
-    padded = jnp.pad(value, [(0, 0), (0, padding)] + [(0, 0)] * (value.ndim - 2), constant_values=fill)
-    return jnp.moveaxis(padded.reshape(value.shape[0], blocks, window, *value.shape[2:]), 1, 0)
+def window_keys(valid, documents, rows: int, length: int, window: int) -> tuple[jax.Array, jax.Array]:
+    """Each slot's window as `(run, window)` `[B, S]` each: the run of its document's real tokens it
+    belongs to, numbered from 1 along the row (a padding slot the run before it, 0 before any), and
+    its window within the run, its real tokens counted from the run's first (-1 before any)."""
+    real = jnp.ones((rows, length), bool) if valid is None else jnp.asarray(valid, bool)
+    documents = (jnp.zeros((rows, length), jnp.int32) if documents is None
+                 else jnp.asarray(documents, jnp.int32))
+    index = jnp.broadcast_to(jnp.arange(length), (rows, length))
+    # The last real slot before each slot, -1 before any.
+    last = jax.lax.cummax(jnp.where(real, index, -1), axis=1)
+    before = jnp.concatenate([jnp.full((rows, 1), -1), last[:, :-1]], axis=1)
+    previous = jnp.take_along_axis(documents, jnp.maximum(before, 0), axis=1)
+    starts = real & ((before < 0) | (previous != documents))
+    runs = jnp.cumsum(starts, axis=1)
+    counted = jnp.cumsum(real, axis=1)
+    opened = jax.lax.cummax(jnp.where(starts, counted - 1, -1), axis=1)
+    return runs, jnp.where(runs > 0, (counted - 1 - opened) // window, -1)
 
 
 def _rows(tree, rows: int):
@@ -94,38 +111,39 @@ def _where(choice: jax.Array, first, second):
                         first, second)
 
 
-def adapted_scores(model, variables, hidden, targets, weights, layout, adaptation: ChunkAdaptation, *,
-                   predict: bool, logits: bool) -> Adapted:
+def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields,
+                   adaptation: ChunkAdaptation, *, predict: bool, logits: bool) -> Adapted:
     """A row's targets scored through its continuum level stepped in context (module docstring):
     `hidden` the final states `[B, S, features]`, `targets` `[B, S]`, `weights` each target's weight in
-    the loss, and `layout` the rows' validity and documents (`dew.nn.inputs.token_layout`)."""
+    the loss, and `fields` the rows' token fields, their documents and real slots read as every
+    reader of rows reads them (`token_layout`, `real_slots`: a validity mask, and a packed row's
+    document 0, are padding). A row's places (`positions`) move no window: each run counts its own.
+    The model owns the level's place in its variables (`SteppedInContext`)."""
     from dew.objectives.lm.chunked import logits_cross_entropy
 
-    params = variables["params"]
-    start = params["continuum"]
+    start = model.in_context_level(variables) if isinstance(model, SteppedInContext) else None
+    if start is None:
+        raise ValueError("the model has no continuum level to step in context")
     steps = _stepped_mask(start, adaptation.select)
     rows, length = targets.shape
     window = adaptation.window
+    marked, documents = token_layout(fields)
+    # Only padding or several documents let a window open inside a block; else every window is one.
+    straddles = marked is not None or documents is not None
+    valid = real_slots(fields, (rows, length)) if straddles else None
+    if valid is not None:
+        # A padding slot weighs nothing, whatever weight it is given.
+        weights = jnp.where(valid, weights, 0)
+    runs, windows = window_keys(valid, documents, rows, length, window)
     blocks = -(-length // window)
-    valid, documents = layout
-    places = counted_places(segments=documents, valid=valid)
-    places = jnp.broadcast_to(jnp.arange(length), (rows, length)) if places is None else places
-    documents = (jnp.zeros((rows, length), jnp.int32) if documents is None
-                 else jnp.asarray(documents, jnp.int32))
-    # A block's padding slots are a document of their own, which no real one numbers, and weigh nothing.
-    alone = jnp.min(documents) - 1
-    inputs = (_blocks(hidden, window, blocks, 0), _blocks(targets, window, blocks, 0),
-              _blocks(weights, window, blocks, 0), _blocks(documents, window, blocks, alone),
-              _blocks(places // window, window, blocks, 0))
-    # Whether a document's window can open inside a block: only where a row holds several documents or
-    # padding; else every window is a block, and the next window is the block's every slot.
-    straddles = layout[1] is not None or layout[0] is not None
-
-    def with_level(level):
-        return {**variables, "params": {**params, "continuum": level}}
-
-    def level_states(level, states):
-        return model.apply(with_level(level), states, method="continuum_states")
+    # The last block's slots past the row weigh nothing and belong to the row's last window.
+    edge = ((0, 0), (0, blocks * window - length))
+    inputs = (*(sequence_blocks(value, window, leading=True) for value in (hidden, targets, weights)),
+              *(sequence_blocks(jnp.pad(key, edge, mode="edge"), window, leading=True)
+                for key in (runs, windows)))
+    def level_states(level, states) -> jax.Array:
+        return jnp.asarray(model.apply(model.with_in_context_level(variables, level), states,
+                                       method="continuum_states"))
 
     def scored(levels, chosen, states, block_targets):
         """Each slot's losses, its states read at its own of `levels` (`chosen`, per slot)."""
@@ -133,7 +151,7 @@ def adapted_scores(model, variables, hidden, targets, weights, layout, adaptatio
         passed = read[0]
         for index, alternative in enumerate(read[1:], start=1):
             passed = jnp.where((chosen == index)[..., None], alternative, passed)
-        block_logits = model.apply(variables, passed, method="head_logits")
+        block_logits = jnp.asarray(model.apply(variables, passed, method="head_logits"))
         losses, top, log_z = logits_cross_entropy(block_logits, block_targets, predict=predict)
         return losses, (top, log_z, block_logits)
 
@@ -144,11 +162,11 @@ def adapted_scores(model, variables, hidden, targets, weights, layout, adaptatio
     started = _rows(start, rows)
 
     def block(carry, block_inputs):
-        level, partial, document, place = carry
-        states, block_targets, block_weights, block_documents, block_places = block_inputs
-        same = block_documents == document[:, None]
-        tail = same & (block_places == place[:, None])
-        following = same & (block_places == place[:, None] + 1)
+        level, partial, run, place = carry
+        states, block_targets, block_weights, block_runs, block_windows = block_inputs
+        same = block_runs == run[:, None]
+        tail = same & (block_windows == place[:, None])
+        following = same & (block_windows == place[:, None] + 1)
         if straddles:
             # The open window's tail, read at the window's own level, finishes its gradient.
             def tail_loss(at):
@@ -161,8 +179,8 @@ def adapted_scores(model, variables, hidden, targets, weights, layout, adaptatio
             closed = partial
             levels = (stepped(level, closed),)
             chosen = jnp.zeros_like(tail, jnp.int32)
-        last_document, last_place = block_documents[:, -1], block_places[:, -1]
-        last = (block_documents == last_document[:, None]) & (block_places == last_place[:, None])
+        last_run, last_place = block_runs[:, -1], block_windows[:, -1]
+        last = (block_runs == last_run[:, None]) & (block_windows == last_place[:, None])
 
         def last_loss(at):
             losses, held = scored(at, chosen, states, block_targets)
@@ -177,12 +195,13 @@ def adapted_scores(model, variables, hidden, targets, weights, layout, adaptatio
         opened = levels[0]
         for index, alternative in enumerate(levels[1:], start=1):
             opened = _where(chosen[:, -1] == index, alternative, opened)
-        continuing = (last_document == document) & (last_place == place)
-        carried = (opened, _where(continuing, closed, reached), last_document, last_place)
+        continuing = (last_run == run) & (last_place == place)
+        carried = (opened, _where(continuing, closed, reached), last_run, last_place)
         return carried, (losses, top, log_z, block_logits if logits else None)
 
     zeros = jax.tree.map(jnp.zeros_like, started)
-    first = (started, zeros, documents[:, 0], jnp.full((rows,), -1, places.dtype))
+    # Before a row's first real token no run is open: run 0, window -1.
+    first = (started, zeros, jnp.zeros((rows,), runs.dtype), jnp.full((rows,), -1, windows.dtype))
     _, (losses, top, log_z, whole) = jax.lax.scan(jax.checkpoint(block), first, inputs)
 
     def joined(value: jax.Array) -> jax.Array:
