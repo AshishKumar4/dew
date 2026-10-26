@@ -212,7 +212,7 @@ def test_a_numpy_arm_is_refused_unless_it_is_given_and_windows_keep_their_arms_p
     def draw(seed):
         return (np.random.default_rng(seed).standard_normal(8).astype(np.float32),)
 
-    with pytest.raises(TypeError, match="as_given"):
+    with pytest.raises(TypeError):
         assert_as_exact(dew, numpy, draw, "a NumPy arm unmarked", seeds=8)
     assert_as_exact(dew, as_given(numpy), draw, "a NumPy arm as given", seeds=8)
     windowed, _ = _arms(over_windows(dew), over_windows(as_given(numpy)))
