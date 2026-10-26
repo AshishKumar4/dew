@@ -132,7 +132,8 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
             held = hooked if initial is None else hooked._replace(
                 initial=(*initial[:2], initial[2][..., first:first + unit]))
             blocks.append(_launch(q, k, columns, guarded_spans, held, guard, spec=form, hooks=hooks,
-                                  tiles=guarded, family=family, training=False, interpret=interpret)[0])
+                                  tiles=guarded, family=family, training=False, interpret=interpret,
+                                  columns=first)[0])
         # Its maxima and overflows `walked_launches` reads of the plain launch alone.
         return jnp.concatenate(blocks, axis=-1), jnp.zeros(live.shape, jnp.float32), jnp.zeros_like(live)
 
@@ -403,7 +404,7 @@ def _trained(spec: algebra.Forward, family: mosaic.Family, start: algebra.Partia
 
 def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Guard | None, *,
             spec: algebra.Forward, hooks: Hooks, tiles: Tiles, family: mosaic.Family, training: bool,
-            interpret: bool):
+            interpret: bool, columns: int | None = None):
     """The forward's launch in `spec`'s form (`guard`'s rows shifting where given): its output `[B, Qp, H,
     Dv]` and its rows' status `[2, B, H, Qp]` fp32, their maxima in the walk's units and 1 where their
     weighted values overflowed (`algebra.walked_launches`); in `training` its residuals too (`_Residuals`):
@@ -485,7 +486,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
     approx_math = approximate(hooks, (block_q, block_k), value.shape[-1], differentiated=False)
     # Each launch named apart, so its compile reports and profile rows say which it is.
     name = (f"attention_{'training' if training else 'forward'}{'_natural' if spec.natural else ''}"
-            f"{'_guarded' if guard is not None else ''}")
+            f"{'_guarded' if guard is not None else ''}{'' if columns is None else f'_columns{columns}'}")
     return family.kernel(entry, out_type=out_type, grid=(heads, queries // pair, batch),
                          grid_names=("heads", "q_tiles", "batch"), consumers=consumers, interpret=interpret,
                          approx_math=approx_math, name=name)(query, key, value, *leaves)

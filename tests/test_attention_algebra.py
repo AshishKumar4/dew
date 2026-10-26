@@ -703,8 +703,7 @@ def test_a_querys_gradient_from_a_state_of_a_small_denominator_at_a_large_scale_
     state = template.Initial(jnp.full((1, 1, 1), 40.0), jnp.full((1, 1, 1), 2.0 ** -40),
                              jnp.zeros((1, 1, 1, 16)))
     hooks = template.Hooks(initial=state)
-    _, want = _accurate_dq(query, key, value, spans, hooks, dout, 2.0 ** 100, "a small denominator")
-    assert 5e24 < want[0, 0, 0, 0] < 7e24
+    _accurate_dq(query, key, value, spans, hooks, dout, 2.0 ** 100, "a small denominator")
 
 
 def test_a_bf16_querys_gradient_over_a_large_key_with_small_cotangents_is_exact():

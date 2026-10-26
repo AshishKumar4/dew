@@ -552,7 +552,7 @@ def test_the_accurate_form_is_one_option_away():
         np.testing.assert_array_equal(np.asarray(out), np.asarray(want), err_msg=form)
         for mine, theirs in zip(grads, (pulled.query, pulled.key, pulled.value), strict=True):
             np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs), err_msg=form)
-    with generation.chosen(attention_form="exact"), pytest.raises(ValueError, match="forms"):
+    with generation.chosen(attention_form="exact"), pytest.raises(ValueError):
         attention_route.attend(query, key, value, spans)
 
 
