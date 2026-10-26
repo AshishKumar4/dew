@@ -31,7 +31,8 @@ MEMORY_SEEDS = 8
 configuration, its token-by-token, decoded, packed, cached and recurrence paths included, at 8 over the
 drawn weights, but the sites `SEEDS` names."""
 SEEDS = {"self-generated gradients": 512, "memory decoder gradient": 512, "memory decoder decode": 16,
-         "adapted memory": 8, "rows split": 256, "rows split cms": 512, "decoded gated_linear_attention": 32}
+         "adapted memory": 8, "rows split": 256, "rows split cms": 512, "decoded gated_linear_attention": 32,
+         "decoded quantized gated_linear_attention": 32}
 """The sites' declared seeds where `seeds_for` on armada, each reference compared with itself, sizes them
 past `MEMORY_SEEDS` or apart from it: the self-modifying memory's and the memory decoder's gradients,
 every parameter's leaf, and the continuum-memory level's rows split over a data axis at 512; the other
@@ -665,6 +666,40 @@ SCALE = 0.125
 coarse steps at 8 to 16 times it."""
 
 
+def test_a_cached_linear_memory_off_the_recurrence_continues_its_full_pass():
+    """A linear memory whose heads' inputs a checkpoint's input quantization rounds runs its general path
+    on every call, while its cache holds the recurrence's state: a prefill and a token-by-token decode
+    through that cache read each token as the full pass does, on par against its paper's update over
+    the rounded inputs in float64 (check 1)."""
+    from dew.quantization import QUANTIZATION, InputQuantization, InputQuantizer
+
+    module = layer("gated_linear_attention")
+    draw = drawn(module)
+    record = InputQuantization(sites=tuple((site, "fp8") for site in inner_sites(draw(0)[1]["params"])))
+    quantized = record.apply(module)
+    scales = jax.tree.map(lambda _: np.float32(SCALE), record.declared())
+    decode = MixerCall(decode=True)
+
+    def scaled(seed: int):
+        x, params = draw(seed)
+        return x, {**params, QUANTIZATION: scales}
+
+    @jax.jit
+    def decoded(x, params):
+        _, cache = quantized.apply(params, x[:, :1], decode, mutable=["cache"])
+        read, cache = quantized.apply({**params, **cache}, x[:, :6], decode, mutable=["cache"])
+        reads = [read]
+        for t in range(6, LENGTH):
+            token, cache = quantized.apply({**params, **cache}, x[:, t:t + 1], decode, mutable=["cache"])
+            reads.append(token)
+        return jnp.concatenate(reads, axis=1)
+
+    rounded = InputQuantizer.fp8(SCALE).qdq
+    assert_as_exact(decoded, applied(quantized), scaled, "decoded quantized gated_linear_attention memory",
+                    seeds=SEEDS["decoded quantized gated_linear_attention"],
+                    truth_fn=written(module, dtype=jnp.float64, inputs=rounded))
+
+
 def level() -> InContextMemory:
     """A continuum-memory level over its block's raw stream, one head of Titans' MLP updated every
     token: its network's input is the stream itself, the same values in every precision."""
@@ -852,10 +887,10 @@ def test_a_quantized_memorys_update_rounds_from_its_own_stream():
 
 def test_serving_quantization_refuses_a_memorys_moving_inner_weights():
     """Serving quantization (`quantize_for_serving`) stores each weight a rule selects quantized, and the
-    products read the stored values; a memory's inner weights move with every token, so there is no
-    stored value to serve, which a pattern selecting them is refused for at init
-    (`QuantizedServingRefused`). One selecting the memory's projections alone serves them, the served
-    decoder computing what quantized training computed, bit for bit."""
+    products read the stored values; Dew does not yet serve a memory's W_0 stored quantized, which a
+    pattern selecting its inner weights is refused for at init (`QuantizedServingRefused`). One
+    selecting the memory's projections alone serves them, the served decoder computing what quantized
+    training computed, bit for bit."""
     pytest.importorskip("qwix")
     from dew.nn.memory import QuantizedServingRefused
     from dew.quantization import Quantization, quantize_for_serving

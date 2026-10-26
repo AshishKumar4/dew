@@ -43,13 +43,13 @@ input quantization at an inner site (`dew.quantization`) rounds that site's inpu
 alike, and Qwix's quantized training quantizes every product of the moving weights, its stochastic
 rounding drawing from each token's key. A frozen FP8 record's codes at an inner kernel stand for W_0's
 kernel, as they decode: in a memory only W_0 is frozen, and each application multiplies the state the
-steps move from it. Qwix's serving quantization, which stores a weight quantized for its products to
-read, is refused for the inner weights, which move with every token (`QuantizedServingRefused`).
+steps move from it. Qwix's serving quantization of the inner weights is refused: Dew does not yet serve
+a memory's W_0 stored quantized (`QuantizedServingRefused`).
 
 A linear memory (`LinearMemory`) on its given target, with no momentum, no orthogonalized or slow
 weights and each token reading its own step, whose heads each compute the linear map of their input by
-their kernel (no wrapper rounds or drops their inputs or quantizes their products, `nonlinear_input`),
-is a row of the shared linear recurrence (`dew.nn.kernels.recurrence`), and runs there: on the dot
+the kernel its state moves (no wrapper rounds or drops their inputs or quantizes their products,
+`_route`), is a row of the shared linear recurrence (`dew.nn.kernels.recurrence`), and runs there: on the dot
 objective its step writes theta k v^T, its retention the decay, at any chunk (the gradient is the same
 at every state); on the l2 objective at chunk 1 without retention it is the delta rule with beta theta
 (Titans takes the gradient before the retention, the gated delta rule after it, so those differ). A
@@ -58,7 +58,9 @@ call) and a cached token its decode step (`recurrence.step`). The recurrence sta
 zero, so W_0 enters as its own term: the delta rule's state is W - W_0, written with the values
 v - W_0^T k, and the dot rule's W - P_t W_0, P_t the product of the shares the document kept; each
 readout adds P_t W_0^T q (P_t one for the delta rule). That readout is computed in at least float32 and
-rounded once to the layer's dtype.
+rounded once to the layer's dtype. Its decode cache holds the recurrence's state whichever route a call
+takes, as a call's wrappers may take it off the recurrence (an adapter's dropout on a training
+forward), whose general path steps the weights that state makes (`_stepped_from_recurrence`).
 """
 
 from __future__ import annotations
@@ -83,7 +85,7 @@ from dew.nn.kernels import recurrence, recurrence_chunk
 from dew.nn.mixer_base import DELTA_RESIDUALS, MEMORY_RESIDUALS
 from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
 from dew.optim import _orthogonalized
-from dew.quantization import decoded_frozen_fp8, quantizes
+from dew.quantization import decoded_frozen_fp8, quantized_products
 
 from .attention import FORWARD_MODE, LayerNorm
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places, sequence_blocks, valid_order
@@ -336,8 +338,7 @@ class InContextMemory(nn.Module):
         memory only W_0 is frozen, and every application multiplies the state the steps move from it.
 
         A weight stored quantized for serving (Qwix's, `dew.quantization.quantize_for_serving`) is
-        refused (`QuantizedServingRefused`): a served product reads the stored value, and an inner
-        weight moves with every token, so there is none to store."""
+        refused (`QuantizedServingRefused`): Dew does not yet serve a memory's W_0 stored quantized."""
         networks = [getattr(self, f"head_{head}") for head in range(self.heads)]
         if self.is_initializing():
             for network in networks:
@@ -366,12 +367,12 @@ class InContextMemory(nn.Module):
 
     def nonlinear_input(self, name: str) -> bool:
         """Whether this call computes the submodule `name` (a head's network), or a module under it,
-        other than as the linear map of its input by its stored kernel, an adapter's branch added: as
-        the Qwix quantization the call runs under selects it (`dew.quantization.quantizes`), and as a
-        method interceptor answers for itself (`dew.lora`'s dropout on a training forward, a
-        checkpoint's input quantization). A linear memory runs the shared recurrence only where every
-        head computes that map (`_route`)."""
-        return quantizes(self, name)
+        other than as a linear map of its input: as the Qwix quantization the call runs under quantizes
+        its activations or gradients (`dew.quantization.quantized_products`), and as a method
+        interceptor answers for itself (`dew.lora`'s dropout on a training forward, a checkpoint's input
+        quantization). A linear memory runs the shared recurrence only where every head is that map, by
+        the kernel its state moves (`_route`)."""
+        return quantized_products(self, name).inputs
 
     @nn.compact
     def __call__(self, x: jax.Array, call: MixerCall = PLAIN_CALL) -> jax.Array:
@@ -397,9 +398,12 @@ class InContextMemory(nn.Module):
         steps = _Steps(query.astype(wide), key.astype(wide), value.astype(wide), theta, mu, a, real, places,
                        self._keys(x))
         hooks, segments = self._route(), tokens.max_segments
-        if hooks is not None:
-            read = (self._recurrent_decoded(hooks, heads, steps, log_kept, segments) if call.decode
-                    else self._recurrent(hooks, heads, steps, log_kept, max_segments=segments)[0])
+        if call.decode and self._recurrence() is not None:
+            # A linear memory's cache holds the recurrence's state on either route: the route may change
+            # between the calls one cache serves, as an adapter's dropout does with the dropout stream.
+            read = self._recurrent_decoded(hooks, heads, steps, log_kept, segments)
+        elif hooks is not None:
+            read = self._recurrent(hooks, heads, steps, log_kept, max_segments=segments)[0]
         elif call.decode:
             read = self._decoded(heads, steps)
         elif tokens.max_segments > 1:
@@ -440,11 +444,14 @@ class InContextMemory(nn.Module):
 
     def _route(self) -> recurrence.Hooks | None:
         """This call's row of the shared linear recurrence (`_recurrence`), or None where its
-        configuration is none or a head computes other than the linear map of its input by its kernel
-        (`nonlinear_input`): an input's quantizer, Qwix's quantized products, an adapter's dropout on a
-        training forward."""
+        configuration is none or a head computes other than the linear map of its input by the kernel
+        its state moves: not linear in its input (`nonlinear_input`: an input's quantizer, Qwix's
+        quantized activations, an adapter's dropout on a training forward), or multiplying by its kernel
+        quantized (Qwix's quantized weights, `dew.quantization.quantized_products`)."""
         hooks = self._recurrence()
-        if hooks is None or any(self.nonlinear_input(f"head_{head}") for head in range(self.heads)):
+        names = [f"head_{head}" for head in range(self.heads)]
+        if hooks is None or any(self.nonlinear_input(name) or quantized_products(self, name).weights
+                                for name in names):
             return None
         return hooks
 
@@ -507,23 +514,55 @@ class InContextMemory(nn.Module):
         wide = at_least_fp32(self.dtype)
         return out.astype(wide) + jnp.exp(share)[..., None] * read_w0(steps.query, READ), state, share
 
-    def _recurrent_decoded(self, hooks: recurrence.Hooks, heads: tuple[_Head, ...], steps: _Steps,
+    def _recurrent_decoded(self, hooks: recurrence.Hooks | None, heads: tuple[_Head, ...], steps: _Steps,
                            log_kept: jax.Array, max_segments: int) -> jax.Array:
-        """A linear memory's cached call (`_recurrent`), the cache holding the recurrence's state
-        (`STATE`) and the log of W_0's share each row's document keeps (`KEPT`), zero for a fresh row;
-        its first call allocates it."""
+        """A linear memory's cached call, the cache holding the recurrence's state (`STATE`) and the log
+        of W_0's share each row's document keeps (`KEPT`), zero for a fresh row, on either route: the
+        recurrence's (`_recurrent`), or, where this call takes a head off it (`hooks` None), the
+        general token path over each head's weights as that state makes them
+        (`_stepped_from_recurrence`). Its first call allocates it."""
         batch, features, wide = steps.real.shape[0], steps.key.shape[-1], at_least_fp32(self.dtype)
         allocated = self.has_variable("cache", STATE)
         held = self.variable("cache", STATE, lambda: rows_like(
             jnp.zeros((batch, self.heads, features, features), wide), steps.real))
         kept = self.variable("cache", KEPT, lambda: rows_like(
             jnp.zeros((batch, self.heads), wide), steps.real))
-        reads, state, share = self._recurrent(hooks, heads, steps, log_kept, max_segments=max_segments,
-                                              held=held.value, kept=kept.value)
+        if hooks is None:
+            reads, state, share = self._stepped_from_recurrence(heads, steps, log_kept, held.value,
+                                                                kept.value)
+        else:
+            reads, state, share = self._recurrent(hooks, heads, steps, log_kept, max_segments=max_segments,
+                                                  held=held.value, kept=kept.value)
         if allocated:
             held.value = state
             kept.value = _at_last(share, steps.real, kept.value)
         return reads
+
+    def _stepped_from_recurrence(self, heads: tuple[_Head, ...], steps: _Steps, log_kept: jax.Array,
+                                 held: jax.Array, kept: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """A linear memory's cached call off the recurrence, from and to the recurrence's state `held`
+        `[B, H, F, F]` and W_0's kept share `kept` `[B, H]`: the readouts `[B, S, H, F]`, the state
+        after them and each token's log share `[B, S, H]`, as `_recurrent` gives them. A head's weights
+        are W_0's every leaf times the share (a retention keeps the kernel and an adapter's B factor
+        alike) with the state added to its kernel (`LINEAR_KERNEL`), the recurrence's `[F_in, F_out]`;
+        the general path steps them token by token with no momentum, as a linear memory on the
+        recurrence has none, its chunk's start of no account (the dot rule's gradient is the same at
+        every state, and the delta rule's chunk one token). The row's document continues, a fresh row's
+        weights being W_0; a later document of the call starts from W_0. The state after is the kernel
+        less the share of W_0's, and a row with no real token keeps its own."""
+        real = steps.real
+        begins, continued = _documents(steps)
+        share = (_within(jnp.where(real[..., None], log_kept, 0.0), begins)
+                 + jnp.where(continued[..., None], kept[:, None], 0.0))
+        rows = tuple(_with_kernel(jax.tree.map(functools.partial(_scaled_rows, jnp.exp(kept[:, index])),
+                                               _rows(head.initial, real)), held[:, index])
+                     for index, head in enumerate(heads))
+        reads, (_, state, _) = self._stepped(heads, steps._replace(places=steps.places + continued),
+                                             (rows, rows, jax.tree.map(jnp.zeros_like, rows)))
+        last = jnp.exp(_at_last(share, real, kept))
+        after = jnp.stack([_kernel(state[index]) - _lead(last[:, index], _kernel(head.initial)[None])
+                           * _kernel(head.initial)[None] for index, head in enumerate(heads)], axis=1)
+        return reads, jnp.where(_lead(jnp.any(real, axis=1), held), after, held), share
 
     # The function, token by token and chunk by chunk.
 
@@ -696,15 +735,15 @@ class InContextMemory(nn.Module):
 
 class QuantizedServingRefused(ValueError):
     """An in-context memory refusing inner weights stored quantized for serving (Qwix's, at the head
-    network `network`'s `leaves`): a served product reads a stored quantized weight, and an inner weight
-    moves with every token, so there is none to store. Its projections serve; quantized training
+    network `network`'s `leaves`): Dew does not yet serve a memory's W_0 stored quantized, which its
+    steps would start from as the weights the stored values decode to, each product of the moving
+    weights quantized afresh. Its projections serve; quantized training
     (`dew.quantization.Quantization.apply`) quantizes every product of the moving weights."""
 
     def __init__(self, network: str, leaves: list[str]):
-        super().__init__(f"{network}'s weights {leaves} are stored quantized for serving, which an "
-                         "in-context memory's inner weights cannot be: they move with every token, so there "
-                         "is no stored value to serve. Select its projections for serving, or train it "
-                         "quantized")
+        super().__init__(f"{network}'s weights {leaves} are stored quantized for serving, and Dew does not "
+                         "yet serve an in-context memory's W_0 stored quantized; select its projections "
+                         "for serving, or train it quantized")
         self.network, self.leaves = network, leaves
 
     def __reduce__(self):
@@ -806,6 +845,26 @@ def _joined(held: dict, moving: dict) -> dict:
 def _lead(scalars: jax.Array, leaf: jax.Array) -> jax.Array:
     """`scalars` broadcast against `leaf`, whose leading dimensions they are."""
     return scalars.reshape(*scalars.shape, *(1,) * (leaf.ndim - scalars.ndim))
+
+
+LINEAR_KERNEL = ("kernel", "kernel")
+"""The path of a linear memory's matrix in its head's weights (`LinearMemory`'s Dense, named kernel)."""
+
+
+def _kernel(weights: dict) -> jax.Array:
+    """A linear memory head's matrix in its `weights`."""
+    return traverse_util.flatten_dict(weights)[LINEAR_KERNEL]
+
+
+def _with_kernel(weights: dict, offset: jax.Array) -> dict:
+    """A linear memory head's `weights` with `offset` added to its matrix."""
+    flat = traverse_util.flatten_dict(weights)
+    return traverse_util.unflatten_dict({**flat, LINEAR_KERNEL: flat[LINEAR_KERNEL] + offset})
+
+
+def _scaled_rows(scale: jax.Array, leaf: jax.Array) -> jax.Array:
+    """A head's leaf `[B, ...]` times its rows' scalars `[B]`."""
+    return _lead(scale, leaf) * leaf
 
 
 def _momentum_step(mu: jax.Array, theta: jax.Array, momentum: jax.Array, gradient: jax.Array) -> jax.Array:

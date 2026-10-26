@@ -231,56 +231,85 @@ def _qwix_wrapped(model: nn.Module, provider: QuantizationProvider, wrapper: Qua
 def _quantized(model: nn.Module, provider: QuantizationProvider, spec: Quantization) -> nn.Module:
     """`model` with the matmuls of its `entry_methods` under Qwix's `provider`, in the class Qwix
     makes for the call, a `QuantizedClass` of `spec`,
-    each method tracing what it calls under the key `QUANTIZED_TRACE` gives the provider."""
+    each method tracing what it calls under the provider's kind and `spec` in `QUANTIZED_TRACE`, which
+    names `spec` as its policy for the layers that read its rules (`quantized_products`)."""
     quantized = quantize_with(model, provider, methods=entry_methods(model),
-                              key=(type(provider).__name__, spec))
+                              key=(type(provider).__name__, spec), policy=spec)
     layer: Any = type(quantized)
     layer._dew_quantization = spec
     return quantized
 
 
 def quantize_with(model: nn.Module, provider: QuantizationProvider, *,
-                  methods: Sequence[str] = ("__call__",), key: Hashable | None = None) -> nn.Module:
+                  methods: Sequence[str] = ("__call__",), key: Hashable | None = None,
+                  policy: Quantization | None = None) -> nn.Module:
     """Qwix's `quantize_model(model, provider, methods=methods)`, each of `methods` tracing what it
     calls under `key` in `QUANTIZED_TRACE` (by default the provider's kind and the provider): the
     way Dew runs a model Qwix quantizes with a provider of its own, so Qwix owns the products the
     thread tracing it forms (`dew.nn.precision.accumulated`) and no other thread's, and its traces
-    stay apart from the plain model's."""
+    stay apart from the plain model's. `key` is the caller's, opaque; `policy` is the `Quantization`
+    the provider follows, whose rules a layer reads (`quantized_products`), or None for a provider whose
+    rules Dew does not know."""
     quantized = _qwix().quantize_model(model, provider, methods=methods)
     layer = type(quantized)
-    key = (type(provider).__name__, provider) if key is None else key
+    trace = QuantizedTrace((type(provider).__name__, provider) if key is None else key, policy)
     for name in methods:
-        setattr(layer, name, _keyed(getattr(layer, name), key))
+        setattr(layer, name, _keyed(getattr(layer, name), trace))
     return quantized
 
 
+@dataclasses.dataclass(frozen=True)
+class QuantizedTrace:
+    """What a quantized model's methods trace under (`QUANTIZED_TRACE`, which jit's cache keys on): the
+    caller's opaque cache `key`, and the `Quantization` its provider follows (`policy`), or None for a
+    provider whose rules Dew does not know."""
+
+    key: Hashable
+    policy: Quantization | None
+
+
 def _keyed[**Arguments, Result](method: Callable[Arguments, Result],
-                                 key: Hashable) -> Callable[Arguments, Result]:
-    """`method` run under `key` in `QUANTIZED_TRACE`."""
+                                 trace: QuantizedTrace) -> Callable[Arguments, Result]:
+    """`method` run under `trace` in `QUANTIZED_TRACE`."""
     @functools.wraps(method)
     def keyed(*args: Arguments.args, **kwargs: Arguments.kwargs) -> Result:
-        with QUANTIZED_TRACE(key):
+        with QUANTIZED_TRACE(trace):
             return method(*args, **kwargs)
     return keyed
 
 
-def quantizes(module: nn.Module, name: str) -> bool:
-    """Whether the Qwix quantization the call runs under (`QUANTIZED_TRACE`) quantizes a product of the
-    bound `module`'s submodule `name` or of a module under it, as its rules select their paths: the
-    submodule's own, and the scope of each parameter it holds. A layer answers its `nonlinear_input`
-    from it (`MultiHeadLatentAttention`, `dew.nn.memory.InContextMemory`), since a quantized product is
-    no linear map of its input by its stored kernel. A provider Dew did not configure (`quantize_with`'s
-    own) keeps its rules to itself, so under one any submodule may be."""
-    key = QUANTIZED_TRACE.value
-    if key is None:
-        return False
-    spec = key[1]
-    if not isinstance(spec, Quantization):
-        return True
+@dataclasses.dataclass(frozen=True)
+class QuantizedProducts:
+    """How the Qwix quantization a call runs under changes the products of a submodule and of the
+    modules under it (`quantized_products`). `inputs`: their activations quantize, or their gradients
+    do, so the submodule is no linear map of its input, which a layer that applies it to another
+    operand (MLA's absorbed kv_b_proj) needs it to be; a weight-only rule with float gradients leaves it
+    linear, by its quantized matrix. `weights`: their weights quantize, so the submodule multiplies by
+    no weight it holds, which a layer that moves its weights (an in-context memory's recurrence) needs
+    it to."""
+
+    inputs: bool
+    weights: bool
+
+
+def quantized_products(module: nn.Module, name: str) -> QuantizedProducts:
+    """How the Qwix quantization the call runs under (`QUANTIZED_TRACE`) changes the products of the
+    bound `module`'s submodule `name` and the modules under it (`QuantizedProducts`), as its policy's
+    rules select their paths: the submodule's own, and the scope of each parameter it holds. A trace
+    with no policy Dew knows (a provider of the caller's own, `quantize_with`) may change any, both
+    ways."""
+    trace = QUANTIZED_TRACE.value
+    if trace is None:
+        return QuantizedProducts(inputs=False, weights=False)
+    policy = trace.policy if isinstance(trace, QuantizedTrace) else None
+    if policy is None:
+        return QuantizedProducts(inputs=True, weights=True)
     scope = (*module.path, name)
     params = flatten_dict(dict(module.variables.get("params", {}).get(name, {})))
     scopes = {scope, *((*scope, *leaf[:-1]) for leaf in params)}
-    return any(spec.rule_for(path) is not None for path in scopes)
+    if all(policy.rule_for(path) is None for path in scopes):
+        return QuantizedProducts(inputs=False, weights=False)
+    return QuantizedProducts(inputs=not policy.weight_only or policy.bwd_qtype is not None, weights=True)
 
 
 def _qwix(module: str = "qwix") -> ModuleType:
@@ -1467,4 +1496,5 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     return served, {**variables, "params": parameters}
 
 
-__all__ = ["InputQuantization", "Quantization", "quantize_with", "split_columns"]
+__all__ = ["InputQuantization", "Quantization", "QuantizedProducts", "QuantizedTrace", "quantize_with",
+           "split_columns"]
