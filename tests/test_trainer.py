@@ -26,6 +26,7 @@ import optax
 import orbax.checkpoint as ocp
 import pytest
 from affine_run import BATCH, FEATURES, Counting, Features, Regression, Spread, dataset, raw_leaf, val_batches
+from flax.core import freeze as frozen_dict
 from recording import Preempting, RecordingTracker
 from steady_state import steady_state
 from token_support import write_token_corpus
@@ -1337,9 +1338,22 @@ class Counted(Objective):
         return loss, Aux({}, variables={"stats": {"seen": variables["stats"]["seen"] + 1}})
 
 
-def test_aux_variables_are_written_back_into_the_state_and_checkpointed(tmp_path):
-    trainer = make_trainer(tmp_path, objective=Counted(), optimizer=optax.adamw(1e-2, weight_decay=1.0))
+class FrozenCounted(Counted):
+    """`Counted`, its collection written back in a Flax `FrozenDict`, as Flax's `apply` writes one
+    under `flax_return_frozendict`."""
+
+    def loss(self, variables, batch, step):
+        loss = jnp.sum(variables["params"]["w"] ** 2)
+        return loss, Aux({}, variables=frozen_dict({"stats": {"seen": variables["stats"]["seen"] + 1}}))
+
+
+@pytest.mark.parametrize("objective", [Counted, FrozenCounted], ids=["dict", "frozen"])
+def test_aux_variables_are_written_back_into_the_state_and_checkpointed(tmp_path, objective):
+    """A collection the loss writes back replaces the state's, in the state's dicts whichever Flax
+    container it comes in."""
+    trainer = make_trainer(tmp_path, objective=objective(), optimizer=optax.adamw(1e-2, weight_decay=1.0))
     state = trainer.fit(dataset(), steps=3, log_every=1)
+    assert type(state.variables["stats"]) is dict
     assert float(state.variables["stats"]["seen"]) == 3.0
     assert set(state.opt_state[0].mu) == {"w"}
 
