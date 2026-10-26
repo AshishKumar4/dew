@@ -181,9 +181,11 @@ class Mosaic(base.Template[mainloop.Tiles]):
     def states_held(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
                     ) -> int:
         """The programs of the states launch at `tiles` a multiprocessor of `target` holds at once
-        (`cost.resident`, each thread at a thread's registers, as `mainloop`'s persistent launches)."""
+        (`mainloop.held_programs`, as its persistent launches')."""
         states = self._states(ba, tiles, target)
-        return cost.resident(target, states.shared, states.threads, cost.THREAD_REGISTERS)
+        family = bundle(target)
+        assert family is not None
+        return mainloop.held_programs(family, target, states.shared)
 
     def _states(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
                 ) -> mainloop.Launch:
