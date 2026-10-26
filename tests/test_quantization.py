@@ -21,6 +21,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from flax.core import FrozenDict
 from reference_error import (
     assert_as_exact,
     assert_as_exact_as_the_reference,
@@ -858,6 +859,34 @@ def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_mode
 
     assert_as_exact(packed_side, canonical_side, lambda seed: (np.int32(seed),), "packed quantized pipeline",
                     seeds=PACKED_SEEDS, truth_fn=truth)
+
+
+def test_a_program_finds_every_quantized_tower_its_models_hold():
+    """The options a program compiles with read the quantization of every model it is handed and every
+    tower those hold (`quantizations`): a quantized text transformer inside a condition's encoder record,
+    inside the tuple of a task's encoders, counts as a quantized denoiser handed alone does, and an
+    unquantized one adds nothing."""
+    from dew.nn.kernels.options import quantizations
+
+    pytest.importorskip("qwix")
+
+    @dataclasses.dataclass(frozen=True)
+    class Encoder:
+        transformer: nn.Module
+        params: dict
+
+    spec = Quantization(dtype="int8")
+    plain = tiny()
+    quantized = spec.apply(plain)
+    weights = {"params": {"kernel": np.zeros((2, 2), np.float32)}}
+    assert quantizations(plain, (("textcontext", Encoder(plain, weights)),)) == []
+    held = quantizations((("textcontext", Encoder(quantized, weights)),))
+    assert [found.dtype for found in held] == ["int8"]
+    assert quantizations(quantized) == held
+    # A FrozenDict makes each nested mapping as it is read: a tower behind fifty such siblings is found.
+    nested = FrozenDict({f"branch_{index}": {"leaf": {"value": np.zeros(())}} for index in range(50)}
+                        | {"tower": {"encoder": Encoder(quantized, weights)}})
+    assert [found.dtype for found in quantizations(nested)] == ["int8"]
 
 
 SPLIT_SEEDS = 16
