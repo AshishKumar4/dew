@@ -64,10 +64,10 @@ def float64_logits(checkpoint, revision, weights, batches) -> list[np.ndarray]:
         return [model(**batch, use_cache=False).logits.double().numpy() for batch in batches]
 
 
-def measure_checkpoint(checkpoint, output, revision=None) -> list[Measured]:
-    """Each parity batch measured (`Measured`), and the measurement's record written to `output`. The
-    reference runs on the CPU whatever JAX's platform, so a CPU-only Torch build supplies it beside a GPU
-    and no TF32 enters it."""
+def measure_checkpoint(checkpoint, output, revision) -> list[Measured]:
+    """Each parity batch of `checkpoint` at its pinned `revision` measured (`Measured`), and the
+    measurement's record written to `output`. The reference runs on the CPU whatever JAX's platform, so
+    a CPU-only Torch build supplies it beside a GPU and no TF32 enters it."""
     config = AutoConfig.from_pretrained(checkpoint, revision=revision)
     processor = AutoProcessor.from_pretrained(checkpoint, revision=revision)
     reference = AutoModelForImageTextToText.from_pretrained(
@@ -98,9 +98,6 @@ def measure_checkpoint(checkpoint, output, revision=None) -> list[Measured]:
             inputs, CONTINUATION, key=jax.random.key(0), sampling=Sampling(temperature=0))
         measured.append(Measured(modality, actual, logits, truth, batch['input_ids'].numpy(),
                                  np.asarray(generated.tokens)[:, -CONTINUATION:], tokens, steps))
-    metadata = Path(checkpoint) / '.cache' / 'huggingface' / 'download' / 'config.json.metadata'
-    revision = (config._commit_hash or revision
-                or (metadata.read_text().splitlines()[0] if metadata.is_file() else None))
     record = {'checkpoint': checkpoint, 'revision': revision, 'dtype': 'float32', 'precision': 'highest',
               'tf32': False, 'device': jax.devices()[0].device_kind,
               'observations': [{'modality': row.modality, 'sequence_length': int(row.truth.shape[1]),
@@ -115,7 +112,7 @@ def measure_checkpoint(checkpoint, output, revision=None) -> list[Measured]:
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('checkpoint')
-    parser.add_argument('--revision')
+    parser.add_argument('--revision', required=True, help='the commit the checkpoint is pinned at')
     parser.add_argument('--output', type=Path, required=True)
     args = parser.parse_args()
     measure_checkpoint(args.checkpoint, args.output, args.revision)
