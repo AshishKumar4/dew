@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import os
 import threading
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -50,7 +51,9 @@ from dew.data.analysis import (
     _until,
     _volatile,
     _written,
+    written,
 )
+from dew.data.compilation import compiling
 from dew.data.dataset import (
     Closeable,
     DataPartition,
@@ -138,21 +141,27 @@ class _OrderFacts(Protocol):
     def order_fingerprints(self) -> Mapping[str, str]: ...
 
 
-def _automatically(stage: Stage) -> bool:
-    """Whether the compiler placed `stage`, a cache the chain did not write (`_automatic`)."""
-    return isinstance(stage, Artifact) and stage.automatic
+def _writable(root: str) -> bool:
+    """Whether this process may make and write `root`: the nearest directory of it that exists may
+    be written (a read-only home, say, may not)."""
+    existing = os.path.abspath(root)
+    while not os.path.exists(existing):
+        existing = os.path.dirname(existing)
+    return os.path.isdir(existing) and os.access(existing, os.W_OK | os.X_OK)
 
 
 def _automatic(pipeline: Pipeline, read: Read, root: str | None) -> Pipeline:
     """`pipeline` with a cache at `root` after its leading deterministic record maps, where one of them
-    costs more to run than its records cost to read back (`Costly`: a decode, a learned tokenizer)
-    and the chain writes no cache: each corpus of a mixture or phases its own. The maps are the ones
+    costs more to run than its records cost to read back (`Costly`: a learned tokenizer's encoding)
+    and the chain writes no cache: each corpus of a mixture or phases its own, in a root this process
+    may write. The maps are the ones
     a cache keys (`_cacheable`) and reads again unchanged (none `_volatile`), and in an indexed read
     none that rejects, whose cache a read by index reads back as a stream, slower than it reruns
     them. It stands for them only in a memory or indexed read, by each input's place in a store
     whose content is named, in a clean checkout whose steps are exact (`Manifest`), and nowhere
     else, so a chain no cache could serve reads as it is written, never refused. It holds the
     records the maps make, and fills, publishes, replays and evicts as `cache(url)` does (`Cache`),
+    though local storage that fails it stops its fill and the run reads on (`Cache.optional`),
     so a run reads the same records with or without it (`Artifact.automatic`), and a run of the
     same maps over the same records reads them back once one has read them whole. Its root is the
     run's to name or refuse (`automatic_root`)."""
@@ -174,12 +183,12 @@ def _automatic(pipeline: Pipeline, read: Read, root: str | None) -> Pipeline:
     steps = [stage.step for stage in prefix if isinstance(stage, (Map, MapWithIndex))]
     if not any(isinstance(step, Costly) and step.costly for step in steps):
         return pipeline
-    if not pipeline.source.supports(read):
+    if not pipeline.source.supports(read) or not _writable(root):
         return pipeline
     key = _cache_key(pipeline.source, prefix, read)
     if key is None or not (key.clean and key.exact):
         return pipeline
-    cached = Artifact(Cache(root), automatic=True)
+    cached = Artifact(Cache(root, optional=True), automatic=True)
     return dataclasses.replace(pipeline, stages=(*prefix, cached, *pipeline.stages[at:]))
 
 
@@ -189,12 +198,11 @@ def _cache_references(pipeline: Pipeline, read: Read) -> tuple[str, ...]:
     it came from."""
     references = []
     for leaf, source in _leaves(pipeline):
-        stages, written = _written(source, leaf.stages), source
-        while materialized(written):
-            written = written.source
-        references += [stage.cache.reference(_cache_manifest(written, stages[:index], read))
-                       for index, stage in enumerate(stages)
-                       if isinstance(stage, Artifact) and not stage.automatic]
+        stages, origin = _written(source, leaf.stages), source
+        while materialized(origin):
+            origin = origin.source
+        references += [stage.cache.reference(_cache_manifest(origin, stages[:index], read))
+                       for index, stage in enumerate(stages) if isinstance(stage, Artifact)]
     return tuple(references)
 
 
@@ -439,14 +447,14 @@ def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]) 
     corpora = build.lowering.order["corpora"]
     if not isinstance(corpora, list):
         raise TypeError("a mixture's order holds its corpora's orders as a list")
-    members = {"": fingerprint({"steps": steps([*(_identity(stage) for stage in train.stages
+    members = {"": fingerprint({"steps": steps([*(_identity(stage) for stage in written(train.stages)
                                                   if not isinstance(stage, (Workers, Prefetch))),
                                                 *(StepIdentity.of(step) for step in host)])})}
     for index, (key, child) in enumerate(zip(_member_keys(_members(source.pipelines)), source.pipelines,
                                              strict=True)):
         sources = [read for _, read in _leaves(child)]
         identities = [*(_identity(stage) for read in sources for stage in _written(read, ())),
-                      *(_identity(stage) for stage in _steps(child)
+                      *(_identity(stage) for stage in written(tuple(_steps(child)))
                         if not isinstance(stage, (Workers, Prefetch)))]
         members[key] = fingerprint({
             "order": unplaced(json_value(corpora[index], "member order")),
@@ -574,6 +582,7 @@ def _build(branch: Pipeline, read: Read, loading: Loading, *, batch: int, traini
     return _Build(read, loading, seed, batch, lowered, training=training)
 
 
+@compiling
 def compile(
     train: Pipeline,
     *,
@@ -707,8 +716,8 @@ def _compiled(
         {"sources": [source.fingerprint() for source in sources]},
         sources,
         (
-            *(_identity(stage) for stage in _steps(original)
-              if not isinstance(stage, (Workers, Prefetch)) and not _automatically(stage)),
+            *(_identity(stage) for stage in written(tuple(_steps(original)))
+              if not isinstance(stage, (Workers, Prefetch))),
             *(StepIdentity.of(step) for step in host),
         ),
     )
@@ -1127,6 +1136,7 @@ def _finite(lowering: _Lowering) -> _Lowering:
                                children=tuple(_finite(child) for child in lowering.children))
 
 
+@compiling
 def iterate(
     pipeline: Pipeline,
     *,
@@ -1207,6 +1217,7 @@ def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int
                       loading=chain._loading or _DEFAULT_LOADING, provision=True, seed=seed)
 
 
+@compiling
 def validation(
     pipeline: Pipeline,
     *,
@@ -1232,6 +1243,7 @@ def validation(
                              host=packed + _held_steps(pipeline) + host)
 
 
+@compiling
 def publish(
     pipeline: Pipeline,
     cache,

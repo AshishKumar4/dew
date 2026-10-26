@@ -37,6 +37,29 @@ class Counted:
         return {**row, "value": np.int32(made)}
 
 
+@dataclass
+class Tokens:
+    """A fixed map to a document of token ids under "text", as a learned tokenizer's, costly to run."""
+
+    costly: bool = True
+
+    def __call__(self, row):
+        return {"text": np.arange(int(row["id"]), int(row["id"]) + 3 + int(row["id"]) % 4, dtype=np.int32)}
+
+
+@dataclass
+class IndexedVolatile:
+    """A map by index that may make another record on each call, as a live fetch may, costly to run."""
+
+    volatile: bool = True
+    costly: bool = True
+    calls: list[int] = field(default_factory=list, repr=False)
+
+    def __call__(self, index, row):
+        self.calls.append(index)
+        return {**row, "value": np.int32(len(self.calls))}
+
+
 def records(offset: int = 0) -> Memory:
     return Memory([{"id": np.int32(offset + index)} for index in range(RECORDS)])
 
@@ -107,6 +130,71 @@ def test_a_chain_reads_the_same_records_and_plan_with_or_without_its_automatic_c
     assert plan(cache=True) == plan(cache=False)
 
 
+LAYOUTS = {
+    "windows": lambda: Pipeline(records()).map(Tokens(), identity="tokens@1").windows(4).shuffle(0),
+    "mixture": lambda: mix([Pipeline(records(offset)).map(Counted(), identity=f"counted-{offset}@1")
+                            .filter(lambda row: int(row["id"]) % 3 != 0) for offset in (0, 100)]),
+}
+
+
+@pytest.mark.parametrize("how", READS)
+@pytest.mark.parametrize("layout", list(LAYOUTS))
+def test_a_laid_out_chain_keeps_its_plan_and_resumes_across_its_automatic_cache(how, layout):
+    """The facts a plan derives of a chain's layout (windows cut from its documents, the members of a
+    mixture read per share) are the same with or without an automatic cache beneath them, so a
+    position saved with it resumes in a run without it."""
+    def loader(*, cache: bool):
+        return compile(LAYOUTS[layout]().repeat(2).batch(2, drop_remainder=False), read=how,
+                       loading=Loading(workers=0, threads=1, read_buffer=1, cache=cache))
+
+    cached = loader(cache=True)
+    stream = cached.train(DataPartition())
+    try:
+        expected = [next(stream) for _ in range(2)]
+        saved = stream.get_state()
+        following = [next(stream) for _ in range(2)]
+    finally:
+        stream.close()
+    assert generations() and expected
+    uncached = loader(cache=False)
+    assert cached.plan is not None and uncached.plan is not None
+    assert cached.plan.record() == uncached.plan.record()
+    resumed = uncached.train(DataPartition())
+    try:
+        resumed.set_state(saved)
+        for batch, again in zip(following, (next(resumed) for _ in range(2)), strict=True):
+            assert batch.keys() == again.keys()
+            for name in batch:
+                np.testing.assert_array_equal(np.asarray(batch[name]), np.asarray(again[name]), err_msg=name)
+    finally:
+        resumed.close()
+
+
+def test_records_changed_between_two_compilations_are_read_as_they_are_now():
+    """A store's records may change between two compilations: the second fingerprints them again, so it
+    reads what its maps make of them now, not what an earlier run cached of the old ones."""
+    rows = [{"id": np.int32(index)} for index in range(RECORDS)]
+    first = read(mapped(Counted(), Memory(rows)), "indexed")
+    rows[0] = {"id": np.int32(50)}
+    second = read(mapped(Counted(), Memory(rows)), "indexed")
+    assert (50, 60) in second and (50, 60) not in first
+
+
+def test_a_root_this_process_may_not_write_caches_nothing_and_reads_on(monkeypatch, tmp_path):
+    """An automatic cache stands only where the process may write its root: under a read-only home the
+    run reads its records as it would with none, and writes nothing."""
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    locked.chmod(0o500)
+    monkeypatch.setenv(AUTOMATIC, str(locked / "cache"))
+    try:
+        step = Counted()
+        assert read(mapped(step), "indexed") == read(mapped(Counted()), "indexed", cache=False)
+        assert not (locked / "cache").exists()
+    finally:
+        locked.chmod(0o700)
+
+
 def test_a_run_or_a_process_opts_out_of_its_automatic_cache(monkeypatch, tmp_path):
     """`Loading(cache=False)` keeps a run from caching, and `DEW_DATA_CACHE=off` every run of the
     process: the map runs on each, and nothing is written."""
@@ -128,8 +216,8 @@ def unnamed():
     return from_grain(grain.MapDataset.source([{"id": np.int32(index)} for index in range(RECORDS)]))
 
 
-@pytest.mark.parametrize("chain", ["cheap step", "unkeyed step", "volatile step", "unnamed store",
-                                   "streamed"])
+@pytest.mark.parametrize("chain", ["cheap step", "unkeyed step", "volatile step", "volatile indexed step",
+                                   "unnamed store", "streamed", "image decode"])
 def test_a_chain_no_cache_could_serve_or_speed_reads_as_written(chain):
     """A chain whose leading steps no cache could stand for, or none would speed, reads as it is
     written, never refused: a step that costs less than reading its records back, one with no
@@ -137,6 +225,24 @@ def test_a_chain_no_cache_could_serve_or_speed_reads_as_written(chain):
     streamed read write no automatic cache, and their steps run on every pass."""
     step = Counted(volatile=chain == "volatile step", costly=chain != "cheap step")
     how = "streamed" if chain == "streamed" else "indexed"
+    if chain == "image decode":
+        # A decode reads an image a record names by path from storage its content does not key.
+        from dew.data import presets
+
+        pixels = [{"id": np.int32(index), "image": np.full((4, 4, 3), index, np.uint8)}
+                  for index in range(RECORDS)]
+        compiled = compile(presets.images(Memory(pixels), 4, batch=2), read="indexed",
+                           loading=Loading(workers=0, threads=1, read_buffer=1))
+        stream = compiled.train(DataPartition())
+        next(stream)
+        stream.close()
+        assert not generations()
+        return
+    if chain == "volatile indexed step":
+        indexed = IndexedVolatile()
+        read(Pipeline(records()).map_with_index(indexed, identity="indexed@1"), how, passes=2)
+        assert len(indexed.calls) == 2 * RECORDS and not generations()
+        return
     if chain == "unkeyed step":
         pipeline = Pipeline(records()).map(lambda row: step(row)).shuffle(0)
     elif chain == "unnamed store":

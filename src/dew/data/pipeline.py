@@ -77,8 +77,10 @@ class Volatile(Protocol):
 @runtime_checkable
 class Costly(Protocol):
     """A step that costs more to run on a record than reading what it made back from a cache costs,
-    as measured: so a chain that runs it first caches what it makes with no `cache=`
-    (`dew.data.compile._automatic`)."""
+    as measured (`tools/benchmark_data.py automatic-cache`), and makes it from the record alone: so a
+    chain that runs it first caches what it makes with no `cache=` (`dew.data.compile._automatic`).
+    An image decode is not one: an image a record names by path is read from storage the record's
+    content does not key."""
 
     costly: bool
 

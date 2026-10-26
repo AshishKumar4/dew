@@ -21,6 +21,7 @@ import numpy as np
 from dew import _checkout
 from dew._hashing import array_header
 from dew._records import JSON, json_value, record
+from dew.data.compilation import checkout_now
 from dew.data.sources.codec import content_fingerprint
 from dew.position import PER_SHARE
 
@@ -262,25 +263,23 @@ def _environment(recorded: Mapping[str, object]) -> dict[str, JSON]:
 
 
 @functools.cache
-def _checkout_facts() -> tuple[str, bool, str]:
-    """The process's checkout as a manifest names it: its revision, whether it is clean, and the
-    fingerprint of its lock files and installed distributions. Read once a process: the reads run
-    git three times and parse every installed distribution's metadata, about a second, which every
-    cache key and plan of a run would pay again for facts a run does not change."""
+def _locked() -> str:
+    """The fingerprint of the checkout's lock files and installed distributions, read once a process:
+    it parses every installed distribution's metadata, most of a second, which no compilation
+    changes."""
     locked = [_checkout.ROOT / name for name in ("pyproject.toml", "uv.lock", "constraints.txt")]
     dependencies = {
         distribution.metadata["Name"]: distribution.version
         for distribution in importlib.metadata.distributions()
         if distribution.metadata["Name"]
     }
-    lock = fingerprint(
+    return fingerprint(
         {
             "files": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in locked
                       if path.is_file()},
             "installed": dependencies,
         }
     )
-    return _checkout.revision() or "unversioned", _checkout.clean(), lock
 
 
 @dataclasses.dataclass(frozen=True)
@@ -315,7 +314,7 @@ class Manifest:
         ran: Sequence[StepIdentity] = (),
         fill: Mapping[str, object] | None = None,
     ) -> Manifest:
-        revision, clean, lock = _checkout_facts()
+        (revision, clean), lock = checkout_now(), _locked()
         return cls(
             source,
             tuple(steps),

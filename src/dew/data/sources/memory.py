@@ -11,6 +11,7 @@ from typing import Protocol, runtime_checkable
 import numpy as np
 
 from dew.batch import Batch
+from dew.data.compilation import once
 from dew.data.dataset import Records
 from dew.data.pipeline import Dataset
 
@@ -114,12 +115,11 @@ class Memory(Dataset):
         return f"memory:{self.identity or self.fingerprint()['sha256']}"
 
     def fingerprint(self) -> Mapping[str, object]:
-        return self._fingerprint
+        """Its content, hashed once a compilation (`dew.data.plan.once`), which a plan, a cache key and
+        a description each read, its records the caller's to change between two."""
+        return once(self, self._fingerprinted)
 
-    @cached_property
-    def _fingerprint(self) -> Mapping[str, object]:
-        """Its content, hashed once, as its records are read once (`_held`): a plan, a cache key and
-        a description each read it."""
+    def _fingerprinted(self) -> Mapping[str, object]:
         rows = self.records("indexed")
         return {
             "store": "memory",

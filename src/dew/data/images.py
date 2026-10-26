@@ -90,10 +90,6 @@ class DecodeImage(grain.MapTransform):
     _: dataclasses.KW_ONLY
     at_least: int | None = None
     rejects: bool = True
-    costly: ClassVar[bool] = True
-    """Decoding costs more than reading the pixels back from a cache (`dew.data.pipeline.Costly`): on an
-    8-core armada host 2000 PNGs of 256 pixels decoded and resized to 128 took 1.0 s by index, against
-    0.6 s read back, and 3.7-3.8 s in a memory read, against 1.0-1.1 s."""
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """RGB pixels under `to`, each image its own height and width, in place of the bytes in `field`."""

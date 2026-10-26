@@ -126,6 +126,11 @@ class Cache:
     retry: int = 3
     shard_bytes: int | str = 16 * 2**20
     storage_options: Mapping[str, object] | None = field(default=None, repr=False)
+    optional: bool = False
+    """Whether a run reads on without it where its local storage fails (no room, no permission): a
+    cache the compiler placed (`dew.data.compile._automatic`), which a run never needs, stops
+    admitting there and its records are computed, as they are with no cache. A cache a chain names
+    stops the run."""
 
     def __post_init__(self) -> None:
         if min(self.spool_limit, _byte_size(self.mirror_bytes), self.local_limit, self.shard_limit) < 1:
@@ -371,7 +376,18 @@ class _Writer:
                     raise ValueError(f"conflicting cache duplicate for row {row_key}")
                 return outputs if transform is not None else outputs[0]
             if not transient and self.admitting:
-                self._admit(row_key, payload)
+                try:
+                    self._admit(row_key, payload)
+                except OSError as error:
+                    # Local storage that fails mid-fill (no room, no permission): an optional cache
+                    # stops admitting, as a full one does with on_full='stop', and reads on.
+                    if not self.cache.optional:
+                        raise
+                    # What it held unwritten is dropped, so its fill ends unsealed and publishes nothing.
+                    self.admitting = False
+                    self.pending.clear()
+                    self.pending_bytes = 0
+                    _log.warning("cache %s stopped admission: %s", self.root.url, error)
         return outputs if transform is not None else outputs[0]
 
     def _admit(self, row_key: str, payload: bytes) -> None:
@@ -660,10 +676,18 @@ class _CachedMap(_Mapped):
         self.writer_lock = threading.RLock()
 
     @property
-    def writer(self) -> _Writer:
+    def writer(self) -> _Writer | _Computed:
         with self.writer_lock:
             if "_writer" not in self.__dict__:
-                writer = _Writer(self.cache, self.key, expected=len(self), source=self.filled)
+                try:
+                    writer = _Writer(self.cache, self.key, expected=len(self), source=self.filled)
+                except OSError as error:
+                    # Local storage that cannot hold a writer: an optional cache computes its records.
+                    if not self.cache.optional:
+                        raise
+                    _log.warning("cache %s writes nothing: %s", self.cache.url, error)
+                    self.__dict__["_writer"] = _Computed()
+                    return self.__dict__["_writer"]
                 finalizer = weakref.finalize(self, writer.close)
                 finalizer.atexit = False
                 self.__dict__["_writer"] = writer
