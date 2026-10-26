@@ -22,7 +22,7 @@ from tuned import fitting, taken
 
 from dew.nn.activations import exact_gelu
 from dew.nn.gpt_oss import GptOssExperts
-from dew.nn.kernels import grouped_matmul, tuning
+from dew.nn.kernels import generation, grouped_matmul, tuning
 from dew.nn.kernels.generation import chosen as kernel_choices, gpu_target, routes, triton_runs
 from dew.nn.moe import ExpertMLP, expert_dispatch, expert_projection
 from dew.training import MeshSpec
@@ -204,15 +204,16 @@ def test_every_tile_of_the_grouped_kernels_holds_the_float64_gate(kernel, width,
 
 
 def test_the_tile_gate_fails_a_launch_off_by_a_rounding():
-    """The tile gate on the CPU's interpreted Triton launch passes it and fails it with its forward off
-    by one part in 2^7, an error no rounding of its sums makes: the reference arm is XLA's, not the
-    launch under test."""
-    gate = _tile_gate(grouped_matmul.Gmm, 64, 128)
-    with kernel_choices(grouped_matmul='triton'):
-        config, *_ = taken(grouped_matmul.Gmm, _tile_gate_arm('pallas'), *gate.draw(0))
-    gate.check(config)
-    with pytest.raises(AssertionError):
-        gate.check(config, fault=1 + 2.0 ** -7)
+    """The tile gate on the Triton launch, interpreted on the CPU as an A100's, passes it and fails it
+    with its forward off by one part in 2^7, an error no rounding of its sums makes: the reference arm is
+    XLA's, not the launch under test."""
+    with generation.assumed("sm80"):
+        gate = _tile_gate(grouped_matmul.Gmm, 64, 128)
+        with kernel_choices(grouped_matmul='triton'):
+            config, *_ = taken(grouped_matmul.Gmm, _tile_gate_arm('pallas'), *gate.draw(0))
+        gate.check(config)
+        with pytest.raises(AssertionError):
+            gate.check(config, fault=1 + 2.0 ** -7)
 
 
 TILE_SIZES = np.array([0, 70, 1, 129, 100, 0], np.int32)
