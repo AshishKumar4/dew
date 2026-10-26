@@ -60,10 +60,11 @@ def split_metrics(suites: Mapping[str, EvalSuite]) -> dict[str, tuple[Metric, ..
 def declarations(suites: Mapping[str, EvalSuite], metrics: Sequence[Metric],
                  summaries: Sequence[Summary], *, loss: bool) -> dict[str, tuple[Metric | Summary, ...]]:
     """Every score a fit declares, by split: each suite's metrics (fit's own `metrics` as `val` where it
-    validates no suite) and the summaries under theirs (`Summary.SPLIT`). Its selections resolve against
-    this and its rankings read their aggregates' scores off it, one declaration for both. A summary is
-    refused where it repeats another's name or weighs a score no evaluation records (`Summary.check`,
-    the objective's validation loss only where it defines one, `loss`)."""
+    validates no suite) and the summaries in their namespace (`Summary.SPLIT`), which no split can be
+    named. Its selections resolve against this and its rankings read their aggregates' scores off it,
+    one declaration for both. A summary is refused where it repeats another's name or weighs a score
+    no evaluation records (`Summary.check`, the objective's validation loss only where it defines one,
+    `loss`)."""
     names = [summary.name for summary in summaries]
     if len(names) != len(set(names)):
         raise ValueError(f"summaries are named apart, and {names} repeats one")
@@ -97,7 +98,7 @@ class FitPlan:
     held_best: bool = False  # a restore_best without Checkpoints (`HeldBest`)
     """Every validation split by name, its metrics and cadence resolved."""
     summaries: tuple[Summary, ...] = ()
-    """The scalars each evaluation that scores every split they weigh forms (`Summary`)."""
+    """The scalars each step whose evaluations score every split they weigh forms (`Summary`)."""
     declared: Mapping[str, tuple[Metric | Summary, ...]] = dataclasses.field(default_factory=dict)
     """Every score the fit declares, by split (`declarations`)."""
     observe: Observe | None = None

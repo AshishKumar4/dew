@@ -948,10 +948,11 @@ class RunConfig:
     validation split, refuses it.
     """
     val_summaries: Annotated[tuple[Summary, ...], record_argument(tuple[Summary, ...])] = ()
-    """Scalars weighed from each evaluation's split scores, a board's weighted index, each formed where
-    the evaluation scored every split it weighs and logged as `summary/<name>`, which `--trainer.best
-    summary/<name>` ranks by (`dew.training.evaluation.Summary`): `--val-summaries '[{"name": "board",
-    "weights": {"val/accuracy": 1, "test/accuracy": 2}, "better": "higher"}]'`.
+    """Scalars weighed from each evaluation's split scores, a board's weighted index, each formed at a
+    step that scored every split it weighs and logged as `evaluation/summary/<name>`, which
+    `--trainer.best evaluation/summary/<name>` ranks by (`dew.training.evaluation.Summary`):
+    `--val-summaries '[{"name": "board", "weights": {"val/accuracy": 1, "test/accuracy": 2},
+    "better": "higher"}]'`.
     """
 
     def __post_init__(self) -> None:
