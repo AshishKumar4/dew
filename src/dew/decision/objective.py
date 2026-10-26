@@ -127,12 +127,14 @@ class Encoding:
                 and rng is not None
                 and rng.random() < self.none_of_the_above
             ):
-                original = question
-                question, label = _none_of_the_above(question, labels[name], drop=rng.random() < 0.5)
-                gold = np.eye(len(question.options))[label]
-                gone = [key for key in original.options if key not in question.options]
-                # The augmentation's own option: it stands for the option it replaced, or for none.
-                dropped[name] = gone[0] if gone else None
+                augmented, label = _none_of_the_above(question, labels[name], drop=rng.random() < 0.5)
+                # A question the augmentation leaves as it is (its own "none of the above" right, or
+                # beside the right option) keeps its own option and the canonical one its group maps.
+                if augmented.options != question.options:
+                    gone = [key for key in question.options if key not in augmented.options]
+                    # The augmentation's own option: it stands for the option it replaced, or for none.
+                    dropped[name] = gone[0] if gone else None
+                    question, gold = augmented, np.eye(len(augmented.options))[label]
             asked[name] = question
             if gold is not None:
                 golds[name] = gold
