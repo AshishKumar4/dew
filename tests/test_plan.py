@@ -404,19 +404,26 @@ def test_a_split_plan_is_timed_against_its_batch_whole_a_rung_up_and_the_faster_
 
 
 @pytest.mark.mesh(devices=2)
-def test_a_plan_over_several_devices_that_fits_whole_is_timed_against_its_batch_whole_a_rung_up(monkeypatch):
-    """Over two devices a plan that fits the batch whole without recomputing is timed against the batch
-    whole one rung up too, whose freed memory lets the scheduler overlap the collectives, and the faster
-    is kept; on one device the same plan is not timed."""
+def test_a_plan_over_two_accelerators_that_fits_whole_is_timed_against_its_batch_whole_a_rung_up(monkeypatch):
+    """Over two accelerators a plan that fits the batch whole without recomputing is timed against the
+    batch whole one rung up too, whose freed memory lets the scheduler overlap the collectives, and the
+    faster is kept. A CPU's collectives are its host's copies, nothing to overlap: over two CPU devices
+    the plan is not timed, so a run over several compiles one device's steps (test_architectures' layout
+    cells, whose drawn steps are fit's own, bit for bit). On one device the plan is never timed."""
     free(monkeypatch, LIMIT)
     trainer = lm()
     trainer.device_mesh = MeshSpec().build(jax.devices()[:2])
     state, _, _ = trainer.place()
     timed = []
     trainer.compile(state, BATCH, lambda steps: (timed.append(len(steps)), [2.0, 1.0])[1])
-    assert timed == [2]
-    assert [(plan["split"], plan["remat"]) for plan in trainer.plan["timed"]] == [(1, None), (1, "minimal")]
-    assert (trainer.plan["split"], trainer.plan["remat"]) == (1, "minimal")
+    if jax.default_backend() == "cpu":
+        assert timed == [] and trainer.plan["timed"] is None
+        assert (trainer.plan["split"], trainer.plan["remat"]) == (1, None)
+    else:
+        assert timed == [2]
+        timings = [(plan["split"], plan["remat"]) for plan in trainer.plan["timed"]]
+        assert timings == [(1, None), (1, "minimal")]
+        assert (trainer.plan["split"], trainer.plan["remat"]) == (1, "minimal")
     alone = lm()
     state, _, _ = alone.place()
     alone.compile(state, BATCH, lambda steps: pytest.fail("a single device's whole plan was timed"))
