@@ -280,14 +280,16 @@ def native(args, pool):
     scoring, variables = task.scoring()
     observed = ObservedScoring(scoring)
     server = ScoringServer.from_task(observed, variables)
-    futures = [server.submit(pool["requests"][str(seed)]) for seed in pool["verdict"]]
+    # The pilots and the verdict's draws in one run, so the paired sizing and the verdict read one commit.
+    seeds = (*pool["pilot"], *pool["verdict"])
+    futures = [server.submit(pool["requests"][str(seed)]) for seed in seeds]
     while server.busy:
         server.step()
     for future in futures:
         future.result()
     if max(observed.batch_rows, default=0) < 2:
         raise RuntimeError("the measurement did not execute a batched engine pass")
-    values = {name: observed.values[name] for seed in pool["verdict"]
+    values = {name: observed.values[name] for seed in seeds
               for name in pool["requests"][str(seed)]["questions"]}
     leaves = jax.tree.leaves(variables)
     devices = {device for value in leaves for device in value.devices()}
@@ -390,7 +392,7 @@ def _across(before, after):
     return after - before
 
 
-def author(args, pool, *, truth):
+def author(args, pool, *, truth, commit):
     from unittest.mock import patch
 
     import numpy as np
@@ -459,7 +461,7 @@ def author(args, pool, *, truth):
             values.update(asked)
             spent = {"seed": seed, "index": index, "seconds": time.perf_counter() - began,
                      **({} if measured is None else _across(before, measured())),
-                     "pool_sha256": pool_hash}
+                     "pool_sha256": pool_hash, "commit": commit}
             if torch.device(args.device).type == "cuda":
                 spent["peak_device_bytes"] = torch.cuda.max_memory_allocated(args.device)
             requests.append(spent)
@@ -493,8 +495,13 @@ def author(args, pool, *, truth):
 
 
 def verdict(args, pool):
+    """Check 1 of native against the author's runtime, each question's option log-probabilities from the
+    float64 truth's. The count is sized paired, native's errors against the author's on the pilots
+    the records hold (`recorded_pilots`), and the verdict judges its own draws at it, never a pilot.
+    Pairing holds because native and the author read the same released weights at their stored
+    precision and the same recorded inputs, so they share their upstream rounding."""
     import numpy as np
-    from reference_error import Inconclusive, assert_as_exact, leaf_summary, seeds_for
+    from reference_error import Inconclusive, assert_as_exact, leaf_summary, recorded_pilots, seeds_for
 
     phases = ("native", "author", "truth")
     metadata = {phase: json.loads((args.records / f"{phase}.json").read_text()) for phase in phases}
@@ -510,6 +517,8 @@ def verdict(args, pool):
             raise ValueError(f"{phase} was recorded at a different parameter storage policy")
         if record["source"] != source:
             raise ValueError(f"{phase} was recorded from a different source manifest")
+    if not metadata["native"].get("commit"):
+        raise ValueError("native was recorded without its commit")
     device = args.device.partition(":")[0]
     if metadata["native"]["platforms"] != ["gpu" if device == "cuda" else device]:
         raise ValueError("the native computation ran on a different device platform")
@@ -523,9 +532,10 @@ def verdict(args, pool):
     if device == "cuda" and truth["cuda_floating_operations"] < 1:
         raise ValueError("the recorded truth executed no floating CUDA operations")
     loaded = {phase: np.load(args.records / f"{phase}.npz") for phase in phases}
+    # Every phase holds the pilots and the verdict's draws, native's in one record of one commit.
+    asked = {name for seed in (*pool["pilot"], *pool["verdict"])
+             for name in pool["requests"][str(seed)]["questions"]}
     for phase, values in loaded.items():
-        expected = pool["verdict"] if phase == "native" else (*pool["pilot"], *pool["verdict"])
-        asked = {name for seed in expected for name in pool["requests"][str(seed)]["questions"]}
         if set(values.files) != asked:
             raise ValueError(f"{phase} does not hold this pool's complete disjoint draw set")
         if phase == "truth" and any(value.dtype != np.float64 for value in values.values()):
@@ -541,6 +551,9 @@ def verdict(args, pool):
         names = pool["requests"][str(int(index))]["questions"]
         return {"log_probabilities": np.concatenate([normalized(loaded[phase][name]) for name in names])}
 
+    def served(index):
+        return log_probabilities("native", index)
+
     def original(index):
         return log_probabilities("author", index)
 
@@ -551,15 +564,15 @@ def verdict(args, pool):
         return {"log_probabilities": leaf_summary(original(index)["log_probabilities"],
                                                   exact(index)["log_probabilities"])}
 
-    recorded.recorded = exact.recorded = True
-    count = seeds_for(original, lambda seed: (np.asarray(pool["sizing_from"] + seed, np.int64),),
-                      "released slot runtime", start=pool["count"], most=len(pool["pilot"]) // 2,
-                      truth_fn=exact)
+    def draw(seed):
+        return (np.asarray(seed, np.int64),)
+
+    original.recorded = recorded.recorded = exact.recorded = True
+    count = seeds_for(recorded_pilots(original, len(pool["pilot"])), draw, "released slot runtime",
+                      dew_fn=served, truth_fn=exact)
     if count > pool["count"]:
         raise Inconclusive(f"the reference requires {count} draws; the fixed set has only {pool['count']}")
-    assert_as_exact(lambda index: log_probabilities("native", index), recorded,
-                    lambda seed: (np.asarray(seed, np.int64),), "released slot runtime",
-                    seeds=count, truth_fn=exact)
+    assert_as_exact(served, recorded, draw, "released slot runtime", seeds=count, truth_fn=exact)
     args.output.write_text(json.dumps({"seeds": count, "verdict": "green", "source": source,
                                       "pool_sha256": pool_hash, "phases": metadata}, indent=2) + "\n")
 
@@ -610,10 +623,13 @@ def main():
             parser.error("a verdict needs its recorded phases")
         verdict(args, pool)
         return
+    from reference_source import git_head
+
+    commit = git_head(ROOT)
     values, metadata = (native(args, pool) if args.phase == "native"
-                        else author(args, pool, truth=args.phase == "truth"))
+                        else author(args, pool, truth=args.phase == "truth", commit=commit))
     metadata.update(phase=args.phase,
-                    pool_sha256=hashlib.sha256(args.pool.read_bytes()).hexdigest(),
+                    pool_sha256=hashlib.sha256(args.pool.read_bytes()).hexdigest(), commit=commit,
                     source=source_identity(args.source),
                     peak_host_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
                     packages={name: importlib.metadata.version(name)
