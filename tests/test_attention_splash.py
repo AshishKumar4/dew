@@ -349,10 +349,12 @@ def test_splash_agrees_with_the_reference_the_oracle_holds(case):
 
 
 @on_tpu
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("case", ORACLE_CASES)
-def test_splash_is_on_par_on_a_tpu(case):
-    """Splash compiled by Mosaic on a TPU, fp32, its output and every gradient (the sinks' included),
-    held to check 1 over fresh draws against XLA's own fp32 attention at the precision a TPU runs it
+def test_splash_is_on_par_on_a_tpu(case, dtype):
+    """Splash compiled by Mosaic on a TPU, in fp32 and in bf16, its production dtype, its output and every
+    gradient (the sinks' included, whose D is the dQ kernel's own, not the rounded output's) held to check 1
+    over fresh draws against XLA's own attention of the same operands at the precision a TPU runs it
     (DEFAULT, as Splash's fp32 matmuls run), truth in float64 on the host. Interpreted on a CPU, a
     kernel's dots are XLA:CPU's, not the kernel's: its dV is bit for bit XLA:CPU's `lax.dot` of the
     weights transposed by the output cotangent, which XLA:CPU sums 2.6 times less exactly than the
@@ -364,8 +366,8 @@ def test_splash_is_on_par_on_a_tpu(case):
     host = jax.devices("cpu")[0]
 
     def draw(seed):
-        query, _, _ = qkv(q_shape, jnp.float32, seed=10 * seed)
-        _, key, value = qkv(kv_shape or q_shape, jnp.float32, seed=10 * seed + 1)
+        query, _, _ = qkv(q_shape, dtype, seed=10 * seed)
+        _, key, value = qkv(kv_shape or q_shape, dtype, seed=10 * seed + 1)
         sinks = 2.0 + jax.random.normal(jax.random.PRNGKey(10 * seed + 2), (q_shape[2],), jnp.float32)
         return query, key, value, sinks
 
@@ -380,7 +382,8 @@ def test_splash_is_on_par_on_a_tpu(case):
         with jax.default_device(host):
             return exact_value_and_grads(query, key, value, **({"sinks": sinks} if sunk else {}), **structure)
 
-    assert_as_exact(splash, reference, draw, f"splash on a tpu, {case}", seeds=FEWEST_SEEDS, truth_fn=truth)
+    assert_as_exact(splash, reference, draw, f"splash on a tpu, {case}, {jnp.dtype(dtype).name}",
+                    seeds=FEWEST_SEEDS, truth_fn=truth)
 
 
 @pytest.mark.mesh(devices=2)
