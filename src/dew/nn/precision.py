@@ -691,13 +691,8 @@ def running_sum(shape: tuple[int, ...], dtype: DTypeLike) -> jax.Array:
 
 
 def added_to(running: jax.Array, term: jax.Array) -> jax.Array:
-    """`running` (`running_sum`) with `term` added: through `compensated_add` where it is a pair. The
-    term joins the sum apart from the computation that made it (`optimization_barrier`): XLA otherwise
-    takes a product's addition into its GEMM, cuBLASLt's beta=1 epilogue with no workspace to split
-    its sum, which on an H100 held a tiled head's state gradient 1.8 to 2.1 times as far from float64
-    as the whole head's one product; apart, 0.86 to 0.92 times, and the head's backward 9% faster at
-    4096 tokens of a 151936-column fp32 head (receipt TL-h100-apart-1725, row 1725)."""
-    term = jax.lax.optimization_barrier(term.astype(running.dtype))
+    """`running` (`running_sum`) with `term` added: through `compensated_add` where it is a pair."""
+    term = term.astype(running.dtype)
     if running.shape[0] == 1:
         return running + term[None]
     pair = compensated_add((running[0], running[1]), (term, jnp.zeros_like(term)))

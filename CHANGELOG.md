@@ -5,10 +5,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
-- A tiled LM head's backward adds each tile's product to its running sums apart from the GEMM that
-  made it (`dew.nn.precision.added_to`): XLA took the addition into the GEMM, whose sum then could not
-  split, and on an H100 the state gradient sat about twice as far from float64 as the whole head's;
-  apart it is nearer than the whole head's, and faster.
+- A tiled LM head's backward adds each vocabulary tile's state product to the state gradient apart
+  from the GEMM that made it: XLA took the addition into the GEMM, whose sum then could not split, and
+  on an H100 the state gradient sat about twice as far from float64 as the whole head's; apart it is
+  nearer than the whole head's, and faster.
 - The library holds no CPU-only algorithm (bible §5): a vocabulary row's fused logsumexp is one
   plain pass on every platform, which Dew's CPU test setting takes in float64 and rounds once
   (`dew.nn.precision.widened_reduction`, beside `accumulated`), in place of a CPU-only blocked
