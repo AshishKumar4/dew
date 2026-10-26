@@ -60,9 +60,9 @@ def decoder(continuum: ContinuumLevel | None = LEVEL, **options) -> CausalTransf
 MODEL = decoder()
 
 
-CORNER_WINDOWS = 8
+CORNER_WINDOWS = {1: 32, 2: 8, 3: 8}
 """The draws a seed pools (`windows`) where the inner step diverges, 0.5 N(0, 1) weights stepped by a
-half. Over 8 seeds of 64 rows its median row's rate times curvature is 4 to 8 at a window of three and
+half, by window: a window of one token steps eleven times a row, three tokens three times. Over 8 seeds of 64 rows its median row's rate times curvature is 4 to 8 at a window of three and
 1.7 to 3.3 at one, past gradient descent's 2 (the configurations below it peak at 1.64), and a row's
 rounding grows by up to 10^4 over its windows, so one draw's error is too heavy-tailed for its
 paired ratio to narrow within 512 seeds: each seed pools this many independent draws."""
@@ -74,13 +74,14 @@ def corner(rate: float, scale: float, window: int) -> bool:
     return (rate, scale) == (0.5, 0.5) and window < LENGTH
 
 
-def pooled(dew, reference, drawn, diverges: bool):
-    """The site's arms, jitted, and its draw: one draw a seed, or where its step diverges
-    `CORNER_WINDOWS` independent draws a seed, each arm run window by window (`over_windows`)."""
+def pooled(dew, reference, drawn, rate: float, scale: float, window: int):
+    """The site's arms, jitted, and its draw: one draw a seed, or where its step diverges (`corner`)
+    its window's `CORNER_WINDOWS` independent draws a seed, each arm run window by window
+    (`over_windows`)."""
     dew, reference = jax.jit(dew), jax.jit(reference)
-    if not diverges:
+    if not corner(rate, scale, window):
         return dew, reference, drawn
-    return over_windows(dew), over_windows(reference), windows(drawn, CORNER_WINDOWS)
+    return over_windows(dew), over_windows(reference), windows(drawn, CORNER_WINDOWS[window])
 
 
 def drawn_variables(seed: int, model: CausalTransformer = MODEL, scale: float = 0.5):
@@ -213,7 +214,7 @@ def test_the_scan_steps_the_level_as_equation_71(kind, window, rate, scale):
     def reference(variables, hidden, targets, weights):
         return equation_71(MODEL, variables, hidden, targets, weights, fields, adaptation)
 
-    arms = pooled(dew, reference, lambda seed: draw(seed, scale=scale), corner(rate, scale, window))
+    arms = pooled(dew, reference, lambda seed: draw(seed, scale=scale), rate, scale, window)
     assert_as_exact(*arms, f"equation 71 over {kind} at a window of {window}, rate {rate}, scale {scale}",
                     seeds=ADAPTATION_SEEDS[window, rate, scale])
 
@@ -238,7 +239,7 @@ def test_padding_steps_alike_however_it_is_marked(kind):
     def reference(variables, hidden, targets, weights):
         return equation_71(MODEL, variables, hidden, targets, weights, fields, adaptation)
 
-    assert_as_exact(*pooled(dew, reference, draw, corner(0.5, 0.5, 3)), f"padding marked as {kind}",
+    assert_as_exact(*pooled(dew, reference, draw, 0.5, 0.5, 3), f"padding marked as {kind}",
                     seeds=PADDING_SEEDS)
 
 
@@ -254,7 +255,7 @@ def test_only_the_selected_parts_step():
     def reference(variables, hidden, targets, weights):
         return equation_71(MODEL, variables, hidden, targets, weights, {}, adaptation)
 
-    assert_as_exact(*pooled(dew, reference, draw, corner(0.5, 0.5, 2)), "up alone stepping",
+    assert_as_exact(*pooled(dew, reference, draw, 0.5, 0.5, 2), "up alone stepping",
                     seeds=SELECTED_SEEDS)
 
 
@@ -282,7 +283,7 @@ def test_training_differentiates_through_every_step(kind, rate, scale):
         return lambda variables, hidden, targets, weights, cotangent: with_gradients(
             lambda variables, hidden: fn(variables, hidden, targets, weights))(variables, hidden, cotangent)
 
-    arms = pooled(differentiated(dew), differentiated(reference), gradient_draw, corner(rate, scale, 3))
+    arms = pooled(differentiated(dew), differentiated(reference), gradient_draw, rate, scale, 3)
     assert_as_exact(*arms, f"the gradient through the windows' steps over {kind}, rate {rate}, scale {scale}",
                     seeds=GRADIENT_SEEDS[kind, rate, scale])
 
