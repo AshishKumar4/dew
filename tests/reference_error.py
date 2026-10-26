@@ -617,11 +617,12 @@ class Finding:
 
 
 RULES = frozenset({"pooled", "row", "zero rows", "not finite", "exact reference", "no measure",
-                   "inconclusive"})
+                   "growth", "inconclusive"})
 """The rules a finding names: the pooled RMS ratio over its factor, the worst row over its factor, a row
 of float64 zero further from it than the reference's, a value not finite, a reference exactly float64
 where Dew is not (measured by Dew's own distance from it), a site where both are (nothing to measure,
-measured 0), and a leaf its seeds leave undecided."""
+measured 0), an error growing over a computation's steps faster than the reference's
+(`assert_grows_no_faster`), and a leaf its seeds leave undecided."""
 
 
 LOG_ZERO = -1075 * math.log(2)
@@ -1325,6 +1326,119 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
                  + "\n".join(kept))
         raise (Inconclusive([Finding(label, "inconclusive", 1.0, found)]) if unresolved
                else AssertionError(found))
+
+
+def _step_errors(value, truth) -> np.ndarray:
+    """A leaf's RMS error from float64 at each of its steps, its leading axis, over the step's values."""
+    squares = np.square(np.asarray(value, np.float64) - np.asarray(truth, np.float64))
+    return np.asarray([root_mean(step) for step in squares.reshape(len(squares), -1)])
+
+
+def _grown(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> tuple[list[str], np.ndarray, np.ndarray]:
+    """Each leaf's growth evidence over `seeds` (`assert_grows_no_faster`): seed by leaf, the log of
+    Dew's RMS error at its last step over its first, less the reference's, which cancels the
+    conditioning the draw gives both arms alike, and whether Dew is finite on every value."""
+    names, growths, finite = None, [], []
+    for seed in seeds:
+        inputs = draw(seed)
+        with jax.enable_x64(new_val=True):
+            truth = (truth_fn or reference_fn)(*widened(inputs))
+        dew, reference = dew_fn(*inputs), reference_fn(*inputs)
+        names = names or _leaf_paths(truth)
+        for name, tree in (("dew", dew), ("the reference", reference)):
+            if _leaf_paths(tree) != names:
+                raise AssertionError(f"{name}'s leaves are {_leaf_paths(tree)}, the truth's {names}")
+        growths.append([])
+        finite.append([])
+        for name, leaf, their_leaf, true in zip(names, jax.tree.leaves(dew), jax.tree.leaves(reference),
+                                                jax.tree.leaves(truth), strict=True):
+            shaped = np.shape(leaf) == np.shape(their_leaf) == np.shape(true)
+            if np.ndim(true) < 1 or len(true) < 2 or not shaped:
+                raise ValueError(f"{name}: growth is measured over two steps or more on its leading axis, "
+                                 f"of a leaf the same shape in both arms and the truth")
+            if not (np.isfinite(np.asarray(true, np.float64)).all() and np.isfinite(their_leaf).all()):
+                raise ValueError(f"{name}: seed {seed}'s float64 or reference values are not all finite; "
+                                 f"draw within the reference's range")
+            mine, theirs = _step_errors(leaf, true), _step_errors(their_leaf, true)
+            if not (mine[0] > 0 and theirs[0] > 0):
+                raise ValueError(f"{name}: seed {seed}'s first step is float64's exactly, so nothing grows "
+                                 f"from it; draw a first step that rounds")
+            logs = _logs([mine[-1], mine[0], theirs[-1], theirs[0]])
+            growths[-1].append(float(logs[0] - logs[1] - logs[2] + logs[3]))
+            finite[-1].append(bool(np.isfinite(leaf).all()))
+    return names, np.asarray(growths), np.asarray(finite)
+
+
+def _growth_judgement(names, growths: np.ndarray, finite: np.ndarray, label: str
+                      ) -> tuple[list[Finding], list[Finding]]:
+    """The growth check's findings (`assert_grows_no_faster`): each leaf not finite, each whose mean
+    log growth over the reference's is over log PARITY, and each its seeds leave undecided."""
+    over, unresolved = [], []
+    limit, count = math.log(PARITY), len(growths)
+    picks = np.random.default_rng(0).integers(0, count, (BOOTSTRAP, count))
+    for index, name in enumerate(names):
+        leaf = label + name
+        if not finite[:, index].all():
+            nonfinite = int(np.sum(~finite[:, index]))
+            over.append(Finding(leaf, "not finite", nonfinite,
+                                f"{leaf}: a value is not finite on {nonfinite} of {count} seeds"))
+            continue
+        values = growths[:, index]
+        mean = float(np.mean(values))
+        means = values[picks].mean(axis=1)
+        low = min(float(np.quantile(means, LOWER_TAIL)), mean)
+        high = max(float(np.quantile(means, 1 - UPPER_TAIL)), mean)
+        factor = (f"{math.exp(min(mean, LOG_LARGEST)):.3f} times the reference's, interval "
+                  f"[{math.exp(min(low, LOG_LARGEST)):.3f}, {math.exp(min(high, LOG_LARGEST)):.3f}]")
+        if high <= limit or (high - low <= limit and mean <= limit):
+            continue
+        if low > limit or high - low <= limit:
+            over.append(Finding(leaf, "growth", mean, f"{leaf}: dew's error grows from its first step to "
+                                f"its last {factor} over {count} seeds (allowed {PARITY})"))
+        else:
+            unresolved.append(Finding(leaf, "inconclusive", mean, f"{leaf}: inconclusive: dew's error "
+                                      f"grows {factor} over {count} seeds, wider than {PARITY}; give the "
+                                      f"site more seeds"))
+    return over, unresolved
+
+
+def assert_grows_no_faster(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None) -> None:
+    """The gate's claim on a computation that diverges by design, an inner loop stepped past its stable
+    rate (ledger 1714), where a draw's rounding grows by orders of magnitude over its steps and its
+    rows, so that no pooled ratio of check 1's resolves: every value Dew returns is finite, and Dew's
+    error grows over the steps no faster than the reference's. Its accuracy is no claim here; that is
+    check 1's on the computation's stable configurations, which run the same code.
+
+    Every leaf's leading axis is the computation's steps, in order, the same in both arms and the
+    truth (`reference_fn` on the inputs widened to float64, or `truth_fn`), each finite on every seed,
+    as the reference must be. On each draw each arm's growth is the log of its RMS error from float64
+    at the last step over the first (`_step_errors`); Dew's less the reference's cancels the draw's
+    conditioning, which amplifies both arms' rounding alike, and is a log of two errors, light-tailed
+    where a ratio of them is not. A leaf passes when the mean of it over the seeds is at most log
+    PARITY, by check 1's bootstrap interval and tails (`_status`'s reading, in logs), and fails above;
+    two pre-declared stages, as check 1's: any leaf not passing at `seeds` draws REDRAW times as many
+    further seeds and is judged again over all of them, then fails or is Inconclusive. The gate
+    compiles the arms as check 1 does (`_arms`)."""
+    if seeds < FEWEST_SEEDS:
+        raise Inconclusive([Finding(label, "inconclusive", FEWEST_SEEDS / max(seeds, 1), f"{label}: {seeds} "
+                                    f"seeds cannot be judged; the gate takes at least {FEWEST_SEEDS}")])
+    _refuse_numpy_arms(draw, dew_fn, reference_fn)
+    dew_fn, reference_fn = _arms(dew_fn, reference_fn)
+    truth_fn = _truth_program(truth_fn)
+    names, growths, finite = _grown(dew_fn, reference_fn, draw, range(seeds), truth_fn)
+    over, unresolved = _growth_judgement(names, growths, finite, label)
+    stage = 1
+    if over or unresolved:
+        further = range(seeds, (1 + REDRAW) * seeds)
+        _, more, more_finite = _grown(dew_fn, reference_fn, draw, further, truth_fn)
+        growths, finite = np.concatenate([growths, more]), np.concatenate([finite, more_finite])
+        over, unresolved = _growth_judgement(names, growths, finite, label)
+        stage = 2
+    _logged(label, stage, _verdict(over, unresolved), [])
+    if over:
+        raise GateFailure(over + unresolved)
+    if unresolved:
+        raise Inconclusive(unresolved)
 
 
 SIZING_FROM = 1 << 20

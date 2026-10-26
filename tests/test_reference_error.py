@@ -17,6 +17,7 @@ from reference_error import (
     as_given,
     assert_as_exact,
     assert_as_exact_as_the_reference,
+    assert_grows_no_faster,
     assert_leaves_as_exact,
     assert_moves,
     assert_same_artifact,
@@ -262,6 +263,42 @@ def test_a_library_arm_holds_dew_to_the_larger_of_its_error_and_the_references()
     verdicts = null_runs(reference, draw, "library arm", seeds=16, runs=2, truth_fn=truth,
                          dew_fn=arm(1.7, "mine"), paired=True, library_fn=library)
     assert [(verdict, stage) for verdict, stage, _ in verdicts] == [("pass", 1), ("pass", 1)], verdicts
+
+
+def test_growth_holds_dew_to_the_references_growth_whatever_a_draws_conditioning():
+    """A diverging computation's claim (`assert_grows_no_faster`): each draw amplifies both arms'
+    rounding alike by a conditioning spanning 10^13 over the draws, which no pooled ratio resolves. A
+    Dew whose error grows as the reference's passes, as does one 1.6 times as far at every step (its
+    accuracy is check 1's, on stable configurations); one whose error grows 4 times as fast fails, as
+    does one not finite on a value."""
+    steps = np.linspace(0.0, 1.0, 8)[:, None]
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        amplified = (10.0 ** rng.uniform(0, 13)) ** steps
+        return (rng.standard_normal((8, 64)), *(1e-7 * amplified * rng.standard_normal((8, 64))
+                                                for _ in range(2)))
+
+    def arm(scale, growth=1.0, noise="mine", finite=True):
+        @as_given
+        def run(x, mine, theirs):
+            value = x + scale * growth ** steps * {"mine": mine, "theirs": theirs}[noise]
+            return {"steps": value if finite else np.where(steps == 1.0, np.inf, value)}
+        return run
+
+    @as_given
+    def truth(x, *_):
+        return {"steps": x}
+
+    reference = arm(1.0, noise="theirs")
+    assert_grows_no_faster(arm(1.0), reference, draw, "as stable", seeds=16, truth_fn=truth)
+    assert_grows_no_faster(arm(1.6), reference, draw, "less accurate", seeds=16, truth_fn=truth)
+    with pytest.raises(GateFailure) as failed:
+        assert_grows_no_faster(arm(1.0, growth=4.0), reference, draw, "faster", seeds=16, truth_fn=truth)
+    assert [finding.rule for finding in failed.value.findings] == ["growth"]
+    with pytest.raises(GateFailure) as failed:
+        assert_grows_no_faster(arm(1.0, finite=False), reference, draw, "inf", seeds=16, truth_fn=truth)
+    assert [finding.rule for finding in failed.value.findings] == ["not finite"]
 
 
 def test_a_reference_compiled_with_options_of_its_own_runs_as_given():
