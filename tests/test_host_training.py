@@ -21,6 +21,7 @@ from dew.checkpoints import Checkpoints
 from dew.data import Loading, Memory
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import DeviceStep
+from dew.distributed.host import companion_mesh, transfer
 from dew.inference.banks import spread
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
@@ -30,7 +31,6 @@ from dew.objectives.base import Aux, EMASpec, Objective, Ratio
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
 from dew.training import Layout, Trainer
-from dew.training.host import companion_mesh, transfer
 
 HOST = Layout(host=("variables",), min_shard=1, tolerance=1.)
 DEVICE = Layout(min_shard=1, tolerance=1.)
@@ -821,7 +821,7 @@ def test_a_streamed_node_takes_the_one_target_its_placement_gives_it_whole():
     tree the sources came from (`held`) is handed the placed node, so the two share one copy."""
     import types
 
-    from dew.training.host import stream
+    from dew.distributed.host import stream
 
     sharding = NamedSharding(Mesh(np.asarray(jax.devices()[:1]), ("data",)), P())
     pair = (np.arange(4, dtype=np.float32), np.ones((2, 3), np.float32))
@@ -841,7 +841,7 @@ def test_a_node_two_places_share_goes_to_each_places_own_target():
     mapping is rebuilt (a defaultdict) is handed the placed node all the same."""
     import collections
 
-    from dew.training.host import stream
+    from dew.distributed.host import stream
 
     first, second = (SingleDeviceSharding(device) for device in jax.devices()[:2])
     pair = (np.arange(4, dtype=np.float32), np.ones((2, 3), np.float32))

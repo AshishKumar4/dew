@@ -111,25 +111,27 @@ def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
     return translated(hf_config, families()[_records.text(model_type, 'model_type')])
 
 
-def _wrapper_text(hf_config: Mapping[str, object], used: set, *,
-                  declared_type: str | None = None) -> DecoderFields:
+def _wrapper_text(hf_config: Mapping[str, object], used: set) -> DecoderFields:
     """Translate the wrapper's text_config as the decoder it is."""
     used.update(("text_config", "tie_word_embeddings"))
-    return translate_config(_text_config(hf_config, declared_type))
+    return translate_config(_text_config(hf_config))
 
 
-def _text_config(hf_config: Mapping[str, object], declared_type: str | None) -> Mapping[str, object]:
-    """The decoder config a wrapper's language model is: its text_config, typed `declared_type` where it
-    names no type, with the wrapper's own head policy."""
+def _typed(hf_config: Mapping[str, object], nested: Mapping[str, object], part: str) -> Mapping[str, object]:
+    """A wrapper's nested `part` config (text, vision or audio), typed as its wrapper declares it where it
+    names no type: `<wrapper model_type>_<part>`, the class the wrapper config builds from a raw dict
+    (its `sub_configs`), so a checkpoint's copy need not repeat the tag. A stated type stays."""
+    return {"model_type": f"{_records.text(hf_config['model_type'], 'model_type')}_{part}", **nested}
+
+
+def _text_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
+    """The decoder config a wrapper's language model is: its text_config, typed as the wrapper declares
+    it (`_typed`), with the wrapper's own head policy."""
     text = hf_config.get("text_config")
     if not isinstance(text, Mapping):
         refuse("text_config",
                 f"a wrapper carries its decoder under text_config, got {text!r}")
-    text = dict(text)
-    if declared_type is not None and 'model_type' not in text:
-        # The wrapper config class supplies its declared nested class when
-        # reading a raw dict. Checkpoint copies need not repeat that tag.
-        text['model_type'] = declared_type
+    text = dict(_typed(hf_config, text, "text"))
     if hf_config.get("model_type") != "llama4":
         # These conditional models own their lm_head at wrapper scope; the
         # nested text model has no head. Llama4 nests a complete causal LM.
@@ -205,7 +207,8 @@ def _llama4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
 def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int,
                    audio_token_id: int) -> AudioFields:
     """Read the optional audio tower and its embedder for a Gemma wrapper, beside the placeholder id
-    the wrapper read for it (`audio_token_id`).
+    the wrapper read for it (`audio_token_id`), its audio_config typed as the wrapper declares it
+    (`_typed`).
 
     Gemma 4 projects encoded frames through the same norm-and-project
     embedder as its images, at the encoder's output width; the processor
@@ -218,8 +221,8 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int,
     used.update(("audio_config", "audio_soft_tokens_per_image"))
     if stated is None:
         return NO_AUDIO.copy()
-    audio = _records.record(stated, "audio_config")
-    if audio.get("model_type") == "gemma4_unified_audio":
+    audio = _typed(hf_config, _records.record(stated, "audio_config"), "audio")
+    if audio["model_type"] == "gemma4_unified_audio":
         # No encoder: the embedder projects raw frames of audio_embed_dim samples each, one placeholder
         # a frame (Gemma4UnifiedAudioConfig's default 640, configuration_gemma4_unified.py:46 at 5.17.0).
         frame = _records.integer(audio.get("audio_embed_dim", 640), "audio_embed_dim")
@@ -258,7 +261,7 @@ def _gemma4_placeholders(hf_config: Mapping[str, object], used: set[str]) -> tup
 
 def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
     """Read a Gemma 4 wrapper: 2D-table tower, position pooler, embedder, decoder."""
-    text = _wrapper_text(hf_config, used, declared_type='gemma4_text')
+    text = _wrapper_text(hf_config, used)
     tower = translate_gemma4_vision_config(hf_config)
     projector = translate_gemma4_projector_config(
         tower["fields"], _records.integer(text.get("emb_features"), "emb_features"))
@@ -274,12 +277,12 @@ def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
 
 def _gemma4_unified_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
     """Encoder-free vision patches and raw audio frames projected into the shared decoder."""
-    text = _wrapper_text(hf_config, used, declared_type='gemma4_unified_text')
+    text = _wrapper_text(hf_config, used)
     width = record_int(text, 'emb_features')
     vision = hf_config.get('vision_config')
     tower = projector = None
     if vision is not None:
-        vision = _records.record(vision, 'vision_config')
+        vision = _typed(hf_config, _records.record(vision, 'vision_config'), 'vision')
         tower = translate_gemma4_unified_vision_config(vision)
         projector = translate_gemma4_projector_config(vision, width,
                                                       record_int(tower['fields'], 'mm_embed_dim'))
@@ -294,6 +297,7 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     if hf_config.get('language_model_only', False) is not False:
         refuse('language_model_only', 'the multimodal wrapper requires its vision component')
     used.add('language_model_only')
+    family = _records.text(hf_config['model_type'], 'model_type')
     text = _wrapper_text(hf_config, used)
     tower = translate_qwen35_vision_config(hf_config)
     projector = translate_qwen35_projector_config(
@@ -305,8 +309,7 @@ def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     video = hf_config.get("video_token_id")
     if video is not None:
         video = _records.integer(video, "video_token_id")
-    return _wrapper_fields(_records.text(hf_config['model_type'], 'model_type'), used, text, tower, projector,
-                           image, None, video=video)
+    return _wrapper_fields(family, used, text, tower, projector, image, None, video=video)
 
 
 def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
@@ -443,14 +446,14 @@ def _wrapper_sources(names: Collection[str], read: Callable[[str], np.ndarray], 
     return sources, tuple(aliases)
 
 
-def language_model_config(hf_config: Mapping[str, object], record: WrapperFields) -> Mapping[str, object]:
+def language_model_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     """The config a wrapper's language model states as its text family's own checkpoint: the text_config
     typed as the wrapper's text model, with the wrapper's head policy, the dtype the wrapper states for
     it, and its family's causal-LM class where it names none. What the wrapper declares at its own
     scope governs its language model over the text_config: its modeling overrides (as
     `translate_wrapper_config` applies them), and the token ids generation reads at wrapper scope
     before the text config's (`generation_config`)."""
-    text = dict(_text_config(hf_config, record["text_model_type"]))
+    text = dict(_text_config(hf_config))
     for field in ("torch_dtype", "dtype"):
         if field in hf_config and field not in text:
             text[field] = hf_config[field]

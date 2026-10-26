@@ -25,8 +25,8 @@ import numpy as np
 import pytest
 from lane_environment import outside_any_cluster
 
+from dew.distributed.placement import parameter_axes
 from dew.training import MeshSpec
-from dew.training.distributed import parameter_axes
 
 # Needs the eight simulated CPU devices conftest configures, except the tests
 # that name fewer: those of stand-in devices need none, and a four-GPU run
@@ -651,10 +651,11 @@ def test_a_link_figure_is_kept_for_its_placement_and_carried_by_a_checkpoint(tmp
     import optax
     from jax.sharding import Mesh
 
+    from dew.distributed.placement import link_topology
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
     from dew.training import Trainer
-    from dew.training.distributed import link_bandwidth, link_topology
+    from dew.training.distributed import link_bandwidth
 
     devices = np.asarray(jax.devices()[:4])
     paired = Mesh(devices.reshape(2, 2), ("data", "tensor"))

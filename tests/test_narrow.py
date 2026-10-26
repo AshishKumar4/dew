@@ -274,7 +274,7 @@ def test_the_fit_check_counts_the_copies_the_first_step_builds(monkeypatch):
     them before its first call, so their bytes count beside the step with the
     prefetched batches: the headroom the check leaves is the step's own,
     `step_headroom` of the devices' free bytes, less the bytes held beside it."""
-    from dew.training.distributed import placed_bytes
+    from dew.distributed.placement import placed_bytes
     from dew.training.memory import step_headroom
 
     limit = 2 ** 40

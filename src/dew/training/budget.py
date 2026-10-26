@@ -18,9 +18,12 @@ from dew.training.interval import Cadence, Tokens
 
 
 def run_length(steps: int | None, epochs: int | None, tokens: int | None, examples: int | None = None, *,
-               required: bool = True) -> None:
+               required: bool = True, counts_tokens: bool = True) -> None:
     """Refuse a run whose length is named twice, by two of `steps`, `epochs` and `examples`, or, where
-    `required`, not at all; `tokens` caps any of them or bounds a run alone."""
+    `required`, not at all; `tokens` caps any of them or bounds a run alone, for an objective that
+    `counts_tokens`."""
+    if tokens is not None and not counts_tokens:
+        raise ValueError("tokens= needs an objective that counts real tokens")
     named = [name for name, value in (("steps", steps), ("epochs", epochs), ("examples", examples))
              if value is not None]
     if len(named) > 1:
