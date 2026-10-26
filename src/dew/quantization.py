@@ -264,6 +264,25 @@ def _keyed[**Arguments, Result](method: Callable[Arguments, Result],
     return keyed
 
 
+def quantizes(module: nn.Module, name: str) -> bool:
+    """Whether the Qwix quantization the call runs under (`QUANTIZED_TRACE`) quantizes a product of the
+    bound `module`'s submodule `name` or of a module under it, as its rules select their paths: the
+    submodule's own, and the scope of each parameter it holds. A layer answers its `nonlinear_input`
+    from it (`MultiHeadLatentAttention`, `dew.nn.memory.InContextMemory`), since a quantized product is
+    no linear map of its input by its stored kernel. A provider Dew did not configure (`quantize_with`'s
+    own) keeps its rules to itself, so under one any submodule may be."""
+    key = QUANTIZED_TRACE.value
+    if key is None:
+        return False
+    spec = key[1]
+    if not isinstance(spec, Quantization):
+        return True
+    scope = (*module.path, name)
+    params = flatten_dict(dict(module.variables.get("params", {}).get(name, {})))
+    scopes = {scope, *((*scope, *leaf[:-1]) for leaf in params)}
+    return any(spec.rule_for(path) is not None for path in scopes)
+
+
 def _qwix(module: str = "qwix") -> ModuleType:
     """Qwix's `module`, imported when a call needs it; without Qwix, an error
     that names the extra which installs it."""
@@ -331,6 +350,24 @@ def frozen_fp8_kernel(leaves: Mapping[str, jax.typing.ArrayLike]) -> jax.Array:
     vocabulary rows (`CausalTransformer.applied_kernel`), traced or not."""
     forward = jnp.asarray(leaves[FROZEN_FP8[0]])
     return (forward.astype(jnp.float32) * jnp.asarray(leaves[FROZEN_FP8[1]], jnp.float32)).T
+
+
+def decoded_frozen_fp8(variables: Variables) -> Variables:
+    """`variables` with each frozen FP8 site's kernel decoded from its packed codes into `params`
+    (`frozen_fp8_kernel`) and its codes gone: the float tree the record packed, which a merge sums an
+    adapter into (`dew.lora.Adapter.merge`) and an in-context memory starts from as its W_0
+    (`dew.nn.memory`). Every other `QUANTIZATION` leaf, an input's scale, stays; the collection goes
+    when the codes were all it held."""
+    held = flatten_dict(dict(variables.get(QUANTIZATION, {})))
+    sites = {path[:-1] for path in held if path[-1] == FROZEN_FP8[0]}
+    if not sites:
+        return variables
+    kernels = {(*site, "kernel"): frozen_fp8_kernel({leaf: held[(*site, leaf)] for leaf in FROZEN_FP8})
+               for site in sites}
+    rest = {path: leaf for path, leaf in held.items() if not (path[:-1] in sites and path[-1] in FROZEN_FP8)}
+    decoded = {name: tree for name, tree in variables.items() if name != QUANTIZATION}
+    decoded["params"] = unflatten_dict({**flatten_dict(dict(variables.get("params", {}))), **kernels})
+    return {**decoded, QUANTIZATION: unflatten_dict(rest)} if rest else decoded
 
 
 def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.Array:
@@ -692,11 +729,12 @@ class InputQuantization:
             if context.method_name == "nonlinear_input":
                 # A layer asks whether its submodule is linear in its input
                 # (`MultiHeadLatentAttention.nonlinear_input`): one that
-                # rounds its input or multiplies in FP8 is not.
+                # rounds its input or multiplies in FP8, or holds a module
+                # that does, is not.
                 name = args[0] if args else kwargs["name"]
-                child = getattr(module, name)
-                return next_fun(*args, **kwargs) or (record.quantizer(child) is not None
-                                                     or child.has_variable(QUANTIZATION, FROZEN_FP8[0]))
+                held = flatten_dict(dict(getattr(module, name).variables.get(QUANTIZATION, {})))
+                return next_fun(*args, **kwargs) or any(
+                    path[-1] in (*INPUT_SCALES.values(), FROZEN_FP8[0]) for path in held)
             calls = context.method_name == "__call__"
             quantizer = record.quantizer(module) if calls else None
             frozen = calls and module.has_variable(QUANTIZATION, FROZEN_FP8[0])
