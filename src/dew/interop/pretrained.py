@@ -964,11 +964,6 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.Wra
         if (not isinstance(sections, (list, tuple)) or len(sections) != 3
                 or any(type(value) is not int or value < 0 for value in sections)):
             raise ValueError("mrope_section must contain three nonnegative integer widths")
-        if text_fields.get("yarn") is not None or text_fields.get("rope_scaling") is not None:
-            # Qwen3_5TextRotaryEmbedding interleaves the ramped frequencies and scales cos/sin by
-            # their amplitude; the mixer's three-axis tables are the plain ones.
-            raise ValueError("a Qwen 3.5 wrapper's rope_parameters names a ramp, and its three-axis "
-                             "rotary tables are the plain frequencies'; load its text decoder alone")
         _wrapper_attention(text_fields, ("full_attention",), {"mrope_section": list(sections)})
     return text_fields
 
