@@ -2,7 +2,6 @@
 
 Replay and effect commits are Dew transaction policies; Optax and Flax oracle their arithmetic.
 """
-import dataclasses
 
 import jax
 import jax.numpy as jnp
@@ -11,6 +10,7 @@ import optax
 import pytest
 from affine_run import raw_leaf
 from flax import struct
+from flax.training import dynamic_scale as dynamic_scale_lib
 
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition
@@ -73,15 +73,13 @@ def batches():
                  "bad": jnp.array(bad), "active": jnp.array(1)}
             for mask, bad in [([1., 0.], False), ([1., 1.], True), ([.5, 1.], False), ([1., 1.], False)]]
 
-class ShortScaleTrainer(Trainer[Ratio | Terms, None]):
-    def initial_state(self, initializer=None, key=None):
-        state = super().initial_state(initializer, key)
-        return dataclasses.replace(state, scale=dataclasses.replace(state.scale, growth_interval=1))
+SHORT_SCALE = dynamic_scale_lib.DynamicScale(growth_interval=1)
+"""A dynamic loss scale that grows after every finite step, so a few steps reach its growth."""
 
 
 def trainer(composite=False, k=2, checkpoints=None):
-    return ShortScaleTrainer(Tiny(composite), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9),
-                   accumulation=k, dynamic_scale=True, checkpoints=checkpoints)
+    return Trainer(Tiny(composite), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9),
+                   accumulation=k, dynamic_scale=SHORT_SCALE, checkpoints=checkpoints)
 
 
 def test_a_commit_counts_the_tokens_of_its_windows_microbatches_alone():
