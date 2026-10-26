@@ -31,7 +31,6 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import linen as nn
-from flax.core import unfreeze
 from flax.training import dynamic_scale as dynamic_scale_lib
 from flax.training.early_stopping import EarlyStopping
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
@@ -39,7 +38,7 @@ from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON, boolean, json_value, record
-from dew.batch import FROZEN, Batch, Variables, select
+from dew.batch import FROZEN, Batch, Variables, dicts, select
 from dew.checkpoints import Checkpoints, Ranking
 from dew.cleanup import attempted
 from dew.data.compile import fitted
@@ -161,7 +160,17 @@ from dew.training.model_flops import (
 )
 from dew.training.narrow import narrowed, narrowed_paths
 from dew.training.observe import Observe
-from dew.training.planning import Candidate, Planned, Timer, plan_step, settled, splits, whole_step
+from dew.training.planning import (
+    Candidate,
+    Planned,
+    Timer,
+    faster,
+    plan_step,
+    settled,
+    splits,
+    untimed_frontier,
+    whole_step,
+)
 from dew.training.profiling import ProfileWindow, owned_capture, start_capture, stop_capture
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
@@ -276,6 +285,12 @@ def loss_scale(dynamic_scale: bool | dynamic_scale_lib.DynamicScale) -> dynamic_
     if isinstance(dynamic_scale, dynamic_scale_lib.DynamicScale):
         return dynamic_scale
     return dynamic_scale_lib.DynamicScale() if dynamic_scale else None
+
+
+def held_dicts[Tree](tree: Tree) -> Tree:
+    """`tree` as a state holds its trees: every mapping a dict (`dew.batch.dicts`), the containers the
+    state's own, so nothing the state does to them reaches the caller's tree."""
+    return jax.tree.map(lambda leaf: leaf, dicts(tree))
 
 
 class Trainer(Generic[Loss, Effects]):
@@ -433,9 +448,10 @@ class Trainer(Generic[Loss, Effects]):
         # Static metadata, the same on every trace of the state: the
         # placement reads it from here rather than tracing init again.
         self._boxed = boxed_axes(initialized)
-        # The state holds its trees as dicts, whichever Flax container (a FrozenDict) the objective's
-        # tree came in, so its placement, its updates and its restores share one structure.
-        params = unfreeze(nn.unbox(initialized))
+        # The state holds its trees as dicts of its own, whichever Flax container (a FrozenDict, under a
+        # mapping or a list) the objective's tree came in, so its placement, its updates, the
+        # collections a step writes back (`write_back`) and its restores share one structure.
+        params = held_dicts(nn.unbox(initialized))
         # A held tree's initializer returns the objective's own arrays (`Objective.held_variables`),
         # which the step's donation would free: the moving state takes buffers of its own, as a
         # placed one does (`distributed.placed_held`). The frozen tree no step donates (`apart`), so
@@ -978,7 +994,7 @@ class Trainer(Generic[Loss, Effects]):
 
     @ruled
     def compile(self, state: TrainState, batch: Batch,
-                timed: Callable[[list[CompiledStep]], list[float]] | None = None) -> CompiledStep:
+                timed: Callable[[list[CompiledStep]], list[list[float]]] | None = None) -> CompiledStep:
         """Compile a transaction over the state and one already-produced global batch.
 
         The step consumes the state it is given. The returned state takes over its
@@ -1074,7 +1090,7 @@ class Trainer(Generic[Loss, Effects]):
         return run
 
     def _planned(self, state: TrainState, batch: Batch, mesh: Mesh, schedule: Schedule, resumed: JSON,
-                 timed: Callable[[list[CompiledStep]], list[float]] | None,
+                 timed: Callable[[list[CompiledStep]], list[list[float]]] | None,
                  ) -> tuple[Planned, StepFlops | None]:
         """The plan `compile` reads `batch` in (`plan_step`), from the run's splits (`splits`), the
         faster by `timed` of a frontier of two, with `plan` its record and the objective at its rung,
@@ -1106,10 +1122,11 @@ class Trainer(Generic[Loss, Effects]):
             candidates, candidates.index(first) if isinstance(first, int) and first in candidates else 0,
             objective=self.objective, mesh=mesh, xla_defaults=self._xla_defaults, narrow=self._narrow,
             base=None if self._base_rung is None else self._base_rung[1], resumed=resumed,
-            frontier=timed is not None and recorded is None)
+            # A recorded plan, and a resumed run's, is the plan it continues: neither is timed again.
+            frontier=timed is not None and recorded is None and resumed is None)
         seconds = timed([self._runner(plan, mesh) for plan in plans]) if len(plans) > 1 and timed else []
-        # Every process runs the plan process zero timed fastest.
-        planned = plans[broadcast_from_process_zero(seconds.index(min(seconds)) if seconds else 0)]
+        # Every process runs the plan process zero timed clearly faster (`faster`).
+        planned = plans[broadcast_from_process_zero(faster(seconds) if seconds else 0)]
         # The state the chosen plan holds between steps, its accumulator and copies included; the
         # plan's fit check counted them before any is built (`Candidate.held`).
         self.validation = self._validation(planned.candidate.prepared)
@@ -1429,8 +1446,9 @@ class Trainer(Generic[Loss, Effects]):
             if checkpoints is not None and checkpoints.latest is not None:
                 run.stop_control = checkpoints.control(checkpoints.latest)
         else:
-            # A supplied state's trees are held as dicts too (`initial_state`).
-            initial = dataclasses.replace(initial, variables=unfreeze(dict(initial.variables)))
+            # A supplied state's trees are held as dicts too (`initial_state`), its optimizer's and
+            # accumulation's mirrors of the parameters with them.
+            initial = held_dicts(dataclasses.replace(initial, variables=dict(initial.variables)))
             shardings, _ = self._validated(initial)
             state = jax.device_put(initial, shardings)
             position = None
@@ -2101,7 +2119,9 @@ class Trainer(Generic[Loss, Effects]):
             agreed_same("training batch layout", lambda: batch_layout(batch))
             began = time.perf_counter()
             with region("compile"):
-                compiled[signature] = (self.compile(state, batch, timer), self.step_flops)
+                # Dew's tests keep a frontier's first plan (`UNTIMED_FRONTIER`), a test setting.
+                compiled[signature] = (self.compile(state, batch, None if untimed_frontier() else timer),
+                                       self.step_flops)
             seconds = time.perf_counter() - began
             links = {axis: AxisLink(link.bytes_per_second, link.spread)
                      for axis, link in self.links.items()}

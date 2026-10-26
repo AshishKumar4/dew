@@ -5,6 +5,15 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- The library holds no CPU-only algorithm (bible §5): a vocabulary row's fused logsumexp is one
+  plain pass on every platform, which Dew's CPU test setting takes in float64 and rounds once
+  (`dew.nn.precision.widened_reduction`, beside `accumulated`), in place of a CPU-only blocked
+  reduction; a float64 schedule division is the plain division; and a plan over several devices is
+  timed against the batch whole a rung up on every backend: it keeps the first plan unless the other's
+  every sample beats it (`dew.training.planning.faster`), so two runs of one configuration train one
+  program, and a resumed run continues its checkpoint's plan untimed. Dew's tests keep a frontier's
+  first plan (`DEW_UNTIMED_FRONTIER`, a test setting like `DEW_WIDE_CPU_ARITHMETIC`). The sharded LM head maps over the axes that
+  split its tokens alone, every other axis left automatic, in place of holding every axis manual.
 - A loaded decoder's pad row takes no gradient wherever its source's table pads it. Kimi Linear, Kimi K3,
   Ouro, Dream, LLaDA-MoE and LLaDA2 now pad `pad_token_id` as their released code does, at their config
   class's own default where a config states none; Dew trained that row before. Qwen 3.5's wrappers load
@@ -75,7 +84,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   new modules; the old ones no longer hold them.
 - A Hub split's shards are the files `datasets` resolves to it from the repository's listing, by its own
   default patterns (`dew.data.sources.hub.split_files`): `dev` and `valid` are `validation`'s, a sharded
-  name's split is its own and a lone file is `train`'s, where a name match missed them.
+  name's split is its own and a lone file is `train`'s, where a name match missed them. A listing of no
+  file gives none. Every Hub call holds tqdm's bar lock first, so streamed sources discovered at once no
+  longer delete it under each other's bars.
 - An immutable upload's `retries` (`Cache.retry`) re-read only an object it created that reads back
   otherwise; a failed transfer raises after its transport's own retries, not Dew's on top of them.
 - A decision run's calibration takes its probabilities through SciPy's `softmax` and fits each
@@ -88,6 +99,7 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   their reverse mode through one `jax.experimental.hijax` linear map (`generation.linear_map`)
   instead of `linear_call`, which JAX deprecates in favour of hijax (jax-ml/jax#41782): their
   gradients still run the backward kernels, under a jit, a shard_map, a scan, a remat or a vmap.
+  timed against the batch whole a rung up on every backend.
 - 8-bit Adam state codes each moment value among the six codes around its estimate, its decade by its
   logarithm, instead of searching the whole map: on an A100, lm-dense's update takes 27.32 ms against
   60.39, its full-remat step 167.9 against 196.3 ms and compiles in 82.3 against 209.8 s, the codes
