@@ -15,7 +15,7 @@ import jax
 import pytest
 from decision_support import decision_rows
 
-from dew.config import ModelConfig, ObjectiveConfig
+from dew.config import ObjectiveConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.config.jepa import JepaRunConfig
 from dew.data import TFDS, Loading, Memory, images as image_steps, presets
@@ -43,6 +43,7 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, PPOObjective, ValueHead
 from dew.objectives.rl.sessions import Call, Session, Status, pack
 from dew.objectives.supervised import CrossEntropy, Supervised
+from dew.registry import ModelConfig
 from dew.sampling.solvers import Euler
 
 IMAGES = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"

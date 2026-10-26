@@ -24,6 +24,7 @@ import numpy as np
 from dew.data.concurrent import Concurrently
 from dew.data.dataset import _QUIET_STOP_SECONDS
 from dew.data.generation import (
+    GENERATION_SCHEMA,
     DependencyManifest,
     Generation,
     Outputs,
@@ -453,7 +454,7 @@ class _Writer:
         self.root.child(shard).put_immutable(payload, retries=retries)
         encoded = _json(
             {
-                "schema": 1,
+                "schema": GENERATION_SCHEMA,
                 "shard": {"path": shard, "bytes": len(payload), "sha256": _hash(payload)},
                 "completions": entries,
             }

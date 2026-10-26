@@ -32,7 +32,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.typing import DTypeLike
 
-from dew import records
+from dew import _records
 from dew.nn.scan_orders import ScanOrder
 
 if TYPE_CHECKING:
@@ -156,17 +156,17 @@ def simple_udit_fields(model: Mapping[str, object]) -> SimpleUDiTFields:
     if unknown:
         raise ValueError(f"unknown FlaxDiff simple_udit config keys {sorted(unknown)}")
     for name in _REFUSED:
-        if records.boolean(model.get(name, False), name):
+        if _records.boolean(model.get(name, False), name):
             raise ValueError(f"a FlaxDiff simple_udit with {name} has no Dew counterpart")
-    hilbert = records.boolean(model.get("use_hilbert", False), "use_hilbert")
+    hilbert = _records.boolean(model.get("use_hilbert", False), "use_hilbert")
     return SimpleUDiTFields(
-        output_channels=records.integer(model["output_channels"], "output_channels"),
-        patch_size=records.integer(model["patch_size"], "patch_size"),
-        emb_features=records.integer(model["emb_features"], "emb_features"),
-        num_layers=records.integer(model["num_layers"], "num_layers"),
-        num_heads=records.integer(model["num_heads"], "num_heads"),
-        mlp_ratio=records.integer(model.get("mlp_ratio", 4), "mlp_ratio"),
-        norm_epsilon=records.number(model.get("norm_epsilon", 1e-5), "norm_epsilon"),
+        output_channels=_records.integer(model["output_channels"], "output_channels"),
+        patch_size=_records.integer(model["patch_size"], "patch_size"),
+        emb_features=_records.integer(model["emb_features"], "emb_features"),
+        num_layers=_records.integer(model["num_layers"], "num_layers"),
+        num_heads=_records.integer(model["num_heads"], "num_heads"),
+        mlp_ratio=_records.integer(model.get("mlp_ratio", 4), "mlp_ratio"),
+        norm_epsilon=_records.number(model.get("norm_epsilon", 1e-5), "norm_epsilon"),
         adaln_silu=False, text_pooling="all", scan_order="hilbert" if hilbert else "raster")
 
 
@@ -183,14 +183,14 @@ def hybrid_dit_fields(model: Mapping[str, object]) -> HybridDiTFields:
     FlaxDiff refuses to set both of."""
     common = simple_udit_fields({name: value for name, value in model.items()
                                  if name not in _HYBRID_READ})
-    zigzag = records.boolean(model.get("use_zigzag", False), "use_zigzag")
+    zigzag = _records.boolean(model.get("use_zigzag", False), "use_zigzag")
     if zigzag and common["scan_order"] == "hilbert":
         raise ValueError("a FlaxDiff hybrid_dit scans in one order, and sets both use_hilbert and use_zigzag")
     return HybridDiTFields(
         **{**common, "scan_order": "zigzag" if zigzag else common["scan_order"]},
-        ssm_state_dim=records.integer(model.get("ssm_state_dim", 64), "ssm_state_dim"),
-        ssm_attention_ratio=records.text(model.get("ssm_attention_ratio", "3:1"), "ssm_attention_ratio"),
-        use_2d_fusion=records.boolean(model.get("use_2d_fusion", False), "use_2d_fusion"))
+        ssm_state_dim=_records.integer(model.get("ssm_state_dim", 64), "ssm_state_dim"),
+        ssm_attention_ratio=_records.text(model.get("ssm_attention_ratio", "3:1"), "ssm_attention_ratio"),
+        use_2d_fusion=_records.boolean(model.get("use_2d_fusion", False), "use_2d_fusion"))
 
 
 def hybrid_dit_variables(weights: Mapping, model: Mapping[str, object], *,
@@ -211,7 +211,7 @@ def _gated(tree, mlp: bool = False):
 def _variables(weights: Mapping, model: Mapping[str, object],
                moved: Mapping[str, tuple[str, ...]], jax_version: str) -> dict:
     params: dict = {}
-    patch = records.integer(model["patch_size"], "patch_size")
+    patch = _records.integer(model["patch_size"], "patch_size")
     for name, value in weights.items():
         if name == SCAN_PROJECTION:
             value = {**value, "kernel": scan_projection(value["kernel"], patch)}
@@ -220,7 +220,7 @@ def _variables(weights: Mapping, model: Mapping[str, object],
         for parent in parents:
             branch = branch.setdefault(parent, {})
         branch[leaf] = _gated(value)
-    table = fourier_table(records.integer(model["emb_features"], "emb_features"), jax_version)
+    table = fourier_table(_records.integer(model["emb_features"], "emb_features"), jax_version)
     return {"params": params,
             "constants": {"conditioning": {"time_embed": {"layers_0": {"frequencies": table}}}}}
 
@@ -235,11 +235,11 @@ def _condition(input_config: Mapping[str, object]) -> tuple[str, str, str]:
     conditions = input_config.get("conditions")
     if not isinstance(conditions, list) or len(conditions) != 1:
         raise ValueError(f"a FlaxDiff run conditions on one text; got {conditions!r}")
-    condition = records.record(conditions[0], "conditions")
-    encoder = records.record(condition["encoder"], "encoder")
-    return (records.text(condition.get("model_key_override") or "textcontext", "model_key_override"),
-            records.text(encoder["modelname"], "modelname"),
-            records.text(condition.get("unconditional_input", ""), "unconditional_input"))
+    condition = _records.record(conditions[0], "conditions")
+    encoder = _records.record(condition["encoder"], "encoder")
+    return (_records.text(condition.get("model_key_override") or "textcontext", "model_key_override"),
+            _records.text(encoder["modelname"], "modelname"),
+            _records.text(condition.get("unconditional_input", ""), "unconditional_input"))
 
 
 def _towers(clip: str, unconditional: str, vae: str, dtype: DtypeName):
@@ -270,15 +270,15 @@ def text_to_image(directory: str | os.PathLike, config: Mapping[str, object], *,
     from dew.diffusion.presets import EDM
     from dew.inference.images import TextToImage
     from dew.inputs import Field, InputSpec
+    from dew.interop.weights import check_tree
     from dew.nn.dit import TextContext
-    from dew.nn.text_encoders import check_tree
     from dew.registry import models, resolve_dtype
     from dew.sampling import CFG, EulerAncestral
 
-    architecture = records.text(config.get("architecture"), "architecture")
+    architecture = _records.text(config.get("architecture"), "architecture")
     if architecture not in _ARCHITECTURES:
         raise ValueError(f"from_flaxdiff knows simple_udit and hybrid_dit runs, not {architecture!r}")
-    arguments = records.record(config.get("arguments") or {}, "arguments")
+    arguments = _records.record(config.get("arguments") or {}, "arguments")
     schedule = config.get("noise_schedule") or arguments.get("noise_schedule")
     if schedule != "edm":
         raise ValueError(f"a FlaxDiff {architecture} run trains on the EDM schedule, not {schedule!r}")
@@ -286,20 +286,21 @@ def text_to_image(directory: str | os.PathLike, config: Mapping[str, object], *,
     if autoencoder != "stable_diffusion":
         raise ValueError(f"from_flaxdiff knows latent runs on the SD VAE, not {autoencoder!r}")
     options = config.get("autoencoder_opts") or {}
-    options = records.record(json.loads(options) if isinstance(options, str) else options,
+    options = _records.record(json.loads(options) if isinstance(options, str) else options,
                              "autoencoder_opts")
 
-    input_config = records.record(config["input_config"], "input_config")
+    input_config = _records.record(config["input_config"], "input_config")
     keyword, clip, unconditional = _condition(input_config)
-    height, width, channels = records.integers(input_config["sample_data_shape"], "sample_data_shape")
-    model_config = records.record(config["model"], "model")
+    height, width, channels = _records.integers(input_config["sample_data_shape"], "sample_data_shape")
+    model_config = _records.record(config["model"], "model")
     fields, convert = _ARCHITECTURES[architecture]
     model = models.build(architecture, fields(model_config), dtype=resolve_dtype(dtype))
     variables = convert(read_checkpoint(directory, ema=ema, best=best),
                          model_config, jax_version=jax_version)
 
     # FlaxDiff's encoders ran in bfloat16.
-    condition, vae = _towers(clip, unconditional, records.text(options["modelname"], "modelname"), "bfloat16")
+    condition, vae = _towers(clip, unconditional, _records.text(options["modelname"], "modelname"),
+                             "bfloat16")
     encoder = condition.encoder
     context = encoder.encode(encoder.params, encoder.tokenize([unconditional]))
     if not isinstance(context, TextContext):

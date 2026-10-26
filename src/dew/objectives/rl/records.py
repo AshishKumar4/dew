@@ -7,8 +7,8 @@ from dataclasses import asdict
 
 import numpy as np
 
+from dew._records import finite, integer, integers, listed, record as section, text
 from dew.inference.rollouts import Draw
-from dew.records import finite, integer, integers, listed, record as section, text
 from dew.sampling.text import Sampling
 
 from .episodes import Episode, EpisodeId, EpisodeStatus, Observation, Transition

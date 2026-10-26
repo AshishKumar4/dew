@@ -36,8 +36,8 @@ import numpy as np
 import torch
 from diffusers import AutoencoderKL
 from diffusers.models.autoencoders import vae as diffusers_vae
-from torch_precision import widened
 from reference_source import saved_fixture
+from torch_precision import widened
 
 ROOT = Path(__file__).resolve().parents[1]
 TINY = ROOT / "tests" / "fixtures" / "vae" / "sd3-tiny"

@@ -6,8 +6,8 @@ parameters are a leaf of the objective's tree, and the trainer's layout
 places them like any other leaf, so a frozen tower's weights reach the
 compiled step as arguments, not as constants compiled into it.
 
-`rebuild(name, fields)` rebuilds an encoder from a run's record, where
-`fields` is what `to_json` wrote.
+`ConditionEncoder.bound(record)` rebuilds an encoder from a run's record, the
+registry's `{"class": ..., "fields": ...}` whose fields `recorded_fields` wrote.
 """
 
 from __future__ import annotations
@@ -24,6 +24,8 @@ import numpy as np
 from flax.typing import Dtype
 from typing_extensions import TypeVar
 
+from dew import _records
+from dew.batch import FROZEN, Variables
 from dew.nn.blocks import table_rows
 from dew.nn.dit import TextContext
 from dew.nn.flops import counted_flops
@@ -41,8 +43,7 @@ from dew.nn.text_encoders import (
     translate_config,
     translate_t5_config,
 )
-from dew.objectives.base import FROZEN, Variables
-from dew.registry import dtype_name, encoders, import_path, resolve_dtype
+from dew.registry import component, dtype_name, resolve_dtype, to_record
 
 if TYPE_CHECKING:
     from torchax.interop import JittableModule
@@ -90,7 +91,7 @@ class ConditionEncoder(ABC, Generic[Raw, Encoded]):
     """Turns one modality's raw data into a conditioning value.
 
     Subclasses implement `from_pretrained`, `tokenize`, `encode` and
-    `to_json`.
+    `recorded_fields`, the record a run keeps of them (`dew.registry.Recorded`).
     """
 
     params: Variables
@@ -113,8 +114,8 @@ class ConditionEncoder(ABC, Generic[Raw, Encoded]):
         """Load the tower named `checkpoint`. This is the one call that opens files.
 
         Anything else a checkpoint needs is a keyword field with a default;
-        `to_json` records those fields, and the registry rebuilds the encoder
-        from them. When you pass `params`, the load uses them as they are. It
+        `recorded_fields` records those fields, and `bound` rebuilds the
+        encoder from them. When you pass `params`, the load uses them as they are. It
         reads the checkpoint's metadata but none of its weights, and keeps
         the values, dtypes and placement of `params`.
         """
@@ -135,31 +136,32 @@ class ConditionEncoder(ABC, Generic[Raw, Encoded]):
         return ()
 
     @abstractmethod
-    def to_json(self) -> dict:
-        """Return the keyword fields that `from_pretrained` rebuilds this encoder from."""
+    def recorded_fields(self) -> Mapping[str, object]:
+        """Return the keyword fields that `from_pretrained` rebuilds this encoder from, its checkpoint
+        among them: the record a run keeps (`dew.registry.Recorded`)."""
 
     def dependencies(self) -> Mapping[str, object]:
         """What `tokenize` makes of raw data depends on: the encoder and the fields it is
         rebuilt from, which hold its context length and its checkpoint's revision."""
-        return {"class": import_path(type(self)), "fields": self.to_json()}
+        return _records.record(to_record(self, ConditionEncoder), "encoder")
 
+    @staticmethod
+    def bound(record: Mapping[str, object], *, params: Variables | None = None) -> ConditionEncoder:
+        """Rebuild the encoder a record names, `{"class": alias or import path, "fields": ...}`
+        (`dew.registry.component`), around `params` where given.
 
-def rebuild(name: str, fields: Mapping[str, object], *,
-            params: Variables | None = None) -> ConditionEncoder:
-    """Rebuild the encoder an alias or import path `name`s from its JSON fields.
-
-    A run's record stores the encoder's import path and the keyword fields `to_json`
-    wrote. This function unpacks those fields into the encoder's
-    `from_pretrained`, so each encoder keeps its own concrete signature.
-    `checkpoint` is the one field every encoder takes, and this function
-    reads it; a record without one raises ValueError. The other fields
-    belong to the encoder, and its signature checks them.
-    """
-    checkpoint = fields.get("checkpoint")
-    if not isinstance(checkpoint, str):
-        raise ValueError(f"the {name} record names no checkpoint to rebuild from")
-    rest = {key: value for key, value in fields.items() if key != "checkpoint"}
-    return encoders[name].from_pretrained(checkpoint, **rest, params=params)
+        The fields are the keywords `recorded_fields` wrote, scalars and dtype names its
+        `from_pretrained` reads itself, passed back to it, so each encoder keeps its own concrete
+        signature. `checkpoint` is the one field every encoder takes; a record without one raises
+        ValueError. With `params` the load reads the checkpoint's metadata and tokenizer, never its
+        weights (`from_pretrained`).
+        """
+        encoder, fields = component(ConditionEncoder, record)
+        checkpoint = fields.get("checkpoint")
+        if not isinstance(checkpoint, str):
+            raise ValueError(f"the {record['class']} record names no checkpoint to rebuild from")
+        rest = {name: value for name, value in fields.items() if name != "checkpoint"}
+        return encoder.from_pretrained(checkpoint, **rest, params=params)
 
 
 def _pinned_tokenizer(checkpoint: str, revision: str | None) -> PinnedTokenizer:
@@ -246,7 +248,7 @@ class _TextTower(ConditionEncoder[str, TextContext]):
         return tuple(self.tokenizer.batch_decode(
             np.asarray(tokens["input_ids"]), skip_special_tokens=True))
 
-    def to_json(self) -> dict:
+    def recorded_fields(self) -> dict:
         return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.dtype),
                 "param_dtype": self.param_dtype, **self.recorded,
                 **({} if self.revision is None else {"revision": self.revision})}
@@ -395,7 +397,7 @@ class CharTable(ConditionEncoder[str, TextContext]):
         return tuple("".join(chr(int(i) - 2) for i in row[row > 1])
                      for row in np.asarray(tokens["input_ids"]))
 
-    def to_json(self) -> dict:
+    def recorded_fields(self) -> dict:
         return {"checkpoint": "char_table", "tokens": self.tokens,
                 "features": self.features, "vocab": self.vocab, "seed": self.seed,
                 "dtype": dtype_name(self.dtype), "param_dtype": self.param_dtype}
@@ -543,9 +545,9 @@ class HFAudio(ConditionEncoder[AudioRow, TextContext]):
         hidden = env.t2j_iso(hidden)
         return TextContext(hidden=hidden, mask=jnp.ones(hidden.shape[:2], jnp.int32))
 
-    def to_json(self) -> dict:
+    def recorded_fields(self) -> dict:
         return {"checkpoint": self.checkpoint, "seconds": self.seconds,
                 "dtype": dtype_name(self.dtype), "param_dtype": self.param_dtype}
 
 
-__all__ = ["CLIPText", "CharTable", "ConditionEncoder", "HFAudio", "T5Text", "rebuild"]
+__all__ = ["CLIPText", "CharTable", "ConditionEncoder", "HFAudio", "T5Text"]

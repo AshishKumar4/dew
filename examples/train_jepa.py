@@ -11,7 +11,6 @@ import jax
 import jax.numpy as jnp
 import tyro
 
-from dew.config import OptimConfig
 from dew.data import TFDS, Dataset, presets
 from dew.data.compile import compile
 from dew.inputs import Field
@@ -24,6 +23,7 @@ from dew.objectives.jepa import (
     LinearProbe,
     MultiBlockMask,
 )
+from dew.optim import OptimConfig
 from dew.training import Checkpoints, Trainer
 
 

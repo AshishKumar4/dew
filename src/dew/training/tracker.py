@@ -13,6 +13,7 @@ backend is imported when the first value is logged into it.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 import hashlib
 import io
@@ -28,6 +29,7 @@ from typing import TYPE_CHECKING, Protocol, TextIO
 import jax
 import numpy as np
 
+from dew._records import integer, record
 from dew.artifacts import (
     Artifact,
     Decisions,
@@ -39,7 +41,6 @@ from dew.artifacts import (
     uint8_pixels,
 )
 from dew.cleanup import attempted
-from dew.records import integer, record
 from dew.telemetry.records import RECORD_TYPES, FitEnded, Record, RunRecord, json_value, reported_number
 
 if TYPE_CHECKING:
@@ -69,14 +70,14 @@ def _home(array: jax.Array | np.ndarray) -> np.ndarray:
 
     A tracker draws on process zero alone, and completing a global array needs
     every process, so an artifact arrives here already brought home by
-    `dew.coordination.collective_host`. The refusal names the missing call
+    `dew._coordination.collective_host`. The refusal names the missing call
     instead of hanging in a collective one process entered by itself.
     """
     if isinstance(array, jax.Array) and not array.is_fully_addressable:
         raise ValueError(
             "a tracker was handed a shard of a global array, which it cannot "
             "complete from one process: bring the artifact home with "
-            "dew.coordination.collective_host on every process before drawing it")
+            "dew.distributed.collective_host on every process before drawing it")
     return np.asarray(array)
 
 def _uint8(images: jax.Array | np.ndarray) -> np.ndarray:
@@ -782,3 +783,17 @@ class Trackers(_OwnedTracker):
         if exc is None and error is not None:
             raise error
 
+
+@dataclasses.dataclass(frozen=True)
+class Wandb:
+    """Where a run reports to Weights & Biases.
+
+    Setting it turns tracking on; the entity and the offline switch have no effect
+    without a project. `name` is the run's display name there, apart from the name
+    its checkpoints are kept under; None shows it as the run is named.
+    """
+
+    project: str
+    entity: str | None = None
+    offline: bool = False
+    name: str | None = None

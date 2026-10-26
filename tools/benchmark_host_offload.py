@@ -37,11 +37,11 @@ import numpy as np
 import tyro
 
 import dew.nn.backbones  # noqa: F401  (registers the kind)
-from dew.hashing import fmix32
+from dew._hashing import fmix32
+from dew.batch import Variables
 from dew.inference.banks import LayerBanks, at_namespace, in_namespace, narrowed, one_layer
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import Variables
 from dew.registry import models
 from dew.sampling.text import decode_ops, prefill_state
 from dew.telemetry.benchmark import resident_memory

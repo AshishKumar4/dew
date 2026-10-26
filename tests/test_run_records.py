@@ -93,10 +93,13 @@ def published_layout() -> tuple[dict, dict]:
     import jax
     from flax.traverse_util import unflatten_dict
 
+    from dew.inference.tasks import earlier_shapes
+
     fixture = json.loads(LAYOUT.read_text())
     variables = unflatten_dict({path: jax.ShapeDtypeStruct(tuple(shape), dtype)
                                 for path, (shape, dtype) in fixture["variables"].items()}, sep="/")
-    return fixture["artifact"], variables
+    # The published run's record, as a run loader reads it (`SavedRun.pinned`).
+    return earlier_shapes(fixture["artifact"]), variables
 
 
 def test_the_published_runs_weights_are_the_ones_its_models_read():
@@ -115,7 +118,7 @@ def test_the_published_runs_weights_are_the_ones_its_models_read():
 
     artifact, variables = published_layout()
     model = saved_model(artifact, None).build()
-    autoencoder = AutoEncoder.from_json(artifact["autoencoder"], params=variables["autoencoder"])
+    autoencoder = AutoEncoder.bound(artifact["autoencoder"], params=variables["autoencoder"])
     sample = tuple(artifact["inputs"]["sample"]["shape"])
     latents = jax.ShapeDtypeStruct((1, *autoencoder.latent_shape(sample)), jnp.float32)
     # CLIP ViT-L/14's 77 tokens of 768 features, the published run's text condition.
