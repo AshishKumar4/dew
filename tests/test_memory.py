@@ -618,7 +618,7 @@ def test_a_memorys_inner_network_rounds_its_inputs_at_their_declared_scale():
         return x, {**params, QUANTIZATION: scales}
 
     rounded = InputQuantizer.fp8(SCALE).qdq
-    assert_as_exact(jax.jit(quantized.apply), written(module, dtype=jnp.float32, inputs=rounded), scaled,
+    assert_as_exact(applied(quantized), written(module, dtype=jnp.float32, inputs=rounded), scaled,
                     "quantized memory", seeds=MEMORY_SEEDS,
                     truth_fn=written(module, dtype=jnp.float64, inputs=rounded))
 
