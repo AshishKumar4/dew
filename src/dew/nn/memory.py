@@ -33,7 +33,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-from collections.abc import Callable
 from typing import ClassVar, Literal, NamedTuple
 
 import jax
@@ -100,15 +99,15 @@ class Gate:
 
 
 class LinearMemory(nn.Module):
-    """`W k`: a linear memory (TTT-Linear's f_lin without its norm and residual, Titans' linear case)."""
+    """`W k`, `W` square over the view's width: a linear memory (TTT-Linear's f_lin without its norm and
+    residual, Titans' linear case)."""
 
-    features: int
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
-        return Dense(self.features, use_bias=False, dtype=self.dtype, precision=self.precision,
+        return Dense(x.shape[-1], use_bias=False, dtype=self.dtype, precision=self.precision,
                      name="kernel")(x)
 
 
@@ -136,16 +135,17 @@ class ResidualMemory(nn.Module):
 
 
 class MLPMemory(nn.Module):
-    """Titans' deep memory: dense layers of `widths` with `activation` between them (Sec 3.1)."""
+    """Titans' deep memory: dense layers of the `hidden` widths, then one back to the view's width,
+    `activation` between them (Sec 3.1)."""
 
-    widths: tuple[int, ...]
+    hidden: tuple[int, ...]
     activation: Literal["gelu", "silu", "relu"] = "silu"
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
     @nn.compact
     def __call__(self, x: jax.Array) -> jax.Array:
-        for index, width in enumerate(self.widths):
+        for index, width in enumerate((*self.hidden, x.shape[-1])):
             if index:
                 x = getattr(nn, self.activation)(x)
             x = Dense(width, dtype=self.dtype, precision=self.precision, name=f"layers_{index}")(x)
@@ -155,15 +155,17 @@ class MLPMemory(nn.Module):
 class InContextMemory(nn.Module):
     """The in-context memory layer `[B, S, D] -> [B, S, D]` (the module docstring).
 
-    `network(dtype=...)` builds the inner network, any module of one vector of the view's width; its
-    parameters, drawn at init, are W_0. `heads` memories run side by side over the views split into
-    heads of `head_features`. A view is projected from the stream, or the stream itself where its
-    `project_*` is off, as a continuum-memory level reads its block's input (one head). `gates` are
-    the step size theta (`learning_rate`), the momentum mu (None: none) and the retention alpha (None:
-    none). `output` projects the heads' readouts back to the stream's width.
+    `network` is the inner network, any module that maps one vector of the view's width to one of the
+    same width and takes a `dtype` (`LinearMemory`, `ResidualMemory`, `MLPMemory`, an existing block
+    such as `GatedMLP`); it runs unbound, at the dtype each use asks, and its parameters, drawn at
+    init, are W_0. `heads` memories run side by side over the views split into heads of
+    `head_features`. A view is projected from the stream, or the stream itself where its `project_*`
+    is off, as a continuum-memory level reads its block's input (one head). `gates` are the step size
+    theta (`learning_rate`), the momentum mu (None: none) and the retention alpha (None: none).
+    `output` projects the heads' readouts back to the stream's width.
     """
 
-    network: Callable[..., nn.Module]
+    network: nn.Module
     heads: int = 1
     head_features: int | None = None
     objective: Objective = Objective()
@@ -199,7 +201,7 @@ class InContextMemory(nn.Module):
 
     def _inner(self, *, wide: bool) -> nn.Module:
         """The inner network, at the state's precision where `wide` (the gradients), else the layer's."""
-        return self.network(dtype=at_least_fp32(self.dtype) if wide else self.dtype, parent=None)
+        return self.network.clone(dtype=at_least_fp32(self.dtype) if wide else self.dtype, parent=None)
 
     def _views(self, x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, int]:
         """The queries, keys and values `[B, S, H, F]` and the views' width F."""
