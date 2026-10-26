@@ -310,14 +310,13 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
 
             keys = algebra.Keys(coords, logits, load, dot, products=products, largest=largest)
             return algebra.plain_step(spec, carry, keys), accumulators
-        held = list(accumulators)
+        def accumulate(acc, scale, parts, value, _):
+            return family.rescaled_products(acc, lambda acc: scale(acc, None), parts, value, interpret)
 
-        def accumulate(scale, parts, value, _):
-            held[0] = family.rescaled_products(held[0], lambda acc: scale(acc, None), parts, value, interpret)
-
-        state = algebra.Partial(jnp.zeros((), jnp.float32), *carry)
+        # The sums are the accumulator's, which the step takes the tile into (`Keys.accumulate`).
+        state = algebra.Partial(accumulators[0], *carry)
         state = algebra.plain_step(spec, state, algebra.Keys(coords, logits, load, dot, accumulate, products))
-        return (state.m, state.total), tuple(held)
+        return (state.m, state.total), (state.acc,)
 
     trained = None
     if residuals is not None:
@@ -358,7 +357,7 @@ def _trained(spec: algebra.Forward, family: mosaic.Family, start: algebra.Partia
     `first`) from `start`: `algebra.training_step`, its split sums in the family's accumulators, taken in
     place a block of the family's swizzled value columns at a time (`Keys.accumulate`), and the anchor's
     value row kept in registers, the same blocks of it, picked from a value tile by its one-hot product where
-    the anchor moved (`KeptRows`, `Argmax.row`): each block's join and pick take a `[rows, unit]` fp32
+    the anchor moved (`KeptRows`): each block's join and pick take a `[rows, unit]` fp32
     temporary, not the whole width's. `scored(index, slots)` gives a tile's place, coordinates, logits and
     products, and `value_of(slots)` its value slot. Returns the state with the split sums as the state's
     sums, and what the walk leaves beside them: the anchor's own weight, the other keys' weights' sum, the
@@ -372,34 +371,33 @@ def _trained(spec: algebra.Forward, family: mosaic.Family, start: algebra.Partia
         return family.registers_product(lhs, rhs, interpret)
 
     def step(index, slots, carry, accumulators):
-        m, total, arg, own, others_total = carry
+        m, total, arg, own, others_total, row = carry
         _, coords, logits, products = scored(index, slots)
-        held = list(accumulators)
 
-        def accumulate(scale, parts, value, kept):
-            for place, (row, columns) in enumerate(zip(kept, blocks, strict=True)):
-                held[place] = family.rescaled_products(held[place], lambda acc, row=row: scale(acc, row),
-                                                       parts, value.at[:, columns], interpret)
+        def accumulate(acc, scale, parts, value, kept):
+            return tuple(family.rescaled_products(block, lambda acc, held=held: scale(acc, held), parts,
+                                                  value.at[:, columns], interpret)
+                         for block, held, columns in zip(acc, kept, blocks, strict=True))
 
         def picked(onehot, value):
             return tuple(dot(onehot, value.at[:, columns]) for columns in blocks)
 
         keys = algebra.Keys(coords, logits, functools.partial(value_of, slots), dot, accumulate, products)
-        # The sums are the accumulators', which the step takes in place (`Keys.accumulate`).
-        state = algebra.Partial(jnp.zeros((), jnp.float32), m, total)
-        state, arg, own, others_total = algebra.training_step(spec, (state, arg, own, others_total), keys,
-                                                              algebra.KeptRows(picked))
-        return (state.m, state.total, arg, own, others_total), tuple(held)
+        # The sums are the accumulators', which the step takes the tile into (`Keys.accumulate`).
+        state = algebra.Partial(tuple(accumulators), m, total)
+        (state, arg, own, others_total), kept = algebra.training_step(
+            spec, (state, arg, own, others_total), keys, algebra.KeptRows(picked, row))
+        return (state.m, state.total, arg, own, others_total, kept.row), state.acc
 
     nothing = family.zeros((rows,))
-    arg = algebra.Argmax(family.full((rows,), -jnp.inf), family.full((rows,), 0, jnp.int32),
-                         row=tuple(family.zeros((rows, unit)).astype(kept_dtype) for _ in blocks))
+    arg = algebra.Argmax(family.full((rows,), -jnp.inf), family.full((rows,), 0, jnp.int32))
+    row = tuple(family.zeros((rows, unit)).astype(kept_dtype) for _ in blocks)
     initial = tuple(start.acc[:, columns.start:columns.start + unit] for columns in blocks)
-    (m, total, arg, own, others_total), accumulators = family.walk(
-        streams, ((step, *reach),), (start.m, start.total, arg, nothing, nothing),
+    (m, total, arg, own, others_total, row), accumulators = family.walk(
+        streams, ((step, *reach),), (start.m, start.total, arg, nothing, nothing, row),
         tuple((rows, unit) for _ in blocks), interpret, first=first, initial=initial)
     acc = jnp.concatenate(accumulators, axis=1) if len(blocks) > 1 else accumulators[0]
-    kept = jnp.concatenate(arg.row, axis=1) if len(blocks) > 1 else arg.row[0]
+    kept = jnp.concatenate(row, axis=1) if len(blocks) > 1 else row[0]
     return algebra.Partial(acc, m, total), (own, others_total, arg.key, kept)
 
 

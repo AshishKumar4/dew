@@ -440,7 +440,7 @@ def test_the_headroom_guard_leaves_ordinary_inputs_bitwise_unchanged(causal):
 @pytest.mark.parametrize("natural", [False, True], ids=["folded", "natural"])
 def test_a_training_step_holding_its_sums_and_anchor_row_is_the_gathering_steps_arithmetic(natural):
     """`algebra.training_step` as a mainloop that holds its split sums in two blocks of value columns
-    (`Keys.accumulate`) and keeps the anchor's value row (`KeptRows`, `Argmax.row`) runs it, Mosaic's
+    (`Keys.accumulate`) and keeps the anchor's value row (`KeptRows`) runs it, Mosaic's
     training forward, against the step that sums whole rows and gathers the row by key (`rows`), the plain-JAX
     and Triton mainloops': the same state, anchor, row sums and split sums, bitwise, over bf16 key tiles whose
     maximum moves, ties among them. Each product is exact in float64 and rounded once, so a column block's is
@@ -467,34 +467,26 @@ def test_a_training_step_holding_its_sums_and_anchor_row_is_the_gathering_steps_
     start = algebra.started(spec, None, queries, width, None)
     gathered = (start, algebra.no_argmax(queries), nothing, nothing)
     for index in range(tiles):
-        gathered = algebra.training_step(spec, gathered, keys_at(index), lambda key: values[key])
+        gathered, _ = algebra.training_step(spec, gathered, keys_at(index), lambda key: values[key])
 
-    held = [start.acc[:, block] for block in columns]
-
-    def accumulate(scale, parts, value, kept):
-        for place, (row, block) in enumerate(zip(kept, columns, strict=True)):
-            held[place] = scale(held[place], row) + algebra.summed_products(parts, value[:, block], dot)
+    def accumulate(acc, scale, parts, value, kept):
+        return tuple(scale(block_sums, row) + algebra.summed_products(parts, value[:, block], dot)
+                     for block_sums, row, block in zip(acc, kept, columns, strict=True))
 
     def picked(onehot, value):
         return tuple(dot(onehot, value[:, block]) for block in columns)
 
-    anchor = algebra.no_argmax(queries)._replace(row=tuple(jnp.zeros((queries, width // 2), jnp.bfloat16)
-                                                           for _ in columns))
-    kept = (algebra.Partial(jnp.zeros((), jnp.float32), start.m, start.total), anchor, nothing, nothing)
+    row = algebra.KeptRows(picked, tuple(jnp.zeros((queries, width // 2), jnp.bfloat16) for _ in columns))
+    sums = tuple(start.acc[:, block] for block in columns)
+    kept = (algebra.Partial(sums, start.m, start.total), algebra.no_argmax(queries), nothing, nothing)
     for index in range(tiles):
-        kept = algebra.training_step(spec, kept, keys_at(index, accumulate), algebra.KeptRows(picked))
-
-    # A kept row and a gathering walk each need their own carry.
-    with pytest.raises(ValueError):
-        algebra.training_step(spec, gathered, keys_at(0), algebra.KeptRows(picked))
-    with pytest.raises(ValueError):
-        algebra.training_step(spec, kept, keys_at(0), lambda key: values[key])
+        kept, row = algebra.training_step(spec, kept, keys_at(index, accumulate), row)
 
     (state, arg, own, others), (kept_state, kept_arg, kept_own, kept_others) = gathered, kept
     for mine, theirs in ((kept_state.m, state.m), (kept_state.total, state.total), (kept_arg.peak, arg.peak),
                          (kept_arg.key, arg.key), (kept_own, own), (kept_others, others),
-                         (jnp.concatenate(held, axis=1), state.acc),
-                         (jnp.concatenate(kept_arg.row, axis=1), values[arg.key])):
+                         (jnp.concatenate(kept_state.acc, axis=1), state.acc),
+                         (jnp.concatenate(row.row, axis=1), values[arg.key])):
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
 
 

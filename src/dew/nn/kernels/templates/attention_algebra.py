@@ -26,7 +26,7 @@ import dataclasses
 import functools
 import math
 from collections.abc import Callable, Iterator
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, overload
 
 import jax
 import jax.numpy as jnp
@@ -219,13 +219,14 @@ class Guard(NamedTuple):
 
 
 class Partial(NamedTuple):
-    """A query block's softmax state, unhooked: the weighted values `acc` `[..., bq, Dv]`, the running
+    """A query block's softmax state, unhooked: the weighted values `acc` `[..., bq, Dv]` (or, where a
+    mainloop's accumulators hold them, the blocks of their columns it holds, `Keys.accumulate`), the running
     maximum `m` `[..., bq]` (in base 2 where the step's logits are) and the denominator `total`
     `[..., bq]`, fp32, both sums at each row's shift on the guarded path, whose `Guard` it carries (None on
     the plain path). `rescale`, `merge` and `finish` take any leading axes, so states a launch wrote per
     slice merge in XLA after it (`exported`, `imported`)."""
 
-    acc: jax.Array
+    acc: Any
     m: jax.Array
     total: jax.Array
     guard: Guard | None = None
@@ -745,14 +746,11 @@ def rescale(acc: jax.Array, alpha: jax.Array) -> jax.Array:
 class Argmax(NamedTuple):
     """The keys' running maximum logit `peak` `[bq]` (the initial state's apart) and `key`, the first
     key that holds it `[bq]` int32: the backward's anchor key (`off_anchor`), a residual of the forward. Under
-    dropout, `multiplier` `[bq]` is that key's draw, which the anchor's own weight takes (`joined`). Where
-    the mainloop keeps the key's value row rather than gather it (`KeptRows`), `row` holds it (`[bq, Dv]`, or
-    the blocks of it the mainloop's accumulators hold), picked from the tile that moved the anchor."""
+    dropout, `multiplier` `[bq]` is that key's draw, which the anchor's own weight takes (`joined`)."""
 
     peak: jax.Array
     key: jax.Array
     multiplier: jax.Array | None = None
-    row: Any = None
 
 
 def no_argmax(rows: int, dropping: bool = False) -> Argmax:
@@ -782,17 +780,17 @@ class Keys(NamedTuple):
     the guarded walk their largest magnitude a key (`magnitudes`, or `largest()` where the mainloop holds the
     values where it cannot read them, a Mosaic slot's shared memory), the
     mainloop's product `dot(a, b)`, `a @ b` in fp32, where the mainloop holds the running sums of the
-    weighted values itself (an MMA's accumulator), `accumulate(scale, parts, value, row)`, which takes them
-    by `scale(acc, row)` and adds the weights' `parts`' products with the values in place
-    (`summed_products`), `row` the old anchor's value row the training step's split sums join (`Argmax.row`,
-    None on the plain step), and the products the logits are a factor of, where they are (`logits_of`), whose
-    extreme the tile's maximum takes (`peak`)."""
+    weighted values itself (an MMA's accumulator), `accumulate(acc, scale, parts, value, row)`, which returns
+    the running sums `acc` (the state's, in the mainloop's own form) taken by `scale(acc, row)` with the
+    weights' `parts`' products with the values added (`summed_products`), `row` the old anchor's value row
+    the training step's split sums join (`KeptRows.row`, None on the plain step), and the products the
+    logits are a factor of, where they are (`logits_of`), whose extreme the tile's maximum takes (`peak`)."""
 
     coords: Coords
     logits: jax.Array
     load: Callable[[], jax.Array]
     dot: Callable[[jax.Array, jax.Array], jax.Array]
-    accumulate: Callable[[Callable, Parts, jax.Array, Any], None] | None = None
+    accumulate: Callable[[Any, Callable, Parts, jax.Array, Any], Any] | None = None
     products: jax.Array | None = None
     largest: Callable[[], jax.Array] | None = None
 
@@ -836,40 +834,53 @@ def magnitudes(value: jax.Array) -> jax.Array:
 
 
 def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
-    """The state after a tile `keys`: its softmax and the product of its weights with its values, into the
-    mainloop's own running sums where it holds them (`Keys.accumulate`; the state's `acc` then is the
-    mainloop's to read, passed through)."""
+    """The state after a tile `keys`: its softmax and the product of its weights with its values, the
+    mainloop's own running sums taking it where it holds them (`Keys.accumulate`, the state's `acc` in its
+    form)."""
     m, factor, p, value, held = _softmax(spec, state, keys)
     if held is None and keys.accumulate is not None:
-        keys.accumulate(lambda acc, _: carry_factor(acc, factor, None), ((narrow(p, value.dtype), None),),
-                        value, None)
-        return Partial(state.acc, m, denominator_after(state.total, factor, p))
+        acc = keys.accumulate(state.acc, lambda acc, _: carry_factor(acc, factor, None),
+                              ((narrow(p, value.dtype), None),), value, None)
+        return Partial(acc, m, denominator_after(state.total, factor, p))
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
     times = functools.partial(_times, keys.dot, value, multiplier=multiplier)
     return stepped(state, m, factor, p, times(p), held, times)
 
 
 class KeptRows(NamedTuple):
-    """A training walk that keeps the anchor's value row in its carry (`Argmax.row`, which its start
-    holds) rather than gather it by key: `pick(onehot, value)`, a tile's value rows at a one-hot
-    `[bq, bk]` (each row's anchor key), in the row's structure (the blocks its accumulators hold), its
-    product with the values."""
+    """A training walk that keeps the anchor's value row rather than gather it by key: `row`, the row it
+    keeps (`[bq, Dv]`, or the blocks of it its accumulators hold), and `pick(onehot, value)`, a tile's value
+    rows at a one-hot `[bq, bk]` (each row's anchor key), in the row's structure, its product with the
+    values. The step returns it with the row the anchor moved to (`training_step`)."""
 
     pick: Callable[[jax.Array, jax.Array], Any]
+    row: Any
+
+
+Gathered = Callable[[jax.Array], jax.Array]
+"""A training walk's value rows gathered by key: each row's `[bq, Dv]` at its anchor key `[bq]`."""
+
+
+@overload
+def training_step(spec: Forward, carry: Carry, keys: Keys, rows: KeptRows) -> tuple[Carry, KeptRows]: ...
+
+
+@overload
+def training_step(spec: Forward, carry: Carry, keys: Keys, rows: Gathered) -> tuple[Carry, Gathered]: ...
 
 
 def training_step(spec: Forward, carry: Carry, keys: Keys,
-                  rows: Callable[[jax.Array], jax.Array] | KeptRows) -> Carry:
+                  rows: Gathered | KeptRows) -> tuple[Carry, Gathered | KeptRows]:
     """A training walk's carry after a tile `keys`: its state, whose sums are the weighted values kept apart
     from the anchor key's (`B`, with the initial state's), the anchor key, its own weight, and the other
     keys' weights' sum (keys alone). Where the anchor moved to this tile, the old anchor's term (its weight
-    times its value row, `rows(key)` each row's at its key `[bq]`, or the one the walk keeps, `Argmax.row`,
-    where `rows` is `KeptRows`) joins `B` and the sum before the rescale (`split_taken`,
+    times its value row, `rows(key)` each row's at its key `[bq]`, or the one the walk keeps, `KeptRows.row`)
+    joins `B` and the sum before the rescale (`split_taken`,
     `split_rows`), and the new anchor's weight is the tile's; the tile's other keys add their product and
     their narrowed weights. So neither is summed with a key's weight cancelled out of it. On the guarded walk
     the tile's product, sum and own weight take the row's shift past its weights' (`beyond_weights`). Where
-    the mainloop holds the sums (`Keys.accumulate`, the plain walk's), it takes them in place, and the
-    state's `acc` is passed through."""
+    the mainloop holds the sums (`Keys.accumulate`, the plain walk's), they take the tile there. Returns the
+    carry and `rows`, a kept row moved where the anchor moved."""
     state, arg, own, others_total = carry
     m, factor, p, value, held = _softmax(spec, state, keys)
     anchor = argmax(arg, keys.logits, keys.coords.k_pos)
@@ -884,11 +895,7 @@ def training_step(spec: Forward, carry: Carry, keys: Keys,
         parts = weights_parts(jnp.where(at_anchor, 0.0, p) * multiplier, value.dtype)
         anchor_draw = drawn(keys.coords, keys.coords.q_pos, anchor.key[:, None])
         anchor = anchor._replace(multiplier=None if anchor_draw is None else anchor_draw[:, 0])
-    kept = isinstance(rows, KeptRows)
-    if kept != (arg.row is not None):
-        raise ValueError("a training walk keeps the anchor's value row (`KeptRows`) exactly where its carry "
-                         "holds one (`Argmax.row`)")
-    old = arg.row if kept else rows(arg.key)
+    old = rows.row if isinstance(rows, KeptRows) else rows(arg.key)
     taken = functools.partial(split_taken, own=own, alpha=factor, moved=moved, held=held,
                               old_multiplier=arg.multiplier)
     accumulate = keys.accumulate if held is None else None
@@ -899,15 +906,14 @@ def training_step(spec: Forward, carry: Carry, keys: Keys,
     else:
         # The tile's fp32 weights done with before its products, so they hold no registers through them.
         after = Partial(state.acc, m, denominator_after(state.total, factor, p))
-        accumulate(lambda acc, row: taken(acc, old_value=row), parts, value, old)
-        acc = state.acc
+        acc = accumulate(state.acc, lambda acc, row: taken(acc, old_value=row), parts, value, old)
     own, others_total = split_rows(own, others_total, factor, moved, others, own_tile, held)
     if isinstance(rows, KeptRows):
         # The anchor's value row where it moved to this tile: the tile's row at its key.
         picked = rows.pick(at_anchor.astype(value.dtype), value)
-        anchor = anchor._replace(row=jax.tree.map(
-            lambda new, kept: jnp.where(expand(moved, kept), new.astype(kept.dtype), kept), picked, arg.row))
-    return after._replace(acc=acc), anchor, own, others_total
+        rows = rows._replace(row=jax.tree.map(
+            lambda new, kept: jnp.where(expand(moved, kept), new.astype(kept.dtype), kept), picked, rows.row))
+    return (after._replace(acc=acc), anchor, own, others_total), rows
 
 
 def plain_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys], start: Partial) -> Partial:
@@ -920,7 +926,7 @@ def training_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys],
     """A training forward's walk (`plain_walk`), its carry also holding the anchor key and the split
     sums, from none (`training_step`)."""
     nothing = jnp.zeros(start.total.shape, jnp.float32)
-    return jax.lax.fori_loop(lo, hi, lambda index, carry: training_step(spec, carry, keys_at(index), rows),
+    return jax.lax.fori_loop(lo, hi, lambda index, carry: training_step(spec, carry, keys_at(index), rows)[0],
                              (start, no_argmax(start.total.shape[0], dropping), nothing, nothing))
 
 
