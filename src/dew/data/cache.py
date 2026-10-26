@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import sqlite3
 import tempfile
 import threading
@@ -21,8 +22,9 @@ from typing import Literal, TypedDict, overload
 import grain.python as grain
 import numpy as np
 
+from dew.cache import dew_cache_dir
 from dew.data.concurrent import Concurrently
-from dew.data.dataset import _QUIET_STOP_SECONDS
+from dew.data.dataset import _QUIET_STOP_SECONDS, Loading
 from dew.data.generation import (
     GENERATION_SCHEMA,
     DependencyManifest,
@@ -47,6 +49,23 @@ from dew.data.sources.records import ArrayRecords
 from dew.data.storage import PreconditionFailed, Store, _byte_size
 
 _log = logging.getLogger(__name__)
+
+
+AUTOMATIC = "DEW_DATA_CACHE"
+"""The environment variable that names the directory a process's runs cache their chains' leading
+deterministic steps in (`automatic_root`), or turns that off (`off`)."""
+
+
+def automatic_root(loading: Loading) -> str | None:
+    """Where a run caches what its chains' leading deterministic steps make of their records, with no
+    `cache=` (`dew.data.compile._automatic`): `$DEW_DATA_CACHE`, else `data` in Dew's cache directory
+    (`dew.cache.dew_cache_dir`), a local root holding at most `Cache.keep_local_bytes`, its oldest
+    generations evicted first (`LocalRetention`). None where the run's `loading` opts out
+    (`Loading(cache=False)`) or the process does (`DEW_DATA_CACHE=off`)."""
+    named = os.environ.get(AUTOMATIC)
+    if not loading.cache or (named is not None and named.strip().lower() in ("off", "0", "false", "")):
+        return None
+    return named or os.path.join(dew_cache_dir(), "data")
 
 
 class Abandoned(RuntimeError):

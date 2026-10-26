@@ -589,11 +589,19 @@ def _cache_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Mani
     without the views of its inputs (`_VIEWS`), which order or select what it holds and make none of
     it. A store given no name states no content (`Manifest.exact`), and its cache would serve any
     other's rows."""
-    stated = source.fingerprint()
-    if not identified(json_value(stated, "source")):
+    manifest = _cache_key(source, prefix, read)
+    if manifest is None:
         raise ValueError(f"a cache keys its store's content, which {source.describe()} doesn't "
                          "state: name it (from_grain(..., name=), from_iter(..., name=), "
                          "from_torch(..., identity=))")
+    return manifest
+
+
+def _cache_key(source: Source, prefix: Sequence[Stage], read: Read) -> Manifest | None:
+    """`_cache_manifest`, or None where `source` states no content of its own to key."""
+    stated = source.fingerprint()
+    if not identified(json_value(stated, "source")):
+        return None
     return _manifest(
         stated,
         (source,),

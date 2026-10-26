@@ -398,6 +398,10 @@ class Cached(Protocol):
 @dataclasses.dataclass(frozen=True)
 class Artifact:
     cache: Cached
+    automatic: bool = False
+    """Whether the compiler placed it (`dew.data.compile._automatic`) rather than the chain: it holds
+    the records its prefix makes, so a run reads the same records with or without it and its plan
+    names none (`dew.data.cache.automatic_root`)."""
 
 
 type Stage = (
