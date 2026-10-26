@@ -213,8 +213,9 @@ def test_tier_three_admits_a_causal_lm_it_can_train_and_refuses_the_rest():
     # Longcat Flash routes its top 12 of routed and identity experts; the probe shrinks all three
     # under the config's own keys (`moe_topk`), so its shrunken router routes within its experts.
     longcat = tiny_config("longcat_flash", n_routed_experts=16, zero_expert_num=8, moe_topk=12,
-                          q_lora_rank=32, kv_lora_rank=16, qk_nope_head_dim=8, qk_rope_head_dim=8, head_dim=8,
-                          v_head_dim=8, expert_ffn_hidden_size=32, num_layers=1, num_hidden_layers=2)
+                          num_key_value_heads=4, q_lora_rank=32, kv_lora_rank=16, qk_nope_head_dim=8,
+                          qk_rope_head_dim=8, head_dim=8, v_head_dim=8, expert_ffn_hidden_size=32, num_layers=1,
+                          num_hidden_layers=2)
     assert isinstance(source_route(longcat.to_dict()), TorchRoute)
     cohere = tiny_config("cohere").to_dict()
     for refused in (tiny_config("bert", is_decoder=False).to_dict(),
