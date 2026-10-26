@@ -1860,14 +1860,12 @@ def _kept_tensors(tensors: Mapping[str, np.ndarray], config: Mapping[str, object
     wrapper's language model's through the wrapper's names."""
     match route:
         case DecoderRoute(record=record):
-            depth = partial(decoders.source_depth, record=record,
-                            model_type=_records.text(config.get("model_type"), "model_type"))
+            depth = decoders.source_depths(record, _records.text(config.get("model_type"), "model_type"))
         case WrapperRoute(wrapper=wrapper):
-            depth = partial(decoders.wrapper_source_depth, record=wrapper)
+            depth = decoders.wrapper_source_depths(wrapper)
         case VerifiedRoute(verified=verified):
             family = verified.entry(config)
-            depth = partial(decoders.source_depth, record=verified.translate(config, tuple(tensors), family),
-                            model_type=family)
+            depth = decoders.source_depths(verified.translate(config, tuple(tensors), family), family)
         case _:
             return tensors
     return {name: tensor for name, tensor in tensors.items() if (held := depth(name)) is None or held < kept}
