@@ -3,10 +3,12 @@ shares, held by check 1 against the source run live over drawn inputs, from its 
 
 - YaRN (ledger 1594): every family whose rotary class builds its rope_type through
   `ROPE_INIT_FUNCTIONS` (transformers 5.16.1, modeling_rope_utils.py:668-674) reads a YaRN record,
-  partial rotaries included, and its logits past the original context are the source's.
+  partial rotaries and Qwen 3.5's wrapper's three-axis rotary included, and its logits past the original
+  context are the source's; Phi-3's config reads 'yarn' as LongRoPE, which its record is.
 - The pad row (ledger 1593): a family whose token embedding is nn.Embedding(padding_idx=pad_token_id)
   gives the pad row no gradient from its lookups, and the rest of the table the source's gradient;
-  a family whose source passes no padding_idx trains the row, as the source does.
+  a family whose source passes no padding_idx trains the row, as the source does. A remote source
+  CI cannot run is the lookup its cited code builds.
 """
 import contextlib
 import json
@@ -17,8 +19,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from flax.traverse_util import flatten_dict
-from interop_support import clearing_selections, token_draw, torch_logits
+from interop_support import assert_pads_as, clearing_selections, token_draw, token_table, torch_logits
 from reference_error import assert_as_exact
 
 from dew.interop import Pretrained
@@ -38,7 +39,7 @@ YARN_SEEDS = {"qwen2-tiny": 8, "qwen2-moe-tiny": 8, "qwen3-moe-tiny": 8, "qwen3-
               "qwen35-tiny": 512, "glm4-moe-tiny": 8, "gpt-neox-tiny": 8, "falcon-tiny": 8,
               "starcoder2-tiny": 8, "mistral-tiny": 8, "mixtral-tiny": 8, "ministral-tiny": 8,
               "gemma-tiny": 8, "gemma2-tiny": 8, "gemma3-tiny": 8, "gemma3n-tiny": 512,
-              "mimo-v2-flash-tiny": 8, "minimax-m2-tiny": 8}
+              "mimo-v2-flash-tiny": 8, "minimax-m2-tiny": 8, "qwen35-moe-text": 512}
 """Each fixture's declared check-1 seeds for its YaRN logits, sized by `seeds_for` on armada: Gemma 3n's
 paired with the reference (`seeds_for(dew_fn=...)`), its arms sharing the draw's weights and inputs, where
 the reference alone, heavy-tailed across draws, resolves within no 512."""
@@ -52,11 +53,59 @@ PADDED_SEEDS = {"llama-tiny": 8, "mistral-tiny": 8, "mixtral-tiny": 8, "ministra
                 "gemma2-tiny": 8, "gemma3-tiny": 8, "gemma3n-tiny": 8, "olmo3-tiny": 8,
                 "starcoder2-tiny": 8, "phi-tiny": 8, "phi3-tiny": 8, "opt-tiny": 8, "gpt-oss-tiny": 8,
                 "deepseek-v2-tiny": 8, "deepseek-v3-tiny": 8, "minimax-m2-tiny": 8,
-                "mimo-v2-flash-tiny": 8, "llama4-tiny": 8, "granitemoe-tiny": 8}
+                "mimo-v2-flash-tiny": 8, "llama4-tiny": 8, "granitemoe-tiny": 8,
+                "deepseek-v32-tiny": 8, "deepseek-v4-tiny": 8, "diffusion-gemma-window-tiny": 8,
+                "gemma4-moe-tiny": 8, "glm5-next-tiny": 8, "glm-moe-dsa-tiny": 8, "modernbert-tiny": 8,
+                "muse-glimmer-text-tiny": 8, "qwen35-moe-text": 8, "kimi-k25-tiny": 8,
+                "kimi-linear-tiny": 8, "kimi-k3-tiny": 8, "ouro-tiny": 8, "dream-tiny": 8,
+                "llada-moe-tiny": 8, "llada-moe-v2-tiny": 8, "llada2-tiny": 8, "llada21-tiny": 8,
+                "llada22-tiny": 8}
 """Families whose source passes padding_idx, by fixture, with their declared check-1 seeds."""
 
-UNPADDED_SEEDS = {"gpt-neox-tiny": 16, "falcon-tiny": 16}
-"""Families whose source passes none (GPTNeoXModel's and FalconModel's plain nn.Embedding)."""
+UNPADDED_SEEDS = {"gpt-neox-tiny": 16, "falcon-tiny": 16, "llada-tiny": 16, "mimo-v2-tiny": 16,
+                  "k2-horizon-tiny": 16, "dory-tiny": 16, "deepseek-v41-tiny": 16}
+"""Families whose source passes none (GPTNeoXModel's and FalconModel's plain nn.Embedding, and the
+remote sources `REMOTE` cites)."""
+
+REMOTE = {
+    "kimi-k3-tiny": "modeling_kimi_linear.py:1093-1097 of moonshotai/Kimi-K3 at f831ab6",
+    "ouro-tiny": "modeling_ouro.py:496-500 of ByteDance/Ouro-1.4B at 574fa66",
+    "dream-tiny": "modeling_dream.py:602-605 of Dream-org/Dream-v0-Base-7B at 6572adb",
+    "llada-moe-tiny": "modeling_lladamoe.py:895-898 of inclusionAI/LLaDA-MoE-7B-A1B-Base at daccaf1",
+    "llada-moe-v2-tiny": "modeling_lladamoe_v2.py:1094-1097 of GSAI-ML/LLaDA-MoE-v2-30B-A3B-Base at 2a513f7",
+    "llada2-tiny": "modeling_llada2_moe.py:750-754 of inclusionAI/LLaDA2.0-mini at dad945c",
+    "llada21-tiny": "modeling_llada2_moe.py:761-765 of inclusionAI/LLaDA2.1-mini at 20e64e2",
+    "llada22-tiny": "modeling_llada2_moe.py:770-774 of inclusionAI/LLaDA2.2-flash at 9b78da3",
+    "llada-tiny": "modeling_llada.py:1035-1037 of GSAI-ML/LLaDA-8B-Base at 0f2787f, no padding_idx",
+    "mimo-v2-tiny": "modeling_mimo_v2.py:1584 of XiaomiMiMo/MiMo-V2.6-Pro-MOPD at 6a7f202, no padding_idx",
+    "k2-horizon-tiny": "modeling_k2_horizon.py:827-830 of IFM/K2-Horizon-0.9B at 383cb66, padding_idx from "
+                       "a `padding_idx` field K2HorizonConfig does not declare",
+    "dory-tiny": "vllm/model_executor/models/dory.py:232 at 55076950, a VocabParallelEmbedding",
+    "deepseek-v41-tiny": "inference/model.py:152-156, :1201 of deepseek-ai/DeepSeek-V4.1-Flash at dba1be0, "
+                         "a ParallelEmbedding",
+}
+"""Remote sources CI cannot run, by fixture, and where each builds its token embedding: an
+nn.Embedding(vocab_size, hidden_size, padding_idx=pad_token_id) where it pads, a lookup with no pad row
+where it does not."""
+
+TEXT_STATED = {"kimi-k25-tiny", "kimi-k3-tiny"}
+"""Wrappers whose language model is built from their text_config, whose pad id it reads
+(modeling_kimi_k25.py:586; modeling_kimi_k3.py:919 of moonshotai/Kimi-K3 at f831ab6): the draw states
+it there."""
+
+TEXT_OF = {"qwen35-moe-text": "qwen35-moe-native-tiny"}
+"""A text decoder no fixture holds alone, read from a wrapper fixture's text_config."""
+
+TEXT_MODELS = {
+    "diffusion_gemma_text": ("transformers.models.diffusion_gemma", "DiffusionGemmaEncoderTextModel")}
+"""A text config transformers maps to no base model, and the model its source builds from it (its
+decoder's embedding is the same, from the same field, modeling_diffusion_gemma.py:1212-1219)."""
+
+
+def _fixture_config(name: str) -> dict:
+    """The fixture's stored config, a wrapper fixture's text_config for a text decoder `TEXT_OF` names."""
+    config = json.loads((FIXTURES / TEXT_OF.get(name, name) / "config.json").read_text())
+    return config["text_config"] if name in TEXT_OF else config
 
 
 def _source(name: str, directory: Path, **fields) -> Path:
@@ -69,7 +118,7 @@ def _source(name: str, directory: Path, **fields) -> Path:
     from dew.interop.verify import scatter_weights
 
     directory.mkdir(parents=True)
-    config = {**json.loads((FIXTURES / name / "config.json").read_text()), **fields}
+    config = {**_fixture_config(name), **fields}
     (directory / "config.json").write_text(json.dumps(config))
     if getattr(AutoConfig.from_pretrained(directory), "head_dim", 0) is None:
         # The source reads a stated head_dim (MinistralAttention, `_compute_yarn_parameters`), which
@@ -113,7 +162,7 @@ def test_a_yarn_record_extends_every_family_whose_source_builds_it(name, tmp_pat
     """The family's reader takes a YaRN record onto its rotated layers, and its logits over drawn ids
     past the original context hold check 1 against the source's."""
 
-    config = json.loads((FIXTURES / name / "config.json").read_text())
+    config = _fixture_config(name)
     directory = _source(name, tmp_path / name, **_yarned(config))
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     model = loaded.model
@@ -130,64 +179,66 @@ def test_a_yarn_record_extends_every_family_whose_source_builds_it(name, tmp_pat
                     truth_fn=torch_logits(wide, float64))
 
 
-def _embedding(params) -> tuple:
-    """The path of the token table among a decoder's params."""
-    (path,) = [path for path in flatten_dict(params) if path[-2:] == ("embed_tokens", "embedding")]
-    return path
+def _padded_config(name: str) -> dict:
+    """The fixture's config with the pad id stated where its source's token embedding reads it."""
+    config = _fixture_config(name)
+    (config["text_config"] if name in TEXT_STATED else config)["pad_token_id"] = PAD
+    return config
+
+
+def _source_embedding(name: str, config: dict, directory: Path, table: np.ndarray):
+    """The source's token embedding module over `config`, holding `table`, and its float64 twin: the
+    text model transformers builds from the config (`TEXT_MODELS`' class where no base model maps it),
+    or for a remote source CI cannot run, the lookup its cited code builds (`REMOTE`)."""
+    import importlib
+
+    import torch
+    from transformers import AutoConfig, AutoModel
+
+    from tools.torch_precision import float64_twin
+
+    if name in REMOTE:
+        pad = PAD if name in PADDED_SEEDS else None
+
+        def built(dtype):
+            return torch.nn.Embedding(*table.shape, padding_idx=pad, dtype=dtype)
+    else:
+        directory.mkdir()
+        (directory / "config.json").write_text(json.dumps(config))
+        settings = AutoConfig.from_pretrained(directory)
+        text_model = TEXT_MODELS.get(config["model_type"])
+
+        def built(dtype):
+            if text_model is None:
+                return AutoModel.from_config(settings, dtype=dtype)
+            module, cls = text_model
+            return getattr(importlib.import_module(module), cls)(settings).to(dtype)
+    source = built(torch.float32)
+    lookup = source if name in REMOTE else source.get_input_embeddings()
+    with torch.no_grad():
+        lookup.weight.copy_(torch.from_numpy(table))
+    wide = float64_twin(source, lambda: built(torch.float64))
+    return lookup, wide if name in REMOTE else wide.get_input_embeddings()
 
 
 @pytest.mark.parametrize("name", sorted({**PADDED_SEEDS, **UNPADDED_SEEDS}))
 def test_the_pad_row_takes_the_gradient_its_source_gives_it(name, tmp_path):
-    """The family's token lookup is its source's: the loaded decoder pads the row the source's own
-    token embedding module pads (its `padding_idx`, None where the source passes none), and over drawn
-    ids, a quarter of them the pad id, under a drawn cotangent on the looked-up rows, the table's
-    gradient holds check 1 against that module's lookup (`nn.Embedding.forward`, before any scale a
-    subclass applies), the pad row's lookups adding nothing where it pads and training it where not.
-    The lookup is where padding_idx acts; through a whole decoder its gradient is the rest of the
-    network's too, which a gated delta net's float32 recurrence makes heavy-tailed in both arms."""
-    import torch
+    """The family's token lookup is its source's (`assert_pads_as`): the decoder its reader builds from
+    a config stating a pad id pads the row the source's own token embedding module pads, and trains it
+    where the source does. The pad row is the reader's, decided where the config translates, and the
+    lookup's gradient reads no weight, so the decoder is built from the config, which several of these
+    sources state without a checkpoint or a causal LM to write one."""
+    from dew.interop.hf_decoders import translate_config
+    from dew.registry import models
 
-    directory = _source(name, tmp_path / name, pad_token_id=PAD)
-    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
-    reference, wide = _reference(directory)
-    padded = name in PADDED_SEEDS
-    stated = PAD if padded else None
-    assert loaded.model.padding_idx == reference.get_input_embeddings().padding_idx == stated
-    path = _embedding(loaded.variables["params"])
-    vocab, width = flatten_dict(loaded.variables["params"])[path].shape
-
-    def draw(seed):
-        rng = np.random.default_rng([0x1593, seed])
-        ids = rng.integers(0, vocab, (8, 32))
-        ids[rng.random(ids.shape) < 0.25] = PAD
-        ids[0, 0] = PAD
-        return ids.astype(np.int32), rng.standard_normal((*ids.shape, width)).astype(np.float32)
-
-    @jax.jit
-    def gradient(variables, ids, cotangent):
-        def loss(params):
-            looked_up = loaded.model.apply({**variables, "params": params}, ids, method="token_embeddings")
-            return jnp.sum(looked_up * cotangent)
-        return flatten_dict(jax.grad(loss)(variables["params"]))[path]
-
-    def ours(ids, cotangent):
-        return {"token table": np.asarray(gradient(loaded.variables, ids, cotangent), np.float64)}
-
-    def theirs(source, precision=contextlib.nullcontext):
-        def run(ids, cotangent):
-            with precision():
-                module = source.get_input_embeddings()
-                module.zero_grad()
-                rows = torch.nn.Embedding.forward(module, torch.from_numpy(ids).long())
-                (rows * torch.from_numpy(cotangent).to(rows.dtype)).sum().backward()
-                return {"token table": module.weight.grad.double().numpy()}
-        return run
-
-    ids, cotangent = draw(0)
-    pad_row = ours(ids, cotangent)["token table"][PAD]
-    assert np.any(pad_row) != padded
-    assert_as_exact(ours, theirs(reference), draw, f"{name} token lookup gradient",
-                    seeds={**PADDED_SEEDS, **UNPADDED_SEEDS}[name], truth_fn=theirs(wide, float64))
+    config = _padded_config(name)
+    model = models.build("causal_transformer",
+                         {**translate_config(config), "dtype": "float32", "attention_impl": "reference"})
+    variables = model.init(jax.random.key(0), jnp.zeros((1, 2), jnp.int32))
+    lookup, wide = _source_embedding(name, config, tmp_path / name, token_table(variables)[1])
+    assert (lookup.padding_idx is not None) == (name in PADDED_SEEDS)
+    assert_pads_as(model, variables, lookup, wide, PAD, name,
+                   seeds={**PADDED_SEEDS, **UNPADDED_SEEDS}[name])
 
 
 KIND_RAMPS = {
@@ -226,14 +277,83 @@ def test_each_layer_kind_rotates_by_its_own_record(name, tmp_path):
                     seeds=KIND_RAMP_SEEDS[name], truth_fn=torch_logits(wide, float64))
 
 
-def test_a_qwen35_wrapper_refuses_a_ramp_its_three_axis_rotary_does_not_apply(tmp_path):
-    """Qwen 3.5's wrapper rotates image positions by three-axis tables of the plain frequencies, so a
-    YaRN record on its text decoder is refused rather than dropped from them."""
-    name = "qwen35-moe-native-tiny"
-    config = json.loads((FIXTURES / name / "config.json").read_text())
+WRAPPER = "qwen35-native-tiny"
+"""A Qwen 3.5 wrapper fixture with its processor's outputs over prompts with images."""
+WRAPPER_SEEDS = 512
+"""The wrapper's YaRN logits' declared check-1 seeds, as many as qwen35-tiny's YaRN logits declare: the
+gated delta net's float32 recurrence is heavy-tailed in both arms."""
+
+
+def test_a_qwen35_wrapper_turns_its_three_axis_rotary_by_a_yarn_record(tmp_path):
+    """Qwen 3.5's wrapper turns each rotated pair of an image token by its temporal, height or width id
+    (`mrope_section`) at the frequencies its record builds through `ROPE_INIT_FUNCTIONS`, and scales
+    cos and sin by the record's attention factor (Qwen3_5TextRotaryEmbedding, modeling_qwen3_5.py:143-213):
+    under a YaRN record, its logits over the fixture's prompts with images, their text ids and pixels
+    drawn, hold check 1 against the source's."""
+    import torch
+    from transformers import AutoModelForImageTextToText
+
+    from tools.torch_precision import float64_twin
+
+    directory = shutil.copytree(FIXTURES / WRAPPER, tmp_path / WRAPPER)
+    config = json.loads((directory / "config.json").read_text())
     text = config["text_config"]
-    text["rope_parameters"] = {**text["rope_parameters"], **YARN}
-    shutil.copytree(FIXTURES / name, tmp_path / name)
-    (tmp_path / name / "config.json").write_text(json.dumps(config))
-    with pytest.raises(ValueError):
-        Pretrained.load(tmp_path / name, dtype="float32", attention_impl="reference")
+    text.update(rope_parameters={**text["rope_parameters"], **YARN}, max_position_embeddings=CONTEXT)
+    (directory / "config.json").write_text(json.dumps(config))
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    assert loaded.processor is not None
+
+    def built(dtype):
+        return AutoModelForImageTextToText.from_pretrained(directory, dtype=dtype,
+                                                           attn_implementation="eager")
+    reference = built(torch.float32).eval()
+    wide = float64_twin(reference, lambda: built(torch.float64)).eval()
+
+    held = {name: np.load(directory / f"{name}.npy")
+            for name in ("input_ids", "attention_mask", "image_grid_thw", "mm_token_type_ids")}
+    pixels = np.load(directory / "pixel_values.npy").shape
+    valid = held["attention_mask"].astype(bool)
+    # The text a prompt holds, below the image and vision marker ids.
+    words = valid & (held["input_ids"] < config["image_token_id"])
+
+    def draw(seed):
+        rng = np.random.default_rng([0x15942, seed])
+        ids = np.where(words, rng.integers(0, config["image_token_id"], words.shape), held["input_ids"])
+        return ({**held, "input_ids": ids, "pixel_values": rng.standard_normal(pixels).astype(np.float32)},)
+
+    processor = loaded.processor
+    model = loaded.model
+    forward = jax.jit(lambda variables, inputs: model.apply(variables, inputs.tokens, **inputs.kwargs()))
+
+    def ours(values):
+        return np.asarray(forward(loaded.variables, processor.from_hf(values)), np.float64)[valid]
+
+    def theirs(source, precision=contextlib.nullcontext):
+        def run(values):
+            with precision(), torch.no_grad():
+                tensors = {name: torch.from_numpy(np.asarray(value)) for name, value in values.items()}
+                logits = source(**tensors, use_cache=False).logits
+            return logits.double().numpy()[valid]
+        return run
+
+    assert_as_exact(ours, theirs(reference), draw, "Qwen 3.5 wrapper YaRN logits", seeds=WRAPPER_SEEDS,
+                    truth_fn=theirs(wide, float64))
+
+
+def test_a_phi3_record_spelled_yarn_is_the_longrope_its_source_reads(tmp_path):
+    """Phi3Config reads rope_type 'yarn' as LongRoPE's older spelling (configuration_phi3.py:101-104) and
+    refuses any other ramp (:122-123), so Phi-3's rotary builds no YaRN: a Phi-3 record spelled 'yarn'
+    is the source's LongRoPE, and its logits past the original context hold check 1 against it."""
+    config = _fixture_config("phi3-tiny")
+    rope = {**config["rope_parameters"], "rope_type": "yarn"}
+    directory = _source("phi3-tiny", tmp_path / "phi3", rope_parameters=rope)
+    # The source writes its config back as it reads it, LongRoPE by name; the release's spelling is put back.
+    saved = json.loads((directory / "config.json").read_text())
+    (directory / "config.json").write_text(json.dumps({**saved, "rope_parameters": rope}))
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    reference, wide = _reference(directory)
+    forward = jax.jit(loaded.model.apply)
+    draw = token_draw(0x15943, config["vocab_size"], (ROWS, config["max_position_embeddings"]))
+    assert_as_exact(lambda ids: np.asarray(forward(loaded.variables, jnp.asarray(ids)), np.float64),
+                    torch_logits(reference), draw, "phi3 'yarn' logits", seeds=8,
+                    truth_fn=torch_logits(wide, float64))

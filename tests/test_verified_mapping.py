@@ -17,7 +17,11 @@ block with per-layer sliding windows); its released 32B checkpoint passes the
 same probe from its config, at 65 GB beyond what this suite downloads. Over
 every registered family, `tools/hf_coverage.py` on the 400 most downloaded
 text-generation repos (2026-10-05) finds one more type that loads:
-GLM-4.7-Flash, as kimi_k2, which the offline GLM_FLASH case checks.
+GLM-4.7-Flash, as kimi_k2, which the offline GLM_FLASH case checks. Two
+sources of GLM-4.7-Flash's own classes, registered as types of their own,
+differ from DeepSeek V3's convention where the probe's eval logits over its
+first positions do not show it: one's table pads no row, the other's rotary
+takes no ramp; the probe refuses each.
 Measured on CPU against transformers 5.16.1 in fp32, over two rows of 64
 random ids:
 
@@ -29,6 +33,7 @@ random ids:
 on logits of magnitude 0.59.
 """
 
+import copy
 import json
 
 import numpy as np
@@ -36,7 +41,12 @@ import pytest
 import torch
 from interop_support import tiny_config
 from safetensors.numpy import load_file
-from transformers import AutoModelForCausalLM
+from transformers import AutoConfig, AutoModelForCausalLM
+from transformers.models.glm4_moe_lite.configuration_glm4_moe_lite import Glm4MoeLiteConfig
+from transformers.models.glm4_moe_lite.modeling_glm4_moe_lite import (
+    Glm4MoeLiteForCausalLM,
+    Glm4MoeLiteRotaryEmbedding,
+)
 
 from dew.interop import Pretrained
 from dew.interop.verify import VerifiedMappingWarning, probe_ids, reference_logits, scatter_weights
@@ -99,3 +109,68 @@ def test_a_verified_load_saves_the_source_config_and_reloads(tmp_path, model_typ
         restored = Pretrained.load(destination, dtype="float32", attention_impl="reference")
     np.testing.assert_array_equal(np.asarray(restored.model.apply(restored.variables, ids)),
                                   np.asarray(loaded.model.apply(loaded.variables, ids)))
+
+
+class _UnpaddedConfig(Glm4MoeLiteConfig):
+    model_type = "unpadded_flash"
+
+
+class _UnpaddedFlash(Glm4MoeLiteForCausalLM):
+    """GLM-4.7-Flash whose table pads no row, whatever pad id its config states."""
+    config_class = _UnpaddedConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+        self.model.embed_tokens.padding_idx = None
+
+
+class _RamplessConfig(Glm4MoeLiteConfig):
+    model_type = "rampless_flash"
+
+
+class _RamplessFlash(Glm4MoeLiteForCausalLM):
+    """GLM-4.7-Flash whose rotary turns at the plain frequencies, whatever ramp its config states."""
+    config_class = _RamplessConfig
+
+    def __init__(self, config):
+        super().__init__(config)
+        plain = copy.deepcopy(config)
+        plain.rope_parameters = {"rope_type": "default", "rope_theta": config.rope_parameters["rope_theta"]}
+        self.model.rotary_emb = Glm4MoeLiteRotaryEmbedding(plain)
+
+
+def _registered(config_class, model_class) -> None:
+    """A type of transformers' own classes Dew registers no family for, as transformers registers a
+    new model type: its config and its causal LM through the auto classes."""
+    AutoConfig.register(config_class.model_type, config_class, exist_ok=True)
+    AutoModelForCausalLM.register(config_class, model_class, exist_ok=True)
+
+
+def test_a_convention_pads_the_row_its_source_pads():
+    """A source whose table pads no row under a config stating a pad id is not DeepSeek V3's
+    convention, whose table pads it: the probe holds each candidate's pad row to the source's own
+    table's, which takes no gradient there (ledger 1593) and which no eval logit shows."""
+    from dew.interop.verify import Unmapped, verify_mapping
+
+    _registered(_UnpaddedConfig, _UnpaddedFlash)
+    config = tiny_config(_UnpaddedConfig.model_type, **GLM_FLASH).to_dict()
+    assert config["pad_token_id"] is not None
+    assert isinstance(verify_mapping(config), Unmapped)
+
+
+FAR_RAMP = {"rope_type": "yarn", "rope_theta": 1e6, "factor": 40.0, "original_max_position_embeddings": 2**28,
+            "beta_fast": 32.0, "beta_slow": 1.0, "mscale": 1.0, "mscale_all_dim": 1.0}
+"""A YaRN record of amplitude one whose stated original context is past every wavelength of the
+probe's rotary, so that at it the ramp rescales no frequency the probe turns."""
+
+
+def test_a_convention_turns_the_ramp_its_source_turns_past_the_original_context():
+    """A source whose rotary turns at the plain frequencies under a config stating a YaRN record is not
+    DeepSeek V3's convention, which ramps them: the probe runs past the record's original context,
+    shrunk below its length as a window is, where the ramp rescales the frequencies it turns."""
+    from dew.interop.verify import Unmapped, verify_mapping
+
+    _registered(_RamplessConfig, _RamplessFlash)
+    config = tiny_config(_RamplessConfig.model_type, **GLM_FLASH, rope_parameters=FAR_RAMP,
+                         max_position_embeddings=2**29).to_dict()
+    assert isinstance(verify_mapping(config), Unmapped)
