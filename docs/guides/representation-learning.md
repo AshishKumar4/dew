@@ -13,7 +13,7 @@ import jax
 import numpy as np
 
 from dew import Field, Trainer
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.data.dataset import Loader
 from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, MultiBlockMask
 

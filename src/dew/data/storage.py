@@ -32,10 +32,10 @@ from huggingface_hub.file_download import REGEX_COMMIT_HASH
 from huggingface_hub.hf_file_system import HfFileSystemResolvedRepositoryPath
 from s3fs import S3FileSystem
 
+from dew._records import JSON, json_value
 from dew.cache import dew_cache_dir
 from dew.data.retention import LocalRetention, evictable, read_pin
 from dew.files import write_atomically
-from dew.records import JSON, json_value
 
 
 class PreconditionFailed(FileExistsError):
@@ -679,31 +679,24 @@ class Store:
                 raise PreconditionFailed(self.url) from error
         if isinstance(fs, S3FileSystem):
             from botocore.exceptions import ClientError
-            from fsspec.asyn import sync
 
-            bucket, key, _ = fs.split_path(path)
-
-            async def put_s3() -> str:
-                client = await fs.set_session()
-                try:
-                    outcome = await client.put_object(
-                        Bucket=bucket,
-                        Key=key,
-                        Body=payload,
-                        **({"IfNoneMatch": "*"} if version is None else {"IfMatch": version}),
-                    )
-                except ClientError as error:
-                    if error.response["ResponseMetadata"]["HTTPStatusCode"] in (409, 412):
-                        raise PreconditionFailed(self.url) from error
-                    raise
-                return outcome["ETag"]
-
-            loop = fs.loop
-            if loop is None:
+            if fs.loop is None:
                 raise ValueError("Dew storage needs synchronous S3 filesystem options")
-            version = sync(loop, put_s3)
+            bucket, key, _ = fs.split_path(path)
+            # Through s3fs's own call, which adds the profile's arguments (its server-side encryption,
+            # a KMS key, SSE-C) and its bucket's regional client, as every other write of it does.
+            try:
+                outcome = fs.call_s3("put_object", Bucket=bucket, Key=key, Body=payload,
+                                     **({"IfNoneMatch": "*"} if version is None else {"IfMatch": version}))
+            except OSError as error:
+                # s3fs translates the refused condition; botocore's answer stays the error's cause.
+                cause = error.__cause__
+                if isinstance(cause, ClientError) and cause.response.get(
+                        "ResponseMetadata", {}).get("HTTPStatusCode") in (409, 412):
+                    raise PreconditionFailed(self.url) from error
+                raise
             fs.invalidate_cache()
-            return version
+            return outcome["ETag"]
         if isinstance(fs, GCSFileSystem):
             bucket, key, _ = fs.split_path(path)
             # The JSON API's upload root beside the API root the filesystem reads (`base`).

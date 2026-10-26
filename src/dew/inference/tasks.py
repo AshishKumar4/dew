@@ -17,7 +17,7 @@ import dataclasses
 import functools
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, Self
+from typing import TYPE_CHECKING, ClassVar, Protocol, Self
 
 import jax
 import jax.numpy as jnp
@@ -27,18 +27,20 @@ from flax.core import freeze
 from jax.sharding import NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike, DTypeLike
 
+from dew._coordination import agreed
+from dew._records import integer, record as named_fields, strings, text as named
+from dew.batch import PARAMETER_ROOTS, Variables, thaw
 from dew.cache import persist_compilations
-from dew.coordination import agreed
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_causal
 from dew.inference.projections import packed_owned
+from dew.interop.sources import SourceReference
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel
-from dew.objectives.base import UNREAD, Variables, thaw
-from dew.records import integer, record as named_fields, text as named
+from dew.objectives.base import UNREAD, Objective
 from dew.sampling import decoding, vocabulary
-from dew.sampling.decoding import LogitsTransform, Stopping
+from dew.sampling.decoding import LogitsTransform, Stopping, id_row
 from dew.sampling.solvers import Solver
 from dew.sampling.strategies import Strategy
 from dew.sampling.text import (
@@ -56,8 +58,8 @@ from dew.telemetry.profile import region
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
-    from dew.config import ModelConfig
     from dew.quantization import Quantization
+    from dew.registry import ModelConfig
     from dew.training.distributed import Layout, MeshSpec
 
 Rows = ModelInputs | ArrayLike | Sequence[Sequence[int]]
@@ -129,7 +131,7 @@ def prepared_inputs(processor: Processor | None, request: Request, *, images: Me
         rows = [row for row in request if not isinstance(row, str)]
         if len(rows) != len(request):
             raise ValueError("a request cannot mix text prompts and numeric token rows")
-        # ModelInputs reads the rows by `dew.nn.inputs.token_id`'s law.
+        # ModelInputs reads the rows by `dew.batch.token_id`'s law.
         return ModelInputs.from_value(rows)
     # A resident array stays where it is; a global one cannot be fetched.
     return ModelInputs.from_value(request)
@@ -260,41 +262,153 @@ def _requested(generated: Generation, budget: int, padding: int) -> Generation:
                    raw_log_probs=generated.raw_log_probs[:, :budget])
 
 
-class SavedRun(NamedTuple):
-    """One checkpoint of a run, pinned: its inference declaration, not the
-    training configuration, and the exact step it is, which a loader reads
-    the weights at too, so a step saved meanwhile cannot pair one step's
-    declaration with another's weights."""
+@dataclass(frozen=True)
+class SavedRun:
+    """One checkpoint of a run, pinned, as every loader of a run reads it (a task's `from_run`,
+    `Pretrained.from_run`, `Adapter.from_run`, `dew export`): its inference declaration, not the
+    training configuration, the objective that wrote it, and the exact step it is, which the
+    weights are read at too (`variables`), so a step saved meanwhile cannot pair one step's
+    declaration with another's weights. A loader reconstructs its own components from the record
+    (`saved_settings`, `saved_model`)."""
 
+    directory: str
     record: Mapping[str, object]
     step: int
 
+    @classmethod
+    def pinned(cls, directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
+        """The selected checkpoint of the run in `directory`, its latest or `step`. A task loaded
+        from it compiles into the persistent cache (`persist_compilations`). `trust` names the
+        packages outside Dew whose modules the record may import (`dew.registry.imported`)."""
+        from dew.checkpoints import Checkpoints
+        from dew.registry import import_trusted, objectives
+        persist_compilations()
+        with Checkpoints(directory) as checkpoints:
+            step = checkpoints.pinned(step)
+            record = checkpoints.artifact(step)
+        import_trusted(record, trust)
+        if record is None:
+            raise ValueError("this checkpoint's objective declares no inference record; declare "
+                             "Objective.inference_record, or call objective.pipeline(state)")
+        record = earlier_shapes(named_fields(record, 'checkpoint artifact'))
+        if 'unrecorded' in record:
+            raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
+        objective = objectives[named(record['objective'], 'objective')]
+        declared = frozenset() if objective.settings is None else settings_fields(objective.settings)
+        stray = set(record) - {'objective', 'model', UNREAD, *declared}
+        if stray:
+            raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
+                             f"{sorted(stray)}")
+        return cls(str(directory), record, step)
 
-def run_record(directory: str, step: int | str | None = None, trust: Sequence[str] = ()) -> SavedRun:
-    """The selected checkpoint of the run in `directory`, pinned (`SavedRun`).
-    A task loaded from it compiles into the persistent cache
-    (`persist_compilations`). `trust` names the packages outside Dew whose
-    modules the record may import (`dew.registry.imported`)."""
-    from dew.checkpoints import Checkpoints
-    from dew.registry import import_trusted, objectives
-    persist_compilations()
-    with Checkpoints(directory) as checkpoints:
-        step = checkpoints.pinned(step)
-        record = checkpoints.artifact(step)
-    import_trusted(record, trust)
-    if record is None:
-        raise ValueError("this checkpoint's objective declares no inference record; declare "
-                         "Objective.inference_record, or call objective.pipeline(state)")
-    record = named_fields(record, 'checkpoint artifact')
-    if 'unrecorded' in record:
-        raise ValueError(f"this run's checkpoints describe no model to load: {record['unrecorded']}")
-    objective = objectives[named(record['objective'], 'objective')]
-    declared = frozenset() if objective.settings is None else settings_fields(objective.settings)
-    stray = set(record) - {'objective', 'model', UNREAD, *declared}
-    if stray:
-        raise ValueError(f"this {objective.__name__} run records fields its objective does not write: "
-                         f"{sorted(stray)}")
-    return SavedRun(record, step)
+    @property
+    def objective(self) -> type[Objective]:
+        """The objective class the run trained, which its record names."""
+        from dew.registry import objectives
+
+        return objectives[named(self.record['objective'], 'objective')]
+
+    def variables(self, *, ema: bool | None, mesh: MeshSpec | Mesh | None = None,
+                  layout: Layout | None = None, param_dtype: DTypeLike | None = None,
+                  parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS) -> Variables:
+        """The model's variables at this step, as every run loader reads them: an objective whose
+        average is its frozen reference gives the trained weights whatever `ema` asks
+        (`Objective.ema_is_reference`), and one that nests the model beside other networks gives the
+        model's own part (`Objective.model_tree`), trained and frozen collections together; the parts
+        the record names unread (`UNREAD`) are neither placed nor read. The other arguments are
+        `Checkpoints.variables`'."""
+        from dew.checkpoints import Checkpoints
+
+        unread = self.record.get(UNREAD, [])
+        if not isinstance(unread, list):
+            raise ValueError(f"{UNREAD} must be a list of paths")
+        objective = self.objective
+        with Checkpoints(self.directory) as checkpoints:
+            variables = checkpoints.variables(
+                step=self.step, ema=False if objective.ema_is_reference else ema, mesh=mesh, layout=layout,
+                param_dtype=param_dtype, parameter_roots=parameter_roots,
+                unread=tuple(strings(path, UNREAD) for path in unread))
+        return objective.model_tree(variables)
+
+
+_EARLIER_AUTOENCODERS = {
+    "sd_vae": ("dew.nn.autoencoders.sd_vae:StableDiffusionVAE", "dew.nn.autoencoders.kl:AutoencoderKL"),
+    "dc_ae": ("dew.nn.autoencoders.dc_ae:DCAutoencoder", "dew.nn.autoencoders.dc_ae:DCAE"),
+    "wan": ("dew.nn.autoencoders.wan:WanAutoencoder", "dew.nn.autoencoders.wan:WanVAE"),
+    "rae": ("dew.nn.autoencoders.rae:RAEAutoencoder", "dew.nn.autoencoders.rae:RAE"),
+    "flux2": ("dew.nn.autoencoders.flux2:Flux2Autoencoder", "dew.nn.autoencoders.kl:AutoencoderKL"),
+    "qwen_image": ("dew.nn.autoencoders.qwen_image:QwenImageAutoencoder",
+                   "dew.nn.autoencoders.qwen_image:QwenImageVAE"),
+}
+"""The built-in autoencoders an earlier run recorded by name, each the wrapper's and its module's
+import paths the record names now (`earlier_shapes`)."""
+
+def earlier_shapes(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A run's record with its components in the shapes Dew writes now, every earlier shape read here
+    and nowhere else (`SavedRun.pinned`), so no component keeps two readers: a decision head's
+    `{"name"}` record, its class by import path or by class name alone in `dew.decision.head`, a
+    built-in autoencoder's by its name with its module's bare fields (`_EARLIER_AUTOENCODERS`), a
+    decision layout's by class name in `dew.decision.layout`, each read as the registry's class record
+    and refused where it holds more than its name and fields (ledger 1239),
+    a processor's source as its encoded string (ledger 1641), and a Qwen or MiMo projector's earlier
+    fields (`_earlier_projectors`, ledger 1622). A record in today's shapes passes as it is. Carried to
+    1.0, when it is deleted (ledger 1552)."""
+    current = dict(record)
+    for key in ("head", "layout"):
+        held = record.get(key)
+        if isinstance(held, Mapping) and "name" in held and not set(held) <= {"name", "fields"}:
+            raise ValueError(f"an earlier run's {key} names its class and its fields alone, not "
+                             f"{sorted(set(held) - {'name', 'fields'})}")
+    head = record.get("head")
+    if isinstance(head, Mapping) and "name" in head and "class" not in head:
+        name = named(head["name"], "head.name")
+        current["head"] = {"class": name if ":" in name else f"dew.decision.head:{name}",
+                           "fields": named_fields(head.get("fields", {}), "head.fields")}
+    autoencoder = record.get("autoencoder")
+    if isinstance(autoencoder, Mapping) and "name" in autoencoder and "class" not in autoencoder:
+        name = named(autoencoder["name"], "autoencoder.name")
+        if name not in _EARLIER_AUTOENCODERS:
+            raise ValueError(f"{name!r} names no built-in autoencoder an earlier run recorded")
+        wrapper, module = _EARLIER_AUTOENCODERS[name]
+        fields = dict(named_fields(autoencoder.get("fields", {}), "autoencoder.fields"))
+        current["autoencoder"] = {"class": wrapper,
+                                  "fields": {**fields, "model": {"class": module, "fields": fields["model"]}}}
+    layout = record.get("layout")
+    if isinstance(layout, Mapping) and "name" in layout and "class" not in layout:
+        current["layout"] = {"class": f"dew.decision.layout:{named(layout['name'], 'layout.name')}",
+                             "fields": named_fields(layout.get("fields", {}), "layout.fields")}
+    processor = record.get("processor")
+    if isinstance(processor, str):
+        # A source's identity was an encoded string before typed component references (ledger 1641).
+        from dew.interop.sources import SourceReference
+        from dew.registry import to_record
+
+        current["processor"] = to_record(SourceReference.parse(processor), SourceReference)
+    if "model" in current:
+        current = _earlier_projectors(current)
+    return current
+
+
+def _earlier_projectors(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A record's earlier Qwen or MiMo projector fields read as today's (`earlier_shapes`), wherever the
+    model nests the projector through another recorded wrapper. Carried until 1.0 (ledger 1622);
+    current constructors and source codecs accept only their current schema."""
+    def current(value):
+        if isinstance(value, Mapping):
+            component = {key: current(field) for key, field in value.items()}
+            name, fields = component.get("class"), component.get("fields")
+            if name in ("dew.nn.vision.qwen35:Qwen35Projector", "dew.nn.vision.mimo:MiMoProjector") \
+                    and isinstance(fields, dict) and "vision_width" in fields:
+                width, merge = fields.pop("vision_width"), fields.pop("merge_size")
+                component["fields"] = {**fields, "hidden_size": width, "spatial_merge_size": merge,
+                                     "width": width * merge ** 2,
+                                     "bias": name == "dew.nn.vision.qwen35:Qwen35Projector"}
+            return component
+        if isinstance(value, list | tuple):
+            return [current(field) for field in value]
+        return value
+
+    return {**record, "model": current(record["model"])}
 
 
 def settings_fields(settings: type) -> frozenset[str]:
@@ -322,7 +436,7 @@ class TaskSettings:
     seq_len: int
     max_new_tokens: int
     tokenizer: str | None
-    processor: str | None
+    processor: SourceReference | None
 
     def __post_init__(self) -> None:
         if type(self.max_new_tokens) is not int or self.max_new_tokens < 0:
@@ -340,36 +454,42 @@ class TextSettings(TaskSettings):
 @dataclass(frozen=True, kw_only=True)
 class MaskedSettings(TaskSettings):
     """A masked-diffusion run's settings (`MaskedGeneration.from_settings`): the masking process,
-    the unmasking solver and its step count beside the common ones."""
+    the unmasking solver and its step count, and the end-of-sequence ids a response stops at,
+    beside the common ones."""
 
     process: DiscreteProcess
     solver: Solver
     sampling_steps: int
+    eos_token_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         super().__post_init__()
         integer(self.sampling_steps, "sampling_steps")
+        if len(self.eos_token_ids):
+            object.__setattr__(self, "eos_token_ids", id_row("eos_token_ids", self.eos_token_ids))
         if not isinstance(self.solver, Unmask):
             raise ValueError("a masked run's task unmasks with an Unmask solver")
 
 
 @dataclass(frozen=True, kw_only=True)
 class BlockSettings(TaskSettings):
-    """A block-diffusion run's settings (`BlockGeneration.from_settings`): the block process and
-    the pad id beside the common ones."""
+    """A block-diffusion run's settings (`BlockGeneration.from_settings`): the block process, the
+    pad id and the end-of-sequence ids a response stops at beside the common ones."""
 
     process: BlockProcess
     pad_token_id: int
+    eos_token_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         super().__post_init__()
         integer(self.pad_token_id, "pad_token_id")
+        if len(self.eos_token_ids):
+            object.__setattr__(self, "eos_token_ids", id_row("eos_token_ids", self.eos_token_ids))
 
 
 def saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> ModelConfig:
     """Read the run's model record, with `dtype` overriding the computation it saved."""
-    from dew.config import ModelConfig
-    from dew.registry import dtype_name, resolve_dtype
+    from dew.registry import ModelConfig, dtype_name, resolve_dtype
 
     config = ModelConfig.from_dict(named_fields(record["model"], "model"))
     return config.with_dtype(dtype_name(resolve_dtype(dtype)))
@@ -388,7 +508,7 @@ def recorded_tokenizer(processor: Processor | None) -> str | None:
     return None
 
 
-def recorded_processor(processor: Processor | None) -> str | None:
+def recorded_processor(processor: Processor | None) -> SourceReference | None:
     """The source a run's record keeps for a checkpoint's own processor
     (`dew.interop.processors.Processor.source`), which `_saved_processor`
     reloads from its files; any other processor records none here."""
@@ -444,7 +564,7 @@ class _NativeTextTask:
     processor: Processor | None
 
     def __post_init__(self) -> None:
-        # A tree split for training, an adapter's or `dew.objectives.base.freeze`'s,
+        # A tree split for training, an adapter's or `dew.batch.freeze`'s,
         # is read whole; a frozen dataclass's field is written through `object.__setattr__`.
         object.__setattr__(self, "variables", freeze(dict(thaw(self.variables))))
 
@@ -480,15 +600,12 @@ class _NativeTextTask:
         as its objective restores them, its task settings, and its host processor. The task owns
         the weights it restored: their projections pack here, once, as a source's do at its load
         (`dew.pipeline`), so every route reads the same packed weights."""
-        from dew.registry import objectives
-
-        record, exact = run_record(directory, step, trust)
-        config = saved_model(record, dtype)
-        held = saved_settings(record, settings)
+        run = SavedRun.pinned(directory, step, trust)
+        config = saved_model(run.record, dtype)
+        held = saved_settings(run.record, settings)
         model = config.build()
         checked(model, held)
-        variables = objectives[named(record["objective"], "objective")]._saved_variables(
-            directory, step=exact, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
+        variables = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
         return model, packed_owned(model, variables), held, _saved_processor(held, config)
 
     @classmethod
@@ -734,10 +851,10 @@ class BlockGeneration(_NativeTextTask):
     def from_settings(cls, model: nn.Module, variables: Variables, settings: BlockSettings,
                       processor: Processor | None) -> BlockGeneration:
         """The task `settings` describe over `model` and `variables`, reading text through
-        `processor`: their process, pad id and canvas budget. A live objective
+        `processor`: their process, pad id, end-of-sequence ids and canvas budget. A live objective
         (`BlockDiffusionObjective.build_task`) and a saved run (`from_run`) build it alike."""
-        return cls(model, variables, settings.process, processor, pad_token_id=settings.pad_token_id,
-                   max_new_tokens=settings.max_new_tokens or None)
+        return cls(model, variables, settings.process, processor, eos_token_ids=settings.eos_token_ids,
+                   pad_token_id=settings.pad_token_id, max_new_tokens=settings.max_new_tokens or None)
 
 
 
@@ -819,11 +936,13 @@ class MaskedGeneration(_NativeTextTask):
     def from_settings(cls, model: nn.Module, variables: Variables, settings: MaskedSettings,
                       processor: Processor | None) -> MaskedGeneration:
         """The task `settings` describe over `model` and `variables`, reading text through
-        `processor`: their process, solver, step count and response budget. A live objective
-        (`MaskedDiffusionObjective.build_task`) and a saved run (`from_run`) build it alike."""
+        `processor`: their process, solver, step count, end-of-sequence ids and response budget. A
+        live objective (`MaskedDiffusionObjective.build_task`) and a saved run (`from_run`) build it
+        alike."""
         assert isinstance(settings.solver, Unmask)
         return cls(model, variables, settings.process, processor, solver=settings.solver,
-                   steps=settings.sampling_steps, max_new_tokens=settings.max_new_tokens or None)
+                   steps=settings.sampling_steps, eos_token_ids=settings.eos_token_ids,
+                   max_new_tokens=settings.max_new_tokens or None)
 
 
 

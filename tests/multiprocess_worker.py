@@ -664,7 +664,7 @@ def mode_pool_refusals(args) -> dict:
     import optax
     from affine_run import FEATURES, Regression
 
-    from dew import coordination
+    from dew import _coordination
     from dew.data import Memory
     from dew.data.compile import compile
     from dew.data.dataset import Loader
@@ -728,7 +728,7 @@ def mode_pool_refusals(args) -> dict:
         "saved": trained(stream(64, 0), Checkpoints(str(Path(args.run_dir) / "saved")), checkpoint_every=1),
     }
     outcomes["latest"] = Checkpoints(str(Path(args.run_dir) / "saved")).latest
-    coordination.agreed("the saved run's listing", lambda: True)
+    _coordination.agreed("the saved run's listing", lambda: True)
     resumed_from = Path(args.run_dir) / "saved"
     if other:
         # A listing taken before step 2 was committed: a copy of the directory without it.
@@ -751,7 +751,7 @@ def mode_fp8_sites(args) -> dict:
     passes one more agreement, which a rank left behind would block."""
     import jax
 
-    from dew import coordination
+    from dew import _coordination
     from dew.quantization import measured_fp8_sites
 
     full = {"params": {"wide": {"kernel": np.zeros((64, 96), np.float32)},
@@ -761,13 +761,13 @@ def mode_fp8_sites(args) -> dict:
     def outcome(variables) -> str:
         try:
             measured_fp8_sites(variables, ("wide", "narrow"), 8)
-        except (ValueError, coordination.PeerFailure) as error:
+        except (ValueError, _coordination.PeerFailure) as error:
             return f"{type(error).__name__}: {error}"
         return "measured"
 
     unsupported = outcome(full)
     missing = outcome(lacking if jax.process_index() == 1 else full)
-    after = coordination.agreed("after the refusals", lambda: True)
+    after = _coordination.agreed("after the refusals", lambda: True)
     return {"unsupported": unsupported, "missing": missing, "after": after}
 
 
@@ -780,7 +780,7 @@ def mode_profile_failure(args) -> dict:
     import jax
     import optax
 
-    from dew.coordination import agree_process_phase
+    from dew._coordination import agree_process_phase
     from dew.training import ProfileWindow, Trainer
 
     profile_dir = Path(args.profile_dir)

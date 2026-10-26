@@ -37,9 +37,11 @@ from flax.training.early_stopping import EarlyStopping
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
+from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
+from dew._records import JSON, boolean, json_value, record
+from dew.batch import FROZEN, Batch, Variables, select
 from dew.checkpoints import Checkpoints, Ranking
 from dew.cleanup import attempted
-from dew.coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew.data.compile import fitted
 from dew.data.dataset import (
     Closeable,
@@ -52,19 +54,14 @@ from dew.data.dataset import (
     stream_identity,
 )
 from dew.data.pipeline import Dataset, DeviceStep
+from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, TENSOR_AXIS, LayoutRefused, LogicalAxes, batch_axes
 from dew.nn.flops import MissingFlopsCount
 from dew.nn.kernels import tuning
 from dew.nn.kernels.generation import assumed, backend, gpu_mesh, gpu_target, measured_kernel
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import (
-    SEQUENCE_AXIS,
-    STAGE_AXIS,
-    TENSOR_AXIS,
-    LayoutRefused,
     Link,
-    LogicalAxes,
     Schedule,
-    batch_axes,
     boxed,
     boxed_axes,
     measured_links,
@@ -72,9 +69,7 @@ from dew.nn.sharding import (
     ruled_boxes,
 )
 from dew.objectives.base import (
-    FROZEN,
     Aux,
-    Batch,
     Initializer,
     Metric,
     Objective,
@@ -83,12 +78,10 @@ from dew.objectives.base import (
     Shown,
     Step,
     TrainingScalar,
-    Variables,
-    select,
     taken_record,
 )
 from dew.optim import learning_rate, with_rates
-from dew.records import JSON, boolean, json_value, record
+from dew.state import MODEL_STATE, Accumulation, TrainState, apart, kept_window, together
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import (
     StepFlops,
@@ -173,14 +166,13 @@ from dew.training.profiling import ProfileWindow, owned_capture, start_capture, 
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, rankings
-from dew.training.state import MODEL_STATE, Accumulation, TrainState, apart, kept_window, together
 from dew.training.tracker import Tracker
 from dew.training.transaction import Committed, Transaction, compact_qk, outcome, window_dropped, with_ema
 
 _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from dew.config import OptimConfig
+    from dew.optim import OptimConfig
     from dew.telemetry.profile import Profiler
 
 StepFn = Callable[[TrainState, Batch], tuple[TrainState, jax.Array, Aux]]
@@ -1641,7 +1633,7 @@ class Trainer(Generic[Loss, Effects]):
         agreed("training announcement", functools.partial(
             self._display.start, started, model=type(trained[0] if trained else self.objective).__name__,
             batch=plan.dataset.batch, precision=precision, shown=shown,
-            averaged=self.objective.ema is not None and not self.objective._ema_is_reference))
+            averaged=self.objective.ema is not None and not self.objective.ema_is_reference))
         return False
 
     def _local_devices(self) -> list:

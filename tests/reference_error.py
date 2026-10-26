@@ -175,8 +175,17 @@ def over_windows(fn):
     XLA compiles (its fusions, its reductions' order, its dots' batching, a kernel's route), which XLA
     holds to no common bits with one draw's, so check 1 would judge a program users never run. The gate
     compiles `fn` as it compiles an arm of one draw (`_arms`), once a signature, and every window calls
-    that program; a torch or NumPy reference passes `as_given`."""
+    that program; a torch or NumPy reference passes `as_given`. The loop keeps `fn`, which a recorded
+    truth's rounding count traces on one window (`indexed_recording`)."""
     return _Windowed(fn)
+
+
+def _one_draws_program(fn, arguments):
+    """`fn` and its `arguments` as one draw's program reads them: a window loop's (`over_windows`) own
+    function on its first window's arguments, any other function on them all."""
+    if not isinstance(fn, _Windowed):
+        return fn, arguments
+    return fn.fn, jax.tree.map(lambda leaf: leaf[0], arguments)
 
 
 WITHOUT_YNN = {"xla_cpu_experimental_ynn_fusion_type": ""}
@@ -1266,6 +1275,26 @@ MOST_SEEDS = 512
 takes larger inputs or fewer shared factors, not more seeds."""
 
 
+def recorded_pilots(reference_fn, draw, count: int):
+    """A view of `reference_fn`, a recorded reference (one `.recorded`), that holds `count` pilot draws
+    from SIZING_FROM on, disjoint from every verdict's seeds and recorded with Dew's arm and the truth
+    from the same inputs: the draws a paired sizing of it takes (`seeds_for`). The view is the site's
+    own; `reference_fn` is left as it is. Every pilot is read now (`draw`'s inputs at each), so a
+    recording that does not hold them all is refused here, not at the doubling that reaches one."""
+    if not getattr(reference_fn, "recorded", False):
+        raise ValueError("pilots belong to a recorded reference; a live one draws its own from SIZING_FROM")
+    if count < 1:
+        raise ValueError(f"a recording of {count} pilots")
+    for seed in range(SIZING_FROM, SIZING_FROM + count):
+        reference_fn(*draw(seed))
+
+    @functools.wraps(reference_fn)
+    def view(*inputs):
+        return reference_fn(*inputs)
+    view.recorded, view.pilots = True, range(SIZING_FROM, SIZING_FROM + count)
+    return view
+
+
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = MOST_SEEDS,
               truth_fn=None, dew_fn=None) -> int:
     """The seeds a site declares: the fewest, doubling from `start`, for which the pooled ratio's
@@ -1280,23 +1309,31 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     validated). The width asked of it is PARITY
     either way. Paired sizing holds out its draws only where `draw` keys an independent stream by the
     whole seed: a draw that enumerates finitely or by a modulus (`(arange(n) + seed) % vocab`) repeats a
-    verdict's inputs at SIZING_FROM and needs a pilot stream of its own first, and a recorded reference
-    (`indexed_recording`), which holds its recorded seeds alone, is refused: its site keeps its
-    recorded count. Fails past `most`, where the site needs larger inputs or fewer shared factors, not
-    more seeds.
+    verdict's inputs at SIZING_FROM and needs a pilot stream of its own first. A recorded reference
+    (`indexed_recording`), which holds its recorded seeds alone, is refused, its site keeping its
+    recorded count, unless its recording holds pilot draws of their own from SIZING_FROM on, recorded
+    with Dew's arm and the truth (`recorded_pilots`): its paired sizing then takes those pilots alone,
+    up to as many as are held. Fails past `most`, where the site needs larger inputs or fewer shared
+    factors, not more seeds.
 
     Each draw is evaluated once however many doublings the sizing takes: a count's draws are its
     predecessor's and the seeds it adds, the reference compared with itself takes its seeds 0 to twice
     the count (the first half against the second), and the reference on the same inputs runs once."""
     if dew_fn is not None and getattr(reference_fn, "recorded", False):
-        raise ValueError(f"{label}: a recorded reference holds its recorded seeds alone, never a paired "
-                         f"sizing's from SIZING_FROM; its site keeps its recorded count")
+        pilots = getattr(reference_fn, "pilots", None)
+        if pilots is None:
+            raise ValueError(f"{label}: a recorded reference holds its recorded seeds alone, never a paired "
+                             f"sizing's from SIZING_FROM; its site keeps its recorded count")
+        most = min(most, len(pilots))
     paired = dew_fn is not None
     _refuse_numpy_arms(draw, *([dew_fn] if paired else []), reference_fn)
     dew_fn, reference_fn = _arms(dew_fn if paired else reference_fn, reference_fn)
     dew_fn = dew_fn if paired else None
     truth_fn = _truth_program(truth_fn)
-    count, drawn = max(start, FEWEST_SEEDS), None
+    count, drawn, wide = max(start, FEWEST_SEEDS), None, []
+    if count > most:
+        raise AssertionError(f"{label}: sizing starts at {count} seeds, past the {most} it may take; "
+                             f"give the site more pilots or start lower")
     first = 0 if dew_fn is None else SIZING_FROM
     while count <= most:
         held = 0 if drawn is None else len(drawn.theirs)
@@ -1554,7 +1591,9 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
         index = int(index)
         computed = live(inputs)
         if not roundings:
-            roundings["count"] = chain_roundings(jax.make_jaxpr(truth_fn)(inputs))
+            # One draw's roundings, a window loop's its window's: each window is a draw of its own.
+            program, arguments = _one_draws_program(truth_fn, (inputs,))
+            roundings["count"] = chain_roundings(jax.make_jaxpr(program)(*arguments))
         eps = float(np.finfo(np.float64).eps)
         if set(computed) != set(sketch):
             raise AssertionError(f"{site}: `truth_fn` gives the leaves {sorted(computed)}, the recording "

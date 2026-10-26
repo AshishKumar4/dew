@@ -28,11 +28,11 @@ from model_support import TINY_DECODER
 from process_support import READ_ONLY, fresh, keeping_picks
 from reference_error import as_given, assert_as_exact, widened, with_gradients, without_ynn
 
+from dew.batch import FROZEN
 from dew.data.dataset import Loader
 from dew.interop.codecs import fp8_block_cast, quantize_fp8_blocks
 from dew.lora import LoRA, unadapted
 from dew.nn.kernels.generation import assumed, device_generation, fp8_tensor_cores
-from dew.objectives.base import FROZEN
 from dew.objectives.lm import LMObjective
 from dew.quantization import (
     FROZEN_FP8,

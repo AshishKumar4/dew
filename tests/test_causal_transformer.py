@@ -162,7 +162,7 @@ def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
     from flax.traverse_util import unflatten_dict
     from jax import export
 
-    from dew.config import ModelConfig
+    from dew.registry import ModelConfig
     from tools.generate_decoder_dropout_fixture import forward_and_gradient
 
     config = {"vocab_size": 17, "emb_features": 8, "num_layers": 1, "num_heads": 2,

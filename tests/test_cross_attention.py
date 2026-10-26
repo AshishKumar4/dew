@@ -25,6 +25,7 @@ from model_support import TINY_DECODER, Digits, decoder, flat_tree
 from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 from test_serving import assert_same_generation
 
+from dew.batch import FROZEN, coordinates, thaw
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
 from dew.inference import RunProcessor, TextGeneration
@@ -44,11 +45,10 @@ from dew.nn.cross_attention import (
 )
 from dew.nn.gemma3n import AltUp
 from dew.nn.hyper_connections import HyperConnections
-from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CrossContext, ModelInputs, coordinates
+from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, CrossContext, ModelInputs
 from dew.nn.kv_cache import KVCache
 from dew.nn.mlp import GatedMLP
 from dew.nn.ngpt import NGPT
-from dew.objectives.base import FROZEN, thaw
 from dew.objectives.lm import LMObjective
 from dew.sampling import Sampling
 from dew.training import Layout, MeshSpec, Trainer
@@ -498,7 +498,7 @@ def test_freeze_keeps_what_a_split_tree_trains():
     """`freeze` over a tree already split keeps its trained leaves training beside those it is asked
     to, and its frozen ones frozen; over an unsplit tree it splits by the filter alone, and freezing
     a split tree by the filter it was split by changes nothing."""
-    from dew.objectives.base import freeze
+    from dew.batch import freeze
 
     tree = {"params": {"a": np.ones(2), "b": np.ones(3), "c": np.ones(4)}, "constants": {"k": np.ones(1)}}
     first = freeze(tree, lambda path: path[-1] == "a")

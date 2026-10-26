@@ -34,59 +34,48 @@ import shlex
 import sys
 import types
 import typing
-from abc import ABC, abstractmethod
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, ClassVar, Literal, Self, TypedDict, Union
 
 import jax
-import optax
 import tyro
 from etils import epath
 
 import dew.io
 from dew import registry
+from dew._coordination import agree_process_phase, agreed
+from dew._records import JSON, duration, record, recorded_duration
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
-from dew.coordination import agree_process_phase, agreed
 from dew.data import records
 from dew.data.compile import fitted
-from dew.data.dataset import Loader, Ramp, Reader, ramped, record_argument
+from dew.data.dataset import Loader, Ramp, Reader, ramped
 from dew.data.pipeline import Dataset, ObjectiveData
 from dew.files import write_atomically
 from dew.inputs import Field
-from dew.lora import AdapterRecord, LoRA
+from dew.lora import LoRA
 from dew.objectives.base import Effects, Loss, Metric, Objective
-from dew.optim import (
-    OPTIMIZER_MAP,
-    STATE_OPTIMIZERS,
-    Optimizer,
-    ParamGroup,
-    ScheduleBase,
-    param_labels,
-    power_profiles,
-    rates_of,
-    scheduled_solver,
-    weight_decay_mask,
-)
-from dew.quantization import InputQuantization, Quantization
-from dew.records import JSON, duration, record, recorded_duration
+from dew.optim import OptimConfig
+from dew.quantization import Quantization
 from dew.registry import (
     Annotation,
-    Configured,
+    ModelConfig,
+    Registered,
     declared_type,
+    default_record,
     from_record,
+    member_fields,
     metrics,
     models,
     objectives,
-    parameter_type,
     parameters,
-    schedules,
     to_record,
     wants_tuple,
 )
+from dew.state import TrainState
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
 from dew.training.budget import Pause, run_length, run_steps
 from dew.training.display import TrainingDisplay
@@ -94,139 +83,15 @@ from dew.training.distributed import Layout, MeshSpec
 from dew.training.profiling import ProfileWindow
 from dew.training.quantization import quantize_trunk
 from dew.training.selection import Best
-from dew.training.state import TrainState
-from dew.training.tracker import LocalTracker, Tracker, Trackers, WandbTracker
+from dew.training.tracker import LocalTracker, Tracker, Trackers, Wandb, WandbTracker
 from dew.training.trainer import Rollout, Trainer
-
-JsonDict = Annotated[
-    Mapping[str, object],
-    tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1,
-        metavar="JSON",
-        instance_from_str=lambda args: json.loads(args[0]),
-        is_instance=lambda value: isinstance(value, dict),
-        str_from_instance=lambda value: [json.dumps(value)],
-    ),
-]
-"""The fields a model is built from, written as a single JSON string on the
-command line. The registry knows which architecture takes which field and
-narrows each one where it builds it, so the values are read there."""
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
-    # tyro reads the runtime annotation, a Union of the aliased specs, and a
-    # type checker cannot read a variable in a type expression. Both get what
-    # they need: the base class statically, the union at runtime.
-    type ScheduleSpec = ScheduleBase
-else:
-    ScheduleSpec = schedules.union
-
-
-ModelWrapper = InputQuantization | AdapterRecord | Quantization
-"""One wrapper a model record keeps (`ModelConfig.wrappers`)."""
-
 
 @dataclasses.dataclass(frozen=True)
-class _Configured(ABC):
-    """A registered class, named by an alias or an import path and held as the path, and the arguments a
-    run gives it: `fields`, the ones the run states, and `defaults`, every other one the class
-    defaults as it defaulted them when the run was first recorded, so the record builds the same
-    thing after a default changes (`arguments`). Each kind names its registry (`_member`) and whether
-    its stated fields are held as their records (`_recorded`)."""
-
-    name: str
-    fields: JsonDict = dataclasses.field(default_factory=dict)
-    defaults: JsonDict = dataclasses.field(default_factory=dict)
-    """Each argument the class defaults and `fields` leaves out, as a record holds it;
-    one a record lacks, as an argument the class has since gained, takes the class's default now."""
-
-    _recorded: ClassVar[bool] = True
-
-    @staticmethod
-    @abstractmethod
-    def _member(name: str) -> type:
-        """The class `name` names, from the kind's registry."""
-
-    def __post_init__(self) -> None:
-        member = self._member(self.name)
-        object.__setattr__(self, "name", registry.import_path(member))
-        if self._recorded:
-            object.__setattr__(self, "fields", registry.argument_records(member, self.fields))
-        object.__setattr__(self, "defaults", _defaults(member, self.fields, self.defaults))
-
-    @property
-    def arguments(self) -> JsonDict:
-        """The arguments the class is built from, before those the caller derives (`_arguments`)."""
-        return _arguments(self._member(self.name), self.fields, self.defaults)
-
-
-@dataclasses.dataclass(frozen=True)
-class ModelConfig(_Configured):
-    """A model's class and the fields the run gives it.
-
-    `name` is an alias or an import path, held as the path. `fields` are the
-    class's own fields, its compute and storage dtypes, attention kernel and
-    matmul precision included, which the command line sets one flag each
-    (`RunConfig.cli`); a recipe fills the ones it derives from its data in
-    `build`. `defaults` holds every other field the class defaults, as it
-    defaulted them when the run was first recorded, so the record builds the
-    same model after a default changes (`arguments`). `wrappers` are the
-    classes the model was wrapped in, in the order they were applied.
-    """
-
-    name: str = "simple_dit"
-    wrappers: tuple[ModelWrapper, ...] = ()
-    """What wraps the built model, innermost first, which `build` applies in
-    order: a checkpoint's input quantization, a bound LoRA (its factors are
-    stored with the checkpoint variables), the quantized training a run
-    wrapped it in."""
-
-    _recorded: ClassVar[bool] = False
-
-    @staticmethod
-    def _member(name: str) -> type:
-        return models[name]
-
-    @classmethod
-    def from_dict(cls, values: Mapping[str, object]) -> Self:
-        """Read back the record `RunConfig.to_dict` writes for this field."""
-        return from_record(cls, values, dtypes=False)
-
-    @property
-    def adapter(self) -> AdapterRecord | None:
-        """The bound LoRA among the wrappers, or None."""
-        return next((wrapper for wrapper in self.wrappers if isinstance(wrapper, AdapterRecord)), None)
-
-    @classmethod
-    def from_model(cls, model) -> Self:
-        """Return the module's class and constructor fields, and each wrapper
-        its class was made in, in the order they were applied."""
-        model_type, layers = registry.wrapper_layers(type(model))
-        wrappers = []
-        for layer in reversed(layers):
-            wrapper = layer._dew_wrapper()
-            if not isinstance(wrapper, ModelWrapper):
-                raise ValueError(f"{type(wrapper).__name__} wraps {model_type.__name__} where no model "
-                                 f"record can name it")
-            wrappers.append(wrapper)
-        return cls(registry.import_path(model_type), registry.record_fields(model, model_type),
-                   wrappers=tuple(wrappers))
-
-    def with_dtype(self, dtype: str | None) -> Self:
-        """This model computing in `dtype` (`dew.registry.with_dtype`); None keeps it."""
-        return dataclasses.replace(self, fields=registry.with_dtype(self.name, self.fields, dtype))
-
-    def build(self, **derived: Configured):
-        """Build the model from its fields and the ones the recipe `derived`."""
-        model = models.build(self.name, {**self.arguments, **derived})
-        for wrapper in self.wrappers:
-            model = wrapper.apply(model)
-        return model
-
-
-@dataclasses.dataclass(frozen=True)
-class ObjectiveConfig(_Configured):
+class ObjectiveConfig(Registered):
     """An objective's class and the arguments the run gives it.
 
     `name` is an alias or an import path, held as the path. `fields` are the
@@ -257,7 +122,7 @@ class ObjectiveConfig(_Configured):
 
 
 @dataclasses.dataclass(frozen=True)
-class MetricConfig(_Configured):
+class MetricConfig(Registered):
     """A metric's class and the arguments the run gives it.
 
     `name` is an alias of `dew.registry.metrics` or an import path, held as
@@ -307,97 +172,27 @@ def _member_flags(member: type, given: Mapping[str, object]) -> tuple[type, Mapp
     flags, started = [], {}
     # One record: a module two defaults share is written once.
     with registry.recording():
-        for name, declared, annotation in _member_fields(member):
+        for name, declared, annotation in member_fields(member):
             declared = None if declared is dataclasses.MISSING else declared
             annotation = registry.resolve_alias(annotation)
             if name in ("dtype", "param_dtype"):
                 typed = registry.DtypeName | None
-                declared = _record_of(name, declared, annotation)
+                declared = default_record(name, declared, annotation)
             elif name == "precision":
                 typed = Literal["default", "high", "highest"] | None
-                declared = _record_of(name, declared, annotation)
+                declared = default_record(name, declared, annotation)
             elif annotation is not None and _scalar(annotation):
                 typed = annotation if declared is not None else annotation | None
             else:
                 typed = Annotated[JSON, _JSON_FLAG]
                 try:
-                    declared = _record_of(name, declared, annotation)
+                    declared = default_record(name, declared, annotation)
                 except (TypeError, ValueError):
                     continue  # a field no record carries keeps its class default
             started[name] = given.get(name, declared)
             copied = functools.partial(copy.deepcopy, started[name])
             flags.append((name, typed, dataclasses.field(default_factory=copied)))
     return dataclasses.make_dataclass(f"{member.__name__}Fields", flags, frozen=True), started
-
-
-def _member_fields(member: type) -> Iterator[tuple[str, Configured, Annotation]]:
-    """Each field `_member_flags` flags: its name, its default
-    (`dataclasses.MISSING` for none) and its annotation (None where its
-    module cannot resolve it). A dataclass with a constructor of its own (a
-    metric over its base's fields) has that constructor's arguments, as the
-    registry builds it (`registry.record_class`)."""
-    if registry.record_class(member) is not None:
-        for field in registry.constructor_fields(member):
-            default = (field.default_factory() if callable(field.default_factory) else field.default)
-            yield field.name, default, declared_type(member, field.name)
-        return
-    for name, (parameter, owner) in registry.parameters(member)[0].items():
-        if parameter.kind is parameter.POSITIONAL_OR_KEYWORD and parameter.default is parameter.empty:
-            continue  # what the caller builds, the model first
-        try:
-            annotation = parameter_type(owner, name)
-        except ValueError:
-            annotation = None
-        default = dataclasses.MISSING if parameter.default is parameter.empty else parameter.default
-        yield name, default, annotation
-
-
-def _record_of(name: str, declared: Configured, annotation: Annotation) -> JSON:
-    """A member's default `declared` as a record holds it: a dtype by its
-    name, a matmul precision by its level, anything else as `to_record`
-    writes it. TypeError or ValueError for a value no record carries."""
-    if name in ("dtype", "param_dtype"):
-        return registry.dtype_name(registry.resolve_dtype(declared))
-    if name == "precision":
-        return None if declared is None else str(declared).lower().removeprefix("precision.")
-    # The record itself, not a copy: a module a later default shares turns
-    # this one into its defining record.
-    record = to_record(declared, annotation)
-    json.dumps(record)
-    return record
-
-
-def _defaults(member: type, stated: Mapping[str, object], recorded: Mapping[str, object]) -> JsonDict:
-    """The record of each field or argument `member` defaults that `stated`
-    leaves out: as `recorded` holds it, or else as the class defaults it now.
-    A default no record carries (a callable, say) is left to the class, and
-    a recorded one the class no longer takes is refused."""
-    defaults, named = {}, set()
-    # One record: a module two defaults share is written once.
-    with registry.recording():
-        for name, declared, annotation in _member_fields(member):
-            named.add(name)
-            if name in stated or name in recorded or declared is dataclasses.MISSING:
-                continue
-            try:
-                defaults[name] = _record_of(name, declared, annotation)
-            except (TypeError, ValueError):
-                continue
-    unknown = sorted(set(recorded) - named)
-    if unknown:
-        raise ValueError(f"{member.__name__} takes no {unknown}, which the record defaults")
-    return {**defaults, **{name: value for name, value in recorded.items() if name not in stated}}
-
-
-def _arguments(member: type, fields: Mapping[str, object], defaults: Mapping[str, object]) -> JsonDict:
-    """What a config builds `member` from beside what its caller derives:
-    `fields`, over each of `defaults` the class no longer defaults the same.
-    A default the class still has is left to it, so a class that treats an
-    argument left out in its own way, as `DPOObjective` holds its reference
-    at unit decay, still does."""
-    now = _defaults(member, {}, {})
-    return {**{name: value for name, value in defaults.items() if name not in now or now[name] != value},
-            **fields}
 
 
 def _chosen(given: list[str], field: str) -> str | None:
@@ -448,168 +243,6 @@ _JSON_FLAG = tyro.constructors.PrimitiveConstructorSpec(
 def _flag_json(text: str) -> JSON:
     """A JSON flag's value: its JSON, or None for `None`, as every optional flag spells it."""
     return None if text == "None" else json.loads(text)
-
-
-def _rate_argument() -> tyro.constructors.PrimitiveConstructorSpec:
-    """The learning rate as one command-line value, the record a run holds: a number, the constant
-    rate, or a schedule's record as JSON (`dew.registry.from_record`)."""
-    annotation = float | ScheduleSpec
-
-    def number(value) -> bool:
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-
-    def read(given: list[str]) -> float | ScheduleBase:
-        value = json.loads(given[0])
-        if number(value):
-            return float(value)
-        built = from_record(annotation, value, dtypes=False)
-        if not isinstance(built, ScheduleBase):
-            raise TypeError(f"--optim.learning-rate is a number or a schedule's record, not {given[0]}")
-        return built
-
-    return tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1, metavar="RATE|JSON", instance_from_str=read,
-        is_instance=lambda given: number(given) or isinstance(given, ScheduleBase),
-        str_from_instance=lambda given: [json.dumps(to_record(given, annotation))])
-
-
-@dataclasses.dataclass(frozen=True)
-class OptimConfig:
-    """Holds the optimizer, learning-rate schedule and gradient clipping."""
-
-    optimizer: Optimizer = "adamw"
-    optimizer_opts: JsonDict = dataclasses.field(default_factory=dict)
-    learning_rate: Annotated[float | ScheduleSpec, _rate_argument()] = 2.7e-4
-    """The learning rate: a constant, or a schedule as one typed record per kind (`dew.optim`).
-
-    The kinds are cosine, power (lm-engine's power law with an optional linear
-    tail), linear, one_cycle (torch's `OneCycleLR`) and exponential; each record
-    holds only its own fields, and `every` steps any of them once per that many
-    updates. On the command line it is one value: `--optim.learning-rate 3e-4`, or a
-    schedule's record, `--optim.learning-rate '{"class": "cosine", "fields": {...}}'`.
-    """
-    weight_decay: float | None = None
-    """The weight decay passed to the optimizer, None keeping its own (adamw's 1e-4, the others'
-    0); for 'adam' it is torch's coupled L2 penalty, added to the gradient before the moments
-    read it, for 'adamw' the decoupled decay. Either decay, the default included, spares biases
-    and vectors such as a norm's scale, timm's split for every optimizer
-    (`dew.optim.weight_decay_mask`); Muon decays them as Moonlight does, and
-    `param_groups` replace the split. Records written before this change decayed every
-    parameter; ParamGroup('all', ('*',)) restores that."""
-    b1: float | None = None
-    """Adam's first-moment decay, for adam, adamw and lamb; None keeps the optimizer's."""
-    b2: float | None = None
-    """Adam's second-moment decay, for adam, adamw and lamb; None keeps the optimizer's."""
-    param_groups: Annotated[tuple[ParamGroup, ...], record_argument(tuple[ParamGroup, ...])] = ()
-    """Per-group learning rates, momentum schedules, weight decay and bounds; the first
-    matching group wins.
-
-    Empty runs one optimizer over every parameter. `ParamGroup.mup` is lm-engine's muP split.
-    """
-    clip_grads: float = 0.0
-    state_dtype: Literal["float32", "bfloat16", "int8"] = "float32"
-    """The dtype of Adam's moments in memory.
-
-    float32 stores adam's and adamw's two moments, and Muon's momentum, in
-    float32 whatever the parameters' dtype, so bfloat16 or float16 weights
-    train on full-precision moments. bfloat16 stores both with stochastic
-    rounding (`dew.optim.bf16_moments`), for adam and adamw only. That halves
-    the optimizer state and reduces the update's memory traffic. int8 stores
-    both blockwise in 8 bits (`dew.optim.int8_moments`, bitsandbytes' and
-    torchao's 8-bit Adam), for adam and adamw only: a quarter of float32's,
-    about 2 bytes a parameter for the two.
-    """
-    forced_weight_normalization: bool = False
-    """Whether to renormalize every magnitude-preserving weight (`dew.nn.mp.MPConv`) after each update.
-
-    This is EDM2's forced weight normalization, which its `edm2_unet` trains with
-    (`dew.nn.mp.forced_weight_normalization`).
-    """
-    ema_profiles: tuple[float, ...] = ()
-    """Relative standard deviations of the power-function EMAs a run keeps for post-hoc EMA.
-
-    See `dew.optim.power_profiles`; Karras et al. use (0.05, 0.10). Every
-    checkpoint save snapshots these averages, and `Checkpoints.posthoc_ema` builds
-    an average with any other relative standard deviation from the snapshots.
-    Empty keeps none.
-    """
-
-    def build(self, steps: int | None) -> optax.GradientTransformation:
-        """Build the optimizer this config describes, with its schedule, parameter groups and clipping.
-
-        `steps` is the run's length in updates, which the schedule decays over unless the
-        config names its own end. With `param_groups`, one optimizer runs per group under
-        `optax.multi_transform`, each on its own schedule (the config's when it names
-        none) times its multiplier, with its own weight decay, `b1` schedule and bounds
-        (`ParamGroup.solver`); the global-norm clip still reads every gradient
-        together, before the groups split them. Each solver holds its rate's
-        fields in its state (`dew.optim.scheduled_solver`), so runs at
-        rates of one schedule's timings compile one step.
-        """
-        opts = dict(self.optimizer_opts)
-        if {'b1', 'b2'} & opts.keys():
-            raise ValueError("b1 and b2 are fields of OptimConfig, not optimizer_opts")
-        given = {'b1': self.b1, 'b2': self.b2, 'weight_decay': self.weight_decay}
-        opts.update({name: value for name, value in given.items() if value is not None})
-        make: Callable[..., optax.GradientTransformation] = OPTIMIZER_MAP[self.optimizer]
-        if self.state_dtype != 'float32':
-            if self.optimizer not in STATE_OPTIMIZERS[self.state_dtype]:
-                raise ValueError(
-                    f"state_dtype={self.state_dtype!r} stores Adam's moments, which "
-                    f"{sorted(STATE_OPTIMIZERS[self.state_dtype])} have; {self.optimizer!r} does not")
-            make = STATE_OPTIMIZERS[self.state_dtype][self.optimizer]
-        elif self.optimizer in ('adam', 'adamw'):
-            opts = {'mu_dtype': 'float32', 'nu_dtype': 'float32', **opts}
-        elif self.optimizer in ('muon', 'muonclip'):
-            opts = {'mu_dtype': 'float32', **opts}
-        if self.param_groups:
-            names = [group.name for group in self.param_groups]
-            if len(set(names)) != len(names):
-                raise ValueError(f"param group names repeat: {names}")
-            solvers = {}
-            for group in self.param_groups:
-                decay = {} if group.weight_decay is None else {'weight_decay': group.weight_decay}
-                solvers[group.name] = group.solver(make, self.learning_rate, steps, {**opts, **decay})
-            solver = optax.multi_transform(solvers, param_labels(self.param_groups))
-        else:
-            if self.optimizer not in ('muon', 'muonclip'):
-                opts['mask'] = weight_decay_mask
-            solver = scheduled_solver(make, self.learning_rate, steps, opts)
-
-        if self.clip_grads > 0:
-            solver = optax.chain(optax.clip_by_global_norm(self.clip_grads), solver)
-        if self.forced_weight_normalization:
-            from dew.nn.mp import forced_weight_normalization
-
-            solver = optax.chain(solver, forced_weight_normalization())
-        if self.ema_profiles:
-            solver = power_profiles(solver, self.ema_profiles)
-        return solver
-
-    def rates(self) -> dict[str | None, dict[str, float]]:
-        """The rate fields each of `build`'s solvers holds in its state
-        (`dew.optim.scheduled_solver`), by param group, or under None
-        for the one solver of a config without groups. A resumed run sets
-        them over its checkpoint's (`with_rates`), so the configured
-        rate is the one it steps at."""
-        if not self.param_groups:
-            return {None: rates_of(self.learning_rate)}
-        return {group.name: group.rates(self.learning_rate) for group in self.param_groups}
-
-
-@dataclasses.dataclass(frozen=True)
-class Wandb:
-    """Where a run reports to Weights & Biases.
-
-    Setting it turns tracking on; the entity and the offline switch have no effect
-    without a project. `name` is the run's display name there, apart from the name
-    its checkpoints are kept under; None shows it as the run is named.
-    """
-
-    project: str
-    entity: str | None = None
-    offline: bool = False
-    name: str | None = None
 
 
 def _best_argument():
@@ -1216,7 +849,6 @@ def _parsed(path: str, text: str, annotation: Annotation) -> JSON:
         return text
 
 
-
 _RANDOM_SEARCH = RandomSearch()
 
 
@@ -1686,5 +1318,4 @@ class RunConfig:
         return finished
 
 
-__all__ = ["JsonDict", "MetricConfig", "ModelConfig", "ObjectiveConfig", "OptimConfig", "Prepared",
-           "RunConfig", "ScheduleSpec", "TrainerConfig", "Wandb", "flag_selected"]
+__all__ = ["MetricConfig", "ObjectiveConfig", "Prepared", "RunConfig", "TrainerConfig", "flag_selected"]

@@ -30,7 +30,7 @@ from reference_error import as_given, assert_as_exact, assert_computes_the_oracl
 from residual_orders import permuted, residual_width
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
-from dew.config import MetricConfig, ModelConfig, ObjectiveConfig
+from dew.config import MetricConfig, ObjectiveConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader
 from dew.data.images import CAPTIONS
@@ -41,7 +41,7 @@ from dew.nn.text_encoders import DEFAULT_MODEL as CLIP_CHECKPOINT
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
-from dew.registry import from_record, metrics, models, to_record
+from dew.registry import ModelConfig, from_record, metrics, models, to_record
 from dew.sampling import CFG, Euler
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 from dew.training.distributed import shard_batch

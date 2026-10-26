@@ -63,8 +63,8 @@ def test_shard_batch_preserves_resident_nested_inputs_without_host_transfer():
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
 
+    from dew.mesh import batch_axes
     from dew.nn.inputs import ModelInputs
-    from dew.nn.sharding import batch_axes
     from dew.training.distributed import MeshSpec, shard_batch
 
     mesh = MeshSpec().build()
@@ -151,8 +151,9 @@ def test_a_packed_request_reads_alike_as_coordinates_and_as_its_fields():
     import jax
     import jax.numpy as jnp
 
+    from dew.batch import COORDINATES_FIELD, coordinates
     from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.nn.inputs import COORDINATES_FIELD, ModelInputs, coordinates
+    from dew.nn.inputs import ModelInputs
 
     model = CausalTransformer(vocab_size=32, emb_features=16, num_layers=1, num_heads=2, num_kv_heads=2,
                               head_dim=8, mlp_features=32, max_seq_len=16, dtype=jnp.float32,
@@ -188,8 +189,9 @@ def test_a_request_generates_alike_from_coordinates_and_from_its_fields(placed):
     import jax.numpy as jnp
     from jax.sharding import NamedSharding, PartitionSpec as P
 
+    from dew.batch import COORDINATES_FIELD, coordinates
     from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.nn.inputs import COORDINATES_FIELD, ModelInputs, coordinates
+    from dew.nn.inputs import ModelInputs
     from dew.sampling import Sampling, generate
     from dew.training import MeshSpec
 
@@ -214,7 +216,8 @@ def test_a_feed_forward_reads_blocks_of_its_own_size_from_the_layers_metadata():
     """The model numbers its block router's blocks once, in its metadata (`AttentionMetadata.blocks`);
     a feed-forward routing blocks of another size numbers its own from the call's coordinates rather
     than read blocks of the wrong width."""
-    from dew.nn.inputs import AttentionMetadata, coordinates, numbered_blocks, routing_blocks
+    from dew.batch import coordinates
+    from dew.nn.inputs import AttentionMetadata, numbered_blocks, routing_blocks
 
     class Routed:
         def __init__(self, block):

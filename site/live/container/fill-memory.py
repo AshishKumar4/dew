@@ -1,4 +1,5 @@
 import numpy as np
+
 blocks = []
 try:
     while True:

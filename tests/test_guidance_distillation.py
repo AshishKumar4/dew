@@ -13,7 +13,7 @@ import pytest
 from diffusion_stubs import batch_for
 from diffusion_support import images_of, saved_after_one_step
 
-from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
+from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.diffusion import broadcast_rates
 from dew.diffusion.presets import EDM, Flow
@@ -23,6 +23,7 @@ from dew.inputs import TextCondition, unit_range
 from dew.objectives.base import TEACHER, Step
 from dew.objectives.diffusion import GuidanceDistillationObjective
 from dew.objectives.diffusion.guidance_distillation import with_guidance
+from dew.registry import ModelConfig
 from dew.sampling import Euler
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"

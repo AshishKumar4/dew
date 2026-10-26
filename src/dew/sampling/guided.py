@@ -39,7 +39,7 @@ import numpy as np
 from flax import struct
 from jax.experimental import checkify
 
-from dew.records import JSON
+from dew._records import JSON
 from dew.sampling.decoding import FILTER, LogitsChain, StepState
 from dew.sampling.vocabulary import (
     Referencing,

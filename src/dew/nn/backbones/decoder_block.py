@@ -15,9 +15,9 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew._records import JSON
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
-from dew.records import JSON
 
 from ..activations import GatedActivation, gated_product
 from ..attention import LayerNorm, RMSNorm
@@ -351,6 +351,8 @@ class BlockWiring:
     parallel_residual: bool = False
     shared_parallel_norm: bool = False
     layer_scalar: Literal["frozen", "trainable"] | None = None
+    branch_scale: float | None = None
+    """Initial value of learned per-feature attention and feed-forward residual scales."""
     ngpt: NGPT | None = None
 
     def __post_init__(self):
@@ -706,11 +708,7 @@ class DecoderBlock(nn.Module):
             self.moe = self.parallel(name='moe')
         if self.wiring.ngpt is not None:
             self._ngpt_rates(self.wiring.ngpt)
-        if self.wiring.layer_scalar == "frozen":
-            self.output_scalar = self.variable(LAYER_SCALAR_COLLECTIONS["frozen"], "layer_scalar", jnp.ones,
-                                               (1,), jnp.float32).value
-        elif self.wiring.layer_scalar == "trainable":
-            self.output_scalar = self.param("layer_scalar", nn.initializers.ones, (1,), jnp.float32)
+        self._residual_scales()
         if self.per_layer_input_dim:
             dense = functools.partial(
                 Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
@@ -853,7 +851,7 @@ class DecoderBlock(nn.Module):
             routes if self._mixer_routes else {})
         if self.wiring.output_norms:
             mixed = self.attention_output_norm(mixed)
-        attention_branch = self._branch(mixed, train)
+        attention_branch = self._branch(mixed, train, "attention")
         joined = self._joined(state)
         if not (self.wiring.parallel_residual or joined):
             state = self._write(state, "attention", attention_branch, site)
@@ -881,7 +879,7 @@ class DecoderBlock(nn.Module):
                 hidden = self.moe(read, hidden, **routes)
             if self.wiring.output_norms:
                 hidden = self.mlp_output_norm(hidden)
-            mlp_branch = self._branch(hidden, train)
+            mlp_branch = self._branch(hidden, train, "mlp")
             if self.wiring.parallel_residual:
                 # GPT-NeoX adds the two branches first, then the residual;
                 # both norms read the block's original stream.
@@ -925,10 +923,25 @@ class DecoderBlock(nn.Module):
         stream, normed = norm.seam(state.x, branch, axes=RESIDUAL)
         return state._replace(x=constrain(stream, RESIDUAL)), normed
 
-    def _branch(self, output, train: bool):
+    def _residual_scales(self):
+        """Initialize the output scalar and the learned vectors on the two residual branches."""
+        if self.wiring.layer_scalar == "frozen":
+            self.output_scalar = self.variable(LAYER_SCALAR_COLLECTIONS["frozen"], "layer_scalar", jnp.ones,
+                                               (1,), jnp.float32).value
+        elif self.wiring.layer_scalar == "trainable":
+            self.output_scalar = self.param("layer_scalar", nn.initializers.ones, (1,), jnp.float32)
+        if self.wiring.branch_scale is not None:
+            start = nn.initializers.constant(self.wiring.branch_scale)
+            self.attention_scale = self.param("attention_scale", start, (self.emb_features,))
+            if self.feedforward is not None:
+                self.mlp_scale = self.param("mlp_scale", start, (self.emb_features,))
+
+    def _branch(self, output, train: bool, site: Literal["attention", "mlp"]):
         """A sublayer's output as it joins the residual: times
         `residual_multiplier` (lm-engine's m_residual, GraniteMoeHybrid's
         residual_multiplier) in its own dtype, then dropped out."""
+        if self.wiring.branch_scale is not None:
+            output = output * (self.attention_scale if site == "attention" else self.mlp_scale)
         return self.dropout(scaled(output, self.residual_multiplier), deterministic=not train)
 
     def _enter(self, residual, train: bool, attention_metadata) -> _BlockState:

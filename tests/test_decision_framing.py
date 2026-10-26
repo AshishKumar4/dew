@@ -12,10 +12,10 @@ import numpy as np
 import pytest
 from PIL import Image
 
+from dew._records import JSON
 from dew.data.text import ByteTokenizer, HFTokenizer
 from dew.decision import Choice, JointLayout, Noul
 from dew.decision.layout import JOINT_PREFILL, JOINT_SYSTEM, Framing, Specials
-from dew.records import JSON
 
 FIXTURES = Path(__file__).parent / "fixtures"
 

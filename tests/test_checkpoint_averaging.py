@@ -15,12 +15,12 @@ import pytest
 from etils import epath
 from reference_error import as_given, assert_as_exact
 
+from dew.batch import freeze, thaw
 from dew.checkpoints import Checkpoints, averaged
 from dew.data import Loading, Memory
 from dew.data.compile import compile
-from dew.lora import Adapter, LoRA
+from dew.lora import Adapter, LoRA, recorded_adapter
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import freeze, thaw
 from dew.objectives.lm import LMObjective
 from dew.training import Trainer
 
@@ -61,13 +61,11 @@ def trained(directory, steps: int, *, adapted: bool, key: int = 0, ema_decay: fl
 def weights(run: str, *, ema: bool | None = None):
     """The run's model tree as its loaders read it, a LoRA run's factors merged into their kernels
     (`Adapter.merge`)."""
-    from dew.config import ModelConfig
-    from dew.inference.tasks import run_record
-    from dew.records import record
+    from dew.inference.tasks import SavedRun, saved_model
 
-    declaration, step = run_record(run)
-    if ModelConfig.from_dict(record(declaration["model"], "model")).adapter is None:
-        return thaw(LMObjective._saved_variables(run, step=step, ema=ema))
+    saved = SavedRun.pinned(run)
+    if recorded_adapter(saved_model(saved.record, None).wrappers) is None:
+        return thaw(saved.variables(ema=ema))
     adapter = Adapter.from_run(run, ema=ema)
     return adapter.merge(adapter.variables)
 
@@ -88,7 +86,7 @@ def test_a_lora_run_and_a_fine_tune_average_their_effective_weights_as_float64_d
         halves = (np.asarray(one, np.float64) + np.asarray(other, np.float64)) / 2
         assert np.asarray(leaf).dtype == np.float32
         assert np.array_equal(np.asarray(leaf), halves.astype(np.float32))
-    assert average.model.adapter is None
+    assert recorded_adapter(average.model.wrappers) is None
     logits = average.model.build().apply(average.variables, TOKENS)
     assert logits.shape == (1, 8, 16) and bool(jnp.all(jnp.isfinite(logits)))
     assert average.runs == ((str(epath.Path(runs[0])), 2, False), (str(epath.Path(runs[1])), 1, False))
