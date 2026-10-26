@@ -303,8 +303,32 @@ def log_gates(hooks: Hooks, given: dict, work):
 
 
 def skipped(hooks: Hooks, out, value, given: dict, work):
-    """An output `[..., Hv, Dv]` in `work` with the skip `D v` added where the hooks have one."""
-    return out + given['skip'].astype(work)[:, None] * value.astype(work) if hooks.skip else out
+    """An output `[..., Hv, Dv]` in `work` with the skip `D v` added where the hooks have one (`_skip`)."""
+    return out + _skip(given['skip'].astype(work), value.astype(work)) if hooks.skip else out
+
+
+@jax.custom_vjp
+def _skip(skip, value):
+    """`D v` of the skip `D` `[Hv]` and values `[..., Hv, Dv]`, whose gradient in `D` sums every token's and
+    value's product as a product (`float32_einsum`) rather than one reduction over them all: XLA:CPU's
+    reduction, without YNNPACK's fusions, summed a chunked call's `B S Dv` products in turn, 2.1 times
+    the token-by-token recurrence's distance from float64 (Mamba2's rated decay, test_recurrence_stability
+    after the gate compiled both arms without them)."""
+    return skip[:, None] * value
+
+
+def _skip_forward(skip, value):
+    return _skip(skip, value), (skip, value)
+
+
+def _skip_backward(residual, grad):
+    skip, value = residual
+    heads, width = value.shape[-2:]
+    summed = float32_einsum('nhv,nhv->h', grad.reshape(-1, heads, width), value.reshape(-1, heads, width))
+    return summed.astype(skip.dtype), (grad * skip[:, None]).astype(value.dtype)
+
+
+_skip.defvjp(_skip_forward, _skip_backward)
 
 
 def normed(hooks: Hooks, out, given: dict, work):
