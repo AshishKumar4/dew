@@ -49,6 +49,8 @@ CONFIGURATIONS = {
     # Linear attention: a linear memory on the dot-product bias, every token (Nested Learning Eq 14-18).
     "linear_attention": {"network": LinearMemory(),
                          "objective": Objective("dot"), "chunk": 1},
+    # The delta rule: a linear memory on the l2 objective, every token (Miras Eq 9, DeltaNet).
+    "delta_rule": {"network": LinearMemory(), "chunk": 1},
     # A continuum-memory level (Nested Learning Sec 7.1): an existing gated MLP over its block's input,
     # reconstructing it, its parameters stepped at the end of every chunk (Eq 71), at a hundredth.
     "cms": {"network": GatedMLP(hidden_features=2 * WIDTH, out_features=WIDTH), "commit": "chunk", "heads": 1,
@@ -218,6 +220,24 @@ def test_yaads_objective_switches_by_the_whole_errors_norm():
     for delta, step in ((0.5, [0.5, 0.5]), (3.0, [2.0, 0.1])):
         gradient = jax.grad(Objective("l2_or_l1", delta=delta))(prediction, target)
         np.testing.assert_array_equal(np.asarray(gradient), np.asarray(step, np.float32))
+
+
+def test_an_l2_linear_memory_runs_the_gated_delta_rule():
+    """A linear memory on the l2 objective that steps every token is the delta rule: traced for an
+    H100, its call takes the gated delta rule's kernels through the shared recurrence's dispatch, and
+    the same memory chunked by four, whose gradients wait for their chunk's start, decides no such
+    route."""
+    from dew.nn.kernels import generation
+
+    def routes(module: InContextMemory) -> list[tuple[str, str]]:
+        x = jax.ShapeDtypeStruct((ROWS, LENGTH, WIDTH), jnp.float32)
+        params = jax.eval_shape(module.init, jax.random.key(0), x)
+        with generation.assumed("sm90"), generation.routes() as found:
+            jax.eval_shape(module.apply, params, x)
+        return [(route.choice, route.kernel) for route in found if route.choice == "gated_delta_rule"]
+
+    assert routes(layer("delta_rule")) == [("gated_delta_rule", "fla")]
+    assert routes(layer("delta_rule").clone(chunk=CHUNK)) == []
 
 
 def test_a_self_generated_target_carries_the_outer_gradient():
