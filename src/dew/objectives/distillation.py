@@ -40,6 +40,7 @@ from flax import linen as nn
 from typing_extensions import TypeVar
 
 from dew.artifacts import Artifacts
+from dew.batch import Batch, Variables, without
 from dew.nn import categorical
 from dew.nn.precision import accumulated
 from dew.objectives.base import (
@@ -47,7 +48,6 @@ from dew.objectives.base import (
     TEACHER,
     UNREAD,
     Aux,
-    Batch,
     EMASpec,
     Objective,
     Omitted,
@@ -55,18 +55,16 @@ from dew.objectives.base import (
     ProgramModule,
     Ratio,
     Step,
-    Variables,
-    without,
 )
 
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)
 
 if TYPE_CHECKING:
+    from dew._records import JSON
     from dew.data.pipeline import ObjectiveData
     from dew.data.text import Tokenizer
     from dew.inference.tasks import Processor
-    from dew.records import JSON
 
 PROJECTIONS = "distillation"
 """The params subtree holding the feature pairs' width projections."""

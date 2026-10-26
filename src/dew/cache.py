@@ -211,6 +211,11 @@ cache would hand a later plain call of the same shapes, and a plain trace a
 quantized call. In this context their traces are kept apart."""
 
 
+INTERCEPTED = jax.make_user_context(default_value=False)
+"""Whether Dew installed a layer interceptor in this trace: adapters, input QDQ and Qwix retain
+their individual projection calls. This is independent of Qwix's arithmetic trace key above."""
+
+
 def keeps_picks() -> bool:
     """Whether this process reads and stores GPU picks, XLA's and the
     kernels' alike: not under `--xla_gpu_deterministic_ops`, whose kernels
@@ -239,7 +244,7 @@ def persist_compilations() -> None:
     seen (a minute for a text-to-image sample on an A100), and every restart compiles them again
     without it. A process Dew readies for training turns it on (`dew.training.runtime.
     ready_process`, from `prepare_process` or the first `fit`), and a task where it is loaded,
-    `dew.pipeline` or a saved run's record (`dew.inference.tasks.run_record`). JAX's own switch,
+    `dew.pipeline` or a saved run's record (`dew.inference.tasks.SavedRun.pinned`). JAX's own switch,
     JAX_ENABLE_COMPILATION_CACHE=false (`jax_enable_compilation_cache`), turns it off, and a
     process pool whose processes key a step apart turns it off the same way. JAX writes entries
     from process 0 alone, so a pool takes the directory only where every process reads it as one
@@ -254,7 +259,7 @@ def persist_compilations() -> None:
     """
     if jax.config.jax_compilation_cache_dir or not jax.config.jax_enable_compilation_cache:
         return
-    from dew.coordination import pool_size
+    from dew._coordination import pool_size
 
     directory = default_compilation_cache_dir()
     if pool_size() > 1 and not _shared_by_pool(directory):
@@ -265,6 +270,6 @@ def persist_compilations() -> None:
 @functools.cache
 def _shared_by_pool(directory: str) -> bool:
     """Whether every process of the pool reads `directory` as one (`seen_by_every_process`)."""
-    from dew.coordination import seen_by_every_process
+    from dew._coordination import seen_by_every_process
 
     return all(seen_by_every_process(directory))

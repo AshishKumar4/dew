@@ -11,10 +11,12 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
+from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
 from dew.data import Files
 from dew.data.steps.generic import Formatting
 from dew.inputs import Field, InputSpec
+from dew.optim import OptimConfig
+from dew.registry import ModelConfig
 
 FEATURES = 8
 

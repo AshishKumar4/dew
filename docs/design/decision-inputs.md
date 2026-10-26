@@ -10,7 +10,7 @@ the other segments, and the per-question layouts as segment configurations. Owne
 
 ## Today
 
-A layout is one of three classes (`MarkerLayout`, `StateFirstLayout`, `JointLayout` in `src/dew/decision/layout.py`, reloaded through `_LAYOUTS` in `task.py`). Each assembles a row's tokens in a fixed order with fixed text, and each new arrangement needs a new class and a registry entry. A context beside the state (`Example.context`) has one path of its own: the backbone's token table embeds it, and the backbone's cross-attention reads it.
+A layout is one of three classes (`MarkerLayout`, `StateFirstLayout`, `JointLayout` in `src/dew/decision/layout.py`, each recorded, as a decision head is, as a registry class record by import path, `{"class", "fields"}`, an earlier run's `{"name"}` read once at the pinned run boundary). Each assembles a row's tokens in a fixed order with fixed text, and each new arrangement needs a new class and a registry entry. A context beside the state (`Example.context`) has one path of its own: the backbone's token table embeds it, and the backbone's cross-attention reads it.
 
 ## 1. A layout is data: segments
 
@@ -26,7 +26,7 @@ A layout is an ordered tuple of segments and a row budget (`max_len`). A segment
 
 Each segment has a budget (a token cap, or none) and a cut rule (`start`, `end`, `never`). Budgets settle in one pass: segments that never cut take their tokens first, and the rest share what remains of `max_len` in their declared priority. That is the rule each class encodes today: a schema is never cut, and the state takes what the schema leaves. A row may hold the state more than once: each copy is a `State` of its own budget (`max_tokens`, or a joint layout's `max_state_tokens`) and cut rule (`keep`), a copy kept whole takes its tokens first, and the copies that cut share what remains max-min within one token, as any row's segments share its room (`dew.data.tokens.share_tokens`: each at most what it holds and its cap, a floor's remainder to the later in ascending order of want, none left over while a copy wants more), each cut from the whole state by its own rule. A question row's copies each render as their own `render` says; a joint row's render compact.
 
-A layout is either joint (every question in one row) or per question (one row a question, the schema segment rendering that question alone). Its record is its segment tuple, each segment a frozen dataclass, recorded and rebuilt through `dew.records` with no closed registry. A composition a user writes reloads as written.
+A layout is either joint (every question in one row) or per question (one row a question, the schema segment rendering that question alone). Its record is its segment tuple, each segment a frozen dataclass, recorded and rebuilt by its import path through `dew.registry`'s typed records (`to_record`, `from_record`), with no closed registry. A composition a user writes reloads as written.
 
 The three layouts become three configurations of these segments. The proof: each configuration lays out the existing fixtures' rows byte for byte as its class does today: tokens, spans, positions and option slots, including the parallel layout and the cut cases. That test lands before the classes go.
 

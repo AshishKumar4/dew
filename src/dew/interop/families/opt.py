@@ -3,7 +3,7 @@
 from collections.abc import Mapping
 from functools import partial
 
-from dew import records
+from dew import _records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
     DecoderFamily,
@@ -20,9 +20,9 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 
 
 def _opt_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
-    hidden = records.integer(hf.get('hidden_size', 768), 'hidden_size')
-    heads = records.integer(hf.get('num_attention_heads', 12), 'num_attention_heads')
-    positions = records.integer(hf.get('max_position_embeddings', 2048), 'max_position_embeddings')
+    hidden = _records.integer(hf.get('hidden_size', 768), 'hidden_size')
+    heads = _records.integer(hf.get('num_attention_heads', 12), 'num_attention_heads')
+    positions = _records.integer(hf.get('max_position_embeddings', 2048), 'max_position_embeddings')
     used.update(('hidden_size', 'num_attention_heads', 'num_hidden_layers', 'ffn_dim',
                  'max_position_embeddings', 'do_layer_norm_before', 'word_embed_proj_dim',
                  'dropout', 'layerdrop', 'init_std', 'enable_bias', 'layer_norm_elementwise_affine',
@@ -36,19 +36,19 @@ def _opt_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         refuse('_remove_final_layer_norm', 'the pre-norm decoder ends with LayerNorm')
     if hf.get('layer_norm_elementwise_affine', True) is not True:
         refuse('layer_norm_elementwise_affine=False', 'the decoder LayerNorm carries scale and bias')
-    embedding = records.integer(hf.get('word_embed_proj_dim') or hidden, 'word_embed_proj_dim')
+    embedding = _records.integer(hf.get('word_embed_proj_dim') or hidden, 'word_embed_proj_dim')
     if embedding != hidden:
         refuse('word_embed_proj_dim', 'the embedding-to-decoder projections are not represented')
     if hf.get('layerdrop', 0):
         refuse('layerdrop', 'stochastic decoder-layer dropping is not represented')
-    activation = records.text(hf.get('activation_function', 'relu'), 'activation_function')
+    activation = _records.text(hf.get('activation_function', 'relu'), 'activation_function')
     mlp = ungated_mlp(activation, ('relu', 'gelu', 'gelu_new'), 'activation_function', 'OPT')
     return native_fields(CausalTransformer)(
-        vocab_size=records.integer(hf.get('vocab_size', 50272), 'vocab_size'),
+        vocab_size=_records.integer(hf.get('vocab_size', 50272), 'vocab_size'),
         emb_features=hidden,
-        num_layers=records.integer(hf.get('num_hidden_layers', 12), 'num_hidden_layers'),
+        num_layers=_records.integer(hf.get('num_hidden_layers', 12), 'num_hidden_layers'),
         num_heads=heads, num_kv_heads=heads, head_dim=hidden // heads,
-        mlp_features=records.integer(hf.get('ffn_dim', 3072), 'ffn_dim'),
+        mlp_features=_records.integer(hf.get('ffn_dim', 3072), 'ffn_dim'),
         mlp=mlp, mlp_bias=bool(hf.get('enable_bias', True)),
         norm_type='layer', norm_bias=True, norm_eps=1e-5,
         qk_norm=False, attention_bias=bool(hf.get('enable_bias', True)),
@@ -56,8 +56,8 @@ def _opt_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         max_seq_len=context_lengths(hf, 2048)[0],
         position_embedding_offset=2,
         tie_embeddings=bool(hf.get('tie_word_embeddings', True)),
-        dropout_rate=records.number(hf.get('dropout', .1), 'dropout'),
-        attention_dropout_rate=records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
+        dropout_rate=_records.number(hf.get('dropout', .1), 'dropout'),
+        attention_dropout_rate=_records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
     )
 
 

@@ -348,7 +348,7 @@ tree = manager.restore(step, args=ocp.args.PyTreeRestore())
 custom = manager.metadata(step).custom_metadata
 ```
 
-`tree` holds, by name, the train-state fields a checkpoint persists (`dew.training.state.CHECKPOINTED`) and, when the data iterator reported one, `position`; Orbax returns `key` as a typed PRNG key. Two things in it are Dew's encodings, each named in `custom`:
+`tree` holds, by name, the train-state fields a checkpoint persists (`dew.state.CHECKPOINTED`) and, when the data iterator reported one, `position`; Orbax returns `key` as a typed PRNG key. Two things in it are Dew's encodings, each named in `custom`:
 
 - An EMA leaf whose path `custom["ema_deltas"]` lists holds byte planes (above): the average's bits are its weight's bits XOR the planes' bytes, plane `k` shifted left by `8 * k`, read as unsigned integers of the weight's width.
 - A collection of the variables or the EMA other than `params` lives in the run's `frozen/` store, one Orbax PyTree checkpoint per content digest; `custom["frozen"]` maps each tree's collection names to their digests, and `ocp.PyTreeCheckpointer().restore(directory / "frozen" / digest)` reads one.

@@ -32,6 +32,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, get_args, runtime_checkable
 
 import grain.python as pygrain
 
+from dew._records import json_value, record
 from dew.data.dataset import Records, SourceSlice
 from dew.data.pipeline import (
     TOKEN_FIELDS,
@@ -76,7 +77,6 @@ from dew.data.plan import Manifest, StepIdentity, _changed, _semantic, identifie
 from dew.data.sources.base import READS, SAME_ROWS, Read, Source, View, _consumed, beneath, materialized
 from dew.data.sources.concatenate import Concatenate
 from dew.data.sources.memory import Memory
-from dew.records import json_value, record
 
 if TYPE_CHECKING:
     from dew.data.generation import Generation

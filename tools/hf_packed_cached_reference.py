@@ -76,8 +76,8 @@ def cached(net, ids: np.ndarray) -> torch.Tensor:
 
 
 def main():
-    from torch_precision import float64
     from reference_source import saved_fixture
+    from torch_precision import float64
 
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)

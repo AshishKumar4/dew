@@ -10,14 +10,15 @@ from typing import Annotated
 import pytest
 from diffusion_support import images_of
 
-from dew.config import RunConfig, ScheduleSpec
+from dew.config import RunConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.config.jepa import JepaRunConfig
 from dew.config.lm import LMRunConfig
 from dew.data import Files
-from dew.data.dataset import Loader, record_argument
+from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow
-from dew.registry import import_path
+from dew.optim import ScheduleSpec
+from dew.registry import import_path, record_argument
 from dew.sampling import Heun
 from dew.training import MeshSpec
 
@@ -195,8 +196,9 @@ def test_a_jepa_run_without_probes_trains_and_validates_its_loss(tmp_path, size)
     square images and over images twice as tall as they are wide, whose patch grid is as tall."""
     import numpy as np
 
-    from dew.config import ModelConfig, TrainerConfig
+    from dew.config import TrainerConfig
     from dew.data import TFDS, Loading, images, presets
+    from dew.registry import ModelConfig
 
     root = REPO_ROOT / "tests" / "fixtures" / "tfds" / "dew_images" / "1.0.0"
     pictures = TFDS("dew_images", path=str(root), split="all")
@@ -230,10 +232,11 @@ def test_a_jepa_run_trains_its_lora_factors_and_ramps_their_momentum_over_its_up
     import jax
     import numpy as np
 
-    from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
+    from dew.config import ObjectiveConfig, TrainerConfig
     from dew.data import TFDS, Loading, presets
     from dew.lora import LoRA
     from dew.objectives.base import FROZEN
+    from dew.registry import ModelConfig
 
     images = TFDS("dew_images", path=str(REPO_ROOT / "tests" / "fixtures" / "tfds" / "dew_images" / "1.0.0"),
                   split="all")

@@ -9,9 +9,9 @@ import optax
 from flax import struct
 from flax.training.dynamic_scale import DynamicScale
 
-from dew.objectives.base import FROZEN, Batch, Variables, merge
+from dew.batch import FROZEN, Batch, Variables, merge
 
-__all__ = ["CHECKPOINTED", "MODEL_STATE", "Accumulation", "TrainState", "Variables"]
+__all__ = ["CHECKPOINTED", "MODEL_STATE", "Accumulation", "TrainState"]
 
 
 @struct.dataclass

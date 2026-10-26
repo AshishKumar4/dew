@@ -353,10 +353,10 @@ def test_cache_refuses_a_stochastic_prefix():
 
 
 def test_iterate_and_validation_read_a_published_generation_as_its_accepted_rows():
+    from dew.batch import VALID_ROWS
     from dew.data.compile import iterate, publish, validation
     from dew.data.dataset import DataPartition
     from dew.data.pipeline import Pipeline
-    from dew.objectives.base import VALID_ROWS
 
     source = Memory([{"id": index} for index in range(8)])
     even = Pipeline(source).filter(lambda row: row["id"] % 2 == 0, identity="even@1")
@@ -1177,13 +1177,13 @@ def test_a_fill_whose_spool_drops_its_last_shard_reads_on_and_publishes_nothing(
 
 
 def test_a_streamed_generation_serves_its_files_at_another_mount(tmp_path):
-    """A streamed generation names its inputs by the shards of the files where they were filled;
-    the same files mounted elsewhere are the same key, whose shards run their steps and write
-    nothing, so the key holds its inputs under the first mount's names alone and a packing plan
-    publishes onto it there."""
+    """A streamed fill names its inputs by their files' places, which the same files mounted elsewhere
+    keep: a cached read at the second mount finds every input the first filled and runs no step, its
+    pieces the chain's own there, and a packing plan publishes onto the generation."""
     import shutil
 
     from dew.data.compile import iterate, publish
+    from dew.data.dataset import Loading
     from dew.data.pipeline import Pipeline
     from dew.data.sources import Files
     from dew.data.text import Chunks, Tokenize
@@ -1192,16 +1192,26 @@ def test_a_streamed_generation_serves_its_files_at_another_mount(tmp_path):
     first.mkdir()
     (first / "rows.jsonl").write_text("".join(json.dumps({"text": "x" * size}) + "\n" for size in (2, 5, 7)))
     shutil.copytree(first, second)
+    tokenized = []
+
+    def counted(row):
+        tokenized.append(row["text"])
+        return row
 
     def chunked(mount):
-        return Pipeline(Files(str(mount / "rows.jsonl"))).map(Tokenize()).flat_map(Chunks(4))
+        return (Pipeline(Files(str(mount / "rows.jsonl"))).map(counted, identity="counted@1").map(Tokenize())
+                .flat_map(Chunks(4)))
 
     def pieces(pipeline):
-        return sorted(row["text"].tolist() for row in iterate(pipeline, read="streamed"))
+        read = iterate(pipeline, read="streamed", loading=Loading(workers=0, threads=1, read_buffer=1))
+        return sorted(row["text"].tolist() for row in read)
 
     cache = Cache(str(tmp_path / "cache"))
     generation = publish(chunked(first), cache, read="streamed")
-    assert pieces(chunked(second).cache(cache)) == pieces(chunked(second))
+    filled = len(tokenized)
+    cached = pieces(chunked(second).cache(cache))
+    assert len(tokenized) == filled
+    assert cached == pieces(chunked(second))
     assert publish(chunked(first).pack(4, bins=2), cache, read="streamed").url != generation.url
 
 
@@ -1688,10 +1698,10 @@ def test_stacked_holdouts_over_a_generation_pick_the_inputs_they_pick_uncached(o
         assert held_out(_tagged(part).cache(generation)) == held_out(_tagged(part))
 
 
-def test_a_generation_a_stream_filled_from_files_mounted_elsewhere_is_refused_under_a_holdout(tmp_path):
-    """The same files mounted at another path read as the store the generation was published from, but
-    a stream names its inputs by where it read their shards, so under a holdout the generation can't
-    place them there, and is refused rather than read as no rows; at its own mount it serves."""
+def test_a_generation_a_stream_filled_from_files_mounted_elsewhere_serves_under_a_holdout(tmp_path):
+    """The same files mounted at another path read as the store the generation was published from, and
+    a stream names its inputs by their files' places, which they keep there: under a holdout the
+    generation serves each part the rows the chain reads uncached, at either mount."""
     import shutil
 
     import pyarrow as pa
@@ -1706,11 +1716,29 @@ def test_a_generation_a_stream_filled_from_files_mounted_elsewhere_is_refused_un
     shutil.copytree(tmp_path / "a", tmp_path / "b")
     generation = publish(_tagged(Pipeline(Files(str(tmp_path / "a"), format="parquet"))), _cache(),
                          read="streamed")
-    here, _ = Pipeline(Files(str(tmp_path / "a"), format="parquet")).holdout(0.25)
-    assert _tags(_tagged(here).cache(generation), "streamed") == _tags(_tagged(here), "streamed")
-    elsewhere, _ = Pipeline(Files(str(tmp_path / "b"), format="parquet")).holdout(0.25)
+    for mount in ("a", "b"):
+        part, _ = Pipeline(Files(str(tmp_path / mount), format="parquet")).holdout(0.25)
+        assert _tags(_tagged(part).cache(generation), "streamed") == _tags(_tagged(part), "streamed")
+
+
+def test_a_generation_written_under_the_earlier_schema_is_refused_as_stale(tmp_path):
+    """A cache generation written under the schema before inputs were named by their files' places is
+    refused rather than read under names it was not written with, where the same manifest under the
+    current schema reads."""
+    from dew.data.compile import publish
+    from dew.data.generation import Generation
+    from dew.data.pipeline import Pipeline
+
+    cache = Cache(str(tmp_path / "cache"))
+    generation = publish(Pipeline(Memory([{"id": index} for index in range(8)], shard_rows=4)), cache,
+                         read="streamed")
+    (manifest,) = (tmp_path / "cache").rglob("generations/*/manifest.json")
+    current = json.loads(manifest.read_bytes())
+    assert Generation(generation.url, {}, None).manifest == current
+    manifest.unlink()
+    manifest.write_bytes(json.dumps({**current, "schema": 1}).encode())
     with pytest.raises(ValueError):
-        _tags(_tagged(elsewhere).cache(generation), "streamed")
+        _ = Generation(generation.url, {}, None).manifest
 
 
 def test_a_generation_a_memory_read_filled_from_unindexed_files_serves_hash_and_records_holdouts(tmp_path):

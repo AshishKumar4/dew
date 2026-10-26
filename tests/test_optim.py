@@ -22,7 +22,6 @@ from model_support import largest_difference
 from optim_support import LR, decoder_params, drawn_tree
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations, without_ynn
 
-from dew.config import OptimConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
 from dew.optim import (
@@ -31,6 +30,7 @@ from dew.optim import (
     Exponential,
     Linear,
     OneCycle,
+    OptimConfig,
     Optimizer,
     ParamGroup,
     Power,
@@ -758,7 +758,8 @@ def test_the_sow_reports_the_kernels_logits():
 def test_policy_steps_carry_live_qk_statistics_to_muonclip(kind):
     from flax import linen as nn
 
-    from dew.objectives.base import Step, part
+    from dew.batch import part
+    from dew.objectives.base import Step
     from dew.objectives.rl import DPOObjective, GRPOObjective, PPOObjective
     from dew.training import Trainer
     from dew.training.transaction import compact_qk
