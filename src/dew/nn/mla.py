@@ -93,6 +93,10 @@ INDEXER_COLLECTION = 'indexer'
 """The collection an attention layer sows its per-query indexer KL under
 when a caller opens it, as the LM objective does to train the indexer."""
 
+SELECTIONS = 'selections'
+"""The collection a lightning indexer sows its heads' agreements before their relu under when a caller
+opens it (`IndexerFront.scored`), as a selection's margin does to read how near a tie each key sits."""
+
 INDEXER_EPS = 1e-8
 """MaxText's `EPS` (src/maxtext/utils/globals.py at 538fe7a3), which its
 `calculate_indexer_loss` adds to the target's normaliser and inside both
@@ -176,17 +180,15 @@ class IndexerFront:
         batch, length = q_resid.shape[:2]
         return self.wq_b(jax.lax.stop_gradient(q_resid)).reshape(batch, length, self.n_heads, self.head_dim)
 
-    def agreements(self, query, keys):
-        """Each head's agreement of `query` with `keys` before its relu `[B, S, H, T]`
-        (`index_agreements`): how near zero a key every head disagrees with sits, which a selection's
-        margin reads."""
-        return index_agreements(query, keys, self.precision)
-
     def scored(self, query, keys, hidden):
-        """`query`'s scores against `keys` `[B, S, T]`, its heads' agreements weighted by
-        `weights_proj` of the detached `hidden` (`index_scores`)."""
-        return index_scores(self.agreements(query, keys), self.weights_proj(jax.lax.stop_gradient(hidden)),
-                            self.head_dim, self.precision)
+        """`query`'s scores against `keys` `[B, S, T]`, its heads' agreements (`index_agreements`)
+        weighted by `weights_proj` of the detached `hidden` (`index_scores`). The agreements are sown
+        into the `selections` collection, which only a caller that asks for it keeps: how near zero a
+        key every head disagrees with sits, which a selection's margin reads."""
+        agreements = index_agreements(query, keys, self.precision)
+        self.sow(SELECTIONS, "agreements", agreements)
+        return index_scores(agreements, self.weights_proj(jax.lax.stop_gradient(hidden)), self.head_dim,
+                            self.precision)
 
 
 @logical_axes({
