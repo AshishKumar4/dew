@@ -930,7 +930,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         it as `holds` do, and its options cover them. `step` are the XLA options of the training step
         the program is part of (`dew.training.memory.step_compiler_options`), beside its modules' own,
         so a host step's programs compile as the resident step does. Keep only the current
-        specialization, not a history of old models or steps.
+        specialization, not a history of old models or steps. The cache is the objective's, so its
+        programs live as long as it does: the process-wide seam every other outer program shares
+        (`dew.nn.kernels.options.program`) would keep each objective alive with them.
         """
         programs = tuple((program.module, (program.head_tile, program.head_fused))
                          for program in self.program_key())

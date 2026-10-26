@@ -20,6 +20,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   them; a prefix page is shared only between prompts that agree on their groups and their tokens up to
   the last grouped one. Disk banks read a
   family whose packed tensors split into views of themselves, fused experts among them.
+- Every outer program Dew compiles goes through one seam (`dew.nn.kernels.options.program`): an image
+  task's encode, noise and solver start, a bank's stacking, an autoencoder's encode and decode, LPIPS's
+  and FID's networks and a host step's unstack, so two loads of one module share its programs. The seam
+  holds placement trees by their structure and leaves. An objective's own programs and the serving
+  kernel's donated step programs stay apart, as their docstrings say.
 - The library holds no CPU-only algorithm (bible §5): a vocabulary row's fused logsumexp is one
   plain pass on every platform, which Dew's CPU test setting takes in float64 and rounds once
   (`dew.nn.precision.widened_reduction`, beside `accumulated`), in place of a CPU-only blocked
@@ -29,6 +34,23 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   runs timed apart may still keep different plans), and a resumed run continues its checkpoint's plan
   untimed. Dew's tests keep a frontier's first plan (`DEW_UNTIMED_FRONTIER`, a test setting like
   `DEW_WIDE_CPU_ARITHMETIC`).
+- Gemma 4 Unified (`google/gemma-4-12B`, `model_type` `gemma4_unified`) loads as a native media wrapper:
+  its encoder-free vision patches and raw audio frames project into the Gemma 4 decoder, either medium
+  optional, and every attention kind reads each vision block whole. Its model FLOPs count its language
+  model, as a vision projector's work is left out; a wrapper with an audio encoder refuses the count.
+  A Gemma 4 audio clip's placeholders now read their valid frames by index, so a clip with masked frames
+  between valid ones maps each placeholder to its own frame.
+- `WeightLayout.source_array` assembles a source tensor in JAX at its compute dtype, traceable, as
+  `export` lays it out; `export` keeps the host copy and the stored dtype.
+- `record_case` takes no proxy: the recorded reference alone then sizes the count.
+- `SafetensorsBanks` streams a media wrapper's language model and the native backbone of a decision
+  release whose readout is stored apart (a slot release), besides a decoder: it reads the source through
+  `dew.interop.pretrained.native_backbone`, `Pretrained.load`'s own translation and tree check over the
+  safetensors alone. A wrapper's towers and projectors are read whole and stay resident. A config that
+  states `expert_dtype` without a quantization config is no longer refused.
+- `tools/slot_runtime_qualification.py` qualifies a released slot runtime against the authors' engine and
+  its float64 truth, the truth's weights streamed from those banks: phases pool, native, environment,
+  author, truth (`--partial` resumes a stopped phase) and verdict, one checkout's commit across them.
 - A loaded decoder's pad row takes no gradient wherever its source's table pads it. Kimi Linear, Kimi K3,
   Ouro, Dream, LLaDA-MoE and LLaDA2 now pad `pad_token_id` as their released code does, at their config
   class's own default where a config states none; Dew trained that row before. Qwen 3.5's wrappers load
