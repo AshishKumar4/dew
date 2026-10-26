@@ -561,6 +561,8 @@ def test_the_timer_steps_the_state_it_was_given_and_hands_back_a_fresh_copy():
 def test_a_run_trains_on_from_the_state_its_plan_timed(monkeypatch, tmp_path):
     """Under `fit`, a frontier is timed on the run's own state, and the run
     trains on from a fresh copy of it: the timed steps count for nothing."""
+    # The frontier timed, as the library times it: Dew's tests keep its first plan otherwise.
+    monkeypatch.delenv(UNTIMED_FRONTIER)
     corpus, whole = token_files(tmp_path), windowed(tmp_path / "whole", 1)
     free(monkeypatch, needs(monkeypatch, whole, lambda: whole.fit(windows(corpus), steps=1,
                                                                   checkpoint_every=None)) - 1)
