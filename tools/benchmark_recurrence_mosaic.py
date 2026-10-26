@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
 """The recurrence template's Mosaic GPU forward (`chunk(..., mainloop='mosaic')`, the device's family's
 bundle) against the chunked op's port (fla's kernels, `generation.chosen(gated_delta_rule='fla')`) and the
-portable math in XLA (`ported=False`), at the scoreboard's delta-rule shapes (`benchmark_recurrence.SHAPES`),
-on the same operands: device milliseconds by CUPTI (every kernel of a call summed, the median of `--repeats`
-calls after `--warmup`) and the heaviest kernels, and memory: the compiled program's arguments, outputs and
-temporaries, and the device's peak in use. The forward, or with `--pass training` the forward and its
-gradient under a fixed cotangent (the template's fast backward, the port's, XLA's). One arm a process
+portable math in XLA (`generation.chosen`'s 'xla'), at the scoreboard's delta-rule shapes
+(`benchmark_recurrence.SHAPES`), on the same operands: device milliseconds by CUPTI (every kernel of a call
+summed, the median of `--repeats` calls after `--warmup`) and the heaviest kernels, and memory: the compiled
+program's arguments, outputs and temporaries, and the device's peak in use. The forward, or with `--pass
+training` the forward and its gradient under a fixed cotangent (the template's fast backward, the port's,
+XLA's). One arm a process
 (`--arm`), so the device's peak is its own; one JSON line an arm, pass and shape.
 
 With `--profile DIR` the arms named (`--arm mosaic,port`) run in one process under one capture of Dew's
@@ -39,8 +40,12 @@ DELTA = ('qwen3.5-27b-gdn', 'qwen3-next-gdn', 'kimi-linear-kda')
 """The delta-rule shapes the template's forward takes: a decay a head (Qwen3.5-27B's and Qwen3-Next's
 gated delta nets) and a key dimension's (Kimi Linear's)."""
 
-ROUTES = {'mosaic': {'mainloop': 'mosaic'}, 'port': {}, 'xla': {'ported': False}}
-"""Each arm's route through the chunked op; the port's under `generation.chosen(gated_delta_rule='fla')`."""
+ROUTES = {'mosaic': {'mainloop': 'mosaic'}, 'port': {}, 'xla': {}}
+"""Each arm's route through the chunked op; the port's and the portable math's under
+`generation.chosen(gated_delta_rule=...)` (`NAMED`)."""
+
+NAMED = {'port': 'fla', 'xla': 'xla'}
+"""The kernel each arm names to the delta rule's selector."""
 
 
 KERNELS = 40
@@ -92,8 +97,8 @@ def compiled_arm(name: str, arm: str, dtype, training: bool = False):
 
     timed = trained if training else forward
     timed.__name__ = f"{'trained' if training else 'forward'}_{arm}"
-    if arm == 'port':
-        with generation.chosen(gated_delta_rule='fla'):
+    if arm in NAMED:
+        with generation.chosen(gated_delta_rule=NAMED[arm]):
             return jax.jit(timed).lower(*args).compile(), args
     return jax.jit(timed).lower(*args).compile(), args
 

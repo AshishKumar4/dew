@@ -11,11 +11,11 @@ import jax
 import jax.numpy as jnp
 import pytest
 from reference_error import assert_as_exact, with_gradients
-from test_recurrence_chunk import token_by_token
+from test_recurrence_chunk import chunk_on, token_by_token
 from test_recurrence_mosaic import DTYPES, SEEDS, SHAPES, draw, geometry, interpreted, on_the_mainloop
 
 from dew.nn.kernels import recurrence
-from dew.nn.kernels.recurrence_chunk import Chunk, chunk, recomputing
+from dew.nn.kernels.recurrence_chunk import Chunk, recomputing
 
 pytestmark = pytest.mark.kernel
 
@@ -71,7 +71,7 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
         return jax.jit(traced)
 
     truth = jax.jit(with_gradients(restarted(functools.partial(token_by_token, hooks), case)))
-    reference = truth if dtype == jnp.float32 else compiled(functools.partial(chunk, hooks, ported=True))
+    reference = truth if dtype == jnp.float32 else compiled(functools.partial(chunk_on, 'fla', hooks))
     on = on_the_mainloop(hooks, case, dtype)
     if on is None:
         return

@@ -19,7 +19,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference, float64_forward
-from test_recurrence_chunk import FORMED, HOOKS, SEEDS as HOOK_SEEDS, draw as hooked_draw, token_by_token
+from test_recurrence_chunk import (
+    FORMED,
+    HOOKS,
+    SEEDS as HOOK_SEEDS,
+    chunk_on,
+    draw as hooked_draw,
+    token_by_token,
+)
 
 from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk, mosaic_rule
@@ -204,7 +211,7 @@ def test_the_mosaic_forward_is_as_exact_as_its_reference(case, dtype):
         return
     dew = jax.jit(on)
     truth = jax.jit(functools.partial(token_by_token, hooks))
-    reference = truth if dtype == jnp.float32 else jax.jit(functools.partial(chunk, hooks, ported=True))
+    reference = truth if dtype == jnp.float32 else jax.jit(functools.partial(chunk_on, 'fla', hooks))
     assert_as_exact(dew, reference, functools.partial(draw, dtype, **geometry(case)),
                     f'the mosaic forward, {case} in {jnp.dtype(dtype).name}', seeds=SEEDS, truth_fn=truth)
 
@@ -259,7 +266,7 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles_as_exact_as_its_referen
                            family=mainloop.FAMILIES['mma.sync'])
 
     truth = jax.jit(functools.partial(token_by_token, hooks))
-    reference = truth if dtype == jnp.float32 else jax.jit(functools.partial(chunk, hooks, ported=True))
+    reference = truth if dtype == jnp.float32 else jax.jit(functools.partial(chunk_on, 'fla', hooks))
     # Each variant: its value block and stages change which program computes a value column.
     for tiles in variants:
         assert_as_exact(jax.jit(functools.partial(dew, tiles=tiles)), reference,
