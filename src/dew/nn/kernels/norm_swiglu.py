@@ -770,8 +770,8 @@ def stream_rms_norm(x, branch, scale, epsilon: float, dtype, offset: bool, after
     scale)` its arithmetic in XLA. The forward reads both addends once and writes the sum beside the norm;
     the reverse takes the stream's own cotangent into the norm's pass, so the sum of the two gradients is
     never a separate pass over the stream; an output nothing reads still gives the reverse a cotangent
-    of zeros, which `linear_call`'s transpose instantiates, and a pre-norm seam reads both. A None
-    branch is `rms_norm`'s, the stream `x` itself. It
+    of zeros, which the linear map's transpose instantiates (`generation.linear_map`), and a pre-norm
+    seam reads both. A None branch is `rms_norm`'s, the stream `x` itself. It
     interprets where no Triton GPU runs it (`generation.triton_runs`), as the CPU suite calls it, and
     lowers for the assumed GPU within `generation.assumed`, as the GDN kernels decide. Every order of
     derivative goes through `portable` and each level's value through the kernels

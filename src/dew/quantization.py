@@ -63,7 +63,7 @@ from flax import core, linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.cache import QUANTIZED_TRACE
-from dew.nn.kernels.generation import backend
+from dew.nn.kernels.generation import backend, linear_map
 from dew.nn.precision import accumulated, bf16_dot_general, correctly_rounded_divide
 
 if TYPE_CHECKING:
@@ -370,12 +370,10 @@ def frozen_fp8_product(x: jax.Array, forward: jax.Array, forward_scale: jax.Arra
 @frozen_fp8_product.defjvp
 def _frozen_fp8_tangent(primals, tangents):
     """The product's tangent along `x`'s, the packed leaves frozen whatever their tangents: the
-    direction times the decoded forward rows in float32 at the highest precision, a linear call whose
-    transpose is the FP8 input gradient, in `x`'s dtype. Its residuals are the packed leaves and an
-    empty array of `x`'s dtype, all a backward reads, so a staged pullback, a remat or a scan keeps
-    no copy of `x`."""
-    from jax.custom_derivatives import linear_call
-
+    direction times the decoded forward rows in float32 at the highest precision, a linear map whose
+    transpose is the FP8 input gradient, in `x`'s dtype (`generation.linear_map`). Its residuals are
+    the packed leaves and an empty array of `x`'s dtype, all a backward reads, so a staged pullback, a
+    remat or a scan keeps no copy of `x`."""
     x, forward, forward_scale, dgrad, dgrad_scale = primals
 
     def tangent(residuals, direction):
@@ -390,7 +388,7 @@ def _frozen_fp8_tangent(primals, tangents):
         return _fp8_rows(cotangent, rows, row_scales).astype(like.dtype)
 
     residuals = (forward, forward_scale, dgrad, dgrad_scale, jnp.zeros((0,), x.dtype))
-    return frozen_fp8_product(*primals), linear_call(tangent, transposed, residuals, tangents[0])
+    return frozen_fp8_product(*primals), linear_map(tangent, transposed, residuals, tangents[0])
 
 
 def frozen_fp8_dense(module: nn.Module, inputs: jax.Array) -> jax.Array:
