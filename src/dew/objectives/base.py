@@ -44,7 +44,7 @@ from typing_extensions import TypeIs, TypeVar
 from dew._distributions import counter_key
 from dew._records import JSON
 from dew.artifacts import Artifact, Artifacts, TokenScores
-from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, everything, part
+from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, dicts, everything, part
 from dew.nn import categorical
 from dew.nn.kernels.options import Option, compiler_options
 from dew.nn.precision import accumulated, at_least_fp32, compensated_sum, weighted_total
@@ -721,7 +721,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         The constructor keeps the model as `model`, the module the objective
         trains, which `program_key` names by default. A loaded task's tree, its
         projections packed for serving, is held as the model's own tree
-        (`dew.inference.projections.unpacked`).
+        (`dew.inference.projections.unpacked`), and a tree of Flax `FrozenDict`s
+        (a loaded task's) as dicts (`dew.batch.dicts`).
         """
         from dew.inference.projections import unpacked
 
@@ -731,7 +732,8 @@ class Objective(ABC, Generic[Loss, Effects]):
             model = source.model
         else:
             model = source
-        self.variables = None if variables is OMITTED or variables is None else unpacked(model, variables)
+        self.variables = None if variables is OMITTED or variables is None else dicts(
+            unpacked(model, variables))
         self.processor = None if processor is OMITTED else processor
         return model
 
