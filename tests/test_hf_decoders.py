@@ -1575,3 +1575,11 @@ def test_a_qwen_config_without_a_window_bound_windows_the_layers_transformers_wi
                     for kind in model.per_layer_types)
     assert windows == tuple(expected)
     assert windows.count("sliding_attention") == 4
+
+
+def test_a_config_of_a_type_transformers_lacks_reads_its_layers_by_its_familys_convention():
+    """Dream (no transformers class) reads by Qwen2's convention, whose class takes a null head_dim
+    as Dream's own config does: the record is the one without it."""
+    config = json.loads((FIXTURES / "dream-tiny" / "config.json").read_text())
+    assert translate_config({**config, "head_dim": None}) == translate_config(
+        {name: value for name, value in config.items() if name != "head_dim"})
