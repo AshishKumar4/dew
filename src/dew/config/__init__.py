@@ -67,8 +67,8 @@ from dew.optim import (
     ScheduleBase,
     param_labels,
     power_profiles,
-    scaled,
-    scaled_solver,
+    rates_of,
+    scheduled_solver,
     weight_decay_mask,
 )
 from dew.quantization import InputQuantization, Quantization
@@ -540,8 +540,8 @@ class OptimConfig:
         none) times its multiplier, with its own weight decay, `b1` schedule and bounds
         (`ParamGroup.solver`); the global-norm clip still reads every gradient
         together, before the groups split them. Each solver holds its rate's
-        scale in its state (`dew.optim.scaled_solver`), so runs at
-        rates of one schedule's shape compile one step.
+        fields in its state (`dew.optim.scheduled_solver`), so runs at
+        rates of one schedule's timings compile one step.
         """
         opts = dict(self.optimizer_opts)
         if {'b1', 'b2'} & opts.keys():
@@ -571,7 +571,7 @@ class OptimConfig:
         else:
             if self.optimizer not in ('muon', 'muonclip'):
                 opts['mask'] = weight_decay_mask
-            solver = scaled_solver(make, *scaled(self.learning_rate), steps, opts)
+            solver = scheduled_solver(make, self.learning_rate, steps, opts)
 
         if self.clip_grads > 0:
             solver = optax.chain(optax.clip_by_global_norm(self.clip_grads), solver)
@@ -583,15 +583,15 @@ class OptimConfig:
             solver = power_profiles(solver, self.ema_profiles)
         return solver
 
-    def rate_scales(self) -> dict[str | None, float]:
-        """The rate scale each of `build`'s solvers holds in its state
-        (`dew.optim.scaled_solver`), by param group, or under None
+    def rates(self) -> dict[str | None, dict[str, float]]:
+        """The rate fields each of `build`'s solvers holds in its state
+        (`dew.optim.scheduled_solver`), by param group, or under None
         for the one solver of a config without groups. A resumed run sets
-        them over its checkpoint's (`with_rate_scales`), so the configured
+        them over its checkpoint's (`with_rates`), so the configured
         rate is the one it steps at."""
         if not self.param_groups:
-            return {None: scaled(self.learning_rate)[0]}
-        return {group.name: group.learning_rate(self.learning_rate)[0] for group in self.param_groups}
+            return {None: rates_of(self.learning_rate)}
+        return {group.name: group.rates(self.learning_rate) for group in self.param_groups}
 
 
 @dataclasses.dataclass(frozen=True)
