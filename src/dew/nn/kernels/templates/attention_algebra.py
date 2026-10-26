@@ -114,8 +114,11 @@ class Forward:
     @property
     def guarded(self) -> bool:
         """Whether a query can see no key, so its maxima and denominators need the empty row's guard: a
-        call of no keys, one whose spans narrow, or one a score hook may mask."""
-        return self.keys == 0 or self.form == "spans" or self.score_mod is not None
+        call of no keys, one whose spans narrow, one a score hook may mask, or one walked past its `queries`,
+        whose padding rows see none (their weights otherwise NaN, which a mainloop rerunning overflowed rows
+        would rerun, `walked_launches`)."""
+        return (self.keys == 0 or self.form == "spans" or self.score_mod is not None
+                or self.queries is not None)
 
     def power(self, x: jax.Array) -> jax.Array:
         """The exponential the logits are in: exp2 folded, the raw form's scaled difference, `natural_exp`
