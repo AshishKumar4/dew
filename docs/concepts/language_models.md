@@ -216,7 +216,13 @@ With gradient accumulation, the cross-entropy and multi-token-prediction (MTP) l
 `prefix` trains a prefix run. Each document's first `prefix` tokens, an int, or its tokens before the first assistant token, `"prompt"`, form one block. A layer that reads blocks whole (`AttentionMixer(bidirectional_blocks=True)` on one of the model's layer kinds) lets each token of the block see the block's later tokens too, and every other token stays causal. The loss scores no target inside its source's block, since the source would read that target off; each other target counts as usual.
 
 ```python
-LMObjective(decoder, seq_len=1024, prefix=64)  # or prefix="prompt" on chat rows
+from dew.nn.mixers import AttentionMixer
+
+# The example's decoder with its one layer kind reading blocks whole.
+prefixed = CausalTransformer(vocab_size=tokenizer.vocab_size, emb_features=64, num_layers=2, num_heads=2,
+                             mlp_features=256, max_seq_len=128, layer_types=("full_attention",) * 2,
+                             kinds={"full_attention": {"mixer": AttentionMixer(bidirectional_blocks=True)}})
+prefix_objective = LMObjective(prefixed, seq_len=64, prefix=16)  # or prefix="prompt" on chat rows
 ```
 
 On the recipe, `--objective.prefix 64` or `--objective.prefix prompt`. The model's trunk must read blocks in at least one layer kind; a prediction depth's kind does not count. The run refuses a prefix longer than `seq_len`, and `mtp_weight`, because a prediction depth's layers read blocks beyond their own source and the exclusion does not cover them. A layer kind's attention chunk (`LayerKind.chunk`) cuts a block wherever the block crosses one of its multiples, and a block's places start wherever its tokens sit in their document (a window that continues a document, or a prompt after cached tokens), so a chunk of any length can cut one. The loss would drop targets that layer never saw, so a prefix, and any batch's blocks, need a trunk layer that reads blocks with no chunk.
