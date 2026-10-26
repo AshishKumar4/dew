@@ -24,8 +24,8 @@ from dew.training import Checkpoints, Trainer
 
 VOCAB = 16
 FEATURES = 8
-LENGTH = 7
-ROWS = 3
+LENGTH = 12
+ROWS = 8
 LEVEL = ContinuumLevel(hidden=4)
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 
@@ -101,24 +101,31 @@ def equation_71(model, variables, hidden, targets, weights, documents, adaptatio
 
 
 def documents_of(*, packed: bool) -> np.ndarray:
-    """Each row's documents: one a row, or three rows packed differently, a document starting
-    inside a window's span of slots."""
+    """Each row's documents: one a row, or each row packed with documents of one to seven tokens,
+    their starts falling inside a window's span of slots."""
     if not packed:
         return np.zeros((ROWS, LENGTH), np.int32)
-    return np.asarray([[1, 1, 2, 2, 2, 2, 2], [1, 1, 1, 1, 1, 2, 3], [1, 2, 2, 2, 3, 3, 3]], np.int32)
+    rng = np.random.default_rng(0)
+    rows = []
+    for _ in range(ROWS):
+        lengths = []
+        while sum(lengths) < LENGTH:
+            lengths.append(int(rng.integers(1, 8)))
+        rows.append(np.repeat(np.arange(1, len(lengths) + 1), lengths)[:LENGTH])
+    return np.asarray(rows, np.int32)
 
 
 def draw(seed: int):
     """A draw's variables, final states, targets and weights, one of them zero."""
     rng = np.random.default_rng(seed)
     weights = rng.uniform(0.5, 1.5, (ROWS, LENGTH)).astype(np.float32)
-    weights[0, 3] = 0.0
+    weights[0, 3] = weights[5, 0] = 0.0
     return (drawn_variables(seed), rng.standard_normal((ROWS, LENGTH, FEATURES)).astype(np.float32),
             rng.integers(0, VOCAB, (ROWS, LENGTH)).astype(np.int32), weights)
 
 
 @pytest.mark.parametrize("packed", [False, True], ids=["documents", "packed"])
-@pytest.mark.parametrize(("window", "rate"), [(1, 0.5), (3, 0.5), (3, 0.0), (16, 0.5)])
+@pytest.mark.parametrize(("window", "rate"), [(1, 0.1), (3, 0.1), (3, 0.0), (32, 0.1)])
 def test_the_scan_steps_the_level_as_equation_71(*, packed, window, rate):
     """Each target's loss is equation 71's: its window read at the level stepped by every window of
     its document before it, on par with the literal loop (check 1), at a window of one token (online
@@ -142,7 +149,7 @@ def test_the_scan_steps_the_level_as_equation_71(*, packed, window, rate):
 def test_only_the_selected_parts_step():
     """A selection steps those parts of the level and holds the rest at their trained values: with
     `up` alone stepping, each loss is equation 71's with `down` fixed (check 1)."""
-    adaptation = ChunkAdaptation(window=2, rate=0.5, select=("up",))
+    adaptation = ChunkAdaptation(window=2, rate=0.1, select=("up",))
     documents = documents_of(packed=False)
 
     def dew(variables, hidden, targets, weights):
@@ -161,7 +168,7 @@ def test_training_differentiates_through_every_step(*, packed):
     and the states: the gradient of the weighted losses, second order through the steps, on par with
     the literal loop's (check 1)."""
     documents = documents_of(packed=packed)
-    adaptation = ChunkAdaptation(window=3, rate=0.5)
+    adaptation = ChunkAdaptation(window=3, rate=0.1)
     layout = (None, jnp.asarray(documents) if packed else None)
 
     def gradient_draw(seed):
