@@ -72,7 +72,7 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy as preserva
 from dew import _records, position
 from dew._coordination import broadcast_from_process_zero, from_every_process, seen_by_every_process
 from dew._hashing import fmix32
-from dew._records import JSON, duration, json_value, share
+from dew._records import JSON, duration, json_value, record, share
 from dew.batch import PARAMETER_ROOTS, Variables
 from dew.cleanup import attempted
 from dew.files import write_atomically
@@ -106,6 +106,9 @@ deleted. The step names it relative to the run directory, so a copied run
 still restores."""
 
 RUN_FILE = "run.json"
+COOLDOWN_FILE = "cooldown.json"
+"""The cooldown branch a run began at a step and has not finished (`Checkpoints.cooldown`), kept beside
+the step's checkpoint, which it outlives: a resume from that step runs it first."""
 """The one file at the root of every run directory, beside its steps, that
 makes it a run: what `dew.pipeline` looks for, locally and on the Hub, and
 what `dew.io.publish` ships with a step. A run built from a config holds the
@@ -1052,6 +1055,25 @@ class Checkpoints:
             root.mkdir(parents=True, exist_ok=True)
             record = {**PYTHON_RUN, "reasons": list(self._reasons)}
             write_atomically(root / RUN_FILE, json.dumps(record, indent=2, sort_keys=True))
+
+    def cooldown(self, step: int) -> Mapping[str, object] | None:
+        """The cooldown branch the run began at `step` and has not finished, as it was resolved there
+        (`dew.training.cooldown`); None where none is (`COOLDOWN_FILE`)."""
+        path = epath.Path(self.directory) / COOLDOWN_FILE
+        pending = record(json.loads(path.read_text()), COOLDOWN_FILE) if path.exists() else None
+        return pending if pending is not None and pending.get("step") == step else None
+
+    def cooling(self, pending: Mapping[str, object] | None) -> None:
+        """Keep `pending` as the cooldown branch the run has begun, or with None that it has none
+        unfinished; process zero writes it, beside the steps (`cooldown`)."""
+        if jax.process_index() != 0:
+            return
+        path = epath.Path(self.directory) / COOLDOWN_FILE
+        if pending is None:
+            path.unlink(missing_ok=True)
+            return
+        path.parent.mkdir(parents=True, exist_ok=True)
+        write_atomically(path, json.dumps(dict(pending), sort_keys=True))
 
     def artifact(self, step: int | str | None = None) -> JSON:
         """Return the selected step's inference declaration.

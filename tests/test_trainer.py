@@ -1310,11 +1310,38 @@ def test_a_cooldown_a_preemption_cuts_short_runs_again_on_resume(tmp_path):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 
+def test_a_cooldown_at_the_runs_last_step_a_preemption_cuts_short_runs_on_resume(tmp_path):
+    """A cooldown at the run's last step that a preemption cuts short stays pending beside the
+    checkpoints (`Checkpoints.cooldown`): the resume runs it, recording what an uninterrupted run
+    records, and completes the run, and a fit of the completed run runs nothing again."""
+    from dew.optim import Linear
+    from dew.training.cooldown import Cooldowns
+
+    stable, cooldowns = Linear(2.0 ** -4, decay_start=64, decay_steps=128), Cooldowns(at=(8,), length=4)
+    uninterrupted = RecordingTracker()
+    cooldown_run(stable, 8, 1, uninterrupted, cooldowns)
+    expected = {step: scalars["cooldown_val/loss"] for step, scalars in uninterrupted.scalars
+                if "cooldown_val/loss" in scalars}
+    assert list(expected) == [8]
+    optimizer = OptimConfig(optimizer="adamw", learning_rate=stable)
+    with pytest.raises(Preempted):
+        make_trainer(tmp_path, tracker=Preempting(7), optimizer=optimizer).fit(
+            dataset(val=val_batches(2)), steps=8, log_every=1, eval_every=8, cooldowns=cooldowns)
+    assert Checkpoints(str(tmp_path / "run")).cooldown(8) is not None
+    resumed, again = RecordingTracker(), RecordingTracker()
+    cooldown_run(stable, 8, 1, resumed, cooldowns, tmp_path)
+    assert {step: scalars["cooldown_val/loss"] for step, scalars in resumed.scalars
+            if "cooldown_val/loss" in scalars} == expected
+    assert Checkpoints(str(tmp_path / "run")).cooldown(8) is None
+    cooldown_run(stable, 8, 1, again, cooldowns, tmp_path)
+    assert not any("cooldown_val/loss" in scalars for _, scalars in again.scalars)
+
+
 def test_a_cooldown_resolves_its_points_and_lengths_as_shares_of_the_run():
     """A cooldown's point is a step or a share of the run, resolved as a cadence's is, and its length a
     step count or a share of the steps the run has taken; it decays as 1 - sqrt(u / U), or linearly."""
     from dew.training.cadence import Tokens
-    from dew.training.cooldown import Cooldowns
+    from dew.training.cooldown import Cooldowns, resolved
 
     cooldowns = Cooldowns(at=("25%", 6), length="50%")
     assert [branch.at for branch in cooldowns.branches(16, None, 1)] == [4, 6]
@@ -1325,21 +1352,23 @@ def test_a_cooldown_resolves_its_points_and_lengths_as_shares_of_the_run():
                                                                     1.0 - math.sqrt(0.75)]
     linear = Cooldowns(at=(4,), shape="linear")
     assert [linear.factor(update, 4) for update in range(4)] == [1.0, 0.75, 0.5, 0.25]
+    # A branch a run kept pending is refused where a resume's updates do not divide its steps.
+    with pytest.raises(ValueError):
+        resolved({"step": 4, "steps": 3, "shape": "linear"}, 2)
 
 
-@pytest.mark.parametrize("refused", ["unscored", "unheld", "computed", "inside", "ended"])
-def test_a_cooldown_a_run_could_not_score_decay_or_come_back_from_is_refused(refused):
+@pytest.mark.parametrize("refused", ["unscored", "unheld", "computed", "inside"])
+def test_a_cooldown_a_run_could_not_score_or_decay_is_refused(refused):
     """A run with no validation to score its branches, an optimizer whose state holds no learning rate
     (plain SGD) or one Optax computes from a step count at each update (an injected schedule function),
-    a point inside an update's window, and a point at the run's last step are each refused before the
-    run trains."""
+    and a point inside an update's window are each refused before the run trains."""
     from dew.training.cooldown import Cooldowns
 
     computed = optax.inject_hyperparams(optax.sgd)(learning_rate=optax.linear_schedule(0.1, 0.0, 8))
     optimizers = {"unheld": optax.sgd(0.1), "computed": computed}
     trainer = make_trainer(optimizer=optimizers.get(refused, OptimConfig()),
                            accumulation=2 if refused == "inside" else 1)
-    at = {"inside": 3, "ended": 8}.get(refused, 4)
+    at = 3 if refused == "inside" else 4
     with pytest.raises(ValueError):
         trainer.fit(dataset(val=val_batches(2)), steps=8, eval_every=None if refused == "unscored" else 8,
                     cooldowns=Cooldowns(at=(at,)))

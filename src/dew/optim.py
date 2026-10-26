@@ -1062,7 +1062,8 @@ def with_rates(opt_state: optax.OptState, rates: Mapping[str | None, Mapping[str
     `RateState`, or a constant in Optax's `learning_rate` hyperparameter. A solver an injected wrapper
     of the run's own holds is reached through the wrapper's inner state (`_rated`). Each keeps the old
     value's dtype and placement."""
-    def wanted(path: jax.tree_util.KeyPath, held: Mapping[str, jax.typing.ArrayLike]) -> Mapping[str, float]:
+    def wanted(path: jax.tree_util.KeyPath, held: Mapping[str, jax.typing.ArrayLike],
+               kind: str) -> Mapping[str, float]:
         return rates[next((entry.key for entry in path
                            if isinstance(entry, jax.tree_util.DictKey) and entry.key in rates), None)]
 
@@ -1074,7 +1075,7 @@ def held_rates(opt_state: optax.OptState) -> dict[jax.tree_util.KeyPath, dict[st
     (`_rated`): a schedule's rate-valued fields, or a constant under `CONSTANT`."""
     held: dict[jax.tree_util.KeyPath, dict[str, float]] = {}
 
-    def read(path: jax.tree_util.KeyPath, rates: Mapping[str, jax.typing.ArrayLike]) -> None:
+    def read(path: jax.tree_util.KeyPath, rates: Mapping[str, jax.typing.ArrayLike], kind: str) -> None:
         held[path] = {name: float(np.asarray(value)) for name, value in rates.items()}
 
     _rated(opt_state, read)
@@ -1087,40 +1088,35 @@ def scaled_rates(opt_state: optax.OptState, held: Mapping[jax.tree_util.KeyPath,
     was read (`held_rates`), of a state of the same optimizer: a schedule's values are proportional to
     its rate-valued fields (`ScheduleBase.values`), so its every value is the held one's times
     `factor`."""
-    return _rated(opt_state, lambda path, _: {name: value * factor for name, value in held[path].items()})
+    return _rated(opt_state, lambda path, *_: {name: value * factor for name, value in held[path].items()})
 
 
 def settable_rates(opt_state: optax.OptState) -> bool:
     """Whether `opt_state` holds a learning rate and every one it holds is one `with_rates` sets: a
     schedule's fields in its `RateState` or a constant, not a rate Optax computes from a step count
-    alone at each update (`optax.inject_hyperparams` of a schedule function)."""
-    found: list[bool] = []
+    alone at each update (`optax.inject_hyperparams` of a schedule function), read through `_rated`."""
+    kinds: list[str] = []
 
-    injected = optax.InjectStatefulHyperparamsState
+    def read(path: jax.tree_util.KeyPath, held: Mapping[str, jax.typing.ArrayLike], kind: str) -> None:
+        kinds.append(kind)
 
-    def walked(tree) -> None:
-        for node in jax.tree.leaves(tree, is_leaf=lambda node: isinstance(node, injected)):
-            if not isinstance(node, injected):
-                continue
-            walked(node.inner_state)
-            if 'learning_rate' in node.hyperparams:
-                schedule = node.hyperparams_states.get('learning_rate')
-                found.append(schedule is None or isinstance(schedule, RateState))
-
-    walked(opt_state)
-    return bool(found) and all(found)
+    _rated(opt_state, read)
+    return bool(kinds) and "computed" not in kinds
 
 
-type Wanted = Callable[[jax.tree_util.KeyPath, Mapping[str, jax.typing.ArrayLike]],
+type Wanted = Callable[[jax.tree_util.KeyPath, Mapping[str, jax.typing.ArrayLike], str],
                        Mapping[str, float] | None]
-"""What a solver at a path should hold of the learning rate it holds (`_rated`), None for what it holds."""
+"""What a solver at a path should hold of the learning rate it holds, of its kind (`_rated`), None for
+what it holds."""
 
 
 def _rated(opt_state: optax.OptState, wanted: Wanted) -> optax.OptState:
     """`opt_state` with each injected solver's learning rate set to what `wanted` gives for the solver's
-    path and the rate it holds: a schedule's rate-valued fields in its `RateState`, or a constant's own
-    value under `CONSTANT`, None leaving it as it is. A solver an injected wrapper holds is reached
-    through the wrapper's inner state. Each keeps the old value's dtype and placement."""
+    path, the rate it holds and its kind: `scheduled`, a schedule's rate-valued fields in its
+    `RateState`; `constant`, a constant's own value under `CONSTANT`; or `computed`, the value Optax
+    computed at the last update from a schedule function, which it computes again at the next. None
+    leaves it as it is. A solver an injected wrapper holds is reached through the wrapper's inner
+    state. Each keeps the old value's dtype and placement."""
     injected = optax.InjectStatefulHyperparamsState
 
     def put(value, like):
@@ -1138,7 +1134,8 @@ def _rated(opt_state: optax.OptState, wanted: Wanted) -> optax.OptState:
             schedule = node.hyperparams_states.get('learning_rate')
             scheduled = isinstance(schedule, RateState)
             held = schedule.rates if scheduled else {CONSTANT: node.hyperparams['learning_rate']}
-            given = wanted(full, held)
+            given = wanted(full, held, "scheduled" if scheduled else "constant" if schedule is None
+                           else "computed")
             if given is None:
                 return node
             if scheduled:

@@ -12,6 +12,7 @@ import math
 from collections.abc import Mapping
 from typing import Literal
 
+from dew import _records
 from dew._records import JSON, is_share, share
 from dew.training.budget import every_step, recorded
 from dew.training.cadence import Tokens
@@ -50,17 +51,11 @@ class Cooldowns:
     def branches(self, steps: int | None, tokens: int | None, accumulation: int) -> tuple[Branch, ...]:
         """Each point resolved against a run of `steps` microsteps, or a budget of `tokens` alone,
         `accumulation` microsteps an update (`every_step`); a point of steps inside an update, whose
-        branch would begin with that update's window part filled, and one at or past the run's last
-        step are refused. A point on the committed-token clock that falls on the run's last step
-        branches none."""
+        branch would begin with that update's window part filled, is refused."""
         inside = [at for at in self.at if isinstance(at, int) and at % accumulation]
         if inside:
             raise ValueError(f"cooldowns at steps {inside} branch inside an update of {accumulation} steps")
         points = [every_step(at, steps, tokens, accumulation, name="cooldowns.at") for at in self.at]
-        ended = [point for point in points if isinstance(point, int) and steps is not None and point >= steps]
-        if ended:
-            raise ValueError(f"cooldowns at steps {ended} branch at or past the run's last step, {steps}, "
-                             "where there is no run to come back to; its own end decays it")
         return tuple(Branch(point, self) for point in points if point is not None)
 
     def factor(self, update: int, updates: int) -> float:
@@ -90,9 +85,10 @@ class Branch:
     cooldowns: Cooldowns
 
     def pending(self, current: int, accumulation: int) -> Pending:
-        """The branch from step `current` as it runs, resolved: its steps and decay, which a run cut
-        short inside it keeps to run it again (`Checkpoints.control`), whatever its config then."""
-        return {"steps": self.cooldowns.steps(current, accumulation), "shape": self.cooldowns.shape}
+        """The branch from step `current` as it runs, resolved: its step, steps and decay, which a run
+        cut short inside it keeps to run it again (`Checkpoints.cooldown`), whatever its config then."""
+        return {"step": current, "steps": self.cooldowns.steps(current, accumulation),
+                "shape": self.cooldowns.shape}
 
     def due(self, step: int, real: int, before: int) -> bool:
         """Whether the step `step`, which brought the committed tokens from `before` to `real`, branches."""
@@ -105,8 +101,18 @@ class Branch:
         return recorded(self.at)
 
 
-type Pending = dict[str, int | str]
-"""A cooldown branch resolved at the step it leaves from: its `steps` and its decay's `shape`."""
+type Pending = Mapping[str, object]
+"""A cooldown branch resolved at the `step` it leaves from: its `steps` and its decay's `shape`."""
+
+
+def resolved(pending: Pending, accumulation: int) -> tuple[int, str]:
+    """A pending branch's steps and decay, refused where its steps are no whole number of the run's
+    updates of `accumulation` steps, as a resume under another accumulation may find them."""
+    steps = _records.integer(pending["steps"], "cooldown steps")
+    if steps % accumulation:
+        raise ValueError(f"a cooldown of {steps} steps is no whole number of this run's updates of "
+                         f"{accumulation} steps")
+    return steps, _records.text(pending["shape"], "cooldown shape")
 
 
 def decay(shape: str, update: int, updates: int) -> float:
@@ -116,14 +122,14 @@ def decay(shape: str, update: int, updates: int) -> float:
     return 1.0 - done if shape == "linear" else 1.0 - math.sqrt(done)
 
 
-def check_branches(branches: tuple[Branch, ...], suites: Mapping[str, object], *, settable: bool,
+def check_branches(branching: bool, suites: Mapping[str, object], *, settable: bool,
                    rollout: bool, scheduled: bool) -> None:
-    """Refuse cooldown branches a run could not score, decay or read as it reads on: one with no
-    validation suite to score them; an optimizer whose state holds no learning rate a branch can scale
-    (`settable`, `dew.optim.settable_rates`); a rollout's (`rollout`), whose acquisition one reader at
-    a time owns; and a schedule's of stages that end on the committed-token clock (`scheduled`), whose
-    stages the branch's reads would not end."""
-    if not branches:
+    """Refuse cooldown branches, where the run is `branching`, that it could not score, decay or read
+    as it reads on: one with no validation suite to score them; an optimizer whose state holds no
+    learning rate a branch can scale (`settable`, `dew.optim.settable_rates`); a rollout's (`rollout`),
+    whose acquisition one reader at a time owns; and a schedule's of stages that end on the
+    committed-token clock (`scheduled`), whose stages the branch's reads would not end."""
+    if not branching:
         return
     if not suites:
         raise ValueError("a cooldown branch is scored by the run's validation suites, and this run "
