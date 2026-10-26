@@ -14,6 +14,7 @@ captured head input through `chunked_cross_entropy`'s own logsumexp and
 lands one fp32 ulp (4.8e-7) from torch's; `LOSS` is two.
 """
 
+import contextlib
 import copy
 import math
 
@@ -810,3 +811,86 @@ def test_a_tier_3_models_final_states_and_head_are_transformers(case, tmp_path):
 
     assert_as_exact(ours, theirs(reference, torch.float32), slotted_rows, f"tier 3 final states {case}",
                     seeds=STATES_SEEDS[case], truth_fn=truth)
+
+
+DECODE_SEEDS = {"cohere": 8, "cohere2": 8}
+"""Each family's declared check-1 seeds for its cached logits, sized by `seeds_for` on armada."""
+
+
+@pytest.mark.parametrize("family", sorted(PACKED_MODELS))
+def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_prefix(family, tmp_path):
+    """A tier-3 model on Dew's attention decodes through Dew's cache: a padded prompt fills its row's
+    slots and each next token one more, and every decoded step's logits hold check 1 against
+    transformers' full forward of that row's prefix (its float64 twin's the truth), Cohere 2's window
+    included; its greedy generation's tokens are the full forward's argmax at each step."""
+    from dew.inference import TextGeneration
+
+    torch.manual_seed(0)
+    model = PACKED_MODELS[family]().eval()
+    model.save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32", max_seq_len=16)
+    assert loaded.model.max_seq_len == 16
+    vocab = model.config.vocab_size
+    with float64():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager").eval()
+        wide.load_state_dict(model.state_dict())
+    reference = copy.deepcopy(model)
+    reference.set_attn_implementation("eager")
+    steps = 4
+
+    @jax.jit
+    def decoded(variables, prompt, valid, continued):
+        cache = loaded.model.apply(variables, prompt.shape[0], method="init_cache", mutable=["cache"])[1]
+        logits, state = loaded.model.apply({**variables, **cache}, prompt, decode=True, attention_mask=valid,
+                                           mutable=["cache"])
+        stepped = [logits[:, -1]]
+        for step in range(steps):
+            logits, state = loaded.model.apply({**variables, **state}, continued[:, step:step + 1],
+                                               decode=True, mutable=["cache"])
+            stepped.append(logits[:, 0])
+        return jnp.stack(stepped, axis=1)
+
+    def draw(seed):
+        """Two rows of a drawn prompt, the first left-padded by a drawn count, and drawn next tokens."""
+        rng = np.random.default_rng([0x1493, seed])
+        prompt = rng.integers(0, vocab, (2, 6)).astype(np.int32)
+        valid = np.ones((2, 6), bool)
+        valid[0, :int(rng.integers(1, 4))] = False
+        return prompt, valid, rng.integers(0, vocab, (2, steps)).astype(np.int32)
+
+    def ours(prompt, valid, continued):
+        return np.asarray(decoded(loaded.variables, prompt, valid, continued), np.float64)
+
+    def theirs(source, precision=contextlib.nullcontext):
+        def run(prompt, valid, continued):
+            rows = []
+            for row in range(2):
+                ids = np.concatenate([prompt[row][valid[row]], continued[row]])
+                with precision(), torch.no_grad():
+                    logits = source(torch.from_numpy(ids[None]).long()).logits[0].double().numpy()
+                real = int(valid[row].sum())
+                rows.append(logits[real - 1:real + steps])
+            return np.stack(rows)
+        return run
+
+    assert_as_exact(ours, theirs(reference), draw, f"{family} cached logits", seeds=DECODE_SEEDS[family],
+                    truth_fn=theirs(wide, float64))
+
+    prompt, _, _ = draw(0)
+    generated = TextGeneration(loaded.model, loaded.variables)(prompt, steps, key=0)
+    full = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(generated)))
+    np.testing.assert_array_equal(np.asarray(generated)[:, prompt.shape[1]:],
+                                  full[:, prompt.shape[1] - 1:-1].argmax(-1))
+
+
+def test_a_tier_3_model_on_transformers_attention_refuses_a_cache(tmp_path):
+    """A tier-3 model on transformers' own attention has no cache Dew's attention writes: opening one
+    is refused as the capability it lacks."""
+    model = transformers.GPTNeoXForCausalLM(transformers.GPTNeoXConfig(**TINY)).eval()
+    model.save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
+    with pytest.raises(Lacks):
+        loaded.model.apply(loaded.variables, 2, method="init_cache", mutable=["cache"])
