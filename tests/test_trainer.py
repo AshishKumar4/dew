@@ -1219,6 +1219,93 @@ def test_each_suite_is_scored_on_its_own_cadence_with_its_own_metrics():
     assert steps == {"often": [2, 4, 6], "rare": [3, 6]}
 
 
+@pytest.mark.parametrize(("written", "expected"), [(("25%", "50%", 2), ([2, 4, 6, 8], [4, 8])),
+                                                   ((2, "50%", "25%"), ([2, 4, 6, 8], [4, 8]))])
+def test_a_cadence_may_be_a_share_of_the_run(tmp_path, written, expected):
+    """A log, validation or suite cadence written as a share of the run's planned steps is the whole
+    steps nearest it, as the steps it resolves to are: 25% and 50% of 8 steps log every 2 and score
+    every 4, and the run's start records what each resolved to."""
+    from dew.training import EvalSuite
+
+    log_every, eval_every, suite_every = written
+    tracker = RecordingTracker()
+    trainer = make_trainer(tmp_path, objective=Features(), tracker=tracker)
+    trainer.fit(dataset(val=None), steps=8, log_every=log_every, eval_every=eval_every,
+                metrics=(Spread([]),),
+                validation={"often": dataset(val=val_batches(1)).val,
+                            "own": EvalSuite(dataset(val=val_batches(1)).val, (Spread([]),), suite_every)})
+    logged = sorted({step for step, scalars in tracker.scalars if "train/loss" in scalars})
+    scored = sorted({step for step, scalars in tracker.scalars if "often/spread" in scalars})
+    assert (logged, scored) == expected
+    assert sorted({step for step, scalars in tracker.scalars if "own/spread" in scalars}) == [2, 4, 6, 8]
+
+
+def test_the_run_start_records_the_cadences_and_warmups_it_resolved(tmp_path):
+    """The run's start record holds each cadence and schedule warmup as the run resolved it, a share
+    of the run among them: 25% of 8 steps logs every 2, and a warmup of 50% is 4 updates."""
+    from dew.training import LocalTracker
+
+    with LocalTracker(tmp_path / "tracking") as tracker:
+        trainer = make_trainer(tmp_path, tracker=tracker,
+                               optimizer=OptimConfig(learning_rate=Cosine(1e-2, warmup_steps="50%")))
+        trainer.fit(dataset(), steps=8, log_every="25%", checkpoint_every="50%")
+    written = (tmp_path / "tracking" / "records.jsonl").read_text().splitlines()
+    started = next(record for record in map(json.loads, written) if record["type"] == "FitStarted")
+    assert started["value"]["cadences"] == {"log_every": 2, "eval_every": None, "checkpoint_every": 4,
+                                            "warmup_steps.learning_rate": 4}
+
+
+def test_a_local_checkpoint_cadence_may_be_a_share_of_the_run(tmp_path):
+    """`Checkpoints.local_every` may be a share of the run, resolved as `fit`'s other cadences are: 25%
+    of 8 steps writes the local checkpoint every 2, and the run's start records it."""
+    from dew.telemetry.records import CheckpointRequested, FitStarted
+
+    tracker = RecordingTracker()
+    checkpoints = Checkpoints(str(tmp_path / "run"), local_directory=str(tmp_path / "local"),
+                              local_every="25%")
+    trainer = Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0), tracker=tracker,
+                      layout=Layout(min_shard=1, tolerance=1.0), checkpoints=checkpoints)
+    trainer.fit(dataset(), steps=8, log_every=4)
+    local = [step for step, value in tracker.artifacts
+             if isinstance(value, CheckpointRequested) and value.local]
+    assert local == [2, 4, 6, 8]
+    started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
+    assert started.cadences["local_every"] == 2
+    with pytest.raises(ValueError):
+        Checkpoints(str(tmp_path / "other"), local_directory=str(tmp_path / "local"), local_every="25")
+
+
+def test_a_share_of_a_token_budget_falls_where_the_committed_tokens_pass_its_multiples():
+    """A cadence written as a share of a token budget alone falls at each step whose commit passes a
+    multiple of that share of the budget's tokens: 25% of 96 logs at the steps that bring the
+    committed tokens past 24, 48, 72 and 96, as a run logging every step counts them."""
+    every = RecordingTracker()
+    make_trainer(objective=TokenRegression(), tracker=every).fit(dataset(), tokens=96, log_every=1)
+    # A log every step reports the tokens that step committed; the run's are their running sum.
+    each = sorted((step, scalars["train/tokens"]) for step, scalars in every.scalars
+                  if "train/tokens" in scalars)
+    committed = dict(zip((step for step, _ in each), itertools.accumulate(tokens for _, tokens in each),
+                         strict=True))
+    passing = sorted(step for step, tokens in committed.items()
+                     if tokens // 24 > committed.get(step - 1, 0) // 24)
+    shared = RecordingTracker()
+    make_trainer(objective=TokenRegression(), tracker=shared).fit(dataset(), tokens=96, log_every="25%")
+    logged = sorted({step for step, scalars in shared.scalars if "train/tokens" in scalars})
+    assert passing and logged == passing
+
+
+@pytest.mark.parametrize("written", ["5", "0%", "150%", "five%"])
+def test_a_cadence_that_is_neither_steps_nor_a_share_is_refused(written):
+    with pytest.raises(ValueError):
+        make_trainer().fit(dataset(), steps=4, log_every=written)
+
+
+def test_a_share_of_a_run_with_no_planned_length_is_refused():
+    """A run bounded by nothing but its data's end has no planned length to take a share of."""
+    with pytest.raises(ValueError):
+        make_trainer().fit(stream(lambda partition: endless()), eval_every="5%")
+
+
 def test_metrics_without_a_cadence_are_scored_once_at_the_end():
     """A metric costly enough to want once is scored by the pass every suite gets at the run's end
     alone, where neither fit's eval_every nor the suite's every schedules another. Metrics with no
