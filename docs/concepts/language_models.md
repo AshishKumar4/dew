@@ -178,8 +178,15 @@ export([{"text": ids[:held]}], "data/corpus-byte/val", format="array_record",
 | `z_loss` | `0.0` | PaLM's squared log-partition auxiliary. |
 | `qk_stats` | `False` | Report per-head attention logit maxima, the key-head count and the head width for `muonclip`, which clips per query group as Megatron Core does and leaves an output gate's weights alone. |
 | `token_accuracy` | `True` | Report argmax accuracy. |
+| `adaptation` | `None` | `ChunkAdaptation(window, rate, select)`: step the model's continuum level in context by this loss (test-time training over the task loss, below). `None` reads the level as trained. |
 
 The step reports `ce`, `perplexity` and `token_accuracy`. `LMObjective` refuses a model built with `causal=False`.
+
+### Test-time training over the task loss
+
+A decoder built with `continuum=ContinuumLevel(hidden)` (`dew.nn.continuum`) reads a small residual level, `x + up(act(down(x)))`, on its final states before its head. `up` starts at zero, so the level starts as the identity and the decoder's logits are its own. `LMObjective(model, seq_len, adaptation=ChunkAdaptation(window=16, rate=0.01))` steps that level in context by the loss it scores, Nested Learning's continuum memory (Behrouz et al., arXiv 2512.24695, section 7.1, equation 71): every `window` tokens of a document the level steps by `rate` times the summed gradient of those tokens' weighted next-token losses, and the next window reads the stepped level. Each document, a packed row's included, starts from the level the run trains, and training learns that start through every step. Evaluation and validation score the same way. `select` names the level's parts that step (`down`, `up`); the others hold their trained values.
+
+No generation steps the level yet, so an adapted objective takes no `samples`, refuses a rollout's `policy` and records no inference task; its runs save and resume their trained state. A continuum level has no transformers counterpart, so a decoder with one does not export.
 
 ### Loss and precision
 
