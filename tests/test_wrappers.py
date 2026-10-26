@@ -327,6 +327,37 @@ def test_a_load_builds_and_reads_only_the_prediction_depths_it_keeps(tmp_path, f
                                   np.asarray(loaded.model.apply(loaded.variables, ids)))
 
 
+@pytest.mark.parametrize("text_only", [False, True], ids=["wrapper", "text"])
+def test_a_wrappers_nested_prediction_layer_is_the_depth_a_load_drops(tmp_path, text_only):
+    """Qwen3.5's prediction layer stored under the wrapper's `model.language_model.mtp.*`, a spelling
+    the wrapper reads as its bare `mtp.*`, is the depth `prediction_depths=0` drops: the copy so
+    stored loads to the source's trunk, leaf for leaf."""
+    import shutil
+
+    from safetensors.numpy import save_file
+
+    from dew.interop import Pretrained
+
+    def load(directory, **options):
+        return Pretrained.load(directory, dtype="float32", attention_impl="reference", text_only=text_only,
+                               **options)
+
+    source = FIXTURES / "qwen38-dense-tiny"
+    nested = tmp_path / "nested"
+    shutil.copytree(source, nested)
+    for shard in nested.glob("*.safetensors"):
+        tensors = load_file(shard)
+        assert any(name.startswith("mtp.") for name in tensors)
+        save_file({f"model.language_model.{name}" if name.startswith("mtp.") else name: array
+                   for name, array in tensors.items()}, shard, metadata={"format": "pt"})
+    ours, theirs = load(nested, prediction_depths=0).variables, load(source, prediction_depths=0).variables
+    leaves = [jax.tree_util.tree_flatten_with_path(tree)[0] for tree in (ours, theirs)]
+    assert [path for path, _ in leaves[0]] == [path for path, _ in leaves[1]]
+    assert not any("mtp_" in jax.tree_util.keystr(path) for path, _ in leaves[0])
+    for (_, mine), (_, other) in zip(*leaves, strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(other))
+
+
 @pytest.mark.parametrize("fixture", ["deepseek-v4-dspark-tiny", "deepseek-v41-tiny"])
 def test_a_drafter_is_kept_whole_or_not_at_all(tmp_path, fixture):
     """A DSpark drafter's stages draft as one, its heads on its last: a count of all its stages keeps

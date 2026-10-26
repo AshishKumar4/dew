@@ -14,7 +14,6 @@ import copy
 import dataclasses
 import json
 import os
-import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import partial
@@ -1824,21 +1823,11 @@ def native_backbone(directory: str | Path, *, param_dtype: str) -> tuple[Mapping
 DEPTH_COUNTS = ("num_nextn_predict_layers", "mtp_num_hidden_layers", "num_mtp_layers", "n_mtp_layers")
 """The fields a source's config counts its multi-token prediction depths by, family by family."""
 
-_LAYER = re.compile(r"(?:model\.|model\.language_model\.|language_model\.model\.|)layers\.(\d+)\."
-                    r"|blk\.(\d+)\.")
-_DEPTH = re.compile(r"(?:model\.)?mtp\.(?:layers\.)?(\d+)\.")
-
 
 def _scopes(config: dict) -> list[dict]:
     """The scopes a decoder's fields are stated in: `config`'s top, then its `text_config` if any."""
     text = config.get("text_config")
     return [config, *([text] if isinstance(text, dict) else [])]
-
-
-def _trunk_layers(config: Mapping[str, object]) -> int:
-    """The decoder layers of `config`'s trunk, its prediction depths' and drafter stages' apart."""
-    layers = [scope.get("num_hidden_layers") for scope in _scopes(dict(config))]
-    return next((count for count in reversed(layers) if isinstance(count, int)), 0)
 
 
 def _kept_depths(config: Mapping[str, object], kept: int) -> dict:
@@ -1864,17 +1853,24 @@ def _kept_depths(config: Mapping[str, object], kept: int) -> dict:
     return written
 
 
-def _unkept_depth(name: str, trunk: int, kept: int) -> bool:
-    """Whether the source tensor `name` belongs to a prediction depth past the first `kept`: a decoder
-    layer past its `trunk`'s (DeepSeek V3's, GLM's, a GGUF's `blk.N`), a numbered `mtp.` block
-    (Qwen3.5's, DeepSeek V4's), or with no depth kept the part every depth shares (Qwen3.5's `mtp.fc`)."""
-    layer = _LAYER.match(name)
-    if layer is not None:
-        return int(layer[1] or layer[2]) - trunk >= kept
-    if not name.startswith(("mtp.", "model.mtp.")):
-        return False
-    depth = _DEPTH.match(name)
-    return (depth is None and not kept) or (depth is not None and int(depth[1]) >= kept)
+def _kept_tensors(tensors: Mapping[str, np.ndarray], config: Mapping[str, object], route: SourceRoute,
+                  kept: int) -> Mapping[str, np.ndarray]:
+    """`tensors` without those of the prediction depths past the first `kept`, none read: the depth of
+    each as its family places it (`decoders.source_depth`), a decoder's by its route's record, a
+    wrapper's language model's through the wrapper's names."""
+    match route:
+        case DecoderRoute(record=record):
+            depth = partial(decoders.source_depth, record=record,
+                            model_type=_records.text(config.get("model_type"), "model_type"))
+        case WrapperRoute(wrapper=wrapper):
+            depth = partial(decoders.wrapper_source_depth, record=wrapper)
+        case VerifiedRoute(verified=verified):
+            family = verified.entry(config)
+            depth = partial(decoders.source_depth, record=verified.translate(config, tuple(tensors), family),
+                            model_type=family)
+        case _:
+            return tensors
+    return {name: tensor for name, tensor in tensors.items() if (held := depth(name)) is None or held < kept}
 
 
 def _load_native_source(source: sources.SourceReference, root: Path, *,
@@ -1927,12 +1923,10 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
         tensors = sources.load_shards(directory)
     if mamba_ssm:
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
-    if prediction_depths is not None:
-        trunk = _trunk_layers(config)
-        tensors = {name: tensor for name, tensor in tensors.items()
-                   if not _unkept_depth(name, trunk, prediction_depths)}
     if language is not None:
         tensors = _language_model_tensors(tensors, language)
+    if prediction_depths is not None:
+        tensors = _kept_tensors(tensors, config, route, prediction_depths)
     translated = _translated(config, route, tensors, directory, dtype=dtype, param_dtype=param_dtype,
                              attention_impl=attention_impl, max_seq_len=max_seq_len, streaming=streaming)
     model, variables, record, built, layouts, retained, export_adapter = translated.built
