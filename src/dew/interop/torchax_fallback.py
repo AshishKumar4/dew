@@ -901,6 +901,9 @@ class TorchCausalLM(nn.Module):
                   if value is not None}
         if not decode:
             return self.logits(tokens, train=train, **fields, **packing)
+        if self.graph.attention_impl is None:
+            raise Lacks("cache", "this model runs transformers' own attention, and a decode cache is the one "
+                                 "Dew's attention writes")
         laid = self._laid(tokens, {**fields, **packing})
         if laid is not None and laid.max_segments > 1:
             raise ValueError("a decoding row continues one document, and these rows hold several")
@@ -921,9 +924,6 @@ class TorchCausalLM(nn.Module):
         """Each attention layer's cache variable by its `layer_idx`, opened at `rows` rows of
         `max_seq_len` slots where it is not yet: its keys' and values' shapes and dtypes are those
         one decoding token of each row writes (`TorchGraph.step` over no held cache)."""
-        if self.graph.attention_impl is None:
-            raise Lacks("cache", "this model runs transformers' own attention, and a decode cache is the one "
-                                 "Dew's attention writes")
         tokens = jnp.zeros((rows, 1), jnp.int32)
         slots = jnp.zeros((rows, 1), jnp.int32)
         filled = jnp.ones((rows, 1), bool)
