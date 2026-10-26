@@ -1344,6 +1344,27 @@ def test_local_retention_keeps_pinned_generations_and_evicts_closed_ones(tmp_pat
     assert cache.generation(first_key) is None
 
 
+def test_local_retention_counts_what_its_root_holds_once_its_record_passes_the_limit(tmp_path):
+    """A local root records the bytes its writes reserve, so a write under the limit counts nothing
+    again. Bytes removed outside a reservation leave the record above what the root holds: the next
+    write the record would refuse counts the root again and is admitted, and nothing is evicted."""
+    from dew.data.retention import LocalRetention
+
+    retention = LocalRetention(tmp_path, 1_000)
+    key = tmp_path / ("a" * 64)
+    for name in ("one", "two"):
+        target = key / name
+        with retention.reserve(target, 400):
+            key.mkdir(exist_ok=True)
+            target.write_bytes(b"x" * 400)
+    assert int((tmp_path / ".retention.bytes").read_text()) == 800
+    (key / "one").unlink()
+    with retention.reserve(key / "three", 400):
+        (key / "three").write_bytes(b"x" * 400)
+    assert sorted(path.name for path in key.iterdir()) == ["three", "two"]
+    assert int((tmp_path / ".retention.bytes").read_text()) == 800
+
+
 def test_local_retention_reclaims_the_bytes_of_fills_closed_before_they_sealed(tmp_path):
     """A run that stops mid-fill closes its writer unsealed, and no generation ever reads its
     shards; once no process holds it, retention reclaims its bytes, so fills stopped again and
