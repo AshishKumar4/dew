@@ -133,6 +133,20 @@ class _UnpaddedFlash(Glm4MoeLiteForCausalLM):
         self.model.embed_tokens.padding_idx = None
 
 
+class _UngeneratingConfig(Glm4MoeLiteConfig):
+    model_type = "ungenerating_flash"
+
+
+class _UngeneratingFlash(Glm4MoeLiteForCausalLM):
+    """GLM-4.7-Flash that does not generate, so its config's pad id is not a generation config's, which
+    transformers holds nonnegative when it saves (generation/configuration_utils.py:879)."""
+    config_class = _UngeneratingConfig
+
+    @classmethod
+    def can_generate(cls) -> bool:
+        return False
+
+
 class _RamplessConfig(Glm4MoeLiteConfig):
     model_type = "rampless_flash"
 
@@ -149,6 +163,7 @@ class _RamplessFlash(Glm4MoeLiteForCausalLM):
 
 
 FLASH_TYPES = {"flash": (_FlashConfig, _Flash), "unpadded": (_UnpaddedConfig, _UnpaddedFlash),
+               "ungenerating": (_UngeneratingConfig, _UngeneratingFlash),
                "rampless": (_RamplessConfig, _RamplessFlash)}
 """GLM-4.7-Flash's classes as types Dew registers no family for: unchanged, and changed where the
 probe's eval logits over its first positions do not show it."""
@@ -171,13 +186,14 @@ def _registered(kind: str, **fields) -> dict:
     return tiny_config(config_class.model_type, **GLM_FLASH, **fields).to_dict()
 
 
-@pytest.mark.parametrize(("kind", "pad"), [("flash", 0), ("flash", -1), ("unpadded", 0)])
+@pytest.mark.parametrize(("kind", "pad"), [("flash", 0), ("ungenerating", -1), ("unpadded", 0)])
 def test_a_convention_pads_the_row_its_source_pads(kind, pad):
     """GLM-4.7-Flash's classes under a type of their own verify as DeepSeek V3's convention, and the same
     classes whose table pads no row, under a config stating a pad id, do not: the probe holds each
     candidate's pad row to the source's own table's, which takes no gradient there (ledger 1593) and
-    which no eval logit shows. A negative pad id names the row it counts back from the table's end, as
-    torch's lookup and Dew's both read it, so -1 is the last row in each."""
+    which no eval logit shows. A negative pad id, which a source that does not generate may state, names
+    the row it counts back from the table's end, as torch's lookup and Dew's both read it, so -1 is the
+    last row in each."""
     from dew.interop.verify import Unmapped, VerifiedMapping, verify_mapping
 
     config = _registered(kind, pad_token_id=pad)
