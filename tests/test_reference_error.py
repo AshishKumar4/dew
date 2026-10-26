@@ -195,6 +195,39 @@ def test_the_gate_compiles_two_dew_arms_without_ynnpack_and_one_beside_a_given_a
     assert_as_exact(dew, host, draw, "a NumPy arm as given", seeds=8)
 
 
+def test_an_arm_of_dew_programs_compiles_them_as_the_gate_compiles_its_other_arm(monkeypatch):
+    """Beside another Dew arm, an arm of Dew's own programs (`dew_programs`) runs with Dew's compile
+    seam holding WITHOUT_YNN open (`compiled_with`), so a program it compiles through the seam
+    (`dew.nn.kernels.options.program`) carries the option, and beside an arm `as_given` it runs as it
+    is; the seam adds nothing once the arm returns, and a run's own XLA flag for an option wins."""
+    from reference_error import WITHOUT_YNN, _arms, as_given, dew_programs
+
+    from dew.nn.kernels import options
+
+    seen = []
+
+    @dew_programs
+    def programs(x):
+        seen.append(options.compiler_options())
+        return options.program(lambda x: x * 2)(x)
+
+    def written(x):
+        return x + x
+
+    mine, _ = _arms(programs, written)
+    np.testing.assert_array_equal(mine(np.ones(3, np.float32)), 2 * np.ones(3, np.float32))
+    expected = WITHOUT_YNN if jax.default_backend() == "cpu" else {}
+    assert seen == [expected] and options.compiler_options() == {}
+    mine, _ = _arms(programs, as_given(lambda x: np.asarray(x) * 2))
+    mine(np.ones(3, np.float32))
+    assert seen[-1] == {}
+    with options.compiled_with({"xla_cpu_experimental_ynn_fusion_type": ""}):
+        assert options.compiler_options() == {"xla_cpu_experimental_ynn_fusion_type": ""}
+        monkeypatch.setenv("XLA_FLAGS", "--xla_cpu_experimental_ynn_fusion_type=dot")
+        assert options.compiler_options() == {}
+    assert options.compiler_options() == {}
+
+
 def test_a_torch_arm_pulls_back_the_cotangent_it_is_given():
     """`torch_with_gradients` gives, bit for bit, a torch function's output and the gradients torch's
     autograd pulls back from the cotangent passed last, cast to the output's dtype, at float32 and at

@@ -8,8 +8,9 @@ facts with the run's own XLA flags.
 
 from __future__ import annotations
 
+import contextlib
 import functools
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from typing import TYPE_CHECKING, ClassVar, Protocol, TypedDict, Unpack, runtime_checkable
 
 import jax
@@ -41,7 +42,25 @@ class Quantized(Protocol):
     _dew_quantization: ClassVar[QuantizedDtypes]
 
 
-def compiler_options(*models: nn.Module) -> dict[str, bool]:
+_COMPILED_WITH: list[dict[str, bool | int | str]] = []
+"""The options `compiled_with` holds open, innermost last."""
+
+
+@contextlib.contextmanager
+def compiled_with(options: Mapping[str, bool | int | str]) -> Iterator[None]:
+    """Every program Dew compiles while this is open adds `options` to its XLA options
+    (`compiler_options`), each but those the run's XLA_FLAGS sets itself: the accuracy gate's seam,
+    through which an arm that runs Dew's own compiled programs (a trainer's step, a task's forward)
+    compiles them as the gate compiles a Dew arm it compiles itself (tests/reference_error.py,
+    `dew_programs`). A program compiled before it opened keeps its own options."""
+    _COMPILED_WITH.append(dict(options))
+    try:
+        yield
+    finally:
+        _COMPILED_WITH.pop()
+
+
+def compiler_options(*models: nn.Module) -> dict[str, bool | int | str]:
     """The XLA options a program that runs `models` compiles with on the default device, for its
     `jax.jit(..., compiler_options=)`. Every program Dew compiles over a task's model or
     autoencoder, or over an objective's modules, takes them. JAX takes compiler options on a
@@ -53,14 +72,18 @@ def compiler_options(*models: nn.Module) -> dict[str, bool]:
     that runs a model quantized to int8, forward or backward, therefore compiles its GEMMs on
     cuBLAS. With CUDA 13, cuBLAS refuses some int8 shapes (on an A100 a contraction of 16 or 48),
     and then the program does not compile rather than compute wrong. A run that sets
-    `xla_gpu_enable_triton_gemm` in XLA_FLAGS keeps its own setting.
+    `xla_gpu_enable_triton_gemm` in XLA_FLAGS keeps its own setting. The options `compiled_with`
+    holds open join them.
     """
     specs = [layer._dew_quantization for layer in map(type, models) if isinstance(layer, Quantized)]
     int8 = any("int8" in (spec.dtype, spec.bwd_qtype) for spec in specs)
-    if (not int8 or backend() != "gpu" or gpu_target().int8_triton_gemm
-            or xla_flag("xla_gpu_enable_triton_gemm") is not None):
-        return {}
-    return {"xla_gpu_enable_triton_gemm": False}
+    options: dict[str, bool | int | str] = {}
+    if (int8 and backend() == "gpu" and not gpu_target().int8_triton_gemm
+            and xla_flag("xla_gpu_enable_triton_gemm") is None):
+        options["xla_gpu_enable_triton_gemm"] = False
+    for opened in _COMPILED_WITH:
+        options.update({name: value for name, value in opened.items() if xla_flag(name) is None})
+    return options
 
 
 type Placements = Sharding | None | tuple[Placements, ...]
@@ -92,6 +115,6 @@ def program[**P, R](function: Callable[P, R], *models: nn.Module,
 
 
 @functools.cache
-def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, bool | int], ...],
+def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, bool | int | str], ...],
                      **arguments: Unpack[JitArguments]) -> jax.stages.Wrapped:
     return jax.jit(function, compiler_options=dict(options), **arguments)
