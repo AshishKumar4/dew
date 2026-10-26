@@ -596,7 +596,7 @@ the port takes in their dtype. Packed documents take the port at any bound: it s
 where they pass, as many as the tokens' chunks, a row's and one, whatever the bound
 (`chunked_launch.Sequences`)."""
 
-PORT_CELLS: dict[tuple[str, str], str] = {
+PORT_CELLS: dict[tuple[str | None, str], str] = {
     ('wgmma', 'forward'): "on an H100 PCIe, 16-bit, the port's forward 0.602 ms against the template's "
                           "0.776 on Qwen3.5-27B's gated delta net and 0.484 against 0.634 on Qwen3-Next's "
                           "(SE-family-h100-e0de17766)",
