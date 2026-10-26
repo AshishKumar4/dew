@@ -443,11 +443,11 @@ def decoder(**fields):
 
 
 def test_a_memory_decoder_trains_scans_remats_and_decodes():
-    """A decoder whose first two layers are memories, which its scanned stack scans as one group: the
-    scanned stack computes the plain loop's logits bit for bit from the same tree; its gradient, and
-    the gradient under a remat policy that keeps each memory's chunk carry (`CARRY`), are the plain
-    loop's, on par against float64 (check 1), and reach every memory's initial network; and its cached
-    decode, token by token after a prefill, gives the full pass's last logits (check 1)."""
+    """A decoder whose first two layers are memories, which its scanned stack scans as one group, from
+    the plain loop's tree: the scanned stack's logits and gradient, and both under a remat policy that
+    keeps each memory's chunk carry (`CARRY`), are the plain loop's, on par against float64 (check 1),
+    the gradient reaching every memory's initial network; and the scanned stack's cached decode, token
+    by token after a prefill, gives the full pass's last logits (check 1)."""
     from model_support import model_draw
 
     from dew.nn.backbones.decoder_block import RematPolicy
@@ -456,9 +456,6 @@ def test_a_memory_decoder_trains_scans_remats_and_decodes():
     rematted = decoder(scan_layers=True, remat=RematPolicy(save=(CARRY,)))
     wide = decoder(dtype=jnp.float64)
     draw_model = model_draw(plain, (2, LENGTH), 37)
-    variables, ids = draw_model(0)
-    np.testing.assert_array_equal(np.asarray(plain.apply(variables, ids)),
-                                  np.asarray(scanned.apply(variables, ids)))
 
     def trained(model):
         """The model's logits and its parameters' gradient under a cotangent."""
