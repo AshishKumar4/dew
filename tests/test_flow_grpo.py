@@ -1111,6 +1111,40 @@ def _kl_derivatives(mean, reference, variance, mean_tangent, reference_tangent, 
     return {"KL": value, "JVP": moved, "VJP to the mean": to_mean, "VJP to the variance": to_variance}
 
 
+def _kinds(exact):
+    """Each float64 value's place in float32's range by its binary exponent (`np.frexp`, `x = m *
+    2**e` with `m` in [1/2, 1)): "normal" a binade clear of the least normal (e from -124 to 128),
+    "over" past the largest (e from 129), "below" under half the least normal or zero (e to -126),
+    and "edge" the binade where one rounding may cross the least normal."""
+    exponent = np.frexp(exact)[1]
+    return np.where(exact == 0, "below", np.where(exponent >= 129, "over", np.where(
+        exponent >= -124, "normal", np.where(exponent <= -126, "below", "edge"))))
+
+
+def _below_normal(values):
+    """Whether each float32 is zero or subnormal: its exponent field is zero."""
+    return (values.astype(np.float32).view(np.uint32) >> 23 & 0xFF) == 0
+
+
+def _assert_kl_outputs(dew, numpy, truth, label):
+    """Each output of `_kl_derivatives` against float64 by its place in float32's range (`_kinds`): a
+    normal value exactly where its float64 value is a float32, else on par with NumPy's range-safe
+    evaluation (check 1); an overflowing one infinite of its sign; one below the normal range zero or
+    subnormal."""
+    for name, exact in truth.items():
+        value, kinds = np.asarray(dew[name]), _kinds(exact)
+        normal, representable = kinds == "normal", np.asarray(exact, np.float32).astype(np.float64) == exact
+        np.testing.assert_array_equal(value[normal & representable],
+                                      np.asarray(exact, np.float32)[normal & representable], err_msg=name)
+        inexact = normal & ~representable
+        if inexact.any():
+            assert_as_exact_as_the_reference(value[inexact], numpy[name][inexact], exact[inexact],
+                                             f"{label}: {name}")
+        over = kinds == "over"
+        assert np.all(np.isinf(value[over]) & (np.sign(value[over]) == np.sign(exact[over]))), name
+        assert np.all(_below_normal(value[kinds == "below"])), name
+
+
 def _kl_grid():
     """Rows over float32's exponent range in the mean, the reference, the variance, the mean's tangent,
     the variance's and the cotangent, each at six exponents from -124 to 125, an inexact significand
@@ -1138,25 +1172,13 @@ def _kl_grid():
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "jit"])
 def test_a_transitions_kl_and_its_derivatives_hold_over_float32s_exponent_range(compiled):
     """Over a grid of float32's exponents in every input (`_kl_grid`), cancelling and not, a transition's
-    KL, its JVP along the mean's, the reference's and the variance's tangents at once, and its VJP to
-    the mean are on their float64 values (check 1) as NumPy's range-safe float32 evaluation is
-    (`_numpy_kl`), wherever the float64 value is a normal float32 a rounding clear of the least normal;
-    where it overflows float32 they are its infinity, and where it is below the normal range they are
-    below it too, eagerly and compiled."""
+    KL, its JVP along the mean's, the reference's and the variance's tangents at once, and its VJPs to
+    the mean and the variance hold their float64 values by their place in float32's range
+    (`_assert_kl_outputs`), eagerly and compiled."""
     inputs = _kl_grid()
     run = jax.jit(_kl_derivatives) if compiled else _kl_derivatives
-    dew = {name: np.asarray(value) for name, value in run(*(jnp.asarray(value) for value in inputs)).items()}
-    numpy, truth = _numpy_kl(*inputs), _kl_truth(*inputs)
-    tiny, largest = np.finfo(np.float32).tiny, np.finfo(np.float32).max
-    for name, exact in truth.items():
-        value, size = dew[name], np.abs(exact)
-        # A rounding clear of the least normal, where a once-rounded result may land below it.
-        normal = (size >= 2 * tiny) & (size <= largest)
-        assert_as_exact_as_the_reference(value[normal], numpy[name][normal], exact[normal],
-                                         f"a KL's {name} over float32's exponents")
-        over = size > 2 * largest
-        assert np.all(np.isinf(value[over]) & (np.sign(value[over]) == np.sign(exact[over]))), name
-        assert np.all(np.abs(value[size < tiny / 2]) < tiny), name
+    _assert_kl_outputs(run(*(jnp.asarray(value) for value in inputs)), _numpy_kl(*inputs), _kl_truth(*inputs),
+                       "a KL over float32's exponents")
 
 
 REVIEWED = {
@@ -1187,18 +1209,11 @@ REVIEWED = {
 def test_a_transitions_kl_and_its_derivatives_are_exact_at_each_reviewed_input(case):
     """Each input a review found leaving float32's range (`REVIEWED`): the KL, its JVP along every
     tangent at once and its VJPs to the mean and the variance, eagerly and compiled, are their float64
-    values rounded to float32 where those are normal, and below the normal range where those are."""
+    values where those are float32s, and otherwise as `_assert_kl_outputs` holds them."""
     inputs = tuple(np.asarray(value, np.float32) for value in REVIEWED[case])
-    truth = _kl_truth(*inputs)
-    tiny = np.finfo(np.float32).tiny
     for run in (_kl_derivatives, jax.jit(_kl_derivatives)):
-        outputs = run(*(jnp.asarray(value) for value in inputs))
-        dew = {name: np.asarray(value) for name, value in outputs.items()}
-        for name, exact in truth.items():
-            below = np.abs(exact) < tiny
-            assert np.all(np.abs(dew[name][below]) < tiny), (case, name)
-            np.testing.assert_array_equal(dew[name][~below], np.asarray(exact, np.float32)[~below],
-                                          err_msg=f"{case}: {name}")
+        _assert_kl_outputs(run(*(jnp.asarray(value) for value in inputs)), _numpy_kl(*inputs),
+                           _kl_truth(*inputs), case)
 
 
 @pytest.mark.parametrize("edge", list(KL_EDGES))
