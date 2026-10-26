@@ -24,7 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import two_documents
-from reference_error import FEWEST_SEEDS, assert_as_exact
+from reference_error import FEWEST_SEEDS, assert_as_exact, with_gradients
 from token_support import token_rows
 
 from dew.nn.attention import (
@@ -211,6 +211,14 @@ def test_the_exchange_agrees_forward_and_backward_where_heads_split_further(spec
         np.testing.assert_allclose(np.asarray(got), np.asarray(want), atol=2e-5, rtol=1e-6)
 
 
+def _dropping_draw(seed):
+    """Queries, keys and values of `heads`' shapes, and an output cotangent."""
+    q_key, k_key, v_key, c_key = jax.random.split(jax.random.key(seed), 4)
+    query = jax.random.normal(q_key, (BATCH, SEQ_LEN, 4, 8), jnp.float32)
+    key, value = (jax.random.normal(k, (BATCH, SEQ_LEN, 2, 8), jnp.float32) for k in (k_key, v_key))
+    return query, key, value, jax.random.normal(c_key, query.shape, jnp.float32)
+
+
 @pytest.mark.mesh
 @pytest.mark.parametrize("exchange", sorted(EXCHANGES))
 @pytest.mark.parametrize("name", ["causal", "full", "packed", "sinks"])
@@ -218,38 +226,36 @@ def test_a_dropping_call_drops_what_one_device_drops(name, exchange):
     """Probability dropout over a sequence the mesh splits draws each weight at
     its global row, head, query and key (`template.DropPlaces`), so either
     exchange drops the weights one device drops, the gather's striped queries
-    too: its output and its query, key and value gradients are the whole
-    sequence's, as the seam's are (row 1709: a split sequence refused dropout)."""
-    query, key, value = heads(jax.random.key(0), kv_heads=2)
+    too: its output and its query, key and value gradients are on par with the
+    whole sequence's (row 1709: a split sequence refused dropout)."""
     call = dict(CALLS[name], dropout_rate=0.3, dropout_rng=jax.random.key(7))
+    mesh = SPLIT.build()
+    exchanged = jax.jit(with_gradients(lambda q, k, v: through(exchange, q, k, v, **call)))
 
-    def loss(attend):
-        return lambda q, k, v: jnp.sum(attend(q, k, v) ** 2)
+    def split(*arrays):
+        with jax.set_mesh(mesh):
+            return exchanged(*arrays)
 
-    def whole_call(q, k, v):
-        return scaled_dot_product_attention(q, k, v, deterministic=False, **call)
-
-    whole = whole_call(query, key, value)
-    whole_grads = jax.grad(loss(whole_call), argnums=(0, 1, 2))(query, key, value)
-    with jax.set_mesh(SPLIT.build()):
-        split = jax.jit(lambda q, k, v: through(exchange, q, k, v, **call))(query, key, value)
-        split_grads = jax.jit(jax.grad(loss(lambda q, k, v: through(exchange, q, k, v, **call)),
-                                       argnums=(0, 1, 2)))(query, key, value)
-    np.testing.assert_allclose(np.asarray(split), np.asarray(whole), atol=TOLERANCE, rtol=0)
-    for got, want in zip(split_grads, whole_grads, strict=True):
-        np.testing.assert_allclose(np.asarray(got), np.asarray(want), atol=2e-5, rtol=1e-6)
+    whole = jax.jit(with_gradients(
+        lambda q, k, v: scaled_dot_product_attention(q, k, v, deterministic=False, **call)))
+    assert_as_exact(split, whole, _dropping_draw, f"{exchange} exchange, {name}, dropping",
+                    seeds=FEWEST_SEEDS)
 
 
 @pytest.mark.mesh
 def test_the_entry_drops_over_a_split_sequence():
     """`scaled_dot_product_attention` under a split sequence takes a dropping
     call (it refused one) and drops what the whole sequence does."""
-    query, key, value = heads(jax.random.key(0), kv_heads=2)
     call = {"causal": True, "dropout_rate": 0.3, "dropout_rng": jax.random.key(7), "deterministic": False}
-    whole = scaled_dot_product_attention(query, key, value, **call)
-    with jax.set_mesh(SPLIT.build()):
-        split = jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))(query, key, value)
-    np.testing.assert_allclose(np.asarray(split), np.asarray(whole), atol=TOLERANCE, rtol=0)
+    mesh = SPLIT.build()
+    entry = jax.jit(with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call)))
+
+    def split(*arrays):
+        with jax.set_mesh(mesh):
+            return entry(*arrays)
+
+    assert_as_exact(split, entry, _dropping_draw, "the entry, dropping over a split sequence",
+                    seeds=FEWEST_SEEDS)
 
 
 @pytest.mark.mesh
