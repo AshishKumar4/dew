@@ -55,18 +55,23 @@ class JoinCase:
 
 JOIN_SUPPORTS: tuple[Requirement[JoinCase], ...] = (
     Requirement('dense', lambda case: case.dense,
-                "a projection is not a plain Dense, whose call the join reproduces", row=INHERENT),
+                "a projection is not a plain Dense, whose call the join reproduces", row=INHERENT,
+                kind='handoff'),
     Requirement('dot_general', lambda case: case.dot_general,
                 "a projection takes a dot_general other than the join's (`float32_dot_general`)",
-                row=INHERENT),
+                row=INHERENT, kind='handoff'),
     Requirement('uniform', lambda case: case.uniform,
-                "the projections differ in width, bias, dtype, precision or promotion", row=INHERENT),
+                "the projections differ in width, bias, dtype, precision or promotion", row=INHERENT,
+                kind='handoff'),
     Requirement('intercepted', lambda case: not case.intercepted,
                 "the model computes under a wrapper (an adapter, a quantization) that intercepts each "
-                "projection's own call", row=INHERENT),
-    Requirement('kernel', lambda case: case.held, "a projection holds no kernel of its own", row=INHERENT),
+                "projection's own call", row=INHERENT, kind='handoff'),
+    Requirement('kernel', lambda case: case.held, "a projection holds no kernel of its own", row=INHERENT,
+                kind='handoff'),
 )
-"""What one GEMM needs to stand in for the projections' own calls."""
+"""What one GEMM needs to stand in for the projections' own calls: each a handoff, so a call outside
+them runs its projections apart even where the join is chosen, as a wrapped model's projections keep their
+own calls (`selection.Requirement`)."""
 
 
 def join_case(projections: Sequence[nn.Module]) -> JoinCase:
