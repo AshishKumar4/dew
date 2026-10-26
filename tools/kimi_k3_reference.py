@@ -51,7 +51,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from reference_source import hub_modules
+from reference_source import config_lookups, hub_modules, record_padding
 from safetensors.torch import save_file
 
 REPO = "moonshotai/Kimi-K3"
@@ -150,6 +150,17 @@ def mxfp4(weight: torch.Tensor):
 
     packed, scale = reference_mxfp4.encoded(weight.detach().float().cpu())
     return packed, scale, reference_mxfp4.decoded(packed, scale)
+
+
+def record_released_padding() -> None:
+    """padding.json for kimi-k3-tiny (`reference_source.record_padding`): the rows the release's own
+    token lookup leaves untrained under the fixture's config with its text config's pad id stated, left
+    out and null, the language model being built of that text config (modeling_kimi_k3.py:919). It
+    builds the model and runs no kernel, so it needs no CUDA device."""
+    configuration, modeling, _ = hub_modules("kimi_k3_remote", REPO, REVISION, REMOTE)
+    record_padding(*config_lookups(lambda fields: configuration.KimiK3Config(**fields),
+                                   modeling.KimiK3ForConditionalGeneration, ("text_config",)),
+                   json.loads((DESTINATION / "config.json").read_text()), DESTINATION, ("text_config",))
 
 
 def released_modules():
@@ -315,5 +326,7 @@ if __name__ == "__main__":
 
     if sys.argv[1:2] == ["orders"]:
         orders(Path(sys.argv[2]))
+    elif sys.argv[1:] == ["padding"]:
+        record_released_padding()
     else:
         main()

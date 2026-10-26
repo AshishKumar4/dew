@@ -229,6 +229,10 @@ def _decoder(text: Mapping[str, object], tied: bool, max_seq_len: int) -> Decode
             'mla_use_nope': True,
             'mla_use_output_gate': bool(text.get('mla_use_output_gate', False))}})
     block = text.get('attn_res_block_size')
+    # KimiLinearModel looks its tokens up through nn.Embedding(..., padding_idx=config.pad_token_id)
+    # (modeling_kimi.py:902-906; K3's modeling_kimi_linear.py:1093-1097), so the pad row takes no
+    # gradient; KimiLinearConfig's own pad id is 0 (configuration_kimi.py:25, configuration_kimi_k3.py:24).
+    pad = text.get('pad_token_id', 0)
     config: DecoderFields = native_fields(CausalTransformer)(
         vocab_size=record_int(text, "vocab_size"),
         emb_features=hidden,
@@ -248,6 +252,7 @@ def _decoder(text: Mapping[str, object], tied: bool, max_seq_len: int) -> Decode
         tie_embeddings=tied,
         mixture=None,
         attention_residuals=None,
+        padding_idx=None if pad is None else _records.integer(pad, 'pad_token_id'),
     )
     config.update(
         mlp=_situ(text) if activation == "situ" else ACTIVATIONS[activation],
