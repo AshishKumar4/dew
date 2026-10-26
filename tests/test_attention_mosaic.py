@@ -508,7 +508,7 @@ def test_a_hooked_launchs_keyed_configs_are_its_derived_ones(launch):
         if launch == "forward":
             op = attention_mosaic.MosaicForward(score_mod=_softcapped, output_mod=_gated, form="causal",
                                                 keys=tokens, scale=128 ** -0.5)
-            ba = _bound(op, query, key, key, spans.start, spans.end, None, None, (), (), None)
+            ba = _bound(op, query, key, key, spans.start, spans.end, None, None, (), (), None, residuals=False)
         else:
             stats = jax.ShapeDtypeStruct((rows, heads, tokens), jnp.float32)
             residuals = (stats, stats, jax.ShapeDtypeStruct((rows, heads, tokens), jnp.int32),
