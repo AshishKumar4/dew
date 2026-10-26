@@ -9,6 +9,7 @@ facts with the run's own XLA flags.
 from __future__ import annotations
 
 import contextlib
+import contextvars
 import functools
 from collections.abc import Callable, Iterator, Mapping
 from typing import TYPE_CHECKING, ClassVar, Protocol, TypedDict, Unpack, runtime_checkable
@@ -42,25 +43,31 @@ class Quantized(Protocol):
     _dew_quantization: ClassVar[QuantizedDtypes]
 
 
-_COMPILED_WITH: list[dict[str, bool | int | str]] = []
-"""The options `compiled_with` holds open, innermost last."""
+type Option = bool | int | str
+"""An XLA compiler option's value, as `jax.jit(..., compiler_options=)` takes it."""
+
+_COMPILED_WITH: contextvars.ContextVar[tuple[Mapping[str, Option], ...]] = contextvars.ContextVar(
+    "compiled_with", default=())
+"""The options `compiled_with` holds open in this context, innermost last."""
 
 
 @contextlib.contextmanager
-def compiled_with(options: Mapping[str, bool | int | str]) -> Iterator[None]:
+def compiled_with(options: Mapping[str, Option]) -> Iterator[None]:
     """Every program Dew compiles while this is open adds `options` to its XLA options
     (`compiler_options`), each but those the run's XLA_FLAGS sets itself: the accuracy gate's seam,
     through which an arm that runs Dew's own compiled programs (a trainer's step, a task's forward)
     compiles them as the gate compiles a Dew arm it compiles itself (tests/reference_error.py,
-    `dew_programs`). A program compiled before it opened keeps its own options."""
-    _COMPILED_WITH.append(dict(options))
+    `dew_programs`). A program compiled before it opened keeps its own options. The options are the
+    context's (a `ContextVar`): another thread, or a worker not handed this context, compiles
+    without them."""
+    token = _COMPILED_WITH.set((*_COMPILED_WITH.get(), dict(options)))
     try:
         yield
     finally:
-        _COMPILED_WITH.pop()
+        _COMPILED_WITH.reset(token)
 
 
-def compiler_options(*models: nn.Module) -> dict[str, bool | int | str]:
+def compiler_options(*models: nn.Module) -> dict[str, Option]:
     """The XLA options a program that runs `models` compiles with on the default device, for its
     `jax.jit(..., compiler_options=)`. Every program Dew compiles over a task's model or
     autoencoder, or over an objective's modules, takes them. JAX takes compiler options on a
@@ -77,11 +84,11 @@ def compiler_options(*models: nn.Module) -> dict[str, bool | int | str]:
     """
     specs = [layer._dew_quantization for layer in map(type, models) if isinstance(layer, Quantized)]
     int8 = any("int8" in (spec.dtype, spec.bwd_qtype) for spec in specs)
-    options: dict[str, bool | int | str] = {}
+    options: dict[str, Option] = {}
     if (int8 and backend() == "gpu" and not gpu_target().int8_triton_gemm
             and xla_flag("xla_gpu_enable_triton_gemm") is None):
         options["xla_gpu_enable_triton_gemm"] = False
-    for opened in _COMPILED_WITH:
+    for opened in _COMPILED_WITH.get():
         options.update({name: value for name, value in opened.items() if xla_flag(name) is None})
     return options
 
@@ -101,7 +108,7 @@ class JitArguments(TypedDict, total=False):
 
 
 def program[**P, R](function: Callable[P, R], *models: nn.Module,
-                    step: Mapping[str, bool | int] | None = None,
+                    step: Mapping[str, Option] | None = None,
                     **arguments: Unpack[JitArguments]) -> jax.stages.Wrapped:
     """`function` jitted with the XLA options a program over `models` compiles with
     (`compiler_options`), and, where it is part of a training step, the step's own beside them
@@ -115,6 +122,6 @@ def program[**P, R](function: Callable[P, R], *models: nn.Module,
 
 
 @functools.cache
-def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, bool | int | str], ...],
+def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, Option], ...],
                      **arguments: Unpack[JitArguments]) -> jax.stages.Wrapped:
     return jax.jit(function, compiler_options=dict(options), **arguments)

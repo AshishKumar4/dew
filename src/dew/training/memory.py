@@ -20,7 +20,7 @@ from jax.sharding import Mesh, NamedSharding
 from dew.data.dataset import rows_of
 from dew.devices import gpu_free_bytes, xla_flag
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
-from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.options import Option, compiler_options
 from dew.nn.protocols import Recomputing, TritonGemm
 from dew.nn.sharding import mesh_axes
 from dew.objectives.base import Batch, Objective, Variables
@@ -82,7 +82,7 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
     (`compiler_options`).
     """
     generation = device_generation()
-    options: dict[str, bool | int | str] = {}
+    options: dict[str, Option] = {}
     if backend() == 'gpu' and devices > 1:
         options.update({name: value for name, value in COLLECTIVES.items() if xla_flag(name) is None})
     small = tokens <= 128

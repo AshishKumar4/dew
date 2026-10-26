@@ -228,8 +228,9 @@ def test_the_templates_gradients_hold_check_1(generation_name, case):
     spec = CASES[case]
     with generation.assumed(generation_name):
         dew = _loss(_dew(spec, interpret_on_cpu=True))
-        dew = dew if generation_name == "sm90" else jax.jit(dew)
-        assert_as_exact(as_given(dew), _loss(_plain(spec)), _draw, f"{case} gradients on {generation_name}",
+        # The sm90 interpreter runs eagerly; the gate compiles the other generations' arm itself.
+        dew = as_given(dew) if generation_name == "sm90" else dew
+        assert_as_exact(dew, _loss(_plain(spec)), _draw, f"{case} gradients on {generation_name}",
                         seeds=SEEDS, truth_fn=_loss(_plain(spec, truth=True)))
 
 
