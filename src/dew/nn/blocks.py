@@ -129,6 +129,16 @@ class Modulation(nn.Module):
         return jnp.split(projected, self.pieces, axis=-1)
 
 
+def padded_row(padding_idx: int | None, rows: int) -> int | None:
+    """The row of a table of `rows` that `padding_idx` names, as torch's `nn.Embedding` reads it: a
+    negative id counts from the table's end, one outside the table is refused, and None names none."""
+    if padding_idx is None:
+        return None
+    if not -rows <= padding_idx < rows:
+        raise ValueError(f"padding_idx {padding_idx} is outside the table of {rows} rows")
+    return padding_idx % rows
+
+
 class TokenEmbedding(nn.Embed):
     """Token lookup with cotangent accumulation in the parameter dtype."""
 
@@ -148,12 +158,9 @@ class TokenEmbedding(nn.Embed):
                 raise ValueError("Embedding dtype promotion must return an array")
         else:
             rows = table_rows(self.embedding, inputs, self.dtype or self.embedding.dtype)
-        if self.padding_idx is None:
+        padding = padded_row(self.padding_idx, self.num_embeddings)
+        if padding is None:
             return rows
-        if not -self.num_embeddings <= self.padding_idx < self.num_embeddings:
-            raise ValueError(f"padding_idx {self.padding_idx} is outside the table of "
-                             f"{self.num_embeddings} rows")
-        padding = self.padding_idx % self.num_embeddings
         return jnp.where((inputs == padding)[..., None], jax.lax.stop_gradient(rows), rows)
 
 
