@@ -371,7 +371,7 @@ def _source_sampling(config: Mapping[str, object], generation_config: Mapping[st
         stop=() if stop is None else _as_strings(stop))
 
 
-def _token_list(value: JSON, name: str) -> list[int]:
+def _token_list(value: _records.JSON, name: str) -> list[int]:
     """A source field holding one token id or a nonempty list of them, read by the one law of ids."""
     return token_ids(value if isinstance(value, list) else [value], where=name)
 
