@@ -24,7 +24,7 @@ from dew import position
 from dew.batch import VALID_ROWS
 from dew.data.cache import Cache
 from dew.data.compile import compile, iterate, validation
-from dew.data.dataset import GRAIN_KILL_SECONDS, WORKER_PROCESS_BYTES, DataPartition, Host, Loading
+from dew.data.dataset import GRAIN_KILL_SECONDS, DataPartition, Loading
 from dew.data.mixing import TokenDeficit, token_weights
 from dew.data.pipeline import Configured, Pipeline, Rejected, mix
 from dew.data.plan import Manifest, Plan, StepIdentity, fingerprint
@@ -786,6 +786,8 @@ def test_automatic_loading_holds_its_reads_and_each_workers_batches_within_half_
     batch, a record where it streams. Eight 64 KiB rows make a 512 KiB batch: 2 MiB holds four reads
     of a batch and no worker, and half a host's memory that holds two and a half workers holds two,
     reading by the batch or by the record. Workers take each CPU but one, at most `max_workers`."""
+    from dew.data.dataset import WORKER_PROCESS_BYTES, Host
+
     rows = grain.MapDataset.source([{"x": np.zeros((8, 16384), np.float32)}] * 6).to_iter_dataset()
     auto = Loading(workers="auto", worker_buffer=2)
     small = dataclasses.replace(auto, ram_budget_mb=2).resolved(rows, reads=1, host=Host(8, 2**40))

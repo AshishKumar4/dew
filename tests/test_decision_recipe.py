@@ -227,6 +227,7 @@ def test_a_decision_corpus_of_one_file_reads_through_every_loading_worker(tmp_pa
     """A corpus whose examples are one JSON-lines file, one physical shard, streams through the run's
     loading workers, each reading the lines of its own part of the file (data.md §10), and a pass
     reads each example once, where a read by more workers than shards was refused."""
+    from dew.batch import VALID_ROWS
     from dew.data.compile import compile
     from dew.data.dataset import DataPartition
     from dew.decision.data import corpus
@@ -243,7 +244,10 @@ def test_a_decision_corpus_of_one_file_reads_through_every_loading_worker(tmp_pa
     loading = Loading(workers=2, threads=1, read_buffer=1, worker_buffer=1)
     reader = compile(chain, loading=loading).train(DataPartition())
     try:
-        states = [example.state for batch in reader for example in batch["example"]]
+        # Each worker batches its own part, the last batch of each filled out with rows it marks.
+        states = [example.state for batch in reader
+                  for example, real in zip(batch["example"], batch.get(VALID_ROWS, [True] * 4), strict=True)
+                  if real]
     finally:
         reader.close()
     assert sorted(states) == sorted(row["state"] for row in rows)
