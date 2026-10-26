@@ -97,8 +97,9 @@ class GaussianTransition:
         error = jnp.square(mean - reference_mean).sum(axis=tuple(range(1, mean.ndim)))
         safe_variance = jnp.where(variance > 0, variance, 1)
         deterministic = jnp.where(error == 0, 0.0, jnp.inf)
-        # Halved after the division, so a variance near float32's largest does not overflow twice it.
-        return jnp.where(variance > 0, error / safe_variance / 2,
+        # Halved before the division, an exact power of two: twice a variance near float32's largest
+        # overflows, as does an error over a variance near its least, where half the quotient fits.
+        return jnp.where(variance > 0, error / 2 / safe_variance,
                          jnp.where(variance == 0, deterministic, jnp.nan))
 
 
