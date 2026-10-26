@@ -572,7 +572,10 @@ def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[
     it leaves it runs that compile as its decoding step instead
     (`resident_formats`). The formats tree holds the cache mapping and is
     not hashable itself, so its leaves and its structure's text key the
-    programs."""
+    programs. They stay apart from `dew.nn.kernels.options.program`, the
+    seam every other outer program shares: they donate the cache they step
+    and take its formats as placements, neither of which that seam's
+    arguments carry."""
     leaves, structure = jax.tree_util.tree_flatten(formats)
     key = (tuple(leaves), str(structure), rows, tuple(options.items()))
     programs = _PROGRAMS.get(key)
