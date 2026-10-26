@@ -11,12 +11,13 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
-from typing import Any
+from typing import Any, overload
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
+from flax.core import FrozenDict
 
 type Variables = Mapping[str, Any]
 """A Flax variables dict: the `params` collection plus any other collection
@@ -413,6 +414,29 @@ def thaw(variables: Variables) -> Variables:
     return {**rest, "params": merge(variables[FROZEN], variables["params"])}
 
 
+@overload
+def dicts(variables: Variables) -> Variables: ...
+
+
+@overload
+def dicts(variables: None) -> None: ...
+
+
+def dicts(variables: Variables | None) -> Variables | None:
+    """`variables` with every mapping a dict: a tree that holds a Flax `FrozenDict` anywhere, under a
+    mapping or a sequence, rebuilt over the same leaves with each one a dict, any other the caller's
+    own tree. The trees an objective holds are dicts, so that a placement writing each placed leaf into
+    the dict that held it (`dew.training.host.stream`) writes into the objective's tree, and a step's
+    collections keep the state's containers."""
+    if variables is None:
+        return None
+    nodes = jax.tree.leaves(variables, is_leaf=lambda node: isinstance(node, FrozenDict))
+    if not any(isinstance(node, FrozenDict) for node in nodes):
+        return variables
+    return jax.tree.map(lambda node: dicts(dict(node)) if isinstance(node, FrozenDict) else node, variables,
+                        is_leaf=lambda node: isinstance(node, FrozenDict))
+
+
 def part(variables: Variables, name: str) -> Variables:
     """Cut the `name` subtree out of every collection that holds one: one
     module's own tree out of an objective's that nests several under each
@@ -434,6 +458,7 @@ __all__ = [
     "PathFilter",
     "Variables",
     "coordinates",
+    "dicts",
     "document_ranks",
     "document_starts",
     "everything",

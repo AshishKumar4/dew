@@ -14,7 +14,7 @@ from flax import linen as nn, struct
 
 from dew._records import integer, record
 from dew.artifacts import Decisions
-from dew.batch import FROZEN, Batch, Variables, part
+from dew.batch import FROZEN, Batch, Variables, dicts, part
 from dew.data.pipeline import Configured, ObjectiveData, Pack, Rejected
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
@@ -873,7 +873,7 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
         self.tokenizer = tokenizer
         self.specials = specials or Specials.of(tokenizer)
         self.loss_rule = LogLoss() if loss is None else loss
-        self.variables = held
+        self.variables = dicts(held)
         self.label_smoothing = label_smoothing
         if not consistency >= 0.0:
             raise ValueError(f"consistency weighs a divergence, so it is nonnegative, got {consistency}")
