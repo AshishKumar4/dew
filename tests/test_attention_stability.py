@@ -46,6 +46,11 @@ PINS = {attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2),
         attention_triton.TritonBackward: attention_triton.BackwardTiles(32, 32, 4, 2, 4, 2)}
 """The Triton mainloop's tiles: every family is a block or less, so one tile walks it."""
 
+INTERPRETED = jax.default_backend() == "cpu"
+"""Whether the frozen Triton mainloop runs interpreted, in a CPU process, or compiled, on a GPU: the A100's
+default for every template call and the H100's for fp16 and the hooks Mosaic refuses, so the GPU tier
+proves on the compiled kernel what the interpreter covers."""
+
 
 @dataclasses.dataclass(frozen=True)
 class Family:
@@ -743,11 +748,11 @@ def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
 
     def triton_forward(*operands):
         with tuning.pinned(PINS):
-            return attention_triton.forward(*operands, interpret=True, **forward_options)
+            return attention_triton.forward(*operands, interpret=INTERPRETED, **forward_options)
 
     def triton_backward(*operands):
         with tuning.pinned(PINS):
-            return attention_triton.backward(*operands, interpret=True, **options)
+            return attention_triton.backward(*operands, interpret=INTERPRETED, **options)
 
     def mosaic_forward(*operands):
         return attention_mosaic.forward(*operands, **forward_options)
@@ -850,7 +855,7 @@ MOSAIC_FAMILIES = [family for family in TEMPLATE_FAMILIES if _mosaic_takes(FAMIL
 def test_the_mosaic_mainloops_default_is_finite_where_the_reference_is_at_fp32s_edges(family):
     """The Mosaic mainloop, which walks under the default's guards over whole launches
     (`algebra.walked_launches`), finite in the default form over every family it takes (its legality rule,
-    `attention_mosaic.refused`: bf16 operands, no hooks yet in its backward; `_default_is_finite`)."""
+    `attention_mosaic.refused`: bf16 operands in its backward, hooks it lowers; `_default_is_finite`)."""
     _default_is_finite(family, "mosaic")
 
 
@@ -875,11 +880,11 @@ def test_the_frozen_triton_backward_reads_a_guarded_forwards_rows_whatever_its_p
 
     def forward(*operands):
         with tuning.pinned(PINS):
-            return attention_triton.forward(*operands, interpret=True)
+            return attention_triton.forward(*operands, interpret=INTERPRETED)
 
     def backward(*operands):
         with tuning.pinned(PINS):
-            return attention_triton.backward(*operands, interpret=True, split=False)
+            return attention_triton.backward(*operands, interpret=INTERPRETED, split=False)
 
     reference = jax.jit(with_gradients(_reference(family_of, anchored=False)))
     unsplit = jax.jit(with_gradients(_differentiable(family_of, forward, backward)))
@@ -1047,7 +1052,7 @@ def test_a_guarded_rows_split_sums_keep_a_subnormal_share_element_wise(dtype):
                  * np.asarray(value, np.float32)[:, 255, 0, 1][:, None, None])
     with tuning.pinned(PINS):
         triton = attention_triton.forward(query, key, value, spans, residuals=True, natural=True,
-                                          interpret=True)
+                                          interpret=INTERPRETED)
     portable = attention_portable.attend(query, key, value, spans, block_q=32, block_k=32,
                                          pad=attention_triton.BLOCK, residuals=True, natural=True)
     for name, (_, _, _, anchors, split) in (("triton", triton), ("portable", portable)):

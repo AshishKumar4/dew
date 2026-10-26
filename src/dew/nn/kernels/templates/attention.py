@@ -1081,8 +1081,9 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     then refines D once from its own sums for the dK/dV launch and the head, query and initial state's
     gradients (`attention_algebra.refinement`). The output hook is no part of it: a differentiated call
     applies `output_mod` past the kernel, where its own derivative runs, and passes `dout` before it.
-    Deterministic: every gradient element is written by one program, a head parameter's partial sums added
-    in a fixed order and a key head's query heads summed in XLA."""
+    Deterministic where `launch` writes every gradient element from one program (the two-launch schedules: a
+    head parameter's partial sums added in a fixed order and a key head's query heads summed in XLA); the
+    Mosaic one-launch schedule adds dQ's tiles atomically, in their arrival order."""
     hooks = Hooks() if hooks is None else hooks
     if hooks.output_mod is not None:
         raise ValueError("the backward takes the output before the output hook (`backward`'s docstring)")

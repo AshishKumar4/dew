@@ -375,6 +375,7 @@ Two measures decide whether a mainloop lands and whether it replaces a route: th
   - (a) the anchored pre-pass;
   - (b) the forward's off-peak accumulator;
   - (b′) a masked-column P·V plus the peak row kept in fp32, a row gather instead of a product.
+  - Form (a) is written once in the algebra (`attention_algebra.OffAnchor`, `off_anchor_delta`) and run by the frozen Triton and the plain-JAX mainloops where a caller asks for it (`split=False`); every route call takes (b) from the forward's split sums (`split_delta`). (a) stays the candidate the measurement weighs. The Mosaic one-launch schedule takes dK/dV at (b) unrefined, with the forward's denominator. That is a different D from the two launches' refined one, and fusing by default waits on Main's call on it.
 - **Every reduction in §3** (hook parameters, dbias, norm weight, split-K, split-KV) takes the fastest merge that passes both checks by default, atomic where faster; deterministic mode takes a fixed-order merge.
 - **The FP8 gate contract** is the accuracy gate's to define before any FP8 code: which reference, and what error budget for scaled products.
 

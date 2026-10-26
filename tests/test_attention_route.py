@@ -390,6 +390,41 @@ def test_the_selector_refuses_a_mask_and_a_bias_by_their_inherent_limits():
         scaled_dot_product_attention(query, key, key, implementation="template", bias=bias)
 
 
+@pytest.mark.skipif(generation.device_generation() != "sm90",
+                    reason="composes the route's mainloops, on an H100")
+@pytest.mark.gpu(reason="composes the route's Mosaic forward and Triton backward, on an H100")
+@pytest.mark.parametrize("case", ["causal", "packed-documents", "sinks-softcap"])
+def test_an_fp16_call_on_an_h100_runs_the_mosaic_forward_then_the_triton_backward_on_par(case):
+    """fp16 on an H100: the Mosaic forward, which takes 16-bit operands, then the frozen Triton backward from
+    its residuals, as the Mosaic backward takes bf16 alone (`attention_mosaic.refused`), composed in that
+    order (traced among the launches, `tuning.seen`) and on par with the reference path (check 1)."""
+    queries, keys = geometry(CASES[case])
+    draw = drawing(queries, keys, jnp.float16, sinks=bool(CASES[case].get("sinks")))
+    template_pass = jax.jit(pulled("template", CASES[case]))
+    with tuning.seen() as launches:
+        template_pass.trace(*draw(0))
+    ops = [op for op, _ in launches]
+    assert any(isinstance(op, attention_mosaic.MosaicForward) for op in ops)
+    assert any(isinstance(op, attention_triton.TritonBackward) for op in ops)
+    assert not any(isinstance(op, attention_mosaic.MosaicBackward) for op in ops)
+    assert_as_exact(template_pass, jax.jit(pulled("reference", CASES[case])), draw,
+                    f"fp16 Mosaic forward, Triton backward, {case}", seeds=SEEDS)
+
+
+@pytest.mark.gpu(reason="walks a sequence of thousands of keys, on a GPU")
+@pytest.mark.parametrize("dtype", DTYPES, ids=lambda dtype: jnp.dtype(dtype).name)
+@pytest.mark.parametrize("length", [4096, 8192])
+def test_a_long_sequence_is_on_par_with_the_reference_path(length, dtype):
+    """A causal call of `length` tokens, two query heads over one key head (`WIDTH` wide), through the
+    template on whichever mainloop the GPU runs it, on par with the reference path (check 1): D, the
+    refinement and the denominator are sums the mainloops run in sequence over its key tiles where the
+    reference sums by tree, so a ratio that grew with the sequence would show here (math review P2.5)."""
+    case = {"causal": True}
+    draw = drawing(length, length, dtype, sinks=False, heads=2, kv_heads=1, rows=1)
+    assert_as_exact(jax.jit(pulled("template", case)), jax.jit(pulled("reference", case)), draw,
+                    f"template route causal {length} {jnp.dtype(dtype).name}", seeds=SEEDS)
+
+
 def test_a_templated_family_runs_the_template_where_its_declared_route_does_not_take_a_call():
     """'auto' on an H100, whose wgmma family has a routed Mosaic template, runs FlashAttention-3 on every
     16-bit call it supports (a plain call, a window) and the template on every other one the template takes
