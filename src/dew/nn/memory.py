@@ -71,6 +71,7 @@ from dew.nn.kernels import recurrence, recurrence_chunk
 from dew.nn.mixer_base import MEMORY_RESIDUALS
 from dew.nn.sharding import LOW_RANK_FACTORS
 from dew.optim import newton_schulz
+from dew.quantization import FROZEN_FP8, QUANTIZATION, frozen_fp8_kernel
 
 from .attention import FORWARD_MODE, LayerNorm
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places, valid_order
@@ -319,9 +320,11 @@ class InContextMemory(nn.Module):
         Each head's parameters are its network's own (`initial/head_0`, ...), so a head's matrix is one
         an optimizer steps on its own (Muon orthogonalizes it apart from the other heads') and a vector a
         vector, as its network declares them. They are drawn at their scope, so an adapter's branch on
-        them draws its factors there, as `dew.lora` draws any target's. The heads step as one stacked
-        state, so they hold one structure. The `slow` weights and an adapter's A factors are held; the
-        rest move (`_gradient` on an adapter's B factor)."""
+        them draws its factors there, as `dew.lora` draws any target's. A head's other collections at
+        that scope (a checkpoint's input scales, `dew.quantization`) reach every application of its
+        network; a frozen FP8 kernel's codes there are W_0's kernel as they decode (`_decoded_codes`).
+        The heads step as one stacked state, so they hold one structure. The `slow` weights and an
+        adapter's A factors are held; the rest move (`_gradient` on an adapter's B factor)."""
         network = self._inner(wide=False)
 
         def drawn(key: jax.Array) -> dict:
@@ -330,20 +333,24 @@ class InContextMemory(nn.Module):
                 one, example)["params"]) for head, one in enumerate(jax.random.split(key, self.heads))}
 
         stored = self.param("initial", drawn)
-        heads = [stored[f"head_{head}"] for head in range(self.heads)]
+        others = {collection: tree["initial"] for collection, tree in self.variables.items()
+                  if collection != "params" and "initial" in tree}
+        heads = [_decoded_codes({"params": stored[name], **{collection: tree[name] for collection, tree
+                                                             in others.items() if name in tree}})
+                 for name in (f"head_{head}" for head in range(self.heads))]
         if any(jax.tree.structure(head) != jax.tree.structure(heads[0]) for head in heads):
-            raise ValueError("an in-context memory's heads step as one state, so they hold one structure of "
-                             "weights: an adapter on one head's network is on every head's")
+            raise ValueError("an in-context memory's heads step as one state, so they hold one structure "
+                             "of variables: an adapter or a quantization on one head's network is on all")
+        stacked = jax.tree.map(lambda *leaves: jnp.stack(leaves), *heads)
         wide = at_least_fp32(self.dtype)
-        stacked = jax.tree.map(lambda *leaves: jnp.stack(leaves).astype(wide), *heads)
-        flat = traverse_util.flatten_dict(stacked)
+        flat = traverse_util.flatten_dict(jax.tree.map(lambda leaf: leaf.astype(wide), stacked.pop("params")))
         unknown = sorted(set(self.slow) - {path[0] for path in flat})
         if unknown:
             raise ValueError(f"slow names {unknown}, which are none of the network's parameters "
                              f"{sorted({path[0] for path in flat})}")
         held = {path for path in flat if path[0] in self.slow or path[-1] == ADAPTER_A}
         return (traverse_util.unflatten_dict({path: leaf for path, leaf in flat.items() if path not in held}),
-                _Heads(traverse_util.unflatten_dict({path: flat[path] for path in held})))
+                _Heads(traverse_util.unflatten_dict({path: flat[path] for path in held}), stacked))
 
     @nn.compact
     def __call__(self, x: jax.Array, call: MixerCall = PLAIN_CALL) -> jax.Array:
@@ -368,7 +375,9 @@ class InContextMemory(nn.Module):
                 if self.has_rng("dropout") else None)
         steps = _Steps(query.astype(wide), key.astype(wide), value.astype(wide), theta, mu, a, real, places,
                        keys)
-        hooks, segments = self._recurrence(), tokens.max_segments
+        # A collection beside the weights (an input's quantizer) makes the network no linear map of its
+        # input, which the recurrence's rows are.
+        hooks, segments = None if heads.collections else self._recurrence(), tokens.max_segments
         if hooks is not None:
             read = (self._recurrent_decoded(hooks, initial, heads, steps, log_kept, segments) if call.decode
                     else self._recurrent(hooks, initial, heads, steps, log_kept, max_segments=segments)[0])
@@ -475,8 +484,10 @@ class InContextMemory(nn.Module):
             params = jax.tree.map(lambda leaf: leaf.astype(dtype) if self.dtype is not None else leaf, params)
             x = x.astype(dtype)
         scope = self._scope(head)
+        variables = {collection: _nested(scope, tree) for collection, tree in
+                     {"params": params, **_head(heads.collections, head, 0)}.items()}
         rngs = {} if keys is None else {"dropout": jax.random.fold_in(jax.random.wrap_key_data(keys), use)}
-        out = _AtScope(self._inner(wide=wide), scope).apply({"params": _nested(scope, params)}, x, rngs=rngs)
+        out = _AtScope(self._inner(wide=wide), scope).apply(variables, x, rngs=rngs)
         if not isinstance(out, jax.Array):
             raise TypeError(f"an in-context memory's network maps a vector to one, got {type(out).__name__}")
         return out
@@ -646,9 +657,29 @@ class _AtScope(nn.Module):
 
 class _Heads(NamedTuple):
     """What each head's network holds beside its moving weights, every leaf stacked over the heads
-    `[H, ...]`: its held parameters, the `slow` ones and an adapter's A factors."""
+    `[H, ...]`: its held parameters, the `slow` ones and an adapter's A factors, and its other
+    collections by name, as stored (a checkpoint's input scales)."""
 
     held: dict
+    collections: dict
+
+
+def _decoded_codes(variables: dict) -> dict:
+    """One head's variables with each frozen FP8 kernel (`dew.quantization.FROZEN_FP8`) decoded into its
+    params (`frozen_fp8_kernel`), as a merge decodes it. The codes stood for a kernel that never moves;
+    in the memory only W_0 is frozen, and every application multiplies the state the steps move from it,
+    as the network computes."""
+    codes = traverse_util.flatten_dict(variables.get(QUANTIZATION, {}))
+    sites = {path[:-1] for path in codes if path[-1] == FROZEN_FP8[0]}
+    if not sites:
+        return variables
+    kernels = {(*site, "kernel"): frozen_fp8_kernel({leaf: codes[(*site, leaf)] for leaf in FROZEN_FP8})
+               for site in sites}
+    rest = {path: leaf for path, leaf in codes.items() if not (path[:-1] in sites and path[-1] in FROZEN_FP8)}
+    variables = {**variables, "params": traverse_util.unflatten_dict(
+        {**traverse_util.flatten_dict(variables["params"]), **kernels})}
+    del variables[QUANTIZATION]
+    return {**variables, QUANTIZATION: traverse_util.unflatten_dict(rest)} if rest else variables
 
 
 class _Steps(NamedTuple):
