@@ -670,7 +670,7 @@ def test_runs_of_other_task_settings_or_a_single_run_do_not_average(decide, tmp_
 
 def released_joint(directory: Path) -> Decide:
     """The tiny joint-head release (`test_decision_joint_checkpoint`), its Qwen 3.5 backbone beside its
-    head, laid out to train in rows of 1024 tokens."""
+    head, laid out in rows of 2048 tokens, which the joint schema of Laya's questions needs."""
     from dew.decision import JointLayout
 
     joint = Path(__file__).parent / "fixtures" / "joint_checkpoint" / "tiny"
@@ -679,7 +679,7 @@ def released_joint(directory: Path) -> Decide:
     for source in [*backbone.iterdir(), joint / "joint_head_config.json", joint / "joint_head.safetensors"]:
         (directory / source.name).symlink_to(source.resolve())
     released = Decide.from_pretrained(directory, attention_impl="xla")
-    return replace(released, layout=JointLayout(max_len=1024))
+    return replace(released, layout=JointLayout(max_len=2048))
 
 
 @pytest.mark.parametrize("kind", ["marker", "state-first", "joint"])
