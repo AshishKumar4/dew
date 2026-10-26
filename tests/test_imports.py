@@ -40,7 +40,8 @@ from flax import linen as nn
 from dew.diffusion import DirectPredictionTransform, FlowMatchingScheduler, Process
 from dew.inputs import Field, InputSpec
 from dew.interop import load_params, save_params
-from dew.sampling import Euler, TextToImage
+from dew.inference import TextToImage
+from dew.sampling import Euler
 
 class Zero(nn.Module):
     def __call__(self, x, time, train=False):

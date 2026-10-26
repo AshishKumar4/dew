@@ -32,11 +32,13 @@ from dew.decision import (
     JointLayout,
     Noul,
     Question,
+    Schema,
     Specials,
     TopProbability,
 )
 from dew.decision.calibration import softmax
 from dew.decision.images import Images
+from dew.decision.layout import JOINT_SEGMENTS
 from dew.interop import Pretrained
 from dew.nn.kernels.generation import measured_kernel
 from dew.training.trainer import Trainer
@@ -140,6 +142,30 @@ def test_the_joint_layout_lays_out_what_the_release_does(tokenizer):
             assert list(laid.span) == reference["span"], (case, laid.name)
             assert [list(span) for span in laid.options] == reference["options"], (case, laid.name)
             assert [questions[laid.name].options[slot] for slot in laid.order] == reference["option_ids"]
+
+
+def test_a_joint_schema_read_in_context_is_the_schema_the_row_holds(tokenizer):
+    """A joint layout that reads its schema as the row's context (`Schema(stream="context")`) lays the
+    release's schema out token for token, as the row that holds it does: the context is the schema's
+    tokens in that row, each span the same tokens' place in the context, and the row the rest, its
+    images and its state as that row holds them."""
+    segments = tuple(Schema(stream="context") if isinstance(segment, Schema) else segment
+                     for segment in JOINT_SEGMENTS)
+    for case, (questions, held) in laid_out(tokenizer).items():
+        request = CASES[case]
+        [read] = JointLayout(segments=segments).rows(tokenizer, Specials.of(tokenizer), request["state"],
+                                                    questions)
+        assert read.spans_in_context and not held.spans_in_context and read.context is not None
+        offset = held.questions[0].span[0] - read.questions[0].span[0]
+        assert held.tokens[offset:offset + len(read.context)] == read.context, case
+        assert held.tokens[:offset] + held.tokens[offset + len(read.context):] == read.tokens, case
+        for inline, contextual in zip(held.questions, read.questions, strict=True):
+            assert (inline.name, inline.order) == (contextual.name, contextual.order)
+            assert inline.span == tuple(at + offset for at in contextual.span), (case, inline.name)
+            assert inline.options == tuple(tuple(at + offset for at in option)
+                                           for option in contextual.options), (case, inline.name)
+        assert (held.state_tokens, held.state_kept, held.media) == (read.state_tokens, read.state_kept,
+                                                                     read.media)
 
 
 def head_logits(tokenizer: HFTokenizer) -> tuple[np.ndarray, ...]:

@@ -5,13 +5,15 @@ from typing import overload
 
 import jax
 import jax.numpy as jnp
+from flax import linen as nn
 from jax import lax
 from jax.core import Tracer
 from jax.typing import ArrayLike
 
 from dew.diffusion.discrete import DiscreteDenoiser
 from dew.diffusion.process import Denoiser
-from dew.sampling.guidance import Guidance, Walk
+from dew.nn.autoencoders import AutoEncoder
+from dew.sampling.guidance import Guidance, Walk, guidance_modules
 from dew.sampling.solvers import RowKeys, RowSolver, Solver
 
 
@@ -191,3 +193,26 @@ def _stepped(solver: Solver, key: jax.Array | RowKeys, index: jax.Array) -> Call
     folded = jax.random.fold_in(key, index)
     return lambda x, t, t_next, denoised, eps, state, *, process, denoise: solver.step(
         x, t, t_next, denoised, eps, state, folded, process, denoise)
+
+
+def sampling_modules(model: nn.Module, guidance: Guidance | None,
+                     autoencoder: AutoEncoder | None) -> tuple[nn.Module, ...]:
+    """Every network a walk of `model` under `guidance` that `autoencoder` decodes runs: the
+    denoiser, an autoguide (`guidance_modules`) and the autoencoder's model, which the program
+    that walks it compiles for (`compiler_options`), a task's and an objective's alike."""
+    return (model, *guidance_modules(guidance), *(() if autoencoder is None else (autoencoder.model,)))
+
+
+def walk_and_decode(denoise: Denoiser, autoencoder: AutoEncoder | None, params, x_T: jax.Array, *,
+                    solver: Solver, guidance: Guidance | None, key: jax.Array, times, final_denoise: bool,
+                    initial=None, decode: bool = True) -> tuple[jax.Array | None, jax.Array]:
+    """`denoise`'s reverse walk from `x_T`: the images, the latents it reaches decoded by
+    `autoencoder` (its weights `params["autoencoder"]`) and clipped to [-1, 1] (None without
+    `decode`), and the latents. The one sampling program a task (`dew.inference.TextToImage`) and an
+    objective's evaluation and preview (`DiffusionObjective.evaluate`) run."""
+    latents = sample(denoise, x_T, solver=solver, guidance=guidance, key=key, times=times,
+                     initial=initial, final_denoise=final_denoise)
+    if not decode:
+        return None, latents
+    images = autoencoder.decode(params["autoencoder"], latents) if autoencoder is not None else latents
+    return jnp.clip(images, -1.0, 1.0), latents

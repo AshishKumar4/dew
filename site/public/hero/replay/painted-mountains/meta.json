@@ -17,7 +17,7 @@
  ],
  "batch_row": 2,
  "model": {
-  "model": "dewml/hybrid-dit-176m, loaded with dew.sampling.TextToImage.from_run",
+  "model": "dewml/hybrid-dit-176m, loaded with dew.inference.TextToImage.from_run",
   "parameters": 175640848,
   "dew_commit": "1bdb25dc88ab64df00ad41550d5a22a8e70edf52",
   "device": "NVIDIA GeForce RTX 4080"

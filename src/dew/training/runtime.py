@@ -40,7 +40,6 @@ from dew.pool import (
 _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from dew.training.distributed import Layout
     from dew.training.tracker import Wandb
 
 
@@ -62,8 +61,7 @@ another."""
 def prepare_process(wandb: Wandb | None = None,
                     multi_host: bool | None = None,
                     xla_flags: str | None = None,
-                    compilation_cache_dir: str | None = None,
-                    *, layout: Layout | None = None) -> None:
+                    compilation_cache_dir: str | None = None) -> None:
     """Set the environment variables and XLA flags, raise the soft file
     descriptor limit, and join the JAX process pool.
 
@@ -81,25 +79,14 @@ def prepare_process(wandb: Wandb | None = None,
     opens a backend. So this call has to come before the first JAX call in
     the process, and it is the first line of every recipe. If you use the
     library without a recipe, set XLA_FLAGS in the environment yourself.
-
-    `layout` is the same `Layout` you pass to `Trainer`. When its `host`
-    includes "variables", the master copy of the whole train state is kept
-    on the CPU and the optimizer update runs there, so this call checks the
-    CPU devices that this requires.
-    JAX_PLATFORMS must then allow CPU beside the accelerator, and
-    JAX_NUM_CPU_DEVICES or the existing XLA flags must give one CPU device
-    per local accelerator before this call. The check raises `ValueError`
-    when they do not, and it never changes the backend configuration after
-    JAX has initialized.
+    A state kept on the CPU (`Layout(host=("variables",))`) needs one CPU
+    device per local accelerator, which the trainer checks on its own mesh
+    (`dew.training.host.companion_mesh`).
     """
     _set_environment(wandb, xla_flags, compilation_cache_dir)
     _raise_limits()
     _join_process_pool(multi_host)
     ready_process()
-    if layout is not None and "variables" in layout.host:
-        from dew.training.distributed import MeshSpec
-        from dew.training.host import companion_mesh
-        companion_mesh(MeshSpec().build())
     _log.info("Number of devices: %s", jax.device_count())
 
 

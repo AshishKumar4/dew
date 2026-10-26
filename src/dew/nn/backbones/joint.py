@@ -27,6 +27,7 @@ from dew.nn.attention import (
     scaled_dot_product_attention,
 )
 from dew.nn.blocks import Modulation
+from dew.nn.dropout import Dropout
 from dew.nn.flops import MissingFlopsCount, attention_flops, matching_lengths, projection_flops
 from dew.nn.mlp import GatedMLP
 from dew.nn.rope import rotate
@@ -352,7 +353,7 @@ class DoubleStreamBlock(nn.Module):
         # zero-initialized one emits shift, scale and then the gates.
         context_scale, context_shift = context_mods[:2] if self.context_pre_only else context_mods[1::-1]
         norm = layer_norm(self.dtype, self.epsilon)
-        dropout = nn.Dropout(self.dropout_rate, deterministic=not train)
+        dropout = Dropout(self.dropout_rate, deterministic=not train)
         normalized = norm(image)
         attention = self._attention("attn", context_out=not self.context_pre_only)
         context_input = modulate(norm(context), context_shift, context_scale)

@@ -429,7 +429,7 @@ Each source control has one rule for its consumer, neutral value, mode and refus
 
 Import `pipeline`, `TextGeneration`, `BlockGeneration`, `MaskedGeneration`, `TextToImage`, `Images`, `DenoisingInputs` and `RunProcessor` from `dew.inference`. `dew.pipeline` is the same function. [Inference](../concepts/inference.md) describes placement and the three workflows.
 
-<!-- api: dew.inference.pipeline.pipeline dew.objectives.Objective.pipeline dew.objectives.Objective.build_task -->
+<!-- api: dew.inference.loading.pipeline dew.objectives.Objective.pipeline dew.objectives.Objective.build_task -->
 
 `Objective.pipeline` builds the objective's task over `state.averaged` or `state.variables`. An omitted processor keeps the objective's own; `None` clears it. `build_task` returns `TextGeneration` for LM, GRPO and PPO's actor, `MaskedGeneration` for MDLM, `BlockGeneration` for block SFT and `TextToImage` for diffusion, which takes no processor. An objective whose `saved_task` builds from the settings its run records (`from_settings`, as Dew's token tasks do) needs no `build_task` of its own: the default builds that task from its `task_settings()` over its model, as a saved run of it loads.
 

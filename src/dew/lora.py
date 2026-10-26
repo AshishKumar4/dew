@@ -60,6 +60,7 @@ from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.dense import _contractions, _linear_site
+from dew.nn.dropout import Dropout
 from dew.nn.flops import (
     MissingFlopsCount,
     counted_flops,
@@ -585,7 +586,7 @@ class _Branch:
         # dropout stream, which is how a training forward is marked; an
         # evaluation forward carries none.
         if self.dropout and module.has_rng("dropout"):
-            x = nn.Dropout(self.dropout, deterministic=False)(x)
+            x = Dropout(self.dropout, deterministic=False)(x)
         x, a, b = promote_dtype(x, a, b, dtype=module.dtype)
         hidden = float32_dot_general(x, a, ((axes, tuple(range(len(axes)))), ((), ())),
                                      precision=module.precision)

@@ -88,7 +88,7 @@ def _pair(max_length: int, directory=None, *, bos: str = "none", source: bool = 
     from transformers import LlamaForCausalLM
 
     from dew.data.text import ByteTokenizer, HFTokenizer
-    from dew.inference.pipeline import RunProcessor
+    from dew.inference.loading import RunProcessor
     from dew.interop.pretrained import Pretrained
     from dew.interop.processors import Processor
     from dew.sampling import Sampling
@@ -196,7 +196,7 @@ def test_a_task_that_names_no_eos_has_no_end_of_text_id_to_condition_on():
     """The id an empty context is conditioned on is the task's EOS; a task whose sampling names none
     is refused, rather than conditioned on id 0, some vocabulary's ordinary token."""
     from dew.data.text import ByteTokenizer
-    from dew.inference.pipeline import RunProcessor
+    from dew.inference.loading import RunProcessor
     from dew.interop.pretrained import Pretrained
     from dew.sampling import Sampling
 

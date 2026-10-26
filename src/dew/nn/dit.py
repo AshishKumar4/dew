@@ -22,6 +22,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew._records import JSON
 from dew.nn.dense import Dense
+from dew.nn.dropout import Dropout
 
 from .activations import gelu_exact_torch, gelu_tanh
 from .attention import LayerNorm, NormalAttention, QKNorm
@@ -659,7 +660,7 @@ class ModulatedBlock(nn.Module):
         self.mlp = GatedMLP(hidden_features, self.features,
                             activation=gelu_tanh if self.gelu_approximate else _exact_gelu, use_bias=True,
                             dtype=self.dtype, precision=self.precision)
-        self.dropout = nn.Dropout(rate=self.dropout_rate)
+        self.dropout = Dropout(rate=self.dropout_rate)
 
     def _apply_2d_fusion(self, ssm_output):
         """Un-permute scan-ordered SSM output to a 2D grid, fuse, re-permute back."""

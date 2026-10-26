@@ -192,9 +192,9 @@ def shapes_of(model: CausalTransformer, tokens, dtype: str) -> dict:
     """The store a source fills, as shapes.
 
     `init` writes fp32 masters, which a training run keeps and a published
-    checkpoint does not: `dew.sampling.pipelines.cast_floating` casts every
-    floating leaf on the way out of a run, so a bf16 case holds bf16 weights
-    and no fp32 copy of them exists anywhere here.
+    checkpoint does not: a published checkpoint holds every floating leaf in
+    the dtype it ships, so a bf16 case holds bf16 weights and no fp32 copy of
+    them exists anywhere here.
     """
     shapes = jax.eval_shape(lambda key: model.init(key, tokens), jax.random.key(0))
     target = jnp.dtype(dtype)

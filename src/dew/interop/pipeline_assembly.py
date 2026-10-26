@@ -27,7 +27,7 @@ from dew import _records
 from dew.batch import Variables
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import Origin, SourceGrid, SourceSchedule
-from dew.inference.pipeline import place
+from dew.inference.loading import place
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.inputs.diffusion import (
     Composition,
@@ -334,7 +334,7 @@ def assemble_pipeline(directory: Path, index: Mapping[str, object], *, dtype: st
 
     With `lazy` every component's leaves are `SourceLeaf` recipes over the
     mapped files, for a placement to read one device shard at a time
-    (`dew.inference.pipeline.place`), but for the convolution kernels and a
+    (`dew.inference.loading.place`), but for the convolution kernels and a
     UNet's per-head attention kernels, which are read whole
     (`dew.interop.weights.record_layouts`). `text=False` binds the text
     encoder to no weights and leaves it out of the variables.
