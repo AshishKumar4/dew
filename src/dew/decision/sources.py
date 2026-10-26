@@ -11,6 +11,8 @@ from functools import partial
 from pathlib import Path
 from typing import Self
 
+import numpy as np
+
 from dew import _records
 from dew.batch import Variables
 from dew.data.text import HFTokenizer
@@ -51,7 +53,9 @@ class DecisionHeadSource(HeadComponent):
 @dataclasses.dataclass(frozen=True, kw_only=True)
 class PretrainedDecision(Pretrained):
     """A native backbone bundle with its readout and declared decision task.
-    Inherited adaptation operates on the backbone; the readout retains its own variables."""
+    Inherited adaptation operates on the backbone; the readout retains its own variables. The release
+    is the backbone and its readout together, which `save` writes: its tensors are not one flat set, so
+    `export` refuses them, and `backbone` is the backbone alone, whose `export` and `save` are its own."""
 
     head: Head
     head_variables: Variables
@@ -65,6 +69,17 @@ class PretrainedDecision(Pretrained):
     def map_variables(self, transform: Callable[[Variables], Variables]) -> Self:
         return dataclasses.replace(self, variables=transform(self.variables),
                                    head_variables=transform(self.head_variables))
+
+    def backbone(self) -> Pretrained:
+        """The native backbone alone, as it was read and as it is adapted (`adapt`), without the
+        readout: its own `export` and `save`, which a release's writer writes beside the readout."""
+        held = {field.name: getattr(self, field.name) for field in dataclasses.fields(Pretrained)}
+        return Pretrained(**held)
+
+    def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
+        raise ValueError("a decision release writes its backbone and its readout apart, which no one "
+                         "flat set of tensors holds: save it, or export its backbone alone "
+                         "(`backbone().export()`)")
 
     def pipeline(self) -> Decide:
         return Decide.of(self.packed())

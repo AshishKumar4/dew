@@ -141,10 +141,8 @@ def save(bundle: "PretrainedDecision", directory: str | Path, *,
     """Write a joint-head release, which `Pretrained.load` reads back: the held native backbone
     as a standard checkpoint with its tokenizer, and beside it the head's sizes
     (`joint_head_config.json`) and tensors under the release's names (`joint_head.safetensors`)."""
-    from dew.interop.pretrained import Pretrained
-
     root = Path(directory)
-    Pretrained.save(bundle, root, max_shard_size=max_shard_size)
+    bundle.backbone().save(root, max_shard_size=max_shard_size)
     bundle.decision_tokenizer.save_pretrained(root)
     sizes = {name: getattr(bundle.head, name) for name in SIZES}
     (root / HEAD_CONFIG).write_text(json.dumps(sizes, indent=1) + "\n")

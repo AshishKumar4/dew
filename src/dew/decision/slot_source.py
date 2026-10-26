@@ -125,7 +125,7 @@ class SlotSource(SourceKind):
         if layout.blocks:
             readout["attention"] = "noncausal"
         root = Path(directory)
-        Pretrained.save(bundle, root, max_shard_size=max_shard_size)
+        bundle.backbone().save(root, max_shard_size=max_shard_size)
         bundle.decision_tokenizer.save_pretrained(root)
         if mode == "head":
             import torch
