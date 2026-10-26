@@ -1180,7 +1180,7 @@ def test_arrayrecords_wait_for_a_busy_reader_before_opening_a_missing_shard(arra
         return underlying_read(reader, index)
 
     def waiting(condition, timeout=None):
-        if condition is source._lock:
+        if condition is source._shards._lock:
             queued.set()
         return condition_wait(condition, timeout)
 

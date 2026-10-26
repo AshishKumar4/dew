@@ -353,7 +353,8 @@ def test_an_image_a_record_names_by_path_is_read_past_the_automatic_cache(tmp_pa
     chain = Pipeline(rows).map(step, identity="counted@1").map(images.DecodeImage("image", rejects=False))
 
     def pixels() -> list[int]:
-        loader = compile(chain.batch(2), read=how, loading=Loading(workers=0, threads=1, read_buffer=1))
+        loader = compile(chain.repeat(1).batch(2, drop_remainder=False), read=how,
+                         loading=Loading(workers=0, threads=1, read_buffer=1))
         stream = loader.train(DataPartition())
         try:
             return sorted(int(image[0, 0, 0]) for batch in stream for image in batch["image"])
