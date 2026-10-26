@@ -1,5 +1,6 @@
 """Policy loss terms and replicated-reader rollout contracts."""
 
+import dataclasses
 from pathlib import Path
 
 import jax
@@ -61,14 +62,14 @@ def test_policy_losses_score_through_the_scorers_head_and_report_the_policys_qk_
     batch, rows = scored_batch(objective)
     step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=reference)
 
-    def trained(built):
+    def trained(built, step):
         (loss, aux), gradient = jax.value_and_grad(built.scalar_loss, has_aux=True)(variables, batch, step)
         return loss, gradient, aux.qk_stats
 
-    loss, gradient, qk = trained(plain)
+    loss, gradient, qk = trained(plain, step)
     assert qk is None
-    headed = objective(model, SEQ, 0.1, head_chunks=2, head_tile="whole", qk_stats=True)
-    headed_loss, headed_gradient, qk = trained(headed)
+    headed = objective(model, SEQ, 0.1, head_chunks=2, head_tile="whole")
+    headed_loss, headed_gradient, qk = trained(headed, dataclasses.replace(step, qk_stats=True))
     np.testing.assert_allclose(headed_loss, loss, rtol=1e-5)
     jax.tree.map(lambda found, expected: np.testing.assert_allclose(found, expected, rtol=1e-4, atol=1e-6),
                  headed_gradient, gradient)

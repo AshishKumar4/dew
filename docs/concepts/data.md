@@ -51,6 +51,7 @@ A preset is a plain function from a dataset and its settings to a dataset, appli
 |---|---|
 | A source and `batch(n)` | The source's fields, with numeric values in JAX's configured widths |
 | `lm` | `text`, int32 `[B, seq_len + 1]`; packing adds `text_coordinates` |
+| `lm` with a prefix run (`LMObjective(prefix=...)`) | `text_block_groups`, int32 `[B, seq_len + 1]`: the blocks a prefix run reads whole, -1 outside any |
 | `sft` | Packed `text`, `text_coordinates` and aligned `text_roles` |
 | `canvas` | One row per assistant turn: `text`, int32 `[B, prompt_length + canvases * canvas_size]`, and `canvas_mask` |
 | `prompts` | Left-padded prompt IDs, prompt lengths and fixed-width reward metadata |

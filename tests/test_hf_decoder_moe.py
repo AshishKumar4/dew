@@ -244,26 +244,32 @@ def test_an_mxfp4_gpt_oss_checkpoint_loads_through_the_dequantization(tmp_path):
         assert np.array_equal(np.asarray(leaf), flat_tree(expected["params"])[path]), path
 
 
+GPT_OSS_20B = ("openai/gpt-oss-20b", "6cee5e81ee83917806bbde320786a8fb61efebee")
+"""The released GPT OSS 20B and the commit both sides read."""
+
+
 @pytest.mark.network
 def test_gpt_oss_20b_matches_transformers_on_the_real_weights():
     """The released MXFP4 checkpoint through the loader against transformers'
     own dequantized bf16 forward at the same prompt. Tolerance on the top-32
     logits 5e-2 for bf16 accumulation over 24 layers; the argmax must agree
     everywhere. The largest observed difference is not recorded here: the
-    test needs the download."""
+    test needs the download. The weights stay in the bf16 the MXFP4 blocks
+    decode to (`param_dtype="auto"`), as the reference holds them: 42 GB on
+    the device, where FP32 master weights would take 84."""
     import torch
     from transformers import AutoTokenizer, GptOssForCausalLM
 
+    repo, revision = GPT_OSS_20B
     prompt = "The Cascade Range runs from northern California through Oregon"
-    ids = AutoTokenizer.from_pretrained("openai/gpt-oss-20b")(
+    ids = AutoTokenizer.from_pretrained(repo, revision=revision)(
         prompt, return_tensors="np")["input_ids"].astype(np.int32)
-    pretrained = Pretrained.load("openai/gpt-oss-20b", dtype="bfloat16",
-                                 attention_impl="xla",
-                                 max_seq_len=int(ids.shape[1]))
+    pretrained = Pretrained.load(repo, dtype="bfloat16", param_dtype="auto", attention_impl="xla",
+                                 max_seq_len=int(ids.shape[1]), revision=revision)
     model, variables = pretrained.model, pretrained.variables
     logits = np.asarray(model.apply(variables, jnp.asarray(ids)), np.float32)[0]
 
-    reference = GptOssForCausalLM.from_pretrained("openai/gpt-oss-20b", dtype=torch.bfloat16)
+    reference = GptOssForCausalLM.from_pretrained(repo, dtype=torch.bfloat16, revision=revision)
     reference.eval()
     reference.set_attn_implementation("eager")
     with torch.no_grad():

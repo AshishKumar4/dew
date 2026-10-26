@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, ClassVar, Self
 from flax import linen as nn
 
 from dew.nn.backbones.decoder_stack import DecoderBank
+from dew.nn.protocols import block_chunks_of
 
 if TYPE_CHECKING:
     from dew._records import JSON
@@ -95,6 +96,12 @@ class DecoderWrapper(nn.Module):
     @nn.nowrap
     def generation_refusal(self) -> str | None:
         return self._decoder.generation_refusal()
+
+    @nn.nowrap
+    def block_chunks(self) -> tuple[int | None, ...]:
+        """The decoder's trunk layers that read blocks, by their attention chunk (`BlockReading`); the
+        wrapper's own modules read none."""
+        return block_chunks_of(self._decoder)
 
     @nn.nowrap
     def with_remat(self, policy: RematPolicy | None) -> Self:

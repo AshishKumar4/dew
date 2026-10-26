@@ -26,7 +26,7 @@ from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
-from dew.batch import EXAMPLE_ROWS, Batch, Variables, merge
+from dew.batch import EXAMPLE_ROWS, Batch, Variables, dicts, merge
 from dew.data.dataset import rows_of
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import rows_spec
@@ -40,7 +40,7 @@ from dew.objectives.base import (
     recorded_metrics,
     with_projected,
 )
-from dew.optim import stepped
+from dew.optim import clips_qk, stepped
 from dew.state import Accumulation, TrainState, apart, together
 from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
@@ -194,9 +194,11 @@ def ema_update(ema, params, decay):
 
 
 def write_back(params: Variables, variables: Variables | None) -> Variables:
-    """Replace nonparameter collections whole; the optimizer owns params."""
+    """Replace nonparameter collections whole; the optimizer owns params. A collection comes back in
+    the state's dicts whichever Flax container the objective's `apply` wrote it in (`dew.batch.dicts`)."""
     if variables is None:
         return params
+    variables = dicts(variables)
     if "params" in variables:
         raise ValueError("Aux.variables cannot carry the params collection; the optimizer owns it")
     for name, collection in variables.items():
@@ -232,15 +234,20 @@ def _all_finite(tree) -> jax.Array:
 
 
 def compact_qk(tree):
-    """Reduce every sowed `max_logits` leaf over its rows, keeping the heads.
+    """Reduce every sowed `max_logits` leaf over its rows, keeping the heads, and a layer's geometry
+    (`kv_heads`, `head_dim`, `qk_nope`) to the one count it is.
 
     The clip reads each head's strongest logit alone, so a retained window
-    holds one row per layer instead of the batch's.
+    holds one row per layer instead of the batch's. A pipelined layer sows
+    its geometry once a microbatch (`StackView`), the same count each time,
+    and the clip reads it as one.
     """
     def compact(path, leaf):
         is_maximum = any(isinstance(entry, jax.tree_util.DictKey) and entry.key == "max_logits"
                          for entry in path)
-        return jnp.max(leaf, axis=-2, keepdims=True) if is_maximum and leaf.ndim > 1 else leaf
+        if is_maximum:
+            return jnp.max(leaf, axis=-2, keepdims=True) if leaf.ndim > 1 else leaf
+        return jnp.max(leaf) if leaf.ndim else leaf
     return jax.tree_util.tree_map_with_path(compact, tree)
 
 
@@ -396,6 +403,11 @@ class Transaction:
         never replays. A general statistics tree reduces only once pooled, so
         its gradient has to be recomputed under the pooled cotangent.
         """
+        if aux.qk_stats is None and clips_qk(state.opt_state):
+            raise ValueError(
+                f"{type(self.objective).__name__} returns no attention logit maxima (Aux.qk_stats) though "
+                "its step asks for them (Step.qk_stats), and the run's optimizer clips by them (a QK-Clip, "
+                "muonclip's): its attention would train unclipped")
         previous = state.accumulation
         fill = state.microstep % self.size
         due = (fill + 1) == self.size
@@ -475,6 +487,7 @@ class Transaction:
         # The part its input ran as, which an attempt counts (`step` times `split` plus its part).
         step_info = Step(accepted // self.split, jax.random.fold_in(state.key, attempt),
                          with_ema(variables, state.ema), committed=state.updates, record=self.record,
+                         qk_stats=clips_qk(state.opt_state),
                          **self.examples(state, index, batch, part=attempt % self.split,
                                          rejected=attempt - accepted))
         return self.read(variables, state.compute), batch, step_info
@@ -687,7 +700,7 @@ class Transaction:
             rejected = attempt - state.microstep
             step_info = Step(state.microstep // self.split, jax.random.fold_in(state.key, attempt),
                              with_ema(state.variables, state.ema), committed=state.updates,
-                             record=self.record,
+                             record=self.record, qk_stats=clips_qk(state.opt_state),
                              **self.examples(state, state.microstep % self.size, batch, part, rejected))
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
             realized = realize(self.read(state.variables, state.compute), batch, step_info)

@@ -192,6 +192,12 @@ Import `LMObjective` from `dew.objectives.lm`.
 
 `indexer` trains DeepSeek-V3.2's lightning indexer on a model whose `mla` mixer names `index_n_heads` and `index_head_dim`. `IndexerTraining("warmup")` needs a mixer without `index_topk`. The model then runs dense attention, `init` puts only the indexer in `params` and the rest of the tree under `frozen` (a `variables` tree may omit the indexer, as a dense checkpoint does), and the loss is the KL of the indexer's softmax from the attention distribution, reported as `indexer_kl`. `IndexerTraining("sparse")` needs a mixer with `index_topk`. The whole tree trains: the cross entropy trains the main weights, and the KL over the selected keys trains the indexer, whose inputs are detached. A warm-up checkpoint's split tree is accepted as `variables`. `weight` scales the KL term.
 
+Import `ExpertBalance` from `dew.objectives.routing`.
+
+<!-- api: dew.objectives.routing.ExpertBalance -->
+
+`ExpertBalance` holds how a run trains its routers. `LMObjective(balance=...)`, `MaskedDiffusionObjective(balance=...)`, `GRPOObjective(balance=...)`, `DPOObjective(balance=...)` and `PPOObjective(balance=...)` compose it: `balance_rate` moves each balancing bias against its load at every committed update (it needs a mixture with `bias=True`), `aux_loss_alpha` and `seq_aux` add DeepSeek V2's balance loss, and `router_z_loss` adds ST-MoE's z-loss. Each term is optional.
+
 Import `generate`, `Sampling` and `Generation` from `dew.sampling`:
 
 <!-- api: dew.sampling.generate dew.sampling.Sampling -->
