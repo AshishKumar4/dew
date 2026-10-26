@@ -1122,7 +1122,8 @@ def _assert_kl_outputs(dew, plain, truth, bounds, label):
     or the end's: infinite of its sign above, zero or subnormal below."""
     for name, exact in truth.items():
         value, reference, kinds = np.asarray(dew[name]), np.asarray(plain[name]), _kinds(exact)
-        held = np.isfinite(reference) & (kinds != "over")
+        # A truth below float32's least normal, or near either end, is held by its kind below.
+        held = np.isfinite(reference) & ((kinds == "normal") | (exact == 0))
         mine, theirs = np.where(held, value, exact), np.where(held, reference, exact)
         axes = tuple(range(1, exact.ndim))
         size = np.max(np.abs(exact), axis=axes) if axes else np.abs(exact)
