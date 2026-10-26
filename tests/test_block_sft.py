@@ -35,7 +35,7 @@ from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.objectives.base import FROZEN, Step, freeze, model_rngs, select, thaw
 from dew.objectives.diffusion.block import BlockDiffusionObjective, _cache_geometry
 from dew.objectives.lm.chunked import chunked_tile, model_logits
-from dew.optim import scale_by_qk_clip
+from dew.optim import scale_by_qk_clip, stepped
 from dew.training import MeshSpec
 from dew.training.transaction import example_fields
 
@@ -705,12 +705,12 @@ def clipped_run(obj, batch, limit):
 
 
 def assert_clipped_at_the_maxima(start, opt_state, passes, final, limit):
-    """`final`'s parameters are `qk_clip(limit)`'s update at the passes' merged maxima, applied to `start` bit
-    for bit, and the clip moved some of them. Returns the maxima it clipped at."""
+    """`final`'s parameters are `qk_clip(limit)`'s update at the passes' merged maxima, applied to `start` with
+    its rescale (`stepped`) bit for bit, and the clip moved some of them. Returns the maxima it clipped at."""
     maxima = jax.tree.map(np.asarray, merged(passes))
     zero = jax.tree.map(np.zeros_like, start["params"])
-    applied, _ = jax.jit(qk_clip(limit).update)(zero, opt_state, start["params"], qk_stats=maxima)
-    expected = jax.tree.map(np.asarray, optax.apply_updates(start["params"], applied))
+    applied, after = jax.jit(qk_clip(limit).update)(zero, opt_state, start["params"], qk_stats=maxima)
+    expected = jax.tree.map(np.asarray, stepped(start["params"], applied, opt_state, after))
     jax.tree.map(np.testing.assert_array_equal, final["params"], expected)
     assert any(not np.array_equal(after, before) for after, before in
                zip(jax.tree.leaves(final["params"]), jax.tree.leaves(start["params"]), strict=True))
