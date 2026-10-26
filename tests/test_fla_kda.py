@@ -15,7 +15,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from delta_rule_support import NAMES, fla_side, float64_truth, math, plain_prefix, recurrence, through
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened, with_gradients
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    widened,
+    with_gradients,
+)
 from tuned import each_config
 
 from dew.nn import kernels
@@ -117,6 +123,7 @@ def test_a_bf16_kimi_delta_attention_trains_on_the_port_as_on_the_math():
 
     wide = jax.jit(forward(layer.clone(dtype=jnp.float64)))
 
+    @as_given
     def truth(params, x, cotangent):
         with jax.enable_x64(new_val=True), kernels.assumed("cpu"):
             return wide(*widened((params, x, cotangent)))
