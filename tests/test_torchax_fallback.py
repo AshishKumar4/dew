@@ -945,6 +945,7 @@ def test_a_slot_release_over_a_tier_3_backbone_scores_and_serves_by_transformers
         [laid] = task.layout.rows(task.tokenizer, task.specials, request["state"], asked(request))
         return laid
 
+    @as_given
     def ours(seed):
         encoded = row(seed)
         [scores] = task.scored([encoded])
