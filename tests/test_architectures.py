@@ -33,6 +33,7 @@ from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.config import MetricConfig, ModelConfig, ObjectiveConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader
+from dew.data.images import CAPTIONS
 from dew.diffusion import presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention import Stage
@@ -714,7 +715,7 @@ def test_a_val_metric_records_its_own_constructors_defaults():
     back. A run's metrics are such records, so a bare alias in their place is refused where the
     run is written: in its record, on its command line and in its fields."""
     clip = MetricConfig("clip")
-    assert clip.defaults == {"modelname": CLIP_CHECKPOINT, "field": "text"}
+    assert clip.defaults == {"modelname": CLIP_CHECKPOINT, "field": CAPTIONS}
     assert from_record(MetricConfig, to_record(clip, MetricConfig)) == clip
     run = unet_run(JSON_UNET)
     with pytest.raises(TypeError):
