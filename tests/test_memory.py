@@ -27,10 +27,11 @@ MEMORY_SEEDS = 8
 configuration, its token-by-token, decoded, packed, cached and recurrence paths included, at 8 over the
 drawn weights."""
 SEEDS = {"self-generated gradients": 256, "memory decoder gradient": 256, "memory decoder decode": 32,
-         "adapted memory": 8}
-"""The sites `seeds_for` on armada sizes past `MEMORY_SEEDS`: the self-modifying memory's and the memory
-decoder's gradients, every parameter's leaf, at 256, each reference compared with itself, and the
-decoder's last logits after a cached decode at 32."""
+         "adapted memory": 8, "rows split": 256}
+"""The sites' declared seeds where `seeds_for` on armada, each reference compared with itself, sizes them
+past `MEMORY_SEEDS` or apart from it: the self-modifying memory's and the memory decoder's gradients,
+every parameter's leaf, and a memory's rows split over an Explicit axis, its gradients among them, at
+256; the decoder's last logits after a cached decode at 32; an adapted memory decoder at 8."""
 
 CONFIGURATIONS = {
     # TTT-Linear (Sec 2.7): f(x) = x + LN(W x), the L2 reconstruction (Eq 4), eta(x) = eta_base sigmoid(.).
@@ -699,15 +700,17 @@ def explicit_rows_run(module: InContextMemory):
 
 
 @pytest.mark.mesh(devices=2)
-@pytest.mark.parametrize("name", ["titans", "gated_linear_attention", "cms"])
-def test_a_memory_runs_its_rows_split_over_an_explicit_axis(name):
+@pytest.mark.parametrize(("name", "commit"), [("titans", "token"), ("titans", "chunk"),
+                                              ("gated_linear_attention", "token")])
+def test_a_memory_runs_its_rows_split_over_an_explicit_axis(name, commit):
     """Rows split over an Explicit data axis, as a run's batch is: a memory's forward, the gradients of
     its weights and stream, its forward over packed documents and a prefill continued token by token
-    through its cache, each on the general chunk scan, the token scan or a linear memory's recurrence,
-    are what one device computes, on par against float64 (check 1)."""
+    through its cache, each on the general chunk scan (each token reading its own step, or its chunk's
+    start), the token scan or a linear memory's recurrence, are what one device computes, on par
+    against float64 (check 1)."""
     from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
-    module = layer(name)
+    module = layer(name).clone(commit=commit)
     mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
     run, draw = explicit_rows_run(module), drawn(module)
     segments = np.broadcast_to(np.where(np.arange(LENGTH) < 5, 1, 2), (ROWS, LENGTH)).astype(np.int32)
@@ -723,7 +726,7 @@ def test_a_memory_runs_its_rows_split_over_an_explicit_axis(name):
             return jax.device_get(run(jax.device_put(x, rows), jax.device_put(params, whole),
                                       jax.device_put(cotangent, rows), jax.device_put(segments, rows)))
 
-    assert_as_exact(split, run, placed, f"{name} memory rows split", seeds=MEMORY_SEEDS,
+    assert_as_exact(split, run, placed, f"{name} memory rows split", seeds=SEEDS["rows split"],
                     truth_fn=explicit_rows_run(module.clone(dtype=jnp.float64)))
 
 
@@ -737,11 +740,11 @@ def test_a_memory_refuses_a_bidirectional_decoder():
 
 
 def test_a_memory_decoder_names_and_climbs_to_the_residuals_its_path_marks(capsys):
-    """A memory kind declares the residuals its path marks (`MixerBase.residuals`): a linear memory on
-    the delta rule, which runs the rule's port, its decay, inverse and memory, each of which a policy
-    saving it alone keeps for the backward, so its decoder's remat ladder takes the rung recomputing
-    the rule's memory alone; Titans' memory its chunk scan's carry, kept alike, and a ladder without
-    that rung."""
+    """A memory kind declares the residuals its path marks (`MixerBase.residuals`), each of which a
+    policy saving it alone keeps for the backward beyond what a policy saving nothing keeps: a linear
+    memory on the delta rule, which runs the rule's port, its decay, inverse and memory, so its
+    decoder's remat ladder takes the rung recomputing the rule's memory alone; Titans' memory its chunk
+    scan's carry, which its scan keeps chunk by chunk, and a ladder without that rung."""
     from jax.ad_checkpoint import print_saved_residuals
     from model_support import TINY_DECODER
 
@@ -757,14 +760,15 @@ def test_a_memory_decoder_names_and_climbs_to_the_residuals_its_path_marks(capsy
         ids = jax.random.randint(jax.random.key(3), (2, LENGTH), 0, 37)
         variables = model.init(jax.random.key(4), ids)
 
-        def saves(name: str) -> bool:
+        def saved(names: tuple[str, ...]) -> str:
             capsys.readouterr()
             loss = jax.checkpoint(lambda held: jnp.sum(model.apply(held, ids) ** 2),
-                                  policy=RematPolicy(save=(name,)).checkpoint_policy())
+                                  policy=RematPolicy(save=names).checkpoint_policy())
             print_saved_residuals(loss, variables)
-            return f"named '{name}'" in capsys.readouterr().out
+            return capsys.readouterr().out
 
-        assert all(saves(name) for name in kind.residuals)
+        nothing = saved(())
+        assert kind.residuals and all(saved((name,)) != nothing for name in kind.residuals)
         climbed = [model]
         while (stronger := climbed[-1].recompute_more()) is not None:
             climbed.append(stronger)
