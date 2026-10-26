@@ -16,6 +16,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import itertools
+import os
 import threading
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -30,7 +31,9 @@ from dew.data.analysis import (
     Measuring,
     _analyzed,
     _at,
+    _cache_key,
     _cache_manifest,
+    _cacheable,
     _capabilities,
     _configured,
     _cut,
@@ -50,7 +53,9 @@ from dew.data.analysis import (
     _volatile,
     _written,
     reach,
+    written,
 )
+from dew.data.compilation import compiling, within
 from dew.data.dataset import (
     Closeable,
     DataPartition,
@@ -81,6 +86,7 @@ from dew.data.pipeline import (
     Batched,
     BatchStage,
     Configured,
+    Costly,
     Dataset,
     DeviceStep,
     Expansion,
@@ -91,6 +97,7 @@ from dew.data.pipeline import (
     Limit,
     Map,
     MapBatch,
+    MapWithIndex,
     Mixture,
     Native,
     ObjectiveData,
@@ -104,6 +111,7 @@ from dew.data.pipeline import (
     Shuffle,
     SingleReader,
     Slice,
+    Stage,
     TokenBudget,
     TokenGeometry,
     Windows,
@@ -135,16 +143,67 @@ class _OrderFacts(Protocol):
     def order_fingerprints(self) -> Mapping[str, str]: ...
 
 
+def _writable(root: str) -> bool:
+    """Whether this process may make and write `root`: the nearest directory of it that exists may
+    be written (a read-only home, say, may not)."""
+    existing = os.path.abspath(root)
+    while not os.path.exists(existing):
+        existing = os.path.dirname(existing)
+    return os.path.isdir(existing) and os.access(existing, os.W_OK | os.X_OK)
+
+
+def _automatic(pipeline: Pipeline, read: Read, root: str | None) -> Pipeline:
+    """`pipeline` with a cache at `root` after its leading deterministic record maps, where one of them
+    costs more to run than its records cost to read back (`Costly`: a learned tokenizer's encoding)
+    and the chain writes no cache: each corpus of a mixture or phases its own, in a root this process
+    may write. The maps are the ones
+    a cache keys (`_cacheable`) and reads again unchanged (none `_volatile`), and in an indexed read
+    none that rejects, whose cache a read by index reads back as a stream, slower than it reruns
+    them. It stands for them only in a memory or indexed read, by each input's place in a store
+    whose content is named, in a clean checkout whose steps are exact (`Manifest`), and nowhere
+    else, so a chain no cache could serve reads as it is written, never refused. It holds the
+    records the maps make, and fills, publishes, replays and evicts as `cache(url)` does (`Cache`),
+    though local storage that fails it stops its fill and the run reads on (`Cache.optional`),
+    so a run reads the same records with or without it (`Artifact.automatic`), and a run of the
+    same maps over the same records reads them back once one has read them whole. Its root is the
+    run's to name or refuse (`automatic_root`)."""
+    from dew.data.cache import Cache
+
+    if root is None or read == "streamed":
+        return pipeline
+    if isinstance(pipeline.source, (Mixture, Phases)):
+        return with_children(pipeline, lambda child: _automatic(child, read, root))
+    if any(isinstance(stage, Artifact) for stage in _steps(pipeline)):
+        return pipeline
+
+    def kept(stage: Stage) -> bool:
+        return (isinstance(stage, (Map, MapWithIndex)) and _cacheable(stage) and not _volatile(stage)
+                and not (read == "indexed" and stage.rejects))
+
+    at = next((index for index, stage in enumerate(pipeline.stages) if not kept(stage)), len(pipeline.stages))
+    prefix = pipeline.stages[:at]
+    steps = [stage.step for stage in prefix if isinstance(stage, (Map, MapWithIndex))]
+    if not any(isinstance(step, Costly) and step.costly for step in steps):
+        return pipeline
+    if not pipeline.source.supports(read) or not _writable(root):
+        return pipeline
+    key = _cache_key(pipeline.source, prefix, read)
+    if key is None or not (key.clean and key.exact):
+        return pipeline
+    cached = Artifact(Cache(root, optional=True), automatic=True)
+    return dataclasses.replace(pipeline, stages=(*prefix, cached, *pipeline.stages[at:]))
+
+
 def _cache_references(pipeline: Pipeline, read: Read) -> tuple[str, ...]:
     """The caches each corpus of `pipeline` reads through, among its stages as its pipeline wrote
     them (`_written`), the ones a memory read already ran included, each named against the source
     it came from."""
     references = []
     for leaf, source in _leaves(pipeline):
-        stages, written = _written(source, leaf.stages), source
-        while materialized(written):
-            written = written.source
-        references += [stage.cache.reference(_cache_manifest(written, stages[:index], read))
+        stages, origin = _written(source, leaf.stages), source
+        while materialized(origin):
+            origin = origin.source
+        references += [stage.cache.reference(_cache_manifest(origin, stages[:index], read))
                        for index, stage in enumerate(stages) if isinstance(stage, Artifact)]
     return tuple(references)
 
@@ -244,7 +303,9 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
         return _Facts(source, read, source.fingerprint(), metadata, held, label)
 
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as readers:
-        pinned = dict(zip(sources, readers.map(pin, sources.values()), strict=True))
+        # Each read in this compilation, which fingerprints each source once (`compiling`).
+        tasks = [within(functools.partial(pin, source)) for source in sources.values()]
+        pinned = dict(zip(sources, readers.map(lambda task: task(), tasks), strict=True))
 
     return tuple(with_stores(branch, lambda source: pinned[id(source)]) for branch in pipelines)
 
@@ -390,14 +451,14 @@ def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]) 
     corpora = build.lowering.order["corpora"]
     if not isinstance(corpora, list):
         raise TypeError("a mixture's order holds its corpora's orders as a list")
-    members = {"": fingerprint({"steps": steps([*(_identity(stage) for stage in train.stages
+    members = {"": fingerprint({"steps": steps([*(_identity(stage) for stage in written(train.stages)
                                                   if not isinstance(stage, (Workers, Prefetch))),
                                                 *(StepIdentity.of(step) for step in host)])})}
     for index, (key, child) in enumerate(zip(_member_keys(_members(source.pipelines)), source.pipelines,
                                              strict=True)):
         sources = [read for _, read in _leaves(child)]
         identities = [*(_identity(stage) for read in sources for stage in _written(read, ())),
-                      *(_identity(stage) for stage in _steps(child)
+                      *(_identity(stage) for stage in written(tuple(_steps(child)))
                         if not isinstance(stage, (Workers, Prefetch)))]
         members[key] = fingerprint({
             "order": unplaced(json_value(corpora[index], "member order")),
@@ -446,6 +507,7 @@ def _prepared(
     training: bool = False,
     objective: ObjectiveData | None = None,
     counts: Sequence[dict[str, CorpusCounts]] | None = None,
+    automatic: str | None = None,
 ) -> tuple[Pipeline, ...]:
     """The one preparation compile, iterate, validation and publish lower from.
 
@@ -456,7 +518,8 @@ def _prepared(
     bind to the sources' metadata. With read='memory' and `counts`, the
     source-scoped steps run and materialize first, so run-scoped steps bind
     to measured facts; publication passes no counts and reads nothing before
-    its fill. The caller materializes what remains.
+    its fill. The caller materializes what remains. A training read caches
+    each corpus's leading deterministic steps under `automatic` (`_automatic`).
     """
     if read not in ("memory", "indexed", "streamed"):
         raise ValueError(f"unknown read mode {read!r}")
@@ -469,6 +532,7 @@ def _prepared(
     _capabilities(branches, read, provision)
     branches = _pin_sources(branches, read)
     _tokenizer_contract(branches)
+    branches = tuple(_automatic(branch, read, automatic) for branch in branches)
     if objective is not None:
         branches = tuple(
             _objective_branch(branch, objective, train=not scored, read=read)
@@ -522,6 +586,7 @@ def _build(branch: Pipeline, read: Read, loading: Loading, *, batch: int, traini
     return _Build(read, loading, seed, batch, lowered, training=training)
 
 
+@compiling
 def compile(
     train: Pipeline,
     *,
@@ -588,6 +653,8 @@ def _staged(
     rejections: Literal["drop", "mask"],
     examples: int | None = None,
 ) -> _Staged:
+    from dew.data.cache import automatic_root
+
     if rejections == "mask":
         raise ValueError(
             "rejections='mask' needs an objective proven mask-safe; no objective currently declares it"
@@ -608,6 +675,7 @@ def _staged(
         training=True,
         objective=objective,
         counts=(counts,) if validation is None else (counts, validation_counts),
+        automatic=automatic_root(loading) if read != "streamed" else None,
     )
     if not any(isinstance(stage, BatchStage) for stage in branches[0].stages):
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
@@ -652,7 +720,8 @@ def _compiled(
         {"sources": [source.fingerprint() for source in sources]},
         sources,
         (
-            *(_identity(stage) for stage in _steps(original) if not isinstance(stage, (Workers, Prefetch))),
+            *(_identity(stage) for stage in written(tuple(_steps(original)))
+              if not isinstance(stage, (Workers, Prefetch))),
             *(StepIdentity.of(step) for step in host),
         ),
     )
@@ -1050,6 +1119,7 @@ def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]
                         if not (isinstance(source, _Memory) and not source.held)), measured=measured)
 
 
+@compiling
 def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
     """Inspect through training's lowering, finite unless a repeat asks otherwise.
 
@@ -1093,6 +1163,7 @@ def _finite(lowering: _Lowering) -> _Lowering:
                                children=tuple(_finite(child) for child in lowering.children))
 
 
+@compiling
 def iterate(
     pipeline: Pipeline,
     *,
@@ -1192,6 +1263,7 @@ def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int
                       loading=chain._loading or _DEFAULT_LOADING, provision=True, seed=seed)
 
 
+@compiling
 def validation(
     pipeline: Pipeline,
     *,
@@ -1217,6 +1289,7 @@ def validation(
                              host=packed + _held_steps(pipeline) + host)
 
 
+@compiling
 def publish(
     pipeline: Pipeline,
     cache,
