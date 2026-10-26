@@ -68,7 +68,7 @@ from jax.interpreters.ad import JVPTracer
 from dew.nn import linear
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, recurrence_chunk
-from dew.nn.mixer_base import MEMORY_RESIDUALS
+from dew.nn.mixer_base import DELTA_RESIDUALS, MEMORY_RESIDUALS
 from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
 from dew.optim import newton_schulz
 from dew.quantization import FROZEN_FP8, QUANTIZATION, frozen_fp8_kernel
@@ -403,6 +403,16 @@ class InContextMemory(nn.Module):
         else:
             read = read.reshape(batch, length, -1)
         return read
+
+    @property
+    def residuals(self) -> tuple[str, ...]:
+        """The residuals this layer marks for a remat policy (`dew.nn.mixer_base.RESIDUALS`): a linear
+        memory on the shared recurrence its rule's (the delta rule's port saves its decay, inverse and
+        memory; the dot rule's portable math marks none), any other its chunk scan's carry."""
+        hooks = self._recurrence()
+        if hooks is None:
+            return MEMORY_RESIDUALS
+        return DELTA_RESIDUALS if hooks.delta else ()
 
     # A linear memory on the shared recurrence.
 

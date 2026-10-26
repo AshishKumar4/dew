@@ -6,7 +6,7 @@ import dataclasses
 import functools
 
 from dew.nn.memory import InContextMemory
-from dew.nn.mixer_base import MEMORY_RESIDUALS, MixerBase, MixerContext
+from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.registry import rebuilt
 
 
@@ -16,10 +16,14 @@ class InContextMemoryMixer(MixerBase):
     it: its network, objective, target, gates, chunk and views, every field it computes by. The
     layer's dtype and matmul precision are the decoder's."""
 
-    residuals = MEMORY_RESIDUALS
     keeps_cache = True
 
     memory: InContextMemory
+
+    @property
+    def residuals(self) -> tuple[str, ...]:
+        """The residuals the memory's path marks (`InContextMemory.residuals`)."""
+        return self.memory.residuals
 
     def build(self, ctx: MixerContext):
         if not ctx.causal:
