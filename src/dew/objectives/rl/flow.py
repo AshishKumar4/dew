@@ -31,6 +31,7 @@ from dew.data.dataset import rows_of
 from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceGrid
+from dew.distributed.batches import row_origins, shared_host_fields, split_fields, with_host
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.precision import at_least_fp32, weighted_total
@@ -41,7 +42,6 @@ from dew.rl.surrogate import clipped_surrogate_terms
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
 from dew.sampling.guidance import CFG, Walk
 from dew.sampling.solvers import Euler, Solver
-from dew.training.distributed import row_origins, shared_host_fields, split_fields, with_host
 
 from .sessions import ADVANTAGES_KEY, OLD_LOG_PROBS_KEY
 
