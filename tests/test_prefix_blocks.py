@@ -307,9 +307,8 @@ def test_a_prefix_runs_stage_keeps_the_blocks_a_record_carries(prefix):
     """The rows a prefix run's compiled chain delivers (`fitted` with its objective's stages), to training
     and to evaluation alike: a record that carries its own blocks keeps them, as the loss keeps a batch's
     (`prefixed_fields`), and one without takes the prefix's, each document's first tokens or its prompt;
-    a prompt run's record that carries blocks needs no roles of its own. The rows' target counts are
-    counted over those blocks, each target inside a block or past its document dropped. A stage a
-    pipeline names itself replaces them."""
+    a prompt run's record that carries blocks needs no roles of its own, and each row's targets the loss
+    scores are counted over those blocks. A stage a pipeline names itself replaces them."""
     from dew.data import Memory
     from dew.data.compile import fitted
     from dew.data.dataset import DataPartition
@@ -329,8 +328,11 @@ def test_a_prefix_runs_stage_keeps_the_blocks_a_record_carries(prefix):
         finally:
             stream.close()
         np.testing.assert_array_equal(delivered["text_block_groups"], np.stack([own, filled]))
-        # Each row's count is the targets its loss scores over those blocks (`scored_tokens`).
-        np.testing.assert_array_equal(delivered["_dew_valid_targets"], objective.scored_tokens(delivered))
+        # Each row's targets its loss scores over those blocks: a document's next tokens, those inside a
+        # block dropped (own: 3 of the first document's 5 and both of the second's; a prefix of 3: 3
+        # and none; the prompts: 3 and both).
+        np.testing.assert_array_equal(objective.scored_tokens(batch_text(delivered)),
+                                      [5, 3] if prefix == PREFIX else [5, 5])
     named = Blocks(prefix=PREFIX).map({**records[0], "text_positions": POSITIONS[1]})
     np.testing.assert_array_equal(named["text_block_groups"], BLOCKS[1])
 
