@@ -26,7 +26,7 @@ import optax
 import orbax.checkpoint as ocp
 import pytest
 from affine_run import BATCH, FEATURES, Counting, Features, Regression, Spread, dataset, raw_leaf, val_batches
-from flax.core import freeze as frozen_dict
+from flax.core import FrozenDict, freeze as frozen_dict
 from recording import Preempting, RecordingTracker
 from steady_state import steady_state
 from token_support import write_token_corpus
@@ -1347,18 +1347,38 @@ class FrozenCounted(Counted):
         return loss, Aux({}, variables=frozen_dict({"stats": {"seen": variables["stats"]["seen"] + 1}}))
 
 
-@pytest.mark.parametrize("objective", [Counted, FrozenCounted], ids=["dict", "frozen"])
+class ListedCounted(Counted):
+    """`Counted`, its count held in a list, which the loss writes back as a Flax `FrozenDict`."""
+
+    def fresh_variables(self, key, held):
+        return {"params": {"w": jnp.ones((2,))}, "stats": {"seen": [{"count": jnp.zeros(())}]}}
+
+    def loss(self, variables, batch, step):
+        loss = jnp.sum(variables["params"]["w"] ** 2)
+        count = variables["stats"]["seen"][0]["count"] + 1
+        return loss, Aux({}, variables={"stats": {"seen": [frozen_dict({"count": count})]}})
+
+
+def seen(stats) -> float:
+    """How many steps a `Counted` collection counted, held as `Counted` or `ListedCounted` holds it."""
+    held = stats["seen"]
+    return float(held[0]["count"] if isinstance(held, list) else held)
+
+
+@pytest.mark.parametrize("objective", [Counted, FrozenCounted, ListedCounted],
+                         ids=["dict", "frozen", "listed"])
 def test_aux_variables_are_written_back_into_the_state_and_checkpointed(tmp_path, objective):
     """A collection the loss writes back replaces the state's, in the state's dicts whichever Flax
-    container it comes in."""
+    container it comes in, under a mapping or a list."""
     trainer = make_trainer(tmp_path, objective=objective(), optimizer=optax.adamw(1e-2, weight_decay=1.0))
     state = trainer.fit(dataset(), steps=3, log_every=1)
-    assert type(state.variables["stats"]) is dict
-    assert float(state.variables["stats"]["seen"]) == 3.0
+    nodes = jax.tree.leaves(state.variables, is_leaf=lambda node: isinstance(node, FrozenDict))
+    assert not any(isinstance(node, FrozenDict) for node in nodes)
+    assert seen(state.variables["stats"]) == 3.0
     assert set(state.opt_state[0].mu) == {"w"}
 
     restored, _ = trainer.checkpoints.restore()
-    assert float(restored["variables"]["stats"]["seen"]) == 3.0
+    assert seen(restored["variables"]["stats"]) == 3.0
 
 
 # --------------------------------------------------------------------------
