@@ -1299,8 +1299,8 @@ def test_a_cooldown_a_preemption_cuts_short_runs_again_on_resume(tmp_path, best)
     optimizer = OptimConfig(optimizer="adamw", learning_rate=stable)
     # The notice step 3's log sends reaches the run after step 4, as its branch begins.
     stopped = Preempting(3)
-    ranked = {"eval_every": 4, "best": Best(lambda scores: scores["val/loss"], weights_only=True)} if best else {
-        "eval_every": 12}
+    weights = Best(lambda scores: scores["val/loss"], weights_only=True)
+    ranked = {"eval_every": 4, "best": weights} if best else {"eval_every": 12}
     with pytest.raises(Preempted):
         make_trainer(tmp_path, tracker=stopped, optimizer=optimizer).fit(
             dataset(val=val_batches(2)), steps=12, log_every=1, cooldowns=cooldowns, **ranked)
