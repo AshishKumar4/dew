@@ -123,13 +123,14 @@ def record_case(label: str, draw, evaluate, proxy, *, truth_proxy=None, store_in
 def record_shard(label: str, draw, evaluate, seeds: range) -> dict[str, np.ndarray]:
     """The evidence `record_case`'s summary keeps of `seeds`, a run of a recording's seeds, each drawn as
     one run draws it (`draw(seed)`) and evaluated (`evaluate(inputs)`, the reference's outputs and their
-    float64 truth): one shard of a recording `merge_shards` joins."""
-    records = []
-    for seed in seeds:
-        inputs = draw(seed)
-        reference, truth = evaluate(inputs)
-        records.append((inputs, jax.tree.map(np.asarray, reference), jax.tree.map(np.asarray, truth)))
-    return _evidence(label, seeds, records)
+    float64 truth): one shard of a recording `merge_shards` joins. Each seed's outputs are summarized
+    as they are evaluated and dropped, so a shard holds its evidence alone."""
+    def records():
+        for seed in seeds:
+            inputs = draw(seed)
+            reference, truth = evaluate(inputs)
+            yield inputs, jax.tree.map(np.asarray, reference), jax.tree.map(np.asarray, truth)
+    return _evidence(label, seeds, records())
 
 
 def merge_shards(label: str, shards: Sequence[Mapping[str, np.ndarray]]) -> dict[str, np.ndarray]:
@@ -156,26 +157,31 @@ def merge_shards(label: str, shards: Sequence[Mapping[str, np.ndarray]]) -> dict
     return result
 
 
-def _evidence(label: str, seeds: range, records: list) -> dict[str, np.ndarray]:
-    """`records`' evidence, one row a seed of `seeds`: each leaf's `leaf_summary` (its rows of float64
-    zero joined, with their count a seed) and its truth's sketch, and each seed's input digest."""
-    evidence = {f"{label}.drawn": np.asarray(seeds, np.int64),
-                f"{label}.input_digest": np.asarray([input_digest(record[0]) for record in records])}
-    for name in records[0][1]:
-        leaves = [leaf_summary(record[1][name], record[2][name]) for record in records]
+def _evidence(label: str, seeds: range, records) -> dict[str, np.ndarray]:
+    """`records`' evidence, one row a seed of `seeds`, read one record at a time (an iterable of
+    (inputs, reference, truth)): each leaf's `leaf_summary` (its rows of float64 zero joined, with their
+    count a seed) and its truth's sketch, and each seed's input digest."""
+    digests, leaves, sketches, shapes = [], {}, {}, {}
+    for seed, (inputs, reference, truth) in zip(seeds, records, strict=True):
+        digests.append(input_digest(inputs))
+        for name in reference:
+            leaves.setdefault(name, []).append(leaf_summary(reference[name], truth[name]))
+            sketches.setdefault(name, []).append(truth_sketch(truth[name], seed))
+            shapes.setdefault(name, np.asarray(np.shape(truth[name]), np.int64))
+    evidence = {f"{label}.drawn": np.asarray(seeds, np.int64), f"{label}.input_digest": np.asarray(digests)}
+    for name, summaries in leaves.items():
         evidence.update({
-            f"{label}.mse.{name}": np.asarray([leaf.mse for leaf in leaves]),
-            f"{label}.worst.{name}": np.asarray([leaf.worst for leaf in leaves]),
-            f"{label}.finite.{name}": np.asarray([leaf.finite for leaf in leaves]),
-            f"{label}.zero_counts.{name}": np.asarray([len(leaf.zero_rows) for leaf in leaves], np.int64),
+            f"{label}.mse.{name}": np.asarray([leaf.mse for leaf in summaries]),
+            f"{label}.worst.{name}": np.asarray([leaf.worst for leaf in summaries]),
+            f"{label}.finite.{name}": np.asarray([leaf.finite for leaf in summaries]),
+            f"{label}.zero_counts.{name}": np.asarray([len(leaf.zero_rows) for leaf in summaries], np.int64),
             f"{label}.zero_rows.{name}": np.concatenate([np.zeros(0, np.int64),
-                                                         *(leaf.zero_rows for leaf in leaves)]),
+                                                         *(leaf.zero_rows for leaf in summaries)]),
             f"{label}.zero_errors.{name}": np.concatenate(
-                [np.zeros(0), *(leaf.zero_errors for leaf in leaves)]),
-            f"{label}.sketch.{name}": np.stack([truth_sketch(record[2][name], seed)
-                                                for seed, record in zip(seeds, records, strict=True)]),
-            f"{label}.shape.{name}": np.asarray(np.shape(records[0][2][name]), np.int64),
-            f"{label}.dtype.{name}": np.asarray(leaves[0].dtype)})
+                [np.zeros(0), *(leaf.zero_errors for leaf in summaries)]),
+            f"{label}.sketch.{name}": np.stack(sketches[name]),
+            f"{label}.shape.{name}": shapes[name],
+            f"{label}.dtype.{name}": np.asarray(summaries[0].dtype)})
     return evidence
 
 
