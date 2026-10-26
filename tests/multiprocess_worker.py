@@ -664,7 +664,7 @@ def mode_pool_refusals(args) -> dict:
     import optax
     from affine_run import FEATURES, Regression
 
-    from dew import coordination
+    from dew import _coordination
     from dew.data import Memory
     from dew.data.compile import compile
     from dew.data.dataset import Loader
@@ -728,7 +728,7 @@ def mode_pool_refusals(args) -> dict:
         "saved": trained(stream(64, 0), Checkpoints(str(Path(args.run_dir) / "saved")), checkpoint_every=1),
     }
     outcomes["latest"] = Checkpoints(str(Path(args.run_dir) / "saved")).latest
-    coordination.agreed("the saved run's listing", lambda: True)
+    _coordination.agreed("the saved run's listing", lambda: True)
     resumed_from = Path(args.run_dir) / "saved"
     if other:
         # A listing taken before step 2 was committed: a copy of the directory without it.
