@@ -21,10 +21,12 @@ READS = ["memory", "indexed"]
 @dataclass
 class Counted:
     """A fixed map that counts its calls, rejecting the records `rejects` names and changing what it
-    makes on each call where `volatile`, as a live fetch may."""
+    makes on each call where `volatile`, as a live fetch may; one that costs more to run than to read
+    back where `costly` (`dew.data.pipeline.Costly`), as a decode does."""
 
     volatile: bool = False
     rejects: frozenset[int] = frozenset()
+    costly: bool = True
     calls: list[int] = field(default_factory=list, repr=False)
 
     def __call__(self, row):
@@ -86,7 +88,9 @@ def test_a_run_reads_its_leading_maps_back_from_the_records_an_earlier_run_made(
 def test_a_chain_reads_the_same_records_and_plan_with_or_without_its_automatic_cache(how, rejects):
     """An automatic cache holds what its maps make, a rejection included, so a run reads the same
     records in the same order whether it fills the cache, reads it back or opts out, and its plan,
-    which names no automatic cache, is the same: a position one run saves resumes in either."""
+    which names no automatic cache, is the same: a position one run saves resumes in either. A read
+    by index caches no map that rejects, whose cache it would read back as a stream, slower than it
+    reruns the map."""
     def chain():
         return mapped(Counted(rejects=rejects))
 
@@ -97,7 +101,8 @@ def test_a_chain_reads_the_same_records_and_plan_with_or_without_its_automatic_c
         return loader.plan.record()
 
     uncached = read(chain(), how, cache=False, passes=2)
-    assert read(chain(), how, passes=2) == uncached and generations()
+    assert read(chain(), how, passes=2) == uncached
+    assert bool(generations()) == (how == "memory" or not rejects)
     assert read(chain(), how, passes=2) == uncached
     assert plan(cache=True) == plan(cache=False)
 
@@ -123,12 +128,14 @@ def unnamed():
     return from_grain(grain.MapDataset.source([{"id": np.int32(index)} for index in range(RECORDS)]))
 
 
-@pytest.mark.parametrize("chain", ["unkeyed step", "volatile step", "unnamed store", "streamed"])
-def test_a_chain_no_cache_could_serve_reads_as_written(chain):
-    """A chain whose leading steps no cache could stand for reads as it is written, never refused:
-    a step with no identity, one that may make other records on each call, a store that names no
-    content, and a streamed read write no automatic cache, and their steps run on every pass."""
-    step = Counted(volatile=chain == "volatile step")
+@pytest.mark.parametrize("chain", ["cheap step", "unkeyed step", "volatile step", "unnamed store",
+                                   "streamed"])
+def test_a_chain_no_cache_could_serve_or_speed_reads_as_written(chain):
+    """A chain whose leading steps no cache could stand for, or none would speed, reads as it is
+    written, never refused: a step that costs less than reading its records back, one with no
+    identity, one that may make other records on each call, a store that names no content, and a
+    streamed read write no automatic cache, and their steps run on every pass."""
+    step = Counted(volatile=chain == "volatile step", costly=chain != "cheap step")
     how = "streamed" if chain == "streamed" else "indexed"
     if chain == "unkeyed step":
         pipeline = Pipeline(records()).map(lambda row: step(row)).shuffle(0)
