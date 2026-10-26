@@ -9,7 +9,7 @@ Arms, each on the same operands:
 - `hand`: the kernel the template replaces, called directly: the delta rule's port (`fla_rule`,
   `fla_gdn` or `fla_kda`), mamba_ssm's port (`mamba_ssd.ssd_scan`, a refusal where it does not take
   the shape), the short conv's kernel (`linear.causal_conv1d`);
-- `xla`: the portable math in XLA (`chunk(..., ported=False)`, `linear.xla_conv1d`);
+- `xla`: the portable math in XLA (`chunk` with `generation.chosen`'s 'xla', `linear.xla_conv1d`);
 - `fla`: fla's own torch/Triton kernels (`chunk_gated_delta_rule` on the queries and keys repeated
   over the value heads, as the layers hand them to it, `chunk_kda`, `causal_conv1d`);
 - `mamba_ssm`: mamba_ssm's `mamba_chunk_scan_combined`;
@@ -155,9 +155,9 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
             inputs = (x, given['dt'], given['A'], B, C, given['D'])
             state = jnp.zeros((shape.batch, shape.value_heads, shape.value_width, shape.key_width))
 
-            def template(x, dt, A, B, C, D, ported=None):
+            def template(x, dt, A, B, C, D):
                 out, final = chunk(SSD, Chunk(C, B, x, beta=dt, rate=A, skip=D), chunk_size=shape.chunk,
-                                   ported=ported, dtype=jnp.float32)
+                                   dtype=jnp.float32)
                 return out, jnp.swapaxes(final, -1, -2)
 
             def hand(x, dt, A, B, C, D):
@@ -175,9 +175,8 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
             inputs = (*(given[key].astype(bf16) for key in ('q', 'k', 'v')), given['g'],
                       given['beta'].astype(bf16))
 
-            def template(q, k, v, g, beta, ported=None):
-                return chunk(hooks, Chunk(q, k, v, log_decay=g, beta=beta), chunk_size=shape.chunk,
-                             ported=ported)
+            def template(q, k, v, g, beta):
+                return chunk(hooks, Chunk(q, k, v, log_decay=g, beta=beta), chunk_size=shape.chunk)
 
             def hand(q, k, v, g, beta):
                 return fla_rule(q, k, v, g, beta, scale=shape.key_width ** -0.5)
@@ -185,7 +184,8 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
             cotangents = (given['do'], given['dfinal'])
 
         def xla(*args):
-            return template(*args, ported=False)
+            with generation.chosen(gated_delta_rule='xla', ssd='xla'):
+                return template(*args)
 
         arms = {'template': template, 'hand': hand, 'xla': xla}
 

@@ -32,10 +32,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact, widened, with_gradients
-from test_recurrence_chunk import CHUNK, KEY_WIDTH, VALUE_HEADS, draw, token_by_token
+from test_recurrence_chunk import CHUNK, KEY_WIDTH, VALUE_HEADS, chunk_on, draw, token_by_token
 
 from dew.nn.kernels import recurrence
-from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.kernels.recurrence_chunk import Chunk
 
 SITES = {'scalar delta': recurrence.Hooks(decay='scalar', scale=KEY_WIDTH ** -0.5),
          'vector delta': recurrence.Hooks(decay='vector', scale=KEY_WIDTH ** -0.5),
@@ -322,7 +322,7 @@ def test_the_chunked_op_stays_finite_and_exact_where_chunked_forms_break(name, r
     """The portable math's output and final memory finite wherever the float64 reference's are on every
     declared seed, and on par with the reference's from float64 (module docstring)."""
     hooks = SITES[name]
-    dew = jax.jit(functools.partial(chunk, hooks, chunk_size=CHUNK, ported=False))
+    dew = jax.jit(functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK))
     reference = jax.jit(functools.partial(token_by_token, hooks))
     draws = functools.partial(stressed, hooks, regime)
     for seed in range(SEEDS[name, regime]):
@@ -343,7 +343,7 @@ def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime):
     """The portable math's gradient finite wherever the reference's in float64 is, and on par with the
     token-by-token recurrence's from float64 (check 1) over the site's declared seeds."""
     hooks = SITES[name]
-    dew = jax.jit(with_gradients(restarting(functools.partial(chunk, hooks, chunk_size=CHUNK, ported=False),
+    dew = jax.jit(with_gradients(restarting(functools.partial(chunk_on, 'xla', hooks, chunk_size=CHUNK),
                                             regime)))
     reference = jax.jit(with_gradients(restarting(functools.partial(token_by_token, hooks), regime)))
     draws = functools.partial(cotangents, hooks, regime)

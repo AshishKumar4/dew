@@ -51,8 +51,8 @@ from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of
 from .joined import joined_dense, joins
 from .kernels import generation
-from .kernels.generation import INHERENT, Refusal, measured_kernel, triton_runs
-from .kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule, on_the_port, recurrent_delta_rule
+from .kernels.generation import INHERENT, Refusal, triton_runs
+from .kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule, kernel_routed, recurrent_delta_rule
 from .kernels.selection import Kernel, Op, Requirement, select
 from .precision import L2NORM_EPS, asks_default_precision, at_least_fp32, float32_dot_general, l2norm
 from .sharding import (
@@ -501,26 +501,26 @@ _LAUNCH = tuple(_launches(code, row) for code, row in (
     ('widths', 'roadmap: recurrence step widths')))
 
 
-def _decode_preferred(case: DecodeCase) -> str:
-    """The row's decode kernel, else the step kernel where the rule's own row names the port and the
-    portable recurrence where it names the math, so a caller choosing the rule's math
-    (`generation.chosen`) decodes unfused."""
-    return measured_kernel('delta_decode', 'step' if measured_kernel('gated_delta_rule', 'xla') == 'fla'
-                           else 'xla')
-
+_STEPPED = Requirement[DecodeCase](
+    'stepped', lambda case: False,
+    "the step kernel decodes beside the caller's own conv and norm: the fused step won at one row alone, "
+    "0.157 ms against 0.165 on an H100, and lost at 32 and 128 rows (SE-decode-h100-d5e0ebadb)",
+    row='ledger 1424', kind='measured')
+"""The fused step's measured refusal: a call naming it (`generation.chosen`) runs it."""
 
 DELTA_DECODE: Op[DecodeCase] = Op('delta_decode', (
-    Kernel('fused', (*_LAUNCH, Requirement('unfused', lambda case: case.fuses,
-                                           "the caller has no conv, gates or gated norm for the fused step "
-                                           "to take; its token runs the step alone", row=INHERENT,
-                                           kind='handoff'))),
+    Kernel('fused', (*_LAUNCH, _STEPPED, Requirement('unfused', lambda case: case.fuses,
+                                                     "the caller has no conv, gates or gated norm for the "
+                                                     "fused step to take; its token runs the step alone",
+                                                     row=INHERENT, kind='handoff'))),
     Kernel('step', _LAUNCH),
-    Kernel('xla', (), generic=True)), _decode_preferred)
-"""The decode selector of both recurrence callers (a gated delta net's layer, `decode_step`'s): the fused
-step (`recurrence.step` with the layer's conv, gates and norm), the step (`recurrence.step` alone,
-`decode_gated_delta_rule`) between a caller's own conv and norm, or the portable recurrence ('xla'), a
-kernel the token does not take handing it to the next. Both kernels update the state in place, which
-JAX's Pallas gives no tangent."""
+    Kernel('xla', (), generic=True)))
+"""The decode selector of both recurrence callers (a gated delta net's layer, `decode_step`'s): the first of
+its kernels that takes the token, by what each takes (no table of GPUs): the step (`recurrence.step`
+alone, `decode_gated_delta_rule`) between a caller's own conv and norm on any GPU Dew's Triton kernels
+run on, the fused step (`recurrence.step` with the layer's conv, gates and norm) where a call names it,
+else the portable recurrence ('xla'), a kernel the token does not take handing it to the next. Both
+kernels update the state in place, which JAX's Pallas gives no tangent."""
 
 
 def recurrent_gated_delta_rule(query, key, value, g, beta, state=None):
@@ -797,7 +797,7 @@ class GatedDeltaNet(nn.Module):
         widths = (self.head_k_dim, self.head_k_dim, self.head_v_dim)
         rows, keys, values = (self._split_heads(part, width) for part, width in
                               zip(jnp.split(mixed, [key_dim, 2 * key_dim], axis=-1), widths, strict=True))
-        ported = S > 1 and on_the_port(rows, keys, values)
+        ported = S > 1 and kernel_routed(rows, keys, values, g, beta)
 
         def scan(convolved, *, starts, valid, held):
             query, key, value = (self._split_heads(part, width)
@@ -809,7 +809,6 @@ class GatedDeltaNet(nn.Module):
                 # held history can make the convolved operands vary where the
                 # projections did not, so the route is asked again of them.
                 return chunk_gated_delta_rule(query, key, value, g, beta, state, self.chunk_size,
-                                              ported=ported and on_the_port(query, key, value),
                                               starts=starts, max_segments=tokens.max_segments)
             # One key head serves `per_v` value heads, the reference's `repeat_interleave`.
             query, key = (repeat_kv_heads(x, self.num_v_heads) for x in (query, key))
