@@ -701,19 +701,17 @@ def _(value: TextSamples):
         {'prompt': value.prompt, 'texts': list(_texts(value))}))])
 
 
-def _histogram(tag: str, values: np.ndarray) -> Summary.Value:
-    """A histogram-plugin summary value of `values`, in 30 buckets, as TensorBoard's own TensorFlow-free
+def _histogram(tag: str, values: np.ndarray) -> Summary:
+    """A histogram-plugin summary of `values`, in 30 buckets, as TensorBoard's own TensorFlow-free
     `histogram_pb` builds it: the plugin's tensor of bucket edges and counts."""
     from tensorboard.plugins.histogram.summary_v2 import histogram_pb
 
-    return histogram_pb(tag, values, buckets=30).value[0]
+    return histogram_pb(tag, values, buckets=30)
 
 
 @_summarize.register
 def _(value: Representations):
-    from tensorboard.compat.proto.summary_pb2 import Summary
-
-    return Summary(value=[_histogram('val/representation_std', _spread(value).astype(np.float64))])
+    return _histogram('val/representation_std', _spread(value).astype(np.float64))
 
 
 @_summarize.register
@@ -721,7 +719,7 @@ def _(value: TokenScores):
     from tensorboard.compat.proto.summary_pb2 import Summary
 
     losses = _counted_losses(value)
-    return Summary(value=[_histogram('val/token_losses', losses)] if losses.size else [])
+    return _histogram('val/token_losses', losses) if losses.size else Summary(value=[])
 
 
 @_summarize.register
