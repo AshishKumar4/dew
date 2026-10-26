@@ -1,7 +1,7 @@
 // Which tutorials the live kernel can run: those that need no GPU and import only the Dew modules
 // its Python context stands in for (site/live/container/model_client.py, install()).
 
-export const LIVE_MODULES = ['dew.interop', 'dew.sampling'];
+export const LIVE_MODULES = ['dew.inference', 'dew.interop', 'dew.sampling'];
 
 /** The Dew modules `code` imports. */
 export const dewImports = (code) => [...code.matchAll(/^\s*(?:from|import)\s+(dew[\w.]*)/gm)].map((match) => match[1]);

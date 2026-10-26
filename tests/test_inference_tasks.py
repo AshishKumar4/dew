@@ -264,7 +264,7 @@ def test_a_task_moves_onto_a_mesh_with_the_variables_it_holds():
     they draw what the task drew before: `stream`, which updates a tree's
     dict nodes in place, took the frozen tree's nodes for leaves and refused
     them."""
-    from dew.inference.pipeline import place
+    from dew.inference.loading import place
     from dew.training import Layout, MeshSpec
 
     model = decoder()
@@ -287,7 +287,7 @@ def test_a_placed_diffusion_gemma_task_keeps_its_rows_sharded_and_draws_the_same
     splits rows over the mesh's batch axes and reads them back from `host()`;
     with one row per device there is no padding, so the batch-wide canvas
     draw matches the single-device one row for row."""
-    from dew.inference.pipeline import place
+    from dew.inference.loading import place
     from dew.nn.inputs import request_axes
     from dew.training import Layout, MeshSpec
 

@@ -11,6 +11,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.typing import DTypeLike
 
 from dew.nn.dense import Dense, DenseGeneral
+from dew.nn.dropout import Dropout
 
 from . import activations
 from .attention import GroupNorm, RMSNorm
@@ -407,7 +408,7 @@ class ResidualBlock(nn.Module):
 
         out = self.norm2(out)
         if self.dropout:
-            out = nn.Dropout(self.dropout)(out, deterministic=not train)
+            out = Dropout(self.dropout)(out, deterministic=not train)
         out = conv(name="conv2")(out)
 
         residual = x

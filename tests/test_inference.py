@@ -32,11 +32,10 @@ from dew.data.images import CAPTIONS
 from dew.data.sources import source
 from dew.data.sources.files import Files
 from dew.diffusion.presets import EDM, Flow
-from dew.inference import RunProcessor, TextGeneration
+from dew.inference import Images, RunProcessor, TextGeneration, TextToImage
 from dew.inputs import Field, TextCondition, unit_range
 from dew.registry import ModelConfig
-from dew.sampling import CFG, DPMSolverSDE, Euler, Heun, TextToImage
-from dew.sampling.pipelines import Images
+from dew.sampling import CFG, DPMSolverSDE, Euler, Heun
 from dew.telemetry.instrumentation import Compiles
 from dew.training import Checkpoints, LocalTracker, Trainer
 
@@ -232,8 +231,8 @@ def test_another_guidance_scale_seed_or_grid_reuses_the_compiled_walk(tmp_path):
                     key=jax.random.PRNGKey(1)).host().images
 
     first = draw(times=grid)
-    # The walk is `dew.sampling.pipelines._run`'s `run`.
-    with Compiles("run") as compiled:
+    # The walk is `dew.inference.images._walk`.
+    with Compiles("_walk") as compiled:
         for other in (draw(scale=2.0, times=grid), draw(seed=2, times=grid), draw(times=nudged)):
             assert not np.allclose(other, first)
         assert np.array_equal(draw(times=grid), first)

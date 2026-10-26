@@ -40,6 +40,7 @@ from dew.objectives.base import (
     recorded_metrics,
     with_projected,
 )
+from dew.optim import stepped
 from dew.state import Accumulation, TrainState, apart, together
 from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
@@ -528,8 +529,10 @@ class Transaction:
                 update, opt_state = self.optimizer.update(native, current.opt_state, stored, qk_stats=qk)
             else:
                 update, opt_state = self.optimizer.update(native, current.opt_state, stored)
+            # The update moves the weights, and each post-step effect of this update (QK-Clip's
+            # rescale, a bounded group's clamp) acts on them (`stepped`).
             params = {**current.variables, "params": self.objective.projected(
-                optax.apply_updates(stored, update), updated=True)}
+                stepped(stored, update, current.opt_state, opt_state), updated=True)}
             if self.aux_shape.effects is not None:
                 params = write_back(params, self.objective.apply_effects(
                     params, self.effects_tree.unflatten(effects)))

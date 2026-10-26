@@ -35,6 +35,7 @@ from dew.diffusion.process import Process, aligned_conditions
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.schedules.source import SourceGrid
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
+from dew.inference.images import ImageSettings, TextToImage
 from dew.inputs import InputSpec, encode_conditions, unit_range
 from dew.lora import unadapted
 from dew.nn.autoencoders import AutoEncoder
@@ -67,7 +68,7 @@ from dew.objectives.base import (
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, PERCEPTUAL, EndToEnd
 from dew.sampling.guidance import CFG, Guidance
-from dew.sampling.pipelines import ImageSettings, TextToImage, sampling_modules, walk_and_decode
+from dew.sampling.sample import sampling_modules, walk_and_decode
 from dew.sampling.solvers import DDIM, Consistency, Solver
 
 if TYPE_CHECKING:
@@ -515,7 +516,7 @@ class DiffusionObjective(Objective[Ratio]):
         The task samples the same way this objective's evaluation does. Its
         conditions are encoded by the run's own towers, so it takes no processor.
         """
-        from dew.sampling.pipelines import TextToImage
+        from dew.inference.images import TextToImage
 
         if processor is not OMITTED:
             raise TypeError("a text-to-image task encodes its conditions with the run's own towers, "
@@ -874,10 +875,10 @@ class DiffusionObjective(Objective[Ratio]):
         x_T = process.noise(noise_key, (count, *self.latent_shape))
         denoise = self.denoiser(params, given, unconditional, process)
         autoencoder, published = self.published_autoencoder(params)
-        walked = walk_and_decode(denoise, autoencoder, published, x_T, solver=self.solver,
-                                 guidance=self.guidance, key=sample_key, times=np.asarray(times),
-                                 final_denoise=self.final_denoise)
-        return walked.images
+        images, _ = walk_and_decode(denoise, autoencoder, published, x_T, solver=self.solver,
+                                    guidance=self.guidance, key=sample_key, times=np.asarray(times),
+                                    final_denoise=self.final_denoise)
+        return images
 
     def _rows(self, batch) -> int:
         """How many samples a batch draws, one per real row: its images' count."""

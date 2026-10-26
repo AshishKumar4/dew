@@ -1769,7 +1769,6 @@ def detections(module: Module) -> Iterator[Finding]:
 
 
 GATE = frozenset({"tests/reference_error.py", "tests/op_certificates.py", "tests/certified.py",
-                  "tools/op_certificates_swiglu.py",
                   "tests/reference_graph.py", "tests/reference_trees.py", "tests/residual_orders.py",
                   "tests/selection_margins.py", "tests/test_selection_margins.py",
                   "tests/test_reference_error.py", "tests/test_op_certificates.py",

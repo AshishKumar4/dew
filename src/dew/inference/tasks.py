@@ -43,7 +43,16 @@ from dew.sampling import decoding, vocabulary
 from dew.sampling.decoding import LogitsTransform, Stopping, id_row
 from dew.sampling.solvers import Solver
 from dew.sampling.strategies import Strategy
-from dew.sampling.text import Criteria, Generation, Sampling, Transforms, generate, with_ids_of
+from dew.sampling.text import (
+    Criteria,
+    Generation,
+    Sampling,
+    Transforms,
+    decoded_rows,
+    generate,
+    row_texts,
+    with_ids_of,
+)
 from dew.telemetry.profile import region
 
 if TYPE_CHECKING:
@@ -139,18 +148,6 @@ def _task_inputs(processor: Processor | None, request: Request, *, images: Media
                                          inputs.tokens.shape[1]), random_key
 
     return agreed("inference task input preparation", prepared) if collective else prepared()
-
-
-def decoded_rows(
-    processor: Processor | None, tokens: ArrayLike, lengths: ArrayLike, width: int
-) -> tuple[str, ...]:
-    """Each row's `lengths` tokens past `width`, as text: what a task's `decode` and a generation's
-    `text` both return. Without a processor there is no text to return, and it raises."""
-    if processor is None:
-        raise ValueError("this generation carries no processor to decode with")
-    rows, counts = np.asarray(tokens), np.asarray(lengths)
-    return tuple(processor.decode(rows[row:row + 1, width:width + int(counts[row])])[0]
-                 for row in range(rows.shape[0]))
 
 
 def generation_budget(requested: int | None, default: int | None, max_length: int | None,
@@ -504,7 +501,7 @@ def recorded_tokenizer(processor: Processor | None) -> str | None:
     own name, byte or Hugging Face. Any other processor records none, and the
     run loads as weights that take ids."""
     from dew.data.text import ByteTokenizer, HFTokenizer
-    from dew.inference.pipeline import RunProcessor
+    from dew.inference.loading import RunProcessor
 
     if isinstance(processor, RunProcessor) and isinstance(processor.tokenizer, ByteTokenizer | HFTokenizer):
         return processor.tokenizer.name
@@ -524,7 +521,7 @@ def _saved_processor(settings: TaskSettings, config: ModelConfig) -> Processor |
     """Build the run's host processor: the checkpoint's own, reloaded from the
     source it recorded beside `config`'s model, or its run tokenizer."""
     from dew.data.text import tokenizer_for
-    from dew.inference.pipeline import RunProcessor
+    from dew.inference.loading import RunProcessor
     from dew.interop.pretrained import load_processor
 
     if settings.processor is not None:
@@ -637,16 +634,9 @@ class _NativeTextTask:
 
 def _canvas_text(processor: Processor | None, generation: CanvasGeneration,
                  trace: str) -> tuple[str, ...]:
-    """Decode a canvas generation's rows past their prompt, traced under `trace`.
-
-    A generation with no prompt width names no boundary to decode from, so it
-    is refused rather than decoded from the start of the canvas.
-    """
+    """Decode a canvas generation's rows past their prompt (`row_texts`), traced under `trace`."""
     with region(trace):
-        if generation.prompt_width is None:
-            raise ValueError("this generation has no prompt width")
-        rows = generation.host()
-        return decoded_rows(processor, rows.tokens, rows.lengths, generation.prompt_width)
+        return row_texts(functools.partial(decoded_rows, processor), generation, generation.prompt_width)
 
 
 @dataclass(frozen=True)
@@ -806,8 +796,8 @@ class TextGeneration(_NativeTextTask):
     def decode(self, generation: Generation) -> tuple[str, ...]:
         """Return each row's valid continuation as text; raises ValueError without a processor."""
         with region("inference.text.decode"):
-            rows = generation.host()
-            return decoded_rows(self.processor, rows.tokens, rows.lengths, generation.prompt_width)
+            return row_texts(functools.partial(decoded_rows, self.processor), generation,
+                             generation.prompt_width)
 
 
 @dataclass(frozen=True)

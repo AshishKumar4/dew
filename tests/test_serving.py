@@ -24,7 +24,7 @@ from sharded import assert_sharded
 from steady_state import guarded, steady_state
 
 from dew.inference import RunProcessor, TextGeneration
-from dew.inference.pipeline import place
+from dew.inference.loading import place
 from dew.inference.serving import Server
 from dew.mesh import BATCH_AXES
 from dew.nn.backbones.causal_transformer import CausalTransformer

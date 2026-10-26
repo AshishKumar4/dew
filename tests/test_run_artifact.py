@@ -54,8 +54,8 @@ def test_the_documented_model_records_itself_and_its_run_loads_back(tmp_path, mo
 
     from dew import Field, InputSpec
     from dew.diffusion.presets import Flow
+    from dew.inference import TextToImage
     from dew.objectives.diffusion import DiffusionObjective
-    from dew.sampling import TextToImage
 
     (tmp_path / "mymodels.py").write_text(
         documented_block("docs/key-concepts.md", "Your own model needs nothing to be recorded"))
@@ -197,9 +197,9 @@ class TinyDenoiser(flax.linen.Module):
 def test_an_adapted_denoiser_run_loads_what_it_trained(tmp_path):
     from dew import Field, InputSpec
     from dew.diffusion.presets import Flow
+    from dew.inference import TextToImage
     from dew.lora import LoRA
     from dew.objectives.diffusion import DiffusionObjective
-    from dew.sampling import TextToImage
 
     base = TinyDenoiser()
     sample = jnp.zeros((1, 4, 4, 3))

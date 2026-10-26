@@ -325,6 +325,17 @@ def settled(planned: Planned, plans: Sequence[Planned], seconds: Sequence[float]
                       for plan, took in zip(plans, seconds, strict=True)] if seconds else None}
 
 
+def opens_frontier(split: int, whole: int, mesh: Mesh) -> bool:
+    """Whether a plan reading its batch in `split` microbatches is timed against the batch whole, in
+    `whole`, a remat rung up (`plan_step`'s frontier): where it splits the batch, or spans accelerators,
+    whose collectives the rung's freed memory lets XLA's scheduler overlap with compute. Measured, not
+    ranked: Qwen3.5-0.8B on an A100-40 ran 1205.6 ms a step in four microbatches, 1174.1 whole under
+    'minimal'; Qwen3.5-9B by fsdp over two A100-80s left 168 of 169 ms of collectives exposed, 15 under
+    'minimal'. A CPU's collectives are its host's copies, nothing to overlap, so its devices open none,
+    and a run over several compiles the steps one device's plan does."""
+    return split != whole or (mesh.devices.size > 1 and mesh.devices.flat[0].platform != "cpu")
+
+
 def plan_step[LossT, EffectsT](
         lower: Callable[[int, bool], Candidate],
         options: Callable[[Candidate], jax.stages.CompilerOptions | None],
@@ -339,9 +350,9 @@ def plan_step[LossT, EffectsT](
     compiled there, the plan staying where it fits; climbing and the frontier pass every half rung asked
     (`onward`). Each compile's measure (`Forecast`) orders the splits; `resumed`, a checkpoint's rung, is
     warned of where it misses; where nothing fits it raises with the closest candidate's numbers. Where the
-    plan splits and `frontier` asks, the batch whole a remat rung up (`remat_more`), the head tiled and
-    unfused, follows where it fits (docs/performance.md), above any rung that dropped the copies. Each
-    compile made comes beside the plans; the objective is left at the last plan's rung, each plan its own."""
+    plan opens a frontier (`opens_frontier`) and `frontier` asks, the batch whole a remat rung up
+    (`remat_more`), the head tiled and unfused, follows where it fits, above any rung that dropped the
+    copies. Each compile made comes beside the plans; the objective is left at the last plan's rung."""
     probes: list[Probe] = []
     refusals: list[RuntimeError] = []
     lowered: dict[tuple[int, str], Candidate] = {}
@@ -435,7 +446,7 @@ def plan_step[LossT, EffectsT](
     if split is None or fitted is None:
         raise RuntimeError(unplanned(probes)) from (refusals[-1] if refusals else None)
     plans = [found(split)]
-    if frontier and split != candidates[0] and onward(lambda: remat_more(objective)):
+    if frontier and opens_frontier(split, candidates[0], mesh) and onward(lambda: remat_more(objective)):
         objective.tile_head()
         objective.unfuse_head()
         xla_defaults, narrow = False, narrow and dropped is None

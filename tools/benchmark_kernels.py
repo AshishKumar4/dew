@@ -6,8 +6,8 @@ mark, so a row is one process.
 - `projection`: `dew.nn.moe.expert_projection` forward and forward plus
   backward, at lm-moe's shape (8192 rows, 8 experts, bf16 compute, Dirichlet
   routing), against a float64 oracle of the rounded operands.
-- `adam`: one AdamW update over the lm-dense parameter tree, fp32 or bf16
-  moment storage (`OptimConfig.state_dtype`).
+- `adam`: one AdamW update over the lm-dense parameter tree, fp32, bf16 or
+  8-bit moment storage (`OptimConfig.state_dtype`).
 - `step`: a whole training step of `lm-dense` (359.8M) or `lm-moe` (321.8M,
   8 experts top-2), through `tools/benchmark_step.py`'s trainer, with the
   grouped matmul, the state dtype and the vocabulary head chosen.
@@ -185,7 +185,7 @@ def main(argv: list[str] | None = None) -> None:
     project.add_argument("--features", type=int, default=2048, help="the expert width it writes")
     project.add_argument("--repeats", type=int, default=50)
     update = modes.add_parser("adam")
-    update.add_argument("--state-dtype", choices=("float32", "bfloat16"), default="float32")
+    update.add_argument("--state-dtype", choices=("float32", "bfloat16", "int8"), default="float32")
     update.add_argument("--repeats", type=int, default=30)
     run = modes.add_parser("step")
     run.add_argument("--path", choices=("lm-dense", "lm-moe", "dit"), required=True)
@@ -193,7 +193,7 @@ def main(argv: list[str] | None = None) -> None:
                      help="none, full, a REMAT_POLICIES name (decoders) or dots (DiT)")
     run.add_argument("--batch", type=int, required=True)
     run.add_argument("--implementation", default="auto")
-    run.add_argument("--state-dtype", choices=("float32", "bfloat16"), default="float32")
+    run.add_argument("--state-dtype", choices=("float32", "bfloat16", "int8"), default="float32")
     run.add_argument("--steps", type=int, default=30)
     run.add_argument("--trace", default=None,
                      help="a directory for a jax.profiler trace of three steady-state steps")

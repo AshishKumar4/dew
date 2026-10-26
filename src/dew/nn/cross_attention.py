@@ -53,6 +53,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.batch import coordinates
+from dew.nn.dropout import Dropout
 
 from .activations import GatedActivation
 from .attention import CROSS_KEY, CROSS_VALUE, NormalAttention
@@ -243,7 +244,7 @@ class GatedCrossAttention(nn.Module):
                            key_value_seq_lengths=jnp.maximum(lengths, 1), cached=decode,
                            cache_dtype=x.dtype if self.dtype is None else self.dtype)
         present = (lengths > 0).reshape((-1,) + (1,) * (stream.ndim - 1))
-        dropout = nn.Dropout(rate=self.dropout_rate)
+        dropout = Dropout(rate=self.dropout_rate)
 
         def joined(stream: jax.Array, name: str, branch: jax.Array) -> jax.Array:
             # The gate in at least float32, and in its own float64 where a run widens it.

@@ -29,6 +29,7 @@ from dew.nn.inputs import (
     ModelInputs,
     Request,
     continuation_keys,
+    host_rows,
     local_rows,
     mesh_of,
     next_position,
@@ -70,17 +71,15 @@ class CanvasGeneration(Generic[ArrayT]):
     def host(self) -> CanvasGeneration[np.ndarray]:
         """This process's real rows as host arrays, without the padding a
         row plan added to fill the devices."""
-        return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
+        return jax.tree.map(lambda leaf: host_rows(leaf, self.rows), self)
 
     @functools.cached_property
     def text(self) -> tuple[str, ...]:
-        """Each real row's response, decoded on first access."""
-        if self.decoder is None:
-            raise ValueError("this generation carries no processor to decode with")
-        if self.prompt_width is None:
-            raise ValueError("this generation has no prompt width")
-        rows = self.host()
-        return self.decoder(rows.tokens, rows.lengths, self.prompt_width)
+        """Each real row's response, decoded on first access (`row_texts`)."""
+        # dew.sampling reads the discrete denoisers, which read this module.
+        from dew.sampling.text import row_texts
+
+        return row_texts(self.decoder, self, self.prompt_width)
 
 
 def refuse_non_denoiser(model: nn.Module) -> None:
