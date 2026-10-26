@@ -45,6 +45,8 @@ CELLS: dict[str, tuple[str, ...]] = {
     "moe_grpo": ("expert4", "expert2_fsdp2", "tensor4", "sequence4"),
     "mla_dpo": ("fsdp4", "sequence4"),
     "hybrid_sft": ("sequence4", "stage4", "data4_explicit"),
+    "routed_tail": ("stage4",),
+    "shared_tail": ("stage2_fsdp2",),
     "mamba1_packed": ("fsdp2_explicit",),
     "dense_packed": ("sequence4",),
     "rigel_packed": ("sequence4",),
@@ -58,7 +60,7 @@ CELLS_ON_FOUR: dict[str, tuple[str, ...]] = {
     "dense": ("stage4", "stage2_sequence2"),
 }
 REFUSED: dict[tuple[str, str], str] = {
-    ("hybrid_sft", "stage4"): "ledger 1436: its layer pattern does not repeat every L / stages layers",
+    ("hybrid_sft", "stage4"): "its four layers alternate two kinds, so no run of four repeats one layer",
 }
 """The cells refused by design, each with its reason."""
 

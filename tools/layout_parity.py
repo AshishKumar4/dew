@@ -197,7 +197,9 @@ def zoo() -> dict[str, Any]:
     split repeats each row's conditioning on every shard by design, which the FLOPs bound would
     count against a row of only a few patches. The last two MoE models and DiffusionGemma keep their
     released configs' routing and layer kinds. The layers a sequence axis
-    splits differently come too: latent attention (MLA), a window (12 rows:
+    splits differently come too: a dense layer before routed ones and a tail
+    sharing the keys and values one layer stored, which a pipeline runs on
+    every stage, latent attention (MLA), a window (12 rows:
     a sequence split two ways reads it from one neighbour, four ways through
     the exchange), Mamba-2 alone, Mamba-1 alone, and packed rows of three
     documents whose boundaries fall inside the shards, in the dense decoder,
@@ -235,6 +237,14 @@ def zoo() -> dict[str, Any]:
                        "n_groups": 1, "chunk_size": 8}}}
     hybrid = {**dense, "layer_types": ("mamba", "attention") * 2,
               "kinds": {"mamba": mamba, "attention": {}}}
+    # DeepSeek's class: a dense first layer before routed ones, each layer
+    # reading its own per-layer input (Gemma's), so a pipeline runs the dense
+    # layer on every stage and slices the inputs past it.
+    routed_tail = {**dense, "num_layers": 5, "per_layer_input_dim": 8,
+                   "mixture": {"experts": 8, "top_k": 2, "expert_features": 32, "layers": (1, 2, 3, 4)}}
+    # Gemma 3n's class: the last two layers read the keys and values the
+    # fourth stored, so a pipeline runs that tail on every stage.
+    shared_tail = {**dense, "num_layers": 6, "kv_shared_layers": (4, 5)}
     nemotron_h = _fixture("nemotron-h-tiny")
     nemotron_h.update(vocab_size=512, num_layers=20, max_seq_len=33,
                      layer_types=tuple(nemotron_h["layer_types"]) * 4)
@@ -272,6 +282,8 @@ def zoo() -> dict[str, Any]:
         "moe": Case("causal_transformer", moe, **lm),
         "moe128": Case("causal_transformer", moe128, **lm),
         "hybrid": Case("causal_transformer", hybrid, **lm),
+        "routed_tail": Case("causal_transformer", routed_tail, **lm),
+        "shared_tail": Case("causal_transformer", shared_tail, **lm),
         "nemotron_h": Case("causal_transformer", nemotron_h, **lm),
         "nemotron_h_moe": Case("causal_transformer", _nemotron_h_moe(), orders=True, **lm),
         "window": Case("causal_transformer", window, **lm),
@@ -466,8 +478,26 @@ def compiled_step(case, fields: dict[str, int], batch, *, one_device: bool = Fal
     data = placed(batch, trainer.device_mesh)
     step = trainer.compile(state, data)
     compiled = {"flops_per_device": trainer.step_flops and trainer.step_flops.hardware,
-                "mesh": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()}}
+                "mesh": {axis: int(size) for axis, size in trainer.device_mesh.shape.items()},
+                "replicated": replicated_share(trainer.objective.model, fields.get("stage", 1), batch)}
     return state, data, step, compiled
+
+
+def replicated_share(model, stages: int, batch) -> float:
+    """The share of `model`'s forward work over `batch`'s rows a pipeline of `stages` runs on every
+    stage (`replicated_flops`); none without a pipeline, and none for a model with no decoder to
+    pipeline, whose work the even split then judges whole."""
+    import jax
+    import numpy as np
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.wrapping import DecoderWrapper
+
+    if stages == 1 or not isinstance(model, (CausalTransformer, DecoderWrapper)):
+        return 0.0
+    rows, length = np.shape(jax.tree.leaves(batch)[0])[:2]
+    lengths = np.full(rows, length)
+    return model.replicated_flops(stages, lengths) / model.model_flops(lengths)
 
 
 def trained(case, fields: dict[str, int], batch, *, steps: int, one_device: bool = False,
@@ -772,13 +802,15 @@ def rounding_limit(dtype: str) -> float:
     return float(jnp.finfo(dtype).eps) ** 0.5
 
 
-def flops_bound(fields: Mapping[str, int]) -> float:
+def flops_bound(fields: Mapping[str, int], replicated: float = 0.0) -> float:
     """The FLOPs a layout's devices may compute together over one device's:
     an even split, and a pipeline of S stages and M microbatches holds each
-    stage's work for M + S - 1 microbatches' time (GPipe's bubble), times
-    FLOPS_SLACK."""
+    stage's work for M + S - 1 microbatches' time (GPipe's bubble) and runs
+    the `replicated` share of the model's work, its layers outside the run
+    the stages repeat (`CausalTransformer.replicated_flops`), on every stage,
+    times FLOPS_SLACK."""
     stages, microbatches = fields.get("stage", 1), fields.get("microbatches", 1)
-    return (microbatches + stages - 1) / microbatches * FLOPS_SLACK
+    return ((1 - replicated) * (microbatches + stages - 1) / microbatches + replicated * stages) * FLOPS_SLACK
 
 
 def widest_floor(floors: dict[str, float], dtype: str) -> str:
@@ -997,7 +1029,7 @@ def run_orders(models: Sequence[str], layouts: Sequence[str], *, dtype: str, dev
             if compiled['flops_per_device'] and ref_compiled['flops_per_device']:
                 row['flops_ratio'] = (compiled['flops_per_device'] * math.prod(compiled['mesh'].values())
                                       / ref_compiled['flops_per_device'])
-                row['flops_bound'] = flops_bound(LAYOUTS[name])
+                row['flops_bound'] = flops_bound(LAYOUTS[name], compiled['replicated'])
                 if row['status'] == 'works' and row['flops_ratio'] > row['flops_bound']:
                     row['status'] = 'REDUNDANT'
             rows.append(row)
@@ -1133,7 +1165,7 @@ def run(models: Sequence[str], layouts: Sequence[str], *, dtype: str, steps: int
                     # Above one when devices compute what one device need not.
                     size = math.prod(compiled["mesh"].values())
                     row["flops_ratio"] = compiled["flops_per_device"] * size / judge.flops_per_device
-                    row["flops_bound"] = flops_bound(LAYOUTS[name])
+                    row["flops_bound"] = flops_bound(LAYOUTS[name], compiled["replicated"])
                     if row["status"] == "works" and row["flops_ratio"] > row["flops_bound"]:
                         row["status"] = "REDUNDANT"
             except LayoutRefused as refusal:

@@ -112,8 +112,10 @@ from .decoder_stack import (
     PassView,
     SharedPassView,
     StackView,
+    StageSplit,
     run_pipeline,
     run_stack,
+    split_stages,
 )
 from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, layer_index, scan_groups
 
@@ -747,16 +749,28 @@ class CausalTransformer(nn.Module):
         return sites
 
     @nn.nowrap
-    def _layer_flops(self, lengths, counter) -> float:
+    def _layer_counts(self, lengths, counter) -> list[float]:
+        """Each layer's work by `counter`, over the passes a call runs it."""
         types = self.per_layer_types
         kinds = self.layer_kinds(types)
         mixer = self.layer_mixer
         specs = self._layer_specs(types, kinds, mixer)
         factories = self.feedforward_factories()
-        total = 0.0
-        for index in range(self.num_layers):
-            block = self._block(specs, mixer, factories, self.wiring, index, f'layers_{index}')
-            total += self.layer_passes(index) * counter(block, lengths)
+        return [self.layer_passes(index) * counter(
+                    self._block(specs, mixer, factories, self.wiring, index, f'layers_{index}'), lengths)
+                for index in range(self.num_layers)]
+
+    @nn.nowrap
+    def replicated_flops(self, stages: int, lengths) -> float:
+        """The work of the layers a pipeline of `stages` runs on every stage rather than once
+        (`stage_split`): those before and after the run its stages repeat."""
+        split = self.stage_split(stages)
+        counts = self._layer_counts(lengths, counted_flops)
+        return sum(counts[:split.prefix]) + sum(counts[self.num_layers - split.suffix:])
+
+    @nn.nowrap
+    def _layer_flops(self, lengths, counter) -> float:
+        total = sum(self._layer_counts(lengths, counter))
         if self.per_layer_input_dim:
             total += projection_flops(lengths, *self.projections()['per_layer_model_projection'])
         if self.loop is not None and self.loop.exit_gate:
@@ -1791,9 +1805,11 @@ class CausalTransformer(nn.Module):
         loops carry one residual dtype, so the stream enters in the dtype it
         settles in (`residual_dtype`). A store built bank by bank
         (`dew.inference.banks`) already holds one array per run, and the view
-        leaves it alone. A pipeline raises `LayoutRefused` for `decode` and
-        for a banked store. With `residual_in_fp32` the stream enters widened,
-        so every sublayer's output adds to it in fp32 whichever loop runs.
+        leaves it alone. A pipeline runs the layers its stages repeat
+        (`split_stages`) and the layers before and after them on every stage,
+        and raises `LayoutRefused` for `decode` and for a banked store. With
+        `residual_in_fp32` the stream enters widened, so every sublayer's output
+        adds to it in fp32 whichever loop runs.
         """
         if self.residual_in_fp32 and isinstance(x, Carried):
             x = x._replace(streams=x.streams.astype(at_least_fp32(x.streams.dtype)))
@@ -1843,7 +1859,7 @@ class CausalTransformer(nn.Module):
                 raise ValueError(
                     "Single-Pass mHC carries each sublayer's collapse beside the streams, "
                     "which the pipeline's microbatch buffers do not hold; run the stack whole")
-            count = self.stage_layers(stages)
+            split = split_stages(self.specs, stages)
             batch_axis = 1 if self.altup is not None else 0
             rows, count_microbatches = x.shape[batch_axis], microbatches()
             if count_microbatches % stages or rows % count_microbatches:
@@ -1866,14 +1882,15 @@ class CausalTransformer(nn.Module):
                     f"compute another's again; use a microbatch count that divides "
                     f"{rows // shards}, or a batch that is a multiple of "
                     f"{count_microbatches * shards} rows")
+            start, count = split.prefix, split.count
             view = StackView(
-                scan_groups(self.scan_keys[:count], self.bank_layers) if self.scan_layers
+                scan_groups(self.scan_keys[start:start + count], self.bank_layers) if self.scan_layers
                 else tuple((index, 1) for index in range(count)),
                 stages=stages, microbatches=count_microbatches,
                 # What enters the loop is read on every iteration; what the
                 # loop creates (the routers' sowing) comes out per iteration.
                 broadcast=tuple(name for name, tree in self.variables.items() if tree),
-                batch_axis=batch_axis)
+                batch_axis=batch_axis, offset=start)
         dtype = self.residual_dtype(
             x, train=train, decode=decode, per_layer_input=per_layer_input,
             attention_metadata=attention_metadata)
@@ -1881,7 +1898,22 @@ class CausalTransformer(nn.Module):
         x = x._replace(streams=x.streams.astype(dtype)) if isinstance(x, Carried) else x.astype(dtype)
         run = nn.map_variables(type(self)._stacked, mapped_collections=True, trans_in_fn=view.stack,
                                trans_out_fn=view.unstack, init=False, mutable=True)
-        return run(self, view, x, train, decode, per_layer_input, attention_metadata)
+        if stages == 1:
+            return run(self, view, x, train, decode, per_layer_input, attention_metadata)
+        # The layers outside the run the stages repeat run on every stage, as the plain loop runs
+        # them, around the pipeline; a provider among them fills the store a later one reads.
+        store = {} if self._provides else None
+        end = self.num_layers - split.suffix
+
+        def outside(x, first: int, last: int):
+            return x if first == last else run_stack(
+                self.layers, self.block, self.specs, tuple((index, 1) for index in range(first, last)), x,
+                train=train, decode=False, kv_store=store, per_layer_input=per_layer_input,
+                attention_metadata=attention_metadata)
+
+        x = outside(x, 0, split.prefix)
+        x = run(self, view, x, train, decode, per_layer_input, attention_metadata)
+        return outside(x, end, self.num_layers)
 
     def banked_collections(self) -> tuple[str, ...]:
         """Return the collections whose layer subtrees the store holds as banks.
@@ -1983,32 +2015,12 @@ class CausalTransformer(nn.Module):
                 variables[collection] = held
         return variables
 
-    def stage_layers(self, stages: int) -> int:
-        """Return the number of layers per stage when the stack splits into `stages`.
-
-        Every stage runs one program, so layer `j` of every stage must match
-        layer `j` of the first stage in kind, feed-forward, width and KV role.
-        A pattern that does not repeat every `num_layers / stages` layers raises
-        `LayoutRefused`, and the error names the first pair that differs.
-        """
-        if self.num_layers % stages:
-            raise LayoutRefused(
-                f"{self.num_layers} layers do not split into {stages} stages of "
-                f"equal length; set stage to a divisor of num_layers")
-        count = self.num_layers // stages
-        for index, spec in enumerate(self.specs):
-            first = self.specs[index % count]
-            if spec == first:
-                continue
-            differing = [field.name for field in dataclasses.fields(LayerSpec)
-                         if getattr(spec, field.name) != getattr(first, field.name)]
-            raise LayoutRefused(
-                f"layer {index} differs from layer {index % count} in "
-                f"{', '.join(differing)}, so stage {index // count} cannot run the "
-                f"first stage's program; a pipeline of {stages} stages needs the "
-                f"layer pattern to repeat every {count} layers, which means a "
-                f"mixture, a layer_types pattern and a K/V sharing that do")
-        return count
+    @nn.nowrap
+    def stage_split(self, stages: int) -> StageSplit:
+        """How the stack runs over `stages` pipeline stages (`split_stages`): the layers before and
+        after the run its stages repeat run on every stage."""
+        types = self.per_layer_types
+        return split_stages(self._layer_specs(types, self.layer_kinds(types), self.layer_mixer), stages)
 
     @property
     def _provides(self) -> bool:

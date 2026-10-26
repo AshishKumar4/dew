@@ -36,6 +36,10 @@ class DecoderWrapper(nn.Module):
         """The wrapper over `decoder` in place of its own, its other modules as they are."""
         return self.clone(**{self.wraps: decoder})
 
+    @nn.nowrap
+    def replicated_flops(self, stages: int, lengths) -> float:
+        return self._decoder.replicated_flops(stages, lengths)
+
     @property
     def vocab_size(self) -> int:
         return self._decoder.vocab_size

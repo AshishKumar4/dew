@@ -12,6 +12,7 @@ call takes is the model's choice (`CausalTransformer.stack`).
 import dataclasses
 import functools
 from collections.abc import Callable, Mapping, Sequence
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -21,7 +22,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import NamedSharding, PartitionSpec as P
 
 from dew.batch import merge
-from dew.mesh import STAGE_AXIS
+from dew.mesh import STAGE_AXIS, LayoutRefused
 
 from ..hyper_connections import Carried
 from ..kv_cache import CURSOR
@@ -481,22 +482,60 @@ def _prefetched_run(banks, primed, state, cache, x, inputs, layer, count: int, *
     return x, changed, staged
 
 
+class StageSplit(NamedTuple):
+    """How a stack of layers runs over a stage axis: the `prefix` layers before the run its stages
+    repeat and the `suffix` layers after it run on every stage, as the plain loop runs them, and
+    each stage runs `count` layers of the run between."""
+    prefix: int
+    count: int
+    suffix: int
+
+
+def split_stages(specs: Sequence[LayerSpec], stages: int) -> StageSplit:
+    """The split of the layers `specs` describe over `stages` that leaves the fewest layers on every
+    stage (`StageSplit`), a shorter suffix first. The run the stages repeat holds `stages` equal
+    stretches of `count` layers, layer `j` of each matching layer `j` of the first in every field of
+    its spec, and none of its layers shares keys and values with another, which a stage's program
+    cannot carry: what a provider leaves is its own (`LayerSpec.provider`), and a sharing layer reads
+    a store no stage holds. A dense prefix before routed layers, a sharing tail and a pattern whose
+    period divides no stage's length each run beside the pipeline. A stack with no such run of
+    `stages` layers or more raises `LayoutRefused`."""
+    layers = len(specs)
+    pipelined = [spec.provider is None and not spec.kv_shared for spec in specs]
+    for outside in range(layers - stages + 1):
+        if (layers - outside) % stages:
+            continue
+        count = (layers - outside) // stages
+        for suffix in range(outside + 1):
+            prefix = outside - suffix
+            run = specs[prefix:layers - suffix]
+            if all(pipelined[prefix:layers - suffix]) and all(
+                    spec == run[index % count] for index, spec in enumerate(run)):
+                return StageSplit(prefix, count, suffix)
+    raise LayoutRefused(
+        f"no run of {stages} or more of the {layers} layers splits into {stages} stages that repeat "
+        f"one program; a pipeline of {stages} stages needs a run of layers whose pattern repeats "
+        f"every run / {stages} layers and holds no layer that shares keys and values")
+
+
 class PipelineStage(nn.Module):
     """Runs the layers of one pipeline stage over one microbatch.
 
     The pipeline vmaps this module over the stage axis, so each stage runs it
     on its own slice of the stacked layer weights. Its variables therefore have
     a leading stage axis, which the `StackView` outside stacks and unstacks.
-    Layer `j` of a stage is `layers_j` here and `layers_{stage * count + j}` in
-    the stored tree, where `count` is the number of layers per stage. `specs`
-    and `groups` describe stage 0, and every stage repeats them.
+    Layer `j` of a stage is `layers_j` here and `layers_{offset + stage * count + j}`
+    in the stored tree, where `offset` is the first layer the stages run and
+    `count` is the number of layers per stage. `specs` and `groups` describe
+    stage 0, and every stage repeats them.
     """
     block: Block
     specs: tuple[LayerSpec, ...]
     groups: tuple[tuple[int, int], ...]
+    offset: int = 0
 
     def setup(self):
-        self.layers = [self.block(index, f'layers_{index}') for index in range(len(self.specs))]
+        self.layers = [self.block(self.offset + index, f'layers_{index}') for index in range(len(self.specs))]
 
     @nn.compact
     def __call__(self, x, train: bool = False, per_layer_input=None, attention_metadata=None):
@@ -555,6 +594,9 @@ class StackView:
     broadcast: tuple[str, ...] = ()
     banked: tuple[str, ...] = ()
     batch_axis: int = 0
+    offset: int = 0
+    """The first stored layer a pipeline's stages run (`StageSplit.prefix`); the layers before it
+    and after its stages stay as they are stored."""
 
     @property
     def per_stage(self) -> int:
@@ -568,7 +610,7 @@ class StackView:
 
     def _outside_names(self, first: int, count: int) -> list[list[str]]:
         """The stored names of a run's layers, one list per stage."""
-        return [[f'layers_{stage * self.per_stage + first + offset}' for offset in range(count)]
+        return [[f'layers_{self.offset + stage * self.per_stage + first + offset}' for offset in range(count)]
                 for stage in range(self.stages)]
 
     @staticmethod
@@ -730,8 +772,9 @@ def run_pipeline(model: nn.Module, view: StackView, x, *, train: bool, per_layer
     reads slot t % (microbatches / stages) and the slots rotate up a stage per
     iteration, so every microbatch reaches stage 0 and finishes in the last
     stage's slot without a gather. The first and last stages - 1 iterations are
-    the bubble. Only the layers pipeline; embeddings, norm, head and loss run on
-    the whole batch, so the loss is the plain loop's mean.
+    the bubble. Only the run of layers the stages repeat pipelines (`StageSplit`,
+    from `view.offset`); embeddings, the layers outside that run, norm, head and
+    loss run on the whole batch, so the loss is the plain loop's mean.
 
     `model` is the decoder whose `_stacked` calls this; its `block` and
     `specs` build the stages.
@@ -784,9 +827,9 @@ def run_pipeline(model: nn.Module, view: StackView, x, *, train: bool, per_layer
         stage_inputs = (None if inputs is None else jax.tree.map(_on_stage_axis, jax.vmap(
             lambda index, stage: jax.tree.map(lambda value: jax.lax.dynamic_slice_in_dim(
                 jax.lax.dynamic_index_in_dim(value, index, 0, keepdims=False),
-                stage * per_stage, per_stage, axis=2), inputs))(ids, stage_ids)))
-        stage = PipelineStage(block=module.block, specs=module.specs[:per_stage],
-                              groups=view.groups, name='stages')
+                view.offset + stage * per_stage, per_stage, axis=2), inputs))(ids, stage_ids)))
+        stage = PipelineStage(block=module.block, specs=module.specs[view.offset:view.offset + per_stage],
+                              groups=view.groups, offset=view.offset, name='stages')
         run = nn.vmap(call_stage, variable_axes={True: 0}, split_rngs={True: True},
                       in_axes=0, out_axes=0, spmd_axis_name=STAGE_AXIS)
         out = _on_stage_axis(run(stage, stages_in, stage_inputs,
