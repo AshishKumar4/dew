@@ -1710,7 +1710,7 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: source
         if source_quantization(config) is not None:
             raise ValueError("text_only takes an unquantized wrapper: a quantized one's module selection "
                              "names the wrapper's modules, which its text checkpoint renames")
-        config = decoders.language_model_config(config, language)
+        config = decoders.language_model_config(config)
         route = source_route(config, remote=remote, pinned=pinned)
     elif text_only and isinstance(route, DiffusionGemmaRoute):
         raise ValueError("text_only takes a media wrapper's language model; DiffusionGemma's decoder is "
