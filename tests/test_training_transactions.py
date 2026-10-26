@@ -331,3 +331,19 @@ def test_an_accumulating_step_updates_the_optimizer_in_its_commit_alone():
                         if instruction.op not in moving
                         and any(".mu" in read or ".nu" in read for read in instruction.reads))
     assert not speculated, speculated
+
+
+def test_a_given_loss_scale_starts_each_state_of_its_own():
+    """A trainer given its dynamic loss scale (`Trainer(dynamic_scale=...)`) starts each state from
+    a copy of it: the step donates its state, so a scale of arrays, as Flax's updates leave one, is
+    still whole after a step for the next state and for another trainer given it."""
+    scale = jax.tree.map(jnp.asarray, dynamic_scale_lib.DynamicScale(growth_interval=1))
+    first = Trainer(Tiny(), optax.sgd(.03), key=jax.random.PRNGKey(9), dynamic_scale=scale)
+    state = first.initial_state()
+    batch = batches()[0]
+    first.compile(state, batch)(state, batch)
+    again = Trainer(Tiny(), optax.sgd(.03), key=jax.random.PRNGKey(9), dynamic_scale=scale)
+    for trainer in (first, again):
+        held = trainer.initial_state().scale
+        np.testing.assert_array_equal(np.asarray(held.scale), np.asarray(scale.scale))
+
