@@ -885,7 +885,7 @@ def test_a_tier_3_source_generates_through_the_pipeline_loader_as_its_bundle_doe
         task = pipeline(str(tmp_path), dtype="float32")
     with pytest.warns(TransformersTierWarning):
         loaded = Pretrained.load(tmp_path, dtype="float32")
-    prompts = [[3, 5, 7, 2], [9, 4]]
+    prompts = [[3, 5, 7, 2], [9, 4, 6, 8]]
     greedy = Sampling(temperature=0.0)
     np.testing.assert_array_equal(
         np.asarray(task(prompts, 3, key=0, sampling=greedy).tokens),
