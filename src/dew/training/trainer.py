@@ -1499,8 +1499,7 @@ class Trainer(Generic[Loss, Effects]):
                     # reports that time apart from its steps'.
                     interval.compiling += time.perf_counter() - began
                 with region("train.step"):
-                    state, loss, aux, finite, accepted, committed = train_step(
-                        self._staged(state, run.current), device)
+                    state, loss, aux, finite, accepted, committed = train_step(state, device)
                 # Read with this step queued behind the one it describes, so the devices go on meanwhile.
                 self._read_taken(run)
                 if self._unproven:
@@ -2161,8 +2160,12 @@ class Trainer(Generic[Loss, Effects]):
         A ramped run reads a new shape at every stage, so `compiled` keeps
         one step per stage with the FLOPs measured for it. A batch whose
         dtype, fields or a node's static field change at the same shapes is
-        another program, compiled as one: an executable refuses it.
+        another program, compiled as one: an executable refuses it. A step
+        that begins a ramp's or a schedule's stage gets its state with the
+        window a rejection left part filled dropped (`_staged`), the state
+        a timed trial steps on too.
         """
+        state = self._staged(state, run.current)
         timer = Timer(state, batch)
         signature = batch_signature(batch)
         if signature not in compiled:
