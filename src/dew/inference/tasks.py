@@ -58,9 +58,9 @@ from dew.telemetry.profile import region
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
+    from dew.distributed.placement import Layout, MeshSpec
     from dew.quantization import Quantization
     from dew.registry import ModelConfig
-    from dew.training.distributed import Layout, MeshSpec
 
 Rows = ModelInputs | ArrayLike | Sequence[Sequence[int]]
 Request = str | Sequence[str] | Rows
@@ -547,7 +547,7 @@ def held(variables: Variables) -> Variables:
     leaf replicated on the mesh the tree's arrays sit on, or committed to this process's default
     device, one leaf at a time (`placed_leaves`), into a tree of its own; a jax.Array stays where it
     is."""
-    from dew.training.host import placed_leaves
+    from dew.distributed.host import placed_leaves
 
     mesh = mesh_of(variables)
     target = default_placement() if mesh is None else NamedSharding(mesh, P())

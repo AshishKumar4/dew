@@ -62,6 +62,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
     from dew.data import Dataset
     from dew.diffusion import Process
+    from dew.distributed import Layout, MeshSpec
     from dew.eval import Mean
     from dew.inference import pipeline
     from dew.inputs import Condition, Field, InputSpec
@@ -77,9 +78,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
         EvalSuite,
         Evaluation,
         Keep,
-        Layout,
         LocalTracker,
-        MeshSpec,
         MLflowTracker,
         Observe,
         Pause,
@@ -98,8 +97,8 @@ _EXPORTS = {
     "Best": "dew.training", "Keep": "dew.training", "Plateau": "dew.training", "EvalSuite": "dew.training",
     "Observe": "dew.training", "Pause": "dew.training",
     "Trainer": "dew.training", "TrainState": "dew.state", "Step": "dew.objectives.base",
-    "Aux": "dew.objectives.base", "EMASpec": "dew.objectives.base", "MeshSpec": "dew.training",
-    "Layout": "dew.training", "Checkpoints": "dew.training", "Tracker": "dew.training",
+    "Aux": "dew.objectives.base", "EMASpec": "dew.objectives.base", "MeshSpec": "dew.distributed",
+    "Layout": "dew.distributed", "Checkpoints": "dew.training", "Tracker": "dew.training",
     "WandbTracker": "dew.training", "LocalTracker": "dew.training", "Trackers": "dew.training",
     "MLflowTracker": "dew.training", "TensorBoardTracker": "dew.training",
     "Evaluation": "dew.training",
