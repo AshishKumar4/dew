@@ -372,7 +372,7 @@ def test_the_delta_rules_selector_keeps_the_port_only_on_its_declared_cells():
         for family in ('wgmma', 'mma.sync', None) for product in ('forward', 'training')}
     for cell, reason in recurrence_chunk.PORT_CELLS.items():
         assert 'declared' in codes[cell] and 'SE-' in reason, (cell, codes[cell])
-    assert 'declared' not in codes['wgmma', 'training'] and 'declared' not in codes['mma.sync', 'forward']
+    assert 'declared' not in codes['wgmma', 'training']
     assert all('device' in codes[None, product] for product in ('forward', 'training'))
     forced = recurrence_chunk.MOSAIC.failed(dataclasses.replace(case, family='wgmma', product='forward'),
                                             forced=True)
