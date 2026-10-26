@@ -300,6 +300,17 @@ def _peeled_chunk_inputs(steps, value, g, beta, starts, chunk_size):
 
 
 def _chunk_delta_residual(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype):
+    """`_kept_residual`'s, or where the block's remat rung recomputes the delta rule's memory (`RECOMPUTED`,
+    'delta_memory') the operands alone, the backward computing the memory and what it derives again, as the
+    port and the template drop theirs: `(out, (kept, operands))`, one of them None."""
+    if "delta_memory" in RECOMPUTED.get():
+        out = _chunk_delta_rule(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
+        return out, (None, (query, key, value, g, beta, state, starts))
+    out, kept = _kept_residual(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
+    return out, (kept, None)
+
+
+def _kept_residual(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype):
     """Keep chunk boundaries and the readout's memory-gradient operands, not per-token memories."""
     out, (steps, entered) = _chunk_delta_forward(
         query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
@@ -321,9 +332,14 @@ def _chunk_delta_backward(chunk_size, delta, scale, dtype, residual, cotangent):
     erasure beside its decay, rather than cancelling separately rounded WY derivatives afterwards.
     Checkpoint every SUB tokens, then replay one span at a time inside the reverse scan. Groups of
     ADJOINT_CHUNKS bound the live span and checkpoints independently of the sequence's length.
-    Replays and adjoints preserve the token recurrence's arithmetic and order."""
+    Replays and adjoints preserve the token recurrence's arithmetic and order. Where the forward kept
+    its operands alone (`_chunk_delta_residual`), the rest is computed again first."""
+    kept, operands = residual
+    if kept is None:
+        query, key, value, g, beta, state, starts = operands
+        _, kept = _kept_residual(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
     del chunk_size, dtype
-    query, key, value, g, beta, resets, entered, transition, decayed_query, weights, scores = residual
+    query, key, value, g, beta, resets, entered, transition, decayed_query, weights, scores = kept
     cotangent, final_cotangent = cotangent
     length = cotangent.shape[1]
     cotangent = _chunk_rows(cotangent.astype(query.dtype), query.shape[3])
