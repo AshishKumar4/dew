@@ -473,6 +473,12 @@ def test_a_training_step_holding_its_sums_and_anchor_row_is_the_gathering_steps_
     for index in range(tiles):
         kept = algebra.training_step(spec, kept, keys_at(index, accumulate), algebra.KeptRows(picked))
 
+    # A kept row and a gathering walk each need their own carry.
+    with pytest.raises(ValueError, match="KeptRows"):
+        algebra.training_step(spec, gathered, keys_at(0), algebra.KeptRows(picked))
+    with pytest.raises(ValueError, match="KeptRows"):
+        algebra.training_step(spec, kept, keys_at(0), lambda key: values[key])
+
     (state, arg, own, others), (kept_state, kept_arg, kept_own, kept_others) = gathered, kept
     for mine, theirs in ((kept_state.m, state.m), (kept_state.total, state.total), (kept_arg.peak, arg.peak),
                          (kept_arg.key, arg.key), (kept_own, own), (kept_others, others),

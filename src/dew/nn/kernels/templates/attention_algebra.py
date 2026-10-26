@@ -884,7 +884,11 @@ def training_step(spec: Forward, carry: Carry, keys: Keys,
         parts = weights_parts(jnp.where(at_anchor, 0.0, p) * multiplier, value.dtype)
         anchor_draw = drawn(keys.coords, keys.coords.q_pos, anchor.key[:, None])
         anchor = anchor._replace(multiplier=None if anchor_draw is None else anchor_draw[:, 0])
-    old = arg.row if isinstance(rows, KeptRows) else rows(arg.key)
+    kept = isinstance(rows, KeptRows)
+    if kept != (arg.row is not None):
+        raise ValueError("a training walk keeps the anchor's value row (`KeptRows`) exactly where its carry "
+                         "holds one (`Argmax.row`)")
+    old = arg.row if kept else rows(arg.key)
     taken = functools.partial(split_taken, own=own, alpha=factor, moved=moved, held=held,
                               old_multiplier=arg.multiplier)
     accumulate = keys.accumulate if held is None else None
