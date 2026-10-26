@@ -6,8 +6,8 @@ only when a `WandbTracker` logs.
 """
 
 from dew.checkpoints import Checkpoints, Keep
+from dew.distributed.placement import Layout, MeshSpec
 from dew.objectives.base import Aux, EMASpec, Metric, Objective, Step
-from dew.training.distributed import Layout, MeshSpec
 
 from .budget import Pause, Plateau
 from .evaluation import EvalSuite, Evaluation

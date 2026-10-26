@@ -129,11 +129,11 @@ import numpy as np
 from dew._coordination import agreed
 from dew.batch import Batch, Variables
 from dew.data.dataset import DataPartition, Loader, tapped
+from dew.distributed.batches import first_reader_batch, shard_batch
 from dew.nn.inputs import local_rows, mesh_of
 from dew.objectives.base import Shown
 from dew.sampling.text import Sampling
 from dew.state import TrainState
-from dew.training.distributed import first_reader_batch, shard_batch
 
 from ..lm import TokenScorer
 from .episodes import EnvironmentFactory, EpisodeCollector, EpisodeInference, EpisodeRecorder, Verifier
