@@ -13,9 +13,10 @@ from reference_error import assert_as_exact, widened
 from steady_state import steady_state
 
 from dew.artifacts import Representations
+from dew.batch import merge, part
 from dew.inputs import Field
 from dew.nn.backbones.jepa import JepaPredictor
-from dew.objectives.base import Step, merge, part
+from dew.objectives.base import Step
 from dew.objectives.jepa import (
     JepaEncoder,
     JepaObjective,
@@ -504,9 +505,9 @@ def test_an_adapted_pretrained_encoder_trains_its_factors_over_one_frozen_base(m
     weights: its factors and the predictor train, its base comes back
     bitwise, and the target encoder is the average of the factors over that
     same frozen base, which evaluation reads."""
+    from dew.batch import FROZEN
     from dew.inputs import unit_range
     from dew.lora import LoRA
-    from dew.objectives.base import FROZEN
 
     encoder = make_encoder()
     pretrained = encoder.init(jax.random.key(5), jnp.ones((1, RES, RES, 3)),

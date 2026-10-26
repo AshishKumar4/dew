@@ -23,7 +23,16 @@ import jax.numpy as jnp
 from flax import struct
 from flax.traverse_util import unflatten_dict
 
-from dew.nn.inputs import COORDINATES_FIELD, Coordinates, token_layout
+from dew.batch import (
+    COORDINATES_FIELD,
+    Batch,
+    Coordinates,
+    Variables,
+    leaves_by_path,
+    merge,
+    sown_nodes,
+    token_layout,
+)
 from dew.nn.moe import (
     EXPERT_BIAS,
     EXPERT_BIAS_COLLECTION,
@@ -36,7 +45,7 @@ from dew.nn.moe import (
     sequence_router_moments,
 )
 from dew.nn.precision import at_least_fp32
-from dew.objectives.base import Batch, Objective, Ratio, Variables, leaves_by_path, merge, sown_nodes
+from dew.objectives.base import Objective, Ratio
 
 __all__ = ["ExpertBalance", "RoutedStatistics", "apply_routed", "reduce_routed", "router_counts",
            "router_moments", "router_scores", "router_z_terms"]

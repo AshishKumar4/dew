@@ -32,25 +32,13 @@ import jax.numpy as jnp
 from flax import linen as nn
 
 from dew.artifacts import TokenScores
+from dew.batch import Variables, real_slots, thaw
 from dew.diffusion.discrete import MDLM_STEPS, REVEALED_UNDEFINED, DiscreteProcess, Unmask, aligned
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
-from dew.nn.inputs import real_slots
 from dew.nn.moe import ROUTER_COLLECTION
 from dew.nn.protocols import Lacks, TokenModel
-from dew.objectives.base import (
-    OMITTED,
-    Aux,
-    EMASpec,
-    Omitted,
-    Ratio,
-    Shown,
-    Source,
-    Step,
-    Variables,
-    model_rngs,
-    thaw,
-)
+from dew.objectives.base import OMITTED, Aux, EMASpec, Omitted, Ratio, Shown, Source, Step, ended, model_rngs
 from dew.objectives.lm.chunked import final_read, refuse_without_logits
 from dew.objectives.lm.head import HeadedObjective
 from dew.objectives.lm.objective import TEXT_KEY, batch_text, text_preview
@@ -67,7 +55,7 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
     """Trains a masked diffusion model on the MDLM negative ELBO.
 
     A batch holds `[B, seq_len]` token ids under `batch["text"]`, and packed
-    windows also their `text_coordinates` (`dew.nn.inputs.Coordinates`).
+    windows also their `text_coordinates` (`dew.batch.Coordinates`).
     `head_chunks` and `head_tile` set how the head is scored, as an LM's
     (`LMObjective`). `balance` trains the routers of a mixture as an LM's does
     (`ExpertBalance`, `dew.objectives.routing`).
@@ -94,6 +82,7 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         decode: Callable[[Sequence[int]], str] | None = None,
         variables: Variables | None | Omitted = OMITTED,
         processor: Processor | None | Omitted = OMITTED,
+        eos_token_ids: Sequence[int] | Omitted = OMITTED,
     ):
         """Build an MDLM objective over `model` for `seq_len`-token rows.
 
@@ -108,7 +97,9 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
 
         `model` may be a loaded source, such as a released LLaDA or Dream
         checkpoint, and `variables` and `processor` override its own
-        (`Objective.bind_model`)."""
+        (`Objective.bind_model`), as `eos_token_ids`, the ids its task's
+        responses stop at, overrides the source's (`ended`)."""
+        self.eos_token_ids = ended(model, eos_token_ids)
         model = self.bind_model(model, variables=variables, processor=processor)
         if not isinstance(model, TokenModel) or model.causal:
             raise Lacks("bidirectional",
@@ -139,10 +130,10 @@ class MaskedDiffusionObjective(HeadedObjective[Ratio | RoutedStatistics, Variabl
         return ObjectiveData(train=(geometry,), evaluate=(geometry,))
 
     def task_settings(self) -> MaskedSettings:
-        """The row length, response budget, process, solver, sampling steps, and tokenizer or
-        source processor: the task's own."""
+        """The row length, response budget, process, solver, sampling steps, end-of-sequence ids, and
+        tokenizer or source processor: the task's own."""
         return MaskedSettings(seq_len=self.seq_len, max_new_tokens=self.seq_len, process=self.process,
-                              solver=self.solver, sampling_steps=self.steps,
+                              solver=self.solver, sampling_steps=self.steps, eos_token_ids=self.eos_token_ids,
                               tokenizer=recorded_tokenizer(self.processor),
                               processor=recorded_processor(self.processor))
 

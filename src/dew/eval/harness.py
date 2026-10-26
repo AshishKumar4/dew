@@ -36,9 +36,10 @@ from lm_eval.api.model import TemplateLM
 from lm_eval.api.registry import register_model
 from lm_eval.models.utils import handle_stop_sequences, normalize_gen_kwargs, postprocess_generated_text
 
+from dew.batch import BLOCKS_FIELD
 from dew.inference.tasks import TextGeneration, cache_ceiling
 from dew.interop.generation_config import source_decoding
-from dew.nn.inputs import BLOCKS_FIELD, ModelInputs, pad_token_rows
+from dew.nn.inputs import ModelInputs, pad_token_rows
 from dew.nn.kernels.options import program
 from dew.nn.visibility import served_blocks
 from dew.objectives.lm.objective import LMObjective, TokenScorer
@@ -121,13 +122,15 @@ class DewLM(TemplateLM):
 
     @classmethod
     def from_run(cls, run: str, *, batch_size: int = 1, ema: bool | None = None,
-                 step: int | str | None = None, dtype: str | None = None) -> DewLM:
+                 step: int | str | None = None, dtype: str | None = None,
+                 trust: Sequence[str] = ()) -> DewLM:
         """Load the run directory `run` as a harness model, the way `dew.pipeline` builds it.
 
         With `ema=None`, it uses the run's averaged weights when the run kept
-        them, and its live weights otherwise.
+        them, and its live weights otherwise. `trust` is as `TextGeneration.from_run`
+        takes it.
         """
-        return cls(TextGeneration.from_run(run, ema=ema, step=step, dtype=dtype),
+        return cls(TextGeneration.from_run(run, ema=ema, step=step, dtype=dtype, trust=trust),
                    batch_size=batch_size)
 
     @classmethod

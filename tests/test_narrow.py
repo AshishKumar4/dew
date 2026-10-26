@@ -375,7 +375,7 @@ def test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads
 def test_a_restored_state_drops_its_templates_copies():
     """The copies are of the template's own parameters; a restored state
     starts without and the step rebuilds them from what was restored."""
-    from dew.training.state import TrainState
+    from dew.state import TrainState
 
     zero, one = jnp.zeros((), jnp.int32), jnp.ones((), jnp.int32)
     template = TrainState(step=zero, microstep=zero, updates=zero, variables={"params": {"w": jnp.ones(2)}},

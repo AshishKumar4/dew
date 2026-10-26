@@ -1,6 +1,6 @@
 """A run holds one frozen tree, shared with its objective: the compiled step takes the frozen tree
 (`variables[FROZEN]`) as an argument of its own, never donated and never returned
-(`dew.training.state.apart`), so the frozen leaves a LoRA run starts from are the objective's held
+(`dew.state.apart`), so the frozen leaves a LoRA run starts from are the objective's held
 arrays, fresh or placed, through every step and through the plan's timing of its candidates; a
 frozen leaf an objective's init builds is the state's own, placed as it starts fresh."""
 
@@ -14,9 +14,9 @@ import optax
 import pytest
 from flax.core import freeze
 
+from dew.batch import FROZEN
 from dew.interop import Pretrained
 from dew.lora import LoRA
-from dew.objectives.base import FROZEN
 from dew.objectives.lm import TEXT_KEY, LMObjective
 from dew.training import Layout, MeshSpec, Trainer
 

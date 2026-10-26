@@ -24,6 +24,7 @@ import pytest
 from data_support import CAPTION_TEMPLATES, keep_captions, listed
 from reader_support import assert_resumes_where_it_stopped
 
+from dew.batch import VALID_ROWS
 from dew.data import Loading, Memory, images, presets
 from dew.data.compile import compile, held, validation
 from dew.data.dataset import (
@@ -41,7 +42,6 @@ from dew.data.pipeline import Pipeline
 from dew.data.sinks import export
 from dew.data.sources import Source, from_torch, source as stored_source
 from dew.data.steps.generic import Formatting
-from dew.objectives.base import VALID_ROWS
 from dew.position import ENVELOPE
 
 WORKERS = {"loading": Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)}

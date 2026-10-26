@@ -15,6 +15,7 @@ from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P, Sing
 from steady_state import steady_state
 from test_training_transactions import SHORT_SCALE, Terms, Tiny, batches
 
+from dew.batch import FROZEN, freeze
 from dew.checkpoints import Checkpoints
 from dew.data import Loading, Memory
 from dew.data.dataset import DataPartition
@@ -24,7 +25,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import FROZEN, Aux, EMASpec, Objective, Ratio, freeze
+from dew.objectives.base import Aux, EMASpec, Objective, Ratio
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
 from dew.training import Layout, Trainer

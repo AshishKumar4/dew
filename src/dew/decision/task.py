@@ -9,7 +9,7 @@ import math
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field, fields, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Self, overload
+from typing import TYPE_CHECKING, Any, Self, overload
 
 import jax
 import jax.numpy as jnp
@@ -18,7 +18,9 @@ from etils import epath
 from jax.typing import DTypeLike
 from PIL import Image
 
-from dew import records
+from dew import _records
+from dew._records import JSON, json_value, record
+from dew.batch import Variables
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition, Reader
 from dew.data.text import HFTokenizer, Tokenizer
@@ -34,9 +36,9 @@ from dew.decision.calibration import (
 from dew.decision.data import Example
 from dew.decision.head import Head
 from dew.decision.images import Images
-from dew.decision.joint_checkpoint import JointCheckpoint
 from dew.decision.laya import LAYA, LayaCheckpoint
 from dew.decision.layout import (
+    QUESTION_FIELDS,
     DecisionInputs,
     Encoded,
     JointLayout,
@@ -64,17 +66,19 @@ from dew.files import write_atomically
 from dew.inference import scoring
 from dew.inference.tasks import shape_bucket
 from dew.interop.processors import Processor
+from dew.interop.safetensors_io import MAX_SHARD_SIZE
+from dew.interop.sources import SourceReference
+from dew.mesh import batch_axes
 from dew.nn.cross_attention import ContextEncoder
 from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
 from dew.nn.kernels.options import program
-from dew.nn.sharding import batch_axes
-from dew.objectives.base import Metric, Objective, Variables
-from dew.records import JSON, json_value, record
+from dew.objectives.base import Metric, Objective, joined
 
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
     from dew.decision.objective import DecisionObjective
+    from dew.decision.sources import PretrainedDecision
     from dew.training.distributed import Layout as Placement, MeshSpec
 
 TASK_FILE = "decide.json"
@@ -140,27 +144,16 @@ class DecideSettings:
     segments with it), the special tokens, the text tokenizer's name, and an image processor's
     source, or None."""
 
-    head: JSON
+    head: Mapping[str, object]
+    """The head's class record (`Head.record`), which `Head.from_record` builds over the backbone it reads,
+    its one field the record leaves to the backbone: a record, not a value the settings build."""
     layout: Layout
     specials: Specials
     tokenizer: str | None
-    processor: str | None
+    processor: SourceReference | None
     context_encoder: ContextEncoder = "table"
     """How the model encodes a row's context (`DecisionModel.context_encoder`); a run recorded before
     the choice existed embedded it by its token table."""
-
-    @staticmethod
-    def of(record: Mapping[str, object]) -> "DecideSettings":
-        """The settings a run's record holds (`saved_settings`). An earlier run's record names its
-        layout by class name alone, one of `dew.decision.layout`'s, and is read as that class's."""
-        from dew.inference.tasks import saved_settings
-
-        laid = record.get("layout")
-        if isinstance(laid, Mapping) and "name" in laid:
-            name = records.text(laid["name"], "layout.name")
-            record = {**record, "layout": {"class": f"dew.decision.layout:{name}",
-                                           "fields": records.json_value(laid.get("fields"), "layout.fields")}}
-        return saved_settings(record, DecideSettings)
 
 
 @dataclass(frozen=True)
@@ -195,27 +188,31 @@ class Decide:
     def from_pretrained(cls, name: str | Path = LAYA, *, subfolder: str | None = None,
                         revision: str | None = None, dtype: str = "float32", param_dtype: str = "float32",
                         attention_impl: str = "auto") -> Self:
-        """Load a released Laya checkpoint (`LayaCheckpoint`) or joint-head
-        checkpoint (`JointCheckpoint`) as a task.
+        """Load a released Laya or joint-head checkpoint through `Pretrained.load` as a task.
 
         A Laya task uses the temperatures that Laya's agent reads from
         `rl_agent_config.json`; a joint-head release ships none. Either
         answers with Jev's confidence; `replace(task, confidence=...)` selects
         Laya's (`EntropyConfidence`) or the top probability (`TopProbability`).
         """
-        label = str(name) if subfolder is None else f"{name}/{subfolder}"
-        if subfolder is None and JointCheckpoint.exists(name, revision=revision):
-            release = JointCheckpoint.load(name, revision=revision, dtype=dtype, param_dtype=param_dtype,
-                                           attention_impl=attention_impl)
-            return cls(release.model, release.variables, JointLayout(), release.tokenizer, release.specials,
-                       name=label, processor=release.processor)
-        checkpoint = LayaCheckpoint.load(name, subfolder=subfolder, revision=revision, dtype=dtype,
-                                         param_dtype=param_dtype, attention_impl=attention_impl)
-        choice, score, noul = checkpoint.temperatures
-        temperatures = Temperatures({"choice": choice, "score": score, "noul": noul},
-                                    checkpoint.bucket_temperatures)
-        return cls(checkpoint.model, checkpoint.variables, checkpoint.layout, checkpoint.tokenizer,
-                   checkpoint.specials, Calibration(temperatures), name=label)
+        from dew.decision.sources import PretrainedDecision
+        from dew.interop.pretrained import Pretrained
+
+        bundle = Pretrained.load(name, subfolder=subfolder, revision=revision, dtype=dtype,
+                                  param_dtype=param_dtype, attention_impl=attention_impl)
+        if not isinstance(bundle, PretrainedDecision):
+            raise TypeError(f"{name} declares no decision task")
+        # The name a caller asked for, a Hub folder included, not the cache path it resolved to.
+        return cls.of(bundle, name=str(name) if subfolder is None else f"{name}/{subfolder}")
+
+    @classmethod
+    def of(cls, bundle: "PretrainedDecision", *, name: str | None = None) -> Self:
+        """Build the declared decision task from a loaded composite bundle, without loading again.
+        It answers under `name`, by default the Hub id the bundle resolved or else its directory."""
+        return cls(DecisionModel(bundle.model, bundle.head),
+                   joined({"backbone": bundle.variables, "head": bundle.head_variables}),
+                   bundle.layout, bundle.decision_tokenizer, bundle.specials, bundle.calibration,
+                   name=name or str(bundle.origin or bundle.source), processor=bundle.processor)
 
     @classmethod
     def _recorded(cls, directory: str, record: Mapping[str, object], backbone, variables: Variables,
@@ -223,11 +220,12 @@ class Decide:
         """The task a run's `record` describes over `backbone` and `variables`, the `weights` they are:
         its head, layout, tokenizer, special tokens and processor as the run recorded them."""
         from dew.data.text import tokenizer_for
+        from dew.inference.tasks import saved_settings
         from dew.interop.pretrained import load_processor
 
-        settings = DecideSettings.of(record)
+        settings = saved_settings(record, DecideSettings)
         width, head_dtype = DecisionModel.head_size(backbone)
-        head = Head.from_record(records.json_value(settings.head, "head"), width)
+        head = Head.from_record(settings.head, width)
         # The head computes in the dtype it recorded, or as a fresh head over
         # the backbone would where the caller overrides the compute dtype.
         model = DecisionModel(backbone, head if dtype is None else head.clone(dtype=head_dtype),
@@ -241,23 +239,26 @@ class Decide:
     @classmethod
     def from_run(cls, directory: str, *, ema: bool | None = None, step: int | str | None = None,
                  mesh: "MeshSpec | Mesh | None" = None, layout: "Placement | None" = None,
-                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None) -> Self:
+                 dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
+                 trust: Sequence[str] = ()) -> Self:
         """Load the `DecisionObjective` run in `directory` as a task.
 
         The task is rebuilt from the run's record over the latest checkpoint's
         weights (or `step`'s), and includes any calibration `save` wrote into the
         run. `ema` selects the averaged weights, and None uses them when the run kept
         them. `mesh` and `layout` place the weights as the trainer does, `dtype`
-        overrides the compute dtype and `param_dtype` the storage dtype.
+        overrides the compute dtype and `param_dtype` the storage dtype. `trust`
+        names the packages outside Dew the run's record may import, as Dew's other
+        tasks' `from_run` take it (`dew.inference.tasks.SavedRun.pinned`).
         The image processor reloads from its recorded source independently of
         the tokenizer that lays out the task's text.
         """
-        from dew.inference.tasks import run_record, saved_model
-        from dew.registry import from_record, objectives
+        from dew.inference.tasks import SavedRun, saved_model
+        from dew.registry import from_record
 
-        record, step = run_record(directory, step)
-        variables = objectives[records.text(record["objective"], "objective")]._saved_variables(
-            directory, step=step, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
+        run = SavedRun.pinned(directory, step, trust)
+        record, step = run.record, run.step
+        variables = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
         if ema is None:
             with Checkpoints(directory) as checkpoints:
                 averaged = checkpoints.stored(step).get("ema") is not None
@@ -268,8 +269,8 @@ class Decide:
         saved = epath.Path(directory) / TASK_FILE
         if not saved.exists():
             return task
-        settings = records.record(json.loads(saved.read_text()), TASK_FILE)
-        fitted = from_record(Weights, records.json_value(settings["weights"], "weights"))
+        settings = _records.record(json.loads(saved.read_text()), TASK_FILE)
+        fitted = from_record(Weights, _records.json_value(settings["weights"], "weights"))
         # An average's own directory names the runs it averages beside the step it holds (`save`).
         if (fitted.step, fitted.ema) != (step, averaged):
             raise ValueError(
@@ -277,10 +278,10 @@ class Decide:
                 f"weights, and this loads step {step}'s {'averaged' if averaged else 'live'} ones; "
                 "fit them again with `calibrated` and `save`, or load the step it was fitted on")
         return replace(task, weights=fitted,
-                       calibration=from_record(Calibration, records.json_value(settings["calibration"],
+                       calibration=from_record(Calibration, _records.json_value(settings["calibration"],
                                                                                "calibration")),
-                       budget=from_record(Budget, records.json_value(settings["budget"], "budget")),
-                       name=records.text(settings["name"], "name"))
+                       budget=from_record(Budget, _records.json_value(settings["budget"], "budget")),
+                       name=_records.text(settings["name"], "name"))
 
     @classmethod
     def averaged(cls, runs: Sequence[str], *, step: int | str | None = None, ema: bool | None = None,
@@ -296,12 +297,12 @@ class Decide:
         whether its average was read, so it is no one run's: `save` writes it to a directory of its own
         as a run, which `from_run` and `dew.pipeline` then load, whatever its layout."""
         from dew.checkpoints import averaged
-        from dew.inference.tasks import run_record
+        from dew.inference.tasks import SavedRun, saved_settings
 
-        recorded = [run_record(directory, step)[0] for directory in runs]
-        first = DecideSettings.of(recorded[0]) if recorded else None
+        recorded = [SavedRun.pinned(directory, step).record for directory in runs]
+        first = saved_settings(recorded[0], DecideSettings) if recorded else None
         for directory, saved in zip(runs, recorded, strict=True):
-            settings = DecideSettings.of(saved)
+            settings = saved_settings(saved, DecideSettings)
             differing = [entry.name for entry in fields(DecideSettings)
                          if getattr(settings, entry.name) != getattr(first, entry.name)]
             if differing:
@@ -312,7 +313,7 @@ class Decide:
                              Weights(average.runs[0][1], ema=False, averaged=average.runs), None)
         return task if calibrate_on is None else task.calibrated(calibrate_on)
 
-    def save_pretrained(self, directory: str | Path) -> None:
+    def save_pretrained(self, directory: str | Path, *, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
         """Write this task as a released checkpoint, which `from_pretrained` reads back.
 
         A ModernBERT backbone under Laya's head and layout is written in Laya's
@@ -332,7 +333,7 @@ class Decide:
         types = applied.types
         LayaCheckpoint(self.model, self.variables, self.layout, self.tokenizer, self.specials,
                        (types.get("choice", 1.0), types.get("score", 1.0), types.get("noul", 1.0)),
-                       dict(applied.buckets)).save(directory)
+                       dict(applied.buckets)).save(directory, max_shard_size=max_shard_size)
 
     def save(self, directory: str) -> None:
         """Write this task's calibration, budget and name into the run `directory`.
@@ -377,8 +378,8 @@ class Decide:
         saved = epath.Path(directory) / TASK_FILE
         held = None
         if saved.exists():
-            fitted = records.record(json.loads(saved.read_text()), TASK_FILE)["weights"]
-            held = from_record(Weights, records.json_value(fitted, "weights"))
+            fitted = _records.record(json.loads(saved.read_text()), TASK_FILE)["weights"]
+            held = from_record(Weights, _records.json_value(fitted, "weights"))
         if held is None or held.averaged != self.weights.averaged:
             raise ValueError(f"{directory} holds a run's checkpoints other than this average, which its "
                              "calibration does not describe; save the average to a directory of its own")
@@ -391,7 +392,7 @@ class Decide:
         import optax
 
         from dew.decision.objective import DecisionObjective
-        from dew.training.state import TrainState
+        from dew.state import TrainState
 
         assert self.weights is not None
         with Checkpoints(directory) as checkpoints:
@@ -934,13 +935,13 @@ def laid_out(batch: Mapping[str, object], max_segments: int, *, spans_in_context
     def given(name: str) -> jax.Array | None:
         return array(name) if name in batch else None
 
-    return DecisionInputs(tokens=array("tokens"), segments=array("segments"), kinds=array("kinds"),
-                          questions=array("questions"), spans=array("spans"),
-                          option_spans=array("option_spans"), options=array("options"),
+    questions: dict[str, Any] = {field.name: array(field.name) if field.when == "always"
+                                 else given(field.name) for field in QUESTION_FIELDS}
+    return DecisionInputs(tokens=array("tokens"), segments=array("segments"), **questions,
                           positions=array("positions"), slots=given("slots"),
                           option_slots=given("option_slots"), slotted=given("slotted"),
                           context=given("context"), context_lengths=given("context_lengths"),
-                          readout=given("readout"), blocks=given("blocks"), max_segments=max_segments,
+                          blocks=given("blocks"), max_segments=max_segments,
                           spans_in_context=spans_in_context)
 
 

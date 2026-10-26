@@ -23,6 +23,7 @@ from jax.sharding import Mesh
 
 import dew.nn.backbones
 import dew.nn.backbones.jepa  # noqa: F401  (registers the kind)
+from dew.batch import Variables, coordinates
 from dew.data import preferences
 from dew.data.chat import ROLES_KEY, Role
 from dew.data.dataset import DataPartition
@@ -40,46 +41,44 @@ from dew.nn.backbones.unet_condition import UNet2DCondition
 from dew.nn.backbones.wan import WanTransformer
 from dew.nn.backbones.z_image import ZImageTransformer
 from dew.nn.diffusion_gemma import DiffusionGemma
-from dew.nn.inputs import ModelInputs, coordinates
+from dew.nn.inputs import ModelInputs
 from dew.nn.multimodal import MultimodalTransformer, VisionConditioner
 from dew.nn.vision import ProjectorBase, TowerBase
-from dew.objectives.base import Objective, Variables
+from dew.objectives.base import Objective
 from dew.objectives.diffusion import BlockDiffusionObjective, DiffusionObjective
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
 from dew.registry import models, projectors, read_arguments, resolve_dtype, towers
+from dew.state import TrainState
 from dew.telemetry.benchmark import carried
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import DevicePrefetchIterator
-from dew.training.state import TrainState
 
 Batch = dict[str, np.ndarray | Mapping[str, np.ndarray] | ModelInputs]
 
 
+@dataclasses.dataclass(frozen=True, eq=False)
 class _DenoisingTextTable(ConditionEncoder[str]):
     """Synthetic token and pooled features for native diffusion models."""
 
-    def __init__(self, table: CharTable, features: int, pooled_features: int | None,
-                 guidance: float | None, masked: bool = False):
-        self.table = table
-        self.params = table.params
-        self.features = features
-        self.pooled_features = pooled_features
-        self.guidance = guidance
-        self.masked = masked
-        """Whether the condition marks the real tokens, as Z-Image reads them."""
+    table: CharTable
+    params: Variables
+    features: int
+    pooled_features: int | None
+    guidance: float | None
+    masked: bool = False
+    """Whether the condition marks the real tokens, as Z-Image reads them."""
 
     @classmethod
     def from_pretrained(cls, checkpoint: str = "char_table", *, tokens: int = TEXT_TOKENS,
                         features: int = TEXT_FEATURES, pooled_features: int | None = None,
                         guidance: float | None = None, masked: bool = False, vocab: int = 130, seed: int = 0,
                         dtype=None):
-        return cls(CharTable.from_pretrained(checkpoint, tokens=tokens,
-                                            features=max(features, pooled_features or 0),
-                                            vocab=vocab, seed=seed, dtype=dtype),
-                   features, pooled_features, guidance, masked)
+        table = CharTable.from_pretrained(checkpoint, tokens=tokens, vocab=vocab, seed=seed, dtype=dtype,
+                                          features=max(features, pooled_features or 0))
+        return cls(table, table.params, features, pooled_features, guidance, masked)
 
     def tokenize(self, data: Sequence[str]) -> Mapping[str, np.ndarray]:
         return self.table.tokenize(data)
@@ -92,9 +91,9 @@ class _DenoisingTextTable(ConditionEncoder[str]):
         return DenoisingCondition(hidden[..., :self.features], pooled, guidance=guidance,
                                   mask=jnp.asarray(text.mask, bool) if self.masked else None)
 
-    def to_json(self) -> dict:
-        return {**self.table.to_json(), "features": self.features, "pooled_features": self.pooled_features,
-                "guidance": self.guidance, "masked": self.masked}
+    def recorded_fields(self) -> dict:
+        return {**self.table.recorded_fields(), "features": self.features,
+                "pooled_features": self.pooled_features, "guidance": self.guidance, "masked": self.masked}
 
 
 def trainer_mesh(mesh: Mapping[str, int]) -> dict[str, object]:

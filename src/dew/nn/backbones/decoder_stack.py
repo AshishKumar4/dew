@@ -20,13 +20,14 @@ from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from dew.objectives.base import merge
+from dew.batch import merge
+from dew.mesh import STAGE_AXIS
 
 from ..hyper_connections import Carried
 from ..kv_cache import CURSOR
 from ..mla import INDEXER_COLLECTION
 from ..moe import ROUTER_COLLECTION
-from ..sharding import STAGE_AXIS, microbatched
+from ..sharding import microbatched
 from .decoder_block import DecoderBlock
 from .layer_plan import LayerSpec, group_layers, group_name
 

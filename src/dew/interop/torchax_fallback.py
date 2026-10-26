@@ -48,25 +48,20 @@ from flax.core.scope import Variable
 from flax.typing import Dtype, PrecisionLike
 from jax.extend.core import Literal, primitives
 
+from dew.batch import COORDINATES_FIELD, VALIDITY_FIELD, Coordinates, coordinates, real_slots
 from dew.interop import sources, verify
 from dew.interop.decoder_parts import context_lengths
 from dew.interop.generation_config import read_generation_config
 from dew.interop.pickles import host_dtype, host_view
 from dew.interop.pretrained import PretrainedFallback, source_processor
 from dew.interop.weights import AUTO
+from dew.mesh import LogicalAxes
 from dew.nn.attention import cache_positions
-from dew.nn.inputs import (
-    COORDINATES_FIELD,
-    VALIDITY_FIELD,
-    Coordinates,
-    coordinates,
-    document_reach,
-    real_slots,
-)
+from dew.nn.inputs import document_reach
 from dew.nn.kv_cache import filled_slots
 from dew.nn.precision import at_least_fp32, configured_precision, float32_products, scaled
 from dew.nn.protocols import Lacks, OutputTable
-from dew.nn.sharding import LogicalAxes, Suffix, parameter_path
+from dew.nn.sharding import Suffix, parameter_path
 from dew.registry import resolve_dtype
 from dew.training.distributed import Layout
 
@@ -1350,20 +1345,22 @@ def _refuse_packing(packing: Mapping[str, object]) -> None:
                     f"which takes no {sorted(packing)}; train it on unpacked rows without packing columns")
 
 
-def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtype: str,
+def load(source: sources.SourceReference, root: Path, *, dtype: str,
          param_dtype: str, attention_impl: str, max_seq_len: int | None,
          admission: TorchAdmission | None = None, weights: bool = True) -> PretrainedFallback:
-    """Load `directory`'s causal LM through transformers and torchax.
+    """Load the causal LM `source` selects through transformers and torchax.
 
-    `directory` is the metadata snapshot `Pretrained.load` resolved and
-    `revision` its commit (None for a local directory); the weights come
-    from the same commit through `sources.snapshot`, so the file
-    selection is the native loader's. `admission` is the decision that sent an
-    unregistered type here (`admitted`), None for `fallback="torchax"`. Without
-    `weights` the model is built from its config on torch's meta device, no
-    weight read, and its variables are their shapes and dtypes alone
-    (`jax.ShapeDtypeStruct`).
+    `root` is the metadata snapshot `Pretrained.load` resolved at `source`'s
+    revision, and `source`'s folder selects the model below it; the weights
+    come from the same commit and folder (`SourceReference.weights`), so the
+    file selection is the native loader's. `admission` is the decision that
+    sent an unregistered type here (`admitted`), None for
+    `fallback="torchax"`. Without `weights` the model is built from its
+    config on torch's meta device, nothing but metadata fetched or read, and
+    its variables are their shapes and dtypes alone (`jax.ShapeDtypeStruct`).
     """
+    name_or_dir, revision = source.name, source.revision
+    directory = source.directory(root)
     attends = admission is not None and admission.attends
     if attention_impl != "auto" and not attends:
         raise ValueError(
@@ -1383,7 +1380,7 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     except ImportError as error:
         raise ImportError(f"fallback='torchax' needs torch, torchax and transformers: {INSTALL}") from error
     if weights:
-        directory = sources.snapshot(str(name_or_dir), revision)
+        directory = source.directory(source.weights(root))
     # Before transformers, whose reader fails on a malformed file without naming it.
     generation_config = read_generation_config(directory)
     storage = "auto" if param_dtype == AUTO else getattr(torch, param_dtype)
@@ -1442,7 +1439,6 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     built = {"dtype": resolve_dtype(dtype), "max_seq_len": capacity, "rebuild": rebuild}
     module = (TorchCausalLM(graph, vocab, **built) if head_name is None
               else TorchTableLM(graph, vocab, head=head_name, **built))
-    source = str(name_or_dir) if revision is None else f"{name_or_dir}@{revision}"
     processor = source_processor(directory, config, config, module, source=source)
     versions = {name: importlib.metadata.version(name) for name in ("transformers", "torchax", "torch")}
     why = ("fallback='torchax'" if admission is None else

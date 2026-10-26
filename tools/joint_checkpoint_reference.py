@@ -99,8 +99,8 @@ def joint_twin(model_class, upstream, backbone, head, head_config: dict):
 
 
 def main() -> None:
-    from torch_precision import float64
     from safetensors.torch import save_file
+    from torch_precision import float64
     from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
 
     from dew.interop.verify import scatter_weights
@@ -222,9 +222,9 @@ def fla_precision() -> str:
 
 
 def images() -> None:
-    from torch_precision import float64
     from PIL import Image
     from safetensors.torch import load_file
+    from torch_precision import float64
     from transformers import AutoProcessor, Qwen3_5ForConditionalGeneration
 
     upstream, model_class = upstream_module()

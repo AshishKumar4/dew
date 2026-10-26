@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import functools
 import json
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -24,10 +24,11 @@ from typing import Literal
 import jax.numpy as jnp
 from flax import linen as nn
 
-from dew import records
-from dew.coordination import agreed
+from dew import _records
+from dew._coordination import agreed
+from dew._records import JSON
+from dew.batch import token_id, token_ids
 from dew.nn.protocols import Bounded, Predicting
-from dew.records import JSON
 from dew.sampling import decoding
 from dew.sampling.strategies import Beam, Speculative, Strategy
 from dew.sampling.text import Sampling, ordered_transforms, with_ids_of
@@ -57,31 +58,19 @@ def _generation_value(config: Mapping[str, object], generation_config: Mapping[s
     text = config.get("text_config", config)
     if not isinstance(text, Mapping):
         raise ValueError("text_config must be a mapping")
-    return records.json_value(generation_config.get(name, config.get(name, text.get(name, default))), name)
+    return _records.json_value(generation_config.get(name, config.get(name, text.get(name, default))), name)
 
 
 def eos_ids(config: Mapping[str, object], generation_config: Mapping[str, object]) -> tuple[int, ...]:
     value = _generation_value(config, generation_config, "eos_token_id")
-    if value is None:
-        return ()
-    values = (value,) if type(value) is int else value
-    if not isinstance(values, (tuple, list)):
-        raise ValueError("eos_token_id must be an integer or a sequence of integers")
-    ids: list[int] = []
-    for entry in values:
-        if type(entry) is not int or entry < 0:
-            raise ValueError("eos_token_id must be an integer or a sequence of integers")
-        ids.append(entry)
-    return tuple(ids)
+    # None and an empty list both state no EOS id; the ids themselves are read by the one law of ids.
+    values = () if value is None else value if isinstance(value, (list, tuple)) else [value]
+    return tuple(token_ids(values, where="eos_token_id")) if values else ()
 
 
 def pad_id(config: Mapping[str, object], generation_config: Mapping[str, object]) -> int:
     value = _generation_value(config, generation_config, "pad_token_id", 0)
-    if value is None:
-        value = 0
-    if type(value) is not int or value < 0:
-        raise ValueError("pad_token_id must be a nonnegative integer")
-    return value
+    return token_id(0 if value is None else value, where="pad_token_id")
 
 
 def generation_limit(
@@ -108,7 +97,7 @@ def return_sequences(config: Mapping[str, object], generation_config: Mapping[st
 def _probability_control(config: Mapping[str, object], generation_config: Mapping[str, object],
                          name: str, default: float) -> float:
     value = _generation_value(config, generation_config, name, default)
-    return default if value is None else records.number(value, name)
+    return default if value is None else _records.number(value, name)
 
 
 @dataclass(frozen=True)
@@ -343,6 +332,12 @@ def _cache_capacity(config: Mapping[str, object], generation_config: Mapping[str
         raise ValueError(f"max_cache_len {value} exceeds the model's max_seq_len {capacity}")
 
 
+TRANSFORMERS_TOP_K = 50
+"""The cut transformers' `generate` samples from where a source leaves `top_k` unset: its documented
+default (`GenerationConfig`, configuration_utils.py, 5.17.0), which its generation preparation installs
+as a `TopKLogitsWarper`. A stated 0 asks for no cut."""
+
+
 def _source_sampling(config: Mapping[str, object], generation_config: Mapping[str, object],
                      do_sample: bool) -> Sampling:
     """Return the policy a source declares, every common control in it."""
@@ -359,8 +354,9 @@ def _source_sampling(config: Mapping[str, object], generation_config: Mapping[st
     typical = read("typical_p") if do_sample else None
     stop = read("stop_strings")
     return Sampling(
-        temperature=records.number(temperature, "temperature") if do_sample else 0.0,
-        top_k=(records.integer(top_k, "top_k") or None) if do_sample and top_k is not None else None,
+        temperature=_records.number(temperature, "temperature") if do_sample else 0.0,
+        top_k=((TRANSFORMERS_TOP_K if top_k is None else _records.integer(top_k, "top_k") or None)
+               if do_sample else None),
         eos_token_ids=eos,
         pad_token_id=pad_id(config, generation_config),
         top_p=_probability_control(config, generation_config, "top_p", Sampling.top_p)
@@ -368,31 +364,23 @@ def _source_sampling(config: Mapping[str, object], generation_config: Mapping[st
         min_p=_probability_control(config, generation_config, "min_p", Sampling.min_p)
         if do_sample else Sampling.min_p,
         repetition_penalty=Sampling.repetition_penalty if penalty is None
-        else records.number(penalty, "repetition_penalty"),
-        no_repeat_ngram_size=0 if ngram is None else records.integer(ngram, "no_repeat_ngram_size"),
-        min_new_tokens=0 if floor is None else records.integer(floor, "min_new_tokens"),
-        typical_p=Sampling.typical_p if typical is None else records.number(typical, "typical_p"),
+        else _records.number(penalty, "repetition_penalty"),
+        no_repeat_ngram_size=0 if ngram is None else _records.integer(ngram, "no_repeat_ngram_size"),
+        min_new_tokens=0 if floor is None else _records.integer(floor, "min_new_tokens"),
+        typical_p=Sampling.typical_p if typical is None else _records.number(typical, "typical_p"),
         stop=() if stop is None else _as_strings(stop))
 
 
-def _token_list(value: object, name: str) -> list[int]:
-    if isinstance(value, int) and not isinstance(value, bool):
-        return [value]
-    if not isinstance(value, (list, tuple)) or not value:
-        raise ValueError(f"{name} must be a non-empty list of token ids")
-    ids = []
-    for token in value:
-        if type(token) is not int or token < 0:
-            raise ValueError(f"{name} must hold non-negative integer token ids")
-        ids.append(token)
-    return ids
+def _token_list(value: _records.JSON, name: str) -> list[int]:
+    """A source field holding one token id or a nonempty list of them, read by the one law of ids."""
+    return token_ids(value if isinstance(value, list) else [value], where=name)
 
 
 def _as_decay(value: object) -> tuple[int, float]:
     if not isinstance(value, (list, tuple)) or len(value) != 2:
         raise ValueError("exponential_decay_length_penalty must be (start_index, factor)")
-    return (records.integer(value[0], "exponential_decay_length_penalty start"),
-            records.number(value[1], "exponential_decay_length_penalty factor"))
+    return (_records.integer(value[0], "exponential_decay_length_penalty start"),
+            _records.number(value[1], "exponential_decay_length_penalty factor"))
 
 
 def _as_bias(value: object) -> list[tuple[list[int], float]]:
@@ -402,7 +390,7 @@ def _as_bias(value: object) -> list[tuple[list[int], float]]:
     for entry in value:
         if not isinstance(entry, (list, tuple)) or len(entry) != 2:
             raise ValueError("each sequence_bias entry is a token id list and a bias")
-        entries.append((_token_list(entry[0], "sequence_bias"), records.number(entry[1], "sequence_bias")))
+        entries.append((_token_list(entry[0], "sequence_bias"), _records.number(entry[1], "sequence_bias")))
     return entries
 
 
@@ -439,16 +427,16 @@ def _source_transforms(config: Mapping[str, object], generation_config: Mapping[
         extra["sequence_bias"] = decoding.sequence_bias(_as_bias(value))
     if (value := read("encoder_repetition_penalty")) is not None:
         extra["encoder_repetition_penalty"] = decoding.PromptRepetitionPenalty(
-            records.number(value, "encoder_repetition_penalty"))
+            _records.number(value, "encoder_repetition_penalty"))
     if (value := read("encoder_no_repeat_ngram_size")) is not None:
         extra["encoder_no_repeat_ngram_size"] = decoding.PromptNoRepeatNGram(
-            records.integer(value, "encoder_no_repeat_ngram_size"))
+            _records.integer(value, "encoder_no_repeat_ngram_size"))
     if (value := read("bad_words_ids")) is not None:
         extra["bad_words_ids"] = decoding.bad_words(_as_words(value), sampling.eos_token_ids)
     if (value := read("min_length")) is not None and eos.size:
-        extra["min_length"] = decoding.MinLength(records.integer(value, "min_length"), eos)
+        extra["min_length"] = decoding.MinLength(_records.integer(value, "min_length"), eos)
     if (value := read("forced_bos_token_id")) is not None:
-        extra["forced_bos_token_id"] = decoding.ForcedBOS(records.integer(value, "forced_bos_token_id"))
+        extra["forced_bos_token_id"] = decoding.ForcedBOS(token_id(value, where="forced_bos_token_id"))
     if (value := read("forced_eos_token_id")) is not None:
         # The reference forces at the effective end of the request, and a call
         # may set its own budget, so the control stays request relative.
@@ -468,11 +456,11 @@ def _source_transforms(config: Mapping[str, object], generation_config: Mapping[
             read("forced_bos_token_id") is not None)
     if sampling.temperature > 0 and not searching:
         if (value := read("top_h")) is not None:
-            extra["top_h"] = decoding.TopH(records.number(value, "top_h"))
+            extra["top_h"] = decoding.TopH(_records.number(value, "top_h"))
         if (value := read("epsilon_cutoff")) is not None:
-            extra["epsilon_cutoff"] = decoding.EpsilonCutoff(records.number(value, "epsilon_cutoff"))
+            extra["epsilon_cutoff"] = decoding.EpsilonCutoff(_records.number(value, "epsilon_cutoff"))
         if (value := read("eta_cutoff")) is not None:
-            extra["eta_cutoff"] = decoding.EtaCutoff(records.number(value, "eta_cutoff"))
+            extra["eta_cutoff"] = decoding.EtaCutoff(_records.number(value, "eta_cutoff"))
     if read("renormalize_logits") is not None:
         extra["renormalize_logits"] = decoding.Renormalize()
     if not extra and not searching:
@@ -493,7 +481,7 @@ def _source_strategy(config: Mapping[str, object], generation_config: Mapping[st
             raise ValueError("stochastic beam search is refused: a selected beam's marginal "
                              "probability is not the per-step candidate probability, so no honest "
                              "behaviour likelihood exists")
-        width = records.integer(beams, "num_beams")
+        width = _records.integer(beams, "num_beams")
         if rows > width:
             raise ValueError(f"num_return_sequences {rows} exceeds num_beams {width}")
         early = _generation_value(config, generation_config, "early_stopping")
@@ -506,7 +494,7 @@ def _source_strategy(config: Mapping[str, object], generation_config: Mapping[st
             width=width,
             length_penalty=Beam.length_penalty
             if penalty is None
-            else records.number(penalty, "length_penalty"),
+            else _records.number(penalty, "length_penalty"),
             early_stopping=early is True if isinstance(early, bool) else "never",
             stop_ids=len(eos_ids(config, generation_config)),
         )
@@ -517,11 +505,11 @@ def _source_strategy(config: Mapping[str, object], generation_config: Mapping[st
                          "checkpoint carries no prediction-depth weights")
     length = read("num_assistant_tokens")
     threshold = read("assistant_confidence_threshold")
-    drafted = Speculative.block - 1 if length is None else records.integer(length, "num_assistant_tokens")
+    drafted = Speculative.block - 1 if length is None else _records.integer(length, "num_assistant_tokens")
     # The block includes the target draw the proposer chains from.
     return Speculative(block=drafted + 1,
                        confidence=Speculative.confidence if threshold is None else
-                       records.number(threshold, "assistant_confidence_threshold"))
+                       _records.number(threshold, "assistant_confidence_threshold"))
 
 
 def _mtp_mode(value: object) -> bool:
@@ -537,9 +525,9 @@ def generation_config_of(sampling: Sampling, max_new_tokens: int | None = None) 
     """The generation_config.json transformers reads `sampling` from, and
     `source_decoding` reads back as the same policy: the inverse of
     `_source_sampling`. A top_k of None is written 0, which both read as no
-    cut (transformers' own default is 50). transformers has no presence or
-    frequency penalty, so a policy using one is refused, not exported
-    without it."""
+    cut, since an unset one reads as transformers' default (`TRANSFORMERS_TOP_K`).
+    transformers has no presence or frequency penalty, so a policy using one
+    is refused, not exported without it."""
     dropped = [name for name in ("presence_penalty", "frequency_penalty") if getattr(sampling, name) != 0.0]
     if dropped:
         raise ValueError(f"transformers' generation config has no {' or '.join(dropped)}; "
@@ -563,18 +551,27 @@ def generation_config_of(sampling: Sampling, max_new_tokens: int | None = None) 
     return values
 
 
-def masked_generation_config(max_new_tokens: int | None = None, pad_token_id: int | None = None
-                             ) -> dict[str, JSON]:
+def masked_generation_config(max_new_tokens: int | None = None, pad_token_id: int | None = None,
+                             eos_token_ids: Sequence[int] = ()) -> dict[str, JSON]:
     """The generation_config.json a masked-diffusion export writes: no KV cache,
-    the response budget and the pad id, which `audit_masked` accepts and
-    `PretrainedMaskedDecoder.text_generation` reads back. Dew's solver and
-    step count have no field there, so the reader's MDLM defaults stand."""
-    values: dict[str, JSON] = {"use_cache": False}
+    the response budget, the pad id and the end-of-sequence ids, which
+    `audit_masked` accepts and `PretrainedMaskedDecoder.text_generation` reads
+    back. Dew's solver and step count have no field there, so the reader's MDLM
+    defaults stand."""
+    values: dict[str, JSON] = {"use_cache": False, **eos_field(eos_token_ids)}
     if max_new_tokens:
         values["max_new_tokens"] = max_new_tokens
     if pad_token_id is not None:
         values["pad_token_id"] = pad_token_id
     return values
+
+
+def eos_field(eos_token_ids: Sequence[int]) -> dict[str, JSON]:
+    """`eos_token_ids` as a generation config's `eos_token_id`, one id or a list (`eos_ids`'s
+    inverse), none where there are none."""
+    ids: list[JSON] = [int(token) for token in eos_token_ids]
+    named: dict[str, JSON] = {} if not ids else {"eos_token_id": ids[0] if len(ids) == 1 else ids}
+    return named
 
 
 def source_decoding(config: Mapping[str, object], generation_config: Mapping[str, object],

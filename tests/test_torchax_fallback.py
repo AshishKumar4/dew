@@ -17,7 +17,10 @@ lands one fp32 ulp (4.8e-7) from torch's; `LOSS` is two.
 import contextlib
 import copy
 import dataclasses
+import json
 import math
+import shutil
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -36,15 +39,15 @@ from reference_error import (
     with_gradients,
 )
 
+from dew.batch import coordinates
 from dew.data.dataset import Loader
 from dew.interop import Pretrained
 from dew.interop.torchax_fallback import TorchLayout, TransformersTierWarning
-from dew.nn.inputs import coordinates
 from dew.nn.protocols import Lacks
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec, Trainer
-from tools.torch_precision import float64
+from tools.torch_precision import float64, float64_twin
 
 # CI runs this file in tasks of its own: torchax renames torch's privateuse1 backend process-wide.
 pytestmark = pytest.mark.torchax
@@ -194,8 +197,8 @@ def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placemen
     tensor's axes, and the one placement keeps the frozen tensors whole over fsdp, split over the
     tensor axis as the table splits them, while the trained ones, their moments and one step's
     update lie as the split layout lays them."""
-    from dew.nn.sharding import mesh_axes
-    from dew.objectives.base import FROZEN, freeze
+    from dew.batch import FROZEN, freeze
+    from dew.mesh import mesh_axes
     from dew.training.distributed import shard_batch
 
     variables = freeze(loaded.variables, lambda path: ".layers.1." in path[1])
@@ -574,6 +577,61 @@ def test_a_load_without_weights_reads_none_and_states_their_shapes(route, tmp_pa
     assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(shapes.variables))
 
 
+_SHAPES = """
+import json
+import sys
+import warnings
+import jax
+from dew.interop import Pretrained
+warnings.simplefilter("ignore")
+loaded = Pretrained.load("dew/tiny-cohere", dtype="float32", fallback="torchax", weights=False)
+print(json.dumps(jax.tree.map(lambda leaf: [list(leaf.shape), str(leaf.dtype)], loaded.variables)))
+"""
+
+
+def test_a_shapes_only_fallback_load_reads_no_weights_from_the_hub(tmp_path):
+    """`fallback='torchax'` without weights reads metadata alone: from a Hub cache holding the
+    commit's metadata and not its weight files, offline, it states every leaf's shape and dtype
+    as the load with weights holds it, as a run resuming from its own checkpoint needs."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    from interop_support import hub_cache
+
+    torch.manual_seed(0)
+    transformers.CohereForCausalLM(transformers.CohereConfig(**COHERE)).save_pretrained(tmp_path / "whole")
+    with pytest.warns(TransformersTierWarning):
+        whole = Pretrained.load(tmp_path / "whole", dtype="float32", fallback="torchax")
+    hub_cache(tmp_path / "hub", "dew/tiny-cohere", tmp_path / "whole")
+    for weights in (tmp_path / "hub").rglob("*.safetensors"):
+        weights.unlink()
+    env = {**os.environ, "HF_HUB_CACHE": str(tmp_path / "hub"), "HF_HUB_OFFLINE": "1", "JAX_PLATFORMS": "cpu"}
+    run = subprocess.run([sys.executable, "-c", _SHAPES], capture_output=True, text=True, env=env)
+    assert run.returncode == 0, run.stderr[-2000:]
+    assert json.loads(run.stdout.splitlines()[-1]) == jax.tree.map(
+        lambda leaf: [list(leaf.shape), str(jnp.dtype(leaf.dtype))], whole.variables)
+
+
+@pytest.mark.parametrize("route", ["tier 3", "fallback"])
+def test_a_selected_folder_loads_its_own_model_through_tier_3(route, tmp_path):
+    """A causal LM stored in a folder below the source's root, selected by `subfolder`, loads the
+    folder's own weights through tier 3, whichever route takes it: the logits are the folder
+    model's as loaded from the folder itself."""
+    torch.manual_seed(0)
+    model = transformers.CohereForCausalLM(transformers.CohereConfig(**COHERE))
+    model.save_pretrained(tmp_path / "root" / "lm")
+    options = {"fallback": "torchax"} if route == "fallback" else {}
+    with pytest.warns(TransformersTierWarning):
+        selected = Pretrained.load(tmp_path / "root", subfolder="lm", dtype="float32", **options)
+    with pytest.warns(TransformersTierWarning):
+        direct = Pretrained.load(tmp_path / "root" / "lm", dtype="float32", **options)
+    ids = jnp.asarray(np.random.default_rng(0).integers(0, COHERE["vocab_size"], (2, 8)), jnp.int32)
+    np.testing.assert_array_equal(selected.model.apply(selected.variables, ids),
+                                  direct.model.apply(direct.variables, ids))
+
+
 @pytest.mark.parametrize("family", ["llama", "neox"])
 def test_bf16_compute_gradients_are_as_exact_as_torchs_bf16(family, tokens, tmp_path):
     """A bf16 checkpoint computing in bf16: LMObjective's loss and its gradient of every parameter
@@ -815,8 +873,135 @@ def test_a_tier_3_models_final_states_and_head_are_transformers(case, tmp_path):
                     seeds=STATES_SEEDS[case], truth_fn=truth)
 
 
+SLOT_TOKENIZER = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
+"""The tokenizer and chat template a tier-3 slot release ships: the tiny Qwen's, byte-level."""
+SLOT_HEAD = 8
+SLOT_SEEDS = 128
+"""The tier-3 slot release's declared check-1 seeds, sized by `seeds_for` on armada."""
+SLOT_WORDS = ("refund", "late", "order", "broken", "account", "charge", "screen", "login")
+
+
+def tier3_slot_release(directory):
+    """A slot release (`SlotReadout`, its stored head) over a tiny Cohere, a type no registered family
+    computes, so its backbone loads as tier 3, with the tiny Qwen's tokenizer and template; the Cohere
+    is sized to that vocabulary and its special ids. Its torch model and its stored head."""
+    text = json.loads((SLOT_TOKENIZER / "config.json").read_text())["text_config"]
+    torch.manual_seed(0)
+    sized = {name: text[name] for name in ("vocab_size", "pad_token_id", "bos_token_id", "eos_token_id")}
+    model = transformers.CohereForCausalLM(transformers.CohereConfig(**{**COHERE, **sized})).eval()
+    model.save_pretrained(directory)
+    for name in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
+        shutil.copy(SLOT_TOKENIZER / name, directory / name)
+    (directory / "readout.json").write_text(json.dumps({"readout": "head", "head_dim": SLOT_HEAD,
+                                                        "n_slots": len(SLOT_WORDS)}))
+    rng, width = np.random.default_rng(0x1657), COHERE["hidden_size"]
+    shapes = {"slot": (len(SLOT_WORDS), width), "q.weight": (SLOT_HEAD, width),
+              "k.weight": (SLOT_HEAD, width)}
+    stored = {name: (rng.standard_normal(shape) * width ** -0.5).astype(np.float32)
+              for name, shape in shapes.items()}
+    torch.save({name: torch.from_numpy(value) for name, value in stored.items()},
+               directory / "readout_head.pt")
+    return model, stored
+
+
+def slot_request(seed):
+    """A drawn request body: a state of drawn words, and a choice among two to four drawn words."""
+    rng = np.random.default_rng([0x1657, int(seed)])
+    state = " ".join(str(word) for word in rng.choice(SLOT_WORDS, int(rng.integers(3, 9))))
+    options = [str(word) for word in rng.choice(SLOT_WORDS, int(rng.integers(2, 5)), replace=False)]
+    return {"state": state, "questions": {"pick": {"type": "choice", "instructions": "Which one?",
+                                                   "criteria": dict.fromkeys(options)}}}
+
+
+def test_a_slot_release_over_a_tier_3_backbone_scores_and_serves_by_transformers_states(tmp_path):
+    """A slot release whose backbone no registered family computes loads it as tier 3 and decides
+    over it: each option's score is the release's law (`SlotReadout`: `<slot_i, h> + <q h, k m_i> /
+    sqrt(head_dim)`, `h` the answer cue's state, `m_i` the mean over option i's line) over transformers'
+    own final states of the row, as exact as transformers' float32 from its float64 twin (check 1), and
+    the scoring server answers a request as the task does alone."""
+    from dew.decision import Question
+    from dew.inference import ScoringServer
+
+    model, stored = tier3_slot_release(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        bundle = Pretrained.load(tmp_path, dtype="float32")
+    assert type(bundle.model).__name__ == "TorchCausalLM"
+    task = bundle.pipeline()
+    reference = copy.deepcopy(model)
+    reference.set_attn_implementation("eager")
+    wide = float64_twin(reference)
+
+    def asked(request):
+        return {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
+
+    def row(seed):
+        request = slot_request(seed)
+        [laid] = task.layout.rows(task.tokenizer, task.specials, request["state"], asked(request))
+        return laid
+
+    def ours(seed):
+        encoded = row(seed)
+        [scores] = task.scored([encoded])
+        return {"scores": np.asarray(scores[0, :len(encoded.questions[0].options)], np.float64)}
+
+    def theirs(source, dtype):
+        def run(seed):
+            encoded = row(seed)
+            [question] = encoded.questions
+            with torch.no_grad():
+                out = source(input_ids=torch.tensor([encoded.tokens]), output_hidden_states=True)
+            # The last of the hidden states is the final norm's output, the states the head reads.
+            states = out.hidden_states[-1][0]
+            answer = states[question.readout]
+            lines = torch.stack([states[start:end].mean(0) for start, end in question.options])
+            head = {name: torch.from_numpy(value).to(dtype) for name, value in stored.items()}
+            scores = (head["slot"][:len(question.options)] @ answer
+                      + lines @ head["k.weight"].T @ (head["q.weight"] @ answer) / math.sqrt(SLOT_HEAD))
+            return {"scores": scores.double().numpy()}
+        return run
+
+    def truth(seed):
+        with float64():
+            return theirs(wide, torch.float64)(seed)
+
+    assert_as_exact(ours, theirs(reference, torch.float32), lambda seed: (np.asarray(seed, np.int64),),
+                    "tier 3 slot release", seeds=SLOT_SEEDS, truth_fn=truth)
+
+    request = slot_request(0)
+    [alone] = task(request["state"], asked(request)).values()
+    server = ScoringServer.from_task(*task.scoring())
+    answered = server.submit(request)
+    server.step()
+    served = answered.result()["answers"]["pick"]
+    assert served["choice"] == alone.choice
+    rounded = [round(float(value), 4) for value in alone.probabilities]
+    assert served["probabilities"] == dict(zip(alone.options, rounded, strict=True))
+
+
 DECODE_SEEDS = {"cohere": 8, "cohere2": 8}
 """Each family's declared check-1 seeds for its cached logits, sized by `seeds_for` on armada."""
+
+
+def test_a_tier_3_source_generates_through_the_pipeline_loader_as_its_bundle_does(tmp_path):
+    """`dew.pipeline` of a tier-3 source on Dew's attention gives the text generation its loaded bundle
+    describes: one greedy sample a prompt, the same tokens from the same prompts."""
+    from dew.inference import pipeline
+    from dew.sampling import Sampling
+
+    torch.manual_seed(0)
+    model = PACKED_MODELS["cohere"]().eval()
+    # Cohere's class defaults name its full vocabulary's special tokens; this one's are inside its 256.
+    for config in (model.config, model.generation_config):
+        config.bos_token_id, config.eos_token_id, config.pad_token_id = 1, 2, 0
+    model.save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        task = pipeline(str(tmp_path), dtype="float32")
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32")
+    prompts, greedy = [[3, 5, 7, 2], [9, 4, 6, 8]], Sampling(temperature=0.0)
+    np.testing.assert_array_equal(
+        task(prompts, 3, key=0, n=1, sampling=greedy).host().tokens,
+        loaded.text_generation()(prompts, 3, key=0, n=1, sampling=greedy).host().tokens)
 
 
 @pytest.mark.parametrize("stated", ["mask", "segments"])
