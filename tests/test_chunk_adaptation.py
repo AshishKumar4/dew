@@ -30,7 +30,11 @@ LEVEL = ContinuumLevel(hidden=4)
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 
 ADAPTATION_SEEDS = 8
-"""Check 1's declared seeds for the scan against equation 71's literal loop (`seeds_for`)."""
+"""Check 1's declared seeds for the scan against equation 71's literal loop, sized paired by
+`seeds_for` on armada."""
+
+SELECTED_SEEDS = 256
+"""Check 1's declared seeds for a level whose `up` alone steps, sized paired by `seeds_for` on armada."""
 
 GRADIENT_SEEDS = 8
 """Check 1's declared seeds for the outer gradient through the windows' steps (`seeds_for`)."""
@@ -131,8 +135,8 @@ def test_the_scan_steps_the_level_as_equation_71(*, packed, window, rate):
     def reference(variables, hidden, targets, weights):
         return equation_71(MODEL, variables, hidden, targets, weights, documents, adaptation)
 
-    assert_as_exact(jax.jit(dew), reference, draw, f"equation 71 at a window of {window}, rate {rate}",
-                    seeds=ADAPTATION_SEEDS)
+    assert_as_exact(jax.jit(dew), jax.jit(reference), draw,
+                    f"equation 71 at a window of {window}, rate {rate}", seeds=ADAPTATION_SEEDS)
 
 
 def test_only_the_selected_parts_step():
@@ -148,7 +152,7 @@ def test_only_the_selected_parts_step():
     def reference(variables, hidden, targets, weights):
         return equation_71(MODEL, variables, hidden, targets, weights, documents, adaptation)
 
-    assert_as_exact(jax.jit(dew), reference, draw, "up alone stepping", seeds=ADAPTATION_SEEDS)
+    assert_as_exact(jax.jit(dew), jax.jit(reference), draw, "up alone stepping", seeds=SELECTED_SEEDS)
 
 
 @pytest.mark.parametrize("packed", [False, True], ids=["documents", "packed"])
@@ -176,7 +180,7 @@ def test_training_differentiates_through_every_step(*, packed):
         return lambda variables, hidden, targets, weights, cotangent: with_gradients(
             lambda variables, hidden: fn(variables, hidden, targets, weights))(variables, hidden, cotangent)
 
-    assert_as_exact(jax.jit(differentiated(dew)), differentiated(reference), gradient_draw,
+    assert_as_exact(jax.jit(differentiated(dew)), jax.jit(differentiated(reference)), gradient_draw,
                     "the gradient through the windows' steps", seeds=GRADIENT_SEEDS)
 
 
@@ -217,7 +221,7 @@ def test_the_gradient_through_the_level_is_its_formula():
         read = states + jax.nn.silu(states @ level["down"]["kernel"]) @ level["up"]["kernel"]
         return plain.apply(without, read, method="logits_from_hidden")
 
-    assert_as_exact(jax.jit(with_gradients(dew)), with_gradients(formula), level_draw,
+    assert_as_exact(jax.jit(with_gradients(dew)), jax.jit(with_gradients(formula)), level_draw,
                     "the gradient through the level", seeds=LEVEL_SEEDS)
 
 
@@ -235,8 +239,8 @@ def test_a_level_that_never_steps_scores_as_the_plain_objective():
     def scored(objective):
         return lambda variables, tokens: objective.token_scores(variables, tokens).losses
 
-    assert_as_exact(jax.jit(scored(adapted)), scored(plain), objective_draw, "a level that never steps",
-                    seeds=OBJECTIVE_SEEDS)
+    assert_as_exact(jax.jit(scored(adapted)), jax.jit(scored(plain)), objective_draw,
+                    "a level that never steps", seeds=OBJECTIVE_SEEDS)
 
 
 def test_a_run_trains_the_level_and_resumes_as_it_ran(tmp_path):
