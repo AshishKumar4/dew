@@ -11,7 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import replace
-from typing import Any, overload
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -414,26 +414,17 @@ def thaw(variables: Variables) -> Variables:
     return {**rest, "params": merge(variables[FROZEN], variables["params"])}
 
 
-@overload
-def dicts(variables: Variables) -> Variables: ...
-
-
-@overload
-def dicts(variables: None) -> None: ...
-
-
-def dicts(variables: Variables | None) -> Variables | None:
-    """`variables` with every mapping a dict: a tree that holds a Flax `FrozenDict` anywhere, under a
-    mapping or a sequence, rebuilt over the same leaves with each one a dict, any other the caller's
-    own tree. The trees an objective holds are dicts, so that a placement writing each placed leaf into
-    the dict that held it (`dew.training.host.stream`) writes into the objective's tree, and a step's
-    collections keep the state's containers."""
-    if variables is None:
-        return None
-    nodes = jax.tree.leaves(variables, is_leaf=lambda node: isinstance(node, FrozenDict))
+def dicts[Tree](tree: Tree) -> Tree:
+    """`tree` (a variables tree, or a state holding several) with every mapping a dict: a tree that
+    holds a Flax `FrozenDict` anywhere, under a mapping, a sequence or any other node, rebuilt over the
+    same leaves with each one a dict, any other the caller's own tree. The trees an objective holds are
+    dicts, so that a placement writing each placed leaf into the dict that held it
+    (`dew.training.host.stream`) writes into the objective's tree, and a step's collections keep the
+    state's containers."""
+    nodes = jax.tree.leaves(tree, is_leaf=lambda node: isinstance(node, FrozenDict))
     if not any(isinstance(node, FrozenDict) for node in nodes):
-        return variables
-    return jax.tree.map(lambda node: dicts(dict(node)) if isinstance(node, FrozenDict) else node, variables,
+        return tree
+    return jax.tree.map(lambda node: dicts(dict(node)) if isinstance(node, FrozenDict) else node, tree,
                         is_leaf=lambda node: isinstance(node, FrozenDict))
 
 
