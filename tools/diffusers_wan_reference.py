@@ -34,6 +34,7 @@ Run with the Dew test environment's diffusers 0.34.0 and torch, on CPU:
 from __future__ import annotations
 
 import contextlib
+import copy
 import json
 import sys
 from dataclasses import dataclass, field
@@ -45,7 +46,7 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from reference_releases import RELEASES, require
-from torch_precision import default_dtype, float64, float64_twin, widened
+from torch_precision import default_dtype, float64, widened
 
 DIFFUSERS = RELEASES["diffusers"]["diffusers"]
 SOURCE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/wan-source"
@@ -145,9 +146,8 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     arrays = {key: value.numpy() for key, value in inputs.items()}
     arrays["probe"] = probe.numpy()
     arrays.update({f"fp32.{key}": value for key, value in walk(model, inputs, probe, torch.float32).items()})
-    wide = float64_twin(model)
     with widened():
-        widest = walk(wide, inputs, probe, torch.float64)
+        widest = walk(model, inputs, probe, torch.float64)
         arrays.update({f"fp64.{key}": value for key, value in widest.items()})
     half = WanTransformer3DModel.from_pretrained(root / name / "transformer", torch_dtype=torch.bfloat16)
     with torch.no_grad():
@@ -326,12 +326,8 @@ def pipeline(destination: str) -> None:
     from diffusers.schedulers import scheduling_unipc_multistep
 
     # The scheduler's tables are its module's own, widened around every call the walk makes into it.
-    from diffusers import WanPipeline
-
-    # Read back from what it saved, inside `float64`, so every module's constructor computes in float64.
     with float64(), float64_scheduler(scheduling_unipc_multistep):
-        wide = WanPipeline.from_pretrained(root / "pipeline", torch_dtype=torch.float64)
-        arrays.update(encoded_and_walked(wide, latents.double(), "_f64"))
+        arrays.update(encoded_and_walked(copy.deepcopy(pipe).to(torch.float64), latents.double(), "_f64"))
     arrays.update(scheduler_replay())
     record = {"diffusers": DIFFUSERS, "torch": torch.__version__, "seed": SEED, "transformer": PIPELINE,
               "vae": PIPELINE_VAE, "prompts": PROMPTS, "frames": FRAMES, "height": HEIGHT, "width": WIDTH,
