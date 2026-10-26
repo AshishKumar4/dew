@@ -188,8 +188,12 @@ def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int,
 
 def copied(source, destination) -> None:
     """`source` (in shared memory) to `destination` (in global memory) through registers: a GPU without
-    TMA's `store_rows` copy."""
-    destination[...] = source[...]
+    TMA's `store_rows` copy, explicitly unoptimized. JAX 0.12 takes a transfer with no `optimized` flag as
+    optimized-only (0.11 downgraded it), which a ladder rung of a row or two cannot be, so its layout
+    inference searched every rung's layouts to exhaustion (ns-gate1: the sm80 forward failed after about
+    1000 s; without the ladder, or with these transfers unoptimized, it lowers in seconds:
+    ns-noladder2, ns-abort1)."""
+    plgpu.store(destination, plgpu.load(source, optimized=False), optimized=False)
 
 
 @dataclasses.dataclass(frozen=True)
