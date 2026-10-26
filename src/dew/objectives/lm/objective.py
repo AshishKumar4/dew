@@ -965,8 +965,8 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         if self.adaptation is not None:
             # The level steps window by window over these targets, weighted as the loss weighs them.
             adapted = adapted_scores(self.model, params, hidden, targets, weights,
-                                     token_layout(prepared.slice_tokens(stop=-1).token_fields),
-                                     self.adaptation, predict=predict, logits=logits)
+                                     prepared.slice_tokens(stop=-1).token_fields, self.adaptation,
+                                     predict=predict, logits=logits)
             return None, (adapted.losses, adapted.predicted, adapted.log_z), adapted.logits
         if logits:
             whole = model_logits(self.model, params, hidden)
