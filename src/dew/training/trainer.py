@@ -247,6 +247,7 @@ class Trainer(Generic[Loss, Effects]):
         lower_for: str | None = None,
         tune_kernels: bool = False,
         record: bool = False,
+        links: Mapping[str, Link] | None = None,
     ):
         """Hold everything a run needs, without opening any of it.
 
@@ -270,6 +271,10 @@ class Trainer(Generic[Loss, Effects]):
         where the process has the GPU to itself (`dew.nn.kernels.tuning.tune`); without it such a
         launch runs the nearest measured shape's config or its heuristic. `record` makes each step return in
         its metrics what each evaluation, replays too, sampled or passed as a boundary (`taken_record`).
+        `links` states a mesh axis's interconnect and its devices' peak (`dew.nn.sharding.Link`) by axis
+        name, in place of measuring them: for devices the peak table does not name, a CPU's among them,
+        where nothing is measured and no projection spreads, or a run that is to decide as another
+        machine's would.
         """
         whole = read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
@@ -316,6 +321,7 @@ class Trainer(Generic[Loss, Effects]):
         # The links the last compiled step decided its projections by, which say whether one spread over
         # each axis (`dew.nn.sharding.Link`), and each mesh axis's measured bandwidth.
         self.links: dict[str, Link] = {}
+        self._stated_links = dict(links or {})
         self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
         self._display = TrainingDisplay()
         self._refusal: str | None = None
@@ -893,22 +899,25 @@ class Trainer(Generic[Loss, Effects]):
         `link_bandwidth` agrees one figure across the pool, so every process
         decides alike and compiles the same program. The peak is the fastest
         device's, on which the FLOPs a spread saves take the least time. Each
-        axis's bandwidth is measured once per mesh, and not at all on a CPU
-        mesh or for a device the peak table does not name, where it decides
-        nothing."""
+        axis's bandwidth is measured once per mesh, and not at all for a
+        device the peak table does not name (a CPU's among them), where it
+        decides nothing; a link the run states (`links`) is taken as stated."""
         devices = list(mesh.devices.flat)
         peaks = [peak for device in devices if (peak := gpu_target(device.device_kind).bf16_peak) is not None]
         peak = max(peaks) if len(peaks) == len(devices) else None
-        platform = devices[0].platform
         links = {}
         for axis in (TENSOR_AXIS, SEQUENCE_AXIS):
             if mesh.shape.get(axis, 1) == 1:
                 continue
+            if axis in self._stated_links:
+                stated = self._stated_links[axis]
+                links[axis] = Link(stated.bytes_per_second, stated.flops_per_second)
+                continue
             if (mesh, axis) not in self._bandwidths:
                 # A resumed run takes the figure its checkpoint traced with, on this very placement.
-                self._bandwidths[mesh, axis] = None if platform == 'cpu' or peak is None else (
+                self._bandwidths[mesh, axis] = None if peak is None else (
                     self._resumed_links.get(link_topology(mesh, axis)) or link_bandwidth(mesh, axis))
-            links[axis] = Link(self._bandwidths[mesh, axis], peak, platform)
+            links[axis] = Link(self._bandwidths[mesh, axis], peak)
         return links
 
     @contextlib.contextmanager

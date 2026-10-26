@@ -423,6 +423,9 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
     import jax
     import optax
 
+    from dew.mesh import SEQUENCE_AXIS, TENSOR_AXIS
+    from dew.nn.kernels.generation import gpu_target
+    from dew.nn.sharding import Link
     from dew.training import Layout, MeshSpec, Trainer
 
     class Drawn(Trainer):
@@ -445,10 +448,15 @@ def _trainer(case, fields: dict[str, int], *, one_device: bool = False, accumula
                 lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), held))
             return jax.device_put(jax.tree.map(lambda leaf: leaf.copy(), held), shardings), shardings, None
 
+    # Devices the peak table does not name (a CPU's) measure no link, so no projection would spread
+    # over them; the layouts state one fast enough that every projection that can spread does, as
+    # it would over NVLink, so the matrix holds the spread path wherever it runs.
+    unmeasured = gpu_target(jax.devices()[0].device_kind).bf16_peak is None
+    links = {axis: Link(1e15, 1e12) for axis in (TENSOR_AXIS, SEQUENCE_AXIS)} if unmeasured else None
     trainer = Drawn(bench.build_objective(case), optax.chain(stash(), optax.adam(1e-3)),
                       key=jax.random.key(0), **bench.trainer_mesh(fields),
                       layout=Layout(min_shard=case.fsdp_min_param_size, tolerance=1.0),
-                      accumulation=accumulation, checkpoints=None, tracker=None)
+                      accumulation=accumulation, checkpoints=None, tracker=None, links=links)
     if one_device:
         trainer.device_mesh = MeshSpec().build([jax.local_devices()[0]])
     elif devices is not None:

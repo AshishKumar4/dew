@@ -147,7 +147,8 @@ class Link:
     """A mesh axis's interconnect, one device's dense bf16 peak, and whether a projection split over the axis.
 
     The trainer measures the interconnect when it places a step
-    (`dew.training.distributed.link_bandwidth`). `down_projection` and
+    (`dew.training.distributed.link_bandwidth`), or takes it as stated
+    (`Trainer(links=...)`). `down_projection` and
     `split_positions` set `spread` when they decide to split a projection in
     the step over the axis.
     """
@@ -155,12 +156,11 @@ class Link:
     bytes_per_second: float | None
     """The bytes one device receives per second in an all-gather over the axis:
     (N - 1) / N of the result, divided by the time the gather took. None where
-    nothing was measured: on a CPU mesh, or on a device the peak table does not
-    name."""
+    nothing was measured or stated: on a device the peak table does not name,
+    a CPU among them."""
     flops_per_second: float | None
     """One device's dense bf16 peak in FLOPs per second, or None for hardware
     Dew's target table does not name (`dew.nn.kernels.gpu_target(...).bf16_peak`)."""
-    platform: str
     spread: bool = False
 
 
@@ -199,7 +199,7 @@ def trace_context() -> tuple:
     pipeline's microbatch count, the logical-axis rules and the measured links. A program cached by
     its arguments' shapes is reused only under the same (`Objective.program`)."""
     schedule = _SCHEDULE.get()
-    links = tuple(sorted((axis, link.bytes_per_second, link.flops_per_second, link.platform)
+    links = tuple(sorted((axis, link.bytes_per_second, link.flops_per_second)
                          for axis, link in _LINKS.get().items()))
     return (None if schedule is None else schedule.count, axis_rules(), links)
 
@@ -217,10 +217,8 @@ def _spreads(axis: str, x: jax.Array, latent: int, tokens: float, *, padding: fl
     twice that fraction of the fp32 weight gradient. It cannot lose where
     the axis's link moves those bytes in no more time than the device's
     peak takes for the saved FLOPs. The weight gradient is a microbatch's,
-    so it weighs more at fewer tokens. A CPU mesh's devices share one host's
-    memory, which moves a byte in less time than a CPU's matmul spends on a
-    thousand FLOPs, and it splits. Without a measured link, or with a device
-    the peak table does not name, the projection runs on every token."""
+    so it weighs more at fewer tokens. Without a measured or stated link,
+    the projection runs on every token, on every platform alike."""
     link = _LINKS.get().get(axis)
     if link is None:
         return False
@@ -232,12 +230,8 @@ def _spreads(axis: str, x: jax.Array, latent: int, tokens: float, *, padding: fl
     flops = 6 * width * latent * saved
     moved = (1 - 1 / shards) * ((width + latent) * x.dtype.itemsize * (tokens + padding)
                                 + 2 * width * latent * 4)
-    if link.platform == 'cpu':
-        spreads = True
-    elif link.bytes_per_second is None or link.flops_per_second is None:
-        spreads = False
-    else:
-        spreads = link.bytes_per_second * flops >= link.flops_per_second * moved
+    spreads = (link.bytes_per_second is not None and link.flops_per_second is not None
+               and link.bytes_per_second * flops >= link.flops_per_second * moved)
     link.spread = link.spread or spreads
     return spreads
 
