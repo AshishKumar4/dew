@@ -12,6 +12,7 @@ registry's `{"class": ..., "fields": ...}` whose fields `recorded_fields` wrote.
 
 from __future__ import annotations
 
+import dataclasses
 from abc import ABC, abstractmethod
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -93,6 +94,10 @@ class ConditionEncoder(ABC, Generic[Raw, Encoded]):
     Subclasses implement `from_pretrained`, `tokenize`, `encode` and
     `recorded_fields`, the record a run keeps of them (`dew.registry.Recorded`).
     """
+
+    if TYPE_CHECKING:
+        # Each encoder is a dataclass, whose fields hold its towers (`dew.nn.kernels.options.quantizations`).
+        __dataclass_fields__: ClassVar[dict[str, dataclasses.Field[object]]]
 
     params: Variables
     parameter_collections: ClassVar[tuple[str, ...] | None] = None

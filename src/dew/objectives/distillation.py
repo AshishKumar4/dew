@@ -42,6 +42,7 @@ from typing_extensions import TypeVar
 from dew.artifacts import Artifacts
 from dew.batch import Batch, Variables, without
 from dew.nn import categorical
+from dew.nn.kernels.options import Held
 from dew.nn.precision import accumulated
 from dew.objectives.base import (
     OMITTED,
@@ -165,6 +166,10 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         teacher = (program._replace(trained=False) for program in self.teacher.program_key())
         return tuple(program._replace(head_fused=False)
                      for program in (*self.student.program_key(), *teacher))
+
+    def towers(self) -> tuple[Held, ...]:
+        """The student's towers, then the teacher's."""
+        return (*self.student.towers(), *self.teacher.towers())
 
     def substitute(self, modules: Sequence[nn.Module]) -> None:
         count = len(self.student.program_key())
