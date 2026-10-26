@@ -528,8 +528,8 @@ def _functional_rotary() -> type:
                 long, _ = ROPE_INIT_FUNCTIONS["longrope"](self.config, None, seq_len=self.original + 1)
                 self.register_buffer("short_inv_freq", short, persistent=False)
                 self.register_buffer("long_inv_freq", long, persistent=False)
-            self.register_buffer("layout", _rotary_layout(replaced, table_forward, short.shape[0]),
-                                 persistent=False)
+            layout, self.held_dtype = _rotary_layout(replaced, table_forward, short.shape[0])
+            self.register_buffer("layout", layout, persistent=False)
 
         def forward(self, x, position_ids, layer_type=None):
             reach = _reach_of(position_ids)[..., None]
@@ -540,15 +540,19 @@ def _functional_rotary() -> type:
                 inv_freq, _ = ROPE_INIT_FUNCTIONS[self.rope_type](self.config, x.device, seq_len=reach + 1)
             freqs = position_ids[..., None].float() * inv_freq.float()
             emb = freqs[..., self.get_buffer("layout")]
-            return ((emb.cos() * self.attention_scaling).to(dtype=x.dtype),
-                    (emb.sin() * self.attention_scaling).to(dtype=x.dtype))
+            dtype = x.dtype if self.held_dtype is None else self.held_dtype
+            return ((emb.cos() * self.attention_scaling).to(dtype=dtype),
+                    (emb.sin() * self.attention_scaling).to(dtype=dtype))
 
-    def _rotary_layout(replaced: torch.nn.Module, table_forward: FunctionType, pairs: int) -> torch.Tensor:
+    def _rotary_layout(replaced: torch.nn.Module, table_forward: FunctionType, pairs: int
+                       ) -> tuple[torch.Tensor, torch.dtype | None]:
         """Which of its `pairs` frequencies each of the replaced rotary's output dimensions carries, read
         off its own `table_forward` at amplitude one over a table of distinct frequencies in (0, 1) at
-        position 1, where cos is one to one. A rotary whose table forward is not that, its cos and sin
-        over the table it holds laid out by frequency (a complex `freqs_cis`, a table recomputed from
-        its own initializer, another amplitude), is refused by name."""
+        position 1, where cos is one to one; and the dtype its tables keep, None where they take the
+        input's (Llama's), else the one they hold whatever the input (Ernie 4.5's float32). A rotary
+        whose table forward is not that, its cos and sin over the table it holds laid out by frequency
+        (a complex `freqs_cis`, a table recomputed from its own initializer, another amplitude), is
+        refused by name."""
         probe = copy.deepcopy(replaced)
         distinct = torch.arange(1, pairs + 1, dtype=torch.float32) / (pairs + 1)
         probe.register_buffer("inv_freq", distinct, persistent=False)
@@ -567,7 +571,11 @@ def _functional_rotary() -> type:
                 and torch.equal(torch.cos(distinct[layout]).to(cos.dtype), cos[0, 0])
                 and torch.equal(torch.sin(distinct[layout]).to(sin.dtype), sin[0, 0])):
             raise refused
-        return layout
+        # The tables' dtype for a narrow input: the input's, or one the forward holds whatever it.
+        with torch.no_grad():
+            narrow, _ = table_forward(probe, torch.zeros(1, dtype=torch.bfloat16),
+                                      torch.ones(1, 1, dtype=torch.long))
+        return layout, None if narrow.dtype == torch.bfloat16 else narrow.dtype
 
     return FunctionalRotary
 
