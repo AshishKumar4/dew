@@ -22,9 +22,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   draws its bucket primes with `sympy.nextprime`, so `sympy` is a dependency.
 - A flow transition's density and KL hold at float32's edges: the density is JAX's isotropic
   `multivariate_normal.logpdf`, where `2 pi` times a variance near float32's largest overflowed, and the
-  KL takes the error's half from its quotient, rounded once, where 2 times such a variance or an error
-  over a variance near float32's least overflowed and half an error near its least flushed to zero (a KL
-  of 0 for 0.5).
+  KL is one division of operands in range, the variance doubled where that fits and else the error
+  halved, where 2 times such a variance or an error over a variance near float32's least overflowed and
+  half an error near its least flushed to zero (a KL of 0 for 0.5); its derivative is each element's
+  slope `(mean - reference) / variance` against the tangent, which neither overflows a tangent over a
+  variance near float32's least nor flushes a cotangent over one near its largest.
   Schulman's k3 KL estimate is one helper through `expm1`
   (`dew.rl.surrogate.sampled_kl`), which a small log ratio's `exp(d) - 1` rounded away.
 - A masked-diffusion row's reveals are its own under RBG keys too (`dew._distributions.counted`, the
