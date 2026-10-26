@@ -445,7 +445,7 @@ def _wrapper_sources(names: Collection[str], read: Callable[[str], np.ndarray], 
     return sources, tuple(aliases)
 
 
-def language_model_config(hf_config: Mapping[str, object], record: WrapperFields) -> Mapping[str, object]:
+def language_model_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     """The config a wrapper's language model states as its text family's own checkpoint: the text_config
     typed as the wrapper's text model, with the wrapper's head policy, the dtype the wrapper states for
     it, and its family's causal-LM class where it names none. What the wrapper declares at its own
