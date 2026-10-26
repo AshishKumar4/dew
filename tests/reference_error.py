@@ -1336,8 +1336,9 @@ def _step_errors(value, truth) -> np.ndarray:
 
 def _grown(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> tuple[list[str], np.ndarray, np.ndarray]:
     """Each leaf's growth evidence over `seeds` (`assert_grows_no_faster`): seed by leaf, the log of
-    Dew's RMS error at its last step over its first, less the reference's, which cancels the
-    conditioning the draw gives both arms alike, and whether Dew is finite on every value."""
+    Dew's RMS error at its last step over its first that both arms round, less the reference's, which
+    cancels the conditioning the draw gives both arms alike, and whether Dew is finite on every value.
+    A step both hold exactly (a gradient no earlier step's loss reaches) is no start of growth."""
     names, growths, finite = None, [], []
     for seed in seeds:
         inputs = draw(seed)
@@ -1360,10 +1361,11 @@ def _grown(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> tuple[list[str],
                 raise ValueError(f"{name}: seed {seed}'s float64 or reference values are not all finite; "
                                  f"draw within the reference's range")
             mine, theirs = _step_errors(leaf, true), _step_errors(their_leaf, true)
-            if not (mine[0] > 0 and theirs[0] > 0):
-                raise ValueError(f"{name}: seed {seed}'s first step is float64's exactly, so nothing grows "
-                                 f"from it; draw a first step that rounds")
-            logs = _logs([mine[-1], mine[0], theirs[-1], theirs[0]])
+            rounded = np.flatnonzero((mine[:-1] > 0) & (theirs[:-1] > 0))
+            if not rounded.size:
+                raise ValueError(f"{name}: on seed {seed} no step before the last rounds in both arms, so "
+                                 f"nothing grows from one; draw steps that round")
+            logs = _logs([mine[-1], mine[rounded[0]], theirs[-1], theirs[rounded[0]]])
             growths[-1].append(float(logs[0] - logs[1] - logs[2] + logs[3]))
             finite[-1].append(bool(np.isfinite(leaf).all()))
     return names, np.asarray(growths), np.asarray(finite)
@@ -1412,13 +1414,14 @@ def assert_grows_no_faster(dew_fn, reference_fn, draw, label: str, *, seeds: int
     Every leaf's leading axis is the computation's steps, in order, the same in both arms and the
     truth (`reference_fn` on the inputs widened to float64, or `truth_fn`), each finite on every seed,
     as the reference must be. On each draw each arm's growth is the log of its RMS error from float64
-    at the last step over the first (`_step_errors`); Dew's less the reference's cancels the draw's
-    conditioning, which amplifies both arms' rounding alike, and is a log of two errors, light-tailed
-    where a ratio of them is not. A leaf passes when the mean of it over the seeds is at most log
-    PARITY, by check 1's bootstrap interval and tails (`_status`'s reading, in logs), and fails above;
-    two pre-declared stages, as check 1's: any leaf not passing at `seeds` draws REDRAW times as many
-    further seeds and is judged again over all of them, then fails or is Inconclusive. The gate
-    compiles the arms as check 1 does (`_arms`)."""
+    at the last step over the first that both arms round (`_step_errors`, `_grown`). Dew's less the
+    reference's cancels the draw's conditioning, which amplifies both arms' rounding alike, and as a
+    difference of logs its spread over draws is finite where a ratio of two errors is heavy-tailed. A
+    leaf passes when the mean of it over the seeds is at most log PARITY, by check 1's bootstrap
+    interval and tails (`_status`'s reading, in logs), and fails above; two pre-declared stages, as
+    check 1's: any leaf not passing at `seeds` draws REDRAW times as many further seeds and is judged
+    again over all of them, then fails or is Inconclusive. The gate compiles the arms as check 1 does
+    (`_arms`)."""
     if seeds < FEWEST_SEEDS:
         raise Inconclusive([Finding(label, "inconclusive", FEWEST_SEEDS / max(seeds, 1), f"{label}: {seeds} "
                                     f"seeds cannot be judged; the gate takes at least {FEWEST_SEEDS}")])
