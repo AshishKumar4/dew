@@ -1863,8 +1863,10 @@ def test_artifact_codec_preserves_extended_numpy_dtypes():
     np.asarray([1, 2], dtype="datetime64[ns]"),
     np.zeros(2, dtype=[("x", "<f4"), ("y", "<i8")]),
     np.arange(2 ** 17, dtype=np.int64).reshape(256, 512),
+    np.ndarray((2,), dtype="V0"),
+    np.zeros(3, dtype="S0"),
 ], ids=["uint8-3d", "fortran", "big-endian", "0d", "empty", "bool", "unicode", "bytes", "datetime",
-        "structured", "long-header-free"])
+        "structured", "long-header-free", "void-0", "bytes-0"])
 def test_artifact_codec_reads_back_every_array_as_saved(value):
     """Every array a record holds reads back as it was saved, its dtype, shape, memory order and
     values, whether its header is read straight or by `np.load`, and owns its writable memory."""
@@ -1875,6 +1877,18 @@ def test_artifact_codec_reads_back_every_array_as_saved(value):
     assert restored.flags.f_contiguous == value.flags.f_contiguous or value.ndim < 2
     assert restored.flags.writeable
     np.testing.assert_array_equal(restored, value)
+
+
+def test_artifact_codec_reads_back_a_complex_field_exactly():
+    """A record's Python complex field reads back as written, both parts exactly, as a record holds it
+    beside its other fields."""
+    from dew.data.sources.codec import decode, encode
+
+    values = {"z": complex(0.1, -2.5e-300), "zs": [complex(1, 0), complex(float("inf"), float("nan"))]}
+    restored = decode(encode(values))
+    assert restored["z"] == values["z"] and isinstance(restored["z"], complex)
+    assert restored["zs"][0] == values["zs"][0]
+    assert restored["zs"][1].real == float("inf") and np.isnan(restored["zs"][1].imag)
 
 
 def test_content_fingerprint_preserves_array_identity_and_sequence_order():

@@ -444,11 +444,14 @@ class Generation:
 
     @cached_property
     def _page(self):
-        # Every page of the input index: inputs are paged by their key's digest, so a read in any order
-        # visits each page all the time, which a few pages held would read and check again each time.
+        # Every page of the input index, as where each input's record stands: inputs are paged by their
+        # key's digest, so a read in any order visits each page all the time, which a few pages held
+        # would read and check again each time. Publication reads the pages' other facts itself.
         @lru_cache(maxsize=256)
-        def opened(page: str) -> dict:
-            return json.loads(_checked(Store(self.url, self.storage_options), self.manifest["pages"][page]))
+        def opened(page: str) -> dict[str, tuple[str, int]]:
+            entries = json.loads(_checked(Store(self.url, self.storage_options),
+                                          self.manifest["pages"][page]))
+            return {key: (entry["shard"], entry["record"]) for key, entry in entries.items()}
 
         return opened
 
@@ -464,18 +467,15 @@ class Generation:
 
     @cached_property
     def _shard(self):
-        verified: set[str] = set()
-
-        # A shuffled read visits every shard all the time: each is checked whole once (its size and
-        # digest), which stands for every record in it (`outputs`), and its readers are kept open.
+        # A shuffled read visits every shard all the time: each is checked whole (its size and digest)
+        # as it is opened, which stands for every record its reader reads (`outputs`), and many readers
+        # are kept open, so a shard is checked again only once its reader has been closed.
         @lru_cache(maxsize=64)
         def opened(path: str) -> ArrayRecords:
             root = Store(self.manifest["root"], self.storage_options)
-            if path not in verified:
-                # A remote shard is checked as its mirror holds it, which its reader then reads; a
-                # local one in place, where a mirror would copy it beside itself.
-                _checked(root if local(root.resolve()[0]) else root.cached(), self.manifest["shards"][path])
-                verified.add(path)
+            # A remote shard is checked as its mirror holds it; a local one in place, where a mirror
+            # would copy it beside itself.
+            _checked(root if local(root.resolve()[0]) else root.cached(), self.manifest["shards"][path])
             return ArrayRecords((root.child(path).url,), self.storage_options)
 
         return opened
@@ -531,9 +531,10 @@ class Generation:
 
     def outputs(self, row_id: RowId) -> Outputs:
         row_key = _row_key(row_id)
-        entry = self._page(input_page(row_key))[row_key]
-        # The shard it reads from was checked whole (`_shard`), so its record is the one written.
-        payload = self._shard(entry["shard"])[entry["record"]]
+        shard, place = self._page(input_page(row_key))[row_key]
+        # The shard it reads from was checked whole as it was opened (`_shard`), so its record is the
+        # one written.
+        payload = self._shard(shard)[place]
         if not isinstance(payload, bytes):
             raise ValueError(f"committed cache record is not bytes: {self.url}")
         return _decode_outputs(payload)

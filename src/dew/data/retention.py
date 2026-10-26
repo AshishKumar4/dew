@@ -14,6 +14,8 @@ from typing import BinaryIO
 
 from filelock import FileLock
 
+from dew.files import write_atomically
+
 
 def read_pin(path: Path) -> BinaryIO:
     """A reader's pin at `path`, shared with every other process's, held until the returned file is
@@ -121,7 +123,7 @@ class LocalRetention:
             if held + needed > self.max_bytes:
                 held = self._size()
             if held + needed <= self.max_bytes:
-                self._ledger.write_text(str(held + needed))
+                write_atomically(self._ledger, str(held + needed))
                 yield
                 return
             for key in self._keys():
@@ -158,7 +160,7 @@ class LocalRetention:
                     f"local cache {self.directory} cannot admit {needed} bytes within "
                     f"keep_local_bytes={self.max_bytes}; its remaining generations or writers are pinned"
                 )
-            self._ledger.write_text(str(held + needed))
+            write_atomically(self._ledger, str(held + needed))
             yield
 
     @staticmethod

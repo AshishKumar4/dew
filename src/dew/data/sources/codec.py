@@ -26,6 +26,7 @@ if TYPE_CHECKING:
 type Value = (
     JSON
     | bytes
+    | complex
     | np.ndarray
     | jax.Array
     | np.generic
@@ -62,7 +63,8 @@ def _saved(encoded: bytes) -> np.ndarray:
         size = int.from_bytes(encoded[8:8 + width], "little")
         start = 8 + width + size
         header = _NPY_HEADER.fullmatch(encoded[8 + width:start].rstrip())
-        if header is not None:
+        # A dtype of no width (`|V0`, `|S0`) has no bytes to read, which `np.load` allocates for.
+        if header is not None and np.dtype(header.group(1).decode()).itemsize:
             descr, order, dims = header.groups()
             shape = tuple(int(dim) for dim in dims.split(b",") if dim.strip())
             dtype = np.dtype(descr.decode())
@@ -173,6 +175,9 @@ def _tree(value: Value, leaves: _Stored | _Hashed, canonical: bool = False) -> J
         return {"scalar": leaves.add(array.view(np.dtype(array.dtype.str)) if dtype else array), **dtype}
     if isinstance(value, float) and not math.isfinite(value):
         return {"float": value.hex()}
+    if isinstance(value, complex):
+        # Its two parts exactly, as a record holds a Python complex beside its other fields.
+        return {"complex": [float(value.real).hex(), float(value.imag).hex()]}
     if value is None or isinstance(value, (bool, int, float, str)):
         return value
     for kind in (datetime.datetime, datetime.date, datetime.time):
@@ -239,6 +244,9 @@ def _restore(node: object, leaves: Mapping[str, bytes]) -> Value:
         return Decimal(node["decimal"])
     if "float" in node:
         return float.fromhex(node["float"])
+    if "complex" in node:
+        real, imag = node["complex"]
+        return complex(float.fromhex(real), float.fromhex(imag))
     if "scalar" in node:
         return _array(node, leaves, "scalar")[()]
     if "bytes" in node:

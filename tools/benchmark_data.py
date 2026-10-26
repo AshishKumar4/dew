@@ -11,6 +11,7 @@ here are the knobs a run has:
 
     python tools/benchmark_data.py --steps 100 --data run.py
     python tools/benchmark_data.py matrix --output data-matrix.json --work matrix-work
+    python tools/benchmark_data.py caching --workload bpe --read indexed --output caching.json
 
 The matrix runs each arm, Dew's reader and plain Grain over the same steps, in
 a fresh interpreter over the same produced files.
@@ -33,7 +34,7 @@ import sys
 import tempfile
 import threading
 import time
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal
@@ -826,6 +827,95 @@ def run_scaling(config: Scaling) -> None:
         str(row["cycle"]): row["records_per_second"] / base for row in rows}}, indent=2, default=str) + "\n")
 
 
+@dataclass(frozen=True)
+class Caching:
+    """A pass over `records` records through a chain's leading map, run each time (`computed`), run
+    while filling a cache of it (`fill`) and read back from that cache (`replay`), each twice and the
+    first pass discarded as warmup, every pass a fresh compile: what a cache costs and saves where its
+    steps are a decode (`images`: PNGs of 256 pixels decoded and resized to 128), a learned tokenizer
+    (`bpe`: a 4,000-token byte-level BPE trained here over the documents of 700 words) or a field
+    selection (`fields`). It qualifies which steps are `Costly` (`dew.data.pipeline`)."""
+
+    workload: Literal["images", "bpe", "fields"] = "bpe"
+    read: Literal["memory", "indexed"] = "indexed"
+    records: int = 2000
+    batch: int = 32
+    output: Path = Path("data-caching.json")
+
+
+def caching_chain(config: Caching, directory: Path) -> "tuple[list[dict], Callable[[str | None], Pipeline]]":
+    """The workload's records in memory and the chain of its leading map over them."""
+    import numpy as np
+
+    from dew.data import Memory, images, text
+    from dew.data.pipeline import Pipeline
+    from dew.data.steps.generic import Fields
+
+    rng = np.random.default_rng(0)
+    if config.workload == "images":
+        import cv2
+
+        rows = [{"id": np.int32(index), "image": cv2.imencode(".png", rng.integers(0, 255, (256, 256, 3),
+                                                                                np.uint8))[1].tobytes()}
+                for index in range(config.records)]
+        steps = (images.DecodeImage("image", rejects=False), images.Resize(128))
+    else:
+        words = np.asarray(["the", "of", "and", "to", "in", "is", "that", "for", "it", "as", "with",
+                            "was", "on", "be", "by", "this", "are", "from", "at", "or", "an", "have",
+                            "not", "which", "data", "model", "train", "token", "layer", "weight", "cache",
+                            "shard", "record", "image", "text", "batch", "step", "loss", "value"])
+        rows = [{"id": np.int32(index), "text": " ".join(rng.choice(words, 700))}
+                for index in range(config.records)]
+        steps = (Fields(("id", "text")),)
+        if config.workload == "bpe":
+            from tokenizers import Tokenizer, models, pre_tokenizers, trainers
+            from transformers import PreTrainedTokenizerFast
+
+            tokenizer = Tokenizer(models.BPE(unk_token="[UNK]"))
+            tokenizer.pre_tokenizer = pre_tokenizers.ByteLevel()
+            tokenizer.train_from_iterator((row["text"] for row in rows[:200]), trainers.BpeTrainer(
+                vocab_size=4000, special_tokens=["[UNK]", "</s>"]))
+            PreTrainedTokenizerFast(tokenizer_object=tokenizer, eos_token="</s>").save_pretrained(directory)
+            steps = (text.tokenize(str(directory)), Fields(("id",)))
+    def chain(cache: str | None) -> Pipeline:
+        mapped = Pipeline(Memory(rows))
+        for step in steps:
+            mapped = mapped.map(step)
+        return (mapped if cache is None else mapped.cache(cache)).batch(config.batch)
+
+    return rows, chain
+
+
+def run_caching(config: Caching) -> None:
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+
+    with tempfile.TemporaryDirectory() as work:
+        _, chain = caching_chain(config, Path(work) / "tokenizer")
+        root = str(Path(work) / "cache")
+
+        def passed(cache: str | None) -> float:
+            started = time.perf_counter()
+            loader = compile(chain(cache), read=config.read, loading=Loading(workers=0, cache=False))
+            stream = loader.train(DataPartition())
+            try:
+                for _ in range(config.records // config.batch):
+                    next(stream)
+            finally:
+                stream.close()
+            return time.perf_counter() - started
+
+        passed(None)
+        rows = {"computed": [passed(None), passed(None)], "fill": [passed(root)],
+                "replay": [passed(root), passed(root)]}
+        shutil.rmtree(root)
+        rows["fill"].append(passed(root))
+    result = {"schema": 1, "config": asdict(config), "host": platform.processor() or platform.machine(),
+              "cpus": os.cpu_count(), "seconds": rows}
+    config.output.write_text(json.dumps(result, indent=2, default=str) + "\n")
+    print(json.dumps(result), flush=True)
+
+
 if __name__ == "__main__":
     if sys.argv[1:2] == ["matrix"]:
         run_matrix(tyro.cli(Matrix, args=sys.argv[2:]))
@@ -833,5 +923,7 @@ if __name__ == "__main__":
         matrix_worker(tyro.cli(Worker, args=sys.argv[2:]))
     elif sys.argv[1:2] == ["scaling"]:
         run_scaling(tyro.cli(Scaling, args=sys.argv[2:]))
+    elif sys.argv[1:2] == ["caching"]:
+        run_caching(tyro.cli(Caching, args=sys.argv[2:]))
     else:
         main(benchmark(sys.argv[1:]))
