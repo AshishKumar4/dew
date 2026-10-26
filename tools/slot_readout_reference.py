@@ -29,7 +29,6 @@ from block_override_reference import (
 )
 from fetched_fixtures import save
 from reference_source import git_head
-from torch_precision import float64_twin
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "tests/fixtures/hf/qwen38-dense-tiny"
@@ -145,9 +144,8 @@ def main():
             truth = AutoModelForImageTextToText.from_config(copy.deepcopy(model.config), dtype=torch.float64,
                                                            attn_implementation="eager").double().eval()
             truth.load_state_dict(model.state_dict())
-            # In the head's own mode, as the float32 one runs.
-            exact_head = float64_twin(head, lambda: readout.ReadoutHead(head.slot.shape[1], len(labels), 8))
-            exact_head.train(head.training)
+            exact_head = readout.ReadoutHead(head.slot.shape[1], len(labels), 8).double()
+            exact_head.load_state_dict(head.state_dict())
         readout.install_noncausal(model)
         readout.install_noncausal(truth)
         capture, exact_capture = (readout.HiddenCapture(value) for value in (model, truth))
