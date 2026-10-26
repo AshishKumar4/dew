@@ -235,7 +235,8 @@ def test_audio_weight_paths_round_trip_every_checkpoint_tensor(audio):
                  conf_num_hidden_layers=1, sscp_conv_channel_size=(8, 4)),
 ], ids=["released", "reduction_2"])
 def test_a_gemma3n_tower_encodes_its_stated_frames_per_token_into_one_token(config):
-    """A Gemma 3n tower encodes `frames_per_token` input frames a token, as its geometry states, which
+    """A Gemma 3n tower encodes `frames_per_token` input frames a token, as its geometry states
+    (`encoded_frame_stride`, the stride the processor counts by), which
     a token-only init sizes its fixed audio slots by: the released config (strides 2 x 2, reduction 4)
     and a tower reducing by 2 each encode three tokens' frames into three tokens."""
     per_token = config.geometry().frames_per_token
