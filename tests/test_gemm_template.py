@@ -256,7 +256,7 @@ def test_every_variant_of_the_mosaic_launches_holds_check_1(generation_name):
     """Each config an opt-in tuning run may time (`KernelOp.variants`: the derived tile and its legal
     neighbours) of the Mosaic GPU forward, and on warpgroup MMA of its kernel gradient, pinned in turn
     and interpreted: as exact as the plain program from float64 truth, so the tuner times only configs
-    proven here."""
+    proven here. fp32 outputs, which every family stores (`mosaic.Family.stores`)."""
     rows, depth, width = 136, 128, 256
     sizes, split = jnp.asarray([70, 66], jnp.int32), 70
 
@@ -268,9 +268,9 @@ def test_every_variant_of_the_mosaic_launches_holds_check_1(generation_name):
 
     def forward(x, w, dy):
         del dy
-        return template.gemm(x, w, sizes, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+        return template.gemm(x, w, sizes, out_dtype=jnp.float32, interpret_on_cpu=True)
 
-    def plain_forward(x, w, dy, wide=jnp.float32, out=jnp.bfloat16):
+    def plain_forward(x, w, dy, wide=jnp.float32, out=jnp.float32):
         del dy
         w = w.astype(wide)
         return jnp.concatenate([x[:split].astype(wide) @ w[0], x[split:].astype(wide) @ w[1]]).astype(out)
@@ -302,8 +302,9 @@ def test_a_stacked_matrix_is_read_in_place_at_a_layer(generation_name):
     """A layer of a stacked `[layers, groups, depth, width]` matrix picked by an index (`gemm`'s `layer`):
     as exact as the plain program's product with that layer's matrices from float64 truth, the stack's
     gradient included (zero at every other layer), and the launch reads the whole stack in place, its
-    matrix operand the stack's every group, no slice of it made. The gradients run eagerly, as the
-    Mosaic interpreters' ordered callbacks need."""
+    matrix operand the stack's every group, no slice of it made; fp32 outputs, which every family stores
+    (`mosaic.Family.stores`). The gradients run eagerly, as the Mosaic interpreters' ordered callbacks
+    need."""
     layers, groups, rows, depth, width = 3, 2, 136, 64, 128
     sizes, layer, split = jnp.asarray([70, 66], jnp.int32), jnp.asarray(1, jnp.int32), 70
 
@@ -314,9 +315,9 @@ def test_a_stacked_matrix_is_read_in_place_at_a_layer(generation_name):
                 jnp.asarray(rng.normal(size=(rows, width)), jnp.bfloat16))
 
     def dew(x, stack):
-        return template.gemm(x, stack, sizes, layer=layer, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
+        return template.gemm(x, stack, sizes, layer=layer, out_dtype=jnp.float32, interpret_on_cpu=True)
 
-    def plain(x, stack, wide=jnp.float32, out=jnp.bfloat16):
+    def plain(x, stack, wide=jnp.float32, out=jnp.float32):
         matrices = stack[1].astype(wide)
         return jnp.concatenate([x[:split].astype(wide) @ matrices[0],
                                 x[split:].astype(wide) @ matrices[1]]).astype(out)
