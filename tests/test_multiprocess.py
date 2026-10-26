@@ -30,7 +30,6 @@ import numpy as np
 import pytest
 from lane_environment import MESH_DEVICES
 from process_support import (
-    REPO_ROOT,
     free_port,
     report_of,
     run_pool,
@@ -1388,35 +1387,18 @@ def test_masked_task_preserves_pool_rows_and_coordinates_invalid_requests(tmp_pa
         assert reports[0][name] + reports[1][name] == single[name], name
 
 
-def stand_in_xprof(directory: Path) -> Path:
-    """A directory holding a stand-in for XProf, the optional package whose converter a profile's
-    export reads (`dew.telemetry.profile.require_profile_support`), installed as version 0.0: its
-    converter names one tool and exports nothing, so a capture starts as it does where XProf is."""
-    convert = directory / "xprof" / "convert"
-    convert.mkdir(parents=True)
-    (directory / "xprof" / "__init__.py").write_text("")
-    (convert / "__init__.py").write_text("")
-    (convert / "raw_to_tool_data.py").write_text(
-        "def xspace_to_tool_names(paths):\n    return ['overview_page']\n\n\n"
-        "def xspace_to_tool_data(paths, tool, params):\n    return b'{}', 'application/json'\n")
-    metadata = directory / "xprof-0.0.dist-info"
-    metadata.mkdir()
-    (metadata / "METADATA").write_text("Metadata-Version: 2.1\nName: xprof\nVersion: 0.0\n")
-    return directory
-
-
 @pytest.mark.distributed
 def test_a_profile_window_that_fails_on_one_rank_fails_the_pool_together(tmp_path):
     """A capture that cannot start on one rank must not leave its peer's open.
 
     Rank 0's scheduled directory is a file, so its start fails while rank 1's
     already began. Both have to report the profiling-start failure and reach
-    the barrier after it rather than hang in a collective."""
+    the barrier after it rather than hang in a collective. The capture's
+    export reads XProf, the optional profile extra, as installed."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
     reports = run_pool("profile_failure", tmp_path / "pool", 2,
                        devices=2, timeout=120, steps=4,
-                       profile_dir=str(tmp_path / "pool" / "trace"),
-                       environment={"PYTHONPATH": os.pathsep.join(
-                           (str(stand_in_xprof(tmp_path / "packages")), str(REPO_ROOT / "src")))})
+                       profile_dir=str(tmp_path / "pool" / "trace"))
     assert "profiling window start" in reports[0]["failed"]
     assert "NotADirectoryError" in reports[0]["failed"]
     assert "profiling window start" in reports[1]["failed"]
