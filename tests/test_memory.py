@@ -85,12 +85,18 @@ def paper_loss(kind: str, objective: Objective):
     return losses[kind]
 
 
-def written(module: InContextMemory, *, dtype, segments=None, gradient=None):
+OUTER = {"ttt_linear": ("norm",), "ttt_mlp": ("norm",)}
+"""The network parameters a configuration's paper meta-learns in its outer loop alone, which the inner
+loop reads at W_0: TTT's inner loop updates W1, b1 (and W2, b2) and its layer norm's scale and bias are
+outer-loop parameters (the authors' ttt.py, `TTTCache.ttt_param_names`)."""
+
+
+def written(module: InContextMemory, *, dtype, segments=None, gradient=None, held=()):
     """The paper's update as a function of the stream, token by token, in `dtype` (float64 for the
     truth): the views and gates from the layer's projections, the state in at least float32, each
     gradient at its chunk's start counted from its document's first token (`segments` `[S]`, one
-    document where None) of the loss its paper writes for the layer's objective (`paper_loss`), and the
-    readout at `dtype`."""
+    document where None) of the loss its paper writes for the layer's objective (`paper_loss`), the
+    network's `held` parameters left at W_0, and the readout at `dtype`."""
     wide = jnp.promote_types(dtype, jnp.float32)
     grad_net, read_net = module.network.clone(dtype=wide), module.network.clone(dtype=dtype)
     loss = paper_loss(module.objective.kind, module.objective)
@@ -103,21 +109,29 @@ def written(module: InContextMemory, *, dtype, segments=None, gradient=None):
             return jnp.full((x.shape[0], HEADS), spec.value, wide)
         return spec.scale * jax.nn.sigmoid((x @ p[name]["kernel"] + p[name]["bias"]).astype(wide))
 
-    def one_head(head0, q, k, v, theta, mu, alpha):
+    def one_head(network0, q, k, v, theta, mu, alpha):
         """One row's and head's tokens `[S, F]`, `[S]`, scanned token by token."""
+        fixed = {name: leaf for name, leaf in network0.items() if name in held}
+        head0 = {name: leaf for name, leaf in network0.items() if name not in held}
+
+        def inner(network, params, x):
+            """`network` at the updated `params` and the held ones."""
+            return network.apply({"params": {**fixed, **params}}, x)
+
         def token(carry, step):
             state, momentum, start, place = carry
             q_t, k_t, v_t, theta_t, mu_t, alpha_t, first = step
             state, momentum, start, place = jax.tree.map(
-                lambda fresh, held: jnp.where(first, fresh, held),
+                lambda fresh, kept: jnp.where(first, fresh, kept),
                 (head0, jax.tree.map(jnp.zeros_like, head0), head0, 0), (state, momentum, start, place))
             start = jax.tree.map(lambda w, s: jnp.where(place % module.chunk == 0, w, s), state, start)
-            target = v_t if module.target == "given" else grad_net.apply({"params": start}, v_t)
-            g = (jax.grad(lambda held: loss(grad_net.apply({"params": held}, k_t), target))(start)
-                 if gradient is None else gradient(loss, grad_net, start, k_t, target))
+            target = v_t if module.target == "given" else inner(grad_net, start, v_t)
+            apply = functools.partial(inner, grad_net)
+            g = (jax.grad(lambda params: loss(apply(params, k_t), target))(start)
+                 if gradient is None else gradient(loss, apply, start, k_t, target))
             momentum = jax.tree.map(lambda s, gl: mu_t * s - theta_t * gl, momentum, g)
             state = jax.tree.map(lambda w, s: (1 - alpha_t) * w + s, state, momentum)
-            cast = jax.tree.map(lambda leaf: leaf.astype(dtype), state)
+            cast = jax.tree.map(lambda leaf: leaf.astype(dtype), {**fixed, **state})
             return (state, momentum, start, place + 1), read_net.apply({"params": cast}, q_t)
 
         carry = (head0, jax.tree.map(jnp.zeros_like, head0), head0, 0)
@@ -182,9 +196,10 @@ def applied(module: InContextMemory, call: MixerCall = PLAIN_CALL):
 def test_a_memory_follows_its_papers_update(name):
     """Each configuration computes its paper's update and readout token by token (`written`), on par
     with that written-out update in float32, against float64 (check 1)."""
-    module = layer(name)
-    assert_as_exact(applied(module), written(module, dtype=jnp.float32), drawn(module), f"{name} memory",
-                    seeds=MEMORY_SEEDS, truth_fn=written(module, dtype=jnp.float64))
+    module, held = layer(name), OUTER.get(name, ())
+    assert_as_exact(applied(module), written(module, dtype=jnp.float32, held=held), drawn(module),
+                    f"{name} memory", seeds=MEMORY_SEEDS,
+                    truth_fn=written(module, dtype=jnp.float64, held=held))
 
 
 def test_yaads_objective_switches_by_the_whole_errors_norm():
@@ -296,9 +311,9 @@ def test_an_orthogonalized_step_follows_the_paper_with_muons_iteration():
 
     module = layer("titans").clone(orthogonalize=5)
 
-    def gradient(loss, network, start, k, target):
+    def gradient(loss, apply, start, k, target):
         """The paper's gradient with Muon's map on each matrix, in the reference's own precision."""
-        g = jax.grad(lambda held: loss(network.apply({"params": held}, k), target))(start)
+        g = jax.grad(lambda held: loss(apply(held, k), target))(start)
         return jax.tree.map(lambda leaf: newton_schulz(leaf, 5) if leaf.ndim == 2 else leaf, g)
 
     assert_as_exact(applied(module), written(module, dtype=jnp.float32, gradient=gradient), drawn(module),
