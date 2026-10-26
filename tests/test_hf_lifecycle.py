@@ -124,7 +124,7 @@ class Training:
     """One causal source's training step.
 
     `state` names the collections the source loads beside `params`, such as
-    MiniMax-M2's routing bias, which a step without `balance_rate` leaves
+    MiniMax-M2's routing bias, which a step without `balance` leaves
     where the checkpoint put it. `images` trains on the fixture's prompts with
     their images, one on the first row and two on the second, so the vision
     tower and the projector train with the language model.

@@ -19,17 +19,19 @@ from dew.checkpoints import Checkpoints
 from dew.data import Loading, presets
 from dew.data.compile import compile
 from dew.data.sources.tokens import TokenFiles
+from dew.diffusion.discrete import MDLM
 from dew.mesh import LayoutRefused
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.kernels.generation import chosen
+from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_tile
 from dew.registry import mixers
 from dew.training import Trainer
 from dew.training.distributed import Layout, MeshSpec, microbatch
 from dew.training.memory import climb_to, recompute_more, rung_record
-from dew.training.planning import Timer, planned, splits
+from dew.training.planning import TIMED_REPEATS, UNTIMED_FRONTIER, Timer, planned, splits
 
 ROWS, SEQ = 32, 16
 BATCH = {"text": jnp.asarray((np.arange(ROWS * (SEQ + 1)).reshape(ROWS, SEQ + 1) * 7) % 64, jnp.int32)}
@@ -136,6 +138,29 @@ def test_the_fit_ladder_tiles_the_head_fused_then_unfused_before_it_recomputes_m
     resumed.restore_head(None, fused=False)
     assert resumed.tile_head() is not None
     assert rung_record(resumed, xla_defaults=False, narrow=True)["head_fused"]
+
+
+def test_the_fit_ladder_tiles_a_masked_diffusion_head_before_it_recomputes_more():
+    """A masked-diffusion objective runs its head by the policy every token objective takes
+    (`dew.objectives.lm.head`): the ladder keeps its whole logits, then tiles it, its gradient in the
+    backward as its loss fuses none, before it recomputes more with the whole logits back; a resumed
+    run climbs to a recorded tiled rung alike."""
+    model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
+                              max_seq_len=SEQ, causal=False)
+
+    def objective():
+        return MaskedDiffusionObjective(model, MDLM(mask_id=63)(), seq_len=SEQ)
+
+    climbing = objective()
+    rungs = [rung_record(climbing, xla_defaults=False, narrow=True)]
+    while len(rungs) < 4 and recompute_more(climbing):
+        rungs.append(rung_record(climbing, xla_defaults=False, narrow=True))
+    tile = list(chunked_tile())
+    assert [(rung["head_tile"], rung["head_fused"], rung["remat"]) for rung in rungs] == [
+        (None, False, None), (tile, False, None), (None, False, "minimal"), (tile, False, "minimal")]
+    resumed = objective()
+    climb_to(resumed, rungs[1])
+    assert rung_record(resumed, xla_defaults=False, narrow=True) == rungs[1]
 
 
 def test_a_microbatch_is_every_splitth_row():
@@ -382,13 +407,40 @@ def test_a_resumed_run_reads_its_batches_in_the_microbatches_its_checkpoint_trai
         windowed(tmp_path / "split", 4).fit(windows(corpus), steps=6, checkpoint_every=2)
 
 
-@pytest.mark.parametrize("seconds, split, remat", [([0.2, 0.1], 1, "minimal"), ([0.1, 0.2], 2, None)])
+@pytest.mark.mesh(devices=2)
+def test_a_resumed_run_continues_the_plan_its_frontier_chose_untimed(tmp_path, monkeypatch):
+    """A run over two devices times its frontier, the batch whole as it fits and a rung up, and keeps one;
+    a run resumed from its checkpoint continues that plan without timing again, as the run it continues
+    compiled it, so the two train one program whatever a second timing would say."""
+    # The frontier timed, as the library times it: Dew's tests keep its first plan otherwise.
+    monkeypatch.delenv(UNTIMED_FRONTIER)
+    corpus = token_files(tmp_path)
+
+    def run(split):
+        trainer = windowed(tmp_path / "frontier", split)
+        trainer.device_mesh = MeshSpec().build(jax.devices()[:2])
+        return trainer
+
+    first = run(1)
+    first.fit(windows(corpus), steps=2, checkpoint_every=2)
+    assert [timing["remat"] for timing in first.plan["timed"]] == [None, "minimal"]
+    resumed = run(None)
+    resumed.fit(windows(corpus), steps=4, checkpoint_every=2)
+    assert resumed.plan["timed"] is None
+    assert (resumed.plan["split"], resumed.plan["remat"]) == (first.plan["split"], first.plan["remat"])
+
+
+@pytest.mark.parametrize("seconds, split, remat", [
+    ([[0.2, 0.21], [0.1, 0.12]], 1, "minimal"), ([[0.1, 0.12], [0.2, 0.21]], 2, None),
+    ([[0.2, 0.3], [0.1, 0.25]], 2, None)], ids=["whole", "split", "within-spread"])
 def test_a_split_plan_is_timed_against_its_batch_whole_a_rung_up_and_the_faster_kept(
         monkeypatch, seconds, split, remat):
     """Where the devices hold a byte less than the batch whole needs at the
     least recomputation, it fits split there, and whole one remat rung up with
-    the head tiled: both are compiled and timed, and the faster is the plan,
-    the objective at its rung, both times recorded."""
+    the head tiled: both are compiled and timed, and the plan is the whole one
+    only where its every sample beats the split one's (`faster`), the split one
+    where their samples overlap, the objective at its rung, each plan's fastest
+    sample recorded."""
     free(monkeypatch, needs(monkeypatch, lm(split=1)) - 1)
     trainer = lm()
     state, _, _ = trainer.place()
@@ -398,32 +450,26 @@ def test_a_split_plan_is_timed_against_its_batch_whole_a_rung_up_and_the_faster_
     assert (trainer.plan["split"], trainer.plan["remat"]) == (split, remat)
     assert trainer.objective.model.remat == (None if remat is None else REMAT_POLICIES[remat])
     assert [(plan["split"], plan["remat"], plan["seconds"]) for plan in trainer.plan["timed"]] == [
-        (2, None, seconds[0]), (1, "minimal", seconds[1])]
+        (2, None, min(seconds[0])), (1, "minimal", min(seconds[1]))]
     state, loss, *_ = step(state, BATCH)
     assert np.isfinite(float(loss))
 
 
 @pytest.mark.mesh(devices=2)
-def test_a_plan_over_two_accelerators_that_fits_whole_is_timed_against_its_batch_whole_a_rung_up(monkeypatch):
-    """Over two accelerators a plan that fits the batch whole without recomputing is timed against the
-    batch whole one rung up too, whose freed memory lets the scheduler overlap the collectives, and the
-    faster is kept. A CPU's collectives are its host's copies, nothing to overlap: over two CPU devices
-    the plan is not timed, so a run over several compiles one device's steps (test_architectures' layout
-    cells, whose drawn steps are fit's own, bit for bit). On one device the plan is never timed."""
+def test_a_plan_over_several_devices_that_fits_whole_is_timed_against_its_batch_whole_a_rung_up(monkeypatch):
+    """Over two devices a plan that fits the batch whole without recomputing is timed against the batch
+    whole one rung up too, whose freed memory lets the scheduler overlap the collectives, and the faster
+    is kept; on one device the plan is never timed."""
     free(monkeypatch, LIMIT)
     trainer = lm()
     trainer.device_mesh = MeshSpec().build(jax.devices()[:2])
     state, _, _ = trainer.place()
     timed = []
-    trainer.compile(state, BATCH, lambda steps: (timed.append(len(steps)), [2.0, 1.0])[1])
-    if jax.default_backend() == "cpu":
-        assert timed == [] and trainer.plan["timed"] is None
-        assert (trainer.plan["split"], trainer.plan["remat"]) == (1, None)
-    else:
-        assert timed == [2]
-        timings = [(plan["split"], plan["remat"]) for plan in trainer.plan["timed"]]
-        assert timings == [(1, None), (1, "minimal")]
-        assert (trainer.plan["split"], trainer.plan["remat"]) == (1, "minimal")
+    trainer.compile(state, BATCH, lambda steps: (timed.append(len(steps)), [[2.0], [1.0]])[1])
+    assert timed == [2]
+    timings = [(plan["split"], plan["remat"]) for plan in trainer.plan["timed"]]
+    assert timings == [(1, None), (1, "minimal")]
+    assert (trainer.plan["split"], trainer.plan["remat"]) == (1, "minimal")
     alone = lm()
     state, _, _ = alone.place()
     alone.compile(state, BATCH, lambda steps: pytest.fail("a single device's whole plan was timed"))
@@ -530,7 +576,8 @@ def test_the_timer_steps_the_state_it_was_given_and_hands_back_a_fresh_copy():
     before = [raw(leaf).copy() for leaf in jax.tree.leaves(state)]
     timer = Timer(state, BATCH)
     seconds = timer([step, step])
-    assert len(seconds) == 2 and all(took > 0 for took in seconds)
+    assert len(seconds) == 2
+    assert all(len(samples) == TIMED_REPEATS and min(samples) > 0 for samples in seconds)
     assert all(leaf.is_deleted() for leaf in jax.tree.leaves(state))
     assert all(np.array_equal(raw(left), right)
                for left, right in zip(jax.tree.leaves(timer.state), before, strict=True))
@@ -539,6 +586,8 @@ def test_the_timer_steps_the_state_it_was_given_and_hands_back_a_fresh_copy():
 def test_a_run_trains_on_from_the_state_its_plan_timed(monkeypatch, tmp_path):
     """Under `fit`, a frontier is timed on the run's own state, and the run
     trains on from a fresh copy of it: the timed steps count for nothing."""
+    # The frontier timed, as the library times it: Dew's tests keep its first plan otherwise.
+    monkeypatch.delenv(UNTIMED_FRONTIER)
     corpus, whole = token_files(tmp_path), windowed(tmp_path / "whole", 1)
     free(monkeypatch, needs(monkeypatch, whole, lambda: whole.fit(windows(corpus), steps=1,
                                                                   checkpoint_every=None)) - 1)
@@ -575,6 +624,17 @@ def test_two_processes_name_one_run_alike():
         assert done.returncode == 0, done.stderr[-3000:]
         keys.append(json.loads(done.stdout.splitlines()[-1]))
     assert keys[0] == keys[1]
+
+
+def test_a_frontier_keeps_its_first_plan_unless_another_is_faster_beyond_the_spread():
+    """`faster` takes a later plan only where its slowest sample beats every sample of the plan it would
+    replace: timings that overlap are the clock's noise, and keep the first."""
+    from dew.training.planning import faster
+
+    assert faster([[2.0, 2.1], [1.0, 1.1]]) == 1
+    assert faster([[1.0, 1.1], [2.0, 2.1]]) == 0
+    assert faster([[1.0, 2.0], [0.9, 1.5]]) == 0
+    assert faster([[3.0], [2.0], [1.0]]) == 2
 
 
 def test_arrays_of_one_byte_layout_and_other_dtypes_fingerprint_apart():

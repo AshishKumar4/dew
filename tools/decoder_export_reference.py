@@ -38,6 +38,7 @@ from dew.batch import Variables
 from dew.interop.pretrained import Pretrained
 from dew.interop.sources import load_shards
 from dew.objectives.lm import LMObjective
+from dew.objectives.routing import ExpertBalance
 from dew.state import TrainState
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
@@ -150,8 +151,8 @@ def logits(source: Pretrained, variables: Variables, ids: np.ndarray) -> np.ndar
 
 def train(case: Case, source: Pretrained, ids: np.ndarray):
     """One real `Trainer` step of plain SGD over the loaded checkpoint (`stepped`)."""
-    objective = LMObjective(source, seq_len=int(ids.shape[1]) - 1, ema_decay=None,
-                            balance_rate=case.balance_rate,
+    balance = None if case.balance_rate is None else ExpertBalance(balance_rate=case.balance_rate)
+    objective = LMObjective(source, seq_len=int(ids.shape[1]) - 1, ema_decay=None, balance=balance,
                             mtp_weight=case.mtp_weight)
     return stepped(objective, ids, case.rate)
 

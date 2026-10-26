@@ -279,7 +279,7 @@ def test_muonclip_steps_both_the_actor_and_a_transformer_critic():
 
     model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1,
                               num_heads=2, mlp_features=16, max_seq_len=8, qk_norm=False)
-    objective = PPOObjective(model, 5, critic=ValueHead(model), qk_stats=True)
+    objective = PPOObjective(model, 5, critic=ValueHead(model))
     optimizer = OptimConfig(optimizer="muonclip", learning_rate=0.,
                             optimizer_opts={"qk_clip_threshold": .01}).build(1)
     trainer = Trainer(objective, optimizer, key=jax.random.key(0))
@@ -291,7 +291,8 @@ def test_muonclip_steps_both_the_actor_and_a_transformer_critic():
              "response_mask": mask, "advantages": mask,
              "behavior_log_probs": jnp.full(ids.shape, -3.),
              "old_values": jnp.zeros_like(mask), "returns": mask}
-    _, aux = objective.loss(initial.variables, batch, Step(jnp.array(0), jax.random.key(1), None))
+    observing = Step(jnp.array(0), jax.random.key(1), None, qk_stats=True)
+    _, aux = objective.loss(initial.variables, batch, observing)
     assert aux.qk_stats is not None and set(aux.qk_stats) == {"policy", "critic"}
     for name, path in (("policy", ()), ("critic", ("backbone",))):
         stats = aux.qk_stats[name]

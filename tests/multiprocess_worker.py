@@ -227,11 +227,11 @@ class Pixels:
         return {"image": np.frombuffer(row["bytes"], np.uint8).reshape(RES, RES, 3)}
 
 
-def online_pipeline(records: int, address: str, *, shared: bool):
+def online_pipeline(records: int, address: str, *, shared: bool, epochs: int | None = None):
     """`elastic_loader`'s records fetched over HTTP from the pool's server at `address`, a url each, in
     either order a fetch is read in: the catalog shuffled and each process fetching its own share of it
     (`shared`), or every process fetching the catalog as a memory read does and shuffling what it kept,
-    one global order."""
+    one global order; `epochs` passes of it, or passes without end."""
     from dew.data import Memory
     from dew.data.pipeline import Pipeline
     from dew.data.sources.urls import Fetch
@@ -239,8 +239,8 @@ def online_pipeline(records: int, address: str, *, shared: bool):
     catalog = Pipeline(Memory([{"url": f"http://{address}/{index}"} for index in range(records)]))
     fetched = (Fetch(output="bytes"), Pixels())
     if shared:
-        return catalog.shuffle(0).repeat().filter_map(*fetched)
-    return catalog.filter_map(*fetched).shuffle(0).repeat()
+        return catalog.shuffle(0).repeat(epochs).filter_map(*fetched)
+    return catalog.filter_map(*fetched).shuffle(0).repeat(epochs)
 
 
 def online_loader(records: int, workers: int, address: str, *, shared: bool):
@@ -422,28 +422,24 @@ def mode_data(args) -> dict:
 
 
 def mode_online_data(args) -> dict:
-    """The first pass of records fetched from the pool's server, each process fetching its share of the
-    shuffled catalog (`online_pipeline`): the records it read, by the image each url's bytes hold, and
-    the plan's lowering. A training order reads on past its pass, so the pass is its batches."""
-    import itertools
-
+    """One pass of records fetched from the pool's server, each process fetching its share of the
+    shuffled catalog (`online_pipeline`) to its end: the records it read, by the image each url's bytes
+    hold."""
     import jax
 
     from dew.data.compile import compile
     from dew.data.dataset import DataPartition
     from dew.training import MeshSpec
 
-    data = compile(online_pipeline(args.records, args.online, shared=True).batch(BATCH), seed=0,
+    data = compile(online_pipeline(args.records, args.online, shared=True, epochs=1).batch(BATCH), seed=0,
                    loading=Loading(workers=args.workers, threads=2, read_buffer=8, worker_buffer=2))
     partition = DataPartition.of(MeshSpec().build())
     stream = data.train(partition)
     try:
-        records = [record for batch in itertools.islice(stream, args.records // BATCH)
-                   for record in batch_records(batch)]
+        records = [record for batch in stream for record in batch_records(batch)]
     finally:
         stream.close()
-    return {"process_index": jax.process_index(), "records": records,
-            "lowering": None if data.plan is None else data.plan.lowering}
+    return {"process_index": jax.process_index(), "records": records}
 
 
 def mode_packed(args) -> dict:
@@ -2278,6 +2274,30 @@ def matrix_data(read: str, cached: str, rejecting: bool, packed: bool, cache_dir
                    loading=Loading(workers=0, threads=1, read_buffer=1))
 
 
+def mode_decision_publish(args) -> dict:
+    """The slot release at `--release`, placed over the pool's devices with its readout partitioned
+    across the processes (`Layout(min_shard=1)`), published as both publishers gather it: written by
+    `SafetensorsReload` into `--run-dir`, and exported as `NCCLPush` sends it, into the `.npz` beside
+    the report. Every process takes part; process 0 writes both."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.inference import rollouts
+    from dew.interop import Pretrained
+    from dew.training import Layout, MeshSpec
+
+    mesh = MeshSpec(fsdp=jax.device_count()).build()
+    placed = Pretrained.load(args.release, dtype="float32", attention_impl="xla", mesh=mesh,
+                             layout=Layout(min_shard=1, tolerance=1.0))
+    written = rollouts.SafetensorsReload(placed, Path(args.run_dir), (), "vllm", dtype="float32")
+    written.write(placed.variables)
+    published = rollouts._published(placed, placed.variables, jnp.dtype("float32"), phase="push gather")
+    if published is not None:
+        np.savez(args.out.with_suffix(".npz"), **published.export())
+    leaves = jax.tree.leaves(placed.head_variables)
+    return {"partitioned": any(not leaf.is_fully_addressable for leaf in leaves)}
+
+
 def mode_matrix(args) -> dict:
     """Train one cell of the data matrix (`--cell read,cache,rejecting,packed`)
     for `--steps`, from where the run directory's checkpoint left it. `batches`
@@ -2305,6 +2325,7 @@ def mode_matrix(args) -> dict:
 
 
 MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget,
+         "decision_publish": mode_decision_publish,
          "host_training": mode_host_training, "step_fits": mode_step_fits,
          "whole_validation": mode_whole_validation, "host_fields": mode_host_fields,
          "topology": mode_topology, "data": mode_data, "online_data": mode_online_data,
@@ -2356,6 +2377,7 @@ def parse_args(argv=None):
     parser.add_argument("--elastic", action="store_true",
                         help="read the training records through a compiled global order, whose "
                              "saved position is a global record count")
+    parser.add_argument("--release", help="the decision release decision_publish places and publishes")
     parser.add_argument("--online", help="host:port of the server whose urls the records are fetched from "
                                          "(`online_loader`)")
     parser.add_argument("--refusal", action="store_true",
