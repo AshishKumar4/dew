@@ -911,6 +911,9 @@ def caching_chain(config: Caching, directory: Path) -> "tuple[list[dict], Callab
 
 
 def run_caching(config: Caching) -> None:
+    import numpy as np
+
+    from dew.batch import VALID_ROWS
     from dew.data.compile import compile
     from dew.data.dataset import DataPartition
 
@@ -924,8 +927,11 @@ def run_caching(config: Caching) -> None:
             loader = compile(chain(cache), read=config.read, loading=Loading(workers=0, cache=False))
             stream = loader.train(DataPartition())
             try:
+                # A short last batch is padded to the batch's rows, its padding marked (`VALID_ROWS`).
                 read = [(int(row), int(digest)) for batch in stream
-                        for row, digest in zip(batch["id"], batch["digest"], strict=True)]
+                        for row, digest, valid in zip(batch["id"], batch["digest"],
+                                                      batch.get(VALID_ROWS, np.ones(len(batch["id"]), bool)),
+                                                      strict=True) if valid]
             finally:
                 stream.close()
             if len(read) != config.records:
