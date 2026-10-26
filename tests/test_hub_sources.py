@@ -546,11 +546,13 @@ def test_a_hub_jsonl_shard_keeps_its_offset_index_in_its_identity_with_the_hub_o
     (["train/a.jsonl", "valid/b.jsonl", "README.md"], "validation", ["valid/b.jsonl"]),
     (["rows.parquet", "README.md"], "train", ["rows.parquet"]),
     (["pretraining/x.parquet", "train.parquet"], "train", ["train.parquet"]),
-], ids=["dev", "sharded", "directories", "lone", "keyword-inside-a-word"])
+    ([], "train", []),
+], ids=["dev", "sharded", "directories", "lone", "keyword-inside-a-word", "empty"])
 def test_a_hub_split_holds_the_files_datasets_resolves_to_it(listing, split, expected):
     """A split's shards are the files `datasets` gives it from the repository's listing, by its own
     default patterns (`split_files`): `dev` and `valid` are `validation`'s, a sharded name's split is
-    its own, a lone file is `train`'s, and a keyword inside another word names no split."""
+    its own, a lone file is `train`'s, a keyword inside another word names no split, and a listing of
+    no file (a configuration's directory holding none) gives none."""
     from dew.data.sources.hub import split_files
 
     assert split_files(listing, split) == expected

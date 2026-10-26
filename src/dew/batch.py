@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
+from flax.core import FrozenDict
 
 type Variables = Mapping[str, Any]
 """A Flax variables dict: the `params` collection plus any other collection
@@ -413,6 +414,20 @@ def thaw(variables: Variables) -> Variables:
     return {**rest, "params": merge(variables[FROZEN], variables["params"])}
 
 
+def dicts[Tree](tree: Tree) -> Tree:
+    """`tree` (a variables tree, or a state holding several) with every mapping a dict: a tree that
+    holds a Flax `FrozenDict` anywhere, under a mapping, a sequence or any other node, rebuilt over the
+    same leaves with each one a dict, any other the caller's own tree. The trees an objective holds are
+    dicts, so that a placement writing each placed leaf into the dict that held it
+    (`dew.training.host.stream`) writes into the objective's tree, and a step's collections keep the
+    state's containers."""
+    nodes = jax.tree.leaves(tree, is_leaf=lambda node: isinstance(node, FrozenDict))
+    if not any(isinstance(node, FrozenDict) for node in nodes):
+        return tree
+    return jax.tree.map(lambda node: dicts(dict(node)) if isinstance(node, FrozenDict) else node, tree,
+                        is_leaf=lambda node: isinstance(node, FrozenDict))
+
+
 def part(variables: Variables, name: str) -> Variables:
     """Cut the `name` subtree out of every collection that holds one: one
     module's own tree out of an objective's that nests several under each
@@ -434,6 +449,7 @@ __all__ = [
     "PathFilter",
     "Variables",
     "coordinates",
+    "dicts",
     "document_ranks",
     "document_starts",
     "everything",
