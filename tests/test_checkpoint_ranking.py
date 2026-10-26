@@ -676,7 +676,8 @@ def test_tile_head_invalidates_validation_trace_for_the_same_batch_shape():
     # finds its program again.
     from flax import linen as nn
 
-    from dew.nn.sharding import DEFAULT_RULES, pipeline_microbatches
+    from dew.mesh import DEFAULT_RULES
+    from dew.nn.sharding import pipeline_microbatches
     with nn.logical_axis_rules((("vocab", None), *DEFAULT_RULES)):
         Evaluation.run(objective, variables, reader, key=jax.random.key(0), loss=True)
     with pipeline_microbatches(2):

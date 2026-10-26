@@ -364,7 +364,7 @@ def test_a_trained_qwen_image_step_exports_and_reloads(source, loaded, arrays, r
     again = Pretrained.load(str(export), dtype="float32", attention_impl="xla")
     rebuilt = QwenImageConditioner.from_pretrained(
         str(export), dtype="float32", **{key: value for key, value in
-                                          again.inputs.conditions["conditioning"].encoder.to_json().items()
+                                          again.inputs.conditions["conditioning"].encoder.recorded_fields().items()
                                           if key not in ("checkpoint", "dtype")},
         params=again.variables["encoders"]["conditioning"])
     tokens = rebuilt.tokenize(prompts)

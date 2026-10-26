@@ -9,12 +9,12 @@ from collections.abc import Callable, Sequence
 import jax.numpy as jnp
 import numpy as np
 
-from dew.coordination import agreed
+from dew._coordination import agreed
+from dew.batch import Batch
 from dew.data.dataset import DataPartition
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, PromptRecord
 from dew.inference.rollouts import Draw, InfrastructureError, response
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of, pad_token_rows
-from dew.objectives.base import Batch
 from dew.sampling.text import Sampling
 
 from ..lm import TokenScorer
@@ -126,6 +126,8 @@ class PolicyCollector:
     def __post_init__(self) -> None:
         if type(self.max_new_tokens) is not int or self.max_new_tokens < 1:
             raise ValueError("a rollout generates at least one token")
+        # The policy's own: the reward's text trims at the end-of-sequence ids generation stops at.
+        object.__setattr__(self, "sampling", self.objective.sampled(self.sampling))
 
     @property
     def width(self) -> int:

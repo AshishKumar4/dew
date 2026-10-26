@@ -68,7 +68,7 @@ import ml_dtypes
 import numpy as np
 from numpy.typing import ArrayLike, DTypeLike
 
-from dew import records
+from dew import _records
 from dew.interop.weights import checkpoint_array
 from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS
 from dew.nn.precision import correctly_rounded_divide
@@ -353,7 +353,7 @@ def packed_mxfp4_format(quantization: Mapping[str, object]) -> None:
     exponent; activations and the KV cache stay in the compute dtype.
     """
     for name, group in _config_groups(quantization).items():
-        group = records.record(group, f'config_groups.{name}')
+        group = _records.record(group, f'config_groups.{name}')
         if group.get('format', 'mxfp4-pack-quantized') != 'mxfp4-pack-quantized':
             raise ValueError(f"config_groups.{name}.format must be mxfp4-pack-quantized")
         for side in ('input_activations', 'output_activations'):
@@ -361,7 +361,7 @@ def packed_mxfp4_format(quantization: Mapping[str, object]) -> None:
                 raise ValueError(
                     f"config_groups.{name}.{side} quantizes activations, which this loader does not"
                 )
-        weights = records.record(group.get('weights'), f'config_groups.{name}.weights')
+        weights = _records.record(group.get('weights'), f'config_groups.{name}.weights')
         wrong = sorted(key for key, value in PACKED_MXFP4_WEIGHTS.items() if weights.get(key, value) != value)
         if wrong:
             raise ValueError(f"config_groups.{name}.weights {wrong} differ from MXFP4's "
@@ -1098,7 +1098,7 @@ def gptq(bits: int, *, v1: bool, grid: Mapping[str, np.ndarray] | None = None) -
 def _integer_bits(quantization: Mapping[str, object], method: str) -> int:
     """The `bits` an AWQ or GPTQ config declares, refusing what this loader
     does not decode."""
-    bits = records.integer(quantization.get('bits'), f'{method} bits')
+    bits = _records.integer(quantization.get('bits'), f'{method} bits')
     if method == 'awq':
         if quantization.get('version', 'gemm') != 'gemm' or quantization.get('zero_point', True) is not True:
             raise ValueError(f"awq version {quantization.get('version')!r} with zero_point "
@@ -1186,16 +1186,16 @@ def _weight_scheme(quantization: Mapping[str, object]) -> _WeightScheme:
                          f"{', '.join(COMPRESSED_TENSORS_FORMATS)} and mxfp4-pack-quantized")
     schemes = set()
     for name, group in _config_groups(quantization).items():
-        group = records.record(group, f'config_groups.{name}')
+        group = _records.record(group, f'config_groups.{name}')
         if group.get('output_activations') is not None:
             raise ValueError(
                 f"config_groups.{name}.output_activations quantizes outputs, which this loader does not"
             )
         activations = group.get('input_activations')
         input_dtype = (None if activations is None
-                       else _nvfp4_input(records.record(activations, "input_activations"),
+                       else _nvfp4_input(_records.record(activations, "input_activations"),
                                          str(form), str(name)))
-        weights = records.record(group.get('weights'), f'config_groups.{name}.weights')
+        weights = _records.record(group.get('weights'), f'config_groups.{name}.weights')
         strategy, kind = weights.get('strategy'), weights.get('type')
         if strategy not in ("tensor", "channel", "group", "block", "tensor_group") or kind not in (
             "int",
@@ -1210,13 +1210,13 @@ def _weight_scheme(quantization: Mapping[str, object]) -> _WeightScheme:
         schemes.add(
             _WeightScheme(
                 str(form),
-                records.integer(weights.get("num_bits"), "num_bits"),
+                _records.integer(weights.get("num_bits"), "num_bits"),
                 kind,
                 bool(weights.get("symmetric", True)),
                 strategy,
                 None
                 if weights.get("group_size") is None
-                else records.integer(weights["group_size"], "group_size"),
+                else _records.integer(weights["group_size"], "group_size"),
                 _block_structure(weights),
                 input_dtype,
             )
@@ -1251,7 +1251,7 @@ def _block_structure(weights: Mapping[str, object]) -> tuple[int, int] | None:
         return None
     if not isinstance(block, list | tuple) or len(block) != 2:
         raise ValueError(f"block_structure {block!r}: a [rows, columns] pair")
-    return records.integer(block[0], 'block_structure'), records.integer(block[1], 'block_structure')
+    return _records.integer(block[0], 'block_structure'), _records.integer(block[1], 'block_structure')
 
 
 def _code_range(scheme: _WeightScheme) -> tuple[float, float]:
@@ -1578,10 +1578,10 @@ def modelopt_nvfp4(config: Mapping[str, object], quantization: Mapping[str, obje
     if method == 'MIXED_PRECISION':
         if not isinstance(quantization.get('quantized_layers'), Mapping):
             raise ValueError("ModelOpt MIXED_PRECISION quantized_layers must declare every algorithm")
-        declared = records.record(quantization['quantized_layers'], 'ModelOpt quantized_layers')
+        declared = _records.record(quantization['quantized_layers'], 'ModelOpt quantized_layers')
         if not declared:
             raise ValueError("ModelOpt MIXED_PRECISION quantized_layers must declare every algorithm")
-        entries = {str(name): records.record(entry, f'ModelOpt quantized_layers.{name}')
+        entries = {str(name): _records.record(entry, f'ModelOpt quantized_layers.{name}')
                    for name, entry in declared.items()}
     else:
         entries = {'': quantization}
@@ -1679,7 +1679,7 @@ def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None
                              f"loader reads store_dtype 'mxfp4' in groups of {GROUP} beside float32 FP8 "
                              f"block scales")
         heads = config.get("num_key_value_heads")
-        return mxfp4_store(side, None if heads is None else records.integer(heads, "num_key_value_heads"))
+        return mxfp4_store(side, None if heads is None else _records.integer(heads, "num_key_value_heads"))
     if method == "fp8":
         block, ue8m0 = fp8_format(quantization)
         return fp8_blocks(block, ue8m0=ue8m0)

@@ -19,9 +19,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.batch import Variables
 from dew.interop import decoder_parts, hf_decoders as decoders
 from dew.interop.streaming import SourceLeaf, WeightLayout
-from dew.objectives.base import Variables
 
 type Place = Callable[[tuple[str, ...]], tuple[str, ...]]
 """Where a leaf of the decoder's own tree sits in the bundle that holds it."""

@@ -49,11 +49,11 @@ import jax.numpy as jnp
 import numpy as np
 from jax.typing import ArrayLike
 
+from dew._records import finite, json_value, record as section
+from dew.batch import Variables
 from dew.data.tokens import first_fit
 from dew.inference.rollouts import Draw
 from dew.nn.inputs import local_rows
-from dew.objectives.base import Variables
-from dew.records import finite, json_value, record as section
 from dew.rl import group_advantage, rloo_advantage
 
 IDS_KEY = "input_ids"
@@ -713,7 +713,7 @@ def agreed_records(packed: dict[str, np.ndarray], support_capacity: int | None) 
     nothing, a share's later reader, keeps nothing. Every process calls
     this, in the order of its other coordination rounds.
     """
-    from dew.coordination import from_every_process
+    from dew._coordination import from_every_process
 
     routed = packed.get(ROUTED_EXPERTS_KEY)
     pool = from_every_process({"routing": None if routed is None else [*routed.shape[2:], routed.dtype.name],

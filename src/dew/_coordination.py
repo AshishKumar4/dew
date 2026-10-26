@@ -283,11 +283,19 @@ class PeerFailure(RuntimeError):
     """Raised when another process failed at a phase agreement that this process passed."""
 
 
-AGREEMENT_PATIENCE_SECONDS = 24 * 3600
-"""How long ranks that reached an agreement wait on the host for the rest.
-
-Host work before an agreement, such as process 0 uploading the final
+_patience_seconds = 24 * 3600.0
+"""How long ranks that reached an agreement wait on the host for the rest, one day unless
+`agreement_patience` sets it. Host work before an agreement, such as process 0 uploading the final
 checkpoint, can take hours; the pool bounds device executions, not this."""
+
+
+def agreement_patience(seconds: float) -> None:
+    """Bound how long a rank that reached an agreement waits on the host for the rest, one day by
+    default: a pool whose host phases are short can learn sooner of a rank stalled before one."""
+    global _patience_seconds
+    if not seconds > 0:
+        raise ValueError(f"an agreement's patience is a positive number of seconds, not {seconds!r}")
+    _patience_seconds = seconds
 
 _agreements = itertools.count()
 
@@ -346,7 +354,7 @@ def _round(word: str) -> list[str]:
     pool size (`docs/performance.md`).
     """
     client, number = _client(), next(_agreements)
-    directory, patience = f"dew/agreement/{number}", int(AGREEMENT_PATIENCE_SECONDS * 1000)
+    directory, patience = f"dew/agreement/{number}", int(_patience_seconds * 1000)
     client.key_value_set(f"{directory}/{jax.process_index()}", word)
     client.wait_at_barrier(directory, patience)
     said = dict(client.key_value_dir_get(directory))
@@ -512,15 +520,3 @@ def end_pool_on_failure(grace: float | None = None) -> None:
     # answering.
     stop_at_exit(watcher, stop.set, timeout=5.0)
 
-
-__all__ = [
-    "PeerFailure",
-    "agree_process_phase",
-    "agreed",
-    "agreed_same",
-    "broadcast_from_process_zero",
-    "collective_host",
-    "end_pool_on_failure",
-    "from_every_process",
-    "seen_by_every_process",
-]

@@ -17,12 +17,17 @@ from pathlib import Path
 import diffusers
 import numpy as np
 import torch
-from diffusers import DDIMScheduler, PNDMScheduler, EulerDiscreteScheduler, DPMSolverMultistepScheduler
-from diffusers import DiffusionPipeline, UNet2DConditionModel
-
-from torch_precision import float64, float64_twin
+from diffusers import (
+    DDIMScheduler,
+    DiffusionPipeline,
+    DPMSolverMultistepScheduler,
+    EulerDiscreteScheduler,
+    PNDMScheduler,
+    UNet2DConditionModel,
+)
 from diffusers_wan_reference import float64_scheduler
 from reference_releases import require
+from torch_precision import float64, float64_twin
 
 
 def check_versions():

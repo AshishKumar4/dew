@@ -18,15 +18,17 @@ import jax
 import numpy as np
 import tyro
 
+from dew._records import number, record
+from dew.batch import Variables, merge
 from dew.checkpoints import Checkpoints
-from dew.config import MetricConfig, ModelConfig, ObjectiveConfig, Prepared, RunConfig, media_field
+from dew.config import MetricConfig, ObjectiveConfig, Prepared, RunConfig, media_field
 from dew.diffusion.presets import EDM, Flow, build_process
 from dew.diffusion.process import Process
 from dew.inputs import AudioCondition, Field, InputSpec, TextCondition
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
 from dew.nn.protocols import IntervalModel, TimeScaled
-from dew.objectives.base import TEACHER, Metric, Variables, merge
+from dew.objectives.base import TEACHER, Metric
 from dew.objectives.diffusion.alignment import Alignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER
 from dew.objectives.diffusion.few_step import SMOOTH_TIME_SCALE, MeanFlowObjective
@@ -37,10 +39,10 @@ from dew.objectives.diffusion.objective import (
     FlowDistillationObjective,
     teacher_weights,
 )
-from dew.records import number, record
 from dew.registry import (
     Configured,
     DtypeName,
+    ModelConfig,
     dtype_name,
     encoders,
     from_record,
@@ -386,13 +388,12 @@ class DiffusionRunConfig(RunConfig):
         the weights the run started from.
         """
         from dew.interop import sources
-        from dew.interop.pretrained import split_revision
 
         def pin(source: str) -> str:
             if os.path.isdir(source):
                 return source
-            name, revision = split_revision(source)
-            return f"{name}@{sources.snapshot(name, revision, weights=False).name}"
+            reference = sources.SourceReference.parse(source)
+            return f"{reference.name}@{reference.metadata().name}"
 
         objective = self.objective
         stated = objective.fields.get("alignment")
@@ -439,15 +440,16 @@ class DiffusionRunConfig(RunConfig):
     def _source(self, variables: Variables | None):
         """The `pretrained` pipeline at the data's resolution: its own
         weights, or `variables` bound over its metadata."""
-        from dew.interop.pretrained import load_diffusion_source, split_revision
+        from dew.interop.pretrained import load_diffusion_source
+        from dew.interop.sources import SourceReference
 
         assert self.pretrained is not None
-        name, revision = split_revision(self.pretrained)
+        reference = SourceReference.parse(self.pretrained)
         # An adapter keeps the pipeline's weights as they are: they load where the start keeps them.
         # The pipeline reads its weights on a resume too, which binds the checkpoint over them.
         placement = self.trainer.source_placement(frozen=self.lora is not None)
         return load_diffusion_source(
-            name, revision=revision, dtype=self._compute or "bfloat16",
+            reference.name, revision=reference.revision, dtype=self._compute or "bfloat16",
             param_dtype=self.pretrained_param_dtype,
             attention_impl=str(self.model.fields.get("attention_impl", "auto")),
             size=self.sample_field().shape[:-1],

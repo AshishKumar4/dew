@@ -46,7 +46,7 @@ from rich.table import Table
 from rich.text import Text
 
 from dew.logging import display_console
-from dew.nn.sharding import EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
+from dew.mesh import EXPERT_AXIS, FSDP_AXIS, TENSOR_AXIS
 from dew.objectives.base import Shown
 from dew.telemetry.records import FitStarted
 from dew.training.evaluation import Evaluation

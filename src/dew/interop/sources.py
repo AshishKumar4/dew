@@ -17,13 +17,13 @@ import json
 import logging
 import os
 from collections.abc import Collection
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import jax
 import numpy as np
 
-from dew import records
+from dew import _records
 from dew.cache import hub_answer, recorded_hub_answer
 from dew.interop import pickles
 from dew.interop.safetensors_io import (
@@ -44,7 +44,7 @@ def load_shards(directory: Path) -> dict[str, np.ndarray]:
     conversion (`pickles.converted`)."""
     files = {path.relative_to(directory).as_posix() for path in directory.rglob("*") if path.is_file()}
 
-    def read(name: str) -> records.JSON:
+    def read(name: str) -> _records.JSON:
         return json.loads((directory / name).read_text())
 
     if weight_files(files, "", read):
@@ -60,6 +60,65 @@ _PICKLES = (".bin", ".pt", ".pth")
 _log = logging.getLogger(__name__)
 
 
+@dataclass(frozen=True)
+class SourceReference:
+    """A local directory or Hub repository, its pinned revision and selected component folder.
+    Saved processor settings keep this record, not a string that has to be parsed again."""
+
+    name: str
+    revision: str | None = None
+    subfolder: str | None = None
+
+    def __post_init__(self):
+        folder = Path(self.subfolder or "")
+        if folder.is_absolute() or ".." in folder.parts:
+            raise ValueError("subfolder must stay inside the resolved source")
+
+    @classmethod
+    def parse(cls, source: str) -> SourceReference:
+        """Read a user-provided repo@revision spelling once, at the input boundary."""
+        if os.path.isdir(source) or "@" not in source:
+            return cls(source)
+        name, revision = source.rsplit("@", 1)
+        if not name or not revision:
+            raise ValueError(f"{source!r} is not a repo@revision reference")
+        return cls(name, revision)
+
+    def metadata(self) -> Path:
+        return snapshot(self.name, self.revision, weights=False) / (self.subfolder or "")
+
+    def directory(self, root: Path) -> Path:
+        return root / (self.subfolder or "")
+
+    def component(self, folder: str) -> SourceReference:
+        """The same snapshot, selecting a component below this source's folder."""
+        selected = (Path(self.subfolder or "") / folder).as_posix()
+        return replace(self, subfolder=None if selected == "." else selected)
+
+    def file(self, root: Path, filename: str) -> Path:
+        """Resolve a component file against the pinned snapshot root, not its folder name."""
+        return repo_file(self.name, root, (Path(self.subfolder or "") / filename).as_posix())
+
+    def optional_file(self, root: Path, filename: str) -> Path | None:
+        """A file, or proven absence at the pinned source. A file the pinned snapshot already holds
+        needs no Hub lookup; an offline lookup for one it lacks raises rather than treating an
+        uncached file as absent and initializing replacement parameters."""
+        selected = (Path(self.subfolder or "") / filename).as_posix()
+        path = root / selected
+        if os.path.lexists(path) or os.path.isdir(self.name):
+            return path if os.path.lexists(path) else None
+        from huggingface_hub import file_exists
+
+        return self.file(root, filename) if file_exists(self.name, selected, revision=root.name) else None
+
+    def weights(self, root: Path, components: tuple[str, ...] = ("",)) -> Path:
+        """The pinned root with exactly the requested component weights present."""
+        requested = tuple((Path(self.subfolder or "") / part).as_posix() for part in components)
+        requested = tuple("" if part == "." else part for part in requested)
+        return snapshot(self.name, self.revision or root.name,
+                        weights=True if requested == ("",) else requested)
+
+
 def missing_weights(source: str, files: Collection[str]) -> str:
     """Say what a source without safetensors weights or transformers'
     PyTorch pickles ships instead, and what loads."""
@@ -73,6 +132,16 @@ def missing_weights(source: str, files: Collection[str]) -> str:
         return (f"{source} ships GGUF files ({', '.join(gguf)}); load one with "
                 f"Pretrained.load(..., gguf_file={gguf[0]!r})")
     return f"{source} has no model.safetensors or model.safetensors.index.json"
+
+
+def tensor_file(path: Path) -> dict[str, np.ndarray]:
+    """One explicitly selected tensor file, using the canonical safetensors reader or safe
+    pickle conversion. No caller needs a separate torch.load path for a named readout file."""
+    if path.suffix == ".safetensors":
+        return read_file(path)[0]
+    if path.suffix in _PICKLES:
+        return read_weights(pickles.converted(path.parent, (path.name,)))
+    raise ValueError(f"{path} is not a supported tensor file")
 
 
 _CONVERSION_TITLE = "Adding `safetensors` variant of this model"
@@ -200,11 +269,16 @@ def snapshot(name_or_dir: str, revision: str | None, *,
         return directory
     files = repo_files(name_or_dir, directory)
 
-    def read(name: str) -> records.JSON:
+    def read(name: str) -> _records.JSON:
         return json.loads((directory / name).read_text())
 
-    selected = [name for folder in (("",) if weights is True else weights)
-                for name in weight_files(files, folder, read)]
+    selected = []
+    for folder in (("",) if weights is True else weights):
+        names = weight_files(files, folder, read)
+        if not names and weights is not True:
+            # A selected component stays at this metadata commit; pickle conversion is local on read.
+            names = weight_files(files, folder, read, stems=pickles.STEMS, suffix=pickles.SUFFIX)
+        selected.extend(names)
     if weights is True and not selected:
         from huggingface_hub.errors import HfHubHTTPError, OfflineModeIsEnabled
 
@@ -253,6 +327,7 @@ class StoredWeights:
 
     name_or_dir: str
     directory: Path
+    subfolder: str = ""
 
     def files(self, folder: str) -> tuple[str, ...]:
         """The repo-relative files that hold `folder`'s weights (`weight_files`): a directory's
@@ -271,7 +346,9 @@ class StoredWeights:
                                                            self.directory.name)).value)
             except OfflineModeIsEnabled:
                 listing = repo_files(self.name_or_dir, self.directory)
-        return weight_files(listing, folder, lambda name: json.loads((self.directory / name).read_text()))
+        selected = (Path(self.subfolder) / folder).as_posix()
+        return weight_files(listing, "" if selected == "." else selected,
+                            lambda name: json.loads((self.directory / name).read_text()))
 
     def specs(self, folder: str) -> dict[str, tuple[str, jax.ShapeDtypeStruct]] | None:
         """Each of `folder`'s tensors, by its stored name: the file that holds it and

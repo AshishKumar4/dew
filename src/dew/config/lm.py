@@ -23,11 +23,12 @@ from typing import ClassVar, NamedTuple
 import jax
 import jax.numpy as jnp
 
-from dew.config import DecoderRunConfig, MetricConfig, ModelConfig, ObjectiveConfig, OptimConfig, Prepared
+from dew._records import integer, text
+from dew.config import DecoderRunConfig, MetricConfig, ObjectiveConfig, Prepared
 from dew.data.text import HFTokenizer, tokenizer_for
 from dew.objectives.lm.objective import Samples
-from dew.records import integer, text
-from dew.registry import DtypeName, objectives, resolve_dtype
+from dew.optim import OptimConfig
+from dew.registry import DtypeName, ModelConfig, objectives, resolve_dtype
 from dew.sampling.text import Sampling
 
 
@@ -139,9 +140,9 @@ class LMRunConfig(DecoderRunConfig):
                 source = source.adapt(self.lora, key=self.trainer.key)
                 model, variables = source.model, source.variables
         if kind == "masked_diffusion":
-            objective = self.masked_objective(model, fields, variables)
+            objective = self.masked_objective(model, fields, variables, source)
         elif kind == "block_diffusion":
-            objective = self.block_objective(model, variables)
+            objective = self.block_objective(model, variables, source)
         else:
             objective = self.objective.build(
                 model=model if source is None else source, seq_len=tokens.seq_len, variables=variables,
@@ -194,7 +195,8 @@ class LMRunConfig(DecoderRunConfig):
         checkpoint's: continuing pretraining on ids from another vocabulary
         trains the embedding table against noise.
         """
-        from dew.interop import Pretrained, split_revision
+        from dew.interop import Pretrained
+        from dew.interop.sources import SourceReference
 
         assert self.pretrained is not None
         choices = ("max_seq_len", "dtype", "attention_impl")
@@ -206,34 +208,36 @@ class LMRunConfig(DecoderRunConfig):
         if reach is not None and not isinstance(reach, int):
             raise ValueError(f"--model.max_seq_len is {reach!r}; the context a checkpoint is reloaded at "
                              "is a number of tokens")
-        name, revision = split_revision(self.pretrained)
+        reference = SourceReference.parse(self.pretrained)
         dtype = resolve_dtype(self.model.fields.get("dtype"))
-        loaded = Pretrained.load(name, dtype=jnp.bfloat16 if dtype is None else dtype,
+        loaded = Pretrained.load(reference.name, dtype=jnp.bfloat16 if dtype is None else dtype,
                                  param_dtype=self.pretrained_param_dtype,
                                  attention_impl=str(self.model.fields.get("attention_impl", "auto")),
-                                 max_seq_len=reach, revision=revision,
+                                 max_seq_len=reach, revision=reference.revision,
                                  # An adapter keeps its source as it is.
                                  **self.trainer.source_placement(frozen=self.lora is not None))
-        if not same_vocabulary(written, loaded, name):
+        if not same_vocabulary(written, loaded, reference.name):
             raise ValueError(f"the token files were written with {written}, and {self.pretrained} "
-                             f"expects its own tokenizer's ids. Retokenize with --tokenizer {name}.")
+                             "expects its own tokenizer's ids. Retokenize with "
+                             f"--tokenizer {reference.name}.")
         # A decoder's embedding table is usually padded past the tokenizer's ids
         # (Qwen3 stores 151936 rows for 151669 tokens), so covering them is the
         # requirement, not matching the count.
         if loaded.model.vocab_size < vocab_size:
             raise ValueError(f"{self.pretrained} has room for {loaded.model.vocab_size} ids and the token "
                              f"files use {vocab_size}")
-        reference = name if loaded.revision is None else f"{name}@{loaded.revision}"
-        return loaded, dataclasses.replace(self, pretrained=reference)
+        pinned = reference.name if loaded.revision is None else f"{reference.name}@{loaded.revision}"
+        return loaded, dataclasses.replace(self, pretrained=pinned)
 
-    def masked_objective(self, model, fields, variables):
+    def masked_objective(self, model, fields, variables, source=None):
         """MDLM over a bidirectional model, its mask id from the model's fields.
 
         A `pretrained` diffusion checkpoint carries `mask_token_id`; a
         from-scratch run names it beside --model.no-causal. A token window is
         `seq_len + 1` ids wide, and masked diffusion has no shift, so it
         denoises the whole row. The validation text is the unmasked rows
-        decoded with the run's tokenizer, or bare ids with no preview budget."""
+        decoded with the run's tokenizer, or bare ids with no preview budget. A loaded `source` is
+        what the objective binds, so its end-of-sequence ids reach the task."""
         from dew.diffusion.discrete import MDLM
 
         mask = fields.get("mask_token_id")
@@ -242,13 +246,14 @@ class LMRunConfig(DecoderRunConfig):
                              "diffusion checkpoint, which carries one, or name --model.mask-token-id beside "
                              "--model.no-causal")
         decode = None if self.max_new_tokens <= 0 else tokenizer_for(self.tokenizer).decode
-        return self.objective.build(model=model, process=MDLM(mask_id=int(mask))(),
-                                    seq_len=self.tokens().seq_len + 1, decode=decode, variables=variables,
-                                    processor=self.processor())
+        return self.objective.build(model=model if source is None else source,
+                                    process=MDLM(mask_id=int(mask))(), seq_len=self.tokens().seq_len + 1,
+                                    decode=decode, variables=variables, processor=self.processor())
 
-    def block_objective(self, model, variables):
+    def block_objective(self, model, variables, source=None):
         """Each complete token-window row split into the clean prompt the run
-        names (`--objective.prompt-length`) and response canvases."""
+        names (`--objective.prompt-length`) and response canvases, over a loaded `source`
+        where there is one, whose end-of-sequence ids the task takes."""
         from dew.nn.protocols import BlockDenoiser
 
         if not isinstance(model, BlockDenoiser):
@@ -261,8 +266,8 @@ class LMRunConfig(DecoderRunConfig):
         response = self.tokens().seq_len + 1 - prompt
         if width < 1 or response < width or response % width:
             raise ValueError("seq_len + 1 must equal prompt_length plus whole training canvases")
-        return self.objective.build(model=model, num_canvases=response // width, variables=variables,
-                                    processor=self.processor())
+        return self.objective.build(model=model if source is None else source, num_canvases=response // width,
+                                    variables=variables, processor=self.processor())
 
 
 def same_vocabulary(written: str, loaded, name: str) -> bool:

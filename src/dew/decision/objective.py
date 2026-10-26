@@ -12,7 +12,9 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
 
+from dew._records import integer, record
 from dew.artifacts import Decisions
+from dew.batch import FROZEN, Batch, Variables, part
 from dew.data.pipeline import Configured, ObjectiveData, Pack, Rejected
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
@@ -20,17 +22,21 @@ from dew.decision.data import Example
 from dew.decision.head import DecisionHead, Head
 from dew.decision.layout import (
     OPTION_TILE,
+    OPTIONS,
+    QUESTION_FIELDS,
     Bounds,
     DecisionInputs,
     Encoded,
     JointLayout,
     Layout,
+    QuestionField,
     QuestionLayout,
     Specials,
     compacted,
     default_layout,
     labelled_rows,
     question_fields,
+    question_owners,
     with_context,
 )
 from dew.decision.model import DecisionModel
@@ -46,27 +52,22 @@ from dew.nn import categorical
 from dew.nn.cross_attention import ContextEncoder, crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import ModelInputs
-from dew.nn.protocols import CountedDecisions, CountedTraining, CrossAttending, TokenModel, VocabularyRows
+from dew.nn.protocols import CountedDecisions, CountedTraining, CrossAttending, TokenModel
 from dew.objectives.base import (
-    FROZEN,
     OMITTED,
     Aux,
-    Batch,
     Objective,
     Omitted,
     ProgramModule,
     Ratio,
     Source,
     Step,
-    Variables,
     joined,
     model_rngs,
-    part,
 )
-from dew.records import integer, record
 
 if TYPE_CHECKING:
-    from dew.training.state import TrainState
+    from dew.state import TrainState
 
 NONE_OF_THE_ABOVE = "none of the above"
 
@@ -168,9 +169,8 @@ class Encoding:
         row: Batch = {
             "tokens": np.asarray(encoded.tokens, np.int32),
             **question_fields(encoded, questions, self.width, labelled_rows([encoded])),
-            "labels": np.zeros(questions, np.int32),
-            "scored": np.zeros(questions, bool),
-            "targets": np.zeros((questions, self.width), np.float32),
+            **{field.name: field.empty(questions, self.width) for field in TRAINING_FIELDS
+               if field.when == "trained"},
         }
         if self.grouped:
             row["groups"], row["canonical"] = _grouped(example, encoded, asked, dropped, self.width)
@@ -200,8 +200,8 @@ def _grouped(example: Example, encoded: Encoded, asked: Mapping[str, Question],
     map. A "none of the above" the augmentation added (`dropped` names the question) that stands for
     the option it dropped maps to that option's canonical one, and one added beside every option to
     none; a question's own option of that name maps as its group says."""
-    groups = np.full(len(encoded.questions), -1, np.int32)
-    canonical = np.full((len(encoded.questions), width), -1, np.int32)
+    groups, canonical = (field.empty(len(encoded.questions), width) for field in TRAINING_FIELDS
+                         if field.when == "grouped")
     for slot, laid in enumerate(encoded.questions):
         found = example.group_of(laid.name)
         if found is None:
@@ -387,23 +387,33 @@ class ConfigureLayout:
         return LayoutRows(encoding) if self.train else EvaluateRows(encoding)
 
 
-_ALONG_THE_QUESTIONS = ("kinds", "questions", "spans", "option_spans", "options", "labels", "scored",
-                        "targets")
-"""The fields of an encoded row that run along its questions."""
-
-_READ_OUT = ("readout",)
-"""The fields that run along its questions of a row whose options stand under labels (`Labels`)."""
-
-_GROUPED = ("groups", "canonical")
-"""The fields that run along its questions of a row whose questions stand in consistency groups
-(`Example.groups`), which an objective with a consistency term reads."""
+TRAINING_FIELDS = (QuestionField("labels", (), np.int32, when="trained"),
+                   QuestionField("scored", (), np.bool_, when="trained"),
+                   QuestionField("targets", (OPTIONS,), np.float32, when="trained"),
+                   QuestionField("groups", (), np.int32, fill=-1, when="grouped"),
+                   QuestionField("canonical", (OPTIONS,), np.int32, fill=-1, when="grouped"))
+"""The fields along a training row's questions beside the model's (`QUESTION_FIELDS`): each question's
+gold `labels`, whether it is `scored`, its soft `targets` over its option slots, and, where its
+questions stand in consistency groups (`Example.groups`), each one's group and each option slot's
+`canonical` option, -1 for none."""
 
 
 def _along(layout: Layout, grouped: bool = False) -> tuple[str, ...]:
-    """The fields along the questions of `layout`'s rows, its readout's where its options stand under
-    labels, and their consistency groups' where they carry them (`grouped`)."""
+    """The fields along the questions of `layout`'s training rows (`QUESTION_FIELDS`,
+    `TRAINING_FIELDS`): its readout's where its options stand under labels, and their consistency
+    groups' where they carry them (`grouped`)."""
     labelled = isinstance(layout, QuestionLayout) and layout.labels is not None
-    return _ALONG_THE_QUESTIONS + (_READ_OUT if labelled else ()) + (_GROUPED if grouped else ())
+    carried = ("always", "trained", *(("labelled",) if labelled else ()), *(("grouped",) if grouped else ()))
+    declared = (*QUESTION_FIELDS, *TRAINING_FIELDS)
+    # The model's and training's fields, then the labelled readout, then the groups, as rows carry them.
+    return tuple(field.name for when in carried for field in declared if field.when == when)
+
+
+def _along_fields(element: Batch, when: tuple[str, ...] = ("always", "trained")) -> tuple[str, ...]:
+    """The declared fields along the questions (`QUESTION_FIELDS`, `TRAINING_FIELDS`) that `element`
+    carries and a row carries `when`, in their declared order."""
+    return tuple(field.name for field in (*QUESTION_FIELDS, *TRAINING_FIELDS)
+                 if field.name in element and field.when in when)
 
 
 def packing(layout: Layout, bounds: Bounds, context_length: int | None = None, grouped: bool = False) -> Pack:
@@ -422,12 +432,9 @@ def packing(layout: Layout, bounds: Bounds, context_length: int | None = None, g
 
 def _rows(batch: Batch, spans_in_context: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Each packed row's tokens, questions and options, window by window: a question the row its span
-    starts in, or, where the spans are the context's (`DecisionInputs.spans_in_context`), the window's
-    one row."""
+    starts in, or, where the spans are the context's, the window's one row (`question_owners`)."""
     segments = np.asarray(batch["segments"])
-    starts = np.asarray(batch["spans"])[..., 0]
-    owners = (np.asarray(batch["questions"], segments.dtype) if spans_in_context else
-              np.where(batch["questions"], np.take_along_axis(segments, starts, axis=1), 0))
+    owners = question_owners(segments, batch["spans"], np.asarray(batch["questions"]), spans_in_context)
     options = np.sum(np.asarray(batch["options"], bool), axis=-1)
     counted = []
     for window, owner, option in zip(segments, owners, options, strict=True):
@@ -471,7 +478,7 @@ class PackedRows(pygrain.MapTransform):
         starts = np.concatenate([[0], np.cumsum(np.bincount(segments)[1:])]).astype(np.int32)
         moved = np.where(owners > 0, starts[np.maximum(owners - 1, 0)], 0)
         options = np.asarray(element["options"])
-        laid = {name: element[name] for name in ("tokens", *_ALONG_THE_QUESTIONS)} | {
+        laid = {name: element[name] for name in ("tokens", *_along_fields(element))} | {
             "segments": segments,
             "positions": element["positions"] if "slots" in element else element["tokens_positions"],
             "spans": element["spans"] + moved[:, None],
@@ -481,6 +488,7 @@ class PackedRows(pygrain.MapTransform):
             # A question's answer cue moves with its row in the window, as its spans do.
             laid["readout"] = element["readout"] + moved
         if "groups" in element:
+            # A group's members are found again among the window's questions.
             laid["groups"], laid["canonical"] = _window_groups(element, owners, options)
         if "slots" in element:
             laid["slots"] = element["slots"]
@@ -725,35 +733,7 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
         if "backbone" not in parts:
             parts["backbone"] = self.model.backbone.init(backbone_key, tokens)
         if "head" not in parts:
-            # The width the head was built for (its parameters read the states' width, not their dtype),
-            # not a trace of the backbone inside every trace of the state.
-            head = self.model.head
-            states = jnp.zeros((1, self.layout.max_len, getattr(head, head.width_field)), jnp.float32)
-            one = jnp.ones((1, 1), bool)
-            inputs = DecisionInputs(
-                tokens=tokens,
-                segments=jnp.ones_like(tokens),
-                kinds=jnp.zeros((1, 1), jnp.int32),
-                questions=one,
-                spans=jnp.asarray([[[0, 1]]]),
-                option_spans=jnp.asarray([[[[0, 1]]]]),
-                options=one[..., None],
-            )
-            backbone = joined({"backbone": parts["backbone"]})
-            if self.model.head.reads_labels:
-                # A readout draws its rows from the backbone's output table, or from its vocabulary rows
-                # where it reads them, its answer at position 0.
-                inputs = dataclasses.replace(inputs, readout=jnp.zeros((1, 1), jnp.int32))
-                gives_rows = isinstance(self.model.backbone, VocabularyRows)
-                table = (self.model.output_table(backbone) if not self.model.head.draws_from_rows
-                         else self.model.table(backbone) if gives_rows else None)
-                labels = self.model.head.tied_labels()
-                tied = (None if labels is None else
-                        jnp.zeros((1, 1, 1, len(labels[0])), jnp.float32))
-                parts["head"] = self.model.head.init(head_key, states, inputs, table, tied=tied)
-            else:
-                table = self.model.table(backbone) if self.model.head.reads_table else None
-                parts["head"] = self.model.head.init(head_key, states, inputs, table)
+            parts["head"] = self.model.initialize_head(head_key, parts["backbone"], tokens)
         return joined(parts)
 
     @property
