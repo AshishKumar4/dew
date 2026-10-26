@@ -1,0 +1,48 @@
+{
+  "generator": "tools/slot_readout_reference.py",
+  "generator_revision": "67ef4cb94405876698956a8b7ee28abf25dd6740",
+  "prompt_repo": "OmniJev/OneJev",
+  "prompt_revision": "81ce62f1597c91e46767d4d02d6ac2e18534fe94",
+  "prompt_files": {
+    "qev/prompt.py": "17dfae09e4dff47cb8ce80e172eba116f188b82b70c2777bd14fd9b8a71680de",
+    "qev/schema.py": "bce4b7d353ac115a9e50aef284975ddeed9a3bb452e3fd928a556668705bc2f3"
+  },
+  "patch_sha256": "f234c125f1d38d82104b9e1f24e75bde51e4401928acfba2fbf5c59ef2fb46b8",
+  "style": {
+    "name": "qev-labels-v2",
+    "system": "Apply the question to the state. Choose exactly one of the listed options. Respond with only its uppercase letter, with no explanation or reasoning.",
+    "layout": "tagged",
+    "show_names": true,
+    "question_header": "Question:",
+    "score_header": "Rate the state:",
+    "answer_line": "Answer with one letter: {letters}.",
+    "answer_line_many": "Answer with one label: {letters}."
+  },
+  "thinking": false,
+  "source": "tests/fixtures/hf/qwen38-dense-tiny",
+  "seeds": 256,
+  "redraw": 4,
+  "head_seed": 43,
+  "precision": "ieee",
+  "device": "cpu",
+  "packages": {
+    "transformers": "5.19.0",
+    "torch": "2.8.0+cpu",
+    "numpy": "2.4.0",
+    "safetensors": "0.8.0",
+    "pydantic": "2.12.5"
+  },
+  "declared_seeds": {
+    "causal_slot_lm": 128,
+    "causal_head": 128,
+    "block_slot_lm": 128,
+    "block_head": 128
+  },
+  "recorded_seed_capacity": {
+    "causal_slot_lm": 256,
+    "causal_head": 256,
+    "block_slot_lm": 256,
+    "block_head": 256
+  },
+  "sizing_revision": "67ef4cb94405876698956a8b7ee28abf25dd6740"
+}

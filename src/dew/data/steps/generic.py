@@ -9,8 +9,8 @@ import grain.python as grain
 import jax
 import numpy as np
 
-from dew.data.dataset import Batch
-from dew.records import record
+from dew._records import record
+from dew.batch import Batch
 
 
 @dataclasses.dataclass(frozen=True)
@@ -54,7 +54,7 @@ class Coordinated(grain.MapTransform):
     """A packed training or validation batch with each window's documents as
     the model reads them: the `<ids>_segment_ids` and `<ids>_positions` a
     packer writes for its `fields` become `<ids>_coordinates`, the model's
-    `dew.nn.inputs.Coordinates` built on the host, holding at most
+    `dew.batch.Coordinates` built on the host, holding at most
     `max_segments` documents a row, or as many as a window holds tokens where
     None (static, so a compiled step is specialized to it). A window holding
     more than its read declared is refused, which a sequence kernel would run
@@ -65,7 +65,7 @@ class Coordinated(grain.MapTransform):
     max_segments: int | None
 
     def map(self, element: Batch) -> Batch:
-        from dew.nn.inputs import coordinates
+        from dew.batch import coordinates
 
         ids = self.fields[0]
         if f"{ids}_segment_ids" not in element:

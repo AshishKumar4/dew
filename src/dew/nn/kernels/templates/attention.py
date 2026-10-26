@@ -35,7 +35,7 @@ from typing import ClassVar, NamedTuple
 import jax
 import jax.numpy as jnp
 
-from dew.hashing import fmix32
+from dew._hashing import fmix32
 from dew.nn.kernels import tuning
 from dew.nn.precision import at_least_fp32, float32_einsum
 

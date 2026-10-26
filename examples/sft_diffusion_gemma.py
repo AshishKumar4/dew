@@ -31,12 +31,12 @@ import jax.numpy as jnp
 import tyro
 
 import dew
-from dew.config import OptimConfig
 from dew.data import Dataset, presets
 from dew.data.sources import source as data_source
 from dew.interop import PretrainedBlockDecoder
 from dew.lora import LoRA
 from dew.objectives.diffusion.block import BlockDiffusionObjective
+from dew.optim import OptimConfig
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests/fixtures"
@@ -95,9 +95,9 @@ def adapted_objective(config: Config) -> tuple[PretrainedBlockDecoder, BlockDiff
     # decoder runs as a scan; a plain loop's fetches would all be hoisted and
     # the whole base would land on the device this is keeping it off.
     scanned = source.model.clone(text=source.model.text.clone(scan_layers=True))
+    # The source over the scanned model, so the objective takes its weights and end-of-sequence ids.
     return source, BlockDiffusionObjective(
-        scanned, prompt_length=config.prompt_tokens,
-        num_canvases=config.canvases, variables=source.variables,
+        replace(source, model=scanned), prompt_length=config.prompt_tokens, num_canvases=config.canvases,
         pad_token_id=int(source.config["text_config"]["pad_token_id"]))
 
 

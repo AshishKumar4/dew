@@ -77,8 +77,10 @@ from jax.custom_derivatives import SymbolicZero
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import triton as plgpu
 
+from dew.mesh import logical_spec
+
 from ..precision import at_least_fp32, compensated_add, compensated_total, rounded_to, two_product
-from ..sharding import logical_spec, manual_map
+from ..sharding import manual_map
 from . import generation, tuning
 from .generation import INHERENT, measured_kernel
 from .selection import Kernel, Op, Requirement, select

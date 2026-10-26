@@ -27,9 +27,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch_precision import float64, float64_twin
 from remote_code_reference import FIXTURES, RELEASES as REGISTERED, released_model
 from safetensors.torch import save_file
+from torch_precision import float64, float64_twin
 
 RELEASES = {
     "llada-moe-tiny": ("inclusionAI/LLaDA-MoE-7B-A1B-Base", "daccaf1ccbf263a427bc9ac2a23b0b004fb275bf",

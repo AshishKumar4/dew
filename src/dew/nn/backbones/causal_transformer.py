@@ -35,10 +35,11 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew._records import JSON
+from dew.batch import Coordinates, coordinates as build_coordinates, merge, shifted_span
+from dew.mesh import LayoutRefused, row_axes
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
-from dew.objectives.base import merge
-from dew.records import JSON
 from dew.registry import from_record, read_arguments
 
 from ..activations import GatedActivation, Situ, ungated_activation
@@ -63,14 +64,11 @@ from ..hyper_connections import (
 )
 from ..inputs import (
     AttentionMetadata,
-    Coordinates,
     CrossContext,
     LayerInputs,
     PredictionPhase,
-    coordinates as build_coordinates,
     coordinates_of,
     numbered_blocks,
-    shifted_span,
 )
 from ..kv_cache import KVCache
 from ..mixer_base import MLP_RESIDUALS, RESIDUALS
@@ -91,15 +89,7 @@ from ..precision import (
 )
 from ..protocols import OutputTable, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
-from ..sharding import (
-    RESIDUAL,
-    LayoutRefused,
-    constrain,
-    logical_axes,
-    microbatches,
-    pipeline_stages,
-    row_axes,
-)
+from ..sharding import RESIDUAL, constrain, logical_axes, microbatches, pipeline_stages
 from .decoder_block import (
     DECODER_REMAT,
     NORM_SITES,
@@ -1568,7 +1558,7 @@ class CausalTransformer(nn.Module):
           states are the masked call's, the padding's are unspecified, and a
           causal layer runs as an unpadded call does.
         - `coordinates` are the tokens' documents, validity and positions as
-          the batch's builder made them (`dew.nn.inputs.coordinates`, with the
+          the batch's builder made them (`dew.batch.coordinates`, with the
           packer's `max_segments`); where None they are built here from
           `segment_ids`, `attention_mask`, `positions` and `right_padded`.
         - `conditioning` carries the sequence the `cross_attention` layers read
@@ -2261,13 +2251,12 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def inference_projection_groups(self, variables: Mapping[str, Mapping]) -> tuple[ProjectionGroup, ...]:
         """Its layers', depths' and drafter's groups, bound without tracing a
-        forward; an encoder serves no decode step and names none. The groups
-        read which parameters the layers hold, never their values, so the
-        layers are bound over the variables' shapes: flax's bound tree is
-        cyclic, and bound over the weights themselves it would keep them alive
-        after the caller drops them until a full collection."""
-        if not self.causal:
-            return ()
+        forward, causal or not: a bidirectional model's masked denoising reads
+        its projections packed as a decoder's steps do. The groups read which
+        parameters the layers hold, never their values, so the layers are
+        bound over the variables' shapes: flax's bound tree is cyclic, and
+        bound over the weights themselves it would keep them alive after the
+        caller drops them until a full collection."""
         bound = self.bind(jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), jnp.result_type(leaf)), variables))
         return declared_groups(*bound.layers, *bound.mtp,

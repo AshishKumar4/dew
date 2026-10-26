@@ -10,8 +10,7 @@ from learning_gate import assert_learns, within
 from optim_support import LR, decoder_params, drawn_tree
 from reference_error import assert_as_exact
 
-from dew.config import OptimConfig
-from dew.optim import OPTIMIZER_MAP
+from dew.optim import OPTIMIZER_MAP, OptimConfig
 
 
 def bf16_state_adamw(**kwargs):

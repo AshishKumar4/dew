@@ -35,8 +35,8 @@ from compressed_tensors.compressors.nvfp4.helpers import unpack_fp4_from_uint8
 from compressed_tensors.quantization import QuantizationArgs, QuantizationScheme, QuantizationStatus
 from compressed_tensors.quantization.lifecycle.forward import dequantize, set_forward_quantized
 from compressed_tensors.quantization.utils.helpers import calculate_qparams, generate_gparam
-from torch_precision import float64, float64_twin
 from safetensors.torch import save_file
+from torch_precision import float64, float64_twin
 from transformers import AutoModelForCausalLM, Qwen3Config, Qwen3ForCausalLM
 
 ROOT = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "codecs" / "storage"

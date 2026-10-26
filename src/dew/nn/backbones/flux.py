@@ -183,10 +183,10 @@ class FluxTransformer(TextStream, nn.Module):
         def embed(values, name: str):
             features = sinusoidal_time(values, TIME_FEATURES, dtype=at_least_fp32(self.dtype))
             features = features.astype(pooled.dtype)
-            return embedding(features, self.features, name, **dense)
+            return embedding(self, features, self.features, name, **dense)
 
         return (guided_time(embed, time, guidance, guidance_embeds=self.guidance_embeds)
-                + embedding(pooled, self.features, "text_embedder", **dense))
+                + embedding(self, pooled, self.features, "text_embedder", **dense))
 
     @nn.nowrap
     def _double(self, **where) -> DoubleStreamBlock:

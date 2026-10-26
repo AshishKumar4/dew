@@ -10,14 +10,14 @@ import pytest
 from recording import RecordingTracker
 from reference_error import assert_as_exact
 
-from dew.config import OptimConfig, RunConfig, TrainerConfig
+from dew.batch import VALID_ROWS
+from dew.config import RunConfig, TrainerConfig
 from dew.data import Memory
 from dew.data.compile import compile
 from dew.data.dataset import Closeable, DataPartition, Loader
 from dew.data.pipeline import Pipeline
 from dew.objectives import Aux, Objective
-from dew.objectives.base import VALID_ROWS
-from dew.optim import Linear
+from dew.optim import Linear, OptimConfig
 from dew.training import Best, Checkpoints, Pause, Trainer
 
 FEATURES = 4

@@ -7,11 +7,11 @@ import jax.numpy as jnp
 import pytest
 from bank_support import SelectedReads, fixture, host_layout, identical, scores, unpack
 
+from dew.batch import merge
 from dew.inference.banks import CheckpointBanks, HeldBanks, at_namespace, entry_tree, in_namespace, narrowed
 from dew.nn.backbones.decoder_stack import DecoderBank, StackView
-from dew.objectives.base import merge
+from dew.state import TrainState
 from dew.training import Checkpoints, Layout
-from dew.training.state import TrainState
 
 DEVICE = Layout(min_shard=1, tolerance=1.0)
 
