@@ -877,6 +877,7 @@ class TorchCausalLM(nn.Module):
         """None: a causal LM is not trained to fill masked tokens."""
         return None
 
+    @nn.compact
     def __call__(self, tokens, train: bool = False, decode: bool = False, attention_mask=None,
                  positions=None) -> jax.Array:
         """The logits of `tokens`, in at least float32: of whole rows, or with `decode` of a decoding
@@ -889,8 +890,10 @@ class TorchCausalLM(nn.Module):
         return self.logits(tokens, train=train, **packing)
 
     def init_cache(self, batch_size: int) -> None:
-        """Open the decode cache of `batch_size` rows (`Decoding`), every slot unfilled."""
-        self._cached(batch_size)
+        """Open the decode cache of `batch_size` rows (`Decoding`), every slot unfilled: one decoding
+        call of no valid token, which writes nothing, as Dew's decoders open theirs."""
+        tokens = jnp.zeros((batch_size, 1), jnp.int32)
+        self(tokens, decode=True, attention_mask=jnp.zeros((batch_size, 1), bool))
 
     def with_cache_capacity(self, capacity: int) -> Self:
         """The model with a decode cache of `capacity` slots a row (`CacheCapacity`)."""
