@@ -625,8 +625,8 @@ def _climbs_and_restores(model, variables, inputs, share: int, **apply) -> None:
 
     for rung in shared:
         stepped = _stepped(rung, variables, inputs, **apply)
-        assert_as_exact(lambda *inputs, rung=rung: np.asarray(_call(rung, variables, inputs, **apply)),
-                        lambda *inputs: np.asarray(_call(model, variables, inputs, **apply)),
+        assert_as_exact(lambda *inputs, rung=rung: _call(rung, variables, inputs, **apply),
+                        lambda *inputs: _call(model, variables, inputs, **apply),
                         lambda seed: _redrawn(inputs, seed), f"forward at {rung.recompute_record()}",
                         seeds=RUNG_SEEDS, truth_fn=forward_truth)
         as_exact(stepped[1], gradient_tree, truth, f"gradient at {rung.recompute_record()}")

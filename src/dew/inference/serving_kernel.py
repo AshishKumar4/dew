@@ -550,7 +550,8 @@ def opened_in(formats: Formats) -> jax.stages.Wrapped:
     return jax.jit(opened, static_argnums=(0, 2, 3, 4), out_shardings=formats)
 
 
-_PROGRAMS: dict[tuple[tuple[Format, ...], str, NamedSharding | None, tuple[tuple[str, bool], ...]],
+type _Options = tuple[tuple[str, bool | int | str], ...]
+_PROGRAMS: dict[tuple[tuple[Format, ...], str, NamedSharding | None, _Options],
                 tuple[jax.stages.Wrapped, jax.stages.Wrapped]] = {}
 """One pair of step programs per resident layout; see `decode_programs`."""
 
