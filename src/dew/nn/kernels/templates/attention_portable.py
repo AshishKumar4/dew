@@ -532,7 +532,8 @@ def _launch(query, key, value, dout, peak, total, initial_term, maximum, key_ind
 def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
              dout: jax.Array, *, block_q: int, block_k: int, pad: int,
              residuals: tuple[jax.Array, jax.Array, jax.Array, Split] | None = None, split: bool = True,
-             scale: float | None = None, natural: bool = NATURAL, accurate: bool = ACCURATE) -> Gradients:
+             scale: float | None = None, natural: bool = NATURAL, accurate: bool = ACCURATE,
+             rounded: bool = True) -> Gradients:
     """The template's backward on this mainloop (`gradients`) at `block_q` by `block_k` tiles, the call
     padded as a backend whose largest tile is `pad` pads it, from the forward's `residuals` (this
     mainloop's `attend`'s where None); with `split`, D from the forward's split sums, as the Triton
@@ -550,4 +551,5 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
         raise ValueError("the first-pass D (split=False) takes no probability dropout; the split sums do")
     launch = functools.partial(_launch, block_q=block_q, block_k=block_k, split=split, natural=natural,
                                accurate=accurate, initial=initial, drop=None if hooks is None else hooks.drop)
-    return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=pad, scale=scale)
+    return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=pad, scale=scale,
+                     rounded=rounded)

@@ -1005,7 +1005,7 @@ def _launch(*arrays, score_mod, score_kinds: tuple[Kind, ...], score_dtypes: tup
 def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
              dout: jax.Array, *, residuals: tuple[jax.Array, jax.Array, jax.Array, Split] | None = None,
              split: bool = True, scale: float | None = None, natural: bool = NATURAL,
-             accurate: bool = ACCURATE, interpret: bool = False) -> Gradients:
+             accurate: bool = ACCURATE, interpret: bool = False, rounded: bool = True) -> Gradients:
     """The template's backward on the Triton mainloop (`gradients`, `TritonBackward`), from the forward's
     `residuals`: its maxima, denominators, anchor keys and split sums (`forward`'s, which it takes again
     where None). With `split`, D comes from the split sums; without, the dQ launch takes its own first pass
@@ -1025,4 +1025,5 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     split = split or algebra.headroom(value.dtype)
     launch = functools.partial(_launch, split=split, natural=natural, accurate=accurate, initial=initial,
                                interpret=interpret)
-    return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=BLOCK, scale=scale)
+    return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=BLOCK, scale=scale,
+                     rounded=rounded)

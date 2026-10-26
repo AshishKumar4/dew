@@ -1064,7 +1064,7 @@ class Gradients:
 def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
               hooks: Hooks | None, dout: jax.Array,
               residuals: tuple[jax.Array, jax.Array, jax.Array, Split], *, block: int,
-              scale: float | None = None) -> Gradients:
+              scale: float | None = None, rounded: bool = True) -> Gradients:
     """The template's backward of its forward under the output's cotangent `dout` `[B, Q, H, Dv]`, from the
     forward's `residuals` (each query's maximum and denominator `[B, H, Q]`, its anchor key, the first
     holding the keys' maximum, `[B, H, Q]` int32, and its split sums, `Split`), through a mainloop's
@@ -1164,9 +1164,13 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         initial = Initial(m=jnp.where(mass > 0, moved, 0.0).astype(state.m.dtype),
                           total=(-(delta * inverse) * factor).astype(state.total.dtype),
                           acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
+    # Unrounded (`rounded` False), dK and dV stay in at least fp32 for a caller that sums them across
+    # shards first and rounds once (`attention_route.attend`'s `operand_dtype`).
+    key_dtype, value_dtype = ((key.dtype, value.dtype) if rounded
+                              else (at_least_fp32(key.dtype), at_least_fp32(value.dtype)))
     return Gradients(dq[:, :queries, :, :width].astype(query.dtype),
-                     dk[:, :keys, :, :width].astype(key.dtype),
-                     dv[:, :keys, :, :value_width].astype(value.dtype),
+                     dk[:, :keys, :, :width].astype(key_dtype),
+                     dv[:, :keys, :, :value_width].astype(value_dtype),
                      tuple(grad.astype(param.value.dtype) for grad, param in zip(grads, hooks.score_params,
                                                                                  strict=True)),
                      initial)

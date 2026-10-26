@@ -393,6 +393,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     config_cls = BackwardTiles
     WALKED = "block_q"
     accurate: bool = ACCURATE
+    rounded: bool = True
 
     def _fwd(self, query, key, value, dout, start, end, query_ids, key_ids, score_params, initial, residuals,
              *, interpret: bool, config: BackwardTiles, return_residuals: bool = False):
@@ -411,7 +412,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         launch = functools.partial(_launch_backward, spec=spec, accurate=self.accurate, tiles=config,
                                    family=family, interpret=interpret)
         return gradients(launch, query, key, value, spans, hooks, dout, residuals,
-                         block=_block(config), scale=self.scale), None
+                         block=_block(config), scale=self.scale, rounded=self.rounded), None
 
     def legal(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget) -> bool:
         # The one launch adds each tile's dQ under the first pass's D: the fast form's, a hookless call's.
@@ -472,7 +473,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
 def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
              dout: jax.Array, *, residuals: tuple[jax.Array, jax.Array, jax.Array, Split],
              scale: float | None = None, natural: bool = NATURAL, accurate: bool = ACCURATE,
-             interpret: bool = False) -> Gradients:
+             interpret: bool = False, rounded: bool = True) -> Gradients:
     """The template's backward on this mainloop (`MosaicBackward`, `gradients`) from a training forward's
     `residuals` (its maxima, denominators, anchor keys and split sums): D about each query's anchor from the
     split sums (`algebra.split_delta`), a dQ launch and a dK/dV launch, and `dq_finish`'s refinement between
@@ -482,7 +483,7 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     it: a differentiated call applies `output_mod` past the kernel, where its own derivative runs, and passes
     `dout` before it. `interpret` runs it on the CPU, as a GPU of the family `generation.assumed` names."""
     op, args = _backward_call(query, key, value, spans, hooks, dout, residuals, scale=scale, natural=natural,
-                              accurate=accurate)
+                              accurate=accurate, rounded=rounded)
     return op(*args, interpret=interpret)
 
 
@@ -508,7 +509,7 @@ def backward_takes(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
 
 def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
                    dout: jax.Array, residuals: tuple, *, scale: float | None, natural: bool,
-                   accurate: bool) -> tuple[MosaicBackward, tuple]:
+                   accurate: bool, rounded: bool = True) -> tuple[MosaicBackward, tuple]:
     """`backward`'s op and its arguments; a dropping call refused before one is built (`_forward_call`)."""
     hooks = Hooks() if hooks is None else hooks
     if hooks.drop is not None:
@@ -518,6 +519,6 @@ def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
                         score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),
                         form=spans.form, keys=spans.keys,
                         scale=query.shape[3] ** -0.5 if scale is None else scale, natural=natural,
-                        accurate=accurate)
+                        accurate=accurate, rounded=rounded)
     return op, (query, key, value, dout, spans.start, spans.end, spans.query_ids, spans.key_ids,
                 tuple(param.value for param in hooks.score_params), hooks.initial, residuals)

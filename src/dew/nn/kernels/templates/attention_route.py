@@ -18,10 +18,11 @@ import functools
 from typing import Literal, overload
 
 import jax
+import jax.numpy as jnp
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import attention_mosaic, attention_portable, attention_triton
-from dew.nn.kernels.templates.attention import Gradients, Hooks, KeySpans, Split
+from dew.nn.kernels.templates.attention import ACCURATE, NATURAL, Gradients, Hooks, KeySpans, Split
 
 PLAIN_TILE = attention_triton.BLOCK
 """The plain-JAX mainloop's tile: the query and key blocks a call walks, and the padding it takes to whole
@@ -32,8 +33,16 @@ Residuals = tuple[jax.Array, jax.Array, jax.Array, Split]
 `[B, H, Q]`, its anchor key `[B, H, Q]` and its split sums (`Split`)."""
 
 
+FORMS = ("fast", "accurate")
+"""The template's forms (kernel-templates.md §1, testing.md): the default, fast (the base-2 fold and
+FlashAttention's arithmetic, `NATURAL`, `ACCURATE`), and the accurate form one option away (natural logits and
+the accurate products), which `generation.chosen(attention_form='accurate')` names for every template call in
+its block."""
+
+
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
-           *, scale: float | None = None) -> jax.Array:
+           *, scale: float | None = None, natural: bool | None = None, accurate: bool | None = None,
+           operand_dtype=None) -> jax.Array:
     """Attention of `query` `[B, Q, H, D]` over `key` and `value` `[B, K, Hk, D]` and `[B, K, Hk, Dv]`.
 
     Each query reads the keys its `spans` leave it, under the score hooks and initial state of `hooks`. The
@@ -41,6 +50,12 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     the query, key and value and in the hooks' parameters and state. `scale` is a Python float, `D ** -0.5` by
     default. An output hook is refused: a differentiated call applies `output_mod` to the output past the
     kernel, where its own derivative runs, so the caller applies it.
+
+    `natural` and `accurate` name its form, each where None the one `generation.chosen(attention_form=...)`
+    names (`FORMS`; 'accurate' takes both), else the default's. `operand_dtype`, where the key and value
+    arrive wider than the mainloops compute them (a sharding wrapper's, so its partial gradients sum wide),
+    narrows the operands to it and hands back the key's and value's gradients unrounded, in their own dtype:
+    the wrapper sums them and rounds once.
     """
     hooks = Hooks() if hooks is None else hooks
     if hooks.output_mod is not None:
@@ -48,7 +63,32 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
                          "the output before an output hook, so the caller applies `output_mod` to the result")
     if hooks.drop is not None and not drops():
         raise NotImplementedError(DROPS_NOT)
-    return _attend(scale, query, key, value, spans, hooks)
+    form = generation.measured_kernel('attention_form', 'fast')
+    if form not in FORMS:
+        raise ValueError(f"attention_form {form!r}: the template's forms are {', '.join(FORMS)}")
+    wide = form == 'accurate'
+    config = _Config(scale, NATURAL or wide if natural is None else natural,
+                     ACCURATE or wide if accurate is None else accurate,
+                     None if operand_dtype is None else jnp.dtype(operand_dtype).name)
+    return _attend(config, query, key, value, spans, hooks)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Config:
+    """A call's static configuration, which its forward and backward share."""
+
+    scale: float | None
+    natural: bool
+    accurate: bool
+    operand_dtype: str | None
+
+    def narrowed(self, query: jax.Array, key: jax.Array,
+                 value: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """The query, key and value at `operand_dtype` where it is given."""
+        if self.operand_dtype is None:
+            return query, key, value
+        dtype = self.operand_dtype
+        return query.astype(dtype), key.astype(dtype), value.astype(dtype)
 
 
 def _on_gpu() -> bool:
@@ -69,74 +109,81 @@ def drops() -> bool:
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(0,))
-def _attend(scale: float | None, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
+def _attend(config: _Config, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
             hooks: Hooks) -> jax.Array:
     """The forward of a call that is not differentiated, which keeps no training state."""
-    return _forward(query, key, value, spans, hooks, scale, residuals=False)
+    return _forward(*config.narrowed(query, key, value), spans, hooks, config, residuals=False)
 
 
-def _attend_forward(scale: float | None, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
+def _attend_forward(config: _Config, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                     hooks: Hooks) -> tuple[jax.Array, tuple]:
     """The forward of a differentiated call, which keeps the residuals its backward reads."""
-    out, peak, total, anchors, split = _forward(query, key, value, spans, hooks, scale, residuals=True)
+    out, peak, total, anchors, split = _forward(*config.narrowed(query, key, value), spans, hooks, config,
+                                                residuals=True)
     return out, (query, key, value, spans, hooks, (peak, total, anchors, split))
 
 
 @overload
 def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
-             scale: float | None, *, residuals: Literal[False]) -> jax.Array:
+             config: _Config, *, residuals: Literal[False]) -> jax.Array:
     ...
 
 
 @overload
 def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
-             scale: float | None, *, residuals: Literal[True]) -> tuple[jax.Array, *Residuals]:
+             config: _Config, *, residuals: Literal[True]) -> tuple[jax.Array, *Residuals]:
     ...
 
 
 def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
-             scale: float | None, *, residuals: bool):
+             config: _Config, *, residuals: bool):
     """The forward on the first mainloop that takes the call here: Mosaic GPU's (the template), Triton's,
     the plain-JAX one's."""
-    declined = attention_mosaic.forward_declined(query, key, value, spans, hooks, scale=scale,
-                                                 residuals=residuals) if _on_gpu() else None
+    form = {"scale": config.scale, "natural": config.natural}
+    declined = attention_mosaic.forward_declined(query, key, value, spans, hooks, residuals=residuals,
+                                                 **form) if _on_gpu() else None
     if _on_gpu() and declined is None:
         _report('mosaic')
-        return attention_mosaic.forward(query, key, value, spans, hooks, scale=scale, residuals=residuals)
+        return attention_mosaic.forward(query, key, value, spans, hooks, residuals=residuals, **form)
     if _on_gpu() and attention_triton.refused(spans) is None:
         _report('triton', declined)
-        return attention_triton.forward(query, key, value, spans, hooks, scale=scale, residuals=residuals)
+        return attention_triton.forward(query, key, value, spans, hooks, residuals=residuals, **form)
     _report('portable', declined)
     return attention_portable.attend(query, key, value, spans, hooks, block_q=PLAIN_TILE, block_k=PLAIN_TILE,
-                                     pad=PLAIN_TILE, scale=scale, residuals=residuals)
+                                     pad=PLAIN_TILE, residuals=residuals, **form)
 
 
-def _attend_backward(scale: float | None, saved: tuple, dout: jax.Array) -> tuple:
-    """The cotangents of the query, key, value and hooks, from the residuals; the spans take none."""
+def _attend_backward(config: _Config, saved: tuple, dout: jax.Array) -> tuple:
+    """The cotangents of the query, key, value and hooks, from the residuals, each in its primal's dtype;
+    the spans take none."""
     query, key, value, spans, hooks, residuals = saved
-    grads = _backward(query, key, value, spans, hooks, dout, residuals, scale)
-    return grads.query, grads.key, grads.value, None, _hooks_cotangent(hooks, grads)
+    grads = _backward(*config.narrowed(query, key, value), spans, hooks, dout, residuals, config)
+    return (grads.query.astype(query.dtype), grads.key.astype(key.dtype), grads.value.astype(value.dtype),
+            None, _hooks_cotangent(hooks, grads))
 
 
 _attend.defvjp(_attend_forward, _attend_backward)
 
 
 def _backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
-              dout: jax.Array, residuals: Residuals, scale: float | None) -> Gradients:
+              dout: jax.Array, residuals: Residuals, config: _Config) -> Gradients:
     """The backward from the forward's residuals on the first mainloop that takes the call here: Mosaic
-    GPU's, Triton's, the plain-JAX one's."""
+    GPU's, Triton's, the plain-JAX one's; its key's and value's gradients unrounded where the call narrowed
+    them (`_Config.operand_dtype`)."""
     call = (query, key, value, spans, hooks, dout)
-    declined = (attention_mosaic.backward_declined(*call, residuals=residuals, scale=scale) if _on_gpu()
+    form = {"scale": config.scale, "natural": config.natural, "accurate": config.accurate}
+    rounded = config.operand_dtype is None
+    declined = (attention_mosaic.backward_declined(*call, residuals=residuals, **form) if _on_gpu()
                 else None)
     if _on_gpu() and declined is None:
         _report('mosaic')
-        return attention_mosaic.backward(*call, residuals=residuals, scale=scale)
+        return attention_mosaic.backward(*call, residuals=residuals, rounded=rounded, **form)
     if _on_gpu() and attention_triton.refused(spans) is None:
         _report('triton', declined)
-        return attention_triton.backward(*call, residuals=residuals, scale=scale)
+        return attention_triton.backward(*call, residuals=residuals, rounded=rounded, **form)
     _report('portable', declined)
     return attention_portable.backward(*call, block_q=PLAIN_TILE, block_k=PLAIN_TILE, pad=PLAIN_TILE,
-                                       residuals=residuals, scale=scale)
+                                       residuals=residuals, rounded=rounded, **form)
 
 
 def _report(kernel: str, declined: str | None = None) -> None:

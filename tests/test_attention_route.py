@@ -49,6 +49,7 @@ from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import (
     attention as template,
     attention_mosaic,
+    attention_portable,
     attention_route,
     attention_triton,
 )
@@ -489,6 +490,53 @@ def test_a_gpu_prefers_the_template_for_a_call_with_block_groups(kind):
             auto = attention.resolve_implementation("auto", query, key, causal=True, block_groups=blocks,
                                                     image_groups=images, key_valid=valid)
             assert (auto == "template") == (target == "sm90"), (target, auto)
+
+
+def test_the_accurate_form_is_one_option_away():
+    """`generation.chosen(attention_form='accurate')` runs every template call in the accurate form (natural
+    logits and the accurate products, `attention_route.FORMS`), its forward and backward bitwise the
+    mainloop's own at that form, and the default runs the fast one; a form the template does not have is
+    refused."""
+    spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
+    query, key, value, _, dout = drawing(QUERIES, KEYS, jnp.float32, sinks=False)(0)
+    tiles = {"block_q": attention_route.PLAIN_TILE, "block_k": attention_route.PLAIN_TILE,
+             "pad": attention_route.PLAIN_TILE}
+
+    def routed(q, k, v):
+        out, pull = jax.vjp(lambda q, k, v: attention_route.attend(q, k, v, spans), q, k, v)
+        return out, pull(dout)
+
+    for form, natural, accurate in (("accurate", True, True), ("fast", False, False)):
+        with generation.chosen(attention_form=form):
+            out, grads = jax.jit(routed)(query, key, value)
+        want = attention_portable.attend(query, key, value, spans, template.Hooks(), natural=natural, **tiles)
+        residuals = attention_portable.attend(query, key, value, spans, template.Hooks(), natural=natural,
+                                              residuals=True, **tiles)[1:]
+        pulled = attention_portable.backward(query, key, value, spans, template.Hooks(), dout,
+                                             residuals=residuals, natural=natural, accurate=accurate, **tiles)
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(want), err_msg=form)
+        for mine, theirs in zip(grads, (pulled.query, pulled.key, pulled.value), strict=True):
+            np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs), err_msg=form)
+    with generation.chosen(attention_form="exact"), pytest.raises(ValueError, match="forms"):
+        attention_route.attend(query, key, value, spans)
+
+
+def test_narrowed_operands_hand_back_their_gradients_unrounded():
+    """A call whose key and value arrive wider than the mainloops compute them (`operand_dtype`, a sharding
+    wrapper's, so its partial gradients sum wide and round once) runs bitwise the narrow call's forward, and
+    hands back the key's and value's gradients in their own fp32, which round to the narrow call's own."""
+    spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
+    query, key, value, _, dout = drawing(QUERIES, KEYS, jnp.bfloat16, sinks=False)(0)
+
+    def routed(k, v, **narrowed):
+        return jax.vjp(lambda k, v: attention_route.attend(query, k, v, spans, **narrowed), k, v)
+
+    narrow, pull = routed(key, value)
+    wide, pull_wide = routed(key.astype(jnp.float32), value.astype(jnp.float32), operand_dtype=jnp.bfloat16)
+    np.testing.assert_array_equal(np.asarray(wide), np.asarray(narrow))
+    for mine, theirs in zip(pull_wide(dout), pull(dout), strict=True):
+        assert mine.dtype == jnp.float32
+        np.testing.assert_array_equal(np.asarray(mine.astype(jnp.bfloat16)), np.asarray(theirs))
 
 
 def test_the_template_reports_the_mainloop_each_pass_runs():
