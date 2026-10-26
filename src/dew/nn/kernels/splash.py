@@ -1124,12 +1124,13 @@ def _attention_fwd(
     out, logsumexp = _forward(
         fwd_mask_info, q, k, v, segment_ids, sinks, blocks=blocks, call=call, residuals=True
     )
-    return out, (q, k, v, segment_ids, sinks, out, logsumexp, dq_mask_info, dkv_mask_info)
+    # Dew: no output among the residuals; the backward's D is its own (`_attention_bwd`).
+    return out, (q, k, v, segment_ids, sinks, logsumexp, dq_mask_info, dkv_mask_info)
 
 
 def _attention_bwd(blocks: BlockSizes, call: _Call, residuals: tuple, do: jax.Array):
     """dQ, dK and dV from the delta pass, the dK/dV kernel and the dQ kernel; the sinks' gradient."""
-    q, k, v, segment_ids, sinks, o, logsumexp, dq_mask_info, dkv_mask_info = residuals
+    q, k, v, segment_ids, sinks, logsumexp, dq_mask_info, dkv_mask_info = residuals
     # Dew: di is each query's sum_k p * dp from the dQ kernel's own pass, not rowsum(o * do).
     di = _dq(
         q, k, v, segment_ids, sinks, logsumexp, do, None, blocks=blocks, mask_info=dq_mask_info, call=call
@@ -1140,12 +1141,10 @@ def _attention_bwd(blocks: BlockSizes, call: _Call, residuals: tuple, do: jax.Ar
     dq = _dq(q, k, v, segment_ids, sinks, logsumexp, do, di, blocks=blocks, mask_info=dq_mask_info, call=call)
     dsinks = None
     if sinks is not None:
-        sinks_exp = -jnp.exp(
-            sinks[..., None, None].astype(jnp.float32) - logsumexp[..., None].astype(jnp.float32)
-        )
-        dsinks = jnp.sum(sinks_exp * o.astype(jnp.float32) * do.astype(jnp.float32), axis=(-1, -2)).astype(
-            sinks.dtype
-        )
+        # Dew: each query's D is di, the dQ kernel's own sum_k p * dp, not the rounded output's
+        # rowsum(o * do).
+        sinks_exp = -jnp.exp(sinks[..., None].astype(jnp.float32) - logsumexp.astype(jnp.float32))
+        dsinks = jnp.sum(sinks_exp * di, axis=-1).astype(sinks.dtype)
     return None, None, None, dq, dk, dv, None, dsinks
 
 
