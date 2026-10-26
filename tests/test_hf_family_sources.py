@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict
 from interop_support import clearing_selections, token_draw, torch_logits
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 
 from dew.interop import Pretrained
 from tools.torch_precision import float64
@@ -125,7 +125,7 @@ def test_a_yarn_record_extends_every_family_whose_source_builds_it(name, tmp_pat
 
     # The twin runs inside `float64`, which widens the casts to float32 its code makes (a norm's,
     # a recurrence's), so its logits are float64's.
-    assert_as_exact(lambda ids: np.asarray(forward(loaded.variables, jnp.asarray(ids)), np.float64),
+    assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, jnp.asarray(ids)), np.float64)),
                     torch_logits(reference), draw, f"{name} YaRN logits", seeds=YARN_SEEDS[name],
                     truth_fn=torch_logits(wide, float64))
 
@@ -170,6 +170,7 @@ def test_the_pad_row_takes_the_gradient_its_source_gives_it(name, tmp_path):
             return jnp.sum(looked_up * cotangent)
         return flatten_dict(jax.grad(loss)(variables["params"]))[path]
 
+    @as_given
     def ours(ids, cotangent):
         return {"token table": np.asarray(gradient(loaded.variables, ids, cotangent), np.float64)}
 
@@ -181,7 +182,7 @@ def test_the_pad_row_takes_the_gradient_its_source_gives_it(name, tmp_path):
                 rows = torch.nn.Embedding.forward(module, torch.from_numpy(ids).long())
                 (rows * torch.from_numpy(cotangent).to(rows.dtype)).sum().backward()
                 return {"token table": module.weight.grad.double().numpy()}
-        return run
+        return as_given(run)
 
     ids, cotangent = draw(0)
     pad_row = ours(ids, cotangent)["token table"][PAD]
@@ -221,7 +222,7 @@ def test_each_layer_kind_rotates_by_its_own_record(name, tmp_path):
 
     draw = clearing_selections(loaded, token_draw(0x15940, config["vocab_size"], (ROWS, LENGTH)), name)
 
-    assert_as_exact(lambda ids: np.asarray(forward(loaded.variables, jnp.asarray(ids)), np.float64),
+    assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, jnp.asarray(ids)), np.float64)),
                     torch_logits(reference), draw, f"{name} per-kind ramp logits",
                     seeds=KIND_RAMP_SEEDS[name], truth_fn=torch_logits(wide, float64))
 

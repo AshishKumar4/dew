@@ -2,9 +2,6 @@
 from operands widened exactly, for a truth no float64 clone of the program gives (an initializer's
 draws, whose float32 bits a float64 run would draw otherwise)."""
 
-import collections
-from collections.abc import Callable
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -34,9 +31,9 @@ def float64_replay(fn):
     `truth_fn` where a float64 run of `fn` would be another program (a float64 draw reads 64-bit
     random bits). It traces `fn` as the float32 program, x64 off, whatever the caller's mode and
     however widened its arguments arrive (check 1 hands a truth widened inputs under x64), and
-    rounds each argument to its traced dtype before widening it, as the program would read it. It traces
-    on the host and compiles its replay itself, once a traced program (`_replay_program`), so the gate
-    runs it as given."""
+    rounds each argument to its traced dtype before widening it, as the program would read it. It runs
+    eagerly, each operation its own float64 dispatch, so its bits are each operation's own (a
+    compiled replay's fusions would move them by ulps), and the gate runs it as given."""
     def run(*arguments):
         with jax.enable_x64(new_val=False):
             graph, shapes = jax.make_jaxpr(fn, return_shape=True)(*arguments)
@@ -44,27 +41,9 @@ def float64_replay(fn):
                   else np.asarray(value).astype(aval.dtype)
                   for value, aval in zip(jax.tree.leaves(arguments), graph.in_avals, strict=True)]
         with jax.enable_x64(new_val=True):
-            outputs = _replay_program(graph)(list(graph.consts), native)
+            outputs = _replayed(graph.jaxpr, graph.consts, native)
         return jax.tree.unflatten(jax.tree.structure(shapes), outputs)
     return as_given(run)
-
-
-_REPLAYS: collections.OrderedDict[str, Callable] = collections.OrderedDict()
-"""The compiled replays of the programs last replayed (`_replay_program`), by program text."""
-
-
-def _replay_program(graph):
-    """`_replayed` of `graph`'s program as one jitted function of its constants and arguments, cached by
-    the program's text (its equations, literals and shapes; its constants' values are arguments), so a
-    traced program compiles its float64 replay once."""
-    key = str(graph.jaxpr)
-    if key not in _REPLAYS:
-        program = graph.jaxpr
-        _REPLAYS[key] = jax.jit(lambda consts, arguments: _replayed(program, consts, arguments))
-        while len(_REPLAYS) > 32:
-            _REPLAYS.popitem(last=False)
-    _REPLAYS.move_to_end(key)
-    return _REPLAYS[key]
 
 
 def _widened(value):

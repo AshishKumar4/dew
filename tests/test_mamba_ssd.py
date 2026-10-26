@@ -15,6 +15,7 @@ import numpy as np
 import pytest
 from reference_error import (
     PRECISION,
+    as_given,
     assert_as_exact,
     declared_seeds,
     indexed_recording,
@@ -183,6 +184,7 @@ def test_a_mamba2_layer_on_the_port_matches_it_on_xla(dtype):
 
     wide = jax.jit(forward(layer.clone(dtype=jnp.float64)))
 
+    @as_given
     def truth(params, x, cotangent):
         with jax.enable_x64(new_val=True), row_names_port(port=False):
             return wide(*widened((params, x, cotangent)))

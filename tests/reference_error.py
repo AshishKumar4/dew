@@ -1546,9 +1546,13 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
 
     reference.recorded = True
 
+    # The truth recomputed, compiled as the gate compiles a truth; its roundings are counted on its trace.
+    live = _truth_program(truth_fn)
+
+    @as_given
     def truth(index, inputs):
         index = int(index)
-        computed = truth_fn(inputs)
+        computed = live(inputs)
         if not roundings:
             roundings["count"] = chain_roundings(jax.make_jaxpr(truth_fn)(inputs))
         eps = float(np.finfo(np.float64).eps)
