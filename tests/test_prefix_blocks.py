@@ -332,8 +332,8 @@ def test_a_prefix_runs_stage_keeps_the_blocks_a_record_carries(prefix):
         # block dropped (own: 3 of the first document's 5 and both of the second's; a prefix of 3: 3
         # and none; the prompts: 3 and both).
         laid = coordinates(segments=delivered["text_segment_ids"], max_segments=ROW, right_padded=True, xp=np)
-        scored = batch_text({TEXT_KEY: delivered["text"], "text_coordinates": laid,
-                             "text_block_groups": delivered["text_block_groups"]})
+        scored = {TEXT_KEY: delivered["text"], "text_coordinates": laid,
+                  "text_block_groups": delivered["text_block_groups"]}
         np.testing.assert_array_equal(objective.scored_tokens(scored), [5, 3] if prefix == PREFIX else [5, 5])
     named = Blocks(prefix=PREFIX).map({**records[0], "text_positions": POSITIONS[1]})
     np.testing.assert_array_equal(named["text_block_groups"], BLOCKS[1])
