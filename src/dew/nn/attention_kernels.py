@@ -418,8 +418,9 @@ TEMPLATE_SUPPORTS = (
 bf16 and fp16 on the queries and keys alike, no arbitrary mask and no bias, no sharded sequence axis, and the
 call's default arithmetic. It takes every other call form: causality, windows, documents, key lengths and
 starts, block groups, sinks, a softcap, and probability dropout off a GPU (`attention_route.drops`). The
-target's measured row prefers it for block calls (`attention_blocks`, `_attention_preferred`); elsewhere it
-runs where a call names it (`implementation='template'`, or `generation.chosen(attention='template')`)."""
+target's measured row would prefer it for block calls (`attention_blocks`, `_attention_preferred`; no target
+states it); it runs where a call names it (`implementation='template'`, or
+`generation.chosen(attention='template')`)."""
 
 
 def _attention_preferred(case: AttentionCase) -> str:
@@ -430,8 +431,8 @@ def _attention_preferred(case: AttentionCase) -> str:
     window, mask, bias, documents, key lengths or key starts (`_narrow`): by default tokamax's Triton
     kernel, measured faster than cuDNN there on an L4 and an RTX 4080; the A10's, A100's and H100's rows
     name flash, measured faster than both (`generation.TARGETS`). A call with block groups takes the
-    target's measured row for them (`attention_blocks`: the template on sm80, faster and smaller than
-    xla's mask at every length measured), else the generic path, over the mask its spans mean (ledger
+    target's measured row for them (`attention_blocks`, which no target states while main's defaults
+    hold: the template runs by name), else the generic path, over the mask its spans mean (ledger
     1537); a call whose spans only key validity or counted places narrow takes the generic path too, no
     row measured for it."""
     backend = generation.backend()
@@ -466,8 +467,8 @@ ATTENTION = Op[AttentionCase]('attention', (
 ), _attention_preferred, _hosted)
 """Attention's selector: the target's preference (`_attention_preferred`), then flash, triton,
 cuDNN, splash, xla and the reference path, the first that takes the call. The template comes last,
-after the reference path, which takes every call, so it runs where a target's row prefers it (sm80's
-block calls) or a call names it."""
+after the reference path, which takes every call, so it runs where a target's row prefers it (none while
+main's defaults hold) or a call names it."""
 
 
 def _decode_preferred(case: AttentionCase) -> str:

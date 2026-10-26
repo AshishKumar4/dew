@@ -426,8 +426,8 @@ def test_on_an_h100_the_routes_backward_is_the_mosaic_template(case):
 def test_a_gpu_prefers_the_template_for_a_call_with_block_groups(kind):
     """A causal call with block or image groups, or key validity: flash and tokamax's Triton kernel refuse
     it by their inherent limits, and cuDNN takes it only as its mask, by measurement. 'auto' resolves a
-    call with groups to the template exactly where the target's measured row names it (`attention_blocks`:
-    sm80's, where the template was faster and smaller than xla's mask at every length), and a call of key
+    call with groups to the template exactly where the target's measured row names it (`attention_blocks`,
+    which no target states while main's defaults hold: the template runs by name), and a call of key
     validity alone, which no row measures, to the generic path on every target. Without causality the
     groups add no key, so the call is an ordinary one, where validity still hides its keys."""
     query = jnp.zeros((ROWS, QUERIES, HEADS, WIDTH), jnp.bfloat16)
@@ -452,8 +452,7 @@ def test_a_gpu_prefers_the_template_for_a_call_with_block_groups(kind):
                                                     image_groups=images, key_valid=valid)
             measured = generation.TARGETS[target].kernels.get("attention_blocks") == "template"
             assert (auto == "template") == (measured and kind != "key_valid"), (target, auto)
-    assert generation.TARGETS["sm80"].kernels["attention_blocks"] == "template"
-    assert "attention_blocks" not in generation.TARGETS["sm90"].kernels
+    assert all("attention_blocks" not in target.kernels for target in generation.TARGETS.values())
 
 
 def test_the_route_takes_score_hooks_and_the_initial_state_and_refuses_an_output_hook():
