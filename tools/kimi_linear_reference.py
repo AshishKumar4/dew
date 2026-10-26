@@ -58,7 +58,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from kimi_k3_reference import LEARNING_RATE, fixture_batch, greedy, record_orders, scatter, sgd_step
-from reference_source import hub_modules
+from reference_source import config_lookups, hub_modules, record_padding
 from safetensors.torch import save_file
 
 REPO = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
@@ -139,6 +139,29 @@ def unbiased_gate(released):
     return forward
 
 
+def remote_modules():
+    """The pinned configuration and modeling modules as the release writes them, transformers'
+    `auto_docstring` the identity while they import (the first of the changes above)."""
+    import transformers.utils
+
+    documented = transformers.utils.auto_docstring
+    transformers.utils.auto_docstring = lambda obj=None, **kwargs: obj if obj is not None else (lambda inner: inner)
+    try:
+        return hub_modules("kimi_linear_remote", REPO, REVISION, REMOTE)
+    finally:
+        transformers.utils.auto_docstring = documented
+
+
+def record_released_padding() -> None:
+    """padding.json for kimi-linear-tiny (`reference_source.record_padding`): the rows the release's own
+    token lookup leaves untrained under the fixture's config with its pad id stated, left out and
+    null. It builds the model and runs no kernel, so it needs no CUDA device."""
+    configuration, modeling = remote_modules()
+    record_padding(*config_lookups(lambda fields: configuration.KimiLinearConfig(**fields),
+                                   modeling.KimiLinearForCausalLM),
+                   json.loads((DESTINATION / "config.json").read_text()), DESTINATION)
+
+
 def released_modules():
     """The pinned configuration and modeling modules, with fla's kernels held
     to IEEE fp32, the gate weighing by unshifted scores and the routed
@@ -150,14 +173,7 @@ def released_modules():
     os.environ["TRITON_CACHE_DIR"] = str(CACHE / "triton-ieee")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    import transformers.utils
-
-    documented = transformers.utils.auto_docstring
-    transformers.utils.auto_docstring = lambda obj=None, **kwargs: obj if obj is not None else (lambda inner: inner)
-    try:
-        configuration, modeling = hub_modules("kimi_linear_remote", REPO, REVISION, REMOTE)
-    finally:
-        transformers.utils.auto_docstring = documented
+    configuration, modeling = remote_modules()
     from fla.ops.kda import wy_fast
 
     assert ieee_only(wy_fast), "fla's recompute_w_u no longer autotunes its dot precision"
@@ -219,7 +235,9 @@ def orders(drawn: Path) -> None:
 if __name__ == "__main__":
     import sys
 
-    if sys.argv[1:2] == ["orders"]:
+    if sys.argv[1:] == ["padding"]:
+        record_released_padding()
+    elif sys.argv[1:2] == ["orders"]:
         orders(Path(sys.argv[2]))
     else:
         main()
