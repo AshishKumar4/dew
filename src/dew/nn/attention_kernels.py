@@ -24,7 +24,7 @@ from .kernels.generation import (
     measured_kernel,
 )
 from .kernels.selection import Kernel, Op, Requirement
-from .kernels.templates import attention_route
+from .kernels.templates import attention_mosaic_program, attention_route
 from .kernels.templates.attention_triton import DTYPES as TEMPLATE_DTYPES
 
 CUDNN_DTYPES = (jnp.bfloat16, jnp.float16)
@@ -428,24 +428,44 @@ target's measured row prefers it for block calls (`attention_blocks`, `_attentio
 runs where a call names it (`implementation='template'`, or `generation.chosen(attention='template')`)."""
 
 
+OLD_ROUTES: dict[str, tuple[str, str]] = {
+    'wgmma': ('flash', "FlashAttention-3 measured faster than the Mosaic template on an H100 (llama-d128 "
+                       "bf16, 2 x 4096, 32 query heads over 8 key heads, CUPTI on an exclusive node): "
+                       "forward 0.588 against 0.761 ms causal and 1.094 against 1.296 full, training forward "
+                       "and backward 2.53 against 11.45 causal and 4.49 against 16.48 full (receipts "
+                       "DERIVED-benchx-h100, BWDSTAGES-h100)"),
+}
+"""Attention's declared cells (bible §4, owner 10-25): for each instruction family whose Mosaic template has a
+routed mainloop (`attention_mosaic_program.BUNDLES`), the old route that keeps the calls it takes there, its
+receipts showing it measured faster than the template on the family's attention forward and training, with
+the receipt. Every other call of such a family takes the template; a family without a routed Mosaic mainloop
+(mma.sync's today) keeps its target row's route, no cell. Nothing is ranked at runtime: the list shrinks as
+the template wins."""
+
+
 def _attention_preferred(case: AttentionCase) -> str:
-    """The kernel the target measured fastest for `case`: splash on a TPU and xla on a CPU, where its
-    calls take the reference path (`_xla_kernel_on_cpu`); on a GPU
-    xla for a query no fused kernel takes the dtype of, else its row's ('attention', cuDNN by
-    default), and the narrow heads' row's ('attention_narrow') for heads at most 64 wide with no
-    window, mask, bias, documents, key lengths or key starts (`_narrow`): by default tokamax's Triton
-    kernel, measured faster than cuDNN there on an L4 and an RTX 4080; the A10's, A100's and H100's rows
-    name flash, measured faster than both (`generation.TARGETS`). A call with block groups takes the
-    target's measured row for them (`attention_blocks`: the template on sm80, faster and smaller than
-    xla's mask at every length measured), else the generic path, over the mask its spans mean (ledger
-    1537); a call whose spans only key validity or counted places narrow takes the generic path too, no
-    row measured for it."""
+    """The kernel `case` runs: splash on a TPU and xla on a CPU, where its calls take the reference path
+    (`_xla_kernel_on_cpu`); on a GPU xla for a query no fused kernel takes the dtype of; on a family whose
+    Mosaic template has a routed mainloop, its declared old route where that takes the call
+    (`OLD_ROUTES`), else the template, which hands a call it does not take to the next kernel by legality;
+    elsewhere its row's ('attention', cuDNN by default), and the narrow heads' row's ('attention_narrow')
+    for heads at most 64 wide with no window, mask, bias, documents, key lengths or key starts
+    (`_narrow`): by default tokamax's Triton kernel, measured faster than cuDNN there on an L4 and an RTX
+    4080; the A10's and A100's rows name flash, measured faster than both (`generation.TARGETS`). A call
+    with block groups takes the target's measured row for them (`attention_blocks`: the template on sm80,
+    faster and smaller than xla's mask at every length measured), else the generic path, over the mask its
+    spans mean (ledger 1537); a call whose spans only key validity or counted places narrow takes the
+    generic path too, no row measured for it."""
     backend = generation.backend()
     if backend != 'gpu':
         return 'tpu' if backend == 'tpu' else 'xla'
     if case.dtype not in CUDNN_DTYPES:
         # No fused GPU kernel takes another dtype, so no measurement prefers one.
         return 'xla'
+    family = generation.family(device_generation())
+    if family in attention_mosaic_program.BUNDLES:
+        old = OLD_ROUTES.get(family)
+        return old[0] if old is not None and not ATTENTION.kernel(old[0]).failed(case) else 'template'
     if case.blocks:
         return measured_kernel('attention_blocks', 'xla')
     if _narrow(case):
@@ -470,10 +490,11 @@ ATTENTION = Op[AttentionCase]('attention', (
     Kernel[AttentionCase]('reference', (), generic=True),
     Kernel[AttentionCase]('template', TEMPLATE_SUPPORTS),
 ), _attention_preferred, _hosted)
-"""Attention's selector: the target's preference (`_attention_preferred`), then flash, triton,
-cuDNN, splash, xla and the reference path, the first that takes the call. The template comes last,
-after the reference path, which takes every call, so it runs where a target's row prefers it (sm80's
-block calls) or a call names it."""
+"""Attention's selector: the call's kernel (`_attention_preferred`: the template, or a declared old route on
+a family with a routed Mosaic mainloop, else the target's row), then flash, triton, cuDNN, splash, xla and
+the reference path, the first that takes the call. The template comes last, after the reference path,
+which takes every call, so it runs where the preference names it (a templated family's calls, sm80's block
+calls) or a call names it."""
 
 
 def _decode_preferred(case: AttentionCase) -> str:

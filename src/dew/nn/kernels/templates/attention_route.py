@@ -1,13 +1,12 @@
 """The attention template as a production route (`dew.nn.attention`'s `implementation='template'`): `attend`,
 the template's forward and backward under one `jax.custom_vjp`, on the mainloops the process's calls run on.
 
-On a GPU the process places calls on, of sm80 or later (`generation.bf16_dot_runs`), the forward runs on the
-Triton mainloop (`attention_triton`) where it takes the call, else on Mosaic GPU's where that mainloop runs
-it on the device (`attention_mosaic.forward_takes`: a call's runs, which the frozen Triton mainloop does not
-walk, `attention_triton.refused`); the backward runs on Mosaic GPU's where it runs the call
-(`attention_mosaic.backward_takes`: its family has a bundle there, the call is one it takes and a config
-fits), else on the Triton mainloop. Everywhere else, or where neither takes the call, both run the
-plain-JAX mainloop (`attention_portable`). Every mainloop's training forward gives the same residuals, so
+On a GPU the process places calls on, of sm80 or later (`generation.bf16_dot_runs`), the forward and the
+backward run on the Mosaic template, Mosaic GPU's mainloop, where it runs the call on the device
+(`attention_mosaic.forward_takes`, `attention_mosaic.backward_takes`: its family has a bundle there, the call
+is one it takes and a config fits), else by legality on the frozen Triton mainloop (`attention_triton`, which
+walks no call's runs, `attention_triton.refused`). Everywhere else, or where neither takes the call, both run
+the plain-JAX mainloop (`attention_portable`). Every mainloop's training forward gives the same residuals, so
 the backward runs wherever it is fastest. The route takes score hooks and the initial state. The caller
 applies an output hook past the kernel, because the template's backward takes the output before it
 (`templates/attention.py`'s `gradients`).
@@ -96,13 +95,13 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
 
 def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
              scale: float | None, *, residuals: bool):
-    """The forward on the first mainloop that takes the call here: Triton's, Mosaic GPU's, the plain-JAX
-    one's."""
-    if _on_gpu() and attention_triton.refused(spans) is None:
-        return attention_triton.forward(query, key, value, spans, hooks, scale=scale, residuals=residuals)
+    """The forward on the first mainloop that takes the call here: Mosaic GPU's (the template), Triton's,
+    the plain-JAX one's."""
     if _on_gpu() and attention_mosaic.forward_takes(query, key, value, spans, hooks, scale=scale,
                                                     residuals=residuals):
         return attention_mosaic.forward(query, key, value, spans, hooks, scale=scale, residuals=residuals)
+    if _on_gpu() and attention_triton.refused(spans) is None:
+        return attention_triton.forward(query, key, value, spans, hooks, scale=scale, residuals=residuals)
     return attention_portable.attend(query, key, value, spans, hooks, block_q=PLAIN_TILE, block_k=PLAIN_TILE,
                                      pad=PLAIN_TILE, scale=scale, residuals=residuals)
 
