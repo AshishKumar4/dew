@@ -63,6 +63,7 @@ rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
 import dataclasses
+import functools
 import hashlib
 import math
 
@@ -1215,14 +1216,24 @@ MOST_SEEDS = 512
 takes larger inputs or fewer shared factors, not more seeds."""
 
 
-def recorded_pilots(reference_fn, count: int):
-    """`reference_fn`, a recorded reference (one `.recorded`), marked as holding `count` pilot draws from
-    SIZING_FROM on, disjoint from every verdict's seeds and recorded with Dew's arm and the truth from
-    the same inputs: the draws a paired sizing of it takes (`seeds_for`)."""
+def recorded_pilots(reference_fn, draw, count: int):
+    """A view of `reference_fn`, a recorded reference (one `.recorded`), that holds `count` pilot draws
+    from SIZING_FROM on, disjoint from every verdict's seeds and recorded with Dew's arm and the truth
+    from the same inputs: the draws a paired sizing of it takes (`seeds_for`). The view is the site's
+    own; `reference_fn` is left as it is. Every pilot is read now (`draw`'s inputs at each), so a
+    recording that does not hold them all is refused here, not at the doubling that reaches one."""
     if not getattr(reference_fn, "recorded", False):
         raise ValueError("pilots belong to a recorded reference; a live one draws its own from SIZING_FROM")
-    reference_fn.pilots = range(SIZING_FROM, SIZING_FROM + count)
-    return reference_fn
+    if count < 1:
+        raise ValueError(f"a recording of {count} pilots")
+    for seed in range(SIZING_FROM, SIZING_FROM + count):
+        reference_fn(*draw(seed))
+
+    @functools.wraps(reference_fn)
+    def view(*inputs):
+        return reference_fn(*inputs)
+    view.recorded, view.pilots = True, range(SIZING_FROM, SIZING_FROM + count)
+    return view
 
 
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = MOST_SEEDS,
@@ -1255,7 +1266,10 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
             raise ValueError(f"{label}: a recorded reference holds its recorded seeds alone, never a paired "
                              f"sizing's from SIZING_FROM; its site keeps its recorded count")
         most = min(most, len(pilots))
-    count, drawn = max(start, FEWEST_SEEDS), None
+    count, drawn, wide = max(start, FEWEST_SEEDS), None, []
+    if count > most:
+        raise AssertionError(f"{label}: sizing starts at {count} seeds, past the {most} it may take; "
+                             f"give the site more pilots or start lower")
     first = 0 if dew_fn is None else SIZING_FROM
     while count <= most:
         held = 0 if drawn is None else len(drawn.theirs)
