@@ -368,13 +368,13 @@ Two measures decide whether a mainloop lands and whether it replaces a route: th
 
 ## 8. Determinism, D and the backward
 
-- **The planned attention backward is the fused, ticket-ordered one:** 5 products, deterministic, under its proof and GPU gate (P5). Split programs (7 products: dK/dV and dQ) are the deterministic fallback where it loses, in one launch or two, by measurement.
+- **The attention backward takes FlashAttention-3's structure:** 5 products, dQ summed across key tiles by atomic adds where that is faster (FA3's TMA reduce-add), the default. Deterministic mode, one flag away, sums dQ in a fixed order: the fused, ticket-ordered launch under its proof and GPU gate (P5), or split programs (7 products: dK/dV and dQ) where those are faster, in one launch or two.
 - **The default is the fastest form that passes both checks, atomic where that is faster** (owner, decided before and confirmed 2026-10-21). Deterministic mode is one flag away and gets the same accuracy and speed gates. The fused ticket form, once proven, makes deterministic mode cost what FA's 5 products cost. The scoreboard measures both modes.
 - **D** is chosen by measurement among passing forms:
   - (a) the anchored pre-pass;
   - (b) the forward's off-peak accumulator;
   - (b′) a masked-column P·V plus the peak row kept in fp32, a row gather instead of a product.
-- **Every reduction in §3** (hook parameters, dbias, norm weight, split-K, split-KV) takes the fastest merge that passes the gate by default, atomic where that is faster; deterministic mode takes a fixed-order merge.
+- **Every reduction in §3** (hook parameters, dbias, norm weight, split-K, split-KV) takes the fastest merge that passes both checks by default, atomic where faster; deterministic mode takes a fixed-order merge.
 - **The FP8 gate contract** is the accuracy gate's to define before any FP8 code: which reference, and what error budget for scaled products.
 
 ## 9. One owner per math, and the deletions
@@ -561,7 +561,7 @@ Later decisions (2026-10-22 to 2026-10-25), which §0 states as the design; wher
 | 40 | initial state's gradients | algebra | `Partial`'s VJP | |
 | 41 | accurate D | algebra | `delta` ∈ {(a), (b), (b′)} | |
 | 42 | dV form by dtype (FA form for bf16, the reference's order for fp16/fp32) | algebra | a rounding point | |
-| 43 | atomic default where faster / deterministic flag | mainloop | atomic dQ by default where faster; fused ticket or split under the flag | |
+| 43 | atomic default / deterministic option | mainloop | atomic dQ by default; fused ticket or split under the deterministic flag | |
 | 44 | GQA reductions | mainloop | an in-program loop over the group (fused) or an XLA sum (split) | |
 
 #### FP8

@@ -25,8 +25,8 @@ nothing (spans, a score hook) guards its maxima and denominators against an empt
 import dataclasses
 import functools
 import math
-from collections.abc import Callable
-from typing import NamedTuple
+from collections.abc import Callable, Iterator
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -745,11 +745,14 @@ def rescale(acc: jax.Array, alpha: jax.Array) -> jax.Array:
 class Argmax(NamedTuple):
     """The keys' running maximum logit `peak` `[bq]` (the initial state's apart) and `key`, the first
     key that holds it `[bq]` int32: the backward's anchor key (`off_anchor`), a residual of the forward. Under
-    dropout, `multiplier` `[bq]` is that key's draw, which the anchor's own weight takes (`joined`)."""
+    dropout, `multiplier` `[bq]` is that key's draw, which the anchor's own weight takes (`joined`). Where
+    the mainloop keeps the key's value row rather than gather it (`KeptRows`), `row` holds it (`[bq, Dv]`, or
+    the blocks of it the mainloop's accumulators hold), picked from the tile that moved the anchor."""
 
     peak: jax.Array
     key: jax.Array
     multiplier: jax.Array | None = None
+    row: Any = None
 
 
 def no_argmax(rows: int, dropping: bool = False) -> Argmax:
@@ -768,29 +771,35 @@ def started(spec: Forward, initial: tuple[jax.Array, jax.Array, jax.Array] | Non
     return state if live is None else headroomed(state, live)
 
 
+Parts = tuple[tuple[jax.Array, jax.Array | None], ...]
+"""A product's parts as a mainloop issues them (`cotangent_parts`, `weights_parts`): each a narrowed
+operand with the power of two its product takes back (None: none)."""
+
+
 class Keys(NamedTuple):
     """A key tile as a mainloop gives it the algebra: its coordinates and (modified) logits `[bq, bk]`,
     `load()` its values `[bk, Dv]`, which a step calls after the softmax (where jax's mha loads them), and on
     the guarded walk their largest magnitude a key (`magnitudes`, or `largest()` where the mainloop holds the
     values where it cannot read them, a Mosaic slot's shared memory), the
     mainloop's product `dot(a, b)`, `a @ b` in fp32, where the mainloop holds the running sums of the
-    weighted values itself (an MMA's accumulator), `accumulate(scale, p, value)`, which takes them by
-    `scale` and adds the narrowed weights' product with the values in place (the plain walk's step), and the
-    products the logits are a factor of, where they are (`logits_of`), whose extreme the tile's maximum
-    takes (`peak`)."""
+    weighted values itself (an MMA's accumulator), `accumulate(scale, parts, value, row)`, which takes them
+    by `scale(acc, row)` and adds the weights' `parts`' products with the values in place
+    (`summed_products`), `row` the old anchor's value row the training step's split sums join (`Argmax.row`,
+    None on the plain step), and the products the logits are a factor of, where they are (`logits_of`), whose
+    extreme the tile's maximum takes (`peak`)."""
 
     coords: Coords
     logits: jax.Array
     load: Callable[[], jax.Array]
     dot: Callable[[jax.Array, jax.Array], jax.Array]
-    accumulate: Callable[[Callable[[jax.Array], jax.Array], jax.Array, jax.Array], None] | None = None
+    accumulate: Callable[[Callable, Parts, jax.Array, Any], None] | None = None
     products: jax.Array | None = None
     largest: Callable[[], jax.Array] | None = None
 
 
 Carry = tuple[Partial, Argmax, jax.Array, jax.Array]
 """A training walk's carry: its state, whose values are `B`, every key's but the anchor's
-(`split_accumulate`), its anchor key, the anchor's own weight and the other keys' weights' sum."""
+(`training_step`), its anchor key, the anchor's own weight and the other keys' weights' sum."""
 
 
 def drawn(coords: Coords, queries: jax.Array, keys: jax.Array) -> jax.Array | None:
@@ -832,37 +841,73 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     mainloop's to read, passed through)."""
     m, factor, p, value, held = _softmax(spec, state, keys)
     if held is None and keys.accumulate is not None:
-        keys.accumulate(lambda acc: carry_factor(acc, factor, None), narrow(p, value.dtype), value)
+        keys.accumulate(lambda acc, _: carry_factor(acc, factor, None), ((narrow(p, value.dtype), None),),
+                        value, None)
         return Partial(state.acc, m, denominator_after(state.total, factor, p))
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
     times = functools.partial(_times, keys.dot, value, multiplier=multiplier)
     return stepped(state, m, factor, p, times(p), held, times)
 
 
-def training_step(spec: Forward, carry: Carry, keys: Keys, rows: Callable[[jax.Array], jax.Array]) -> Carry:
-    """A training walk's carry after a tile `keys`: the anchor key and the split sums the backward reads
-    (`split_accumulate`), `rows(key)` each row's value row at its key `[bq]`, the old anchor's where it
-    moved."""
+class KeptRows(NamedTuple):
+    """A training walk that keeps the anchor's value row in its carry (`Argmax.row`, which its start
+    holds) rather than gather it by key: `pick(onehot, value)`, a tile's value rows at a one-hot
+    `[bq, bk]` (each row's anchor key), in the row's structure (the blocks its accumulators hold), its
+    product with the values."""
+
+    pick: Callable[[jax.Array, jax.Array], Any]
+
+
+def training_step(spec: Forward, carry: Carry, keys: Keys,
+                  rows: Callable[[jax.Array], jax.Array] | KeptRows) -> Carry:
+    """A training walk's carry after a tile `keys`: its state, whose sums are the weighted values kept apart
+    from the anchor key's (`B`, with the initial state's), the anchor key, its own weight, and the other
+    keys' weights' sum (keys alone). Where the anchor moved to this tile, the old anchor's term (its weight
+    times its value row, `rows(key)` each row's at its key `[bq]`, or the one the walk keeps, `Argmax.row`,
+    where `rows` is `KeptRows`) joins `B` and the sum before the rescale (`split_taken`,
+    `split_rows`), and the new anchor's weight is the tile's; the tile's other keys add their product and
+    their narrowed weights. So neither is summed with a key's weight cancelled out of it. On the guarded walk
+    the tile's product, sum and own weight take the row's shift past its weights' (`beyond_weights`). Where
+    the mainloop holds the sums (`Keys.accumulate`, the plain walk's), it takes them in place, and the
+    state's `acc` is passed through."""
     state, arg, own, others_total = carry
     m, factor, p, value, held = _softmax(spec, state, keys)
     anchor = argmax(arg, keys.logits, keys.coords.k_pos)
     moved = anchor.peak > arg.peak
-    at_anchor = keys.coords.k_pos == anchor.key[:, None]
+    at_anchor = keys.coords.k_pos == expand(anchor.key, keys.logits)
     others, own_tile = anchor_split(narrow(p, value.dtype), at_anchor)
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
-    if multiplier is None:
-        product = keys.dot(others, value)
-    else:
+    parts = ((others, None),)
+    if multiplier is not None:
         # The other keys' dropped weights; the anchor's own weight stays undropped (it is `own`), and the
         # anchor takes its draw's multiplier here, which the forward's output and the backward read.
-        product = _times(keys.dot, value, jnp.where(at_anchor, 0.0, p), multiplier)
+        parts = weights_parts(jnp.where(at_anchor, 0.0, p) * multiplier, value.dtype)
         anchor_draw = drawn(keys.coords, keys.coords.q_pos, anchor.key[:, None])
         anchor = anchor._replace(multiplier=None if anchor_draw is None else anchor_draw[:, 0])
-    acc, own, others_total = split_accumulate(state.acc, own, others_total, factor, moved, rows(arg.key),
-                                              product, others, own_tile, held, old_multiplier=arg.multiplier)
-    times = functools.partial(_times, keys.dot, value, multiplier=multiplier)
-    state = stepped(state, m, factor, p, jnp.zeros_like(acc), held, times)
-    return state._replace(acc=acc), anchor, own, others_total
+    kept = isinstance(rows, KeptRows)
+    if kept != (arg.row is not None):
+        raise ValueError("a training walk keeps the anchor's value row (`KeptRows`) exactly where its carry "
+                         "holds one (`Argmax.row`)")
+    old = arg.row if kept else rows(arg.key)
+    taken = functools.partial(split_taken, own=own, alpha=factor, moved=moved, held=held,
+                              old_multiplier=arg.multiplier)
+    accumulate = keys.accumulate if held is None else None
+    if accumulate is None:
+        times = functools.partial(_times, keys.dot, value, multiplier=multiplier)
+        after = stepped(state, m, factor, p, jnp.zeros_like(state.acc), held, times)
+        acc = taken(state.acc, old_value=old) + beyond_weights(summed_products(parts, value, keys.dot), held)
+    else:
+        # The tile's fp32 weights done with before its products, so they hold no registers through them.
+        after = Partial(state.acc, m, denominator_after(state.total, factor, p))
+        accumulate(lambda acc, row: taken(acc, old_value=row), parts, value, old)
+        acc = state.acc
+    own, others_total = split_rows(own, others_total, factor, moved, others, own_tile, held)
+    if isinstance(rows, KeptRows):
+        # The anchor's value row where it moved to this tile: the tile's row at its key.
+        picked = rows.pick(at_anchor.astype(value.dtype), value)
+        anchor = anchor._replace(row=jax.tree.map(
+            lambda new, kept: jnp.where(expand(moved, kept), new.astype(kept.dtype), kept), picked, arg.row))
+    return after._replace(acc=acc), anchor, own, others_total
 
 
 def plain_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys], start: Partial) -> Partial:
@@ -966,30 +1011,12 @@ def anchor_split(narrowed: jax.Array, at_anchor: jax.Array) -> tuple[jax.Array, 
             jnp.where(at_anchor, narrowed, zero).astype(jnp.float32).sum(axis=-1))
 
 
-def split_accumulate(others: jax.Array, own: jax.Array, others_total: jax.Array, alpha: jax.Array,
-                     moved: jax.Array, old_value: jax.Array, product: jax.Array, rest: jax.Array,
-                     own_tile: jax.Array, held: Room | None = None,
-                     old_multiplier: jax.Array | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """A training forward's weighted values kept apart from the anchor key's (`others`, `B`, with the
-    initial state's), the anchor's own weight, and the other keys' weights' sum (`others_total`, keys
-    alone), after a tile: where the anchor moved to this tile (`moved`), the old anchor's term (its
-    weight times its value row, `old_value`, which the mainloop gathers, and its weight) joins `B` and
-    the sum before the rescale, and the new anchor's weight is the tile's (`own_tile`); the tile's other
-    keys add their `product` and their narrowed weights `rest`. So neither is summed with a key's weight
-    cancelled out of it. On the guarded walk the tile's product, sum and own weight take the row's shift
-    past its weights' (`beyond_weights`)."""
-    taken = split_taken(others, own, alpha, moved, old_value, held, old_multiplier)
-    own, total = split_rows(own, others_total, alpha, moved, rest, own_tile, held)
-    return taken + beyond_weights(product, held), own, total
-
-
 def split_taken(others: jax.Array, own: jax.Array, alpha: jax.Array, moved: jax.Array, old_value: jax.Array,
                 held: Room | None = None, old_multiplier: jax.Array | None = None) -> jax.Array:
-    """`split_accumulate`'s split sums before the tile's product joins them: where the anchor moved, the
-    old anchor's term (its weight `own` before the tile, under dropout times its draw's multiplier
-    `old_multiplier`, times its value row `old_value`) joined, then taken
-    to the new maximum by `alpha`. A mainloop that accumulates the product in place applies this to its
-    accumulator first."""
+    """A training step's split sums before the tile's product joins them (`training_step`): where the
+    anchor moved, the old anchor's term (its weight `own` before the tile, under dropout times its draw's
+    multiplier `old_multiplier`, times its value row `old_value`) joined, then taken to the new maximum by
+    `alpha`. A mainloop that accumulates the product in place applies this to its accumulator first."""
     old = old_value.astype(jnp.float32)
     anchored = own if old_multiplier is None else own * old_multiplier
     joined = jnp.where(expand(moved, old), expand(anchored, old) * old, 0.0)
@@ -998,8 +1025,9 @@ def split_taken(others: jax.Array, own: jax.Array, alpha: jax.Array, moved: jax.
 
 def split_rows(own: jax.Array, others_total: jax.Array, alpha: jax.Array, moved: jax.Array, rest: jax.Array,
                own_tile: jax.Array, held: Room | None = None) -> tuple[jax.Array, jax.Array]:
-    """`split_accumulate`'s row sums after a tile: the anchor's own weight (the tile's where the anchor
-    moved to it), and the other keys' weights' sum, the old anchor's weight joining it where it moved."""
+    """A training step's row sums after a tile (`training_step`): the anchor's own weight (the tile's where
+    the anchor moved to it), and the other keys' weights' sum, the old anchor's weight joining it where it
+    moved."""
     total = (carry_factor(others_total + jnp.where(moved, own, 0.0), alpha, held)
              + beyond_weights(rest.astype(jnp.float32).sum(axis=-1), held))
     own_tile = beyond_weights(own_tile.astype(jnp.float32), held)
@@ -1328,7 +1356,7 @@ def off_anchor_delta(state: OffAnchor, anchor_value: jax.Array, dout: jax.Array,
 def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, total: jax.Array,
                 state_total: jax.Array, anchor_value: jax.Array, dout: jax.Array,
                 key_index: jax.Array, shift: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """`off_anchor_delta` from a training forward's split sums (`split_accumulate`), the backward's first
+    """`off_anchor_delta` from a training forward's split sums (`training_step`), the backward's first
     pass taken by the forward: `B` with the initial state's share inside it, the other keys' weights'
     sum, the anchor's own weight, the denominator `total` and the initial state's own `state_total`, all
     at the forward's maximum. D's numerator about 0 is `(B + own v_c) · dO`, about `c = v_c · dO` it is
@@ -1359,11 +1387,6 @@ def split_mass(own: jax.Array, others_total: jax.Array, total: jax.Array, shift:
     with no dQ pass)."""
     over = jnp.where(shift < 0, 1.0, inverse(power2(total, -shift)))
     return (own + others_total) * over
-
-
-Parts = tuple[tuple[jax.Array, jax.Array | None], ...]
-"""A product's parts as a mainloop issues them (`cotangent_parts`, `weights_parts`): each a narrowed
-operand with the power of two its product takes back (None: none)."""
 
 
 class DqSums(NamedTuple):
@@ -1435,13 +1458,13 @@ def _dq_rows(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, se
 
 
 def dq_terms(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array | None, *,
-             scale: float, kinds: tuple, summed: tuple, dtype, accurate: bool) -> tuple[DqSums, Parts]:
-    """`dq_step`'s row sums after a tile and dQ's parts (`cotangent_parts`) a mainloop adds to dQ, into its
-    accumulator in place where it can, for keys of `dtype`: the whole of the fast form's step, and the
-    accurate form's with `keyed_terms` where it takes no score hook."""
+             scale: float, kinds: tuple, summed: tuple) -> tuple[DqSums, jax.Array]:
+    """`dq_step`'s row sums after a tile and dQ's score cotangents pulled and scaled, whose parts
+    (`cotangent_parts`, `formed_parts`) a mainloop adds to dQ, into its accumulator in place where it can: the
+    whole of the fast form's step, and the accurate form's with `keyed_terms` where it takes no score
+    hook."""
     terms, _ = _dq_rows(sums, weights, cotangents, slopes, seen, kinds=kinds, summed=summed)
-    pulled_cotangents = pulled(cotangents, slopes, seen, kinds)[0]
-    return terms, cotangent_parts(pulled_cotangents * scale, dtype, accurate=accurate)
+    return terms, pulled(cotangents, slopes, seen, kinds)[0] * scale
 
 
 def keyed_terms(sums: DqSums, weights: jax.Array, prior: jax.Array, *, scale: float, dtype
@@ -1461,23 +1484,24 @@ def keyed_terms(sums: DqSums, weights: jax.Array, prior: jax.Array, *, scale: fl
 
 def dq_issued(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array | None, dtype,
               prior: jax.Array, *, scale: float, kinds: tuple, summed: tuple, accurate: bool
-              ) -> tuple[DqSums, Parts, tuple[jax.Array | None, Parts] | None]:
+              ) -> tuple[DqSums, jax.Array, tuple[jax.Array | None, Parts] | None]:
     """A dQ pass's row sums after a key tile and the products a mainloop issues for it, for keys of `dtype`:
     the sums with their row fields updated (the cotangents' and the weights' sums, the summed parameters'
     pullbacks and, in the accurate form, the keyed mass and exponent); dQ's parts (`cotangent_parts`), whose
     products with the keys join dQ; and in the accurate form the keyed parts (`weights_parts`), whose products
     join the keyed sums behind the row factor `(factor, parts)` the sums take first (None: none); None in the
     fast form. `dq_step` takes these products as the Triton and plain-JAX mainloops do; a mainloop that issues
-    them in place takes the same parts."""
+    them in place takes the same parts. dQ's come as its scaled cotangents, whose parts a mainloop forms
+    (`cotangent_parts`) or forms a part at a time (`formed_parts`)."""
     if not accurate or slopes is None:
         terms, parts = dq_terms(sums, weights, cotangents, slopes, seen, scale=scale, kinds=kinds,
-                                summed=summed, dtype=dtype, accurate=accurate)
+                                summed=summed)
         if not accurate:
             return terms, parts, None
         terms, keyed = keyed_terms(terms, weights, prior, scale=scale, dtype=dtype)
         return terms, parts, (None, keyed)
     terms, pulled_weights = _dq_rows(sums, weights, cotangents, slopes, seen, kinds=kinds, summed=summed)
-    parts = cotangent_parts(pulled(cotangents, slopes, seen, kinds)[0] * scale, dtype, accurate=accurate)
+    parts = pulled(cotangents, slopes, seen, kinds)[0] * scale
     # The tile's coefficients against the keys, `pulled weight · scale / prior`, joined into the running
     # mean as a softmax's sums are joined under a running maximum. Each is held at its row's power of two,
     # never formed whole where it would overflow (a hook's slope near fp32's largest): the row's largest
@@ -1514,7 +1538,7 @@ def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, see
     error at its first D), where dQ's per query is FlashAttention's."""
     terms, parts, keyed = dq_issued(sums, weights, cotangents, slopes, seen, key.dtype, prior, scale=scale,
                                     kinds=kinds, summed=summed, accurate=accurate)
-    terms = terms._replace(dq=sums.dq + summed_products(parts, key, dot))
+    terms = terms._replace(dq=sums.dq + cotangent_product(parts, key, dot, accurate=accurate))
     if keyed is None:
         return terms
     factor, keyed_parts = keyed
@@ -1769,20 +1793,33 @@ def cotangent_parts(cotangents: jax.Array, dtype, *, accurate: bool) -> Parts:
     holds fp32's range, so no part leaves it (measured on the H100: 28% over one product, where a scaled
     bf16-and-fp16 pair cost 3x). An fp16 one takes two fp16 products at power-of-two scales that keep each
     part in its range: the cotangents' largest at 2^14, and what their rounding lost likewise, 21 bits."""
+    return tuple(formed_parts(cotangents, dtype, accurate=accurate))
+
+
+def formed_parts(cotangents: jax.Array, dtype, *, accurate: bool
+                 ) -> Iterator[tuple[jax.Array, jax.Array | None]]:
+    """`cotangent_parts` a part at a time, each formed only as it is taken: a mainloop that retires each
+    part's product before taking the next (`Family.register_products`' `retired`) holds one part's registers
+    beside the cotangents, not every part's."""
     if dtype == jnp.float32:
-        return ((cotangents, None),)
+        yield cotangents, None
+        return
     if dtype == jnp.bfloat16 and not accurate:
-        return ((_bf16(cotangents), None),)
+        yield _bf16(cotangents), None
+        return
     if dtype == jnp.bfloat16:
         high = _bf16(cotangents)
+        yield high, None
         rest = cotangents - high.astype(jnp.float32)
         middle = rest.astype(jnp.bfloat16)
-        low = (rest - middle.astype(jnp.float32)).astype(jnp.bfloat16)
-        return (high, None), (middle, None), (low, None)
+        yield middle, None
+        yield (rest - middle.astype(jnp.float32)).astype(jnp.bfloat16), None
+        return
     scaled, high_exponent = _scaled(cotangents)
     high = scaled.astype(dtype)
+    yield high, high_exponent
     low, low_exponent = _fp16_scaled(scaled - high.astype(jnp.float32))
-    return (high, high_exponent), (low, low_exponent + high_exponent)
+    yield low, low_exponent + high_exponent
 
 
 def cotangent_product(cotangents: jax.Array, operand: jax.Array,

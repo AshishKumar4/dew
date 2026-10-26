@@ -644,20 +644,7 @@ class PretrainedDecoder(Pretrained):
         placing them. An adapted model whose factors are not merged keeps its
         projection paths and is not packed.
         """
-        rows = return_sequences(self.config, self.generation_config)
-        policy, logits, strategy = source_decoding(
-            self.config, self.generation_config, self.model, rows, sampling)
-        return TextGeneration(
-            self.model,
-            self.variables,
-            self.text_processor,
-            policy,
-            max_new_tokens=generation_limit(self.config, self.generation_config, "max_new_tokens"),
-            max_length=generation_limit(self.config, self.generation_config, "max_length"),
-            n=rows,
-            logits=logits,
-            strategy=strategy,
-        )
+        return _text_generation(self, sampling)
 
 
 
@@ -786,11 +773,34 @@ class PretrainedPipeline(Pretrained):
 class PretrainedFallback(Pretrained):
     """A causal LM run as transformers' PyTorch forward, lowered to JAX by torchax (tier 3).
 
-    It fine-tunes on next-token prediction, without Dew's kernels, sharding rules
-    or cached generation; to generate, use transformers' own
-    `AutoModelForCausalLM.from_pretrained(source).generate`. Train it like any
-    source, `LMObjective(fallback, seq_len)`.
+    It fine-tunes on next-token prediction, without Dew's kernels or sharding rules; train it like
+    any source, `LMObjective(fallback, seq_len)`. One whose attention runs on Dew's generates through
+    Dew's decode cache (`text_generation`, as a native decoder's, which `dew.pipeline` and the
+    server run); one on transformers' own refuses a cache (`TorchCausalLM`).
     """
+
+    def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
+        """The text generation task this source describes, as a native decoder's
+        (`PretrainedDecoder.text_generation`)."""
+        return _text_generation(self, sampling)
+
+
+def _text_generation(loaded: Pretrained, sampling: Sampling | None) -> TextGeneration:
+    """The text generation task a causal source describes (`PretrainedDecoder.text_generation`)."""
+    rows = return_sequences(loaded.config, loaded.generation_config)
+    policy, logits, strategy = source_decoding(loaded.config, loaded.generation_config, loaded.model, rows,
+                                               sampling)
+    return TextGeneration(
+        loaded.model,
+        loaded.variables,
+        loaded.text_processor,
+        policy,
+        max_new_tokens=generation_limit(loaded.config, loaded.generation_config, "max_new_tokens"),
+        max_length=generation_limit(loaded.config, loaded.generation_config, "max_length"),
+        n=rows,
+        logits=logits,
+        strategy=strategy,
+    )
 
 
 def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dtype: str = "float32",
