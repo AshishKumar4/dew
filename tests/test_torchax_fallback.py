@@ -1101,25 +1101,21 @@ LONGCAT_SEEDS = 8
 """Longcat's declared check-1 seeds, sized by `seeds_for` on armada."""
 
 
-def test_experts_transformers_loops_over_run_at_static_shapes_as_transformers_computes_them(tmp_path):
-    """Longcat Flash's experts, which transformers runs as a loop whose shapes the routing decides, run in
-    tier 3 at static shapes (`functional_experts`): its logits over drawn ids, among whose routes identity
-    experts are, hold check 1 against transformers' forward, its float64 twin the truth."""
+def _longcat(tmp_path, config: dict, **load):
+    """A tiny Longcat Flash of `config` loaded in tier 3 with `load`, its eager copy and its float64 twin,
+    and its logits' arms: `ours(tokens)` from the loaded model, `theirs(source, precision)` from a source."""
     torch.manual_seed(0)
-    model = transformers.LongcatFlashForCausalLM(transformers.LongcatFlashConfig(**LONGCAT)).eval()
+    model = transformers.LongcatFlashForCausalLM(transformers.LongcatFlashConfig(**config)).eval()
     model.save_pretrained(tmp_path)
     with pytest.warns(TransformersTierWarning):
-        loaded = Pretrained.load(tmp_path, dtype="float32")
+        loaded = Pretrained.load(tmp_path, dtype="float32", **load)
     with float64():
         wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
                                                              attn_implementation="eager").eval()
         wide.load_state_dict(model.state_dict())
-    routes = []
-    hook = model.model.layers[0].mlp.experts.register_forward_hook(
-        lambda module, inputs, output: routes.append(inputs[1].clone()))
+    reference = copy.deepcopy(model)
+    reference.set_attn_implementation("eager")
     forward = jax.jit(loaded.model.apply)
-
-    draw = token_draw(0x1496, LONGCAT["vocab_size"], (2, 12))
 
     def ours(tokens):
         return np.asarray(forward(loaded.variables, tokens), np.float64)
@@ -1130,8 +1126,18 @@ def test_experts_transformers_loops_over_run_at_static_shapes_as_transformers_co
                 return source(torch.from_numpy(tokens).long()).logits.double().numpy()
         return run
 
-    reference = copy.deepcopy(model)
-    reference.set_attn_implementation("eager")
+    return model, reference, wide, ours, theirs
+
+
+def test_experts_transformers_loops_over_run_at_static_shapes_as_transformers_computes_them(tmp_path):
+    """Longcat Flash's experts, which transformers runs as a loop whose shapes the routing decides, run in
+    tier 3 at static shapes (`functional_experts`): its logits over drawn ids, among whose routes identity
+    experts are, hold check 1 against transformers' forward, its float64 twin the truth."""
+    model, reference, wide, ours, theirs = _longcat(tmp_path, LONGCAT)
+    routes = []
+    hook = model.model.layers[0].mlp.experts.register_forward_hook(
+        lambda module, inputs, output: routes.append(inputs[1].clone()))
+    draw = token_draw(0x1496, LONGCAT["vocab_size"], (2, 12))
     theirs(model)(*draw(0))
     hook.remove()
     identity = routes[0] >= LONGCAT["n_routed_experts"]
@@ -1189,28 +1195,9 @@ IDENTITY_SEEDS = 8
 def test_identity_experts_alone_run_as_transformers_runs_them(tmp_path):
     """A Longcat Flash of identity experts alone holds no projections, and tier 3 passes each routed
     token through, weighted, as transformers does: its logits hold check 1, the float64 twin the truth."""
-    torch.manual_seed(0)
-    model = transformers.LongcatFlashForCausalLM(transformers.LongcatFlashConfig(
-        **{**LONGCAT, "n_routed_experts": 0, "zero_expert_num": 3})).eval()
-    model.save_pretrained(tmp_path)
-    with pytest.warns(TransformersTierWarning):
-        loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
-    with float64():
-        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
-                                                             attn_implementation="eager").eval()
-        wide.load_state_dict(model.state_dict())
-    forward = jax.jit(loaded.model.apply)
-
-    def theirs(source, precision=contextlib.nullcontext):
-        def run(tokens):
-            with precision(), torch.no_grad():
-                return source(torch.from_numpy(tokens).long()).logits.double().numpy()
-        return run
-
-    reference = copy.deepcopy(model)
-    reference.set_attn_implementation("eager")
-    assert_as_exact(lambda tokens: np.asarray(forward(loaded.variables, tokens), np.float64),
-                    theirs(reference), token_draw(0x1498, LONGCAT["vocab_size"], (2, 12)),
+    _, reference, wide, ours, theirs = _longcat(
+        tmp_path, {**LONGCAT, "n_routed_experts": 0, "zero_expert_num": 3}, fallback="torchax")
+    assert_as_exact(ours, theirs(reference), token_draw(0x1498, LONGCAT["vocab_size"], (2, 12)),
                     "identity-only longcat logits", seeds=IDENTITY_SEEDS, truth_fn=theirs(wide, float64))
 
 
