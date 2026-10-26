@@ -126,7 +126,9 @@ def test_examples_grouped_across_rows_train_in_one_window_and_agree_as_one_group
     their members, labelled or not, are one group of it, mapped onto its canonical options; the term
     is `group_divergence` over those members' logits, computed apart from the window."""
     backbone = tiny_backbone().clone(max_seq_len=layout.max_len)
-    objective = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=layout,
+    head = (JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
+            if layout.joint else None)
+    objective = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=layout, head=head,
                                   consistency=0.5)
     reader = decision_rows([PARAPHRASED, NEGATED], None, objective=objective.data(),
                            tokens=layout.max_len)
