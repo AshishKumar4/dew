@@ -1145,18 +1145,22 @@ def fitted[Entry](
 
 def _endless(chain: Pipeline) -> Pipeline:
     """`chain` read endlessly: a repeat before its batch where it has none and its read can end. A
-    chain of phases repeats in each phase its read can end, at the place the chain's own repeat
-    takes in it, and none in a phase that already reads on (`_reads_on`), as Grain refuses to
-    repeat an order without end; a mixture whose members all read on is read as it is."""
+    chain of phases reads each phase through the chain's own stages, and where one of them already
+    reads on (`_reads_on`), as Grain refuses to repeat an order without end, each other phase repeats
+    at the place the chain's own repeat takes, its share of the chain's stages before the batch moved
+    into it; a mixture whose members all read on is read as it is."""
     if any(isinstance(stage, Repeat) for stage in chain.stages) or _reads_on(chain):
         return chain
-    source = chain.source
-    if isinstance(source, Phases) and any(_reads_on(child) for child in source.pipelines):
-        # Each phase reads its stages then the chain's, where the repeat goes after the phase's own.
-        return with_children(chain, lambda child: child if _reads_on(child) else child.repeat())
     batching = [index for index, stage in enumerate(chain.stages)
                 if isinstance(stage, (BatchStage, TokenBudget))]
     at = batching[0] if batching else len(chain.stages)
+    source = chain.source
+    if isinstance(source, Phases):
+        read = [child._then(*chain.stages[:at]) for child in source.pipelines]
+        if any(map(_reads_on, read)):
+            each = tuple(phase if _reads_on(phase) else phase.repeat() for phase in read)
+            return dataclasses.replace(chain, source=dataclasses.replace(source, pipelines=each),
+                                       stages=chain.stages[at:])
     return dataclasses.replace(chain, stages=(*chain.stages[:at], Repeat(None), *chain.stages[at:]))
 
 
