@@ -569,53 +569,69 @@ def scale_by_adam(b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, *,
     return optax.GradientTransformation(init_fn, update_fn)
 
 
-def bf16_moments(b1: float, b2: float, eps: float, eps_root: float,
-                 nesterov: bool) -> optax.GradientTransformation:
-    """`scale_by_adam` with both moments stored in bf16.
+@dataclasses.dataclass(frozen=True)
+class _Store:
+    """How `_stored_moments` keeps Adam's moments: `zeros(params, signed)` a moment's stored zeros (the signed
+    one Adam's first); `parts(structure, moment)` its stored leaves in the gradient's order; `decoded(part,
+    signed)` one as float32; `encoded(moment, part, signed, salt)` a float32 one stored as `part` is, `salt` a
+    uint32 of the step, the leaf and the moment; `whole(structure, parts)` the moment from its leaves."""
+    zeros: Callable
+    parts: Callable
+    decoded: Callable
+    encoded: Callable
+    whole: Callable
 
-    Each update runs optax's own update one leaf at a time, on that leaf's
-    moments widened to fp32, and writes the new moments back stochastically
-    rounded (`stochastic_round_bf16`), seeded by the step count, the leaf and
-    the moment: the step is optax's, only the storage is Dew's. Leaf by leaf
-    keeps one leaf's fp32 moments live at a time; widening the whole state
-    first held all of them and raised the update's peak from 4.49 to 7.37 GB
-    on the lm-dense tree (RTX 4080). Round to nearest would lose every
-    increment of the second moment smaller than half its bf16 spacing, which
-    at b2 = 0.999 is most of them; a stochastic rounding keeps each one in
-    expectation. The state keeps optax's `ScaleByAdamState` layout, so
-    sharding and checkpoints read it as they read fp32 state.
-    """
+
+def _stored_moments(b1: float, b2: float, eps: float, eps_root: float, nesterov: bool,
+                    store: _Store) -> optax.GradientTransformation:
+    """`scale_by_adam` with both moments kept as `store` keeps them. Each update runs optax's own update one
+    leaf at a time, on that leaf's moments decoded to fp32, and stores the new ones: the step is optax's,
+    only the storage is Dew's. Leaf by leaf keeps one leaf's fp32 moments live at a time; widening a bf16
+    state whole first held all of them and raised the update's peak from 4.49 to 7.37 GB on the lm-dense
+    tree (RTX 4080). The state keeps optax's `ScaleByAdamState`, its moments in `store`'s form."""
     inner = scale_by_adam(b1=b1, b2=b2, eps=eps, eps_root=eps_root, nesterov=nesterov)
 
     def init_fn(params):
-        def zeros(leaf):
-            return jnp.zeros(leaf.shape, jnp.bfloat16)
-        return optax.ScaleByAdamState(count=jnp.zeros([], jnp.int32),
-                                      mu=jax.tree.map(zeros, params),
-                                      nu=jax.tree.map(zeros, params))
+        return optax.ScaleByAdamState(count=jnp.zeros([], jnp.int32), mu=store.zeros(params, signed=True),
+                                      nu=store.zeros(params, signed=False))
 
     def update_fn(updates, state, params=None):
         del params  # scale_by_adam reads none
         step = fmix32(jnp.asarray(state.count).astype(jnp.uint32) * jnp.uint32(0x27D4EB2F))
         leaves, structure = jax.tree.flatten(updates)
-        mus, nus = structure.flatten_up_to(state.mu), structure.flatten_up_to(state.nu)
+        mus, nus = store.parts(structure, state.mu), store.parts(structure, state.nu)
         scaled, new_mu, new_nu, count = [], [], [], state.count
         for index, (gradient, mu, nu) in enumerate(zip(leaves, mus, nus, strict=True)):
             # One array is a pytree of one leaf, so optax updates the leaf alone.
             update, one = inner.update(gradient, optax.ScaleByAdamState(
-                count=state.count, mu=mu.astype(jnp.float32), nu=nu.astype(jnp.float32)))
+                count=state.count, mu=store.decoded(mu, signed=True), nu=store.decoded(nu, signed=False)))
             if not isinstance(one, optax.ScaleByAdamState):
                 raise TypeError(f"scale_by_adam returned {type(one).__name__}")
             count = one.count
             salt = fmix32(step + jnp.uint32(2 * index + 1) * jnp.uint32(0x165667B1))
             scaled.append(update)
-            new_mu.append(stochastic_round_bf16(jnp.asarray(one.mu), salt))
-            new_nu.append(stochastic_round_bf16(jnp.asarray(one.nu),
-                                                fmix32(salt + jnp.uint32(0x9E3779B9))))
+            new_mu.append(store.encoded(jnp.asarray(one.mu), mu, signed=True, salt=salt))
+            new_nu.append(store.encoded(jnp.asarray(one.nu), nu, signed=False,
+                                        salt=fmix32(salt + jnp.uint32(0x9E3779B9))))
         return structure.unflatten(scaled), optax.ScaleByAdamState(
-            count=count, mu=structure.unflatten(new_mu), nu=structure.unflatten(new_nu))
+            count=count, mu=store.whole(structure, new_mu), nu=store.whole(structure, new_nu))
 
     return optax.GradientTransformation(init_fn, update_fn)
+
+
+def bf16_moments(b1: float, b2: float, eps: float, eps_root: float,
+                 nesterov: bool) -> optax.GradientTransformation:
+    """`scale_by_adam` with both moments stored in bf16 (`_stored_moments`), written back stochastically
+    rounded (`stochastic_round_bf16`), seeded by the step count, the leaf and the moment. Round to nearest
+    would lose every increment of the second moment smaller than half its bf16 spacing, which at b2 =
+    0.999 is most of them; a stochastic rounding keeps each one in expectation. The moments are trees of
+    the parameters' shapes, so sharding and checkpoints read them as they read fp32 state."""
+    return _stored_moments(b1, b2, eps, eps_root, nesterov, _Store(
+        zeros=lambda params, signed: jax.tree.map(lambda leaf: jnp.zeros(leaf.shape, jnp.bfloat16), params),
+        parts=lambda structure, moment: structure.flatten_up_to(moment),
+        decoded=lambda part, signed: part.astype(jnp.float32),
+        encoded=lambda moment, part, signed, salt: stochastic_round_bf16(moment, salt),
+        whole=lambda structure, parts: structure.unflatten(parts)))
 
 
 def dynamic_map(*, signed: bool) -> np.ndarray:
@@ -635,12 +651,14 @@ def dynamic_map(*, signed: bool) -> np.ndarray:
     return np.sort(np.asarray(values, np.float32))
 
 
-class QuantizedMoment(NamedTuple):
-    """A moment of an optimizer's state in 8 bits (`int8_moments`): each value's code, the index of its
-    nearest `dynamic_map` value, in the leaf's own shape, and each block's scale, the largest magnitude
-    of its `block` values along the last axis, which the codes' values are fractions of."""
-    codes: jax.Array
-    scales: jax.Array
+class QuantizedMoments(NamedTuple):
+    """A moment of an optimizer's state in 8 bits (`int8_moments`), as two trees of the parameters' own
+    paths, so each leaf is placed as its parameter is: `codes`, each value's code, the index of its nearest
+    `dynamic_map` value, in the parameter's shape (a parameter `int8_moments` keeps whole, its float32
+    moment), and `scales`, each block's largest magnitude along the last axis, which the codes' values are
+    fractions of (None where the moment is kept whole)."""
+    codes: object
+    scales: object
 
 
 QUANTIZED_SIZE = 4096
@@ -651,60 +669,37 @@ one's scales cost more than its codes save, and it stays float32."""
 def int8_moments(b1: float, b2: float, eps: float, eps_root: float, nesterov: bool,
                  block: int = 256) -> optax.GradientTransformation:
     """`scale_by_adam` with both moments stored in 8 bits, blockwise (Dettmers et al., arXiv 2110.02861, as
-    torchao's `AdamW8bit` stores them): each block of `block` values along a leaf's last axis keeps its
-    largest magnitude in float32 and each value the code of the nearest `dynamic_map` value to its
-    fraction of it, the first moment's map signed and the second's unsigned. A leaf of fewer than
-    `QUANTIZED_SIZE` values, or whose last axis `block` does not divide, keeps float32 moments.
-
-    Each update runs optax's own update one leaf at a time, on that leaf's moments dequantized to fp32,
-    and quantizes the new moments to the nearest code (`quantized`): the step is optax's, only the storage
-    is 8-bit. Leaf by leaf keeps one leaf's fp32 moments live at a time, as `bf16_moments` does. A
-    moment's bytes fall from 4 a value to 1 and its block's share of a float32 scale, 1/64 a value at the
-    default block."""
-    inner = scale_by_adam(b1=b1, b2=b2, eps=eps, eps_root=eps_root, nesterov=nesterov)
-    maps = {True: jnp.asarray(dynamic_map(signed=True)), False: jnp.asarray(dynamic_map(signed=False))}
+    torchao's `AdamW8bit` stores them, through `_stored_moments`): each block of `block` values along a
+    leaf's last axis keeps its largest magnitude in float32 and each value the code of the nearest
+    `dynamic_map` value to its fraction of it (`quantized`), the first moment's map signed and the
+    second's unsigned. A leaf of fewer than `QUANTIZED_SIZE` values, or whose last axis `block` does not
+    divide, keeps float32 moments. A moment's bytes fall from 4 a value to 1 and its block's share of a
+    float32 scale, 1/64 a value at the default block."""
+    maps = {signed: jnp.asarray(dynamic_map(signed=signed)) for signed in (True, False)}
 
     def held(leaf) -> bool:
         return leaf.size >= QUANTIZED_SIZE and leaf.ndim > 0 and leaf.shape[-1] % block == 0
 
-    def zeros(leaf):
-        if not held(leaf):
-            return jnp.zeros(leaf.shape, jnp.float32)
-        return QuantizedMoment(jnp.full(leaf.shape, _zero_code(dynamic_map(signed=True)), jnp.uint8),
-                               jnp.zeros((*leaf.shape[:-1], leaf.shape[-1] // block), jnp.float32))
+    def zeros(params, signed: bool) -> QuantizedMoments:
+        zero = _zero_code(dynamic_map(signed=signed))
+        return QuantizedMoments(
+            jax.tree.map(lambda leaf: jnp.full(leaf.shape, zero, jnp.uint8) if held(leaf)
+                         else jnp.zeros(leaf.shape, jnp.float32), params),
+            jax.tree.map(lambda leaf: jnp.zeros((*leaf.shape[:-1], leaf.shape[-1] // block), jnp.float32)
+                         if held(leaf) else None, params))
 
-    def unsigned_zeros(leaf):
-        moment = zeros(leaf)
-        if not isinstance(moment, QuantizedMoment):
-            return moment
-        return moment._replace(codes=jnp.full(leaf.shape, _zero_code(dynamic_map(signed=False)), jnp.uint8))
+    def encoded(moment, part, signed, salt):
+        return (moment, None) if part[1] is None else quantized(moment, maps[signed], block)
 
-    def init_fn(params):
-        return optax.ScaleByAdamState(count=jnp.zeros([], jnp.int32), mu=jax.tree.map(zeros, params),
-                                      nu=jax.tree.map(unsigned_zeros, params))
-
-    def update_fn(updates, state, params=None):
-        del params  # scale_by_adam reads none
-        leaves, structure = jax.tree.flatten(updates)
-        mus = structure.flatten_up_to(state.mu)
-        nus = structure.flatten_up_to(state.nu)
-        scaled, new_mu, new_nu, count = [], [], [], state.count
-        for gradient, mu, nu in zip(leaves, mus, nus, strict=True):
-            update, one = inner.update(gradient, optax.ScaleByAdamState(
-                count=state.count, mu=dequantized(mu, maps[True], block),
-                nu=dequantized(nu, maps[False], block)))
-            if not isinstance(one, optax.ScaleByAdamState):
-                raise TypeError(f"scale_by_adam returned {type(one).__name__}")
-            count = one.count
-            scaled.append(update)
-            new_mu.append(quantized(jnp.asarray(one.mu), maps[True], block)
-                          if isinstance(mu, QuantizedMoment) else one.mu)
-            new_nu.append(quantized(jnp.asarray(one.nu), maps[False], block)
-                          if isinstance(nu, QuantizedMoment) else one.nu)
-        return structure.unflatten(scaled), optax.ScaleByAdamState(
-            count=count, mu=structure.unflatten(new_mu), nu=structure.unflatten(new_nu))
-
-    return optax.GradientTransformation(init_fn, update_fn)
+    return _stored_moments(b1, b2, eps, eps_root, nesterov, _Store(
+        zeros=zeros,
+        parts=lambda structure, moment: list(zip(structure.flatten_up_to(moment.codes),
+                                                 structure.flatten_up_to(moment.scales), strict=True)),
+        decoded=lambda part, signed: (part[0] if part[1] is None
+                                      else dequantized(*part, maps[signed], block)),
+        encoded=encoded,
+        whole=lambda structure, parts: QuantizedMoments(structure.unflatten([part[0] for part in parts]),
+                                                        structure.unflatten([part[1] for part in parts]))))
 
 
 def _zero_code(values: np.ndarray) -> int:
@@ -712,20 +707,17 @@ def _zero_code(values: np.ndarray) -> int:
     return int(np.flatnonzero(values == 0)[0])
 
 
-def dequantized(moment, values: jax.Array, block: int) -> jax.Array:
-    """A moment as float32: a `QuantizedMoment`'s codes' values times their blocks' scales, a float32
-    moment as it is."""
-    if not isinstance(moment, QuantizedMoment):
-        return moment
-    fractions = values[moment.codes.astype(jnp.int32)]
+def dequantized(codes: jax.Array, scales: jax.Array, values: jax.Array, block: int) -> jax.Array:
+    """A moment stored in 8 bits as float32: its `codes`' `values` times their blocks' `scales`."""
+    fractions = values[codes.astype(jnp.int32)]
     blocked = fractions.reshape(*fractions.shape[:-1], -1, block)
-    return (blocked * moment.scales[..., None]).reshape(fractions.shape)
+    return (blocked * scales[..., None]).reshape(fractions.shape)
 
 
-def quantized(moment: jax.Array, values: jax.Array, block: int) -> QuantizedMoment:
-    """`moment` in 8 bits: each block of `block` values along its last axis scaled by its largest
-    magnitude (at least 1e-12), and each value coded by the nearest of `values`, ascending, a value
-    halfway between two taking the larger, as torchao's `quantize_8bit_with_qmap` does."""
+def quantized(moment: jax.Array, values: jax.Array, block: int) -> tuple[jax.Array, jax.Array]:
+    """`moment` in 8 bits, its codes and its blocks' scales: each block of `block` values along its last
+    axis scaled by its largest magnitude (at least 1e-12), and each value coded by the nearest of `values`,
+    ascending, a value halfway between two taking the larger, as torchao's `quantize_8bit_with_qmap` does."""
     blocked = moment.reshape(*moment.shape[:-1], -1, block)
     scales = jnp.maximum(jnp.max(jnp.abs(blocked), axis=-1), 1e-12)
     fractions = (blocked / scales[..., None]).reshape(moment.shape)
@@ -735,7 +727,7 @@ def quantized(moment: jax.Array, values: jax.Array, block: int) -> QuantizedMome
                      values.shape[0] - 1)
     above = jnp.minimum(below + 1, values.shape[0] - 1)
     nearest = jnp.where(fractions - values[below] >= (values[above] - values[below]) * 0.5, above, below)
-    return QuantizedMoment(nearest.astype(jnp.uint8), scales)
+    return nearest.astype(jnp.uint8), scales
 
 
 def _coupled_decay(solver: optax.GradientTransformation, weight_decay: float,
