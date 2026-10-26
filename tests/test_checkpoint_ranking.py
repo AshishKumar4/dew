@@ -59,20 +59,21 @@ class Value:
 
 @dataclasses.dataclass
 class Scripted:
-    """A lower-is-better metric that scores each evaluation `scores`' next value, whatever it reads."""
+    """A lower-is-better metric that scores each evaluation it finalizes `scores`' next value, whatever
+    it reads: a warming pass, which finalizes nothing, takes none."""
     name: str
     scores: Iterator[float]
     shown: Shown = dataclasses.field(default_factory=lambda: Shown(better='lower'))
     reads = TokenScores
 
     def __call__(self, artifact, batch):
-        return next(self.scores)
+        return 0.0
 
     def merge(self, left, right):
         return left
 
     def finalize(self, value):
-        return value
+        return next(self.scores)
 
 
 def data():
