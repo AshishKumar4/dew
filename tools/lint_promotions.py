@@ -9,7 +9,9 @@ name bound only to one) on a module, or the unbound `torch.nn.Module.double(modu
 class the file imports, `torch.nn`'s and transformers' among them, or one it defines on such a base), a
 library's reader (`from_pretrained`, `from_config`, `from_single_file`), a deep copy of a module, a
 module-preserving call on one (`eval()`, `cpu()`, `to(device)`), a function of the file that returns
-one, and a name or attribute chain bound to any of these until it is bound to something else. A
+one, and a name or attribute chain bound to any of these until it is bound to something else; a
+function of the file that promotes a parameter to another (`walk(model, ..., dtype)`) promotes the
+module it is given at the float64 it is given. A
 forward's result, an attribute of a module (a tensor or a submodule) and an item of one are not, nor
 is a module built inside `float64` or `widened`, or at float64 by its `dtype`. Blind spots, documented:
 a module the file receives (a parameter, a factory it is passed, an attribute another method set), a
@@ -45,8 +47,8 @@ WIDE = ("torch_precision.float64", "torch_precision.widened")
 
 class _File:
     """What SLOP022 reads of one file: each node's import table, the classes it defines on an imported
-    base (or on another such), the functions of it that return a module, and the nodes built inside a
-    float64 context."""
+    base (or on another such), the functions of it that return a module and those that promote a
+    parameter (`_promoter`), and the nodes built inside a float64 context."""
 
     def __init__(self, tree: ast.Module, parent: Sequence[str]):
         self.tables = {id(node): table for node, table in scopes.scoped(tree.body, {}, list(parent))}
@@ -58,6 +60,8 @@ class _File:
         functions = {node.name: node for node in ast.walk(tree)
                      if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)}
         self.factories: set[str] = set()
+        self.promoters = {name: found for name, function in functions.items()
+                          if (found := _promoter(function)) is not None}
         grown = True
         while grown:
             before = (len(self.classes), len(self.factories))
@@ -77,8 +81,10 @@ class _File:
         return any(called == path or called.endswith("." + path) for path in WIDE)
 
     def _constructs(self, node: ast.expr) -> bool:
-        """Whether `node` names an imported class: a capitalized last name, not a tensor's."""
-        name = self.resolved(node).rpartition(".")[2]
+        """Whether `node` names a class: an imported name, or an attribute of anything
+        (`model_module.Transformer`), whose last name is capitalized, and not a tensor's."""
+        spelled = node.attr if isinstance(node, ast.Attribute) else ""
+        name = self.resolved(node).rpartition(".")[2] or spelled
         return bool(name) and name[0].isupper() and name not in TENSORS and not name.endswith("Tensor")
 
     def float64(self, node: ast.expr, aliases: frozenset[str]) -> bool:
@@ -119,6 +125,38 @@ def _key(node: ast.expr) -> str | None:
         parts.append(node.attr)
         node = node.value
     return ".".join([node.id, *reversed(parts)]) if isinstance(node, ast.Name) else None
+
+
+Promoter = tuple[int, str, int | None, str | None]
+"""A function's promoted parameter, by position and name, and the parameter it is promoted to (None
+for `double()`)."""
+
+
+def _promoter(function: ast.FunctionDef | ast.AsyncFunctionDef) -> Promoter | None:
+    """The first parameter a function promotes (`Promoter`): by `double()`, or by `to` or `type` to
+    another of its parameters, positionally or as `dtype`."""
+    names = [argument.arg for argument in (*function.args.posonlyargs, *function.args.args)]
+    named = {argument.arg for argument in scopes.arguments(function)}
+    for node in scopes.own(function):
+        if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                and node.func.attr in PROMOTIONS and isinstance(node.func.value, ast.Name)
+                and node.func.value.id in named):
+            continue
+        promoted = node.func.value.id
+        place = names.index(promoted) if promoted in names else -1
+        if node.func.attr == "double":
+            return place, promoted, None, None
+        for dtype in (*node.args, *(keyword.value for keyword in node.keywords if keyword.arg == "dtype")):
+            if isinstance(dtype, ast.Name) and dtype.id in named:
+                return place, promoted, names.index(dtype.id) if dtype.id in names else -1, dtype.id
+    return None
+
+
+def _argument(call: ast.Call, place: int | None, name: str | None) -> ast.expr | None:
+    """The argument a call passes a parameter, by its position or its name."""
+    if place is not None and 0 <= place < len(call.args):
+        return call.args[place]
+    return next((keyword.value for keyword in call.keywords if keyword.arg == name), None)
 
 
 def _at_float64(file: _File, call: ast.Call) -> bool:
@@ -208,9 +246,16 @@ def _modules(file: _File, body: Sequence[ast.stmt], around: frozenset[str],
 
 
 def _promotes(file: _File, call: ast.Call, held: frozenset[str], aliases: frozenset[str]) -> bool:
-    """Whether `call` promotes a module to float64: bound, on a module the file proves one, or unbound,
-    a class's `double`, `to` or `type` given the module first."""
+    """Whether `call` promotes a module to float64: bound, on a module the file proves one; unbound, a
+    class's `double`, `to` or `type` given the module first; or a function of the file that promotes
+    its parameter (`_promoter`), given a module there and float64 as the dtype it promotes to."""
     function = call.func
+    if isinstance(function, ast.Name) and function.id in file.promoters:
+        place, promoted, dtype_place, dtype = file.promoters[function.id]
+        if not file.module(_argument(call, place, promoted), held):
+            return False
+        given = None if dtype is None else _argument(call, dtype_place, dtype)
+        return dtype is None or (given is not None and file.float64(given, aliases))
     if not isinstance(function, ast.Attribute) or function.attr not in PROMOTIONS:
         return False
     arguments = list(call.args)
@@ -252,6 +297,7 @@ def promotions(tree: ast.Module, parent: Sequence[str]) -> Iterator[ast.Call]:
 
 def message(call: ast.Call) -> str:
     """SLOP022's finding for one promotion."""
-    return (f"promotes a torch module built in float32 to float64 (`.{call.func.attr}`), which keeps what "
+    called = f".{call.func.attr}" if isinstance(call.func, ast.Attribute) else _key(call.func)
+    return (f"promotes a torch module built in float32 to float64 (`{called}`), which keeps what "
             "its constructor computed rounded to float32 (ledger 1601): build its twin inside "
             "tools/torch_precision.py's `float64`, by `float64_twin`")

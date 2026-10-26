@@ -44,7 +44,19 @@ PROMOTIONS = {
     "built outside float64, promoted inside it": (
         "from torch_precision import float64\n" + LINEAR + "with float64():\n    model.double()", 1),
     "a deep copy inside float64": ("import copy\nfrom tools.torch_precision import float64\n" + LINEAR
-                                   + "with float64():\n    twin = copy.deepcopy(model)\n    twin.double()", 1),
+                                   + "with float64():\n    twin = copy.deepcopy(model)\n"
+                                   "    twin.double()", 1),
+    "a class of a module the file is given": (
+        "def build(model_module, args):\n    net = model_module.Transformer(args)\n"
+        "    return net.double()", 1),
+    "a function of the file that promotes its parameter": (
+        "import torch\ndef walk(model, rows, dtype):\n    model = model.to(dtype)\n    return model(rows)\n"
+        "def main():\n    encoder = torch.nn.Linear(4, 4)\n    mine = walk(encoder, rows, torch.float32)\n"
+        "    truth = walk(encoder, rows, dtype=torch.float64)", 1),
+    "such a function, given a parameter or float32": (
+        "import torch\ndef walk(model, dtype):\n    return model.to(dtype)\n"
+        "def main(given):\n    walk(given, torch.float64)\n"
+        "    walk(torch.nn.Linear(4, 4), torch.float32)", 0),
     "a forward's result": (LINEAR + "logits = model(x)\nlogits.double()\nmodel(x).double()", 0),
     "a tensor's deep copy": ("import copy\nweights = copy.deepcopy(tensor)\nweights.double()", 0),
     "a module's tensor attribute and item": (LINEAR + "model.weight.double()\n"

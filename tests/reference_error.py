@@ -66,6 +66,7 @@ import dataclasses
 import functools
 import hashlib
 import math
+from collections.abc import Sequence
 
 import jax
 import jax.numpy as jnp
@@ -786,21 +787,27 @@ class _Draws:
                       self.zero_rows + other.zero_rows, np.concatenate([self.finite, other.finite]),
                       self.widths)
 
-    def against_larger(self, library: "_Draws") -> "_Draws":
+    def against_larger(self, library: "_Draws", leaves: Sequence[str]) -> "_Draws":
         """These draws judged against the larger of their reference's error and `library`'s, the same
-        Dew on the same draws against the library arm (`assert_as_exact`'s `library_fn`): seed by seed
-        and leaf by leaf, the reference's evidence (its error, its worst row, its rows of float64 zero)
-        is whichever of the two arms' error is the larger there, and a value must be finite in both."""
+        Dew on the same draws against the library arm (`assert_as_exact`'s `library_fn`), on the
+        exception's `leaves` alone: seed by seed and leaf by leaf, the reference's evidence (its error,
+        its worst row, its rows of float64 zero) is whichever of the two arms' error is the larger there,
+        and a value must be finite in both. Every other leaf is the reference's alone."""
         if library.names != self.names or len(library.mine) != len(self.mine):
             raise AssertionError("the library arm's draws are not the reference's")
-        pick = library.theirs > self.theirs
+        unknown = sorted(set(leaves) - set(self.names))
+        if unknown or not leaves:
+            raise ValueError(f"a library arm names the leaves it covers, of {self.names}; it names "
+                             f"{list(leaves)}")
+        covered = np.isin(self.names, leaves)
+        pick = (library.theirs > self.theirs) & covered
         worst = self.worst.copy()
         worst[..., 1] = np.where(pick, library.worst[..., 1], self.worst[..., 1])
         zero_rows = [[(theirs if chosen else mine)
                       for mine, theirs, chosen in zip(seed, other, picked, strict=True)]
                      for seed, other, picked in zip(self.zero_rows, library.zero_rows, pick, strict=True)]
         return _Draws(self.names, self.mine, np.where(pick, library.theirs, self.theirs), worst, zero_rows,
-                      self.finite & library.finite, self.widths)
+                      self.finite & (library.finite | ~covered), self.widths)
 
 
 def pooled_zero_rows(evidence: list[ZeroRows]) -> list[tuple[int, float, float]]:
@@ -1190,7 +1197,8 @@ def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str]) -> N
 
 
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None,
-                    orders=None, library_fn=None, library_row: int | None = None) -> None:
+                    orders=None, library_fn=None, library_row: int | None = None,
+                    library_leaves: Sequence[str] = ()) -> None:
     """Check 1 of the gate: on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst (NARROW_FACTORS' factor at rows of one or
@@ -1235,8 +1243,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     arm decomposes a product the reference computes whole and the library's own accuracy at the
     pieces' shapes is the residual, a library arm on the same inputs runs the arm's pieces through the
     library and combines them exactly (in float64), and Dew is held within PARITY of the larger of the
-    reference's error and that arm's, seed by seed (`_Draws.against_larger`). Every other rule is as
-    above; a site without it is judged against the reference alone.
+    reference's error and that arm's, seed by seed, on the leaves the exception covers
+    (`library_leaves`, by their paths; `_Draws.against_larger`). Every other leaf, and every other rule,
+    is as above; a site without it is judged against the reference alone.
 
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
@@ -1246,8 +1255,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                                     f"seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
                                     f"(`seeds_for`)")])
     narrow_leaves: list[str] = []
-    if (library_fn is None) != (library_row is None):
-        raise ValueError(f"{label}: a library arm is the owner's exception, named with its ledger row")
+    if (library_fn is None) != (library_row is None) or (library_fn is None) != (not library_leaves):
+        raise ValueError(f"{label}: a library arm is the owner's exception, named with its ledger row and "
+                         f"the leaves it covers")
     _refuse_numpy_arms(draw, dew_fn, reference_fn)
     dew_fn, reference_fn = _arms(dew_fn, reference_fn)
     library_fn = None if library_fn is None else _arms(library_fn, library_fn)[1]
@@ -1258,7 +1268,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
         if library_fn is not None:
             # The truth is the site's own, so both arms are measured from the same float64 values.
             draws = draws.against_larger(_drawn(dew_fn, library_fn, draw, range(start, stop),
-                                                truth_fn or reference_fn, orders=orders))
+                                                truth_fn or reference_fn, orders=orders), library_leaves)
         narrow_leaves[:] = [name for name, width in zip(draws.names, draws.widths, strict=True)
                             if width in NARROW_FACTORS]
         return draws
@@ -1334,12 +1344,15 @@ def _step_errors(value, truth) -> np.ndarray:
     return np.asarray([root_mean(step) for step in squares.reshape(len(squares), -1)])
 
 
-def _grown(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> tuple[list[str], np.ndarray, np.ndarray]:
-    """Each leaf's growth evidence over `seeds` (`assert_grows_no_faster`): seed by leaf, the log of
+def _grown(dew_fn, reference_fn, draw, seeds, truth_fn=None
+           ) -> tuple[list[str], np.ndarray, np.ndarray, np.ndarray]:
+    """Each leaf's growth evidence over `seeds` (`assert_grows_no_faster`), seed by leaf: the log of
     Dew's RMS error at its last step over its first that both arms round, less the reference's, which
-    cancels the conditioning the draw gives both arms alike, and whether Dew is finite on every value.
-    A step both hold exactly (a gradient no earlier step's loss reaches) is no start of growth."""
-    names, growths, finite = None, [], []
+    cancels the conditioning the draw gives both arms alike; whether Dew is finite on every value; and
+    Dew's RMS error where the reference holds every step exactly, which Dew must too. A step both hold
+    exactly (a gradient no earlier step's loss reaches) is no start of growth, and a draw on which an
+    arm holds every step so (a parameter the loss never reads), or Dew is not finite, has none (NaN)."""
+    names, growths, finite, exact = None, [], [], []
     for seed in seeds:
         inputs = draw(seed)
         with jax.enable_x64(new_val=True):
@@ -1351,6 +1364,7 @@ def _grown(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> tuple[list[str],
                 raise AssertionError(f"{name}'s leaves are {_leaf_paths(tree)}, the truth's {names}")
         growths.append([])
         finite.append([])
+        exact.append([])
         for name, leaf, their_leaf, true in zip(names, jax.tree.leaves(dew), jax.tree.leaves(reference),
                                                 jax.tree.leaves(truth), strict=True):
             shaped = np.shape(leaf) == np.shape(their_leaf) == np.shape(true)
@@ -1360,34 +1374,53 @@ def _grown(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> tuple[list[str],
             if not (np.isfinite(np.asarray(true, np.float64)).all() and np.isfinite(their_leaf).all()):
                 raise ValueError(f"{name}: seed {seed}'s float64 or reference values are not all finite; "
                                  f"draw within the reference's range")
+            finite[-1].append(bool(np.isfinite(leaf).all()))
             mine, theirs = _step_errors(leaf, true), _step_errors(their_leaf, true)
+            exact[-1].append(0.0 if theirs.any() or not finite[-1][-1] else root_mean(np.square(mine)))
+            if not (finite[-1][-1] and mine.any() and theirs.any()):
+                growths[-1].append(math.nan)
+                continue
             rounded = np.flatnonzero((mine[:-1] > 0) & (theirs[:-1] > 0))
             if not rounded.size:
                 raise ValueError(f"{name}: on seed {seed} no step before the last rounds in both arms, so "
                                  f"nothing grows from one; draw steps that round")
             logs = _logs([mine[-1], mine[rounded[0]], theirs[-1], theirs[rounded[0]]])
             growths[-1].append(float(logs[0] - logs[1] - logs[2] + logs[3]))
-            finite[-1].append(bool(np.isfinite(leaf).all()))
-    return names, np.asarray(growths), np.asarray(finite)
+    return names, np.asarray(growths), np.asarray(finite), np.asarray(exact)
 
 
-def _growth_judgement(names, growths: np.ndarray, finite: np.ndarray, label: str
+def _growth_judgement(names, growths: np.ndarray, finite: np.ndarray, exact: np.ndarray, label: str
                       ) -> tuple[list[Finding], list[Finding]]:
-    """The growth check's findings (`assert_grows_no_faster`): each leaf not finite, each whose mean
-    log growth over the reference's is over log PARITY, and each its seeds leave undecided."""
+    """The growth check's findings (`assert_grows_no_faster`): each leaf not finite, each Dew does not
+    hold exactly where the reference does, each whose mean log growth over the reference's is over
+    log PARITY, and each its seeds leave undecided: measured on fewer than FEWEST_SEEDS, or straddling
+    PARITY wider than it."""
     over, unresolved = [], []
-    limit, count = math.log(PARITY), len(growths)
-    picks = np.random.default_rng(0).integers(0, count, (BOOTSTRAP, count))
+    limit = math.log(PARITY)
     for index, name in enumerate(names):
-        leaf = label + name
+        leaf, seeds = label + name, len(growths)
         if not finite[:, index].all():
             nonfinite = int(np.sum(~finite[:, index]))
             over.append(Finding(leaf, "not finite", nonfinite,
-                                f"{leaf}: a value is not finite on {nonfinite} of {count} seeds"))
+                                f"{leaf}: a value is not finite on {nonfinite} of {seeds} seeds"))
             continue
-        values = growths[:, index]
+        if exact[:, index].any():
+            missed = int(np.sum(exact[:, index] > 0))
+            over.append(Finding(leaf, "exact reference", float(np.max(exact[:, index])),
+                                f"{leaf}: the reference equals float64 at every step on {missed} of {seeds} "
+                                f"seeds and dew does not"))
+        values = growths[:, index][~np.isnan(growths[:, index])]
+        count = len(values)
+        if not count:
+            # Both arms hold every step exactly on every seed: nothing grows.
+            continue
+        if count < FEWEST_SEEDS:
+            unresolved.append(Finding(leaf, "inconclusive", FEWEST_SEEDS / count,
+                                      f"{leaf}: inconclusive: growth is measured on {count} of {seeds} "
+                                      f"seeds, under {FEWEST_SEEDS}"))
+            continue
         mean = float(np.mean(values))
-        means = values[picks].mean(axis=1)
+        means = values[np.random.default_rng(0).integers(0, count, (BOOTSTRAP, count))].mean(axis=1)
         low = min(float(np.quantile(means, LOWER_TAIL)), mean)
         high = max(float(np.quantile(means, 1 - UPPER_TAIL)), mean)
         factor = (f"{math.exp(min(mean, LOG_LARGEST)):.3f} times the reference's, interval "
@@ -1428,14 +1461,13 @@ def assert_grows_no_faster(dew_fn, reference_fn, draw, label: str, *, seeds: int
     _refuse_numpy_arms(draw, dew_fn, reference_fn)
     dew_fn, reference_fn = _arms(dew_fn, reference_fn)
     truth_fn = _truth_program(truth_fn)
-    names, growths, finite = _grown(dew_fn, reference_fn, draw, range(seeds), truth_fn)
-    over, unresolved = _growth_judgement(names, growths, finite, label)
+    names, *evidence = _grown(dew_fn, reference_fn, draw, range(seeds), truth_fn)
+    over, unresolved = _growth_judgement(names, *evidence, label)
     stage = 1
     if over or unresolved:
-        further = range(seeds, (1 + REDRAW) * seeds)
-        _, more, more_finite = _grown(dew_fn, reference_fn, draw, further, truth_fn)
-        growths, finite = np.concatenate([growths, more]), np.concatenate([finite, more_finite])
-        over, unresolved = _growth_judgement(names, growths, finite, label)
+        _, *more = _grown(dew_fn, reference_fn, draw, range(seeds, (1 + REDRAW) * seeds), truth_fn)
+        evidence = [np.concatenate(pair) for pair in zip(evidence, more, strict=True)]
+        over, unresolved = _growth_judgement(names, *evidence, label)
         stage = 2
     _logged(label, stage, _verdict(over, unresolved), [])
     if over:
@@ -1577,7 +1609,8 @@ def recording(path) -> dict[str, np.ndarray]:
 
 def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: int = 0,
               truth_fn=None, two_stage: bool = True, dew_fn=None, orders=None,
-              paired: bool = False, library_fn=None) -> list[tuple[str, int, list[str]]]:
+              paired: bool = False, library_fn=None,
+              library_leaves: Sequence[str] = ()) -> list[tuple[str, int, list[str]]]:
     """Check 1 run `runs` times on an equally exact pair, the reference against itself on disjoint
     draws: each run's verdict, "pass", "over" or "inconclusive", the stage it reached and its findings
     (`_judgement`'s, each naming its leaf and rule), a run judged as `assert_as_exact` judges a site
@@ -1592,8 +1625,9 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
     then the other implementation (an equally exact one, or a fault); `orders` judges rows over each
     draw's orbit, as a site that declares one. The runs evaluate their arms as given: a class's
     arms compile themselves where they are programs, and a fault injects itself on the host.
-    `library_fn` judges each run against the larger of the reference's error and that library arm's,
-    as `assert_as_exact` does (paired runs: the library arm is measured on Dew's own draws)."""
+    `library_fn` judges each run against the larger of the reference's error and that library arm's
+    on `library_leaves`, as `assert_as_exact` does (paired runs: the library arm is measured on Dew's
+    own draws)."""
     if paired and dew_fn is None:
         raise ValueError("a paired null run takes its other implementation, `dew_fn`")
     verdicts = []
@@ -1608,7 +1642,7 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
             if library_fn is not None:
                 seeds_here = range(base + start, base + stop)
                 draws = draws.against_larger(_drawn(dew_fn or reference_fn, library_fn, draw, seeds_here,
-                                                    truth_fn or reference_fn, orders=orders))
+                                                    truth_fn or reference_fn, orders=orders), library_leaves)
             return draws
 
         over, unresolved, stage = _staged(drawn, seeds, label, two_stage=two_stage)
