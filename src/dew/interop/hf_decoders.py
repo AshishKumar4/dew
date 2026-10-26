@@ -149,6 +149,13 @@ def _wrapper_token_id(hf_config: Mapping[str, object], used: set, *names: str) -
     return refuse(names[0], f"the placeholder positions are marked by {list(names)}, none is set")
 
 
+def _defaulted_token_id(hf_config: Mapping[str, object], used: set[str], name: str, default: int) -> int:
+    """A placeholder id the source's transformers config class defaults: the config's own where it states
+    one, else that default, as the config class reads it."""
+    used.add(name)
+    return _records.integer(hf_config.get(name, default), name)
+
+
 def _wrapper_fields(model_type: str, used: set[str], text: DecoderFields, tower: Mapping[str, object] | None,
                     projector: Mapping[str, object] | None, image: int, tokens: int | None,
                     audio: AudioFields = NO_AUDIO, *, video: int | None = None,
@@ -244,10 +251,8 @@ def _gemma4_placeholders(hf_config: Mapping[str, object], used: set[str]) -> tup
     configuration_gemma4.py:349,352 and configuration_gemma4_unified.py:309,312), and both stay
     placeholders to the decoder whether or not a tower reads them."""
     image = _wrapper_token_id(hf_config, used, "image_token_id", "image_token_index")
-    used.update(("video_token_id", "audio_token_id"))
-    video, audio = (_records.integer(hf_config.get(name, default), name)
-                    for name, default in (("video_token_id", 258884), ("audio_token_id", 258881)))
-    return image, video, audio
+    return (image, _defaulted_token_id(hf_config, used, "video_token_id", 258884),
+            _defaulted_token_id(hf_config, used, "audio_token_id", 258881))
 
 
 def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
@@ -313,9 +318,11 @@ def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
         refuse("vision_soft_tokens_per_image", f"the MobileNet adapter produces {count} tokens")
     image = _wrapper_token_id(hf_config, used, "image_token_id")
     used.update(("vision_soft_tokens_per_image", "boa_token_id", "eoa_token_id"))
+    # Gemma3nConfig's audio placeholder where the config leaves it out (transformers 5.17.0,
+    # configuration_gemma3n.py:460).
+    audio = _defaulted_token_id(hf_config, used, "audio_token_id", 262273)
     return _wrapper_fields("gemma3n", used, text, tower, projector, image, count,
-                           _wrapper_audio(hf_config, used, record_int(text, "emb_features"),
-                                          _wrapper_token_id(hf_config, used, "audio_token_id")))
+                           _wrapper_audio(hf_config, used, record_int(text, "emb_features"), audio))
 
 
 _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields]] = {
