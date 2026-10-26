@@ -19,7 +19,7 @@ operation to the program, and outside `generation.routes()` it records nothing
 
 import dataclasses
 from collections.abc import Callable, Mapping
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from . import generation
 from .generation import Refusal, Route
@@ -71,6 +71,7 @@ class Kernel[C]:
                 if not (forced and requirement.kind == 'measured') and not requirement.holds(case)]
 
 
+@runtime_checkable
 class Celled(Protocol):
     """A case an op with declared cells reads (`Op.declared`): its `cell`, the device's instruction
     family (`generation.family`, None outside every family) and the kind of call it is (a GEMM's
@@ -180,9 +181,9 @@ def _old_route[C](op: Op[C], case: C) -> tuple[Kernel[C], str, Refusal | None] |
     """The old route a declared cell runs (`Op.declared`): its kernel where it takes the call, the
     kernel the op would prefer otherwise, and that one's refusal naming the receipt; None where the call's
     cell is not declared or its old route cannot run it."""
-    if not op.declared:
+    if not op.declared or not isinstance(case, Celled):
         return None
-    cell = case.cell  # pyright: ignore[reportAttributeAccessIssue]  # an op that declares cells reads Celled
+    cell = case.cell
     if cell not in op.declared:
         return None
     name, receipt = op.declared[cell]

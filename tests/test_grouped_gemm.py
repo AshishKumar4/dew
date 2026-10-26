@@ -16,7 +16,6 @@ from jax.sharding import Mesh
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations, with_gradients
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
-from dew.nn.kernels.templates import cost
 from dew.nn.kernels.templates.gemm import mosaic_gpu, template
 from dew.nn.moe import expert_projection
 from tools import grouped_oracle as oracle
@@ -200,7 +199,6 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
                                           label)
 
 
-
 @pytest.mark.gpu(reason="needs a GPU the installed dew-cutlass holds kernels for")
 @pytest.mark.parametrize("sizes", [name for name in SIZES if any(SIZES[name])])
 def test_cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
@@ -274,14 +272,12 @@ def test_a_program_traced_for_one_gpu_traces_again_for_another_of_its_family():
 @INTERPRETS
 @pytest.mark.parametrize("unseen", UNSEEN)
 def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
-    """On a GPU no row measured, each Mosaic GPU launch's tiles are its family's, generated from the
-    family's facts and the call's extents, and fit the GPU's block; the cost model picks among them on
-    the GPU's own facts (at a Qwen3 MoE projection's extents, not every pick the same GPU family's
-    canonical device picks), and the call takes those picks. Named there, the projection's forward and
+    """On a GPU no row measured, each Mosaic GPU launch's tile is its family's, derived from the
+    family's facts, the GPU's own and the call's extents, and fits the GPU's block, and the call takes
+    it. Named there, the projection's forward and
     its gradients through them (the matrix frozen where the family runs no kernel gradient) are as exact
     as XLA's ragged dot from float64."""
     target = UNSEEN[unseen]
-    canonical = generation.TARGETS[target.generation]
     family = generation.family(target.generation)
     # mma.sync's tiles run the product and the input gradient; the kernel gradient is warpgroup MMA's.
     launched = {"MosaicGmm", "MosaicTgmm"} if target.wgmma else {"MosaicGmm"}
@@ -299,10 +295,9 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
                                             interpret_on_cpu=True), (x, dy)))
         return named
 
-    # At a Qwen3 MoE projection's extents, traced (never run): each launch takes the tile the cost model
-    # picks on the GPU's facts among its family's fitting ones, not every one the canonical device's.
+    # At a Qwen3 MoE projection's extents, traced (never run): each launch takes the tile it derives on
+    # the GPU's facts.
     budget = generation.shared_budget(target)
-    differs = []
     with (generation.assumed(target), generation.chosen(grouped_matmul="mosaic_gpu"),
           tuning.seen() as launches):
         for product, shapes in products(65536, 2048, 1536, 128):
@@ -312,9 +307,7 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
                 continue
             assert tile.family == family and tile in launch.fitting(ba, target)
             assert launch.staged_bytes(ba, tile, target) <= budget
-            assert tile == launch.estimate(ba, target)[1]
-            differs.append(tile != launch.estimate(ba, canonical)[1])
-    assert any(differs)
+            assert tile == launch.derived(ba, target)
 
     sizes = SIZES["ragged"]
     group_sizes = jnp.asarray(sizes, jnp.int32)
@@ -342,7 +335,7 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
               if isinstance(launch, grouped_matmul._Mosaic)]
     assert {type(launch).__name__ for launch, _, _ in mosaic} == launched
     with generation.assumed(target):
-        assert all(tile == launch.estimate(ba, target)[1] for launch, ba, tile in mosaic)
+        assert all(tile == launch.derived(ba, target) for launch, ba, tile in mosaic)
 
 
 @INTERPRETS
@@ -450,25 +443,6 @@ def test_the_kernels_write_each_product_in_its_own_dtype(generation_name):
             ((4, DEPTH, WIDTH), jnp.dtype(jnp.float32))} <= written
 
 
-def test_the_cost_model_charges_each_multiprocessor_its_programs_in_turn():
-    """A multiprocessor does its programs' work one after another: a launch of one program per
-    multiprocessor takes one program's time, one more program a second, and the device bytes bound it
-    from below."""
-    target = generation.TARGETS["sm90"]
-    program = 4096 * 1000 / (target.tensor_rate("16bit") * target.clock_hz)
-
-    def seconds(programs, device_bytes=0.0):
-        work = cost.Cost(programs=programs, device_bytes=device_bytes, program_flops=4096 * 1000)
-        return cost.seconds(work, target)
-
-    sms = target.multiprocessors
-    # Each side is the same arithmetic in the same order, so the times are equal exactly.
-    assert seconds(0) == 0
-    assert seconds(sms) == program
-    assert seconds(sms + 1) == 2 * program
-    assert seconds(1, device_bytes=target.memory_bandwidth) == 1.0
-
-
 def test_a_mig_slice_keeps_its_generations_tensor_rate():
     """A SKU's catalogued peak lowers its generation's rate where its multiprocessors and clock would
     exceed it (a GeForce part's half-rate accumulation) and never raises it: an A100, whose catalogue
@@ -495,16 +469,6 @@ def test_a_gpu_of_no_family_runs_xla_s_grouped_matmul():
     (route,) = {(route.kernel, route.refusal.detail if route.refusal else None) for route in taken
                 if route.choice == "grouped_matmul"}
     assert route[0] == "xla" and route[1]
-
-
-def test_a_block_aligned_launch_counts_the_tiles_its_groups_take():
-    """A block-aligned launch runs each row block once and once more for each group boundary inside a
-    block: one group takes exactly its blocks, many groups at most one more each after the first, and
-    one row a single tile however many groups there are."""
-    assert grouped_matmul._block_tiles(16384, 1, 128) == 128
-    assert grouped_matmul._block_tiles(16384, 128, 128) == 128 + 127
-    assert grouped_matmul._block_tiles(1, 256, 128) == 1
-    assert grouped_matmul._block_tiles(100, 8, 64) == 2 + 7
 
 
 @pytest.mark.parametrize("block_m,block_n", [(64, 128), (128, 512)])
@@ -591,36 +555,6 @@ def test_an_mma_sync_forward_of_no_depth_is_zero():
         got = jax.jit(lambda x, w: template.gemm(x, w, jnp.asarray([128], jnp.int32), out_dtype=jnp.float32,
                                                  precision="default", interpret_on_cpu=True))(lhs, rhs)
     assert not np.any(np.asarray(got))
-
-
-def test_a_launch_of_fewer_programs_than_its_slots_costs_one_programs_service():
-    """A lone program costs its own service, however many a multiprocessor could hold, and its pipeline
-    hides no more steps' latency than it takes: the estimate is the same at any residency, and at any
-    stage count past its steps."""
-    with generation.assumed("sm80"):
-        target = generation.gpu_target()
-
-    def seconds(**fields):
-        return cost.seconds(cost.Cost(**{"programs": 1, "device_bytes": 1.0, "program_flops": 1e6, "steps": 2,
-                                         "stages": 3, "resident": 1} | fields), target)
-
-    assert seconds(resident=12) == seconds(resident=1)
-    assert seconds(stages=9) == seconds(stages=3) < seconds(stages=2)
-
-
-def test_the_cost_model_names_a_fact_its_target_lacks():
-    """A GPU outside every instruction family (sm60, before Turing) states no tensor rate and gives no
-    estimate, naming the fact; the grouped kernels are then not eligible there, so XLA's ragged dot runs
-    without one."""
-    target = generation.GpuTarget("sm60", "a GPU of no family", 227 * 1024, multiprocessors=148,
-                                  clock_hz=1.9e9, memory_bandwidth=8e12)
-    with pytest.raises(ValueError):
-        cost.seconds(cost.Cost(programs=1, device_bytes=0, program_flops=1.0), target)
-    ba = grouped_matmul.Gmm().bind(jax.ShapeDtypeStruct((64, 128), jnp.bfloat16),
-                                   jax.ShapeDtypeStruct((2, 128, 128), jnp.bfloat16),
-                                   jax.ShapeDtypeStruct((2,), jnp.int32), out_dtype="bfloat16",
-                                   trans_rhs=False, interpret=False)
-    assert not grouped_matmul.Gmm().eligible(ba, target)
 
 
 def halved(acc, bias):
