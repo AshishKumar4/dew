@@ -621,7 +621,8 @@ def test_processes_fetch_disjoint_shares_of_one_online_order(tmp_path):
 
 
 @pytest.mark.distributed
-def test_a_pool_whose_processes_fetched_other_records_is_refused_before_it_trains(tmp_path):
+def test_a_pool_whose_processes_fetched_other_records_is_refused_before_it_trains(tmp_path,
+                                                                                online_checkpoint):
     """Every process of a memory read fetches the whole catalog itself. A fetch that fails for now on
     one of them (the first GET of a url answered 503) leaves that process holding other accepted
     records, and the pool is refused before any process trains, rather than cutting its shares from
@@ -639,10 +640,12 @@ def test_a_pool_whose_processes_fetched_other_records_is_refused_before_it_train
         request.send_header("Content-Length", "0")
         request.end_headers()
 
-    with serving(flaky) as address, pytest.raises(AssertionError,
-                                                  match="training data differs between the processes"):
-        run_pool("fit", tmp_path / "out", 2, name="online", online=address, run_dir=tmp_path / "run",
-                 fsdp_size=1, steps=POOL_STEPS, records=RECORDS, environment=ONLINE)
+    with serving(flaky) as address:
+        reports = run_pool("fit", tmp_path / "out", 2, name="online", online=address, refusal=True,
+                           run_dir=tmp_path / "run", fsdp_size=1, steps=POOL_STEPS, records=RECORDS,
+                           environment=ONLINE)
+    # The same pool over a server that answers every url trains (`online_checkpoint`).
+    assert [(report["refused"], report["written_steps"]) for report in reports] == [("ValueError", [])] * 2
 
 
 @pytest.fixture(scope="module")

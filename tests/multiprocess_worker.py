@@ -692,8 +692,15 @@ def mode_fit(args) -> dict:
         # The source's last batch trains the step `block_after` past where the run restored.
         observe = Observe(1, blocked(checkpoints, loader, (restored_step or 0) + args.block_after,
                                      Path(args.notify)))
-    state = trainer.fit(Loader(open_train, val=None, batch=BATCH, records=args.records),
-                        steps=args.steps, log_every=1, checkpoint_every=args.save_every, observe=observe)
+    try:
+        state = trainer.fit(Loader(open_train, val=None, batch=BATCH, records=args.records),
+                            steps=args.steps, log_every=1, checkpoint_every=args.save_every, observe=observe)
+    except ValueError as refusal:
+        if not args.refusal:
+            raise
+        # A refusal the run expects: what it refused with, and the steps it saved before it.
+        return {"refused": type(refusal).__name__,
+                "written_steps": sorted(int(step) for step in checkpoints._open().all_steps())}
     dump_params(args.out.with_suffix(".npz"), state.variables)
     if observe is not None:
         # Each observation is already whole on this host: written as it is, gathered by nothing.
@@ -2351,6 +2358,8 @@ def parse_args(argv=None):
                              "saved position is a global record count")
     parser.add_argument("--online", help="host:port of the server whose urls the records are fetched from "
                                          "(`online_loader`)")
+    parser.add_argument("--refusal", action="store_true",
+                        help="fit reports the ValueError it is refused with instead of raising it")
     parser.add_argument("--shared", action="store_true",
                         help="each process fetches its own share of the shuffled catalog (`online_pipeline`)")
     parser.add_argument("--profile-dir", help="directory the scheduled profile window writes")
