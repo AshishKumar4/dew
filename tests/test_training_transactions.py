@@ -11,7 +11,7 @@ import optax
 import pytest
 from affine_run import raw_leaf
 from flax import struct
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, dew_programs
 
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition
@@ -386,6 +386,7 @@ def test_a_clipped_run_stores_its_stepped_kernels_times_the_clip():
     def attention(params):
         return params["layers_0"]["self_attn"]
 
+    @dew_programs
     def trained(params, tokens):
         # The step donates its state, so each run places its own copy.
         key = jax.random.wrap_key_data(host.key, impl=impl)
