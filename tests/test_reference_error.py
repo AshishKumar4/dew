@@ -162,6 +162,19 @@ def test_a_without_ynn_arm_runs_over_windows():
     np.testing.assert_array_equal(over_windows(without_ynn(lambda x: x * 2))(x), x * 2)
 
 
+def test_a_recordings_measured_errors_size_its_site_as_seeds_for_would():
+    """`seeds_resolving` over the reference's errors measured apart (a recording's merged shards) gives
+    `seeds_for`'s count for the reference compared with itself on the same draws, and refuses a
+    recording of too few seeds."""
+    from reference_error import _drawn, seeds_for, seeds_resolving
+
+    count = seeds_for(_product, _draw, "product")
+    draws = _drawn(_product, _product, _draw, range(4 * count))
+    assert seeds_resolving(draws.theirs, draws.names, "product") == count
+    with pytest.raises(AssertionError):
+        seeds_resolving(draws.theirs[:count], draws.names, "product", start=count)
+
+
 def test_a_torch_arm_pulls_back_the_cotangent_it_is_given():
     """`torch_with_gradients` gives, bit for bit, a torch function's output and the gradients torch's
     autograd pulls back from the cotangent passed last, cast to the output's dtype, at float32 and at
