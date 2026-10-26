@@ -576,6 +576,12 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         del dtypes
         return columns
 
+    def stores(self, dtype) -> bool:
+        """Whether a tile of `dtype` in the accumulator's layout reaches global memory (`persist`'s stores,
+        `stored`): any dtype, unless the family's path to global memory refuses it."""
+        del dtype
+        return True
+
     def published(self) -> None:
         """A consumer's writes to shared memory made visible to the readers that read it asynchronously
         (warpgroup MMA, TMA), before any of them reads it: a family whose products read shared memory
@@ -683,7 +689,8 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         # launch context first and takes the tile and its scratch.
         summed: Callable[..., jax.Array] = plgpu.inline_mgpu(
             arg_types=(self.layout, plgpu.RefType()),
-            return_type=plgpu.ShapeDtypeStruct((value.shape[1],), jnp.float32, layout=self.column))(sums)
+            return_type=plgpu.ShapeDtypeStruct((value.shape[1],), jnp.dtype(jnp.float32),
+                                               layout=self.column))(sums)
         return summed(value, scratch)
 
     def as_row(self, vector: jax.Array) -> jax.Array:

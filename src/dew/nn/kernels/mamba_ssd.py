@@ -13,7 +13,7 @@ each kernel's grid, and the numerics mamba_ssm runs: operands in their own dtype
 the states the chunks enter stored in the operands' dtype, the decay between two steps of a chunk
 `exp(min(acs_i - acs_j, 0))` of the log decay `acs` cumulated within the chunk, and each gradient of the
 decay summed from its products as mamba_ssm's stable kernels sum it. Products of fp32 operands take
-TF32x3 (`fla_gdn._dot`) where mamba_ssm's take one TF32, and the output is stored in fp32 where
+BF16x6 (`fla_gdn._dot`) where mamba_ssm's take one TF32, and the output is stored in fp32 where
 mamba_ssm rounds it to the operands' dtype: a sequence-sharded scan adds the earlier shards' state to it
 before any rounding (`dew.nn.mixers.mamba2._ssd`), and the gated norm after it reads fp32 anyway.
 mamba_ssm's deterministic mode is the only one: a sum over a kernel's blocks lands in a workspace that
@@ -108,10 +108,11 @@ def _operand(ba):
 
 
 def _picks(tiles: Tiles, fp32: Tiles | None = None) -> Mapping[str, Tiles]:
-    """A launch's config by operand dtype, `fp32` where it differs from `tiles`: the fastest measured
-    on an H100 at Nemotron 3 Ultra's shapes (one row of 4096 tokens, 256 heads of 64 over 8 groups, a
-    state of 128, chunks of 128), each summing kernel taking a group's every head.
-    fp32's TF32x3 products want smaller blocks: at bf16's picks its launches summed 10.6 ms against 5.9.
+    """A launch's config without a measurement, by operand dtype, `fp32` where it differs from
+    `tiles`: the tuner's pick on an H100 at Nemotron 3 Ultra's shapes (one row of 4096 tokens, 256 heads
+    of 64 over 8 groups, a state of 128, chunks of 128), each summing kernel taking a group's every head.
+    fp32's split products want smaller blocks: at bf16's picks its launches summed 10.6 ms against 5.9
+    (TF32x3, the products then).
     mamba_ssm's own autotuner picks the same for seven of the twelve it tunes; its picks for the chunk
     state, the state passing, both `C B^T` products and the chunk scan ran 4% to 70% slower on the port
     there (2026-10-13)."""
