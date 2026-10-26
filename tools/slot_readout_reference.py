@@ -1,7 +1,8 @@
 """Record the released renderer, block adapter and readout on the tiny native Qwen source.
 
-Run with transformers 5.19 and the source's PyTorch dependencies, then use --calibrate in
-the project's gate environment. The output belongs under tests/fixtures for fetched storage.
+Run in the author's environment (`python tools/slot_runtime_qualification.py environment` prints its
+Python), then use --calibrate in the project's gate environment. The output belongs under
+tests/fixtures for fetched storage.
 """
 
 import argparse
@@ -25,6 +26,7 @@ from block_override_reference import (
     calibrate,
     oracle_precision,
     release_source,
+    require_reference_transformers,
 )
 from fetched_fixtures import save
 from reference_source import git_head, package, published_files
@@ -48,7 +50,7 @@ WIDTH = 512
 def runtime():
     """The pinned author's prompt with the release patch applied, beside its actual readout definitions."""
     held = published_files(PROMPT_REPO, PROMPT_REVISION, PROMPT_FILES)
-    patch, _ = release_source()
+    patch = release_source()
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         for name in PROMPT_FILES:
@@ -61,7 +63,7 @@ def runtime():
         prompt = importlib.import_module("slot_reference.prompt")
         schema = importlib.import_module("slot_reference.schema")
         readout = importlib.import_module("slot_reference.readout")
-        yield prompt, schema, vars(readout)
+        yield prompt, schema, readout
 
 
 def draw(seed: int, tokenizer, prompt, schema, readout):
@@ -91,7 +93,7 @@ def draw(seed: int, tokenizer, prompt, schema, readout):
                                                   enable_thinking=False)
         start = rendered.rindex(question.suffix)
         characters = [(start + begin, start + end) for begin, end in question.option_spans]
-        ids, prefix, positions = readout["token_layout"](tokenizer, rendered, start, characters)
+        ids, prefix, positions = readout.token_layout(tokenizer, rendered, start, characters)
         if len(ids) > WIDTH:
             raise ValueError(f"the recorded row needs {len(ids)} tokens, over its width {WIDTH}")
         tokens[index, :len(ids)] = ids
@@ -100,7 +102,7 @@ def draw(seed: int, tokenizer, prompt, schema, readout):
         lengths.append(len(ids))
         prefixes.append(prefix)
     return ({"tokens": tokens, "lengths": np.asarray(lengths, np.int32), "spans": spans,
-             "options": options, "blocks": readout["block_ids"](prefixes, lengths, WIDTH, "cpu").numpy(),
+             "options": options, "blocks": readout.block_ids(prefixes, lengths, WIDTH, "cpu").numpy(),
              "probe": rng.standard_normal(int(options.sum())).astype(np.float32)}, requests)
 
 
@@ -109,7 +111,7 @@ def observed(model, head, capture, readout, inputs, labels, *, blocked: bool, dt
     lengths = torch.from_numpy(inputs["lengths"])
     mask = torch.arange(tokens.shape[1])[None] < lengths[:, None]
     groups = torch.from_numpy(inputs["blocks"]) if blocked else None
-    with readout["blocks"](groups):
+    with readout.blocks(groups):
         output = model(input_ids=tokens, attention_mask=mask, use_cache=False)
     hidden = capture.pop()
     if hidden.dtype != dtype or output.logits.dtype != dtype:
@@ -118,7 +120,7 @@ def observed(model, head, capture, readout, inputs, labels, *, blocked: bool, dt
     answer = hidden[rows, lengths - 1]
     positions = [spans[valid].tolist()
                  for spans, valid in zip(inputs["spans"], inputs["options"], strict=True)]
-    pooled = readout["pool_options"](hidden, positions, inputs["options"].shape[1])
+    pooled = readout.pool_options(hidden, positions, inputs["options"].shape[1])
     selected = torch.from_numpy(inputs["options"])
     probe = torch.from_numpy(inputs["probe"]).to(dtype)
     result = {}
@@ -152,8 +154,7 @@ def main():
         return
     if args.seeds is None or args.redraw is None or args.seeds <= 0 or args.redraw < 0:
         parser.error("seeds must be positive and redraw nonnegative")
-    if importlib.metadata.version("transformers") != "5.19.0":
-        raise RuntimeError("the released block adapter is recorded against transformers 5.19.0")
+    require_reference_transformers()
     torch.set_num_threads(1)
     torch.set_float32_matmul_precision("highest")
     torch.manual_seed(43)
@@ -167,17 +168,17 @@ def main():
                for ids, label in zip(labels, prompt.SLOT_LABELS[:16], strict=True)):
             raise ValueError("every recorded slot must be one round-tripping token in the tiny vocabulary")
         labels = [ids[0] for ids in labels]
-        head = readout["ReadoutHead"].from_lm_head(model.get_output_embeddings().weight, labels, 8)
+        head = readout.ReadoutHead.from_lm_head(model.get_output_embeddings().weight, labels, 8)
         torch.nn.init.normal_(head.k.weight, std=0.2)
         with oracle_precision():
             truth = AutoModelForImageTextToText.from_config(copy.deepcopy(model.config), dtype=torch.float64,
                                                            attn_implementation="eager").double().eval()
             truth.load_state_dict(model.state_dict())
-            exact_head = readout["ReadoutHead"](head.slot.shape[1], len(labels), 8).double()
+            exact_head = readout.ReadoutHead(head.slot.shape[1], len(labels), 8).double()
             exact_head.load_state_dict(head.state_dict())
-        readout["install_noncausal"](model)
-        readout["install_noncausal"](truth)
-        capture, exact_capture = (readout["HiddenCapture"](value) for value in (model, truth))
+        readout.install_noncausal(model)
+        readout.install_noncausal(truth)
+        capture, exact_capture = (readout.HiddenCapture(value) for value in (model, truth))
         args.output.mkdir(parents=True, exist_ok=True)
         model.save_pretrained(args.output)
         tokenizer.save_pretrained(args.output)
