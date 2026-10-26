@@ -515,7 +515,7 @@ def chosen(fitted: Trainer):
     timed = fitted.plan["timed"]
     kept = [(timing["split"], timing["remat"]) == (fitted.plan["split"], fitted.plan["remat"])
             for timing in timed or ()]
-    return lambda steps: [0.0 if keep else 1.0 for keep in kept]
+    return lambda steps: [[0.0] if keep else [1.0] for keep in kept]
 
 
 def drawn_steps(case: Case, tmp_path, fsdp, devices, initial, steps: int, *, exact: bool = False,

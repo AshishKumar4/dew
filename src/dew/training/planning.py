@@ -224,23 +224,35 @@ class Planned:
         return {"split": self.split, "rows": rows_of(self.candidate.micro), **self.rung}
 
 
-TIMED_STEPS, TIMED_WARMUP = 10, 2
-"""The steps a frontier's plans are timed over (`step_seconds`), after the
-warmup ones, each plan's own: a split step's first call builds its window."""
+TIMED_STEPS, TIMED_REPEATS, TIMED_WARMUP = 10, 3, 2
+"""A frontier's plans are each timed `TIMED_REPEATS` times over `TIMED_STEPS` steps (`step_seconds`),
+after the warmup ones, each plan's own: a split step's first call builds its window."""
 
 
-def step_seconds(step: Callable, state: TrainState, batch: Batch) -> float:
-    """Seconds a step of `step` takes on `batch` from `state`, the mean of
-    `TIMED_STEPS` queued and synchronized once after `TIMED_WARMUP`
-    (`dew.telemetry.benchmark.samples`), each step consuming the state the
-    one before it returned, as training does."""
+def step_seconds(step: Callable, state: TrainState, batch: Batch) -> list[float]:
+    """Seconds a step of `step` takes on `batch` from `state`, each of `TIMED_REPEATS` samples the mean
+    of `TIMED_STEPS` queued and synchronized once after `TIMED_WARMUP`
+    (`dew.telemetry.benchmark.samples`), each step consuming the state the one before it returned, as
+    training does."""
     held = [state]
 
     def stepped() -> TrainState:
         held[0], *_ = step(held[0], batch)
         return held[0]
 
-    return samples(stepped, warmup=TIMED_WARMUP, repeats=1, calls=TIMED_STEPS)[0]
+    return samples(stepped, warmup=TIMED_WARMUP, repeats=TIMED_REPEATS, calls=TIMED_STEPS)
+
+
+def faster(timings: Sequence[Sequence[float]]) -> int:
+    """The plan of a frontier's `timings` (each plan's samples, `step_seconds`) that runs faster: a later
+    one only where its slowest sample beats every sample of the first's, the first otherwise. A choice
+    within the timings' spread is the clock's noise, which would give two runs of one configuration
+    different plans, and so different models and steps, where neither runs faster."""
+    chosen = 0
+    for index, timing in enumerate(timings[1:], start=1):
+        if max(timing) < min(timings[chosen]):
+            chosen = index
+    return chosen
 
 
 @dataclasses.dataclass
@@ -252,7 +264,7 @@ class Timer:
     state: TrainState
     batch: Batch
 
-    def __call__(self, steps: Sequence[Callable]) -> list[float]:
+    def __call__(self, steps: Sequence[Callable]) -> list[list[float]]:
         # The frozen tree is no step's to change or donate, and the objective's held tree shares it: it
         # is kept as it is, and the moving state alone is copied, freed and restored.
         moving, frozen = apart(self.state)
@@ -314,13 +326,13 @@ class Forecast:
         return min(guesses, default=None)
 
 
-def settled(planned: Planned, plans: Sequence[Planned], seconds: Sequence[float],
+def settled(planned: Planned, plans: Sequence[Planned], seconds: Sequence[Sequence[float]],
             probes: Sequence[Probe]) -> dict[str, JSON]:
     """The record of `planned`, of `plans` a frontier timed at `seconds` a
     step (none where one plan fit first): every compile the search made,
     `probes`, and each timed plan's split, rows, rung and seconds."""
     return {**planned.record(), "probes": [probe.record() for probe in probes],
-            "timed": [{**plan.record(), "seconds": took}
+            "timed": [{**plan.record(), "seconds": min(took)}
                       for plan, took in zip(plans, seconds, strict=True)] if seconds else None}
 
 
