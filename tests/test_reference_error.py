@@ -741,8 +741,7 @@ def test_a_recorded_truth_over_windows_counts_one_window_and_checks_every_one():
 
     def moved_last(inputs):
         # The last window's truth moved by a millionth, every other window's as it is.
-        moved = product(inputs)
-        return {"y": moved["y"] * (1 + 1e-6)} if np.asarray(inputs["x"])[0, 0] == last else moved
+        return {"y": product(inputs)["y"] * jnp.where(inputs["x"][0, 0] == last, 1 + 1e-6, 1.0)}
 
     with jax.enable_x64(new_val=True):
         recorded = recorder.record_case("site", draw, evaluate, jax.vmap(product), summary=True)
