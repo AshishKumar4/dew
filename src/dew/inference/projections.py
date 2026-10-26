@@ -303,23 +303,27 @@ def unpacked(model: nn.Module, variables: Variables) -> Variables:
     devices whole (fully addressable, or replicated on every device) splits on the host; any other
     one, sharded across processes or over this process's own devices, splits where it lives. A
     group stored quantized for serving (`TextGeneration.quantized`, Qwix's arrays in place of its
-    kernel) stays packed: such a tree computes only as the served model it was quantized for,
-    which reads it packed, and an export of it is refused where the source's layout reads the
-    members. A tree that holds no group to split is returned as it is."""
-    groups = tuple(group for group in _held_packed(model, variables) if all(
-        isinstance(leaf, (jax.Array, np.ndarray)) for leaf in _node(variables, "params", group.path)[
-            group.packed].values()))
+    kernel) splits as its values and scales do (`dew.quantization.split_columns`), each member the
+    packed kernel's columns quantized as they were, but where rules that quantize activations select
+    the packed site and not its members alike: a member's product would then find no rule and no
+    activation recipe its kernel records (`dew.quantization`'s serving provider), so the group stays
+    as the rules name it. A tree that holds no group to split is returned as it is."""
+    from dew.quantization import split_columns
+
+    layer = type(model)
+    spec = layer._dew_quantization if isinstance(layer, QuantizedClass) else None
+
+    def splits(group: ProjectionGroup) -> bool:
+        stored = _node(variables, "params", group.path)[group.packed].values()
+        plain = all(isinstance(leaf, (jax.Array, np.ndarray)) for leaf in stored)
+        if spec is None or spec.weight_only or plain:
+            return True
+        return len({spec.rule_for((*group.path, name)) for name in (*group.members, group.packed)}) == 1
+
+    groups = tuple(group for group in _held_packed(model, variables) if splits(group))
     if not groups:
         return variables
-
-    def parts(leaf, widths):
-        edges = np.cumsum(widths)[:-1].tolist()
-        if isinstance(leaf, jax.Array) and not (leaf.is_fully_addressable or (
-                leaf.is_fully_replicated and leaf.sharding.has_addressable_devices)):
-            return jnp.split(leaf, edges, axis=-1)
-        return np.split(np.asarray(leaf), edges, axis=-1)
-
-    split = _split(variables, groups, parts)
+    split = _split(variables, groups, split_columns)
     return freeze(split) if isinstance(variables, FrozenDict) else split
 
 
