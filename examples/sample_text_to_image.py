@@ -31,6 +31,7 @@ import numpy as np
 import tyro
 from PIL import Image, ImageDraw, ImageFont
 
+import dew
 from dew.artifacts import uint8_pixels
 from dew.inference import TextToImage
 from dew.interop import SourceReference
@@ -70,7 +71,10 @@ def load(model: str) -> TextToImage:
     if Path(model).is_dir():
         return TextToImage.from_run(model)
     source = SourceReference.parse(model)
-    return TextToImage.from_pretrained(source.name, revision=source.revision)
+    pipe = dew.pipeline(source.name, revision=source.revision)
+    if not isinstance(pipe, TextToImage):
+        raise TypeError(f"{model} holds a {type(pipe).__name__} run, which draws no images")
+    return pipe
 
 
 def grid(title: str, prompts, seeds, images: np.ndarray) -> Image.Image:
