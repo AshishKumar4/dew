@@ -193,7 +193,15 @@ def _divergence(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> j
     (`_scaled`), so no step leaves float32's range where the KL keeps it: an error near float32's least
     over a variance as small (a KL of 0.5 where half the error flushed to zero), a squared difference
     past its largest over a variance as wide. A KL within a rounding of float32's least normal may round
-    below it, which XLA:CPU flushes. Its derivatives are `_gaussian_kl`'s."""
+    below it, which XLA:CPU flushes. Its derivatives are `_gaussian_kl`'s.
+
+    The guarantee is range, not exact accumulation: each sum of signed terms rounds as a float32 sum
+    does once its terms are aligned to the largest, so terms that cancel the largest keep nothing
+    below float32's precision of it (a JVP of `[2**60, 2**60, 2**-100]` along `[2**60, -2**60, 1]`
+    is 0, not `2**-100`; a difference keeps no tail below its own precision). An exact accumulation
+    over a row's exponent range costs a pass per term over the whole latent, which a transition's
+    KL, taken over every latent coordinate, does not pay. The checks (tests/test_flow_grpo.py) hold
+    the KL and its derivatives to float64 as a range-safe float32 evaluation in NumPy is held."""
     *_, quotient, power = _divergence_parts(mean, reference, variance)
     return _scaled(quotient, power)
 
