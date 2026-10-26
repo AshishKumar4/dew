@@ -49,6 +49,7 @@ and `tiny_inputs`, which that file's registry-wide parametrization needs.
 
 import dataclasses
 import functools
+import itertools
 import json
 from pathlib import Path
 from typing import NamedTuple
@@ -62,6 +63,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened
 from test_architectures import CASES as ARCHITECTURES, MASK, TEXT_FEATURES, TEXT_TOKENS, VOCAB
 from tiny_models import build_model, tiny_inputs
+from tool_support import load
 
 from dew.interop import Pretrained, hf_decoders
 from dew.lora import LoRA
@@ -545,6 +547,17 @@ def _call(model, variables, inputs, **apply) -> jax.Array:
     return model.apply(variables, *inputs, **apply)
 
 
+def _saved(model, variables, inputs, **apply) -> int:
+    """The bytes `model`'s forward keeps for its backward: the residuals its linearization holds
+    (`jax.linearize`), traced abstractly. A remat rung recomputes what it does not keep, so a stronger
+    rung keeps fewer."""
+    def forward(params):
+        return _call(model, {**variables, "params": params}, inputs, **apply)
+
+    kept = jax.eval_shape(lambda params: jax.linearize(forward, params)[1], variables["params"])
+    return sum(leaf.size * leaf.dtype.itemsize for leaf in jax.tree.leaves(kept))
+
+
 def _stepped(model, variables, inputs, **apply) -> tuple[jax.Array, dict]:
     """A step's forward and its gradient in every floating parameter."""
     output = _call(model, variables, inputs, **apply)
@@ -572,6 +585,8 @@ def _rungs(model) -> list:
 RUNG_SEEDS = 8
 """Check 1's declared seeds for a rung's forward against the model's, sized paired by `seeds_for` on
 an A100, where a rung's checkpoint barriers change the forward program."""
+ZEROS_DRAWN = load("layout_parity").zeros_drawn
+"""A parameter tree with each all-zero leaf drawn (tools/layout_parity.py)."""
 
 
 def _redrawn(inputs, seed: int):
@@ -591,14 +606,20 @@ def _redrawn(inputs, seed: int):
 
 def _climbs_and_restores(model, variables, inputs, **apply) -> None:
     """Each rung holds less than the one below it, and its top rung steps the
-    forward the model does: the top rung's checkpoint makes its forward another
+    forward the model does. Each rung keeps fewer residual bytes for its
+    backward than the rung below it (`_saved`), so no rung is a remat that
+    recomputes nothing. The top rung's checkpoint makes its forward another
     program, which check 1 holds against the model's from the model's float64
     twin over drawn inputs. Its backward recomputes, which can round apart
     (gemma2-tiny's gradients by up to 1.2e-4, kimi-k3-tiny's 8.3e-3 of 10.8;
     test_decoder_remat.py found the same), so the gradients are the model's
-    bits or as exact as them. A rung's record restores it from any rung below
-    it and moves no rung above it, and the top rung runs over the model's
-    variables, every collection where it was.
+    bits or as exact as them. Both are taken over the variables with every
+    all-zero leaf drawn (tools/layout_parity.py's `zeros_drawn`): a zero output
+    projection or an identity modulation, as a fresh DiT holds them, would
+    leave its trunk's gradient zero and a wrong recomputed backward unseen. A
+    rung's record restores it from any rung below it and moves no rung above
+    it, and the top rung runs over the model's variables, every collection
+    where it was.
 
     Of testing.md's memory settings, no remat and a rung of the planner's, a
     model meets each once here: its top rung, which recomputes every name its
@@ -616,6 +637,10 @@ def _climbs_and_restores(model, variables, inputs, **apply) -> None:
             assert restored == records[max(low, high)], (records[low], records[high], restored)
     assert all(rung.restore_recompute("no rung").recompute_record() == record
                for rung, record in zip(rungs, records, strict=True))
+    variables = {**variables, "params": ZEROS_DRAWN(variables["params"], jax.random.key(7))}
+    saved = [_saved(rung, variables, inputs, **apply) for rung in rungs]
+    assert all(above < below for below, above in itertools.pairwise(saved)), list(zip(records, saved,
+                                                                                         strict=True))
     _, gradient_tree = _stepped(model, variables, inputs, **apply)
     truth = functools.cache(
         lambda: _stepped(_float64(model), widened(variables), widened(inputs), **apply)[1])
