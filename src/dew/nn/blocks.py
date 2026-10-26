@@ -290,8 +290,10 @@ def _torch_bicubic_weights(size_in: int, size_out: int, antialias: bool) -> np.n
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 """The ImageNet pixel statistics, per RGB channel, that encoders trained on ImageNet read their
-inputs under: transformers' `IMAGENET_DEFAULT_MEAN` and `IMAGENET_DEFAULT_STD`, which a test holds
-these equal to (Dew imports no transformers at module level)."""
+inputs under: transformers' `IMAGENET_DEFAULT_MEAN` and `IMAGENET_DEFAULT_STD`, written out since
+importing those runs `transformers.utils`, which imports torch where it is installed (transformers
+5.16.1, utils/generic.py), and image sampling imports this module with neither
+(tests/test_imports.py)."""
 
 
 def torch_bicubic_resize(x, height: int, width: int, *, antialias: bool = False):
