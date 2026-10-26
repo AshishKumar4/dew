@@ -1461,10 +1461,14 @@ def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]
 
 
 NAMED = _Need('named', lambda case: False,
-              "CUTLASS's grouped GEMM runs only where a call names it (`generation.chosen`)",
-              row="roadmap: close the grouped GEMM's gap to CUTLASS", kind='measured')
-"""What keeps CUTLASS's launches off every call that does not name them: a vendored kernel that no
-measurement ranks against the template's."""
+              lambda case: "this launch runs only where a call names it (`generation.chosen`)",
+              row="owner, bible 67b4f84: a template replaces a production route once measured at least as "
+                  "fast", kind='measured')
+"""What keeps a launch off every call that does not name it: the TPU's, whose native run no measurement
+has shown at least as fast as main's route there, XLA's program (BIBLE §4: base/kernels reaches main with
+main's defaults), and CUTLASS's, a vendored kernel no measurement ranks against the template's. Mosaic
+GPU's launch keeps the place main's chooser gave it on an H100, where it measured faster than Triton's
+(test_gemm_template's HOOKED_RECEIPTS: 5.9 ms against 10.2 at Llama 3 8B's gate projection)."""
 
 
 _FAMILIES = {mosaic_sm90.WGMMA.name: mosaic_sm90.WGMMA, mosaic_sm80.Mma.name: mosaic_sm80.Mma}
@@ -1491,12 +1495,14 @@ _GMMS = (MosaicGmm(), MosaicTpuGmm(), Gmm(), CutlassGmm())
 _TGMMS = (MosaicTgmm(), MosaicTpuTgmm(), Tgmm(), CutlassTgmm())
 
 GROUPED: selection.Op[GroupedCase] = selection.Op('grouped_matmul', (
-    *(_launch_kernel(launch.name, *((NAMED,) if launch.name == 'cutlass' else ())) for launch in _GMMS),
+    *(_launch_kernel(launch.name, *((NAMED,) if launch.name in ('mosaic_tpu', 'cutlass') else ()))
+      for launch in _GMMS),
     selection.Kernel[GroupedCase]('xla', (), generic=True)))
-"""The grouped selector, in a fixed order: the first of Mosaic GPU's, the TPU's and Triton's launches
-that takes the call, Triton's taking only what both Mosaic launches refuse, else XLA's program;
-CUTLASS's only by name (`NAMED`). Every implementation shares the template's signature, so each binds
-the call's own arguments, `_GMMS`' for a product, `_TGMMS`' for a kernel gradient."""
+"""The grouped selector, in a fixed order, main's route: Mosaic GPU's launch where it takes the call (an
+H100's, where it measured faster than Triton's; mma.sync's where this JAX lowers it), Triton's where it
+refuses, else XLA's program; the TPU's and CUTLASS's launches only by name (`NAMED`). Every
+implementation shares the template's signature, so each binds the call's own arguments, `_GMMS`' for a
+product, `_TGMMS`' for a kernel gradient."""
 
 
 def grouped_case(launches, arguments, options, *, product: Product, whole: bool,

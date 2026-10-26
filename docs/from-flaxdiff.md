@@ -59,7 +59,8 @@ It takes three things from the old run:
 ```python
 import json
 
-from dew.sampling import Heun, TextToImage
+from dew.inference import TextToImage
+from dew.sampling import Heun
 
 config = json.load(open("run_config.json"))  # the run's saved training config
 pipe = TextToImage.from_flaxdiff("checkpoints/350000", config, jax_version="0.5.3")

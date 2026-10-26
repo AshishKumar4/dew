@@ -740,8 +740,9 @@ def test_the_quantized_serving_benchmark_samples_through_the_task_and_reads_its_
     from flax import linen as nn
 
     from dew.diffusion import DirectPredictionTransform, FlowMatchingScheduler, Process
+    from dew.inference import TextToImage
     from dew.inputs import Field, InputSpec
-    from dew.sampling import Euler, TextToImage
+    from dew.sampling import Euler
 
     class Zero(nn.Module):
         def __call__(self, x, time, train=False):

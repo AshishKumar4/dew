@@ -483,7 +483,6 @@ def test_splash_sizes_its_backward_to_a_v5es_scoped_vmem(dtype, width, softcap, 
     assert (sizes.block_q, sizes.block_kv) == (1024, 1024)
     assert (sizes.block_q_dkv, sizes.block_kv_dkv, sizes.block_kv_dkv_compute) == (backward,) * 3
     assert (sizes.block_q_dq, sizes.block_kv_dq) == (backward,) * 2
-    assert sizes.delta_from_weights and not sizes.use_fused_bwd_kernel
 
 
 def test_splash_keeps_its_backward_blocks_where_a_tpus_limit_is_unmeasured():

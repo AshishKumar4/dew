@@ -1008,6 +1008,12 @@ def local_rows(leaf: jax.typing.ArrayLike, *, host: bool = True) -> jax.Array | 
     return np.concatenate(blocks, axis=0)
 
 
+def host_rows(leaf: jax.typing.ArrayLike, rows: int | None) -> np.ndarray:
+    """This process's first `rows` real rows of a result leaf, as a host array (`local_rows`): the
+    result without the rows its batch was padded with to fill the devices. None keeps every row."""
+    return local_rows(leaf)[:rows]
+
+
 def request_key(key: int | jax.Array | None) -> jax.Array:
     """Normalize an integer seed or a single JAX key to one typed PRNG key."""
     if key is None or isinstance(key, bool):
@@ -1195,7 +1201,7 @@ class RowPlan:
 
     def host(self, leaf) -> np.ndarray:
         """Return this process's real rows of a result leaf as a host array."""
-        return local_rows(leaf)[:self.rows]
+        return host_rows(leaf, self.rows)
 
 
 @dataclass(frozen=True)

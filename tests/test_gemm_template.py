@@ -1001,16 +1001,17 @@ NARROW_GRADIENT_CASES = ("norm and bias", "gated prologue", "cast prologue", "br
 @pytest.mark.parametrize("case", NARROW_GRADIENT_CASES)
 def test_the_tpu_launches_gradients_hold_check_1(case):
     """Every operand's cotangent of a bf16 matrix at the default precision, where no product adds step by
-    step, so the forward and both gradients run the TPU's launches, interpreted: as exact as JAX's
-    derivative of the plain program from float64 truth."""
+    step, so the forward and both gradients run the TPU's launches, named and interpreted: as exact as
+    JAX's derivative of the plain program from float64 truth."""
     spec = CASES[case]
 
     def drawn(seed):
         x, w, *rest = _draw(seed)
         return (x, w.astype(jnp.bfloat16), *rest)
 
+    # Named: the TPU's launches run by name until measured (`grouped_matmul.NAMED`).
     with (generation.assumed("v5e"), jax.default_matmul_precision("default"),
-          generation.routes() as taken):
+          generation.chosen(grouped_matmul="mosaic_tpu"), generation.routes() as taken):
         assert_as_exact(_gradients(_dew(spec, interpret_on_cpu=True)), jax.jit(_gradients(_plain(spec))),
                         _gradient_draw(spec, drawn), f"{case} gradients on the TPU's launches", seeds=SEEDS,
                         truth_fn=_gradients(_plain(spec, truth=True)))
