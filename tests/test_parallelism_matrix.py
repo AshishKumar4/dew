@@ -43,6 +43,7 @@ CELLS: dict[str, tuple[str, ...]] = {
     "grouped": ("fsdp2_tensor2",),
     "gated": ("tensor4",),
     "moe_grpo": ("expert4", "expert2_fsdp2", "tensor4", "sequence4"),
+    "moe_exchange": ("expert4", "expert2_fsdp2"),
     "mla_dpo": ("fsdp4", "sequence4"),
     "hybrid_sft": ("sequence4", "stage4", "data4_explicit"),
     "routed_tail": ("stage4",),

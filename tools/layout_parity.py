@@ -220,6 +220,11 @@ def zoo() -> dict[str, Any]:
              "num_kv_heads": 4, "head_dim": 8, "mlp_features": 128, "max_seq_len": 33}
     moe = {**dense, "mixture": {"experts": 8, "top_k": 2, "expert_features": 32,
                                 "layers": (0, 1, 2, 3)}}
+    # The expert exchange under a capacity: each device's buckets hold what
+    # its sequences keep, one round, so its program splits evenly. Dropless,
+    # the exchange also compiles the rounds a skewed routing needs, which a
+    # static count of the step's FLOPs reads whether or not they run.
+    exchange = {**moe, "mixture": {**moe["mixture"], "dispatch": "exchange", "capacity_factor": 2.0}}
     moe128 = {**dense, "mixture": {**_fixture("qwen3-30b-a3b")["mixture"], "expert_features": 32,
                                    "layers": (0, 1, 2, 3)}}
     # Four periods of five sliding layers and one global one, so each stage
@@ -281,6 +286,7 @@ def zoo() -> dict[str, Any]:
         "gated": Case("causal_transformer", {**dense, **OWN_GATE}, **lm),
         "moe": Case("causal_transformer", moe, **lm),
         "moe128": Case("causal_transformer", moe128, **lm),
+        "moe_exchange": Case("causal_transformer", exchange, **lm),
         "hybrid": Case("causal_transformer", hybrid, **lm),
         "routed_tail": Case("causal_transformer", routed_tail, **lm),
         "shared_tail": Case("causal_transformer", shared_tail, **lm),
