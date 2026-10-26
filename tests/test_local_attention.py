@@ -235,6 +235,7 @@ def test_chunks_from_a_shared_vector_of_places_split_over_an_explicit_sequence_a
     mesh = MeshSpec(sequence=2, explicit=("sequence",)).build(jax.devices()[:2])
     run = jax.jit(attend)
 
+    @as_given
     def split(q, k, v):
         with jax.set_mesh(mesh):
             placed = [jax.device_put(x, NamedSharding(mesh, PartitionSpec(None, "sequence")))

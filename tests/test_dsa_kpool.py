@@ -159,7 +159,8 @@ def dew_block(variables, **overrides):
 
 def reference_block_output(block):
     """The reference block, fp32, as a function of a draw: its output on the valid rows."""
-    return lambda hidden, valid: {'output': on_valid_rows(reference_output(block, hidden, valid), valid)}
+    return as_given(lambda hidden, valid: {'output': on_valid_rows(reference_output(block, hidden, valid),
+                                                                    valid)})
 
 
 def float64_block(block):
@@ -250,6 +251,7 @@ def torch_gradients(block):
         with float64() if wide else contextlib.nullcontext():
             return torch.func.functional_call(block, params, (x, valid))[0]
 
+    @as_given
     def run(hidden, valid, readout):
         _, grad_x, grads, _ = torch_with_gradients(forward)(np.asarray(hidden), named, np.asarray(valid),
                                                            np.asarray(readout))

@@ -146,7 +146,6 @@ def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, nam
     weights = {model: {key: value.detach().numpy() for key, value in model.named_parameters()}
                for model in (narrow_model, wide_model)}
 
-    @as_given
     def reference_walk(model, drawn):
         """The source's call in the draw's dtype, and the same gradients under the same cotangent as
         `z_image_walk`'s (`torch_with_gradients`), channels last."""
