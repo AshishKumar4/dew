@@ -32,7 +32,8 @@ from dew.nn.sparse_selection import selection_mask, sparse_latent_attention, top
 from dew.quantization import QUANTIZATION, InputQuantization
 
 HEADS, RANK, NOPE, ROPE, VALUE = 4, 24, 16, 8, 12
-SEEDS = {'selection': 8, 'packed selection': 8, 'sparse layer': 8, 'dropped-out adapter': 16}
+SEEDS = {'selection': 8, 'packed selection': 8, 'sparse layer': 8, 'dropped-out adapter': 16,
+         'act-quantized kv_b_proj': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 
 
@@ -208,6 +209,32 @@ def test_a_quantized_kv_b_proj_keeps_the_masked_kernel(quantized):
 
     for sparse, masked in zip(jax.tree.leaves(run(qk=False)), jax.tree.leaves(run(qk=True)), strict=True):
         np.testing.assert_array_equal(np.asarray(sparse), np.asarray(masked))
+
+
+def test_an_act_quantized_kv_b_proj_keeps_the_masked_kernel():
+    """Qwix's fake-quantized products at kv_b_proj (`dew.quantization.Quantization`) round its input, the
+    latents themselves. The absorbed path applies kv_b_proj to the identity, where the rounding would
+    land on the identity instead, so such a call runs the masked kernel: on par (check 1) with the same
+    call with `qk` open, its truth that call in float64, each seed drawing its own weights."""
+    pytest.importorskip("qwix")
+    from dew.quantization import Quantization
+
+    layer = MultiHeadLatentAttention(
+        emb_features=32, num_heads=HEADS, max_seq_len=64, q_lora_rank=16, kv_lora_rank=RANK,
+        qk_nope_head_dim=NOPE, qk_rope_head_dim=ROPE, v_head_dim=VALUE,
+        index_topk=5, index_n_heads=2, index_head_dim=16, attention_impl="reference")
+    model = Quantization(patterns=("kv_b_proj",)).apply(layer)
+    init = jax.jit(layer.init)
+
+    def draw(seed):
+        return (init(jax.random.key(seed), jnp.zeros((2, 21, 32))), *hidden_draw(seed))
+
+    def masked(variables, hidden):
+        return model.apply(variables, hidden, mutable=["qk"])[0]
+
+    assert_as_exact(jax.jit(model.apply), jax.jit(masked), draw, 'act-quantized kv_b_proj',
+                    seeds=SEEDS['act-quantized kv_b_proj'],
+                    truth_fn=lambda variables, hidden: masked(widened(variables), hidden))
 
 
 def test_memory_follows_the_selection_not_the_sequence():
