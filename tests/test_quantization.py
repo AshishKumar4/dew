@@ -29,7 +29,7 @@ from reference_error import (
 )
 from token_support import token_rows
 
-from dew.config import ObjectiveConfig, OptimConfig
+from dew.config import ObjectiveConfig
 from dew.lora import _updated as lora_update
 from dew.nn.attention_residuals import depth_mixed
 from dew.nn.blocks import torch_bicubic_resize
@@ -40,6 +40,7 @@ from dew.nn.sharding import pipeline_microbatches
 from dew.nn.ssm import diagonal_recurrence
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
+from dew.optim import OptimConfig
 from dew.quantization import UNQUANTIZED, Quantization, quantize_for_serving, quantize_with
 from dew.registry import models
 from dew.training.distributed import Layout, MeshSpec, shard_batch
@@ -1132,8 +1133,9 @@ def diffusion_run(directory, batch=RUN_BATCH, **trainer):
     images, one step, nothing written but the record."""
     from diffusion_support import images_of
 
-    from dew.config import ModelConfig, TrainerConfig
+    from dew.config import TrainerConfig
     from dew.config.diffusion import DiffusionRunConfig
+    from dew.registry import ModelConfig
 
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 16,

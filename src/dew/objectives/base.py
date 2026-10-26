@@ -22,7 +22,6 @@ from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from typing import (
     TYPE_CHECKING,
-    Any,
     ClassVar,
     Generic,
     Literal,
@@ -43,13 +42,14 @@ from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
 from dew._distributions import counter_key
+from dew._records import JSON
 from dew.artifacts import Artifact, Artifacts, TokenScores
+from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, everything, part
 from dew.nn import categorical
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import accumulated, at_least_fp32, compensated_sum, weighted_total
 from dew.nn.protocols import HiddenStates, ProjectsParameters
 from dew.nn.sharding import rows_taken
-from dew.records import JSON, strings
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -65,30 +65,12 @@ if TYPE_CHECKING:
     from dew.nn.autoencoders import AutoEncoder
     from dew.nn.backbones.decoder_stack import DecoderBank
     from dew.sampling.guidance import Guidance
+    from dew.state import TrainState
     from dew.training.distributed import Layout, MeshSpec
-    from dew.training.state import TrainState
 
     type Task = TextGeneration | BlockGeneration | MaskedGeneration | TextToImage
 
-type Variables = Mapping[str, Any]
-"""A Flax variables dict: the `params` collection plus any other collection
-the modules keep (`moe`, `batch_stats`, an objective's frozen encoders)."""
 
-type Batch = Mapping[str, Any]
-"""One batch of training examples, as the trainer and every objective read it.
-
-It is declared here and imported by `dew.data.dataset`, so a field added on
-one side has the same type on the other. The values are not all arrays.
-Besides the arrays a step consumes, a batch can hold the prepared text inputs
-of a language run, the file paths a video corpus loads lazily, the integer
-row counts a packer keeps and the record lists a mixture reads. A narrower
-value type would be wrong about what `dew.data` already builds."""
-type Path = tuple[str, ...]
-type PathFilter = Callable[[Path], bool]
-"""A function that selects leaves of a variables tree by the tuple of dict keys above them.
-
-One filter type is used for the EMA selection, for `optax.multi_transform`
-labels and for frozen subtrees."""
 type Initializer = Partial
 """An objective's `init` with its held variables bound as `Partial` children,
 which a JIT takes as arguments (`Objective.initializer` says why)."""
@@ -496,146 +478,13 @@ class Prediction:
     hidden: tuple[jax.Array, ...]
 
 
-def everything(path: Path) -> bool:
-    return True
-
-
-def under(*prefix: str) -> PathFilter:
-    """Return a filter that accepts the leaves below `prefix`.
-
-    For example, `under("params", "context_encoder")`.
-    """
-    return lambda path: path[:len(prefix)] == prefix
-
-
-def select(tree: Variables, keep: PathFilter) -> Variables:
-    """Return the subtree of `tree` whose leaves `keep` accepts, nested the same way.
-
-    A branch with no accepted leaf is dropped, so the result is what the EMA
-    stores and what `merge` puts back. Raises `ValueError` when `keep`
-    accepts no leaf at all.
-    """
-    def prune(node, path):
-        if isinstance(node, Mapping):
-            kept = {name: prune(child, (*path, name)) for name, child in node.items()}
-            return {name: child for name, child in kept.items() if child is not None} or None
-        return node if keep(path) else None
-
-    selected = prune(tree, ())
-    if not selected:
-        raise ValueError("the filter selected no leaf of the variables tree")
-    return selected
-
-
-def merge(tree: Variables, overlay: Variables) -> Variables:
-    """Return a copy of `tree` with every leaf in `overlay` written over it."""
-    merged = dict(tree)
-    for name, child in overlay.items():
-        held = tree.get(name)
-        merged[name] = (merge(held, child)
-                        if isinstance(held, Mapping) and isinstance(child, Mapping)
-                        else child)
-    return merged
-
-
 TEACHER = "teacher"
 """The collection of a distilling objective's frozen teacher variables."""
 
 UNREAD = "unread"
 """The field of an inference record naming the parts of the run's tree its model does not read
-(`without`), which a loader leaves unrestored (`Objective._saved_variables`): a distillation's
+(`without`), which a loader leaves unrestored (`dew.inference.tasks.SavedRun.variables`): a distillation's
 teacher and projections beside the student it saves."""
-
-
-def without(tree: Variables, paths: Sequence[Sequence[str]]) -> Variables:
-    """`tree` without the subtree at each of `paths`, a path the tree does not hold left as it is."""
-    kept = dict(tree)
-    for path in paths:
-        name, *rest = path
-        if name in kept:
-            if rest:
-                held = kept[name]
-                kept[name] = without(held, [rest]) if isinstance(held, Mapping) else held
-            else:
-                del kept[name]
-    return kept
-
-FROZEN = "frozen"
-"""The name of the collection where a partially trained run keeps its frozen weights.
-
-The optimizer updates the `params` collection and nothing else, so the
-leaves that `freeze` keeps in `params` are the ones that train. The frozen
-leaves stay in this collection as part of the state, and `thaw` merges the
-two before the model reads them."""
-
-PARAMETER_ROOTS = (("params",), (FROZEN,))
-"""The collections of a variables tree that hold a model's parameters, which a run's loaders read
-and a storage dtype casts: the trained ones and the frozen."""
-
-
-VALID_ROWS = "valid_rows"
-
-EXAMPLE_ROWS = "example_rows"
-"""A training batch's column of each row's place among its step's records, int32: the order the
-records' stream holds them in, whatever process read a row (`dew.training.distributed.marked`). The
-trainer's transaction reads it for the examples' draws (`Step.example_index`) and takes it out of the
-batch the objective sees."""
-"""The field every evaluation batch holds: one bool per row, True for a real record and False for a repeat.
-
-A split's last batch is padded to full size with repeats of its own rows, and
-a process whose share runs out before the others' scores a copy of its last
-batch in which every row is a repeat. That way a pass is whole batches on
-every process and counts each record once. A loss weights its rows by this
-field, and its batch-wide terms are taken over the real rows only. Training
-batches never have it.
-"""
-
-
-def freeze(variables: Variables, trainable: PathFilter) -> Variables:
-    """Move the `params` leaves that `trainable` rejects into the `FROZEN` collection.
-
-    `trainable` sees full leaf paths, `("params", ...)`. A tree already split
-    keeps training the leaves its `params` hold, beside those `trainable`
-    takes from either collection, and keeps the rest frozen: an adapter
-    attached over another keeps both training. Raises `ValueError` when the
-    split keeps every leaf or none, since then there is nothing to split.
-    """
-    training = (frozenset() if FROZEN not in variables else frozenset(
-        ("params", *(entry.key for entry in path))
-        for path, _ in jax.tree_util.tree_leaves_with_path(variables["params"])))
-    variables = thaw(variables)
-
-    def trains(path: Path) -> bool:
-        return path in training or trainable(path)
-
-    leaves = jax.tree_util.tree_leaves_with_path(variables["params"])
-    kept = sum(trains(("params", *(entry.key for entry in path))) for path, _ in leaves)
-    if kept in (0, len(leaves)):
-        raise ValueError(
-            f"trainable keeps {kept} of {len(leaves)} parameter leaves, which "
-            f"{'freezes' if kept else 'trains'} nothing")
-    moving = select(variables, lambda path: path[0] == "params" and trains(path))
-    frozen = select(variables, lambda path: path[0] == "params" and not trains(path))
-    return {**variables, "params": moving["params"], FROZEN: frozen["params"]}
-
-
-def thaw(variables: Variables) -> Variables:
-    """Undo `freeze`, merging the frozen leaves back into one `params` collection.
-
-    Variables without a `FROZEN` collection are returned unchanged.
-    """
-    if FROZEN not in variables:
-        return variables
-    rest = {name: value for name, value in variables.items() if name != FROZEN}
-    return {**rest, "params": merge(variables[FROZEN], variables["params"])}
-
-
-def part(variables: Variables, name: str) -> Variables:
-    """Cut the `name` subtree out of every collection that holds one: one
-    module's own tree out of an objective's that nests several under each
-    collection, `params/policy` and `frozen/policy`, so an adapted module's
-    base comes with its factors."""
-    return {collection: subtree[name] for collection, subtree in variables.items() if name in subtree}
 
 
 def projected_parts(params: Variables, owners: Mapping[str, ProjectsParameters | nn.Module | HiddenStates], *,
@@ -771,7 +620,6 @@ def _ruled_jvp(primals, tangents):
                                     zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
 
 
-
 class Objective(ABC, Generic[Loss, Effects]):
     """Defines what is learned: the parameters, the loss and what evaluation produces."""
 
@@ -810,13 +658,15 @@ class Objective(ABC, Generic[Loss, Effects]):
     """The dataclass of what a saved run records beside its objective and model
     (`task_settings`), the one list of those fields: the objective writes an
     instance, its `saved_task` reads it back, and a record holding any other
-    field is refused (`dew.inference.tasks.run_record`). None records nothing
+    field is refused (`dew.inference.tasks.SavedRun.pinned`). None records nothing
     more."""
     """The task class a saved run of this objective loads as, which `dew.pipeline` builds from the run.
 
     A subclass inherits its parent's. None means a saved run of this
     objective loads as no task."""
-    _ema_is_reference: ClassVar[bool] = False
+    ema_is_reference: ClassVar[bool] = False
+    """Whether the objective's average is the frozen reference its loss compares against (an RL
+    policy's), which validation, `pipeline` and a saved run's loader never read as the trained weights."""
     # The name an objective that trains other networks beside its model nests
     # the model under in every collection, as PPO nests its policy beside the
     # critic; None when the saved tree is the model's.
@@ -898,7 +748,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         reference, as the base `init` returns the whole collection (it projects
         `params` alone), is shared: the trainer's state holds that very array,
         which no step donates, so a run and its objective hold one frozen tree
-        (`dew.training.state.apart`). A frozen leaf `init` builds, another
+        (`dew.state.apart`). A frozen leaf `init` builds, another
         array's copy or values of its own, is the state's own.
         """
         return self.variables
@@ -1444,44 +1294,18 @@ class Objective(ABC, Generic[Loss, Effects]):
     def evaluation_variables(self, variables: Variables, step: Step) -> Variables:
         """Return the weights a validation pass and a preview score: the
         step's average when the run keeps one, unless that average is the
-        objective's frozen reference (`_ema_is_reference`), else `variables`."""
-        return variables if step.ema is None or self._ema_is_reference else step.ema
+        objective's frozen reference (`ema_is_reference`), else `variables`."""
+        return variables if step.ema is None or self.ema_is_reference else step.ema
 
     def _pipeline_weights(self, state: TrainState, ema: bool | None) -> Variables:
-        if self._ema_is_reference or ema is False or (ema is None and state.ema is None):
+        if self.ema_is_reference or ema is False or (ema is None and state.ema is None):
             return state.variables
         return state.averaged
 
     @classmethod
-    def _saved_variables(cls, directory: str, *, step: int | str | None, ema: bool | None,
-                         mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-                         param_dtype: DTypeLike | None = None,
-                         parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS
-                         ) -> Variables:
-        """Return the model's variables from a run of this objective, as every run loader reads them.
-
-        The arguments are `Checkpoints.variables`'. An objective whose average
-        is its frozen reference gives the trained weights whatever `ema` asks,
-        and one that nests the model beside other networks gives the model's
-        own part, its trained and frozen collections together.
-        """
-        from dew.checkpoints import Checkpoints
-
-        with Checkpoints(directory) as checkpoints:
-            step = checkpoints.pinned(step)
-            record = checkpoints.artifact(step)
-            unread = record.get(UNREAD, []) if isinstance(record, Mapping) else []
-            if not isinstance(unread, list):
-                raise ValueError(f"{UNREAD} must be a list of paths")
-            variables = checkpoints.variables(
-                step=step, ema=False if cls._ema_is_reference else ema, mesh=mesh, layout=layout,
-                param_dtype=param_dtype, parameter_roots=parameter_roots,
-                unread=tuple(strings(path, UNREAD) for path in unread))
-        return cls._model_tree(variables)
-
-    @classmethod
-    def _model_tree(cls, variables: Variables) -> Variables:
-        """The `_model_part` subtree of `variables`, or the whole tree when the objective names none."""
+    def model_tree(cls, variables: Variables) -> Variables:
+        """The model's own subtree of a tree this objective's class trains (`_model_part`), or the whole
+        tree when the objective names none: what a saved run's loader reads (`SavedRun.variables`)."""
         return variables if cls._model_part is None else part(variables, cls._model_part)
 
     def model_variables(self, variables: Variables) -> Variables:
@@ -1492,7 +1316,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         part, trained and frozen collections together, of an objective that
         nests the model beside other networks or frozen ones.
         """
-        return self._model_tree(variables)
+        return self.model_tree(variables)
 
     def task_settings(self) -> DataclassInstance | None:
         """Return the task settings a saved step records beside its model, an
@@ -1517,8 +1341,7 @@ class Objective(ABC, Generic[Loss, Effects]):
         settings returns None; a custom research method can still restore its
         raw state.
         """
-        from dew.config import ModelConfig
-        from dew.registry import import_path, record_fields, to_record
+        from dew.registry import ModelConfig, import_path, record_fields, to_record
 
         settings = self.task_settings()
         if settings is None:
@@ -1594,6 +1417,23 @@ class Source(Protocol[M]):
 
     @property
     def text_processor(self) -> Processor | None: ...
+
+
+@runtime_checkable
+class Ending(Protocol):
+    """A loaded source that names the end-of-sequence ids its generation stops at, as
+    `dew.interop.Pretrained` does (`eos_token_ids`)."""
+
+    @property
+    def eos_token_ids(self) -> tuple[int, ...]: ...
+
+
+def ended(source: nn.Module | Source, eos_token_ids: Sequence[int] | Omitted) -> tuple[int, ...]:
+    """The end-of-sequence ids a task over `source` stops at: `eos_token_ids` where given, else a
+    loaded source's own (`Ending`), else none, as a bare model names none."""
+    if eos_token_ids is not OMITTED:
+        return tuple(eos_token_ids)
+    return tuple(source.eos_token_ids) if isinstance(source, Ending) else ()
 
 
 S = TypeVar("S")
@@ -1676,7 +1516,6 @@ def mean_of_totals(accumulated: tuple[float, float]) -> float:
     return accumulated[0] / accumulated[1]
 
 
-
 def token_log_probs(logits: jax.Array, tokens: jax.Array) -> jax.Array:
     """`log_softmax(logits)[..., tokens]`, reduced in at least fp32 (`dew.nn.categorical`).
 
@@ -1685,17 +1524,12 @@ def token_log_probs(logits: jax.Array, tokens: jax.Array) -> jax.Array:
     return -categorical.cross_entropy(logits, tokens)
 
 __all__ = [
-    "FROZEN",
     "OMITTED",
-    "VALID_ROWS",
     "Aux",
-    "Batch",
     "EMASpec",
     "Metric",
     "Objective",
     "Omitted",
-    "Path",
-    "PathFilter",
     "Prediction",
     "ProgramModule",
     "Ratio",
@@ -1705,15 +1539,7 @@ __all__ = [
     "Step",
     "TrainingScalar",
     "TrainingScalars",
-    "Variables",
-    "everything",
-    "freeze",
     "joined",
-    "merge",
     "model_rngs",
-    "part",
-    "select",
-    "thaw",
     "training_rngs",
-    "under",
 ]

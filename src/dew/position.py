@@ -22,7 +22,7 @@ import dataclasses
 import json
 from collections.abc import Mapping
 
-from dew.records import record
+from dew._records import record
 
 ENVELOPE = "dew_global_position"
 """The key a global position is written under.

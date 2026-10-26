@@ -19,7 +19,8 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew import records
+from dew import _records
+from dew.batch import coordinates
 from dew.interop.weights import translate_parameters
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
@@ -31,7 +32,7 @@ from .attention import LayerNorm, RMSNorm
 from .audio import AudioEncoding
 from .backbones.decoder_block import BlockWiring, DecoderBlock
 from .blocks import TokenEmbedding
-from .inputs import AttentionMetadata, coordinates, sequence_blocks
+from .inputs import AttentionMetadata, sequence_blocks
 from .mixer_base import MixerContext
 from .mixers.attention import CausalSelfAttention
 from .mlp import GatedMLP
@@ -249,8 +250,12 @@ class MiMoAudioCodeEncoder(nn.Module):
                                   dot_general=float32_dot_general)
         if cfg.projection_layers == 1:
             return dense(cfg.out_hidden_size, name="projection")(x)
-        hidden = dense(4 * cfg.group_size * cfg.input_local_dim, name="projection_fc1")(x)
-        return dense(cfg.out_hidden_size, name="projection_fc2")(gelu_exact(hidden))
+        mlp = GatedMLP(4 * cfg.group_size * cfg.input_local_dim, cfg.out_hidden_size,
+                        in_features=x.shape[-1], activation=gelu_exact,
+                        names=("projection_fc1", "projection_fc2"), dtype=self.dtype,
+                        precision=self.precision)
+        nn.share_scope(self, mlp)
+        return mlp(x)
 
 
 class MiMoAudioTower(nn.Module):
@@ -307,64 +312,64 @@ def translate_mimo_audio_config(audio_config: Mapping[str, object],
         raise ValueError(f"ln_type {tokenizer_config.get('ln_type')!r} is not the tokenizer's layer norm")
     if str(tokenizer_config.get("activation_function", "gelu")) != "gelu":
         raise ValueError("the tokenizer's feed-forward is GELU")
-    if records.number(audio_config.get("partial_rotary_factor", 1.0), "partial_rotary_factor") != 1.0:
+    if _records.number(audio_config.get("partial_rotary_factor", 1.0), "partial_rotary_factor") != 1.0:
         raise ValueError("the audio encoder rotates every head dimension")
-    channels = records.integer(audio_config["audio_channels"], "audio_channels")
+    channels = _records.integer(audio_config["audio_channels"], "audio_channels")
     # The release writes the vocabularies as text: one size for every channel, or each one's, dashed.
     vocab = str(audio_config.get("speech_vocab_size", 1280))
-    sizes = [records.integer(int(size), "speech_vocab_size") for size in vocab.split("-")]
+    sizes = [_records.integer(int(size), "speech_vocab_size") for size in vocab.split("-")]
     sizes = sizes if len(sizes) > 1 else sizes * channels
-    stages = records.integer(tokenizer_config.get("num_quantizers", 20), "num_quantizers")
+    stages = _records.integer(tokenizer_config.get("num_quantizers", 20), "num_quantizers")
     books = tokenizer_config.get("codebook_size", 1024)
-    books = records.integers(books, "codebook_size") if isinstance(books, (list, tuple)) else (
-        records.integer(books, "codebook_size"),) * stages
+    books = _records.integers(books, "codebook_size") if isinstance(books, (list, tuple)) else (
+        _records.integer(books, "codebook_size"),) * stages
     books = (*books, *(books[-1],) * (stages - len(books)))[:stages]
     skip = tokenizer_config.get("encoder_skip_layer_id")
     tokenizer = {
-        "n_mels": records.integer(tokenizer_config["n_mels"], "n_mels"),
-        "sampling_rate": records.integer(tokenizer_config["sampling_rate"], "sampling_rate"),
-        "nfft": records.integer(tokenizer_config["nfft"], "nfft"),
-        "hop_length": records.integer(tokenizer_config["hop_length"], "hop_length"),
-        "window_size": records.integer(tokenizer_config["window_size"], "window_size"),
-        "fmin": records.number(tokenizer_config.get("fmin", 0.0), "fmin"),
+        "n_mels": _records.integer(tokenizer_config["n_mels"], "n_mels"),
+        "sampling_rate": _records.integer(tokenizer_config["sampling_rate"], "sampling_rate"),
+        "nfft": _records.integer(tokenizer_config["nfft"], "nfft"),
+        "hop_length": _records.integer(tokenizer_config["hop_length"], "hop_length"),
+        "window_size": _records.integer(tokenizer_config["window_size"], "window_size"),
+        "fmin": _records.number(tokenizer_config.get("fmin", 0.0), "fmin"),
         "fmax": (None if tokenizer_config.get("fmax") is None
-                 else records.number(tokenizer_config["fmax"], "fmax")),
-        "d_model": records.integer(tokenizer_config["d_model"], "d_model"),
-        "kernel_size": records.integer(tokenizer_config["kernel_size"], "kernel_size"),
-        "stride_size": records.integer(tokenizer_config["stride_size"], "stride_size"),
-        "avg_pooler": records.integer(tokenizer_config["avg_pooler"], "avg_pooler"),
-        "encoder_layers": records.integer(tokenizer_config["encoder_layers"], "encoder_layers"),
-        "encoder_attention_heads": records.integer(tokenizer_config["encoder_attention_heads"],
+                 else _records.number(tokenizer_config["fmax"], "fmax")),
+        "d_model": _records.integer(tokenizer_config["d_model"], "d_model"),
+        "kernel_size": _records.integer(tokenizer_config["kernel_size"], "kernel_size"),
+        "stride_size": _records.integer(tokenizer_config["stride_size"], "stride_size"),
+        "avg_pooler": _records.integer(tokenizer_config["avg_pooler"], "avg_pooler"),
+        "encoder_layers": _records.integer(tokenizer_config["encoder_layers"], "encoder_layers"),
+        "encoder_attention_heads": _records.integer(tokenizer_config["encoder_attention_heads"],
                                                    "encoder_attention_heads"),
-        "encoder_ffn_dim": records.integer(tokenizer_config["encoder_ffn_dim"], "encoder_ffn_dim"),
-        "encoder_causal": records.boolean(tokenizer_config.get("encoder_causal", False), "encoder_causal"),
-        "encoder_attn_window_size": records.integers(
+        "encoder_ffn_dim": _records.integer(tokenizer_config["encoder_ffn_dim"], "encoder_ffn_dim"),
+        "encoder_causal": _records.boolean(tokenizer_config.get("encoder_causal", False), "encoder_causal"),
+        "encoder_attn_window_size": _records.integers(
             tokenizer_config.get("encoder_attn_window_size", [-1, -1]), "encoder_attn_window_size"),
-        "encoder_skip_layer_id": None if skip is None else records.integer(skip, "encoder_skip_layer_id"),
-        "hybrid_attention": records.boolean(tokenizer_config.get("hybrid_attention", False),
+        "encoder_skip_layer_id": None if skip is None else _records.integer(skip, "encoder_skip_layer_id"),
+        "hybrid_attention": _records.boolean(tokenizer_config.get("hybrid_attention", False),
                                             "hybrid_attention"),
-        "swa_per_block": records.integer(tokenizer_config.get("swa_per_block", 2), "swa_per_block"),
-        "rope_theta": records.number(tokenizer_config.get("rope_theta", 10000.0), "rope_theta"),
+        "swa_per_block": _records.integer(tokenizer_config.get("swa_per_block", 2), "swa_per_block"),
+        "rope_theta": _records.number(tokenizer_config.get("rope_theta", 10000.0), "rope_theta"),
         "codebook_size": books,
     }
     return {"class": "mimo_audio", "fields": {
         "tokenizer": tokenizer,
         "audio_channels": channels,
-        "group_size": records.integer(audio_config["group_size"], "group_size"),
-        "input_local_dim": records.integer(audio_config["input_local_dim"], "input_local_dim"),
-        "input_local_layers": records.integer(audio_config["input_local_layers"], "input_local_layers"),
-        "input_local_attn_heads": records.integer(audio_config["input_local_attn_heads"],
+        "group_size": _records.integer(audio_config["group_size"], "group_size"),
+        "input_local_dim": _records.integer(audio_config["input_local_dim"], "input_local_dim"),
+        "input_local_layers": _records.integer(audio_config["input_local_layers"], "input_local_layers"),
+        "input_local_attn_heads": _records.integer(audio_config["input_local_attn_heads"],
                                                   "input_local_attn_heads"),
-        "input_local_intermediate_size": records.integer(audio_config["input_local_intermediate_size"],
+        "input_local_intermediate_size": _records.integer(audio_config["input_local_intermediate_size"],
                                                          "input_local_intermediate_size"),
-        "input_full_attention": records.boolean(audio_config.get("input_full_attention", True),
+        "input_full_attention": _records.boolean(audio_config.get("input_full_attention", True),
                                                 "input_full_attention"),
-        "rope_theta": records.number(audio_config.get("rope_theta", 640000.0), "rope_theta"),
-        "add_post_norm": records.boolean(audio_config.get("add_post_norm", True), "add_post_norm"),
-        "projection_layers": records.integer(audio_config.get("projection_layers", 2), "projection_layers"),
-        "out_hidden_size": records.integer(audio_config["out_hidden_size"], "out_hidden_size"),
+        "rope_theta": _records.number(audio_config.get("rope_theta", 640000.0), "rope_theta"),
+        "add_post_norm": _records.boolean(audio_config.get("add_post_norm", True), "add_post_norm"),
+        "projection_layers": _records.integer(audio_config.get("projection_layers", 2), "projection_layers"),
+        "out_hidden_size": _records.integer(audio_config["out_hidden_size"], "out_hidden_size"),
         "speech_vocab_size": tuple(sizes),
-        "audio_segment_size": records.integer(audio_config.get("audio_segment_size", 6000),
+        "audio_segment_size": _records.integer(audio_config.get("audio_segment_size", 6000),
                                               "audio_segment_size"),
     }}
 

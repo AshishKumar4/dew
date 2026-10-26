@@ -11,7 +11,8 @@ from functools import cached_property
 
 import grain.python as grain
 
-from dew.data.dataset import Batch, Loading, Ranges
+from dew.batch import Batch
+from dew.data.dataset import Loading, Ranges
 from dew.data.storage import Store, local, on_gcs
 
 from .codec import decode

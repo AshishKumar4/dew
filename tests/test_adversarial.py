@@ -17,7 +17,7 @@ from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference, float64_terms, widened
 
 import dew
-from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
+from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.diffusion.presets import Flow
 from dew.inference import TextToImage
@@ -27,6 +27,7 @@ from dew.objectives.base import TEACHER, Step
 from dew.objectives.diffusion import AdversarialDistillationObjective
 from dew.objectives.diffusion.adversarial import Head
 from dew.objectives.diffusion.objective import DISCRIMINATOR, SPECTRAL
+from dew.registry import ModelConfig
 from dew.sampling import Consistency, Euler
 from dew.training import Trainer
 
@@ -257,9 +258,9 @@ def test_a_lora_student_distills_beside_its_whole_teacher():
     """The teacher runs through its own model, so a LoRA student over its
     weights distills: a step trains its factors and the heads, and the
     weights it froze stay the teacher's."""
+    from dew.batch import FROZEN
     from dew.inputs import Field, InputSpec
     from dew.lora import LoRA
-    from dew.objectives.base import FROZEN
 
     model = SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2)
     teacher = model.init(jax.random.PRNGKey(0), jnp.zeros((1, 4, 4, 3)), jnp.ones((1,)))

@@ -20,7 +20,7 @@ import jax
 import numpy as np
 
 from dew import Trainer
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.data import ByteTokenizer, Memory
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective

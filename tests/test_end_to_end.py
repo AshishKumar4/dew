@@ -600,10 +600,11 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     from diffusion_stubs import batch_for
     from diffusion_support import images_of, saved_after_one_step
 
-    from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
+    from dew.config import ObjectiveConfig, TrainerConfig
     from dew.config.diffusion import DiffusionRunConfig
     from dew.inputs import TextCondition
     from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
+    from dew.registry import ModelConfig
 
     for name in ("tiny_diffusers", "rae"):
         with tarfile.open(FIXTURES / f"{name}.tar.xz") as archive:
@@ -641,7 +642,7 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
 
 
 BUILT_INS = tuple(entry.wrapper for entry in REGISTRATIONS)
-"""Every built-in autoencoder, one per registration (`AutoEncoder.from_json`'s)."""
+"""Every built-in autoencoder, one per registration (the sources `pretrained.REGISTRATIONS` loads)."""
 
 
 def test_only_the_kl_autoencoders_with_a_posterior_reach_end_to_end_tuning():

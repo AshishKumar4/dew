@@ -240,8 +240,8 @@ def as_a_step(trainer, variables, micro, gradient):
     `Trainer._planned` derives them), so a check of that step against it compiles both arms alike: on
     a GPU the step keeps dots that share an input apart, where XLA's default merges them into one
     GEMM, which rounds otherwise."""
-    from dew.nn.sharding import batch_axes
-    from dew.objectives.base import FROZEN
+    from dew.batch import FROZEN
+    from dew.mesh import batch_axes
     from dew.training.memory import device_tokens, step_compiler_options
 
     mesh = trainer.device_mesh
