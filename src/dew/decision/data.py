@@ -407,13 +407,15 @@ class _DecisionSource(View[Source]):
             if self.table is not None and "questions" not in row and "example" not in row:
                 self._facts.update(questions=1, options=len(self.table.options or self._classes))
                 continue
-            example = row.get("example")
-            example = Example.of(row) if example is None else Example.of(example)
-            self._facts["questions"] = max(self._facts.get("questions", 0), len(example.questions))
-            self._facts["options"] = max(
-                self._facts.get("options", 0),
-                max((len(question.options) for question in example.questions.values()), default=0),
-            )
+            held = row.get("example")
+            held = row if held is None else held
+            # Grouped examples train as one unit, whose questions a window holds together.
+            examples = (GroupedExamples.of(held).examples
+                        if isinstance(held, GroupedExamples) or "examples" in held else (Example.of(held),))
+            asked = [question for example in examples for question in example.questions.values()]
+            self._facts["questions"] = max(self._facts.get("questions", 0), len(asked))
+            self._facts["options"] = max(self._facts.get("options", 0),
+                                         max((len(question.options) for question in asked), default=0))
 
     def metadata(self) -> Mapping[str, object]:
         stated = self.source.metadata()

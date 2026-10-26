@@ -218,8 +218,9 @@ def _grouped(group_of: GroupOf, encoded: Encoded, asked: Mapping[str, Question],
     map. A "none of the above" the augmentation added (`dropped` names the question) that stands for
     the option it dropped maps to that option's canonical one, and one added beside every option to
     none; a question's own option of that name maps as its group says."""
-    groups, canonical = (field.empty(len(encoded.questions), width) for field in TRAINING_FIELDS
-                         if field.when == "grouped")
+    declared = {field.name: field for field in TRAINING_FIELDS}
+    groups, canonical = (declared[name].empty(len(encoded.questions), width)
+                         for name in ("groups", "canonical"))
     for slot, laid in enumerate(encoded.questions):
         found = group_of(laid.name)
         if found is None:
