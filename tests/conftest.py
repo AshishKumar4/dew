@@ -119,6 +119,13 @@ def own_rung_records(monkeypatch, tmp_path_factory):
 
 
 @pytest.fixture(autouse=True)
+def own_data_cache(monkeypatch, tmp_path_factory):
+    """Each test keeps its own automatic data cache (`dew.data.cache.automatic_root`): records one
+    test's maps made are not another's to read back."""
+    monkeypatch.setenv("DEW_DATA_CACHE", str(tmp_path_factory.mktemp("data-cache")))
+
+
+@pytest.fixture(autouse=True)
 def own_hub_answers(monkeypatch, tmp_path_factory):
     """Each test keeps its own recorded Hub answers (`dew.cache.hub_answer`): a commit one test's
     stand-in answered is not another's offline record."""

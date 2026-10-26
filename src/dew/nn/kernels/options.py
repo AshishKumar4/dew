@@ -8,17 +8,22 @@ facts with the run's own XLA flags.
 
 from __future__ import annotations
 
+import contextlib
+import contextvars
+import dataclasses
 import functools
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, TypedDict, Unpack, runtime_checkable
 
 import jax
+import numpy as np
 from jax.sharding import Sharding
 
 from dew.devices import xla_flag
 from dew.nn.kernels.generation import backend, gpu_target
 
 if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
     from flax import linen as nn
 
 
@@ -41,26 +46,90 @@ class Quantized(Protocol):
     _dew_quantization: ClassVar[QuantizedDtypes]
 
 
-def compiler_options(*models: nn.Module) -> dict[str, bool]:
+type Held = nn.Module | DataclassInstance | Mapping[str, Held] | tuple[Held, ...] | list[Held] | None
+"""What a program runs that may hold a quantized tower (`quantizations`): a model, a record of one (a
+condition's encoder), or a mapping or sequence of them; anything else a record holds is passed over."""
+
+
+def quantizations(*models: Held) -> list[QuantizedDtypes]:
+    """The quantization every model class among `models` carries (`Quantized`), and every tower they
+    hold: each module a model, a task's encoder or any record it is handed holds in its fields,
+    a tuple's or a mapping's entries, at any depth, so a quantized text encoder inside a condition's
+    encoder counts as the denoiser beside it does. Arrays and their trees are not walked."""
+    found: list[QuantizedDtypes] = []
+    # Each object visited, held until the walk ends: a mapping's values may be made as they are read
+    # (a FrozenDict's nested ones), and a freed one's id could name a later, unvisited value.
+    seen: dict[int, Held] = {}
+
+    def walk(value: Held) -> None:
+        if id(value) in seen or isinstance(value, (jax.Array, np.ndarray, str, bytes, int, float, type)):
+            return
+        seen[id(value)] = value
+        if isinstance(value, Quantized):
+            found.append(type(value)._dew_quantization)
+        if isinstance(value, Mapping):
+            for entry in value.values():
+                walk(entry)
+        elif isinstance(value, (tuple, list)):
+            for entry in value:
+                walk(entry)
+        elif dataclasses.is_dataclass(value):
+            for field in dataclasses.fields(value):
+                if field.name not in ("parent", "name"):
+                    walk(getattr(value, field.name, None))
+
+    for model in models:
+        walk(model)
+    return found
+
+
+type Option = bool | int | str
+"""An XLA compiler option's value, as `jax.jit(..., compiler_options=)` takes it."""
+
+_COMPILED_WITH: contextvars.ContextVar[tuple[Mapping[str, Option], ...]] = contextvars.ContextVar(
+    "compiled_with", default=())
+"""The options `compiled_with` holds open in this context, innermost last."""
+
+
+@contextlib.contextmanager
+def compiled_with(options: Mapping[str, Option]) -> Iterator[None]:
+    """Every program Dew compiles while this is open adds `options` to its XLA options
+    (`compiler_options`), each but those the run's XLA_FLAGS sets itself: the accuracy gate's seam,
+    through which an arm that runs Dew's own compiled programs (a trainer's step, a task's forward)
+    compiles them as the gate compiles a Dew arm it compiles itself (tests/reference_error.py,
+    `dew_programs`). A program compiled before it opened keeps its own options. The options are the
+    context's (a `ContextVar`): another thread, or a worker not handed this context, compiles
+    without them."""
+    token = _COMPILED_WITH.set((*_COMPILED_WITH.get(), dict(options)))
+    try:
+        yield
+    finally:
+        _COMPILED_WITH.reset(token)
+
+
+def compiler_options(*models: Held) -> dict[str, Option]:
     """The XLA options a program that runs `models` compiles with on the default device, for its
-    `jax.jit(..., compiler_options=)`. Every program Dew compiles over a task's model or
-    autoencoder, or over an objective's modules, takes them. JAX takes compiler options on a
-    program's outermost jit alone, so a module's own jitted method runs under the options of the
-    program that calls it.
+    `jax.jit(..., compiler_options=)`. Every program Dew compiles over a task's model,
+    autoencoder or encoders, or over an objective's modules, takes them, for every tower they hold
+    (`quantizations`). JAX takes compiler options on a program's outermost jit alone, so a module's
+    own jitted method runs under the options of the program that calls it.
 
     XLA's Triton GEMM fusion computes some int8 dots as two or four times their product
     (openxla/xla#51016), silently, on every GPU measured (`GpuTarget.int8_triton_gemm`). A program
     that runs a model quantized to int8, forward or backward, therefore compiles its GEMMs on
     cuBLAS. With CUDA 13, cuBLAS refuses some int8 shapes (on an A100 a contraction of 16 or 48),
     and then the program does not compile rather than compute wrong. A run that sets
-    `xla_gpu_enable_triton_gemm` in XLA_FLAGS keeps its own setting.
+    `xla_gpu_enable_triton_gemm` in XLA_FLAGS keeps its own setting. The options `compiled_with`
+    holds open join them.
     """
-    specs = [layer._dew_quantization for layer in map(type, models) if isinstance(layer, Quantized)]
-    int8 = any("int8" in (spec.dtype, spec.bwd_qtype) for spec in specs)
-    if (not int8 or backend() != "gpu" or gpu_target().int8_triton_gemm
-            or xla_flag("xla_gpu_enable_triton_gemm") is not None):
-        return {}
-    return {"xla_gpu_enable_triton_gemm": False}
+    int8 = any("int8" in (spec.dtype, spec.bwd_qtype) for spec in quantizations(*models))
+    options: dict[str, Option] = {}
+    if (int8 and backend() == "gpu" and not gpu_target().int8_triton_gemm
+            and xla_flag("xla_gpu_enable_triton_gemm") is None):
+        options["xla_gpu_enable_triton_gemm"] = False
+    for opened in _COMPILED_WITH.get():
+        options.update({name: value for name, value in opened.items() if xla_flag(name) is None})
+    return options
 
 
 type Placements = Sharding | None | tuple[Placements, ...] | Mapping[str, Placements]
@@ -78,8 +147,8 @@ class JitArguments(TypedDict, total=False):
     out_shardings: Placements
 
 
-def program[**P, R](function: Callable[P, R], *models: nn.Module,
-                    step: Mapping[str, bool | int] | None = None,
+def program[**P, R](function: Callable[P, R], *models: Held,
+                    step: Mapping[str, Option] | None = None,
                     **arguments: Unpack[JitArguments]) -> jax.stages.Wrapped:
     """`function` jitted with the XLA options a program over `models` compiles with
     (`compiler_options`), and, where it is part of a training step, the step's own beside them
@@ -119,7 +188,7 @@ class _Placed(NamedTuple):
 
 
 @functools.cache
-def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, bool | int], ...], *,
+def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, Option], ...], *,
                      static_argnums: int | tuple[int, ...] | None = None,
                      static_argnames: str | tuple[str, ...] | None = None,
                      in_shardings: _Placed | None = None, out_shardings: _Placed | None = None

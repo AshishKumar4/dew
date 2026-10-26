@@ -27,7 +27,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact, without_ynn
 
 from dew.distributed.placement import parameter_axes
 from dew.telemetry.instrumentation import collective, custom_call_kind, hlo_instructions
@@ -121,8 +121,10 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
     exchange), which XLA, unable to split an opaque call, would otherwise insert to replicate it; and no
     copy or transpose at a kernel call's edge (`boundary_copies`). `donate` names the arguments `fn`
     takes in place, as its callers donate them (a kernel that aliases its state into its output): a
-    call that keeps them would make XLA copy each before the kernel overwrites it."""
-    run = jax.jit(fn, donate_argnums=donate)
+    call that keeps them would make XLA copy each before the kernel overwrites it. Both arms are Dew's
+    programs, compiled here as the gate compiles two Dew arms (`without_ynn`) and run as given: the
+    split one is the executable whose collectives the contract reads."""
+    run = without_ynn(fn, donate_argnums=donate)
 
     def put(args):
         return [jax.device_put(arg, NamedSharding(mesh, spec)) for arg, spec in zip(args, specs, strict=True)]
@@ -146,7 +148,7 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
     def one_device(*args):
         return run(*kept(args))
 
-    assert_as_exact(split, one_device, draw, label, seeds=seeds, truth_fn=truth_fn)
+    assert_as_exact(as_given(split), as_given(one_device), draw, label, seeds=seeds, truth_fn=truth_fn)
 
 
 VIEWS = frozenset({"bitcast", "get-tuple-element", "tuple", "parameter"})

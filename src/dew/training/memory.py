@@ -24,7 +24,7 @@ from dew.devices import gpu_free_bytes, xla_flag
 from dew.distributed.placement import parameter_axes
 from dew.mesh import mesh_axes
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
-from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.options import Option, compiler_options
 from dew.nn.protocols import Recomputing, TritonGemm
 from dew.objectives.base import Objective
 from dew.state import TrainState
@@ -83,7 +83,7 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
     (`compiler_options`).
     """
     generation = device_generation()
-    options: dict[str, bool | int] = {}
+    options: dict[str, Option] = {}
     if backend() == 'gpu' and devices > 1:
         options.update({name: value for name, value in COLLECTIVES.items() if xla_flag(name) is None})
     small = tokens <= 128
@@ -96,7 +96,7 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
             and modules and not any(isinstance(module, TritonGemm) and module.keeps_triton_gemm
                                     for module in modules)):
         options['xla_gpu_enable_triton_gemm'] = False
-    options.update(compiler_options(*modules))
+    options.update(compiler_options(*objective.towers()))
     return options or None
 
 

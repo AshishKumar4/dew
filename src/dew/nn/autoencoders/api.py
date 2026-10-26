@@ -146,6 +146,13 @@ class AutoEncoder(ABC):
     params: Variables
     model: nn.Module
 
+    def towers(self) -> tuple[nn.Module, ...]:
+        """The networks this autoencoder runs, whose quantization the programs that call it compile for
+        (`dew.nn.kernels.options.compiler_options`): its `model`, none for one that computes without a
+        network (a pooling one)."""
+        model = vars(self).get("model")
+        return () if model is None else (model,)
+
     def record_arguments(self) -> dict:
         """The subclass's constructor arguments besides `model` and `params`, as it was given them (a
         built-in's compute dtype and latent normalization), which its record rebuilds it with
