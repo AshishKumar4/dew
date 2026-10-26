@@ -243,6 +243,21 @@ def test_a_dropping_call_drops_what_one_device_drops(name, exchange):
 
 
 @pytest.mark.mesh
+@pytest.mark.parametrize("exchange", sorted(EXCHANGES))
+def test_a_dropping_template_call_of_no_keys_runs_inside_either_exchange(exchange):
+    """A dropping call of no keys on the template's route inside either exchange, whose padded tiles draw
+    at places no table holds (`template.Draw`): every output is zero, as the whole call's (the reviewer's
+    witness: an empty table failed the draw's lookup)."""
+    query = jax.random.normal(jax.random.key(0), (BATCH, SEQ_LEN, 4, 8), jnp.float32)
+    empty = jnp.zeros((BATCH, 0, 2, 8), jnp.float32)
+    call = {"dropout_rate": 0.3, "dropout_rng": jax.random.key(7), "implementation": "template"}
+    whole = scaled_dot_product_attention(query, empty, empty, deterministic=False, **call)
+    with jax.set_mesh(SPLIT.build()):
+        split = jax.jit(lambda q, k, v: through(exchange, q, k, v, **call))(query, empty, empty)
+    np.testing.assert_array_equal(np.asarray(split), np.asarray(whole))
+
+
+@pytest.mark.mesh
 def test_the_entry_drops_over_a_split_sequence():
     """`scaled_dot_product_attention` under a split sequence takes a dropping
     call (it refused one) and drops what the whole sequence does."""
