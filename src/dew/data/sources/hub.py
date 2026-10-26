@@ -32,10 +32,10 @@ def hold_progress_lock() -> None:
 
 def split_files(paths: Sequence[str], split: str) -> list[str]:
     """The `paths` of a repository listing that `datasets` gives `split`, by its default patterns
-    (`datasets.data_files.get_data_patterns`), resolved as it resolves them (`resolve_pattern`), over
-    an empty in-memory copy of the listing: the listing itself, which the Hub answered once and
-    offline replays, is all the patterns read."""
-    from datasets.data_files import get_data_patterns, resolve_pattern
+    (`datasets.data_files.get_data_patterns`), resolved as it resolves a split's patterns
+    (`DataFilesList.from_patterns`), over an empty in-memory copy of the listing: the listing itself,
+    which the Hub answered once and offline replays, is all the patterns read."""
+    from datasets.data_files import DataFilesList, get_data_patterns
     from fsspec.implementations.memory import MemoryFileSystem
 
     fs, root = MemoryFileSystem(), f"/dew-hub-listing/{uuid.uuid4().hex}"
@@ -43,8 +43,9 @@ def split_files(paths: Sequence[str], split: str) -> list[str]:
         fs.pipe_file(f"{root}/{path}", b"")
     base = f"memory://{root}"
     try:
+        # A listing with no data files at all is datasets' FileNotFoundError (EmptyDatasetError).
         patterns = {str(name): found for name, found in get_data_patterns(base).items()}
-        resolved = {url for pattern in patterns.get(split, ()) for url in resolve_pattern(pattern, base)}
+        resolved = set(DataFilesList.from_patterns(list(patterns.get(split, ())), base_path=base))
     except FileNotFoundError:
         resolved = set()
     finally:
