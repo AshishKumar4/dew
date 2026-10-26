@@ -38,6 +38,7 @@ from interop_support import fixture_arrays
 from jax.sharding import PartitionSpec as P
 from recording import RecordingTracker
 from reference_error import assert_as_exact, torch_with_gradients, with_gradients
+from selection_margins import indexer_margins
 from tool_support import load
 
 from dew.data.dataset import Loader
@@ -185,10 +186,11 @@ def dew_walk(name: str, settings: dict, attention_impl: str = "reference"):
 
 
 def boundary_gap(name: str, hidden: np.ndarray) -> float:
-    """The smallest margin, over every query, between the reference's last selected index score and
-    its best rejected one (modeling_deepseek_v32.py, `DeepseekV32Indexer.forward`, replayed): a query
-    that sees no more keys than the budget, or whose boundary is an exact zero tie (which
-    `stable_top_k` decides alike in float32 and float64), has no margin to keep."""
+    """The smallest margin, over every query, of the reference's top-k (modeling_deepseek_v32.py,
+    `DeepseekV32Indexer.forward`, replayed) in its scores' units (`indexer_margins`): the gap between
+    its last selected index score and its best rejected one, or at an exact zero tie, how near zero
+    a tied key's best head agreement sits. A query that sees no more keys than the budget has no
+    margin to keep."""
     from transformers.models.deepseek_v32.modeling_deepseek_v32 import apply_rotary_pos_emb
 
     block, rotary = reference_block(name)
@@ -205,19 +207,13 @@ def boundary_gap(name: str, hidden: np.ndarray) -> float:
         k_rot, k_pass = torch.split(indexer.k_norm(indexer.wk(states)).unsqueeze(2), rope, dim=-1)
         q_rot, k_rot = apply_rotary_pos_emb(q_rot, k_rot, cos, sin, unsqueeze_dim=2)
         query, keys = torch.cat([q_rot, q_pass], dim=-1), torch.cat([k_rot, k_pass], dim=-1).squeeze(2)
-        scores = torch.relu(torch.matmul(query.float(), keys.transpose(-1, -2).float().unsqueeze(1))
-                            * indexer.softmax_scale)
+        agreements = (torch.matmul(query.float(), keys.transpose(-1, -2).float().unsqueeze(1))
+                      * indexer.softmax_scale)
         weights = indexer.weights_proj(states).float() * indexer.n_heads ** -0.5
-        index = torch.matmul(weights.unsqueeze(-2), scores).squeeze(-2)
-        future = torch.arange(length)[None, None, :] > positions[:, :, None]
-        ranked = index.masked_fill(future, float("-inf")).sort(-1, descending=True).values
-        budget = indexer.index_topk
-        if length <= budget:
-            return math.inf
-        kept, rejected = ranked[..., budget - 1], ranked[..., budget]
-        decided = torch.isfinite(rejected) & ~((kept == 0) & (rejected == 0))
-        margins = torch.where(decided, kept - rejected, torch.full_like(kept, math.inf))
-        return float(margins.min())
+        index = torch.matmul(weights.unsqueeze(-2), torch.relu(agreements)).squeeze(-2)
+        seen = torch.arange(length)[None, None, :] <= positions[:, :, None]
+    return float(np.min(indexer_margins(index.numpy(), agreements.numpy(), seen.numpy(), indexer.index_topk,
+                                        relative=False)))
 
 
 def block_draw(name: str):
