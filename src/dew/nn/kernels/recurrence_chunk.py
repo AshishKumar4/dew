@@ -701,8 +701,8 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     instruction family (`mainloop.family_of`), interpreted off a GPU of a family a bundle claims (Mosaic GPU's
     interpreter, `mainloop.INTERPRETED`'s). Its gradient: the gated delta rule's in a 16-bit call on the
     mainloop (`mainloop.gradients`, fla's DAG, fla's rounding) where its launches hold on the device
-    (`mainloop.backward_holds`); on a GPU, a delta rule's call the port takes (`PORT_SUPPORTS`) the port's
-    gradient where they do not (`fla_rule`'s custom VJP, its forward computed again there); every other
+    (`mainloop.backward_holds`); on a GPU, a 16-bit delta rule's call the port takes (`PORT_SUPPORTS`) the
+    port's gradient where they do not (`fla_rule`'s custom VJP, its forward computed again there); every other
     call's the portable math's (`chunk_delta_rule`'s, the recurrence's own adjoint), its forward recomputed
     there. Its states and output
     launches take `tiles` (`mainloop.Tiles`, the template's config, `templates.recurrence.template`); a
@@ -724,12 +724,14 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
                                         shared=generation.shared_budget(template.Mosaic.launched()),
                                         starts=starts, max_segments=max_segments))
     run_back = {name: value for name, value in run.items() if name != "floor"}
-    # Where the fast backward's launches do not hold, the port's gradient where the port takes the call (its
-    # forward computed again inside its own custom VJP), else the portable math's: the portable adjoint on a
-    # GPU took 140 to 155 ms where the port's training step took 3.1 (SE-family-h100-1342a8963).
+    # Where the fast backward's launches do not hold, a 16-bit call's gradient the port's where the port takes
+    # the call (its forward computed again inside its own custom VJP), else the portable math's: the portable
+    # adjoint on a GPU took 140 to 155 ms where the port's training step took 3.1 (SE-family-h100-1342a8963).
+    # An fp32 call's stays the portable math's: the port's put its gradient 1.6 to 3.3 times the fp32
+    # recurrence's distance from float64 (SE-family-h100-be7214123).
     case = PortCase(reverse=not FORWARD_MODE.get(), varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(dtype), key_width=key.shape[-1])
-    ported = (not fast and delta and device is not None
+    ported = (not fast and delta and device is not None and dtype != jnp.float32
               and all(requirement.holds(case) for requirement in PORT_SUPPORTS))
 
     # The documents' starts an operand, not closed over (a custom VJP's function closes over no tracer).
