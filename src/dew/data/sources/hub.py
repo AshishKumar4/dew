@@ -20,12 +20,14 @@ from .hf import arrow_rows, class_names
 
 
 def hold_progress_lock() -> None:
-    """Give `datasets`' progress-bar class a lock of its own, before a Hub read. `datasets` reads a split's
-    shards through tqdm's thread_map, which lends the class a lock for the map and deletes it after where
-    the class held none. Two splits read at once (compile's readers: a holdout's train and held) then
-    delete it under each other's bars: "type object 'tqdm' has no attribute '_lock'". Held, each map
-    restores it instead."""
-    from datasets.utils.tqdm import tqdm as bars
+    """Give tqdm's own progress-bar class a lock, before any call into `datasets`. `datasets` maps a split's
+    files through tqdm's thread_map (resolving a listing's files to a split, reading or preparing its
+    shards), which lends the bar class it is given a lock for the map and deletes it after where neither
+    the class nor a class it derives from held one. Two maps at once (compile's readers: a holdout's train
+    and held; several streamed sources discovered together) then delete it under each other's bars:
+    "type object 'tqdm' has no attribute '_lock'". Held by tqdm's class, which every bar class `datasets`
+    lends a map derives from, each map finds it and restores it instead."""
+    from tqdm import tqdm as bars
 
     bars.get_lock()
 
@@ -38,6 +40,11 @@ def split_files(paths: Sequence[str], split: str) -> list[str]:
     from datasets.data_files import DataFilesList, get_data_patterns
     from fsspec.implementations.memory import MemoryFileSystem
 
+    if not paths:
+        # No file, so none of any split's, and no copy of the listing to make or remove.
+        return []
+    # `from_patterns` resolves the files through tqdm's thread_map.
+    hold_progress_lock()
     fs, root = MemoryFileSystem(), f"/dew-hub-listing/{uuid.uuid4().hex}"
     for path in paths:
         fs.pipe_file(f"{root}/{path}", b"")
