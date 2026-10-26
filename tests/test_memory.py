@@ -31,8 +31,7 @@ MEMORY_SEEDS = 8
 configuration, its token-by-token, decoded, packed, cached and recurrence paths included, at 8 over the
 drawn weights, but the sites `SEEDS` names."""
 SEEDS = {"self-generated gradients": 512, "memory decoder gradient": 512, "memory decoder decode": 16,
-         "adapted memory": 8, "rows split": 256, "rows split cms": 512, "decoded gated_linear_attention": 32,
-         "decoded quantized gated_linear_attention": 32}
+         "adapted memory": 8, "rows split": 256, "rows split cms": 512, "decoded gated_linear_attention": 32}
 """The sites' declared seeds where `seeds_for` on armada, each reference compared with itself, sizes them
 past `MEMORY_SEEDS` or apart from it: the self-modifying memory's and the memory decoder's gradients,
 every parameter's leaf, and the continuum-memory level's rows split over a data axis at 512; the other
@@ -696,7 +695,7 @@ def test_a_cached_linear_memory_off_the_recurrence_continues_its_full_pass():
 
     rounded = InputQuantizer.fp8(SCALE).qdq
     assert_as_exact(decoded, applied(quantized), scaled, "decoded quantized gated_linear_attention memory",
-                    seeds=SEEDS["decoded quantized gated_linear_attention"],
+                    seeds=MEMORY_SEEDS,
                     truth_fn=written(module, dtype=jnp.float64, inputs=rounded))
 
 
