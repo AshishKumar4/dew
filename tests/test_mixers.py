@@ -32,6 +32,7 @@ from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.inputs import TOKENWISE, AttentionMetadata, MixerCall, coordinates
 from dew.nn.kernels.generation import chosen
+from dew.nn.memory import Gate, InContextMemory, MLPMemory
 from dew.nn.mixer_base import MixerRefused
 from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
@@ -225,7 +226,10 @@ KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm"
                "mamba2": ({"num_heads": 8, "head_dim": 32, "state_size": 32, "n_groups": 4,
                            "chunk_size": 64}, {}),
                "gated_delta_net": ({"linear_num_key_heads": 2, "linear_num_value_heads": 4,
-                                    "linear_key_head_dim": 16, "linear_value_head_dim": 16}, {})}
+                                    "linear_key_head_dim": 16, "linear_value_head_dim": 16}, {}),
+               "memory": ({"memory": InContextMemory(
+                   network=MLPMemory(hidden=(16,)), heads=2, head_features=8, chunk=4, normalize=True,
+                   learning_rate=Gate(scale=0.1), momentum=Gate(), retention=Gate(bias=-2.0))}, {})}
 """The fields a kind needs beyond its defaults to build in `tiny`: its own, then the model's. The
 recurrent kinds default to their models' heads (Kimi Linear's 64 of 128, Qwen3.5's 32 of 128), whose
 per-key pairwise decays alone take 134 MB a chunk in KDA's portable math."""
@@ -234,7 +238,7 @@ REFUSED = {"kpool_sparse_attention"}
 """Kinds that refuse packed rows."""
 
 SEEDS = {"attention": 64, "deepseek_v4": 256, "gated_delta_net": 512, "kimi_delta_attention": 512,
-         "llama4": 128, "mamba": 32, "mamba2": 256, "mla": 64, "mlp": 64}
+         "llama4": 128, "mamba": 32, "mamba2": 256, "memory": 8, "mla": 64, "mlp": 64}
 """Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for which
 documents run alone compared with themselves resolve PARITY in every logit and parameter gradient (on
 armada). Mamba2's 8 heads of 32 over a state of 32 in 64-token chunks (`KIND_FIELDS`) take 256 at 0.04 s a
@@ -352,7 +356,7 @@ POLICY_VALUES = {"force_fp32_for_softmax": False, "attn_logit_softcap": 30.0, "a
 KIND_CONTEXT = {"llama4": {"qk_norm": False}, "deepseek_v4": {"sliding_window": 8}}
 """Layer fields a kind needs to build at all, beyond the test's context."""
 
-ATTENDS_NOTHING = {"mlp", "gated_delta_net", "kimi_delta_attention", "mamba", "mamba2"}
+ATTENDS_NOTHING = {"mlp", "gated_delta_net", "kimi_delta_attention", "mamba", "mamba2", "memory"}
 """The registry's kinds that mix tokens without attention, whose layers' attention policies are not theirs."""
 
 
