@@ -1374,7 +1374,7 @@ type SourceRoute = DecoderRoute | WrapperRoute | DiffusionGemmaRoute | VerifiedR
 def source_route(config: Mapping[str, object], *,
                  verified: Callable[..., verify.VerifiedMapping | verify.Unmapped] = verify.verify_mapping,
                  admitted: Callable[[verify.Unmapped], TorchAdmission] | None = None,
-                 remote: Path | None = None) -> SourceRoute:
+                 remote: Path | None = None, revision: str | None = None) -> SourceRoute:
     """The route `Pretrained.load` reads `config`'s source by, or the refusal it raises for it, on the
     config alone: a storage format the codecs cannot decode, a registered family's or wrapper's own
     refusal of the config, a speculative drafter of any model_type (`decoder_parts.DrafterRefused`),
@@ -1383,7 +1383,8 @@ def source_route(config: Mapping[str, object], *,
     `verified` checks an unregistered decoder against transformers (`verify.verify_mapping`), and
     `admitted` decides whether tier 3 runs one it leaves unmapped (`torchax_fallback.admitted` when
     None); a census over many configs passes a memo of each. `remote` is the repository whose own
-    modeling code the load opted into running (`trust_remote_code`)."""
+    modeling code the load opted into running (`trust_remote_code`), and `revision` the Hub commit it
+    was fetched at, which a verification of that code is recorded under."""
     source_quantization(config)
     decoder_parts.refuse_drafter(config)
     family = config.get("model_type")
@@ -1392,7 +1393,7 @@ def source_route(config: Mapping[str, object], *,
     if _media_wrapper(config):
         return WrapperRoute(decoders.translate_wrapper_config(config))
     if isinstance(family, str) and family not in decoders.families():
-        match verified(config) if remote is None else verified(config, remote=remote):
+        match verified(config) if remote is None else verified(config, remote=remote, revision=revision):
             case verify.VerifiedMapping() as mapping:
                 return VerifiedRoute(mapping)
             case verify.Unmapped() as unmapped:
@@ -1617,15 +1618,16 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
                               description.tokenizer_folder, **description.fields)
 
 
-def _routed(config: Mapping[str, object], *, remote: Path | None, text_only: bool,
+def _routed(config: Mapping[str, object], *, remote: Path | None, revision: str | None, text_only: bool,
             overrides: Mapping[str, object] | None
             ) -> tuple[Mapping[str, object], SourceRoute, decoder_parts.WrapperFields | None]:
     """A native source's config, its route and, where `text_only` takes a wrapper's language model
     alone, that model's wrapper fields, decided before any weight downloads, on the config alone: a
     format the codec cannot read, a family's refusal, an unregistered decoder checked against
     transformers (tiers 2 and 3). The language model reads as its text family's checkpoint
-    (`decoders.language_model_config`); a route that reads no `overrides` refuses them."""
-    route = source_route(config, remote=remote)
+    (`decoders.language_model_config`); a route that reads no `overrides` refuses them. `remote` and
+    `revision` are `source_route`'s."""
+    route = source_route(config, remote=remote, revision=revision)
     language = route.wrapper if text_only and isinstance(route, WrapperRoute) else None
     if language is not None:
         if decoders.bundles(config):
@@ -1636,7 +1638,7 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, text_only: boo
             raise ValueError("text_only takes an unquantized wrapper: a quantized one's module selection "
                              "names the wrapper's modules, which its text checkpoint renames")
         config = decoders.language_model_config(config, language)
-        route = source_route(config, remote=remote)
+        route = source_route(config, remote=remote, revision=revision)
     elif text_only and isinstance(route, DiffusionGemmaRoute):
         raise ValueError("text_only takes a media wrapper's language model; DiffusionGemma's decoder is "
                          "its whole model")
@@ -1675,7 +1677,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
         config = mamba2.config_from_mamba_ssm(config)
     config = _overridden(config, overrides)
     family = config.get("model_type")
-    config, route, language = _routed(config, remote=remote, text_only=text_only, overrides=overrides)
+    config, route, language = _routed(config, remote=remote, revision=commit, text_only=text_only,
+                                      overrides=overrides)
     if isinstance(route, TorchRoute):
         from dew.interop import torchax_fallback
         selected = source if component is None else source.component(component.config_folder)
