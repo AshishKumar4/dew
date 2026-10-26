@@ -227,12 +227,6 @@ def _chunk_delta_forward(query, key, value, g, beta, state, chunk_size, starts, 
     Dv = value.shape[-1]
     steps = chunked(query, key, value, g, beta, chunk_size, starts=starts, delta=delta, scale=scale)
     T = S + steps.padding
-    # XLA:CPU workaround: under a jitted scan over the layers the chunk
-    # loop's zero initial state came back with other values in most
-    # processes (GLM-5-Next off by 8.7, 10.1 or NaN, byte-identical modules).
-    # The barrier materializes the zero. Remove it when XLA:CPU no longer
-    # returns an uninitialized scan carry here.
-    state = jax.lax.optimization_barrier(state)
     grown, last, kept, last_token = _peeled_chunk_inputs(steps, value, g, beta, starts, chunk_size)
     entered, v_corrected, state = xla_chunk_states(
         steps.key, steps.w, steps.u, grown, last, state, kept, last_token=last_token, delta=delta)
@@ -860,7 +854,8 @@ def recurrent_delta_rule(query, key, value, g, beta, state=None, *, starts=None)
     `g` is the log decay per key dimension, `[B, S, H, Dk]`, which is
     `recurrent_kimi_delta_attention` (modeling_glm5_next.py:428-478). The
     gated delta rule decays per head, one decay over every key dimension.
-    A token `starts` `[B, S]` marks begins a packed document from a zero memory.
+    A token `starts` `[B, S]` marks begins a packed document from a zero memory. Each token is the decode
+    step's update (`recurrence.update`), the scan only its orchestration.
     """
     dtype = jnp.result_type(query, key, value)
     work = at_least_fp32(dtype)
@@ -869,13 +864,10 @@ def recurrent_delta_rule(query, key, value, g, beta, state=None, *, starts=None)
     query = query * (key.shape[-1] ** -0.5)
 
     def one_token(s, step):
-        q_t, k_t, v_t, g_t, beta_t = (step[name] for name in ('q', 'k', 'v', 'g', 'beta'))
         s = jnp.where(step['start'][:, None, None, None], 0.0, s)
-        s = s * jnp.exp(g_t)[..., :, None]                 # rows decay per key dimension
-        kv_mem = jnp.sum(s * k_t[..., :, None], axis=-2)   # [B, H, Dv]
-        delta = (v_t - kv_mem) * beta_t[..., None]        # [B, H, Dv]
-        s = s + k_t[..., :, None] * delta[..., None, :]    # [B, H, Dk, Dv]
-        return s, jnp.sum(s * q_t[..., :, None], axis=-2)  # [B, H, Dv]
+        out, s = recurrence.update(s, step['q'], step['k'], step['v'], jnp.exp(step['g']),
+                                   step['beta'][..., None], delta=True)
+        return s, out
     # The scan stacks along the first axis, so the operands go time-major.
     if state is None:
         state = jnp.zeros((query.shape[0], query.shape[-2], key.shape[-1],
