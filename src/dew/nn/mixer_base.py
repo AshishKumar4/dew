@@ -30,7 +30,9 @@ QKV_RESIDUALS = ('q_proj', 'k_proj', 'v_proj', 'kv_proj')
 ATTENTION_RESIDUALS = (*QKV_RESIDUALS, 'o_proj')
 MLP_RESIDUALS = ('gate_proj', 'up_proj', 'down_proj')
 DELTA_RESIDUALS = ('delta_decay', 'delta_inverse', 'delta_memory')
-RESIDUALS = (*ATTENTION_RESIDUALS, 'context', 'scan', 'conv', *DELTA_RESIDUALS, *MLP_RESIDUALS)
+MEMORY_RESIDUALS = ('memory_carry',)
+RESIDUALS = (*ATTENTION_RESIDUALS, 'context', 'scan', 'conv', *DELTA_RESIDUALS, *MEMORY_RESIDUALS,
+             *MLP_RESIDUALS)
 """The values a block names as it runs, each after the projection that
 produced it: `kv_proj` is latent attention's fused `kv_b_proj`, `context`
 a mixer's output before `o_proj`, the attention kernel's or a recurrence's,
@@ -40,7 +42,9 @@ linear-attention or SSM mixer's short conv output (`causal_conv1d`,
 its queries, keys and values for a delta rule), `delta_decay`,
 `delta_inverse` and `delta_memory` the rule's cumulated decay, chunk inverse
 and memory (with `w` and the corrected values) the port saves for its
-backward (`dew.nn.kernels.fla_gdn`), and the MLP names cover the dense MLP
+backward (`dew.nn.kernels.fla_gdn`), `memory_carry` an in-context memory's
+network and momentum as each chunk of its scan hands them on
+(`dew.nn.memory.CARRY`), and the MLP names cover the dense MLP
 and the routed experts alike. A remat policy picks from these; a
 name off the list is a typo that would otherwise recompute silently."""
 ATTENTION_CONTEXT_RESIDUALS = (*ATTENTION_RESIDUALS, 'context')

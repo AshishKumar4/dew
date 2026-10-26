@@ -6,7 +6,7 @@ import dataclasses
 import functools
 
 from dew.nn.memory import InContextMemory
-from dew.nn.mixer_base import MixerBase, MixerContext
+from dew.nn.mixer_base import DELTA_RESIDUALS, MEMORY_RESIDUALS, MixerBase, MixerContext
 from dew.registry import rebuilt
 
 
@@ -16,6 +16,8 @@ class InContextMemoryMixer(MixerBase):
     it: its network, objective, target, gates, chunk and views, every field it computes by. The
     layer's dtype and matmul precision are the decoder's."""
 
+    residuals = (*MEMORY_RESIDUALS, *DELTA_RESIDUALS)
+    """Its chunk scan's carry, and the delta rule's where a linear memory runs on the recurrence."""
     keeps_cache = True
 
     memory: InContextMemory

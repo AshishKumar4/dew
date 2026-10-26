@@ -58,14 +58,16 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, recurrence_chunk
+from dew.nn.mixer_base import MEMORY_RESIDUALS
 from dew.optim import newton_schulz
 
 from .attention import LayerNorm
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places, valid_order
 from .precision import at_least_fp32, l2norm
 
-CARRY = "memory_carry"
-"""The name of the state a chunk hands the next (`checkpoint_name`), for a remat policy to save."""
+CARRY = MEMORY_RESIDUALS[0]
+"""The name of the state a chunk hands the next (`checkpoint_name`), for a remat policy to save
+(`dew.nn.mixer_base.RESIDUALS`)."""
 
 STATE, MOMENTUM, START, COUNT = "memory_state", "memory_momentum", "memory_start", "memory_count"
 """The decode cache's variables: the network's fast parameters now, the momentum, the parameters at the
