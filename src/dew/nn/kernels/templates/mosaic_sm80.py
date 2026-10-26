@@ -63,6 +63,29 @@ class Streams:
     views: dict
 
 
+STAGING_SOLVED = (0, 11, 2, 20)
+"""The first JAX whose Mosaic GPU layout inference solves a kernel's independent shared-memory buffers
+apart (Dew's fork, 0.11.2.post20, its `_independent_components`): before it, an mma.sync tile staging its
+output through a buffer read back row by row exhausts the solver at every tile but the one 128 x 256 x 32
+(AMPERE3, SM80-probe), which a thread's registers do not hold."""
+
+
+UNSOLVED_LINE = (0, 12)
+"""The JAX line whose layout inference exhausts the solver on mma.sync's tiles again,
+`_independent_components` and all: the GEMM forward's 128 x 128 x 32 tile failed to find a layout after 24
+minutes on the fork's 0.12.0.1.post23 (ns-gate1, a compile-only A100 on armada), where 0.11.2.post21 lowered
+and ran it (R10)."""
+
+
+def staging_solved() -> bool:
+    """Whether this JAX's release (its version's numbers, a post release's last) is `STAGING_SOLVED` or
+    later on a line whose layout inference solves mma.sync's tiles (not `UNSOLVED_LINE`'s)."""
+    import jax
+    numbers = tuple(int(part.removeprefix("post")) for part in jax.__version__.split(".")
+                    if part.removeprefix("post").isdigit())
+    return STAGING_SOLVED <= numbers < UNSOLVED_LINE
+
+
 @dataclasses.dataclass(frozen=True)
 class Mma(mosaic.Family):
     """mma.sync's bundle for operands of `dtype`: one compute warpgroup a program and no producer
@@ -74,6 +97,25 @@ class Mma(mosaic.Family):
     rows = 16
     consumers = 1
     bounded_loads = False
+    role_rows = 4 * 16
+    operands_in_registers = True
+    rhs_copies = 4
+    most_shared = 163 * 1024  # sm80's and sm87's opt-in block (sm86's and sm89's 99 KiB)
+    reduction_scratch = plgpu.CompilerParams().reduction_scratch_bytes  # its kernels' default parameters
+    column_scratch = 0  # its column sums take its kernels' reduction scratch
+
+    def registers(self, consumers: int) -> int:
+        del consumers  # one role, at a thread's whole budget
+        return 255
+
+    def column_unit(self, dtype) -> int:
+        # Its stores move a row through registers, laid over the role's threads, one element or more each.
+        del dtype
+        return mosaic.THREADS
+
+    def depths(self, dtype) -> tuple[int, ...]:
+        # Its operand blocks' rows staged at a 128- or 64-byte swizzle (`swizzled`).
+        return tuple(swizzle // jnp.dtype(dtype).itemsize for swizzle in (mosaic.SWIZZLE_BYTES, 64))
 
     @property
     def layout(self):
@@ -96,11 +138,11 @@ class Mma(mosaic.Family):
         return plgpu.Layout.MMA_RHS(self.dtype)
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
-               interpret: bool, approx_math: bool = True) -> Callable:
+               interpret: bool, approx_math: bool = True, name: str | None = None) -> Callable:
         _one(consumers)
         return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                             compiler_params=plgpu.CompilerParams(approx_math=approx_math),
-                            interpret=mosaic.interpreted(interpret))
+                            interpret=mosaic.interpreted(interpret), kernel_name=name)
 
     def scoped(self, body, *allocations, streams) -> None:
         pl.run_scoped(lambda *refs: body(*refs, streams=streams), *allocations)
@@ -125,8 +167,8 @@ class Mma(mosaic.Family):
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, consumer: Callable, *,
                 consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0) -> None:
         # Each tile's pipeline is its own (`emit_pipeline` fills and drains it), its step count static; an
-        # output is staged after it, in the shared memory its stages held, and stored through registers
-        # (no TMA before Hopper).
+        # output is staged after it, scoped apart from its stages though Mosaic reserves both at once
+        # (`grouped_matmul._Mosaic.staged_bytes`), and stored through registers (no TMA before Hopper).
         _one(consumers)
         del in_flight
 
@@ -199,6 +241,23 @@ class Mma(mosaic.Family):
             # lowering (jax 0.11.2).
             raise NotImplementedError("mma.sync's bundle adds into global memory only interpreted")
         view[...] = view[...] + value
+
+    def column_sums(self, value: jax.Array, scratch, interpret: bool) -> jax.Array:
+        # One warpgroup a program: Mosaic GPU's own reduction across its warps, through the scratch its
+        # kernels' parameters reserve (`reduction_scratch`).
+        del scratch, interpret
+        return value.sum(axis=0)
+
+    def stores(self, dtype) -> bool:
+        # Its tiles reach global memory through registers (no TMA): a 16-bit MMA-layout tile's stores
+        # write 16-byte row pieces, partial 32-byte sectors, which JAX 0.12's transfers refuse at every
+        # width (ns-store3: [64, 32] to [64, 256] bf16), staged through shared memory or not.
+        return jnp.dtype(dtype).itemsize >= 4
+
+    def published(self) -> None:
+        # Its products read shared memory through ldmatrix, the warpgroup's own loads, which the store's
+        # automatic barriers order.
+        pass
 
     def held(self, ref):
         return plgpu.load(ref, layout=self.lhs, optimized=False)

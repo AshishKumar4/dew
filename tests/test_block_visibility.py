@@ -233,6 +233,24 @@ def test_a_non_causal_kind_reading_blocks_keeps_its_kernel(without_deterministic
     assert routes(block_groups=jnp.asarray(BLOCKS)) == plain
 
 
+WINDOWED_BLOCKS = {"sliding_attention": {"window": 2, "mixer": AttentionMixer(bidirectional_blocks=True)}}
+
+
+@pytest.mark.parametrize("kinds", [{"full_attention": {}}, WINDOWED_BLOCKS], ids=["full", "window-blocks"])
+def test_padding_inside_a_row_reaches_the_fused_kernel_as_its_keys_validity(kinds):
+    """A call with padding inside its rows hands the kernel its real keys and, under a window, the places
+    the window counts, rather than a mask it builds: a layer naming the template runs it, where the template
+    refuses a mask by its inherent limit (so a mask built here would raise)."""
+    decoder = model(**kinds).clone(dtype=jnp.bfloat16, attention_impl="template")
+    ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)
+    params = decoder.clone(attention_impl="xla").init(jax.random.key(1), ids)
+    blocks = jnp.asarray(WINDOWED) if kinds is WINDOWED_BLOCKS else None
+    with generation.assumed("sm80"), generation.routes() as found:
+        jax.eval_shape(lambda params, ids: decoder.apply(params, ids, attention_mask=jnp.asarray(GAPS),
+                                                         block_groups=blocks), params, ids)
+    assert {route.kernel for route in found if route.choice == "attention"} == {"template"}
+
+
 def test_a_server_keeps_a_block_layers_prefill_apart():
     """A server's mixed step reads each row's cache as a decode step does, which carries no groups, so a
     model with a kind reading blocks or images keeps its prompts' prefill in a forward of its own."""

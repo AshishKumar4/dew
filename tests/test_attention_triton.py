@@ -7,10 +7,18 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact, assert_fp32_reduction_bound
-from test_attention_template import CASES, ROWS, SINKS, SOFTCAP, arguments, geometry as core_geometry
+from test_attention_template import (
+    CASES,
+    ROWS,
+    RUN_CASES,
+    SINKS,
+    SOFTCAP,
+    arguments,
+    geometry as core_geometry,
+)
 
 from dew.nn.attention import alibi_bias
-from dew.nn.kernels import tuning
+from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
     attention_algebra as algebra,
@@ -151,6 +159,34 @@ def test_the_forward_is_on_par_over_the_core_s_other_call_forms(form):
     check(CASES[form], HOOKS["none"], jnp.float32, PINNED[1])
 
 
+@pytest.mark.parametrize("config", PINNED[:3], ids=str)
+@pytest.mark.parametrize("form", RUN_CASES)
+def test_the_plain_forward_is_on_par_over_runs(form, config):
+    """Each query's runs (`test_attention_template.RUN_CASES`), a decision row's: the plain-JAX mainloop
+    walks each query block's ranges in turn, at tiles that part its fragments."""
+    check(RUN_CASES[form], HOOKS["none"], jnp.float32, config, mainloop="portable")
+
+
+def test_the_frozen_mainloop_refuses_runs():
+    """The frozen Triton mainloop walks one key interval a query: its legality rule names a call's runs, its
+    launches are not eligible for them, and its forward and backward refuse them before any launch, so the
+    route takes the Mosaic or the plain-JAX mainloop (ledger 956)."""
+    queries, keys = core_geometry(RUN_CASES["runs"])
+    spans = template.spans(queries, keys, ROWS, **arguments(RUN_CASES["runs"]))
+    reason = attention_triton.refused(spans)
+    assert reason is not None and attention_triton.refused(template.spans(queries, keys, ROWS)) is None
+    query = jnp.zeros((ROWS, queries, 2, 32), jnp.float32)
+    key = jnp.zeros((ROWS, keys, 1, 32), jnp.float32)
+    op = attention_triton.TritonForward(keys=keys)
+    ba = op.bind(query, key, key, spans.start, spans.end, None, None, (), (), None, None, None,
+                 residuals=False, interpret=True)
+    assert not op.eligible(ba, generation.gpu_target("sm90"))
+    with pytest.raises(NotImplementedError):
+        attention_triton.forward(query, key, key, spans, interpret=True)
+    with pytest.raises(NotImplementedError):
+        attention_triton.backward(query, key, key, spans, None, query, interpret=True)
+
+
 @pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
 @pytest.mark.parametrize("dtype", attention_triton.DTYPES, ids=DTYPE_IDS)
 @pytest.mark.parametrize("hooks", HOOKS.values(), ids=HOOKS)
@@ -240,11 +276,13 @@ BACKWARD_SEEDS = {(("alibi",), "float32"): 64, (("alibi",), "bfloat16"): 128,
 is a gradient of four values a draw, and an initial state's of a few a query."""
 
 
-def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32):
+def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32, *, rows: int = ROWS,
+                heads: int = 4):
     """The score hooks `names` asks for, as a score_mod and a draw of its parameters and the softmax's
-    initial state for a seed (each a `[B, H, ...]` array or `Initial`, fp32): a softcap, ALiBi, a query's
-    temperature, a per-key bias, a dense bias as one score_mod; sinks, or a resumed partial (its maximum,
-    a positive denominator and a numerator of any sign), as the initial state."""
+    initial state for a seed (each a `[B, H, ...]` array or `Initial`, fp32, `rows` by `heads` query heads):
+    a softcap, ALiBi, a query's temperature, a per-key bias, a dense bias as one score_mod; sinks, or a
+    resumed partial (its maximum, a positive denominator and a numerator of any sign), as the initial
+    state."""
     kinds = [kind for name, kind in (("alibi", template.Kind.HEAD), ("temperature", template.Kind.QUERY),
                                      ("key", template.Kind.KEY), ("tile", template.Kind.TILE))
              if name in names]
@@ -269,20 +307,20 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32):
         streams = jax.random.split(jax.random.fold_in(jax.random.key(77), seed), 6)
         params = []
         if "alibi" in names:
-            params.append(alibi_bias(jnp.ones((1, 1)), 4, dtype=jnp.float32).reshape(4))
+            params.append(alibi_bias(jnp.ones((1, 1)), heads, dtype=jnp.float32).reshape(heads))
         if "temperature" in names:
-            params.append(jax.random.uniform(streams[0], (ROWS, 4, queries), jnp.float32, 0.5, 1.5))
+            params.append(jax.random.uniform(streams[0], (rows, heads, queries), jnp.float32, 0.5, 1.5))
         if "key" in names:
-            params.append(jax.random.normal(streams[1], (ROWS, 4, keys)))
+            params.append(jax.random.normal(streams[1], (rows, heads, keys)))
         if "tile" in names:
-            params.append(jax.random.normal(streams[2], (ROWS, 4, queries, keys)))
+            params.append(jax.random.normal(streams[2], (rows, heads, queries, keys)))
         initial = None
         if "sinks" in names:
-            initial = template.sinks(SINKS, ROWS, queries, value_width)
+            initial = template.sinks(SINKS[:heads], rows, queries, value_width)
         if "resumed" in names:
-            total = jnp.exp(0.5 * jax.random.normal(streams[3], (ROWS, 4, queries)))
-            acc = jax.random.normal(streams[4], (ROWS, 4, queries, value_width)) * total[..., None]
-            initial = template.Initial(jax.random.normal(streams[5], (ROWS, 4, queries)), total, acc)
+            total = jnp.exp(0.5 * jax.random.normal(streams[3], (rows, heads, queries)))
+            acc = jax.random.normal(streams[4], (rows, heads, queries, value_width)) * total[..., None]
+            initial = template.Initial(jax.random.normal(streams[5], (rows, heads, queries)), total, acc)
         return tuple(params), initial
 
     scoring = bool({"softcap", "custom", "indexed", "alibi", "temperature", "key", "tile"} & set(names))
@@ -362,6 +400,15 @@ backward's fast form) and the accurate one (natural logits and the backward's ac
 def test_the_backward_is_on_par_over_every_call_form(form, config, options):
     """Each call form's keys, fp32, no hooks, at pinned dQ and dK/dV configs, in both forms."""
     check_backward(CASES[form], (), jnp.float32, config, **options)
+
+
+@pytest.mark.parametrize("options", TEMPLATE_FORMS.values(), ids=TEMPLATE_FORMS)
+@pytest.mark.parametrize("config", PINNED[:2], ids=str)
+@pytest.mark.parametrize("form", RUN_CASES)
+def test_the_plain_backward_is_on_par_over_runs(form, config, options):
+    """Each query's runs on the plain-JAX mainloop: its query walk takes its ranges as the forward does, and
+    its key walk reads the query blocks some range of which holds its keys, in both forms."""
+    check_backward(RUN_CASES[form], (), jnp.float32, config, mainloop="portable", **options)
 
 
 @pytest.mark.parametrize("form", [form for form in CASES if form not in BACKWARD_FORMS])

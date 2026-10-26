@@ -58,6 +58,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   template's fused kernels rather than xla's `[B, 1, S, S]` mask (268 MB a row a layer at 16k
   tokens), where it measured faster at every length; every other path takes the mask the spans mean. A window counts a call's places, padding
   inside a row skipped, in the spans too.
+- `scaled_dot_product_attention(key_valid=, places=)` reads a call's real keys and the places its
+  window counts as the template's spans, the invalid keys hidden as padding's document id hides
+  them, so a row with padding inside it, a decoder's padded batch or a packed batch with holes, runs
+  fused on a GPU rather than on xla's `[B, 1, S, S]` mask. Local attention's short windows and
+  DeepSeek V4's window mask read the same spans.
 - `dew.nn.attention.scaled_dot_product_attention(..., implementation='template')`
   runs the attention template's route
   (`dew.nn.kernels.templates.attention_route.attend`): causality, windows,

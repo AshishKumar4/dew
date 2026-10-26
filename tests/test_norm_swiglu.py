@@ -336,7 +336,7 @@ def full_step(dtype, draw: int = 0):
 def test_every_config_of_the_norm_kernels_holds_the_float64_gate(kernel, dtype, operands):
     """Each config the tuner may pick, at a step's rows, at rows wider than
     a tile holds two of, and at rows narrow enough for its tallest tiles:
-    the space declares only configs proven here."""
+    its variants are only configs proven here (`KernelOp.variants`)."""
     (x, scale), seed = {"full step": lambda: full_step(dtype),
                         "wide rows": lambda: norm_operands((7, 4096), dtype, jnp.float32),
                         "narrow rows": lambda: norm_operands((4099, 256), dtype, jnp.float32)}[operands]()

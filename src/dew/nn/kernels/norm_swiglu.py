@@ -93,11 +93,27 @@ partial rows it writes stay a small share of what it reads."""
 MAX_PROGRAMS = 1024
 ELEMENT_BLOCK = 1024
 PACKED_BLOCK = 4096
-"""The packed SwiGLU's heuristic columns a program. Over every config of its space at Qwen3.5-0.8B's
+"""The packed SwiGLU's heuristic columns a program. Of the configs measured at Qwen3.5-0.8B's
 24576 rows of 2 x 3584 (bf16, 2026-10-15), a whole row of 4096 with four warps was the fastest
 forward on an A100 80GB and an H100 and within 1% of the fastest reverse, level with the apart
 kernel's best (forward 0.323 against 0.315 ms on the A100, 0.181 against 0.178 on the H100), where
 512 columns, the largest power of two dividing the width, lost 3 to 10%."""
+
+
+def _neighbours[C: (RowsConfig, ReverseConfig, BlockConfig)](config: C,
+                                                               **steps: tuple[int, int]) -> tuple[C, ...]:
+    """`config` first, then each field of `steps` halved and doubled alone, within its `(least, most)`:
+    a launch's variants (`tuning.KernelOp.variants`), the configs an opt-in tuning run times beside it."""
+    found = [config]
+    for name, (least, most) in steps.items():
+        value = getattr(config, name)
+        found += [dataclasses.replace(config, **{name: other}) for other in (value // 2, value * 2)
+                  if least <= other <= most]
+    return tuple(dict.fromkeys(found))
+
+
+WARPS = (1, 8)
+"""The warps a program's variants range over: at least one, at most eight."""
 
 
 def _row_block(width: int) -> int:
@@ -631,6 +647,7 @@ class RmsForward(tuning.KernelOp):
     row's mean square with epsilon, whose inverse root the norm multiplies by."""
 
     config_cls: ClassVar[type[RowsConfig]] = RowsConfig
+
     ROWS: ClassVar[tuple[str, ...]] = ('x', 'branch', 'gate')
 
     def _fwd(self, x: jax.Array, branch: jax.Array | None, scale: jax.Array | None, gate: jax.Array | None, *,
@@ -652,10 +669,10 @@ class RmsForward(tuning.KernelOp):
     def _get_heuristics_config(self, ba) -> RowsConfig:
         return RowsConfig(_row_block(ba.arguments['x'].shape[1]), 4)
 
-    def _get_autotuning_configs(self, ba) -> set[RowsConfig]:
-        width = pl.next_power_of_2(ba.arguments['x'].shape[1])
-        return {RowsConfig(rows, warps) for rows in (1, 2, 4, 8, 16, 32)
-                if rows == 1 or rows * width <= 16384 for warps in (1, 2, 4, 8)}
+    def variants(self, ba) -> tuple[RowsConfig, ...]:
+        # A program's rows within twice the heuristic's register tile.
+        rows = max(1, 2 * ROW_ELEMENTS // pl.next_power_of_2(ba.arguments['x'].shape[1]))
+        return _neighbours(ba.heuristics_config, rows=(1, rows), warps=WARPS)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -665,6 +682,7 @@ class RmsBackward(tuning.KernelOp):
     compensated partial sums of the weight's."""
 
     config_cls: ClassVar[type[ReverseConfig]] = ReverseConfig
+
     ROWS: ClassVar[tuple[str, ...]] = ('x', 'gate', 'mean_square', 'dy', 'ds')
 
     def _fwd(self, x: jax.Array, scale: jax.Array | None, gate: jax.Array | None, mean_square: jax.Array,
@@ -691,11 +709,10 @@ class RmsBackward(tuning.KernelOp):
         block = _row_block(width)
         return ReverseConfig(block, max(1, min(MAX_PROGRAMS, pl.cdiv(rows, block * ROW_BLOCKS))), 4)
 
-    def _get_autotuning_configs(self, ba) -> set[ReverseConfig]:
-        width = pl.next_power_of_2(ba.arguments['x'].shape[1])
-        return {ReverseConfig(rows, programs, warps) for rows in (1, 2, 4, 8, 16)
-                if rows == 1 or rows * width <= 8192
-                for programs in (256, 512, 1024, 2048) for warps in (2, 4, 8)}
+    def variants(self, ba) -> tuple[ReverseConfig, ...]:
+        rows = max(1, 2 * ROW_ELEMENTS // pl.next_power_of_2(ba.arguments['x'].shape[1]))
+        return _neighbours(ba.heuristics_config, rows=(1, rows), programs=(1, 2 * MAX_PROGRAMS),
+                           warps=WARPS)
 
 
 _RMS_FORWARD = RmsForward()
@@ -883,15 +900,15 @@ def _packed_backward(gate_up_ref, dy_ref, d_ref, *, block: int, interpret: bool)
 @dataclasses.dataclass(frozen=True)
 class _Elementwise(tuning.KernelOp):
     """An elementwise launch over flat operands: `ELEMENT_BLOCK` elements and
-    four warps a program unless measured."""
+    four warps a program."""
 
     config_cls: ClassVar[type[BlockConfig]] = BlockConfig
 
     def _get_heuristics_config(self, ba) -> BlockConfig:
         return BlockConfig(ELEMENT_BLOCK, 4)
 
-    def _get_autotuning_configs(self, ba) -> set[BlockConfig]:
-        return {BlockConfig(block, warps) for block in (256, 512, 1024, 2048, 4096) for warps in (1, 2, 4, 8)}
+    def variants(self, ba) -> tuple[BlockConfig, ...]:
+        return _neighbours(ba.heuristics_config, block=(128, 4 * PACKED_BLOCK), warps=WARPS)
 
 
 def _launch(kernel, name: str, operands, outputs, grid: tuple[int, ...], config: BlockConfig,
@@ -932,7 +949,7 @@ class SwigluBackward(_Elementwise):
 @dataclasses.dataclass(frozen=True)
 class _Packed(_Elementwise):
     """A packed projection's launch over `[rows, 2 * width]`, gate then up in each row: a program a
-    row's block of columns, unless measured the whole row up to `PACKED_BLOCK` columns."""
+    row's block of columns, the whole row up to `PACKED_BLOCK` columns."""
 
     def _get_heuristics_config(self, ba) -> BlockConfig:
         return BlockConfig(min(PACKED_BLOCK, pl.next_power_of_2(ba.arguments['gate_up'].shape[1] // 2)), 4)

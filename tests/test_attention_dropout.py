@@ -37,6 +37,7 @@ from dew.nn.kernels.templates import (
     attention_portable,
     attention_route,
     attention_triton,
+    mosaic_sm90,
 )
 from dew.nn.kernels.templates.attention import dropout_keep, dropout_seed
 
@@ -506,7 +507,7 @@ def test_the_gpu_mainloops_refuse_a_dropping_call_at_every_entry():
                  template.Split(jnp.zeros((ROWS, HEADS, 8, WIDTH), jnp.float32), stats, stats, stats))
     for backward in (False, True):
         assert attention_mosaic.refused(jnp.bfloat16, WIDTH, WIDTH, hooks, backward=backward,
-                                        tile=(64, 64)) is not None
+                                        family=mosaic_sm90.WGMMA) is not None
     assert attention_triton.refused(spans, hooks) is not None
     with generation.assumed("sm90"):
         with pytest.raises(NotImplementedError):

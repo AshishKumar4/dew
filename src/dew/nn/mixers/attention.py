@@ -21,13 +21,11 @@ from jax.typing import DTypeLike
 from dew.nn.attention import (
     RMSNorm,
     alibi_bias,
-    cached_validity,
     causal_attention_mask,
     chunk_mask,
     cudnn_takes_mask,
     kernel_for_materialized_mask,
     max_attention_logits,
-    open_kv_cache,
     reference_only,
     scaled_dot_product_attention,
     visibility_mask,
@@ -47,7 +45,18 @@ from dew.nn.inputs import (
     document_reach,
 )
 from dew.nn.kernels.selection import select
-from dew.nn.kv_cache import PAGED, PLACES, TABLE, Append, KVCache, KVStore, filled_slots, rotated
+from dew.nn.kv_cache import (
+    PAGED,
+    PLACES,
+    TABLE,
+    Append,
+    KVCache,
+    KVStore,
+    cached_validity,
+    filled_slots,
+    open_kv_cache,
+    rotated,
+)
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import QKV_RESIDUALS, MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain
@@ -159,6 +168,12 @@ class _Masking(NamedTuple):
     its slot."""
     groups: _Groups
     """The keys' block and image groups the layer reads."""
+    valid: jax.Array | None
+    """An uncached call's real keys `[B, S]`, which the kernel reads beside its causal flag, documents and
+    groups, its window counting `key_places`, the real tokens' (`counted_places`), or None."""
+    runs: jax.Array | None
+    """The call's key runs `[B, S, R, 2]` (`AttentionMetadata.key_runs`), its window counting
+    `key_places`, or None."""
 
 
 @logical_axes({
@@ -186,10 +201,10 @@ class CausalSelfAttention(nn.Module):
     sharing): it reads the keys, values and places its provider stashed in
     `kv_store`, post rope and norm, and keeps no cache.
     """
-    reads: ClassVar[frozenset[str]] = frozenset({"pairwise_mask", "key_positions", "position_bias",
-                                                 "admitted"})
-    """Every `MIXING` field of its call (`dew.nn.inputs.MixerCall`): it masks by a pairwise mask,
-    places keys, adds a position bias and runs a server's mixed step."""
+    reads: ClassVar[frozenset[str]] = frozenset({"pairwise_mask", "key_positions", "key_runs",
+                                                 "position_bias", "admitted"})
+    """Every `MIXING` field of its call (`dew.nn.inputs.MixerCall`): it masks by a pairwise mask or key
+    runs, places keys, adds a position bias and runs a server's mixed step."""
 
     ctx: MixerContext
     """The layer's geometry and attention policies, as the backbone resolves
@@ -528,17 +543,6 @@ class CausalSelfAttention(nn.Module):
             rope_scaling=self.ctx.rope_scaling if self.ctx.yarn is None else self.ctx.yarn,
             dtype=dtype, reach=reach)
 
-    def _validity_mask(self, valid, counted, causal: bool, window: int | None, documents,
-                       groups: _Groups) -> jax.Array:
-        """An uncached call's visibility with its key validity `valid` `[B, S]` as one mask
-        `[B, 1, S, S]`: its causality, documents and groups' spans (`visibility_mask`) under the layer's
-        window, which counts tokens (`counted` `[B, S]`, `counted_places`, padding among them skipped), and
-        only its real keys."""
-        valid = jnp.asarray(valid, bool)
-        return visibility_mask(valid.shape[1], valid.shape[1], causal, window, valid[:, None, None, :],
-                               documents, block_groups=groups.block_groups, image_groups=groups.image_groups,
-                               places=jnp.broadcast_to(counted, valid.shape))
-
     def _group_fields(self) -> tuple[str, ...]:
         """The `AttentionMetadata` fields of groups a causal layer reads: `image_groups` under
         `bidirectional_images`, `block_groups` under `bidirectional_blocks`; a non-causal one reads none,
@@ -859,40 +863,71 @@ class CausalSelfAttention(nn.Module):
         cached = isinstance(documents, CrossDocuments)
         if (cached or groups != _Groups()) and self.ctx.attention_impl != 'auto':
             implementation = masked  # a named kernel's handoff (`_mask_kernel`)
+        valid = None
         if prefix is None and self._restricts_visibility(attention_metadata, decode) and not cached:
             # A decode step's mask and a cache call's documents hold the rows' validity; an uncached
-            # call's is one mask of its whole visibility, its window counting real tokens.
-            if not decode:
-                assert attention_metadata is not None and attention_metadata.valid is not None
-                mask = self._validity_mask(attention_metadata.valid, places, causal, window, documents,
-                                           groups)
-                causal, window, documents, groups = False, None, None, _Groups()
-            implementation = masked
-        if attention_metadata is not None and attention_metadata.pairwise_mask is not None:
-            mask, key_positions = self._pairwise_mask(attention_metadata, rotary_positions, B, S,
-                                                      key.shape[-3])
-            key_places = key_places if key_positions is None else key_positions
-            causal, window, documents, groups = False, None, None, _Groups()
-            implementation = masked
+            # call's real keys reach the kernel beside the rest, its window counting real tokens.
+            valid = None if decode or attention_metadata is None else attention_metadata.valid
+            if decode or self.ctx.attention_impl != 'auto':
+                implementation = masked
+        runs = None
+        if attention_metadata is not None and (attention_metadata.pairwise_mask is not None
+                                               or attention_metadata.key_runs is not None):
+            mask, runs, window, key_places, implementation = self._overridden(
+                attention_metadata, rotary_positions, B, S, key.shape[-3], key_places, implementation, masked,
+                decode)
+            causal, documents, groups, valid = False, None, _Groups(), None
         if self.ctx.attention_chunk is not None:
-            mask = self._chunked(mask, documents, causal, window, groups, places, key_places, S,
+            mask = self._chunked(mask, documents, causal, window, groups, valid, runs, places, key_places, S,
                                  key.shape[-3], self.ctx.attention_chunk)
-            causal, window, documents, groups = False, None, None, _Groups()
+            causal, window, documents, groups, valid, runs = False, None, None, _Groups(), None, None
             implementation = masked
         max_segments = (None if documents is None else 1 if isinstance(documents, CrossDocuments)
                         else coordinates_of(attention_metadata, B, S).max_segments)
         return _Masking(query, key, value, causal, window, mask, documents, max_segments, implementation,
-                        cursor, starts, key_places, groups)
+                        cursor, starts, key_places, groups, valid, runs)
 
     @staticmethod
-    def _chunked(mask, documents, causal: bool, window: int | None, groups: _Groups, places, key_places,
-                 length: int, keys: int, chunk: int):
-        """`mask` with a call's documents, causality, window and block groups folded in
-        (`visibility_mask`), joined with the layer's chunks of `chunk` places: the decode and diagnostic
+    def _chunked(mask, documents, causal: bool, window: int | None, groups: _Groups, valid, runs, places,
+                 key_places, length: int, keys: int, chunk: int):
+        """`mask` with a call's documents, causality, window, block groups, key validity `valid` and key
+        runs folded in (`visibility_mask`, the window counting real tokens where validity is given, or the
+        runs' key places), joined with the layer's chunks of `chunk` places: the decode and diagnostic
         paths, each query and key in the chunk of its counted place, never its cache slot."""
         seen = visibility_mask(length, keys, causal, window, mask, documents,
-                               block_groups=groups.block_groups, image_groups=groups.image_groups)
+                               block_groups=groups.block_groups, image_groups=groups.image_groups,
+                               key_valid=valid, key_runs=runs,
+                               places=(key_places if runs is not None
+                                       else None if valid is None else places))
         return seen & chunk_mask(places, key_places, chunk)
+
+    def _overridden(self, metadata: AttentionMetadata, rotary_positions, B: int, S: int, keys: int,
+                    key_places, implementation: str, masked: str, decode: bool):
+        """A call's own visibility, which replaces the layer's causality, documents, groups and validity:
+        its pairwise mask `[B, 1, S, keys]` (`_pairwise_mask`), or its key runs `[B, S, R, 2]`, which the
+        kernel reads as the template's spans (`AttentionMetadata.key_runs`), a windowed layer windowing each
+        run over the key positions the call gives, its queries read at them too where they are its own
+        tokens; with the window, the places its keys are read at and the kernel: the mask's (`masked`), or
+        where the layer chooses ('auto') an uncached call's, the one the runs choose. A cached call's
+        windowed runs, its queries at places of their own, come to their mask."""
+        if metadata.pairwise_mask is not None:
+            mask, key_positions = self._pairwise_mask(metadata, rotary_positions, B, S, keys)
+            return mask, None, None, key_places if key_positions is None else key_positions, masked
+        runs = jnp.asarray(metadata.key_runs)
+        if runs.ndim != 4 or runs.shape[:2] != (B, S) or runs.shape[-1] != 2:
+            raise ValueError("attention_key_runs must be [B, queries, R, 2]")
+        key_positions = metadata.key_positions
+        if key_positions is not None and key_positions.shape != (B, keys):
+            raise ValueError("attention_key_positions must be [B, keys]")
+        window = None if key_positions is None else self.ctx.sliding_window
+        key_places = key_places if key_positions is None else key_positions
+        if window is not None and keys != S:
+            query_places = jnp.broadcast_to(jnp.asarray(rotary_positions), (B, S))
+            mask = visibility_mask(S, keys, causal=False, sliding_window=window, key_runs=runs,
+                                   places=(query_places, key_positions))
+            return mask, None, None, key_places, masked
+        kernel = implementation if self.ctx.attention_impl == 'auto' and not decode else masked
+        return None, runs, window, key_places, kernel
 
     def _pairwise_mask(self, metadata: AttentionMetadata, rotary_positions, B: int, S: int, keys: int):
         """A call's own mask `[B, 1, S, keys]` (`AttentionMetadata.pairwise_mask`) and the places its
@@ -923,16 +958,20 @@ class CausalSelfAttention(nn.Module):
         general kernel otherwise, with the per-head logit maxima sown for
         QK-Clip when a caller opened that collection."""
         (query, key, value, causal, window, mask, documents, max_segments, implementation, cursor, starts,
-         _, groups) = masking
+         key_places, groups, valid, runs) = masking
         B, S = query.shape[:2]
+        # The call's spans past its causal flag, window, mask and documents, as the kernel reads them: its
+        # groups, and its real keys with the places its window counts.
+        blocks, images = groups.block_groups, groups.image_groups
+        held = None if valid is None and runs is None else key_places
         # The per-head maxima the QK-Clip reads. Computed only when a caller
         # opened the collection; the plain forward leaves it closed and its
         # leaves bitwise identical.
         sowing = not self.is_initializing() and self.is_mutable_collection("qk")
         if sowing:
             # Over the keys the call sees, as its spans say them (`visibility_mask`).
-            seen = visibility_mask(S, key.shape[-3], causal, window, mask, documents,
-                                   block_groups=groups.block_groups, image_groups=groups.image_groups)
+            seen = visibility_mask(S, key.shape[-3], causal, window, mask, documents, block_groups=blocks,
+                                   image_groups=images, key_valid=valid, key_runs=runs, places=held)
             self.sow("qk", "max_logits", max_attention_logits(query, key, mask=seen, bias=bias))
             self.sow("qk", "kv_heads", jnp.asarray(key.shape[-2]))
             self.sow("qk", "head_dim", jnp.asarray(query.shape[-1]))
@@ -942,7 +981,7 @@ class CausalSelfAttention(nn.Module):
                 force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
                 implementation=self.ctx.attention_impl, causal=causal, sliding_window=window,
                 mask=mask, bias=bias, sinks=sinks, softcap=self.ctx.attn_logit_softcap, segment_ids=documents,
-                block_groups=groups.block_groups, image_groups=groups.image_groups,
+                block_groups=blocks, image_groups=images, key_valid=valid, key_runs=runs, places=held,
                 dropout_rate=self.ctx.attention_dropout_rate, dropout_rng=self.make_rng("dropout"),
                 deterministic=False), 'context')
         # A chunk or metadata mask replaces `cursor` and keeps the gather; a window the kernels read
@@ -961,7 +1000,8 @@ class CausalSelfAttention(nn.Module):
                 implementation=implementation, causal=causal,
                 sliding_window=window, mask=mask, bias=bias, sinks=sinks,
                 softcap=self.ctx.attn_logit_softcap, segment_ids=documents, max_segments=max_segments,
-                block_groups=groups.block_groups, image_groups=groups.image_groups), 'context')
+                block_groups=blocks, image_groups=images, key_valid=valid, key_runs=runs, places=held),
+                'context')
         return attention
 
     def _mixed_positions(self, admitted: Admitted, valid) -> jax.Array:
@@ -986,9 +1026,10 @@ class CausalSelfAttention(nn.Module):
         into its row of the cache, then each decoding row's query reads its
         row as a decode step does, and each prompt's queries read their row
         up to their own slot. Its rows' caches are its whole visibility, so a
-        call that also carries a pairwise mask, key positions or a position
-        bias is refused by name rather than run without them."""
+        call that also carries a pairwise mask, key runs, key positions or a
+        position bias is refused by name rather than run without them."""
         carried = [name for name, given in (("a pairwise mask", metadata.pairwise_mask),
+                                            ("key runs", metadata.key_runs),
                                             ("key positions", metadata.key_positions),
                                             ("a position bias", metadata.position_bias)) if given is not None]
         if carried:
@@ -1139,7 +1180,7 @@ class CausalSelfAttention(nn.Module):
         if self.alibi or decode or (not self.is_initializing() and self.is_mutable_collection("qk")):
             return False
         return metadata is None or (
-            metadata.pairwise_mask is None and metadata.position_bias is None
+            metadata.pairwise_mask is None and metadata.key_runs is None and metadata.position_bias is None
             and all(getattr(metadata, name) is None for name in self._group_fields()))
 
     def _output(self, attention, gate, batch: int, length: int, own_value):
