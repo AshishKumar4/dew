@@ -807,7 +807,8 @@ def test_a_summary_is_formed_once_where_the_end_completes_the_step_a_plateau_sto
     its splits: here `often`, worse at step 2 than at 1, before `rare`'s step 3. The end scores `rare`
     there, joined to that step's `often` score, and each summary is formed once at the step, by the
     evaluation that completes the splits it weighs: `board`, over both, at the end, logged and ranked by
-    `Best`; `solo`, over `often` alone, at the step's own evaluation, and not again at the end."""
+    `Best`; `solo`, over `often` alone, at the step's own evaluation, and not again at the end. The
+    display shows both as the step's one evaluation of the summaries, each with its history."""
     from dew.training import EvalSuite
 
     often, rare = Scripted('often', iter([1.0, 2.0])), Scripted('rare', iter([4.0]))
@@ -827,6 +828,9 @@ def test_a_summary_is_formed_once_where_the_end_completes_the_step_a_plateau_sto
     assert int(state.step) == 2
     assert rows(BOARD) == [(2, (2.0 + 3 * 4.0) / 4)] and rows(f'{Summary.SPLIT}/solo') == [(1, 1.0), (2, 2.0)]
     assert run.checkpoints.resolve('best') == 2
+    shown = f'{run._display.label(Summary.SPLIT)} · step 2'
+    assert [(row.name, list(row.values)) for heading, row in run._display.evaluation_rows()
+            if heading == shown] == [('solo', [1.0, 2.0]), ('board', [(2.0 + 3 * 4.0) / 4])]
 
 
 @pytest.mark.parametrize('beside', [False, True], ids=['alone', 'beside-summaries'])
