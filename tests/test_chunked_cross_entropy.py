@@ -146,6 +146,7 @@ def test_vocabulary_bias_is_fp32_after_tied_or_untied_head_products(dtype, tied)
             losses = optax.softmax_cross_entropy_with_integer_labels(head(bias).logits(states), targets)
         return {f'{tile}': losses for tile in (None, (2, 11))}
 
+    @as_given
     def truth(states, bias, targets):
         losses = true_losses(head(bias), states, targets, dtype)
         return {f'{tile}': losses for tile in (None, (2, 11))}
@@ -239,6 +240,7 @@ def test_a_checkpoints_head_input_quantization_reaches_every_head_that_scores_it
             return optax.softmax_cross_entropy_with_integer_labels(
                 chunked.model_logits(model, variables, states), targets)
 
+    @as_given
     def truth(states, targets):
         return true_losses(table, states, targets, dtype)
 
@@ -315,7 +317,7 @@ def test_the_scale_and_bias_gradients_match_full_logits_under_the_float64_rule(d
 
     assert_as_exact(jax.jit(under('default', pulled(bounded))), jax.jit(under('default', pulled(full))),
                     with_cotangent(draw, full), f'{dtype} vocabulary gradient', seeds=SEEDS['scale and bias'],
-                    truth_fn=pulled(truth))
+                    truth_fn=as_given(pulled(truth)))
 
 
 @pytest.mark.mesh(devices=2)
@@ -630,7 +632,7 @@ def test_bf16_states_from_the_backbone_score_as_the_logits_did(chunks, tie_embed
 
     assert_as_exact(jax.jit(tiled), jax.jit(whole), draw,
                     f'{dtype} {tie_embeddings} {chunks} backbone states', seeds=SEEDS['backbone states'],
-                    truth_fn=lambda hidden, targets: true_losses(table, hidden, targets, dtype))
+                    truth_fn=as_given(lambda hidden, targets: true_losses(table, hidden, targets, dtype)))
     hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
     matrix = OutputTable(head_matrix(model, variables), vocab_major=False)
     _, predicted, _ = chunked_cross_entropy(hidden, matrix, ids, chunks)

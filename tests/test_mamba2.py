@@ -326,6 +326,7 @@ def test_a_layer_split_over_the_sequence_runs_padded_and_packed_rows_as_whole_on
                 return jax.jit(pulled)(hidden, cotangent)
         return split
 
+    @as_given
     def truth(hidden, cotangent):
         with jax.enable_x64(new_val=True):
             return run(module.clone(dtype=jnp.float64), widened(variables))(*widened((hidden, cotangent)))

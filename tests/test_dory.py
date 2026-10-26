@@ -15,6 +15,7 @@ import pytest
 from decision_support import decision_rows
 from interop_support import assert_reloads, assert_same_stored_tensors
 from reference_error import (
+    as_given,
     assert_as_exact,
     assert_as_exact_as_the_reference,
     assert_computes_the_oracle,
@@ -442,7 +443,7 @@ def test_a_lora_on_every_projection_trains_resumes_saves_and_merges(tmp_path):
         return adapted.model.apply(resumed, drawn)
 
     assert_as_exact(merged_logits, adapted_logits, draw, 'merged adapter logits', seeds=MERGED_SEEDS,
-                    truth_fn=lambda drawn: float64_forward(adapted.model, resumed, drawn)[0])
+                    truth_fn=as_given(lambda drawn: float64_forward(adapted.model, resumed, drawn)[0]))
 
 
 INTENT = Choice('which team?', {'billing': 'payments', 'technical': 'outages', 'sales': 'pricing'})

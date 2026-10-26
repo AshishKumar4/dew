@@ -239,7 +239,8 @@ def test_the_student_gradient_matches_the_reference_cotangents(kind):
         return student_pullback(wide=wide)(trainable, ids, tuple(jnp.asarray(value) for value in cotangents))
 
     assert_as_exact(dew, pulled, drawn_parameters(params), f"{kind} student gradient",
-                    seeds=DISTILLATION_SEEDS["gradient"], truth_fn=lambda params: pulled(params, "float64"))
+                    seeds=DISTILLATION_SEEDS["gradient"],
+                    truth_fn=as_given(lambda params: pulled(params, "float64")))
     # The fixture's own draw: the student's logits as near its float64 forward as the fixture's,
     # which the reference generator wrote from the same forward.
     outputs = student_forward(wide=False)(params["params"], ids)
