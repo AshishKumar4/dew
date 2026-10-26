@@ -451,7 +451,7 @@ flowchart TD
 
 ## 9. Performance
 
-The chain lowers one stage per Grain operator. Dew passes `where=` predicates to the Arrow reader and runs `batched=True` maps over columns. Stage fusion is tracked in the [roadmap](../roadmap.md#data). The target is to beat plain Grain on every workload; each gate is published with its measurement. Measurements recorded with this design: planned text packing is 0.929× plain Grain on an A100, images 0.91 to 1.04×, and online CC3M fetch 45.5 images/s against 42.7 for the old loader.
+Adjacent record steps (`map`, `filter`, `filter_map`, `random_map`, `flat_map`, `map_with_index`) lower as one Grain operator, as tf.data fuses maps and filters: one call per record for the run, so a step written after a filter runs where the steps before it do, on the read's threads or in its workers, and a run's one random step draws what it draws lowered alone. Dew passes `where=` predicates to the Arrow reader and runs `batched=True` maps over columns. The target is to beat plain Grain on every workload; each gate is published with its measurement. Measurements recorded with this design: planned text packing is 0.929× plain Grain on an A100, images 0.91 to 1.04×, and online CC3M fetch 45.5 images/s against 42.7 for the old loader.
 
 ## 10. Execution and storage contracts
 
