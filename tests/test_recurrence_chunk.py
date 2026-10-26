@@ -393,3 +393,35 @@ def test_a_call_runs_its_products_kernels_apart():
     value, grad = jax.value_and_grad(lambda x: recurrence_chunk._by_product(forward, training, x).sum())(x)
     assert value == 3.0 * x.sum()
     np.testing.assert_array_equal(grad, jnp.full(3, 3.0))
+
+
+@pytest.mark.parametrize("packed", PACKED, ids=["one sequence", "packed"])
+def test_the_portable_rule_recomputes_its_memory_where_the_rung_names_it(packed):
+    """Under a remat rung recomputing the delta rule's memory (`recurrence_chunk.recomputing`,
+    'delta_memory'), the portable rule (`chunk_delta_rule`, a CPU's route) keeps its operands alone and
+    computes its memory again in its backward, as the port and the template drop theirs: its residuals
+    hold fewer bytes than the kept rule's, its gradients the kept rule's bit for bit."""
+    keys = jax.random.split(jax.random.key(7), 6)
+    rows, length, heads, width = 2, 37, 2, 8
+    query, key, value = (jax.random.normal(k, (rows, length, heads, width)) for k in keys[:3])
+    g = -jax.nn.softplus(jax.random.normal(keys[3], (rows, length, heads, 1)))
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (rows, length, heads)))
+    starts = jax.random.bernoulli(keys[5], 0.1, (rows, length)) if packed else None
+    operands = (query, key, value, g, beta)
+
+    def loss(*operands):
+        out, final = recurrence_chunk.chunk_delta_rule(*operands, chunk_size=CHUNK, starts=starts)
+        return jnp.sum(out ** 2) + jnp.sum(final)
+
+    def residual_bytes(fn) -> int:
+        return sum(leaf.nbytes for leaf in jax.tree.leaves(jax.vjp(fn, *operands)[1]))
+
+    def recomputed(*operands):
+        with recurrence_chunk.recomputing(("delta_memory",)):
+            return loss(*operands)
+
+    assert residual_bytes(recomputed) < residual_bytes(loss)
+    kept = jax.jit(jax.grad(loss, argnums=range(5)))(*operands)
+    again = jax.jit(jax.grad(recomputed, argnums=range(5)))(*operands)
+    for want, got in zip(kept, again, strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
