@@ -418,6 +418,14 @@ def write_gemma4_unified_native() -> None:
             layer.layer_scalar.fill_(0.8 + index * 0.125)
     model.save_pretrained(destination, safe_serialization=True)
     config.to_json_file(destination / "config.json", use_diff=False)
+    # The decoder alone, as the wrapper states it: the committed config its text family's kernel routes
+    # trace (tools/kernel_routes.py), which find a family's fixture by its top-level model_type.
+    stated = json.loads((destination / "config.json").read_text())
+    text = ROOT / "gemma4-unified-text-tiny"
+    text.mkdir(parents=True, exist_ok=True)
+    (text / "config.json").write_text(json.dumps(
+        {**stated["text_config"], "transformers_version": stated["transformers_version"]},
+        indent=2, sort_keys=True) + "\n")
     special = {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3,
                "<|video|>": 56, "<audio>": 57, "<start_of_audio>": 58, "<end_of_audio>": 59,
                "<image_soft_token>": 60, "<start_of_image>": 61, "<end_of_image>": 62}
