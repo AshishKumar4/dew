@@ -14,7 +14,7 @@ import numpy as np
 import optax
 import pytest
 from decision_support import decision_rows
-from interop_support import allocated_bytes
+from interop_support import allocated_bytes, written_tensors
 from PIL import Image
 from reference_error import assert_as_exact_as_the_reference, float64_forward, ieee_fixture
 from safetensors.numpy import load_file
@@ -321,20 +321,6 @@ def released(kind: str, directory: Path) -> Path:
     for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
         (directory / source.name).symlink_to(source.resolve())
     return directory
-
-
-def written_tensors(directory: Path) -> dict[str, np.ndarray]:
-    """Every tensor a saved release holds, by its name in its file: its safetensors shards and a slot
-    head's `readout_head.pt`."""
-    import torch
-
-    held = {}
-    for path in sorted(directory.glob("*.safetensors")):
-        held.update(load_file(path))
-    if (directory / "readout_head.pt").is_file():
-        held.update({name: tensor.numpy() for name, tensor in
-                     torch.load(directory / "readout_head.pt", weights_only=True).items()})
-    return held
 
 
 @pytest.mark.parametrize("kind", ["joint", "slot", "laya"])
