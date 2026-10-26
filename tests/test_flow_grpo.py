@@ -370,6 +370,7 @@ def test_flow_objective_matches_clipping_and_conditional_gaussian_kl():
         return jax.vmap(closed, (0, 0, 0, 0, 0, None, None))(trajectory.states, trajectory.times, advantages,
                                                              mask, one, *gains)
 
+    @as_given
     def truth(start, advantages, mask, one):
         trajectory = walked_in_float32(jax.vmap(walk), start)
         with jax.enable_x64(new_val=True):
@@ -555,9 +556,11 @@ def assert_rescores_as_walked(objective, variables, rollout_of, density, label: 
             return {"recorded": found, "rescored": found}
         return run
 
-    assert_as_exact(lambda batch: {"recorded": batch["old_log_probs"], "rescored": rescore(variables, batch)},
+    # The recorded log probabilities beside the rescored ones, and the widened weights' truth, on the host.
+    assert_as_exact(as_given(lambda batch: {"recorded": batch["old_log_probs"],
+                                            "rescored": rescore(variables, batch)}),
                     closed(variables, np.float32), lambda seed: (rollout_of(seed),), label, seeds=seeds,
-                    truth_fn=lambda batch: closed(widened(variables), np.float64)(batch))
+                    truth_fn=as_given(lambda batch: closed(widened(variables), np.float64)(batch)))
 
 
 class Inpainting(nn.Module):

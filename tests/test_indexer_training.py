@@ -116,7 +116,7 @@ def test_the_loss_its_gradient_and_the_selection_are_maxtexts(name):
     assert_as_exact(lambda index, inputs, cotangent: kl(inputs, cotangent),
                     as_given(lambda index, inputs, cotangent: reference(index, inputs)),
                     lambda seed: (*recorded_draw(seed), np.float32(1)), f"{name} indexer loss", seeds=seeds,
-                    truth_fn=lambda index, inputs, cotangent: truth(index, inputs))
+                    truth_fn=as_given(lambda index, inputs, cotangent: truth(index, inputs)))
 
     legacy = fixture()
     legacy_keep = causal(META["length"]) if mask == "causal" else packed_keep(legacy["segments"])

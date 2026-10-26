@@ -352,6 +352,7 @@ def test_padding_repro_greedy_and_seeded_reproducibility(sampling, name):
 
     wide = scored(model, params, sampling, "float64")
 
+    @as_given
     def full(prompt, key, tokens):
         return wide(prompt, np.full(ROWS, 2), key, tokens)
 
@@ -439,6 +440,7 @@ def test_prompt_perplexity_uses_unpadded_context_and_real_transitions(kind):
 
     wide = full(model.clone(dtype="float64"), widened(params))
 
+    @as_given
     def truth(prompt, lengths):
         with jax.enable_x64(new_val=True):
             return wide(prompt, lengths)
@@ -495,7 +497,7 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
         def run(key, rolled):
             with jax.enable_x64(new_val=True):
                 return stepped(wide, weights, widened(rolled))
-        return run
+        return as_given(run)
 
     def stepped(objective, params, rolled):
         def raw_policy_loss(p):
@@ -554,6 +556,7 @@ def test_padding_slots_do_not_consume_cache_capacity(kind):
 
     wide = scored(model, params, greedy, "float64")
 
+    @as_given
     def full(prompt, tokens):
         return wide(prompt, np.full(ROWS, 2), None, tokens)
 
