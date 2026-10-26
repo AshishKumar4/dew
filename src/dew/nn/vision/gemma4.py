@@ -459,14 +459,16 @@ def export_gemma4_vision_config(tower: Gemma4Vision) -> Mapping[str, object]:
     }
 
 
-def translate_gemma4_projector_config(vision: Mapping[str, object],
-                                      text_width: int) -> Record:
-    """A Gemma 4 wrapper's projector fields: decoder width, norm epsilon."""
-    return {
-        "class": "gemma4", "fields": {
+def translate_gemma4_projector_config(vision: Mapping[str, object], text_width: int,
+                                      input_width: int | None = None) -> Record:
+    """A Gemma 4 wrapper's projector fields: decoder width, norm epsilon, and the width of the raw media
+    it projects where no encoder precedes it (`input_width`, Gemma 4 Unified's)."""
+    fields: dict[str, object] = {
         "text_width": int(text_width),
-        "norm_eps": _records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
-    }}
+        "norm_eps": _records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps")}
+    if input_width is not None:
+        fields["input_features"] = int(input_width)
+    return {"class": "gemma4", "fields": fields}
 
 
 Gemma4Vision.checkpoint = TowerLayout("vision_tower.", gemma4_vision_path)

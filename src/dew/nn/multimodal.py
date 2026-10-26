@@ -239,9 +239,11 @@ class MultimodalTransformer(DecoderWrapper):
 
     @nn.nowrap
     def model_flops(self, lengths) -> float:
-        """Text-only decoder work. Media inputs require their own tower geometry."""
-        if isinstance(self.audio_projection, HardVocabularyEmbedder):
-            raise MissingFlopsCount("MultimodalTransformer needs its hard-audio-vocabulary matrix geometry")
+        """The language model's work over the real tokens; the media towers' and projectors' work is left
+        out. A model with an audio encoder refuses: its encoder's work over its frames has no count here.
+        A projector of raw audio frames alone (Gemma 4 Unified) is left out, as a vision projector is."""
+        if self.audio is not None:
+            raise MissingFlopsCount("MultimodalTransformer has no count of its audio encoder's work")
         return counted_flops(self.language_model, lengths)
 
     @nn.nowrap

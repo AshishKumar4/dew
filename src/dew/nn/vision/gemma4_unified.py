@@ -1,4 +1,4 @@
-"""Encoder-free Gemma 4 media embeddings, from transformers 5.16.1's gemma4_unified.
+"""Encoder-free Gemma 4 media embeddings, from transformers 5.17.0's gemma4_unified.
 
 The processor merges image patches before the axial embedding. Vision states and raw waveform
 frames then use the same scale-free RMS projector, before entering the shared text decoder.
@@ -39,19 +39,16 @@ class Gemma4UnifiedVision(TowerBase):
                              channels=3, position_size=self.mm_posemb_size, retains_patch_slots=True)
 
 
-def translate_vision(config: Mapping[str, object]) -> Record:
+def translate_gemma4_unified_vision_config(config: Mapping[str, object]) -> Record:
+    """A Unified vision_config's embedding fields, each at Gemma4UnifiedVisionConfig's default where the
+    config leaves it out. Its num_soft_tokens is the processor's budget, which this embedding never
+    reads: Dew takes the processor's patches as they are."""
     fields = {field.name: _records.integer(config.get(field.name, field.default), field.name)
               for field in dataclasses.fields(Gemma4UnifiedVision)}
     width = fields["mm_embed_dim"]
     if _records.integer(config.get("output_proj_dims", width), "output_proj_dims") != width:
         raise ValueError("output_proj_dims must equal mm_embed_dim for the vision embedding projection")
     return {"class": "gemma4_unified", "fields": fields}
-
-
-def translate_projector(config: Mapping[str, object], text_width: int, input_width: int) -> Record:
-    return {"class": "gemma4", "fields": {
-        "text_width": text_width, "input_features": input_width,
-        "norm_eps": _records.number(config.get("rms_norm_eps", 1e-6), "rms_norm_eps")}}
 
 
 _TENSORS = {
