@@ -533,10 +533,11 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
                 answer, updated = model.apply(
                     {**params, 'cache': empty}, history,
                     attention_mask=jnp.arange(history.shape[1])[None, :] < following[:, None],
-                    decode=True, mutable=['cache'], method='states_and_logits')
-                states, logits = answer
+                    decode=True, mutable=['cache'], method='states_and_logits' if exposed else None)
                 rows = jnp.arange(tokens.shape[0])[:, None]
-                rebuilt = (states[rows, slots], logits[rows, slots]), updated
+                # The same answer `append` gives: states beside the logits where the model exposes them.
+                picked = jax.tree.map(lambda leaf: leaf[rows, slots], answer)
+                rebuilt = picked, updated
 
                 def replaced(fresh, held):
                     selected = crossing.reshape(-1, *(1,) * (fresh.ndim - 1))

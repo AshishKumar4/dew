@@ -265,6 +265,12 @@ class _Sizes:
         spelled = {name: key for name, key in type(defaults).attribute_map.items() if name in _SPELLED}
         return cls(hf_config, spelled, defaults)
 
+    def aliased(self, name: str) -> str:
+        """The key the config class reads `name` under through its attribute map (Longcat Flash's
+        `moe_topk` for `num_experts_per_tok`), every alias of it: for the routed and latent sizes the
+        probe shrinks by their meaning, which each alias keeps."""
+        return name if self.defaults is None else type(self.defaults).attribute_map.get(name, name)
+
     def key(self, name: str) -> str:
         """The config's own key for the standard size `name`."""
         return self.keys.get(name, name)
@@ -322,18 +328,27 @@ def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -
         fields[key('num_hidden_layers')] = depth
     # A routed or latent-attention type keeps its structure at small widths:
     # four experts, two per token, and small latent ranks.
+    # A stated query-key width is the latent heads' two parts together; identity ('zero') experts keep
+    # their place beside the routed ones.
     small = {'num_experts': 4, 'n_routed_experts': 4, 'num_local_experts': 4, 'num_experts_per_tok': 2,
              'moe_intermediate_size': 2 * small_hidden, 'shared_expert_intermediate_size': 2 * small_hidden,
+             'expert_ffn_hidden_size': 2 * small_hidden, 'zero_expert_num': 2,
              'kv_lora_rank': _HEAD_DIM, 'q_lora_rank': 2 * _HEAD_DIM, 'qk_nope_head_dim': _HEAD_DIM,
-             'qk_rope_head_dim': _HEAD_DIM // 2, 'v_head_dim': _HEAD_DIM, 'n_group': 1, 'topk_group': 1}
-    fields.update({key: value for key, value in small.items() if key in hf_config})
+             'qk_rope_head_dim': _HEAD_DIM // 2, 'qk_head_dim': _HEAD_DIM + _HEAD_DIM // 2,
+             'v_head_dim': _HEAD_DIM, 'n_group': 1, 'topk_group': 1}
+    fields.update({sizes.aliased(name): value for name, value in small.items()
+                   if sizes.aliased(name) in hf_config})
     if 'first_k_dense_replace' in hf_config:
         fields['first_k_dense_replace'] = min(records.integer(hf_config['first_k_dense_replace'],
                                                               'first_k_dense_replace'), 1)
     if key('num_key_value_heads') in hf_config:
         fields[key('num_key_value_heads')] = small_kv
     if key('head_dim') in hf_config:
-        fields[key('head_dim')] = _HEAD_DIM
+        # A latent-attention config whose head_dim states its rotary width (Longcat Flash's) keeps the
+        # two equal.
+        stated = hf_config[key('head_dim')]
+        rotary = 'qk_rope_head_dim' in hf_config and stated == hf_config['qk_rope_head_dim']
+        fields[key('head_dim')] = _HEAD_DIM // 2 if rotary else _HEAD_DIM
     # A window or a chunk shrinks below the probe's length, so the probe runs past it.
     for positional in ('sliding_window', 'attention_chunk_size'):
         if isinstance(hf_config.get(positional), int):
