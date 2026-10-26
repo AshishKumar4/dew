@@ -149,6 +149,30 @@ def test_a_confident_labels_derivative_survives_and_sums_to_zero(margin):
                                   optax.softmax_cross_entropy_with_integer_labels(jnp.asarray(rows), labels))
 
 
+UNCONFIDENT_SEEDS = {16: 8, 4096: 8}
+"""Check 1's declared seeds for a label's derivative over rows whose label is not confident, at each
+vocabulary width, sized by `seeds_for`."""
+
+
+@pytest.mark.parametrize("width", sorted(UNCONFIDENT_SEEDS))
+def test_a_labels_derivative_over_unconfident_rows_is_on_par_with_autodiffs(width):
+    """Where no label is confident, the label loss's derivative, every other class's probability and
+    at the label minus their sum (arXiv:2610.31642, eq. 7), is on par with autodiff's of the log-softmax
+    written out (check 1): the sum, rounded once, loses nothing to `p - 1` at a row of few classes or
+    many."""
+    labels = jnp.arange(4) % width
+
+    def draw(seed):
+        return (np.random.default_rng(seed).standard_normal((4, width)).astype(np.float32),)
+
+    def written(rows):
+        return -jnp.take_along_axis(jax.nn.log_softmax(rows), labels[:, None], axis=-1).sum()
+
+    assert_as_exact(jax.jit(jax.grad(lambda rows: categorical.cross_entropy(rows, labels).sum())),
+                    jax.jit(jax.grad(written)), draw, f"an unconfident label's derivative over {width}",
+                    seeds=UNCONFIDENT_SEEDS[width])
+
+
 def written_softmax(rows: jax.Array) -> jax.Array:
     """The softmax written out: each row moved to its largest logit, exponentiated and normalized, its
     derivative autodiff's, through the maximum too."""
