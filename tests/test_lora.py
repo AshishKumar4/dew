@@ -32,7 +32,7 @@ from affine_run import Replaying
 from flax import linen as nn
 from interop_support import extract_fixture, hub_cache
 from model_support import flat_tree
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, widened
 from safetensors.numpy import load_file
 from test_joined import row_joins
 
@@ -630,7 +630,7 @@ def test_a_clipped_linear_adapts_once_inside_its_bounds_and_reloads(tmp_path):
     import torch
 
     model, variables, adapter, draw, forward, reference = clipped_adapter_case()
-    assert_as_exact(forward, lambda *args: reference(torch.float32, *args), draw,
+    assert_as_exact(forward, as_given(lambda *args: reference(torch.float32, *args)), draw,
                     "clipped linear adapter", seeds=CLIPPED_SEEDS,
                     truth_fn=lambda *args: reference(torch.float64, *args))
     factors, inputs, _ = draw(3)

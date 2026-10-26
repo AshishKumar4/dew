@@ -905,6 +905,7 @@ def _recorded_pairs(dew, reference, count: int, missing=()):
         asked.append(int(seed))
         return theirs[int(seed)]
 
+    @as_given
     def recorded_dew(seed):
         return mine[int(seed)]
 
