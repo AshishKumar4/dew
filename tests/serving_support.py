@@ -1,6 +1,7 @@
 """Check 1 of a server's draws against a full forward of its decoder, shared by the serving tests."""
 
 import dataclasses
+import itertools
 from collections.abc import Mapping, Sequence
 
 import jax
@@ -36,12 +37,16 @@ def served_inputs(row: np.ndarray, request: Served, vocab: int) -> ModelInputs:
 
 
 def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], label: str, *, serving: dict,
-                           hits: Sequence[int] | None = None, budget: int = SERVED_BUDGET) -> None:
-    """Check 1 of a server's draws: greedy requests through a server over `task` with `serving`, all queued
-    at once, or with `hits` one after another (`prefix_hits` after each, its shared prefix tokens), draw
+                           hits: Sequence[int] | None = None, rounds: Sequence[int] | None = None,
+                           budget: int = SERVED_BUDGET) -> None:
+    """Check 1 of a server's draws: greedy requests through a server over `task` with `serving`, queued in
+    `rounds` (how many go in together before the server runs them; all at once where None, one a round
+    where `hits` is given), with `hits` the shared prefix tokens after each round (`prefix_hits`), draw
     what the lone task draws, and score each drawn token's raw log probability on par with a full forward
     of the decoder over the prompt, its groups (the prefix run's where it carries none) and the tokens
     drawn before it, from the float64 twin's. `task` draws greedily and stops at its `budget` alone."""
+    if rounds is None:
+        rounds = (len(requests),) if hits is None else (1,) * len(requests)
     decoder, variables, vocab = task.model, task.variables, task.model.vocab_size
     wide = decoder.clone(dtype=jnp.float64, attention_impl="reference")
     width = max(request.length for request in requests)
@@ -59,12 +64,11 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
     @as_given
     def served(row, drawn):
         tickets, shared, before = [], [], server.prefix_hits
-        for index, request in enumerate(requests):
-            tickets.append(server.submit(served_inputs(row, request, vocab), budget, key=index))
-            if hits is not None:
-                server.run()
-                shared.append(server.prefix_hits - before)
-        server.run()
+        for end in itertools.accumulate(rounds):
+            tickets.extend(server.submit(served_inputs(row, requests[index], vocab), budget, key=index)
+                           for index in range(len(tickets), end))
+            server.run()
+            shared.append(server.prefix_hits - before)
         assert hits is None or shared == list(hits), shared
         generations = [ticket.result().host() for ticket in tickets]
         for generation, tokens in zip(generations, drawn, strict=True):

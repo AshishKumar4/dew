@@ -600,7 +600,8 @@ class Server:
         """Each row state leaf (`row_state`) with its slot axis holding the groups' `States` entries,
         placed as the slots are; None where rows keep none."""
         self._restores: list[tuple[int, int]] = []
-        """The (slot, entry) pairs the next call restores before it runs: rows seated after a prefix."""
+        """The (slot, entry) pairs the next call restores before it runs: rows seated after a prefix, up
+        to every slot, whether or not their first piece goes in that call."""
         self._captures: list[tuple[int, int]] = []
         """The (slot, entry) pairs whose state the last call left at a kept boundary."""
         rows = self.rows
@@ -862,6 +863,17 @@ class Server:
             salt = hasher.digest()
         return _Row(tokens, budget, seed, fold, Ticket(), context=context, salt=salt, groups=groups)
 
+    def _book_capture(self, slot: int, row: _Row) -> None:
+        """Keep the state the call leaves in `slot` where the row's piece ends at a boundary it keeps
+        (`_Row.snapshots`, `PagedRows.kept`). An entry two rows book in one call keeps the later
+        booking's state, as `States` names it."""
+        if row.prefilled not in row.snapshots or not isinstance(self.rows, PagedRows):
+            return
+        entry = self.rows.kept(row)
+        if entry is not None:
+            others = [(held, kept) for held, kept in self._captures if kept != entry]
+            self._captures = [*others, (slot, entry)]
+
     def _piece_end(self, row: _Row) -> int:
         """Where the row's next prefill piece ends: the prompt's end, or `chunk` tokens on when the rows
         prefill in pieces, and on past `chunk` to the last member of a group the cut would split, a block
@@ -918,7 +930,7 @@ class Server:
         with self._context():
             if self._restores:
                 self._resident, self._carried = self._restored(
-                    self._resident, self._carried, self._states, *_padded(self._restores, self.admission, 0))
+                    self._resident, self._carried, self._states, *_padded(self._restores, self.slots, 0))
                 self._restores = []
             program = self._step if admission is None else self._admitting
             error, (self._resident, self._carried, draws) = program(
@@ -1044,10 +1056,7 @@ class Server:
             tables[index, :len(table)] = table
             cursors[index] = row.prefilled
             row.prefilled += len(piece)
-            if row.prefilled in row.snapshots and isinstance(self.rows, PagedRows):
-                entry = self.rows.kept(row)
-                if entry is not None:
-                    self._captures.append((slot, entry))
+            self._book_capture(slot, row)
             final[index] = row.prefilled == len(row.prompt)
             history[index, capacity - len(row.prompt):] = row.prompt
             history_valid[index, capacity - len(row.prompt):] = True

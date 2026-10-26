@@ -677,16 +677,21 @@ def test_a_multimodal_model_serves_over_its_language_models_cache(options):
         np.testing.assert_array_equal(served.host().tokens[:, :walked.shape[1]], walked)
 
 
-def hybrid_task():
+def hybrid_model(vocab_size: int = VOCAB) -> CausalTransformer:
     """Qwen3.5's stack at toy size: two gated-delta-net layers, whose recurrent memory and conv
     tail are each row's own state, and one full-attention layer, whose keys a paged server pages."""
-    model = CausalTransformer(
-        vocab_size=VOCAB, emb_features=16, num_layers=3, num_heads=2, num_kv_heads=2, head_dim=8,
+    return CausalTransformer(
+        vocab_size=vocab_size, emb_features=16, num_layers=3, num_heads=2, num_kv_heads=2, head_dim=8,
         mlp_features=32, max_seq_len=128, dtype="float32",
         layer_types=("linear_attention",) * 2 + ("full_attention",),
         kinds={"linear_attention": {"mixer": {"class": "gated_delta_net", "fields": {
             "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 6,
             "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}}})
+
+
+def hybrid_task():
+    """`hybrid_model`'s greedy task, over drawn weights."""
+    model = hybrid_model()
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     return TextGeneration(model, params, RunProcessor(Digits()),
                           sampling=Sampling(temperature=0, eos_token_ids=EOS))
@@ -713,28 +718,37 @@ HYBRID_SHARED = {"slots": 2, "capacity": 64, "kv_cache": KVCache(page_size=4, pa
 """A paged server sharing full pages of 4 prompt tokens, its rows' recurrent state beside them."""
 
 
-@pytest.mark.parametrize("requests, options, hits", [
-    ((Served(12), Served(12), Served(12, flipped=(9,))), {}, (0, 8, 16)),
-    ((Served(12), Served(12), Served(12, flipped=(9,))), {"chunk": 3}, (0, 8, 16)),
-    ((Served(12), Served(12, flipped=(6,))), {}, (0, 0)),
-    ((Served(12), Served(12, flipped=(6,))), {"prefix_state_every": 1}, (0, 4)),
-    ((Served(12), Served(12, flipped=(1,)), Served(12)), {"prefix_states": 1}, (0, 0, 0)),
-    ((Served(12), Served(12, flipped=(1,)), Served(12)), {"prefix_states": 2}, (0, 0, 8))],
-    ids=["deepest", "deepest-in-pieces", "shallower", "every-page", "evicted", "kept"])
-def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(requests, options, hits):
+@pytest.mark.parametrize("requests, options, hits, rounds", [
+    ((Served(12), Served(12), Served(12, flipped=(9,)), Served(12, flipped=(1,)), Served(12),
+      Served(12, flipped=(6,))), {}, (0, 8, 16, 16, 24, 24), None),
+    ((Served(12), Served(12), Served(12, flipped=(9,))), {"chunk": 3}, (0, 8, 16), None),
+    ((Served(12), Served(12, flipped=(6,))), {"prefix_state_every": 1}, (0, 4), None),
+    ((Served(12), Served(12, flipped=(1,)), Served(12)), {"prefix_states": 1}, (0, 0, 0), None),
+    ((Served(12), Served(12, flipped=(1,)), Served(12), Served(12, flipped=(1,))), {"prefix_states": 1},
+     (0, 8), (2, 2)),
+    ((Served(12), Served(12), Served(12)), {"admission": 1}, (0, 16), (1, 2))],
+    ids=["by-default", "in-pieces", "every-page", "evicted", "one-entry-booked-twice",
+         "restores-past-admission"])
+def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(requests, options, hits, rounds):
     """A shared prefix's pages hold its keys, and a hybrid stack's rows keep their recurrent memory and
     conv tail beside them: the server keeps the state a prompt leaves at its deepest shareable page
     boundary (and every `prefix_state_every` pages below it), a piece cut to end there, and a later prompt
-    reuses the pages as deep as a state is kept, starting its row from that state. A prompt agreeing with
-    an earlier one past its deepest boundary reads both its pages; one agreeing only through its first
-    page reads none, unless a state is kept there; a state evicted from a store of one entry takes its
-    reuse with it. Each request draws what it draws alone and scores it as a full forward does (check 1)."""
+    reuses the pages as deep as a state is kept, starting its row from that state. By default (a store of
+    two entries): a repeat reads both full pages, as does a prompt agreeing with it past its deepest
+    boundary; one agreeing nowhere reads none, its state taking the other entry, so the first prompt's
+    is still kept and its repeat reads its pages again; one agreeing only through its first page reads
+    none, as no state is kept there. Where a state is kept every page, that one reads its first page; a
+    store of one entry evicts the first prompt's state for the next one's and its reuse with it. Two
+    prompts admitted together into a store of one entry keep one state, the later booking's, which the
+    next round's repeat of it reads; two repeats seated together each restore their state, past the
+    one prompt piece a call admits. Each request draws what it draws alone and scores it as a full
+    forward does (check 1)."""
     # A vocabulary of 64 and eight draws a request, so each request's scores spread enough to measure.
-    model = hybrid_task().model.clone(vocab_size=64)
+    model = hybrid_model(vocab_size=64)
     task = TextGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
                           sampling=Sampling(temperature=0, pad_token_id=0))
     assert_served_as_exact(task, requests, f"hybrid shared prefix {hits}",
-                           serving={**HYBRID_SHARED, **options}, hits=hits, budget=8)
+                           serving={**HYBRID_SHARED, **options}, hits=hits, rounds=rounds, budget=8)
 
 
 def served_alongside(bound, slots=4, admission=2, **options):
