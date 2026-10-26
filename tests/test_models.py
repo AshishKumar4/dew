@@ -631,7 +631,7 @@ def test_group_norm_is_as_exact_as_torch_s_where_a_group_s_mean_dwarfs_its_sprea
     def torch_s(x, scale, bias):
         return torch.nn.functional.group_norm(x.movedim(-1, 1), groups, scale, bias, eps=1e-6).movedim(1, -1)
 
-    assert_as_exact(jax.jit(normalized(GroupNorm(groups, epsilon=1e-6))), torch_with_gradients(torch_s),
+    assert_as_exact(normalized(GroupNorm(groups, epsilon=1e-6)), torch_with_gradients(torch_s),
                     draw, "offset group norm", seeds=OFFSET_GROUP_NORM_SEEDS,
                     truth_fn=normalized(nn.GroupNorm(groups, epsilon=1e-6, dtype=jnp.float64)))
 

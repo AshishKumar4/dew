@@ -963,20 +963,21 @@ def test_an_objective_over_a_quantized_packed_task_holds_the_canonical_tree():
     def draw(seed):
         return (np.random.default_rng([0x1313, seed]).integers(1, vocab, size=(2, 5)).astype(np.int32),)
 
-    def exact(tokens):
-        """The served packed tree's float64 logits: each quantized kernel's integers times its scales."""
-        def value(node):
-            if isinstance(node, Annotated):
-                return np.asarray(qwix.dequantize(node.array.astype(jnp.float64)), np.float64)
-            floating = np.issubdtype(np.asarray(node).dtype, np.floating)
-            return np.asarray(node, np.float64) if floating else node
+    def value(node):
+        """A leaf in float64: a quantized kernel its integers times its scales."""
+        if isinstance(node, Annotated):
+            return np.asarray(qwix.dequantize(node.array.astype(jnp.float64)), np.float64)
+        floating = np.issubdtype(np.asarray(node).dtype, np.floating)
+        return np.asarray(node, np.float64) if floating else np.asarray(node)
+
+    with jax.enable_x64(new_val=True):
         weights = jax.tree.map(value, dict(served.variables),
                                is_leaf=lambda node: isinstance(node, Annotated))
-        return np.asarray(wide.apply(weights, tokens))
 
-    assert_as_exact(lambda tokens: np.asarray(served.model.apply(held, tokens)),
-                    lambda tokens: np.asarray(served.model.apply(served.variables, tokens)), draw,
-                    "split quantized tree", seeds=SPLIT_SEEDS, truth_fn=exact)
+    assert_as_exact(lambda tokens: served.model.apply(held, tokens),
+                    lambda tokens: served.model.apply(served.variables, tokens), draw,
+                    "split quantized tree", seeds=SPLIT_SEEDS,
+                    truth_fn=lambda tokens: wide.apply(weights, tokens))
     packed_only = dew.pipeline(str(directory), dtype="float32").quantized(
         Quantization(patterns=(".*/qkv_proj",)))
     kept = LMObjective(packed_only.model, 3, variables=packed_only.variables).variables
