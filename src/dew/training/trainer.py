@@ -1157,7 +1157,7 @@ class Trainer(Generic[Loss, Effects]):
             lowered, launches = tuning.tune(lower, measure=True)
         else:
             # The tuner is off (bible §6): each launch takes its derived config, nothing settled or read.
-            lowered = lower()
+            lowered, launches = lower(), launches or "[]"
         return Candidate(micro, shapes, copies, shardings, prepared, held, lowered, launches)
 
     def _prepared(self, state: TrainState, batch: Batch, schedule: Schedule, window: int,
