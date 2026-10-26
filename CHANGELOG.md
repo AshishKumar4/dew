@@ -7,7 +7,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 - `OptimConfig(state_dtype='int8')` stores adam's and adamw's moments blockwise in 8 bits
   (`dew.optim.int8_moments`, bitsandbytes' and torchao's 8-bit Adam): a quarter of float32's state, the
-  update computed from the moments dequantized to fp32.
+  update computed from the moments dequantized to fp32 (an A100's full-remat step of a 234M-parameter
+  decoder: peak 3.22 GB against fp32 state's 4.22, 81.2 ms against 52.9). bf16 and 8-bit Adam share one
+  leafwise transform, and an 8-bit moment's codes and scales are placed by their parameters' axes.
 - A confident target's loss gradient is the rest of its row's probability summed directly, as arXiv:2610.31642's eq. 7 takes it, through every chunked head (the tiled, whole, fused and vocabulary-split heads) and the whole-logits loss (`logits_cross_entropy`). Each took the target's entry as its share less one, which rounds to 0 once the share rounds to 1, so the row's gradient stopped summing to zero by the rest mass, about 2e-9 at a margin of 20 and 4e-18 at 40. The forward pass reduces one more operand per row for it, and the loss values are unchanged.
 - An autoencoder's latent normalization is one traced map, `dew.nn.autoencoders.LatentAffine`, which
   `AutoEncoder.encode` and `decode` apply through one hook, `latent_affine(params, dtype)`: a configured
