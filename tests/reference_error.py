@@ -236,8 +236,40 @@ def dew_programs(fn):
 
 
 def _given(fn) -> bool:
-    """Whether the gate runs `fn` as it is given (`as_given`, a recorded reference)."""
+    """Whether the gate runs `fn` as it is given (`as_given`, a recorded reference), a window loop's
+    arm by its own (`over_windows`)."""
+    if isinstance(fn, _Windowed):
+        return _given(fn.fn)
     return bool(getattr(fn, "as_given", False) or getattr(fn, "recorded", False))
+
+
+def _compiles(fn) -> bool:
+    """Whether the gate compiles `fn` itself: a plain function, not an arm it runs as given, a program
+    already compiled (a jit) or an arm of Dew's own programs (`dew_programs`)."""
+    fn = fn.fn if isinstance(fn, _Windowed) else fn
+    return not (_given(fn) or getattr(fn, "dew_programs", False) or hasattr(fn, "lower"))
+
+
+def _refuse_numpy_arms(draw, *arms) -> None:
+    """Refuse an arm the gate would compile that computes in NumPy: called once as it is given on a
+    draw's inputs (a window's, for a window loop's arm), a JAX arm returns JAX arrays, and an arm that
+    returns NumPy arrays is a NumPy reference, which compiled would compute in JAX, in float32 where
+    its draw is float64, by other sums. It passes `as_given`; a Dew arm that only converts its
+    outputs returns them unconverted instead."""
+    plain = [fn for fn in dict.fromkeys(arms) if _compiles(fn)]
+    if not plain:
+        return
+    drawn = draw(0)
+    for fn in plain:
+        inputs = drawn
+        if isinstance(fn, _Windowed):
+            fn, inputs = fn.fn, jax.tree.map(lambda leaf: leaf[0], drawn)
+        outputs = jax.tree.leaves(fn(*inputs))
+        kinds = {type(leaf).__name__ for leaf in outputs if not isinstance(leaf, jax.Array)}
+        if kinds:
+            raise TypeError(f"{getattr(fn, '__qualname__', repr(fn))} returns {sorted(kinds)}: a NumPy arm, "
+                            f"which the gate would compile in JAX; pass it as_given, or return its JAX "
+                            f"values unconverted")
 
 
 def _compiled(fn, compile):
@@ -1210,6 +1242,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                                     f"seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
                                     f"(`seeds_for`)")])
     narrow_leaves: list[str] = []
+    _refuse_numpy_arms(draw, dew_fn, reference_fn)
     dew_fn, reference_fn = _arms(dew_fn, reference_fn)
 
     def drawn(start, stop):
@@ -1267,6 +1300,7 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
         raise Inconclusive([Finding(label, "inconclusive", FEWEST_SEEDS / max(seeds, 1), f"{label}: {seeds} "
                                     f"seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
                                     f"(`seeds_for`)")])
+    _refuse_numpy_arms(draw, changed_fn, original_fn)
     changed_fn, original_fn = _arms(changed_fn, original_fn)
     draws = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn)
     moved, kept, unresolved = _moved(draws, 1)
@@ -1312,8 +1346,10 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     if dew_fn is not None and getattr(reference_fn, "recorded", False):
         raise ValueError(f"{label}: a recorded reference holds its recorded seeds alone, never a paired "
                          f"sizing's from SIZING_FROM; its site keeps its recorded count")
-    dew_fn, reference_fn = _arms(reference_fn if dew_fn is None else dew_fn, reference_fn)
-    dew_fn = None if dew_fn is reference_fn else dew_fn
+    paired = dew_fn is not None
+    _refuse_numpy_arms(draw, *([dew_fn] if paired else []), reference_fn)
+    dew_fn, reference_fn = _arms(dew_fn if paired else reference_fn, reference_fn)
+    dew_fn = dew_fn if paired else None
     count, drawn = max(start, FEWEST_SEEDS), None
     first = 0 if dew_fn is None else SIZING_FROM
     while count <= most:
@@ -1366,6 +1402,11 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
     draw's orbit, as a site that declares one."""
     if paired and dew_fn is None:
         raise ValueError("a paired null run takes its other implementation, `dew_fn`")
+    # The runs compile their arms as check 1 does (`_arms`).
+    if dew_fn is not None:
+        dew_fn, reference_fn = _arms(dew_fn, reference_fn)
+    else:
+        reference_fn = _arms(reference_fn, reference_fn)[1]
     verdicts = []
     span = (1 + REDRAW) * seeds
     for run in range(first, first + runs):

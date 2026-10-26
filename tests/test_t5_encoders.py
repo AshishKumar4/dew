@@ -17,7 +17,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
+from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
 
 from dew.inputs import T5Text
 
@@ -167,5 +167,5 @@ def test_the_real_checkpoint_matches_the_reference():
         drawn = t5_draw(seed, reference_model.config.vocab_size)
         return drawn["input_ids"], drawn["attention_mask"]
 
-    assert_as_exact(encode, lambda ids, mask: ran(reference_model, ids, mask), draw,
+    assert_as_exact(encode, as_given(lambda ids, mask: ran(reference_model, ids, mask)), draw,
                     "t5-small last hidden states", seeds=T5_SMALL_SEEDS, truth_fn=wide_ran)

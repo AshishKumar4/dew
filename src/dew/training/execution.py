@@ -44,7 +44,7 @@ from dew.inference.banks import (
     one_layer,
 )
 from dew.nn.backbones.layer_plan import group_name, layer_index
-from dew.nn.kernels.options import program
+from dew.nn.kernels.options import Option, program
 from dew.nn.sharding import batch_axes
 from dew.objectives.base import FROZEN, merge, select, thaw, without
 from dew.training.distributed import batch_shardings
@@ -309,7 +309,7 @@ class HostExecution:
         self.device = device
         self.unstack = jax.jit(functools.partial(_logical, sites=self.sites))
 
-    def forward(self, step: Mapping[str, bool | int]):
+    def forward(self, step: Mapping[str, Option]):
         """The loss and its pullback, compiled for the objective's modules as they are now, under the
         `step`'s XLA options (`step_options`): the objective owns the program, which its fit ladder
         replaces with its model. The dataset's device steps run in it, on the accelerator, before the
@@ -319,7 +319,7 @@ class HostExecution:
             functools.partial(_forward, functools.partial(_after, self.device, self.objective._loss)),
             static_argnames=("layout",), holds=self.device, step=step)
 
-    def step_options(self, variables, batch) -> dict[str, bool | int]:
+    def step_options(self, variables, batch) -> dict[str, Option]:
         """The XLA options the resident step compiles under (`step_compiler_options`), which the host
         step's forward and pullback take too, so the two differ by the host boundary alone: the
         tokens each accelerator device steps of `batch`, whether the step trains next to frozen
