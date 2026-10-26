@@ -114,8 +114,9 @@ def test_the_output_kernel_computes_flas_expression(dtype, shape, tiles):
 def test_the_cumsum_kernel_is_flas_chunk_local_cumsum(reverse, columns):
     """Within each chunk of each head, and each key dimension of a decay per key dimension (fla's
     vector kernel), the inclusive sum of the tokens times the base-2 scale, from the end for the
-    gradient, within fp32 rounding of numpy's float64 sum: forward fla's plain fp32 prefix, scaled
-    after the sum, and the gradient's from the end compensated (`compensated_add`), rounded once."""
+    gradient, within fp32 rounding of numpy's float64 sum: forward the prefix in float64, scaled after
+    the sum and rounded once (fla's is plain fp32), and the gradient's from the end compensated
+    (`compensated_add`), rounded once."""
     g = -jnp.exp(jax.random.normal(jax.random.key(3), (2, 192, 3, *columns)) - 3.0)
     tokens = np.asarray(g, np.float64).reshape(2, 3, 64, 3, *columns)
     kernel = functools.partial(cumulated, scale=fla_gdn.RCP_LN2, reverse=reverse,

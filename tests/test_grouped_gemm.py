@@ -283,6 +283,8 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
     target = UNSEEN[unseen]
     canonical = generation.TARGETS[target.generation]
     family = "wgmma" if target.wgmma else "mma.sync"
+    if not target.wgmma and not mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16)).stores(jnp.bfloat16):
+        pytest.skip("mma.sync stores no bf16 tile on this JAX (Family.stores): these calls run Triton")
     # mma.sync's tiles run the product and the input gradient; the kernel gradient is warpgroup MMA's.
     launched = {"MosaicGmm", "MosaicTgmm"} if target.wgmma else {"MosaicGmm"}
 
@@ -551,7 +553,9 @@ def ampere(generation_name: str = "sm80"):
 @pytest.mark.parametrize("sizes", [name for name in SIZES if any(SIZES[name])])
 def test_an_ampere_gpu_runs_mosaics_launch_first(sizes, out_dtype):
     """Without warpgroup MMA, the Mosaic GPU forward's mma.sync tile (`mosaic_gpu.derived`) comes before
-    Triton's launch in the grouped selector's order: unnamed, the call runs Mosaic's; named, each is as
+    Triton's launch in the grouped selector's order where mma.sync stores the output dtype
+    (`mosaic.Family.stores`: fp32, not a 16-bit tile, which JAX 0.12's global transfers refuse from its
+    layout): unnamed, the call runs Mosaic's, or Triton's at bf16; named, each launch that takes it is as
     exact as XLA's ragged dot rounded to its output dtype from float64, unrouted rows and empty groups
     included."""
     x, w, dy, group = operands(SIZES[sizes], jnp.bfloat16)
@@ -575,12 +579,14 @@ def test_an_ampere_gpu_runs_mosaics_launch_first(sizes, out_dtype):
                if ba.arguments["interpret"] == (jax.default_backend() == "cpu")]
         return got, ran
 
-    for named, kernel in (("triton", "Gmm"), ("mosaic_gpu", "MosaicGmm")):
+    stored = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16)).stores(out_dtype)
+    named_launches = (("triton", "Gmm"), *((("mosaic_gpu", "MosaicGmm"),) if stored else ()))
+    for named, kernel in named_launches:
         got, ran = running(grouped_matmul=named)
         assert {type(launch).__name__ for launch, _ in ran} == {kernel} and got.dtype == out_dtype
         check(got, reference, truth[0], group, f"sm80 forward through {kernel} to {jnp.dtype(out_dtype)}")
     _, ran = running()
-    assert {type(launch).__name__ for launch, _ in ran} == {"MosaicGmm"}
+    assert {type(launch).__name__ for launch, _ in ran} == {"MosaicGmm" if stored else "Gmm"}
 
 
 @pytest.mark.skipif(not AMPERE_CLASS, reason="no mma.sync kernel this GPU and JAX lower")
