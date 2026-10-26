@@ -546,34 +546,27 @@ class Store:
         """Create this object from `payload`, or accept the byte-identical
         object an earlier attempt created, and return the stored version.
 
-        Other bytes already at the URL are refused with a ValueError. A failed
-        transfer, or an object this call created that reads back otherwise, is
-        an OSError, tried again up to `retries` times, a longer wait before
-        each, before it is raised.
+        Other bytes already at the URL are refused with a ValueError. An object
+        this call created that reads back otherwise is read again, up to
+        `retries` times, a longer wait before each, then an OSError: no
+        transport checks what a write left. A failed transfer raises at once,
+        after the transport's own retries (s3fs's, gcsfs's, huggingface_hub's).
         """
-        for attempt in range(retries + 1):
-            try:
-                return self._put_immutable(payload)
-            except OSError:
-                if attempt == retries:
-                    raise
-                time.sleep(min(0.25 * 2**attempt, 10))
-        raise AssertionError("the last attempt returns or raises")
-
-    def _put_immutable(self, payload: bytes) -> str:
-        """One attempt of `put_immutable`."""
         try:
             self.put_if_absent(payload)
         except PreconditionFailed:
             created = False
         else:
             created = True
-        found = self.get_versioned()
-        if found.data == payload:
-            return found.version
-        if created:
-            raise OSError(f"uploaded object did not verify: {self.url}")
-        raise ValueError(f"an immutable object already holds other bytes: {self.url}")
+        for attempt in range(retries + 1):
+            if attempt:
+                time.sleep(min(0.25 * 2 ** (attempt - 1), 10))
+            found = self.get_versioned()
+            if found.data == payload:
+                return found.version
+            if not created:
+                raise ValueError(f"an immutable object already holds other bytes: {self.url}")
+        raise OSError(f"uploaded object did not verify: {self.url}")
 
     def _backend(self) -> tuple[AbstractFileSystem, str, str]:
         fs, path = self.resolve()
