@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 import tokamax
 from fla_gdn_support import CONV_SHAPES, conv_config_cases, conv_training_cases, kda_training_cases
-from generation_support import lowers
+from generation_support import COMPILES_FOR_TPU, lowers
 from kernel_compile import compile_kernels, failures
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurrence, short_conv, tuning
@@ -64,8 +64,9 @@ def rule_launches(module) -> tuple:
         return port(*args, None, 0.125, 64, interpret=True)
 
     def both(q, k, v, g, beta, h0, do):
-        (_, final), pull = jax.vjp(rule, q, k, v, g, beta, h0)
-        return pull((do, jnp.zeros_like(final)))
+        # The output returned, so the forward's every launch is live: a dead one is DCE'd (jax 0.12).
+        (out, final), pull = jax.vjp(rule, q, k, v, g, beta, h0)
+        return out, pull((do, jnp.zeros_like(final)))
 
     with tuning.launches():
         beta = g.update(shape=g.shape[:3], dtype=jnp.bfloat16)
@@ -244,6 +245,7 @@ def test_the_resource_gate_refuses_a_spilling_mosaic_kernel():
         assert len(mosaic_failures([{**record, "kernels": [a, b, c]}])) == 2
 
 
+@COMPILES_FOR_TPU
 def test_splash_compiles_for_a_v5e_with_libtpu():
     """Dew's splash path, forward and backward, compiled by libtpu for a compile-only v5e on this CPU
     (tests/kernel_compile.py): within the v5e's scoped VMEM, as the blocks splash takes are sized

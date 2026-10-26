@@ -14,7 +14,7 @@ is off (`VLLM_USE_FUSED_MOE_GROUPED_TOPK` false, no CUDA platform) and the
 top-k is sorted (`VLLM_BATCH_INVARIANT`), so it takes the torch path. For
 each case it records gate logits, the bias, the chosen experts and their
 weights: once in float32 and once in float64
-(`diffusers_wan_reference.widened`, which widens the function's float32
+(`torch_precision.widened`, which widens the function's float32
 return cast), the truth tests/reference_error.py measures both from. Every
 token's k-th and (k+1)-th selection scores, and its groups' scores where it
 chooses among groups, are at least MARGIN apart in float64, so float32
@@ -96,7 +96,7 @@ def margins(logits: np.ndarray, bias: np.ndarray, config: dict) -> np.ndarray:
 
 
 def main():
-    from diffusers_wan_reference import widened
+    from torch_precision import widened
 
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)

@@ -245,6 +245,13 @@ if "lingering" in value("-p"):
     if "waits" in value("-p"):
         time.sleep(60)
     sys.exit(1)
+if "leaves" in value("-p"):
+    # A server it starts in its process group, its output elsewhere, which runs on as the trial ends.
+    import subprocess
+    server = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"],
+                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    with open(os.path.join(trial, "child.json"), "w") as out:
+        json.dump(server.pid, out)
 if "once" in value("-p"):
     # The first trial of the task directory hangs, with its pid in the marker; the others finish.
     try:
@@ -504,6 +511,22 @@ def ended(pid):
         return True
 
 
+def test_a_finished_trial_ends_what_it_left_running_in_its_group(tmp_path, harbor):
+    """Harbor finishes its trial and exits with a server it started still running in its process
+    group, its output elsewhere: the trial completes, and the server ends with it."""
+    (tmp_path / "leaves").mkdir()
+    gateway, _ = fake_gateway()
+    source = HarnessSource(harbor_trials(harbor, tmp_path / "trials"), gateway, grace=1.0)
+    try:
+        (future,) = source.submit(Task("leaves", {HARBOR_KEY: str(tmp_path / "leaves")}), 1, version=0,
+                                  key=KEY)
+        rollout = future.result(timeout=30)
+    finally:
+        source.close()
+    (child,) = (tmp_path / "trials").glob("*/child.json")
+    assert rollout.status is Status.COMPLETED and ended(json.loads(child.read_text()))
+
+
 @pytest.mark.parametrize("task", ["lingering-exits", "lingering-waits", "lingering-detached-waits"])
 def test_a_trial_past_its_timeout_resolves_whatever_holds_its_output(tmp_path, harbor, task):
     """Harbor exits before the deadline (`exits`) or on its interrupt (`waits`), and a child that
@@ -730,12 +753,13 @@ def test_an_interrupted_trainer_kills_its_trials_and_starts_no_queued_one(tmp_pa
     assert time.monotonic() - began < 30
     (seen,) = (tmp_path / "trials").glob("*/seen.json")
     assert not list((tmp_path / "trials").glob("*/result.json"))
-    # The running trial died with its trainer rather than running on without it.
+    # The running trial died with its trainer rather than running on without it. Orphaned by the
+    # trainer, it is reparented to the namespace's init, which may leave it a zombie for longer.
     pid = json.loads(seen.read_text())["pid"]
     deadline = time.monotonic() + 10
-    while Path(f"/proc/{pid}").exists() and time.monotonic() < deadline:
+    while not ended(pid) and time.monotonic() < deadline:
         time.sleep(0.1)
-    alive = Path(f"/proc/{pid}").exists()
+    alive = not ended(pid)
     if alive:
         os.kill(pid, 9)
     assert not alive, "the interrupted trainer's running trial outlived it"

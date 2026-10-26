@@ -20,7 +20,6 @@ import tyro
 
 from dew.checkpoints import Checkpoints
 from dew.config import MetricConfig, ModelConfig, ObjectiveConfig, Prepared, RunConfig, media_field
-from dew.data.compile import fitted
 from dew.data.dataset import record_argument
 from dew.diffusion.presets import EDM, Flow, build_process
 from dew.diffusion.process import Process
@@ -391,7 +390,7 @@ class DiffusionRunConfig(RunConfig):
         run = self.pinned()
         objective = run.build()
         # Compiled once: `train` reads the run's length and cadences off this loader and trains on it.
-        dataset, held = fitted(run.chain(), run.validation, objective=objective.data(), seed=run.data_seed)
+        dataset, held = run.compiled(objective.data(), run.chain(), run.validation)
         metrics = run.build_eval_metrics(bool(held))
         rollout = None
         if isinstance(objective, FlowGRPOObjective) and run.rollout is not None:
@@ -463,12 +462,15 @@ class DiffusionRunConfig(RunConfig):
 
         assert self.pretrained is not None
         name, revision = split_revision(self.pretrained)
+        # An adapter keeps the pipeline's weights as they are: they load where the start keeps them.
+        # The pipeline reads its weights on a resume too, which binds the checkpoint over them.
+        placement = self.trainer.source_placement(frozen=self.lora is not None)
         return load_diffusion_source(
             name, revision=revision, dtype=self._compute or "bfloat16",
             param_dtype=self.pretrained_param_dtype,
             attention_impl=str(self.model.fields.get("attention_impl", "auto")),
             size=self.sample_field().shape[:-1],
-            variables=variables)
+            variables=variables, mesh=placement.get("mesh"), layout=placement.get("layout"))
 
     def _process(self, convention: Process | None) -> Process:
         """The preset's process, which must be of the kind the pretrained

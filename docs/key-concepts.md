@@ -36,7 +36,7 @@ model = CausalTransformer(
     emb_features=64, num_layers=2, num_heads=4,
     mlp_features=256, max_seq_len=128)
 objective = LMObjective(model, seq_len=64)
-trainer = Trainer(objective, OptimConfig(rate=3e-3),
+trainer = Trainer(objective, OptimConfig(learning_rate=3e-3),
                   key=jax.random.key(0))
 state = trainer.fit(data, steps=100, log_every=25)
 

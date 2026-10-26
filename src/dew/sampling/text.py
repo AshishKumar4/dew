@@ -32,6 +32,7 @@ from jax.experimental import checkify
 from jax.typing import ArrayLike
 from typing_extensions import TypeVar
 
+from dew.hashing import array_fingerprint
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import (
     ModelInputs,
@@ -45,7 +46,7 @@ from dew.nn.inputs import (
     valid_order,
     with_validity,
 )
-from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.options import program
 from dew.nn.kv_cache import gather_cache_rows, refuse_unassigned, write_cache
 from dew.nn.protocols import (
     BlockDenoiser,
@@ -740,7 +741,7 @@ def _stable(value: object, seen: frozenset[int] = frozenset()) -> Identity:
         return ("mapping", tuple(sorted((repr(name), _stable(entry, seen))
                                         for name, entry in value.items())))
     if isinstance(value, (np.ndarray, np.generic, jax.Array)):
-        return ("array", *_hashed(value))
+        return ("array", _hashed(value))
     if isinstance(value, functools.partial):
         return ("partial", _stable(value.func, seen), _stable(value.args, seen),
                 _stable(dict(value.keywords), seen))
@@ -769,10 +770,11 @@ def _stable(value: object, seen: frozenset[int] = frozenset()) -> Identity:
     return (_named(kind), text)
 
 
-def _hashed(value: np.ndarray | np.generic | jax.Array) -> tuple[tuple[int, ...], str, str]:
-    """An array's shape, dtype and contents, as a comparable triple."""
-    array = np.ascontiguousarray(np.asarray(value))
-    return (array.shape, str(array.dtype), hashlib.sha256(array.tobytes()).hexdigest())
+def _hashed(value: np.ndarray | np.generic | jax.Array) -> str:
+    """An array's dtype, shape and contents, fingerprinted (`dew.hashing.array_fingerprint`)."""
+    digest = hashlib.sha256()
+    array_fingerprint(digest, np.asarray(value))
+    return digest.hexdigest()
 
 
 def _digest(components: Components) -> tuple[Identity, str]:
@@ -841,13 +843,6 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
         params, inputs, keys, budget, transforms, stopping, strategy)
 
 
-@functools.cache
-def _compiled(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
-    """The generation program over `rows`, compiled with the model's own XLA `options`
-    (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never share it."""
-    return jax.jit(_checked, static_argnames=("model", "trips", "pad_id", "n", "packing"),
-                   in_shardings=(None, rows, rows, None, None, None, None),
-                   out_shardings=(None, rows), compiler_options=dict(options))
 
 
 _DEFAULT_SAMPLING = Sampling()
@@ -915,11 +910,13 @@ def generate(model: nn.Module, params: Variables,
         refuse_unassigned(model.kv_cache, plan.count, capacity)
     from dew.inference.projections import pending
 
-    program = _compiled(plan.sharding, tuple(compiler_options(model).items()))
+    compiled = program(_checked, model, static_argnames=("model", "trips", "pad_id", "n", "packing"),
+                       in_shardings=(None, plan.sharding, plan.sharding, None, None, None, None),
+                       out_shardings=(None, plan.sharding))
     # A tree a loader owns arrives packed; one borrowed from a live objective packs in the call.
-    failure, output = program(model, decoding_storage(model, params), plan.place(request.padded()),
-                              plan.keys(request.key), jnp.int32(max_new_tokens), scanned, sampling.pad, n,
-                              *components, pending(model, params))
+    failure, output = compiled(model, decoding_storage(model, params), plan.place(request.padded()),
+                               plan.keys(request.key), jnp.int32(max_new_tokens), scanned, sampling.pad, n,
+                               *components, pending(model, params))
     # The error's flags are the one read a request waits on.
     jax.device_get(failure).throw()
     return replace(output, rows=plan.rows * n)

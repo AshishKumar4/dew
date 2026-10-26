@@ -23,6 +23,7 @@ from dew.nn.attention import attention_case, scaled_dot_product_attention, with_
 from dew.nn.attention_kernels import DECODE, kernel_refusals
 from dew.nn.decode_geometry import folded_attention
 from dew.nn.kernels.generation import chosen, routes as generation_routes
+from dew.nn.precision import FP32_SUMS
 
 pytestmark = pytest.mark.kernel
 
@@ -207,7 +208,9 @@ def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, ho
     read = spanned(jnp.zeros_like(lengths), lengths, key.shape[1])
 
     def reference(query, key, value):
-        with jax.default_matmul_precision("float32"):
+        # The decode kernel interprets on this CPU what a GPU computes: its reference sums as the target
+        # does (fp32), not as the CPU's policy does.
+        with jax.default_matmul_precision(FP32_SUMS):
             return reference_attention(query, key, value, mask=jnp.asarray(read), sinks=sinks,
                                        softcap=softcap)
 
@@ -239,53 +242,54 @@ def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, ho
                             seeds=FEWEST_SEEDS, truth_fn=truth)
 
 
+SINK_SEEDS = 256
+"""The sinks' gradient and tangent site's declared draws: `seeds_for` of its reference over this draw gives
+256 on an H100, either cap."""
+
+
 @pytest.mark.parametrize("softcap", [None, SOFTCAP], ids=["plain", "softcap"])
 def test_a_decode_steps_sinks_take_their_gradient_and_tangent_through_the_dispatch(softcap):
     """A grouped decode step with sinks through Dew's attention (`scaled_dot_product_attention`) routes
     to the decode kernel, the sinks an operand of its derivative: traced, the gradient and the tangent
-    with respect to them take that route; on a GPU each is within tests/reference_error.py's rule of the
-    reference path's against float64 (`exact_attention`)."""
+    with respect to them take that route; on a GPU each is on par with the reference path's (check 1,
+    `assert_as_exact`), over draws of the step's queries, keys, values and sinks at its lengths."""
 
     from dew.nn.kernels import generation
 
     query, key, value, lengths = grouped_case(jnp.float32)
+
+    def derivatives(implementation, precision):
+        def attend(query, key, value, sinks):
+            return scaled_dot_product_attention(
+                query, key, value, sinks=sinks, softcap=softcap, key_value_seq_lengths=lengths,
+                implementation=implementation)
+
+        def both(query, key, value, sinks):
+            with jax.default_matmul_precision(precision):
+                grad = jax.grad(lambda sinks: jnp.sum(attend(query, key, value, sinks) ** 2))(sinks)
+                tangent = jax.jvp(lambda sinks: attend(query, key, value, sinks), (sinks,),
+                                  (jnp.ones_like(sinks),))[1]
+            return grad, tangent
+        return both
+
     sinks = jnp.asarray(SINKS, jnp.float32)
-    read = spanned(jnp.zeros_like(lengths), lengths, key.shape[1])
-
-    def attend(implementation):
-        return lambda sinks: scaled_dot_product_attention(
-            query, key, value, sinks=sinks, softcap=softcap, key_value_seq_lengths=lengths,
-            implementation=implementation)
-
-    def grad(implementation):
-        return jax.grad(lambda sinks: jnp.sum(attend(implementation)(sinks) ** 2))
-
-    def tangent(implementation):
-        return lambda sinks: jax.jvp(attend(implementation), (sinks,), (jnp.ones_like(sinks),))[1]
-
     with on_the_gpu(), generation.routes() as found:
-        jax.make_jaxpr(grad("auto"))(sinks)
-        jax.make_jaxpr(tangent("auto"))(sinks)
+        jax.make_jaxpr(derivatives("auto", "default"))(query, key, value, sinks)
     assert {(route.choice, route.kernel) for route in found if route.choice == "decode"} == {
         ("decode", "decode")}
     if not ON_GPU:
         return
-    with jax.enable_x64(new_val=True):
-        wide = [jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value, sinks)]
 
-        def exact(sinks):
-            return exact_attention(*wide[:3], sinks, softcap=softcap, mask=read)
+    def draw(seed):
+        streams = jax.random.split(jax.random.key(seed), 4)
+        return (jax.random.normal(streams[0], query.shape, jnp.float32),
+                jax.random.normal(streams[1], key.shape, jnp.float32) * 0.3,
+                jax.random.normal(streams[2], value.shape, jnp.float32),
+                jax.random.normal(streams[3], sinks.shape, jnp.float32) * 2.0)
 
-        exact_grad = jax.grad(lambda s: jnp.sum(exact(s) ** 2))(wide[3])
-        exact_tangent = jax.jvp(exact, (wide[3],), (jnp.ones_like(wide[3]),))[1]
-    with jax.default_matmul_precision("default"):
-        got = jax.jit(grad("auto"))(sinks), jax.jit(tangent("auto"))(sinks)
-    with jax.default_matmul_precision("float32"):
-        want = jax.jit(grad("reference"))(sinks), jax.jit(tangent("reference"))(sinks)
-    for label, mine, theirs, truth in zip(("gradient", "tangent"), got, want, (exact_grad, exact_tangent),
-                                          strict=True):
-        assert_as_exact_as_the_reference(np.asarray(mine), np.asarray(theirs), np.asarray(truth),
-                                         f"the sinks' {label} through the decode kernel")
+    assert_as_exact(jax.jit(derivatives("auto", "default")), jax.jit(derivatives("reference", "float32")),
+                    draw, f"the sinks' derivatives through the decode kernel, softcap {softcap}",
+                    seeds=SINK_SEEDS)
 
 
 @pytest.mark.parametrize("target", ["sm80", "sm90"])
@@ -403,6 +407,24 @@ def decode_step(lengths):
         return folded_attention(query, key, value, with_key_lengths(None, lengths, key.shape[-3]))
 
     return attended, folded
+
+
+def test_a_decode_step_traced_with_x64_on_runs_the_decode_kernel():
+    """A float32 decode step traced with x64 on, as a float64 truth around a served model traces it,
+    lowers for the GPU on this CPU through the decode kernel: its block and slice counts take the span's
+    integer type, not the int64 a Python int becomes."""
+    from dew.nn.kernels.generation import assumed, gpu_mesh
+    from dew.training._lowering import triton_kernels
+
+    with jax.enable_x64(new_val=True):
+        attended, _ = decode_step(jnp.asarray([1, 20], jnp.int32))
+        query = jax.ShapeDtypeStruct((2, 4, 2, 64), jnp.float32)
+        key = jax.ShapeDtypeStruct((2, 64, 2, 64), jnp.float32)
+        mesh = gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
+        with assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
+            lowered = jax.jit(attended).trace(query, key, key).lower(lowering_platforms=("cuda",))
+    # The decode kernel, and its guarded launch, which runs only where the plain one overflowed.
+    assert triton_kernels(lowered) == {"decode_attention": 1, "decode_attention_headroom": 1}
 
 
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])

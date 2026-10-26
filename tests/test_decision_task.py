@@ -3,7 +3,7 @@
 import base64
 import io
 import json
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import jax
@@ -13,6 +13,7 @@ from decision_support import decision_rows
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference
 from steady_state import steady_state
 
+from dew.artifacts import Decisions
 from dew.decision import (
     Abstention,
     Binning,
@@ -27,6 +28,7 @@ from dew.decision import (
     Temperatures,
 )
 from dew.decision.calibration import softmax
+from dew.decision.metrics import Answered
 from dew.decision.task import decoded_images
 
 FIXTURES = Path(__file__).parent / "fixtures" / "laya"
@@ -520,3 +522,180 @@ def test_a_released_checkpoint_refuses_what_its_layout_cannot_hold(decide, tmp_p
     gated = decide.gated(0.5)
     with pytest.raises(ValueError):
         gated.save_pretrained(tmp_path)
+
+
+MESH_SEEDS = 8
+"""Check 1's declared seeds for a task's logits on a mesh against one device's."""
+
+
+@dataclass(frozen=True)
+class Recorded:
+    """A metric that records each answered question's probabilities over its real options as a pass
+    evaluates them (`Answered`), in the pass's order, and scores nothing."""
+
+    found: list
+    name = "recorded"
+    reads = Decisions
+
+    def __call__(self, artifact, batch, /) -> float:
+        answered = Answered.of(artifact)
+        self.found.extend(row[real] for row, real in zip(answered.probabilities, answered.options,
+                                                         strict=True))
+        return 0.0
+
+    def merge(self, accumulated: float, contribution: float, /) -> float:
+        return accumulated
+
+    def finalize(self, accumulated: float, /) -> float:
+        return accumulated
+
+
+@pytest.mark.mesh
+def test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh(decide):
+    """A task whose weights are placed on a mesh of every device scores its examples there, its rows
+    split over the mesh's row axes, as a run's validation splits them, rather than handing one device's
+    inputs to weights on several: a pass of three rows, the task's budget, is rounded up to a multiple
+    of the devices the mesh splits rows over. Each answered question's probabilities as its score
+    evaluates them (`Evaluation.run`), and its logits as its calibration reads them (`_scored`), are on
+    par from float64 with the task's on one device (check 1), and its metrics are the ones it scores
+    there."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.training import MeshSpec
+
+    examples = answered()
+    mesh = MeshSpec().build(jax.devices())
+    task = replace(decide, budget=Budget(rows=3))
+    wide = replace(Decide.from_pretrained(TINY, dtype="float64", param_dtype="float64", attention_impl="xla"),
+                   budget=task.budget)
+
+    def evaluated(on: Decide) -> np.ndarray:
+        found: list = []
+        on.score(examples, [Recorded(found)])
+        return np.concatenate(found)
+
+    def held_logits(on: Decide) -> np.ndarray:
+        return np.concatenate([scored.logits for scored in on._scored(on._held(examples, on._mesh))])
+
+    def spread(variables) -> Decide:
+        return replace(task, variables=jax.device_put(variables, NamedSharding(mesh, PartitionSpec())))
+
+    def draw(seed):
+        key = jax.random.key(seed)
+        return (jax.tree.map(lambda leaf: leaf * (1 + 0.05 * jax.random.normal(key, np.shape(leaf))),
+                             decide.variables),)
+
+    def alone(variables) -> np.ndarray:
+        return held_logits(replace(task, variables=variables))
+
+    def truth(variables) -> np.ndarray:
+        return held_logits(replace(wide, variables=variables))
+
+    assert_as_exact(lambda variables: held_logits(spread(variables)), alone, draw, "scored on a mesh",
+                    seeds=MESH_SEEDS, truth_fn=truth)
+    assert_as_exact(lambda variables: evaluated(spread(variables)),
+                    lambda variables: evaluated(replace(task, variables=variables)), draw,
+                    "evaluated on a mesh", seeds=MESH_SEEDS,
+                    truth_fn=lambda variables: evaluated(replace(wide, variables=variables)))
+    alone, scores = task.score(examples), spread(decide.variables).score(examples)
+    assert set(scores) == set(alone) and all(np.isfinite(value) for value in scores.values())
+    assert scores["accuracy"] == alone["accuracy"]
+
+
+def trained_runs(decide, tmp_path, count: int, *, name: str = "run") -> list[str]:
+    """`count` runs of the task trained apart, one more step each, from one head (the task's own, held):
+    each a checkpoint of its own, as averaging reads them."""
+    import optax
+
+    from dew.checkpoints import Checkpoints
+    from dew.decision import DecisionObjective
+    from dew.training.trainer import Trainer
+
+    runs = []
+    for index in range(count):
+        objective = DecisionObjective(decide)
+        data = decision_rows(answered() * 2, 8, answered(), objective=objective.data())
+        directory = str(tmp_path / f"{name}{index}")
+        checkpoints = Checkpoints(directory, keep=1)
+        Trainer(objective, optax.adam(1e-3), key=index, checkpoints=checkpoints).fit(
+            data, steps=index + 1, log_every=100, checkpoint_every=index + 1, eval_every=100)
+        checkpoints.wait()
+        runs.append(directory)
+    return runs
+
+
+def test_runs_that_share_a_head_average_as_the_checkpoints_average_them_and_refit_their_temperatures(
+        decide, tmp_path):
+    """Runs trained apart from one held head average: the task's weights are the runs' fp32 mean as
+    any run's average takes it (`dew.checkpoints.averaged`), each floating leaf float64's mean of the
+    two rounded to fp32; the task's weights record every run's step and read, so no one run's
+    directory may hold its calibration (`save` refuses), and `calibrate_on` refits it as the average's
+    own calibration."""
+    from etils import epath
+
+    from dew.checkpoints import averaged
+
+    runs = trained_runs(decide, tmp_path, 2)
+    tasks = [Decide.from_run(run) for run in runs]
+    two = Decide.averaged(runs)
+    trees = (two.variables, averaged(runs).variables, tasks[0].variables, tasks[1].variables)
+    for leaf, general, one, other in zip(*(jax.tree.leaves(tree) for tree in trees), strict=True):
+        assert np.array_equal(np.asarray(leaf), np.asarray(general))
+        if np.issubdtype(np.asarray(leaf).dtype, np.floating):
+            halves = (np.asarray(one, np.float64) + np.asarray(other, np.float64)) / 2
+            assert np.array_equal(np.asarray(leaf), halves.astype(np.float32))
+    assert two.weights is not None
+    assert [entry[0] for entry in two.weights.averaged] == [str(epath.Path(run)) for run in runs]
+    assert two.calibration == Calibration()
+    with pytest.raises(ValueError):
+        two.save(runs[0])
+    # Enough held-out answers that every question kind clears its calibration minimum (TYPE_MINIMUM).
+    held_out = answered() * 10
+    calibrated = Decide.averaged(runs, calibrate_on=held_out)
+    assert calibrated.calibration != Calibration()
+    assert calibrated.calibration == two.calibrated(held_out).calibration
+
+
+def test_runs_of_other_task_settings_or_a_single_run_do_not_average(decide, tmp_path):
+    """Runs average where their recorded task settings are one task's: a run laid out otherwise does
+    not average with the others, nor does a single run."""
+    runs = trained_runs(decide, tmp_path, 1)
+    with pytest.raises(ValueError):
+        Decide.averaged(runs)
+    other = replace(decide, layout=replace(decide.layout, head_max_len=decide.layout.head_max_len // 2))
+    runs += trained_runs(other, tmp_path, 1, name="other")
+    with pytest.raises(ValueError):
+        Decide.averaged(runs)
+
+
+def test_an_averaged_task_of_any_layout_saves_reloads_and_serves_as_it_was(decide, tmp_path):
+    """An average of runs over a question layout other than Laya's, its temperatures refit on held-out
+    answers, saves to a directory of its own as a run (`save`), which `from_run` reads back with its
+    weights, calibration and provenance, answering every case as the task it was. Saving it there
+    again keeps it; a run's own directory, which holds other weights, refuses it."""
+    import dataclasses
+
+    from dew.decision import StateFirstLayout
+
+    other = replace(decide, layout=StateFirstLayout(max_len=decide.layout.max_len,
+                                                    head_max_len=decide.layout.head_max_len))
+    runs = trained_runs(other, tmp_path, 2)
+    held_out = answered() * 10
+    task = Decide.averaged(runs, calibrate_on=held_out)
+    assert task.calibration != Calibration()
+    directory = str(tmp_path / "averaged")
+    task.save(directory)
+    reloaded = Decide.from_run(directory)
+    assert reloaded.layout == task.layout and reloaded.weights == task.weights
+    assert reloaded.calibration == task.calibration
+    for leaf, own in zip(jax.tree.leaves(reloaded.variables), jax.tree.leaves(task.variables), strict=True):
+        assert np.array_equal(np.asarray(leaf), np.asarray(own))
+    for request in CASES.values():
+        questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
+        found, expected = reloaded(request["state"], questions), task(request["state"], questions)
+        assert found.keys() == expected.keys()
+        for name in expected:
+            np.testing.assert_equal(dataclasses.asdict(found[name]), dataclasses.asdict(expected[name]))
+    reloaded.save(directory)
+    with pytest.raises(ValueError):
+        task.save(runs[0])

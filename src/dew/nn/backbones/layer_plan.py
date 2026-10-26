@@ -70,6 +70,10 @@ class LayerKind:
     """Whether this kind's attention adds a learned sink logit per head
     (`dew.nn.attention_sinks`); None takes the model's `attention_sinks`.
     MiMo-V2-Flash sinks its windowed layers alone."""
+    qk_norm: bool | None = None
+    """Whether this kind's attention norms its queries and keys; None takes
+    the model's `qk_norm`. Llama 4 norms its rotated layers alone
+    (`use_qk_norm`, Llama4TextAttention)."""
     mixer: MixerBase | None = None
     """This kind's mixer value, or its record. None uses the model's mixer."""
 
@@ -111,6 +115,7 @@ class ResolvedKind:
     head_dim: int
     partial_rotary_factor: float | None
     sinks: bool
+    qk_norm: bool
     mixer: MixerBase | None
 
 

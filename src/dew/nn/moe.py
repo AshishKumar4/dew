@@ -121,7 +121,7 @@ class RouterMoments:
 
 def global_router_loss(stats: RouterMoments, alpha: float) -> jax.Array:
     """DeepSeek V2 auxiliary loss for each pool of routed positions."""
-    scores = stats.scores.astype(jnp.promote_types(stats.scores.dtype, jnp.float32))
+    scores = stats.scores.astype(at_least_fp32(stats.scores.dtype))
     positions = jax.lax.stop_gradient(stats.positions.astype(scores.dtype))
     counts = jax.lax.stop_gradient(stats.counts.astype(scores.dtype))
     denominator = jnp.where(positions > 0, positions, 1) ** 2 * stats.top_k
@@ -133,7 +133,7 @@ def sequence_router_moments(scores: jax.Array, indices: jax.Array, valid: jax.Ar
                             max_segments: int | None = None) -> RouterMoments:
     """Each document's router moments over its real queries."""
     rows, length, experts = scores.shape
-    scores = scores.astype(jnp.promote_types(scores.dtype, jnp.float32))
+    scores = scores.astype(at_least_fp32(scores.dtype))
     segments = (1 if documents is None else length) if max_segments is None else max_segments
     documents = jnp.ones((rows, length), jnp.int32) if documents is None else documents
     owners = jnp.where(valid & (documents != 0), documents - 1, segments)
@@ -848,7 +848,7 @@ def _widened[Tree](parameters: Tree) -> Tree:
     rounds it."""
     def widen(leaf):
         if jnp.issubdtype(leaf.dtype, jnp.floating):
-            return leaf.astype(jnp.promote_types(leaf.dtype, jnp.float32))
+            return leaf.astype(at_least_fp32(leaf.dtype))
         return leaf
     return jax.tree.map(widen, parameters)
 

@@ -75,8 +75,9 @@ class Processor(Protocol):
 
     Calling it turns text, with optional images, into `ModelInputs`.
     `decode` turns token rows into one string per row, `encode` one text into its ids, with the
-    special tokens a sequence carries or without, and `bos_id` is the id a sequence starts with, or
-    None.
+    special tokens a sequence carries or without, `spelling` a row of ids into the text the
+    tokenizer's own decode gives it, its special tokens spelled out, and `bos_id` is the id a
+    sequence starts with, or None.
     """
 
     def __call__(self, text: str | Sequence[str], *, images: Media | None = None) -> ModelInputs: ...
@@ -84,6 +85,8 @@ class Processor(Protocol):
     def decode(self, tokens: ArrayLike) -> list[str]: ...
 
     def encode(self, text: str, *, specials: bool) -> list[int]: ...
+
+    def spelling(self, ids: Sequence[int]) -> str: ...
 
     @property
     def bos_id(self) -> int | None: ...
@@ -423,14 +426,14 @@ def resident(model: nn.Module, variables: Variables) -> Variables:
 def held(variables: Variables) -> Variables:
     """`variables` placed on the device once (`resident`'s placement, its storage as given): each host
     leaf replicated on the mesh the tree's arrays sit on, or committed to this process's default
-    device; a jax.Array stays where it is."""
+    device, one leaf at a time (`placed_leaves`), into a tree of its own; a jax.Array stays where it
+    is."""
+    from dew.training.host import placed_leaves
+
     mesh = mesh_of(variables)
     target = default_placement() if mesh is None else NamedSharding(mesh, P())
-
-    def placed(leaf):
-        return jax.device_put(leaf, target) if isinstance(leaf, (np.ndarray, np.generic)) else leaf
-
-    return jax.tree.map(placed, variables)
+    return placed_leaves(variables, lambda _, leaf: jax.device_put(leaf, target)
+                         if isinstance(leaf, (np.ndarray, np.generic)) else leaf, in_place=False)
 
 
 class _NativeTextTask:

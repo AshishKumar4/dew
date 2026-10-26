@@ -46,7 +46,7 @@ decide.systemone({
 #   "urgent": {"type": "noul", "noul": 0.91}}, "usage": {"input_tokens": ..., "output_tokens": 0}}
 ```
 
-The response has exactly Jev's fields, with numbers rounded to four places. `details=True` adds what Laya's server adds: a noul's confidence, whether a gated answer abstained, and how much of the state the rows kept. A request may also carry `images`, PIL images or encoded images, bare or as `data:` URLs, which a task whose backbone reads images lays out with the state, as a joint-head release does (`decide(state, questions, images=[...])` takes them too); `strict=True` answers exactly as Jev's endpoint does, dropping such extension fields.
+The response has exactly Jev's fields, with numbers rounded to four places. `details=True` adds what Laya's server adds: a noul's confidence, whether a gated answer abstained, and how much of the state the rows kept. A request may also carry `context`, any JSON a task with context layers reads beside the state (refused past its `context_length`, and dropped under `strict`), and `images`, PIL images or encoded images, bare or as `data:` URLs, which a task whose backbone reads images lays out with the state, as a joint-head release does (`decide(state, questions, images=[...])` takes them too); `strict=True` answers exactly as Jev's endpoint does, dropping such extension fields.
 
 `systemone` also takes a list of request bodies and returns their responses in order, each as it would answer the body alone, the bodies' rows scored together in one pass per budget's worth (the task's `Budget`). Rows that hold images share a pass where they are as long as each other and their images alike, and a body Jev would refuse takes the `ValueError` it would raise alone in its place, the others answered all the same.
 
@@ -102,7 +102,7 @@ def asked(rows):
                      instructions="Which banking request is this?").read("memory")
 
 objective = DecisionObjective(qwen, loss=LogLoss() + 0.5 * Brier())
-state = Trainer(objective, OptimConfig(rate=1e-4), key=0).fit(
+state = Trainer(objective, OptimConfig(learning_rate=1e-4), key=0).fit(
     asked(train).shuffle(0).repeat().batch(32), steps=2_000, eval_every=500,
     validation={"val": asked(val).batch(32)}, metrics=[Accuracy(), ECE()])
 
@@ -116,6 +116,8 @@ Examples need not come from a table: `objective.dataset` takes any labelled exam
 Any model that gives its final states is a backbone (`dew.nn.protocols.HiddenStates`): a `CausalTransformer`, causal or bidirectional as ModernBERT is, the text path of a multimodal model such as Qwen 3.5, or DiffusionGemma, whose encoder reads each clean row once whole. A bidirectional backbone reads Laya's layout. A causal one reads `StateFirstLayout`, which puts the state first and each marker after its option, so every marker has read the state, the question and its option. The backbone and the head are applied as separate modules over one variables tree, so a LoRA backbone trains its factors and the head while the base weights stay fixed.
 
 The head is a value too. Laya's `DecisionHead` scores one question per row at its markers. The `JointSchemaHead`, with its `JointLayout`, reads every question of a request in one row and decides them together: it pools each question's instructions and each option's tokens, adds a lexical prior from the backbone's vocabulary rows, and lets the questions attend to each other. A backbone gives those rows through `dew.nn.protocols.VocabularyRows`: `vocabulary_rows()` returns each token's `[vocab, features]` row as its head scores it, read from the bound variables, so past a nonlinear head or with an adapter on the head the rows are the ones the head applies. `CausalTransformer`, `MultimodalTransformer`, DiffusionGemma and the torchax fallback implement it, and a custom backbone under the joint head implements it too; the head refuses one that does not. `DecisionRunConfig(pretrained=backbone, head=JointShape())` draws one over a fresh backbone, which `backbone` names: a Hugging Face model, not a Laya checkpoint, since a Laya checkpoint trains under its own head. `Decide.from_pretrained` also reads a released joint-head checkpoint (`JointCheckpoint`), a Qwen 3.5 backbone with `joint_head_config.json` and `joint_head.safetensors` beside it, and the backbone's processor, and answers as the release's own model does, images included, which the processor lays out before the state (`tests/test_decision_joint_checkpoint.py` holds the layout, the head and the two together to the release's code, with and without images). Such a release reports an answer's top probability as its confidence, where `systemone` reports Jev's; `replace(decide, confidence=TopProbability())` answers with the top probability. A release fine-tunes like Laya's, its head and layout coming with it. Training pads every row to the layout's `max_len`, and a release's is the 16384 tokens it serves, so set one that fits the data:
+
+A head may instead read the backbone's own answer. A question layout given `labels=Labels()` writes each option as a lettered line, `A. billing`, and ends its row with an answer cue, `Answer:`; `LabelReadout` scores each option as the backbone's own logit for its letter there, so before any training the decision is what the language model would answer. `untied=True` gives each letter a row of its own, drawn from the backbone's, to train. `SlotReadout` is the head of a published slot release, read by its own law.
 
 <!-- not run: a fragment; the release is the reader's own, a directory or a Hub repo id -->
 ```python
@@ -136,7 +138,7 @@ DecisionObjective(CausalTransformer(vocab_size=50368, num_layers=12, causal=Fals
 DecisionObjective(Pretrained.load("Qwen/Qwen3-8B").adapt(LoRA(rank=256, modules=("q_proj", "v_proj")), key=0))
 ```
 
-A run saves like any other: `Decide.from_run(run)` and `dew.pipeline(run)` rebuild the task from its record, and `decide.save(run)` writes the fitted calibration into it.
+A run saves like any other: `Decide.from_run(run)` and `dew.pipeline(run)` rebuild the task from its record, and `decide.save(run)` writes the fitted calibration into it. Runs of one task trained apart from one start (the same held head, or a fresh head drawn from the same trainer key, over the same backbone and layout) average: `Decide.averaged([run_a, run_b], calibrate_on=held_out)` returns the task over the fp32 mean of their weights (`dew.checkpoints.averaged`, which averages any runs of one model), its temperatures refit on the held-out answers, since a calibration belongs to one set of weights. Its `weights` record every run it averaged, so no one run's directory holds it: `averaged.save("runs/averaged")` writes it to a directory of its own as a run, which `Decide.from_run` and `dew.pipeline` load and serve as any run, whatever its layout.
 
 ## From a table, on the command line
 

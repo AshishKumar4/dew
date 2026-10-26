@@ -8,7 +8,7 @@ of each prompt's own length. It records the output and, against a fixed
 cotangent, the gradients of the latents, the prompt states and every
 parameter (the weights rounded to bfloat16-representable values so the
 fixture compresses), unmodified, in float32, the reference, and in float64,
-the truth (`diffusers_wan_reference.float64`: the source's float32 pins
+the truth (`torch_precision.float64`: the source's float32 pins
 widened).
 
 The pipeline half saves one tiny `ZImagePipeline` over the published
@@ -35,7 +35,8 @@ from pathlib import Path
 import numpy as np
 import torch
 from diffusers_reference_helpers import perturb, recording, saved_pipeline, tiny_qwen3_encoder
-from diffusers_wan_reference import float64, float64_scheduler
+from torch_precision import float64
+from diffusers_wan_reference import float64_scheduler
 from reference_releases import RELEASES
 
 DIFFUSERS = RELEASES["diffusers-0.40"]["diffusers"]
@@ -164,6 +165,7 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
     float32 and, the saved pipeline loaded widened, in float64 (`fp64.`)."""
     from diffusers import ZImagePipeline
     from diffusers.pipelines.z_image import pipeline_z_image
+    from diffusers.schedulers import scheduling_flow_match_euler_discrete
 
     pipe = build_pipeline(root)
     generator = torch.Generator().manual_seed(SEED + 9)
@@ -186,7 +188,8 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
 
     narrow = walk(pipe, torch.float32)
     # The call keeps its latents in float32, which it names and asserts in its own module.
-    with float64(), float64_scheduler(pipeline_z_image):
+    with (float64(), float64_scheduler(pipeline_z_image),
+          float64_scheduler(scheduling_flow_match_euler_discrete)):
         wide_pipe = ZImagePipeline.from_pretrained(root / "pipeline", torch_dtype=torch.float64,
                                                    local_files_only=True)
         wide_pipe.set_progress_bar_config(disable=True)

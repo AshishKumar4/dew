@@ -30,6 +30,7 @@ import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 from collections.abc import Iterable
@@ -78,7 +79,9 @@ class Benchmark:
     warmup: int = 5
     """Steps to run before timing starts."""
     read: Literal["memory", "indexed", "streamed"] = "indexed"
-    loading: Loading = field(default_factory=Loading)
+    loading: Loading | None = None
+    """How to load the chain, turned on by its own flags (`--loading.workers 8`), which takes it over
+    the chain's own `loading(...)`; none times the chain as a run reads it, under its own."""
 
 
 def measure(batches: Iterable, steps: int, warmup: int) -> list[float]:
@@ -108,6 +111,14 @@ def report(latencies: list[float], batch_size: int) -> None:
     print(f"samples/sec:      {len(latencies) * batch_size / sum(latencies):.1f}")
     print(f"step latency p50: {percentile(latencies, 0.5) * 1e3:.2f} ms")
     print(f"step latency p95: {percentile(latencies, 0.95) * 1e3:.2f} ms")
+
+
+def benchmark(args: list[str]) -> Benchmark:
+    """The benchmark `args` ask for, a `--loading.` flag turning on the tool's own loading."""
+    from dew.config import flag_selected
+
+    return tyro.cli(tyro.conf.CascadeSubcommandArgs[Benchmark],
+                    args=flag_selected(args, {"loading": "loading"}))
 
 
 def main(config: Benchmark) -> None:
@@ -518,6 +529,7 @@ def training_measure(factory, objective, config: Worker) -> dict:
     import optax
 
     from dew.telemetry.instrumentation import model_flops_utilization
+    from dew.telemetry.profile import capture_options
     from dew.training import Trainer
     from dew.training.distributed import DevicePrefetchIterator
 
@@ -563,6 +575,21 @@ def training_measure(factory, objective, config: Worker) -> dict:
         jax.block_until_ready(state)
         if segment_started is not None:
             completed_seconds += time.perf_counter() - segment_started
+        timeline = None
+        if jax.default_backend() != "cpu":
+            # After the timed steps, so the trace's own overhead is not in them, as `benchmark_step`
+            # traces. A shape first seen here compiles inside the window, and its idle counts.
+            with tempfile.TemporaryDirectory() as directory:
+                with jax.profiler.trace(directory, profiler_options=capture_options()):
+                    for _ in range(timed.train_steps):
+                        batch = next(reader)
+                        counted.counts.get_nowait()
+                        key = signature(batch)
+                        if key not in compiled:
+                            compiled[key] = trainer.compile(state, batch)
+                        state = compiled[key](state, batch)[0]
+                    jax.block_until_ready(state)
+                timeline = device_idle(directory)
     resolved = jax.device_get(signals)
     if any(not bool(finite) or not bool(accepted) for _, finite, accepted in resolved):
         raise ValueError("the real small-model update was nonfinite or not accepted")
@@ -580,7 +607,7 @@ def training_measure(factory, objective, config: Worker) -> dict:
             "tokens_per_second": sum(row["tokens"] for row in measured) / seconds,
             "padding_fraction": None if padded == 0 else 1 - sum(
                 row["tokens"] for row in measured) / padded,
-            "compile_count": len(compiles), "compiles": compiles,
+            "compile_count": len(compiles), "compiles": compiles, "device_timeline": timeline,
             "losses": [float(resolved[row["signal_index"]][0]) for row in measured],
             "scope": "real asynchronous Trainer.compile updates; compilation boundaries excluded",
             "model_mfu_bf16_peak": model_flops_utilization(model_flops, seconds),
@@ -589,6 +616,21 @@ def training_measure(factory, objective, config: Worker) -> dict:
             "hlo_utilization_bf16_peak": model_flops_utilization(hlo_flops, seconds),
             "utilization_scope": "optimized executable work, including padding, over dense bf16 peak; "
                                  "not an analytic real-token MFU"}
+
+
+def device_idle(directory: str) -> dict[str, float]:
+    """The share of the traced steps' device window no kernel ran in, from the accelerator's own
+    timeline (`trace_window.window_split`, summed over its devices), and the part of it a batch's
+    host-to-device copy ended, the device waiting for data."""
+    from trace_window import device_events, window_totals
+
+    planes, _ = device_events(directory)
+    if not planes:
+        raise ValueError(f"the trace under {directory} holds no accelerator kernels")
+    split = window_totals([(event.name, event.start_ns, event.end_ns) for event in events]
+                          for events in planes.values())
+    return {"device_idle_fraction": (split["idle_input"] + split["idle_host"]) / split["window"],
+            "device_input_idle_fraction": split["idle_input"] / split["window"]}
 
 
 def stage_profile(factory, batches: int = 16) -> list[dict]:
@@ -643,8 +685,10 @@ def matrix_worker(config: Worker) -> dict:
 def comparison(rows: list[dict]) -> list[dict]:
     """The data acceptance checks for each workload, Dew's reader against plain Grain over the same
     steps: steady throughput within 5%, resident memory, parent and workers, at most Grain's and
-    10%, a warm first batch within 10 s of opening and a cold one within 30 s, and the device
-    idle under 5% of a training step, waiting for data."""
+    10%, a warm first batch within 10 s of opening and a cold one within 30 s, and the device idle
+    under 5% of its traced training steps' timeline, where it has an accelerator to trace. The
+    training loop's own wait in `next(reader)` is reported beside it, never checked: it overlaps
+    the updates still running on the device."""
     verdicts = []
     for workload in sorted({row["workload"] for row in rows}):
         arms = {row["engine"]: row for row in rows if row["workload"] == workload and not row.get("cold")}
@@ -667,8 +711,9 @@ def comparison(rows: list[dict]) -> list[dict]:
             verdict["cold_first_batch_from_open_seconds"] = cold["dew"]["first_batch_from_open_seconds"]
         if "training" in dew:
             training = dew["training"]
-            verdict["device_idle_fraction"] = training["data_wait_ms"] / (
+            verdict["host_data_wait_fraction"] = training["data_wait_ms"] / (
                 training["data_wait_ms"] + training["step_ms"])
+            verdict.update(training["device_timeline"] or {})
         verdict["checks"] = {
             "within_5_percent_of_grain": verdict["dew_over_grain"] >= 0.95,
             "rss_within_grain_plus_10_percent": verdict["rss_over_grain"] <= 1.10,
@@ -789,4 +834,4 @@ if __name__ == "__main__":
     elif sys.argv[1:2] == ["scaling"]:
         run_scaling(tyro.cli(Scaling, args=sys.argv[2:]))
     else:
-        main(tyro.cli(tyro.conf.CascadeSubcommandArgs[Benchmark]))
+        main(benchmark(sys.argv[1:]))

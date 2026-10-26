@@ -27,22 +27,22 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from diffusers_wan_reference import float64
+from torch_precision import float64, float64_twin
 from remote_code_reference import FIXTURES, RELEASES as REGISTERED, released_model
 from safetensors.torch import save_file
 
 RELEASES = {
     "llada-moe-tiny": ("inclusionAI/LLaDA-MoE-7B-A1B-Base", "daccaf1ccbf263a427bc9ac2a23b0b004fb275bf",
-                       ("configuration_lladamoe.py", "modeling_lladamoe.py"), "AutoModelForCausalLM", True),
+                       ("configuration_lladamoe.py", "modeling_lladamoe.py"), "AutoModelForCausalLM"),
     "llada-moe-v2-tiny": ("GSAI-ML/LLaDA-MoE-v2-30B-A3B-Base", "2a513f7a4634e426b2ab030e6defb24001d0c847",
                           ("configuration_lladamoe_v2.py", "modeling_lladamoe_v2.py"),
-                          "AutoModelForCausalLM", True),
+                          "AutoModelForCausalLM"),
     "llada2-tiny": ("inclusionAI/LLaDA2.0-mini", "dad945cac317da394b390f82c7b40691d8a881ed",
-                    ("configuration_llada2_moe.py", "modeling_llada2_moe.py"), "AutoModelForCausalLM", True),
+                    ("configuration_llada2_moe.py", "modeling_llada2_moe.py"), "AutoModelForCausalLM"),
     "llada21-tiny": ("inclusionAI/LLaDA2.1-mini", "20e64e2ad21644d0e5248586ed9c942cdd45de0f",
-                     ("configuration_llada2_moe.py", "modeling_llada2_moe.py"), "AutoModelForCausalLM", True),
+                     ("configuration_llada2_moe.py", "modeling_llada2_moe.py"), "AutoModelForCausalLM"),
     "llada22-tiny": ("inclusionAI/LLaDA2.2-flash", "9b78da3f9149f1e239fb6d15f20a326fde574b9f",
-                     ("configuration_llada2_moe.py", "modeling_llada2_moe.py"), "AutoModelForCausalLM", True),
+                     ("configuration_llada2_moe.py", "modeling_llada2_moe.py"), "AutoModelForCausalLM"),
 }
 LICENSES = {"llada-moe-tiny": "apache-2.0", "llada-moe-v2-tiny": "apache-2.0", "llada2-tiny": "apache-2.0",
             "llada21-tiny": "apache-2.0", "llada22-tiny": "apache-2.0"}
@@ -91,8 +91,8 @@ def serve(name: str) -> None:
     REGISTERED.update(RELEASES)
     with tempfile.TemporaryDirectory() as workspace, torch.no_grad():
         native = released_model(name, Path(workspace) / 'fp32').float()
-        with float64():
-            wide = released_model(name, Path(workspace) / 'f64').double()
+        # Its float64 twin (`float64_twin`): built inside `float64`, its constructor's tables float64's.
+        wide = float64_twin(native, lambda: released_model(name, Path(workspace) / 'f64'))
         while True:
             request = _received(sys.stdin.buffer)
             ids = torch.from_numpy(request['ids'].astype(np.int64))

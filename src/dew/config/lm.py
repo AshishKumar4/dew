@@ -24,7 +24,6 @@ import jax
 import jax.numpy as jnp
 
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
-from dew.data.compile import fitted
 from dew.data.text import HFTokenizer, tokenizer_for
 from dew.objectives.lm.objective import Perplexity, Samples
 from dew.records import integer, text
@@ -47,13 +46,16 @@ class LMRunConfig(RunConfig):
     RESUMABLE: ClassVar[tuple[str, ...]] = (*RunConfig.RESUMABLE, "prompt", "max_new_tokens", "sampling")
 
     objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("lm"))
-    """The objective and its arguments: lm, masked_diffusion (MDLM), or
-    block_diffusion (the official DiffusionGemma fine-tuning objective)."""
+    """The objective and its arguments: lm, masked_diffusion (MDLM),
+    block_diffusion (the official DiffusionGemma fine-tuning objective), or
+    any objective by its import path that `LMObjective`'s arguments build:
+    the decoder, `seq_len`, its starting `variables`, `samples`, `processor`
+    and `qk_stats`."""
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
     optim: OptimConfig = dataclasses.field(
         default_factory=lambda: OptimConfig(
-            rate=6e-4,
+            learning_rate=6e-4,
             weight_decay=0.1, clip_grads=1.0))
     tokenizer: str = "byte"
     """The tokenizer the ids were written with: 'byte', or an HF tokenizer name."""
@@ -77,10 +79,6 @@ class LMRunConfig(RunConfig):
         if self.pretrained is None and self.pretrained_param_dtype != "float32":
             raise ValueError("--pretrained-param-dtype stores a --pretrained checkpoint's parameters; "
                              "this run loads none")
-        if self.objective.name not in (objectives.paths[name] for name in ("lm", "masked_diffusion",
-                                                                             "block_diffusion")):
-            raise ValueError(
-                f"--objective {self.objective.name!r} is not lm, masked_diffusion or block_diffusion")
         if self.objective.name == objectives.paths["block_diffusion"] and self.pretrained is None:
             raise ValueError("block_diffusion fine-tuning requires --pretrained")
 
@@ -143,8 +141,7 @@ class LMRunConfig(RunConfig):
                 model=model if source is None else source, seq_len=tokens.seq_len, variables=variables,
                 samples=samples, processor=self.processor(), qk_stats=self.optim.optimizer == "muonclip")
         # Compiled once: the run's length and its cadences are read off this loader, which `train` trains on.
-        loaded, held = fitted(self.chain(), self.validation, objective=objective.data(),
-                              seed=self.data_seed)
+        loaded, held = self.compiled(objective.data(), self.chain(), self.validation)
         # The run's own default metric, asked for where it holds a validation split to score.
         scored = self.trainer.eval_interval(loaded) is not None and bool(held)
         validation = (Perplexity(),) if scored else ()
@@ -205,8 +202,9 @@ class LMRunConfig(RunConfig):
         loaded = Pretrained.load(name, dtype=jnp.bfloat16 if dtype is None else dtype,
                                  param_dtype=self.pretrained_param_dtype,
                                  attention_impl=str(self.model.fields.get("attention_impl", "auto")),
-                                 max_seq_len=reach, revision=revision, weights=not self.trainer.resumes(),
-                                 on_host=True)
+                                 max_seq_len=reach, revision=revision,
+                                 # An adapter keeps its source as it is.
+                                 **self.trainer.source_placement(frozen=self.lora is not None))
         if not same_vocabulary(written, loaded, name):
             raise ValueError(f"the token files were written with {written}, and {self.pretrained} "
                              f"expects its own tokenizer's ids. Retokenize with --tokenizer {name}.")

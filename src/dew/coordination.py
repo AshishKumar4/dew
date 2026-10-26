@@ -19,7 +19,7 @@ import socket
 import sys
 import threading
 import types
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import TYPE_CHECKING, Literal, overload
 
 import jax
@@ -180,6 +180,22 @@ def broadcast_from_process_zero(value):
     return from_every_process(value if jax.process_index() == 0 else None)[0]
 
 
+def seen_by_every_process(directory: str) -> list[bool]:
+    """Whether each process of the pool, in rank order, finds a file process 0 writes in the local
+    `directory` (made if absent): whether they all read it as one directory, on a filesystem they
+    share, rather than each on a disk of its own."""
+    mark = os.path.join(directory, f".dew-shared-{broadcast_from_process_zero(os.urandom(8).hex())}")
+    if jax.process_index() == 0:
+        os.makedirs(directory, exist_ok=True)
+        with open(mark, "w"):
+            pass
+    from_every_process(None)  # every process looks once the mark is written
+    seen = from_every_process(os.path.exists(mark))
+    if jax.process_index() == 0:
+        os.remove(mark)
+    return seen
+
+
 def agreed[T](phase: str, operation: Callable[[], T]) -> T:
     """Run `operation` on every rank, then agree on the outcome before going on.
 
@@ -188,6 +204,21 @@ def agreed[T](phase: str, operation: Callable[[], T]) -> T:
     the next collective. The peers raise `PeerFailure`; the failing rank
     re-raises its own error. On one process this is a plain call.
     """
+    return agreed_count(phase, operation, lambda _: True)[0]
+
+
+def agreed_next[T](phase: str, stream: Iterator[T]) -> T | None:
+    """`stream`'s next item, read on every rank and agreed (`agreed`), or None where it has ended on
+    every rank; refused on all of them where it ended on some and not the others."""
+    read, ended = agreed_count(phase, lambda: next(stream, None), lambda read: read is None)
+    if 0 < ended < jax.process_count():
+        raise ValueError(f"{phase}: the stream ended on {ended} of {jax.process_count()} processes and the "
+                         "others read on: each process's stream must hold as many items")
+    return read
+
+
+def agreed_count[T](phase: str, operation: Callable[[], T], counted: Callable[[T], bool]) -> tuple[T, int]:
+    """`agreed`, with how many ranks' outcomes `counted` holds for, learned in the same round."""
     held: tuple[T] | None = None
     error: BaseException | None = None
     try:
@@ -195,13 +226,13 @@ def agreed[T](phase: str, operation: Callable[[], T]) -> T:
     except BaseException as failure:
         error = failure
     try:
-        agree_process_phase(error, phase=phase)
+        count = agree_process_phase(error, phase=phase, available=held is not None and counted(held[0]))
     except BaseException as failure:
         if error is None:
             raise PeerFailure(str(failure)) from failure
         raise
     assert held is not None
-    return held[0]
+    return held[0], count
 
 
 def agreed_same[T](phase: str, find: Callable[[], T]) -> T:
@@ -491,4 +522,5 @@ __all__ = [
     "collective_host",
     "end_pool_on_failure",
     "from_every_process",
+    "seen_by_every_process",
 ]

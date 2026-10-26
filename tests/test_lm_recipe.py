@@ -1,6 +1,7 @@
 """recipes/lm/train.py: what it refuses, and a run over real token files."""
 
 import dataclasses
+import importlib
 import json
 from pathlib import Path
 
@@ -141,6 +142,18 @@ def test_the_recipe_trains_on_tokenized_files(tmp_path, packed):
     np.testing.assert_allclose(actual.behavior_log_probs, expected.behavior_log_probs, atol=1e-7, rtol=1e-7)
 
 
+def test_the_recipe_trains_an_lm_objective_it_names_by_import_path(tmp_path):
+    """An objective Dew does not ship, named by its import path, builds from the arguments the recipe
+    gives an LM objective and trains, with no edit to the recipe."""
+    # A run names a package outside Dew once it is imported.
+    importlib.import_module("lm_objectives")
+
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    config = run_config(tokens, "--trainer.steps", "1", "--trainer.name", "own", "--objective",
+                        "lm_objectives:Anchored")
+    assert int(config.run().step) == 1
+
+
 def test_a_token_budget_alone_trains_over_data_with_no_epoch_length(tmp_path):
     """Packing a streamed read online leaves a run no epoch to count, and a run whose length is its
     tokens alone needs none: it trains until its targets reach the budget."""
@@ -229,6 +242,21 @@ def export_tiny_decoder(directory, *, tokenizer="byte", vocab_size=256):
     variables = model.init(jax.random.key(0), jnp.ones((1, 4), jnp.int32))
     PretrainedDecoder.from_model(model, variables, tokenizer=tokenizer).save(str(directory))
     return directory
+
+
+def test_a_token_budget_trains_over_a_stream_with_no_epoch_length(tmp_path):
+    """`--trainer.tokens` alone bounds a run over windows read as a stream, each share its own order,
+    which has no epoch length to count: the run trains until its real tokens reach the budget, three
+    batches of eight windows of SEQ targets."""
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ)
+    streamed = windows(tokens).read("streamed")
+    assert compile(streamed).steps_per_epoch is None
+    model = '{"emb_features": 16, "num_layers": 1, "num_heads": 2}'
+    config = LMRunConfig.cli(recipe_args(
+        tokens, "--trainer.tokens", str(3 * 8 * SEQ), "--trainer.eval-every", "None",
+        "--trainer.checkpoint-every", "None", "--trainer.name", "tokens", "--max-new-tokens", "0",
+        model_config=model), default=LMRunConfig(data=streamed))
+    assert int(config.run().step) == 3
 
 
 def recipe_args(tokens, *args, model_config="{}"):
@@ -419,6 +447,54 @@ def test_a_pretrained_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
         assert (tmp_path / "from-run" / name).read_bytes() == (tmp_path / "in-process" / name).read_bytes()
 
 
+class Started(LMRunConfig):
+    """A run that hands back the objective it would train, rather than training it."""
+
+    def train(self, objective, dataset, **settings):
+        return objective
+
+
+@pytest.mark.parametrize(("lora", "whole"), [(True, False), (True, True), (False, False)],
+                         ids=["lora", "lora-frozen-whole", "full"])
+def test_a_pretrained_runs_source_loads_where_its_start_keeps_it(tmp_path, lora, whole):
+    """A LoRA run from a source reads each leaf of its frozen base onto its trainer's fsdp mesh,
+    sharded as its layout shards the state (every leaf past `min_shard=1`, so some split), never into
+    a host array (`TrainerConfig.source_placement`): its start places none of the base again, the
+    state's frozen leaves the source's arrays themselves, each where the state keeps it. A layout
+    that keeps the frozen tree whole, and a run that trains the source itself, read it on the host."""
+    import optax
+
+    from dew.objectives.base import FROZEN
+    from dew.training import Layout, MeshSpec, Trainer
+
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
+    adapter = ("--lora.rank", "4", "--lora.modules", "q_proj") if lora else ()
+    config = Started.cli(recipe_args(tokens, "--pretrained", str(checkpoint), "--trainer.steps", "1",
+                                     "--max-new-tokens", "0", *adapter),
+                         default=Started(data=windows(tokens), validation=windows(tokens, held=True)))
+    sharded = Layout(min_shard=1, frozen_whole=whole)
+    config = dataclasses.replace(config, trainer=dataclasses.replace(
+        config.trainer, mesh=MeshSpec(fsdp=jax.device_count()), layout=sharded))
+    objective = config.prepare().train("placed")
+    held = objective.held_variables()
+    assert held is not None
+    base = held[FROZEN] if lora else held["params"]
+    if whole or not lora:
+        assert not any(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(base))
+        return
+    assert all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(base))
+    assert any(leaf.addressable_shards[0].data.shape != leaf.shape for leaf in jax.tree.leaves(base))
+    trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.key(0), mesh=config.trainer.mesh,
+                      layout=config.trainer.layout)
+    state, shardings = trainer.place()[:2]
+    assert ({id(leaf) for leaf in jax.tree.leaves(state.variables[FROZEN])}
+            == {id(leaf) for leaf in jax.tree.leaves(base)})
+    placed = jax.tree.leaves(shardings.variables[FROZEN])
+    for leaf, sharding in zip(jax.tree.leaves(base), placed, strict=True):
+        assert leaf.sharding == sharding
+
+
 def test_a_scratch_run_trains_a_lora_that_saves_from_the_run_alone(tmp_path):
     """From scratch, `--lora.rank 2 --lora.modules q_proj v_proj`
     binds the adapter to a fresh draw of the model from the run's key and
@@ -570,7 +646,7 @@ def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
         "--trainer.steps", "1", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "masked",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--objective.ema-decay", "None", "--max-new-tokens", "0", "--optim.rate", "0.001"],
+        "--objective.ema-decay", "None", "--max-new-tokens", "0", "--optim.learning-rate", "0.001"],
         default=LMRunConfig(data=data))
 
     state = config.run()
@@ -612,7 +688,7 @@ def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
         "--trainer.steps", "1", "--trainer.log-every", "1",
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "block",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-        "--max-new-tokens", "0", "--optim.rate", "0.001"], default=LMRunConfig(data=spans))
+        "--max-new-tokens", "0", "--optim.learning-rate", "0.001"], default=LMRunConfig(data=spans))
     state = config.run()
     assert int(state.updates) == 1
     original = Pretrained.load(checkpoint, dtype="float32", attention_impl="xla", max_seq_len=12)
@@ -649,7 +725,7 @@ def test_block_diffusion_trains_quantized_as_any_lm_recipe_does(tmp_path):
             "--trainer.steps", "1", "--trainer.log-every", "1",
             "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", name,
             "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
-            "--max-new-tokens", "0", "--optim.rate", "0.001", *quantized],
+            "--max-new-tokens", "0", "--optim.learning-rate", "0.001", *quantized],
             default=LMRunConfig(data=spans))
 
     quantized = run("quantized")

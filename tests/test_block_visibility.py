@@ -211,10 +211,12 @@ def test_a_blocks_last_call_reads_its_earlier_keys_past_the_window_from_the_cach
                     truth_fn=full(wide))
 
 
-def test_a_non_causal_kind_reading_blocks_keeps_its_kernel():
+def test_a_non_causal_kind_reading_blocks_keeps_its_kernel(without_deterministic_ops):
     """A non-causal kind sees its whole row already, so the groups it would read add nothing: a call with
     and without them reports the same attention routes on an A100 (`generation.routes`), cuDNN named, with
-    no mask of their own."""
+    no mask of their own. Only routes are traced, no program compiled, so on the cuda lane, whose
+    --xla_gpu_deterministic_ops keeps cuDNN away from a run (`without_deterministic_ops`), the flag is
+    taken out for the routes the claim is about."""
     decoder = model(full_attention={"mixer": AttentionMixer(bidirectional_blocks=True)}).clone(
         causal=False, attention_impl="cudnn", dtype=jnp.bfloat16)
     ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, VOCAB)

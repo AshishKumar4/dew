@@ -117,7 +117,7 @@ def smoke_config(config: Config, out: Path) -> DiffusionRunConfig:
         text=TextCondition(encoder="clip_text", checkpoint=config.clip_model),
         val_metrics=(MetricConfig("fid", {"weights": config.inception_weights}),
                      MetricConfig("clip_score", {"modelname": config.clip_model})),
-        optim=OptimConfig(rate=1e-3),
+        optim=OptimConfig(learning_rate=1e-3),
         trainer=TrainerConfig(checkpoint_dir=str(out / "checkpoints"), steps=3,
                               log_every=1, eval_every=3, checkpoint_every=3,
                               mesh=MeshSpec(fsdp=1), multi_host=False,
@@ -146,9 +146,9 @@ def slice_config(config: Config) -> DiffusionRunConfig:
         text=TextCondition(encoder="clip_text", checkpoint=config.clip_model),
         val_metrics=(MetricConfig("fid", {"weights": config.inception_weights}),
                      MetricConfig("clip_score", {"modelname": config.clip_model})),
-        optim=OptimConfig(weight_decay=0.01, rate=Cosine(
-            peak=config.learning_rate, warmup_steps=2000, init=config.learning_rate,
-            end=2e-4)),
+        optim=OptimConfig(weight_decay=0.01, learning_rate=Cosine(
+            peak_value=config.learning_rate, warmup_steps=2000, init_value=config.learning_rate,
+            end_value=2e-4)),
         trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"),
                               steps=config.steps,
                               log_every=50, eval_every=2000, checkpoint_every=2000,

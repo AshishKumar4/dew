@@ -48,13 +48,14 @@ from dew.interop.decoder_parts import (
     DecoderFields,
     Reading,
     WrapperFields,
-    _refuse_drafter,
     _unread,
     held_parts,
     hf_activation,
+    modeling_overrides,
     record_float,
     record_int,
     refuse,
+    refuse_drafter,
     translated,
 )
 from dew.interop.streaming import LazyTree, SourceLeaf, WeightLayout, materialize
@@ -84,7 +85,7 @@ type AttentionResidualsFields = NativeFields[AttentionResiduals]
 def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
     """Translate one registered family's config, refusing any setting Dew does not compute."""
 
-    _refuse_drafter(hf_config)
+    refuse_drafter(hf_config)
     model_type = hf_config.get('model_type')
     # A multimodal repo's config.json is a wrapper whose model_type names the
     # whole model and whose text_config holds the decoder;
@@ -111,15 +112,22 @@ def translate_config(hf_config: Mapping[str, object]) -> DecoderFields:
 def _wrapper_text(hf_config: Mapping[str, object], used: set, *,
                   declared_type: str | None = None) -> DecoderFields:
     """Translate the wrapper's text_config as the decoder it is."""
+    used.update(("text_config", "tie_word_embeddings"))
+    return translate_config(_text_config(hf_config, declared_type))
+
+
+def _text_config(hf_config: Mapping[str, object], declared_type: str | None) -> Mapping[str, object]:
+    """The decoder config a wrapper's language model is: its text_config, typed `declared_type` where it
+    names no type, with the wrapper's own head policy."""
     text = hf_config.get("text_config")
     if not isinstance(text, Mapping):
         refuse("text_config",
                 f"a wrapper carries its decoder under text_config, got {text!r}")
-    used.add("text_config")
+    text = dict(text)
     if declared_type is not None and 'model_type' not in text:
         # The wrapper config class supplies its declared nested class when
         # reading a raw dict. Checkpoint copies need not repeat that tag.
-        text = {**text, 'model_type': declared_type}
+        text['model_type'] = declared_type
     if hf_config.get("model_type") != "llama4":
         # These conditional models own their lm_head at wrapper scope; the
         # nested text model has no head. Llama4 nests a complete causal LM.
@@ -127,9 +135,8 @@ def _wrapper_text(hf_config: Mapping[str, object], used: set, *,
         tied = hf_config.get("tie_word_embeddings", default_tied)
         if tied is not None and not isinstance(tied, bool):
             refuse("tie_word_embeddings", "the wrapper head takes a boolean tying policy")
-        text = {**text, "tie_word_embeddings": bool(tied)}
-        used.add("tie_word_embeddings")
-    return translate_config(text)
+        text["tie_word_embeddings"] = bool(tied)
+    return text
 
 
 def _wrapper_token_id(hf_config: Mapping[str, object], used: set, *names: str) -> int:
@@ -299,6 +306,7 @@ def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
                 "no supported multimodal wrapper is registered for this model")
     used = {"model_type"}
     record = read(hf_config, used)
+    modeling_overrides(hf_config, record["text"], used)
     unknown = _unread(hf_config, used)
     if unknown:
         refuse(f"config fields {sorted(unknown)}",
@@ -385,6 +393,35 @@ def _wrapper_sources(names: Collection[str], read: Callable[[str], np.ndarray], 
             aliases.append((previous, name))
         sources[group][local] = name
     return sources, tuple(aliases)
+
+
+def language_model_config(hf_config: Mapping[str, object], record: WrapperFields) -> Mapping[str, object]:
+    """The config a wrapper's language model states as its text family's own checkpoint: the text_config
+    typed as the wrapper's text model, with the wrapper's head policy, the dtype the wrapper states for
+    it, and its family's causal-LM class where it names none. What the wrapper declares at its own
+    scope governs its language model over the text_config: its modeling overrides (as
+    `translate_wrapper_config` applies them), and the token ids generation reads at wrapper scope
+    before the text config's (`generation_config`)."""
+    text = dict(_text_config(hf_config, record["text_model_type"]))
+    for field in ("torch_dtype", "dtype"):
+        if field in hf_config and field not in text:
+            text[field] = hf_config[field]
+    for field in ("modeling_overrides", "eos_token_id", "pad_token_id", "bos_token_id"):
+        if hf_config.get(field) is not None:
+            text[field] = hf_config[field]
+    family = families().get(records.text(text["model_type"], "model_type"))
+    if family is not None and "architectures" not in text:
+        text["architectures"] = [family.architecture]
+    return text
+
+
+def language_model_names(names: Collection[str], read: Callable[[str], np.ndarray], record: WrapperFields,
+                         checked: Checked = NOTHING_CHECKED) -> dict[str, str]:
+    """Each tensor name of a wrapper's language model, as its text family reads it, to the wrapper's
+    name of it (`wrapper_route`). The media towers' names are not among them, nor read: only the
+    language model's spellings of one tensor are compared."""
+    own = [name for name in names if wrapper_route(name, record)[0] == "language_model"]
+    return _wrapper_sources(own, read, record, checked)[0]["language_model"]
 
 
 def _text_aliases(names: Collection[str], read: Callable[[str], np.ndarray], config,
@@ -647,7 +684,7 @@ def held_depths(fields: dict, params: Mapping[str, object]) -> None:
 def translate_weights(
     hf_tensors: Mapping[str, np.ndarray],
     config: DecoderFields,
-    model_type: str | None = None,
+    model_type: str | DecoderFamily | None = None,
     *,
     param_dtype: str = "float32",
     lazy: bool = False,
@@ -662,7 +699,7 @@ def translate_weights(
 def read_decoder(
     hf_tensors: Mapping[str, np.ndarray],
     config: DecoderFields,
-    model_type: str | None = None,
+    model_type: str | DecoderFamily | None = None,
     *,
     param_dtype: str = "float32",
     lazy: bool = False,
@@ -694,10 +731,10 @@ def read_decoder(
     what the backbone would be built from, so it cannot tell apart two families
     that compute the same thing under different tensor names. Kimi K2.5's
     decoder, for example, is DeepSeek V3's computation nested under
-    `language_model.`.
+    `language_model.`. A family that is no registered one, as a type verified from parts loads by
+    (`dew.interop.parts.family`), is passed itself.
     """
-    family = (_family_for_config(config) if model_type is None
-              else families()[model_type])
+    family = _family_for_config(config) if model_type is None else family_entry(model_type)
     # A tied head and a depth's embedding and head are checked copies of
     # tensors the tree already takes, so they are dropped here; any other
     # second tensor for a filled leaf is refused where it is placed.
@@ -731,6 +768,7 @@ def translate_denoiser_weights(
     config: DecoderFields,
     *,
     param_dtype: str = "float32",
+    lazy: bool = False,
     checked: Checked = NOTHING_CHECKED,
 ) -> Variables:
     """Map a DiffusionGemma text checkpoint into the shared tree plus self-conditioning.
@@ -751,7 +789,7 @@ def translate_denoiser_weights(
     text = {local: hf_tensors[name] for local, name in text_names.items()}
     sc = {local: hf_tensors[name] for local, name in sc_names.items()}
     return {
-        "text": translate_weights(text, config, param_dtype=param_dtype,
+        "text": translate_weights(text, config, param_dtype=param_dtype, lazy=lazy,
                                   checked=_renamed(checked, text_names)),
         "self_conditioning": {
             "params": translate_sc_weights(sc, param_dtype=param_dtype)
@@ -879,6 +917,15 @@ def export_config(model) -> Mapping[str, object]:
         'hidden_act': hf_activation(model.mlp),
         'use_cache': model.causal,
     }
+    from dew.nn.mixers import AttentionMixer
+
+    overrides = {}
+    for name in set(model.per_layer_types):
+        mixer = model.kind_of(name).mixer or model.mixer or AttentionMixer()
+        if isinstance(mixer, AttentionMixer) and mixer.bidirectional_blocks:
+            overrides[name] = "block_bidirectional"
+    if overrides:
+        config["modeling_overrides"] = {"attention": overrides}
     # A dial only some families' references read cannot ride in another
     # family's config. Qwen2 splits the o_proj bias from the others, and
     # Dream's reference is that block with the causal mask dropped
@@ -948,6 +995,10 @@ def export_config(model) -> Mapping[str, object]:
         config.pop('rope_local_base_freq', None)
     elif ramped:
         config['rope_scaling'] = dataclasses.asdict(next(iter(ramped.values())))
+    defaulted = family.defaults.get('pad_token_id') is not None
+    if family.padding_idx and (model.padding_idx is not None or defaulted):
+        # An explicit null where the class defaults to a pad id, so that id takes no row the model trains.
+        config['pad_token_id'] = model.padding_idx
     config.update(exported)
     written = {key: value for key, value in config.items()
                if value is not None or key == 'pad_token_id' or key in family.export_nulls}
@@ -1038,6 +1089,11 @@ def bundles(config: Mapping[str, object]) -> bool:
 def families() -> dict[str, DecoderFamily]:
     """The single mutable name table, also used for registered source aliases."""
     return {name: family for family in ENTRIES for name in family.model_types}
+
+
+def family_entry(family: str | DecoderFamily) -> DecoderFamily:
+    """A registered family by its name, or a family given itself (one assembled from parts)."""
+    return family if isinstance(family, DecoderFamily) else families()[family]
 
 def _family_of(fields: CausalTransformer) -> DecoderFamily:
     return next(family for family in ENTRIES if family.matches(fields))

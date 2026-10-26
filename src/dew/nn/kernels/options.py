@@ -1,4 +1,5 @@
-"""The XLA options a program compiles with, by the models it runs and the device it runs on.
+"""The XLA options a program compiles with, by the models it runs and the device it runs on, and the
+one place a program over them is compiled (`program`).
 
 `dew.nn.kernels.generation` stays free of Dew's imports, since benchmark
 environments load its target table without Dew or JAX; this reads its
@@ -7,7 +8,12 @@ facts with the run's own XLA flags.
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
+import functools
+from collections.abc import Callable, Mapping
+from typing import TYPE_CHECKING, ClassVar, Protocol, TypedDict, Unpack, runtime_checkable
+
+import jax
+from jax.sharding import Sharding
 
 from dew.devices import xla_flag
 from dew.nn.kernels.generation import backend, gpu_target
@@ -55,3 +61,37 @@ def compiler_options(*models: nn.Module) -> dict[str, bool]:
             or xla_flag("xla_gpu_enable_triton_gemm") is not None):
         return {}
     return {"xla_gpu_enable_triton_gemm": False}
+
+
+type Placements = Sharding | None | tuple[Placements, ...]
+"""Where a program's arguments or results sit, as `jax.jit` takes them: one sharding, none (where
+they are), or a tuple of either, one for each."""
+
+
+class JitArguments(TypedDict, total=False):
+    """The arguments of `jax.jit` a program over models takes (`program`), each hashable."""
+
+    static_argnums: int | tuple[int, ...]
+    static_argnames: str | tuple[str, ...]
+    in_shardings: Placements
+    out_shardings: Placements
+
+
+def program[**P, R](function: Callable[P, R], *models: nn.Module,
+                    step: Mapping[str, bool | int] | None = None,
+                    **arguments: Unpack[JitArguments]) -> jax.stages.Wrapped:
+    """`function` jitted with the XLA options a program over `models` compiles with
+    (`compiler_options`), and, where it is part of a training step, the step's own beside them
+    (`step`, `dew.training.memory.step_compiler_options`), with the rest of `jax.jit`'s `arguments`
+    (its static arguments, its shardings): one program for each function, options and arguments,
+    which every call with the same reuses, so a quantized model and another never share one. Every
+    program Dew compiles over a task's model, an autoencoder or an objective's modules outside an
+    objective's own (`Objective.program`) is one of these."""
+    options = {**compiler_options(*models), **(step or {})}
+    return _program(function, tuple(sorted(options.items())), **arguments)
+
+
+@functools.cache
+def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, bool | int], ...],
+                     **arguments: Unpack[JitArguments]) -> jax.stages.Wrapped:
+    return jax.jit(function, compiler_options=dict(options), **arguments)

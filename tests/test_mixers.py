@@ -393,14 +393,16 @@ def test_a_mixers_refusal_names_its_kind_and_entries_across_a_process_boundary()
 
 @pytest.mark.parametrize("kind, rungs", [
     ("attention", [None, "minimal", "save_dot_except_mlp", "full"]),
-    ("mamba2", [None, "minimal_with_conv", "minimal", "full"]),
-    ("gated_delta_net", [None, "all_but_delta_memory", "minimal_with_conv", "minimal", "full"]),
+    ("mamba2", [None, "minimal_with_scan_and_conv", "minimal_with_conv", "minimal", "full"]),
+    ("gated_delta_net", [None, "all_but_delta_memory", "minimal_with_scan_and_conv", "minimal_with_conv",
+                         "minimal", "full"]),
 ])
 def test_a_decoder_climbs_only_the_remat_rungs_its_layers_mark(kind, rungs):
     """`recompute_more` passes a rung that keeps the same of the decoder's marked names as the rung
     below or above it: 'all_but_delta_memory', which recomputes a delta rule's memory alone, is a
-    rung only for a decoder with a delta rule, and the ladder of any other is the one before it (a
-    recurrent decoder's 'save_dot_except_mlp' keeps no more of its names than 'full')."""
+    rung only for a decoder with a delta rule, 'minimal_with_scan_and_conv', which keeps a
+    recurrence's scan, only for a decoder with a recurrence, so attention's ladder is the one before
+    either (a recurrent decoder's 'save_dot_except_mlp' keeps no more of its names than 'full')."""
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
     model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=64, **overrides)
     climbed = [model]
@@ -413,9 +415,10 @@ def test_a_decoder_climbs_only_the_remat_rungs_its_layers_mark(kind, rungs):
 @chosen(gated_delta_rule="fla")
 def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, capsys):
     """A decoder skips the remat rungs that keep none of its mixers' names (`MixerBase.residuals`), so
-    a kind may name only what its layer marks: under `jax.checkpoint` with a policy saving all of them,
-    a tiny decoder of that kind saves each one for its backward. A delta rule's decay and inverse are
-    its port's (`row_names_port`, interpreted off a GPU)."""
+    a kind may name only what its layer marks: under `jax.checkpoint` with a policy saving each one
+    alone, a tiny decoder of that kind saves it for its backward. A recurrence's output is both its
+    'context' and its 'scan', either of which keeps it. A delta rule's decay and inverse are its
+    port's (`row_names_port`, interpreted off a GPU)."""
     from jax.ad_checkpoint import print_saved_residuals
 
     from dew.nn.backbones.decoder_block import RematPolicy
@@ -425,15 +428,17 @@ def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, capsy
     model = tiny(mixer=value, max_seq_len=64, **KIND_FIELDS.get(kind, ({}, {}))[1])
     tokens = jax.random.randint(jax.random.key(3), (1, 64), 0, VOCAB)
     variables = model.init(jax.random.key(4), tokens)
-    policy = RematPolicy(save=value.residuals).checkpoint_policy()
 
     def loss(variables):
         return jnp.sum(model.apply(variables, tokens) ** 2)
 
-    capsys.readouterr()
-    print_saved_residuals(jax.checkpoint(loss, policy=policy), variables)
-    saved = capsys.readouterr().out
-    assert [name for name in value.residuals if f"named '{name}'" not in saved] == []
+    def saves(name):
+        capsys.readouterr()
+        policy = RematPolicy(save=(name,)).checkpoint_policy()
+        print_saved_residuals(jax.checkpoint(loss, policy=policy), variables)
+        return f"named '{name}'" in capsys.readouterr().out
+
+    assert [name for name in value.residuals if not saves(name)] == []
 
 
 def one_tap(kind):

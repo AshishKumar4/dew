@@ -56,11 +56,13 @@ from .precision import (
     asks_default_precision,
     at_default_precision,
     at_least_fp32,
+    capped_logits,
     configured_precision,
     float32_dot_general,
     float32_einsum,
     float32_products,
     operand_precision,
+    rms_statistics,
     rounded_to,
 )
 from .rope import rotate
@@ -318,9 +320,9 @@ def max_attention_logits(query: jax.Array, key: jax.Array, *, causal: bool = Fal
     heads = query.shape[-2]
     key = repeat_kv_heads(key, heads)
     scale = 1.0 / math.sqrt(query.shape[-1])
-    logits = jnp.einsum('...qhd,...khd->...hqk',
-                        query.astype(jnp.float32) * jnp.asarray(scale, jnp.float32),
-                        key.astype(jnp.float32), precision=operand_precision(jnp.float32))
+    logits = float32_einsum('...qhd,...khd->...hqk',
+                            query.astype(jnp.float32) * jnp.asarray(scale, jnp.float32),
+                            key.astype(jnp.float32), precision=operand_precision(jnp.float32))
     if bias is not None:
         logits = logits + bias.astype(jnp.float32)
     combined = combined_attention_mask(
@@ -359,7 +361,7 @@ def _xla_rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, sca
     activated = (lambda y: y) if activation is None else activation
     if fp32_statistics:
         y = x.astype(at_least_fp32(x.dtype))
-        y = y * jax.lax.rsqrt(jnp.mean(jnp.square(y), axis=-1, keepdims=True) + epsilon)
+        y = y * rms_statistics(y, epsilon)[1]
     else:
         # The reference rounds every step to the input dtype. XLA fuses the
         # chain and carries fp32 between the ops, so each rounding is explicit.
@@ -519,7 +521,7 @@ def unweighted_rmsnorm(x, eps: float, *, implementation: str = 'auto'):
         return norm_swiglu.rms_norm(x, None, eps, x.dtype, offset=False, after_cast=False, portable=portable,
                                     inverse_rounded=True)
     fp32 = x.astype(at_least_fp32(x.dtype))
-    inverse = jax.lax.rsqrt(jnp.mean(jnp.square(fp32), axis=-1, keepdims=True) + eps)
+    inverse = rms_statistics(fp32, eps)[1]
     return x * inverse.astype(x.dtype)
 
 
@@ -1220,10 +1222,6 @@ def template_attention(query, key, value, causal: bool, sliding_window, *, sinks
                       image_groups=(image_groups, ("activation_batch", None)), seed=(dropout_seed, (None,)))
 
 
-VALUE_BLOCK = 256
-"""Keys per block of `weighted_values`' fp32 sum on XLA:CPU."""
-
-
 def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
     """The probability-value product, with the probabilities in the value's dtype.
 
@@ -1236,36 +1234,12 @@ def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
     that produced them still reduced in fp32, which is where the precision
     was needed.
 
-    `equation` is flax's value product, '...hqk,...khd->...qhd'. On XLA:CPU
-    an fp32 product sums each block of VALUE_BLOCK keys apart and the
-    blocks' sums after. YNNPACK, XLA:CPU's dot, sums up to about 1024 keys
-    in one chain: fp32 attention over 512, 2048 and 8192 keys rounded 1.34,
-    1.75 and 1.63 times as far from float64 as torch's SDPA does, and 0.98,
-    0.96 and 0.87 times in blocks. Writing each block's product costs a
-    forward 3% to 9% at 512 to 1024 keys on two threads (docs/performance.md).
+    `equation` is flax's value product, '...hqk,...khd->...qhd'; a CPU under
+    Dew's tests sums an fp32 one in float64 and rounds once (`precision.accumulated`).
     """
     if equation != '...hqk,...khd->...qhd':
         raise ValueError(f"weighted_values takes flax's value product, got {equation!r}")
-    weights = weights.astype(value.dtype)
-    plain = functools.partial(float32_einsum, equation, precision=precision)
-    if value.dtype != jnp.float32 or value.shape[-3] <= VALUE_BLOCK or generation.backend() != 'cpu':
-        return plain(weights, value)
-    # Both modes differentiate the plain product: neither sums over the keys, and the blocked
-    # form's own cost the backward an eighth more on two threads.
-    return forward_differentiable(functools.partial(_blocked_values, precision=precision), plain,
-                                  weights, value)
-
-
-def _blocked_values(weights, value, precision) -> jax.Array:
-    """`weighted_values`' product summed in blocks of VALUE_BLOCK keys."""
-    keys = value.shape[-3]
-    blocks = -(-keys // VALUE_BLOCK)
-    pad = blocks * VALUE_BLOCK - keys
-    weights = jnp.pad(weights, [(0, 0)] * (weights.ndim - 1) + [(0, pad)])
-    value = jnp.pad(value, [(0, 0)] * (value.ndim - 3) + [(0, pad), (0, 0), (0, 0)])
-    weights = weights.reshape(*weights.shape[:-1], blocks, VALUE_BLOCK)
-    value = value.reshape(*value.shape[:-3], blocks, VALUE_BLOCK, *value.shape[-2:])
-    return float32_einsum('...hqck,...ckhd->...qhdc', weights, value, precision=precision).sum(-1)
+    return float32_einsum(equation, weights.astype(value.dtype), value, precision=precision)
 
 
 
@@ -1315,7 +1289,7 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     if wide_logits:
         logits = logits * width ** -0.5
     if softcap is not None:
-        logits = jnp.tanh(logits / softcap) * softcap
+        logits = capped_logits(logits, softcap)
     if bias is not None:
         logits = logits + bias
     if mask is not None:
@@ -1647,17 +1621,33 @@ def forward_differentiable(value, tangent, *arrays, precision: str | None = None
     `precision` is the kernel's own arithmetic, which the reference's products
     take too (`jax.default_matmul_precision`), so a kernel of IEEE fp32 products
     is not differentiated by TF32 ones; None leaves the products at the
-    caller's."""
+    caller's. Only the arrays a derivative moves are the reference's tangents: a known zero stays
+    out of its derivative, where a product's own derivative (`dew.nn.precision.accumulated`'s on a
+    CPU) takes its moving operands alone."""
+    from jax.custom_derivatives import SymbolicZero
+
     @jax.custom_jvp
     def attend(*arrays):
         return value(*arrays)
 
-    @attend.defjvp
     def rule(primals, tangents):
-        with contextlib.nullcontext() if precision is None else jax.default_matmul_precision(precision):
-            differentiated = jax.jvp(tangent, primals, tangents)[1]
-        return attend(*primals), differentiated
+        live = [index for index, direction in enumerate(tangents) if not isinstance(direction, SymbolicZero)]
+        output = attend(*primals)
+        if not live:
+            return output, jax.tree.map(jnp.zeros_like, output)
 
+        def moved(*moving):
+            arrays = list(primals)
+            for index, array in zip(live, moving, strict=True):
+                arrays[index] = array
+            return tangent(*arrays)
+
+        with contextlib.nullcontext() if precision is None else jax.default_matmul_precision(precision):
+            differentiated = jax.jvp(moved, tuple(primals[index] for index in live),
+                                     tuple(tangents[index] for index in live))[1]
+        return output, differentiated
+
+    attend.defjvp(rule, symbolic_zeros=True)
     return attend(*arrays)
 
 
@@ -1747,10 +1737,10 @@ def _xla_kernel_narrows(query) -> bool:
 
 def _xla_kernel_on_cpu() -> bool:
     """Whether jax.nn's xla attention would run this call on a CPU, where 'auto' and 'xla' take the
-    reference path. jax's differentiates the softmax through rowsum(dO * O), which leaves a query
-    that reads one key a rounding's gradient where the softmax's own derivative, the reference
-    path's, is exactly zero; and it sums an fp32 value product over every key in one chain, as
-    YNNPACK, XLA:CPU's dot, does, where `weighted_values` sums it in blocks."""
+    reference path. jax's sums fp32 products in fp32, as XLA:CPU's dot does, where Dew's tests sum a
+    CPU's in float64 (`precision.accumulated`), and it differentiates the softmax through rowsum(dO * O),
+    which leaves a query that reads one key a rounding's gradient where the softmax's own derivative,
+    the reference path's, is exactly zero."""
     return generation.backend() == 'cpu'
 
 

@@ -15,6 +15,8 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from diffusion_support import as_a_step, float64_gradient, moved_weights, objective_gradient
+from reference_error import assert_as_exact
 from safetensors.numpy import load_file
 
 from dew import Trainer
@@ -66,42 +68,94 @@ def reference_variables(loaded, name):
     return objective(loaded, variables=values).init(jax.random.key(0))
 
 
-def trainer_update(obj, batch, run_key):
-    """The trainer's first SGD update (rate 0.001) of a variables tree's params on one device, and the
-    objective's own update under the step's draws (`example_fields`), compiled as one program. One
-    device holds the comparison to the trainer's composition of the update, which computes it to the
-    bit; its layouts are the parallelism matrix's."""
-    trainer = Trainer(obj, optax.sgd(0.001), key=run_key, split=1)
+def trainer_update(obj, batch, run_key, optimizer):
+    """The trainer's first step under `optimizer` of a variables tree on one device, compiled once
+    over batches of `batch`'s shapes (`stepped`, its stepped state), the step's draws
+    (`example_fields`) and the trainer. One device holds the comparison to the trainer's composition
+    of the update; its layouts are the parallelism matrix's."""
+    trainer = Trainer(obj, optimizer, key=run_key, split=1)
     trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
     initial = trainer.initial_state()
     step = Step(jnp.asarray(0, jnp.int32), jax.random.fold_in(initial.key, 0), None,
                 **example_fields(initial, 0, 1, batch))
     run = trainer.compile(jax.tree.map(jnp.copy, initial), batch)
 
-    def stepped(values):
+    def stepped(values, rows=batch):
         # The step consumes its state: it steps copies.
         state = jax.tree.map(jnp.copy, initial).replace(variables=jax.tree.map(jnp.copy, values))
-        state, *_ = run(state, batch)
-        return jax.tree.map(np.asarray, state.variables["params"])
+        state, *_ = run(state, rows)
+        return state
 
-    @jax.jit
-    def objective_update(values):
-        gradient = jax.grad(lambda trainable: obj.scalar_loss(
-            {**values, "params": trainable}, batch, step)[0])(values["params"])
-        return jax.tree.map(lambda value, grad: value - 0.001 * grad, values["params"], gradient)
-
-    return stepped, objective_update
+    return stepped, step, trainer
 
 
-def assert_updates_as_the_objective(obj, batch, data, run_key, variables):
-    """The trainer's update is the objective's at the step's draws, to the bit (`trainer_update`), and
-    the run's own path, its loader, plan and marked rows, takes that update on one device."""
-    stepped, objective_update = trainer_update(obj, batch, run_key)
-    expected = objective_update(variables)
-    assert_tree_equal(stepped(variables), expected)
+UPDATE_SEEDS = {"text": 8, "image": 16}
+"""Check 1's declared seeds for the trainer's gradient of each SFT model, sized paired (`seeds_for` with
+the trainer's step as `dew_fn`). The text model's, over drawn batches (`varied`), is the most of three
+platforms': its two arms took bitwise the same gradient at every draw on JAX 0.11's and 0.12's CPU and
+on an A100, and each sized it at 8 (run-tests sf-1546v-paired-main-c464b5df0 and
+sf-1546v-paired-jax012-f65f56d57, node receipts SF-1546v-a100). Its error is heavy-tailed, alike in
+both arms: four draws of 320 held at most 72% of a leaf's pooled error on 0.11, 87% on 0.12 and 86% on
+the A100 (sf-1546v-tail-main-c464b5df0, sf-1546v-tail-jax012-f65f56d57), so the reference against
+itself does not resolve within 4096 seeds and the paired count is the site's (ledger 1546)."""
+
+UPDATE_ROWS = 8
+"""Rows of each drawn text batch (`varied`)."""
+
+
+def varied(batch, rows: int):
+    """`batches(seed)` of `rows` rows of `batch`'s layouts, tiled, each real token (not the pad, 0)
+    drawn afresh from the fixture's 32-token vocabulary at every seed, the masks the layouts' own: each
+    draw's update then averages over conditioning of its own. Over the fixture's one batch, four
+    weight draws of 320 carried 83 to 97% of each arm's pooled error at the attention leaves, the same
+    draws in both arms, and its truth moved smoothly with the weights there, about 500 times their
+    relative noise, as at the other draws (ledger 1546)."""
+    tiled = jax.tree.map(lambda value: np.concatenate([np.asarray(value)] * (rows // len(value)), axis=0),
+                         batch)
+
+    def drawn(seed):
+        tokens = np.asarray(tiled["text"])
+        fresh = np.random.default_rng([seed, rows]).integers(1, 32, tokens.shape, dtype=tokens.dtype)
+        return {**tiled, "text": np.where(tokens != 0, fresh, tokens)}
+
+    return drawn
+
+
+def assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, seeds: int, batches=None):
+    """The trainer's update is the objective's at the step's draws. The gradient its step takes, which
+    sgd with a momentum of zero keeps as its trace, is on par with the objective's own over drawn
+    weights (check 1), and over drawn batches of `batch`'s shapes where `batches(seed)` draws them,
+    `twin`, the objective over its model in float64, at the same draws the truth; they are two
+    programs, which round otherwise, the objective's compiled with the step's compiler options
+    (`as_a_step`). The gradients are compared as they are, not through an update applied to the
+    weights, whose rounding at the weights' magnitude would swamp theirs; at each draw the step's
+    weights are then sgd(1)'s rule of that trace to the bit, the weights less the trace in float32, so
+    the update applies the gradient it holds. The run's own path, its loader, plan and marked rows,
+    takes the trainer's own update on one device, to the bit: the same program on the same values."""
+    drawn = (lambda seed: batch) if batches is None else batches
+    stepped, step, trainer = trainer_update(obj, drawn(0), run_key, optax.sgd(1.0, momentum=0.0))
+    weights = moved_weights(variables)
+
+    def draw(seed):
+        return (*weights(seed), drawn(seed))
+
+    def trained(values, rows):
+        state = stepped(values, rows)
+        trace = jax.tree.map(np.asarray, optax.tree_utils.tree_get(state.opt_state, "trace"))
+        rule = jax.tree.map(lambda before, gradient: (np.asarray(before) - gradient).astype(np.float32),
+                            values["params"], trace)
+        assert_tree_equal(jax.tree.map(np.asarray, state.variables["params"]), rule)
+        return trace
+
+    gradient = as_a_step(trainer, variables, drawn(0),
+                         lambda values, rows: objective_gradient(obj, values, rows, step))
+    assert_as_exact(trained, gradient, draw, "trainer update", seeds=seeds,
+                    truth_fn=float64_gradient(twin, step))
+    taken, _, _ = trainer_update(obj, batch, run_key, optax.sgd(0.001))
     solo = Trainer(obj, optax.sgd(0.001), key=run_key)
     solo.device_mesh = MeshSpec().build(jax.devices()[:1])
-    assert_tree_equal(solo.fit(data, steps=1, log_every=1).variables["params"], expected)
+    assert_tree_equal(solo.fit(data, steps=1, log_every=1).variables["params"],
+                      jax.tree.map(np.asarray, taken(variables).variables["params"]))
 
 
 def assert_tree_equal(actual, expected):
@@ -267,10 +321,9 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
     run_key = jax.random.key(int(reference["run_seed"]))
     data = dataset(batch)
     variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
-    # The objective's update is compiled as one program, as the trainer's is: XLA:CPU's compiled
-    # gradient of this model sits 1.0 to 5.2 times further from float64 than the same ops run one by
-    # one (measured per leaf, 2026-10-21), a gap of the compiler's and not of the trainer.
-    assert_updates_as_the_objective(obj, batch, data, run_key, variables)
+    wide = objective(Pretrained.load(FIXTURE, dtype="float64", attention_impl="xla", max_seq_len=32))
+    assert_updates_as_the_objective(obj, wide, batch, data, run_key, variables, UPDATE_SEEDS["text"],
+                                    batches=varied(batch, UPDATE_ROWS))
     trainer = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=Checkpoints(str(tmp_path / "run")))
     updated = trainer.fit(data, steps=1, checkpoint_every=1, log_every=1)
     # Google's dense text-only model: transformers' DiffusionGemmaForBlockDiffusion
@@ -394,7 +447,10 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     stream = grain.MapDataset.source([batch]).repeat().to_iter_dataset()
     data = Loader(train=lambda partition: iter(stream), val=None, records=rows, batch=rows)
     run_key = jax.random.key(2)
-    assert_updates_as_the_objective(obj, batch, data, run_key, variables)
+    wide = Pretrained.load(FIXTURE.parent / "diffusion-gemma-workflow", dtype="float64", attention_impl="xla",
+                           max_seq_len=32)
+    twin = BlockDiffusionObjective(wide.model, prompt_length=8, variables=wide.variables)
+    assert_updates_as_the_objective(obj, twin, batch, data, run_key, variables, UPDATE_SEEDS["image"])
     checkpoints = Checkpoints(str(tmp_path / "run"))
     updated = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=checkpoints).fit(
         data, steps=1, checkpoint_every=1, log_every=1)

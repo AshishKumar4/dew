@@ -122,19 +122,20 @@ def test_the_fit_ladder_tiles_the_head_fused_then_unfused_before_it_recomputes_m
         return LMObjective(model, seq_len=SEQ)
 
     climbing = objective()
-    rungs = [rung_record(climbing, xla_defaults=False)]
+    rungs = [rung_record(climbing, xla_defaults=False, narrow=True)]
     while len(rungs) < 5 and recompute_more(climbing):
-        rungs.append(rung_record(climbing, xla_defaults=False))
+        rungs.append(rung_record(climbing, xla_defaults=False, narrow=True))
     tile = list(chunked_tile())
     assert [(rung["head_tile"], rung["head_fused"], rung["remat"]) for rung in rungs] == [
         (None, False, None), (tile, True, None), (tile, False, None), (None, False, "minimal"),
         (tile, True, "minimal")]
     resumed = objective()
     climb_to(resumed, rungs[2])
-    assert rung_record(resumed, xla_defaults=False) == rungs[2]
+    assert rung_record(resumed, xla_defaults=False, narrow=True) == rungs[2]
     # A head put back whole, as a new shape starts from the run's own rung, tiles fused again.
     resumed.restore_head(None, fused=False)
-    assert resumed.tile_head() is not None and rung_record(resumed, xla_defaults=False)["head_fused"]
+    assert resumed.tile_head() is not None
+    assert rung_record(resumed, xla_defaults=False, narrow=True)["head_fused"]
 
 
 def test_a_microbatch_is_every_splitth_row():
@@ -464,7 +465,7 @@ def test_a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further
         trainer.compile(state, BATCH, lambda steps: pytest.fail("the plan at its first split was timed"))
     assert (trainer.plan["split"], trainer.plan["remat"]) == (4, half)
     assert trainer.objective.model.remat == REMAT_POLICIES[half]
-    assert_searched(asked(trainer), (4, half), 2, (1, "minimal_with_conv"), half=half)
+    assert_searched(asked(trainer), (4, half), 2, (1, "minimal_with_scan_and_conv"), half=half)
 
 
 def test_a_plan_at_no_recomputation_times_its_frontier_past_the_half_rung(monkeypatch):
@@ -476,7 +477,8 @@ def test_a_plan_at_no_recomputation_times_its_frontier_past_the_half_rung(monkey
     state, _, _ = trainer.place()
     trainer.compile(state, BATCH, lambda steps: pytest.fail("a single plan was timed"))
     assert (trainer.plan["split"], trainer.plan["remat"]) == (4, None)
-    assert_searched(asked(trainer), (4, None), 2, (1, "minimal_with_conv"), half="all_but_delta_memory")
+    assert_searched(asked(trainer), (4, None), 2, (1, "minimal_with_scan_and_conv"),
+                    half="all_but_delta_memory")
 
 
 def test_a_decoder_without_a_half_rung_asks_its_splits_at_no_recomputation(monkeypatch):

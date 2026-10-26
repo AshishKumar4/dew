@@ -265,13 +265,15 @@ class DiffusionObjective(Objective[Ratio]):
 
     def data(self, tokenizer=None) -> ObjectiveData:
         """Each batch's captions tokenized for the conditions, on the host, as
-        the step reads them, and the fields other conditions read (a clip's
-        sound) encoded; without text conditions, captions are dropped."""
-        from dew.data.images import EncodeCaptions, EncodeFields
+        the step reads them, and kept beside as host strings, which a metric
+        or a reward reads with its own tokenizer (`dew.eval.images.CLIPScore`),
+        under `CAPTIONS`; and the fields other conditions read (a clip's sound)
+        encoded."""
+        from dew.data.images import CAPTIONS, EncodeCaptions, EncodeFields
         from dew.data.pipeline import ObjectiveData
 
         conditions = self.inputs.conditions.values()
-        steps = (EncodeCaptions(self.inputs.tokenize if conditions else None),
+        steps = (EncodeCaptions(self.inputs.tokenize if conditions else None, keep=CAPTIONS),
                  *((EncodeFields(self.inputs.encode_fields),)
                    if any(not condition.encoder.reads_captions for condition in conditions) else ()))
         return ObjectiveData(train_batch=steps, evaluate_batch=steps)

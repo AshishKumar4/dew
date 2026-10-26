@@ -26,6 +26,7 @@ from dew.artifacts import TokenScores
 from dew.inference.tasks import BlockGeneration, BlockSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import ModelInputs, real_places, shifted_span, token_layout
+from dew.nn.precision import at_least_fp32, weighted_total
 from dew.nn.protocols import BlockDenoiser, CacheCapacity, Lacks, LayerScalars
 from dew.nn.sharding import LOGITS, constrain
 from dew.nn.visibility import same_group
@@ -113,9 +114,8 @@ def _row_losses(losses: jax.Array, mask: jax.Array, batch: Batch) -> Ratio:
     The mass is the row count, so accumulation weighs rows equally however
     many tokens each one counted.
     """
-    mass = mask.sum(axis=-1)
-    return Objective.row_mean(jnp.sum(jnp.where(mask != 0, losses, 0) * mask, axis=-1) / jnp.maximum(mass, 1),
-                              batch)
+    total, mass = weighted_total(losses, mask.astype(losses.dtype), axis=-1)
+    return Objective.row_mean(total / jnp.maximum(mass, 1), batch)
 
 
 class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
@@ -220,16 +220,6 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                              process=self._process(), pad_token_id=self.pad_token_id,
                              tokenizer=recorded_tokenizer(self.processor),
                              processor=recorded_processor(self.processor))
-
-    def build_task(self, variables: Variables, *,
-                   processor: Processor | None | Omitted = OMITTED) -> BlockGeneration:
-        """Return the model over `variables` as a `BlockGeneration` task.
-
-        The sampler keeps the published defaults, and the caller sets the
-        tokenizer's EOS ids.
-        """
-        return BlockGeneration.from_settings(self.model, variables, self.task_settings(),
-                                             self.processor if processor is OMITTED else processor)
 
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
@@ -441,7 +431,9 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
                 attention_pairwise_mask=decoder_mask, attention_key_positions=decoder_keys,
                 states=True)
 
-        zero_logits = jnp.zeros((*response.shape, self.model.vocab_size), jnp.float32)
+        # The zero signal in the dtype the model's states compute in, at least fp32, so a float64 model's
+        # first pass mixes its table in float64 (`soft_embeddings`), as its second does.
+        zero_logits = jnp.zeros((*response.shape, self.model.vocab_size), at_least_fp32(encoder_states.dtype))
         # The conditioning pass carries no gradient, so its states stop it
         # before the head and nothing of that pass is kept for the backward.
         first = jax.lax.stop_gradient(constrain(model_logits(

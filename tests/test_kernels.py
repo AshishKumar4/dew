@@ -27,7 +27,7 @@ from dew.nn.attention import NormalAttention, scaled_dot_product_attention, weig
 from dew.nn.kernels import bf16_dot_runs
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import attention as template
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import FP32_SUMS, at_least_fp32
 
 pytestmark = pytest.mark.kernel
 
@@ -667,7 +667,8 @@ def test_a_query_reading_another_sequences_documents_reads_its_own_documents_key
 def test_queries_reading_another_sequences_documents_on_the_tpu_kernels_are_as_exact_as_xla():
     """Packed queries over a context packed by its own documents (`key_segment_ids`) on 'tpu', which
     interprets off a TPU: the output and the three gradients within tests/reference_error.py's rule of
-    xla's against float64, a document of the queries' the context lacks among them."""
+    xla's against float64, a document of the queries' the context lacks among them; xla's sums are
+    the TPU's, fp32 (`FP32_SUMS`), and a CPU runs them on its reference path."""
     queries = jnp.asarray([[1] * 40 + [2] * 30 + [3] * 30 + [0] * 28])
     keys = jnp.asarray([[1] * 50 + [3] * 50 + [0] * 28])
     arrays = [jax.random.normal(jax.random.key(seed), (1, 128, 2, 128), jnp.float32) for seed in range(3)]
@@ -681,7 +682,9 @@ def test_queries_reading_another_sequences_documents_on_the_tpu_kernels_are_as_e
         out, pull = jax.vjp(attend, *arrays)
         return (out, *pull(cotangent.astype(out.dtype)))
 
-    found, reference = (derivatives(name, *arrays) for name in ("tpu", "xla"))
+    found = derivatives("tpu", *arrays)
+    with jax.default_matmul_precision(FP32_SUMS):
+        reference = derivatives("xla", *arrays)
     with jax.enable_x64(new_val=True):
         truth = derivatives("reference", *(jnp.asarray(x, jnp.float64) for x in arrays))
     for name, got, want, exact in zip(("out", "dq", "dk", "dv"), found, reference, truth, strict=True):
@@ -771,12 +774,12 @@ def test_single_query_cudnn_decode_matches_float64_attention_and_gradients(witho
             assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
 
 
-@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the blocked sum is XLA:CPU's")
-def test_cpu_fp32_attention_rounds_closer_to_float64_in_blocks():
+@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the float64 sum is a CPU's")
+def test_cpu_fp32_attention_rounds_closer_to_float64_than_jax_nn():
     """Over 2048 keys of cross-attention-like inputs, Dew's fp32 attention on
-    XLA:CPU is at most three quarters of jax.nn's xla distance from float64
-    (measured 0.55 of it; torch's SDPA sits between, docs/performance.md),
-    and the blocked product's gradients are the plain product's."""
+    XLA:CPU, its products summed in float64 (`dew.nn.precision.accumulated`),
+    is at most three quarters of jax.nn's xla distance from float64 (torch's
+    SDPA sits between, docs/performance.md)."""
     rng = np.random.default_rng(0)
     query, key = (rng.normal(size=(1, length, 2, 128)).astype(np.float32) * 0.6 for length in (128, 2048))
     value = rng.normal(size=(1, 2048, 2, 128)).astype(np.float32)
@@ -789,22 +792,13 @@ def test_cpu_fp32_attention_rounds_closer_to_float64_in_blocks():
     mine, theirs = distance(dew, truth), distance(plain, truth)
     assert mine <= 0.75 * theirs, (mine, theirs)
 
-    weights = jax.nn.softmax(jnp.asarray(logits, jnp.float32))
-    blocked = jax.grad(lambda w, v: jnp.sum(weighted_values('...hqk,...khd->...qhd', w, v) ** 2), (0, 1))
-    out = weighted_values('...hqk,...khd->...qhd', weights, value)
-    cotangent = 2 * out
-    want = (jnp.einsum('...qhd,...khd->...hqk', cotangent, value),
-            jnp.einsum('...hqk,...qhd->...khd', weights, cotangent))
-    for got, expected in zip(blocked(weights, value), want, strict=True):
-        np.testing.assert_array_equal(got, expected)
 
-
-@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the blocked sum is XLA:CPU's")
-def test_cpu_fp32_attention_over_keys_summed_in_blocks_takes_forward_mode():
-    """fp32 reference attention over 300 keys, whose values XLA:CPU sums in blocks (`weighted_values`),
-    as a consistency model's JVP runs it under `forward_mode_attention` (sCM, rCM): its value, tangent and
-    three gradients are within tests/reference_error.py's rule of jax.nn.dot_product_attention's against
-    float64. The blocked product's custom_vjp refused forward mode."""
+@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the float64 sum is a CPU's")
+def test_cpu_fp32_attention_summed_in_float64_takes_forward_mode():
+    """fp32 reference attention over 300 keys, whose products a CPU sums in float64
+    (`dew.nn.precision.accumulated`), as a consistency model's JVP runs it under
+    `forward_mode_attention` (sCM, rCM): its value, tangent and three gradients are within
+    tests/reference_error.py's rule of jax.nn.dot_product_attention's against float64."""
     from dew.nn.attention import forward_mode_attention
 
     arrays = [jax.random.normal(jax.random.key(seed), (1, 300, 2, 16), jnp.float32) for seed in range(7)]
@@ -830,14 +824,14 @@ def test_cpu_fp32_attention_over_keys_summed_in_blocks_takes_forward_mode():
         assert_as_exact_as_the_reference(np.asarray(got), np.asarray(want), np.asarray(exact), name)
 
 
-@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the blocked sum is XLA:CPU's")
-def test_a_layer_that_builds_its_mask_sums_its_cpu_fp32_values_in_blocks_too():
+@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the float64 sum is a CPU's")
+def test_a_layer_that_builds_its_mask_sums_its_cpu_fp32_values_in_float64_too():
     """A layer whose rows are padded on the left builds its mask and runs the
-    kernel a materialized mask takes (`kernel_for_materialized_mask`). Over
-    more than 256 fp32 keys on XLA:CPU that is the reference path's blocked
-    sum, the route `resolve_implementation` takes for an unmasked call
-    (`_takes_reference`): the padded rows' real logits under 'auto' are the
-    'reference' kernel's, bit for bit."""
+    kernel a materialized mask takes (`kernel_for_materialized_mask`). On a
+    CPU that is the reference path, whose products sum in float64, the route
+    `resolve_implementation` takes for an unmasked call (`_takes_reference`):
+    the padded rows' real logits under 'auto' are the 'reference' kernel's,
+    bit for bit."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
 
     def model(implementation):
@@ -858,30 +852,33 @@ def test_a_layer_that_builds_its_mask_sums_its_cpu_fp32_values_in_blocks_too():
 def test_the_reference_path_is_flax_attention_op_for_op(dtype, forced, dropout_rate):
     """Without sinks the reference path (`reference_attention`) is flax's
     `dot_product_attention` handed the key heads repeated over their group and
-    Dew's value product (`weighted_values`), bitwise: in each compute dtype,
+    its probability product (`weighted_values`), bitwise: in each compute dtype,
     the softmax forced to fp32 or not, an fp32 bias wider than half-precision
     logits and a causal mask. Its probability draw is Dew's own (row 1521: the
     keep bits every route draws from one rng, `template.dropout_keep`, so a
     route never changes which weights drop) and its multiplier Dew's (row 1533:
     1 / (1 - rate) rounded once in at least fp32), applied where flax applies
     its own: flax's weights (`dot_product_attention_weights`) under Dew's keep
-    mask and multiplier, then the value product."""
+    mask and multiplier, then the value product. Both sum their fp32 products
+    as XLA does (`FP32_SUMS`), the reference path's own float64 sums on a CPU
+    being the policy's (tests/test_cpu_accumulation.py)."""
     keys = jax.random.split(jax.random.key(0), 5)
     query = jax.random.normal(keys[0], (2, 6, 4, 8), dtype)
     key, value = (jax.random.normal(drawn, (2, 6, 2, 8), dtype) for drawn in keys[1:3])
     bias = jax.random.normal(keys[3], (2, 4, 6, 6), jnp.float32)
     drop = {"dropout_rate": dropout_rate, "dropout_rng": keys[4], "deterministic": not dropout_rate}
-    ours = scaled_dot_product_attention(query, key, value, implementation="reference", causal=True, bias=bias,
-                                        force_fp32_for_softmax=forced, **drop)
-    weights = nn.dot_product_attention_weights(
-        query, jnp.repeat(key, 2, axis=2), bias=bias, mask=jnp.tril(jnp.ones((6, 6), bool))[None, None],
-        force_fp32_for_softmax=forced, einsum=jnp.einsum)
-    if dropout_rate:
-        wide = at_least_fp32(dtype)
-        keep = template.dropout_keep(template.dropout_seed(keys[4]), dropout_rate, weights.shape)
-        scale = jnp.asarray(1.0 / (1.0 - dropout_rate), wide)
-        weights = (weights.astype(wide) * jnp.where(keep, scale, 0)).astype(dtype)
-    theirs = weighted_values('...hqk,...khd->...qhd', weights, jnp.repeat(value, 2, axis=2))
+    with jax.default_matmul_precision(FP32_SUMS):
+        ours = scaled_dot_product_attention(query, key, value, implementation="reference", causal=True,
+                                            bias=bias, force_fp32_for_softmax=forced, **drop)
+        weights = nn.dot_product_attention_weights(
+            query, jnp.repeat(key, 2, axis=2), bias=bias, mask=jnp.tril(jnp.ones((6, 6), bool))[None, None],
+            force_fp32_for_softmax=forced, einsum=jnp.einsum)
+        if dropout_rate:
+            wide = at_least_fp32(dtype)
+            keep = template.dropout_keep(template.dropout_seed(keys[4]), dropout_rate, weights.shape)
+            scale = jnp.asarray(1.0 / (1.0 - dropout_rate), wide)
+            weights = (weights.astype(wide) * jnp.where(keep, scale, 0)).astype(dtype)
+        theirs = weighted_values('...hqk,...khd->...qhd', weights, jnp.repeat(value, 2, axis=2))
     np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 
@@ -1053,6 +1050,26 @@ def test_narrow_heads_take_the_kernel_their_target_measured_fastest(generation_n
     assert route.preferred == narrow
     # The row qualifies the preferred kernel: only host facts (backend, wheel) may turn it down here.
     assert "row" not in refused
+
+
+@pytest.mark.parametrize("head_dim, kept", [(8, False), (16, True)])
+def test_heads_narrower_than_the_triton_kernel_computes_take_the_next_kernel(head_dim, kept):
+    """A causal bf16 call of narrow heads prefers tokamax's Triton kernel where its GPU's row names it
+    for them, an L4's: 8-wide heads, which that kernel computes wrong (`TRITON_NARROWEST`), are refused
+    by their width and the next kernel takes the call; 16-wide heads keep it."""
+    from dew.nn.attention import attention_case, resolve_implementation
+    from dew.nn.attention_kernels import ATTENTION, kernel_refusals
+    from dew.nn.kernels import generation
+
+    query = jnp.zeros((2, 128, 4, head_dim), jnp.bfloat16)
+    with generation.assumed("sm89"), generation.routes() as found:
+        resolve_implementation("auto", query, query, causal=True)
+        refused = {refusal.code for refusal in kernel_refusals(
+            ATTENTION, "triton", attention_case(query, query, causal=True))}
+    (route,) = [route for route in found if route.choice == "attention"]
+    assert route.preferred == "triton"
+    assert ("head_dim" not in refused) == kept
+    assert (route.kernel == "triton") == kept
 
 
 @pytest.mark.parametrize("call, refused", [

@@ -55,6 +55,41 @@ def precision() -> ModelConfig:
     return dataclasses.replace(model, fields={**model.fields, "dtype": "float32", "attention_impl": "xla"})
 
 
+def test_a_shape_only_pipeline_load_retains_geometry_without_eager_native_copies(pipelines, tmp_path,
+                                                                               monkeypatch):
+    """A shape-only load preserves every component's parameter geometry and storage dtype.
+    Checkpoint validation still requires valid safetensors files. A delegating NumPy allocation
+    recorder measures host buffers, not implementation calls: deferred linear leaves allocate fewer
+    native-layout bytes than an eager load of the same already-warmed pipeline."""
+    from dew.interop import Pretrained
+
+    original = pipelines / "sd3" / "pipeline"
+    expected = Pretrained.load(original, dtype="float32", attention_impl="xla", on_host=True)
+    selected = tmp_path / "source"
+    shutil.copytree(original, selected)
+    allocated = []
+    allocate = np.empty
+
+    def recording(*args, **kwargs):
+        array = allocate(*args, **kwargs)
+        allocated.append(array.nbytes)
+        return array
+
+    with monkeypatch.context() as patch:
+        patch.setattr(np, "empty", recording)
+        Pretrained.load(selected, dtype="float32", attention_impl="xla", on_host=True)
+        eager_bytes = sum(allocated)
+        allocated.clear()
+        loaded = Pretrained.load(selected, dtype="float32", attention_impl="xla", weights=False)
+        deferred_bytes = sum(allocated)
+    assert eager_bytes > 0 and deferred_bytes < eager_bytes
+    shapes = jax.tree.leaves(loaded.variables)
+    assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in shapes)
+    assert jax.tree.structure(loaded.variables) == jax.tree.structure(expected.variables)
+    for actual, wanted in zip(shapes, jax.tree.leaves(expected.variables), strict=True):
+        assert actual.shape == wanted.shape and actual.dtype == wanted.dtype
+
+
 def value(objective, params, batch) -> float:
     loss, _ = objective.loss(params, batch, Step(jnp.asarray(0), jax.random.PRNGKey(5), None))
     return float(loss.total / loss.mass)

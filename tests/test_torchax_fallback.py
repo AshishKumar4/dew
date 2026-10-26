@@ -1,4 +1,5 @@
-"""Tier 3: `Pretrained.load(..., fallback="torchax")` over transformers' own forward.
+"""Tier 3: transformers' own forward, run by torchax: `Pretrained.load` of an unregistered causal LM
+no registered convention computes, and `Pretrained.load(..., fallback="torchax")` of any.
 
 The offline cases build a tiny random GPT-NeoX, an architecture Dew has no
 family for and whose rotary `inv_freq` is a buffer, save it the way
@@ -24,15 +25,23 @@ import pytest
 import torch
 import transformers
 from jax.sharding import PartitionSpec as P
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations
+from reference_error import (
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    equations,
+    torch_with_gradients,
+    with_gradients,
+)
 
 from dew.data.dataset import Loader
 from dew.interop import Pretrained
-from dew.interop.torchax_fallback import TorchLayout
+from dew.interop.torchax_fallback import TorchLayout, TransformersTierWarning
+from dew.nn.inputs import coordinates
+from dew.nn.protocols import Lacks
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec, Trainer
-from tools.diffusers_wan_reference import float64
+from tools.torch_precision import float64
 
 # CI runs this file in tasks of its own: torchax renames torch's privateuse1 backend process-wide.
 pytestmark = pytest.mark.torchax
@@ -46,8 +55,9 @@ LOSS = 1e-6
 GRADIENT = 1.7e-6
 """Twice the worst leaf's max |Δgrad| over its max |grad| measured on CPU,
 8.3e-7 at the first layer's post-attention norm bias."""
-HEAD_SEEDS, BF16_SEEDS = 256, 256
-"""Each site's check-1 seeds, sized by `seeds_for` on 2026-10-20 on armada."""
+HEAD_SEEDS, BF16_SEEDS = 512, 512
+"""Each site's check-1 seeds, sized by `seeds_for` on armada: the most any of its cases took (the
+softcap head's and GPT-NeoX's)."""
 
 
 @pytest.fixture(scope="module")
@@ -86,25 +96,31 @@ def objective_loss(objective, variables, tokens, *, scalar: bool = False):
 
 def token_draws(tokens):
     """Check 1's draw of token rows: `tokens` (the fixture's) at seed 0, else rows of their shape
-    drawn uniformly from the vocabulary."""
+    drawn uniformly from the vocabulary; and the loss's cotangent, one, a step's."""
     def draw(seed):
         if seed == 0:
-            return (tokens,)
-        return (np.random.default_rng(seed).integers(0, TINY["vocab_size"], tokens.shape).astype(np.int32),)
+            return tokens, np.float32(1)
+        rows = np.random.default_rng(seed).integers(0, TINY["vocab_size"], tokens.shape).astype(np.int32)
+        return rows, np.float32(1)
 
     return draw
 
 
 def loss_and_gradients(loaded, model, params):
     """A draw's LM loss of the fallback-loaded model and its gradient for each parameter `model`
-    (its torch twin) names, the loss as `[1]`: the function check 1 holds against torch's step."""
+    (its torch twin) names under the draw's cotangent (`with_gradients`), the loss as `[1]`: the
+    function check 1 holds against torch's step."""
     objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
-    step = jax.jit(jax.value_and_grad(lambda params, ids: objective_loss(
-        objective, {**loaded.variables, "params": params}, ids, scalar=True)))
+
+    @jax.jit
+    def step(params, ids, cotangent):
+        return with_gradients(lambda params: objective_loss(
+            objective, {**loaded.variables, "params": params}, ids, scalar=True))(params, cotangent)
+
     names = [name for name, _ in model.named_parameters()]
 
-    def dew_fn(ids):
-        value, grads = step(params, ids)
+    def dew_fn(ids, cotangent):
+        value, grads = step(params, ids, cotangent)
         return {"loss": value[None]} | {name: grads[name] for name in names}
 
     return dew_fn
@@ -242,16 +258,23 @@ def head_model(head):
     return model
 
 
-def torch_step(model, tokens, stored=torch.float32) -> dict[str, np.ndarray]:
-    """transformers' own loss over `tokens` and torch autograd's gradient of
-    every parameter, rounded to the `stored` dtype a parameter is kept in,
-    as float64 arrays."""
+def torch_step(model, tokens, cotangent, stored=torch.float32) -> dict[str, np.ndarray]:
+    """transformers' own loss over `tokens` and the gradient of every parameter under the draw's
+    `cotangent` (`torch_with_gradients`), rounded to the `stored` dtype a parameter is kept in, as
+    float64 arrays. Each parameter enters at float32 (float64 in a float64 model) and is cast to its
+    own dtype inside, so a bf16 model's gradients are its own, exactly widened."""
     ids = torch.from_numpy(tokens.astype(np.int64))
-    model.zero_grad()
-    loss = model(ids, labels=ids).loss
-    loss.backward()
-    return {"loss": np.asarray([loss.item()])} | {
-        name: parameter.grad.to(stored).double().numpy() for name, parameter in model.named_parameters()}
+    entry = torch.float64 if next(model.parameters()).dtype == torch.float64 else torch.float32
+    own = {name: parameter.dtype for name, parameter in model.named_parameters()}
+    weights = {name: parameter.detach().to(entry).numpy() for name, parameter in model.named_parameters()}
+
+    def loss(params):
+        typed = {name: value.to(own[name]) for name, value in params.items()}
+        return torch.func.functional_call(model, typed, (ids,), {"labels": ids}).loss
+
+    value, gradients = torch_with_gradients(loss)(weights, cotangent)
+    return {"loss": np.asarray([value], np.float64)} | {
+        name: torch.from_numpy(gradient).to(stored).double().numpy() for name, gradient in gradients.items()}
 
 
 @pytest.mark.parametrize("head", HEADS)
@@ -276,8 +299,8 @@ def test_a_head_trains_as_transformers_does_by_what_it_is(head, tokens, tmp_path
 
     reference_model = copy.deepcopy(model).float()
 
-    def reference_fn(ids):
-        return torch_step(reference_model, ids, getattr(torch, stored))
+    def reference_fn(ids, cotangent):
+        return torch_step(reference_model, ids, cotangent, getattr(torch, stored))
 
     # Truth: the same weights in a model built in float64, its float32 pins
     # (the loss's logits.float(), an RMS norm's upcast) widened and its
@@ -287,15 +310,265 @@ def test_a_head_trains_as_transformers_does_by_what_it_is(head, tokens, tmp_path
                                                                    attn_implementation="eager").eval()
         wide_model.load_state_dict(model.state_dict())
 
-    def truth_fn(ids):
+    def truth_fn(ids, cotangent):
         with float64():
-            return torch_step(wide_model, ids, torch.float64)
+            return torch_step(wide_model, ids, cotangent, torch.float64)
 
-    dew = dew_fn(tokens)
+    dew = dew_fn(tokens, np.float32(1))
     assert_as_exact(dew_fn, reference_fn, token_draws(tokens), f"torchax {head} LM step", seeds=HEAD_SEEDS,
                     truth_fn=truth_fn)
     if head in ("zero bias", "bias"):
         assert np.abs(dew["lm_head.bias"]).max() > 0
+
+
+COHERE = {**TINY, "num_key_value_heads": 2}
+"""A tiny Cohere: parallel attention and feed-forward under one bias-free layer norm, rotary pairs
+interleaved and a scaled head, a type Dew registers no family for and no registered family's
+convention computes."""
+UNREGISTERED_SEEDS = 256
+"""The unregistered type's check-1 seeds, sized by `seeds_for` on armada."""
+
+
+def saved_cohere(directory):
+    """A tiny Cohere saved to `directory`, and the torch model it holds."""
+    torch.manual_seed(0)
+    model = transformers.CohereForCausalLM(transformers.CohereConfig(**COHERE)).eval()
+    model.save_pretrained(directory)
+    return model
+
+
+def test_an_unregistered_causal_lm_loads_as_transformers_own_forward(tokens, tmp_path):
+    """A causal model_type Dew registers no family for, which no registered family's convention
+    computes, loads without `fallback` as tier 3, warning so (`TransformersTierWarning`), its every
+    layer's attention computed by Dew's, as its layers all ask transformers' attention interface:
+    its LM loss and the gradient of every parameter are as exact as transformers' own over the same
+    stored weights, measured from transformers in float64 (check 1)."""
+    model = saved_cohere(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32")
+    assert loaded.model.graph.attention_impl == "auto"
+
+    dew_fn = loss_and_gradients(loaded, model, {name: jnp.asarray(leaf)
+                                                for name, leaf in loaded.variables["params"].items()})
+    reference = copy.deepcopy(model)
+    with float64():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager").eval()
+        wide.load_state_dict(model.state_dict())
+
+    def truth_fn(ids, cotangent):
+        with float64():
+            return torch_step(wide, ids, cotangent, torch.float64)
+
+    assert_as_exact(dew_fn, lambda ids, cotangent: torch_step(reference, ids, cotangent), token_draws(tokens),
+                    "tier 3 cohere LM step", seeds=UNREGISTERED_SEEDS, truth_fn=truth_fn)
+
+
+PACKED_SEEDS = {"cohere": 256, "cohere2": 256}
+"""Each model's packed rows' check-1 seeds, sized by `seeds_for` on armada."""
+
+PACKED_MODELS = {
+    "cohere": lambda: transformers.CohereForCausalLM(transformers.CohereConfig(**COHERE)),
+    "cohere2": lambda: transformers.Cohere2ForCausalLM(transformers.Cohere2Config(
+        **COHERE, sliding_window=4, layer_types=["sliding_attention", "full_attention"])),
+}
+"""Unregistered types tier 3 runs on Dew's attention: Cohere's every layer full, Cohere 2's first a
+window of 4 keys, which counts each document's real tokens."""
+
+
+def packed_rows(seed):
+    """Two rows of SEQ + 1 token ids: a drawn run of padding first, numbered with the first document but
+    no real token, then two documents cut at a drawn place, the second holding a padding slot among
+    its tokens; their documents, validity, and the loss's cotangent, one."""
+    rng = np.random.default_rng([0xBAC, seed])
+    ids = rng.integers(0, TINY["vocab_size"], (2, SEQ + 1)).astype(np.int32)
+    places = np.arange(SEQ + 1)[None, :]
+    lead = rng.integers(0, 3, (2, 1))
+    cuts = rng.integers(lead + 3, SEQ - 5)
+    gaps = rng.integers(cuts + 2, SEQ - 1)
+    segments = np.where(places < cuts, 1, 2).astype(np.int32)
+    valid = (places >= lead) & (places != gaps)
+    return ids, segments, valid, np.float32(1)
+
+
+def documents_alone(model, ids, segments, valid, cotangent, stored=torch.float32):
+    """transformers' run of each document's real tokens on its own: the mean next-token loss over the
+    targets `LMObjective` scores in the rows, a real token following the real one beside it in the same
+    document, and each parameter's gradient under the cotangent (`torch_with_gradients`)."""
+    entry = torch.float64 if next(model.parameters()).dtype == torch.float64 else torch.float32
+    weights = {name: parameter.detach().to(entry).numpy() for name, parameter in model.named_parameters()}
+    runs = []
+    for row in range(ids.shape[0]):
+        for document in np.unique(segments[row][valid[row]]):
+            at = np.flatnonzero((segments[row] == document) & valid[row])
+            run = torch.from_numpy(ids[row, at].astype(np.int64))[None]
+            runs.append((run, torch.from_numpy(np.flatnonzero(np.diff(at) == 1))))
+
+    def loss(params):
+        total = sum(torch.nn.functional.cross_entropy(
+            torch.func.functional_call(model, params, (run,)).logits[0, :-1][scored], run[0, 1:][scored],
+            reduction="sum") for run, scored in runs)
+        return total / sum(len(scored) for _, scored in runs)
+
+    value, gradients = torch_with_gradients(loss)(weights, cotangent)
+    return {"loss": np.asarray([value], np.float64)} | {
+        name: torch.from_numpy(gradient).to(stored).double().numpy() for name, gradient in gradients.items()}
+
+
+@pytest.mark.parametrize("family", sorted(PACKED_MODELS))
+def test_a_packed_row_trains_each_document_as_transformers_runs_it_alone(family, tmp_path):
+    """On Dew's attention a tier-3 model trains on packed rows with padding: each document attends
+    within its real tokens, a window counting them alone, and rotates from its own first, so
+    `LMObjective`'s loss over the rows and every parameter's gradient are as exact as transformers'
+    run of each document's real tokens on its own, measured from that run in float64 (check 1)."""
+    torch.manual_seed(0)
+    model = PACKED_MODELS[family]().eval()
+    model.save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32")
+    assert loaded.model.graph.attention_impl == "auto"
+    objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
+    names = [name for name, _ in model.named_parameters()]
+
+    @jax.jit
+    def stepped(params, ids, segments, valid, cotangent):
+        def loss(params):
+            laid = coordinates(segments=segments, valid=valid)
+            stats, _ = objective.loss({**loaded.variables, "params": params},
+                                      {"text": ids, "text_coordinates": laid},
+                                      Step(step=jnp.int32(0), key=jax.random.key(1), ema=None))
+            return objective.reduce_loss(stats)[0]
+        value, gradients = with_gradients(loss)(params, cotangent)
+        return {"loss": value[None]} | {name: gradients[name] for name in names}
+
+    def ours(ids, segments, valid, cotangent):
+        return stepped(loaded.variables["params"], jnp.asarray(ids), jnp.asarray(segments),
+                       jnp.asarray(valid), cotangent)
+
+    reference = copy.deepcopy(model)
+    with float64():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager")
+        wide.load_state_dict(model.state_dict())
+
+    def truth(ids, segments, valid, cotangent):
+        with float64():
+            return documents_alone(wide, ids, segments, valid, cotangent, torch.float64)
+
+    def theirs(ids, segments, valid, cotangent):
+        return documents_alone(reference, ids, segments, valid, cotangent)
+
+    assert_as_exact(ours, theirs, packed_rows, f"tier 3 {family} packed rows", seeds=PACKED_SEEDS[family],
+                    truth_fn=truth)
+
+
+def test_a_training_call_that_drops_attention_needs_a_dropout_rng(tmp_path):
+    """Dew's attention draws a training call's attention dropout from the call's 'dropout' rng, so one
+    given none is refused rather than run without the dropout the model asks for."""
+    torch.manual_seed(0)
+    config = transformers.CohereConfig(**COHERE, attention_dropout=0.1)
+    transformers.CohereForCausalLM(config).save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32")
+    ids = jnp.asarray(packed_rows(0)[0])
+    with pytest.raises(ValueError):
+        loaded.model.apply(loaded.variables, ids, train=True, method="logits")
+    trained = loaded.model.apply(loaded.variables, ids, train=True, method="logits",
+                                 rngs={"dropout": jax.random.key(0)})
+    assert np.all(np.isfinite(np.asarray(trained)))
+
+
+DROPPING_SEEDS = 8
+"""The dropping call's check-1 seeds, sized by `seeds_for` on armada."""
+
+
+def test_a_training_call_that_drops_attention_reads_each_documents_real_tokens(tmp_path):
+    """A training call that drops attention probabilities reads the keys an eval call does: over packed
+    rows with padding among their tokens, Cohere 2's window counts each document's real tokens.
+    Dropping one probability in a billion keeps every one in all but a billionth of draws, so the
+    training call's logits on the real tokens are as exact as transformers' eval of each document's
+    real tokens on its own, from its float64 run (check 1)."""
+    torch.manual_seed(0)
+    model = transformers.Cohere2ForCausalLM(transformers.Cohere2Config(
+        **COHERE, sliding_window=4, layer_types=["sliding_attention", "full_attention"],
+        attention_dropout=1e-9)).eval()
+    model.save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32")
+
+    @jax.jit
+    def trained(ids, segments, valid):
+        logits = loaded.model.apply(loaded.variables, ids, train=True, segment_ids=segments,
+                                    attention_mask=valid, method="logits",
+                                    rngs={"dropout": jax.random.key(5)})
+        return {"logits": jnp.where(valid[..., None], logits, 0)}
+
+    def ours(ids, segments, valid, _):
+        return trained(jnp.asarray(ids), jnp.asarray(segments), jnp.asarray(valid))
+
+    def alone(model, ids, segments, valid):
+        logits = np.zeros((*ids.shape, TINY["vocab_size"]))
+        with torch.no_grad():
+            for row in range(ids.shape[0]):
+                for document in np.unique(segments[row][valid[row]]):
+                    at = np.flatnonzero((segments[row] == document) & valid[row])
+                    run = torch.from_numpy(ids[row, at].astype(np.int64))[None]
+                    logits[row, at] = model(run).logits[0].double()
+        return {"logits": logits}
+
+    with float64():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager").eval()
+        wide.load_state_dict(model.state_dict())
+
+    def truth(ids, segments, valid, _):
+        with float64():
+            return alone(wide, ids, segments, valid)
+
+    assert_as_exact(ours, lambda ids, segments, valid, _: alone(model, ids, segments, valid), packed_rows,
+                    "tier 3 cohere2 dropping call", seeds=DROPPING_SEEDS, truth_fn=truth)
+
+
+def test_a_type_whose_attention_asks_no_interface_runs_its_own_and_reads_no_packing(tmp_path):
+    """OpenAI GPT's layers compute their attention in their own code, asking transformers' attention
+    interface nothing: tier 3 runs that attention as transformers does, so it names no Dew kernel
+    (`attention_impl`) and reads no packed rows (`Lacks`)."""
+    torch.manual_seed(0)
+    config = transformers.OpenAIGPTConfig(n_embd=64, n_layer=2, n_head=4, vocab_size=TINY["vocab_size"],
+                                          n_positions=64)
+    transformers.OpenAIGPTLMHeadModel(config).save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32")
+    assert loaded.model.graph.attention_impl is None
+    ids, segments, _, _ = packed_rows(0)
+    with pytest.raises(Lacks):
+        loaded.model.apply(loaded.variables, jnp.asarray(ids), segment_ids=jnp.asarray(segments),
+                           method="logits")
+    # Refused before the load warns of its tier.
+    with pytest.raises(ValueError):
+        Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+@pytest.mark.parametrize("route", ["tier 3", "fallback"])
+def test_a_load_without_weights_reads_none_and_states_their_shapes(route, tmp_path):
+    """Without its weights a tier-3 source is built from its config alone, its weight files never read
+    (here removed), and its variables state every leaf's shape and dtype as the load with weights
+    holds it: what a run resuming from its own checkpoint builds its state around. The explicit route
+    and the automatic one read it alike."""
+    import shutil
+
+    torch.manual_seed(0)
+    transformers.CohereForCausalLM(transformers.CohereConfig(**COHERE)).save_pretrained(tmp_path / "whole")
+    options = {"fallback": "torchax"} if route == "fallback" else {}
+    with pytest.warns(TransformersTierWarning):
+        whole = Pretrained.load(tmp_path / "whole", dtype="float32", **options)
+    shutil.copytree(tmp_path / "whole", tmp_path / "shapes")
+    for weights in (tmp_path / "shapes").glob("*.safetensors"):
+        weights.unlink()
+    with pytest.warns(TransformersTierWarning):
+        shapes = Pretrained.load(tmp_path / "shapes", dtype="float32", weights=False, **options)
+    assert type(shapes.model) is type(whole.model)
+    assert jax.tree.map(lambda leaf: (leaf.shape, leaf.dtype), shapes.variables) == jax.tree.map(
+        lambda leaf: (leaf.shape, jnp.dtype(leaf.dtype)), whole.variables)
+    assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(shapes.variables))
 
 
 @pytest.mark.parametrize("family", ["llama", "neox"])
@@ -323,17 +596,17 @@ def test_bf16_compute_gradients_are_as_exact_as_torchs_bf16(family, tokens, tmp_
 
     reference_model = copy.deepcopy(model)
 
-    def reference_fn(ids):
-        return torch_step(reference_model, ids, torch.bfloat16)
+    def reference_fn(ids, cotangent):
+        return torch_step(reference_model, ids, cotangent, torch.bfloat16)
 
     with float64():
         wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
                                                              attn_implementation="eager").eval()
         wide.load_state_dict(model.state_dict())
 
-    def truth_fn(ids):
+    def truth_fn(ids, cotangent):
         with float64():
-            return torch_step(wide, ids, torch.float64)
+            return torch_step(wide, ids, cotangent, torch.float64)
 
     assert_as_exact(dew_fn, reference_fn, token_draws(tokens), f"torchax bf16 {family} LM step",
                     seeds=BF16_SEEDS, truth_fn=truth_fn)
@@ -439,3 +712,101 @@ def test_a_float32_forwards_logits_and_its_output_tables_are_as_exact_as_torchs(
         truth = wide(torch.from_numpy(np.asarray(ids, np.int64))).logits.numpy()
     assert_as_exact_as_the_reference(direct, reference, truth, "the forward's logits")
     assert_as_exact_as_the_reference(table, reference, truth, "the output table's logits")
+
+
+STATES_SEEDS = {"cohere": 8, "cohere2": 8, "cohere2 keyed": 8}
+"""The final states' declared check-1 seeds, sized by `seeds_for` on armada."""
+
+
+def slotted_rows(seed):
+    """A drawn option-slot row as a decision readout lays it: a prompt every token sees, then options
+    each seeing the prompt and itself causally and no other option, positions restarting after the
+    prompt for each option; its tokens, `[B, S, S]` visibility and `[B, S]` positions."""
+    rng = np.random.default_rng([0x1657, seed])
+    prompt = int(rng.integers(3, 7))
+    lengths = rng.integers(1, 4, 3)
+    group = np.concatenate([np.zeros(prompt, int),
+                            *[np.full(n, option + 1) for option, n in enumerate(lengths)]])
+    length = len(group)
+    positions = np.concatenate([np.arange(prompt), *[prompt + np.arange(n) for n in lengths]])
+    order = np.arange(length)
+    shared = (group[:, None] == group[None, :]) | (group[None, :] == 0)
+    visible = (order[:, None] >= order[None, :]) & shared
+    tokens = rng.integers(0, COHERE_VOCAB, (2, length)).astype(np.int32)
+    rows = (2, length, length)
+    return tokens, np.broadcast_to(visible, rows).copy(), np.tile(positions, (2, 1)).astype(np.int32)
+
+
+COHERE_VOCAB = transformers.CohereConfig(**COHERE).vocab_size
+
+
+@pytest.mark.parametrize("case", sorted(STATES_SEEDS))
+def test_a_tier_3_models_final_states_and_head_are_transformers(case, tmp_path):
+    """A tier-3 model whose head is no plain product (Cohere's logits are scaled) gives the states its
+    head reads (`hidden_states`), transformers' final normed states, under a stated visibility (an
+    option-slot row's) at its tokens' positions, and its head over given states (`logits_from_hidden`),
+    transformers' logits; Cohere 2's window keeps each query to the keys within it of the stated keys'
+    positions where the call states them (`keyed`), and leaves the stated visibility whole where not,
+    as Dew's own attention reads them. Each as exact as transformers' own float32 from its float64 twin
+    (check 1), transformers given the same masks, a window's layers theirs, and position ids. A decision
+    head sizes itself to the states (`DecisionModel.head_size`), which the model's initialization
+    traces."""
+    from dew.decision.model import DecisionModel
+
+    family, keyed = case.split(" ")[0], case.endswith("keyed")
+    torch.manual_seed(0)
+    model = PACKED_MODELS[family]().eval()
+    model.save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32")
+    assert type(loaded.model).__name__ == "TorchCausalLM"
+    assert DecisionModel.head_size(loaded.model) == (COHERE["hidden_size"], None)
+    with float64():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager").eval()
+        wide.load_state_dict(model.state_dict())
+    window = getattr(model.config, "sliding_window", None)
+
+    @jax.jit
+    def ours_jitted(variables, tokens, visible, positions):
+        keys = {"attention_key_positions": positions} if keyed else {}
+        hidden = loaded.model.apply(variables, tokens, positions=positions, attention_pairwise_mask=visible,
+                                    method="hidden_states", **keys)
+        return hidden, loaded.model.apply(variables, hidden, method="logits_from_hidden")
+
+    def ours(tokens, visible, positions):
+        hidden, logits = ours_jitted(loaded.variables, tokens, visible, positions)
+        return {"states": np.asarray(hidden, np.float64), "logits": np.asarray(logits, np.float64)}
+
+    def masks(visible, positions, dtype):
+        """The additive 4D masks each layer type reads: the stated visibility, a window's layers
+        within it of the keys' positions where keyed."""
+        def additive(seen):
+            return torch.zeros(seen.shape, dtype=dtype).masked_fill(
+                torch.from_numpy(~seen), torch.finfo(dtype).min)[:, None]
+        near = visible
+        if keyed and window is not None:
+            near = visible & (positions[:, :, None] - positions[:, None, :] < window)
+        types = set(getattr(model.config, "layer_types", None) or ["full_attention"])
+        return {kind: additive(near if kind == "sliding_attention" else visible) for kind in types}
+
+    def theirs(source, dtype):
+        def run(tokens, visible, positions):
+            mask = masks(visible, positions, dtype)
+            with torch.no_grad():
+                out = source(input_ids=torch.from_numpy(tokens).long(),
+                             attention_mask=mask if len(mask) > 1 else mask["full_attention"],
+                             position_ids=torch.from_numpy(positions).long(), output_hidden_states=True)
+            # The last of the hidden states is the final norm's output, the states the head reads.
+            return {"states": out.hidden_states[-1].double().numpy(), "logits": out.logits.double().numpy()}
+        return run
+
+    reference = copy.deepcopy(model)
+    reference.set_attn_implementation("eager")
+
+    def truth(*inputs):
+        with float64():
+            return theirs(wide, torch.float64)(*inputs)
+
+    assert_as_exact(ours, theirs(reference, torch.float32), slotted_rows, f"tier 3 final states {case}",
+                    seeds=STATES_SEEDS[case], truth_fn=truth)

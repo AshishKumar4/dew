@@ -45,7 +45,7 @@ from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
 from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
-from dew.nn.precision import at_least_fp32, float32_dot_general, float32_products
+from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, float32_einsum, float32_products
 from dew.nn.sharding import LayoutRefused, logical_axes, rows_like, sequence_shards
 from dew.nn.ssm import affine_spans
 
@@ -86,7 +86,7 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
         # The reference's `combine_fn` (modeling_mamba.py:231-234).
         decays, writes = jax.lax.associative_scan(affine_spans, (decay, write), axis=1)
         states = decays * h[:, None] + writes
-        read = jnp.einsum('bcdn,bcn->bcd', states, C_c, precision=float32_products(states.dtype))
+        read = float32_einsum('bcdn,bcn->bcd', states, C_c)
         return states[:, -1], read
 
     final, out = jax.lax.scan(one_chunk, carried, tuple(chunks(t) for t in (x, dt, B, C, resets)))
@@ -238,8 +238,8 @@ class _StepProjection(nn.Module):
             (self.rank, self.features))
         bias = self.param('bias', inverse_softplus_step, (self.features,))
         dtype = self.dtype if self.dtype is not None else raw.dtype
-        widened = jnp.matmul(raw.astype(dtype), kernel.astype(dtype),
-                             precision=float32_products(dtype, self.precision))
+        product = functools.partial(jnp.matmul, precision=float32_products(dtype, self.precision))
+        widened = accumulated(product, raw.astype(dtype), kernel.astype(dtype))
         wide = at_least_fp32(widened.dtype)
         return nn.softplus(widened.astype(wide) + bias.astype(wide))
 
@@ -269,7 +269,7 @@ class MambaMixer(MixerBase):
     SSM has no keys to cache or positions to rotate.
     """
 
-    residuals = ('context', 'conv')
+    residuals = ('context', 'scan', 'conv')
 
     intermediate_size: int = 1536
     state_size: int = 16

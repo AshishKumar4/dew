@@ -43,6 +43,22 @@ def test_journal_refuses_a_different_policy_at_identical_clocks(tmp_path):
         collect(collector, changed)
 
 
+def test_journal_tells_apart_policies_whose_weights_are_equal_bytes_of_another_dtype():
+    """A policy's weights in float8_e4m3fn and the same bytes read as float8_e4m3fnuz are two
+    policies, which NumPy names by one '<V1' code: the journal's policy fingerprint keys each by its
+    named dtype, so a recovery under the other refuses, while the same weights match again."""
+    import ml_dtypes
+
+    from dew.objectives.rl.journal import policy_digest
+
+    bits = np.arange(64, dtype=np.uint8).reshape(8, 8)
+    weights = {"params": {"kernel": bits.view(ml_dtypes.float8_e4m3fn)}}
+    other = {"params": {"kernel": bits.view(ml_dtypes.float8_e4m3fnuz)}}
+    again = {"params": {"kernel": bits.copy().view(ml_dtypes.float8_e4m3fn)}}
+    assert policy_digest(weights) == policy_digest(again)
+    assert policy_digest(weights) != policy_digest(other)
+
+
 class Saying(SquareSession):
     """The square tool, whose observations also say the chat messages they added, as read-only mappings."""
 

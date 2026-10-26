@@ -36,6 +36,7 @@ from typing import Annotated, TextIO
 
 import tyro
 
+from dew.cleanup import exit_code, groups_ended, signal_group
 from dew.cli import tpu_setup
 from dew.cli.gcloud import emit
 from dew.cli.tpu import reach
@@ -486,15 +487,6 @@ def _relay(rank: int, stream: TextIO, tail: collections.deque[str]) -> None:
         emit(f"[{rank}] {text}")
 
 
-def _signalled(group: int, signum: int) -> bool:
-    """Send `signum` to process group `group`, whether a process of it was there to take it."""
-    try:
-        os.killpg(group, signum)
-    except ProcessLookupError:
-        return False
-    return True
-
-
 def _interrupted(child: subprocess.Popen) -> bool:
     """Stop a rank started over ssh as `remote_script` arranges, by its terminal: whether its ssh was
     still there to carry the interrupt (`STOP_BYTE`)."""
@@ -505,14 +497,6 @@ def _interrupted(child: subprocess.Popen) -> bool:
     except BrokenPipeError:
         return False
     return True
-
-
-def _held(child: subprocess.Popen) -> bool:
-    """Whether a rank's process group still holds a process: its own, or one it started, which its
-    exit leaves running on in the group (a data worker, a server). Its own exit is reaped first,
-    which a group of exited processes alone no longer counts."""
-    child.poll()
-    return _signalled(child.pid, 0)
 
 
 def _stop(running: Sequence[subprocess.Popen], grace: float, forced: threading.Event) -> None:
@@ -531,15 +515,11 @@ def _stop(running: Sequence[subprocess.Popen], grace: float, forced: threading.E
     """
     # Each rank leads a session of its own (`supervise`), whose group its pid names.
     for child in running:
-        if _held(child) and not (child.stdin is not None and _interrupted(child)):
-            _signalled(child.pid, signal.SIGTERM)
-    deadline = time.monotonic() + grace
-    while (not forced.is_set() and time.monotonic() < deadline
-           and any(_held(child) for child in running)):
-        time.sleep(POLL_SECONDS)
+        if not (child.stdin is not None and _interrupted(child)):
+            signal_group(child, signal.SIGTERM)
+    groups_ended(running, grace, forced)
     for child in (*running[1:], *running[:1]):
-        if _held(child):
-            _signalled(child.pid, signal.SIGKILL)
+        signal_group(child, signal.SIGKILL)
         child.wait()
 
 
@@ -617,7 +597,8 @@ def supervise(processes: Sequence[Process], cwd: str | None) -> int:
             relay.start()
             relays.append(relay)
         while True:
-            codes = [child.poll() for child in running]
+            # Read unreaped, so each rank's group keeps its id until `_stop` signals it.
+            codes = [exit_code(child) for child in running]
             failed = next(((rank, code) for rank, code in enumerate(codes) if code), None)
             if failed is not None:
                 rank, code = failed
@@ -639,6 +620,10 @@ def supervise(processes: Sequence[Process], cwd: str | None) -> int:
                 return 128 - code if code < 0 else code
             if all(code == 0 for code in codes):
                 emit(f"all {len(running)} ranks exited 0")
+                # What a rank started and left running in its group (a data worker, a server) ends with
+                # the pool, as it does when a rank fails.
+                _escalate(forced)
+                _stop(running, FAILURE_GRACE, forced)
                 return 0
             time.sleep(POLL_SECONDS)
     except BaseException as error:

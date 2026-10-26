@@ -654,6 +654,11 @@ class Processor:
             raise ValueError("decode expects integer [B, S] token rows")
         return self.reference.batch_decode(array.tolist(), skip_special_tokens=True)
 
+    def spelling(self, ids: Sequence[int]) -> str:
+        """The text the source's tokenizer decodes `ids` to, its special tokens spelled out, as
+        transformers' `decode` gives it by default."""
+        return self.reference.batch_decode([list(ids)], skip_special_tokens=False)[0]
+
     @property
     def bos_id(self) -> int | None:
         """The id the source's tokenizer starts a sequence with, or None."""

@@ -8,22 +8,15 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+import scipy.special
+from reference_error import assert_as_exact
 
+from dew._distributions import counter_key
 from dew.data.dataset import DataPartition
 from dew.diffusion import presets
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.nn.backbones import SimpleDiT
-from dew.objectives.base import (
-    EXAMPLE_ROWS,
-    EXAMPLE_STREAM,
-    Aux,
-    Objective,
-    Ratio,
-    Recorder,
-    Step,
-    example_stream,
-    stream,
-)
+from dew.objectives.base import EXAMPLE_ROWS, EXAMPLE_STREAM, Aux, Objective, Ratio, Recorder, Step, stream
 from dew.objectives.diffusion.few_step import MeanFlowObjective, ShortcutObjective
 from dew.training.distributed import marked
 from dew.training.transaction import example_places
@@ -53,17 +46,106 @@ def test_a_record_draws_alike_however_many_processes_read_its_step():
                                   [9, 11, 13, 15])
 
 
-def test_each_example_draws_its_own_values_under_any_key_implementation():
+NORMAL_SEEDS = {"threefry2x32": 8, "rbg": 16, "layouts": 64}
+"""The normal-draw sites' declared draws (`seeds_for`): each draw is the step's key from its seed.
+Each draws WIDTH values a row of each example: float32's erf_inv is up to 63 ulps from float64 near
+|u| = 1, so a leaf of a few hundred values pools a heavy tail and resolved no ratio within 512 seeds
+(at WIDTH 64)."""
+
+WIDTH = 2048
+"""The values a check-1 draw adds to each draw shape, as a last axis (`NORMAL_SEEDS`)."""
+
+LOW = float(np.nextafter(np.float32(-1.0), np.float32(0.0)))
+"""The least uniform `jax.random.normal` draws: the float32 just above -1."""
+
+
+def normal_truth(bits):
+    """`jax.random.normal`'s float32 draw from `bits` in float64: its uniform, exact in float64 (23 bits
+    of the word times the span's 24), then sqrt(2) times the inverse error function."""
+    floats = (np.asarray(bits, np.uint64) >> np.uint64(9)).astype(np.float64) * 2.0 ** -23
+    uniform = np.maximum(LOW, floats * float(np.float32(1.0) - np.float32(LOW)) + LOW)
+    return np.sqrt(2.0) * scipy.special.erfinv(uniform)
+
+
+def example_bits(key, examples, shape):
+    """Each example's raw 32-bit words as its own stream draws them alone (`Step.sample`'s counter
+    stream); a float32 normal reads one word an element, under a float64 truth too."""
+    base = jax.random.fold_in(counter_key(key), stream("noise"))
+    return [np.asarray(jax.random.bits(jax.random.fold_in(base, example), shape, jnp.uint32))
+            for example in examples]
+
+
+@pytest.mark.parametrize("impl", ["threefry2x32", "rbg"])
+def test_each_example_draws_its_own_bits_under_any_key_implementation(impl):
     """A mapped draw under an RBG key would take every example's values from its first key: the
-    examples draw from a counter-based stream of the key's bits, each its own."""
-    for impl in ("threefry2x32", "rbg"):
-        key = jax.random.key(5, impl=impl)
+    examples draw from a counter-based stream of the key's bits, each its own. The bits are exact
+    (`example_bits`); the normal draws over them are on par with each example's alone by check 1
+    against their float64 truth (`normal_truth`), since a batch's fused program may round a lane's
+    floats otherwise (XLA:CPU on AVX-512, jax 0.12)."""
+    key = jax.random.key(5, impl=impl)
+    step = Step(jnp.asarray(0), key, None)
+    bits = np.asarray(step.sample("noise", jax.random.bits, (3,), rows=4))
+    assert len({tuple(row) for row in bits}) == 4
+    np.testing.assert_array_equal(bits, np.stack(example_bits(key, range(4), (3,))))
+
+    def keyed(data):
+        return jax.random.wrap_key_data(data, impl=impl)
+
+    @jax.jit
+    def batched(data):
+        return Step(jnp.asarray(0), keyed(data), None).sample("noise", jax.random.normal, (3, WIDTH),
+                                                               dtype=jnp.float32, rows=4)
+
+    @jax.jit
+    def alone(data):
+        base = jax.random.fold_in(counter_key(keyed(data)), stream("noise"))
+        return jnp.stack([jax.random.normal(jax.random.fold_in(base, example), (3, WIDTH))
+                          for example in range(4)])
+
+    def truth(data):
+        return np.stack([normal_truth(bits) for bits in example_bits(keyed(data), range(4), (3, WIDTH))])
+
+    assert_as_exact(batched, alone, lambda seed: (jax.random.key_data(jax.random.key(seed, impl=impl)),),
+                    f"{impl} normal draws", seeds=NORMAL_SEEDS[impl], truth_fn=truth)
+
+
+LAYOUTS = [(rows, shape) for shape in ((3,), (5, 7), (2, 3, 4)) for rows in (1, 3, 4, 7, 16)]
+"""A batch of each row count at each draw shape: a row, a grid and a volume."""
+
+
+def test_an_examples_draw_is_its_own_whatever_batch_it_is_drawn_in():
+    """An example's bits are the same drawn alone, among 3, 4, 7 or 16 rows, or at a draw shape of a
+    row, a grid or a volume, exactly; its normal draw over them is on par with its own alone by check 1
+    against their float64 truth, since a batch's fused program may round a lane's floats otherwise
+    (XLA:CPU's AVX-512 loop contracts some lanes' mul-adds, jax 0.12)."""
+    key = jax.random.key(11)
+    for rows, shape in LAYOUTS:
         step = Step(jnp.asarray(0), key, None)
-        values = np.asarray(step.sample("noise", jax.random.normal, (3,), dtype=jnp.float32, rows=4))
-        assert len({tuple(row) for row in values}) == 4
-        base = jax.random.fold_in(example_stream(key), stream("noise"))
-        third = jax.random.normal(jax.random.fold_in(base, 2), (3,))
-        np.testing.assert_array_equal(values[2], np.asarray(third))
+        bits = np.asarray(step.sample("noise", jax.random.bits, shape, rows=rows))
+        np.testing.assert_array_equal(bits, np.stack(example_bits(key, range(rows), shape)))
+
+    floats = [(rows, (*shape, WIDTH)) for rows, shape in LAYOUTS]
+
+    @jax.jit
+    def batched(data):
+        step = Step(jnp.asarray(0), jax.random.wrap_key_data(data), None)
+        return {f"{rows}x{shape}": step.sample("noise", jax.random.normal, shape, dtype=jnp.float32,
+                                               rows=rows) for rows, shape in floats}
+
+    @jax.jit
+    def alone(data):
+        base = jax.random.fold_in(counter_key(jax.random.wrap_key_data(data)), stream("noise"))
+        return {f"{rows}x{shape}": jnp.stack([jax.random.normal(jax.random.fold_in(base, example), shape)
+                                               for example in range(rows)]) for rows, shape in floats}
+
+    def truth(data):
+        drawn = jax.random.wrap_key_data(data)
+        return {f"{rows}x{shape}": np.stack([normal_truth(bits)
+                                             for bits in example_bits(drawn, range(rows), shape)])
+                for rows, shape in floats}
+
+    assert_as_exact(batched, alone, lambda seed: (jax.random.key_data(jax.random.key(seed)),),
+                    "normal draws across batches", seeds=NORMAL_SEEDS["layouts"], truth_fn=truth)
 
 
 def test_a_recorder_and_a_tape_hold_each_example_once_and_whole():
@@ -132,31 +214,45 @@ def test_a_few_step_update_gives_its_roles_by_place_on_every_layout(kind):
 
 HALVES_ROWS, HALVES_SEEDS = 32, 128
 """Check 1's declared seeds for MeanFlow's update read as two halves of 32 rows, sized by `seeds_for`
-(2026-10-21, on armada). A shortcut model's loss is not held so: its float32 total against float64,
-compared with itself over disjoint seeds, resolves no ratio within 512 seeds at 8, 32 or 64 rows."""
+on armada. A shortcut model's loss is not held so: its float32 total against float64, compared with
+itself over disjoint seeds, resolves no ratio within 512 seeds at 8, 32 or 64 rows; its targets are,
+each example's a unit (`SHORTCUT_SEEDS`)."""
+SHORTCUT_SEEDS = 8
+"""Check 1's declared seeds for a shortcut model's per-example targets, an update read as two halves of
+32 rows against its whole batch, sized by `seeds_for`."""
+
+
+def halves_case(kind):
+    """A few-step objective of `kind`, its float64 twin, a batch of HALVES_ROWS images and captions,
+    and the draw of its weights check 1 reads: each seed's normal weights, 0.3 a unit."""
+    import copy
+
+    objective = few_step(kind)
+    twin = copy.copy(objective)
+    twin.substitute([objective.model.clone(dtype=jnp.float64)])
+    initial = objective.init(jax.random.PRNGKey(0))
+    leaves, tree = jax.tree.flatten(initial["params"])
+    images = jax.random.randint(jax.random.PRNGKey(1), (HALVES_ROWS, 4, 4, 3), 0, 256)
+    batch = {"image": np.asarray(images, np.uint8),
+             **objective.inputs.tokenize([str(row) for row in range(HALVES_ROWS)])}
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.PRNGKey(seed), len(leaves))
+        return ({**initial, "params": jax.tree.unflatten(tree, [
+            0.3 * jax.random.normal(key, leaf.shape) for key, leaf in zip(keys, leaves, strict=True)])},)
+
+    return objective, twin, batch, draw
 
 
 def test_a_meanflow_update_read_as_halves_is_on_par_with_its_whole_batch():
     """The halves' summed losses, each example at its own draws and role, are on par with the whole
     batch's over drawn weights (check 1), the float64 twin's the truth: the outcome the recorded draws
     and roles above feed."""
-    import copy
 
     from reference_error import assert_as_exact
 
-    objective, rows = few_step("meanflow"), HALVES_ROWS
-    twin = copy.copy(objective)
-    twin.substitute([objective.model.clone(dtype=jnp.float64)])
-    initial = objective.init(jax.random.PRNGKey(0))
-    leaves, tree = jax.tree.flatten(initial["params"])
-    images = jax.random.randint(jax.random.PRNGKey(1), (rows, 4, 4, 3), 0, 256)
-    batch = {"image": np.asarray(images, np.uint8),
-             **objective.inputs.tokenize([str(row) for row in range(rows)])}
-
-    def draw(seed):
-        keys = jax.random.split(jax.random.PRNGKey(seed), len(leaves))
-        return ({**initial, "params": jax.tree.unflatten(tree, [
-            0.3 * jax.random.normal(key, leaf.shape) for key, leaf in zip(keys, leaves, strict=True)])},)
+    objective, twin, batch, draw = halves_case("meanflow")
+    rows = HALVES_ROWS
 
     def summed(objective, part: slice):
         step = Step(jnp.asarray(0), jax.random.key(2), None, example_key=UPDATE,
@@ -171,6 +267,31 @@ def test_a_meanflow_update_read_as_halves_is_on_par_with_its_whole_batch():
 
     assert_as_exact(halves, summed(objective, slice(0, rows)), draw, "meanflow halves", seeds=HALVES_SEEDS,
                     truth_fn=summed(twin, slice(0, rows)))
+
+
+def test_a_shortcut_update_read_as_halves_targets_each_example_as_its_whole_batch_does():
+    """A whole update's teacher reads the rows it bootstraps alone, gathered, and a part's reads every row
+    (`ShortcutObjective._bootstrapped`): each example's target, the flow's or the teacher's two half
+    steps, is on par between the two over drawn weights (check 1, each example a row), the float64
+    twin's whole batch the truth. The loss's squared errors differ from it only through the target."""
+
+    objective, twin, batch, draw = halves_case("shortcut")
+    rows = HALVES_ROWS
+
+    def targets(objective, *parts: slice):
+        def read(variables):
+            recorder = Recorder()
+            for part in parts:
+                step = Step(jnp.asarray(0), jax.random.key(2), None, example_key=UPDATE,
+                            example_index=jnp.asarray(np.arange(rows)[part], jnp.int32), example_count=rows,
+                            recorder=recorder)
+                objective.loss(variables, jax.tree.map(lambda value, part=part: value[part], batch), step)
+            return recorder.tape(rows)["shortcut targets"]
+        return read
+
+    halves = targets(objective, slice(0, rows // 2), slice(rows // 2, rows))
+    assert_as_exact(halves, targets(objective, slice(0, rows)), draw, "shortcut halves",
+                    seeds=SHORTCUT_SEEDS, truth_fn=targets(twin, slice(0, rows)))
 
 
 def test_each_examples_posterior_draw_is_its_own():

@@ -28,9 +28,9 @@ from dew.decision import (
     Specials,
     StateFirstLayout,
 )
-from dew.decision.head import DecisionHead, JointSchemaHead
-from dew.decision.layout import OPTION_TILE, DecisionInputs, compacted
-from dew.decision.objective import _ALONG_THE_QUESTIONS
+from dew.decision.head import DecisionHead, JointSchemaHead, LabelReadout
+from dew.decision.layout import OPTION_TILE, DecisionInputs, Labels, compacted
+from dew.decision.objective import _ALONG_THE_QUESTIONS, _READ_OUT
 from dew.decision.task import laid_out
 from dew.interop import Pretrained
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -71,14 +71,19 @@ def attending(length: int) -> CausalTransformer:
 
 
 ROWS = StateFirstLayout(max_len=256, head_max_len=64, option_tokens=8)
+LABELS = Labels(variants=("{}",))
+"""Labels a byte vocabulary spells as one token each: the bare letter."""
 ARMS = {
     "joint": (JointLayout(max_len=1536), qwen35,
              lambda: JointSchemaHead(64, width=32, routing_layers=1, layers=1, heads=2, feedforward=64)),
     "marker": (ROWS, qwen35, lambda: DecisionHead(64, layers=1)),
     "parallel": (replace(ROWS, parallel=True), attending, lambda: DecisionHead(32, layers=1)),
+    "readout": (replace(ROWS, head_max_len=128, option_tokens=24, labels=LABELS), qwen35,
+                lambda: LabelReadout(64, LABELS.ids(TOKENIZER, 3))),
 }
 """Joint rows under the joint schema head and rows of one question under the marker head,
-both over Qwen3.5; parallel options, whose pairwise mask Gated DeltaNet refuses, over attention."""
+both over Qwen3.5; parallel options, whose pairwise mask Gated DeltaNet refuses, over attention;
+options under labels read at each row's answer cue by the backbone's own logits, over Qwen3.5."""
 
 
 def objective_for(arm: str) -> DecisionObjective:
@@ -98,6 +103,11 @@ def windows(objective, rows: int) -> dict:
     return {name: np.asarray(value) for name, value in batch.items() if name != VALID_ROWS}
 
 
+def along(batch) -> tuple[str, ...]:
+    """The batch's fields along its questions, its answer cues' where its options stand under labels."""
+    return tuple(name for name in (*_ALONG_THE_QUESTIONS, *_READ_OUT) if name in batch)
+
+
 def owners(batch) -> np.ndarray:
     """Each question slot's row in its window, 0 for a padding slot."""
     rows = np.take_along_axis(batch["segments"], batch["spans"][..., 0], axis=1)
@@ -109,11 +119,13 @@ def alone(batch, window: int, row: int) -> dict:
     where = np.flatnonzero(batch["segments"][window] == row)
     start, end = int(where[0]), int(where[-1]) + 1
     asked = np.flatnonzero(owners(batch)[window] == row)
-    one = {name: batch[name][window, asked][None] for name in _ALONG_THE_QUESTIONS}
-    along = ("tokens", "positions", "slots")
-    one |= {name: batch[name][window, start:end][None] for name in along if name in batch}
+    one = {name: batch[name][window, asked][None] for name in along(batch)}
+    tokens = ("tokens", "positions", "slots")
+    one |= {name: batch[name][window, start:end][None] for name in tokens if name in batch}
     one |= {"segments": np.ones((1, end - start), np.int32), "spans": one["spans"] - start,
             "option_spans": one["option_spans"] - start * one["options"][..., None]}
+    if "readout" in one:
+        one["readout"] = one["readout"] - start
     if "option_slots" in batch:
         slots, real = compacted(one["options"][0], OPTION_TILE)
         one["option_slots"], one["slotted"] = slots[None], real[None]
@@ -134,7 +146,7 @@ def at_offset(batch, window: int, row: int) -> dict:
     mine = segments == row
     before = np.arange(segments.size) < np.flatnonzero(mine)[0]
     asked = np.flatnonzero(owners(batch)[window] == row)
-    one = {name: batch[name][window, asked][None] for name in _ALONG_THE_QUESTIONS}
+    one = {name: batch[name][window, asked][None] for name in along(batch)}
     one |= {name: np.where(mine.reshape(-1, *(1,) * (batch[name].ndim - 2)), batch[name][window], 0)[None]
             for name in ("tokens", "slots") if name in batch}
     if "positions" in batch:
@@ -143,24 +155,29 @@ def at_offset(batch, window: int, row: int) -> dict:
     return one | {"segments": (before + mine * (1 + before.any())).astype(np.int32)[None]}
 
 
-def in_place(batch, window: int, row: int) -> dict:
-    """`batch` with row `row` alone in window `window` where the window packed it (`at_offset`) and
-    every other window empty: the packed batch's shapes, so every product a row's tokens enter runs
-    at the packed run's shapes."""
+def in_place(batch, placed: list[tuple[int, int]]) -> dict:
+    """`batch` with each `(window, row)` of `placed`, at most one a window, alone in its window where
+    the window packed it (`at_offset`), and every other window empty: the packed batch's shapes, so
+    every product a row's tokens enter runs at the packed run's shapes. A window reads no other, so
+    rows of different windows run alone together."""
+    assert len({window for window, _ in placed}) == len(placed), "one row a window"
     one = {name: np.zeros_like(value) for name, value in batch.items()}
-    for name, value in at_offset(batch, window, row).items():
-        one[name][window, :value.shape[1]] = value[0]
-    if "option_slots" in batch:
-        one["option_slots"][window], one["slotted"][window] = compacted(one["options"][window],
-                                                                        batch["option_slots"].shape[1])
+    for window, row in placed:
+        for name, value in at_offset(batch, window, row).items():
+            one[name][window, :value.shape[1]] = value[0]
+        if "option_slots" in batch:
+            one["option_slots"][window], one["slotted"][window] = compacted(
+                one["options"][window], batch["option_slots"].shape[1])
     return one
 
 
 def apart(batch) -> dict:
     """Each row of the batch's windows in a window of its own, as the packer lays out a window that
-    holds one row: the row, then segment-0 padding to the window's length, and its question slots
-    first. Every row's window has one shape, so the rows alone run as one batch."""
-    length, questions = batch["tokens"].shape[1], batch["kinds"].shape[1]
+    holds one row: the row, then segment-0 padding to the longest row's length, which no real token
+    reads, and its question slots first. Every row's window has one shape, so the rows alone run as
+    one batch."""
+    length = max(int(np.count_nonzero(batch["segments"][window] == row)) for window, row in rows_of(batch))
+    questions = batch["kinds"].shape[1]
 
     def widened(name, value):
         """`value` padded with zeros along the row's tokens or questions to the window's."""
@@ -194,7 +211,10 @@ def decided(objective, variables, batch, segments: int):
     return objective.model.logits(variables, laid_out(batch, segments)), gradient(objective, variables, batch)
 
 
-@pytest.mark.parametrize("arm", ["joint", "marker", "parallel"])
+# The joint arm's float64 truth over the seeds its gradients need is numeric work at model size, a GPU's
+# (BIBLE §8): on armada it took 705 s of CPU, the suite's whole critical path; the others take 187 s and 36 s.
+@pytest.mark.parametrize("arm", [pytest.param("joint", marks=pytest.mark.gpu(
+    reason="the joint arm's float64 truth at the seeds it needs")), "marker", "parallel"])
 def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     """Rows packed into windows (segments, positions restarting per row, spans moved) give each
     question's logits and the parameters' gradients each row gives alone where its window packed it,
@@ -211,6 +231,21 @@ def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
                                           objective.model.head.clone(dtype=jnp.float64)), PACKING_SEEDS[arm])
 
 
+def test_a_labelled_readout_reads_each_packed_row_at_its_own_answer_cue():
+    """Rows whose options stand under labels, packed into windows, read each question's answer at its
+    row's answer cue, moved with the row: each row's label logits and the backbone's gradients are the
+    row's alone where its window packed it (check 1), the readout the backbone's own logits, whose
+    float64 truth is the float64 backbone's. Each question's answer position is its own row's last
+    token, the cue's, in its window."""
+    objective = objective_for("readout")
+    batch = windows(objective, 2)
+    for window, row in rows_of(batch):
+        last = np.flatnonzero(batch["segments"][window] == row)[-1]
+        assert np.all(batch["readout"][window][owners(batch)[window] == row] == last)
+    assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64),
+                                          objective.model.head), PACKING_SEEDS["readout"])
+
+
 @pytest.mark.gpu(reason="FlashAttention's packed sequences run on CUDA")
 def test_a_bf16_joint_head_on_flash_reads_each_packed_row_alone(without_deterministic_ops):
     """The joint schema head in bf16 on flash: its routing and field layers read the window's tokens
@@ -225,15 +260,8 @@ def test_a_bf16_joint_head_on_flash_reads_each_packed_row_alone(without_determin
                              dtype=jnp.bfloat16, attention_impl="flash"),
         loss=LogLoss(), shuffle_options=False)
     head = objective.model.head.clone(dtype=jnp.float64, attention_impl="xla")
-    # A bf16 scalar's gradient is one rounding draw, the extreme-value statistic the RMS rule does
-    # not hold (tests/reference_error.py): the residual gate's ran from 1.2e-4 to 1.1e-3 from
-    # float64 over packed and alone, flash and xla, on an A100. The head's attention projections
-    # carry flash's forward and backward into many entries each.
-    def attending_in_the_head(path: str) -> bool:
-        return "['head']" in path and ("attn" in path or "['attention']" in path)
-
     assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64), head),
-                              PACKING_SEEDS["flash"], held=attending_in_the_head)
+                              PACKING_SEEDS["flash"])
 
 
 def asked(batch, logits) -> np.ndarray:
@@ -248,26 +276,39 @@ def rows_alone(decide, batch):
     the packed batch's shapes (`in_place`), by `decide(batch)`, the logits at their questions' options
     and the gradients summed over the rows: the packed run's own arithmetic, its products' shapes, the
     rule's chunks and attention's row length the window's, so the two differ only where another row
-    enters, and in how the rows' gradients add."""
-    logits, grads = [], None
-    for window, row in rows_of(batch):
-        one = in_place(batch, window, row)
+    enters, and in how the rows' gradients add. Each call holds one row of every window that has one
+    left, the windows' `k`th rows together, as no window reads another."""
+    every = rows_of(batch)
+    rounds = [[(window, row) for window, row in every if row == index]
+              for index in range(1, max(row for _, row in every) + 1)]
+    logits, grads = {}, None
+    for placed in rounds:
+        one = in_place(batch, placed)
         row_logits, row_grads = decide(one)
-        logits.append(np.asarray(row_logits)[window][one["options"][window]])
+        for window, row in placed:
+            logits[window, row] = np.asarray(row_logits)[window][one["options"][window]]
         grads = row_grads if grads is None else jax.tree.map(jnp.add, grads, row_grads)
-    return np.concatenate(logits), grads
+    return np.concatenate([logits[place] for place in every]), grads
 
 
-PACKING_SEEDS = {"joint": 8, "marker": 8, "parallel": 16, "flash": 8}
-"""Check 1's declared seeds for each arm's packed window, sized by `seeds_for` (2026-10-21, on armada;
-the flash arm's on an A100)."""
+PACKING_SEEDS = {"joint": 256, "marker": 256, "parallel": 256, "flash": 8, "readout": 8}
+"""Check 1's declared seeds for each arm's packed window: the most paired sizing (`seeds_for` with the
+packed window as `dew_fn`) gives on any platform the site runs on. An H100 took 256 for the joint arm
+and 128 for the marker and parallel arms (node receipts TL-h100-packing-size-*-3), an A100 128 for the
+joint arm and 256 for the marker and parallel arms (SF-a100-packing-seeds), armada 16, 8 and 8 (run-tests
+sf-packing-cpu-sizing-898ec4ac6); the flash arm's is an A100's, and the readout arm's 8 is an A100's
+(SF-readout-sizing), an H100's and armada's. The A100's are the head's gradients whose float64
+truth is zero by symmetry, which both arms err at by 0 to 3 fp32 ulps: the marker and parallel arms'
+scorer_out bias, shared by a question's options, and the joint arm's attention key biases (ledger
+1548). Twice the rows a draw took the same counts on an A100 (node receipts SF-packing-scale2-sizing),
+each draw twice the work."""
 
 
-def assert_rows_decided_alone(objective, wide_modules, seeds: int, held=lambda path: True) -> None:
+def assert_rows_decided_alone(objective, wide_modules, seeds: int) -> None:
     """Two packed windows of the examples decide each row's questions as the row does alone where its
-    window packed it (`rows_alone`), logits and the gradients of the leaves `held` names (by
-    `jax.tree_util.keystr`) on par with it (check 1) over drawn parameters, the truth `wide_modules`,
-    the backbone and head in float64, over the rows in windows of their own."""
+    window packed it (`rows_alone`), logits and every parameter's gradient on par with it (check 1)
+    over drawn parameters, the truth `wide_modules`, the backbone and head in float64, over the rows
+    in windows of their own."""
     batch = windows(objective, 2)
     assert max(int(segments.max()) for segments in batch["segments"]) > 1, "no window packed two rows"
     # A sequence kernel runs as many documents as the coordinates bound, and a window's padding as one
@@ -280,29 +321,21 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, held=lambda p
     wide.substitute(wide_modules)
     decide = jax.jit(lambda variables, batch: decided(objective, variables, batch, segments))
 
-    def kept(tree):
-        return {name: leaf for name, leaf in ((jax.tree_util.keystr(path), leaf)
-                                              for path, leaf in jax.tree_util.tree_leaves_with_path(tree))
-                if held(name)}
-
     def packed(variables):
         logits, grads = decide(variables, batch)
-        return asked(batch, logits), kept(grads)
+        return asked(batch, logits), grads
 
     def alone(variables):
-        logits, grads = rows_alone(lambda one: decide(variables, one), batch)
-        return logits, kept(grads)
+        return rows_alone(lambda one: decide(variables, one), batch)
 
     @jax.jit
     def apart_in_float64(variables):
-        return (wide.model.logits(variables, laid_out(rows, segments)),
-                kept(gradient(wide, variables, rows)))
+        return wide.model.logits(variables, laid_out(rows, segments)), gradient(wide, variables, rows)
 
     def truth(variables):
         logits, grads = apart_in_float64(variables)
         return np.asarray(logits)[rows["options"]], grads
 
-    assert kept(objective.init(jax.random.key(0))), "no gradient leaf held"
     # A logit sums within its row's window; a parameter's gradient over every window's tokens, in
     # another order than the rows alone.
     initialized = jax.jit(objective.init)

@@ -11,6 +11,7 @@ import pytest
 from jax.experimental import checkify
 from model_support import greedy_walk as walk, initialized_decoder
 
+from dew._distributions import row_draw
 from dew.sampling import Beam, Sample, Sampling, decoding, generate
 from dew.sampling.decoding import StepState
 from dew.sampling.strategies import draw
@@ -249,6 +250,26 @@ def test_a_length_limit_truncates_a_row_and_a_stop_terminates_it(model):
     assert searched.lengths.tolist() == [2] and searched.terminated.tolist() == [False]
 
 
+@pytest.mark.parametrize("chain", ["none", "greedy"])
+def test_a_float64_decoders_beam_searches_in_float64(model, chain):
+    """A float64 decoder's beam scores and log probabilities are float64, as the categorical computes
+    them (`dew.nn.categorical`): over its own logits, no transform between (`logits=()`), or through a
+    chain whose transforms return float32 scores, its search scans its carry and reports each token's
+    likelihood under the model in float64: each a float64 value no float32 holds, as a likelihood
+    computed in float32 and widened would be."""
+    module, params = model
+    prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
+    with jax.enable_x64(new_val=True):
+        wide = module.clone(dtype=jnp.float64)
+        values = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), params)
+        searched = generate(wide, values, prompt, 2, key=jax.random.key(0),
+                            sampling=Sampling(temperature=0, pad_token_id=11),
+                            **({"logits": ()} if chain == "none" else {}), strategy=Beam(width=2))
+        assert searched.lengths.tolist() == [2] and searched.raw_log_probs.dtype == jnp.float64
+        found = np.asarray(searched.raw_log_probs)[0]
+        assert np.all(found != found.astype(np.float32).astype(np.float64))
+
+
 def test_a_callers_criterion_ends_the_row_it_names(model):
     """A stopping callable runs after every committed token, and the row that
     matched keeps the token that ended it."""
@@ -395,3 +416,15 @@ def test_sampling_defaults_and_explicit_policies_generate_the_same_outputs(model
     b = generate(module, params, prompt, 3, key=jax.random.key(0), sampling=sampling, logits=explicit)
     for field in ("tokens", "lengths", "terminated", "behavior_log_probs", "raw_log_probs"):
         np.testing.assert_array_equal(np.asarray(getattr(a, field)), np.asarray(getattr(b, field)))
+
+
+@pytest.mark.parametrize("impl", ["rbg", "unsafe_rbg", "threefry2x32"])
+def test_a_rows_draw_is_its_own_under_any_key_implementation(impl):
+    """Each row's token is drawn under its own key, the same whatever rows it is drawn beside: `vmap`
+    draws every row of an RBG key implementation from the first key's stream, which a row drawn by
+    itself never reads."""
+    keys = jax.random.split(jax.random.key(3, impl=impl), 8)
+    scores = jnp.zeros((8, 4096), jnp.float32)
+    drawn = jax.jit(row_draw)
+    alone = np.concatenate([np.asarray(drawn(keys[row:row + 1], scores[row:row + 1])) for row in range(8)])
+    np.testing.assert_array_equal(np.asarray(drawn(keys, scores)), alone)

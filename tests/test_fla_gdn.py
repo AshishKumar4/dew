@@ -33,6 +33,7 @@ from reference_error import (
     equations,
     float64_terms,
     widened,
+    with_gradients,
 )
 from sharded import assert_runs_per_shard, boundary_copies
 from tuned import each_config
@@ -119,8 +120,9 @@ def test_the_output_kernel_computes_flas_expression(dtype, shape, tiles):
 def test_the_cumsum_kernel_is_flas_chunk_local_cumsum(reverse, columns):
     """Within each chunk of each head, and each key dimension of a decay per key dimension (fla's
     vector kernel), the inclusive sum of the tokens times the base-2 scale, from the end for the
-    gradient, within fp32 rounding of numpy's float64 sum: forward fla's plain fp32 prefix, scaled
-    after the sum, and the gradient's from the end compensated (`compensated_add`), rounded once."""
+    gradient, within fp32 rounding of numpy's float64 sum: forward the prefix in float64, scaled after
+    the sum and rounded once (fla's is plain fp32), and the gradient's from the end compensated
+    (`compensated_add`), rounded once."""
     g = -jnp.exp(jax.random.normal(jax.random.key(3), (2, 192, 3, *columns)) - 3.0)
     tokens = np.asarray(g, np.float64).reshape(2, 3, 64, 3, *columns)
     kernel = functools.partial(cumulated, scale=fla_gdn.RCP_LN2, reverse=reverse,
@@ -893,31 +895,38 @@ compared with itself did not resolve within 512 seeds on an A100 (`in_proj_b`'s 
 gradients, a few sums over one draw's few tokens); with fresh parameters a draw, one row of 64 took
 512 seeds, two of 128 took 256, and four of 256 take 64, as eight of 512 do."""
 
-SEEDS = {(1, 1): 64, (2, 1): 64, (2, 2): 64}
-"""Each remat policy's declared seeds for check 1 (`assert_as_exact`), keyed by the
-(`fla_chunk_fwd_h`, `fla_chunk_fwd_o`) launches its gradient is held to, sized by `seeds_for` on an
+REMAT_SEEDS = 64
+"""Each remat policy's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on an
 A100 (2026-10-21), where the policies' programs differ: the fewest for which the layer's gradient
 without remat compared with itself resolves the factor in every leaf, truth the float64 layer's
 gradient. The three policies share that reference, the draw and the truth, so one sizing gives all
 three. Off a GPU the two are bitwise."""
 
 
-@pytest.mark.parametrize("policy, memories, outputs", [
-    (None, 1, 1),
-    ({"recompute": ("delta_memory",)}, 2, 1),
-    ({"save": ("context", "delta_decay", "delta_inverse")}, 2, 2),
+FORWARD = ("recurrence_cumulated", "fla_kkt_solve", "fla_recompute_w_u", "fla_chunk_fwd_h",
+           "fla_chunk_fwd_o")
+"""The rule's forward launches: the decay's prefix ('delta_decay'), the inverse ('delta_inverse'), the
+memory's two ('delta_memory') and the output."""
+
+MEMORY = ("fla_recompute_w_u", "fla_chunk_fwd_h")
+"""The launches that compute the memory, the one residual a remat rung recomputes."""
+
+
+@pytest.mark.parametrize("policy, recomputed", [
+    (None, ()),
+    ({"recompute": ("delta_memory",)}, MEMORY),
+    ({"save": ("context", "delta_decay", "delta_inverse")}, MEMORY),
 ])
 @generation.chosen(gated_delta_rule="fla")
-def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(policy, memories, outputs):
+def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(policy, recomputed):
     """A block's remat policy keeps or recomputes the port's named residuals
     (`mixer_base.RESIDUALS`): without one the layer saves its decay, inverse and memory
     ('delta_memory') for its backward; 'all_but_delta_memory', which the block applies by tracing its
     layers recomputing that name (`recurrence_chunk.recomputing`) rather than by a checkpoint policy, has the
     backward recompute the memory alone; a policy saving the output, decay and inverse saves those
-    three. Each is read from the kernels the gradient runs: the memory's (`fla_chunk_fwd_h`) once
-    where it is saved and again in the backward where it is recomputed; the output's
-    (`fla_chunk_fwd_o`) once, but where the policy recomputes the memory, whose recompute re-runs the
-    rule's forward, output and all. Each computes the gradients the layer computes without remat, on
+    three, and the backward recomputes the memory alone. Each is read from the kernels the gradient
+    runs: every forward launch once (`FORWARD`), and once more only the memory's (`MEMORY`) where it is
+    recomputed, none the policy saves. Each computes the gradients the layer computes without remat, on
     par with it by check 1 (`assert_as_exact`) over fresh parameters and inputs drawn from each seed
     (`REMAT_ROWS` rows of `REMAT_LENGTH` tokens), truth the float64 layer's gradient; off a GPU,
     bitwise. A GPU compiles
@@ -946,25 +955,30 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
     graph = jax.make_jaxpr(jax.grad(remat))(params, x)
     launched = [str(equation.params["name"]) for equation in equations(graph)
                 if equation.primitive.name == "pallas_call"]
-    counted = (launched.count("fla_chunk_fwd_h"), launched.count("fla_chunk_fwd_o"))
-    assert counted == (memories, outputs), launched
-    reference_grad, remat_grad = jax.jit(jax.grad(loss)), jax.jit(jax.grad(remat))
-    want, got = reference_grad(params, x), remat_grad(params, x)
+    counted = {name: launched.count(name) for name in FORWARD}
+    assert counted == {name: 1 + (name in recomputed) for name in FORWARD}, launched
+    def pulled(fn):
+        """`fn`'s gradient in the parameters under the loss's cotangent the draw holds."""
+        return jax.jit(lambda params, x, one: with_gradients(fn)(params, x, one)[1])
+
+    reference_grad, remat_grad = pulled(loss), pulled(remat)
+    one = jnp.ones((), jnp.float32)
+    want, got = reference_grad(params, x, one), remat_grad(params, x, one)
 
     def draw(seed):
         keys = jax.random.split(jax.random.key(seed))
         x = jax.random.normal(keys[0], (REMAT_ROWS, REMAT_LENGTH, 64))
-        return initialize(keys[1], x), x
+        return initialize(keys[1], x), x, one
 
     wide = layer.clone(dtype=jnp.float64)
 
-    def truth(params, x):
+    def truth(params, x, one):
         # The float64 layer's rule is the portable math, which the port chosen above refuses.
         with generation.chosen(gated_delta_rule="xla"):
-            return jax.grad(lambda params: jnp.sum(wide.apply(params, x) ** 2))(params)
+            return with_gradients(lambda params, x: jnp.sum(wide.apply(params, x) ** 2))(params, x, one)[1]
 
     assert_as_exact(remat_grad, reference_grad, draw, "remat policy gradient",
-                    seeds=SEEDS[(memories, outputs)], truth_fn=jax.jit(truth))
+                    seeds=REMAT_SEEDS, truth_fn=jax.jit(truth))
     if jax.default_backend() != "gpu":
         for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(got), jax.tree.leaves(want),
                                         strict=True):

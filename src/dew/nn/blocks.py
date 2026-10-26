@@ -12,10 +12,11 @@ from jax.typing import DTypeLike
 
 from dew.nn.dense import Dense, DenseGeneral
 
+from . import activations
 from .attention import GroupNorm, RMSNorm
 from .conv import Conv
 from .flops import projection_flops
-from .precision import at_least_fp32, float32_dot_general
+from .precision import at_least_fp32, float32_dot_general, float32_einsum
 from .rope import sinusoid_frequencies, sinusoids
 from .sharding import constrain, explicit_spec, rows_taken, whole_spec
 
@@ -92,7 +93,7 @@ def modulation(conditioning, features: int, pieces: int, *, name: str, silu: boo
     return Dense(pieces * features, use_bias=bias, dtype=dtype, precision=precision, name=name,
                  kernel_init=nn.initializers.zeros if zero_init else nn.initializers.lecun_normal(),
                  dot_general=float32_dot_general)(
-        nn.silu(conditioning) if silu else conditioning)
+        activations.silu(conditioning) if silu else conditioning)
 
 
 class Modulation(nn.Module):
@@ -130,16 +131,29 @@ class Modulation(nn.Module):
 class TokenEmbedding(nn.Embed):
     """Token lookup with cotangent accumulation in the parameter dtype."""
 
+    padding_idx: int | None = None
+    """The id whose row this lookup reads but never trains, as torch's `nn.Embedding(padding_idx=...)`
+    leaves it: the row's gradient takes nothing from the places that read that id. A negative id
+    counts from the table's end, as torch counts it; one outside the table is refused. None trains
+    every row it reads."""
+
     def __call__(self, inputs: jax.Array) -> jax.Array:
         if not jnp.issubdtype(inputs.dtype, jnp.integer):
             raise ValueError("Input type must be an integer or unsigned integer.")
         if self.num_embeddings == 1:
             values = jnp.broadcast_to(self.embedding, (*inputs.shape, self.features))
-            promoted, = self.promote_dtype(values, dtype=self.dtype, inexact=False)
-            if promoted is None:
+            rows, = self.promote_dtype(values, dtype=self.dtype, inexact=False)
+            if rows is None:
                 raise ValueError("Embedding dtype promotion must return an array")
-            return promoted
-        return table_rows(self.embedding, inputs, self.dtype or self.embedding.dtype)
+        else:
+            rows = table_rows(self.embedding, inputs, self.dtype or self.embedding.dtype)
+        if self.padding_idx is None:
+            return rows
+        if not -self.num_embeddings <= self.padding_idx < self.num_embeddings:
+            raise ValueError(f"padding_idx {self.padding_idx} is outside the table of "
+                             f"{self.num_embeddings} rows")
+        padding = self.padding_idx % self.num_embeddings
+        return jnp.where((inputs == padding)[..., None], jax.lax.stop_gradient(rows), rows)
 
 
 class FourierEmbedding(nn.Module):
@@ -195,7 +209,7 @@ def sinusoidal_time(time, features: int, *, dtype: DTypeLike, shift: float = 0, 
 class TimeProjection(nn.Module):
     """Two dense layers with the activation after each."""
     features: int
-    activation: Callable = jax.nn.gelu
+    activation: Callable = activations.gelu_tanh
     dtype: Dtype | None = None
     precision: PrecisionLike = None
 
@@ -281,7 +295,7 @@ def torch_bicubic_resize(x, height: int, width: int, *, antialias: bool = False)
     reference only through this arithmetic."""
     rows = _torch_bicubic_weights(x.shape[1], height, antialias)
     columns = _torch_bicubic_weights(x.shape[2], width, antialias)
-    return jnp.einsum("oh,bhwc,pw->bopc", rows, x, columns, precision=jax.lax.Precision.HIGHEST)
+    return float32_einsum("oh,bhwc,pw->bopc", rows, x, columns, precision=jax.lax.Precision.HIGHEST)
 
 
 class Upsample(nn.Module):

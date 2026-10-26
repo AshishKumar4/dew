@@ -514,7 +514,9 @@ def test_a_calibration_comes_back_with_the_weights_it_was_fitted_on(tmp_path):
     calibrated.save(str(tmp_path))
     reloaded = Decide.from_run(str(tmp_path))
     assert reloaded.calibration == calibrated.calibration
-    assert json.loads((tmp_path / "decide.json").read_text())["weights"] == {"step": 1, "ema": False}
+    # One run's weights average no runs; a file written before the field reads as one that names none.
+    assert json.loads((tmp_path / "decide.json").read_text())["weights"] == {"step": 1, "ema": False,
+                                                                           "averaged": []}
 
     trainer.fit(data, steps=2, log_every=100, checkpoint_every=1)
     checkpoints.wait()

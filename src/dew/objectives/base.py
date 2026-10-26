@@ -42,9 +42,11 @@ from flax import struct
 from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
+from dew._distributions import counter_key
 from dew.artifacts import Artifact, Artifacts, TokenScores
+from dew.nn import categorical
 from dew.nn.kernels.options import compiler_options
-from dew.nn.precision import compensated_sum
+from dew.nn.precision import accumulated, at_least_fp32, compensated_sum, weighted_total
 from dew.nn.protocols import HiddenStates, ProjectsParameters
 from dew.nn.sharding import rows_taken
 from dew.records import JSON, strings
@@ -240,13 +242,6 @@ def stream(name: str) -> int:
     return fold
 
 
-def example_stream(key: jax.Array) -> jax.Array:
-    """A counter-based key (threefry2x32) of `key`'s bits, whatever `key`'s implementation: a mapped
-    draw under it is each mapped key's own, where an RBG key maps every draw from its first key
-    (https://docs.jax.dev/en/latest/jax.random.html#advanced-rng-configuration)."""
-    return jax.random.wrap_key_data(jax.random.bits(key, (2,), jnp.uint32), impl="threefry2x32")
-
-
 @struct.dataclass
 class Step:
     """What the trainer tells an objective about the current step.
@@ -326,7 +321,7 @@ class Step:
         folded with `name` (`stream`): `[rows, *shape]`, the same values an example draws on any layout,
         as `jax.random`'s draws take them. `dtype` is the draw's own, never a model's, so a float64 twin
         draws what the run drew; None leaves it out, and `shape` None calls `draw(key)`, a draw that fixes
-        both. The key is the example's place folded into `example_stream` of the update's key, or of the
+        both. The key is the example's place folded into `counter_key` of the update's key, or of the
         attempt's outside a run. With a `tape` holding `name`, its rows for these examples instead,
         at the draw's dtype."""
         examples = self.examples(rows)
@@ -355,7 +350,7 @@ class Step:
         if self.tape is not None and name in self.tape:
             like = jax.eval_shape(drawn, jax.random.key(0))
             return self._taped(self.tape[name], name, examples, like.shape).astype(like.dtype)
-        key = jax.random.fold_in(example_stream(self.key if self.example_key is None else self.example_key),
+        key = jax.random.fold_in(counter_key(self.key if self.example_key is None else self.example_key),
                                  stream(name))
         return jax.vmap(lambda example: drawn(jax.random.fold_in(key, example)))(examples)
 
@@ -712,6 +707,18 @@ class SavedTask(Protocol):
 
 
 @runtime_checkable
+class SettingsTask(SavedTask, Protocol):
+    """A saved task that builds from the settings its run records (`Objective.task_settings`), over a
+    model, its variables and a processor: a live objective builds it as a saved run loads it
+    (`Objective.build_task`). Dew's token tasks (`TextGeneration`, `BlockGeneration`,
+    `MaskedGeneration`) are such classes."""
+
+    @classmethod
+    def from_settings(cls, model: nn.Module, variables: Variables, settings,
+                      processor: Processor | None) -> Self: ...
+
+
+@runtime_checkable
 class ReleasedTask(SavedTask, Protocol):
     """A saved task that publishes its run as a released checkpoint of its own layout
     (`Decide.save_pretrained`), which `dew export` writes in place of its model's source layout."""
@@ -760,7 +767,7 @@ def _ruled(value: jax.Array, rule: Variables, params: Variables) -> jax.Array:
 def _ruled_jvp(primals, tangents):
     value, rule, _ = primals
     moved_value, _, moved = tangents
-    return value, moved_value + sum(jnp.vdot(leaf, change) for leaf, change in
+    return value, moved_value + sum(accumulated(jnp.vdot, leaf, change) for leaf, change in
                                     zip(jax.tree.leaves(rule), jax.tree.leaves(moved), strict=True))
 
 
@@ -814,6 +821,10 @@ class Objective(ABC, Generic[Loss, Effects]):
     # the model under in every collection, as PPO nests its policy beside the
     # critic; None when the saved tree is the model's.
     _model_part: ClassVar[str | None] = None
+    # The name the model's tree nests its recorded model (`recorded_model`) under, beside parts its record
+    # leaves out, as a decision model nests its backbone beside its head; None when the model's tree is
+    # the recorded model's. A LoRA record's factors merge there (`dew.checkpoints.averaged`).
+    _recorded_part: ClassVar[str | None] = None
     shown: Mapping[str, Shown] = {}
     """How the display shows the metrics `loss` reports, keyed by the names it reports them under.
 
@@ -882,6 +893,13 @@ class Objective(ABC, Generic[Loss, Effects]):
         tower. The trainer calls this once and passes the result to `init`, so
         an objective never has to read its own held arrays inside a trace.
         The default is the starting tree, `variables`.
+
+        A leaf of the `FROZEN` collection that `init` returns as it is, by
+        reference, as the base `init` returns the whole collection (it projects
+        `params` alone), is shared: the trainer's state holds that very array,
+        which no step donates, so a run and its objective hold one frozen tree
+        (`dew.training.state.apart`). A frozen leaf `init` builds, another
+        array's copy or values of its own, is the state's own.
         """
         return self.variables
 
@@ -1037,7 +1055,7 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     def program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (),
                 holds: tuple[DeviceStep | AutoEncoder | Guidance, ...] = (),
-                modules: tuple[nn.Module, ...] = ()):
+                modules: tuple[nn.Module, ...] = (), step: Mapping[str, bool | int] | None = None):
         """`function` jitted as this objective's program `name`, reused only while its modules and head
         tiles stay fixed (`program_key`), and under the context it traced in (`trace_context`).
 
@@ -1050,8 +1068,10 @@ class Objective(ABC, Generic[Loss, Effects]):
         step runs or a sample's guidance and autoencoder, whose numbers it bakes in: the program is
         reused only while they are the same objects, and one over others replaces it. `modules` are
         the networks it runs beside the objective's own, an autoguide's or an autoencoder's: they key
-        it as `holds` do, and its options cover them. Keep only the current specialization, not a
-        history of old models or steps.
+        it as `holds` do, and its options cover them. `step` are the XLA options of the training step
+        the program is part of (`dew.training.memory.step_compiler_options`), beside its modules' own,
+        so a host step's programs compile as the resident step does. Keep only the current
+        specialization, not a history of old models or steps.
         """
         programs = tuple((program.module, (program.head_tile, program.head_fused))
                          for program in self.program_key())
@@ -1063,8 +1083,8 @@ class Objective(ABC, Generic[Loss, Effects]):
             self._program_cache = cached
         from dew.nn.sharding import trace_context
         # The options follow where the program runs (`compiler_options`), so they key it too.
-        options = compiler_options(*(module for module, _ in programs), *modules)
-        key = (name, trace_context(), tuple(options.items()))
+        options = {**compiler_options(*(module for module, _ in programs), *modules), **(step or {})}
+        key = (name, trace_context(), tuple(sorted(options.items())))
         held = cached[1].get(key)
         kept = (*holds, *modules)
         if held is None or len(held[0]) != len(kept) or any(
@@ -1136,7 +1156,7 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     @staticmethod
     def row_mean(values: jax.Array, batch: Batch, axis: int | tuple[int, ...] | None = None, *,
-                 rows: int | tuple[int, ...] = 0) -> Ratio:
+                 rows: int | tuple[int, ...] = 0, weights: jax.Array | None = None) -> Ratio:
         """Return the mean of `values` over `axis`, as the `Ratio` of their sum and count.
 
         `rows` is the axis of `values`, or the consecutive axes, that index `batch`'s
@@ -1145,16 +1165,27 @@ class Objective(ABC, Generic[Loss, Effects]):
         `VALID_ROWS`, a repeat row has zero weight in both, so a loss and every
         batch-wide term computed through this count each real record once. Without
         `VALID_ROWS`, as in training, this is the sum (`compensated_sum`) and the size.
+
+        With `weights`, each value counts for its weight, broadcast to `values`: the `Ratio`
+        is of their weighted sum and the weights' (`dew.nn.precision.weighted_total`), a value
+        of weight 0, a padded target's loss, selected away before its product, so a NaN or an
+        infinity there adds nothing.
         """
-        dtype = jnp.promote_types(values.dtype, jnp.float32)
+        dtype = at_least_fp32(values.dtype)
         axes = (tuple(range(values.ndim)) if axis is None
                 else (axis,) if isinstance(axis, int) else tuple(axis))
-        if VALID_ROWS not in batch:
+        real = None
+        if VALID_ROWS in batch:
+            held = (rows,) if isinstance(rows, int) else rows
+            shape = [values.shape[a] if a in held else 1 for a in range(values.ndim)]
+            real = Objective.row_weights(batch, math.prod(values.shape[a] for a in held)).reshape(shape) > 0
+        if weights is not None:
+            weights = jnp.broadcast_to(weights, values.shape)
+            counted = weights if real is None else jnp.where(real, weights, 0)
+            return Ratio(*weighted_total(values, counted, axes))
+        if real is None:
             count = math.prod(values.shape[a] for a in axes)
             return Ratio(compensated_sum(values, axes), jnp.asarray(count, dtype))
-        held = (rows,) if isinstance(rows, int) else rows
-        shape = [values.shape[a] if a in held else 1 for a in range(values.ndim)]
-        real = Objective.row_weights(batch, math.prod(values.shape[a] for a in held)).reshape(shape) > 0
         # Selected rather than multiplied, so a repeat holding a NaN still adds nothing.
         return Ratio(compensated_sum(jnp.where(real, values, jnp.zeros((), values.dtype)), axes),
                      jnp.sum(jnp.broadcast_to(real, values.shape).astype(dtype), axes))
@@ -1227,7 +1258,7 @@ class Objective(ABC, Generic[Loss, Effects]):
             return stats.mean()
         if isinstance(stats, (jax.Array, float, int)):
             value = jnp.asarray(stats)
-            value = value.astype(jnp.promote_types(value.dtype, jnp.float32))
+            value = value.astype(at_least_fp32(value.dtype))
             if value.ndim != 0:
                 raise ValueError("a unit-mass loss must be scalar")
             return value, jnp.asarray(a=True)
@@ -1501,11 +1532,18 @@ class Objective(ABC, Generic[Loss, Effects]):
         """Return the task over `variables`, the trained tree as the run keeps it.
 
         `processor` encodes and decodes in place of the objective's own, an
-        explicit None included. Objectives without a generation task raise
-        `TypeError`. A plugin objective returns its own `saved_task` class, so
-        the return type also allows a `SavedTask` besides Dew's own tasks.
+        explicit None included. An objective whose `saved_task` builds from
+        the settings its run records (`SettingsTask`) builds it from its own
+        (`task_settings`) over its model, as a saved run of it loads; any other
+        overrides this, or has no inference task and raises `TypeError`. A
+        plugin objective's task is its own `saved_task` class, so the return
+        type also allows a `SavedTask` besides Dew's own tasks.
         """
-        raise TypeError(f"{type(self).__name__} has no inference task")
+        task, settings, model = self.saved_task, self.task_settings(), vars(self).get("model")
+        if task is None or settings is None or model is None or not isinstance(task, SettingsTask):
+            raise TypeError(f"{type(self).__name__} has no inference task")
+        return task.from_settings(model, variables, settings,
+                                  self.processor if processor is OMITTED else processor)
 
     def pipeline(self, state: TrainState, *, ema: bool | None = None,
                  processor: Processor | None | Omitted = OMITTED) -> Task | SavedTask:
@@ -1640,16 +1678,11 @@ def mean_of_totals(accumulated: tuple[float, float]) -> float:
 
 
 def token_log_probs(logits: jax.Array, tokens: jax.Array) -> jax.Array:
-    """`log_softmax(logits)[..., tokens]`, reduced in fp32 whatever `logits` holds.
+    """`log_softmax(logits)[..., tokens]`, reduced in at least fp32 (`dew.nn.categorical`).
 
-    `tokens` is `logits.shape[:-1]` of ids and the result has that shape. A
-    bf16 log partition over a vocabulary carries bf16's 8-bit mantissa into
-    every score, which is error in the second decimal of a log probability
-    near -10; fp32 carries the logits exactly and rounds only the reduction.
-    optax's cross entropy reads the target logit without building the
-    normalized row.
+    `tokens` is `logits.shape[:-1]` of ids and the result has that shape.
     """
-    return -optax.softmax_cross_entropy_with_integer_labels(logits.astype(jnp.float32), tokens)
+    return -categorical.cross_entropy(logits, tokens)
 
 __all__ = [
     "FROZEN",

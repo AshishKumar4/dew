@@ -565,7 +565,7 @@ Later decisions (2026-10-22 and 2026-10-23), which §0 states as the design; whe
 | # | Variant | Maps to |
 |---|---|---|
 | 50 | check 1 and check 2 for every form and hook, bf16 included | gate |
-| 51 | bitwise reproducible runs | the same-schedule reproducibility test |
+| 51 | bitwise reproducible runs in deterministic mode | the same-schedule reproducibility test |
 
 #### Survey additions (FlagAttention, fla and tokamax)
 

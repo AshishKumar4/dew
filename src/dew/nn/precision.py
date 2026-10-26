@@ -8,19 +8,35 @@ so the mixed f32 x bf16 backward products run at the fp32 rate. XLA's
 `BF16_BF16_F32` dot algorithm names the arithmetic instead (bf16 operands,
 fp32 accumulation, whatever the storage), and jax carries `precision` into
 the transpose rules, so the backward follows; jax's own xla attention sets it
-for this reason (jax-ml/jax#24047).
-"""
+for this reason (jax-ml/jax#24047). Dew's products at that algorithm type
+their operands bf16 instead (`bf16_dot_general`, which the dot family runs
+for it): an A100 computes the algorithm wrong where a dot has a vector side
+or sits below XLA's GEMM rewrite threshold.
+
+Dew's test processes run wide CPU arithmetic (`WIDE_CPU_ARITHMETIC`, which tests/lane_environment.py
+sets): a CPU then sums every float32 product of the dot family, dot_general, einsum and matmul, in
+float64 and rounds once (`accumulated`), since XLA:CPU chooses its fp32 dot accumulation by shape,
+instruction set and release, and jax 0.12's summed twice numpy's error from float64 where 0.11's
+summed 0.6 of it. A library process's products are the plain products on every platform.
+Convolutions, depthwise ones included, keep XLA's fp32 sum on a CPU: no convolution's check 1
+failed there, and XLA:CPU's float64 convolution cost a 3x3 one's training step 44 times (15.5 to
+675 ms on a 4x32x32x128 map), its best rewrite 2 to 4. Should a convolution's check 1 resolve above
+its bar, the recorded fix is that rewrite: the kernel's shifted windows taken inside the float64
+scope and contracted with the taps as one 2D product (stride 1 train 3.9 times, stride 2 1.6)."""
 
 from __future__ import annotations
 
 import contextlib
 import functools
+import os
 from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import opt_einsum
 from flax.typing import Dtype, PrecisionLike
+from jax.extend import core
 from jax.typing import DTypeLike
 
 
@@ -35,6 +51,30 @@ def at_least_fp32(dtype: DTypeLike | None) -> jnp.dtype:
     return jnp.promote_types(jnp.float32 if dtype is None else dtype, jnp.float32)
 
 
+def rms_statistics(x: jax.Array, epsilon: float, *, axis=-1, keepdims: bool = True,
+                   count: int | None = None) -> tuple[jax.Array, jax.Array]:
+    """Mean square and inverse RMS in at least fp32. A padded kernel tile supplies its logical
+    `count` after zeroing padding; an ordinary array uses its reduction dimensions. Callers own
+    when the inverse, normalized values and learned scale round."""
+    square = jnp.square(x.astype(at_least_fp32(x.dtype)))
+    mean = (jnp.mean(square, axis=axis, keepdims=keepdims) if count is None
+            else jnp.sum(square, axis=axis, keepdims=keepdims) / count)
+    return mean, jax.lax.rsqrt(mean + epsilon)
+
+
+def weighted_total(x: jax.Array, weights: jax.Array, axis=None) -> tuple[jax.Array, jax.Array]:
+    """Weighted total and mass along `axis` (an int, a tuple, or None for every axis), in `x`'s
+    dtype, each summed once rounded (`compensated_sum`), so a loss over many tokens rounds as its
+    exact sum does. Broadcastable weights mark excluded values with zero; those values are selected
+    away before multiplication, so their NaNs and infinities cannot reach the sum. The caller owns
+    its denominator policy."""
+    weights = jnp.broadcast_to(jnp.asarray(weights, x.dtype), x.shape)
+    kept = jnp.where(weights != 0, x, 0)
+    axes = tuple(range(x.ndim)) if axis is None else tuple(
+        dimension % x.ndim for dimension in ((axis,) if isinstance(axis, int) else axis))
+    return compensated_sum(kept * weights, axes), compensated_sum(weights, axes)
+
+
 def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     """`product` plus `bias` broadcast over its leading axes, in the dtype their addition promotes
     to, as flax's layer adds them.
@@ -46,14 +86,38 @@ def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     a bfloat16 bias added to bfloat16 products sums its gradient over every position in bfloat16,
     where torch's addmm sums its in float32: Qwen 2's projection biases, summed over 8192 tokens,
     came out up to 3.75 times further from float64 than torch's own bfloat16 gradients. Broadcast
-    at fp32, the gradient sums at fp32 and rounds once into the bias.
+    at fp32, the gradient sums at fp32 and rounds once into the bias. A CPU running Dew's wide
+    arithmetic (`WIDE_CPU_ARITHMETIC`) sums it in float64, as it sums a float32 product (`spread`).
     """
     dtype, wide = jnp.result_type(product, bias), at_least_fp32(bias.dtype)
     # The bias takes the product's rank before the sum, as flax's layers reshape it, so no rank is
     # promoted implicitly. Broadcast at fp32 and rounded back, it adds as flax adds it (XLA folds
     # the round trip, so the product and bias fuse as before) and its gradient sums at fp32.
     bias = jnp.reshape(bias.astype(wide), (1,) * (product.ndim - bias.ndim) + bias.shape)
-    return product.astype(dtype) + jnp.broadcast_to(bias, product.shape).astype(dtype)
+    return product.astype(dtype) + spread(bias, product.shape).astype(dtype)
+
+
+def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
+    """`value` broadcast to `shape`, whose transpose, the sum of a cotangent over every position the
+    value spread over (a bias's gradient), a CPU running wide arithmetic (`WIDE_CPU_ARITHMETIC`, Dew's
+    tests) takes in float64 and rounds once, as it sums a float32 product (`accumulated`): there the
+    broadcast is the outer product of ones and the value, whose transpose is a product. Elsewhere,
+    or where `accumulated` leaves a product its own sum, it is the broadcast, whose transpose JAX
+    sums in the value's dtype."""
+    axes = tuple(axis for axis, (size, total) in enumerate(zip(value.shape, shape, strict=True))
+                 if size == 1 and total != 1)
+    if not axes or not _sums_in_float64(value):
+        return jnp.broadcast_to(value, shape)
+    kept = tuple(axis for axis in range(len(shape)) if axis not in axes)
+
+    def outer(value: jax.Array) -> jax.Array:
+        # Only the size-one axes are dropped, so a sharded kept axis keeps its own sharding.
+        ones = jnp.ones(tuple(shape[axis] for axis in axes), value.dtype)
+        product = accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((), ()), ((), ()))),
+                              ones, jnp.squeeze(value, axes))
+        return jnp.transpose(product, tuple(np.argsort((*axes, *kept))))
+
+    return jax.lax.platform_dependent(value, cpu=outer, default=lambda value: jnp.broadcast_to(value, shape))
 
 
 def precision_names(precision: jax.lax.PrecisionLike) -> frozenset[str]:
@@ -116,6 +180,148 @@ def products_dtype(*operands) -> jnp.dtype | None:
     return jnp.result_type(*dtypes)
 
 
+def _intercepted() -> bool:
+    """Whether this thread traces a quantized model's method, whose products Qwix owns
+    (`dew.cache.QUANTIZED_TRACE`, which jit's cache keys on)."""
+    from dew.cache import QUANTIZED_TRACE
+
+    return QUANTIZED_TRACE.value is not None
+
+
+_OWN_DERIVATIVES = (core.primitives.custom_vjp_call_p, core.primitives.custom_jvp_call_p)
+"""JAX's primitives for a function that states its own derivative (`jax.custom_vjp`, `jax.custom_jvp`)."""
+
+
+def _own_backward(jaxpr) -> bool:
+    """Whether a product's trace states a derivative of its own (a `jax.custom_vjp`, as Qwix's
+    quantized products are when Qwix quantizes a model directly, or a `jax.custom_jvp`), in it or any
+    program inside it (`jax.extend.core.subjaxprs`): a product its library owns, which `accumulated`
+    neither widens nor transposes, since a transpose would differentiate its primal instead."""
+    return (any(eqn.primitive in _OWN_DERIVATIVES for eqn in jaxpr.eqns)
+            or any(_own_backward(program) for program in core.subjaxprs(jaxpr)))
+
+
+FP32_SUMS = "F32_F32_F32"
+"""JAX's dot algorithm of fp32 operands summed in fp32: as a process's or a scope's default matmul
+precision, the statement that its fp32 products sum as an accelerator sums them, which `accumulated`
+honors on a CPU."""
+
+
+WIDE_CPU_ARITHMETIC = "DEW_WIDE_CPU_ARITHMETIC"
+"""The environment variable that, set to 1, has a process's CPU programs take the arithmetic Dew's
+tests hold a CPU to: float32 products summed in float64 and rounded once (`accumulated`, `spread`), a
+loop's running sum of them compensated so it rounds once too (`compensates_loops`), a row's logsumexp
+reduced in levels of short blocks (`dew.objectives.lm.chunked`) and a float64 division divided as
+written (`dew.diffusion.schedules.common.divided`). Read as each program is traced; set by the tests'
+environment (tests/lane_environment.py), never by the library, which without it takes none of these
+forms on any platform. Each such site chooses the wide form by the platform the
+program is lowered for (`platform_dependent`, or for a loop's carry the platform its code is chosen
+for), so a test that lowers for an accelerator keeps the target's."""
+
+
+def wide_cpu_arithmetic() -> bool:
+    """Whether this process runs wide CPU arithmetic (`WIDE_CPU_ARITHMETIC`)."""
+    return os.environ.get(WIDE_CPU_ARITHMETIC) == "1"
+
+
+def _sums_in_float64(*operands) -> bool:
+    """Whether a CPU sums these operands' products in float64 (`accumulated`): in a process running wide
+    CPU arithmetic (`WIDE_CPU_ARITHMETIC`), float32 arrays, in no scope that states fp32 sums
+    (`FP32_SUMS`), outside a quantized model's trace (`_intercepted`)."""
+    return (wide_cpu_arithmetic() and jax.config.jax_default_matmul_precision != FP32_SUMS
+            and not _intercepted()
+            and all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
+            and products_dtype(*operands) == jnp.dtype(jnp.float32))
+
+
+def float64_sum(product: Callable[..., jax.Array], *operands, dtype: DTypeLike) -> jax.Array:
+    """`product(*operands)`, a sum of products, taken in float64 from its operands widened exactly and
+    rounded once to `dtype`, under `jax.enable_x64` for its own trace: the sum `accumulated` takes on a
+    CPU under Dew's wide arithmetic (`WIDE_CPU_ARITHMETIC`), with no platform of its own to choose.
+    Its products run at HIGHEST precision, whatever fp32 algorithm the caller bound, which would
+    narrow float64 operands back to float32."""
+    with jax.enable_x64(new_val=True):
+        wide = product(*_widened(operands), precision=jax.lax.Precision.HIGHEST, preferred_element_type=None)
+        return wide.astype(dtype)
+
+
+def _widened(operands) -> list[jax.Array]:
+    """`operands` as the float64 operands of their float32 product: each converted to the dtype they
+    multiply in (`products_dtype`), as the product converts them, then widened exactly."""
+    dtype = products_dtype(*operands)
+    return [operand.astype(dtype).astype(jnp.float64) for operand in operands]
+
+
+def accumulated(product: Callable[..., jax.Array], *operands,
+                preferred_element_type: DTypeLike | None = None) -> jax.Array:
+    """`product(*operands, preferred_element_type=...)`, a sum of products of `operands` (a dot, an
+    einsum, a matmul): the plain product, but in a process running wide CPU arithmetic
+    (`WIDE_CPU_ARITHMETIC`, Dew's tests), where they multiply in float32 (`products_dtype`) a CPU
+    sums the products in float64 and rounds the sum once to the dtype the product returns.
+    Each fp32 product is exact in float64, so the result is within half an fp32 ulp of the float64
+    sum at every shape, where XLA's CPU dot chooses its fp32 accumulation by shape, instruction set
+    and release (jax 0.12's sums twice numpy's error from float64 at widths where jax 0.11's summed
+    0.6 of it). It costs a CPU product about twice the time (2048-cubed 56 to 126 ms on armada's
+    EPYC); a GPU or TPU product, and any whose products are 16-bit, are the product itself. float64
+    runs on these ops alone, under `jax.enable_x64` for their own trace, which nothing outside
+    reads, and their gradients and tangents are float64 sums too. An operand that is not an array (a
+    quantized one, Qwix's `QArray`) leaves the product to its own library, whose dequantized sum
+    keeps XLA's accumulation.
+
+    A library that swaps JAX's products for its own while a model runs (Qwix, quantizing) owns them:
+    the product is its, as flax's own layers' would be. One whose trace calls a backward of its own
+    (a `jax.custom_vjp`, Qwix's when it quantizes a model directly) is left to it whole, its forward
+    and its backward, read from the trace that gives the product's dtype (`_own_backward`).
+
+    The wide sum is Dew's test setting, not a user option: a process without `WIDE_CPU_ARITHMETIC`
+    traces the plain product alone. Under it, it is real CPU execution's policy alone, chosen by the
+    platform the program is lowered for
+    (`platform_dependent`), which keys every compiled program: a step a CPU lowers for a GPU target
+    (`dew.training.trainer.Trainer.lower_for`, `lowering_platforms=('cuda',)`) takes the target's
+    fp32 sum, and a Pallas kernel's body, interpreted on a CPU to stand in for a GPU, never forms its
+    products here. A computation that stands for such a target, a reference for a kernel interpreted
+    on a CPU, states its fp32 sums with JAX's dot algorithm for them, `with
+    jax.default_matmul_precision(FP32_SUMS)`, which jit's cache keys as it keys every precision."""
+    from dew.nn.kernels.generation import linear_tangent
+
+    narrow = functools.partial(product, preferred_element_type=preferred_element_type)
+    if not _sums_in_float64(*operands):
+        return narrow(*operands)
+    traced, shape = jax.make_jaxpr(narrow, return_shape=True)(*operands)
+    dtype = shape.dtype
+    if jnp.promote_types(dtype, jnp.float32) != jnp.float32 or _own_backward(traced.jaxpr):
+        # A wider result converts the operands to it, so the products are not float32's; a product
+        # with a backward of its own is its library's.
+        return narrow(*operands)
+
+    def summed(*operands):
+        return float64_sum(product, *operands, dtype=dtype)
+
+    def pulled(saved, operands, cotangent, live):
+        """The cotangents of the operands at `live`, each the float64 sum of its products rounded
+        once: JAX transposes a product after its trace, outside the scope that widened it, so the
+        pullback is formed in that scope here, for the operands a reverse pass differentiates alone."""
+        with jax.enable_x64(new_val=True):
+            wide = _widened(operands)
+            wide_cotangent = cotangent.astype(jnp.float64)
+
+            def transposed(index):
+                # The product is linear in each operand alone, so its transpose there forms the
+                # cotangent's products and nothing of the forward.
+                def alone(operand):
+                    return product(*wide[:index], operand, *wide[index + 1:],
+                                   precision=jax.lax.Precision.HIGHEST, preferred_element_type=None)
+
+                (gradient,) = jax.linear_transpose(alone, wide[index])(wide_cotangent)
+                return gradient.astype(operands[index].dtype)
+
+            return tuple(transposed(index) for index in live)
+
+    # Forward mode differentiates `summed` as it traces, inside its scope; reverse mode runs `pulled`.
+    wide = linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True)
+    return jax.lax.platform_dependent(*operands, cpu=wide, default=narrow)
+
+
 L2NORM_EPS = 1e-6
 """The epsilon `l2norm` adds under its square root: FLA's, and Dory's `justnorm`'s."""
 
@@ -132,25 +338,75 @@ def l2norm(x: jax.Array, eps: float = L2NORM_EPS) -> jax.Array:
 
 def float32_dot_general(lhs, rhs, dimension_numbers, precision: jax.lax.PrecisionLike = None,
                         preferred_element_type: DTypeLike | None = None, **kwargs) -> jax.Array:
-    """`jax.lax.dot_general` at the precision its operands' own dtype takes (`float32_products`):
-    the product a flax layer forms (`nn.Dense(dot_general=...)`), resolved where flax has
-    promoted its operands, so a layer of any dtype, unset included, multiplies as it computes."""
-    return jax.lax.dot_general(lhs, rhs, dimension_numbers,
-                               precision=float32_products(products_dtype(lhs, rhs), precision),
-                               preferred_element_type=preferred_element_type, **kwargs)
+    """`jax.lax.dot_general` at the precision its operands' own dtype takes (`float32_products`),
+    accumulated as Dew accumulates a CPU's float32 products (`accumulated`): the product a flax
+    layer forms (`nn.Dense(dot_general=...)`), resolved where flax has promoted its operands, so a
+    layer of any dtype, unset included, multiplies as it computes. At the `BF16_BF16_F32` algorithm
+    it is `bf16_dot_general`'s product."""
+    precision = float32_products(products_dtype(lhs, rhs), precision)
+    if _bf16_algorithm(precision):
+        return _held(bf16_dot_general(lhs, rhs, dimension_numbers), preferred_element_type, lhs, rhs)
+    return accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=dimension_numbers,
+                                         precision=precision, **kwargs),
+                       lhs, rhs, preferred_element_type=preferred_element_type)
 
 
 def float32_einsum(subscripts: str, *operands, precision: jax.lax.PrecisionLike = None,
-                   **kwargs) -> jax.Array:
+                   preferred_element_type: DTypeLike | None = None, **kwargs) -> jax.Array:
     """`jnp.einsum` at the precision its operands' own dtype takes (`float32_products`), as
-    `float32_dot_general` is a layer's."""
-    return jnp.einsum(subscripts, *operands,
-                      precision=float32_products(products_dtype(*operands), precision), **kwargs)
+    `float32_dot_general` is a layer's, accumulated alike, and `bf16_einsum`'s product at the
+    `BF16_BF16_F32` algorithm."""
+    precision = float32_products(products_dtype(*operands), precision)
+    if _bf16_algorithm(precision):
+        return _held(_bf16_contracted(subscripts, *operands), preferred_element_type, *operands)
+    return accumulated(functools.partial(jnp.einsum, subscripts, precision=precision, **kwargs), *operands,
+                       preferred_element_type=preferred_element_type)
+
+
+def _bf16_contracted(subscripts: str, *operands) -> jax.Array:
+    """`jnp.einsum(subscripts, *operands)` of any expression einsum takes, each of its products
+    `bf16_einsum`'s: the operands contracted two at a time along opt_einsum's path, as `jnp.einsum`
+    contracts them, an index a pair's result drops that only one of the pair holds summed out of
+    that operand first, and an operand's own indices (a sum, a diagonal, a transpose) taken by
+    einsum alone, which forms no product."""
+    _, path = opt_einsum.contract_path(subscripts, *operands, shapes=False)
+    held = list(operands)
+    for indices, _, step, *_ in path.contraction_list:
+        pair = [held.pop(index) for index in indices]
+        given, produced = step.split("->")
+        specs = given.split(",")
+        if len(pair) == 1:
+            held.append(jnp.einsum(step, *pair))
+            continue
+        kept = []
+        for at, (spec, operand) in enumerate(zip(specs, pair, strict=True)):
+            other = specs[1 - at]
+            own = "".join(dict.fromkeys(label for label in spec if label in other or label in produced))
+            kept.append((own, operand if own == spec else jnp.einsum(f"{spec}->{own}", operand)))
+        (left, lhs), (right, rhs) = kept
+        held.append(bf16_einsum(f"{left},{right}->{produced}", lhs, rhs))
+    (contracted,) = held
+    return contracted
+
+
+def _bf16_algorithm(precision: jax.lax.PrecisionLike) -> bool:
+    """Whether `precision` names XLA's `BF16_BF16_F32` dot algorithm, which Dew's products run as
+    `bf16_dot_general`."""
+    return precision_names(precision) == {jax.lax.DotAlgorithmPreset.BF16_BF16_F32.name}
+
+
+def _held(product: jax.Array, preferred_element_type: DTypeLike | None, *operands) -> jax.Array:
+    """A product the dot family formed in fp32 as the dtype it would have returned: the preferred
+    one, else its operands' (`products_dtype`)."""
+    held = products_dtype(*operands) if preferred_element_type is None else preferred_element_type
+    return product.astype(held)
 
 
 def float32_matmul(lhs, rhs) -> jax.Array:
-    """`lhs @ rhs` at the precision its operands' own dtype takes (`float32_products`)."""
-    return jnp.matmul(lhs, rhs, precision=float32_products(products_dtype(lhs, rhs)))
+    """`lhs @ rhs` at the precision its operands' own dtype takes (`float32_products`), accumulated
+    as `float32_dot_general` is."""
+    return accumulated(functools.partial(jnp.matmul, precision=float32_products(products_dtype(lhs, rhs))),
+                       lhs, rhs)
 
 
 def configurable_precision(precision: jax.lax.PrecisionLike) -> bool:
@@ -204,10 +460,9 @@ def fp32_result_dot_general(precision: PrecisionLike = None):
     def dot_general(lhs, rhs, dimension_numbers, precision=None,
                     preferred_element_type=None):
         del precision, preferred_element_type  # this head's policy, not the layer's
-        return jax.lax.dot_general(
-            lhs, rhs, dimension_numbers,
-            precision=operand_precision(lhs.dtype, requested),
-            preferred_element_type=at_least_fp32(lhs.dtype))
+        return float32_dot_general(lhs, rhs, dimension_numbers,
+                                   precision=operand_precision(lhs.dtype, requested),
+                                   preferred_element_type=at_least_fp32(lhs.dtype))
 
     return dot_general
 
@@ -419,10 +674,48 @@ def compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
 
 @functools.partial(jax.custom_jvp, nondiff_argnums=(1,))
 def _compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
-    wide = values.astype(jnp.promote_types(values.dtype, jnp.float32))
+    wide = values.astype(at_least_fp32(values.dtype))
     zero = jnp.zeros((), wide.dtype)
     hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), compensated_add, axes)
     return compensated_total((hi, lo), jnp.sum(wide, axes)).astype(values.dtype)
+
+
+def compensates_loops() -> bool:
+    """Whether a running sum of float32 products carried across a loop keeps what each addition
+    drops (`compensated_add`), so the loop's sum rounds once as one product's does: where a CPU sums
+    each product in float64 (`accumulated`), in a process running Dew's wide CPU arithmetic
+    (`WIDE_CPU_ARITHMETIC`). A carry's shape is fixed when its loop traces, so this
+    reads the platform a call's code is chosen for (`dew.nn.kernels.generation.backend`), as a CPU's
+    attention routing does; an accelerator's running sum is the plain one, as its products' sums are
+    float32's."""
+    from dew.nn.kernels.generation import backend
+
+    return (wide_cpu_arithmetic() and backend() == "cpu"
+            and jax.config.jax_default_matmul_precision != FP32_SUMS and not _intercepted())
+
+
+def running_sum(shape: tuple[int, ...], dtype: DTypeLike) -> jax.Array:
+    """An empty running sum of `shape` (`added_to`, `running_total`): `[3, *shape]`, a double-float
+    pair and the plain sum beside it, where loops compensate (`compensates_loops`), else `[1, *shape]`,
+    the plain sum alone. Its leading axis is the form's, so a loop slices and updates the sum's own
+    axes one past theirs."""
+    return jnp.zeros((3 if compensates_loops() else 1, *shape), dtype)
+
+
+def added_to(running: jax.Array, term: jax.Array) -> jax.Array:
+    """`running` (`running_sum`) with `term` added: through `compensated_add` where it is a pair."""
+    term = term.astype(running.dtype)
+    if running.shape[0] == 1:
+        return running + term[None]
+    pair = compensated_add((running[0], running[1]), (term, jnp.zeros_like(term)))
+    return jnp.stack((*pair, running[2] + term))
+
+
+def running_total(running: jax.Array) -> jax.Array:
+    """A running sum's value (`running_sum`): a pair's rounded once (`compensated_total`), else the sum."""
+    if running.shape[0] == 1:
+        return running[0]
+    return compensated_total((running[0], running[1]), running[2])
 
 
 def compensated_total(pair: tuple[jax.Array, jax.Array], plain: jax.Array) -> jax.Array:
@@ -482,15 +775,6 @@ def bf16_logits(logits: jax.Array) -> jax.Array:
         default=lambda x: rounded_to(x, jnp.bfloat16))
 
 
-def _algorithm_operand(value: jax.Array) -> jax.Array:
-    """`value` as a bf16-algorithm product reads it. GPU and TPU round inside
-    the product, so the value passes as it is and no rounded copy is written;
-    the CPU backend ignores the algorithm, so there it is rounded first."""
-    return jax.lax.platform_dependent(
-        value, cpu=lambda value: jnp.asarray(rounded_operand(value, jnp.bfloat16)),
-        default=lambda value: value)
-
-
 def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
     """A flax layer's `dot_general` for a vocabulary head: a result at
     least fp32 whose operands are the compute dtype's values, in both
@@ -509,11 +793,12 @@ def head_dot_general(dtype: Dtype | None, precision: PrecisionLike = None):
                     preferred_element_type=None):
         del precision, preferred_element_type  # this head's policy, not the layer's
         if rounds:
-            rhs = _algorithm_operand(rhs)
-        logits = jax.lax.dot_general(lhs, rhs, dimension_numbers,
-                                     precision=float32_products(products_dtype(lhs, rhs), resolved),
-                                     preferred_element_type=at_least_fp32(lhs.dtype))
-        return bf16_logits(logits) if rounds else logits
+            # The bf16 product, exact in fp32 (`bf16_product`).
+            return bf16_logits(bf16_dot_general(lhs, rhs, dimension_numbers))
+        return accumulated(functools.partial(
+            jax.lax.dot_general, dimension_numbers=dimension_numbers,
+            precision=float32_products(products_dtype(lhs, rhs), resolved)),
+            lhs, rhs, preferred_element_type=at_least_fp32(lhs.dtype))
 
     return dot_general
 
@@ -554,19 +839,133 @@ def head_product(subscripts: str, hidden: jax.Array, head: jax.Array,
     if rounds_to_bf16(hidden.dtype if compute is None else compute, precision):
         return bf16_product(subscripts, hidden, head)
     wide = at_least_fp32(hidden.dtype)
-    return jnp.einsum(subscripts, hidden.astype(wide), head,
-                      precision=float32_products(wide, precision), preferred_element_type=wide)
+    return float32_einsum(subscripts, hidden.astype(wide), head, precision=precision,
+                          preferred_element_type=wide)
 
 
 def bf16_product(subscripts: str, hidden: jax.Array, head: jax.Array) -> jax.Array:
     """`jnp.einsum(subscripts, hidden, head)` multiplied as bf16 and its result rounded to bf16, held
     in fp32: the one product a bf16 head computes (`head_product`) and a tiled head computes over
     each tile, so the two round each logit alike."""
-    states = _algorithm_operand(hidden.astype(jnp.float32))
-    logits = jnp.einsum(subscripts, states, _algorithm_operand(head.astype(at_least_fp32(head.dtype))),
-                        precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
-                        preferred_element_type=jnp.float32)
-    return bf16_logits(logits)
+    return bf16_logits(bf16_einsum(subscripts, hidden, head))
+
+
+def bf16_dot_general(lhs: jax.Array, rhs: jax.Array, dimension_numbers) -> jax.Array:
+    """`jax.lax.dot_general(lhs, rhs, dimension_numbers)` multiplied as XLA's `BF16_BF16_F32` dot
+    algorithm states the arithmetic: the operands rounded to bf16 (to nearest even), each product
+    exact and summed in fp32 to an fp32 result. Backward, the cotangent rounds to bf16 once and each
+    operand's gradient is the same product of it and the other operand, held in the operand's dtype;
+    forward mode takes the product's own tangent (`linear_tangent`). The one product Dew runs at
+    that algorithm: the dot family's (`float32_dot_general`, `float32_einsum`) and a bf16 head's.
+
+    Its operands are bf16 arrays multiplied at the default precision, whatever a scope configures
+    (an F16 preset would narrow a bf16 operand to fp16), not wider ones under the algorithm; a CPU,
+    which runs no bf16 dot at some layouts, multiplies their values in fp32, exactly. On an
+    A100, XLA's dot under the algorithm with a vector side (one row or one column), or below its
+    GEMM rewrite threshold (6 x 3 x 8), did not round fp32 operands to nearest even, and products
+    of exact bf16 values came out off round-to-nearest-even at their ties; at a vector side bf16
+    operands under the algorithm missed too, at the default precision and at the highest. With bf16
+    operands and no algorithm every shape was exact (node receipts SF-a100-tie-probe3 and 4). A
+    one-token tile of the chunked head and a one-row decode are such dots."""
+    from .kernels.generation import linear_tangent
+
+    (lhs_contracting, rhs_contracting), (lhs_batch, rhs_batch) = dimension_numbers
+    numbers = ((tuple(lhs_contracting), tuple(rhs_contracting)), (tuple(lhs_batch), tuple(rhs_batch)))
+
+    def typed(lhs, rhs, numbers):
+        def native(lhs, rhs):
+            return jax.lax.dot_general(lhs, rhs, numbers, precision=jax.lax.Precision.DEFAULT,
+                                       preferred_element_type=jnp.float32)
+
+        def widened(lhs, rhs):
+            # XLA:CPU has no bf16 x bf16 = fp32 dot at every layout ("Unsupported element type for
+            # DotThunk"); bf16 values multiply exactly in fp32, so the fp32 dot is the same arithmetic.
+            return jax.lax.dot_general(lhs.astype(jnp.float32), rhs.astype(jnp.float32), numbers,
+                                       precision=jax.lax.Precision.HIGHEST,
+                                       preferred_element_type=jnp.float32)
+
+        return jax.lax.platform_dependent(lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16), cpu=widened,
+                                          default=native)
+
+    def pulled(saved, operands, cotangent):
+        """Each operand's cotangent: the product's transpose to it over the cotangent rounded to bf16."""
+        del saved
+        rounded = cotangent.astype(jnp.bfloat16)
+        return tuple(_transposed(rounded, operands, numbers, side, typed).astype(operands[side].dtype)
+                     for side in (0, 1))
+
+    def forward(lhs, rhs):
+        return typed(lhs, rhs, numbers)
+
+    return linear_tangent(lambda lhs, rhs: (forward(lhs, rhs), ()), pulled, forward)(lhs, rhs)
+
+
+def _transposed(cotangent, operands, numbers, side: int, product) -> jax.Array:
+    """The transpose of a dot to its operand at `side` (0 the left, 1 the right) over the dot's
+    `cotangent`: `product` of the cotangent and the other operand, contracting the other's free axes
+    and batching the batch axes, its axes then put in the operand's order. The dot's result holds
+    its batch axes, then the left operand's free axes, then the right's, each in axis order."""
+    (contracting, batch) = numbers
+    mine_contracting, other_contracting = contracting[side], contracting[1 - side]
+    mine_batch, other_batch = batch[side], batch[1 - side]
+    mine, other = operands[side], operands[1 - side]
+    mine_free = [axis for axis in range(mine.ndim) if axis not in (*mine_contracting, *mine_batch)]
+    other_free = [axis for axis in range(other.ndim) if axis not in (*other_contracting, *other_batch)]
+    first_free = len(mine_batch) + (len(mine_free) if side == 0 else 0)
+    other_axes = tuple(range(first_free, first_free + len(other_free)))
+    formed = product(cotangent, other, ((other_axes, tuple(other_free)),
+                                        (tuple(range(len(mine_batch))), tuple(other_batch))))
+    # `formed` holds the batch axes, the cotangent's other free axes (this operand's own) and the other
+    # operand's contracting axes in axis order, each the axis of this operand it contracted with.
+    order = [*mine_batch, *mine_free,
+             *(mine_contracting[other_contracting.index(axis)] for axis in sorted(other_contracting))]
+    return jnp.transpose(formed, tuple(int(axis) for axis in np.argsort(order)))
+
+
+def bf16_einsum(subscripts: str, lhs: jax.Array, rhs: jax.Array) -> jax.Array:
+    """`jnp.einsum(subscripts, lhs, rhs)` as `bf16_dot_general` multiplies, of two operands each of
+    whose indices is in the result or in the other operand. An index the two share at sizes 1 and n
+    broadcasts to n, as einsum's does."""
+    numbers, order, shapes = _dot_numbers(subscripts, lhs.shape, rhs.shape)
+    lhs, rhs = (jnp.broadcast_to(operand, shape) for operand, shape in zip((lhs, rhs), shapes, strict=True))
+    return jnp.transpose(bf16_dot_general(lhs, rhs, numbers), order)
+
+
+def _dot_numbers(subscripts: str, lhs_shape: tuple[int, ...], rhs_shape: tuple[int, ...]):
+    """An einsum's `subscripts` over two operands of these shapes as `jax.lax.dot_general`'s dimension
+    numbers, the permutation that takes the dot's result (batch, left free, right free) to the
+    einsum's, and each operand's shape with every index the two share broadcast from 1 to the other's
+    size. An ellipsis spans each operand's remaining axes, aligned from the right."""
+    given, produced = subscripts.replace(" ", "").split("->")
+    left_spec, right_spec = given.split(",")
+    extents = [len(shape) - len(spec.replace("...", "")) for spec, shape in ((left_spec, lhs_shape),
+                                                                              (right_spec, rhs_shape))]
+
+    def labels(spec: str, extent: int) -> list[str]:
+        if "..." not in spec:
+            return list(spec)
+        head, tail = spec.split("...")
+        return [*head, *(f"...{extent - index}" for index in range(extent)), *tail]
+
+    left, right = labels(left_spec, extents[0]), labels(right_spec, extents[1])
+    out = labels(produced, max(extents))
+    batch = [label for label in left if label in right and label in out]
+    contracted = [label for label in left if label in right and label not in out]
+    formed = [*batch, *(label for label in left if label not in right),
+              *(label for label in right if label not in left)]
+    if len(set(left)) < len(left) or len(set(right)) < len(right) or sorted(formed) != sorted(out):
+        raise ValueError(f"{subscripts!r} is not a product of two operands each of whose indices is in "
+                         f"the result or in the other operand")
+    sizes: dict[str, int] = {}
+    for label, size in (*zip(left, lhs_shape, strict=True), *zip(right, rhs_shape, strict=True)):
+        sizes[label] = max(size, sizes.get(label, 1))
+
+    def axes(labels: list[str], named: list[str]) -> tuple[int, ...]:
+        return tuple(labels.index(label) for label in named)
+
+    numbers = ((axes(left, contracted), axes(right, contracted)), (axes(left, batch), axes(right, batch)))
+    shapes = tuple(tuple(sizes[label] for label in labels) for labels in (left, right))
+    return numbers, tuple(formed.index(label) for label in out), shapes
 
 
 def at_default_precision[Output](fn: Callable[..., Output]) -> Callable[..., Output]:

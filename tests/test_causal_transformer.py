@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER, decode_steps, model_draw, with_logit_cotangent
-from reference_error import assert_as_exact, torch_with_gradients, with_gradients
+from reference_error import assert_as_exact, torch_with_gradients, widened, with_gradients, without_ynn
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -30,6 +30,7 @@ from dew.nn.hyper_connections import HyperConnections
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates.attention import dropout_keep, dropout_seed
 from dew.nn.mixers import AttentionMixer
+from dew.nn.precision import FP32_SUMS
 from dew.nn.rope import YarnScaling
 
 VOCAB = 37
@@ -48,7 +49,7 @@ SEEDS = {'decode': 16, 'kernels': 16, 'window kernels': 8, 'softcap': 32, 'route
          'grouped': 32, 'sliding decode': 16, 'hybrid decode': 512, 'sandwich': 8, 'packed alone': 16,
          'metadata': 128, 'packed kernels': 16, 'bf16 head': 8, 'strict head': 8, 'norm gradient': 8,
          'xsa': 32, 'xsa decode': 8, 'grouped decode': 32, 'cached prefill': 8, 'packed cudnn': 8,
-         'cudnn decode': 16, 'padded prefill': 8, 'right padded': 16, 'rotary': 8}
+         'cudnn decode': 16, 'padded prefill': 8, 'right padded': 16, 'rotary': 8, 'old record': 64}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, and the GPU
 sites on an A100): the most any of a site's cases took."""
 
@@ -146,7 +147,12 @@ def test_attention_dropout_reaches_local_and_grouped_heads(rng, geometry):
     assert np.asarray(evaluated).tobytes() == np.asarray(baseline).tobytes()
 
 
-def test_old_decoder_record_keeps_zero_dropout_and_bitwise_outputs():
+def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
+    """A decoder record from before dropout builds with every rate zero and computes what its
+    serialized pre-dropout forward and gradient compute: the export run as serialized is check 1's
+    reference, and the same pre-dropout program exported in float64 from the same source its truth,
+    over the export's own weights and drawn ids (the two are different programs, which no bits
+    bind)."""
     from flax.traverse_util import unflatten_dict
     from jax import export
 
@@ -160,20 +166,35 @@ def test_old_decoder_record_keeps_zero_dropout_and_bitwise_outputs():
     assert model.embedding_dropout_rate == model.attention_dropout_rate == 0
     directory = Path(__file__).with_name("fixtures")
     held = np.load(directory / "decoder-default-dropout.npz")
-    try:
-        before = export.deserialize((directory / "decoder-default-dropout.jaxexport").read_bytes())
-    except Exception as error:
-        pytest.fail(f"cannot deserialize the pre-dropout forward/gradient export: {error}")
-    with jax.default_device(jax.devices("cpu")[0]):
-        ids = jnp.asarray(held["ids"])
-        params = unflatten_dict({tuple(name.split("/")[1:]): jnp.asarray(leaf)
-                                 for name, leaf in held.items() if name.startswith("params/")})
+    before, wide = (export.deserialize((directory / f"decoder-default-dropout{suffix}.jaxexport")
+                                       .read_bytes()) for suffix in ("", "-float64"))
+    cpu = jax.devices("cpu")[0]
+    params = unflatten_dict({tuple(name.split("/")[1:]): np.asarray(leaf)
+                             for name, leaf in held.items() if name.startswith("params/")})
+    with jax.default_device(cpu):
+        assert jax.tree.structure(jax.jit(forward_and_gradient(model))(params, held["ids"])) == \
+            jax.tree.structure(before.call(params, held["ids"]))
+    # The two arms are two Dew programs, compiled alike (testing.md: both without YNNPACK's fusions).
+    current, exported = without_ynn(forward_and_gradient(model)), without_ynn(before.call)
 
-        expected = before.call(params, ids)
-        actual = jax.jit(forward_and_gradient(model))(params, ids)
-        assert jax.tree.structure(actual) == jax.tree.structure(expected)
-        for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
-            assert np.asarray(left).tobytes() == np.asarray(right).tobytes()
+    def draw(seed):
+        ids = np.random.default_rng([0x0D, seed]).integers(0, 17, held["ids"].shape)
+        return (ids.astype(held["ids"].dtype),)
+
+    def ours(ids):
+        with jax.default_device(cpu), jax.default_matmul_precision(FP32_SUMS):
+            return jax.device_get(current(params, ids))
+
+    def theirs(ids):
+        with jax.default_device(cpu):
+            return jax.device_get(exported(params, ids))
+
+    def truth(ids):
+        with jax.enable_x64(new_val=True), jax.default_device(cpu):
+            return jax.device_get(wide.call(widened(params), ids))
+
+    assert_as_exact(ours, theirs, draw, "an old record against its export", seeds=SEEDS["old record"],
+                    truth_fn=truth)
 
 
 def flax_with_keep(query, value, mask, rng, rate: float) -> jax.Array:
@@ -505,9 +526,10 @@ def hybrid(**overrides):
                 **overrides)
 
 
-def test_a_yarn_layer_refuses_a_partial_rotary(rng):
-    """YaRN ramps a whole head's frequencies (`dew.nn.rope.rotary_freqs`), so a layer given YaRN and a
-    partial rotary refuses at its first call."""
+def test_a_yarn_layer_refuses_a_proportional_partial_rotary(rng):
+    """YaRN ramps the rotated width and has no proportional form (`dew.nn.rope.rotary_freqs`), so a
+    layer given YaRN and a partial rotary under the proportional convention, the default, refuses at
+    its first call."""
     with pytest.raises(ValueError):
         tiny(partial_rotary_factor=0.5, yarn=YarnScaling()).init(rng, tokens(rng))
 
@@ -1152,11 +1174,12 @@ def test_an_expert_gated_product_rounds_its_projections_and_product_under_jit(ac
     expert takes gate g and up u through projections that sum each with an
     eighth of its bf16 ulp, which rounds back to g and u only if the
     projection's rounding survives, and a down projection that hands the
-    product out unchanged: on the fixture's g and u the MLP's output must be
-    Torch's product, and over drawn ones its input's gradient as exact as
-    Torch's (`_torch_gated_gradients`) by the float64 gate: the fused kernel
-    rounds the gate's gradient once from fp32, where Torch rounds the
-    cotangent first."""
+    product out unchanged: on the fixture's g and u the compiled MLP's output
+    and gradient are the bits it computes from g and u alone, the same
+    program summing each with zero, and over drawn ones its output and its
+    input's gradient are as exact as Torch's (`_torch_gated_gradients`) by
+    the float64 gate: the fused kernel rounds the gate's gradient once from
+    fp32, where Torch rounds the cotangent first."""
     from reference_error import assert_as_exact
 
     fixture = np.load(Path(__file__).parent / "fixtures" / "gated_product" / "bf16.npz")
@@ -1164,13 +1187,13 @@ def test_an_expert_gated_product_rounds_its_projections_and_product_under_jit(ac
         np.asarray(fixture[f"{activation}/{key}"], np.float32).reshape(GATED_SHAPE)
         for key in ("gate", "up", "cotangent", "output", "d_gate", "d_up"))
     fixed = tuple(jnp.asarray(value, jnp.bfloat16) for value in (gate, up, cotangent))
-    expert = _expert_gated(activation)
-    out, _ = jax.jit(expert)(*fixed)
-    np.testing.assert_array_equal(np.asarray(out, np.float32),
-                                  np.hstack([output] + [np.zeros_like(output)] * 3), err_msg="output")
+    expert = jax.jit(_expert_gated(activation))
+    offsets = (jax.tree.leaves(expert(*fixed, np.float32(offset))) for offset in (1, 0))
+    for summed, alone in zip(*offsets, strict=True):
+        np.testing.assert_array_equal(np.asarray(summed, np.float32), np.asarray(alone, np.float32))
     reference = functools.partial(_torch_gated_gradients, activation)
-    # The reference arm is Torch's own: on the fixture it gives the gradients Torch recorded there.
-    for got, want in zip(reference(*fixed), (d_gate, d_gate, d_up, d_up), strict=True):
+    # The reference arm is Torch's own: on the fixture it gives what Torch recorded there.
+    for got, want in zip(reference(*fixed), (output, d_gate, d_gate, d_up, d_up), strict=True):
         np.testing.assert_array_equal(np.asarray(got, np.float32), want)
 
     def draw(seed):
@@ -1183,26 +1206,35 @@ def test_an_expert_gated_product_rounds_its_projections_and_product_under_jit(ac
 
     activated = GATED_ACTIVATIONS[activation]
 
-    def truth(gate, up, cotangent):
-        _, d_gate, d_up = with_gradients(lambda gate, up: activated(gate) * up)(gate, up, cotangent)
-        return d_gate, d_gate, d_up, d_up
+    def handed_out(product, *gradients):
+        """The product in the output's first block, the down projection's zeros in the others."""
+        return jnp.hstack([product] + [jnp.zeros_like(product)] * 3), *gradients
 
-    assert_as_exact(jax.jit(lambda *inputs: _blocks(expert(*inputs)[1])), reference, draw,
-                    f"{activation} input gradient", seeds=GATED_SEEDS, truth_fn=truth)
+    def truth(gate, up, cotangent):
+        product, d_gate, d_up = with_gradients(lambda gate, up: activated(gate) * up)(gate, up, cotangent)
+        return handed_out(product, d_gate, d_gate, d_up, d_up)
+
+    def ours(*inputs):
+        out, dx = expert(*inputs, np.float32(1))
+        return out, *_blocks(dx)
+
+    assert_as_exact(ours, lambda *inputs: handed_out(*reference(*inputs)), draw,
+                    f"{activation} output and input gradient", seeds=GATED_SEEDS, truth_fn=truth)
 
 
 GATED_SHAPE = (16, 128)
 GATED_SEEDS = 8
-"""The gated product's declared draws (`reference_error.seeds_for` of Torch's gradients on them)."""
+"""The gated product's declared draws (`reference_error.seeds_for` of Torch's product and gradients on
+them)."""
 GATED_ACTIVATIONS = {"swiglu": jax.nn.silu, "geglu": functools.partial(jax.nn.gelu, approximate=True),
                      "geglu_exact": functools.partial(jax.nn.gelu, approximate=False)}
 """Each gated activation's float64 truth."""
 
 
 def _expert_gated(activation):
-    """One expert of `ExpertMLP` whose projections hand `gate` and `up` (each summed with an eighth of
-    its bf16 ulp) to its gated product and the product out unchanged: `(gate, up, cotangent)` to the
-    MLP's output and its input's gradient."""
+    """One expert of `ExpertMLP` whose projections hand `gate` and `up` (each summed with `offset`
+    times an eighth of its bf16 ulp, a value the program takes) to its gated product and the product
+    out unchanged: `(gate, up, cotangent)` to the MLP's output and its input's gradient."""
     from dew.nn.moe import ExpertMLP
 
     tokens, width = GATED_SHAPE
@@ -1218,9 +1250,9 @@ def _expert_gated(activation):
         mantissa, exponent = jnp.frexp(values.astype(jnp.float32))
         return jnp.where(values != 0, jnp.ldexp(jnp.sign(mantissa), exponent - 11), 0.0)
 
-    def run(gate, up, cotangent):
-        x = jnp.hstack([gate.astype(jnp.float32), eighth_ulp(gate), up.astype(jnp.float32),
-                        eighth_ulp(up)]).astype(jnp.bfloat16)
+    def run(gate, up, cotangent, offset):
+        x = jnp.hstack([gate.astype(jnp.float32), offset * eighth_ulp(gate), up.astype(jnp.float32),
+                        offset * eighth_ulp(up)]).astype(jnp.bfloat16)
         slot_cotangent = jnp.hstack([cotangent] + [jnp.zeros_like(cotangent)] * 3)
         return with_gradients(lambda x: model.apply(variables, x, weights, indices))(x, slot_cotangent)
 
@@ -1233,18 +1265,18 @@ def _blocks(dx):
 
 
 def _torch_gated_gradients(activation, gate, up, cotangent):
-    """Torch's gradients of its bf16 gated product `act(gate) * up` (transformers' gated MLP, as
-    tools/gated_product_reference.py runs it), in the input gradient's four blocks."""
+    """Torch's bf16 gated product `act(gate) * up` (transformers' gated MLP, as
+    tools/gated_product_reference.py runs it) and its gradients, in the input gradient's four blocks."""
     import torch.nn.functional as F
 
     act = {"swiglu": F.silu, "geglu": functools.partial(F.gelu, approximate="tanh"),
            "geglu_exact": F.gelu}[activation]
     # The bf16 inputs held in float32, which holds them exactly, and cast to bf16 inside the product,
     # whose bf16 output takes the cotangent at bf16.
-    _, d_gate, d_up = torch_with_gradients(lambda gate, up: act(gate.bfloat16()) * up.bfloat16())(
+    product, d_gate, d_up = torch_with_gradients(lambda gate, up: act(gate.bfloat16()) * up.bfloat16())(
         *(np.asarray(value, np.float32) for value in (gate, up, cotangent)))
-    d_gate, d_up = (jnp.asarray(value, jnp.bfloat16) for value in (d_gate, d_up))
-    return d_gate, d_gate, d_up, d_up
+    product, d_gate, d_up = (jnp.asarray(value, jnp.bfloat16) for value in (product, d_gate, d_up))
+    return product, d_gate, d_gate, d_up, d_up
 
 
 def test_exclusive_self_attention_removes_the_own_value_direction_per_query_head():

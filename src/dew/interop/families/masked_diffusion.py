@@ -376,7 +376,9 @@ def _dream_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     used.add('use_mrope')
     config = qwen2_config(hf_config, used)
     mask = _mask_token(hf_config, used)
-    config.update(causal=False, mask_token_id=mask)
+    # Dream continues Qwen2.5's next-token head, so its reference reads position i from logits i-1
+    # (`torch.cat([logits[:, :1], logits[:, :-1]], dim=1)` in its generation and training code).
+    config.update(causal=False, mask_token_id=mask, shifted_logits=True)
     return config
 
 
@@ -543,6 +545,7 @@ DIFFUSION_GEMMA_TEXT = DecoderFamily(
     preserve_source_layout=False,
     bidirectional=True,
     defaults=GEMMA4_DEFAULTS,
+    padding_idx=True,
 )
 
 DREAM = DecoderFamily(

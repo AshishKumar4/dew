@@ -80,6 +80,7 @@ from jax.experimental import checkify
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
+from dew.hashing import array_fingerprint
 from dew.inference.engine import Timed, normalized, reloaded, settled
 from dew.inference.pages import Pages
 from dew.inference.projections import pack_projections, packed_layout
@@ -760,8 +761,12 @@ class Server:
                 positions[valid], (np.cumsum(valid, axis=1) - 1)[valid])):
             raise ValueError("a served prompt cannot carry noncanonical positions")
         self.rows.refuse(int(valid[0].sum()), budget)
-        salt = b"" if context is None else hashlib.blake2b(
-            np.asarray(context.shape, np.int64).tobytes() + context.tobytes(), digest_size=16).digest()
+        salt = b""
+        if context is not None:
+            # The context's dtype too, so equal bytes of another dtype salt apart.
+            hasher = hashlib.blake2b(digest_size=16)
+            array_fingerprint(hasher, np.asarray(context))
+            salt = hasher.digest()
         return _Row(ids[0][valid[0]].astype(np.int32), budget, seed, fold, Ticket(), context=context,
                     salt=salt)
 
