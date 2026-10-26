@@ -579,28 +579,21 @@ def mode_steps(args) -> dict:
 
 
 
-class FailingLocalDirectory(LossRecorder):
-    """A tracker that, once step `step - 1` is logged, puts a file where this process's local
-    checkpoint directory was, so the local save at `step` fails in orbax's background thread as a
-    full or read-only disk would make it fail."""
-
-    def __init__(self, directory: Path, step: int):
-        super().__init__()
-        self.directory, self.step = directory, step
-
-    def log(self, scalars, step):
-        super().log(scalars, step)
-        if step == self.step - 1:
-            self.directory.rename(self.directory.with_name(self.directory.name + ".moved"))
-            self.directory.write_text("not a directory")
+def failing_local_directory(directory: Path, step: int):
+    """An observation (`Observe`'s call) that, at step `step - 1` on the process it runs on, puts a
+    file where that process's local checkpoint directory was, so its local save at `step` fails in
+    orbax's background thread as a full or read-only disk would make it fail."""
+    def observed(state):
+        if int(state.step) == step - 1 and directory.is_dir():
+            directory.rename(directory.with_name(directory.name + ".moved"))
+            directory.write_text("not a directory")
+    return observed
 
 
 def mode_fit(args) -> dict:
     import jax
 
-    failing = None if args.fail_local_save is None else FailingLocalDirectory(
-        Path(args.local_dir) / f"process{args.process_id}", args.fail_local_save)
-    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size, tracker=failing,
+    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size,
                             local_dir=args.local_dir, local_every=args.local_every)
     checkpoints = trainer.checkpoints
     assert checkpoints is not None
@@ -619,6 +612,9 @@ def mode_fit(args) -> dict:
     # The variables, split over the processes by fsdp, which an observation gathers whole on each.
     observe = None if args.observe_every is None else Observe(args.observe_every,
                                                               lambda state: state.variables)
+    if args.fail_local_save is not None:
+        observe = Observe(1, failing_local_directory(Path(args.local_dir) / f"process{args.process_id}",
+                                                     args.fail_local_save))
     if args.block_after:
         # The source's last batch trains the step `block_after` past where the run restored.
         observe = Observe(1, blocked(checkpoints, loader, (restored_step or 0) + args.block_after,
@@ -779,8 +775,6 @@ def mode_profile_failure(args) -> dict:
     from dew.coordination import agree_process_phase
     from dew.training import ProfileWindow, Trainer
 
-    # The optional XProf package is a stand-in on this process's path (the driver's), whose
-    # converter exports nothing, so the start path runs as installed.
     profile_dir = Path(args.profile_dir)
     if args.process_id == 0:
         profile_dir.parent.mkdir(parents=True, exist_ok=True)
