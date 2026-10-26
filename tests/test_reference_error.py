@@ -227,6 +227,37 @@ def test_a_numpy_arm_is_refused_unless_it_is_given_and_windows_keep_their_arms_p
     assert min(seen[1:]) >= SIZING_FROM
 
 
+def test_a_float64_truth_runs_as_one_compiled_program():
+    """The gate compiles a JAX truth (`_truth_program`): its first call runs as given and every later
+    one is the compiled program's, whose values are the eager truth's own. A NumPy truth (its first
+    call returns host values) runs as given, and so do a truth `as_given`, one compiled already and a
+    window loop's by its own; a check over a compiled truth judges as over the eager one."""
+    from reference_error import _Truth, _truth_program, _Windowed, as_given, over_windows
+
+    calls = []
+
+    def truth(x, w):
+        calls.append(isinstance(x, jax.core.Tracer))
+        return {"y": jnp.dot(x, w, precision="highest")}
+
+    with jax.enable_x64(new_val=True):
+        program = _truth_program(truth)
+        x, w = (np.asarray(value, np.float64) for value in _draw(0))
+        eager = program(x, w)
+        compiled = program(x, w)
+        assert calls[0] is False and True in calls
+        np.testing.assert_allclose(compiled["y"], eager["y"], rtol=1e-14)
+        numpy = _truth_program(lambda x, w: {"y": np.asarray(x) @ np.asarray(w)})
+        numpy(x, w)
+        assert numpy.run is numpy.fn
+    given = as_given(truth)
+    assert _truth_program(given) is given and _truth_program(_product) is _product
+    assert _truth_program(None) is None
+    windowed = _truth_program(over_windows(truth))
+    assert isinstance(windowed, _Windowed) and isinstance(windowed.fn, _Truth)
+    assert_as_exact(_reordered, _product, _draw, "a compiled truth", seeds=8, truth_fn=truth)
+
+
 def test_an_arm_of_dew_programs_compiles_them_as_the_gate_compiles_its_other_arm(monkeypatch):
     """Beside another Dew arm, an arm of Dew's own programs (`dew_programs`) runs with Dew's compile
     seam holding WITHOUT_YNN open (`compiled_with`), so a program it compiles through the seam

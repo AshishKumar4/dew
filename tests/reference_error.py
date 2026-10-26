@@ -62,10 +62,12 @@ arithmetic in float64 is held to the oracle first, within the float64
 rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
+import collections
 import dataclasses
 import functools
 import hashlib
 import math
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -285,6 +287,37 @@ def _compiled(fn, compile):
     return compile(fn)
 
 
+class _Truth:
+    """A check's float64 truth as the gate runs it (`_truth_program`): its first call runs `fn` as it is
+    given and decides the rest, compiled where that call returned JAX values, as given where it
+    returned host values (a NumPy truth)."""
+
+    def __init__(self, fn):
+        self.fn, self.run = fn, None
+
+    def __call__(self, *inputs):
+        if self.run is not None:
+            return self.run(*inputs)
+        first = self.fn(*inputs)
+        on_device = all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(first))
+        self.run = jax.jit(self.fn) if on_device else self.fn
+        return first
+
+
+def _truth_program(fn):
+    """`fn`, a check's float64 truth, as the gate runs it: compiled, once a signature, so the truth runs
+    as one float64 program on the device's FP64 units rather than one eager dispatch an equation, every
+    primitive at its own float64 semantics. A truth the gate runs as given (`as_given`: torch, a
+    recording, a host loop), one compiled already (a jit, `dew_programs`), or none, as it is; a window
+    loop's by its own; a NumPy truth (its first call returns host values) as given after that call. A
+    JAX truth with host work inside fails at its trace, loudly, and passes `as_given`."""
+    if fn is None or _given(fn) or getattr(fn, "dew_programs", False) or hasattr(fn, "lower"):
+        return fn
+    if isinstance(fn, _Windowed):
+        return _Windowed(_truth_program(fn.fn))
+    return _Truth(fn)
+
+
 def _with_ynn_off(fn):
     """`fn` run with Dew's compile seam holding WITHOUT_YNN open on the CPU lane (`dew_programs`)."""
     from dew.nn.kernels.options import compiled_with
@@ -414,7 +447,9 @@ def float64_replay(fn):
     `truth_fn` where a float64 run of `fn` would be another program (a float64 draw reads 64-bit
     random bits). It traces `fn` as the float32 program, x64 off, whatever the caller's mode and
     however widened its arguments arrive (check 1 hands a truth widened inputs under x64), and
-    rounds each argument to its traced dtype before widening it, as the program would read it."""
+    rounds each argument to its traced dtype before widening it, as the program would read it. It traces
+    on the host and compiles its replay itself, once a traced program (`_replay_program`), so the gate
+    runs it as given."""
     def run(*arguments):
         with jax.enable_x64(new_val=False):
             graph, shapes = jax.make_jaxpr(fn, return_shape=True)(*arguments)
@@ -422,9 +457,27 @@ def float64_replay(fn):
                   else np.asarray(value).astype(aval.dtype)
                   for value, aval in zip(jax.tree.leaves(arguments), graph.in_avals, strict=True)]
         with jax.enable_x64(new_val=True):
-            outputs = _replayed(graph.jaxpr, graph.consts, native)
+            outputs = _replay_program(graph)(list(graph.consts), native)
         return jax.tree.unflatten(jax.tree.structure(shapes), outputs)
-    return run
+    return as_given(run)
+
+
+_REPLAYS: collections.OrderedDict[str, Callable] = collections.OrderedDict()
+"""The compiled replays of the programs last replayed (`_replay_program`), by program text."""
+
+
+def _replay_program(graph):
+    """`_replayed` of `graph`'s program as one jitted function of its constants and arguments, cached by
+    the program's text (its equations, literals and shapes; its constants' values are arguments), so a
+    traced program compiles its float64 replay once."""
+    key = str(graph.jaxpr)
+    if key not in _REPLAYS:
+        program = graph.jaxpr
+        _REPLAYS[key] = jax.jit(lambda consts, arguments: _replayed(program, consts, arguments))
+        while len(_REPLAYS) > 32:
+            _REPLAYS.popitem(last=False)
+    _REPLAYS.move_to_end(key)
+    return _REPLAYS[key]
 
 
 def _floating(dtype) -> bool:
@@ -1244,6 +1297,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     narrow_leaves: list[str] = []
     _refuse_numpy_arms(draw, dew_fn, reference_fn)
     dew_fn, reference_fn = _arms(dew_fn, reference_fn)
+    truth_fn = _truth_program(truth_fn)
 
     def drawn(start, stop):
         draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders)
@@ -1302,6 +1356,7 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
                                     f"(`seeds_for`)")])
     _refuse_numpy_arms(draw, changed_fn, original_fn)
     changed_fn, original_fn = _arms(changed_fn, original_fn)
+    truth_fn = _truth_program(truth_fn)
     draws = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn)
     moved, kept, unresolved = _moved(draws, 1)
     if not moved:
@@ -1350,6 +1405,7 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     _refuse_numpy_arms(draw, *([dew_fn] if paired else []), reference_fn)
     dew_fn, reference_fn = _arms(dew_fn if paired else reference_fn, reference_fn)
     dew_fn = dew_fn if paired else None
+    truth_fn = _truth_program(truth_fn)
     count, drawn = max(start, FEWEST_SEEDS), None
     first = 0 if dew_fn is None else SIZING_FROM
     while count <= most:
