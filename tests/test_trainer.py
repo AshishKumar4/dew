@@ -1465,17 +1465,38 @@ def test_a_tree_of_any_kind_of_mapping_is_held_as_dicts_where_it_enters(tmp_path
     assert not others and float(counted(state.variables["stats"])) == 3.0
 
 
-def recorded_momentum() -> optax.GradientTransformation:
-    """Momentum whose state is a record that is a mapping of its own kind (`nnx.State`), read by
-    attribute, as an optimizer may keep its state."""
-    from flax import nnx
+@jax.tree_util.register_pytree_node_class
+class MomentumRecord(Mapping):
+    """An optimizer's state that is a mapping of its own kind, read by attribute: its momentum."""
 
+    def __init__(self, momentum):
+        self.momentum = momentum
+
+    def __getitem__(self, key):
+        return {"momentum": self.momentum}[key]
+
+    def __iter__(self):
+        return iter(("momentum",))
+
+    def __len__(self):
+        return 1
+
+    def tree_flatten(self):
+        return (self.momentum,), None
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        return cls(*children)
+
+
+def recorded_momentum() -> optax.GradientTransformation:
+    """Momentum kept in a `MomentumRecord`."""
     def init(params):
-        return nnx.State({"momentum": jax.tree.map(jnp.zeros_like, params)})
+        return MomentumRecord(jax.tree.map(jnp.zeros_like, params))
 
     def update(updates, state, params=None):
         momentum = jax.tree.map(lambda held, gradient: 0.9 * held + gradient, state.momentum, updates)
-        return jax.tree.map(lambda held: -1e-2 * held, momentum), nnx.State({"momentum": momentum})
+        return jax.tree.map(lambda held: -1e-2 * held, momentum), MomentumRecord(momentum)
 
     return optax.GradientTransformation(init, update)
 
@@ -1485,7 +1506,7 @@ def test_a_supplied_state_keeps_an_optimizer_record_that_is_a_mapping_of_its_own
     mapping of its own kind stays one, its fields read as its update reads them."""
     trainer = make_trainer(tmp_path, objective=Counted(), optimizer=recorded_momentum())
     state = trainer.fit(dataset(), steps=2, log_every=1, state=trainer.initial_state())
-    assert int(state.step) == 2 and type(state.opt_state).__name__ == "State"
+    assert int(state.step) == 2 and isinstance(state.opt_state, MomentumRecord)
 
 
 def test_a_supplied_state_whose_parameters_and_moments_hold_a_frozen_dict_in_a_list_trains(tmp_path):
