@@ -15,6 +15,7 @@ leaves, so the production join and the rendezvous right after it are what
 every pool test runs.
 """
 
+import collections
 import json
 import os
 import re
@@ -560,11 +561,12 @@ def elastic_checkpoint(tmp_path_factory):
 
 
 @pytest.mark.distributed
+@pytest.mark.parametrize("records", ["resident", "http"])
 @pytest.mark.parametrize("processes", [1, 4])
-def test_a_pool_position_resumes_on_another_process_count(tmp_path, elastic_checkpoint,
-                                                          processes):
+def test_a_pool_position_resumes_on_another_process_count(tmp_path, request, records, processes):
     """Two processes save where the run's data stopped, and one process or
-    four take it over.
+    four take it over, over records held in memory or fetched over HTTP by
+    every process into one global order.
 
     Real processes, because a pool is where the position is gathered onto
     every host, written by orbax from process zero and read back by
@@ -574,10 +576,13 @@ def test_a_pool_position_resumes_on_another_process_count(tmp_path, elastic_chec
     global batches that run trained on, and the loss is a mean over the
     step's rows, so which process holds which row cannot change them.
     """
+    resident = records == "resident"
+    saved = request.getfixturevalue("elastic_checkpoint" if resident else "online_checkpoint")
     directory = tmp_path / "resumed-run"
-    shutil.copytree(elastic_checkpoint["run_dir"], directory)
-    flags = {"name": "elastic", "elastic": True, "fsdp_size": 1,
-             "steps": 2 * POOL_STEPS, "records": RECORDS}
+    shutil.copytree(saved["run_dir"], directory)
+    flags = {"name": "elastic", "elastic": True} if resident else {
+        "name": "online", "online": request.getfixturevalue("online_server"), "environment": ONLINE}
+    flags |= {"fsdp_size": 1, "steps": 2 * POOL_STEPS, "records": RECORDS}
 
     resumed = run_pool("fit", tmp_path / "resumed", processes, run_dir=directory, **flags)
     whole = run_pool("fit", tmp_path / "whole", processes,
@@ -610,14 +615,24 @@ ONLINE = {"NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}
 @pytest.mark.distributed
 def test_processes_fetch_disjoint_shares_of_one_online_order(tmp_path):
     """Two processes each fetch their own share of one shuffled catalog over HTTP: the first pass's
-    shares cover the corpus once, and the read is cut per share, so neither fetches the other's."""
-    with serving(served) as address:
+    shares cover the corpus once, and the server answers every url, the two together asking for
+    fewer than two passes' worth, so neither fetched the other's share (each reads a little of its
+    next pass ahead)."""
+    answered, lock = collections.Counter(), threading.Lock()
+
+    def counted(request) -> None:
+        with lock:
+            answered[request.path] += 1
+        served(request)
+
+    with serving(counted) as address:
         reports = run_pool("online_data", tmp_path / "out", 2, online=address, records=RECORDS,
                            environment=ONLINE)
     shards = [report["records"] for report in reports]
     assert not set(shards[0]) & set(shards[1]), "both processes read the same record"
     assert sorted(shards[0] + shards[1]) == list(range(RECORDS))
-    assert [report["lowering"] for report in reports] == ["per-share", "per-share"]
+    assert set(answered) == {f"/{index}" for index in range(RECORDS)}
+    assert sum(answered.values()) < 2 * RECORDS, answered
 
 
 @pytest.mark.distributed
@@ -682,27 +697,6 @@ def test_an_online_pool_trains_on_what_its_records_hold(online_checkpoint, elast
     for index in range(2):
         assert_identical_parameters(dumped_params(online_checkpoint["out"] / f"process{index}.json"),
                                     dumped_params(elastic_checkpoint["out"] / f"process{index}.json"))
-
-
-@pytest.mark.distributed
-@pytest.mark.parametrize("processes", [1, 4])
-def test_an_online_pool_position_resumes_on_another_process_count(tmp_path, online_server,
-                                                                   online_checkpoint, processes):
-    """An online run that two processes saved in one global order resumes on one process or four,
-    fetching from where the saved global count stopped: the resumed pool lands where a pool of its
-    size that nobody stopped does, at the same position, on the same parameters."""
-    directory = tmp_path / "resumed-run"
-    shutil.copytree(online_checkpoint["run_dir"], directory)
-    flags = {"name": "online", "online": online_server, "fsdp_size": 1, "steps": 2 * POOL_STEPS,
-             "records": RECORDS, "environment": ONLINE}
-    resumed = run_pool("fit", tmp_path / "resumed", processes, run_dir=directory, **flags)
-    whole = run_pool("fit", tmp_path / "whole", processes, run_dir=tmp_path / "whole-run", **flags)
-    for index, report in enumerate(resumed):
-        assert report["restored_step"] == POOL_STEPS
-        assert report["step"] == 2 * POOL_STEPS
-        assert report["dataset_state"] == whole[index]["dataset_state"]
-        assert_same_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
-                               dumped_params(tmp_path / "whole" / f"process{index}.json"))
 
 
 @pytest.mark.distributed
