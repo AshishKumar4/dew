@@ -30,6 +30,18 @@ readouts one `vmap` over its states. A packed row, and a cached call, run token 
 which is the definition. The state is the network's parameters, a traced carry: the network is
 applied unbound (`network.apply({"params": W}, x)`) and W_0 is this layer's own parameter, so the layer
 composes with a scanned layer stack and remat; the chunk's carry is named (`CARRY`) for a remat policy.
+
+A linear memory (`LinearMemory`) on its given target, with no momentum, no orthogonalized or slow
+weights and each token reading its own step, is a row of the shared linear recurrence
+(`dew.nn.kernels.recurrence`), and runs there: on the dot objective its step writes theta k v^T, its
+retention the decay, at any chunk (the gradient is the same at every state); on the l2 objective at
+chunk 1 without retention it is the delta rule with beta theta (Titans takes the gradient before the
+retention, the gated delta rule after it, so those differ). A call runs the recurrence's chunked op
+(`recurrence_chunk.chunk`, on its kernels where they take the call) and a cached token its decode step
+(`recurrence.step`). The recurrence starts each document from zero, so W_0 enters as its own term: the
+delta rule's state is W - W_0, written with the values v - W_0^T k, and the dot rule's W - P_t W_0, P_t
+the product of the shares the document kept; each readout adds P_t W_0^T q (P_t one for the delta
+rule). That readout is computed in at least float32 and rounded once to the layer's dtype.
 """
 
 from __future__ import annotations
@@ -45,6 +57,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn.dense import Dense
+from dew.nn.kernels import recurrence, recurrence_chunk
 from dew.optim import newton_schulz
 
 from .attention import LayerNorm
@@ -58,6 +71,9 @@ STATE, MOMENTUM, START, COUNT = "memory_state", "memory_momentum", "memory_start
 """The decode cache's variables: the network's fast parameters now, the momentum, the parameters at the
 chunk's start, and the real tokens of each row's current document seen, rows first. A row that has
 seen none starts from W_0."""
+KEPT = "memory_kept"
+"""A linear memory's decode cache beside its recurrence state (`STATE`): the log of the share of W_0
+each row's current document keeps, the sum of its log retentions, rows first."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -242,14 +258,33 @@ class InContextMemory(nn.Module):
             query, key = l2norm(query), l2norm(key)
         return query, key, value, features
 
-    def _gate(self, name: str, gate: Gate, x: jax.Array) -> jax.Array:
-        """The gate's value a token and head `[B, S, H]`, in at least float32."""
-        wide = at_least_fp32(self.dtype)
-        if gate.value is not None:
-            return jnp.full((*x.shape[:2], self.heads), gate.value, wide)
+    def _logit(self, name: str, gate: Gate, x: jax.Array) -> jax.Array:
+        """A projected gate's logit a token and head `[B, S, H]`, in at least float32."""
         logit = Dense(self.heads, dtype=self.dtype, precision=self.precision, name=name,
                       bias_init=nn.initializers.constant(gate.bias))(x)
-        return gate.scale * jax.nn.sigmoid(logit.astype(wide))
+        return logit.astype(at_least_fp32(self.dtype))
+
+    def _gate(self, name: str, gate: Gate, x: jax.Array) -> jax.Array:
+        """The gate's value a token and head `[B, S, H]`, in at least float32."""
+        if gate.value is not None:
+            return jnp.full((*x.shape[:2], self.heads), gate.value, at_least_fp32(self.dtype))
+        return gate.scale * jax.nn.sigmoid(self._logit(name, gate, x))
+
+    def _kept(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
+        """The share `a = 1 - alpha` of the network each token keeps `[B, S, H]` and its log, in at least
+        float32: one and zero without a retention."""
+        wide = at_least_fp32(self.dtype)
+        gate = self.retention
+        if gate is None:
+            return jnp.ones((*x.shape[:2], self.heads), wide), jnp.zeros((*x.shape[:2], self.heads), wide)
+        if gate.value is not None:
+            alpha = jnp.full((*x.shape[:2], self.heads), gate.value, wide)
+            return 1 - alpha, jnp.log1p(-alpha)
+        logit = self._logit("retention", gate, x)
+        # log(1 - s sigmoid(z)) = log((1 - s) + e^-z) - log(1 + e^-z): finite wherever s is at most one,
+        # where the sigmoid rounds to one included.
+        log_kept = jnp.logaddexp(jnp.log1p(-gate.scale), -logit) - jax.nn.softplus(-logit)
+        return 1 - gate.scale * jax.nn.sigmoid(logit), log_kept
 
     def _split(self, initial: dict) -> tuple[dict, dict]:
         """W_0's fast parameters, which the sequence updates, and its `slow` ones."""
@@ -277,8 +312,7 @@ class InContextMemory(nn.Module):
         query, key, value, features = self._views(x)
         theta = self._gate("learning_rate", self.learning_rate, x)
         mu = (jnp.zeros_like(theta) if self.momentum is None else self._gate("momentum", self.momentum, x))
-        a = (jnp.ones_like(theta) if self.retention is None
-             else 1 - self._gate("retention", self.retention, x))
+        a, log_kept = self._kept(x)
         wide = at_least_fp32(self.dtype)
         initial, slow = self._split(jax.tree.map(lambda leaf: leaf.astype(wide), self._initial(features)))
         slow = jax.tree.map(lambda leaf: jnp.broadcast_to(leaf, (batch, *leaf.shape)), slow)
@@ -291,7 +325,12 @@ class InContextMemory(nn.Module):
         places = counted_places(tokens.segments, tokens.valid)
         places = jnp.broadcast_to(jnp.arange(length)[None], (batch, length)) if places is None else places
         steps = _Steps(query.astype(wide), key.astype(wide), value.astype(wide), theta, mu, a, real, places)
-        if call.decode:
+        hooks = self._recurrence()
+        if hooks is not None:
+            (w0,) = jax.tree.leaves(initial)
+            read = (self._recurrent_decoded(hooks, w0, steps, log_kept, tokens.max_segments) if call.decode
+                    else self._recurrent(hooks, w0, steps, log_kept, max_segments=tokens.max_segments)[0])
+        elif call.decode:
             read = self._decoded(initial, slow, steps)
         elif tokens.max_segments > 1:
             read = self._stepped(initial, slow, steps)[0]
@@ -304,6 +343,78 @@ class InContextMemory(nn.Module):
         else:
             read = read.reshape(batch, length, -1)
         return read
+
+    # A linear memory on the shared recurrence.
+
+    def _recurrence(self) -> recurrence.Hooks | None:
+        """This memory's form as a row of the shared linear recurrence (the module docstring), or None
+        where it is none: a linear network on its given target, stepping each matrix as its gradient
+        with no momentum and every weight fast, each token reading its own step, on the dot objective
+        (any chunk, its gradient the same at every state) or on the l2 objective at chunk 1 without
+        retention (the delta rule, whose gradient Titans takes before the retention and the gated rule
+        after it), a retention keeping a share of the network in (0, 1]."""
+        gate = self.retention
+        kept = gate is None or (0 <= gate.scale <= 1 if gate.value is None else 0 <= gate.value < 1)
+        rows = {"dot": True, "l2": self.chunk == 1 and gate is None}
+        linear = (isinstance(self.network, LinearMemory) and self.target == "given" and self.momentum is None
+                  and not self.orthogonalize and not self.slow and self.commit == "token")
+        if not (linear and kept and rows.get(self.objective.kind, False)):
+            return None
+        # The l2 rule's log decay is zero: with a decay the delta rule takes the port's kernels.
+        return recurrence.Hooks(decay="scalar", delta=self.objective.kind == "l2", write_gate=True, scale=1.0)
+
+    def _recurrent(self, hooks: recurrence.Hooks, w0: jax.Array, steps: _Steps, log_kept: jax.Array, *,
+                   max_segments: int, held: jax.Array | None = None, kept: jax.Array | None = None
+                   ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """The readouts `[B, S, H, F]` of a linear memory of W_0 `w0` `[H, F, F]` through the shared
+        recurrence, its state after them `[B, H, F, F]` and each token's log of the share of W_0 its
+        document keeps `[B, S, H]`: the recurrence's chunked op, or its decode step for a cached call
+        of one token, continuing the state `held` and the share `kept` `[B, H]` a cache holds. The
+        recurrence starts each document from zero, so W_0 enters as its own term (the module
+        docstring)."""
+        real = steps.real
+        # A padding token neither steps nor decays the memory.
+        beta = jnp.where(real[..., None], steps.theta, 0.0)
+        log_decay = jnp.where(real[..., None], log_kept, 0.0)
+
+        def read_w0(view: jax.Array) -> jax.Array:
+            return jnp.einsum("bshi,hio->bsho", view, w0, precision=self.precision)
+
+        value = steps.value - read_w0(steps.key) if hooks.delta else steps.value
+        begins = real & (steps.places == 0)
+        # The row's first document continues the state and share the row holds; each later one starts.
+        continued = jnp.cumsum(begins, axis=1) <= 1
+        if held is not None and real.shape[1] == 1:
+            out, _, state = recurrence.step(hooks, recurrence.Step(
+                held, query=steps.query[:, 0], key=steps.key[:, 0], value=value[:, 0],
+                log_decay=log_decay[:, 0], beta=beta[:, 0], active=real[:, 0]))
+            out = out[:, None]
+        else:
+            out, state = recurrence_chunk.chunk(hooks, recurrence_chunk.Chunk(
+                steps.query, steps.key, value, log_decay=log_decay, beta=beta, state=held,
+                starts=begins & ~continued), max_segments=max_segments)
+        share = _within(log_decay, begins)
+        if kept is not None:
+            share = share + jnp.where(continued[..., None], kept[:, None], 0.0)
+        return out.astype(w0.dtype) + jnp.exp(share)[..., None] * read_w0(steps.query), state, share
+
+    def _recurrent_decoded(self, hooks: recurrence.Hooks, w0: jax.Array, steps: _Steps, log_kept: jax.Array,
+                           max_segments: int) -> jax.Array:
+        """A linear memory's cached call (`_recurrent`), the cache holding the recurrence's state
+        (`STATE`) and the log of W_0's share each row's document keeps (`KEPT`), zero for a fresh row;
+        its first call allocates it."""
+        batch, length = steps.real.shape
+        allocated = self.has_variable("cache", STATE)
+        held = self.variable("cache", STATE, jnp.zeros, (batch, *w0.shape), w0.dtype)
+        kept = self.variable("cache", KEPT, jnp.zeros, (batch, w0.shape[0]), w0.dtype)
+        reads, state, share = self._recurrent(hooks, w0, steps, log_kept, max_segments=max_segments,
+                                              held=held.value, kept=kept.value)
+        if allocated:
+            held.value = state
+            last = jnp.max(jnp.where(steps.real, jnp.arange(length), 0), axis=1)
+            kept.value = jnp.where(jnp.any(steps.real, axis=1)[:, None], share[jnp.arange(batch), last],
+                                   kept.value)
+        return reads
 
     # The function, token by token and chunk by chunk.
 
@@ -458,6 +569,16 @@ class _Steps(NamedTuple):
     a: jax.Array
     real: jax.Array
     places: jax.Array
+
+
+def _within(values: jax.Array, begins: jax.Array) -> jax.Array:
+    """Each token's sum of `values` `[B, S, ...]` over its document up to it, `begins` `[B, S]` marking
+    each document's first token: a sum that restarts at each, scanned as one associative scan."""
+    def combined(first: tuple, second: tuple) -> tuple:
+        (opened, summed), (opens, adds) = first, second
+        return opened | opens, jnp.where(_lead(opens, adds), adds, summed + adds)
+
+    return jax.lax.associative_scan(combined, (begins, values), axis=1)[1]
 
 
 def _lead(scalars: jax.Array, leaf: jax.Array) -> jax.Array:
