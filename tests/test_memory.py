@@ -250,6 +250,29 @@ def test_an_l2_linear_memory_runs_the_gated_delta_rule():
     assert routes(layer("delta_rule").clone(chunk=CHUNK)) == []
 
 
+@pytest.mark.parametrize(("dtype", "features", "kernel"), [
+    ("float32", FEATURES, "step"), ("float64", FEATURES, "xla"), ("float32", 12, "xla")],
+    ids=["fp32", "float64", "width_12"])
+def test_a_cached_linear_memorys_token_takes_the_shared_decode_dispatch(dtype, features, kernel):
+    """A linear memory's cached token, traced for an H100, steps through the shared decode dispatch: the
+    recurrence's step kernel where it takes the state, fp32 of power-of-two widths, else the portable
+    step, so a float64 memory keeps its own precision and a head width the kernel's blocks do not take
+    never reaches its launch."""
+    from dew.nn.kernels import generation
+
+    module = layer("delta_rule", dtype=jnp.dtype(dtype)).clone(head_features=features)
+    decode = MixerCall(decode=True)
+    with jax.enable_x64(new_val=dtype == "float64"):
+        x = jax.ShapeDtypeStruct((ROWS, 1, WIDTH), jnp.dtype(dtype))
+        params = jax.eval_shape(module.init, jax.random.key(0), x)
+        _, cache = jax.eval_shape(lambda held, x: module.apply(held, x, decode, mutable=["cache"]),
+                                  params, x)
+        with generation.assumed("sm90"), generation.routes() as found:
+            jax.eval_shape(lambda held, cached, x: module.apply({**held, **cached}, x, decode,
+                                                                mutable=["cache"]), params, cache, x)
+    assert [route.kernel for route in found if route.choice == "delta_decode"] == [kernel]
+
+
 class Product(nn.Module):
     """`k W`, a linear memory's function as a network of this test's own, which the layer runs on its
     general path rather than the shared recurrence."""
