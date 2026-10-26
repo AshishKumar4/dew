@@ -447,6 +447,13 @@ class Tokenize(grain.MapTransform):
     def dependencies(self) -> Mapping[str, object]:
         return {"tokenizer": self.vocabulary.dependencies()}
 
+    @property
+    def costly(self) -> bool:
+        """Whether encoding costs more than reading the ids back from a cache
+        (`dew.data.pipeline.Costly`): a learned tokenizer's does, Dew's bytes' do not, as
+        `tools/benchmark_data.py caching` measures (docs/design/data.md, section 8)."""
+        return self.tokenizer != "byte"
+
     def map(self, element: Batch) -> Batch:
         value = element[self.field]
         if not isinstance(value, str):
