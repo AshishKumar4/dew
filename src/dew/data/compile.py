@@ -1141,13 +1141,26 @@ def fitted[Entry](
 
 
 def _endless(chain: Pipeline) -> Pipeline:
-    """`chain` read endlessly: a repeat before its batch where it has none."""
-    if any(isinstance(stage, Repeat) for stage in chain.stages):
+    """`chain` read endlessly: a repeat before its batch where it has none and its read can end. Each
+    phase of a phased read repeats on its own, so one that already does is read as it is, and a
+    mixture whose members all repeat endlessly never ends."""
+    if any(isinstance(stage, Repeat) for stage in chain.stages) or _reads_on(chain):
         return chain
+    if isinstance(chain.source, Phases):
+        return with_children(chain, _endless)
     batching = [index for index, stage in enumerate(chain.stages)
                 if isinstance(stage, (BatchStage, TokenBudget))]
     at = batching[0] if batching else len(chain.stages)
     return dataclasses.replace(chain, stages=(*chain.stages[:at], Repeat(None), *chain.stages[at:]))
+
+
+def _reads_on(chain: Pipeline) -> bool:
+    """Whether `chain` reads endlessly as written: it repeats without end, or mixes members that all
+    do."""
+    if any(isinstance(stage, Repeat) and stage.epochs is None for stage in chain.stages):
+        return True
+    source = chain.source
+    return isinstance(source, Mixture) and all(_reads_on(child) for child in source.pipelines)
 
 
 def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int | None = None,
