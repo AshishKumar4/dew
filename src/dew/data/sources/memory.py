@@ -10,7 +10,8 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 
-from dew.data.dataset import Batch, Records
+from dew.batch import Batch
+from dew.data.dataset import Records
 from dew.data.pipeline import Dataset
 
 from .base import Read, ShardManifest, _indexed_manifest
@@ -138,7 +139,7 @@ class Memory(Dataset):
         return self.values
 
     def manifest(self) -> ShardManifest:
-        return _indexed_manifest(self, "memory", "memory", self.shard_rows)
+        return _indexed_manifest(self, "memory", self.shard_rows)
 
     def metadata(self) -> Mapping[str, object]:
         return {"rows": len(self.records("indexed")), "count_rules": self._count_rules}

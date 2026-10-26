@@ -34,10 +34,9 @@ import pytest
 from reference_error import assert_as_exact_as_the_reference
 from tool_support import REPO_ROOT, load
 
-from dew.config import OptimConfig
 from dew.interop import Pretrained
 from dew.objectives.lm import TEXT_KEY, LMObjective
-from dew.optim import Cosine, ParamGroup
+from dew.optim import Cosine, OptimConfig, ParamGroup
 from dew.training import MeshSpec, Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -125,8 +124,8 @@ def test_packed_documents_give_every_step_the_work_counted_for_one(monkeypatch):
     it counts attention within each document only."""
     import json
 
+    from dew.batch import coordinates
     from dew.interop import translate_config
-    from dew.nn.inputs import coordinates
 
     monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
     common = load("reference_runs/common")

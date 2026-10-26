@@ -25,15 +25,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew import registry
+from dew import _records, registry
+from dew.batch import Batch, Variables
 from dew.nn.inputs import ModelInputs
 from dew.nn.precision import at_least_fp32
 from dew.nn.text_encoders import DEFAULT_MODEL
-from dew.objectives.base import Batch, Variables
 from dew.registry import DtypeName
 
 from .diffusion import DiffusionConditioner
-from .encoders import CharTable, CLIPText, ConditionEncoder, HFAudio, T5Text, rebuild
+from .encoders import CharTable, CLIPText, ConditionEncoder, HFAudio, T5Text
 
 
 def unit_range(pixels: jax.typing.ArrayLike) -> jax.Array:
@@ -69,21 +69,13 @@ class Condition:
     field: str = "text"
     unconditional: str | float | Mapping[str, object] = ""
 
-    def to_json(self) -> dict:
-        return {
-            "encoder": {"class": registry.import_path(type(self.encoder)), "fields": self.encoder.to_json()},
-            "field": self.field,
-            "unconditional": self.unconditional,
-        }
-
-    @classmethod
-    def from_json(cls, record: Mapping, *, params: Variables | None = None) -> Condition:
-        encoder = record["encoder"]
-        return cls(
-            encoder=rebuild(encoder["class"], encoder["fields"], params=params),
-            field=record["field"],
-            unconditional=record["unconditional"],
-        )
+    @staticmethod
+    def bound(record: Mapping[str, object], *, params: Variables | None = None) -> Condition:
+        """The condition a run recorded (`dew.registry.to_record`), its encoder rebuilt around `params`
+        where given (`ConditionEncoder.bound`) and its other fields read as the registry reads them."""
+        encoder = ConditionEncoder.bound(_records.record(record["encoder"], "encoder"), params=params)
+        # The encoder is built, which the registry leaves as it is (`registry.from_record`).
+        return registry.from_record(Condition, {**record, "encoder": encoder})
 
 
 @dataclass(frozen=True)
@@ -176,53 +168,17 @@ class InputSpec:
                     f"but the first training batch has shape {tuple(actual)}"
                 )
 
-    def to_json(self) -> dict:
-        return {
-            "sample": {
-                "key": self.sample.key,
-                "shape": list(self.sample.shape),
-                **({"variable_axes": list(self.sample.variable_axes)} if self.sample.variable_axes else {}),
-            },
-            "conditions": {keyword: condition.to_json() for keyword, condition in self.conditions.items()},
-            **(
-                {
-                    "mask": {
-                        "key": self.mask.key,
-                        "shape": list(self.mask.shape),
-                        **(
-                            {"variable_axes": list(self.mask.variable_axes)}
-                            if self.mask.variable_axes
-                            else {}
-                        ),
-                    }
-                }
-                if self.mask is not None
-                else {}
-            ),
-        }
-
-    @classmethod
-    def from_json(cls, record: Mapping, *, params: Mapping[str, Variables] | None = None) -> InputSpec:
-        """Rebuild the spec from its JSON record, around the given condition parameters.
-
-        `params` maps each condition's keyword to its encoder's parameters.
-        When it is None, each encoder loads its own weights."""
-        sample = record["sample"]
-        return cls(
-            sample=Field(sample["key"], tuple(sample["shape"]), tuple(sample.get("variable_axes", ()))),
-            conditions={
-                keyword: Condition.from_json(condition, params=None if params is None else params[keyword])
-                for keyword, condition in record["conditions"].items()
-            },
-            mask=Field(
-                record["mask"]["key"],
-                tuple(record["mask"]["shape"]),
-                tuple(record["mask"].get("variable_axes", ())),
-            )
-            if "mask" in record
-            else None,
-        )
-
+    @staticmethod
+    def bound(record: Mapping[str, object], *, params: Mapping[str, Variables] | None = None) -> InputSpec:
+        """The spec a run recorded (`dew.registry.to_record`), each condition's encoder rebuilt around
+        its parameters, `params` by the keyword it is passed under (`Condition.bound`); without
+        `params` each encoder loads its own weights. The other fields are read as the registry reads
+        them."""
+        conditions = {keyword: Condition.bound(_records.record(condition, keyword),
+                                               params=None if params is None else params[keyword])
+                      for keyword, condition in _records.record(record.get("conditions", {}),
+                                                                "conditions").items()}
+        return registry.from_record(InputSpec, {**record, "conditions": conditions})
 
 @dataclasses.dataclass(frozen=True)
 class TextCondition:
@@ -263,9 +219,9 @@ class TextCondition:
                   (("max_length", self.max_length), ("revision", self.revision))
                   if value is not None}
         return Condition(
-            rebuild(self.encoder, {"checkpoint": self.checkpoint,
-                                   "dtype": dtype if self.dtype is None else self.dtype,
-                                   "param_dtype": self.param_dtype, **fields}, params=params),
+            ConditionEncoder.bound({"class": self.encoder, "fields": {
+                "checkpoint": self.checkpoint, "dtype": dtype if self.dtype is None else self.dtype,
+                "param_dtype": self.param_dtype, **fields}}, params=params),
             field=self.field, unconditional=self.unconditional)
 
 
@@ -291,9 +247,10 @@ class AudioCondition:
         """Build the tower over supplied params for waveforms of `seconds` (the clips' `audio_seconds`,
         `Dataset.facts`), without loading source weights or casting storage."""
         return Condition(
-            rebuild(self.encoder, {"checkpoint": self.checkpoint, "seconds": seconds,
-                                   "dtype": dtype if self.dtype is None else self.dtype,
-                                   "param_dtype": self.param_dtype}, params=params),
+            ConditionEncoder.bound({"class": self.encoder, "fields": {
+                "checkpoint": self.checkpoint, "seconds": seconds,
+                "dtype": dtype if self.dtype is None else self.dtype, "param_dtype": self.param_dtype}},
+                params=params),
             field="audio", unconditional=0.0)
 
 

@@ -122,13 +122,13 @@ def gradient_sync(mesh) -> dict:
 
 
 def agreements() -> dict:
-    """The median seconds of each way the pool shares a host value (`dew.coordination`): a
+    """The median seconds of each way the pool shares a host value (`dew._coordination`): a
     coordination-service barrier alone, a 4-byte device allgather (how agreements once went), a
     round of the service (`from_every_process`), an agreement on an outcome and on a value."""
     import numpy as np
     from jax.experimental import multihost_utils
 
-    from dew.coordination import _client, agree_process_phase, agreed_same, from_every_process
+    from dew._coordination import _client, agree_process_phase, agreed_same, from_every_process
 
     client = _client()
     rounds = iter(range(1_000_000))

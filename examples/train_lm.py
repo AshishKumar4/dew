@@ -21,12 +21,12 @@ import jax
 import jax.numpy as jnp
 import tyro
 
-from dew.config import OptimConfig
 from dew.data import ByteTokenizer, presets
 from dew.data.sources import TokenFiles
 from dew.inference import RunProcessor
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Samples
+from dew.optim import OptimConfig
 from dew.sampling import Sampling
 from dew.training import Checkpoints, Trainer
 

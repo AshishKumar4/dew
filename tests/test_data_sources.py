@@ -1992,9 +1992,34 @@ def test_a_local_store_whose_producer_declared_other_bytes_is_refused(tmp_path):
             Files(url, file_info={url: stale}).fingerprint()
 
 
+def test_an_exports_files_of_one_place_shard_apart(tmp_path):
+    """Two files of a provisioned (committed) ArrayRecord directory whose writers' directories are left
+    out of their places, so they share one, are still two shards: a read of the files, and of a
+    concatenation of them, holds every record of both."""
+    import array_record.python.array_record_module as array_record
+
+    from dew.data.sources import Concatenate
+
+    root = tmp_path / "export"
+    for writer, values in (("a", (0, 1)), ("b", (2, 3))):
+        (root / "shards" / writer).mkdir(parents=True)
+        writing = array_record.ArrayRecordWriter(str(root / "shards" / writer / "part-000000.array_record"),
+                                                 "group_size:1")
+        for value in values:
+            writing.write(str(value).encode())
+        writing.close()
+    files = Files(str(root), format="array_record").provision()
+    assert len({shard.id for shard in files.manifest().shards}) == 2
+    for source in (files, Concatenate((files,))):
+        manifest = source.manifest()
+        read = sorted(bytes(row) for shard in manifest.shards for row in manifest.reader(shard))
+        assert read == [b"0", b"1", b"2", b"3"]
+
+
 def _indexed_source(kind: str, root: Path):
     """A source of `kind` that streams its indexed records, and the shards (id, location, start,
-    stop, rows) its manifest names: the ids a cache keys rows by and a saved position counts into."""
+    stop, rows) its manifest names: the ids a cache keys rows by and a saved position counts into,
+    which name no directory a local store's fingerprint leaves out."""
     from token_support import write_token_corpus
 
     from dew.data.pipeline import Pack, Pipeline
@@ -2002,15 +2027,15 @@ def _indexed_source(kind: str, root: Path):
 
     if kind == "memory":
         return Memory([{"id": index} for index in range(7)], shard_rows=3), [
-            ("memory:0", "memory", 0, 3, 3), ("memory:3", "memory", 3, 6, 3), ("memory:6", "memory", 6, 7, 1)]
+            ("records:0", "memory", 0, 3, 3), ("records:3", "memory", 3, 6, 3),
+            ("records:6", "memory", 6, 7, 1)]
     if kind == "tfds":
         import tensorflow_datasets as tfds
 
         path = str(Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0")
-        named = f"tfds:dew_images/None:None:all:{path}"
         return TFDS("dew_images", path=path, split="all", shard_rows=8,
                     decoders={"image": tfds.decode.SkipDecoding()}), [
-            (f"{named}:0", path, 0, 8, 8), (f"{named}:8", path, 8, 16, 8), (f"{named}:16", path, 16, 20, 4)]
+            ("records:0", path, 0, 8, 8), ("records:8", path, 8, 16, 8), ("records:16", path, 16, 20, 4)]
     if kind == "generation":
         from dew.data.cache import Cache
         from dew.data.compile import publish
@@ -2019,33 +2044,33 @@ def _indexed_source(kind: str, root: Path):
                              Cache(str(root / "cache")), read="indexed",
                              loading=Loading(workers=0, threads=1, read_buffer=0))
         url = generation.url
-        return generation.source(), [(f"{url}:0", url, 0, 4096, 4096), (f"{url}:4096", url, 4096, 4100, 4)]
+        return generation.source(), [("records:0", url, 0, 4096, 4096), ("records:4096", url, 4096, 4100, 4)]
     if kind == "planned":
         from dew.data.packing import PackedSource
 
         documents = [np.arange(3, dtype=np.int32) + index for index in range(1030)]
         held = Memory({"text": documents, "length": [3] * 1030}, identity="documents")
         return PackedSource.planned(held, Pack(4, bins=1)), [
-            ("memory:documents:0", "memory:documents", 0, 1024, 1024),
-            ("memory:documents:1024", "memory:documents", 1024, 1030, 6)]
+            ("records:0", "memory:documents", 0, 1024, 1024),
+            ("records:1024", "memory:documents", 1024, 1030, 6)]
     corpus = write_token_corpus(root, np.tile(np.array([5, 255], np.uint16), 1030), eos_id=255)
     tokens = TokenFiles(corpus.train).provision()
     if kind == "tokens":
-        return tokens, [(f"{corpus.train}:train:0", corpus.train, 0, 1024, 1024),
-                        (f"{corpus.train}:train:1024", corpus.train, 1024, 1030, 6)]
+        return tokens, [("records:0", corpus.train, 0, 1024, 1024),
+                        ("records:1024", corpus.train, 1024, 1030, 6)]
     from dew.data.steps.windows import WindowSource
 
     windows = WindowSource(tokens, tokens.tokens, 4, 1)
-    named = f"{tokens.describe()} causal windows=4,stride=1"
-    return windows, [(f"{named}:0", named, 0, 1024, 1024), (f"{named}:1024", named, 1024, 2048, 1024),
-                     (f"{named}:2048", named, 2048, 2056, 8)]
+    described = f"{tokens.describe()} causal windows=4,stride=1"
+    return windows, [("records:0", described, 0, 1024, 1024), ("records:1024", described, 1024, 2048, 1024),
+                     ("records:2048", described, 2048, 2056, 8)]
 
 
 @pytest.mark.parametrize("kind", ["memory", "tfds", "tokens", "windows", "generation", "planned"])
 def test_an_indexed_source_streams_as_bounded_shards_of_its_records(tmp_path, kind):
-    """A source read by index streams as consecutive shards of its records, each named by its
-    store and first row; a shard reads that slice of the indexed records, and the manifest
-    pickles, reader and all, for Grain's worker processes."""
+    """A source read by index streams as consecutive shards of its records, each named by its first
+    record, wherever the source is; a shard reads that slice of the indexed records, and the
+    manifest pickles, reader and all, for Grain's worker processes."""
     source, expected = _indexed_source(kind, tmp_path)
     manifest = source.manifest()
     named = [(shard.id, shard.uri, shard.start, shard.stop, shard.rows) for shard in manifest.shards]

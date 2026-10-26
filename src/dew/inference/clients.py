@@ -21,8 +21,9 @@ from typing import TYPE_CHECKING, Literal, Protocol
 import jax
 import numpy as np
 
-from dew.nn.inputs import key_seed, token_id
-from dew.records import JSON, record as section
+from dew._records import JSON, record as section
+from dew.batch import token_id
+from dew.nn.inputs import key_seed
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:

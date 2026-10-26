@@ -13,6 +13,7 @@ import pytest
 from decision_support import decision_rows
 
 from dew.artifacts import Decisions
+from dew.batch import FROZEN, VALID_ROWS
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
@@ -35,7 +36,7 @@ from dew.decision import (
 )
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import FROZEN, VALID_ROWS, joined
+from dew.objectives.base import joined
 from dew.training.trainer import Trainer
 
 FIXTURES = Path(__file__).parent / "fixtures" / "laya"
@@ -372,8 +373,12 @@ def test_a_saved_vision_run_answers_image_rows(tmp_path, separate_tokenizer):
 
     assert reloaded.processor is not None
     np.testing.assert_array_equal(second, first)
-    assert reloaded.processor.source == str(directory)
-    assert objective.inference_record()["processor"] == str(directory)
+    from dew.interop.sources import SourceReference
+    from dew.registry import from_record
+
+    assert reloaded.processor.source == SourceReference(str(directory))
+    held_source = from_record(SourceReference, objective.inference_record()["processor"])
+    assert held_source == reloaded.processor.source
     assert not np.array_equal(second, reloaded("charged twice!", asked)["team"].probabilities)
 
 
@@ -486,11 +491,12 @@ def test_a_head_records_the_matmul_precision_it_computes_at(precision):
     assert precision_names(Head.from_record(record, 32).precision) == precision_names(precision)
 
 
-@pytest.mark.parametrize("record", [{"features": 32, "layers": 1}, {"name": "DecisionHead", "layers": 1}],
-                         ids=["unnamed", "flat"])
+@pytest.mark.parametrize("record", [{"features": 32, "layers": 1}, {"class": "DecisionHead", "layers": 1},
+                                    {"class": "dew.decision.layout:FramedLayout", "fields": {}}],
+                         ids=["unnamed", "flat", "not a head"])
 def test_a_head_record_names_its_head_and_holds_its_fields(record):
-    """A run records a head as its name and its fields (`Head.record`); a
-    record of another shape is refused rather than read as Laya's head."""
+    """A run records a head as the registry's class record, its class and its fields (`Head.record`); a
+    record of another shape, or of a class that is no head, is refused rather than read as Laya's head."""
     from dew.decision.head import Head
 
     with pytest.raises(ValueError):

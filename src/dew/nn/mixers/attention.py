@@ -18,6 +18,7 @@ from flax import linen as nn
 from jax.ad_checkpoint import checkpoint_name
 from jax.typing import DTypeLike
 
+from dew.batch import Coordinates
 from dew.nn.attention import (
     RMSNorm,
     alibi_bias,
@@ -40,7 +41,6 @@ from dew.nn.inputs import (
     PLAIN_CALL,
     Admitted,
     AttentionMetadata,
-    Coordinates,
     MixerCall,
     coordinates_of,
     counted_places,

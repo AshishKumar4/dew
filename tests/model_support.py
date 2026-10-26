@@ -64,7 +64,7 @@ def decode_steps(model):
 def two_documents(rng: np.random.Generator, rows: int, length: int):
     """The `Coordinates` of `rows` packed rows of `length` tokens: two documents a row, the second
     starting at a column `rng` draws for each row, and the last row's final three slots padding."""
-    from dew.nn.inputs import coordinates
+    from dew.batch import coordinates
 
     segments = np.ones((rows, length), np.int32)
     positions = np.zeros((rows, length), np.int32)

@@ -48,15 +48,18 @@ from typing import ClassVar, NotRequired, Protocol, TypedDict, runtime_checkable
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import linen as nn, traverse_util
+from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.linen.module import Interceptor
 from flax.nnx import bridge
 
+from dew._records import finite
+from dew.batch import FROZEN, Path, Variables, freeze, merge as overlay, part, select, thaw
+from dew.cache import INTERCEPTED
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
-from dew.nn.dense import Dense, DenseGeneral
+from dew.nn.dense import _contractions, _linear_site
 from dew.nn.dropout import Dropout
 from dew.nn.flops import (
     MissingFlopsCount,
@@ -84,16 +87,14 @@ from dew.nn.protocols import (
     CountedVideo,
 )
 from dew.nn.sharding import LOW_RANK_FACTORS
-from dew.objectives.base import FROZEN, Path, Variables, freeze, merge as overlay, part, select, thaw
 from dew.quantization import (
     FROZEN_FP8,
     QUANTIZATION,
     InputQuantization,
-    frozen_fp8_kernel,
+    decoded_frozen_fp8,
     measured_fp8_sites,
 )
-from dew.records import finite
-from dew.registry import rebuilt, wrapper_layers
+from dew.registry import Wrapper, rebuilt, wrapper_layers
 
 PEFT_CONFIG = "adapter_config.json"
 PEFT_WEIGHTS = "adapter_model.safetensors"
@@ -347,21 +348,18 @@ class Adapter:
         binding whose shapes do not fit the restored factors is refused by name.
         `trust` is as `TextGeneration.from_run` takes it.
         """
-        from dew.config import ModelConfig
-        from dew.inference.tasks import run_record
-        from dew.records import record, text
-        from dew.registry import objectives
+        from dew.inference.tasks import SavedRun, saved_model
 
-        declaration, step = run_record(str(directory), step, trust)
-        config = ModelConfig.from_dict(record(declaration['model'], 'model'))
-        if config.adapter is None:
+        run = SavedRun.pinned(str(directory), step, trust)
+        config = saved_model(run.record, None)
+        adapter = recorded_adapter(config.wrappers)
+        if adapter is None:
             raise ValueError(f"{directory} trained no adapter")
-        objective = objectives[text(declaration['objective'], 'objective')]
-        variables = objective._saved_variables(str(directory), step=step, ema=ema)
+        variables = run.variables(ema=ema)
         # The recorded model's own tree, where the objective's nests it beside parts the record leaves out.
-        if objective._recorded_part is not None:
-            variables = part(variables, objective._recorded_part)
-        return cls.recorded(config.build(), variables, config.adapter)
+        if run.objective._recorded_part is not None:
+            variables = part(variables, run.objective._recorded_part)
+        return cls.recorded(config.build(), variables, adapter)
 
     @classmethod
     def recorded(cls, model: nn.Module, variables: Variables, adapter: AdapterRecord) -> Adapter:
@@ -402,23 +400,17 @@ class Adapter:
         `variables` is the adapted tree, whole or split as a trainer keeps it. The sum
         runs in at least fp32 at full precision and is stored in the kernel's dtype,
         as PEFT's `merge_and_unload` does. A frozen FP8 site's kernel is the one its
-        codes decode to (`frozen_fp8_kernel`), targeted or not, and the codes go,
-        since a model under the record would multiply them in the merged kernel's
-        place. The result is one `params` collection.
+        codes decode to (`dew.quantization.decoded_frozen_fp8`), targeted or not, and
+        the codes go, since a model under the record would multiply them in the merged
+        kernel's place. The result is one `params` collection.
         """
-        variables = thaw(variables)
-        coded = {path[:-1] for path in traverse_util.flatten_dict(variables.get(QUANTIZATION, {}))
-                 if path[-1] == FROZEN_FP8[0]}
+        variables = decoded_frozen_fp8(thaw(variables))
         merged: dict = {}
-        for site in coded:
-            _insert(merged, ("params", *site, "kernel"), _base_kernel(variables, ("params", *site)))
         for path, target in self.targets.items():
             node = _node(variables, path)
-            kernel = _updated(_base_kernel(variables, path), node["lora_A"], node["lora_B"],
-                              self.scale(target))
+            kernel = _updated(node["kernel"], node["lora_A"], node["lora_B"], self.scale(target))
             _insert(merged, (*path, "kernel"), kernel)
-        dropped = ({(*path, factor) for path in self.targets for factor in FACTORS}
-                   | {(QUANTIZATION, *site, leaf) for site in coded for leaf in FROZEN_FP8})
+        dropped = {(*path, factor) for path in self.targets for factor in FACTORS}
         return select(overlay(variables, merged), lambda path: path not in dropped)
 
     def save(self, variables: Variables, path: str | FilePath) -> None:
@@ -486,6 +478,18 @@ def _updated(kernel: jax.Array, a: jax.Array, b: jax.Array, scale: float) -> jax
     return (kernel.astype(dtype) + scale * delta).astype(kernel.dtype)
 
 
+def _targets_under(targets: Mapping[Path, Target], path: Path) -> bool:
+    """Whether a target lies at or under the module `path`, a scanned run standing for each layer it
+    runs (`_target_at`)."""
+    paths = [path]
+    for depth, name in enumerate(path):
+        layers = group_layers(name)
+        if layers is not None and len(layers) > 1:
+            paths = [(*held[:depth], f"layers_{index}", *held[depth + 1:])
+                     for held in paths for index in layers]
+    return any(target[:len(held)] == held for target in targets for held in paths)
+
+
 def _target_at(targets: Mapping[Path, Target], path: Path) -> Target | None:
     """Return the target a module path names, seen through the stack that runs
     it: a scanned run's module `layers_3_7` stands for layers 3 through 7,
@@ -549,11 +553,12 @@ class _Branch:
         if context.method_name == "nonlinear_input":
             # A layer asks whether its submodule is linear in its input on
             # this call (`MultiHeadLatentAttention.nonlinear_input`): the
-            # branch's dropout draws on it, on a target under a dropout stream.
+            # branch's dropout draws on it, on a target at or under it under
+            # a dropout stream.
             name = args[0] if args else kwargs["name"]
             return next_fun(*args, **kwargs) or bool(
                 self.dropout and module.has_rng("dropout")
-                and _target_at(self.targets, root + module.path + (name,)) is not None)
+                and _targets_under(self.targets, root + module.path + (name,)))
         if context.method_name == "applied_kernel":
             # A model asks for the kernel its submodule multiplies by
             # (`CausalTransformer.applied_kernel`): a target's carries the
@@ -566,23 +571,17 @@ class _Branch:
             child = getattr(module, name)
             a, b = child.get_variable("params", "lora_A"), child.get_variable("params", "lora_B")
             return _updated(kernel, a, b, _scale(target, self.rslora))
-        target = _target_at(self.targets, root + module.path) if context.method_name == "__call__" else None
+        target = (_target_at(self.targets, root + module.path)
+                  if context.method_name in ("__call__", "_linear") else None)
         if target is None:
             return next_fun(*args, **kwargs)
-        # Dew's layers are flax's with the bias summed at fp32; a model built on flax's own adapts alike.
-        if type(module) not in (Dense, DenseGeneral, nn.Dense, nn.DenseGeneral):
-            raise TypeError(
-                f"{'/'.join(root + module.path)} is a {type(module).__name__}; an adapter "
-                "targets Dense and DenseGeneral kernels")
+        if not _linear_site(context, "/".join(root + module.path)):
+            return next_fun(*args, **kwargs)
         x = args[0] if args else kwargs["inputs"]
         output = next_fun(*args, **kwargs)
-        if isinstance(module, nn.DenseGeneral):
-            if module.batch_dims:
-                raise TypeError(f"{'/'.join(root + module.path)} contracts with batch dims")
-            axes = (module.axis,) if isinstance(module.axis, int) else tuple(module.axis)
-        else:
-            axes = (-1,)
-        axes = tuple(sorted(axis % x.ndim for axis in axes))
+        axes, batch_dims = _contractions(module, x.ndim)
+        if batch_dims:
+            raise TypeError(f"{'/'.join(root + module.path)} contracts with batch dims")
         if module.has_variable("params", "lora_A"):
             # A frozen FP8 site holds no kernel past init (`_fp8_packed`); its factors hold their shapes.
             a, b = module.get_variable("params", "lora_A"), module.get_variable("params", "lora_B")
@@ -763,11 +762,11 @@ def _adapted(model: nn.Module, bound: _Bound) -> nn.Module:
             return _record(bound)
 
         def apply(self, variables, *args, **kwargs):
-            with nn.intercept_methods(branch):
+            with INTERCEPTED(new_value=True), nn.intercept_methods(branch):
                 return super().apply(thaw(variables), *args, **kwargs)
 
         def init_with_output(self, *args, **kwargs):
-            with nn.intercept_methods(branch):
+            with INTERCEPTED(new_value=True), nn.intercept_methods(branch):
                 output, variables = super().init_with_output(*args, **kwargs)
             return output, _fp8_packed(model, dict(freeze(variables, lambda path: path in factors)))
 
@@ -825,6 +824,11 @@ class AdapterRecord:
         return targets, layouts
 
 
+def recorded_adapter(wrappers: Sequence[Wrapper]) -> AdapterRecord | None:
+    """The LoRA bound among a model record's `wrappers` (`ModelConfig.wrappers`), or None."""
+    return next((wrapper for wrapper in wrappers if isinstance(wrapper, AdapterRecord)), None)
+
+
 def _record(bound: _Bound) -> AdapterRecord:
     """The bound adapter as a model record holds it."""
     targets = bound.targets
@@ -845,15 +849,9 @@ def _site_codes(variables: Variables, path: Path) -> Mapping | None:
     return leaves if FROZEN_FP8[0] in leaves else None
 
 
-def _base_kernel(variables: Variables, path: Path) -> jax.Array:
-    """The kernel of the module at `path`: its own, or a frozen FP8 site's
-    decoded from its packed codes (`frozen_fp8_kernel`)."""
-    codes = _site_codes(variables, path)
-    return _node(variables, path)["kernel"] if codes is None else jnp.asarray(frozen_fp8_kernel(codes))
-
-
 def _kernel_shape(variables: Variables, path: Path) -> tuple[int, ...]:
-    """The shape of `_base_kernel`, read without decoding a frozen FP8 site."""
+    """The shape of the kernel of the module at `path`, its own or a frozen FP8 site's as its codes
+    decode (`decoded_frozen_fp8`), read without decoding them."""
     codes = _site_codes(variables, path)
     return tuple(np.shape(_node(variables, path)["kernel"] if codes is None else codes[FROZEN_FP8[0]].T))
 

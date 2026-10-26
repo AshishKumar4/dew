@@ -404,14 +404,14 @@ def test_a_failure_no_agreement_hears_ends_the_peer_after_the_grace():
     to rank 0, whose watch ends it once the grace has passed unheard."""
     program = ("import orbax.checkpoint.multihost\n"
                "import os, threading\n"
-               "import dew.coordination as coordination\n"
-               "coordination.FAILURE_GRACE_SECONDS = 3.0\n"
-               "coordination.FAILURE_POLL_SECONDS = 0.5\n"
+               "import dew._coordination as engine\n"
+               "engine.FAILURE_GRACE_SECONDS = 3.0\n"
+               "engine.FAILURE_POLL_SECONDS = 0.5\n"
                "from dew.training.runtime import prepare_process\n"
                "prepare_process()\n"
                "import jax\n"
                "if jax.process_index() == 1:\n"
-               "    coordination.publish_failure(RuntimeError('injected failure'), 'a step')\n"
+               "    engine.publish_failure(RuntimeError('injected failure'), 'a step')\n"
                "else:\n"
                "    threading.Event().wait()\n")
     started = time.monotonic()
@@ -569,8 +569,8 @@ def test_a_pool_whose_program_ends_while_its_failure_watches_read_exits_cleanly(
     whose programs had run to their end: SIGABRT and "terminate called ..."
     in the pool tests of two CI runs (ci/train-2, ci/commit-select). Every
     watch here reads without a pause, so each rank ends mid-read."""
-    program = ("import dew.coordination as coordination\n"
-               "coordination.FAILURE_POLL_SECONDS = 0\n"
+    program = ("import dew._coordination as engine\n"
+               "engine.FAILURE_POLL_SECONDS = 0\n"
                "from dew.training.runtime import prepare_process\n"
                "prepare_process()\n")
     code, output = four_rank_pool(program)
@@ -603,7 +603,7 @@ def test_a_rank_busy_on_its_host_before_an_agreement_leaves_the_pool_running():
                "runtime.EXECUTION_TIMEOUT = '20s'\n"
                "runtime.prepare_process()\n"
                "import time, jax\n"
-               "from dew.coordination import agreed\n"
+               "from dew._coordination import agreed\n"
                "if jax.process_index() == 1:\n"
                "    time.sleep(45)\n"
                "print('agreed', agreed('upload', lambda: jax.process_index()))\n")
@@ -700,7 +700,7 @@ def test_a_rank_whose_leaf_cannot_be_read_reports_at_the_gather_preflight():
                "runtime.prepare_process()\n"
                "import jax, numpy as np\n"
                "from jax.sharding import NamedSharding, PartitionSpec\n"
-               "from dew import coordination\n"
+               "from dew import distributed as coordination\n"
                "from dew.training import MeshSpec\n"
                "mesh = MeshSpec(fsdp=jax.device_count()).build()\n"
                "value = np.arange(4 * jax.device_count(), dtype=np.float32)\n"
@@ -729,7 +729,7 @@ def test_a_rank_that_holds_nothing_copies_none_of_the_tree_to_its_host():
         "runtime.prepare_process()\n"
         "import jax, jax.numpy as jnp, numpy as np\n"
         "from jax.sharding import NamedSharding, PartitionSpec\n"
-        "from dew import coordination\n"
+        "from dew import distributed as coordination\n"
         "from dew.training import MeshSpec\n"
         "mesh = MeshSpec(fsdp=jax.device_count()).build()\n"
         "def placed(value, spec):\n"

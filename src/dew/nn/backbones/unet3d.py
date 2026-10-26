@@ -14,8 +14,8 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.batch import merge
 from dew.nn.dense import Dense
-from dew.objectives.base import merge
 
 from ..attention import NormalAttention, RMSNorm
 from ..blocks import TimeProjection
