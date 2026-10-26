@@ -337,7 +337,10 @@ def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -
     if key('num_key_value_heads') in hf_config:
         fields[key('num_key_value_heads')] = small_kv
     if key('head_dim') in hf_config:
-        fields[key('head_dim')] = _HEAD_DIM
+        # A latent-attention config whose head_dim states its rotary width (Longcat Flash's) keeps the
+        # two equal.
+        rotary = 'qk_rope_head_dim' in hf_config and hf_config[key('head_dim')] == hf_config['qk_rope_head_dim']
+        fields[key('head_dim')] = _HEAD_DIM // 2 if rotary else _HEAD_DIM
     # A window or a chunk shrinks below the probe's length, so the probe runs past it.
     for positional in ('sliding_window', 'attention_chunk_size'):
         if isinstance(hf_config.get(positional), int):
