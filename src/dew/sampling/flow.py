@@ -21,7 +21,7 @@ from flax import struct
 from jax.typing import ArrayLike
 
 from dew.diffusion.process import Denoiser, Process
-from dew.diffusion.schedules import RectifiedFlow, expand
+from dew.diffusion.schedules import RectifiedFlow, divided, expand
 from dew.nn.precision import at_least_fp32
 
 from .guidance import Guidance, Walk
@@ -126,7 +126,9 @@ def _gaussian_kl_jvp(primals, tangents):
     so an untouched variance's zero tangent is a zero term whatever the KL's size."""
     (difference, variance), (difference_tangent, variance_tangent) = primals, tangents
     value = _gaussian_kl(difference, variance)
-    slope = difference / expand(variance, difference)
+    # IEEE division (`divided`): XLA:CPU takes a division by a broadcast as a product with its
+    # reciprocal, which a variance near float32's largest takes below the normal range.
+    slope = divided(difference, expand(variance, difference))
     moved = (slope * difference_tangent).sum(axis=tuple(range(1, difference.ndim)))
     return value, moved - value * (variance_tangent / variance)
 
