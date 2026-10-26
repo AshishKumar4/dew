@@ -305,10 +305,17 @@ def test_a_joint_release_saves_as_the_release_it_was_read_from(tmp_path):
         bundle, name="release").systemone(request)
 
 
-def test_a_joint_release_fine_tunes_and_reloads_from_the_run(tmp_path):
-    """A joint-head release is a whole task to fine-tune: its Qwen 3.5 backbone,
-    joint head and layout train together on rows of several questions, and
-    the saved run loads back as a task with identical probabilities."""
+def test_a_joint_release_fine_tunes_averages_and_reloads_from_its_runs(tmp_path):
+    """A joint-head release is a whole task to fine-tune: its Qwen 3.5 backbone, joint head and layout
+    train together on rows of several questions, and the saved run loads back as a task with identical
+    probabilities. Two such runs average into one task, its temperatures refit on held-out answers
+    (`Decide.averaged`), which saves to a directory of its own and reloads through `from_run` and
+    `dew.pipeline` answering as it did (1505)."""
+    import dataclasses
+
+    from dew.decision import Calibration
+    from dew.inference.loading import pipeline
+
     release = tmp_path / "release"
     release.mkdir()
     for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
@@ -323,22 +330,38 @@ def test_a_joint_release_fine_tunes_and_reloads_from_the_run(tmp_path):
     objective = DecisionObjective(Decide.from_pretrained(release, attention_impl="xla"),
                                   layout=JointLayout(max_len=1024))
     data = decision_rows(examples, 8, examples, objective=objective.data())
-    run = tmp_path / "run"
-    checkpoints = Checkpoints(str(run), keep=1)
     start = objective.init(jax.random.key(0))
-    state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
-        data, steps=2, log_every=100, checkpoint_every=2)
-    checkpoints.wait()
+    runs, states = [], []
+    for index, steps in enumerate((2, 1)):
+        run = tmp_path / f"run{index}"
+        checkpoints = Checkpoints(str(run), keep=1)
+        states.append(Trainer(objective, optax.adam(1e-3), key=index, checkpoints=checkpoints).fit(
+            data, steps=steps, log_every=100, checkpoint_every=steps))
+        checkpoints.wait()
+        runs.append(str(run))
     before = jax.tree.leaves(start["params"]["head"])
-    after = jax.tree.leaves(state.variables["params"]["head"])
+    after = jax.tree.leaves(states[0].variables["params"]["head"])
     assert any(not np.array_equal(np.asarray(a), np.asarray(b)) for a, b in zip(before, after, strict=True))
 
-    live, reloaded = objective.pipeline(state), Decide.from_run(str(run))
+    live, reloaded = objective.pipeline(states[0]), Decide.from_run(runs[0])
     assert live.processor is not None  # the release's, which reads images
     asked = {"team": team, "urgent": urgent}
     first, second = live("charged twice!", asked), reloaded("charged twice!", asked)
     for answer, again in zip(first.values(), second.values(), strict=True):
         np.testing.assert_array_equal(answer.probabilities, again.probabilities)
+
+    task = Decide.averaged(runs, calibrate_on=examples * 4)
+    assert task.calibration != Calibration()
+    averaged = str(tmp_path / "averaged")
+    task.save(averaged)
+    for loaded in (Decide.from_run(averaged), pipeline(averaged)):
+        assert isinstance(loaded, Decide)
+        assert loaded.layout == task.layout and loaded.weights == task.weights
+        assert loaded.calibration == task.calibration
+        for state in ("charged twice!", "is the site down?"):
+            found, expected = loaded(state, asked), task(state, asked)
+            for name in expected:
+                np.testing.assert_equal(dataclasses.asdict(found[name]), dataclasses.asdict(expected[name]))
 
 
 def test_a_joint_release_reads_images_as_its_own_model_does(tmp_path):
