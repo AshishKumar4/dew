@@ -235,9 +235,9 @@ def orders(drawn: Path) -> None:
 if __name__ == "__main__":
     import sys
 
-    if sys.argv[1:2] == ["orders"]:
-        orders(Path(sys.argv[2]))
-    elif sys.argv[1:] == ["padding"]:
+    if sys.argv[1:] == ["padding"]:
         record_released_padding()
+    elif sys.argv[1:2] == ["orders"]:
+        orders(Path(sys.argv[2]))
     else:
         main()
