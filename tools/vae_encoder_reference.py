@@ -50,7 +50,7 @@ def walk(encoder, image, probe, dtype):
 
 def main():
     from reference_source import saved_fixture
-    from torch_precision import widened
+    from torch_precision import float64_twin, widened
 
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)
@@ -66,6 +66,8 @@ def main():
     arrays: dict[str, np.ndarray] = {"image": image.numpy()}
     arrays.update({f"param.{name}": value.detach().numpy().astype(ml_dtypes.bfloat16).view(np.uint16)
                    for name, value in encoder.named_parameters()})
+    # The float64 twin, built inside `float64` so its constructor computes in float64, with these weights.
+    wide = float64_twin(encoder, lambda: AutoencoderKL.from_config(CONFIG).encoder)
     for batch in BATCHES:
         rows = image[:batch]
         with torch.no_grad():
@@ -75,9 +77,8 @@ def main():
         single = walk(encoder, rows, probe, torch.float32)
         arrays.update({f"{batch}/fp32.{key}": value for key, value in single.items()})
         with widened():
-            truth = walk(encoder, rows, probe, torch.float64)
+            truth = walk(wide, rows, probe, torch.float64)
         arrays.update({f"{batch}/fp64.{key}": value for key, value in truth.items()})
-        encoder = encoder.to(torch.float32)
         gap = np.abs(single["moments"] - truth["moments"]).max()
         print(f"batch {batch}: moments {tuple(shape)}, fp32 off float64 by {gap:.3g}")
     meta = {"diffusers": __import__("diffusers").__version__, "torch": torch.__version__, "config": CONFIG,
