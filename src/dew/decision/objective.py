@@ -298,12 +298,17 @@ class Fit(pygrain.MapTransform):
     whose rows then train as one unit (`_unit`)."""
     bounds: Bounds | None = None
     """The most rows and questions a packed window holds, which a unit of rows fits in or is rejected."""
+    none_of_the_above: float = 0.0
+    """The rate the training encoding adds a "none of the above" at (`Encoding`), for which a unit's
+    rows are budgeted at their longest."""
     rejects = True
 
     def map(self, element: Batch) -> Batch | Rejected:
         held = element.get("example", element)
         if isinstance(held, GroupedExamples) or (isinstance(held, Mapping) and "examples" in held):
-            return self._unit(GroupedExamples.of(held))
+            grouped = GroupedExamples.of(held)
+            # Without a consistency term the examples are rows of their own, which no window ties.
+            return self._unit(grouped) if self.grouped else self._apart(grouped)
         example = Example.of(held)
         if self.grouped and example.groups and not self.layout.joint:
             # Its grouped questions stand in rows of their own, which train as one unit.
@@ -344,6 +349,36 @@ class Fit(pygrain.MapTransform):
         return tuple(FittedRow(example, tuple(question.name for question in row.questions), len(row.tokens),
                                row.state_kept < row.state_tokens, tokens) for row in laid)
 
+    def _apart(self, grouped: GroupedExamples) -> Batch | Rejected:
+        """Grouped examples' labelled rows, each as an example of its own lays it out (`QuestionRows`
+        spreads them), where no consistency term reads their groups."""
+        rows = []
+        for example in grouped.examples:
+            labels = example.labels()
+            if not labels:
+                continue
+            asked = (example.questions if self.layout.joint
+                     else {name: example.questions[name] for name in labels})
+            fitted = self._rows(example, asked)
+            if isinstance(fitted, Rejected):
+                return fitted
+            rows.extend(fitted)
+        return {"decision_rows": tuple(rows)} if rows else Rejected("unlabelled")
+
+    def _longest(self, row: FittedRow) -> int:
+        """The most tokens `row` encodes to: each answered choice given a "none of the above" beside
+        its options where the training encoding may add one (`Encoding`), the longest it lays out."""
+        example = row.example
+        if not self.none_of_the_above:
+            return row.length
+        labels = example.labels()
+        asked = {name: (_none_of_the_above(question, labels[name], drop=False)[0]
+                        if name in example.answers and isinstance(question, Choice) else question)
+                 for name in row.names for question in (example.questions[name],)}
+        laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked,
+                                tokens=row.tokens.tolist())
+        return sum(len(each.tokens) for each in laid)
+
     def _unit(self, grouped: GroupedExamples) -> Batch | Rejected:
         """Grouped examples' rows as one unit, which the packer places in one window: each example's
         rows as the layout lays them out, with the example's index (`FittedUnit`), a row of each of its
@@ -367,7 +402,7 @@ class Fit(pygrain.MapTransform):
             if isinstance(fitted, Rejected):
                 return fitted
             rows.extend((index, row) for row in fitted)
-        length = sum(row.length for _, row in rows)
+        length = sum(self._longest(row) for _, row in rows)
         questions = sum(len(row.names) for _, row in rows)
         bounds = self.bounds
         if length > self.layout.max_len or (bounds is not None and (len(rows) > bounds.segments
@@ -416,14 +451,15 @@ def _encoded_unit(encoding: "Encoding", unit: FittedUnit, rng: np.random.Generat
 @dataclass(frozen=True)
 class QuestionRows:
     def flat_map(self, element: Batch) -> Sequence[Batch]:
-        if "decision_unit" in element:
+        if "decision_rows" not in element:
+            # A joint layout's row, or a unit of rows the packer places whole.
             return (element,)
         return tuple(
             {"decision": row, "_dew_length": row.length, "_dew_truncated": row.truncated}
             | {
                 "_dew_bounds": {
                     "slots": {
-                        "questions": 1,
+                        "questions": len(row.names),
                         "options": max(len(row.example.questions[name].options) for name in row.names),
                     }
                 }
@@ -974,13 +1010,15 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
                                    grouped=grouped)
         evaluating = dataclasses.replace(training, train=False)
         fit = Fit(self.layout, self.tokenizer, self.specials, self.model.head, self.context_length, grouped,
-                  self.bounds)
-        expand = () if self.layout.joint else (QuestionRows(),)
+                  self.bounds, self.none_of_the_above)
+        held = dataclasses.replace(fit, none_of_the_above=0.0)
+        # Rows a record spreads into: a layout of a question a row's, or grouped examples' apart.
+        expand = (QuestionRows(),)
         options = self.bounds.options if self.layout.joint else None
         compact = None if options is None else -(-options // OPTION_TILE) * OPTION_TILE
         return ObjectiveData(
             train=(fit, *expand, Configured(training, needs=("slots",), scope="run", random=True)),
-            evaluate=(fit, *expand, Configured(evaluating, needs=("slots",), scope="run")),
+            evaluate=(held, *expand, Configured(evaluating, needs=("slots",), scope="run")),
             pack=packing(self.layout, self.bounds, self.context_length, grouped),
             packed=(PackedRows(self.layout.max_len, compact),),
         )

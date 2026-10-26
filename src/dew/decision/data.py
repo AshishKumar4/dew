@@ -154,8 +154,9 @@ def _checked_groups(groups: Sequence[tuple[str, Mapping[str, Mapping[str, str]]]
 def _member(key: str) -> tuple[int, str]:
     """A grouped examples' member key, `"<example index>.<question>"`, as its example and question."""
     index, _, question = key.partition(".")
-    if not index.isdigit() or not question:
-        raise ValueError(f"a member of grouped examples is named '<example index>.<question>', got {key!r}")
+    if not index.isdigit() or index != str(int(index)) or not question:
+        raise ValueError(f"a member of grouped examples is named '<example index>.<question>', its index "
+                         f"written once (0, not 00), got {key!r}")
     return int(index), question
 
 
@@ -374,7 +375,7 @@ class _DecisionSource(View[Source]):
                 if isinstance(names, (list, tuple)) and (not self.before or _named_by(rows, self.table.label,
                                                                                         names)):
                     self._classes[:] = [str(name) for name in names]
-                elif isinstance(first, Mapping) and "questions" not in first and "example" not in first:
+                elif isinstance(first, Mapping) and not {"questions", "example", "examples"} & set(first):
                     if self.table.label not in first:
                         raise ValueError(f"decision table needs column {self.table.label!r}")
                     self._classes[:] = sorted({
@@ -404,7 +405,7 @@ class _DecisionSource(View[Source]):
             row = rows[index]
             if row is None:
                 continue
-            if self.table is not None and "questions" not in row and "example" not in row:
+            if self.table is not None and not {"questions", "example", "examples"} & set(row):
                 self._facts.update(questions=1, options=len(self.table.options or self._classes))
                 continue
             held = row.get("example")
