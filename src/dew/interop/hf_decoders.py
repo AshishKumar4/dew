@@ -508,8 +508,7 @@ def _text_aliases(names: Collection[str], read: Callable[[str], np.ndarray], con
                 # This copy stands in for the trunk's embedding (`_tied_names`),
                 # so it is the one the tree takes, not a copy of it.
                 continue
-            if (depths is not None and parts[2].isdigit()
-                    and int(parts[2]) - int(config["num_layers"]) >= depths):
+            if _unkept_copy(name, config, depths):
                 # A depth the load does not keep: its copy is dropped as a copy, unread.
                 aliases.append((name, reference))
                 continue
@@ -756,6 +755,15 @@ def held_depths(fields: dict, params: Mapping[str, object], kept: int | None = N
         fields["num_nextn_predict_layers"] = held
 
 
+def _unkept_copy(name: str, config, depths: int | None) -> bool:
+    """Whether `name` is a depth's copy of the trunk's embedding or head (`model.layers.<depth>.*`,
+    past the trunk's layers) of a depth past the first `depths` a load keeps."""
+    parts = name.split(".")
+    return (depths is not None and len(parts) >= 4 and parts[:2] == ["model", "layers"] and parts[2].isdigit()
+            and parts[3:] in (["embed_tokens", "weight"], ["shared_head", "head", "weight"])
+            and int(parts[2]) - int(config["num_layers"]) >= depths)
+
+
 def _depth_index(name: str) -> int | None:
     """The prediction depth a parameter named `mtp_<depth>` holds, else None."""
     match = re.fullmatch(r"mtp_(\d+)", str(name))
@@ -855,9 +863,9 @@ def read_decoder(
                 for name in [name for name in collection if dropped(name)]:
                     del collection[name]
         # Nor does the source the load binds name them, so a save writes the depths it kept alone.
-        readings = tuple(reading for reading in readings
-                         if not any(part.path is not None and len(part.path) > 1 and dropped(part.path[1])
-                                    for part in reading.parts))
+        readings = tuple(reading for reading in readings if not _unkept_copy(reading.name, config, depths)
+                         and not any(part.path is not None and len(part.path) > 1 and dropped(part.path[1])
+                                     for part in reading.parts))
     return (variables if lazy else materialize(variables)), readings
 
 
