@@ -227,6 +227,43 @@ def test_a_numpy_arm_is_refused_unless_it_is_given_and_windows_keep_their_arms_p
     assert min(seen[1:]) >= SIZING_FROM
 
 
+def test_a_library_arm_holds_dew_to_the_larger_of_its_error_and_the_references():
+    """With the owner's library arm (`library_fn`), Dew is held within PARITY of the larger of the
+    reference's error and the library arm's, seed by seed: a Dew 1.7 times the reference's error passes
+    beside a library arm 1.8 times it, fails without it, and fails at 3 times (past the library arm's
+    own by 1.67); a library arm without its ledger row is refused. Null runs judge as the site does."""
+    from reference_error import null_runs
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return rng.standard_normal(4096), *(1e-7 * rng.standard_normal(4096) for _ in range(3))
+
+    def arm(scale, noise):
+        @as_given
+        def run(x, mine, theirs, library):
+            return {"y": x + scale * {"mine": mine, "theirs": theirs, "library": library}[noise]}
+        return run
+
+    @as_given
+    def truth(x, *_):
+        return {"y": x}
+
+    reference, library = arm(1.0, "theirs"), arm(1.8, "library")
+    assert_as_exact(arm(1.7, "mine"), reference, draw, "library arm", seeds=16, truth_fn=truth,
+                    library_fn=library, library_row=1543)
+    with pytest.raises(GateFailure):
+        assert_as_exact(arm(1.7, "mine"), reference, draw, "no library arm", seeds=16, truth_fn=truth)
+    with pytest.raises(GateFailure):
+        assert_as_exact(arm(3.0, "mine"), reference, draw, "past the library", seeds=16, truth_fn=truth,
+                        library_fn=library, library_row=1543)
+    with pytest.raises(ValueError):
+        assert_as_exact(arm(1.7, "mine"), reference, draw, "unrecorded", seeds=16, truth_fn=truth,
+                        library_fn=library)
+    verdicts = null_runs(reference, draw, "library arm", seeds=16, runs=2, truth_fn=truth,
+                         dew_fn=arm(1.7, "mine"), paired=True, library_fn=library)
+    assert [(verdict, stage) for verdict, stage, _ in verdicts] == [("pass", 1), ("pass", 1)], verdicts
+
+
 def test_a_float64_truth_runs_as_one_compiled_program():
     """The gate compiles a JAX truth (`_truth_program`): its first call runs as given and every later
     one is the compiled program's, whose values are the eager truth's own. A NumPy truth (its first

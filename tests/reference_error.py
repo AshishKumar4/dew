@@ -758,6 +758,22 @@ class _Draws:
                       self.zero_rows + other.zero_rows, np.concatenate([self.finite, other.finite]),
                       self.widths)
 
+    def against_larger(self, library: "_Draws") -> "_Draws":
+        """These draws judged against the larger of their reference's error and `library`'s, the same
+        Dew on the same draws against the library arm (`assert_as_exact`'s `library_fn`): seed by seed
+        and leaf by leaf, the reference's evidence (its error, its worst row, its rows of float64 zero)
+        is whichever of the two arms' error is the larger there, and a value must be finite in both."""
+        if library.names != self.names or len(library.mine) != len(self.mine):
+            raise AssertionError("the library arm's draws are not the reference's")
+        pick = library.theirs > self.theirs
+        worst = self.worst.copy()
+        worst[..., 1] = np.where(pick, library.worst[..., 1], self.worst[..., 1])
+        zero_rows = [[(theirs if chosen else mine)
+                      for mine, theirs, chosen in zip(seed, other, picked, strict=True)]
+                     for seed, other, picked in zip(self.zero_rows, library.zero_rows, pick, strict=True)]
+        return _Draws(self.names, self.mine, np.where(pick, library.theirs, self.theirs), worst, zero_rows,
+                      self.finite & library.finite, self.widths)
+
 
 def pooled_zero_rows(evidence: list[ZeroRows]) -> list[tuple[int, float, float]]:
     """The rows of float64 zero Dew is further from than ROW_FACTOR times the reference over a run's
@@ -1144,7 +1160,7 @@ def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str]) -> N
 
 
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None,
-                    orders=None) -> None:
+                    orders=None, library_fn=None, library_row: int | None = None) -> None:
     """Check 1 of the gate: on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst (NARROW_FACTORS' factor at rows of one or
@@ -1185,6 +1201,13 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     judgement's stage is logged (STAGES_LOG). A leaf the reference holds exactly on every seed, Dew
     must too.
 
+    `library_fn`, the owner's exception under BIBLE §7 (recorded on ledger row `library_row`): where Dew's
+    arm decomposes a product the reference computes whole and the library's own accuracy at the
+    pieces' shapes is the residual, a library arm on the same inputs runs the arm's pieces through the
+    library and combines them exactly (in float64), and Dew is held within PARITY of the larger of the
+    reference's error and that arm's, seed by seed (`_Draws.against_larger`). Every other rule is as
+    above; a site without it is judged against the reference alone.
+
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
     (tests/certified.py)."""
@@ -1193,12 +1216,19 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                                     f"seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
                                     f"(`seeds_for`)")])
     narrow_leaves: list[str] = []
+    if (library_fn is None) != (library_row is None):
+        raise ValueError(f"{label}: a library arm is the owner's exception, named with its ledger row")
     _refuse_numpy_arms(draw, dew_fn, reference_fn)
     dew_fn, reference_fn = _arms(dew_fn, reference_fn)
+    library_fn = None if library_fn is None else _arms(library_fn, library_fn)[1]
     truth_fn = _truth_program(truth_fn)
 
     def drawn(start, stop):
         draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders)
+        if library_fn is not None:
+            # The truth is the site's own, so both arms are measured from the same float64 values.
+            draws = draws.against_larger(_drawn(dew_fn, library_fn, draw, range(start, stop),
+                                                truth_fn or reference_fn, orders=orders))
         narrow_leaves[:] = [name for name, width in zip(draws.names, draws.widths, strict=True)
                             if width in NARROW_FACTORS]
         return draws
@@ -1401,7 +1431,7 @@ def recording(path) -> dict[str, np.ndarray]:
 
 def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: int = 0,
               truth_fn=None, two_stage: bool = True, dew_fn=None, orders=None,
-              paired: bool = False) -> list[tuple[str, int, list[str]]]:
+              paired: bool = False, library_fn=None) -> list[tuple[str, int, list[str]]]:
     """Check 1 run `runs` times on an equally exact pair, the reference against itself on disjoint
     draws: each run's verdict, "pass", "over" or "inconclusive", the stage it reached and its findings
     (`_judgement`'s, each naming its leaf and rule), a run judged as `assert_as_exact` judges a site
@@ -1415,7 +1445,9 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
     both procedures on the same draws. `paired` runs both arms on the same draws, as a site does, `dew_fn`
     then the other implementation (an equally exact one, or a fault); `orders` judges rows over each
     draw's orbit, as a site that declares one. The runs evaluate their arms as given: a class's
-    arms compile themselves where they are programs, and a fault injects itself on the host."""
+    arms compile themselves where they are programs, and a fault injects itself on the host.
+    `library_fn` judges each run against the larger of the reference's error and that library arm's,
+    as `assert_as_exact` does (paired runs: the library arm is measured on Dew's own draws)."""
     if paired and dew_fn is None:
         raise ValueError("a paired null run takes its other implementation, `dew_fn`")
     verdicts = []
@@ -1424,9 +1456,14 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
         base = run * 2 * span
 
         def drawn(start, stop, base=base):
-            return _drawn(dew_fn or reference_fn, reference_fn, draw, range(base + start, base + stop),
-                          truth_fn, orders=orders,
-                          reference_seeds=None if paired else range(base + span + start, base + span + stop))
+            draws = _drawn(dew_fn or reference_fn, reference_fn, draw, range(base + start, base + stop),
+                           truth_fn, orders=orders,
+                           reference_seeds=None if paired else range(base + span + start, base + span + stop))
+            if library_fn is not None:
+                seeds_here = range(base + start, base + stop)
+                draws = draws.against_larger(_drawn(dew_fn or reference_fn, library_fn, draw, seeds_here,
+                                                    truth_fn or reference_fn, orders=orders))
+            return draws
 
         over, unresolved, stage = _staged(drawn, seeds, label, two_stage=two_stage)
         verdicts.append((_verdict(over, unresolved), stage, [str(finding) for finding in over + unresolved]))
