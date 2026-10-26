@@ -332,7 +332,10 @@ class InContextMemory(nn.Module):
             return {f"head_{head}": _unnested(self._scope(head), _AtScope(network, self._scope(head)).init(
                 one, example)["params"]) for head, one in enumerate(jax.random.split(key, self.heads))}
 
-        stored = self.param("initial", drawn)
+        # A wrapper's packing (a frozen FP8 record's codes in a kernel's place) leaves a stored W_0 another
+        # structure than a fresh draw's, which a param's check against its initializer would refuse.
+        stored = (self.get_variable("params", "initial") if self.has_variable("params", "initial")
+                  else self.param("initial", drawn))
         others = {collection: tree["initial"] for collection, tree in self.variables.items()
                   if collection != "params" and "initial" in tree}
         heads = [_decoded_codes({"params": stored[name], **{collection: tree[name] for collection, tree
