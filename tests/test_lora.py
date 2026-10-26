@@ -32,7 +32,7 @@ from affine_run import Replaying
 from flax import linen as nn
 from interop_support import extract_fixture, hub_cache
 from model_support import flat_tree
-from reference_error import assert_as_exact_as_the_reference, widened
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened, without_ynn
 from safetensors.numpy import load_file
 from test_joined import row_joins
 
@@ -769,10 +769,17 @@ def _registry_decoder():
     return config, model, model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
 
 
+REGISTRY_SEEDS = 16
+"""The fresh adapter's check-1 seeds, sized paired by `seeds_for` on an A100, where XLA merges the
+adapter's product with the base's."""
+
+
 def test_a_registry_model_adapts_through_the_names_its_own_kernels_carry(tmp_path):
     """No loader in sight: the module paths under `params` are the names
-    `target_modules` matches, the fresh adapter is the identity, and the
-    factors write and read back in PEFT's layout under those names."""
+    `target_modules` matches, the fresh adapter is the identity (its `B` exactly zero, so the adapted
+    model computes the base model's function, held by check 1 against the base model from its
+    float64 twin: the two are different programs), and the factors write and read back in PEFT's
+    layout under those names."""
     _, model, variables = _registry_decoder()
     adapter = LoRA(rank=2, modules=("q_proj", "layers_1.mlp.up_proj"), alpha=4.0).apply(
         model, variables, key=1)
@@ -780,9 +787,21 @@ def test_a_registry_model_adapts_through_the_names_its_own_kernels_carry(tmp_pat
     assert set(adapter.targets) == {("params", "layers_0", "self_attn", "q_proj"),
                                     ("params", "layers_1", "self_attn", "q_proj"),
                                     ("params", "layers_1", "mlp", "up_proj")}
-    tokens = jnp.asarray([[3, 4, 5, 6, 7, 8]])
-    np.testing.assert_array_equal(np.asarray(adapter.model.apply(adapted, tokens)),
-                                  np.asarray(model.apply(variables, tokens)))
+    factors = [leaf for path, leaf in flat_tree(adapted["params"]).items() if path.endswith("lora_B")]
+    assert len(factors) == 3 and not any(np.any(np.asarray(factor)) for factor in factors)
+    adapted_logits, base_logits = without_ynn(adapter.model.apply), without_ynn(model.apply)
+    wide = model.clone(dtype=jnp.float64)
+
+    def draw(seed):
+        return (np.random.default_rng([0x10A, seed]).integers(0, REGISTRY_FIELDS["vocab_size"], (2, 8)),)
+
+    def truth(tokens):
+        with jax.enable_x64(new_val=True):
+            return np.asarray(wide.apply(widened(variables), jnp.asarray(tokens)))
+
+    assert_as_exact(lambda tokens: np.asarray(adapted_logits(adapted, jnp.asarray(tokens))),
+                    lambda tokens: np.asarray(base_logits(variables, jnp.asarray(tokens))), draw,
+                    "a fresh adapter against its base", seeds=REGISTRY_SEEDS, truth_fn=truth)
 
     adapter.save(adapted, tmp_path)
     written = load_file(tmp_path / lora.PEFT_WEIGHTS)
