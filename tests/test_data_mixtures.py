@@ -1045,6 +1045,19 @@ def assert_same(left: dict, right: dict, why: str) -> None:
         np.testing.assert_array_equal(left[name], right[name], err_msg=f"{why}: {name}")
 
 
+@pytest.mark.parametrize("combined", ["phases", "mix"])
+def test_a_fit_reads_corpora_that_repeat_themselves_as_they_are_written(tmp_path, combined):
+    """A fit reads a dataset without a repeat endlessly by adding one. Phases whose corpora repeat
+    themselves, and a mix of members that all do, already read endlessly, so the fit reads them as
+    written, landing where the same chain compiled as it is lands."""
+    first = Pipeline(Memory(Indexed(1, 64))).shuffle(0).repeat()
+    second = Pipeline(Memory(Indexed(2, 64))).shuffle(1).repeat()
+    chain = (phases((first, 3), (second, None)) if combined == "phases" else mix([first, second])).batch(8)
+    read = regression_trainer(tmp_path / "fitted").fit(chain, steps=5)
+    compiled = regression_trainer(tmp_path / "compiled").fit(compile(chain, seed=0), steps=5)
+    assert_same(parameters(read), parameters(compiled), f"{combined} as the fit reads it")
+
+
 class TokenCounted(Regression):
     """`Regression` whose records each commit `id % 3 + 1` real tokens, so the steps of a run commit
     unevenly."""
