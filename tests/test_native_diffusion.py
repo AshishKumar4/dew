@@ -271,12 +271,12 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
     from dew.config import ObjectiveConfig
     from dew.config.diffusion import DiffusionRunConfig
     from dew.diffusion.schedules import DiscreteNoiseScheduler
+    from dew.inference.images import ImageSettings
     from dew.interop.pretrained import load_diffusion_source
     from dew.objectives import Step
     from dew.objectives.diffusion import DiffusionObjective
     from dew.registry import from_record, to_record
     from dew.sampling import sample
-    from dew.sampling.pipelines import ImageSettings
 
     directory = tmp_path / "sd"
     shutil.copytree(saved_pipelines / "sd", directory)

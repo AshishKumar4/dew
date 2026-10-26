@@ -26,7 +26,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import NamedSharding, PartitionSpec
 from model_support import TINY_DECODER
 from process_support import READ_ONLY, fresh, keeping_picks
-from reference_error import assert_as_exact, widened, with_gradients
+from reference_error import assert_as_exact, widened, with_gradients, without_ynn
 
 from dew.batch import FROZEN
 from dew.data.dataset import Loader
@@ -195,6 +195,134 @@ def test_the_frozen_product_multiplies_the_cast_rows_exactly_and_trains_no_kerne
     assert gradients[0].dtype == x.dtype and all(gradient is None or not np.any(gradient)
                                                  for gradient in gradients[1:])
     assert_products_exact(jax.jit(fp8_products), "the frozen FP8 product")
+
+
+TANGENT_SEEDS = 16
+"""The forward-mode product's declared draws (check 1, `assert_as_exact`), sized by `seeds_for` (on
+armada): the fewest for which the float32 reference compared with itself resolves the factor."""
+
+
+def tangent_case(seed=1):
+    """`product_case`'s input and packed kernel, and a direction for the input: `(x, forward,
+    forward_scale, dgrad, dgrad_scale, direction)`."""
+    x, *leaves, _ = product_case(seed)
+    direction = jnp.asarray(np.random.default_rng([7, seed]).standard_normal(x.shape), x.dtype)
+    return x, *leaves, direction
+
+
+def tangents(x, forward, forward_scale, dgrad, dgrad_scale, direction):
+    """Dew's frozen product in forward mode (`jax.jvp`): its value and its tangent along `direction`."""
+    return jax.jvp(lambda x: frozen_fp8_product(x, forward, forward_scale, dgrad, dgrad_scale), (x,),
+                   (direction,))
+
+
+# Both arms of the forward-mode check are Dew programs, compiled alike (docs/design/testing.md).
+fp8_tangents = without_ynn(tangents)
+
+
+def default_precision_tangents(*inputs):
+    """`fp8_tangents` compiled under JAX's default matmul precision, not the suite's highest
+    (`lane_environment`): the products state their own."""
+    with jax.default_matmul_precision("default"):
+        return fp8_tangents(*inputs)
+
+
+def decoded_tangents(x, forward, forward_scale, dgrad, dgrad_scale, direction):
+    """The reference arm: the dequantized forward product (`dequantized_products`) and the direction
+    times the decoded forward rows, each code times its row's scale, multiplied in float32 by XLA."""
+    codes, scales = fp8_block_cast(x, (1, x.shape[1]))
+    rows = forward.astype(jnp.float32) * forward_scale
+    value = jnp.dot(codes.astype(jnp.float32) * scales, rows.T, precision=jax.lax.Precision.HIGHEST,
+                    preferred_element_type=jnp.float32)
+    return value, jnp.dot(direction.astype(jnp.float32), rows.T, precision=jax.lax.Precision.HIGHEST,
+                          preferred_element_type=jnp.float32)
+
+
+def exact_tangents(x, forward, forward_scale, dgrad, dgrad_scale, direction):
+    """The float64 product of the cast rows (`exact_products`) and the direction times the decoded
+    forward rows in float64."""
+    codes, scales = quantize_fp8_blocks(np.asarray(x, np.float32), (1, x.shape[1]))
+    rows = exactly(forward, forward_scale)
+    return exactly(codes, scales) @ rows.T, np.asarray(direction, np.float64) @ rows.T
+
+
+def test_the_frozen_product_in_forward_mode_is_the_decoded_kernels_tangent():
+    """Forward mode (`jax.jvp`, MeanFlow's target) takes the product's value as the FP8 product and its
+    tangent as the input's direction times the decoded kernel (`frozen_fp8_kernel`), the linear map the
+    FP8 products stand for, each on par with the dequantized float32 products by check 1 from float64,
+    whatever JAX's default matmul precision; the packed leaves take no tangent."""
+    assert_as_exact(default_precision_tangents, without_ynn(decoded_tangents), tangent_case,
+                    "the frozen FP8 product in forward mode", seeds=TANGENT_SEEDS, truth_fn=exact_tangents)
+    x, *leaves, _ = tangent_case()
+    _, along_leaves = jax.jvp(frozen_fp8_product, (x, *leaves),
+                              (jnp.zeros_like(x), *(jnp.ones_like(leaf) for leaf in leaves)))
+    assert not np.any(np.asarray(along_leaves))
+
+
+def test_the_frozen_products_backward_keeps_its_packed_leaves_and_not_its_input():
+    """Reverse mode reads the input's dtype alone, so the residuals its pullback keeps (the leaves of
+    the `jax.vjp` pullback, a `jax.tree_util.Partial`) are the packed leaves and never the `[M, in]`
+    input, as a staged pullback, a remat or a scan would hold them."""
+    x, *leaves, _ = product_case()
+    _, pullback = jax.vjp(lambda x, *leaves: jnp.sum(frozen_fp8_product(x, *leaves)), x, *leaves)
+    saved = jax.tree.leaves(pullback)
+    assert saved
+    kept = [(leaf.shape, leaf.dtype) for leaf in saved]
+    assert (x.shape, x.dtype) not in kept, kept
+    assert all((held.shape, held.dtype) in kept for held in leaves[2:]), kept
+
+
+def test_meanflow_trains_an_adapter_over_an_fp8_base():
+    """MeanFlow's target is its model's JVP in time (`jax.jvp`), which runs through each frozen FP8 site
+    in forward mode, and its loss's gradient runs through them in reverse: Adam steps on an adapter over
+    a DiT whose MLP projections are FP8 sites keep the loss finite and move every factor the adapter
+    trains, and the packed base stays out of what trains."""
+    from dew.diffusion import presets
+    from dew.inputs import CharTable, Condition, Field, InputSpec
+    from dew.nn.backbones import SimpleDiT
+    from dew.objectives.base import Step
+    from dew.objectives.diffusion.few_step import MeanFlowObjective
+
+    model = SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1, interval=True)
+    inputs = InputSpec(Field("image", (4, 4, 3)),
+                       {"textcontext": Condition(CharTable.from_pretrained("char_table"))})
+    plain = MeanFlowObjective(model, presets.MeanFlow()(), inputs, ema_decay=None)
+    variables = plain.model_variables(plain.init(jax.random.key(0)))
+    # adaLN-Zero's gates and output start at zero, where no gradient reaches the MLP; drawn weights let it.
+    leaves, structure = jax.tree.flatten(variables["params"])
+    keys = jax.random.split(jax.random.key(4), len(leaves))
+    variables = {**variables, "params": jax.tree.unflatten(structure, [
+        0.3 * jax.random.normal(key, leaf.shape, leaf.dtype)
+        for key, leaf in zip(keys, leaves, strict=True)])}
+    kernels = flatten_dict(variables["params"], sep="/")
+    named = tuple(path.removesuffix("/kernel") for path in kernels
+                  if path.endswith("/kernel") and path.split("/")[-2] in ("up_proj", "down_proj"))
+    assert named
+    fp8_base = InputQuantization(frozen_fp8=named, measured_on=device_generation())
+    adapter = LoRA(rank=2, modules=("up_proj",)).apply(model, variables, key=1, fp8_base=fp8_base)
+    assert set(sites(adapter)) == set(named)
+    # The objective's tree is the adapter's beside the condition encoders' own.
+    objective = MeanFlowObjective(adapter.model, presets.MeanFlow()(), inputs, ema_decay=None,
+                                  variables={**plain.init(jax.random.key(0)), **adapter.variables})
+    tree = objective.init(jax.random.key(0))
+    batch = {"image": np.asarray(jax.random.randint(jax.random.key(1), (4, 4, 4, 3), 0, 256), np.uint8),
+             **inputs.tokenize(["a", "b", "c", "d"])}
+
+    def loss(params, step):
+        return objective.scalar_loss({**tree, "params": params}, batch,
+                                     Step(step=jnp.asarray(step), key=jax.random.key(2), ema=None))[0]
+
+    optimizer = optax.adam(1e-2)
+    params, state = tree["params"], optimizer.init(tree["params"])
+    for step in range(3):
+        value, gradients = jax.value_and_grad(loss)(params, step)
+        assert np.isfinite(float(value))
+        updates, state = optimizer.update(gradients, state, params)
+        params = optax.apply_updates(params, updates)
+    assert QUANTIZATION in tree and all(path.endswith(("lora_A", "lora_B")) for path in
+                                        flatten_dict(tree["params"], sep="/"))
+    assert all(not np.array_equal(np.asarray(after), np.asarray(before)) for after, before in
+               zip(jax.tree.leaves(params), jax.tree.leaves(tree["params"]), strict=True))
 
 
 @pytest.mark.mesh(devices=2)
@@ -427,17 +555,15 @@ own process from measuring (`dew.cache.keeps_picks`)."""
 
 @pytest.mark.gpu(reason="FP8 tensor cores and cuBLASLt's FP8 GEMM")
 @pytest.mark.skipif(not FP8_CORES, reason="this GPU has no FP8 tensor cores")
-def test_a_wide_site_measures_faster_in_fp8_and_compiles_to_an_fp8_gemm(tmp_path):
-    """On a GPU with FP8 tensor cores the wide projection measures faster in
-    FP8 and the narrow one does not (H100: 1.47x and 0.70x), and the frozen
-    product's forward and input gradient compile to cuBLASLt FP8 GEMMs at
-    that width. The packed leaves and the gradient are the step's arguments,
-    as a train state's are: XLA folds widened constant codes into a float32
-    GEMM. It runs in a process without the suite's deterministic ops, as a
-    run that measures does; a GPU shared with other work (`READ_ONLY`)
-    measures nothing, fairly, and skips."""
+def test_a_frozen_sites_products_take_no_fp8_gemm_whose_sum_is_narrower(tmp_path):
+    """On a GPU with FP8 tensor cores the frozen product's forward and input gradient compile to no
+    cuBLASLt FP8 GEMM, whose running sum on Hopper is narrower than fp32's (`_fp8_rows`), even at the
+    wide projection, and the measurement records the sites it took on this generation. The packed
+    leaves and the gradient are the step's arguments, as a train state's are. It runs in a process
+    without the suite's deterministic ops, as a run that measures does; a GPU shared with other work
+    (`READ_ONLY`) measures nothing, fairly, and skips."""
     found = fresh(QUALIFY, cache_dir=tmp_path, flags=keeping_picks())
     if found is None:
         pytest.skip("this GPU is shared with other work (gpu-run -n 0.5), where no process measures")
-    assert found["sites"] == ["wide"] and found["measured_on"] == found["generation"]
-    assert found["fp8_gemms"] == 2
+    assert set(found["sites"]) <= {"wide", "narrow"} and found["measured_on"] == found["generation"]
+    assert found["fp8_gemms"] == 0

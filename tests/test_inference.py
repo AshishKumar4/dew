@@ -28,14 +28,14 @@ from dew.config import MetricConfig, ObjectiveConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data import ByteTokenizer, presets
 from dew.data.dataset import Loader
+from dew.data.images import CAPTIONS
 from dew.data.sources import source
 from dew.data.sources.files import Files
 from dew.diffusion.presets import EDM, Flow
-from dew.inference import RunProcessor, TextGeneration
+from dew.inference import Images, RunProcessor, TextGeneration, TextToImage
 from dew.inputs import Field, TextCondition, unit_range
 from dew.registry import ModelConfig
-from dew.sampling import CFG, DPMSolverSDE, Euler, Heun, TextToImage
-from dew.sampling.pipelines import Images
+from dew.sampling import CFG, DPMSolverSDE, Euler, Heun
 from dew.telemetry.instrumentation import Compiles
 from dew.training import Checkpoints, LocalTracker, Trainer
 
@@ -231,8 +231,8 @@ def test_another_guidance_scale_seed_or_grid_reuses_the_compiled_walk(tmp_path):
                     key=jax.random.PRNGKey(1)).host().images
 
     first = draw(times=grid)
-    # The walk is `dew.sampling.pipelines._run`'s `run`.
-    with Compiles("run") as compiled:
+    # The walk is `dew.inference.images._walk`.
+    with Compiles("_walk") as compiled:
         for other in (draw(scale=2.0, times=grid), draw(seed=2, times=grid), draw(times=nudged)):
             assert not np.allclose(other, first)
         assert np.array_equal(draw(times=grid), first)
@@ -268,7 +268,9 @@ def validated_run(directory, *, validates: bool, **fields):
     encoder = objective.inputs.conditions["textcontext"].encoder
     images = np.tile(np.linspace(0, 255, RES, dtype=np.float32)[None, :, None, None],
                      (8, 1, RES, 3)).astype(np.uint8)
-    batch = {"image": images, "text": encoder.tokenize(["a", "b", "c", "d", "e", "f", "g", "h"])}
+    # As a run's data holds it (`DiffusionObjective.data`): the captions' tokens and the captions as text.
+    captions = ["a", "b", "c", "d", "e", "f", "g", "h"]
+    batch = {"image": images, "text": encoder.tokenize(captions), CAPTIONS: np.asarray(captions)}
     data = Loader(train=lambda partition: Replaying(lambda position: batch),
                   val=(lambda partition: iter([batch])) if validates else None, records=None, batch=8)
     checkpoints = Checkpoints(str(directory / "checkpoints"), keep=1)

@@ -24,6 +24,7 @@ from dew.interop.decoder_parts import (
     base_config,
     hf_activation,
     kinds_of,
+    read_rope,
     refuse,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -33,8 +34,10 @@ from dew.nn.backbones.layer_plan import LayerKind
 
 def _muse_text_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
     """Read a Muse Glimmer text config into `CausalTransformer` fields."""
-    config = base_config(hf_config, used, rope=PLAIN_SPELLING, qk_norm=True, scale_after_cast=False,
-                         tie_embeddings=True)
+    # Each layer rotates at its own base (layer_rope_theta, below); a ramp over them stays refused
+    # until a check holds one against MuseGlimmerTextRotaryEmbedding.
+    config = base_config(hf_config, used, rope=read_rope(hf_config, used, PLAIN_SPELLING, ramps=('llama3',)),
+                         qk_norm=True, scale_after_cast=False, tie_embeddings=True)
     layer_types = _records.strings(config['layer_types'], 'layer_types')
     rope_theta = _records.number(config['rope_theta'], 'rope_theta')
     thetas = hf_config.get('layer_rope_theta')
@@ -93,4 +96,5 @@ MUSE_GLIMMER_TEXT = DecoderFamily(
     # MuseGlimmerTextConfig's defaults for the fields its decoder reads.
     defaults={'rms_norm_eps': 1e-5, 'tie_word_embeddings': False, 'num_key_value_heads': 2, 'head_dim': 128,
               'max_position_embeddings': 131072},
+    padding_idx=True,
 )

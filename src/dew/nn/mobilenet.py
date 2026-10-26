@@ -19,6 +19,8 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.dropout import Dropout
+
 from .activations import gelu_tanh
 from .attention import RMSNorm, scaled_dot_product_attention
 from .blocks import torch_nearest_resize
@@ -207,7 +209,7 @@ class MobileResidual(nn.Module):
                 x = MobileLayerScale(self.layer_scale, name="layer_scale")(x)
         if incoming == self.features and spec.stride == 1 and not self.noskip:
             if self.drop_path:
-                x = nn.Dropout(self.drop_path, broadcast_dims=(1, 2, 3),
+                x = Dropout(self.drop_path, broadcast_dims=(1, 2, 3),
                                name="drop_path")(x, deterministic=not train)
             x = x + shortcut
         return x
@@ -296,7 +298,7 @@ class MobileAttention(nn.Module):
         if self.layer_scale is not None:
             x = MobileLayerScale(self.layer_scale, name="layer_scale")(x)
         if self.drop_path:
-            x = nn.Dropout(self.drop_path, broadcast_dims=(1, 2, 3),
+            x = Dropout(self.drop_path, broadcast_dims=(1, 2, 3),
                            name="drop_path")(x, deterministic=not train)
         return x + shortcut
 

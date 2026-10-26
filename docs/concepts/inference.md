@@ -138,7 +138,7 @@ On the RTX 4080, the 176M text-to-image model then holds 183 MiB of denoiser wei
 ```python
 import jax.numpy as jnp
 
-from dew.sampling import TextToImage
+from dew.inference import TextToImage
 from dew.quantization import Quantization
 
 pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype=jnp.bfloat16,

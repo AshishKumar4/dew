@@ -517,16 +517,6 @@ class TrainerConfig:
         with Checkpoints(os.path.join(self.checkpoint_dir, self.name), keep=self.keep) as checkpoints:
             return checkpoints.latest is not None
 
-    def resolved(self, dataset: Loader) -> tuple[Self, Loader, int | None]:
-        """This config and `dataset` as a run trains on them, and the run's steps: the accumulation
-        its token budget sets (`accumulating`), the dataset its batch ramp reads, and the step cap over
-        that (`total_steps`), before which the ramp goes, since it reads fewer records a step early
-        and a pass over the data is that many steps longer. Its updates are the steps over the
-        accumulation."""
-        trainer = self.accumulating(dataset)
-        dataset = dataset if trainer.batch_ramp is None else ramped(dataset, trainer.batch_ramp)
-        return trainer, dataset, trainer.total_steps(dataset)
-
     def source_placement(self, *, frozen: bool) -> SourcePlacement:
         """Where a run that starts from a source (`Pretrained.load`) reads it: the load's keywords,
         `frozen` where the run keeps the source as it is (an adapter trained over it). A run that
@@ -541,6 +531,16 @@ class TrainerConfig:
         if not frozen or "variables" in self.layout.host or self.layout.frozen_whole:
             return {"on_host": True}
         return {"mesh": self.mesh, "layout": self.layout}
+
+    def resolved(self, dataset: Loader) -> tuple[Self, Loader, int | None]:
+        """This config and `dataset` as a run trains on them, and the run's steps: the accumulation
+        its token budget sets (`accumulating`), the dataset its batch ramp reads, and the step cap over
+        that (`total_steps`), before which the ramp goes, since it reads fewer records a step early
+        and a pass over the data is that many steps longer. Its updates are the steps over the
+        accumulation."""
+        trainer = self.accumulating(dataset)
+        dataset = dataset if trainer.batch_ramp is None else ramped(dataset, trainer.batch_ramp)
+        return trainer, dataset, trainer.total_steps(dataset)
 
     def total_steps(self, dataset: Loader) -> int | None:
         """Return the step cap from `steps`, `epochs` or `examples`, None for a token-only run
@@ -1150,8 +1150,7 @@ class RunConfig:
         from dew.training import prepare_process, run_timestamp
 
         trainer = self.trainer
-        prepare_process(trainer.wandb, trainer.multi_host, trainer.xla_flags, trainer.compilation_cache_dir,
-                        layout=trainer.layout)
+        prepare_process(trainer.wandb, trainer.multi_host, trainer.xla_flags, trainer.compilation_cache_dir)
         prepared = self.prepare()
         stated = prepared.run.objective
         name = trainer.name or (f"{'run' if stated is None else objectives.label(stated.name)}-"

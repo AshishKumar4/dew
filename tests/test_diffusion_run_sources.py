@@ -28,14 +28,15 @@ from dew.config.diffusion import DiffusionRunConfig, FlowRolloutConfig
 from dew.diffusion.presets import Flow, ResolutionShift
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceSchedule
+from dew.inference import TextToImage
+from dew.inference.images import ImageSettings
 from dew.inputs import TextCondition
 from dew.objectives import Step
 from dew.objectives.diffusion import Alignment, DiffusionObjective
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, TUNED_WEIGHTS, EndToEnd
 from dew.objectives.rl.flow import OLD_LOG_PROBS_KEY, REWARDS_KEY, FlowGRPOObjective
 from dew.registry import ModelConfig, to_record
-from dew.sampling import Euler, TextToImage
-from dew.sampling.pipelines import ImageSettings
+from dew.sampling import Euler
 from dew.training import Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -628,7 +629,7 @@ def test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference(tmp_
     task restores the trained policy under `from_run`'s default `ema=None`,
     the weights the objective's own pipeline publishes."""
     from dew.checkpoints import Checkpoints
-    from dew.sampling.pipelines import TextToImage
+    from dew.inference import TextToImage
 
     config = grpo_run(beta=0.1, directory=str(tmp_path))
     objective = config.build()

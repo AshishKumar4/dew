@@ -1,5 +1,6 @@
 """Shared model requests keep untrusted inputs away from model memory."""
 import ast
+import contextlib
 import sys
 from pathlib import Path
 
@@ -19,7 +20,8 @@ def test_image_transport_keeps_native_pixels_and_preparation_keys(service, tmp_p
     import numpy as np
     from test_inference import make_run
 
-    from dew.sampling import CFG, Heun, TextToImage
+    from dew.inference import TextToImage
+    from dew.sampling import CFG, Heun
 
     progress = load("progress", "site/live/container")
     client = load("model_client", "site/live/container")
@@ -44,6 +46,22 @@ def test_image_transport_keeps_native_pixels_and_preparation_keys(service, tmp_p
         {"step": 1, "steps": 4}, {"step": 2, "steps": 4}, {"step": 3, "steps": 4}, {"stage": "decode"}]
 
 
+@contextlib.contextmanager
+def stood_in(client):
+    """The live kernel's stand-ins for Dew's modules (`model_client.install`) for the block, and Dew's
+    own back after it, whichever modules the stand-ins name: a later test in this process imports
+    Dew's own, where restoring a list of names once missed `dew.inference`, and `dew.inference.scoring`
+    found the stand-in."""
+    held = {name: module for name, module in sys.modules.items() if name.split(".")[0] == "dew"}
+    try:
+        client.install()
+        yield
+    finally:
+        for name in [name for name in sys.modules if name.split(".")[0] == "dew"]:
+            del sys.modules[name]
+        sys.modules.update(held)
+
+
 def test_the_live_sampler_cell_loads_the_model_the_live_image_serves(service, monkeypatch):
     """The live editor's cell (site/src/data/sampler.py), run through the live kernel's stand-ins,
     asks the shared model process for the model it loaded from the image's pin
@@ -63,16 +81,14 @@ def test_the_live_sampler_cell_loads_the_model_the_live_image_serves(service, mo
         return native.describe(payload)
 
     monkeypatch.setattr(client, "request", shared)
-    for name in ("dew", "dew.interop", "dew.sampling"):
-        monkeypatch.setitem(sys.modules, name, sys.modules.get(name))
     monkeypatch.setattr(sys, "meta_path", list(sys.meta_path))
-    client.install()
     # The cell up to its pipeline: what follows samples, which the shared process does with the
     # pipeline the description names.
     cell = ast.parse((SITE / "src" / "data" / "sampler.py").read_text())
     loaded = next(index for index, statement in enumerate(cell.body)
                   if isinstance(statement, ast.Assign) and ast.unparse(statement.targets[0]) == "pipe")
     namespace = {}
-    exec(compile(ast.Module(cell.body[:loaded + 1], type_ignores=[]), "sampler.py", "exec"), namespace)
+    with stood_in(client):
+        exec(compile(ast.Module(cell.body[:loaded + 1], type_ignores=[]), "sampler.py", "exec"), namespace)
     assert len(asked) == 1
     assert (namespace["pipe"].repo, namespace["pipe"].revision) == (native.repo, native.revision)

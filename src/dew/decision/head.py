@@ -11,7 +11,7 @@ given it as `[V, D]` rows.
 
 import functools
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import ClassVar, NamedTuple
 
 import jax
@@ -36,7 +36,7 @@ from dew.nn.mixers import AttentionMixer
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import accumulated, at_least_fp32, capped_logits, scaled_logits
 from dew.nn.scatter import DROPPED
-from dew.registry import component, from_record, import_path, record_fields
+from dew.registry import Record, component, from_record, import_path, record_fields
 
 
 def _layer_norm(dtype: Dtype | None, name: str) -> nn.Module:
@@ -80,7 +80,7 @@ class Head(nn.Module):
             raise ValueError("this head reads one question a row; lay the rows out with a "
                              "QuestionLayout or use a joint head")
 
-    def record(self) -> JSON:
+    def record(self) -> Record:
         """Return the head as a run records it, the registry's class record (`dew.registry.component`):
         its class by import path and its fields but the width, which the backbone it reads gives, so
         any head reloads, one of a package the run trusts too."""
@@ -90,7 +90,7 @@ class Head(nn.Module):
         return {"class": import_path(type(self)), "fields": fields}
 
     @staticmethod
-    def from_record(record: JSON, width: int) -> "Head":
+    def from_record(record: JSON | Mapping[str, object], width: int) -> "Head":
         """Rebuild the head a run recorded, reading states `width` wide, in the numerics it
         recorded. An earlier run's record is read through `dew.inference.tasks.earlier_shapes`."""
         head, fields = component(Head, _records.record(record, "head"))
@@ -166,7 +166,10 @@ class DecisionHead(Head):
         # Every token takes its row's question type: a QuestionLayout row asks one question.
         owned = inputs.question_segments[:, None, :] == inputs.segments[:, :, None]
         kinds = jnp.sum(jnp.where(owned, inputs.kinds[:, None, :], 0), axis=-1)
-        x = states + self.type_embedding(kinds).astype(states.dtype)
+        # A padding token's state enters none of the head's blocks, whose attention multiplies its
+        # masked probabilities by every value.
+        x = (jnp.where(inputs.valid[..., None], states, 0)
+             + self.type_embedding(kinds).astype(states.dtype))
         metadata = AttentionMetadata(coordinates=inputs.coordinates())
         for block in self.blocks:
             x = block(x, train=train, attention_metadata=metadata)
@@ -253,13 +256,16 @@ class _FieldLayer(nn.Module):
 def _span_means(values: jax.Array, spans: jax.Array) -> jax.Array:
     """The mean of `values` `[B, L, D]` over each `[..., 2]` (start, end) span of its row.
 
-    `spans` is `[B, ...]`; an empty span, a padding slot's, gives zeros.
+    `spans` is `[B, ...]`; an empty span, a padding slot's, gives zeros. A token no span of its row
+    reads is selected away before the product, so padding's NaN or infinity never reaches a mean (the
+    rule of `dew.nn.precision.weighted_total`).
     """
     positions = jnp.arange(values.shape[1])
     inside = (positions >= spans[..., :1]) & (positions < spans[..., 1:])
     counts = jnp.maximum(jnp.sum(inside, axis=-1, keepdims=True), 1)
-    flat = inside.reshape(inside.shape[0], -1, inside.shape[-1]).astype(values.dtype)
-    summed = accumulated(functools.partial(jnp.einsum, "bnl,bld->bnd"), flat, values)
+    flat = inside.reshape(inside.shape[0], -1, inside.shape[-1])
+    read = jnp.where(jnp.any(flat, axis=1)[..., None], values, 0)
+    summed = accumulated(functools.partial(jnp.einsum, "bnl,bld->bnd"), flat.astype(values.dtype), read)
     summed = summed.reshape(*inside.shape[:-1], values.shape[-1])
     return summed / counts.astype(values.dtype)
 
@@ -403,11 +409,16 @@ class JointSchemaHead(Head):
         if inputs.spans_in_context != (spanned is not None):
             raise ValueError("a schema read as the row's context comes with the context's states, and "
                              "only then")
-        hidden = self.hidden_norm(states)
+        # A padding token's state, whatever the backbone left there, enters no norm, memory or mean:
+        # the attention over the memory multiplies its masked probabilities by every value.
+        hidden = self.hidden_norm(jnp.where(inputs.valid[..., None], states, 0))
         pooled, pooled_tokens = hidden, inputs.tokens
         if spanned is not None:
-            assert inputs.context is not None, "the context's states come with its tokens"
-            pooled, pooled_tokens = self.hidden_norm(spanned), inputs.context
+            assert inputs.context is not None and inputs.context_lengths is not None, (
+                "the context's states come with its tokens and their count")
+            real = jnp.arange(spanned.shape[1]) < inputs.context_lengths[:, None]
+            pooled = self.hidden_norm(jnp.where(real[..., None], spanned, 0))
+            pooled_tokens = inputs.context
         batch = inputs.tokens.shape[0]
         memory = self.memory_projection(hidden)
         # Each question reads its own row of the window: that row's last token, and its tokens alone.

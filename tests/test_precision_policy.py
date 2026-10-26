@@ -17,9 +17,9 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.diffusion_gemma import soft_embeddings
 from dew.nn.dsa_kpool import KPoolSparseAttention
 from dew.nn.inputs import AttentionMetadata, MixerCall
-from dew.nn.llama4 import Llama4Mixer
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerContext
+from dew.nn.mixers.attention import AttentionMixer
 from dew.nn.mla import MultiHeadLatentAttention
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import fp32_result_dot_general
@@ -54,12 +54,12 @@ LAYERS = {
     "packed": lambda **policy: CausalTransformer(
         vocab_size=64, num_layers=1, emb_features=32, num_heads=4, num_kv_heads=2,
         max_seq_len=32, **policy),
-    "llama4_chunk": lambda **policy: Llama4Mixer().build(MixerContext(
-        emb_features=32, num_heads=4, num_kv_heads=2, head_dim=8, max_seq_len=32, attention_chunk=4,
-        qk_norm=False, **policy))(),
-    "llama4_global": lambda **policy: Llama4Mixer(use_rope=False).build(MixerContext(
-        emb_features=32, num_heads=4, num_kv_heads=2, head_dim=8, max_seq_len=32, qk_norm=False,
-        **policy))(),
+    "llama4_chunk": lambda **policy: AttentionMixer(rotary_pairs="adjacent", qk_norm_weight=False).build(
+        MixerContext(emb_features=32, num_heads=4, num_kv_heads=2, head_dim=8, max_seq_len=32,
+                     attention_chunk=4, qk_norm=True, **policy))(),
+    "llama4_global": lambda **policy: AttentionMixer(nope=True, temperature_tuning=(8192.0, 0.1)).build(
+        MixerContext(emb_features=32, num_heads=4, num_kv_heads=2, head_dim=8, max_seq_len=32, qk_norm=False,
+                     **policy))(),
     "mla": lambda **policy: MultiHeadLatentAttention(
         emb_features=32, num_heads=4, max_seq_len=32, q_lora_rank=16, kv_lora_rank=8,
         qk_nope_head_dim=8, qk_rope_head_dim=8, v_head_dim=8, **policy),
@@ -349,6 +349,18 @@ def test_the_dot_family_at_the_bf16_algorithm_multiplies_bf16_operands(form, sha
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want, np.float32))
     for grad, wanted in zip(grads, wants, strict=True):
         np.testing.assert_array_equal(np.asarray(grad), np.asarray(wanted, np.float32))
+
+
+def test_an_einsum_at_the_bf16_algorithm_sums_without_a_product_in_fp32():
+    """An einsum that forms no product, a sum, sums in fp32 at the bf16 algorithm, as einsum's own
+    reduction does at the preferred type: 257 bf16 ones sum to 257, which bf16 cannot hold. (A sum
+    that feeds a product is the product's operand, which the algorithm rounds to bf16.)"""
+    from dew.nn.precision import float32_einsum
+
+    summed = float32_einsum("i->", jnp.ones((257,), jnp.bfloat16),
+                            precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+                            preferred_element_type=jnp.float32)
+    np.testing.assert_array_equal(np.asarray(summed), np.asarray(257.0, np.float32))
 
 
 @pytest.mark.parametrize(("subscripts", "shapes"), [

@@ -48,7 +48,7 @@ from typing import ClassVar, NotRequired, Protocol, TypedDict, runtime_checkable
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import linen as nn, traverse_util
+from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.linen.module import Interceptor
 from flax.nnx import bridge
@@ -60,6 +60,7 @@ from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.dense import _contractions, _linear_site
+from dew.nn.dropout import Dropout
 from dew.nn.flops import (
     MissingFlopsCount,
     counted_flops,
@@ -90,7 +91,7 @@ from dew.quantization import (
     FROZEN_FP8,
     QUANTIZATION,
     InputQuantization,
-    frozen_fp8_kernel,
+    decoded_frozen_fp8,
     measured_fp8_sites,
 )
 from dew.registry import Wrapper, rebuilt, wrapper_layers
@@ -186,7 +187,10 @@ class LoRA:
         `fp8_base` (`fp8_base`'s measurement) runs its frozen sites' products in
         FP8: their kernels are packed from the base this adapter freezes, and the
         model computes them under the record, inside the adapter's branch. FP8
-        changes the function, by about E4M3's rounding of each operand.
+        changes the function, by about E4M3's rounding of each operand. Until an
+        FP8 product keeps fp32's sums (ledger 1625) it saves neither memory nor
+        time: its codes take two bytes a parameter, as bf16's do, and multiply as
+        bf16 values (`dew.quantization.frozen_fp8_product`).
         """
         from dew.nn.inputs import request_key
 
@@ -215,7 +219,8 @@ class LoRA:
         """Measure which projections of the base this adapter freezes run
         faster in FP8 at `tokens` rows a step, on process 0's GPU for the
         whole pool, and return the record `apply` takes as its `fp8_base`
-        (`measured_fp8_sites`).
+        (`measured_fp8_sites`): none until an FP8 product keeps fp32's sums
+        (ledger 1625), which saves neither memory nor time before then.
 
         `modules` names the projections as `modules` does (this adapter's own
         when None) and `layouts` resolves them as `apply` does. The
@@ -395,23 +400,17 @@ class Adapter:
         `variables` is the adapted tree, whole or split as a trainer keeps it. The sum
         runs in at least fp32 at full precision and is stored in the kernel's dtype,
         as PEFT's `merge_and_unload` does. A frozen FP8 site's kernel is the one its
-        codes decode to (`frozen_fp8_kernel`), targeted or not, and the codes go,
-        since a model under the record would multiply them in the merged kernel's
-        place. The result is one `params` collection.
+        codes decode to (`dew.quantization.decoded_frozen_fp8`), targeted or not, and
+        the codes go, since a model under the record would multiply them in the merged
+        kernel's place. The result is one `params` collection.
         """
-        variables = thaw(variables)
-        coded = {path[:-1] for path in traverse_util.flatten_dict(variables.get(QUANTIZATION, {}))
-                 if path[-1] == FROZEN_FP8[0]}
+        variables = decoded_frozen_fp8(thaw(variables))
         merged: dict = {}
-        for site in coded:
-            _insert(merged, ("params", *site, "kernel"), _base_kernel(variables, ("params", *site)))
         for path, target in self.targets.items():
             node = _node(variables, path)
-            kernel = _updated(_base_kernel(variables, path), node["lora_A"], node["lora_B"],
-                              self.scale(target))
+            kernel = _updated(node["kernel"], node["lora_A"], node["lora_B"], self.scale(target))
             _insert(merged, (*path, "kernel"), kernel)
-        dropped = ({(*path, factor) for path in self.targets for factor in FACTORS}
-                   | {(QUANTIZATION, *site, leaf) for site in coded for leaf in FROZEN_FP8})
+        dropped = {(*path, factor) for path in self.targets for factor in FACTORS}
         return select(overlay(variables, merged), lambda path: path not in dropped)
 
     def save(self, variables: Variables, path: str | FilePath) -> None:
@@ -479,6 +478,18 @@ def _updated(kernel: jax.Array, a: jax.Array, b: jax.Array, scale: float) -> jax
     return (kernel.astype(dtype) + scale * delta).astype(kernel.dtype)
 
 
+def _targets_under(targets: Mapping[Path, Target], path: Path) -> bool:
+    """Whether a target lies at or under the module `path`, a scanned run standing for each layer it
+    runs (`_target_at`)."""
+    paths = [path]
+    for depth, name in enumerate(path):
+        layers = group_layers(name)
+        if layers is not None and len(layers) > 1:
+            paths = [(*held[:depth], f"layers_{index}", *held[depth + 1:])
+                     for held in paths for index in layers]
+    return any(target[:len(held)] == held for target in targets for held in paths)
+
+
 def _target_at(targets: Mapping[Path, Target], path: Path) -> Target | None:
     """Return the target a module path names, seen through the stack that runs
     it: a scanned run's module `layers_3_7` stands for layers 3 through 7,
@@ -542,11 +553,12 @@ class _Branch:
         if context.method_name == "nonlinear_input":
             # A layer asks whether its submodule is linear in its input on
             # this call (`MultiHeadLatentAttention.nonlinear_input`): the
-            # branch's dropout draws on it, on a target under a dropout stream.
+            # branch's dropout draws on it, on a target at or under it under
+            # a dropout stream.
             name = args[0] if args else kwargs["name"]
             return next_fun(*args, **kwargs) or bool(
                 self.dropout and module.has_rng("dropout")
-                and _target_at(self.targets, root + module.path + (name,)) is not None)
+                and _targets_under(self.targets, root + module.path + (name,)))
         if context.method_name == "applied_kernel":
             # A model asks for the kernel its submodule multiplies by
             # (`CausalTransformer.applied_kernel`): a target's carries the
@@ -581,7 +593,7 @@ class _Branch:
         # dropout stream, which is how a training forward is marked; an
         # evaluation forward carries none.
         if self.dropout and module.has_rng("dropout"):
-            x = nn.Dropout(self.dropout, deterministic=False)(x)
+            x = Dropout(self.dropout, deterministic=False)(x)
         x, a, b = promote_dtype(x, a, b, dtype=module.dtype)
         hidden = float32_dot_general(x, a, ((axes, tuple(range(len(axes)))), ((), ())),
                                      precision=module.precision)
@@ -837,15 +849,9 @@ def _site_codes(variables: Variables, path: Path) -> Mapping | None:
     return leaves if FROZEN_FP8[0] in leaves else None
 
 
-def _base_kernel(variables: Variables, path: Path) -> jax.Array:
-    """The kernel of the module at `path`: its own, or a frozen FP8 site's
-    decoded from its packed codes (`frozen_fp8_kernel`)."""
-    codes = _site_codes(variables, path)
-    return _node(variables, path)["kernel"] if codes is None else jnp.asarray(frozen_fp8_kernel(codes))
-
-
 def _kernel_shape(variables: Variables, path: Path) -> tuple[int, ...]:
-    """The shape of `_base_kernel`, read without decoding a frozen FP8 site."""
+    """The shape of the kernel of the module at `path`, its own or a frozen FP8 site's as its codes
+    decode (`decoded_frozen_fp8`), read without decoding them."""
     codes = _site_codes(variables, path)
     return tuple(np.shape(_node(variables, path)["kernel"] if codes is None else codes[FROZEN_FP8[0]].T))
 

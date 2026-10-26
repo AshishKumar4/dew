@@ -65,7 +65,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from dew.cache import INTERCEPTED, QUANTIZED_TRACE
 from dew.nn.dense import _contractions, _linear_site
 from dew.nn.kernels.generation import backend
-from dew.nn.precision import accumulated, correctly_rounded_divide
+from dew.nn.precision import accumulated, bf16_dot_general, correctly_rounded_divide
 
 if TYPE_CHECKING:
     from qwix import QArray, QuantizationProvider
@@ -232,37 +232,84 @@ def _qwix_wrapped(model: nn.Module, provider: QuantizationProvider, wrapper: Qua
 def _quantized(model: nn.Module, provider: QuantizationProvider, spec: Quantization) -> nn.Module:
     """`model` with the matmuls of its `entry_methods` under Qwix's `provider`, in the class Qwix
     makes for the call, a `QuantizedClass` of `spec`,
-    each method tracing what it calls under the key `QUANTIZED_TRACE` gives the provider."""
+    each method tracing what it calls under the provider's kind and `spec` in `QUANTIZED_TRACE`, which
+    names `spec` as its policy for the layers that read its rules (`quantized_products`)."""
     quantized = quantize_with(model, provider, methods=entry_methods(model),
-                              key=(type(provider).__name__, spec))
+                              key=(type(provider).__name__, spec), policy=spec)
     layer: Any = type(quantized)
     layer._dew_quantization = spec
     return quantized
 
 
 def quantize_with(model: nn.Module, provider: QuantizationProvider, *,
-                  methods: Sequence[str] = ("__call__",), key: Hashable | None = None) -> nn.Module:
+                  methods: Sequence[str] = ("__call__",), key: Hashable | None = None,
+                  policy: Quantization | None = None) -> nn.Module:
     """Qwix's `quantize_model(model, provider, methods=methods)`, each of `methods` tracing what it
     calls under `key` in `QUANTIZED_TRACE` (by default the provider's kind and the provider): the
     way Dew runs a model Qwix quantizes with a provider of its own, so Qwix owns the products the
     thread tracing it forms (`dew.nn.precision.accumulated`) and no other thread's, and its traces
-    stay apart from the plain model's."""
+    stay apart from the plain model's. `key` is the caller's, opaque; `policy` is the `Quantization`
+    the provider follows, whose rules a layer reads (`quantized_products`), or None for a provider whose
+    rules Dew does not know."""
     quantized = _qwix().quantize_model(model, provider, methods=methods)
     layer = type(quantized)
-    key = (type(provider).__name__, provider) if key is None else key
+    trace = QuantizedTrace((type(provider).__name__, provider) if key is None else key, policy)
     for name in methods:
-        setattr(layer, name, _keyed(getattr(layer, name), key))
+        setattr(layer, name, _keyed(getattr(layer, name), trace))
     return quantized
 
 
+@dataclasses.dataclass(frozen=True)
+class QuantizedTrace:
+    """What a quantized model's methods trace under (`QUANTIZED_TRACE`, which jit's cache keys on): the
+    caller's opaque cache `key`, and the `Quantization` its provider follows (`policy`), or None for a
+    provider whose rules Dew does not know."""
+
+    key: Hashable
+    policy: Quantization | None
+
+
 def _keyed[**Arguments, Result](method: Callable[Arguments, Result],
-                                 key: Hashable) -> Callable[Arguments, Result]:
-    """`method` run under `key` in `QUANTIZED_TRACE`."""
+                                 trace: QuantizedTrace) -> Callable[Arguments, Result]:
+    """`method` run under `trace` in `QUANTIZED_TRACE`."""
     @functools.wraps(method)
     def keyed(*args: Arguments.args, **kwargs: Arguments.kwargs) -> Result:
-        with QUANTIZED_TRACE(key), INTERCEPTED(new_value=True):
+        with QUANTIZED_TRACE(trace), INTERCEPTED(new_value=True):
             return method(*args, **kwargs)
     return keyed
+
+
+@dataclasses.dataclass(frozen=True)
+class QuantizedProducts:
+    """How the Qwix quantization a call runs under changes the products of a submodule and of the
+    modules under it (`quantized_products`). `inputs`: their activations quantize, or their gradients
+    do, so the submodule is no linear map of its input, which a layer that applies it to another
+    operand (MLA's absorbed kv_b_proj) needs it to be; a weight-only rule with float gradients leaves it
+    linear, by its quantized matrix. `weights`: their weights quantize, so the submodule multiplies by
+    no weight it holds, which a layer that moves its weights (an in-context memory's recurrence) needs
+    it to."""
+
+    inputs: bool
+    weights: bool
+
+
+def quantized_products(module: nn.Module, name: str) -> QuantizedProducts:
+    """How the Qwix quantization the call runs under (`QUANTIZED_TRACE`) changes the products of the
+    bound `module`'s submodule `name` and the modules under it (`QuantizedProducts`), as its policy's
+    rules select their paths: the submodule's own, and the scope of each parameter it holds."""
+    trace: QuantizedTrace | None = QUANTIZED_TRACE.value
+    if trace is None:
+        return QuantizedProducts(inputs=False, weights=False)
+    policy = trace.policy
+    if policy is None:
+        # A trace that names no policy (a provider of the caller's own) may quantize anything.
+        return QuantizedProducts(inputs=True, weights=True)
+    scope = (*module.path, name)
+    params = flatten_dict(dict(module.variables.get("params", {}).get(name, {})))
+    scopes = {scope, *((*scope, *leaf[:-1]) for leaf in params)}
+    if all(policy.rule_for(path) is None for path in scopes):
+        return QuantizedProducts(inputs=False, weights=False)
+    return QuantizedProducts(inputs=not policy.weight_only or policy.bwd_qtype is not None, weights=True)
 
 
 def _qwix(module: str = "qwix") -> ModuleType:
@@ -334,40 +381,82 @@ def frozen_fp8_kernel(leaves: Mapping[str, jax.typing.ArrayLike]) -> jax.Array:
     return (forward.astype(jnp.float32) * jnp.asarray(leaves[FROZEN_FP8[1]], jnp.float32)).T
 
 
+def decoded_frozen_fp8(variables: Variables) -> Variables:
+    """`variables` with each frozen FP8 site's kernel decoded from its packed codes into `params`
+    (`frozen_fp8_kernel`) and its codes gone: the float tree the record packed, which a merge sums an
+    adapter into (`dew.lora.Adapter.merge`) and an in-context memory starts from as its W_0
+    (`dew.nn.memory`). Every other `QUANTIZATION` leaf, an input's scale, stays; the collection goes
+    when the codes were all it held."""
+    held = flatten_dict(dict(variables.get(QUANTIZATION, {})))
+    sites = {path[:-1] for path in held if path[-1] == FROZEN_FP8[0]}
+    if not sites:
+        return variables
+    kernels = {(*site, "kernel"): frozen_fp8_kernel({leaf: jnp.asarray(held[(*site, leaf)])
+                                                     for leaf in FROZEN_FP8}) for site in sites}
+    rest = {path: leaf for path, leaf in held.items() if not (path[:-1] in sites and path[-1] in FROZEN_FP8)}
+    decoded = {name: tree for name, tree in variables.items() if name != QUANTIZATION}
+    decoded["params"] = unflatten_dict({**flatten_dict(dict(variables.get("params", {}))), **kernels})
+    return {**decoded, QUANTIZATION: unflatten_dict(rest)} if rest else decoded
+
+
 def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.Array:
     """`values @ rows.T`, `[M, K]` by E4M3 `[N, K]`, in float32: `values`'
-    rows cast by the FP8 block cast, the codes widened in the dot and both
-    rows' scales applied after it, the form XLA's GPU compiler rewrites to an
-    FP8 GEMM (cuBLASLt)."""
+    rows cast by the FP8 block cast, both sides' codes multiplied exactly and
+    summed in fp32 (`dew.nn.precision.bf16_dot_general`: an E4M3 code is a
+    bf16 value) and both rows' scales applied after. The widened codes are
+    held apart from the product (an optimization barrier), so XLA's GPU
+    compiler does not rewrite it to an FP8 GEMM: Hopper's FP8 tensor cores
+    keep a narrower running sum, and at 512 x 4096 x 4096 on an H100 that
+    GEMM lay 291 times the dequantized float32 product's distance from
+    float64 at the highest precision and 3011 times at the default, where
+    this product lies at 0.53 times it, in 1.7 times the FP8 GEMM's time
+    (receipts ig-fp8-probe3, 4 and 5). The FP8 GEMM returns with a kernel
+    whose sum keeps float32's accuracy (ledger 1625)."""
     from dew.interop.codecs import fp8_block_cast
 
     codes, scales = fp8_block_cast(values, (1, values.shape[1]))
-    product = accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((1,), (1,)), ((), ()))),
-                          codes.astype(jnp.float32), rows.astype(jnp.float32),
-                          preferred_element_type=jnp.float32)
+    held_codes, held_rows = jax.lax.optimization_barrier(
+        (codes.astype(jnp.bfloat16), rows.astype(jnp.bfloat16)))
+    product = bf16_dot_general(held_codes, held_rows, (((1,), (1,)), ((), ())))
     return product * scales * row_scales.T
 
 
-@jax.custom_vjp
+@jax.custom_jvp
 def frozen_fp8_product(x: jax.Array, forward: jax.Array, forward_scale: jax.Array, dgrad: jax.Array,
                        dgrad_scale: jax.Array) -> jax.Array:
     """`x @ kernel` in float32, `[M, in]` by a frozen kernel packed as
     `frozen_fp8_leaves`: FP8 products forward and for `x`'s gradient, and no
-    gradient for the kernel, which is frozen."""
+    gradient for the kernel, which is frozen. Forward mode (`jax.jvp`, MeanFlow's
+    target) takes the input's tangent times the decoded kernel
+    (`frozen_fp8_kernel`) in float32, the map the FP8 products stand for, and
+    reverse mode runs the FP8 input gradient (`_frozen_fp8_tangent`)."""
     return _fp8_rows(x, forward, forward_scale)
 
 
-def _frozen_fp8_forward(x, forward, forward_scale, dgrad, dgrad_scale):
-    # The input's dtype rides as an empty array, a residual JAX can hold.
-    return _fp8_rows(x, forward, forward_scale), (jnp.zeros((0,), x.dtype), dgrad, dgrad_scale)
+@frozen_fp8_product.defjvp
+def _frozen_fp8_tangent(primals, tangents):
+    """The product's tangent along `x`'s, the packed leaves frozen whatever their tangents: the
+    direction times the decoded forward rows in float32 at the highest precision, a linear call whose
+    transpose is the FP8 input gradient, in `x`'s dtype. Its residuals are the packed leaves and an
+    empty array of `x`'s dtype, all a backward reads, so a staged pullback, a remat or a scan keeps
+    no copy of `x`."""
+    from jax.custom_derivatives import linear_call
 
+    x, forward, forward_scale, dgrad, dgrad_scale = primals
 
-def _frozen_fp8_backward(residuals, cotangent):
-    like, dgrad, dgrad_scale = residuals
-    return _fp8_rows(cotangent, dgrad, dgrad_scale).astype(like.dtype), None, None, None, None
+    def tangent(residuals, direction):
+        rows, row_scales = (jax.lax.stop_gradient(leaf) for leaf in residuals[:2])
+        decoded = rows.astype(jnp.float32) * row_scales.astype(jnp.float32)
+        return accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((1,), (1,)), ((), ())),
+                                             precision=jax.lax.Precision.HIGHEST),
+                           direction.astype(jnp.float32), decoded, preferred_element_type=jnp.float32)
 
+    def transposed(residuals, cotangent):
+        _, _, rows, row_scales, like = residuals
+        return _fp8_rows(cotangent, rows, row_scales).astype(like.dtype)
 
-frozen_fp8_product.defvjp(_frozen_fp8_forward, _frozen_fp8_backward)
+    residuals = (forward, forward_scale, dgrad, dgrad_scale, jnp.zeros((0,), x.dtype))
+    return frozen_fp8_product(*primals), linear_call(tangent, transposed, residuals, tangents[0])
 
 
 def frozen_fp8_dense(module: nn.Module, inputs: jax.Array) -> jax.Array:
@@ -669,11 +758,12 @@ class InputQuantization:
             if context.method_name == "nonlinear_input":
                 # A layer asks whether its submodule is linear in its input
                 # (`MultiHeadLatentAttention.nonlinear_input`): one that
-                # rounds its input or multiplies in FP8 is not.
+                # rounds its input or multiplies in FP8, or holds a module
+                # that does, is not.
                 name = args[0] if args else kwargs["name"]
-                child = getattr(module, name)
-                return next_fun(*args, **kwargs) or (record.quantizer(child) is not None
-                                                     or child.has_variable(QUANTIZATION, FROZEN_FP8[0]))
+                held = flatten_dict(dict(getattr(module, name).variables.get(QUANTIZATION, {})))
+                return next_fun(*args, **kwargs) or any(
+                    path[-1] in (*INPUT_SCALES.values(), FROZEN_FP8[0]) for path in held)
             calls = context.method_name in ("__call__", "_linear")
             quantizer = record.quantizer(module) if calls else None
             frozen = calls and module.has_variable(QUANTIZATION, FROZEN_FP8[0])
@@ -740,9 +830,9 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
     stored tree, `/`-joined) is timed both ways, forward and input
     gradient, by `dew.telemetry.benchmark.samples` on a GPU the process holds
     alone: bf16 operands as a bf16 Dense multiplies them, and the FP8
-    products `frozen_fp8_dense` runs. On an H100 FP8 won from about 2048
-    inputs and outputs and lost below: 0.70x at 1024 by 1024, 1.10x at 4096
-    by 4096, 1.47x at 4096 by 12288 (docs/performance.md). The record names
+    products `frozen_fp8_dense` runs. Those multiply the codes as bf16 values
+    (`_fp8_rows`), slower than a bf16 Dense, so no site measures faster until
+    an FP8 kernel keeps fp32's sums (ledger 1625; docs/performance.md). The record names
     the sites and the generation, so a run reproduces the choice; a GPU
     without FP8 tensor cores is refused by name.
 
@@ -1398,4 +1488,5 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     return served, {**variables, "params": parameters}
 
 
-__all__ = ["InputQuantization", "Quantization", "quantize_with", "split_columns"]
+__all__ = ["InputQuantization", "Quantization", "QuantizedProducts", "QuantizedTrace", "quantize_with",
+           "split_columns"]

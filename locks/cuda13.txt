@@ -620,7 +620,7 @@ jaraco-functools==4.6.0
     # via
     #   cheroot
     #   keyring
-jax==0.12.0.1.post23
+jax==0.12.0.1.post26
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
@@ -1546,6 +1546,7 @@ stringzilla==5.2.0
     # via albucore
 sympy==1.14.0
     # via
+    #   dewml (pyproject.toml)
     #   cfn-lint
     #   torch
 synchronicity==0.12.6

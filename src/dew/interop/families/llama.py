@@ -15,7 +15,6 @@ from functools import partial
 from dew import _records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
-    DEFAULT_MAX_SEQ_LEN,
     FUSED_EXPERTS,
     MOE_NAMES,
     PLAIN_SPELLING,
@@ -41,8 +40,7 @@ def llama_config(hf_config, used):
     # attends every key, and LlamaMLP's projections carry mlp_bias's biases.
     # LlamaRotaryEmbedding builds any rope_type the rope utilities do, YaRN
     # among them (modeling_llama.py:82-86).
-    rope = read_rope(hf_config, used, PLAIN_SPELLING, yarn_max_pos=_records.integer(hf_config.get(
-        'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'))
+    rope = read_rope(hf_config, used, PLAIN_SPELLING)
     return base_config(hf_config, used, rope=rope, reads=frozenset({'attention_bias', 'mlp_bias'}))
 
 
@@ -135,6 +133,8 @@ GRANITEMOE = DecoderFamily(
     export_path=partial(renamed_name, _GRANITEMOE_NAMES),
     packed=_GRANITEMOE_PACKED,
     preserve_source_layout=True,
+    padding_idx=True,
+    defaults={'max_position_embeddings': 2048},
 )
 
 MIXTRAL = DecoderFamily(
@@ -149,6 +149,7 @@ MIXTRAL = DecoderFamily(
     # MixtralConfig's defaults (its rope base is its spelling's).
     defaults={'num_experts_per_tok': 2, 'num_local_experts': 8, 'rms_norm_eps': 1e-5,
               'num_key_value_heads': 8, 'max_position_embeddings': 131072},
+    padding_idx=True,
 )
 
 
@@ -165,4 +166,5 @@ MISTRAL = DecoderFamily(
     # an export of a model without one says so with a null.
     defaults={'sliding_window': 4096, 'num_key_value_heads': 8, 'max_position_embeddings': 131072},
     export_nulls=('sliding_window',),
+    padding_idx=True,
 )

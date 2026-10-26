@@ -32,8 +32,9 @@ import tyro
 from PIL import Image, ImageDraw, ImageFont
 
 from dew.artifacts import uint8_pixels
+from dew.inference import TextToImage
 from dew.interop import SourceReference
-from dew.sampling import CFG, DPMSolverMultistep, EulerAncestral, Heun, TextToImage
+from dew.sampling import CFG, DPMSolverMultistep, EulerAncestral, Heun
 
 # Each sampler's solver, step count and classifier-free guidance.
 SAMPLERS = {

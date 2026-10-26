@@ -116,6 +116,24 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
     assert all(entry["split"] != ci.COLLECT and entry["cache"] == "off" for entry in daily)
 
 
+def test_a_python_no_run_has_timed_weighs_a_file_by_another_pythons_time(ci, tmp_path, monkeypatch):
+    """A file 3.14 has no measured time for (3.14 runs every file only on the daily run) weighs, and
+    splits, by 3.12's measured time of it, not by its tests' least recorded times, so armada's
+    longest-first dispatch does not start it last (train 143: 3.14 tasks of 500-800 s, weighed near
+    the target, started 550-760 s into the run)."""
+    (tmp_path / "tests/test_heavy.py").write_text("")
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {"tests/test_heavy.py::test_a": 150.0, "tests/test_heavy.py::test_b": 100.0}))
+    monkeypatch.setenv("DEW_TEST_CACHE", "off")
+    entries = ci.plan(240.0, {"files": {"3.12:tests/test_heavy.py": 800.0}})
+    weighed = {python: sum(entry["weight"] for entry in entries if entry["python"] == python)
+               for python in ("3.12", "3.14")}
+    assert weighed["3.14"] == weighed["3.12"] >= 800.0, weighed
+    cuts = {python: sorted(entry["split"] for entry in entries if entry["python"] == python)
+            for python in ("3.12", "3.14")}
+    assert cuts["3.14"] == cuts["3.12"] and len(cuts["3.12"]) > 1, cuts
+
+
 def test_a_collect_task_rows_each_file_red_where_it_would_not_import(ci, tmp_path):
     """The newest Python's collect-only task turns a file's row red where
     the file does not import or skips on a missing import, and keeps one
@@ -1030,8 +1048,9 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
     ({"tools/armada/session.py": "# the session\n"}, "off"),
     ({".github/workflows/ci.yml": "on: []\n"}, "off"),
     ({"Makefile": "all:\n"}, "off"),
+    ({"CHANGELOG.md": "# Changes\n\n- an entry\n"}, "on"),
 ], ids=["a source module", "a docs page", "a notebook", "a tool", "the project", "a lock",
-        "the test session", "a workflow", "a file no record places"])
+        "the test session", "a workflow", "a file no record places", "the changelog"])
 def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_place_it(
         ci, tmp_path, changed, policy):
     """CI's test cache policy for a change from main: each file's own inputs decide ('on') where the records

@@ -27,6 +27,7 @@ from flax import linen as nn
 from dew import _records
 from dew._coordination import agreed
 from dew._records import JSON
+from dew.batch import token_id, token_ids
 from dew.nn.protocols import Bounded, Predicting
 from dew.sampling import decoding
 from dew.sampling.strategies import Beam, Speculative, Strategy
@@ -62,26 +63,14 @@ def _generation_value(config: Mapping[str, object], generation_config: Mapping[s
 
 def eos_ids(config: Mapping[str, object], generation_config: Mapping[str, object]) -> tuple[int, ...]:
     value = _generation_value(config, generation_config, "eos_token_id")
-    if value is None:
-        return ()
-    values = (value,) if type(value) is int else value
-    if not isinstance(values, (tuple, list)):
-        raise ValueError("eos_token_id must be an integer or a sequence of integers")
-    ids: list[int] = []
-    for entry in values:
-        if type(entry) is not int or entry < 0:
-            raise ValueError("eos_token_id must be an integer or a sequence of integers")
-        ids.append(entry)
-    return tuple(ids)
+    # None and an empty list both state no EOS id; the ids themselves are read by the one law of ids.
+    values = () if value is None else value if isinstance(value, (list, tuple)) else [value]
+    return tuple(token_ids(values, where="eos_token_id")) if values else ()
 
 
 def pad_id(config: Mapping[str, object], generation_config: Mapping[str, object]) -> int:
     value = _generation_value(config, generation_config, "pad_token_id", 0)
-    if value is None:
-        value = 0
-    if type(value) is not int or value < 0:
-        raise ValueError("pad_token_id must be a nonnegative integer")
-    return value
+    return token_id(0 if value is None else value, where="pad_token_id")
 
 
 def generation_limit(
@@ -343,6 +332,12 @@ def _cache_capacity(config: Mapping[str, object], generation_config: Mapping[str
         raise ValueError(f"max_cache_len {value} exceeds the model's max_seq_len {capacity}")
 
 
+TRANSFORMERS_TOP_K = 50
+"""The cut transformers' `generate` samples from where a source leaves `top_k` unset: its documented
+default (`GenerationConfig`, configuration_utils.py, 5.17.0), which its generation preparation installs
+as a `TopKLogitsWarper`. A stated 0 asks for no cut."""
+
+
 def _source_sampling(config: Mapping[str, object], generation_config: Mapping[str, object],
                      do_sample: bool) -> Sampling:
     """Return the policy a source declares, every common control in it."""
@@ -360,7 +355,8 @@ def _source_sampling(config: Mapping[str, object], generation_config: Mapping[st
     stop = read("stop_strings")
     return Sampling(
         temperature=_records.number(temperature, "temperature") if do_sample else 0.0,
-        top_k=(_records.integer(top_k, "top_k") or None) if do_sample and top_k is not None else None,
+        top_k=((TRANSFORMERS_TOP_K if top_k is None else _records.integer(top_k, "top_k") or None)
+               if do_sample else None),
         eos_token_ids=eos,
         pad_token_id=pad_id(config, generation_config),
         top_p=_probability_control(config, generation_config, "top_p", Sampling.top_p)
@@ -375,17 +371,9 @@ def _source_sampling(config: Mapping[str, object], generation_config: Mapping[st
         stop=() if stop is None else _as_strings(stop))
 
 
-def _token_list(value: object, name: str) -> list[int]:
-    if isinstance(value, int) and not isinstance(value, bool):
-        return [value]
-    if not isinstance(value, (list, tuple)) or not value:
-        raise ValueError(f"{name} must be a non-empty list of token ids")
-    ids = []
-    for token in value:
-        if type(token) is not int or token < 0:
-            raise ValueError(f"{name} must hold non-negative integer token ids")
-        ids.append(token)
-    return ids
+def _token_list(value: _records.JSON, name: str) -> list[int]:
+    """A source field holding one token id or a nonempty list of them, read by the one law of ids."""
+    return token_ids(value if isinstance(value, list) else [value], where=name)
 
 
 def _as_decay(value: object) -> tuple[int, float]:
@@ -448,7 +436,7 @@ def _source_transforms(config: Mapping[str, object], generation_config: Mapping[
     if (value := read("min_length")) is not None and eos.size:
         extra["min_length"] = decoding.MinLength(_records.integer(value, "min_length"), eos)
     if (value := read("forced_bos_token_id")) is not None:
-        extra["forced_bos_token_id"] = decoding.ForcedBOS(_records.integer(value, "forced_bos_token_id"))
+        extra["forced_bos_token_id"] = decoding.ForcedBOS(token_id(value, where="forced_bos_token_id"))
     if (value := read("forced_eos_token_id")) is not None:
         # The reference forces at the effective end of the request, and a call
         # may set its own budget, so the control stays request relative.
@@ -537,9 +525,9 @@ def generation_config_of(sampling: Sampling, max_new_tokens: int | None = None) 
     """The generation_config.json transformers reads `sampling` from, and
     `source_decoding` reads back as the same policy: the inverse of
     `_source_sampling`. A top_k of None is written 0, which both read as no
-    cut (transformers' own default is 50). transformers has no presence or
-    frequency penalty, so a policy using one is refused, not exported
-    without it."""
+    cut, since an unset one reads as transformers' default (`TRANSFORMERS_TOP_K`).
+    transformers has no presence or frequency penalty, so a policy using one
+    is refused, not exported without it."""
     dropped = [name for name in ("presence_penalty", "frequency_penalty") if getattr(sampling, name) != 0.0]
     if dropped:
         raise ValueError(f"transformers' generation config has no {' or '.join(dropped)}; "
