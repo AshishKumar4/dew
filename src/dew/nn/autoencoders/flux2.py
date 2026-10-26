@@ -11,6 +11,7 @@ sees.
 """
 from __future__ import annotations
 
+import functools
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -20,6 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.interop.components import bind_component
+from dew.nn.kernels.options import program
 from dew.objectives.base import Variables
 
 from ..scan_orders import pixel_shuffle, pixel_unshuffle
@@ -38,6 +40,19 @@ PUBLISHED = ("AutoencoderKLFlux2",)
 """The `_class_name` a published AutoencoderKLFlux2's config states."""
 
 
+def _folded(model: AutoencoderKL, params, image, key=None, noise=None):
+    """One batch of frames encoded and folded 2x2 into the latent's channels, a posterior's `noise`
+    unfolded to the layout it is drawn in."""
+    return pixel_unshuffle(jnp.asarray(model.apply({"params": params}, image, key,
+                                                   None if noise is None else pixel_shuffle(noise),
+                                                   method=model.encode)))
+
+
+def _unfolded(model: AutoencoderKL, params, latent):
+    """One batch of folded latents unfolded and decoded."""
+    return model.apply({"params": params}, pixel_shuffle(latent), method=model.decode)
+
+
 class Flux2Autoencoder(ModuleAutoEncoder[AutoencoderKL]):
     """Native FLUX.2 VAE weights, the 2x2 fold and the batch-norm statistics
     as the latent normalization, per folded channel."""
@@ -46,11 +61,8 @@ class Flux2Autoencoder(ModuleAutoEncoder[AutoencoderKL]):
         super().__init__(model, params)
         # `Flux2Pipeline._patchify_latents` and `_unpatchify_latents`, channels last. A posterior's
         # `noise` comes in the folded latent's layout and is unfolded to the one it is drawn in.
-        self.encode_single_frame = jax.jit(lambda params, image, key=None, noise=None: pixel_unshuffle(
-            jnp.asarray(model.apply({"params": params}, image, key,
-                                    None if noise is None else pixel_shuffle(noise), method=model.encode))))
-        self.decode_single_frame = jax.jit(lambda params, latent: model.apply(
-            {"params": params}, pixel_shuffle(latent), method=model.decode))
+        self.encode_single_frame = functools.partial(program(_folded, model, static_argnums=0), model)
+        self.decode_single_frame = functools.partial(program(_unfolded, model, static_argnums=0), model)
         mean, variance = np.asarray(mean, np.float32), np.asarray(variance, np.float32)
         scale = 1.0 / np.sqrt(variance + np.float32(epsilon))
         if mean.shape != (4 * model.latent_channels,) or scale.shape != mean.shape:
