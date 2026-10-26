@@ -1602,15 +1602,16 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
     backbone = None
     shared: Mapping[str, np.ndarray] = {}
     if component is not None:
-        # The route of the config the backbone translates, a mamba_ssm one's normalized as
-        # `_load_native_source` normalizes it. The transformers forward reads its backbone's weights
-        # itself, and none without them; the shared file is read for it only where the head is stored
-        # in it, but its weights' snapshot is resolved and pinned here whenever it reads weights.
-        routed = (mamba2.config_from_mamba_ssm(component.config) if mamba2.is_mamba_ssm(component.config)
-                  else component.config)
+        # The route of the config the backbone translates (`_native_config`), decided once, before its
+        # weights are read, and carried to its load, so an unregistered backbone is verified once. The
+        # transformers forward reads its backbone's weights itself, and none without them; the shared
+        # file is read for it only where the head is stored in it, but its weights' snapshot is resolved
+        # and pinned here whenever it reads weights.
         pinned = source.component(component.config_folder)
         remote = None if code is None else pinned.directory(code)
-        forwarded = isinstance(source_route(routed, remote=remote, pinned=pinned), TorchRoute)
+        routed = _routed(_native_config(component.config, overrides), remote=remote, pinned=pinned,
+                         text_only=False, overrides=overrides)
+        forwarded = isinstance(routed.route, TorchRoute)
         reads_shared = not forwarded or bool(head_source.weight_file is None and component.tensor_prefix)
         if weights or reads_shared:
             weight_source = source.component(component.weights_folder)
@@ -1626,7 +1627,7 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
             gguf_file=None, component=component, tensors=tensors,
             placed=placed, streaming=streaming, dtype=dtype, param_dtype=param_dtype,
             attention_impl=attention_impl, max_seq_len=max_seq_len, weights=weights, overrides=overrides,
-            remote=remote, pinned=pinned)
+            remote=remote, routed=routed)
     else:
         _unread_overrides(overrides, "a release without a native backbone")
     missing = False
@@ -1673,10 +1674,26 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
                               description.tokenizer_folder, **description.fields)
 
 
+def _native_config(config: Mapping[str, object],
+                   overrides: Mapping[str, object] | None) -> Mapping[str, object]:
+    """The config a native load builds from a source's own: a mamba_ssm one's normalized to transformers'
+    Mamba-2 fields, with the load's `overrides` over it (`with_overrides`)."""
+    if mamba2.is_mamba_ssm(config):
+        config = mamba2.config_from_mamba_ssm(config)
+    return with_overrides(config, overrides)
+
+
+class _Routed(NamedTuple):
+    """A native source's config, its route and its wrapper fields where a wrapper's language model is
+    taken alone (`_routed`)."""
+
+    config: Mapping[str, object]
+    route: SourceRoute
+    language: decoder_parts.WrapperFields | None
+
+
 def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: sources.SourceReference | None,
-            text_only: bool,
-            overrides: Mapping[str, object] | None
-            ) -> tuple[Mapping[str, object], SourceRoute, decoder_parts.WrapperFields | None]:
+            text_only: bool, overrides: Mapping[str, object] | None) -> _Routed:
     """A native source's config, its route and, where `text_only` takes a wrapper's language model
     alone, that model's wrapper fields, decided before any weight downloads, on the config alone: a
     format the codec cannot read, a family's refusal, an unregistered decoder checked against
@@ -1693,7 +1710,7 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: source
         if source_quantization(config) is not None:
             raise ValueError("text_only takes an unquantized wrapper: a quantized one's module selection "
                              "names the wrapper's modules, which its text checkpoint renames")
-        config = decoders.language_model_config(config, language)
+        config = decoders.language_model_config(config)
         route = source_route(config, remote=remote, pinned=pinned)
     elif text_only and isinstance(route, DiffusionGemmaRoute):
         raise ValueError("text_only takes a media wrapper's language model; DiffusionGemma's decoder is "
@@ -1701,7 +1718,7 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: source
     if isinstance(route, TorchRoute | DiffusionGemmaRoute):
         _unread_overrides(overrides, "the transformers forward" if isinstance(route, TorchRoute)
                           else "a diffusion Gemma's text tower")
-    return config, route, language
+    return _Routed(config, route, language)
 
 
 class _Translated(NamedTuple):
@@ -1782,10 +1799,13 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
                         tensors: Mapping[str, np.ndarray] | None = None,
                         overrides: Mapping[str, object] | None = None,
                         remote: Path | None = None, pinned: sources.SourceReference | None = None,
+                        routed: _Routed | None = None,
                         text_only: bool = False) -> tuple[Pretrained, bool]:
     """Decode native source weights and bind their processors and export layout, and whether the
     bundle is a wrapper's language model taken alone (`text_only`). `remote` is the source's own code
-    where the load runs it, and `pinned` where it was fetched (`source_route`).
+    where the load runs it, and `pinned` where it was fetched (`source_route`). `routed` is the route a
+    caller decided for this config already (`_routed`), a composite's for its backbone before reading
+    its weights, which the load takes rather than route the config, and verify its code, again.
 
     Diffusers pipelines and the explicit torchax fallback have already taken
     their own routes; this boundary handles native decoders and media wrappers,
@@ -1801,12 +1821,11 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
         config = component.config
         directory = source.component(component.config_folder).directory(root)
     mamba_ssm = mamba2.is_mamba_ssm(config)
-    if mamba_ssm:
-        config = mamba2.config_from_mamba_ssm(config)
-    config = with_overrides(config, overrides)
+    config = _native_config(config, overrides)
     family = config.get("model_type")
-    config, route, language = _routed(config, remote=remote, pinned=pinned, text_only=text_only,
-                                      overrides=overrides)
+    if routed is None:
+        routed = _routed(config, remote=remote, pinned=pinned, text_only=text_only, overrides=overrides)
+    config, route, language = routed
     if isinstance(route, TorchRoute):
         from dew.interop import torchax_fallback
         selected = source if component is None else source.component(component.config_folder)
