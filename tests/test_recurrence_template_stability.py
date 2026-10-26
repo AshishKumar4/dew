@@ -8,11 +8,12 @@ test_recurrence_stability holds the portable math:
 - check 1 (`assert_as_exact`): on par from float64 with its reference arm, the fla port's
   (`chunk_on('fla', ...)`), whose numbers it runs.
 
-Natively on a GPU of a family the mainloop claims, interpreted off one at the cases `INTERPRETED` names. The
-gradient's arm asserts which backward runs: the fast backward where its launches hold at the call's derived
-tiles (`mainloop.backward_holds`, as `mosaic_rule` reads it; natively, its reverse launch in the trace), and
-on an mma.sync GPU, where they do not, the port's, whose gradient its reference arm computes too, so check 1
-there holds the forward alone."""
+Natively on a GPU of a family the mainloop claims (`NATIVE`: interpreted, one case's check 1 outran the CPU
+tier's hour); off one, the CPU interprets the forward's finiteness under aligned keys and reads the
+gradient's backward decision. The gradient's arm asserts which backward runs: the fast backward where its
+launches hold at the call's derived tiles (`mainloop.backward_holds`, as `mosaic_rule` reads it; natively,
+its reverse launch in the trace), and on an mma.sync GPU, where they do not, the port's, whose gradient its
+reference arm computes too, so check 1 there holds the forward alone."""
 
 import dataclasses
 import functools
@@ -40,12 +41,7 @@ REGIMES = ('decays near zero', 'steep then mild', 'aligned keys', 'resets on chu
 `PAIR_FLOOR` (decays near zero, steep then mild), the inverse's fp16 doubling (aligned keys, the write gate
 near one), the walk's resets (resets on chunks' edges) and its carried memory (a long sequence)."""
 
-INTERPRETED = {('aligned keys', 'forward'), ('resets on chunk edges', 'gradient')}
-"""The cases the CPU interprets: the inverse's fp16 doubling under aligned keys, and the fast backward's
-launches over documents reset on chunks' edges; the rest are the GPU tier's (`NATIVE`)."""
-
-CASES = [pytest.param(regime, product, id=f'{regime}-{product}',
-                      marks=() if (regime, product) in INTERPRETED else NATIVE)
+CASES = [pytest.param(regime, product, id=f'{regime}-{product}', marks=NATIVE)
          for regime in REGIMES for product in ('forward', 'gradient')]
 
 
@@ -123,3 +119,20 @@ def test_the_template_stays_finite_and_on_par_with_the_port_where_chunked_forms_
         assert_finite(dew, truth, draws(seed), regime)
     assert_as_exact(dew, reference, draws, f'the template, {regime}, its {product}',
                     seeds=SEEDS['scalar delta', regime], truth_fn=truth)
+
+
+def test_the_template_forward_stays_finite_under_aligned_keys_interpreted():
+    """The template's 16-bit forward, interpreted, finite wherever the float64 recurrence's is on aligned keys
+    with the write gate near one, where the inverse's fp16 doubling grows most (`_merges`)."""
+    regime = 'aligned keys'
+    (operands,) = (bf16(stressed(HOOKS, regime, 0)[0]),)
+    assert_finite(jax.jit(functools.partial(chunk, HOOKS, mainloop='mosaic')),
+                  jax.jit(functools.partial(token_by_token, HOOKS)), (operands,), regime)
+
+
+@pytest.mark.parametrize('regime', REGIMES)
+def test_the_template_gradient_takes_the_fast_backward_where_its_launches_hold(regime):
+    """Off a GPU, the template's gradient over each regime's draw takes its fast backward, its launches held
+    at the call's derived tiles by the interpreted bundle (`fast_backward`)."""
+    operands, _ = cotangents(HOOKS, regime, 0)
+    assert fast_backward(restarting(lambda given: given, regime)(bf16(operands)))
