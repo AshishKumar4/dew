@@ -895,7 +895,7 @@ def test_ddim_at_eta_one_walks_as_diffusers_ddim_scheduler_on_the_same_draws():
 
 def test_rk4s_update_divides_by_six_as_ieee_division_does():
     """RK4's update, x + (k1 + 2 k2 + 2 k3 + k4) dt / 6, divides by six as IEEE does
-    (`dew.diffusion.schedules.divided`), bit for bit: with every stage's eps the same sixteenths, so
+    (`dew.nn.precision.divided`), bit for bit: with every stage's eps the same sixteenths, so
     the stages' sum is exact, the update is the product with dt rounded once, its correctly rounded
     sixth and the sum with x, where XLA:CPU's division by a constant multiplies by the rounded
     reciprocal and parts with IEEE's quotient on about a third of values."""

@@ -7,8 +7,9 @@ import jax.numpy as jnp
 from flax import struct
 from jax import lax
 
-from dew.diffusion.schedules import divided, expand
+from dew.diffusion.schedules import expand
 from dew.diffusion.schedules.common import ancestral_variance
+from dew.nn.precision import divided
 
 from .common import _check_gaps, _grid_levels, _history_gaps, _push, _sigma_integrator
 

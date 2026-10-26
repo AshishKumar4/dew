@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 import jax
 import jax.numpy as jnp
 
-from dew.nn.precision import at_least_fp32, correctly_rounded_divide
+from dew.nn.precision import at_least_fp32
 
 
 def expand(coefficient, x):
@@ -24,21 +24,6 @@ def ancestral_variance(sigma, following):
     step from `sigma` to `following` adds (k-diffusion's `get_ancestral_step` at eta 1, before its
     root), on a number or an array of either library: each caller takes its own root, cap or clamp."""
     return following ** 2 * (sigma ** 2 - following ** 2) / sigma ** 2
-
-
-def divided(numerator, rate):
-    """`numerator / rate` as a source written in PyTorch divides a state by a rate: IEEE division,
-    whatever the backend's own division does. A float32, bfloat16 or float16 quotient is
-    `dew.nn.precision.correctly_rounded_divide`'s of the operands widened to float32, rounded to its
-    dtype, as PyTorch's float32 opmath gives it, under any compiler flags. A float64 one is the plain
-    division."""
-    numerator, rate = jnp.asarray(numerator), jnp.asarray(rate)
-    dtype = jnp.result_type(numerator, rate)
-    if not jnp.issubdtype(dtype, jnp.floating):
-        return numerator / rate
-    if dtype == jnp.float64:
-        return numerator / rate
-    return correctly_rounded_divide(numerator.astype(jnp.float32), rate.astype(jnp.float32)).astype(dtype)
 
 
 def times(t) -> jax.Array:

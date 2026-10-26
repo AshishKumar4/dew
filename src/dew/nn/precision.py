@@ -622,6 +622,22 @@ def _divide_jvp(primals, tangents):
     return correctly_rounded_divide(*primals), jax.jvp(jnp.divide, primals, tangents)[1]
 
 
+def divided(numerator, rate):
+    """`numerator / rate` as a source written in PyTorch divides a state by a rate, or an array by a
+    constant: IEEE division, whatever the backend's own division does (XLA takes a division by a
+    constant as a product with its rounded reciprocal, on a CPU and an A100 alike, row 1402). A
+    float32, bfloat16 or float16 quotient is `correctly_rounded_divide`'s of the operands widened to
+    float32, rounded to its dtype, as PyTorch's float32 opmath gives it, under any compiler flags. A
+    float64 one is the plain division."""
+    numerator, rate = jnp.asarray(numerator), jnp.asarray(rate)
+    dtype = jnp.result_type(numerator, rate)
+    if not jnp.issubdtype(dtype, jnp.floating):
+        return numerator / rate
+    if dtype == jnp.float64:
+        return numerator / rate
+    return correctly_rounded_divide(numerator.astype(jnp.float32), rate.astype(jnp.float32)).astype(dtype)
+
+
 def compensated_add(left, right):
     """Add two double-float values, `(hi, lo)` pairs whose sum is the value:
     `hi` is the sum rounded and `lo` what the rounding dropped (the his'
@@ -687,7 +703,15 @@ def running_sum(shape: tuple[int, ...], dtype: DTypeLike) -> jax.Array:
     pair and the plain sum beside it, where loops compensate (`compensates_loops`), else `[1, *shape]`,
     the plain sum alone. Its leading axis is the form's, so a loop slices and updates the sum's own
     axes one past theirs."""
-    return jnp.zeros((3 if compensates_loops() else 1, *shape), dtype)
+    return paired_sum(shape, dtype) if compensates_loops() else jnp.zeros((1, *shape), dtype)
+
+
+def paired_sum(shape: tuple[int, ...], dtype: DTypeLike) -> jax.Array:
+    """An empty running sum of `shape` that is a double-float pair on every backend, the plain sum
+    beside it (`added_to`, `running_total`): for partials of a product Dew splits where its reference
+    takes the product whole, so the sum's error is the partials' own, whether XLA takes the addition
+    into a GEMM's epilogue or cuBLAS splits a product's sum by its shape (row 1725)."""
+    return jnp.zeros((3, *shape), dtype)
 
 
 def added_to(running: jax.Array, term: jax.Array) -> jax.Array:
