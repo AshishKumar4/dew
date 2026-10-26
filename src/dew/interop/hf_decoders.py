@@ -477,8 +477,12 @@ def language_model_names(names: Collection[str], read: Callable[[str], np.ndarra
 
 def _text_aliases(names: Collection[str], read: Callable[[str], np.ndarray], config,
                   tied_head_names: tuple[str, str] = ('lm_head.weight', 'model.embed_tokens.weight'),
-                  checked: Checked = NOTHING_CHECKED) -> tuple[tuple[str, str], ...]:
+                  checked: Checked = NOTHING_CHECKED,
+                  depths: int | None = None) -> tuple[tuple[str, str], ...]:
     """Check tied-head/MTP values and return the verified source relationships.
+
+    A depth past the first `depths` a load keeps (`read_decoder`) is not read: its copies are
+    returned unchecked, so the tree drops them as it drops every copy.
 
     `tied_head_names` is the family's own spelling of the head and the
     embedding, which is not `lm_head.weight` everywhere: DeepSeek V4 stores
@@ -503,6 +507,11 @@ def _text_aliases(names: Collection[str], read: Callable[[str], np.ndarray], con
             if reference == name:
                 # This copy stands in for the trunk's embedding (`_tied_names`),
                 # so it is the one the tree takes, not a copy of it.
+                continue
+            if (depths is not None and parts[2].isdigit()
+                    and int(parts[2]) - int(config["num_layers"]) >= depths):
+                # A depth the load does not keep: its copy is dropped as a copy, unread.
+                aliases.append((name, reference))
                 continue
             if reference not in names or not _equal(read, name, reference, checked):
                 raise ValueError(f"{name} differs from {shared}, which the depth shares")
@@ -814,7 +823,7 @@ def read_decoder(
     # tensors the tree already takes, so they are dropped here; any other
     # second tensor for a filled leaf is refused where it is placed.
     copies = {copy for copy, _ in _text_aliases(hf_tensors, hf_tensors.__getitem__, config,
-                                                 _tied_names(family, config, hf_tensors), checked)}
+                                                 _tied_names(family, config, hf_tensors), checked, depths)}
     readings = family.readings(hf_tensors, config)
     # params is always a collection, mapped tensors or not. A checkpoint
     # whose every tensor maps to nothing is an empty tree.

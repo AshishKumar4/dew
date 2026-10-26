@@ -23,8 +23,9 @@ from dew.objectives.base import Metric
 from dew.optim import OptimConfig
 from dew.telemetry.profile import region
 from dew.training.budget import Plateau, every_step, recorded
+from dew.training.cadence import Cadence, Tokens
 from dew.training.evaluation import EvalSuite, Evaluation, Summary
-from dew.training.interval import Cadence, Interval, Taken, Tokens
+from dew.training.interval import Interval, Taken
 from dew.training.observe import Observe
 from dew.training.runtime import PreemptionNotice
 from dew.training.selection import Best, HeldBest

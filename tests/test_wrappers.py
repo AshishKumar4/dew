@@ -286,23 +286,27 @@ def _misshapen_depths(source: Path, target: Path, depth: str) -> Path:
     return target
 
 
-@pytest.mark.parametrize(("fixture", "depth", "declared"), [("glm4-moe-tiny", "model.layers.2.", 1),
-                                                            ("deepseek-v41-tiny", "mtp.1.", 3)])
-def test_a_load_builds_and_reads_only_the_prediction_depths_it_keeps(tmp_path, fixture, depth, declared):
-    """`prediction_depths` keeps the first that many of a decoder's prediction depths: 0 builds the
-    trunk alone, and a count below the checkpoint's builds those first depths. The others are neither
-    built nor read, so a copy whose other depths no decoder could read loads as the source does, to the
-    same trunk logits, and saves its kept depths alone, reloading to the same model."""
+@pytest.mark.parametrize(("fixture", "depth"), [("glm4-moe-tiny", "model.layers.2."),
+                                              ("qwen38-dense-tiny", "mtp.")])
+def test_a_load_builds_and_reads_only_the_prediction_depths_it_keeps(tmp_path, fixture, depth):
+    """`prediction_depths=0` builds a decoder's trunk alone: its depth is neither built nor read, its
+    copies of the trunk's embedding and head unchecked, so a copy whose depth no decoder could read
+    loads as the source does, to the same trunk logits, and saves its trunk alone, reloading to the
+    same model. A count at least the checkpoint's keeps every depth it holds."""
     from dew.interop import Pretrained
 
     source = FIXTURES / fixture
-    whole = Pretrained.load(source, dtype="float32", attention_impl="reference")
-    assert whole.model.num_nextn_predict_layers == declared
-    kept = 0 if declared == 1 else 1
+    whole = Pretrained.load(source, dtype="float32", attention_impl="reference", text_only=True)
+    assert whole.model.num_nextn_predict_layers == 1
+    every = Pretrained.load(source, dtype="float32", attention_impl="reference", text_only=True,
+                            prediction_depths=2)
+    assert every.model == whole.model
+    kept = 0
     misshapen = _misshapen_depths(source, tmp_path / "misshapen", depth)
     with pytest.raises(ValueError):
-        Pretrained.load(misshapen, dtype="float32", attention_impl="reference")
-    loaded = Pretrained.load(misshapen, dtype="float32", attention_impl="reference", prediction_depths=kept)
+        Pretrained.load(misshapen, dtype="float32", attention_impl="reference", text_only=True)
+    loaded = Pretrained.load(misshapen, dtype="float32", attention_impl="reference", text_only=True,
+                             prediction_depths=kept)
     assert loaded.model.num_nextn_predict_layers == kept
     assert sorted(name for name in loaded.variables["params"] if str(name).startswith("mtp_")) == [
         f"mtp_{index}" for index in range(kept)]
