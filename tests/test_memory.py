@@ -23,25 +23,25 @@ configuration, its token-by-token path included, at 8 over the drawn weights."""
 
 CONFIGURATIONS = {
     # TTT-Linear (Sec 2.7): f(x) = x + LN(W x), the L2 reconstruction (Eq 4), eta(x) = eta_base sigmoid(.).
-    "ttt_linear": {"network": functools.partial(ResidualMemory, hidden=None, norm=True)},
+    "ttt_linear": {"network": ResidualMemory(hidden=None, norm=True)},
     # TTT-MLP: a 4x GELU MLP inside the residual and norm.
-    "ttt_mlp": {"network": functools.partial(ResidualMemory, hidden=4 * FEATURES, activation="gelu")},
+    "ttt_mlp": {"network": ResidualMemory(hidden=4 * FEATURES, activation="gelu")},
     # Titans' deep memory with momentum and forgetting (Eq 12-14).
-    "titans": {"network": functools.partial(MLPMemory, widths=(2 * FEATURES, FEATURES)),
+    "titans": {"network": MLPMemory(hidden=(2 * FEATURES,)),
                "momentum": Gate(), "retention": Gate(bias=-2.0)},
     # Moneta: the lp bias with p = 3 (Miras Eq 10, 24) and retention. Its gradient grows with the
     # error's square, so it steps a two-hundredth where the others step a tenth.
-    "moneta": {"network": functools.partial(ResidualMemory, hidden=4 * FEATURES),
+    "moneta": {"network": ResidualMemory(hidden=4 * FEATURES),
                "objective": Objective("lp", p=3.0), "retention": Gate(bias=-2.0),
                "learning_rate": Gate(scale=0.005)},
     # Yaad: Huber's bias (Miras Eq 13, 26).
-    "yaad": {"network": functools.partial(ResidualMemory, hidden=4 * FEATURES),
+    "yaad": {"network": ResidualMemory(hidden=4 * FEATURES),
              "objective": Objective("huber", delta=0.5), "retention": Gate(bias=-2.0)},
     # Nested Learning's self-modifying memory: a residual MLP (Eq 89), its own target (Eq 84), retention.
-    "self_modifying": {"network": functools.partial(ResidualMemory, hidden=2 * FEATURES, norm=False),
+    "self_modifying": {"network": ResidualMemory(hidden=2 * FEATURES, norm=False),
                        "target": "self_generated", "retention": Gate(bias=-2.0)},
     # Linear attention: a linear memory on the dot-product bias, every token (Nested Learning Eq 14-18).
-    "linear_attention": {"network": functools.partial(LinearMemory, features=FEATURES),
+    "linear_attention": {"network": LinearMemory(),
                          "objective": Objective("dot"), "chunk": 1},
 }
 """Each configuration with its paper's queries and keys l2-normalized (Titans Sec 4.4, TTT's views) and
@@ -63,7 +63,7 @@ def written(module: InContextMemory, *, dtype, segments=None, gradient=None):
     gradient at its chunk's start counted from its document's first token (`segments` `[S]`, one
     document where None), and the readout at `dtype`."""
     wide = jnp.promote_types(dtype, jnp.float32)
-    grad_net, read_net = module.network(dtype=wide), module.network(dtype=dtype)
+    grad_net, read_net = module.network.clone(dtype=wide), module.network.clone(dtype=dtype)
     firsts = np.arange(LENGTH) == 0 if segments is None else np.r_[True, segments[1:] != segments[:-1]]
 
     def gate(name, spec, x, p):
@@ -210,7 +210,7 @@ def test_a_decode_continues_the_full_pass():
 def test_a_zero_step_reads_the_initial_network():
     """With no step, every token reads the initial network over its query, as that network computes
     it over the queries, on par against float64 (check 1): the update adds exact zeros."""
-    module = InContextMemory(network=functools.partial(ResidualMemory, hidden=4 * FEATURES), heads=HEADS,
+    module = InContextMemory(network=ResidualMemory(hidden=4 * FEATURES), heads=HEADS,
                              head_features=FEATURES, learning_rate=Gate(value=0.0), output=False,
                              chunk=CHUNK)
 
@@ -250,13 +250,14 @@ def decoder(**fields):
     from model_support import TINY_DECODER
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.layer_plan import LayerKind
+    from dew.nn.mixers.memory import InContextMemoryMixer
 
-    memory = {"mixer": {"class": "memory", "fields": {
-        "network": "mlp", "widths": (16,), "activation": "silu", "momentum": True, "retention": True,
-        "heads": 2, "head_dim": 8, "chunk": 4, "learning_rate_scale": 0.5}}}
+    memory = InContextMemory(network=MLPMemory(hidden=(16,)), heads=2, head_features=8, chunk=4,
+                             learning_rate=Gate(scale=0.5), momentum=Gate(), retention=Gate(bias=-2.0))
     return CausalTransformer(**{"vocab_size": 37, **TINY_DECODER, "num_layers": 4, "dtype": "float32",
                                 "layer_types": ("memory", "attention") * 2,
-                                "kinds": {"memory": memory, "attention": {}}, **fields})
+                                "kinds": {"memory": LayerKind(mixer=InContextMemoryMixer(memory))}, **fields})
 
 
 def test_a_memory_layer_kind_trains_scans_and_decodes_in_a_decoder():
