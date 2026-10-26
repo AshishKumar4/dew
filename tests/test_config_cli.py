@@ -117,6 +117,32 @@ def test_a_python_run_whose_chain_is_unrecorded_trains_from_dew_train(tmp_path):
         RunConfig.load(str(tmp_path / "runs" / "unrecorded_run"))
 
 
+@pytest.mark.parametrize("built", ["in Python", "as a run states them"])
+def test_a_run_trainer_fit_trains_directly_says_why_no_record_rebuilds_it(tmp_path, built):
+    """A run that `Trainer.fit` trains directly writes a run.json no record rebuilds, naming each part
+    of the trainer a run's record states otherwise: its objective, built in Python, always, and an
+    optax optimizer and a JAX key where it was given them in place of an OptimConfig and an integer
+    seed. `RunConfig.load` refuses it, saying each."""
+    import jax
+    import optax
+    from test_run_budgets import OptimConfig, Pulled, chain, records
+
+    from dew.checkpoints import Checkpoints
+    from dew.training import Trainer
+
+    (x,) = records(0)
+    optimizer, key = ((optax.adam(0.1), jax.random.key(0)) if built == "in Python"
+                      else (OptimConfig(optimizer="adam", learning_rate=0.1), 0))
+    Trainer(Pulled(), optimizer, key=key, checkpoints=Checkpoints(str(tmp_path))).fit(
+        chain(x), steps=1, checkpoint_every=1)
+    record = json.loads((tmp_path / "run.json").read_text())
+    assert record["rebuildable"] is False
+    assert len(record["reasons"]) == (3 if built == "in Python" else 1)
+    with pytest.raises(ValueError) as refused:
+        RunConfig.load(str(tmp_path))
+    assert all(reason in str(refused.value) for reason in record["reasons"])
+
+
 def test_an_lm_run_over_images_is_refused():
     with pytest.raises(ValueError):
         LMRunConfig(data=images_of("tfds://oxford_flowers102", 32)).prepare()
@@ -232,10 +258,10 @@ def test_a_jepa_run_trains_its_lora_factors_and_ramps_their_momentum_over_its_up
     import jax
     import numpy as np
 
+    from dew.batch import FROZEN
     from dew.config import ObjectiveConfig, TrainerConfig
     from dew.data import TFDS, Loading, presets
     from dew.lora import LoRA
-    from dew.objectives.base import FROZEN
     from dew.registry import ModelConfig
 
     images = TFDS("dew_images", path=str(REPO_ROOT / "tests" / "fixtures" / "tfds" / "dew_images" / "1.0.0"),

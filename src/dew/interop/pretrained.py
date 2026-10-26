@@ -77,11 +77,11 @@ from dew.sampling.text import Sampling
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
+    from dew.distributed.placement import Layout, MeshSpec
     from dew.inference.tasks import SavedRun
     from dew.interop.torchax_fallback import TorchAdmission
     from dew.lora import Adapter, LoRA
     from dew.nn.cross_attention import CrossAttention
-    from dew.training.distributed import Layout, MeshSpec
 
 
 
@@ -145,8 +145,8 @@ def on_default_device(variables: Variables) -> Variables:
     """`variables` with each host leaf on JAX's default device as a `jnp` array is, uncommitted, so a
     jitted call reads it where it is and a placement moves it, one leaf at a time: a leaf's transfer
     completes before the next starts, and its host copy is released (a memory-mapped one's pages
-    evicted, `dew.training.host.evict`) once its device copy is written back in its place."""
-    from dew.training.host import placed_leaves
+    evicted, `dew.distributed.host.evict`) once its device copy is written back in its place."""
+    from dew.distributed.host import placed_leaves
 
     # A freshly loaded tree's nodes are its own plain dicts, written in place so that no host leaf
     # outlives its device copy.
