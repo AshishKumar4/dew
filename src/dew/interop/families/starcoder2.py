@@ -80,4 +80,6 @@ STARCODER2 = DecoderFamily(
     weight_path=partial(renamed_path, GPT_MLP),
     export_path=partial(renamed_name, GPT_MLP),
     preserve_source_layout=False,
+    padding_idx=True,
+    defaults={'max_position_embeddings': 4096},
 )

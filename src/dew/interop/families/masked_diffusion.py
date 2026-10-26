@@ -545,6 +545,7 @@ DIFFUSION_GEMMA_TEXT = DecoderFamily(
     preserve_source_layout=False,
     bidirectional=True,
     defaults=GEMMA4_DEFAULTS,
+    padding_idx=True,
 )
 
 DREAM = DecoderFamily(

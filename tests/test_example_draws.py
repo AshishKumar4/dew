@@ -11,21 +11,12 @@ import pytest
 import scipy.special
 from reference_error import assert_as_exact
 
+from dew._distributions import counter_key
 from dew.data.dataset import DataPartition
 from dew.diffusion import presets
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.nn.backbones import SimpleDiT
-from dew.objectives.base import (
-    EXAMPLE_ROWS,
-    EXAMPLE_STREAM,
-    Aux,
-    Objective,
-    Ratio,
-    Recorder,
-    Step,
-    example_stream,
-    stream,
-)
+from dew.objectives.base import EXAMPLE_ROWS, EXAMPLE_STREAM, Aux, Objective, Ratio, Recorder, Step, stream
 from dew.objectives.diffusion.few_step import MeanFlowObjective, ShortcutObjective
 from dew.training.distributed import marked
 from dew.training.transaction import example_places
@@ -79,7 +70,7 @@ def normal_truth(bits):
 def example_bits(key, examples, shape):
     """Each example's raw 32-bit words as its own stream draws them alone (`Step.sample`'s counter
     stream); a float32 normal reads one word an element, under a float64 truth too."""
-    base = jax.random.fold_in(example_stream(key), stream("noise"))
+    base = jax.random.fold_in(counter_key(key), stream("noise"))
     return [np.asarray(jax.random.bits(jax.random.fold_in(base, example), shape, jnp.uint32))
             for example in examples]
 
@@ -107,7 +98,7 @@ def test_each_example_draws_its_own_bits_under_any_key_implementation(impl):
 
     @jax.jit
     def alone(data):
-        base = jax.random.fold_in(example_stream(keyed(data)), stream("noise"))
+        base = jax.random.fold_in(counter_key(keyed(data)), stream("noise"))
         return jnp.stack([jax.random.normal(jax.random.fold_in(base, example), (3, WIDTH))
                           for example in range(4)])
 
@@ -143,7 +134,7 @@ def test_an_examples_draw_is_its_own_whatever_batch_it_is_drawn_in():
 
     @jax.jit
     def alone(data):
-        base = jax.random.fold_in(example_stream(jax.random.wrap_key_data(data)), stream("noise"))
+        base = jax.random.fold_in(counter_key(jax.random.wrap_key_data(data)), stream("noise"))
         return {f"{rows}x{shape}": jnp.stack([jax.random.normal(jax.random.fold_in(base, example), shape)
                                                for example in range(rows)]) for rows, shape in floats}
 

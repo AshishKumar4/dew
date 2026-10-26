@@ -4,6 +4,8 @@ Restoring the ranked training state is Dew's lifecycle; Orbax oracles storage an
 """
 import dataclasses
 import datetime
+import itertools
+from collections.abc import Iterator
 from typing import ClassVar
 
 import jax
@@ -18,9 +20,8 @@ from dew.checkpoints import Checkpoints, Keep, Metrics, Ranking
 from dew.data.dataset import DataPartition
 from dew.objectives.base import Aux, Objective, Shown
 from dew.telemetry.records import FitEnded
-from dew.training import Trainer
+from dew.training import Best, Plateau, Trainer
 from dew.training.evaluation import MetricScores
-from dew.training.trainer import Best, Plateau
 
 
 class Overfit(Objective):
@@ -53,6 +54,25 @@ class Value:
 
     def finalize(self, value):
         return value
+
+
+@dataclasses.dataclass
+class Scripted:
+    """A lower-is-better metric that scores each evaluation it finalizes `scores`' next value, whatever
+    it reads: a warming pass, which finalizes nothing, takes none."""
+    name: str
+    scores: Iterator[float]
+    shown: Shown = dataclasses.field(default_factory=lambda: Shown(better='lower'))
+    reads = TokenScores
+
+    def __call__(self, artifact, batch):
+        return 0.0
+
+    def merge(self, left, right):
+        return left
+
+    def finalize(self, value):
+        return next(self.scores)
 
 
 def data():
@@ -154,6 +174,36 @@ def test_an_aggregate_reads_a_split_on_its_own_cadence_as_nan_where_it_was_not_s
     run.checkpoints.wait()
     assert run.checkpoints.resolve('best:aggregate:0') == 1
     assert run.checkpoints.resolve('best:aggregate:1') == 2
+
+
+@pytest.mark.parametrize("end", ["stream", "plateau"])
+def test_a_run_that_ends_off_a_rare_suites_cadence_is_ranked_by_it_at_its_last_step(tmp_path, end):
+    """Whatever ends a run, its last step is scored by every suite before its checkpoint is saved: a
+    training stream that runs out after four batches, or a plateau that stops the run at step 4. Both
+    suites rise as training does, so each one's best is the last step, which the frequent suite ranks
+    there; the rare suite, scored every third step, would never rank it from a checkpoint saved before
+    that suite scored it."""
+    from dew.training import EvalSuite
+
+    metric = Value('value', Shown(better='lower'))
+
+    class Ending(Counting):
+        def __next__(self):
+            if self.index == 4:
+                raise StopIteration
+            batch = super().__next__()
+            return {**batch, 'validation': np.zeros(len(batch['x']), bool)}
+
+    loaded = dataclasses.replace(data(), train=lambda partition: Ending()) if end == "stream" else data()
+    run = trainer(tmp_path / 'run')
+    state = run.fit(loaded, steps=10, log_every=1, eval_every=1, metrics=[metric],
+                    validation={'often': data().val, 'rare': EvalSuite(data().val, (metric,), 3)},
+                    best=[Best(lambda scores: scores[('often', metric)], mode='max'),
+                          Best(lambda scores: scores[('rare', metric)], mode='max')],
+                    stop=Plateau(metric, evals=3, split='often') if end == "plateau" else None)
+    run.checkpoints.wait()
+    assert int(state.step) == 4
+    assert run.checkpoints.resolve('best:aggregate:0') == run.checkpoints.resolve('best:aggregate:1') == 4
 
 
 def test_an_aggregate_reads_a_training_scalar_whose_name_has_parts(tmp_path):
@@ -293,6 +343,36 @@ def test_ranked_loss_and_periodic_retention(tmp_path):
         checkpoints.wait()
     assert checkpoints.best == 2
     assert {entry.step for entry in checkpoints.kept()} == {2, 4, 5}
+
+
+def test_ranked_ties_keep_the_older_steps(tmp_path):
+    """A ranking's best `top` steps are Orbax's `BestN` over the steps it scored: of tied scores the
+    older steps are kept, and a step the ranking never scored is not among them. The run's own first
+    step ranks by its higher training loss."""
+    run = trainer(tmp_path / 'run', keep=Keep(latest=1))
+    state = run.fit(dataclasses.replace(data(), val=None), steps=1, log_every=1)
+    checkpoints = run.checkpoints
+    for step, loss in [(2, .5), (3, .5), (4, None), (5, .5), (6, .7), (7, .9)]:
+        ranking = None if loss is None else Ranking('train/loss', loss, 'min', top=2)
+        checkpoints.save(step, state.replace(step=jnp.int32(step)), None, ranking=ranking)
+        checkpoints.wait()
+    assert {entry.step for entry in checkpoints.kept()} == {2, 3, 7}
+
+
+def test_plateau_counts_an_improvement_as_flax_early_stopping_does(tmp_path):
+    """An evaluation improves on the best where Flax's `EarlyStopping` says it does, by more than
+    `min_delta` (`best - value > min_delta`): 1 - 2**-24 improves on 1 by 2**-24, more than a
+    `min_delta` of 2**-24 - 2**-60, though `1 - min_delta` rounds to it in float64. So a plateau of one
+    evaluation stops at the first evaluation that does not improve, the third, not the second."""
+    delta, value = 2.0 ** -24 - 2.0 ** -60, 1.0 - 2.0 ** -24
+    assert 1.0 - delta == value
+    metric = Scripted('value', itertools.chain([1.0], itertools.repeat(value)))
+    run = trainer(tmp_path / 'run')
+    state = run.fit(data(), steps=10, log_every=1, eval_every=1, checkpoint_every=1, metrics=[metric],
+                    stop=Plateau(metric, evals=1, min_delta=delta))
+    assert int(state.step) == 3
+    held = run.checkpoints.control(3)['plateau:val/value']
+    assert (held['best'], held['bad']) == (value, 1)
 
 
 def test_plateau_restores_patience_and_stops_after_eligible_evaluations(tmp_path):
