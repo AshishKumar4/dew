@@ -48,7 +48,7 @@ from jax.extend import core as jax_core
 from ..precision import at_least_fp32, rounded_operand
 from . import generation, selection, tuning
 from .generation import INHERENT
-from .templates import base, cost, mosaic, mosaic_sm80, mosaic_sm90
+from .templates import base, bundles, cost, mosaic
 from .templates.gemm import mosaic_gpu, mosaic_tpu
 from .templates.product import Product
 
@@ -709,7 +709,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
     def _families(self, ba) -> tuple[mosaic.Family, ...]:
         """The bundles the launch takes at its operands' dtype, interpreted or lowered (`_families`)."""
-        return _families(ba.arguments['tokens'].dtype, interpreted=bool(ba.arguments['interpret']))
+        return bundles.families(ba.arguments['tokens'].dtype, interpreted=bool(ba.arguments['interpret']))
 
     @abc.abstractmethod
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
@@ -1472,16 +1472,6 @@ GPU's launch keeps the place main's chooser gave it on an H100, where it measure
 def _bundle(config: mosaic_gpu.Tiles, dtype) -> mosaic.Family:
     """The bundle `config` runs on, for operands of `dtype` (`mosaic_gpu.family_of`)."""
     return mosaic_gpu.family_of(config, dtype)
-
-
-def _families(dtype, *, interpreted: bool) -> tuple[mosaic.Family, ...]:
-    """The bundles the Mosaic GPU launches generate tiles for at operands of `dtype`: Hopper's warpgroup
-    MMA's, and Ampere's mma.sync's where this JAX's layout inference places its tiles
-    (`mosaic_sm80.staging_solved`), or `interpreted` in a CPU process, whose interpreter takes them at
-    any JAX (a CPU's lowering for an assumed Ampere GPU takes them only where the GPU's own would); a
-    launch derives its tile on its target's (`_Mosaic._family`)."""
-    ampere = mosaic_sm80.staging_solved() or (interpreted and jax.default_backend() == 'cpu')
-    return mosaic_sm90.WGMMA, *((mosaic_sm80.Mma(jnp.dtype(dtype)),) if ampere else ())
 
 
 _GMMS = (MosaicGmm(), MosaicTpuGmm(), Gmm(), CutlassGmm())
