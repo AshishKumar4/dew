@@ -1054,12 +1054,19 @@ KL_EDGES = {
 
 
 def _numpy_kl(mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent):
-    """The KL, its JVP along every tangent at once and its VJPs, in NumPy's float32, every
-    difference, product and quotient of operands over their powers of two (`np.frexp`) and the power
-    restored once (`np.ldexp`), the textbook's range-safe evaluation, independent of Dew's."""
+    """The KL, its JVP along every tangent at once and its VJPs, in NumPy's float32, the textbook's
+    range-safe evaluation, independent of Dew's: each coordinate's difference over its own power of two
+    (`np.frexp`), every product of significands with its exponents added and a row's products aligned
+    to its largest before they sum, and each power restored once (`np.ldexp`)."""
     def apart(left, right):
-        power = np.maximum(np.frexp(np.max(np.abs(left), 1))[1], np.frexp(np.max(np.abs(right), 1))[1])
-        return np.ldexp(left, -power[:, None]) - np.ldexp(right, -power[:, None]), power
+        power = np.maximum(np.frexp(left)[1], np.frexp(right)[1])
+        part, own = np.frexp(np.ldexp(left, -power) - np.ldexp(right, -power))
+        return part, own + power
+
+    def contracted(left, right):
+        products, powers = left[0] * right[0], left[1] + right[1]
+        top = np.max(np.where(products != 0, powers, -4096), axis=1)
+        return np.sum(np.ldexp(products, powers - top[:, None]), axis=1), top
 
     def joined(left, left_power, right, right_power):
         left_power = np.where(left != 0, left_power, -4096)
@@ -1067,21 +1074,18 @@ def _numpy_kl(mean, reference, variance, mean_tangent, reference_tangent, varian
         power = np.maximum(left_power, right_power)
         return np.ldexp(np.ldexp(left, left_power - power) + np.ldexp(right, right_power - power), power)
 
-    difference, shift = apart(mean, reference)
+    difference = apart(mean, reference)
     level, spread = np.frexp(variance)
-    quotient, power = np.sum(difference**2, axis=1) / level, 2 * shift - spread - 1
-    moving, moving_shift = apart(mean_tangent, reference_tangent)
-    (part, part_power), (step, step_power) = np.frexp(difference), np.frexp(moving)
-    products, powers = part * step, part_power + step_power
-    top = np.max(np.where(products != 0, powers, -4096), axis=1)
-    along = np.sum(np.ldexp(products, powers - top[:, None]), axis=1)
+    total, top = contracted(difference, difference)
+    quotient, power = total / level, top - spread - 1
+    along, along_power = contracted(difference, apart(mean_tangent, reference_tangent))
     stretch, stretch_power = np.frexp(variance_tangent)
     scale, scale_power = np.frexp(cotangent)
     return {"KL": np.ldexp(quotient, power),
-            "JVP": joined(along / level, top + shift + moving_shift - spread,
+            "JVP": joined(along / level, along_power - spread,
                           -(quotient * stretch / level), power + stretch_power - spread),
-            "VJP to the mean": np.ldexp((scale / level)[:, None] * part,
-                                        (scale_power + shift - spread)[:, None] + part_power),
+            "VJP to the mean": np.ldexp((scale / level)[:, None] * difference[0],
+                                        (scale_power - spread)[:, None] + difference[1]),
             "VJP to the variance": -np.ldexp(scale * quotient / level, scale_power + power - spread)}
 
 
@@ -1111,14 +1115,22 @@ def _kl_derivatives(mean, reference, variance, mean_tangent, reference_tangent, 
     return {"KL": value, "JVP": moved, "VJP to the mean": to_mean, "VJP to the variance": to_variance}
 
 
+EDGE = 2.0**-16
+"""How near float32's least normal or its largest an exact value lies, relatively, where a few
+roundings may take a computed one across that bound (to a flushed subnormal or an infinity)."""
+
+
 def _kinds(exact):
-    """Each float64 value's place in float32's range by its binary exponent (`np.frexp`, `x = m *
-    2**e` with `m` in [1/2, 1)): "normal" a binade clear of the least normal (e from -124 to 128),
-    "over" past the largest (e from 129), "below" under half the least normal or zero (e to -126),
-    and "edge" the binade where one rounding may cross the least normal."""
-    exponent = np.frexp(exact)[1]
-    return np.where(exact == 0, "below", np.where(exponent >= 129, "over", np.where(
-        exponent >= -124, "normal", np.where(exponent <= -126, "below", "edge"))))
+    """Each float64 value's place in float32's range: "normal" from a few roundings above the least
+    normal, its whole lowest binade [2**-126, 2**-125) but that sliver, to a few below the largest;
+    "over" from 2**128, past every float32; "below" zero or under half the least normal, which rounds
+    to zero or a subnormal; and "edge" the slivers between, where a few roundings may cross a bound
+    (`EDGE`)."""
+    size = np.abs(exact)
+    tiny, largest = float(np.finfo(np.float32).tiny), float(np.finfo(np.float32).max)
+    return np.where(size >= 2.0**128, "over", np.where(
+        (size >= tiny * (1 + EDGE)) & (size <= largest * (1 - EDGE)), "normal", np.where(
+            (size == 0) | (size < tiny / 2), "below", "edge")))
 
 
 def _below_normal(values):
@@ -1145,28 +1157,40 @@ def _assert_kl_outputs(dew, numpy, truth, label):
         assert np.all(_below_normal(value[kinds == "below"])), name
 
 
+KL_LEVELS = (-126, -125, -100, -63, -26, -1, 0, 1, 26, 63, 100, 126, 127)
+"""The exponents a grid row's operands take: both of float32's edge binades, its middle, and between."""
+
+
 def _kl_grid():
-    """Rows over float32's exponent range in the mean, the reference, the variance, the mean's tangent,
-    the variance's and the cotangent, each at six exponents from -124 to 125, an inexact significand
-    each, two elements a row: means apart and tangents apart, or equal elements whose tangents cancel;
-    the reference's tangent 0.7 of the mean's. From -124, so a row's smaller element is still normal:
-    XLA:CPU reads a subnormal input as zero, which no float64 truth of the input's own value does."""
-    levels = (-124, -60, -1, 0, 60, 125)
-    grid = np.asarray(list(itertools.product(levels, repeat=6)))
-    significands = (1.3, 1.7, 1.1, 1.9, 1.5, 1.2)
-    mean, reference, variance, tangent, stretch, cotangent = (
-        np.ldexp(np.float32(significand), grid[:, index]) for index, significand in enumerate(significands))
+    """Rows of three coordinates over float32's exponent range in every operand and tangent: each value
+    a signed significand in [1, 2) at a level of `KL_LEVELS`, or zero, drawn apart per coordinate, every
+    level met in every operand; and in a third of the rows the mean's largest coordinate is the
+    reference's (a cancelling maximum, its survivors at their own levels), in another third the
+    tangents' largest cancel likewise. Every input is a normal float32 or zero: XLA:CPU reads a
+    subnormal input as zero, which no float64 truth of the input's own value does."""
+    rng = np.random.default_rng(1778)
+    rows = 3 * 4096
 
-    def pairs(first, second):
-        return np.stack([first, second], 1)
+    def drawn(shape, zeros=0.2):
+        levels = rng.choice(KL_LEVELS, shape)
+        values = np.ldexp(rng.uniform(1, 2, shape) * rng.choice((-1.0, 1.0), shape), levels)
+        return np.where(rng.random(shape) < zeros, 0.0, values).astype(np.float32)
 
-    apart = (pairs(mean, np.float32(0.8) * mean), pairs(reference, np.float32(0.6) * reference),
-             pairs(tangent, np.float32(0.6) * tangent))
-    cancelling = (pairs(mean, mean), pairs(reference, reference), pairs(tangent, -tangent))
-    means, references, tangents = (np.concatenate(pair).astype(np.float32)
-                                   for pair in zip(apart, cancelling, strict=True))
-    rows = [np.tile(column, 2).astype(np.float32) for column in (variance, stretch, cotangent)]
-    return means, references, rows[0], tangents, np.float32(0.7) * tangents, rows[1], rows[2]
+    mean, reference, mean_tangent, reference_tangent = (drawn((rows, 3)) for _ in range(4))
+    variance = np.abs(drawn((rows,), zeros=0)).astype(np.float32)
+    variance_tangent, cotangent = drawn((rows,)), drawn((rows,), zeros=0.05)
+    cancelling, tangents = slice(0, rows // 3), slice(rows // 3, 2 * rows // 3)
+    mean[cancelling, 0] = np.ldexp(np.float32(1.5), rng.choice((126, 127, 100, 0), rows // 3))
+    reference[cancelling, 0] = mean[cancelling, 0]
+    mean_tangent[tangents, 0] = np.ldexp(np.float32(1.25), rng.choice((127, 126, 63), rows // 3))
+    reference_tangent[tangents, 0] = mean_tangent[tangents, 0]
+    # Every level in every operand at least once, in a row of its own.
+    for index, level in enumerate(KL_LEVELS):
+        for operand in (mean, reference, mean_tangent, reference_tangent):
+            operand[2 * rows // 3 + index, index % 3] = np.ldexp(np.float32(1.75), level)
+        for operand in (variance, variance_tangent, cotangent):
+            operand[2 * rows // 3 + index] = np.ldexp(np.float32(1.75), level)
+    return mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent
 
 
 @pytest.mark.parametrize("compiled", [False, True], ids=["eager", "jit"])
@@ -1200,6 +1224,8 @@ REVIEWED = {
         [[2.0**-63]], [[0]], [1], [[2.0**-64]], [[0]], [-1], [1]),
     "a difference past the largest": (
         [[2.0**127]], [[-2.0**127]], [np.finfo(np.float32).max], [[1]], [[0]], [0], [1]),
+    "train 201's cancelling maximum": (
+        [[2.0**126, 2.0**-26]], [[2.0**126, 0]], [2.0**-52], [[0, 2.0**-26]], [[0, 0]], [0], [1]),
     "a difference below the least": (
         [[(1 + 2.0**-23) * 2.0**-126]], [[2.0**-126]], [2.0**-126], [[2.0**127]], [[0]], [0], [2.0**127]),
 }
