@@ -40,13 +40,18 @@ def run_steps(loader: Loader, steps: int | None, epochs: int | None, tokens: int
     return loader.epoch_steps(epochs, accumulation)
 
 
-def run_tokens(loader: Loader, tokens: int | None, *, counts_tokens: bool) -> int | None:
+def budget_tokens(loader: Loader, tokens: int | None) -> int | None:
     """The run's token budget: `tokens`, or where a schedule's last stage ends the data at its tokens
-    (`dew.data.pipeline.schedule`), the first reached; refused where the objective counts none."""
-    if (tokens is not None or loader.token_ends is not None) and not counts_tokens:
-        raise ValueError("tokens= and a schedule's stages need an objective that counts real tokens")
+    (`dew.data.pipeline.schedule`), the first reached; what a fit's and a config's run length read."""
     last = None if loader.token_ends is None else loader.token_ends[-1]
     return last if tokens is None else tokens if last is None else min(tokens, last)
+
+
+def run_tokens(loader: Loader, tokens: int | None, *, counts_tokens: bool) -> int | None:
+    """The run's token budget (`budget_tokens`), refused where the objective counts no tokens."""
+    if (tokens is not None or loader.token_ends is not None) and not counts_tokens:
+        raise ValueError("tokens= and a schedule's stages need an objective that counts real tokens")
+    return budget_tokens(loader, tokens)
 
 
 @dataclasses.dataclass(frozen=True)
