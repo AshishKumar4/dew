@@ -389,7 +389,8 @@ def test_clip_image_transform_matches_the_reference_processor(config, height, wi
         return (crop * processor.rescale_factor - mean) / std
 
     assert_as_exact(as_given(lambda pixels: np.asarray(transform(pixels))),
-                    lambda pixels: processor(list(pixels), return_tensors="np")["pixel_values"], draw,
+                    as_given(lambda pixels: processor(list(pixels), return_tensors="np")["pixel_values"]),
+                    draw,
                     f"image transform {height}x{width}", seeds=SEEDS['image transform'], truth_fn=normalized)
 
 

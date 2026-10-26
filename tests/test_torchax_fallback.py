@@ -26,6 +26,7 @@ import torch
 import transformers
 from jax.sharding import PartitionSpec as P
 from reference_error import (
+    as_given,
     assert_as_exact,
     assert_as_exact_as_the_reference,
     equations,
@@ -299,6 +300,7 @@ def test_a_head_trains_as_transformers_does_by_what_it_is(head, tokens, tmp_path
 
     reference_model = copy.deepcopy(model).float()
 
+    @as_given
     def reference_fn(ids, cotangent):
         return torch_step(reference_model, ids, cotangent, getattr(torch, stored))
 
@@ -360,8 +362,8 @@ def test_an_unregistered_causal_lm_loads_as_transformers_own_forward(tokens, tmp
         with float64():
             return torch_step(wide, ids, cotangent, torch.float64)
 
-    assert_as_exact(dew_fn, lambda ids, cotangent: torch_step(reference, ids, cotangent), token_draws(tokens),
-                    "tier 3 cohere LM step", seeds=UNREGISTERED_SEEDS, truth_fn=truth_fn)
+    assert_as_exact(dew_fn, as_given(lambda ids, cotangent: torch_step(reference, ids, cotangent)),
+                    token_draws(tokens), "tier 3 cohere LM step", seeds=UNREGISTERED_SEEDS, truth_fn=truth_fn)
 
 
 PACKED_SEEDS = {"cohere": 256, "cohere2": 256}
@@ -455,6 +457,7 @@ def test_a_packed_row_trains_each_document_as_transformers_runs_it_alone(family,
         with float64():
             return documents_alone(wide, ids, segments, valid, cotangent, torch.float64)
 
+    @as_given
     def theirs(ids, segments, valid, cotangent):
         return documents_alone(reference, ids, segments, valid, cotangent)
 
@@ -525,7 +528,8 @@ def test_a_training_call_that_drops_attention_reads_each_documents_real_tokens(t
         with float64():
             return alone(wide, ids, segments, valid)
 
-    assert_as_exact(ours, lambda ids, segments, valid, _: alone(model, ids, segments, valid), packed_rows,
+    assert_as_exact(ours, as_given(lambda ids, segments, valid, _: alone(model, ids, segments, valid)),
+                    packed_rows,
                     "tier 3 cohere2 dropping call", seeds=DROPPING_SEEDS, truth_fn=truth)
 
 
@@ -596,6 +600,7 @@ def test_bf16_compute_gradients_are_as_exact_as_torchs_bf16(family, tokens, tmp_
 
     reference_model = copy.deepcopy(model)
 
+    @as_given
     def reference_fn(ids, cotangent):
         return torch_step(reference_model, ids, cotangent, torch.bfloat16)
 
