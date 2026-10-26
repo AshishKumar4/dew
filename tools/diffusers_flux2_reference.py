@@ -39,8 +39,8 @@ from pathlib import Path
 import numpy as np
 import torch
 from diffusers_reference_helpers import perturb, recording, saved_pipeline, tiny_qwen3_encoder
-from torch_precision import float64, float64_twin
 from reference_releases import RELEASES
+from torch_precision import float64, float64_twin
 
 DIFFUSERS = RELEASES["diffusers-0.40"]["diffusers"]
 BASE = {"patch_size": 1, "in_channels": 8, "num_layers": 2, "num_single_layers": 2, "attention_head_dim": 16,

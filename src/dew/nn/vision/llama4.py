@@ -3,21 +3,19 @@
 """
 
 import dataclasses
-import functools
 from collections.abc import Mapping
 
 import jax
-import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew import records
-from dew.nn.attention import LayerNorm
+from dew import _records
+from dew.interop.weights import in_params
 from dew.nn.dense import Dense
-from dew.nn.inputs import AttentionMetadata
 from dew.nn.precision import float32_dot_general
-from dew.nn.text_encoders import _encoder_layer_path, checked_image, clip_layer
-from dew.nn.vision.vit import MergeProjector
+from dew.nn.scan_orders import patchify
+from dew.nn.text_encoders import _encoder_layer_path
+from dew.nn.vision.vit import LearnedPositions, MergeProjector, SpecialTokens, VisionTransformer, ViTLayout
 from dew.registry import Record
 
 from .common import (
@@ -29,29 +27,24 @@ from .common import (
     _side,
     _vision_section,
     head_width,
-    in_params,
     rope_base,
     trunk_geometry,
 )
 
 
 def pixel_shuffle(patches: jax.Array, ratio: float) -> jax.Array:
-    """Space to depth: each ratio-by-ratio block becomes one thicker token.
+    """Space to depth: each block of `1 / ratio` patches a side of the square
+    patch grid becomes one thicker token, its patches row by row (`patchify`).
 
     The inverse of a pixel shuffle at the same ratio (modeling_llama4.py,
     pixel_shuffle): tokens shrink by ratio squared and channels grow by it.
     """
     batch, count, channels = patches.shape
     side = round(count ** 0.5)
-    grown = round(channels / ratio ** 2)
-    if abs(grown * ratio ** 2 - channels) > 1e-6:
-        raise ValueError(
-            f"{channels} channels do not split over a shuffle ratio of {ratio}")
-    grid = patches.reshape(batch, side, side, channels)
     block = round(1 / ratio)
-    shuffled = grid.reshape(batch, side // block, block, side // block, block, channels)
-    shuffled = shuffled.transpose(0, 1, 3, 2, 4, 5)
-    return shuffled.reshape(batch, (side // block) ** 2, grown)
+    if block * ratio != 1:
+        raise ValueError(f"a shuffle ratio of {ratio} does not gather whole blocks of patches")
+    return patchify(patches.reshape(batch, side, side, channels), block)
 
 
 class Llama4VisionTransformer(nn.Module):
@@ -70,35 +63,8 @@ class Llama4VisionTransformer(nn.Module):
 
     def setup(self):
         cfg = self.config
-        head = head_width(cfg.hidden_size, cfg.num_heads)
-        grid = cfg.image_size // cfg.patch_size
-        if grid * cfg.patch_size != cfg.image_size:
-            raise ValueError(
-                f"image_size ({cfg.image_size}) must tile patch_size "
-                f"({cfg.patch_size})")
-        self.patch_embedding = Dense(
-            cfg.hidden_size, use_bias=False, dtype=self.dtype,
-            precision=self.precision, name="patch_embedding", dot_general=float32_dot_general)
-        self.class_embedding = self.param(
-            "class_embedding", nn.initializers.normal(cfg.hidden_size ** -0.5),
-            (cfg.hidden_size,))
-        self.positional_embedding = self.param(
-            "positional_embedding", nn.initializers.normal(cfg.hidden_size ** -0.5),
-            (grid * grid + 1, cfg.hidden_size))
-        norm = functools.partial(LayerNorm, epsilon=cfg.layer_norm_eps,
-                                 dtype=self.dtype)
-        self.layernorm_pre = norm(name="layernorm_pre")
-        # The grid's rotary turns adjacent pairs, the x angles over the first
-        # half of each head and the y angles over the second
-        # (modeling_llama4.py, Llama4VisionRotaryEmbedding).
-        side = head // 2
-        self.layers = [
-            clip_layer(cfg.hidden_size, cfg.num_heads, cfg.intermediate_size, grid * grid + 1,
-                       activation="gelu_exact", eps=cfg.layer_norm_eps, rotary_axes=(side, side),
-                       rotary_pairs="adjacent", rope_theta=cfg.rope_theta, dtype=self.dtype,
-                       precision=self.precision, name=f"layers_{index}")
-            for index in range(cfg.num_layers)]
-        self.layernorm_post = norm(name="layernorm_post")
+        self.trunk = VisionTransformer(cfg.layout(), dtype=self.dtype, precision=self.precision)
+        nn.share_scope(self, self.trunk)
         # The reference's adapter maps the shuffled patches through two bias-free maps with an
         # exact GELU after each, the last one included (modeling_llama4.py, Llama4VisionMLP2).
         self.vision_adapter = MergeProjector(
@@ -108,29 +74,7 @@ class Llama4VisionTransformer(nn.Module):
 
     def __call__(self, pixel_values) -> jax.Array:
         cfg = self.config
-        pixel_values = checked_image(pixel_values, cfg.num_channels, cfg.image_size)
-        batch, channels = pixel_values.shape[:2]
-        grid = cfg.image_size // cfg.patch_size
-        patches = pixel_values.reshape(
-            batch, channels, grid, cfg.patch_size, grid, cfg.patch_size)
-        patches = patches.transpose(0, 2, 4, 1, 3, 5)
-        hidden_states = self.patch_embedding(
-            patches.reshape(batch, grid * grid, channels * cfg.patch_size ** 2))
-        class_token = jnp.broadcast_to(
-            self.class_embedding.astype(hidden_states.dtype), (batch, 1, cfg.hidden_size))
-        hidden_states = jnp.concatenate([hidden_states, class_token], axis=1)
-        hidden_states = hidden_states + self.positional_embedding.astype(hidden_states.dtype)
-        hidden_states = self.layernorm_pre(hidden_states)
-        # Each patch sits at its column and row plus one, row-major, and the
-        # class token last at the origin, which turns by nothing
-        # (Llama4VisionRotaryEmbedding._compute_freqs_ci).
-        index = jnp.arange(grid * grid)
-        positions = jnp.concatenate([jnp.stack([index % grid + 1, index // grid + 1], axis=-1),
-                                     jnp.zeros((1, 2), index.dtype)])
-        metadata = AttentionMetadata(rotary_positions=positions[None])
-        for layer in self.layers:
-            hidden_states = layer(hidden_states, attention_metadata=metadata)
-        hidden_states = self.layernorm_post(hidden_states)[:, :-1, :]
+        hidden_states = self.trunk(pixel_values)
         return self.vision_adapter(pixel_shuffle(hidden_states, cfg.pixel_shuffle_ratio))
 
 
@@ -151,6 +95,22 @@ class Llama4Vision(TowerBase):
     projector_input_dim: int = 4096
     projector_output_dim: int = 4096
 
+    def layout(self) -> ViTLayout:
+        initialize = nn.initializers.normal(self.hidden_size ** -0.5)
+        return ViTLayout(
+            depth=self.num_layers, hidden_size=self.hidden_size, num_heads=self.num_heads,
+            num_kv_heads=self.num_heads, head_dim=head_width(self.hidden_size, self.num_heads),
+            intermediate_size=self.intermediate_size, activation="gelu_exact", in_channels=self.num_channels,
+            patch_size=self.patch_size, temporal_patch_size=1, spatial_merge_size=1,
+            norm_type="fast_layer", norm_eps=self.layer_norm_eps, norm_bias=True, mlp_bias=True,
+            packed=False, patch_bias=False, attention=("full",) * self.num_layers,
+            order=("patches",) * self.num_layers, sinks=(False,) * self.num_layers,
+            positions=LearnedPositions(self.image_size // self.patch_size, "fixed", initializer=initialize),
+            special_tokens=SpecialTokens("last", initializer=initialize), image_size=self.image_size,
+            rotary="adjacent", pre_norm=True, post_norm="layer", outer_norm_eps=self.layer_norm_eps,
+            output="patches", rope_theta=self.rope_theta, rotary_columns_first=True, rotary_origin=1,
+            merge_blocks=False)
+
     def build(self) -> nn.Module:
         return Llama4VisionTransformer(self)
 
@@ -159,7 +119,7 @@ class Llama4Vision(TowerBase):
                              channels=self.num_channels)
 
 
-class Llama4ProjectorModule(nn.Module):
+class Llama4Projector(ProjectorBase):
     """Tower output to text width: one bias-free map."""
 
     text_width: int
@@ -175,27 +135,17 @@ class Llama4ProjectorModule(nn.Module):
         return self.linear(image_features)
 
 
-@dataclasses.dataclass(frozen=True)
-class Llama4Projector(ProjectorBase):
-    """Llama 4's projector fields: the text width."""
-
-    text_width: int
-
-    def build(self) -> nn.Module:
-        return Llama4ProjectorModule(text_width=self.text_width)
-
-
 # Llama 4 names its layers' norms and maps as the decoder block does.
 _LAYER_NORMS = {name: name for name in ("input_layernorm", "post_attention_layernorm")}
 _LAYER_PROJECTIONS = {name: name for name in ("q_proj", "k_proj", "v_proj", "o_proj")}
 _LLAMA4_VISION_TENSORS = {
-    "patch_embedding.linear.weight": ("patch_embedding", "kernel"),
-    "class_embedding": ("class_embedding",),
-    "positional_embedding_vlm": ("positional_embedding",),
-    "layernorm_pre.weight": ("layernorm_pre", "scale"),
-    "layernorm_pre.bias": ("layernorm_pre", "bias"),
-    "layernorm_post.weight": ("layernorm_post", "scale"),
-    "layernorm_post.bias": ("layernorm_post", "bias"),
+    "patch_embedding.linear.weight": ("patch_embed", "kernel"),
+    "class_embedding": ("class_token",),
+    "positional_embedding_vlm": ("position_table", "embedding"),
+    "layernorm_pre.weight": ("pre_norm", "scale"),
+    "layernorm_pre.bias": ("pre_norm", "bias"),
+    "layernorm_post.weight": ("post_norm", "scale"),
+    "layernorm_post.bias": ("post_norm", "bias"),
     "vision_adapter.mlp.fc1.weight": ("vision_adapter", "fc1", "kernel"),
     "vision_adapter.mlp.fc2.weight": ("vision_adapter", "fc2", "kernel"),
 }
@@ -204,7 +154,7 @@ _LLAMA4_VISION_TENSORS = {
 def llama4_vision_path(hf_name: str) -> tuple[str, ...] | None:
     """One Llama 4 vision tensor name into its path in a trunk tree."""
     path = _LLAMA4_VISION_TENSORS.get(hf_name) or _encoder_layer_path(
-        hf_name.split("."), "model", _LAYER_NORMS, _LAYER_PROJECTIONS)
+        hf_name.split("."), "model", _LAYER_NORMS, _LAYER_PROJECTIONS, block="blocks")
     if path is None:
         raise ValueError(f"unknown tensor name {hf_name!r}")
     return path
@@ -230,10 +180,10 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Record:
             "middle layer this trunk never returns")
     if vision.get("multi_modal_projector_bias", False):
         raise ValueError("multi_modal_projector_bias=True needs a projector bias this map lacks")
-    output_dim = records.integer(
+    output_dim = _records.integer(
         vision.get("vision_output_dim", vision.get("projector_output_dim", 0)), "vision_output_dim"
     )
-    if output_dim != records.integer(vision.get("projector_output_dim", output_dim), "projector_output_dim"):
+    if output_dim != _records.integer(vision.get("projector_output_dim", output_dim), "projector_output_dim"):
         raise ValueError(
             f"vision_output_dim ({output_dim}) disagrees with projector_output_dim "
             f"({vision.get('projector_output_dim')}), the adapter's width")
@@ -241,15 +191,15 @@ def translate_llama4_vision_config(hf_config: Mapping[str, object]) -> Record:
         "class": "llama4", "fields": {
         **trunk_geometry(vision),
         "image_size": _side(vision.get("image_size", 336), "image_size"),
-        "patch_size": records.integer(vision.get("patch_size", 14), "patch_size"),
-        "num_channels": records.integer(vision.get("num_channels", 3), "num_channels"),
-        "layer_norm_eps": records.number(
+        "patch_size": _records.integer(vision.get("patch_size", 14), "patch_size"),
+        "num_channels": _records.integer(vision.get("num_channels", 3), "num_channels"),
+        "layer_norm_eps": _records.number(
             vision.get("norm_eps", vision.get("layer_norm_eps", 1e-5)), "norm_eps"
         ),
         "rope_theta": rope_base(vision, 10000.0),
-        "pixel_shuffle_ratio": records.number(vision.get("pixel_shuffle_ratio", 0.5), "pixel_shuffle_ratio"),
-        "projector_input_dim": records.integer(vision["projector_input_dim"], "projector_input_dim"),
-        "projector_output_dim": records.integer(vision["projector_output_dim"], "projector_output_dim"),
+        "pixel_shuffle_ratio": _records.number(vision.get("pixel_shuffle_ratio", 0.5), "pixel_shuffle_ratio"),
+        "projector_input_dim": _records.integer(vision["projector_input_dim"], "projector_input_dim"),
+        "projector_output_dim": _records.integer(vision["projector_output_dim"], "projector_output_dim"),
     }}
 
 

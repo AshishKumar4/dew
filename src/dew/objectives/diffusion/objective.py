@@ -27,8 +27,9 @@ import numpy as np
 import optax
 from flax import linen as nn
 
+from dew._coordination import agreed, collective_host
 from dew.artifacts import ImageGrid, VideoGrid
-from dew.coordination import agreed, collective_host
+from dew.batch import FROZEN, Batch, Variables, merge, thaw, under
 from dew.diffusion.presets import Preset, build_process
 from dew.diffusion.process import Process, aligned_conditions
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
@@ -53,22 +54,16 @@ from dew.nn.protocols import (
     RequiresText,
 )
 from dew.objectives.base import (
-    FROZEN,
     OMITTED,
     TEACHER,
     Aux,
-    Batch,
     EMASpec,
     Objective,
     Omitted,
     ProgramModule,
     Ratio,
     Step,
-    Variables,
-    merge,
     model_rngs,
-    thaw,
-    under,
 )
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, Alignment
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, PERCEPTUAL, EndToEnd
@@ -507,8 +502,8 @@ class DiffusionObjective(Objective[Ratio]):
     def task_settings(self) -> ImageSettings:
         """The process, input encoders, autoencoder and sampling convention."""
         from dew.registry import to_record
-        return ImageSettings(self.process, self.inputs.to_json(),
-                             None if self.autoencoder is None else self.autoencoder.to_json(),
+        return ImageSettings(self.process, to_record(self.inputs, InputSpec),
+                             None if self.autoencoder is None else to_record(self.autoencoder, AutoEncoder),
                              self.solver, self.guidance, self.steps,
                              # A tuned autoencoder's weights and statistics sit in the run's own tree.
                              None if self.end_to_end is None else to_record(self.end_to_end, EndToEnd),
@@ -893,7 +888,7 @@ class DiffusionObjective(Objective[Ratio]):
         """Sample the batch's conditions on every rank, agreeing at each phase.
 
         The weights are the EMA copy when the step carries one and it is not
-        the objective's reference (`_ema_is_reference`), else the live ones.
+        the objective's reference (`ema_is_reference`), else the live ones.
         `limit` caps the rows drawn, which is what a preview takes. Returns
         the samples and the condition tokens behind them.
         """

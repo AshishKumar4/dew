@@ -19,6 +19,7 @@ import pytest
 from reference_error import assert_as_exact, without_ynn
 from test_decision_objective import SPECIALS, TOKENIZER
 
+from dew.batch import part, thaw
 from dew.decision import Choice
 from dew.decision.head import LabelReadout, SlotReadout
 from dew.decision.layout import DecisionInputs, Labels, StateFirstLayout
@@ -28,7 +29,6 @@ from dew.interop import Pretrained
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.protocols import OutputTable
-from dew.objectives.base import part, thaw
 from dew.quantization import InputQuantizer
 
 LLAMA = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"

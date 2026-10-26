@@ -40,8 +40,8 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "tools"))
 import lint_scopes as scopes
 
 DEW_GROUPS: list[tuple[str, list[str]]] = [
-    ("Top level", ["dew"]),
-    ("Training", ["dew.training", "dew.training.budget", "dew.training.state", "dew.optim", "dew.training.quantization",
+    ("Top level", ["dew", "dew.batch", "dew.mesh"]),
+    ("Training", ["dew.training", "dew.training.budget", "dew.state", "dew.optim", "dew.training.quantization",
                   "dew.training.runtime", "dew.training.distributed", "dew.training.posthoc"]),
     ("Objectives", ["dew.objectives", "dew.objectives.base", "dew.objectives.lm", "dew.objectives.diffusion",
                     "dew.objectives.diffusion.adversarial",
@@ -70,6 +70,7 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                 "dew.nn.backbones.qwen_image", "dew.nn.backbones.sd3", "dew.nn.backbones.wan",
                 "dew.nn.backbones.z_image", "dew.nn.mp",
                 "dew.nn.diffusion_gemma", "dew.nn.gemma3n", "dew.nn.multimodal", "dew.nn.cross_attention",
+                "dew.nn.memory",
                 "dew.nn.autoencoders", "dew.nn.autoencoders.pretrained", "dew.nn.categorical", "dew.nn.inputs", "dew.nn.mixers.attention", "dew.nn.mlp", "dew.nn.protocols", "dew.nn.kernels", "dew.nn.sharding",
                 "dew.lora"]),
     ("Diffusion and sampling", ["dew.diffusion", "dew.diffusion.process", "dew.diffusion.schedules",
@@ -84,7 +85,7 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
     ("Conditions and evaluation", ["dew.inputs", "dew.inputs.encoders", "dew.eval", "dew.eval.harness"]),
     ("Configuration", ["dew.config", "dew.config.lm", "dew.config.jepa", "dew.config.diffusion",
                        "dew.config.sweep"]),
-    ("Utilities", ["dew.rl", "dew.artifacts", "dew.coordination", "dew.records", "dew.telemetry.profile",
+    ("Utilities", ["dew.rl", "dew.artifacts", "dew.distributed", "dew.telemetry.profile",
                    "dew.telemetry.benchmark", "dew.figures"]),
 ]
 # Places that show users Dew code; every Dew name they use must resolve to the
@@ -230,7 +231,7 @@ def public_entries(module: griffe.Module) -> Iterator[Entry]:
 
 
 def is_flax_module(cls: griffe.Class) -> bool:
-    return any(re.search(r"(^|\.)(nn\.)?Module$", str(base)) and "linen" in str(base) or str(base) == "nn.Module"
+    return any((re.search(r"(^|\.)(nn\.)?Module$", str(base)) and "linen" in str(base)) or str(base) == "nn.Module"
                for base in cls.bases)
 
 

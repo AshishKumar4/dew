@@ -17,9 +17,9 @@ import jax.numpy as jnp
 import numpy as np
 from flax.traverse_util import flatten_dict
 
+from dew.batch import Variables
 from dew.interop.safetensors_io import SEPARATOR, flatten, read_file, unflatten, write_file
 from dew.interop.weights import ParamTree
-from dew.objectives.base import Variables
 
 # The FID feature extractor's weights, the jax-fid pickle mirrored on the Hub
 # with a pinned revision and digest. The bytes are byte-identical to the

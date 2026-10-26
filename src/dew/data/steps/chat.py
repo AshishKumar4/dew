@@ -10,8 +10,9 @@ from typing import Literal
 import grain.python as grain
 import numpy as np
 
+from dew._records import integer, record
+from dew.batch import Batch
 from dew.data.chat import ROLES_KEY, Role
-from dew.data.dataset import Batch
 from dew.data.facts import shaped, unshaped
 from dew.data.pipeline import Rejected
 from dew.data.prompts import (
@@ -29,7 +30,6 @@ from dew.data.prompts import (
     _utf8,
 )
 from dew.data.text import ByteTokenizer, HFTokenizer, tokenizer_for
-from dew.records import integer, record
 
 
 @dataclasses.dataclass(frozen=True)

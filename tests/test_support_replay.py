@@ -16,10 +16,10 @@ import optax
 import pytest
 from affine_run import dataset
 
+from dew.batch import FROZEN
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.protocols import OutputTable
-from dew.objectives.base import FROZEN
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_cross_entropy, logits_support_log_probs, model_logits
 from dew.objectives.rl.grpo import GRPOObjective

@@ -34,6 +34,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from dew.batch import FROZEN, merge, select, thaw, without
 from dew.inference.banks import (
     assembled,
     bank_sharding,
@@ -43,10 +44,9 @@ from dew.inference.banks import (
     narrowed,
     one_layer,
 )
+from dew.mesh import batch_axes
 from dew.nn.backbones.layer_plan import group_name, layer_index
 from dew.nn.kernels.options import program
-from dew.nn.sharding import batch_axes
-from dew.objectives.base import FROZEN, merge, select, thaw, without
 from dew.training.distributed import batch_shardings
 from dew.training.host import transfer
 from dew.training.memory import device_tokens, step_compiler_options

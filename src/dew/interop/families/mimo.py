@@ -26,7 +26,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from functools import partial
 
-from dew import records
+from dew import _records
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     PLAIN_SPELLING,
@@ -74,7 +74,7 @@ def _rope(hf: Mapping[str, object], kind: str) -> tuple[float, float, Ramp | Non
     its base, or the released flat fields with the reference's defaults and no ramp."""
     nested = hf.get('rope_parameters')
     if nested is not None:
-        entry = records.record(records.record(nested, 'rope_parameters').get(kind),
+        entry = _records.record(_records.record(nested, 'rope_parameters').get(kind),
                                f'rope_parameters {kind}')
         # MiMoV2FlashRotaryEmbedding indexes each entry's base and builds the kind's rope_type over
         # the rotated dims (modeling_mimo_v2_flash.py:80-111): its plain initializer defaults an
@@ -84,20 +84,20 @@ def _rope(hf: Mapping[str, object], kind: str) -> tuple[float, float, Ramp | Non
         plain = entry.get('rope_type', entry.get('type', 'default')) in ('default', 'none')
         theta, factor, ramp = partial_rope_entry(
             entry, f'rope_parameters.{kind}', default_factor=0.334 if plain else 1.0,
-            max_pos=None if stated is None else records.integer(stated, 'max_position_embeddings'))
+            max_pos=None if stated is None else _records.integer(stated, 'max_position_embeddings'))
         return theta, factor, nested_ramp(ramp)
     theta = hf.get('rope_theta' if kind == 'full_attention' else 'swa_rope_theta', _FLASH_THETAS[kind])
-    return (records.number(theta, 'rope_theta'),
-            records.number(hf.get('partial_rotary_factor', 0.334), 'partial_rotary_factor'), None)
+    return (_records.number(theta, 'rope_theta'),
+            _records.number(hf.get('partial_rotary_factor', 0.334), 'partial_rotary_factor'), None)
 
 
 def _check_released(hf: Mapping[str, object], used: set[str], *, layers: tuple[str, ...],
                     sparse: tuple[int, ...], kv_heads: int) -> None:
     """Accept the authors' own fields where they state what transformers
     computes from its defaults, and refuse any that state another model."""
-    heads = records.integer(hf['num_attention_heads'], 'num_attention_heads')
-    head_dim = records.integer(hf.get('head_dim', 192), 'head_dim')
-    value_dim = records.integer(hf.get('v_head_dim', 128), 'v_head_dim')
+    heads = _records.integer(hf['num_attention_heads'], 'num_attention_heads')
+    head_dim = _records.integer(hf.get('head_dim', 192), 'head_dim')
+    value_dim = _records.integer(hf.get('v_head_dim', 128), 'v_head_dim')
     window = hf.get('sliding_window', 128)
     expected = {
         'hybrid_layer_pattern': [0 if kind == 'full_attention' else 1 for kind in layers],
@@ -117,17 +117,17 @@ def _check_released(hf: Mapping[str, object], used: set[str], *, layers: tuple[s
 
 
 def _mimo_v2_flash_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
-    count = records.integer(hf['num_hidden_layers'], 'num_hidden_layers')
-    layers = (records.strings(hf['layer_types'], 'layer_types') if hf.get('layer_types') is not None
+    count = _records.integer(hf['num_hidden_layers'], 'num_hidden_layers')
+    layers = (_records.strings(hf['layer_types'], 'layer_types') if hf.get('layer_types') is not None
               else _default_layers(count))
     if set(layers) - set(_KINDS) or len(layers) != count:
         refuse(f'layer_types {list(layers)!r}', 'one full_attention or sliding_attention entry per layer')
-    schedule = (records.strings(hf['mlp_layer_types'], 'mlp_layer_types')
+    schedule = (_records.strings(hf['mlp_layer_types'], 'mlp_layer_types')
                 if hf.get('mlp_layer_types') is not None else ('dense',) + ('sparse',) * (count - 1))
     if set(schedule) - {'dense', 'sparse'} or len(schedule) != count:
         refuse(f'mlp_layer_types {list(schedule)!r}', 'one dense or sparse entry per layer')
     sparse = tuple(index for index, kind in enumerate(schedule) if kind == 'sparse')
-    kv_heads = records.integer(hf.get('num_key_value_heads', 4), 'num_key_value_heads')
+    kv_heads = _records.integer(hf.get('num_key_value_heads', 4), 'num_key_value_heads')
     _check_released(hf, used, layers=layers, sparse=sparse, kv_heads=kv_heads)
     (full_theta, full_factor, full_ramp), (local_theta, local_factor, local_ramp) = (
         _rope(hf, kind) for kind in _KINDS)
@@ -137,7 +137,7 @@ def _mimo_v2_flash_config(hf: Mapping[str, object], used: set[str]) -> DecoderFi
                           'rms_norm_eps': hf.get('rms_norm_eps', hf.get('layernorm_epsilon', 1e-5))},
                          used, layer_types=layers, rope=Ropes(full_theta), scale_after_cast=True,
                          reads=frozenset({'sliding_window', 'attention_bias'}))
-    window = (records.integer(hf.get('sliding_window', 128), 'sliding_window')
+    window = (_records.integer(hf.get('sliding_window', 128), 'sliding_window')
               if 'sliding_attention' in layers else None)
     kinds = decoder_kinds(layers, window, local_theta, None, None)
     if 'sliding_attention' in layers:
@@ -149,7 +149,7 @@ def _mimo_v2_flash_config(hf: Mapping[str, object], used: set[str]) -> DecoderFi
         if ramp is not None and kind in layers:
             kinds.setdefault(kind, native_fields(LayerKind)())[ramp_field(ramp)] = ramp
     return _attention_and_experts(
-        config, hf, used, kinds, value_dim=records.integer(hf.get('v_head_dim', 128), 'v_head_dim'),
+        config, hf, used, kinds, value_dim=_records.integer(hf.get('v_head_dim', 128), 'v_head_dim'),
         scale=0.707, factor=full_factor, count=count, sparse=sparse)
 
 
@@ -163,10 +163,10 @@ def _attention_and_experts(config: DecoderFields, hf: Mapping[str, object], used
     config.update(
         kinds=kinds, value_head_dim=value_dim,
         value_scale=None if (stated := hf.get('attention_value_scale', scale)) is None
-        else records.number(stated, 'attention_value_scale'),
+        else _records.number(stated, 'attention_value_scale'),
         o_proj_bias=False, partial_rotary_factor=None if factor == 1.0 else factor,
         partial_rotary_type='default',
-        attention_dropout_rate=records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
+        attention_dropout_rate=_records.number(hf.get('attention_dropout', 0.), 'attention_dropout'),
         mixture=_mixture(hf, count, used, sparse))
     return config
 
@@ -259,10 +259,10 @@ def _layer_flags(hf: Mapping[str, object], used: set[str],
     block = hf.get('hybrid_block_size')
     pattern = hf.get('hybrid_layer_pattern')
     if pattern is None:
-        size = None if block is None else records.integer(block, 'hybrid_block_size')
+        size = None if block is None else _records.integer(block, 'hybrid_block_size')
         sliding = tuple(bool(size and (index + 1) % size) for index in range(count))
     else:
-        sliding = tuple(bool(slides) for slides in records.integers(pattern, 'hybrid_layer_pattern'))
+        sliding = tuple(bool(slides) for slides in _records.integers(pattern, 'hybrid_layer_pattern'))
     frequency = hf.get('moe_layer_freq')
     if isinstance(frequency, int) and not isinstance(frequency, bool):
         routed = tuple(frequency > 0 and index % frequency == 0 for index in range(count))
@@ -279,28 +279,28 @@ def _layer_flags(hf: Mapping[str, object], used: set[str],
 
 
 def _mimo_v2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
-    count = records.integer(hf['num_hidden_layers'], 'num_hidden_layers')
+    count = _records.integer(hf['num_hidden_layers'], 'num_hidden_layers')
     sliding, routed = _layer_flags(hf, used, count)
     layers = tuple('sliding_attention' if slides else 'full_attention' for slides in sliding)
     experts = hf.get('n_routed_experts') is not None
     sparse = tuple(index for index, routes in enumerate(routed) if routes and experts)
     # MiMoV2Config's geometry and its defaults (configuration_mimo_v2.py:156-197).
-    heads = records.integer(hf.get('num_attention_heads', 32), 'num_attention_heads')
-    kv_heads = records.integer(hf.get('num_key_value_heads') or heads, 'num_key_value_heads')
-    width = records.integer(hf['hidden_size'], 'hidden_size')
-    head_dim = records.integer(hf.get('head_dim') or width // heads, 'head_dim')
-    value_dim = records.integer(hf.get('v_head_dim') or head_dim, 'v_head_dim')
-    swa_head_dim = records.integer(hf.get('swa_head_dim') or head_dim, 'swa_head_dim')
-    swa = {'swa_num_attention_heads': (records.integer(hf.get('swa_num_attention_heads') or heads,
+    heads = _records.integer(hf.get('num_attention_heads', 32), 'num_attention_heads')
+    kv_heads = _records.integer(hf.get('num_key_value_heads') or heads, 'num_key_value_heads')
+    width = _records.integer(hf['hidden_size'], 'hidden_size')
+    head_dim = _records.integer(hf.get('head_dim') or width // heads, 'head_dim')
+    value_dim = _records.integer(hf.get('v_head_dim') or head_dim, 'v_head_dim')
+    swa_head_dim = _records.integer(hf.get('swa_head_dim') or head_dim, 'swa_head_dim')
+    swa = {'swa_num_attention_heads': (_records.integer(hf.get('swa_num_attention_heads') or heads,
                                                        'swa_num_attention_heads'), heads),
            'swa_head_dim': (swa_head_dim, head_dim),
-           'swa_v_head_dim': (records.integer(hf.get('swa_v_head_dim') or swa_head_dim, 'swa_v_head_dim'),
+           'swa_v_head_dim': (_records.integer(hf.get('swa_v_head_dim') or swa_head_dim, 'swa_v_head_dim'),
                               value_dim)}
     for key, (stated, full) in swa.items():
         if stated != full and 'sliding_attention' in layers:
             refuse(f'{key} {stated}', f"Dew's sliding layers hold the full layers' {full}; "
                                       'its kinds differ in key heads alone')
-    swa_kv_heads = records.integer(hf.get('swa_num_key_value_heads') or kv_heads,
+    swa_kv_heads = _records.integer(hf.get('swa_num_key_value_heads') or kv_heads,
                                    'swa_num_key_value_heads')
     layout = hf.get('attention_projection_layout') or 'split'
     if layout not in ('split', 'fused_qkv'):
@@ -321,12 +321,12 @@ def _mimo_v2_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
                                                     or hf.get('intermediate_size'))},
                          used, layer_types=layers, rope=Ropes(theta), scale_after_cast=True,
                          reads=frozenset({'sliding_window', 'attention_bias'}))
-    local_theta = records.number(hf.get('swa_rope_theta') or theta, 'swa_rope_theta')
-    kinds = decoder_kinds(layers, None if window is None else records.integer(window, 'sliding_window'),
+    local_theta = _records.number(hf.get('swa_rope_theta') or theta, 'swa_rope_theta')
+    kinds = decoder_kinds(layers, None if window is None else _records.integer(window, 'sliding_window'),
                           local_theta, None, None)
     for kind, key in (('full_attention', 'add_full_attention_sink_bias'),
                       ('sliding_attention', 'add_swa_attention_sink_bias')):
-        if records.boolean(hf.get(key, False), key) and kind in layers:
+        if _records.boolean(hf.get(key, False), key) and kind in layers:
             kinds.setdefault(kind, native_fields(LayerKind)())['sinks'] = True
     if 'sliding_attention' in kinds:
         # A windowed kind rotates whole heads unless it states its own

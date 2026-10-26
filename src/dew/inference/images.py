@@ -18,15 +18,16 @@ from jax.experimental import multihost_utils
 from jax.typing import ArrayLike, DTypeLike
 from typing_extensions import TypeVar
 
+from dew._coordination import agreed
+from dew._records import JSON
 from dew.artifacts import uint8_pixels
-from dew.coordination import agreed
+from dew.batch import Variables, thaw
 from dew.diffusion.process import Conditioning, Process
 from dew.inputs import InputSpec, encode_conditions, unit_range
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.inputs import RowPlan, generation_signature, host_rows, local_rows, mesh_of, request_key
 from dew.nn.kernels.options import program
-from dew.objectives.base import OMITTED, Omitted, Variables, thaw
-from dew.records import JSON
+from dew.objectives.base import OMITTED, Omitted
 from dew.registry import dtype_name, resolve_dtype
 from dew.sampling.guidance import CFG, Guidance
 from dew.sampling.sample import sampling_modules, walk_and_decode
@@ -131,9 +132,10 @@ class Images(Generic[ArrayT]):
 class ImageSettings:
     """What a text-to-image run records beside its model, and its task is built with
     (`TextToImage.from_objective`, `TextToImage.from_run`): the process, the solver, the
-    guidance and the step count, and the records of the input encoders
-    (`InputSpec.to_json`), the autoencoder (`AutoEncoder.to_json`) and an end-to-end tuning
-    (`EndToEnd`), which a saved run rebuilds over its own weights at the dtype it asks for.
+    guidance and the step count, and the records of the input encoders and the autoencoder
+    (`dew.registry.to_record`, read back by `InputSpec.bound` and `AutoEncoder.bound`) and an
+    end-to-end tuning (`EndToEnd`), which a saved run rebuilds over its own weights at the dtype it
+    asks for.
     A run trained from a loaded pipeline samples on that pipeline's own grid, recorded as `grid`
     (`SourceGrid`), and ends as its solver does, with no closing denoise (`TextToImage.grid`)."""
 
@@ -148,7 +150,7 @@ class ImageSettings:
     grid: JSON = None
 
     def __post_init__(self) -> None:
-        from dew.records import integer
+        from dew._records import integer
 
         integer(self.sampling_steps, "sampling_steps")
 
@@ -251,17 +253,16 @@ class TextToImage:
         the checkpoint's dtypes exactly. `trust` names the packages outside
         Dew the run's record may import (`TextGeneration.from_run`).
         """
-        from dew.config import ModelConfig
+        from dew._records import record as fields
         from dew.diffusion.schedules.source import SourceGrid
-        from dew.inference.tasks import run_record, saved_settings
+        from dew.inference.tasks import SavedRun, saved_settings
         from dew.nn.autoencoders import AutoEncoder
         from dew.objectives.diffusion.objective import without_loss_heads
-        from dew.records import record as fields, text
-        from dew.registry import from_record, objectives
+        from dew.registry import ModelConfig, from_record
 
-        record, step = run_record(directory, step, trust)
-        settings = saved_settings(record, ImageSettings)
-        config = ModelConfig.from_dict(fields(record['model'], 'model'))
+        run = SavedRun.pinned(directory, step, trust)
+        settings = saved_settings(run.record, ImageSettings)
+        config = ModelConfig.from_dict(fields(run.record['model'], 'model'))
         inputs_record = fields(settings.inputs, 'inputs')
         autoencoder_record = None if settings.autoencoder is None else fields(settings.autoencoder,
                                                                               'autoencoder')
@@ -276,19 +277,18 @@ class TextToImage:
                 for keyword, condition in conditions.items()}}
             if autoencoder_record is not None:
                 autoencoder_record = _computing(autoencoder_record, compute)
-        params = objectives[text(record['objective'], 'objective')]._saved_variables(
-            directory, ema=ema, step=step, mesh=mesh, layout=layout, param_dtype=param_dtype,
-            parameter_roots=_parameter_roots(inputs_record, autoencoder_record))
-        inputs = InputSpec.from_json(inputs_record, params=params.get('encoders', {}))
+        params = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype,
+                               parameter_roots=_parameter_roots(inputs_record, autoencoder_record))
+        inputs = InputSpec.bound(inputs_record, params=params.get('encoders', {}))
         end_to_end = settings.end_to_end
         autoencoder = None
         if autoencoder_record is not None and end_to_end is not None:
             from dew.objectives.diffusion.end_to_end import AUTOENCODER, EndToEnd
             tuning = from_record(EndToEnd, fields(end_to_end, 'end_to_end'), dtypes=False)
-            frozen = AutoEncoder.from_json(autoencoder_record, params=params['params'][AUTOENCODER])
+            frozen = AutoEncoder.bound(autoencoder_record, params=params['params'][AUTOENCODER])
             autoencoder, params = tuning.tuned(frozen, params)
         elif autoencoder_record is not None:
-            autoencoder = AutoEncoder.from_json(autoencoder_record, params=params['autoencoder'])
+            autoencoder = AutoEncoder.bound(autoencoder_record, params=params['autoencoder'])
         grid = None if settings.grid is None else from_record(SourceGrid, fields(settings.grid, 'grid'))
         return cls(config.build(), settings.process, inputs, without_loss_heads(params), autoencoder,
                    steps=settings.sampling_steps, guidance=settings.guidance, solver=settings.solver,
@@ -733,14 +733,15 @@ def _parameter_roots(inputs: Mapping[str, object], autoencoder: Mapping[str, obj
     """The parameter roots of a recorded run's tree, which a storage override
     casts: the denoiser's, each condition encoder's own collections and the
     autoencoder's. The rest keep the dtypes they were saved in."""
-    from dew.objectives.base import PARAMETER_ROOTS
-    from dew.records import record, text
-    from dew.registry import encoders
+    from dew._records import record
+    from dew.batch import PARAMETER_ROOTS
+    from dew.inputs.encoders import ConditionEncoder
+    from dew.registry import component
 
     roots: list[tuple[str, ...]] = list(PARAMETER_ROOTS)
     for keyword, condition in record(inputs['conditions'], 'conditions').items():
-        name = text(record(record(condition, keyword)['encoder'], 'encoder')['class'], 'encoder class')
-        collections = encoders[name].parameter_collections
+        encoder, _ = component(ConditionEncoder, record(record(condition, keyword)['encoder'], 'encoder'))
+        collections = encoder.parameter_collections
         roots.extend([("encoders", keyword)] if collections is None else
                      [("encoders", keyword, collection) for collection in collections])
     if autoencoder is not None:
@@ -749,16 +750,16 @@ def _parameter_roots(inputs: Mapping[str, object], autoencoder: Mapping[str, obj
 
 
 def _computing(owner: Mapping[str, object], compute: str) -> Mapping[str, object]:
-    """A recorded encoder or autoencoder computing in `compute`: its own
-    `dtype`, and the dtype of the model it wraps where it records one."""
-    from dew.records import record
+    """A recorded encoder or autoencoder (a class record, `dew.registry.component`) computing in
+    `compute`: its own `dtype`, and the dtype of the model it wraps where it records one."""
+    from dew._records import record
 
     recorded = dict(record(owner['fields'], 'fields'))
     if 'dtype' in recorded:
         recorded['dtype'] = compute
     model = recorded.get('model')
-    if isinstance(model, Mapping) and 'dtype' in model:
-        recorded['model'] = {**record(model, 'model'), 'dtype': compute}
+    if isinstance(model, Mapping) and 'dtype' in record(model.get('fields', {}), 'model.fields'):
+        recorded['model'] = {**model, 'fields': {**record(model['fields'], 'model.fields'), 'dtype': compute}}
     return {**owner, 'fields': recorded}
 
 

@@ -22,7 +22,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew import records
+from dew import _records
+from dew._records import JSON
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.common import GeneralizedNoiseScheduler, NoiseScheduler, ancestral_variance
 from dew.diffusion.schedules.cosine import cosine_beta_schedule
@@ -31,7 +32,6 @@ from dew.diffusion.schedules.flow import RectifiedFlow, static_shift
 from dew.diffusion.schedules.karras import rho_ramp
 from dew.diffusion.transforms import PredictionTransform
 from dew.nn.sharding import rows_taken
-from dew.records import JSON
 
 if TYPE_CHECKING:
     from dew.diffusion.schedules.source_policy import FlowShift, Origin, SourcePolicy
@@ -259,7 +259,7 @@ def published_betas(*, count: JSON, start: JSON, end: JSON, schedule: JSON,
     adds GeoDiff's sigmoid, and Heun adds the exponential alpha-bar. A table
     that does not have `count` finite entries in [0, 1] raises `ValueError`.
     """
-    length = records.integer(count, "num_train_timesteps")
+    length = _records.integer(count, "num_train_timesteps")
     if length < 1:
         raise ValueError("num_train_timesteps must be positive")
     if trained is not None:
@@ -267,8 +267,8 @@ def published_betas(*, count: JSON, start: JSON, end: JSON, schedule: JSON,
             raise ValueError("trained_betas must be a numeric sequence")
         betas = np.asarray(trained, np.float32)
     else:
-        first = records.number(start, "beta_start")
-        final = records.number(end, "beta_end")
+        first = _records.number(start, "beta_start")
+        final = _records.number(end, "beta_end")
         kind = named_choice(schedule, "beta_schedule", schedules)
         if kind == "linear":
             betas = _published_linspace(first, final, length)

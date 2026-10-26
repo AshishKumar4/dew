@@ -16,8 +16,7 @@ import flax.serialization
 import jax
 import numpy as np
 
-from dew.config import ModelConfig
-from dew.registry import to_record
+from dew.registry import ModelConfig, to_record
 
 
 class Residual(nn.Module):
@@ -65,7 +64,7 @@ REBUILD = """
 import json, sys
 import flax.serialization, jax, jax.numpy as jnp, numpy as np
 import test_linen_records
-from dew.config import ModelConfig
+from dew.registry import ModelConfig
 out = {}
 for name, saved in json.loads(sys.stdin.read()).items():
     model = ModelConfig.from_dict(saved["record"]).build()

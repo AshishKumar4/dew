@@ -14,12 +14,13 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 
-from dew.config import JsonDict, ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig, media_field
+from dew.config import ObjectiveConfig, Prepared, RunConfig, media_field
 from dew.data.pipeline import ObjectiveData
 from dew.inputs import Field
 from dew.objectives.jepa.masking import MultiBlockMask
 from dew.objectives.jepa.probes import KnnProbe, LinearProbe
-from dew.registry import models
+from dew.optim import OptimConfig
+from dew.registry import JsonDict, ModelConfig, models
 
 SHARED_MODEL_KEYS = ("emb_features", "num_heads", "mlp_ratio", "ssm_attention_ratio",
                      "ssm_state_dim", "dropout_rate", "precision")

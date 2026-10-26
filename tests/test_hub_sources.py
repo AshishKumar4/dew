@@ -536,3 +536,21 @@ def test_a_hub_jsonl_shard_keeps_its_offset_index_in_its_identity_with_the_hub_o
     # The offline Hub confirms no file: `HfFileSystem.exists` reads an unreachable Hub as absent.
     monkeypatch.setattr(HfFileSystem, "exists", lambda self, path, **kwargs: False)
     assert Hub("owner/lines", revision="pinned").files.fingerprint() == identity
+
+
+@pytest.mark.parametrize("listing, split, expected", [
+    (["data/dev-00000.parquet", "data/train-00000.parquet"], "validation", ["data/dev-00000.parquet"]),
+    (["data/train-00000-of-00002.parquet", "data/train-00001-of-00002.parquet",
+      "data/test-00000-of-00001.parquet"], "train",
+     ["data/train-00000-of-00002.parquet", "data/train-00001-of-00002.parquet"]),
+    (["train/a.jsonl", "valid/b.jsonl", "README.md"], "validation", ["valid/b.jsonl"]),
+    (["rows.parquet", "README.md"], "train", ["rows.parquet"]),
+    (["pretraining/x.parquet", "train.parquet"], "train", ["train.parquet"]),
+], ids=["dev", "sharded", "directories", "lone", "keyword-inside-a-word"])
+def test_a_hub_split_holds_the_files_datasets_resolves_to_it(listing, split, expected):
+    """A split's shards are the files `datasets` gives it from the repository's listing, by its own
+    default patterns (`split_files`): `dev` and `valid` are `validation`'s, a sharded name's split is
+    its own, a lone file is `train`'s, and a keyword inside another word names no split."""
+    from dew.data.sources.hub import split_files
+
+    assert split_files(listing, split) == expected

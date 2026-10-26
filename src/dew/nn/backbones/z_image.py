@@ -27,7 +27,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.attention import RMSNorm
-from dew.nn.blocks import sinusoidal_time
+from dew.nn.blocks import modulation, sinusoidal_time
 from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from dew.nn.precision import at_least_fp32, float32_dot_general
@@ -122,8 +122,8 @@ class ZImageBlock(nn.Module):
         if not self.modulation:
             x = x + norm("attention_norm2")(attention(norm("attention_norm1")(x)))
             return x + norm("ffn_norm2")(feed_forward(norm("ffn_norm1")(x)))
-        modulated = Dense(self.modulation_features, dtype=self.dtype, precision=self.precision,
-                          name="modulation", dot_general=float32_dot_general)(embedded)[:, None]
+        modulated = modulation(embedded, self.features, 4, name="modulation", silu=False, dtype=self.dtype,
+                               precision=self.precision)[:, None]
         scale, gate, scale_mlp, gate_mlp = jnp.split(modulated, 4, axis=-1)
         attended = attention(norm("attention_norm1")(x) * (1 + scale))
         x = x + jnp.tanh(gate) * norm("attention_norm2")(attended)
@@ -221,10 +221,11 @@ class ZImageTransformer(nn.Module):
         source_time = (1000.0 - jnp.asarray(time, width)) * jnp.asarray(self.t_scale / 1000.0, width)
         features = sinusoidal_time(source_time, FREQUENCIES, dtype=width).astype(dtype)
         maps = self.projections(0, 0)
-        hidden = Dense(maps['t_embedder_1'][1], dtype=self.dtype, precision=self.precision,
-                       name="t_embedder_1", dot_general=float32_dot_general)(features)
-        return Dense(maps['t_embedder_2'][1], dtype=self.dtype, precision=self.precision,
-                     name="t_embedder_2", dot_general=float32_dot_general)(nn.silu(hidden))
+        mlp = GatedMLP(maps['t_embedder_1'][1], maps['t_embedder_2'][1], in_features=features.shape[-1],
+                        activation=nn.silu, use_bias=True, names=("t_embedder_1", "t_embedder_2"),
+                        dtype=self.dtype, precision=self.precision)
+        nn.share_scope(self, mlp)
+        return mlp(features)
 
     @nn.compact
     def __call__(self, x, time, conditioning: DenoisingCondition, train: bool = False):
@@ -290,9 +291,8 @@ class ZImageTransformer(nn.Module):
         for index in range(self.n_layers):
             joined = self._block(name=f"layers_{index}")(joined, rotation, image_span + spans, embedded)
 
-        scale = 1 + Dense(maps['final_modulation'][1], dtype=self.dtype, precision=self.precision,
-                          name="final_modulation",
-                          dot_general=float32_dot_general)(nn.silu(embedded))[:, None]
+        scale = 1 + modulation(embedded, self.dim, 1, name="final_modulation", dtype=self.dtype,
+                               precision=self.precision)[:, None]
         out = Dense(maps['final_linear'][1], dtype=self.dtype, precision=self.precision,
                     name="final_linear", dot_general=float32_dot_general)(
             layer_norm(self.dtype)(joined[:, :count]) * scale)
