@@ -588,22 +588,40 @@ class AugmentationKey(grain.RandomMapTransform):
         return {**element, "image_augmentation_key": rng.integers(0, 2**32, size=2, dtype=np.uint32)}
 
 
+CAPTIONS = "captions"
+"""The field a diffusion objective keeps each batch's captions under as host text (`EncodeCaptions`),
+which a metric or a reward reads with its own tokenizer (`dew.eval.images.CLIPScore`)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class EncodeCaptions:
+    """Each batch's captions encoded by `reader` for the conditions that read them, or dropped without
+    one; `keep` names a field to hold them beside as host text, which a metric reads against its own
+    tokenizer (`dew.eval.images.CLIPScore`) and no compiled step takes (`split_fields`). A reader that
+    encodes a field of that name too is refused (ValueError), rather than one overwriting the other."""
+
     reader: Callable[[Sequence[str]], Batch] | None = dataclasses.field(default=None, repr=False)
+    keep: str | None = None
 
     @property
     def identity(self) -> str:
+        kept = "" if self.keep is None else f"+keep={self.keep}"
         if self.reader is None:
-            return "dew.drop-captions@1"
-        return f"dew.encode-captions:{callable_name(self.reader)}"
+            return "dew.drop-captions@1" if self.keep is None else f"dew.keep-captions@1:{self.keep}"
+        return f"dew.encode-captions{kept}:{callable_name(self.reader)}"
 
     def __call__(self, batch: Batch) -> Batch:
         held = dict(batch)
         if "caption" not in held:
             return held
         captions = [str(value) for value in held.pop("caption")]
-        return held if self.reader is None else {**held, **self.reader(captions)}
+        encoded = held if self.reader is None else {**held, **self.reader(captions)}
+        if self.keep is None:
+            return encoded
+        if self.keep in encoded:
+            raise ValueError(f"the captions kept as {self.keep!r} would overwrite the field of that name the "
+                             "conditions read; keep them under another")
+        return {**encoded, self.keep: np.asarray(captions)}
 
 
 @dataclasses.dataclass(frozen=True)

@@ -71,7 +71,9 @@ def clip_scale(s_max: jax.Array, tau: float) -> jax.Array:
     non-positive. MaxText's formula reads `minimum(1, tau / (s + 1e-6))`,
     which goes negative for such a head; Dew clips nothing there instead,
     since logits below zero need no bounding."""
-    s_max = jnp.asarray(s_max, jnp.float32)
+    s_max = jnp.asarray(s_max)
+    # At least float32, as the clip computes it; a float64 truth's maxima stay float64.
+    s_max = s_max.astype(jnp.promote_types(s_max.dtype, jnp.float32))
     return jnp.where(s_max > 0, jnp.minimum(1.0, tau / (s_max + 1e-6)), 1.0)
 
 
@@ -89,7 +91,9 @@ def clip_mla_reference(param: np.ndarray, scale: np.ndarray, qk_nope: int,
     transcribed: the head slice of a `wq_b`/`wkv_b` kernel by `sqrt(scale)`,
     the tail of `wq_b` (rotary queries) by `scale`, the tail of `wkv_b`
     (values) left alone."""
-    scale_b = np.expand_dims(np.asarray(scale, np.float32), -1)
+    scale = np.asarray(scale)
+    # At least float32, as MaxText computes it; a float64 truth's scale stays float64.
+    scale_b = np.expand_dims(scale.astype(np.result_type(scale.dtype, np.float32)), -1)
     head, tail = param[..., :qk_nope], param[..., qk_nope:]
     head_new = head * np.sqrt(scale_b).astype(param.dtype)
     if layer == "wq_b":

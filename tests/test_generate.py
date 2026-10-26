@@ -39,7 +39,7 @@ def test_every_native_sampler_declares_the_key_it_requires():
 
     from dew.diffusion.block import BlockProcess
     from dew.diffusion.discrete import DiscreteProcess
-    from dew.sampling.pipelines import TextToImage
+    from dew.inference import TextToImage
 
     for function in (generate, BlockProcess.generate, DiscreteProcess.generate, TextToImage.prepare,
                      TextToImage.__call__):

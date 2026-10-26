@@ -13,7 +13,7 @@ each kernel's grid, and the numerics mamba_ssm runs: operands in their own dtype
 the states the chunks enter stored in the operands' dtype, the decay between two steps of a chunk
 `exp(min(acs_i - acs_j, 0))` of the log decay `acs` cumulated within the chunk, and each gradient of the
 decay summed from its products as mamba_ssm's stable kernels sum it. Products of fp32 operands take
-TF32x3 (`fla_gdn._dot`) where mamba_ssm's take one TF32, and the output is stored in fp32 where
+BF16x6 (`fla_gdn._dot`) where mamba_ssm's take one TF32, and the output is stored in fp32 where
 mamba_ssm rounds it to the operands' dtype: a sequence-sharded scan adds the earlier shards' state to it
 before any rounding (`dew.nn.mixers.mamba2._ssd`), and the gated norm after it reads fp32 anyway.
 mamba_ssm's deterministic mode is the only one: a sum over a kernel's blocks lands in a workspace that
@@ -141,7 +141,8 @@ def _picks(tiles: Tiles, fp32: Tiles | None = None) -> Mapping[str, Tiles]:
     """A launch's config without a measurement, by operand dtype, `fp32` where it differs from
     `tiles`: the tuner's pick on an H100 at Nemotron 3 Ultra's shapes (one row of 4096 tokens, 256 heads
     of 64 over 8 groups, a state of 128, chunks of 128), each summing kernel taking a group's every head.
-    fp32's TF32x3 products want smaller blocks: at bf16's picks its launches summed 10.6 ms against 5.9.
+    fp32's split products want smaller blocks: at bf16's picks its launches summed 10.6 ms against 5.9
+    (TF32x3, the products then).
     mamba_ssm's own autotuner picks the same for seven of the twelve it tunes; its picks for the chunk
     state, the state passing, both `C B^T` products and the chunk scan ran 4% to 70% slower on the port
     there (2026-10-13)."""
@@ -575,7 +576,10 @@ def _dstates_kernel(dout_ref, c_ref, da_ref, *refs, batch: int, length: int, chu
             scale = jnp.where(seq[0][rows] == earlier, scale, 0.0)
         dout = (dout.astype(jnp.float32) * scale[:, None]).astype(dout.dtype)
         cm = read_rows(c_ref.at[rows], _from(limit, offset)).astype(dout.dtype)
-        return acc + _dot(dout.T, cm, exact=exact)
+        # IEEE products, mamba_ssm's: where a document begins, its carry is zero and the state's gradient
+        # is this sum alone, which TF32x3 put at 1.52 times mamba_ssm's distance from float64 on an A100
+        # (the initial state's, packed documents; IEEE 0.98).
+        return acc + _dot(dout.T, cm, exact=exact, ieee=True)
 
     out_ref[...] = jax.lax.fori_loop(0, chunk // bk, step, jnp.zeros(out_ref.shape, jnp.float32))
 

@@ -103,7 +103,8 @@ class DecisionSource(SourceKind):
     """The metadata signatures of Laya and joint-head releases."""
 
     @staticmethod
-    def describe(directory: Path) -> CompositeSource | None:
+    def describe(directory: Path, overrides: Mapping[str, object] | None = None) -> CompositeSource | None:
+        # A Laya or joint-head layout reads nothing a backbone's modeling_overrides change.
         if (directory / CONFIG_FILE).is_file():
             config = _records.record(json.loads((directory / CONFIG_FILE).read_text()), CONFIG_FILE)
             native = _records.record(json.loads((directory / "encoder/config.json").read_text()),

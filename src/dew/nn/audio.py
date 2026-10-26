@@ -72,7 +72,7 @@ class Gemma3nAudio(TowerBase):
         return Gemma3nAudioEncoder(self)
 
     def geometry(self) -> TowerGeometry:
-        return TowerGeometry(mel_features=self.input_feat_size)
+        return TowerGeometry(mel_features=self.input_feat_size, frames_per_token=encoded_frame_stride(self))
 
 
 @dataclasses.dataclass(frozen=True)

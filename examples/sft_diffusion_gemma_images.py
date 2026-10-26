@@ -263,7 +263,7 @@ def main(config: Config) -> Path:
                               checkpoint_every=config.eval_every, mesh=MeshSpec(fsdp=1),
                               multi_host=False, compilation_cache_dir=None))
     prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
-                    run.trainer.compilation_cache_dir, layout=run.trainer.layout)
+                    run.trainer.compilation_cache_dir)
     objective = run.objective.build(model=model)
     data = caption_data(config, parts, labels)
     started = time.perf_counter()

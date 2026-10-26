@@ -77,4 +77,5 @@ FALCON = DecoderFamily(
     packed=grouped_qkv('.self_attention.query_key_value'), export_weights=decoder_tensors,
     preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'transformer.word_embeddings.weight'),
+    defaults={'max_position_embeddings': 2048},
 )

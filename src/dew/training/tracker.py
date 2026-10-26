@@ -641,17 +641,14 @@ class TensorBoardTracker(_OwnedTracker):
 
 
 def _text(tag: str, payload: str) -> Summary.Value:
-    """A text-plugin summary value: the string tensor a text tab reads."""
-    from tensorboard.compat.proto import summary_pb2, tensor_pb2, tensor_shape_pb2, types_pb2
+    """A text-plugin summary value: the one-string tensor a text tab reads, its metadata and tensor
+    built as TensorBoard's own TensorFlow-free `text_pb` builds them."""
+    from tensorboard.compat.proto.summary_pb2 import Summary
+    from tensorboard.plugins.text.metadata import create_summary_metadata
+    from tensorboard.util.tensor_util import make_tensor_proto
 
-    return summary_pb2.Summary.Value(
-        tag=tag,
-        metadata=summary_pb2.SummaryMetadata(
-            plugin_data=summary_pb2.SummaryMetadata.PluginData(plugin_name='text')),
-        tensor=tensor_pb2.TensorProto(
-            dtype=types_pb2.DT_STRING, string_val=[payload.encode()],
-            tensor_shape=tensor_shape_pb2.TensorShapeProto(
-                dim=[tensor_shape_pb2.TensorShapeProto.Dim(size=1)])))
+    return Summary.Value(tag=tag, metadata=create_summary_metadata(display_name=None, description=None),
+                         tensor=make_tensor_proto([payload], dtype=np.object_))
 
 
 def _picture(tag: str, encoded: bytes, frame: np.ndarray) -> Summary.Value:
@@ -705,21 +702,17 @@ def _(value: TextSamples):
         {'prompt': value.prompt, 'texts': list(_texts(value))}))])
 
 
-def _histogram(tag: str, values: np.ndarray):
-    """A histogram-plugin summary value of `values`, in 30 buckets."""
-    from tensorboard.compat.proto.summary_pb2 import HistogramProto, Summary
+def _histogram(tag: str, values: np.ndarray) -> Summary:
+    """A histogram-plugin summary of `values`, in 30 buckets, as TensorBoard's own TensorFlow-free
+    `histogram_pb` builds it: the plugin's tensor of bucket edges and counts."""
+    from tensorboard.plugins.histogram.summary_v2 import histogram_pb
 
-    counts, edges = np.histogram(values, bins=30)
-    return Summary.Value(tag=tag, histo=HistogramProto(
-        min=values.min(), max=values.max(), num=values.size, sum=values.sum(),
-        sum_squares=(values ** 2).sum(), bucket_limit=edges[1:].tolist(), bucket=counts.tolist()))
+    return histogram_pb(tag, values, buckets=30)
 
 
 @_summarize.register
 def _(value: Representations):
-    from tensorboard.compat.proto.summary_pb2 import Summary
-
-    return Summary(value=[_histogram('val/representation_std', _spread(value).astype(np.float64))])
+    return _histogram('val/representation_std', _spread(value).astype(np.float64))
 
 
 @_summarize.register
@@ -727,7 +720,7 @@ def _(value: TokenScores):
     from tensorboard.compat.proto.summary_pb2 import Summary
 
     losses = _counted_losses(value)
-    return Summary(value=[_histogram('val/token_losses', losses)] if losses.size else [])
+    return _histogram('val/token_losses', losses) if losses.size else Summary(value=[])
 
 
 @_summarize.register

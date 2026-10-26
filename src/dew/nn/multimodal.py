@@ -172,8 +172,10 @@ class AudioConditioner(nn.Module):
 
     def initialize_parameters(self) -> None:
         """Create the audio leaves during a token-only model init."""
-        mel = self.audio.geometry().mel_features or 128
-        frames = 16 if self.soft_tokens is None else 16 * self.soft_tokens
+        geometry = self.audio.geometry()
+        mel = geometry.mel_features or 128
+        # Fixed slots take no more encoded frames than they hold: one token's frames a slot.
+        frames = 16 if self.soft_tokens is None else (geometry.frames_per_token or 16) * self.soft_tokens
         self({"input_features": jnp.zeros((1, 1, frames, mel), self.dtype or jnp.float32),
               "input_features_mask": jnp.ones((1, 1, frames), bool)})
 

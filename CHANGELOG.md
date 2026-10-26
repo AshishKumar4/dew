@@ -5,6 +5,18 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- `UNet2DCondition` stores its time embeddings' two maps flat, as `time_linear_1` and `time_linear_2`
+  (and `additional_time_linear_1` and `_2`), where they were `time/in_proj` and `time/out_proj`; a
+  published UNet loads as before. An AutoencoderKL's resnets are `dew.nn.blocks.ResidualBlock` called
+  without a time embedding, and `dew.nn.autoencoders.vae.FlaxResnetBlock2D` is gone. `dew.nn.engram`
+  draws its bucket primes with `sympy.nextprime`, so `sympy` is a dependency.
+- A flow transition's density and KL hold at a variance near float32's largest: the density is JAX's
+  isotropic `multivariate_normal.logpdf`, and the KL halves after its division, where `2 pi` or 2 times
+  the variance overflowed. Schulman's k3 KL estimate is one helper through `expm1`
+  (`dew.rl.surrogate.sampled_kl`), which a small log ratio's `exp(d) - 1` rounded away.
+- A masked-diffusion row's reveals are its own under RBG keys too (`dew._distributions.counted`, the
+  rest of ledger 1669), and TensorBoard histograms are its own `histogram_pb`'s, the plugin's tensor.
+- The host CPU classifier is the CI's (tools/armada/host.py), not the library's: `dew._host` is gone.
 - `OptimConfig` and `ScheduleSpec` move from `dew.config` to `dew.optim`, beside the optimizers and
   schedules they build; `Wandb` moves to `dew.training` (`dew.training.tracker`), beside the tracker that
   reads it; and
@@ -48,6 +60,27 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   `dew.objectives.lm.objective`); the axis names, `DEFAULT_RULES`, `axis_rules`, `logical_spec`,
   `row_axes`, `batch_axes` and `LayoutRefused` (from `dew.nn.sharding`). Import them from their
   new modules; the old ones no longer hold them.
+- A Hub split's shards are the files `datasets` resolves to it from the repository's listing, by its own
+  default patterns (`dew.data.sources.hub.split_files`): `dev` and `valid` are `validation`'s, a sharded
+  name's split is its own and a lone file is `train`'s, where a name match missed them.
+- An immutable upload's `retries` (`Cache.retry`) re-read only an object it created that reads back
+  otherwise; a failed transfer raises after its transport's own retries, not Dew's on top of them.
+- A decision run's calibration takes its probabilities through SciPy's `softmax` and fits each
+  temperature with SciPy's bounded L-BFGS-B on its inverse, at least 1e-3, in place of a hand-written
+  softmax and Newton loop; the grouping, ragged rows and soft targets are as before.
+- An S3 store's conditional writes go through s3fs's own call (`call_s3`), as its reads and plain writes
+  do, so a profile's server-side encryption (a KMS key, SSE-C) and its bucket's regional client reach
+  them; a refused condition is still `PreconditionFailed`.
+- 8-bit Adam state codes each moment value among the six codes around its estimate, its decade by its
+  logarithm, instead of searching the whole map: on an A100, lm-dense's update takes 27.32 ms against
+  60.39, its full-remat step 167.9 against 196.3 ms and compiles in 82.3 against 209.8 s, the codes
+  the search's (`dew.optim.quantized`).
+- `OptimConfig(state_dtype='int8')` stores adam's and adamw's moments blockwise in 8 bits
+  (`dew.optim.int8_moments`, bitsandbytes' and torchao's 8-bit Adam): a quarter of float32's state, the
+  update computed from the moments dequantized to fp32. On an A100, lm-dense's full-remat step peaks at
+  5.88 GB against fp32 state's 8.09 and takes 196.3 ms against 151.7 (`tools/benchmark_kernels.py
+  step --state-dtype int8`). bf16 and 8-bit Adam share one leafwise transform, and an 8-bit moment's
+  codes and scales are placed by their parameters' axes.
 - `Trainer.fit(examples=N)` and `--trainer.examples N` bound a run to the chain's
   first N records, counted before packing and each read once, its steps (and so
   its schedule) the ones the data plan counts for them. `Pause(fraction)`, as
@@ -59,7 +92,19 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   over its accumulation, where it ramped over its steps; its `--lora` adapts
   the encoder, which the run used to record and ignore. An LM run bounded by
   `--trainer.tokens` alone trains over data with no epoch length.
+- `Plateau` counts an improvement as Flax's `EarlyStopping` does, which now runs its count: the best less the value must exceed `min_delta`. Its own test, the value below the best less `min_delta`, rounds that bound, so a best of 1 and a value of 1 - 2**-24 under a `min_delta` of 2**-24 - 2**-60 counted no improvement.
+- A row drawn under its own key (text sampling's draw, masked diffusion's reveal) draws the same whatever rows it is drawn beside with an RBG key implementation (`rbg`, `unsafe_rbg`) too: `vmap` drew every row from the first key's stream, so each row key is made counter-based first, a key at a time. Threefry keys draw as before.
+- A checkpoint ranking's best steps are Orbax's `BestN` over the steps it scored, and TensorBoard's text summaries are its own `text_pb`'s, each the same as before.
 - A confident target's loss gradient is the rest of its row's probability summed directly, as arXiv:2610.31642's eq. 7 takes it, through every chunked head (the tiled, whole, fused and vocabulary-split heads) and the whole-logits loss (`logits_cross_entropy`). Each took the target's entry as its share less one, which rounds to 0 once the share rounds to 1, so the row's gradient stopped summing to zero by the rest mass, about 2e-9 at a margin of 20 and 4e-18 at 40. The forward pass reduces one more operand per row for it, and the loss values are unchanged.
+- An autoencoder's latent normalization is one traced map, `dew.nn.autoencoders.LatentAffine`, which
+  `AutoEncoder.encode` and `decode` apply through one hook, `latent_affine(params, dtype)`: a configured
+  autoencoder's comes from its `LatentNormalization` (`affine`), a tuned REPA-E run's from its running
+  statistics. `LatentNormalization.normalized`/`restored` and `TunedAutoEncoder.running_normalization` are
+  gone: `latent_affine(...).normalized`/`restored` replace them.
+- Two optimizers from Nested Learning (arXiv 2512.24695) as Optax transforms: `dew.optim.scale_by_m3`, M3's
+  Muon over Adam's second moment with a slow momentum gathered once per chunk, and
+  `dew.optim.delta_gradient_descent`, the step to eq. 56's minimizer given each kernel's input. M3
+  orthogonalizes through optax's own Muon iteration (`optax.contrib.scale_by_muon` with no momentum).
 - A filtered or packed read resumes on any number of readers once it is prepared: publish its rows (and
   a terminal pack's plan) as a generation with `dew data publish` and read it by index, and a new run
   lowers to the global order. A per-share read refused on another topology now says so.

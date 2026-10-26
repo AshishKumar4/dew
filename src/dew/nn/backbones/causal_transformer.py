@@ -39,6 +39,7 @@ from dew._records import JSON
 from dew.batch import Coordinates, coordinates as build_coordinates, merge, shifted_span
 from dew.mesh import LayoutRefused, row_axes
 from dew.nn.dense import Dense
+from dew.nn.dropout import Dropout
 from dew.registry import from_record, read_arguments
 
 from ..activations import GatedActivation, Situ, ungated_activation
@@ -525,6 +526,7 @@ class CausalTransformer(nn.Module):
             head_dim=(self.features_per_head if kind.head_dim is None else kind.head_dim),
             partial_rotary_factor=self._kind_rotary(kind),
             sinks=self.attention_sinks if kind.sinks is None else kind.sinks,
+            qk_norm=self.qk_norm if kind.qk_norm is None else kind.qk_norm,
             mixer=kind.mixer)
 
     def _kind_rotary(self, kind: LayerKind) -> float | None:
@@ -597,7 +599,7 @@ class CausalTransformer(nn.Module):
         """Return one layer's mixer geometry as a `MixerContext` built from the resolved kind.
 
         `head_dim`, `rope_theta`, `window`, the two rotary ramps, the partial
-        rotary and the sinks take the layer kind's resolved values
+        rotary, the sinks and the query-key norm take the layer kind's resolved values
         (`kind_of`), and the precision the model's layers take (`products`). Every other field
         is the model's field of the same name. A kind builds its `DecoderBlock` factory
         from this context and its own record, and `setup` chooses the mixer
@@ -611,7 +613,7 @@ class CausalTransformer(nn.Module):
             "k_eq_v": self.attention_k_eq_v and kind.window is None,
             "kv_shared": kv_shared, "kv_store_key": layer_type,
             "partial_rotary_factor": kind.partial_rotary_factor, "attention_sinks": kind.sinks,
-            "init_std": self.init_stds[0], "output_init_std": self.init_stds[1],
+            "qk_norm": kind.qk_norm, "init_std": self.init_stds[0], "output_init_std": self.init_stds[1],
             "precision": self.precision}
         return MixerContext(**resolved, **{field.name: getattr(self, field.name)
                                            for field in dataclasses.fields(MixerContext)
@@ -852,7 +854,7 @@ class CausalTransformer(nn.Module):
             embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
                             else nn.initializers.normal(self.initializer_range)))
         if self.embedding_dropout_rate:
-            self.embedding_dropout = nn.Dropout(self.embedding_dropout_rate, name="embedding_dropout")
+            self.embedding_dropout = Dropout(self.embedding_dropout_rate, name="embedding_dropout")
         if self.embedding_norm:
             self.embedding_layernorm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
@@ -2185,7 +2187,7 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def recompute_more(self) -> Self | None:
         """One rung up `DECODER_REMAT`, past any rung that keeps nothing more of the names
-        these layers mark than the rung above it (`MixerBase.residuals`), whose step would
+        these layers mark than the rung above it (`MixerBase.marks`), whose step would
         compile the same; None at the top or off the ladder."""
         if self.remat not in DECODER_REMAT[:-1]:
             return None
@@ -2217,13 +2219,13 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def marked_residuals(self) -> frozenset[str]:
         """The `RESIDUALS` this decoder's layers can mark: each layer's mixer kind's
-        (`MixerBase.residuals`, every name where a kind does not say) and the MLP's."""
+        (`MixerBase.marks`, every name where a kind does not say) and the MLP's."""
         types = self.per_layer_types
         mixers = [kind.mixer or self.mixer for kind in self.layer_kinds(types).values()]
-        if any(mixer is not None and mixer.residuals is None for mixer in mixers):
+        if any(mixer is not None and mixer.marks() is None for mixer in mixers):
             return frozenset(RESIDUALS)
         default = AttentionMixer.residuals or ()
-        return frozenset(MLP_RESIDUALS).union(*(default if mixer is None else mixer.residuals or ()
+        return frozenset(MLP_RESIDUALS).union(*(default if mixer is None else mixer.marks() or ()
                                                 for mixer in mixers))
 
     @nn.nowrap
@@ -2237,13 +2239,12 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def inference_projection_groups(self, variables: Mapping[str, Mapping]) -> tuple[ProjectionGroup, ...]:
         """Its layers', depths' and drafter's groups, bound without tracing a
-        forward; an encoder serves no decode step and names none. The groups
-        read which parameters the layers hold, never their values, so the
-        layers are bound over the variables' shapes: flax's bound tree is
-        cyclic, and bound over the weights themselves it would keep them alive
-        after the caller drops them until a full collection."""
-        if not self.causal:
-            return ()
+        forward, causal or not: a bidirectional model's masked denoising reads
+        its projections packed as a decoder's steps do. The groups read which
+        parameters the layers hold, never their values, so the layers are
+        bound over the variables' shapes: flax's bound tree is cyclic, and
+        bound over the weights themselves it would keep them alive after the
+        caller drops them until a full collection."""
         bound = self.bind(jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), jnp.result_type(leaf)), variables))
         return declared_groups(*bound.layers, *bound.mtp,

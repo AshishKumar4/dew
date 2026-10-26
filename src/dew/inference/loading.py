@@ -26,11 +26,11 @@ from dew.batch import Variables
 from dew.cache import persist_compilations
 from dew.checkpoints import PYTHON_RUN, RUN_FILE
 from dew.data.text import Tokenizer
+from dew.inference.images import TextToImage
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.objectives.base import SavedTask
 from dew.registry import dtype_name
-from dew.sampling.pipelines import TextToImage
 
 if TYPE_CHECKING:
     from jax.sharding import Mesh
@@ -129,7 +129,7 @@ def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | 
                  revision: str | None) -> SavedTask:
     from dew.distributed.placement import MeshSpec as DefaultMesh
     from dew.inference.projections import packed_owned
-    from dew.interop import Pretrained
+    from dew.interop import Pretrained, PretrainedPipeline
 
     storage = "auto" if param_dtype is None else param_dtype
     placement = DefaultMesh() if mesh is None else mesh
@@ -137,9 +137,11 @@ def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | 
               if dtype is None else
               Pretrained.load(source, revision=revision, dtype=dtype, param_dtype=storage, mesh=placement,
                               layout=layout))
-    # This loader owns its fresh bundle exclusively. Public bundle.pipeline borrows weights;
-    # packing here may relinquish the unpacked device buffers without invalidating a caller's tree.
-    loaded = replace(loaded, variables=packed_owned(loaded.model, loaded.variables))
+    if not isinstance(loaded, PretrainedPipeline):
+        # The task owns the weights it loaded: their projections pack once, where they were placed.
+        # (Public bundle.pipeline borrows weights; packing here may relinquish the unpacked device
+        # buffers without invalidating a caller's tree.)
+        loaded = replace(loaded, variables=packed_owned(loaded.model, loaded.variables))
     return loaded.pipeline()
 
 

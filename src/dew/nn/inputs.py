@@ -371,10 +371,10 @@ def numbered_blocks(tokens: Coordinates, shape: tuple[int, int], block: int) -> 
 
 
 def document_reach(segments, valid, places) -> jax.Array:
-    """Each token's document's furthest place `[B, S]`: `places` at the document's last real token,
-    which LongRoPE picks its factors by, as the reference picks them by a sequence's largest position,
-    so a packed document reads the factors it reads alone. A padding slot reads the next document's,
-    or its row's last. Documents are where `document_starts` puts them."""
+    """Each token's document's furthest place `[B, S]`: the largest of `places` over the document's real
+    tokens, which LongRoPE picks its factors by, as the reference picks them by a sequence's largest
+    position, so a packed document reads the factors it reads alone, its places in any order. A padding
+    slot reads the next document's, or its row's last. Documents are where `document_starts` puts them."""
     segments = rows_like(jnp.asarray(segments), jnp.asarray(segments))
     shape = jnp.shape(segments)
     places = rows_like(jnp.broadcast_to(places, shape), segments)
@@ -382,13 +382,21 @@ def document_reach(segments, valid, places) -> jax.Array:
     if valid is not None:
         real = real & rows_like(jnp.asarray(valid, bool), segments)
     index = jnp.broadcast_to(jnp.arange(shape[1]), shape)
+    starts = document_starts(segments, real)
+    # Each real token's document, numbered per row from its first real token, and that document's
+    # largest place; a padding slot's number reaches no document.
+    numbered = jnp.cumsum(starts | (real & (jnp.cumsum(real, axis=1) == 1)), axis=1, dtype=jnp.int32)
+    documents = jnp.where(real, numbered + jnp.arange(shape[0])[:, None] * (shape[1] + 1), -1)
+    furthest = jax.ops.segment_max(jnp.where(real, places, jnp.iinfo(jnp.int32).min).ravel(),
+                                   documents.ravel(), num_segments=shape[0] * (shape[1] + 1))
+    held = jnp.take(furthest, jnp.maximum(documents, 0)).reshape(shape)
     # The slot of the next document's first real token after each slot, the row's length past the last.
-    following = jnp.where(document_starts(segments, real), index, shape[1])
+    following = jnp.where(starts, index, shape[1])
     following = jnp.flip(jax.lax.cummin(jnp.flip(following, axis=1), axis=1), axis=1)
     following = jnp.pad(following[:, 1:], ((0, 0), (0, 1)), constant_values=shape[1])
     # The last real token before it, which ends the slot's document.
     ends = jnp.take_along_axis(_last_marked(real), following - 1, axis=1)
-    return jnp.take_along_axis(places, ends, axis=1)
+    return jnp.take_along_axis(held, ends, axis=1).astype(places.dtype)
 
 
 def _last_marked(marked: jax.Array) -> jax.Array:
@@ -810,6 +818,12 @@ def local_rows(leaf: jax.typing.ArrayLike, *, host: bool = True) -> jax.Array | 
     return np.concatenate(blocks, axis=0)
 
 
+def host_rows(leaf: jax.typing.ArrayLike, rows: int | None) -> np.ndarray:
+    """This process's first `rows` real rows of a result leaf, as a host array (`local_rows`): the
+    result without the rows its batch was padded with to fill the devices. None keeps every row."""
+    return local_rows(leaf)[:rows]
+
+
 def request_key(key: int | jax.Array | None) -> jax.Array:
     """Normalize an integer seed or a single JAX key to one typed PRNG key."""
     if key is None or isinstance(key, bool):
@@ -999,7 +1013,7 @@ class RowPlan:
 
     def host(self, leaf) -> np.ndarray:
         """Return this process's real rows of a result leaf as a host array."""
-        return local_rows(leaf)[:self.rows]
+        return host_rows(leaf, self.rows)
 
 
 @dataclass(frozen=True)

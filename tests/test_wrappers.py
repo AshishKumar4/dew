@@ -217,3 +217,117 @@ def test_every_stored_spelling_of_a_media_tensor_writes_back_from_its_one_leaf(t
     np.testing.assert_array_equal(written[spelled], tensors[spelled] + 0.25)
     np.testing.assert_array_equal(written[spelled.removeprefix("model.")], written[spelled])
     Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
+
+
+def _without(source: Path, target: Path, dropped) -> Path:
+    """A copy of `source` whose weights omit every tensor `dropped` names."""
+    import shutil
+
+    from safetensors.numpy import save_file
+
+    shutil.copytree(source, target)
+    tensors = load_file(target / "model.safetensors")
+    save_file({name: array for name, array in tensors.items() if not dropped(name)},
+              target / "model.safetensors", metadata={"format": "pt"})
+    return target
+
+
+def test_a_text_only_load_is_the_wrappers_language_model_as_its_text_checkpoint(tmp_path):
+    """`text_only` loads Qwen3.5's language model alone: a checkpoint without its vision tower loads as
+    a decoder holding no media part, it computes the wrapper's text logits bit for bit, and it saves as
+    Qwen3.5's text checkpoint (`Qwen3_5ForCausalLM`, no tower), which loads back to the same logits."""
+    from dew.interop import Pretrained, PretrainedDecoder
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    source = FIXTURES / "qwen35-native-tiny"
+    blind = _without(source, tmp_path / "blind", lambda name: name.startswith("model.visual."))
+    text = Pretrained.load(blind, dtype="float32", attention_impl="reference", text_only=True)
+    wrapper = Pretrained.load(source, dtype="float32", attention_impl="reference")
+    assert isinstance(text, PretrainedDecoder) and isinstance(text.model, CausalTransformer)
+    ids = jnp.asarray(np.load(source / "input_ids.npy"))
+    ids = jnp.where(ids < text.model.vocab_size, ids, 0)
+    logits = np.asarray(text.model.apply(text.variables, ids))
+    np.testing.assert_array_equal(logits, np.asarray(wrapper.model.apply(wrapper.variables, ids)))
+
+    text.save(tmp_path / "export")
+    config = json.loads((tmp_path / "export" / "config.json").read_text())
+    assert (config["model_type"], config["architectures"]) == ("qwen3_5_text", ["Qwen3_5ForCausalLM"])
+    assert not any(name.startswith(("model.visual.", "visual.")) for name in load_file(
+        tmp_path / "export" / "model.safetensors"))
+    reloaded = Pretrained.load(tmp_path / "export", dtype="float32", attention_impl="reference")
+    np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)), logits)
+
+
+def test_a_text_only_load_takes_a_checkpoint_without_its_prediction_depth():
+    """A Qwen3.5 release whose config names one prediction depth but whose checkpoint holds the trunk
+    alone (re-saved by transformers, which builds no depth) loads text-only as that trunk."""
+    from dew.interop import Pretrained
+
+    config = json.loads((FIXTURES / "qwen35-blocks-tiny" / "config.json").read_text())
+    assert config["text_config"]["mtp_num_hidden_layers"] == 1
+    text = Pretrained.load(FIXTURES / "qwen35-blocks-tiny", dtype="float32", attention_impl="reference",
+                           text_only=True)
+    assert text.model.num_nextn_predict_layers == 0
+    assert not any(str(name).startswith("mtp_") for name in text.variables["params"])
+
+
+def test_a_text_only_load_keeps_what_the_wrapper_declares_for_its_language_model(tmp_path):
+    """What a wrapper declares at its own scope governs its language model alone: block reading its
+    modeling overrides turn on still admits a future block mate, and its end-of-text id still ends
+    generation; and a vision tensor stored under two disagreeing names, which the full load refuses,
+    is never compared."""
+    import shutil
+
+    from safetensors.numpy import save_file
+
+    from dew.interop import Pretrained
+    from dew.interop.generation_config import eos_ids
+
+    directory = tmp_path / "source"
+    shutil.copytree(FIXTURES / "qwen35-tiny-mm", directory)
+    config = json.loads((directory / "config.json").read_text())
+    config["modeling_overrides"] = {"attention": {
+        "full_attention": "block_bidirectional", "linear_attention": "causal"}}
+    config["eos_token_id"] = 3
+    config["text_config"] = {**config["text_config"], "eos_token_id": None}
+    (directory / "config.json").write_text(json.dumps(config))
+    tensors = load_file(directory / "model.safetensors")
+    spelled = next(name for name in tensors if name.startswith("model.visual."))
+    tensors[spelled.removeprefix("model.")] = tensors[spelled] + 1
+    save_file(tensors, directory / "model.safetensors", metadata={"format": "pt"})
+    with pytest.raises(ValueError):
+        Pretrained.load(directory, dtype="float32", attention_impl="reference")
+    text = Pretrained.load(directory, dtype="float32", attention_impl="reference", text_only=True)
+    ids = jnp.asarray([[1, 2, 3, 4]], jnp.int32)
+    altered, blocked = ids.at[0, 1].set(7), jnp.asarray([[0, 0, -1, -1]], jnp.int32)
+
+    def first(tokens, groups=None):
+        return np.asarray(text.model.apply(text.variables, tokens, block_groups=groups))[0, 0]
+
+    np.testing.assert_array_equal(first(ids), first(altered))
+    assert np.any(first(ids, blocked) != first(altered, blocked))
+    assert eos_ids(text.config, text.generation_config) == (3,)
+
+
+@pytest.mark.parametrize(("fixture", "dropped"), [
+    ("qwen35-native-tiny", "model.visual.patch_embed.proj.weight"),
+    ("qwen35-native-tiny", "model.visual.merger.linear_fc1.weight"),
+    ("qwen38-dense-tiny", "mtp.layers.0.mlp.down_proj.weight"),
+], ids=["tower", "projector", "prediction_depth"])
+def test_a_wrapper_missing_a_tensor_of_a_component_it_builds_is_refused(tmp_path, fixture, dropped):
+    """A wrapper checkpoint lacking one tensor of its tower, its projector, or a prediction depth it
+    holds the rest of is refused at load, rather than loading that component without it."""
+    import shutil
+
+    from safetensors.numpy import save_file
+
+    from dew.interop import Pretrained
+
+    target = tmp_path / fixture
+    shutil.copytree(FIXTURES / fixture, target)
+    tensors = load_file(target / "model.safetensors")
+    assert dropped in tensors
+    kept = {name: array for name, array in tensors.items() if name != dropped}
+    save_file(kept, target / "model.safetensors", metadata={"format": "pt"})
+    with pytest.raises(ValueError):
+        Pretrained.load(target, dtype="float32", attention_impl="reference")

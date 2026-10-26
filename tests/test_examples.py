@@ -28,9 +28,9 @@ from dew import Checkpoints
 from dew.artifacts import uint8_pixels
 from dew.data.dataset import DataPartition, Loader
 from dew.diffusion.presets import Flow
+from dew.inference import TextToImage
 from dew.inputs import Condition, Field, InputSpec
 from dew.interop import load_params
-from dew.sampling import TextToImage
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 

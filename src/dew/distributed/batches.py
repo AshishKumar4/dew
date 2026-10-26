@@ -1,14 +1,18 @@
 """A run's batches on the devices: the fields a batch carries to the host apart (`split_fields`,
 `with_host`), the shape a batch's compiled step is keyed by (`Signature`), its shardings and its
-placement on a mesh (`batch_shardings`, `shard_batch`, `first_reader_batch`), and the prefetch that
-keeps the next batches in flight within a memory budget (`DevicePrefetchIterator`). Where the state's
-arrays live is `dew.distributed.placement`'s, whose placed-tree helpers this reads."""
+placement on a mesh (`batch_shardings`, `shard_batch`, `first_reader_batch`), its host fields
+gathered across processes by the rows' origins (`row_origins`, `shared_host_fields`), and the
+prefetch that keeps the next batches in flight within a memory budget (`DevicePrefetchIterator`).
+Where the state's arrays live is `dew.distributed.placement`'s, whose placed-tree helpers this
+reads."""
 
 from __future__ import annotations
 
+import base64
 import collections
 import json
 import logging
+import pickle
 import threading
 from collections.abc import Callable, Iterator, Mapping
 from typing import overload
@@ -20,7 +24,7 @@ from flax import linen as nn
 from jax.experimental import multihost_utils
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 
-from dew._coordination import agreed, broadcast_from_process_zero, stop_at_exit
+from dew._coordination import agreed, broadcast_from_process_zero, from_every_process, stop_at_exit
 from dew.batch import Batch
 from dew.data.dataset import Budgeted, Checkpointable, Closeable, DataPartition, Stoppable
 from dew.distributed.placement import Placement, placeable, placed_bytes, placed_shapes
@@ -145,6 +149,7 @@ def placed_abstract(mesh: Mesh, batch: Batch) -> Batch:
 
     return jax.tree.map(shape, batch, batch_shardings(mesh, batch))
 
+
 def shard_batch(mesh: Mesh, batch: Batch, reads: Mapping[Signature, tuple[bool, ...]] | None = None) -> Batch:
     """Assemble this process's share of each array into a globally sharded one.
 
@@ -252,6 +257,44 @@ def first_reader_batch(mesh: Mesh, batch: Mapping[str, np.ndarray]) -> dict[str,
     source = next(process for process, (index, reader) in enumerate(gathered["share"].tolist())
                   if index == partition.index and reader == 0)
     return {name: np.asarray(gathered[name][source]) for name in layout}
+
+
+def row_origins(mesh: Mesh, rows: int) -> jax.Array:
+    """Each row of the batch placed on `mesh`, numbered by where it came from, `share * rows + row`:
+    this process's `rows` rows of its share (`DataPartition.of`), placed as the batch's are
+    (`shard_batch`), so the gathered numbers say which share's row each row of the batch is."""
+    share = DataPartition.of(mesh).index
+    return shard_batch(mesh, {"origin": share * rows + np.arange(rows, dtype=np.int32)})["origin"]
+
+
+def shared_host_fields(mesh: Mesh, host: Batch, origins: np.ndarray, rows: int) -> Batch:
+    """The host fields of a batch spread over processes, each row where `origins` places it: every
+    share's own rows, from its first reader, which no device carries, so they meet on the host
+    (`from_every_process`), numbered as `row_origins` numbers them. Every process takes part; the
+    fields are whole on each, a list or array column a leaf, as a validation pass and a rollout's
+    reward read them."""
+    partition = DataPartition.of(mesh)
+    # Agreed, so a record no reader can serialize fails every process rather than leaving its peers
+    # waiting for its fields.
+    told = agreed("host fields serialization", lambda: base64.b64encode(pickle.dumps(host)).decode()
+                  if partition.reader == 0 else "")
+    shares = {index: pickle.loads(base64.b64decode(word))
+              for index, word in from_every_process([partition.index, told]) if word}
+    ordered = [shares[index] for index in range(len(shares))]
+    share, row = np.divmod(origins, rows)
+
+    def gathered(*columns):
+        first = columns[0]
+        # A field of one value for the whole batch, not one a row (`rows_of`), is every share's alike.
+        rowed = len(first) == rows if isinstance(first, list | tuple) else np.shape(first)[:1] == (rows,)
+        if not rowed:
+            return first
+        values = [columns[position][place] for position, place in zip(share, row, strict=True)]
+        if not isinstance(first, np.ndarray):
+            return values
+        return np.asarray(values, dtype=object) if first.dtype == object else np.asarray(values)
+
+    return jax.tree.map(gathered, *ordered, is_leaf=lambda column: not isinstance(column, Mapping))
 
 
 # The batches a `DevicePrefetchIterator` queues ahead of the step by default.

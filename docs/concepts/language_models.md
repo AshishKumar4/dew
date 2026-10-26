@@ -215,7 +215,7 @@ With gradient accumulation, the cross-entropy and multi-token-prediction (MTP) l
 
 ## Pretrained checkpoints
 
-`Pretrained.load(name_or_dir)` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle that holds the native Flax model, its variables, the checkpoint's processor or tokenizer, the source config and the generation defaults. The bundle's class depends on the kind of source it read, and each class has the methods that work for that kind: `PretrainedDecoder` (text generation), `PretrainedMaskedDecoder` (LLaDA, Dream), `PretrainedBlockDecoder` (DiffusionGemma), `PretrainedPipeline` (latent diffusion, `text_to_image`) and `PretrainedFallback` (tier 3, transformers' own forward, training only). Every kind can take an adapter (`adapt`), and you can pass any of them in place of the model to the objective that trains it. Calling `load` on a specifi…
+`Pretrained.load(name_or_dir)` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle that holds the native Flax model, its variables, the checkpoint's processor or tokenizer, the source config and the generation defaults. The bundle's class depends on the kind of source it read, and each class has the methods that work for that kind: `PretrainedDecoder` (text generation), `PretrainedMaskedDecoder` (LLaDA, Dream), `PretrainedBlockDecoder` (DiffusionGemma), `PretrainedPipeline` (latent diffusion, `text_to_image`) and `PretrainedFallback` (tier 3, transformers' own forward; text generation where its attention is Dew's). Every kind can take an adapter (`adapt`), and you can pass any of them in place of the model to the objective that trains it. Calling `load` on a specifi…
 
 `LMObjective(bundle, seq_len, **options)` trains a decoder bundle from its loaded weights. With token files prepared using the checkpoint's tokenizer (`dew data export ... --tokenizer Qwen/Qwen3-0.6B`), fine-tuning uses the same trainer as training from scratch:
 
@@ -308,6 +308,8 @@ Loading works in three tiers.
 ### Multimodal checkpoints
 
 A multimodal checkpoint loads as a `MultimodalTransformer`. Its variables hold the text decoder under `language_model` and the vision tower and projector under `tower` and `projector`; Gemma 3n and Gemma 4 also have an audio tower and its embedder, under `audio_tower` and `audio_projector`. The checkpoint's processor resizes and normalizes the media, cuts them into patches and expands the placeholders, and Dew's `Processor` runs it and lays out its outputs row by row.
+
+To train or serve the language model alone, load it with `text_only=True`: `Pretrained.load("Qwen/Qwen3.5-0.8B", text_only=True)` builds Qwen3.5's text decoder from the checkpoint's `model.language_model.*` tensors and the tokenizer, and reads no vision tensor. It computes the multimodal model's logits on text, and `save` writes Qwen3.5's own text checkpoint (`Qwen3_5ForCausalLM`). A checkpoint whose config names a prediction depth it doesn't hold, as transformers' own re-saves of Qwen3.5 are, loads as its trunk.
 
 The next examples read the tiny checkpoints under `tests/fixtures/hf` in a Dew repository checkout. They run on CPU and show how the calls work; the models are too small to say anything about language quality. This one loads a tiny Gemma 3 and gives it images:
 

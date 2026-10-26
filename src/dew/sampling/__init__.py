@@ -4,7 +4,6 @@ from .decoding import LogitsTransform, StepState, Stopping
 from .flow import FlowSDE, FlowTrajectory, GaussianTransition
 from .guidance import APG, CFG, Autoguidance, CFGPlusPlus, Guidance
 from .guided import Grammar
-from .pipelines import TextToImage
 from .sample import sample
 from .solvers import (
     DDIM,
@@ -65,7 +64,6 @@ __all__ = [
     "StepState",
     "Stopping",
     "Strategy",
-    "TextToImage",
     "UniPC",
     "generate",
     "sample",

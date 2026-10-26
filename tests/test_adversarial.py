@@ -20,6 +20,7 @@ import dew
 from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.diffusion.presets import Flow
+from dew.inference import TextToImage
 from dew.inputs import TextCondition
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import TEACHER, Step
@@ -27,7 +28,7 @@ from dew.objectives.diffusion import AdversarialDistillationObjective
 from dew.objectives.diffusion.adversarial import Head
 from dew.objectives.diffusion.objective import DISCRIMINATOR, SPECTRAL
 from dew.registry import ModelConfig
-from dew.sampling import Consistency, Euler, TextToImage
+from dew.sampling import Consistency, Euler
 from dew.training import Trainer
 
 HEAD = np.load(Path(__file__).resolve().parent / "fixtures" / "stylegan_t" / "head.npz")

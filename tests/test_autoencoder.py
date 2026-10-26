@@ -162,6 +162,32 @@ def test_every_registration_is_one_autoencoder_with_a_fixture():
 
 
 @pytest.mark.parametrize("kind", RECORDS)
+def test_every_built_in_normalizes_by_its_records_shift_and_factor_bit_for_bit(kind, tmp_path):
+    """Each built-in autoencoder, the KL VAE and a published RAE among them, normalizes its encoder's
+    latent by its record's shift and factor, `(z - shift) * factor` or, one that divides, over the
+    factor, and decode restores the inverse before its decoder: each bit for bit the formula written out
+    on the same draw, as the normalization applied it before its traced map (`LatentAffine`) held it."""
+    if kind == "sd_vae":
+        autoencoder = tiny_vae(latent_shift=0.3, latent_scale=2.5)
+        params = autoencoder.params
+    else:
+        autoencoder, params = _published(kind, tmp_path)
+    side = 2 * autoencoder.downscale_factor
+    frames = (5,) if kind == "wan" else ()
+    shape = (*frames, side, side, getattr(autoencoder.model, "image_channels", 3))
+    image = jax.random.uniform(jax.random.key(0), (2, *shape), minval=-1.0, maxval=1.0)
+    raw = autoencoder.encode_video(params, image) if frames else autoencoder.encode_batch(params, image)
+    normalization = autoencoder.normalization
+    shift, factor = (jnp.asarray(value, raw.dtype) for value in (normalization.shift, normalization.factor))
+    np.testing.assert_array_equal(autoencoder.encode(params, image),
+                                  (raw - shift) / factor if normalization.divides else (raw - shift) * factor)
+    z = jax.random.normal(jax.random.key(1), raw.shape, raw.dtype)
+    restored = z * factor + shift if normalization.divides else z / factor + shift
+    decode = autoencoder.decode_video if frames else autoencoder.decode_batch
+    np.testing.assert_array_equal(autoencoder.decode(params, z), decode(params, restored))
+
+
+@pytest.mark.parametrize("kind", RECORDS)
 def test_a_stochastic_encoder_samples_at_its_given_noise_and_a_deterministic_one_refuses_it(kind, tmp_path):
     """A training step hands each example's posterior draw to the encoder as `noise`, in the latent's
     own layout: a stochastic encoder's latent is its posterior's sample at it, its mean at zero noise

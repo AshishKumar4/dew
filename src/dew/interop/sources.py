@@ -173,6 +173,16 @@ METADATA_PATTERNS = ["*.json", "*.txt", "*.model", "*.tiktoken", "*.jinja"]
 """Configs, indexes, tokenizer and chat-template files: everything a load reads but weights."""
 
 
+def remote_code(name_or_dir: str | Path, directory: Path) -> Path:
+    """The directory holding a source's own Python modules, its remote code: a local directory as it
+    is, or the snapshot with the repo's `*.py` files fetched at its commit."""
+    if not os.path.isdir(name_or_dir):
+        from huggingface_hub import snapshot_download
+
+        snapshot_download(str(name_or_dir), revision=directory.name, allow_patterns=["*.py"])
+    return directory
+
+
 def repo_file(name_or_dir: str | Path, directory: Path, filename: str) -> Path:
     """The local path of `filename` in a directory, or `filename` downloaded
     from the repo at the snapshot's commit.

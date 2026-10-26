@@ -36,7 +36,7 @@ from dew._hashing import array_fingerprint
 from dew._records import finite
 from dew.batch import Variables, real_slots, token_positions, valid_order, with_validity
 from dew.interop.weights import decoding_storage
-from dew.nn.inputs import ModelInputs, PredictionPhase, Request, local_rows, mesh_of, next_position
+from dew.nn.inputs import ModelInputs, PredictionPhase, Request, host_rows, local_rows, mesh_of, next_position
 from dew.nn.kernels.options import program
 from dew.nn.kv_cache import gather_cache_rows, refuse_unassigned, write_cache
 from dew.nn.protocols import (
@@ -306,18 +306,36 @@ class Generation(Generic[ArrayT]):
 
     def host(self) -> Generation[np.ndarray]:
         """Return this process's real rows as host arrays, without the padding rows that fill the devices."""
-        return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
+        return jax.tree.map(lambda leaf: host_rows(leaf, self.rows), self)
 
     @functools.cached_property
     def text(self) -> tuple[str, ...]:
-        """Each real row's valid continuation, decoded on first access.
+        """Each real row's valid continuation, decoded on first access (`row_texts`)."""
+        return row_texts(self.decoder, self, self.prompt_width)
 
-        Raises `ValueError` when the generation has no processor to decode with.
-        """
-        if self.decoder is None:
-            raise ValueError("this generation carries no processor to decode with")
-        rows = self.host()
-        return self.decoder(rows.tokens, rows.lengths, self.prompt_width)
+
+def decoded_rows(processor, tokens: ArrayLike, lengths: ArrayLike, width: int) -> tuple[str, ...]:
+    """Each row's `lengths` tokens past `width`, as text, by `processor`: what a task's `decode` and a
+    generation's `text` both return (`row_texts`). Without a processor there is no text to return, and
+    it raises."""
+    if processor is None:
+        raise ValueError("this generation carries no processor to decode with")
+    rows, counts = np.asarray(tokens), np.asarray(lengths)
+    return tuple(processor.decode(rows[row:row + 1, width:width + int(counts[row])])[0]
+                 for row in range(rows.shape[0]))
+
+
+def row_texts(decoder, generation, prompt_width: int | None) -> tuple[str, ...]:
+    """A text or canvas generation's real rows decoded past their prompt by `decoder`, `decoded_rows`
+    over a processor: its rows on the host (`generation.host()`), each row's tokens past
+    `prompt_width`. A generation with no decoder, or with no prompt width to decode from, is refused
+    (ValueError) rather than decoded from the start of its tokens."""
+    if decoder is None:
+        raise ValueError("this generation carries no processor to decode with")
+    if prompt_width is None:
+        raise ValueError("this generation has no prompt width")
+    rows = generation.host()
+    return decoder(rows.tokens, rows.lengths, prompt_width)
 
 
 def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops: DecodeOps,
@@ -503,10 +521,11 @@ def decode_ops(model: nn.Module, params: Variables, pad_id: int, depths: int | N
                 answer, updated = model.apply(
                     {**params, 'cache': empty}, history,
                     attention_mask=jnp.arange(history.shape[1])[None, :] < following[:, None],
-                    decode=True, mutable=['cache'], method='states_and_logits')
-                states, logits = answer
+                    decode=True, mutable=['cache'], method='states_and_logits' if exposed else None)
                 rows = jnp.arange(tokens.shape[0])[:, None]
-                rebuilt = (states[rows, slots], logits[rows, slots]), updated
+                # The same answer `append` gives: states beside the logits where the model exposes them.
+                picked = jax.tree.map(lambda leaf: leaf[rows, slots], answer)
+                rebuilt = picked, updated
 
                 def replaced(fresh, held):
                     selected = crossing.reshape(-1, *(1,) * (fresh.ndim - 1))

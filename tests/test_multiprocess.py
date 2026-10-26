@@ -152,10 +152,21 @@ def document_corpus(directory: Path, documents: int, length) -> Corpus:
     return write_token_corpus(directory, stream, stream, vocab_size=documents + 1, eos_id=0)
 
 
+ZONES = ("UTC0", "ZZZ+11", "ZZZ-9", "ZZZ+5")
+"""Each rank's time zone (TZ, POSIX's offset form, which needs no zone database): its wall clock
+eleven, nine or five hours from the first rank's, as processes on hosts set apart read theirs, where
+processes on one machine read nearly the same second."""
+
+
+def zoned(mode, out, *, process_id: int, **flags):
+    """`spawn`, the rank's wall clock in its own time zone (`ZONES`)."""
+    return spawn(mode, out, process_id=process_id, environment={"TZ": ZONES[process_id]}, **flags)
+
+
 @pytest.fixture(scope="module")
 def two_processes(tmp_path_factory):
-    """The topology two real processes on one 4x2 mesh report."""
-    return run_pool("topology", tmp_path_factory.mktemp("topology"), 2, fsdp_size=2)
+    """The topology two real processes on one 4x2 mesh report, each its clock in its own zone."""
+    return run_pool("topology", tmp_path_factory.mktemp("topology"), 2, fsdp_size=2, start=zoned)
 
 
 # --------------------------------------------------------------------------
@@ -183,9 +194,19 @@ def test_the_mesh_covers_every_process_in_the_pool(two_processes):
 
 
 @pytest.mark.distributed
+def test_every_process_names_its_run_by_the_first_processs_clock(two_processes):
+    """A run's default name holds its start time, and that name is the checkpoint directory every
+    process writes into, so each process takes process 0's clock (`run_timestamp`): two processes
+    whose own clocks read eleven hours apart, as hosts in other zones read theirs, name one run."""
+    first, second = two_processes
+    assert first["own_clock"] != second["own_clock"]
+    assert first["run_timestamp"] == second["run_timestamp"]
+
+
+@pytest.mark.distributed
 def test_four_processes_build_the_same_mesh_as_two(tmp_path):
     """Two devices per process, four processes, one mesh over all eight."""
-    reports = run_pool("topology", tmp_path, 4, fsdp_size=2)
+    reports = run_pool("topology", tmp_path, 4, fsdp_size=2, start=zoned)
     for index, report in enumerate(reports):
         assert report["process_index"] == index
         assert report["local_device_count"] == MESH_DEVICES // 4
@@ -868,16 +889,16 @@ def test_every_process_writes_its_own_local_checkpoint_every_n_steps(tmp_path):
 @pytest.mark.distributed
 def test_a_local_save_that_fails_in_the_background_ends_the_pool(tmp_path):
     """A process whose local checkpoint fails in orbax's background thread
-    (FileExistsError creating its tmp directory, as on a CI shard on
-    2026-10-05) raises at its next save, and the pool ends with it, rather
-    than the two processes waiting for ever in barriers the other will not
-    reach: that shard's pool hung until its 600 s timeout."""
+    (its tmp directory not made, as FileExistsError left one on a CI shard on
+    2026-10-05; here a file stands where its local directory was) raises at
+    its next save, and the pool ends with it, rather than the two processes
+    waiting for ever in barriers the other will not reach: that shard's pool
+    hung until its 600 s timeout."""
     directory = tmp_path
     coordinator = f"127.0.0.1:{free_port()}"
     (directory / "out").mkdir()
     pool = [spawn("fit", directory / "out" / f"process{index}.json", processes=2, process_id=index,
-                  coordinator=coordinator, **local_flags(directory),
-                  fail_local_save=LOCAL_EVERY * 2 if index == 1 else None)
+                  coordinator=coordinator, **local_flags(directory), fail_local_save=LOCAL_EVERY * 2)
             for index in range(2)]
     outputs = []
     for process in pool:
@@ -885,7 +906,7 @@ def test_a_local_save_that_fails_in_the_background_ends_the_pool(tmp_path):
             outputs.append(process.communicate(timeout=120)[0])
         except subprocess.TimeoutExpired:
             pytest.fail(stuck(pool, "end after a failed local save"))
-    assert pool[1].returncode != 0 and "FileExistsError" in outputs[1], outputs[1][-4000:]
+    assert pool[1].returncode != 0 and "NotADirectoryError" in outputs[1], outputs[1][-4000:]
     assert pool[0].returncode != 0, outputs[0][-4000:]
 
 
@@ -1371,7 +1392,9 @@ def test_a_profile_window_that_fails_on_one_rank_fails_the_pool_together(tmp_pat
 
     Rank 0's scheduled directory is a file, so its start fails while rank 1's
     already began. Both have to report the profiling-start failure and reach
-    the barrier after it rather than hang in a collective."""
+    the barrier after it rather than hang in a collective. The capture's
+    export reads XProf, the optional profile extra, as installed."""
+    pytest.importorskip("xprof.convert.raw_to_tool_data", reason="optional profile extra")
     reports = run_pool("profile_failure", tmp_path / "pool", 2,
                        devices=2, timeout=120, steps=4,
                        profile_dir=str(tmp_path / "pool" / "trace"))
