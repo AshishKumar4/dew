@@ -5,6 +5,7 @@ to the XLA expression of the same fla kernel with the same dtypes. Triton's own 
 speed against fla's kernels are the GPU session's (c53 onwards).
 """
 
+import contextlib
 import functools
 
 import fla_gdn_support as support
@@ -806,7 +807,10 @@ def test_the_rule_computes_the_route_its_geometry_selects(label):
         with row_names_port(), pytest.raises(KernelRefused):
             run_rule(recurrence_chunk.chunk_gated_delta_rule, mode, operands, cotangents)
     if refused:
-        with generation.assumed("sm80"):
+        from dew.nn.attention import forward_mode_attention
+
+        forward = forward_mode_attention() if mode == "forward" else contextlib.nullcontext()
+        with generation.assumed("sm80"), forward:
             routed = recurrence_chunk.port_kernel(*operands[:5], operands[5], report=False,
                                                   product="training" if mode == "reverse" else "forward")
         assert routed in ("mosaic_gpu", "xla"), routed
