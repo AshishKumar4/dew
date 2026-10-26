@@ -56,6 +56,7 @@ from dew.nn.precision import (
     running_sum,
     running_total,
     scaled_logits,
+    widened_reduction,
 )
 from dew.nn.protocols import (
     AffineHead,
@@ -232,15 +233,18 @@ def _row_terms(logits, predict: bool, labels) -> tuple[
     # The rest of the row leaves each row's target column out, so the target's entry is its rest summed
     # directly, never its share less one (`_softmax_cotangent`).
     operands = [logits, jnp.ones_like(logits), (columns != labels[..., None]).astype(logits.dtype)]
-    initial = [jnp.array(-jnp.inf, logits.dtype), jnp.array(0, logits.dtype), jnp.array(0, logits.dtype)]
+    starts = [-jnp.inf, 0, 0]
     if predict:
         operands.append(columns)
-        initial.append(jnp.array(jnp.iinfo(jnp.int32).max, jnp.int32))
+        starts.append(jnp.iinfo(jnp.int32).max)
 
     def reduced(*operands):
-        return jax.lax.reduce(operands, tuple(initial), combine, (operands[0].ndim - 1,))
+        initial = tuple(jnp.array(start, operand.dtype)
+                        for start, operand in zip(starts, operands, strict=True))
+        return jax.lax.reduce(operands, initial, combine, (operands[0].ndim - 1,))
 
-    terms = reduced(*operands)
+    # Dew's CPU test setting takes the row's sums in float64 (`widened_reduction`); a run, one fused pass.
+    terms = widened_reduction(reduced, *operands)
     return terms[0] + jnp.log(terms[1]), ((terms[0], terms[3]) if predict else None), terms[:3]
 
 
