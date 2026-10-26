@@ -19,7 +19,7 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 from flax import struct
-from jax.custom_derivatives import SymbolicZero
+from jax.custom_derivatives import SymbolicZero, linear_call
 from jax.typing import ArrayLike
 
 from dew.diffusion.process import Denoiser, Process
@@ -121,32 +121,53 @@ def _gaussian_kl(difference: jax.Array, variance: jax.Array) -> jax.Array:
 
 @functools.partial(_gaussian_kl.defjvp, symbolic_zeros=True)
 def _gaussian_kl_jvp(primals, tangents):
-    """The KL's derivative, each term a coefficient the primals give times its tangent, so no step but
-    the last meets the tangent and that step's result is the term itself. The difference's coefficient
-    is each element's slope `difference / variance`, one division an element (`divided`), so neither a
-    tangent over a variance near float32's least (`4 / 2**-126`, whose half fits) nor a cotangent over
-    one near its largest leaves the range before the slope meets it. The variance's, `-KL / variance`,
-    is that one division where it is a normal number, and else the KL times the tangent over the
-    variance, where the coefficient alone overflows (a variance near float32's least) or flushes (one
-    near its largest) and the term need not: a tangent over the variance first (`2**-126 / 2**32`)
-    left the range where the term (`-2**-65`) does not. An untouched variance's term is none (a
-    symbolic zero)."""
-    (difference, variance), (difference_tangent, variance_tangent) = primals, tangents
+    """The KL's derivative as one linear map in two orders (`linear_call`), each keeping its steps in
+    float32's range where the result is. Forward mode sums the difference's tangent against the
+    difference before one division by the variance (`divided`), so a cancelling tangent (`[16, -16]`
+    at a difference of 0.5 over 2**-126) sums to its 0 rather than to two overflowing products; its
+    transpose, reverse mode, takes each element's slope `difference / variance` against the
+    cotangent, so a cotangent over a variance near float32's largest (whose `1 / (2 variance)` is
+    below the normal range) meets the slope, which is not. The variance's coefficient `-KL /
+    variance` is two factors of about its root each (`_halves`), the tangent or the cotangent meeting
+    one and then the other, so neither a tangent over the variance first (`2**-126 / 2**32`) nor the
+    coefficient alone (`2**249` at the least) leaves the range the term keeps. A tangent JAX knows
+    is zero (a symbolic zero) takes no part."""
+    difference, variance = primals
     value = _gaussian_kl(difference, variance)
+    live = tuple(index for index, tangent in enumerate(tangents) if not isinstance(tangent, SymbolicZero))
+    if not live:
+        return value, jnp.zeros_like(value)
+    held, spread = _halves(value, variance)
     axes = tuple(range(1, difference.ndim))
-    moved = jnp.zeros_like(value)
-    if not isinstance(difference_tangent, SymbolicZero):
+
+    def forward(residuals, moving):
+        difference, variance, held, spread = residuals
+        terms = dict(zip(live, moving, strict=True))
+        moved = jnp.zeros_like(held)
+        if 0 in terms:
+            moved = moved + divided((difference * terms[0]).sum(axis=axes), variance)
+        if 1 in terms:
+            moved = moved - held * terms[1] * spread
+        return moved
+
+    def transposed(residuals, cotangent):
+        difference, variance, held, spread = residuals
         slope = divided(difference, expand(variance, difference))
-        moved = (slope * difference_tangent).sum(axis=axes)
-    if not isinstance(variance_tangent, SymbolicZero):
-        coefficient = value / variance
-        size = jnp.abs(coefficient)
-        normal = (size >= jnp.finfo(coefficient.dtype).tiny) & (size < jnp.inf)
-        # A branch's unused operands are 0 and 1, so a cotangent through either is never inf times 0.
-        direct = jnp.where(normal, coefficient, 0)
-        through, divisor = jnp.where(normal, 0, value), jnp.where(normal, 1, variance)
-        moved = moved - (direct * variance_tangent + through * variance_tangent / divisor)
-    return value, moved
+        pulled = {0: slope * expand(cotangent, difference), 1: -(cotangent * spread) * held}
+        return [pulled[index] for index in live]
+
+    return value, linear_call(forward, transposed, (difference, variance, held, spread),
+                              [tangents[index] for index in live])
+
+
+def _halves(numerator: jax.Array, divisor: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`numerator / divisor` as two factors of about its root each: the numerator over a power of two,
+    and that power over the divisor (`divided`), the power half their exponents' sum, so a number
+    multiplied by one and then the other leaves float32's range only where the whole product does."""
+    _, top = jnp.frexp(numerator)
+    _, bottom = jnp.frexp(divisor)
+    power = (top + bottom) // 2
+    return jnp.ldexp(numerator, -power), divided(jnp.ldexp(jnp.ones_like(divisor), power), divisor)
 
 
 def flow_transition(x: ArrayLike, velocity: ArrayLike, sigma: ArrayLike,
