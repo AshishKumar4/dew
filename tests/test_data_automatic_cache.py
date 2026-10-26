@@ -40,11 +40,12 @@ def records(offset: int = 0) -> Memory:
 
 
 def mapped(step: Counted, source: Memory | None = None) -> Pipeline:
-    """`step` over `source` as a chain's leading map, its records shuffled after it."""
+    """`step` over `source` as a chain's leading map, its records shuffled after it: globally, or in a
+    window where it rejects some, as a read by index shuffles no order a step can drop from."""
     pipeline = Pipeline(records() if source is None else source)
-    pipeline = (pipeline.filter_map(step, identity="counted@1") if step.rejects
-                else pipeline.map(step, identity="counted@1"))
-    return pipeline.shuffle(0)
+    if step.rejects:
+        return pipeline.filter_map(step, identity="counted@1").shuffle(0, window=4)
+    return pipeline.map(step, identity="counted@1").shuffle(0)
 
 
 def read(chain: Pipeline, how: str, *, cache: bool = True, passes: int = 1) -> list[tuple[int, int]]:
@@ -85,9 +86,7 @@ def test_a_run_reads_its_leading_maps_back_from_the_records_an_earlier_run_made(
 def test_a_chain_reads_the_same_records_and_plan_with_or_without_its_automatic_cache(how, rejects):
     """An automatic cache holds what its maps make, a rejection included, so a run reads the same
     records in the same order whether it fills the cache, reads it back or opts out, and its plan,
-    which names no automatic cache, is the same: a position one run saves resumes in either. An
-    indexed read caches no map that rejects, as a cache that drops records is read per share where
-    the chain written reads one global order."""
+    which names no automatic cache, is the same: a position one run saves resumes in either."""
     def chain():
         return mapped(Counted(rejects=rejects))
 
@@ -98,8 +97,7 @@ def test_a_chain_reads_the_same_records_and_plan_with_or_without_its_automatic_c
         return loader.plan.record()
 
     uncached = read(chain(), how, cache=False, passes=2)
-    assert read(chain(), how, passes=2) == uncached
-    assert bool(generations()) == (how == "memory" or not rejects)
+    assert read(chain(), how, passes=2) == uncached and generations()
     assert read(chain(), how, passes=2) == uncached
     assert plan(cache=True) == plan(cache=False)
 
