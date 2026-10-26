@@ -1510,8 +1510,7 @@ class RunConfig:
         from dew.training import prepare_process, run_timestamp
 
         trainer = self.trainer
-        prepare_process(trainer.wandb, trainer.multi_host, trainer.xla_flags, trainer.compilation_cache_dir,
-                        layout=trainer.layout)
+        prepare_process(trainer.wandb, trainer.multi_host, trainer.xla_flags, trainer.compilation_cache_dir)
         prepared = self.prepare()
         stated = prepared.run.objective
         name = trainer.name or (f"{'run' if stated is None else objectives.label(stated.name)}-"
