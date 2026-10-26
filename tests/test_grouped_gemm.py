@@ -283,8 +283,6 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
     target = UNSEEN[unseen]
     canonical = generation.TARGETS[target.generation]
     family = "wgmma" if target.wgmma else "mma.sync"
-    if not target.wgmma and not mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16)).stores(jnp.bfloat16):
-        pytest.skip("mma.sync stores no bf16 tile on this JAX (Family.stores): these calls run Triton")
     # mma.sync's tiles run the product and the input gradient; the kernel gradient is warpgroup MMA's.
     launched = {"MosaicGmm", "MosaicTgmm"} if target.wgmma else {"MosaicGmm"}
 

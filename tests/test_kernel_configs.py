@@ -200,13 +200,13 @@ a few tiles a group (the kernels' resources do not grow with them)."""
 
 def _gemm_mainloop_cases(generation_name: str, *, every_consumer_count: bool = False) -> list:
     """Each GEMM Mosaic mainloop a `generation_name` GPU runs, at the one tile its launch derives from the
-    generation's facts (`Template.derived`): the forward and the input gradient (`MosaicGmm`, fp32 outputs,
-    which every family stores: `mosaic.Family.stores`), the kernel gradient (`MosaicTgmm`) in bf16 and in
-    fp32 with exact sums, the forward with an RMS norm's prologue and a bias epilogue and the kernel
-    gradient with the prologue, on either family where it stores the outputs; each a family's
-    mainloop only where it takes the call (`Template.eligible`). With `every_consumer_count`, also the
-    forward with bf16 outputs, and each form at one consumer and at the family's most (`Family.consumers`)
-    where that tile is legal, each case named with its count (`x1`, `x2`)."""
+    generation's facts (`Template.derived`): the forward and the input gradient (`MosaicGmm`), the kernel
+    gradient (`MosaicTgmm`) in bf16, and on warpgroup MMA the kernel gradient in fp32 with exact sums, the
+    forward with an RMS norm's prologue and a bias epilogue and the kernel gradient with the prologue;
+    each a family's mainloop only where it takes the call (`Template.eligible`). With
+    `every_consumer_count`, also the forward with bf16 outputs, and each form at one consumer and at the
+    family's most (`Family.consumers`) where that tile is legal, each case named with its count (`x1`,
+    `x2`)."""
     from test_gemm_template import biased, normed
 
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
