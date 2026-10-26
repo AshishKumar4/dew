@@ -14,11 +14,19 @@ from typing import ClassVar
 import jax
 import jax.numpy as jnp
 
-from dew.config import JsonDict, ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig, media_field
+from dew.config import (
+    JsonDict,
+    MetricConfig,
+    ModelConfig,
+    ObjectiveConfig,
+    OptimConfig,
+    Prepared,
+    RunConfig,
+    media_field,
+)
 from dew.data.pipeline import ObjectiveData
 from dew.inputs import Field
 from dew.objectives.jepa.masking import MultiBlockMask
-from dew.objectives.jepa.probes import KnnProbe, LinearProbe
 from dew.registry import models
 
 SHARED_MODEL_KEYS = ("emb_features", "num_heads", "mlp_ratio", "ssm_attention_ratio",
@@ -92,10 +100,18 @@ class JepaRunConfig(RunConfig):
             encoder, adapted = adapter.model, {"encoder_variables": adapter.variables}
         objective = self.objective.build(encoder=encoder, predictor=predictor, mask=mask, sample=sample,
                                          **ramp, **adapted)
-        probes = () if not self.probe_classes else (
-            LinearProbe(self.probe_classes), KnnProbe(self.probe_classes, k=self.knn_k))
+        probes = self.validation_metrics(validates=bool(held))
         return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=probes,
                                                       validation=held))
+
+    def default_metrics(self, *, validates: bool) -> tuple[MetricConfig, ...]:
+        """A linear and a k-nearest-neighbour probe of the frozen encoder, where `probe_classes` names
+        the labels' classes, whatever the data holds: a run without a validation split refuses them."""
+        del validates
+        if not self.probe_classes:
+            return ()
+        return (MetricConfig("linear_probe", {"num_classes": self.probe_classes}),
+                MetricConfig("knn_probe", {"num_classes": self.probe_classes, "k": self.knn_k}))
 
 
 __all__ = ["JepaRunConfig"]

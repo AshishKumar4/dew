@@ -239,19 +239,19 @@ def test_another_guidance_scale_seed_or_grid_reuses_the_compiled_walk(tmp_path):
     assert compiled.count == 0
 
 
-def test_build_eval_metrics_follows_the_sample_field(tmp_path):
+def test_validation_metrics_follow_the_sample_field(tmp_path):
     """A video run scores its `VideoGrid` against its `video` field: a PSNR stating no field reads
     that grid there, and an image-only metric raises a ValueError naming it in
-    `build_eval_metrics`, before the trainer."""
+    `validation_metrics`, before the trainer."""
     video = dataclasses.replace(run_config(tmp_path),
                                 data=Files("clips", format="files").pipe(presets.video, 2 / 25, frames=2,
                                                                           fps=25, size=8, batch=2),
                                 val_metrics=(MetricConfig("psnr"),))
-    (metric,) = video.build_eval_metrics()
+    (metric,) = video.validation_metrics(validates=True)
     images = np.zeros((2, 2, 8, 8, 3), np.uint8)
     assert np.isinf(metric.finalize(metric(VideoGrid(unit_range(images)), {"video": images})))
     with pytest.raises(ValueError):
-        dataclasses.replace(video, val_metrics=(MetricConfig("clip"),)).build_eval_metrics()
+        dataclasses.replace(video, val_metrics=(MetricConfig("clip"),)).validation_metrics(validates=True)
 
 
 TINY_CLIP = str(Path(__file__).parent / "fixtures" / "clip" / "tiny")
@@ -278,7 +278,7 @@ def validated_run(directory, *, validates: bool, **fields):
                           checkpoints=checkpoints, tracker=tracker)
         try:
             trainer.fit(data, steps=2, log_every=100, checkpoint_every=2,
-                        metrics=config.build_eval_metrics(data.val is not None))
+                        metrics=config.validation_metrics(validates=data.val is not None))
         finally:
             checkpoints.wait()
     with LocalTracker(directory / "tracking") as journal:
@@ -299,7 +299,7 @@ def test_an_image_run_validates_on_clip_by_default_with_the_model_its_metric_nam
     scalars, _ = validated_run(tmp_path / "named", validates=True, val_metrics=named.val_metrics)
     final = {name: value for step, values in scalars if step == 2 for name, value in values.items()}
     assert 0.0 <= final["val/clip_similarity"] <= 2.0
-    assert run_config(tmp_path).build_eval_metrics(validates=True)[0].name == "clip_similarity"
+    assert run_config(tmp_path).validation_metrics(validates=True)[0].name == "clip_similarity"
     scalars, latest = validated_run(tmp_path / "unvalidated", validates=False)
     assert latest == 2 and not any(name.startswith("val/") for _, values in scalars for name in values)
 
@@ -310,7 +310,7 @@ def test_a_metric_a_run_names_without_a_validation_split_refuses_before_an_updat
     named = (MetricConfig("psnr"),)
     # The metric builds for data that does not validate; the run is what refuses it.
     run = dataclasses.replace(run_config(tmp_path), val_metrics=named)
-    assert len(run.build_eval_metrics(validates=False)) == 1
+    assert len(run.validation_metrics(validates=False)) == 1
     with pytest.raises(ValueError):
         validated_run(tmp_path, validates=False, val_metrics=named)
     assert Checkpoints(str(tmp_path / "checkpoints"), keep=1).latest is None

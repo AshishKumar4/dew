@@ -173,7 +173,7 @@ def test_a_checkpoint_loops_at_the_passes_and_over_the_block_asked():
     weights as they were; --loop-layers gives the tiny Qwen 3.5, which does not
     loop, a loop over a block of its own layers; a block with no passes, or
     passes with no block, on a decoder that does not loop is refused."""
-    from dew.decision.config import looping
+    from dew.config import looping
     from dew.interop import Pretrained
     from dew.nn.backbones.decoder_stack import Loop
 
