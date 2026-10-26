@@ -491,6 +491,18 @@ def test_a_gpu_prefers_the_template_for_a_call_with_block_groups(kind):
             assert (auto == "template") == (target == "sm90"), (target, auto)
 
 
+def test_the_template_reports_the_mainloop_each_pass_runs():
+    """A template call reports the mainloop its forward and its backward run (`generation.route`,
+    'attention_mainloop'), so the kernel-route audit sees a call on a GPU that leaves the Mosaic template: on
+    a CPU the plain-JAX one's, which a CPU prefers."""
+    query, key, value, sinks, dout = drawing(QUERIES, KEYS, jnp.float32, sinks=True)(0)
+    with generation.routes() as found:
+        jax.jit(pulled("template", CASES["causal"])).trace(query, key, value, sinks, dout)
+    reported = [(route.kernel, route.preferred, route.refusal) for route in found
+                if route.choice == "attention_mainloop"]
+    assert reported == [("portable", "portable", None)] * 2
+
+
 def test_the_route_takes_score_hooks_and_the_initial_state_and_refuses_an_output_hook():
     """`attend` runs a score hook and the initial state, and refuses an output hook of its own: its backward
     takes the output before one, so the caller applies it."""
