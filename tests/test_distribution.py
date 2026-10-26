@@ -904,28 +904,17 @@ def test_the_readers_of_one_share_train_on_the_rows_its_first_reader_sampled(tmp
 @pytest.mark.mesh(devices=2)
 def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
     """A pool runs twice over one persistent compilation cache, and the second
-    run loads its step on every process. jax 0.11.2 keyed an executable by the
-    compiling process's topology fingerprint, which on a GPU describes the
-    device down to its NVLink links, and only process 0 writes entries. On the
-    box, whose GPUs 0 and 1 share NVLink and 2 and 3 do not, a pool of GPUs 1
-    and 2 loaded the step on one process and compiled it on the other, whose
-    sharded autotuning then waited for ever for its peer's share. Each process
-    here reports a fingerprint of its own, as those two did, whatever devices
-    the run has; Dew's JAX build (constraints.txt) hashes the fingerprints of
-    every process a computation spans."""
+    run loads its step on every process: only process 0 writes entries, so each
+    process keys the step as process 0 did. JAX keys an executable by its
+    process's topology fingerprint, which on a GPU counts its NVLink links, and
+    jaxlib 0.12 starts no GPU pool whose processes' fingerprints differ
+    (openxla/xla#49677; docs/guides/multi-node.md), so a pool that starts keys
+    alike."""
     cache, records = tmp_path / "cache", tmp_path / "records"
     program = (
         "import json, sys\n"
         "from pathlib import Path\n"
         "import jax\n"
-        "from jax._src.lib import xla_client\n"
-        "topology_of = xla_client.get_topology_for_devices\n"
-        "class Apart:\n"
-        "    def __init__(self, topology):\n"
-        "        self.topology = topology\n"
-        "    def fingerprint(self):\n"
-        "        return self.topology.fingerprint() ^ (jax.process_index() + 1)\n"
-        "xla_client.get_topology_for_devices = lambda devices: Apart(topology_of(devices))\n"
         "events = []\n"
         "jax.monitoring.register_event_listener(lambda event, **_: events.append(event))\n"
         "jax.config.update('jax_explain_cache_misses', True)\n"
