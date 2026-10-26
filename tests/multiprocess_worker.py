@@ -12,9 +12,10 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import shutil
 import threading
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -287,27 +288,12 @@ def dump_params(path: Path, params) -> None:
     np.savez(path, **params_dict(params))
 
 
-class YearAhead(datetime):
-    """A clock a year off, for every process but the first in topology mode.
-
-    Two processes on one machine read the same second nearly always, so a
-    run name that came from each process's own clock would agree in a test
-    and split on a pod. Skewing one clock a year makes the source visible.
-    """
-
-    @classmethod
-    def now(cls, tz=None):
-        return datetime.now(tz) + timedelta(days=400)
-
-
 def mode_topology(args) -> dict:
     import jax
 
     from dew.training import runtime
     from dew.training.distributed import MeshSpec, shard_batch
 
-    if args.process_id > 0:
-        runtime.datetime = YearAhead
     mesh = MeshSpec(fsdp=args.fsdp_size).build()
     rows = BATCH // args.processes
     local = row_marked_batch()[args.process_id * rows:(args.process_id + 1) * rows]
@@ -340,7 +326,8 @@ def mode_topology(args) -> dict:
         "preserved_rows": sorted({int(value) for shard in owned.addressable_shards
                                   for value in np.asarray(shard.data)[:, 0]}),
         "run_timestamp": runtime.run_timestamp(),
-        "own_year": runtime.datetime.now().year,
+        # This process's own wall clock, in the time zone its environment names (TZ).
+        "own_clock": datetime.now().strftime("%Y-%m-%d_%H:%M:%S"),
     }
 
 
@@ -419,7 +406,7 @@ def mode_packed(args) -> dict:
     }
 
 
-def token_trainer(name, checkpoint_base, fsdp: int, seq_len: int):
+def token_trainer(name, checkpoint_base, fsdp: int, seq_len: int, **options):
     """A small decoder over token windows, with checkpoints, as a recipe
     would build it.
 
@@ -442,7 +429,7 @@ def token_trainer(name, checkpoint_base, fsdp: int, seq_len: int):
     return Trainer(
         LMObjective(model, seq_len), optax.sgd(0.1), key=jax.random.key(0),
         mesh=MeshSpec(fsdp=fsdp), layout=Layout(min_shard=TINY),
-        checkpoints=Checkpoints(str(checkpoint_dir(checkpoint_base, name)), keep=4))
+        **{"checkpoints": Checkpoints(str(checkpoint_dir(checkpoint_base, name)), keep=4), **options})
 
 
 class Recording:
@@ -547,10 +534,8 @@ def restored_state(trainer):
 
 
 def mode_token_budget(args) -> dict:
-    trainer = token_trainer(args.name, args.out.parent, fsdp=1, seq_len=4)
-    trainer.checkpoints = None
     tracker = LossRecorder()
-    trainer.tracker = tracker
+    trainer = token_trainer(args.name, args.out.parent, fsdp=1, seq_len=4, checkpoints=None, tracker=tracker)
     data = token_data(args, packed=False, loading=Loading(workers=0, threads=1, read_buffer=1))
     state = trainer.fit(data, tokens=80, log_every=1)
     return {"step": int(state.step), "updates": int(state.updates), "logged": len(tracker.losses)}
@@ -594,30 +579,28 @@ def mode_steps(args) -> dict:
 
 
 
-def fail_local_save(step: int) -> None:
-    """Make this process's local checkpoint at `step` fail in its background
-    thread, where orbax creates the step's tmp directories."""
-    from orbax.checkpoint._src.path import atomicity
+class FailingLocalDirectory(LossRecorder):
+    """A tracker that, once step `step - 1` is logged, puts a file where this process's local
+    checkpoint directory was, so the local save at `step` fails in orbax's background thread as a
+    full or read-only disk would make it fail."""
 
-    create = atomicity._create_tmp_directory
+    def __init__(self, directory: Path, step: int):
+        super().__init__()
+        self.directory, self.step = directory, step
 
-    async def failing(async_makedir_func, tmp_dir, *args, **kwargs):
-        path = Path(tmp_dir)
-        # The item's directory under the step's, in this process's local directory.
-        if path.name.startswith("default.") and path.parent.name.startswith(f"{step}.orbax-checkpoint-tmp") \
-                and path.parent.parent.name.startswith("process"):
-            raise FileExistsError(17, "File exists", str(tmp_dir))
-        return await create(async_makedir_func, tmp_dir, *args, **kwargs)
-
-    atomicity._create_tmp_directory = failing
+    def log(self, scalars, step):
+        super().log(scalars, step)
+        if step == self.step - 1:
+            self.directory.rename(self.directory.with_name(self.directory.name + ".moved"))
+            self.directory.write_text("not a directory")
 
 
 def mode_fit(args) -> dict:
     import jax
 
-    if args.fail_local_save is not None:
-        fail_local_save(args.fail_local_save)
-    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size,
+    failing = None if args.fail_local_save is None else FailingLocalDirectory(
+        Path(args.local_dir) / f"process{args.process_id}", args.fail_local_save)
+    trainer = build_trainer(args.name, args.run_dir, args.fsdp_size, tracker=failing,
                             local_dir=args.local_dir, local_every=args.local_every)
     checkpoints = trainer.checkpoints
     assert checkpoints is not None
@@ -676,9 +659,9 @@ def mode_pool_refusals(args) -> dict:
     well. Each outcome is the error's text, or None for a fit that trained."""
     import jax
     import optax
-    import orbax.checkpoint as ocp
     from affine_run import FEATURES, Regression
 
+    from dew import coordination
     from dew.data import Memory
     from dew.data.compile import compile
     from dew.data.dataset import Loader
@@ -741,14 +724,15 @@ def mode_pool_refusals(args) -> dict:
         "saved": trained(stream(64, 0), Checkpoints(str(Path(args.run_dir) / "saved")), checkpoint_every=1),
     }
     outcomes["latest"] = Checkpoints(str(Path(args.run_dir) / "saved")).latest
+    coordination.agreed("the saved run's listing", lambda: True)
+    resumed_from = Path(args.run_dir) / "saved"
     if other:
-        # A listing of the shared directory taken before step 2 was committed.
-        listing = type(ocp.step.standard_name_format())
-        listed = listing.find_all
-        listing.find_all = lambda name_format, base: (found for found in listed(name_format, base)
-                                                       if found.step != 2)
+        # A listing taken before step 2 was committed: a copy of the directory without it.
+        resumed_from = Path(args.run_dir) / "saved-before-2"
+        shutil.copytree(Path(args.run_dir) / "saved", resumed_from, ignore=lambda _, names: [
+            name for name in names if name == "2"])
     resumed = Trainer(Regression(), optax.sgd(1e-2), key=jax.random.key(0), mesh=MeshSpec(),
-                      checkpoints=Checkpoints(str(Path(args.run_dir) / "saved")))
+                      checkpoints=Checkpoints(str(resumed_from)))
     try:
         outcomes["stale"] = int(resumed.place()[0].step)
     except (ValueError, RuntimeError) as error:
@@ -792,23 +776,11 @@ def mode_profile_failure(args) -> dict:
     import jax
     import optax
 
-    import dew.telemetry.profile as telemetry_profile
     from dew.coordination import agree_process_phase
     from dew.training import ProfileWindow, Trainer
 
-    # The optional XProf package is absent in the test environment; stubbing
-    # its converter keeps the start path real while export becomes a no-op.
-    class Converter:
-        def xspace_to_tool_names(self, paths):
-            return ["overview_page"]
-
-        def xspace_to_tool_data(self, paths, tool, params):
-            return b"{}", "application/json"
-
-    telemetry_profile.require_profile_support = lambda: Converter()
-    real_version = telemetry_profile.version
-    telemetry_profile.version = (lambda name: "0.0" if name == "xprof"
-                                 else real_version(name))
+    # The optional XProf package is a stand-in on this process's path (the driver's), whose
+    # converter exports nothing, so the start path runs as installed.
     profile_dir = Path(args.profile_dir)
     if args.process_id == 0:
         profile_dir.parent.mkdir(parents=True, exist_ok=True)
@@ -1155,8 +1127,8 @@ def mode_evaluation_contract(args) -> dict:
     Numerical, Ratio, Drawing, batches, validation = _evaluation_parts(case)
 
     objective = Numerical()
-    trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(37))
-    state, _, _ = trainer.place()
+    placed = Trainer(objective, optax.sgd(.01), key=jax.random.key(37))
+    state, _, _ = placed.place()
     data = Loader(train=lambda partition: batches(), val=lambda partition: validation(), records=8, batch=8)
     results = {}
     for failure in ("normal", "repeat", "untracked", "preview_only", "uneven", "empty",
@@ -1165,7 +1137,8 @@ def mode_evaluation_contract(args) -> dict:
                     "deleted_batch", "deleted_preview", "mismatched_plan"):
         case.failure = failure
         events.clear()
-        trainer.tracker = Drawing() if rank == 0 and failure not in ("untracked", "no_consumer") else None
+        trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(37), mesh=placed.mesh, tracker=(
+            Drawing() if rank == 0 and failure not in ("untracked", "no_consumer") else None))
         metric = Ratio()
         if failure == "mismatch" and rank == 1:
             metric.name = "another_metric"
@@ -1254,162 +1227,15 @@ def mode_evaluation_clocks(args) -> dict:
     return {"step": result.step, "event": list(result.event_key), "scores": result.scalars}
 
 
-def _preview_objective(kind):
-    """A preview-failure case's objective and a batch for it. A diffusion or masked
-    objective's compiled sampler is a program of its own, which a case replaces
-    (`replaced`) or takes away with AttributeError."""
-    from dew.diffusion import presets
-    from dew.diffusion.discrete import MDLM
-    from dew.inputs import Field, InputSpec
-    from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.nn.backbones.dit import SimpleDiT
-    from dew.objectives.diffusion import DiffusionObjective
-    from dew.objectives.diffusion.masked import MaskedDiffusionObjective
-    from dew.objectives.lm import LMObjective, Samples
-    from dew.sampling import Euler
-
-    def sampled(base):
-        class Sampled(base):
-            replaced = None
-
-            @property
-            def _sample(self):
-                if self.replaced is AttributeError:
-                    raise AttributeError("_sample")
-                return super()._sample if self.replaced is None else self.replaced
-
-        return Sampled
-
-    model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
-                              max_seq_len=8, causal=kind != "masked", dtype="float32", attention_impl="xla")
-    if kind == "lm":
-        return (LMObjective(model, seq_len=4, samples=Samples(prompt=[1, 2], max_new_tokens=1)),
-                {"text": np.ones((3, 5), np.int32)})
-    if kind == "masked":
-        return (sampled(MaskedDiffusionObjective)(model, MDLM(mask_id=7)(), seq_len=4, samples=1, steps=2),
-                {"text": np.ones((3, 4), np.int32)})
-    return (sampled(DiffusionObjective)(SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2),
-                                        presets.EDM(regime="pixel"), InputSpec(Field("image", (RES, RES, 3))),
-                                        steps=2, solver=Euler(), guidance=None),
-            {"image": np.zeros((3, RES, RES, 3), np.uint8)})
-
-
-def _builtin_sampler_failure(kind, phase, source, rank, fault):
-    """A sampler failure at its public invocation or artifact preflight seam."""
-    import jax
-
-    import dew.sampling.text as text_sampling
-
-    def sample_failure(*sample_args, fault=fault, kind=kind, phase=phase, source=source, **kwargs):
-        if phase == "generation" and rank == source:
-            raise fault
-        if kind == "diffusion":
-            result = np.zeros((kwargs["count"], RES, RES, 3), np.float32)
-        else:
-            result = np.ones((1, 3 if kind == "lm" else 4), np.int32)
-        if phase == "preflight" and rank == source:
-            result = jax.device_put(result, jax.local_devices()[0])
-            result.delete()
-        if kind == "lm":
-            return text_sampling.Generation(
-                tokens=result, lengths=jax.numpy.ones((1,), jax.numpy.int32),
-                terminated=jax.numpy.zeros((1,), bool),
-                behavior_log_probs=jax.numpy.zeros((1, 1)),
-                raw_log_probs=jax.numpy.zeros((1, 1)), rows=1)
-        if kind == "masked":
-            return result, np.zeros((), bool)
-        return result
-    return sample_failure
-
-
-def mode_builtin_preview_failures(args) -> dict:
-    """Exercise nested builtin preview failures while both ranks remain alive."""
-    import jax
-    import optax
-
-    from dew.data.dataset import Loader
-    from dew.inference import TextGeneration
-    from dew.training import Trainer
-
-    rank = jax.process_index()
-    reports = {}
-    for kind in ("lm", "diffusion", "masked"):
-        objective, batch = _preview_objective(kind)
-        tracker = ScoreRecorder()
-        trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(0),
-                          tracker=tracker if rank == 0 else None)
-        state, _, _ = trainer.place()
-        original = objective._prompt if kind == "lm" else None
-        original_generate = TextGeneration.__call__
-        closed = []
-
-        for phase in ("setup", "generation", "preflight"):
-            for source in (0, 1):
-                case = f"{kind}-{phase}-{source}"
-                fault = ValueError(f"{case}: local sampler failure before device work")
-
-                def validation(*, batch=batch, case=case, closed=closed):
-                    try:
-                        yield batch
-                    finally:
-                        closed.append(case)
-
-                data = Loader(train=lambda partition: validation(), val=lambda partition: validation(),
-                               records=6, batch=6)
-
-                sample_failure = _builtin_sampler_failure(kind, phase, source, rank, fault)
-
-                if phase == "setup":
-                    if rank == source and kind == "lm":
-                        delattr(objective, "_prompt")
-                    elif rank == source:
-                        objective.replaced = AttributeError
-                elif kind == "lm":
-                    TextGeneration.__call__ = sample_failure
-                else:
-                    objective.replaced = sample_failure
-                try:
-                    result = Evaluation.run(objective, state.variables, data.val, key=state.key,
-                          preview=trainer.tracker is not None, mesh=trainer.device_mesh)
-                    trainer._report_evaluation(result)
-                except (AttributeError, ValueError, RuntimeError) as error:
-                    reports[case] = {"type": type(error).__name__, "error": str(error),
-                                     "runtime": isinstance(error, RuntimeError),
-                                     "original": error is fault, "closed": case in closed}
-                else:
-                    reports[case] = {"error": None}
-                finally:
-                    if kind == "lm":
-                        objective._prompt = original
-                    else:
-                        objective.replaced = None
-                    TextGeneration.__call__ = original_generate
-                # Files keep the successful escapee alive without accidentally
-                # matching the stranded rank's next JAX phase agreement.
-                ready = args.out.parent / f"{case}.{rank}.ready"
-                ready.write_text("returned")
-                peer = args.out.parent / f"{case}.{1 - rank}.ready"
-                deadline = time.monotonic() + 30
-                while not peer.exists():
-                    if time.monotonic() >= deadline:
-                        raise RuntimeError(f"{case}: peer never returned from evaluation")
-                    time.sleep(.01)
-        case = f"{kind}-healthy"
-        result = Evaluation.run(objective, state.variables, data.val, key=state.key,
-                          preview=trainer.tracker is not None, mesh=trainer.device_mesh)
-        trainer._report_evaluation(result)
-        reports[case] = {"scores": result.scalars, "drawn": len(tracker.drawn)}
-    return reports
-
-
 def mode_training_contract(args) -> dict:
     """A rejected shard and a partial composite checkpoint in a real pool."""
     import jax
     import jax.numpy as jnp
     import optax
-    from test_training_transactions import ShortScaleTrainer, Tiny
+    from test_training_transactions import SHORT_SCALE, Tiny
 
     from dew.checkpoints import Checkpoints
+    from dew.training import Trainer
     from dew.training.distributed import shard_batch
 
     class Rows(Tiny):
@@ -1418,9 +1244,9 @@ def mode_training_contract(args) -> dict:
 
     checkpoints = Checkpoints(args.run_dir)
     def build():
-        return ShortScaleTrainer(Rows(composite=True), optax.adamw(.03, weight_decay=.1),
-                                 key=jax.random.PRNGKey(9), accumulation=2,
-                                 dynamic_scale=True, checkpoints=checkpoints)
+        return Trainer(Rows(composite=True), optax.adamw(.03, weight_decay=.1),
+                       key=jax.random.PRNGKey(9), accumulation=2,
+                       dynamic_scale=SHORT_SCALE, checkpoints=checkpoints)
     trainer = build()
     state, _, _ = trainer.place()
     rank, processes = jax.process_index(), jax.process_count()
@@ -2417,7 +2243,6 @@ MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget,
          "evaluation_contract": mode_evaluation_contract,
          "evaluation_replicas": mode_evaluation_replicas,
          "evaluation_clocks": mode_evaluation_clocks,
-         "builtin_preview_failures": mode_builtin_preview_failures,
          "profile_failure": mode_profile_failure, "pool_refusals": mode_pool_refusals,
          "fp8_sites": mode_fp8_sites}
 
