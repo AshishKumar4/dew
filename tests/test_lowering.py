@@ -158,9 +158,12 @@ def _step_lowered(generation: str):
 @pytest.mark.parametrize("generation", GPUS)
 def test_a_hybrid_language_model_step_lowers_for_the_gpu_with_every_kernel_its_generation_chooses(generation):
     """A Qwen 3.5 hybrid's training step, lowered on this CPU for the GPU, calls the short conv's
-    kernels and those of every Pallas choice the generation's row names for a step's layers (the
-    norms, SwiGLU and the gated delta rule's port), so none was interpreted or refused there."""
-    expected = SHORT_CONV.union(*(FAMILIES[key][1] for key in chosen(generation, "step")))
+    kernels, those of every Pallas choice the generation's row names for a step's layers (the norms and
+    SwiGLU), and the gated delta rule's training kernels (`recurrence_chunk.GATED_DELTA`, no row read):
+    the recurrence template's Mosaic launches on a warpgroup-MMA GPU, whose training cell it takes, no
+    Triton kernel among them, else the port's, so none was interpreted or refused there."""
+    delta = set() if family(generation) == 'wgmma' else FAMILIES['gated_delta_rule', 'fla'][1]
+    expected = SHORT_CONV | delta | set().union(*(FAMILIES[key][1] for key in chosen(generation, "step")))
     assert set(triton_kernels(_step_lowered(generation))) == expected
 
 
@@ -262,9 +265,10 @@ def _mamba2_lowered(generation: str):
 @pytest.mark.parametrize("generation", GPUS)
 def test_a_mamba2_layer_lowers_for_the_gpu_with_the_ssd_scan_its_generation_chooses(generation):
     """A Mamba-2 layer, its launches settled as the trainer settles them, lowers to the short conv's
-    kernels and, where the row names the port for the scan, mamba_ssm's fourteen ported kernels; where
-    it does not, to none of them. Its unweighted norm takes the fused RMSNorm where the row names it."""
-    expected = SHORT_CONV.union(*(FAMILIES[key][1] for key in chosen(generation, "mamba2")))
+    kernels and mamba_ssm's fourteen ported kernels, which take the scan on any GPU Dew's Triton kernels
+    run on (`recurrence_chunk.SCAN`, no row read). Its unweighted norm takes the fused RMSNorm where the
+    row names it."""
+    expected = SHORT_CONV | FAMILIES['ssd', 'pallas'][1]
     expected |= set().union(*(FAMILIES[key][1] for key in chosen(generation, "step") if key[0] == "rms_norm"))
     assert set(triton_kernels(_mamba2_lowered(generation))) == expected
 

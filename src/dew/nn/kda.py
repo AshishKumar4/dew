@@ -191,8 +191,8 @@ class KimiDeltaAttention(nn.Module):
         # normalises the queries and keys (`l2norm`) and rounds once, to the
         # dtype the rule takes: the projections' where the port runs it, as
         # fla's layer hands them over, the wide one for the math.
-        parts = (split(part) for part in jnp.split(projected, 3, axis=-1))
-        ported = S > 1 and kernel_routed(*parts, g, beta, floor=self.lower_bound)
+        rows, keys, values = (split(part) for part in jnp.split(projected, 3, axis=-1))
+        ported = S > 1 and kernel_routed(rows, keys, values, g, beta, floor=self.lower_bound)
         heads = ((self.qkv_features, self.head_dim),) * 2 + ((self.qkv_features, None),)
         out = held_scan(self, projected, taps, None, scan,
                         (self.num_heads, self.head_dim, self.head_dim), decode=decode, coordinates=tokens,
