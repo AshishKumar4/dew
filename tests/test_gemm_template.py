@@ -455,7 +455,8 @@ def test_a_dense_product_whose_extents_no_tile_divides_holds_check_1(transpose_r
     def forward(run):
         return lambda x, w, ms, nw, b, cotangent: run(x, w, ms, nw, b)
 
-    with generation.assumed("sm80"), tuning.seen() as launches:
+    # Named: a dense cell runs XLA's dot unnamed (`grouped_matmul.OLD_ROUTES`).
+    with generation.assumed("sm80"), generation.chosen(grouped_matmul="triton"), tuning.seen() as launches:
         truth = functools.partial(plain, wide=jnp.float64, out=jnp.float64)
         assert_as_exact(jax.jit(forward(dew)), jax.jit(forward(plain)), draw, "dense 65x40x100", seeds=SEEDS,
                         truth_fn=forward(truth))
@@ -1541,22 +1542,24 @@ def test_each_cell_runs_the_template_unless_its_old_route_measured_faster(genera
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     rows, depth, width, groups = 4096, 1024, 2048, 8
     sizes = jnp.full((groups,), rows // groups, jnp.int32)
-    x, dy = bf16((rows, depth)), bf16((rows, width))
+    x, dy, grouped, dense = (bf16((rows, depth)), bf16((rows, width)), bf16((groups, depth, width)),
+                             bf16((depth, width)))
     calls = {
-        ("forward", "grouped"): (lambda: template.gemm(x, bf16((groups, depth, width)), sizes,
-                                                       out_dtype=jnp.bfloat16)),
-        ("input_gradient", "grouped"): (lambda: template.gemm(dy, bf16((groups, depth, width)), sizes,
-                                                              transpose_rhs=True, out_dtype=jnp.bfloat16)),
-        ("kernel_gradient", "grouped"): lambda: template.gemm_t(x, dy, sizes, out_dtype=jnp.bfloat16),
-        ("forward", "dense"): lambda: template.gemm(x, bf16((depth, width)), None, out_dtype=jnp.bfloat16),
-        ("input_gradient", "dense"): (lambda: template.gemm(dy, bf16((depth, width)), None,
-                                                            transpose_rhs=True, out_dtype=jnp.bfloat16)),
-        ("kernel_gradient", "dense"): lambda: template.gemm_t(x, dy, None, out_dtype=jnp.bfloat16),
+        ("forward", "grouped"): (lambda x, w: template.gemm(x, w, sizes, out_dtype=jnp.bfloat16), x, grouped),
+        ("input_gradient", "grouped"): (lambda dy, w: template.gemm(dy, w, sizes, transpose_rhs=True,
+                                                                    out_dtype=jnp.bfloat16), dy, grouped),
+        ("kernel_gradient", "grouped"): (lambda x, dy: template.gemm_t(x, dy, sizes, out_dtype=jnp.bfloat16),
+                                         x, dy),
+        ("forward", "dense"): (lambda x, w: template.gemm(x, w, None, out_dtype=jnp.bfloat16), x, dense),
+        ("input_gradient", "dense"): (lambda dy, w: template.gemm(dy, w, None, transpose_rhs=True,
+                                                                  out_dtype=jnp.bfloat16), dy, dense),
+        ("kernel_gradient", "dense"): (lambda x, dy: template.gemm_t(x, dy, None, out_dtype=jnp.bfloat16),
+                                       x, dy),
     }
     family = "wgmma" if generation.gpu_target(generation_name).wgmma else "mma.sync"
-    for (made, shape), call in calls.items():
+    for (made, shape), (call, *operands) in calls.items():
         cell = (family, made, shape)
         expected = grouped_matmul.OLD_ROUTES[cell][0] if cell in grouped_matmul.OLD_ROUTES else "mosaic_gpu"
         with generation.assumed(generation_name), generation.routes() as taken:
-            jax.eval_shape(call)
+            jax.jit(call).trace(*operands)
         assert _kernels(taken) == {expected}, (cell, _kernels(taken))
