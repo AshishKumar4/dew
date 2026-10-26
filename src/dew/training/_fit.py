@@ -255,8 +255,8 @@ def stage_reached(plan: FitPlan, run: FitRun, interval: Interval) -> tuple[Phase
     stream opened again where the step that reached them left it, the stages that step's commit passed
     ended there, reading nothing, and the stage it now reads; what the prefetch worker read ahead of
     the end is dropped untrained. The last stage's tokens, where they end the data, are the run's token
-    budget (`dew.training.budget.run_tokens`). None before a stage's end, which the devices' count is read for before
-    each step while it lies ahead, as a token budget's is."""
+    budget (`dew.training.budget.run_tokens`). None before a stage's end, which the devices' count is
+    read for before each step while it lies ahead, as a token budget's is."""
     ends = plan.dataset.token_ends
     state = None if run.train is None else run.train.source_state
     if ends is None or state is None:
