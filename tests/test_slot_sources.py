@@ -319,7 +319,7 @@ def test_a_slot_draw_transfers_only_selected_host_rows_and_matches_a_device_draw
 @pytest.mark.parametrize("attention", ["causal", "block"])
 def test_the_loaded_slot_runtime_matches_author_scores_and_readout_vjps(tmp_path, mode, attention):
     import jax.numpy as jnp
-    from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
+    from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
 
     from dew.batch import part
     from dew.decision import DecisionInputs, Question
@@ -357,6 +357,7 @@ def test_the_loaded_slot_runtime_matches_author_scores_and_readout_vjps(tmp_path
                            (("slot", "slots"), ("q.weight", "q"), ("k.weight", "k"))})
         return result
 
+    @as_given
     def native(index, held):
         rows = []
         for request in requests[int(index)]:

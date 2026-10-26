@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from reference_error import assert_as_exact, seeds_for
+from reference_error import as_given, assert_as_exact, seeds_for
 
 from dew.optim import NEWTON_SCHULZ, delta_gradient_descent, scale_by_m3
 
@@ -95,6 +95,7 @@ def test_m3s_directions_are_algorithm_1s_across_its_chunks():
         with jax.default_matmul_precision("highest"):
             return np.asarray(muon_orthogonalized(jnp.asarray(matrix)))
 
+    @as_given
     def reference(gradients):
         return jax.tree.map(lambda leaf: m3_directions(leaf, orthogonalized), gradients)
 
@@ -168,7 +169,7 @@ def test_delta_gradient_descent_steps_to_eq_56s_minimizer():
         rng = np.random.default_rng(seed)
         return tuple(rng.standard_normal(shape).astype(np.float32) for shape in ((5, 3), (5,), (3,)))
 
-    assert_as_exact(stepped, delta_minimizer, draw, "delta gradient descent", seeds=NESTED_SEEDS)
+    assert_as_exact(stepped, as_given(delta_minimizer), draw, "delta gradient descent", seeds=NESTED_SEEDS)
     kernel, x, output_gradient = (jnp.asarray(value) for value in draw(0))
     params = {"kernel": kernel, "bias": jnp.ones(3)}
     gradients = {"kernel": jnp.outer(x, output_gradient), "bias": output_gradient}

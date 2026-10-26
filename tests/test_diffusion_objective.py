@@ -23,6 +23,7 @@ from diffusion_support import (
     objective_gradient,
 )
 from flax import linen as nn
+from reference_error import as_given
 
 from dew.data.dataset import Loader
 from dew.diffusion import broadcast_rates, expand, presets
@@ -318,7 +319,7 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
     rows, images and prompts, its weights moved from the fixture's, and its step's key, which draws
     the times, the noise and the dropped rows. The two routes are two programs, which round
     otherwise."""
-    from reference_error import assert_as_exact, widened, without_ynn
+    from reference_error import as_given, assert_as_exact, widened, without_ynn
 
     source, variables, _, step = conditional_mmdit
     dropped = DiffusionObjective(source.model, source.process, source.inputs,
@@ -394,7 +395,7 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
                                       variables=widened(variables))
             return trained(through(wide, widened(values), tokens, at))
 
-    assert_as_exact(dew, reference, draw, f"null dropout at {probability}",
+    assert_as_exact(as_given(dew), as_given(reference), draw, f"null dropout at {probability}",
                     seeds=NULL_DROPOUT_SEEDS[probability], truth_fn=truth)
 
 
@@ -515,6 +516,7 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
     info = Step(jnp.asarray(0), jax.random.fold_in(initial.key, 0), None, **fields)
     twin = float64_twin(objective)
 
+    @as_given
     def pooled(variables):
         # The step donates its state: each draw steps a copy of the untouched template.
         state = jax.tree.map(jnp.copy, template).replace(variables=jax.tree.map(jnp.asarray, variables))
@@ -545,7 +547,7 @@ def test_a_host_master_step_draws_each_examples_noise_as_the_resident_step_does(
     programs compile under the resident step's options (`step_compiler_options`). A host-master run's
     draws by the attempt would read other times, noise and dropped conditions, and step elsewhere."""
     import optax
-    from reference_error import assert_as_exact
+    from reference_error import as_given, assert_as_exact
 
     from dew.training import Layout, Trainer
     from dew.training.transaction import example_fields
@@ -561,6 +563,7 @@ def test_a_host_master_step_draws_each_examples_noise_as_the_resident_step_does(
         run = trainer.compile(placed, batch)
         where = jax.tree.map(lambda leaf: leaf.sharding, template.variables)
 
+        @as_given
         def stepped(variables):
             # The step donates its state: each draw steps a copy of the untouched template.
             state = jax.tree.map(jnp.copy, template).replace(variables=jax.device_put(variables, where))

@@ -11,7 +11,15 @@ import optax
 import pytest
 import torch
 from flax.traverse_util import flatten_dict, unflatten_dict
-from reference_error import assert_as_exact, indexed_recording, over_windows, recording, seeds_for, windows
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    indexed_recording,
+    over_windows,
+    recording,
+    seeds_for,
+    windows,
+)
 from transformers import (
     AutoModelForImageTextToText,
     Gemma4UnifiedConfig,
@@ -51,6 +59,8 @@ def forward_functions(source):
     def forward(batch):
         return native.model.apply(native.variables, batch.tokens, **batch.kwargs())
 
+    # Each arm runs row by row on the host (its row's length read from its mask), as given.
+    @as_given
     def ours(inputs):
         batch = processor.from_hf(inputs)
         result = {}
@@ -72,11 +82,12 @@ def forward_functions(source):
                 torch.float64 if wide else torch.float32).cpu().numpy()
                     for row, single in enumerate(_row_slices(tensors, model))}
 
+    @as_given
     def oracle(inputs):
         with float64():
             return theirs(truth, inputs, wide=True)
 
-    return ours, lambda inputs: theirs(reference, inputs), oracle
+    return ours, as_given(lambda inputs: theirs(reference, inputs)), oracle
 
 
 def assert_forward(source, draw, label, site):
@@ -84,7 +95,7 @@ def assert_forward(source, draw, label, site):
     stored = recording(FIXTURE / f"{site}.npz")
     seeds = int(stored[f"{site}.seeds"])
     drawn, reference, truth = indexed_recording(stored, site, seeds, inputs_of=draw)
-    assert_as_exact(lambda index, inputs: ours(inputs), reference, drawn,
+    assert_as_exact(as_given(lambda index, inputs: ours(inputs)), reference, drawn,
                     label, seeds=seeds, truth_fn=truth)
 
 
@@ -368,7 +379,7 @@ def test_unified_runtime_observations_follow_the_reference(source, site, functio
         recorded_draw, reference, truth = indexed_recording(
             stored, "backward", seeds, inputs_of=windows(lambda seed: draw(seed)[0], BACKWARD_WINDOW),
             truth_fn=over_windows(native_truth))
-        assert_as_exact(lambda index, inputs: over_windows(ours)(inputs), reference, recorded_draw,
+        assert_as_exact(as_given(lambda index, inputs: over_windows(ours)(inputs)), reference, recorded_draw,
                         "Gemma4 Unified recorded backward", seeds=seeds, truth_fn=truth)
         return
 
@@ -379,8 +390,8 @@ def test_unified_runtime_observations_follow_the_reference(source, site, functio
     stored = recording(FIXTURE / f"{site}.npz")
     seeds = int(stored[f"{site}.seeds"])
     recorded_draw, reference, truth = indexed_recording(stored, site, seeds, inputs_of=inputs_of)
-    assert_as_exact(lambda index, inputs: ours(
-        {name: value for name, value in inputs.items() if name != "continuation"}, inputs["continuation"]),
+    assert_as_exact(as_given(lambda index, inputs: ours(
+        {name: value for name, value in inputs.items() if name != "continuation"}, inputs["continuation"])),
         reference, recorded_draw, f"Gemma4 Unified {site}", seeds=seeds, truth_fn=truth)
 
 

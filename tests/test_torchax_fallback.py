@@ -32,6 +32,7 @@ import transformers
 from interop_support import token_draw
 from jax.sharding import PartitionSpec as P
 from reference_error import (
+    as_given,
     assert_as_exact,
     assert_as_exact_as_the_reference,
     equations,
@@ -305,6 +306,7 @@ def test_a_head_trains_as_transformers_does_by_what_it_is(head, tokens, tmp_path
 
     reference_model = copy.deepcopy(model).float()
 
+    @as_given
     def reference_fn(ids, cotangent):
         return torch_step(reference_model, ids, cotangent, getattr(torch, stored))
 
@@ -366,8 +368,8 @@ def test_an_unregistered_causal_lm_loads_as_transformers_own_forward(tokens, tmp
         with float64():
             return torch_step(wide, ids, cotangent, torch.float64)
 
-    assert_as_exact(dew_fn, lambda ids, cotangent: torch_step(reference, ids, cotangent), token_draws(tokens),
-                    "tier 3 cohere LM step", seeds=UNREGISTERED_SEEDS, truth_fn=truth_fn)
+    assert_as_exact(dew_fn, as_given(lambda ids, cotangent: torch_step(reference, ids, cotangent)),
+                    token_draws(tokens), "tier 3 cohere LM step", seeds=UNREGISTERED_SEEDS, truth_fn=truth_fn)
 
 
 PACKED_SEEDS = {"cohere": 256, "cohere2": 256}
@@ -461,6 +463,7 @@ def test_a_packed_row_trains_each_document_as_transformers_runs_it_alone(family,
         with float64():
             return documents_alone(wide, ids, segments, valid, cotangent, torch.float64)
 
+    @as_given
     def theirs(ids, segments, valid, cotangent):
         return documents_alone(reference, ids, segments, valid, cotangent)
 
@@ -531,7 +534,8 @@ def test_a_training_call_that_drops_attention_reads_each_documents_real_tokens(t
         with float64():
             return alone(wide, ids, segments, valid)
 
-    assert_as_exact(ours, lambda ids, segments, valid, _: alone(model, ids, segments, valid), packed_rows,
+    assert_as_exact(ours, as_given(lambda ids, segments, valid, _: alone(model, ids, segments, valid)),
+                    packed_rows,
                     "tier 3 cohere2 dropping call", seeds=DROPPING_SEEDS, truth_fn=truth)
 
 
@@ -657,6 +661,7 @@ def test_bf16_compute_gradients_are_as_exact_as_torchs_bf16(family, tokens, tmp_
 
     reference_model = copy.deepcopy(model)
 
+    @as_given
     def reference_fn(ids, cotangent):
         return torch_step(reference_model, ids, cotangent, torch.bfloat16)
 
@@ -835,6 +840,7 @@ def test_a_tier_3_models_final_states_and_head_are_transformers(case, tmp_path):
                                     method="hidden_states", **keys)
         return hidden, loaded.model.apply(variables, hidden, method="logits_from_hidden")
 
+    @as_given
     def ours(tokens, visible, positions):
         hidden, logits = ours_jitted(loaded.variables, tokens, visible, positions)
         return {"states": np.asarray(hidden, np.float64), "logits": np.asarray(logits, np.float64)}
@@ -860,7 +866,7 @@ def test_a_tier_3_models_final_states_and_head_are_transformers(case, tmp_path):
                              position_ids=torch.from_numpy(positions).long(), output_hidden_states=True)
             # The last of the hidden states is the final norm's output, the states the head reads.
             return {"states": out.hidden_states[-1].double().numpy(), "logits": out.logits.double().numpy()}
-        return run
+        return as_given(run)
 
     reference = copy.deepcopy(model)
     reference.set_attn_implementation("eager")
@@ -939,6 +945,7 @@ def test_a_slot_release_over_a_tier_3_backbone_scores_and_serves_by_transformers
         [laid] = task.layout.rows(task.tokenizer, task.specials, request["state"], asked(request))
         return laid
 
+    @as_given
     def ours(seed):
         encoded = row(seed)
         [scores] = task.scored([encoded])
@@ -958,7 +965,7 @@ def test_a_slot_release_over_a_tier_3_backbone_scores_and_serves_by_transformers
             scores = (head["slot"][:len(question.options)] @ answer
                       + lines @ head["k.weight"].T @ (head["q.weight"] @ answer) / math.sqrt(SLOT_HEAD))
             return {"scores": scores.double().numpy()}
-        return run
+        return as_given(run)
 
     def truth(seed):
         with float64():
@@ -1053,6 +1060,7 @@ def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_pre
         valid[0, :int(rng.integers(1, 4))] = False
         return prompt, valid, rng.integers(0, vocab, (2, steps)).astype(np.int32)
 
+    @as_given
     def ours(prompt, valid, continued):
         return np.asarray(decoded(loaded.variables, prompt, valid, continued), np.float64)
 
@@ -1066,7 +1074,7 @@ def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_pre
                 real = int(valid[row].sum())
                 rows.append(logits[real - 1:real + steps])
             return np.stack(rows)
-        return run
+        return as_given(run)
 
     assert_as_exact(ours, theirs(reference), draw, f"{family} cached logits ({stated})",
                     seeds=DECODE_SEEDS[family], truth_fn=theirs(wide, float64))
@@ -1191,6 +1199,7 @@ def test_a_rotary_that_recomputes_its_tables_runs_each_packed_document_as_transf
 
     segments = np.concatenate([np.full(length, index + 1) for index, length in enumerate(lengths)])[None]
 
+    @as_given
     def ours(tokens):
         return np.asarray(forward(loaded.variables, tokens.astype(np.int32), segments), np.float64)
 
@@ -1204,7 +1213,7 @@ def test_a_rotary_that_recomputes_its_tables_runs_each_packed_document_as_transf
                                 .double().numpy())
                 start += length
             return np.concatenate(rows, axis=1)
-        return run
+        return as_given(run)
 
     reference = copy.deepcopy(model)
     reference.set_attn_implementation("eager")
@@ -1248,6 +1257,7 @@ def test_a_rotary_that_recomputes_its_tables_decodes_as_transformers_generates(r
         valid[0, :2] = False
         return prompt, valid, rng.integers(0, vocab, (2, steps)).astype(np.int32)
 
+    @as_given
     def ours(prompt, valid, continued):
         return np.asarray(decoded(loaded.variables, prompt, valid, continued), np.float64)
 
@@ -1266,7 +1276,7 @@ def test_a_rotary_that_recomputes_its_tables_decodes_as_transformers_generates(r
                         logits.append(out.logits[0, -1])
                 rows.append(torch.stack(logits).double().numpy())
             return np.stack(rows)
-        return run
+        return as_given(run)
 
     reference = copy.deepcopy(model)
     reference.set_attn_implementation("eager")
@@ -1302,6 +1312,7 @@ def _longcat(tmp_path, config: dict, **load):
     reference.set_attn_implementation("eager")
     forward = jax.jit(loaded.model.apply)
 
+    @as_given
     def ours(tokens):
         return np.asarray(forward(loaded.variables, tokens), np.float64)
 
@@ -1309,7 +1320,7 @@ def _longcat(tmp_path, config: dict, **load):
         def run(tokens):
             with precision(), torch.no_grad():
                 return source(torch.from_numpy(tokens).long()).logits.double().numpy()
-        return run
+        return as_given(run)
 
     return model, reference, wide, ours, theirs
 

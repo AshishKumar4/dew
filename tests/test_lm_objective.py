@@ -23,12 +23,12 @@ import selection_margins
 from affine_run import dataset
 from recording import RecordingTracker
 from reference_error import (
+    as_given,
     assert_as_exact,
     assert_as_exact_as_the_reference,
     over_windows,
     widened,
     windows,
-    without_ynn,
 )
 from token_support import token_batch_of
 
@@ -123,7 +123,7 @@ scalar's error is one value a seed, and these sites took 256 to 512 seeds to res
 def assert_as_exact_over_instances(dew, reference, draw, label, *, seeds, truth_fn):
     """Check 1 of a scalar `dew` against `reference` and `truth_fn`, each draw INSTANCES of `draw`'s
     (`reference_error.windows`), every arm run window by window as one draw's program (`over_windows`)."""
-    assert_as_exact(over_windows(without_ynn(dew)), over_windows(without_ynn(reference)),
+    assert_as_exact(over_windows(dew), over_windows(reference),
                     windows(draw, INSTANCES), label, seeds=seeds, truth_fn=over_windows(jax.jit(truth_fn)))
 
 
@@ -426,7 +426,7 @@ def test_scoring_with_samples_configured_does_not_decode():
 
     # Evaluation's per-target losses, scored without a preview, on par with each target's cross entropy
     # written from the decoder's logits (check 1).
-    assert_as_exact(without_ynn(scored), without_ynn(written_losses(objective.model)), drawn_tokens(),
+    assert_as_exact(scored, written_losses(objective.model), drawn_tokens(),
                     "scoring beside samples", seeds=EVALUATED_SEEDS,
                     truth_fn=written_losses(objective.model.clone(dtype=jnp.float64)))
 
@@ -587,7 +587,7 @@ def test_the_validation_pass_scores_perplexity_per_token_and_logs_it():
         return scores
 
     wide = make_objective(model=tiny_decoder().clone(dtype=jnp.float64), pad_id=0)
-    assert_as_exact(passed, without_ynn(evaluated(trainer.objective)),
+    assert_as_exact(as_given(passed), evaluated(trainer.objective),
                     lambda seed: (variables, token_batch(BATCH, seed=seed + 2)[TEXT_KEY]),
                     "the pass's scores", seeds=PASS_SEEDS, truth_fn=evaluated(wide))
 
@@ -924,6 +924,7 @@ def test_z_loss_gradient_carries_the_reference_factor():
     compiled = {np.dtype(np.float32): programs(model),
                 np.dtype(np.float64): programs(model.clone(dtype=jnp.float64))}
 
+    @as_given
     def reference(params, tokens):
         wide = jax.tree.leaves(params)[0].dtype == np.float64
         apply, pull = compiled[np.dtype(np.float64 if wide else np.float32)]

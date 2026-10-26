@@ -21,7 +21,7 @@ import pytest
 from diffusion_stubs import PROMPTS, batch_for
 from diffusion_support import images_of
 from interop_support import allocated_bytes
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 
 from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig, FlowRolloutConfig
@@ -508,6 +508,7 @@ def test_the_resolution_shift_and_the_noise_levels_it_maps_to_are_diffusers(cons
     def dew(times):
         return {name: schedule.rates(times)[1] for name, schedule in schedules.items()}
 
+    @as_given
     def diffusers(times):
         return {name: scheduler.time_shift(mu, 1.0, times) for name, mu in mus.items()}
 

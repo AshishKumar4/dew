@@ -13,7 +13,7 @@ import numpy as np
 import pytest
 import torch
 from interop_support import assert_pads_as, clearing_selections, token_draw, torch_logits
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 
 from dew.interop import Pretrained, parts
 from dew.interop.verify import VerifiedMapping, scatter_weights, verify_mapping
@@ -198,7 +198,7 @@ def test_a_model_of_known_parts_loads_natively_from_its_own_code(tmp_path, name)
 
     # A routed source's draws clear its routers' margin, so every run routes alike.
     draw = clearing_selections(loaded, token_draw(0x1607, TINY["vocab_size"], (4, 24)), name)
-    assert_as_exact(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64),
+    assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
                     torch_logits(reference), draw, f"{name} logits", seeds=SEEDS[name],
                     truth_fn=torch_logits(wide, float64))
 

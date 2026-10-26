@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as splash
 from model_support import model_draw
-from reference_error import assert_as_exact, with_gradients
+from reference_error import as_given, assert_as_exact, with_gradients
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -235,6 +235,7 @@ def test_chunks_from_a_shared_vector_of_places_split_over_an_explicit_sequence_a
     mesh = MeshSpec(sequence=2, explicit=("sequence",)).build(jax.devices()[:2])
     run = jax.jit(attend)
 
+    @as_given
     def split(q, k, v):
         with jax.set_mesh(mesh):
             placed = [jax.device_put(x, NamedSharding(mesh, PartitionSpec(None, "sequence")))
@@ -295,6 +296,7 @@ def test_a_chunked_kind_decodes_what_its_whole_sequence_pass_computes(origin, sh
     step = jax.jit(lambda variables, cache, tokens, places: model.apply(
         {**variables, "cache": cache}, tokens, positions=places, decode=True, mutable=["cache"]))
 
+    @as_given
     def decoded(variables, tokens):
         logits, mutated = step(variables, made(variables), tokens[:, :4], positions[..., :4])
         steps = [logits[:, -1]]
@@ -416,6 +418,7 @@ def test_a_row_with_padding_among_its_tokens_counts_its_tokens_over_a_sequence_a
     mesh = MeshSpec(sequence=2, explicit=("sequence",) if explicit else ()).build(jax.devices()[:2])
     run = jax.jit(attend)
 
+    @as_given
     def split(q, k, v):
         with jax.set_mesh(mesh):
             placed = [jax.device_put(x, NamedSharding(mesh, PartitionSpec(None, "sequence")))

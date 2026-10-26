@@ -9,7 +9,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact, without_ynn
+from reference_error import assert_as_exact
 from sampling_gate import assert_draws_as_declared
 from scipy import stats
 
@@ -174,8 +174,8 @@ def test_the_denoiser_normalizes_bf16_logits_in_fp32():
         return ((4 * jax.random.normal(jax.random.key(seed), (2, 4, 1024))).astype(jnp.bfloat16),)
 
     assert np.all(np.isneginf(np.asarray(jax.jit(normalized)(*draw(0)))[..., mask]))
-    assert_as_exact(without_ynn(lambda logits: normalized(logits)[..., :mask]),
-                    without_ynn(lambda logits: jax.nn.log_softmax(logits[..., :mask].astype(jnp.float32))),
+    assert_as_exact(lambda logits: normalized(logits)[..., :mask],
+                    lambda logits: jax.nn.log_softmax(logits[..., :mask].astype(jnp.float32)),
                     draw, "bf16 log-probabilities", seeds=NORMALIZED_SEEDS,
                     truth_fn=lambda logits: jax.nn.log_softmax(logits[..., :mask]))
 
@@ -317,7 +317,7 @@ def test_the_loss_is_the_mean_of_the_terms_evaluation_reports_under_the_weights_
             return of.evaluate(params, {"text": drawn}, taped(corruption)).losses.sum() / drawn.size
         return mean
 
-    assert_as_exact(without_ynn(loss), without_ynn(mean_of_terms(objective)), draw, "masked loss",
+    assert_as_exact(loss, mean_of_terms(objective), draw, "masked loss",
                     seeds=LOSS_SEEDS, truth_fn=mean_of_terms(wide))
 
     averaged = jax.tree.map(lambda leaf: 1.5 * leaf, params)

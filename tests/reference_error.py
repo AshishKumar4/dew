@@ -155,30 +155,37 @@ def windows(draw, count: int):
     return drawn
 
 
+class _Windowed:
+    """An arm of one draw (`fn`) over `windows`' stacked arguments, window by window (`over_windows`):
+    the gate compiles `fn` as it compiles any arm (`_arms`) and runs the windows through that program."""
+
+    def __init__(self, fn):
+        self.fn = fn
+
+    def __call__(self, *arguments):
+        return _stack_host([self.fn(*jax.tree.map(lambda leaf, index=index: leaf[index], arguments))
+                            for index in range(_window_count(arguments))])
+
+
 def over_windows(fn):
     """`fn`, an arm of one draw, run over `windows`' stacked arguments window by window, each window's
     arguments sliced from the stack, with its outputs stacked on their leading axis as host arrays.
 
     Each window runs the program one draw runs, never a batched one: a batch axis changes the program
     XLA compiles (its fusions, its reductions' order, its dots' batching, a kernel's route), which XLA
-    holds to no common bits with one draw's, so check 1 would judge a program users never run. Pass a
-    JAX arm jitted (`jax.jit(fn)`, `without_ynn(fn)`), so it compiles once a signature and every window
-    calls that program; a torch or NumPy reference as it is. The loop keeps `fn` (`window_fn`), which
-    a recorded truth's rounding count traces on one window (`indexed_recording`)."""
-    def run(*arguments):
-        return _stack_host([fn(*jax.tree.map(lambda leaf, index=index: leaf[index], arguments))
-                            for index in range(_window_count(arguments))])
-    run.window_fn = fn
-    return run
+    holds to no common bits with one draw's, so check 1 would judge a program users never run. The gate
+    compiles `fn` as it compiles an arm of one draw (`_arms`), once a signature, and every window calls
+    that program; a torch or NumPy reference passes `as_given`. The loop keeps `fn`, which a recorded
+    truth's rounding count traces on one window (`indexed_recording`)."""
+    return _Windowed(fn)
 
 
 def _one_draws_program(fn, arguments):
     """`fn` and its `arguments` as one draw's program reads them: a window loop's (`over_windows`) own
     function on its first window's arguments, any other function on them all."""
-    window_fn = getattr(fn, "window_fn", None)
-    if window_fn is None:
+    if not isinstance(fn, _Windowed):
         return fn, arguments
-    return window_fn, jax.tree.map(lambda leaf: leaf[0], arguments)
+    return fn.fn, jax.tree.map(lambda leaf: leaf[0], arguments)
 
 
 WITHOUT_YNN = {"xla_cpu_experimental_ynn_fusion_type": ""}
@@ -194,16 +201,157 @@ because compiler options take no such spelling and that one leaves a scan's redu
 
 def without_ynn(fn, **jit_options):
     """`fn` jitted with WITHOUT_YNN on the CPU lane, the process's default backend
-    (`jax.default_backend()`), and plain `jax.jit` elsewhere. It compiles both arms of a check 1
-    between two Dew paths, such as an interpreted kernel and the XLA program it replaces, the latter
-    the arm the check measures against, so that the two run the same kind of code on any host. A
-    program Dew's users run compiles with the fusions, as they do. Call it at top level, since on the
-    CPU lane its compiler options refuse to be nested in another jit, differentiated through or
-    batched; `over_windows` runs it window by window. A caller's own compiler options take
-    precedence over WITHOUT_YNN's."""
+    (`jax.default_backend()`), and plain `jax.jit` elsewhere: how the gate compiles both arms of a
+    check 1 between two Dew paths (`_arms`), such as an interpreted kernel and the XLA program it
+    replaces, so that the two run the same kind of code on any host. A program Dew's users run compiles
+    with the fusions, as they do. On the CPU lane its compiler options refuse to be nested in another
+    jit, differentiated through or batched, so the gate compiles an arm whole; a site passes its arms
+    as functions and never calls this. A caller's own compiler options take precedence over
+    WITHOUT_YNN's; `fn` already compiled so is returned as it is."""
+    if getattr(fn, "without_ynn", False):
+        return fn
     if jax.default_backend() == "cpu":
         jit_options["compiler_options"] = {**WITHOUT_YNN, **(jit_options.get("compiler_options") or {})}
-    return jax.jit(fn, **jit_options)
+    compiled = jax.jit(fn, **jit_options)
+    compiled.without_ynn = True
+    return compiled
+
+
+def as_given(fn):
+    """`fn`, an arm the gate runs as it is given and never compiles: a torch or NumPy reference, or a Dew
+    arm that runs whole programs of its own (a trainer's fit, a placement on a mesh and the program
+    run there, a host loop). The other arm of its check then compiles as Dew's users run it, with the
+    fusions (`_arms`), as the programs this one runs do."""
+    @functools.wraps(fn)
+    def given(*inputs, **options):
+        return fn(*inputs, **options)
+    given.as_given = True
+    return given
+
+
+def dew_programs(fn):
+    """`fn`, a Dew arm that runs Dew's own compiled programs (a trainer's step, a task's forward, a
+    server's decode), which the gate cannot compile but which take their XLA options from Dew's one
+    seam (`dew.nn.kernels.options.compiler_options`). Beside another Dew arm, the gate runs it with
+    that seam holding WITHOUT_YNN open (`compiled_with`), so the programs it compiles go without
+    YNNPACK's fusions as the gate's own compile of its other arm does; beside an arm `as_given`, as it
+    is, with the fusions. A program it compiled before its check, or compiles by a bare `jax.jit`
+    outside the seam, keeps its own options."""
+    @functools.wraps(fn)
+    def programs(*inputs, **options):
+        return fn(*inputs, **options)
+    programs.dew_programs = True
+    return programs
+
+
+def _given(fn) -> bool:
+    """Whether the gate runs `fn` as it is given (`as_given`, a recorded reference), a window loop's
+    arm by its own (`over_windows`)."""
+    if isinstance(fn, _Windowed):
+        return _given(fn.fn)
+    return bool(getattr(fn, "as_given", False) or getattr(fn, "recorded", False))
+
+
+def _compiles(fn) -> bool:
+    """Whether the gate compiles `fn` itself: a plain function, not an arm it runs as given, a program
+    already compiled (a jit) or an arm of Dew's own programs (`dew_programs`)."""
+    fn = fn.fn if isinstance(fn, _Windowed) else fn
+    return not (_given(fn) or getattr(fn, "dew_programs", False) or hasattr(fn, "lower"))
+
+
+def _refuse_numpy_arms(draw, *arms) -> None:
+    """Refuse an arm the gate would compile that computes in NumPy: called once as it is given on a
+    draw's inputs (a window's, for a window loop's arm), a JAX arm returns JAX arrays, and an arm that
+    returns NumPy arrays is a NumPy reference, which compiled would compute in JAX, in float32 where
+    its draw is float64, by other sums. It passes `as_given`; a Dew arm that only converts its
+    outputs returns them unconverted instead."""
+    plain = [fn for fn in dict.fromkeys(arms) if _compiles(fn)]
+    if not plain:
+        return
+    drawn = draw(0)
+    for fn in plain:
+        inputs = drawn
+        if isinstance(fn, _Windowed):
+            fn, inputs = fn.fn, jax.tree.map(lambda leaf: leaf[0], drawn)
+        outputs = jax.tree.leaves(fn(*inputs))
+        kinds = {type(leaf).__name__ for leaf in outputs if not isinstance(leaf, jax.Array)}
+        if kinds:
+            raise TypeError(f"{getattr(fn, '__qualname__', repr(fn))} returns {sorted(kinds)}: a NumPy arm, "
+                            f"which the gate would compile in JAX; pass it as_given, or return its JAX "
+                            f"values unconverted")
+
+
+def _compiled(fn, compile):
+    """`fn` as the gate runs it: as given (`_given`), as it is where it is a `without_ynn` program
+    already (another jit around it would nest its compiler options), or compiled by `compile`, a
+    window loop's arm within it (`over_windows`)."""
+    if _given(fn) or getattr(fn, "without_ynn", False):
+        return fn
+    if getattr(fn, "dew_programs", False):
+        return fn if compile is jax.jit else _with_ynn_off(fn)
+    if isinstance(fn, _Windowed):
+        return _Windowed(_compiled(fn.fn, compile))
+    return compile(fn)
+
+
+class _Truth:
+    """A check's float64 truth as the gate runs it (`_truth_program`): its first call runs `fn` as it is
+    given and decides the rest, compiled where that call returned JAX values, as given where it
+    returned host values (a NumPy truth). A truth that returns JAX values is traced at that first call,
+    so one that does host work on its inputs (a widening or a conversion on the host) fails there, at
+    its first seed, naming itself; it passes `as_given`."""
+
+    def __init__(self, fn):
+        self.fn, self.run = fn, None
+
+    def __call__(self, *inputs):
+        if self.run is not None:
+            return self.run(*inputs)
+        first = self.fn(*inputs)
+        self.run = self.fn
+        if all(isinstance(leaf, jax.Array) for leaf in jax.tree.leaves(first)):
+            self.run = jax.jit(self.fn)
+            self.run.trace(*inputs)
+        return first
+
+
+def _truth_program(fn):
+    """`fn`, a check's float64 truth, as the gate runs it: compiled, once a signature, so the truth runs
+    as one float64 program on the device's FP64 units rather than one eager dispatch an equation, every
+    primitive at its own float64 semantics. A truth the gate runs as given (`as_given`: torch, a
+    recording, a host loop), one compiled already (a jit, `dew_programs`), or none, as it is; a window
+    loop's by its own; a NumPy truth (its first call returns host values) as given after that call. A
+    JAX truth with host work inside fails at its trace, loudly, and passes `as_given`."""
+    if fn is None or _given(fn) or getattr(fn, "dew_programs", False) or hasattr(fn, "lower"):
+        return fn
+    if isinstance(fn, _Windowed):
+        return _Windowed(_truth_program(fn.fn))
+    return _Truth(fn)
+
+
+def _with_ynn_off(fn):
+    """`fn` run with Dew's compile seam holding WITHOUT_YNN open on the CPU lane (`dew_programs`)."""
+    from dew.nn.kernels.options import compiled_with
+
+    @functools.wraps(fn)
+    def run(*inputs, **options):
+        with compiled_with(WITHOUT_YNN if jax.default_backend() == "cpu" else {}):
+            return fn(*inputs, **options)
+    return run
+
+
+def _arms(dew_fn, reference_fn):
+    """The two arms of a check as the gate runs them (docs/design/testing.md, "the numerical contract"):
+    where both are Dew paths, each without YNNPACK's fusions (`without_ynn`), whose microkernels the
+    host's instruction set picks at run time, so the two run the same kind of code on any host: a
+    plain function the gate compiles so, an arm that runs Dew's own programs (`dew_programs`) with
+    them compiled so through Dew's seam; where one runs as it is given (`as_given`: torch, NumPy, a
+    recording, a host loop over programs of its own), the other as Dew's users run it, with the
+    fusions (`jax.jit`). A site passes plain functions; the gate compiles them, so no site can compile
+    one arm otherwise than its other. One function as both arms compiles once."""
+    compile = jax.jit if _given(dew_fn) or _given(reference_fn) else without_ynn
+    reference = _compiled(reference_fn, compile)
+    return (reference if dew_fn is reference_fn else _compiled(dew_fn, compile)), reference
 
 
 def with_gradients(fn, *, has_aux: bool = False):
@@ -256,7 +404,8 @@ def torch_with_gradients(fn):
     - An input the output does not reach has a zero gradient, a non-floating one none, and an output no
       input reaches pulls nothing back.
     - A narrow float array (bfloat16, the float8 formats) goes in and comes out through the float32 that
-      holds it."""
+      holds it.
+    The gate runs the torch arm as it is given (`as_given`)."""
     def run(*arguments):
         import torch
 
@@ -282,104 +431,11 @@ def torch_with_gradients(fn):
             gradients[index] = _host_array(torch.zeros_like(flat[index]) if grad is None else grad)
         return jax.tree.map(_host_array, out), *jax.tree.unflatten(tree, gradients)
 
-    return run
-
-
-REPLAYED = frozenset({
-    "add", "sub", "mul", "div", "neg", "max", "min", "sqrt", "exp", "expm1", "log", "erf", "erf_inv",
-    "broadcast_in_dim", "convert_element_type", "gather", "iota", "reshape", "slice", "squeeze",
-    "stack", "stop_gradient",
-})
-"""The float operations `float64_replay` evaluates in float64: those an initializer's parameters
-depend on (the parallelism matrix's models', surveyed). Any other operation on a float refuses."""
-FORMATTED = frozenset({"bitcast_convert_type", "nextafter", "reduce_precision"})
-"""Operations whose meaning is a float format's: `float64_replay` runs them at the traced dtypes
-and widens a float they return."""
-
-
-def float64_replay(fn):
-    """`fn` as its float64 truth: its program, as traced, with every operation on a float run in
-    float64 from operands widened exactly, so no float result is rounded but where the program
-    names a format. Operations on integers, bits and keys run as traced, so a draw's random bits
-    and the uniform built from them are the program's own (`FORMATTED`); a float literal or constant
-    is the program's value widened. The program's calls (`jit`), custom derivatives' calls and
-    scans are replayed inside, each equation under the context it was traced in; a float
-    operation outside `REPLAYED`, a complex one, and any other call of a program refuse by name.
-    Returns a function of `fn`'s arguments whose float results are float64, for check 1's
-    `truth_fn` where a float64 run of `fn` would be another program (a float64 draw reads 64-bit
-    random bits). It traces `fn` as the float32 program, x64 off, whatever the caller's mode and
-    however widened its arguments arrive (check 1 hands a truth widened inputs under x64), and
-    rounds each argument to its traced dtype before widening it, as the program would read it."""
-    def run(*arguments):
-        with jax.enable_x64(new_val=False):
-            graph, shapes = jax.make_jaxpr(fn, return_shape=True)(*arguments)
-        native = [value if jax.dtypes.issubdtype(aval.dtype, jax.dtypes.extended)
-                  else np.asarray(value).astype(aval.dtype)
-                  for value, aval in zip(jax.tree.leaves(arguments), graph.in_avals, strict=True)]
-        with jax.enable_x64(new_val=True):
-            outputs = _replayed(graph.jaxpr, graph.consts, native)
-        return jax.tree.unflatten(jax.tree.structure(shapes), outputs)
-    return run
+    return as_given(run)
 
 
 def _floating(dtype) -> bool:
     return jnp.issubdtype(dtype, jnp.floating)
-
-
-def _widened(value):
-    """`value` with a float widened exactly to float64: `widened` for one value, kept on the device,
-    since inside a replayed scan body it is a tracer, which a host array cannot hold."""
-    dtype = value.dtype if hasattr(value, "dtype") else np.result_type(value)
-    return jnp.asarray(value, jnp.float64) if _floating(dtype) else value
-
-
-def _replayed(graph, consts, arguments):
-    held = {variable: _widened(value) for variable, value in
-            zip((*graph.constvars, *graph.invars), (*consts, *arguments), strict=True)}
-
-    def read(variable):
-        return _widened(variable.val) if hasattr(variable, "val") else held[variable]
-
-    for equation in graph.eqns:
-        with equation.ctx.manager:
-            outputs = _replayed_equation(equation, [read(variable) for variable in equation.invars])
-        held.update(zip(equation.outvars, outputs, strict=True))
-    return [read(variable) for variable in graph.outvars]
-
-
-def _replayed_equation(equation, values):
-    name, params = equation.primitive.name, equation.params
-    dtypes = [variable.aval.dtype for variable in (*equation.invars, *equation.outvars)
-              if hasattr(variable.aval, "dtype")]
-    if any(jnp.issubdtype(dtype, jnp.complexfloating) for dtype in dtypes):
-        raise NotImplementedError(f"float64_replay has no float64 rule for complex {name}")
-    if name == "jit":
-        return _replayed(params["jaxpr"].jaxpr, params["jaxpr"].consts, values)
-    if name in ("custom_jvp_call", "custom_vjp_call"):
-        return _replayed(params["call_jaxpr"].jaxpr, params["call_jaxpr"].consts, values)
-    if name == "scan":
-        # The body, replayed in float64 for its operands' widened dtypes, as the scan's own.
-        body = params["jaxpr"]
-        widened = jax.make_jaxpr(lambda *operands: _replayed(body.jaxpr, body.consts, list(operands)))(
-            *(jax.ShapeDtypeStruct(variable.aval.shape, jnp.float64 if _floating(variable.aval.dtype)
-                                   else variable.aval.dtype) for variable in body.jaxpr.invars))
-        return equation.primitive.bind(*values, **{**params, "jaxpr": widened})
-    if next(equations(params), None) is not None:
-        # A call this replay does not open may hold float arithmetic its integer boundary hides.
-        raise NotImplementedError(f"float64_replay does not replay inside {name}")
-    if name in FORMATTED or not any(_floating(dtype) for dtype in dtypes):
-        traced = [jnp.asarray(value).astype(variable.aval.dtype) if hasattr(variable.aval, "dtype")
-                  and _floating(variable.aval.dtype) else value
-                  for value, variable in zip(values, equation.invars, strict=True)]
-        outputs = equation.primitive.bind(*traced, **equation.primitive.get_bind_params(params))
-        outputs = outputs if equation.primitive.multiple_results else [outputs]
-        return [_widened(output) if _floating(output.dtype) else output for output in outputs]
-    if name not in REPLAYED:
-        raise NotImplementedError(f"float64_replay has no float64 rule for {name}")
-    widened = {key: jnp.float64 if key in ("dtype", "new_dtype") and value is not None
-               and _floating(value) else value for key, value in params.items()}
-    outputs = equation.primitive.bind(*values, **equation.primitive.get_bind_params(widened))
-    return outputs if equation.primitive.multiple_results else [outputs]
 
 
 def equations(graph, *, platform: str | None = None):
@@ -1103,7 +1159,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     output dtype it closes over). A draw may be an orbit's: the same values under an exact symmetry
     the seed picks. `seeds` is the site's declared count, sized by `seeds_for` so the reference
     compared with itself resolves PARITY, or, where the arms share their upstream rounding, so Dew
-    paired with the reference does; jit the two functions so every seed reuses one compiled program.
+    paired with the reference does. The gate compiles the two functions (`_arms`), once for every seed:
+    two Dew paths without YNNPACK's fusions, a Dew arm beside an arm run `as_given` with them.
 
     Where a computation has an orbit of summation orders, `orders(inputs)` lists a draw's inputs at K
     of them, the draw itself first: an exact symmetry of the result (a batch's rows in another order
@@ -1136,6 +1193,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                                     f"seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
                                     f"(`seeds_for`)")])
     narrow_leaves: list[str] = []
+    _refuse_numpy_arms(draw, dew_fn, reference_fn)
+    dew_fn, reference_fn = _arms(dew_fn, reference_fn)
+    truth_fn = _truth_program(truth_fn)
 
     def drawn(start, stop):
         draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders)
@@ -1192,6 +1252,9 @@ def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth
         raise Inconclusive([Finding(label, "inconclusive", FEWEST_SEEDS / max(seeds, 1), f"{label}: {seeds} "
                                     f"seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
                                     f"(`seeds_for`)")])
+    _refuse_numpy_arms(draw, changed_fn, original_fn)
+    changed_fn, original_fn = _arms(changed_fn, original_fn)
+    truth_fn = _truth_program(truth_fn)
     draws = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn)
     moved, kept, unresolved = _moved(draws, 1)
     if not moved:
@@ -1266,6 +1329,11 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
             raise ValueError(f"{label}: a recorded reference holds its recorded seeds alone, never a paired "
                              f"sizing's from SIZING_FROM; its site keeps its recorded count")
         most = min(most, len(pilots))
+    paired = dew_fn is not None
+    _refuse_numpy_arms(draw, *([dew_fn] if paired else []), reference_fn)
+    dew_fn, reference_fn = _arms(dew_fn if paired else reference_fn, reference_fn)
+    dew_fn = dew_fn if paired else None
+    truth_fn = _truth_program(truth_fn)
     count, drawn, wide = max(start, FEWEST_SEEDS), None, []
     if count > most:
         raise AssertionError(f"{label}: sizing starts at {count} seeds, past the {most} it may take; "
@@ -1346,7 +1414,8 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
     reference (a dropped term, a wrong scale), the runs measure the procedure's power on that class,
     both procedures on the same draws. `paired` runs both arms on the same draws, as a site does, `dew_fn`
     then the other implementation (an equally exact one, or a fault); `orders` judges rows over each
-    draw's orbit, as a site that declares one."""
+    draw's orbit, as a site that declares one. The runs evaluate their arms as given: a class's
+    arms compile themselves where they are programs, and a fault injects itself on the host."""
     if paired and dew_fn is None:
         raise ValueError("a paired null run takes its other implementation, `dew_fn`")
     verdicts = []
@@ -1518,9 +1587,13 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
 
     reference.recorded = True
 
+    # The truth recomputed, compiled as the gate compiles a truth; its roundings are counted on its trace.
+    live = _truth_program(truth_fn)
+
+    @as_given
     def truth(index, inputs):
         index = int(index)
-        computed = truth_fn(inputs)
+        computed = live(inputs)
         if not roundings:
             # One draw's roundings, a window loop's its window's: each window is a draw of its own.
             program, arguments = _one_draws_program(truth_fn, (inputs,))
