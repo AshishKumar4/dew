@@ -33,6 +33,7 @@ import optax
 import tyro
 
 from dew._hashing import fmix32
+from dew._records import share
 from dew.mesh import LogicalAxes
 from dew.nn.precision import at_least_fp32, stochastic_bf16
 from dew.nn.sharding import declarations, declared_axes
@@ -1164,6 +1165,11 @@ class ParamGroup:
         return rates_of(learning_rate if self.schedule is None else self.schedule,
                       self.learning_rate_multiplier)
 
+    def rate[R](self, learning_rate: R) -> R | ScheduleBase:
+        """The rate its solver runs at: its own schedule, or the config's `learning_rate` where it
+        names none."""
+        return learning_rate if self.schedule is None else self.schedule
+
     def solver(self, make: Callable[..., optax.GradientTransformation],
                learning_rate: float | ScheduleBase, steps: int | None,
                opts: Mapping[str, object]) -> optax.GradientTransformation:
@@ -1177,8 +1183,8 @@ class ParamGroup:
         if self.b1 is not None and 'b1' not in inspect.signature(make).parameters:
             raise ValueError(f"param group {self.name!r} schedules b1, and its optimizer "
                              f"takes no b1 (adam, adamw and lamb do)")
-        solver = scheduled_solver(make, learning_rate if self.schedule is None else self.schedule, steps,
-                                  opts, self.b1, self.learning_rate_multiplier)
+        solver = scheduled_solver(make, self.rate(learning_rate), steps, opts, self.b1,
+                                  self.learning_rate_multiplier)
         if self.bounds is not None:
             solver = optax.chain(solver, _keep_within(*self.bounds))
         return solver
@@ -1345,6 +1351,19 @@ class ScheduleBase:
             raise ValueError(f"{type(self).__name__} needs {field} or trainer.steps as its step horizon")
         return steps
 
+    def warmup(self, steps: int | None) -> int | None:
+        """Its warmup in its own steps over a run of `steps` updates, its share of the run resolved
+        (`_warmup`), as a run's plan records it; None for a schedule with no warmup of steps."""
+        return None
+
+    def _warmup(self, written: int | str, steps: int | None, horizon: int | None = None) -> int:
+        """A warmup of `written` steps in its own steps over a run of `steps` of them: as written, or a
+        share of the run such as `5%` (`dew._records.share`), the whole steps nearest it, of the run's
+        steps or, where the run has none, of the schedule's own `horizon`."""
+        if not isinstance(written, str):
+            return written
+        return round(share(written) * self._horizon(steps if steps is not None else horizon, "warmup_steps"))
+
     def values(self, steps: int | None, rates: Rates | None = None
                ) -> optax.Schedule:
         """Return the value at each of the schedule's own steps, over `steps` of them, from its
@@ -1364,25 +1383,30 @@ class Cosine(ScheduleBase):
     """
 
     peak_value: float = dataclasses.field(metadata={'rate': True})
-    warmup_steps: int = 10000
+    warmup_steps: int | str = 10000
+    """Its warmup in its own steps, or a share of the run such as `5%` (`ScheduleBase._warmup`)."""
     end_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
     init_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
     decay_steps: int | None = None
+
+    def warmup(self, steps: int | None) -> int:
+        return self._warmup(self.warmup_steps, steps, self.decay_steps)
 
     def values(self, steps: int | None, rates: Rates | None = None
                ) -> optax.Schedule:
         rates = self.rates() if rates is None else rates
         decay_steps = self._horizon(steps if self.decay_steps is None else self.decay_steps, "decay_steps")
-        if self.warmup_steps >= decay_steps:
+        warmup = self.warmup(steps)
+        if warmup >= decay_steps:
             raise ValueError(f"Cosine needs warmup_steps={self.warmup_steps} smaller than "
                              f"decay_steps={decay_steps}")
         # `optax.warmup_cosine_decay_schedule`'s own pieces, joined as it joins them; it forms the
         # floor's ratio by branching on the peak, so the ratio is the configured fields' (`values`).
         alpha = 0.0 if self.peak_value == 0.0 else self.end_value / self.peak_value
         return optax.join_schedules([
-            optax.linear_schedule(rates['init_value'], rates['peak_value'], self.warmup_steps),
-            optax.cosine_decay_schedule(rates['peak_value'], decay_steps - self.warmup_steps, alpha),
-        ], [self.warmup_steps])
+            optax.linear_schedule(rates['init_value'], rates['peak_value'], warmup),
+            optax.cosine_decay_schedule(rates['peak_value'], decay_steps - warmup, alpha),
+        ], [warmup])
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1406,20 +1430,25 @@ class Power(ScheduleBase):
     """
 
     peak_value: float = dataclasses.field(metadata={'rate': True})
-    warmup_steps: int
+    warmup_steps: int | str
+    """Its warmup in its own steps, or a share of the run such as `5%` (`ScheduleBase._warmup`)."""
     a: float = dataclasses.field(metadata={'rate': True})
     b: float = -0.51
     c: float = 1.0
     tail: PowerTail | None = None
 
+    def warmup(self, steps: int | None) -> int:
+        return self._warmup(self.warmup_steps, steps, None if self.tail is None else self.tail.steps)
+
     def values(self, steps: int | None, rates: Rates | None = None
                ) -> optax.Schedule:
         rates = self.rates() if rates is None else rates
         tail = self.tail
+        warmup = self.warmup(steps)
         if tail is None:
-            return power_schedule(rates['peak_value'], self.warmup_steps, rates['a'], self.b, self.c)
+            return power_schedule(rates['peak_value'], warmup, rates['a'], self.b, self.c)
         return power_schedule(
-            rates['peak_value'], self.warmup_steps, rates['a'], self.b, self.c, decay_start=tail.start,
+            rates['peak_value'], warmup, rates['a'], self.b, self.c, decay_start=tail.start,
             decay_end=self._horizon(steps if tail.steps is None else tail.steps, "tail.steps"),
             end_value=rates['tail.end_value'])
 
@@ -1434,15 +1463,19 @@ class Linear(ScheduleBase):
     """
 
     peak_value: float = dataclasses.field(metadata={'rate': True})
-    warmup_steps: int = 0
+    warmup_steps: int | str = 0
+    """Its warmup in its own steps, or a share of the run such as `5%` (`ScheduleBase._warmup`)."""
     decay_start: int | None = None
     decay_steps: int | None = None
     end_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
 
+    def warmup(self, steps: int | None) -> int:
+        return self._warmup(self.warmup_steps, steps, self.decay_steps)
+
     def values(self, steps: int | None, rates: Rates | None = None
                ) -> optax.Schedule:
         rates = self.rates() if rates is None else rates
-        return linear_schedule(rates['peak_value'], self.warmup_steps, self.decay_start,
+        return linear_schedule(rates['peak_value'], self.warmup(steps), self.decay_start,
                                self._horizon(steps if self.decay_steps is None else self.decay_steps,
                                              "decay_steps"),
                                end_value=rates['end_value'])
@@ -1469,7 +1502,8 @@ class OneCycle(ScheduleBase):
     peak_value: float = dataclasses.field(metadata={'rate': True})
     init_value: float | None = dataclasses.field(default=None, metadata={'rate': True})
     end_value: float | None = dataclasses.field(default=None, metadata={'rate': True})
-    warmup_fraction: float = 0.3
+    warmup_fraction: float | str = 0.3
+    """The share of the run its rise lasts, torch's `pct_start`: a fraction, or a share such as `30%`."""
 
     def rates(self) -> dict[str, float]:
         """The peak, and the init and end values with torch's derived defaults resolved."""
@@ -1477,12 +1511,21 @@ class OneCycle(ScheduleBase):
         return {'peak_value': self.peak_value, 'init_value': init,
                 'end_value': init / 1e4 if self.end_value is None else self.end_value}
 
+    def _rise(self, steps: int) -> float:
+        """The step its rate peaks at over a run of `steps`, torch's phase end, kept a float as torch
+        keeps it."""
+        fraction = self.warmup_fraction
+        return (share(fraction) if isinstance(fraction, str) else fraction) * steps - 1
+
+    def warmup(self, steps: int | None) -> int:
+        """The steps of its rise, to the whole step its rate peaks at (`_rise`)."""
+        return round(self._rise(self._horizon(steps, "trainer.steps")))
+
     def values(self, steps: int | None, rates: Rates | None = None
                ) -> optax.Schedule:
         rates = self.rates() if rates is None else rates
         steps = self._horizon(steps, "trainer.steps")
-        # torch's phase ends, kept as floats as torch keeps them.
-        rise, last = self.warmup_fraction * steps - 1, steps - 1
+        rise, last = self._rise(steps), steps - 1
         if not 0 < rise < last:
             raise ValueError(f"a one-cycle schedule over {steps} steps with warmup fraction "
                              f"{self.warmup_fraction} has no rise or no fall; give it more steps")
@@ -1631,6 +1674,24 @@ class OptimConfig:
     an average with any other relative standard deviation from the snapshots.
     Empty keeps none.
     """
+
+    def warmups(self, steps: int | None) -> dict[str, int]:
+        """Each of its schedules' warmup in that schedule's own steps over a run of `steps` updates,
+        its share of the run resolved (`ScheduleBase.warmup`), by where the config holds it, as a
+        run's plan records it; a schedule with no warmup of steps is not among them."""
+        held: list[tuple[str, object]] = [] if self.param_groups else [("learning_rate", self.learning_rate)]
+        for group in self.param_groups:
+            # The schedules the group's solver runs (`ParamGroup.rate`): the config's own where the
+            # group names none.
+            rate = "learning_rate" if group.schedule is None else f"param_groups.{group.name}.schedule"
+            held += [(rate, group.rate(self.learning_rate)), (f"param_groups.{group.name}.b1", group.b1)]
+        warmups = {}
+        for name, schedule in held:
+            if isinstance(schedule, ScheduleBase):
+                warmup = schedule.warmup(None if steps is None else steps // schedule.every)
+                if warmup is not None:
+                    warmups[name] = warmup
+        return warmups
 
     def build(self, steps: int | None) -> optax.GradientTransformation:
         """Build the optimizer this config describes, with its schedule, parameter groups and clipping.

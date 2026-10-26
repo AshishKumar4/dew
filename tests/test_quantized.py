@@ -19,6 +19,7 @@ import struct
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
@@ -212,6 +213,33 @@ def test_a_checkpoint_with_block_scales_loads_dequantized(tmp_path, block):
     assert np.array_equal(bits(kv_b), bits(expected["model.layers.0.self_attn.kv_b_proj.weight"].T))
     assert np.array_equal(params["layers_0"]["mlp"]["gate_proj"]["kernel"],
                           tensors["model.layers.0.mlp.gate_proj.weight"].T)
+
+
+def test_an_fp8_checkpoint_loads_and_saves_without_the_prediction_depths_it_drops(tmp_path):
+    """GLM's tiny fixture shipped as fp8 in its trunk and its prediction depth: `prediction_depths=0`
+    leaves the depth's quantized weights and scales unread, so the load binds the trunk's scales alone,
+    and its save requantizes the trunk and reloads to the same logits."""
+    from dew.interop.safetensors_io import read_file
+    directory = tmp_path / "fp8"
+    shutil.copytree(FIXTURE.parent / "glm4-moe-tiny", directory)
+    config = json.loads((directory / "config.json").read_text())
+    config["quantization_config"] = {**DEEPSEEK_V3, "weight_block_size": [16, 16]}
+    (directory / "config.json").write_text(json.dumps(config))
+    tensors, _ = read_file(directory / "model.safetensors")
+    shipped = dict(tensors)
+    for name in ("model.layers.0.self_attn.q_proj.weight", "model.layers.2.eh_proj.weight"):
+        shipped[name], shipped[name + SCALE_SUFFIX] = quantize_fp8_blocks(tensors[name], (16, 16))
+    write_safetensors(directory / "model.safetensors", shipped)
+
+    loaded = Pretrained.load(str(directory), dtype="float32", attention_impl="reference",
+                             prediction_depths=0)
+    assert loaded.model.num_nextn_predict_layers == 0
+    loaded.save(tmp_path / "saved")
+    reloaded = Pretrained.load(str(tmp_path / "saved"), dtype="float32", attention_impl="reference")
+    assert reloaded.model.num_nextn_predict_layers == 0
+    ids = jnp.arange(8, dtype=jnp.int32)[None] % loaded.model.vocab_size
+    np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
+                                  np.asarray(loaded.model.apply(loaded.variables, ids)))
 
 
 # --------------------------------------------------------------------------

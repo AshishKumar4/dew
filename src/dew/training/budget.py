@@ -1,15 +1,19 @@
 """How long a run trains and what ends it early: its one budget, in steps, epochs, examples or tokens
-(`run_length`, `run_steps`), and the stop policies `Trainer.fit` takes beside it (`Plateau`, `Pause`)."""
+(`run_length`, `run_steps`), the stop policies `Trainer.fit` takes beside it (`Plateau`, `Pause`), and
+its cadences resolved against it (`every_step`)."""
 
 from __future__ import annotations
 
 import dataclasses
+import datetime
 import math
 import types
 from typing import Literal
 
+from dew._records import JSON, is_share, recorded_duration, share
 from dew.data.dataset import Loader
 from dew.objectives.base import Metric, TrainingScalar
+from dew.training.cadence import Cadence, Tokens
 from dew.training.evaluation import Summary
 
 
@@ -69,6 +73,34 @@ class Plateau:
             raise ValueError("Plateau needs evals >= 1 and min_delta >= 0")
 
 
+def every_step(value: int | str | None, steps: int | None, tokens: int | None, accumulation: int, *,
+               name: str) -> Cadence:
+    """`value`, a cadence of steps or a share of the run such as `5%` (`dew._records.share`), resolved
+    once against the run's planned length: a share of `steps` microsteps, `accumulation` an update,
+    the whole updates nearest it and at least one; of a token budget alone, a cadence of that many
+    committed tokens (`Tokens`). A share of a run with no planned length is refused by `name`."""
+    if not isinstance(value, str):
+        return value
+    if not is_share(value):
+        raise ValueError(f"{name}={value!r} is no cadence: give steps or a share of the run, such as 5%")
+    fraction = share(value)
+    if steps is not None:
+        return max(1, round(fraction * (steps // accumulation))) * accumulation
+    if tokens is not None:
+        return Tokens(max(1, math.ceil(fraction * tokens)))
+    raise ValueError(f"{name}={value!r} is a share of the run, which has no planned length: give it "
+                     "steps=, epochs=, examples= or tokens=")
+
+
+def recorded(cadence: Cadence | str | datetime.timedelta) -> JSON:
+    """`cadence` as a run's plan records it: its steps, its committed tokens or its duration."""
+    if isinstance(cadence, Tokens):
+        return {"tokens": cadence.every}
+    if isinstance(cadence, datetime.timedelta):
+        return recorded_duration(cadence)
+    return cadence
+
+
 @dataclasses.dataclass(frozen=True)
 class Pause:
     """Ends the run once it has trained `fraction` of its budget, its state and data position
@@ -97,4 +129,5 @@ class Pause:
         return step, real
 
 
-__all__ = ["Pause", "Plateau", "run_length", "run_steps", "run_tokens"]
+__all__ = ["Pause", "Plateau", "every_step", "recorded", "run_length", "run_steps",
+           "run_tokens"]

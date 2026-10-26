@@ -158,7 +158,7 @@ class DecisionRunConfig(DecoderRunConfig):
         frozen = self.lora is not None or self.context_layers is not None
         start = Pretrained.load(self.pretrained, subfolder=self.subfolder, revision=self.revision,
                                 dtype=dtype, param_dtype=self.param_dtype, attention_impl=attention_impl,
-                                **self.trainer.source_placement(frozen=frozen))
+                                **self.source_keywords(frozen=frozen))
         release = isinstance(start, PretrainedDecision)
         if release and self.head is not None:
             raise ValueError("--head draws a head over a fresh backbone; a decision release reads with "

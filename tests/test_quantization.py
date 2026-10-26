@@ -21,6 +21,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from flax.core import FrozenDict
 from reference_error import (
     as_given,
     assert_as_exact,
@@ -863,26 +864,127 @@ def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_mode
                     seeds=PACKED_SEEDS, truth_fn=truth)
 
 
-def test_an_objective_over_a_quantized_packed_task_holds_its_served_tree():
-    """A task's tree quantized for serving computes only as its served model, which reads its
-    projections packed: an objective built over it, a distillation teacher's, holds that tree as it
-    is, and computes the served task's logits."""
+def test_a_program_finds_every_quantized_tower_its_models_hold():
+    """The options a program compiles with read the quantization of every model it is handed and every
+    tower those hold (`quantizations`): a quantized text transformer inside a condition's encoder record,
+    inside the tuple of a task's encoders, counts as a quantized denoiser handed alone does, and an
+    unquantized one adds nothing."""
+    from dew.nn.kernels.options import quantizations
+
+    pytest.importorskip("qwix")
+
+    @dataclasses.dataclass(frozen=True)
+    class Encoder:
+        transformer: nn.Module
+        params: dict
+
+    spec = Quantization(dtype="int8")
+    plain = tiny()
+    quantized = spec.apply(plain)
+    weights = {"params": {"kernel": np.zeros((2, 2), np.float32)}}
+    assert quantizations(plain, (("textcontext", Encoder(plain, weights)),)) == []
+    held = quantizations((("textcontext", Encoder(quantized, weights)),))
+    assert [found.dtype for found in held] == ["int8"]
+    assert quantizations(quantized) == held
+    # A FrozenDict makes each nested mapping as it is read: a tower behind fifty such siblings is found.
+    nested = FrozenDict({f"branch_{index}": {"leaf": {"value": np.zeros(())}} for index in range(50)}
+                        | {"tower": {"encoder": Encoder(quantized, weights)}})
+    assert [found.dtype for found in quantizations(nested)] == ["int8"]
+
+
+def test_a_diffusion_step_compiles_for_the_quantized_text_tower_it_encodes_with():
+    """A text-to-image objective's programs run its conditions' encoders and its autoencoder beside its
+    denoiser (`Objective.towers`), so the options its step and its samples compile with read a quantized
+    text tower (`compiler_options`) as they read a quantized denoiser."""
+    from pathlib import Path
+
+    from dew.diffusion import presets
+    from dew.inputs import Condition, Field, InputSpec
+    from dew.inputs.encoders import CLIPText
+    from dew.nn.backbones.dit import SimpleDiT
+    from dew.nn.kernels.options import quantizations
+    from dew.objectives.diffusion import DiffusionObjective
+
+    pytest.importorskip("qwix")
+    encoder = CLIPText.from_pretrained(str(Path(__file__).parent / "fixtures" / "clip" / "tiny"))
+
+    def objective(tower):
+        return DiffusionObjective(SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
+                                            mlp_ratio=1),
+                                  presets.Flow(), InputSpec(Field("image", (8, 8, 3)),
+                                                            {"textcontext": Condition(tower)}),
+                                  guidance=None, steps=2)
+
+    assert quantizations(*objective(encoder).towers()) == []
+    tower = Quantization(dtype="int8").apply(encoder.transformer)
+    quantized = dataclasses.replace(encoder, transformer=tower)
+    assert [found.dtype for found in quantizations(*objective(quantized).towers())] == ["int8"]
+
+
+SPLIT_SEEDS = 16
+"""The split quantized tree's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on
+armada."""
+
+
+def test_an_objective_over_a_quantized_packed_task_holds_the_canonical_tree():
+    """A task's tree quantized for serving holds its projections packed; an objective built over it, a
+    distillation teacher's, holds the model's canonical tree (`dew.inference.projections.unpacked`), each
+    member the packed kernel's columns quantized as they were (`split_columns`), and computes logits on
+    par (check 1) with the served task's over drawn prompts, from the quantized model's own float64
+    value: the unquantized model in float64 over the served packed weights dequantized exactly. A
+    rule that quantizes activations and names the packed site alone keeps that group packed, its members
+    named by no rule: the objective's forward is the served task's."""
     from pathlib import Path
 
     import dew
+    from dew.interop import Pretrained
     from dew.objectives.lm import LMObjective
+    from dew.quantization import Annotated
 
-    pytest.importorskip("qwix")
+    qwix = pytest.importorskip("qwix")
     directory = Path(__file__).parent / "fixtures/hf/llama-tiny"
     served = dew.pipeline(str(directory), dtype="float32").quantized(
         Quantization(weight_only=True, patterns=(".*_proj",)))
     assert "qkv_proj" in served.variables["params"]["layers_0"]["self_attn"]
     held = LMObjective(served.model, 3, variables=served.variables).variables
-    for ours, theirs in zip(jax.tree.leaves(held), jax.tree.leaves(served.variables), strict=True):
-        assert ours is theirs
-    tokens = jnp.asarray([[1, 2, 3]], jnp.int32)
-    np.testing.assert_array_equal(served.model.apply(held, tokens),
-                                  served.model.apply(served.variables, tokens))
+    layer, packed_layer = held["params"]["layers_0"], served.variables["params"]["layers_0"]
+    assert "qkv_proj" not in layer["self_attn"] and "gate_up_proj" not in layer["mlp"]
+    for (block, packed_name), names in ((("self_attn", "qkv_proj"), ("q_proj", "k_proj", "v_proj")),
+                                        (("mlp", "gate_up_proj"), ("gate_proj", "up_proj"))):
+        if packed_name not in packed_layer[block]:
+            continue
+        members = [qwix.dequantize(layer[block][name]["kernel"].array) for name in names]
+        np.testing.assert_array_equal(np.concatenate(members, axis=-1),
+                                      qwix.dequantize(packed_layer[block][packed_name]["kernel"].array))
+    canonical = Pretrained.load(directory, dtype="float32").model
+    wide = canonical.clone(dtype=jnp.float64)
+    vocab = canonical.vocab_size
+
+    def draw(seed):
+        return (np.random.default_rng([0x1313, seed]).integers(1, vocab, size=(2, 5)).astype(np.int32),)
+
+    def value(node):
+        """A leaf in float64: a quantized kernel its integers times its scales."""
+        if isinstance(node, Annotated):
+            return np.asarray(qwix.dequantize(node.array.astype(jnp.float64)), np.float64)
+        floating = np.issubdtype(np.asarray(node).dtype, np.floating)
+        return np.asarray(node, np.float64) if floating else np.asarray(node)
+
+    with jax.enable_x64(new_val=True):
+        weights = jax.tree.map(value, dict(served.variables),
+                               is_leaf=lambda node: isinstance(node, Annotated))
+
+    assert_as_exact(lambda tokens: served.model.apply(held, tokens),
+                    lambda tokens: served.model.apply(served.variables, tokens), draw,
+                    "split quantized tree", seeds=SPLIT_SEEDS,
+                    truth_fn=lambda tokens: wide.apply(weights, tokens))
+    packed_only = dew.pipeline(str(directory), dtype="float32").quantized(
+        Quantization(patterns=(".*/qkv_proj",)))
+    kept = LMObjective(packed_only.model, 3, variables=packed_only.variables).variables
+    assert "qkv_proj" in kept["params"]["layers_0"]["self_attn"]
+    tokens = draw(0)[0]
+    np.testing.assert_array_equal(packed_only.model.apply(kept, tokens),
+                                  packed_only.model.apply(packed_only.variables, tokens))
 
 
 def test_a_quantized_multimodal_task_keeps_its_processor_and_media():
@@ -1383,6 +1485,37 @@ def image_flow():
         return walked(placed(prepared, dtype), steps=2, key=1, decode=False).host().latents
 
     assert_computed_as_on_the_host(run, "an int8 image task's latents")
+
+
+def test_an_objective_encodes_through_an_int8_text_tower_as_the_host_does():
+    """A program an objective compiles (`Objective.program`) compiles for every tower it runs
+    (`Objective.towers`), so a prompt encoded there by an int8 CLIP tower, the denoiser beside it in float,
+    is as exact as the host's encoding. With Triton's GEMMs open to XLA (`with_triton_gemms`)."""
+    with_triton_gemms(int8_tower_flow)
+
+
+def int8_tower_flow():
+    from dew.diffusion import presets
+    from dew.inputs import Condition, Field, InputSpec
+    from dew.inputs.encoders import CLIPText
+    from dew.nn.backbones.dit import SimpleDiT
+    from dew.objectives.diffusion import DiffusionObjective
+
+    encoder = CLIPText.from_pretrained(str(Path(__file__).parent / "fixtures" / "clip" / "tiny"))
+    tower = Quantization(dtype="int8").apply(encoder.transformer)
+    tokens = encoder.tokenize(["a red bird", "a blue fish"])
+    held = jax.device_get(encoder.params)
+
+    def run(dtype):
+        encoding = dataclasses.replace(encoder, transformer=tower.clone(dtype=dtype))
+        objective = DiffusionObjective(
+            SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1, dtype=dtype),
+            presets.Flow(), InputSpec(Field("image", (8, 8, 3)), {"textcontext": Condition(encoding)}),
+            guidance=None, steps=2)
+        encode = objective.program("prompt encoding", objective.encode)
+        return encode({"textcontext": placed(held, dtype)}, {"textcontext": tokens})["textcontext"].hidden
+
+    assert_computed_as_on_the_host(run, "an int8 text tower's encoding")
 
 
 def test_an_int8_guide_walks_as_the_host_does():

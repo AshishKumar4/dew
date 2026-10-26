@@ -350,8 +350,17 @@ def _qwen_mtp_path(
             raise ValueError(f"unknown Qwen MTP tensor {name!r}")
         return block_path("model." + tail, config)
 
-    return prediction_path(name, "mtp", 0, record_int(config, "num_nextn_predict_layers", 0),
+    return prediction_path(name, "mtp", qwen_mtp_depth(name, config),
+                           record_int(config, "num_nextn_predict_layers", 0),
                            name.removeprefix("mtp."), _QWEN_MTP_FIELDS, block)
+
+
+def qwen_mtp_depth(name: str, config: Mapping[str, object]) -> int | None:
+    """The prediction depth of a Qwen tensor: 0 for any of its single prediction layer's `mtp.*`
+    (`_qwen_mtp_path`), None for the trunk's."""
+    return 0 if name.startswith("mtp.") else None
+
+
 def _qwen35_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
     if name.startswith("mtp."):
         return _qwen_mtp_path(name, config, dew_path)
@@ -383,7 +392,7 @@ QWEN3_NEXT = DecoderFamily(
     'qwen3_next',
     'Qwen3NextForCausalLM',
     lambda model: {},
-    weight_path=qwen35_moe_path,
+    weight_path=qwen35_moe_path, prediction_depth=qwen_mtp_depth,
     packed=FUSED_EXPERTS,
     preserve_source_layout=True,
     padding_idx=True,
@@ -397,7 +406,7 @@ QWEN3_5_MOE_TEXT = DecoderFamily(
     'qwen3_5_moe_text',
     'Qwen3_5MoeForCausalLM',
     lambda model: {},
-    weight_path=qwen35_moe_path,
+    weight_path=qwen35_moe_path, prediction_depth=qwen_mtp_depth,
     packed=FUSED_EXPERTS,
     preserve_source_layout=True,
     padding_idx=True,
@@ -413,7 +422,7 @@ QWEN3_5_TEXT = DecoderFamily(
     QWEN35,
     'Qwen3_5ForCausalLM',
     lambda model: {},
-    weight_path=_qwen35_path,
+    weight_path=_qwen35_path, prediction_depth=qwen_mtp_depth,
     preserve_source_layout=True,
     padding_idx=True,
     defaults={'max_position_embeddings': 32768},
@@ -453,7 +462,7 @@ QWEN2_MOE = DecoderFamily(
     'qwen2_moe',
     'Qwen2MoeForCausalLM',
     lambda model: {},
-    weight_path=qwen35_moe_path,
+    weight_path=qwen35_moe_path, prediction_depth=qwen_mtp_depth,
     packed=FUSED_EXPERTS,
     preserve_source_layout=True,
     # Qwen2MoeConfig's defaults for the fields its decoder reads.
