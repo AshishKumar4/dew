@@ -173,20 +173,11 @@ def _flash_built(case: AttentionCase) -> bool:
             or flash_built_for(device_generation(), architectures))
 
 
-def _declared(kernel: str) -> bool:
-    """Whether the target's instruction family declares `kernel` its old route (`OLD_ROUTES`), which keeps
-    every call it supports there: its measured qualifications against the other old routes hold."""
-    old = OLD_ROUTES.get(generation.family(device_generation()) or '')
-    return old is not None and old[0] == kernel
-
-
 def _qualified(code: str, has: Callable[[AttentionCase], bool], choice: str, default: str,
                feature: str) -> Requirement[AttentionCase]:
     """FlashAttention's measured requirement that the target row names it for `choice` where a call
-    `has` the feature (`default` the row's answer where it names nothing), which a family declaring it
-    holds (`_declared`)."""
-    return _Need(code, lambda case: not has(case) or _declared('flash')
-                 or measured_kernel(choice, default) == 'flash',
+    `has` the feature (`default` the row's answer where it names nothing)."""
+    return _Need(code, lambda case: not has(case) or measured_kernel(choice, default) == 'flash',
                        lambda case: f"{feature}, for which its target row names it on no "
                                     f"{device_generation()}",
                        row='roadmap: qualify flash attention', kind='measured')
@@ -201,10 +192,8 @@ def _narrow(case: AttentionCase) -> bool:
 
 
 def _row_names_flash(case: AttentionCase) -> bool:
-    """Whether the target's row names FlashAttention for `case`: its family's declared route (`_declared`),
-    else its narrow heads' row where that speaks for the call (`_narrow`), else its attention row."""
-    if _declared('flash'):
-        return True
+    """Whether the target's row names FlashAttention for `case`: its narrow heads' row where that
+    speaks for the call (`_narrow`), else its attention row."""
     if _narrow(case) and measured_kernel('attention_narrow', 'triton') == 'flash':
         return True
     return measured_kernel('attention', 'cudnn') == 'flash'
@@ -229,7 +218,7 @@ FLASH_SUPPORTS = (
                 "the call packs documents with no bound on a row's (`Coordinates.max_segments`), which its "
                 "packed sequences need", row=INHERENT),
     _Need('packed_documents', lambda case: case.documents is None or case.max_segments is None
-                or case.max_segments <= FLASH_PACKED_SEGMENTS or _declared('flash'),
+                or case.max_segments <= FLASH_PACKED_SEGMENTS,
                 lambda case: f"the call packs up to {case.max_segments} documents a row, past the "
                              f"{FLASH_PACKED_SEGMENTS} its empty sequences cost less than the document mask",
                 row='measured: flash packed-document cap (docs/performance.md)', kind='measured'),
@@ -438,24 +427,26 @@ bf16 and fp16 on the queries and keys alike, no arbitrary mask and no bias, no s
 call's default arithmetic. It takes every other call form: causality, windows, documents, key lengths and
 starts, block groups, sinks, a softcap, and probability dropout off a GPU (`attention_route.drops`). The
 call runs it by default on a family whose Mosaic template has a routed mainloop, where its declared old
-route does not take the call (`_attention_preferred`), and where a target's measured row prefers it for
-block calls (`attention_blocks`); elsewhere where a call names it (`implementation='template'`, or
-`generation.chosen(attention='template')`)."""
+route does not take the call (`_attention_preferred`); elsewhere where a call names it
+(`implementation='template'`, or `generation.chosen(attention='template')`)."""
 
 
-OLD_ROUTES: dict[str, tuple[str, str]] = {
-    'wgmma': ('flash', "FlashAttention-3 measured faster than the Mosaic template on an H100 (llama-d128 "
-                       "bf16, 2 x 4096, 32 query heads over 8 key heads, CUPTI on an exclusive node): "
-                       "forward 0.588 against 0.761 ms causal and 1.094 against 1.296 full, training forward "
-                       "and backward 2.53 against 11.45 causal and 4.49 against 16.48 full (receipts "
-                       "DERIVED-benchx-h100, BWDSTAGES-h100)"),
+OLD_ROUTES: dict[tuple[str, str], tuple[str, str]] = {
+    ('wgmma', 'attention'): (
+        'flash', "FlashAttention-3 measured faster than the Mosaic template on an H100 (llama-d128 bf16, "
+                 "2 x 4096, 32 query heads over 8 key heads, CUPTI on an exclusive node): forward 0.588 "
+                 "against 0.761 ms causal and 1.094 against 1.296 full, training forward and backward 2.53 "
+                 "against 11.45 causal and 4.49 against 16.48 full (receipts DERIVED-benchx-h100, "
+                 "BWDSTAGES-h100)"),
 }
-"""Attention's declared cells (bible §4, owner 10-25): for each instruction family whose Mosaic template has a
-routed mainloop (`attention_mosaic_program.BUNDLES`), the old route that keeps the calls it takes there, its
-receipts showing it measured faster than the template on the family's attention forward and training, with
-the receipt. Every other call of such a family takes the template; a family without a routed Mosaic mainloop
-(mma.sync's today) keeps its target row's route, no cell. Nothing is ranked at runtime: the list shrinks as
-the template wins."""
+"""Attention's declared cells (bible §4, owner 10-25), by (instruction family, product) as the GEMMs' and the
+recurrence's: for each family whose Mosaic template has a routed mainloop
+(`attention_mosaic_program.BUNDLES`), the old route that keeps the calls it takes there, its receipts showing
+it measured faster than the template, with the receipt. Attention has one product: a call's kernel is chosen
+before it is differentiated (`attention_route.attend`'s `custom_vjp`), so its forward and its training run one
+kernel, and the receipts cover both. Every other call of such a family takes the template; a family without a
+routed Mosaic mainloop (mma.sync's today) keeps its target row's route, no cell. Nothing is ranked at runtime:
+the list shrinks as the template wins."""
 
 
 def _attention_preferred(case: AttentionCase) -> str:
@@ -468,10 +459,8 @@ def _attention_preferred(case: AttentionCase) -> str:
     for heads at most 64 wide with no window, mask, bias, documents, key lengths or key starts
     (`_narrow`): by default tokamax's Triton kernel, measured faster than cuDNN there on an L4 and an RTX
     4080; the A10's and A100's rows name flash, measured faster than both (`generation.TARGETS`). A call
-    with block groups takes the target's measured row for them (`attention_blocks`: the template on sm80,
-    faster and smaller than xla's mask at every length measured), else the generic path, over the mask its
-    spans mean (ledger 1537); a call whose spans only key validity or counted places narrow takes the
-    generic path too, no row measured for it."""
+    with block groups, key validity or counted places, which no old kernel's spans express, takes the
+    generic path there by legality, over the mask its spans mean (ledger 1537)."""
     backend = generation.backend()
     if backend != 'gpu':
         return 'tpu' if backend == 'tpu' else 'xla'
@@ -480,10 +469,8 @@ def _attention_preferred(case: AttentionCase) -> str:
         return 'xla'
     family = generation.family(device_generation())
     if family in attention_mosaic_program.BUNDLES:
-        old = OLD_ROUTES.get(family)
+        old = OLD_ROUTES.get((family, 'attention'))
         return old[0] if old is not None and not ATTENTION.kernel(old[0]).failed(case) else 'template'
-    if case.blocks:
-        return measured_kernel('attention_blocks', 'xla')
     if _narrow(case):
         return measured_kernel('attention_narrow', 'triton')
     return measured_kernel('attention', 'cudnn')

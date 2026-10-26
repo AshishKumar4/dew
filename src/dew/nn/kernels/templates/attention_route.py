@@ -100,9 +100,12 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     the plain-JAX one's."""
     if _on_gpu() and attention_mosaic.forward_takes(query, key, value, spans, hooks, scale=scale,
                                                     residuals=residuals):
+        _report('forward', 'mosaic')
         return attention_mosaic.forward(query, key, value, spans, hooks, scale=scale, residuals=residuals)
     if _on_gpu() and attention_triton.refused(spans) is None:
+        _report('forward', 'triton')
         return attention_triton.forward(query, key, value, spans, hooks, scale=scale, residuals=residuals)
+    _report('forward', 'portable')
     return attention_portable.attend(query, key, value, spans, hooks, block_q=PLAIN_TILE, block_k=PLAIN_TILE,
                                      pad=PLAIN_TILE, scale=scale, residuals=residuals)
 
@@ -123,11 +126,25 @@ def _backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     GPU's, Triton's, the plain-JAX one's."""
     call = (query, key, value, spans, hooks, dout)
     if _on_gpu() and attention_mosaic.backward_takes(*call, residuals=residuals, scale=scale):
+        _report('backward', 'mosaic')
         return attention_mosaic.backward(*call, residuals=residuals, scale=scale)
     if _on_gpu() and attention_triton.refused(spans) is None:
+        _report('backward', 'triton')
         return attention_triton.backward(*call, residuals=residuals, scale=scale)
+    _report('backward', 'portable')
     return attention_portable.backward(*call, block_q=PLAIN_TILE, block_k=PLAIN_TILE, pad=PLAIN_TILE,
                                        residuals=residuals, scale=scale)
+
+
+def _report(pass_name: str, kernel: str) -> None:
+    """Report the mainloop a pass of the template runs (`generation.route`, 'attention_mainloop'): Mosaic
+    GPU's on a GPU, else the plain-JAX one's, each off it naming why (`attention_mosaic.forward_takes`,
+    `backward_takes`)."""
+    preferred = 'mosaic' if _on_gpu() else 'portable'
+    refusal = None if kernel == preferred else generation.Refusal(
+        'mosaic', f"the Mosaic mainloop does not take this call's {pass_name} on this device "
+                  f"(`attention_mosaic.{pass_name}_takes`)", generation.INHERENT)
+    generation.route('attention_mainloop', kernel=kernel, preferred=preferred, refusal=refusal)
 
 
 def _hooks_cotangent(hooks: Hooks, grads: Gradients) -> Hooks:

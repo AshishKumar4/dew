@@ -69,7 +69,7 @@ def _facts(value):
     return value
 
 
-CHOICES = frozenset({'attention', 'attention_blocks', 'attention_narrow', 'attention_packed',
+CHOICES = frozenset({'attention', 'attention_mainloop', 'attention_narrow', 'attention_packed',
                      'attention_sinks', 'attention_window', 'decode', 'delta_decode', 'delta_gates',
                      'gate_up', 'gemm_epilogue', 'gemm_prologue', 'gated_delta_rule', 'grouped_matmul',
                      'local_attention', 'mla', 'narrow_copies', 'paged_decode', 'rms_norm', 'short_conv',
@@ -368,24 +368,12 @@ class GpuTarget:
 # 2.78 ms and the decode kernel 0.42 at one row of 131072 keys; cuDNN's 7 wins at 4, 16 and 128 rows
 # by 0.7 to 18%, 0.56 ms against 0.47 at 16 rows of 8192); Qwen3.5-0.8B's 8/2 heads of 256,
 # which cuDNN does not take on sm80, the decode kernel at 1.04x the fastest in geometric mean.
-# Block calls (`attention_blocks`: causal calls whose queries read their block or image whole, bf16, causal,
-# width 128, 16 query heads over 8, blocks of 256; BLOCKS-time-a100 and -h100 at feat/block-visibility
-# 70c3bc4d9, synchronized ms forward / forward and backward): A100, the template 0.54/2.07 at 2048 keys,
-# 1.09/5.66 at 4096, 10.3/45.5 at 16384, peak 111 and 885 MB; xla over the spans' mask 1.17/2.71 (747 MB),
-# 3.52/8.06, and 60.6 forward at 16384, its backward out of memory (asked 48 GB); cuDNN over the mask as a
-# bias 0.67/2.55, 1.34/7.45, 17.9/85.8. H100, the template 1.46/2.87, 1.66/3.56, 5.61/28.2; xla
-# 1.69/2.70, 3.86/7.37, 47.5/90.6 (43.6 GB). sm90 states no row: a default is at least as fast and as small
-# on every call it serves (BIBLE §4), and a row holds for every length, where at 2048 keys the template's
-# forward and backward is 6% slower than xla's mask, though 2.1 and 3.2 times faster at 4096 and 16384.
-# A target without the row keeps the default block calls had before it, xla over their dense mask (the
-# mask the mixer built for image groups). Ledger 1537 retires the row, and the sm90 gate, when attention's
-# choice ranks by cost, which takes the length.
 TARGETS = {target.generation: target for target in (
     # T4: 40 SMs at a 1590 MHz boost, 320 GB/s (the T4 datasheet).
     GpuTarget('sm75', 'Tesla T4', 64 * 1024, dense_peaks={'Tesla T4': {}, 'NVIDIA Tesla T4': {}},
               aliases=('gpu:t4', 't4'), multiprocessors=40, clock_hz=1590e6, memory_bandwidth=320e9),
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
-              {'attention': 'flash', 'attention_blocks': 'template', 'attention_narrow': 'flash',
+              {'attention': 'flash', 'attention_narrow': 'flash',
                'attention_window': 'flash', 'attention_sinks': 'flash',
                'attention_packed': 'flash', 'xla_triton_gemm': 'off', 'decode': 'decode',
                'rms_norm': 'pallas', 'swiglu': 'pallas', 'gate_up': 'joined', 'delta_gates': 'joined',

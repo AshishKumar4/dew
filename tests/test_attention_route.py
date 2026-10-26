@@ -49,7 +49,6 @@ from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import (
     attention as template,
     attention_mosaic,
-    attention_mosaic_program,
     attention_route,
     attention_triton,
 )
@@ -392,8 +391,9 @@ def test_the_selector_refuses_a_mask_and_a_bias_by_their_inherent_limits():
 
 def test_a_templated_family_runs_the_template_where_its_declared_route_does_not_take_a_call():
     """'auto' on an H100, whose wgmma family has a routed Mosaic template, runs FlashAttention-3 on every
-    16-bit call it supports (a plain call, a window, documents past the old 64-a-row cap) and the template on
-    every other one the template takes (sinks and a softcap, key lengths); an fp32 call stays on xla, the
+    16-bit call it supports (a plain call, a window) and the template on every other one the template takes
+    (sinks and a softcap, key lengths, documents past FlashAttention's measured 64-a-row cap, which stays
+    its own requirement); an fp32 call stays on xla, the
     Mosaic template taking 16-bit operands alone. Every other target runs its row's route, never the
     template on these calls; a call naming the template, or `generation.chosen` naming it for the attention
     choice, takes it everywhere (bible §4, owner 10-25)."""
@@ -403,7 +403,8 @@ def test_a_templated_family_runs_the_template_where_its_declared_route_does_not_
     calls = {
         "plain": (QUERIES, {}, "flash"),
         "window": (QUERIES, {"causal": True, "sliding_window": 24}, "flash"),
-        "documents past the cap": (documents, {"segment_ids": many, "max_segments": documents // 2}, "flash"),
+        "documents past the cap": (documents, {"segment_ids": many, "max_segments": documents // 2},
+                                   "template"),
         "sinks and a softcap": (QUERIES, {"sinks": sinks, "softcap": SOFTCAP}, "template"),
         "key lengths": (QUERIES, {"causal": True, "key_value_seq_lengths": LENGTHS}, "template"),
     }
@@ -463,11 +464,10 @@ def test_on_an_h100_the_routes_backward_is_the_mosaic_template(case):
 def test_a_gpu_prefers_the_template_for_a_call_with_block_groups(kind):
     """A causal call with block or image groups, or key validity: flash and tokamax's Triton kernel refuse
     it by their inherent limits, and cuDNN takes it only as its mask, by measurement. 'auto' resolves a
-    call with groups to the template on a family whose Mosaic template has a routed mainloop (wgmma's, its
-    default) and where the target's measured row names it (`attention_blocks`: sm80's, where the template
-    was faster and smaller than xla's mask at every length), and a call of key validity alone to the
-    template on a templated family and to the generic path on every other, no row measuring it. Without
-    causality the groups add no key, so the call is an ordinary one, where validity still hides its keys."""
+    call with groups or key validity to the template on a family whose Mosaic template has a routed
+    mainloop (wgmma's, its default), and to the generic path by legality on every other, no old kernel's
+    spans expressing it. Without causality the groups add no key, so the call is an ordinary one, where
+    validity still hides its keys."""
     query = jnp.zeros((ROWS, QUERIES, HEADS, WIDTH), jnp.bfloat16)
     key = jnp.zeros((ROWS, QUERIES, KV_HEADS, WIDTH), jnp.bfloat16)
     groups = jnp.asarray(block_groups()[0])
@@ -488,11 +488,7 @@ def test_a_gpu_prefers_the_template_for_a_call_with_block_groups(kind):
         with generation.assumed(target):
             auto = attention.resolve_implementation("auto", query, key, causal=True, block_groups=blocks,
                                                     image_groups=images, key_valid=valid)
-            measured = generation.TARGETS[target].kernels.get("attention_blocks") == "template"
-            templated = generation.family(target) in attention_mosaic_program.BUNDLES
-            assert (auto == "template") == (templated or (measured and kind != "key_valid")), (target, auto)
-    assert generation.TARGETS["sm80"].kernels["attention_blocks"] == "template"
-    assert "attention_blocks" not in generation.TARGETS["sm90"].kernels
+            assert (auto == "template") == (target == "sm90"), (target, auto)
 
 
 def test_the_route_takes_score_hooks_and_the_initial_state_and_refuses_an_output_hook():
