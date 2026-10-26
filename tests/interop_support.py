@@ -1,7 +1,7 @@
 """What several interop tests read off a reference: a checkpoint's stored
-bytes, a source autoencoder's vector-Jacobian products and the audio features
-a checkpoint's own extractor makes; and a Hub cache an offline process
-resolves a repo from."""
+bytes, a source autoencoder's vector-Jacobian products, the audio features
+a checkpoint's own extractor makes and the pad row of its token lookup; and a
+Hub cache an offline process resolves a repo from."""
 
 import functools
 import json
@@ -12,7 +12,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from reference_error import widened
+from reference_error import assert_as_exact, widened
 
 
 def allocated_bytes(monkeypatch, operation):
@@ -86,14 +86,14 @@ def extract_fixture(archive: Path, directory: Path) -> Path:
     return directory
 
 
-def hub_cache(cache: Path, repo_id: str, source: Path) -> str:
-    """Put `source` in `cache` as `repo_id` at one commit, as a download leaves
+def hub_cache(cache: Path, repo_id: str, source: Path,
+              commit: str = "0123456789abcdef0123456789abcdef01234567") -> str:
+    """Put `source` in `cache` as `repo_id` at `commit`, as a download leaves
     it: the snapshot, the branch's commit and the commit's tree listing
     (huggingface_hub's tree cache). A process with HF_HUB_CACHE=cache and
     HF_HUB_OFFLINE=1 then resolves `repo_id` to that commit, which this returns."""
     from huggingface_hub._tree_cache import TREE_CACHE_FORMAT_VERSION
 
-    commit = "0123456789abcdef0123456789abcdef01234567"
     repo = cache / f"models--{repo_id.replace('/', '--')}"
     shutil.copytree(source, repo / "snapshots" / commit)
     (repo / "refs").mkdir()
@@ -366,6 +366,66 @@ def torch_logits(source, precision=None):
         with (precision or contextlib.nullcontext)(), torch.no_grad():
             return source(torch.from_numpy(np.asarray(ids)).long()).logits.double().numpy()
     return run
+
+
+def token_table(variables) -> tuple[tuple[str, ...], np.ndarray]:
+    """The path of a decoder's token table among its params, and the table."""
+    from flax.traverse_util import flatten_dict
+
+    params = flatten_dict(variables["params"])
+    (path,) = [path for path in params if path[-2:] == ("embed_tokens", "embedding")]
+    return path, np.asarray(params[path])
+
+
+def assert_pads_as(model, variables, lookup, wide, pad: int, label: str, *, seeds: int) -> None:
+    """A decoder's token lookup is its source's (ledger 1593): `model` pads the row `lookup`, the
+    source's own token embedding module holding `model`'s table, pads (its `padding_idx`, None where
+    the source passes none), and over drawn ids, a quarter of them `pad`, under a drawn cotangent on
+    the looked-up rows, the table's gradient holds check 1 against that module's lookup
+    (`nn.Embedding.forward`, before any scale a subclass applies), from its float64 twin `wide`: the
+    pad row's lookups add nothing where it pads and train it where not."""
+    import contextlib
+
+    import torch
+    from flax.traverse_util import flatten_dict
+
+    from tools.torch_precision import float64
+
+    padded = lookup.padding_idx is not None
+    assert model.padding_idx == lookup.padding_idx in (pad, None)
+    path, table = token_table(variables)
+    vocab, width = table.shape
+
+    def draw(seed):
+        rng = np.random.default_rng([0x1593, seed])
+        ids = rng.integers(0, vocab, (8, 32))
+        ids[rng.random(ids.shape) < 0.25] = pad
+        ids[0, 0] = pad
+        return ids.astype(np.int32), rng.standard_normal((*ids.shape, width)).astype(np.float32)
+
+    @jax.jit
+    def gradient(variables, ids, cotangent):
+        def loss(params):
+            looked_up = model.apply({**variables, "params": params}, ids, method="token_embeddings")
+            return jnp.sum(looked_up * cotangent)
+        return flatten_dict(jax.grad(loss)(variables["params"]))[path]
+
+    def ours(ids, cotangent):
+        return {"token table": np.asarray(gradient(variables, ids, cotangent), np.float64)}
+
+    def theirs(module, precision=contextlib.nullcontext):
+        def run(ids, cotangent):
+            with precision():
+                module.zero_grad()
+                rows = torch.nn.Embedding.forward(module, torch.from_numpy(ids).long())
+                (rows * torch.from_numpy(cotangent).to(rows.dtype)).sum().backward()
+                return {"token table": module.weight.grad.double().numpy()}
+        return run
+
+    ids, cotangent = draw(0)
+    assert np.any(ours(ids, cotangent)["token table"][pad]) != padded
+    assert_as_exact(ours, theirs(lookup), draw, f"{label} token lookup gradient", seeds=seeds,
+                    truth_fn=theirs(wide, float64))
 
 
 def token_draw(salt: int, vocab: int, shape: tuple[int, ...]):
