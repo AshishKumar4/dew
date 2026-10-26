@@ -465,6 +465,31 @@ class MultimodalTransformer(DecoderWrapper):
         """Return the decoder's logits of final states `hidden`."""
         return self.language_model.logits_from_hidden(hidden)
 
+    @property
+    def in_context(self) -> bool:
+        """Whether the decoder holds a continuum level (`SteppedInContext`)."""
+        return self.language_model.in_context
+
+    @nn.nowrap
+    def in_context_level(self, variables):
+        """The decoder's continuum level's parameters in `variables` (`SteppedInContext`)."""
+        held = {**variables, "params": variables["params"][self.wraps]}
+        return self.language_model.in_context_level(held)
+
+    @nn.nowrap
+    def with_in_context_level(self, variables, level):
+        """`variables` holding `level` as the decoder's continuum level (`SteppedInContext`)."""
+        held = self.language_model.with_in_context_level({"params": variables["params"][self.wraps]}, level)
+        return {**variables, "params": {**variables["params"], self.wraps: held["params"]}}
+
+    def continuum_states(self, hidden):
+        """The decoder's final states `hidden` past its continuum level (`SteppedInContext`)."""
+        return self.language_model.continuum_states(hidden)
+
+    def head_logits(self, states):
+        """The decoder's head over states its continuum level already read (`SteppedInContext`)."""
+        return self.language_model.head_logits(states)
+
     def states_and_logits(self, tokens, **kwargs):
         """Return the final hidden states and their logits from one media-aware forward pass."""
         hidden = self.hidden_states(tokens, **kwargs)
