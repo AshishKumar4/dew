@@ -592,10 +592,11 @@ def _softmax_cotangent(logits, first, excluded, peaks, masses, rests, labels, d_
     rounds to 1. The partition's part is the target's own share, never 1 less
     the rest, which an unlikely target's share would cancel to 0. Without
     `picked` the entry is `d_partition * p_t + d_first * label_entry`; with it,
-    `d_first + d_partition * p_t` taken as `(d_first + d_partition) +
-    d_partition * label_entry`, where the loss's cotangents `d_first =
-    -d_partition` leave the label entry alone. A target outside the tile
-    one-hots to zero rather than to a wrapped column."""
+    `d_first + d_partition * p_t` taken as `(d_first + d_partition) * p_t -
+    d_first * label_entry`, where the loss's cotangents `d_first =
+    -d_partition` leave the label entry alone and the partition's alone leaves
+    its share. A target outside the tile one-hots to zero rather than to a
+    wrapped column."""
     exponentials = jnp.exp(_without(logits, first, excluded) - peaks[:, None])
     # A target at the excluded column scores a constant +inf, which no logit moves.
     selected = _without(jax.nn.one_hot(labels - first, logits.shape[-1], dtype=bool), first,
@@ -603,7 +604,7 @@ def _softmax_cotangent(logits, first, excluded, peaks, masses, rests, labels, d_
     coefficient = d_partition if picked else d_first + d_partition
     share = exponentials * (coefficient / masses)[:, None]
     entry = label_entry(exponentials / masses[:, None], (rests / masses)[:, None])
-    target = ((d_first + d_partition)[:, None] + d_partition[:, None] * entry if picked
+    target = (exponentials * ((d_first + d_partition) / masses)[:, None] - d_first[:, None] * entry if picked
               else exponentials * (d_partition / masses)[:, None] + d_first[:, None] * entry)
     return jnp.where(selected, target, share)
 

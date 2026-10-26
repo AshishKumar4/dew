@@ -36,8 +36,9 @@ ADAPTATION_SEEDS = 8
 SELECTED_SEEDS = 256
 """Check 1's declared seeds for a level whose `up` alone steps, sized paired by `seeds_for` on armada."""
 
-GRADIENT_SEEDS = 8
-"""Check 1's declared seeds for the outer gradient through the windows' steps (`seeds_for`)."""
+GRADIENT_SEEDS = 512
+"""Check 1's declared seeds for the outer gradient through the windows' steps: the 512 over which its
+verdict resolves on armada, where its paired sizing (`seeds_for`) does not within 512."""
 
 LEVEL_SEEDS = 8
 """Check 1's declared seeds for the gradient through the level against its formula (`seeds_for`)."""
