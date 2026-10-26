@@ -128,7 +128,7 @@ def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | 
                  dtype: str | None, param_dtype: str | None,
                  revision: str | None) -> SavedTask:
     from dew.inference.projections import packed_owned
-    from dew.interop import Pretrained
+    from dew.interop import Pretrained, PretrainedPipeline
     from dew.training.distributed import MeshSpec as DefaultMesh
 
     storage = "auto" if param_dtype is None else param_dtype
@@ -137,9 +137,11 @@ def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | 
               if dtype is None else
               Pretrained.load(source, revision=revision, dtype=dtype, param_dtype=storage, mesh=placement,
                               layout=layout))
-    # This loader owns its fresh bundle exclusively. Public bundle.pipeline borrows weights;
-    # packing here may relinquish the unpacked device buffers without invalidating a caller's tree.
-    loaded = replace(loaded, variables=packed_owned(loaded.model, loaded.variables))
+    if not isinstance(loaded, PretrainedPipeline):
+        # The task owns the weights it loaded: their projections pack once, where they were placed.
+        # (Public bundle.pipeline borrows weights; packing here may relinquish the unpacked device
+        # buffers without invalidating a caller's tree.)
+        loaded = replace(loaded, variables=packed_owned(loaded.model, loaded.variables))
     return loaded.pipeline()
 
 
