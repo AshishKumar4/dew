@@ -36,7 +36,6 @@ from flax.training.early_stopping import EarlyStopping
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
-from dew import position as positions
 from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON, boolean, json_value, record
 from dew.batch import FROZEN, Batch, Variables, dicts, select
@@ -100,7 +99,7 @@ from dew.telemetry.records import (
     Record,
     StepCompiled,
 )
-from dew.training._fit import FitPlan, FitRun, split_metrics, waited_read
+from dew.training._fit import FitPlan, FitRun, split_metrics, stage_reached, suites as fit_suites, waited_read
 from dew.training._lowering import Lowered
 from dew.training.budget import Pause, Plateau, run_length, run_steps
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -232,26 +231,6 @@ def _reported(rollout: Rollout | None, metrics: Sequence[Metric]) -> dict[str, S
         **getattr(rollout, "shown", {}),
         **{metric.name: shown for metric in metrics if (shown := getattr(metric, "shown", None)) is not None},
     }
-
-
-def _suites(dataset: Loader, validation: Mapping[str, Reader | EvalSuite] | None,
-            metrics: Sequence[Metric], eval_every: int | None) -> dict[str, EvalSuite]:
-    """Every split `fit` validates, by name, with its metrics and cadence
-    resolved: `dataset.val` alone is the one suite `val`."""
-    if validation is None:
-        if metrics and dataset.val is None:
-            # Else the metrics would never be scored, and the run would not say so.
-            raise ValueError("metrics score validation data: give the dataset a val split, or validation=")
-        # `val` is read only when a pass is scheduled; a dataset need not hold one.
-        validation = {"val": dataset.val} if (eval_every or metrics) and dataset.val is not None else {}
-    elif not validation:
-        raise ValueError("validation must contain a split")
-    suites = {}
-    for name, entry in validation.items():
-        suite = entry if isinstance(entry, EvalSuite) else EvalSuite(entry)
-        suites[name] = EvalSuite(suite.data, tuple(suite.metrics) or tuple(metrics),
-                                 eval_every if suite.every is None else suite.every)
-    return suites
 
 
 def _read_whole(accumulation: int, split: int | None, step: Callable[..., StepFn] | None, layout: Layout,
@@ -1392,7 +1371,7 @@ class Trainer(Generic[Loss, Effects]):
         steps = run_steps(loader, steps, epochs, tokens, self.accumulation, examples)
         count_compilation_cache()
         self._schedule(None if steps is None else steps // self.accumulation)
-        suites = _suites(loader, validation, metrics, eval_every)
+        suites = fit_suites(loader, validation, metrics, eval_every)
         selection, plateau, pause = self._fit_policies(best, stop, metrics, suites, checkpoint_every,
                                                        steps, tokens)
         self._preflight(loader, plateau, suites, preview=preview,
@@ -1675,32 +1654,14 @@ class Trainer(Generic[Loss, Effects]):
                                       reads=run.reads, prepare=prepare)
 
     def _scheduled(self, plan: FitPlan, run: FitRun, interval: Interval) -> None:
-        """End the stage of a schedule the run stands in (`dew.data.pipeline.schedule`) at the step
-        whose commit reached its tokens, on every process alike, as the committed tokens are the
-        pool's: the stream opens again where that step left it, in the next stage, and what the
-        prefetch worker read ahead of the end is dropped untrained. The last stage's tokens, where
-        they end the data, are the run's token budget (`_fitted`). The devices' count is read before
-        each step while a stage's end lies ahead, as a token budget's is."""
-        ends = plan.dataset.token_ends
-        state = None if run.train is None else run.train.source_state
-        if ends is None or state is None:
+        """Open the next stage of a schedule where the run's commits reached the one it stands in
+        (`stage_reached`), the prefetch worker reading it from the step that ended the last."""
+        reached = stage_reached(plan, run, interval)
+        if reached is None:
             return
-        stage = len(positions.read(state).completed)
-        if stage >= len(ends) - 1 or interval.real_tokens < (end := ends[stage] or 0):
-            return
-        assert run.train is not None and run.partition is not None
-        run.train.close()
-        run.train = None
-        run.source = source = plan.dataset.train(run.partition)
-        if not isinstance(source, PhasedStream):
-            raise TypeError("a schedule reads its stages as phases")
-        # A stage a single step's commit passed ends where it starts, reading nothing.
-        committed = interval.real_tokens
-        while stage < len(ends) - 1 and committed >= end:
-            state, stage = source.ending(state), stage + 1
-            end = ends[stage] or 0
+        source, state, stage = reached
         self._display.note(f"Stage {stage} of the schedule begins at step {run.current}, after "
-                           f"{committed} committed tokens")
+                           f"{interval.real_tokens} committed tokens")
         # An update pools one stage's batches: a window a rejection left part filled at the commit the
         # stage begins after is dropped as a ramp's stage drops it (`_staged`), and laid out for the
         # stage's batches, which may be shaped as no earlier stage's were (`_runner`).
@@ -1715,14 +1676,10 @@ class Trainer(Generic[Loss, Effects]):
         """`dataset` and `validation` as the fit reads them (`fitted`), and the run's token budget:
         `tokens`, or where a schedule's last stage ends the data at its tokens, the first reached."""
         loader, validation = fitted(dataset, validation, objective=self.objective.data(), examples=examples)
-        last = None if loader.token_ends is None else loader.token_ends[-1]
-        tokens = last if tokens is None else tokens if last is None else min(tokens, last)
-        if tokens is not None and not self.objective.counts_tokens:
+        if (tokens is not None or loader.token_ends is not None) and not self.objective.counts_tokens:
             raise ValueError("tokens= and a schedule's stages need an objective that counts real tokens")
-        if loader.token_ends is not None and not self.objective.counts_tokens:
-            raise ValueError("a schedule's stages end at committed tokens, which needs an objective that "
-                             "counts real tokens")
-        return loader, validation, tokens
+        last = None if loader.token_ends is None else loader.token_ends[-1]
+        return loader, validation, last if tokens is None else tokens if last is None else min(tokens, last)
 
     def _local_devices(self) -> list:
         """This process's devices of the mesh, whose memory the fit check reads."""
