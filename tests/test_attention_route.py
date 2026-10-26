@@ -406,7 +406,10 @@ def test_a_templated_family_runs_the_template_where_its_declared_route_does_not_
         family = generation.family(target)
         with generation.assumed(target):
             for call in calls:
-                auto = attention.resolve_implementation("auto", query, key, **call)
+                # The kernel selected, not what this host runs of it (`attention_kernels._hosted`).
+                with generation.routes() as found:
+                    attention.resolve_implementation("auto", query, key, **call)
+                (auto,) = [route.kernel for route in found if route.choice == "attention"]
                 if family in attention_mosaic_program.BUNDLES:
                     old = OLD_ROUTES[family][0]
                     takes = not kernel_refusals(ATTENTION, old, attention.attention_case(query, key, **call))
