@@ -660,16 +660,17 @@ def chunk_scores(queries: Load, keys: Load, columns: int, gate, low, dtype, issu
     return jnp.where(lag >= 0, scores, 0.0).astype(dtype)
 
 
-def chunk_output(queries: Load, entered: Load, columns: int, gate, low, scores, value, scale: float,
+def chunk_output(queries: Load, entered: Load, columns: int, grown, scores, value, scale: float,
                  issue: Issue):
     """A chunk's output `[C, BV]`, fp32, a decay a head: `scale ((q S) exp2(g) + scores v)`, the key column
-    blocks `queries(c)` and `entered(c)` (the memory the chunk entered) summed into fp32 ('memory'), and the
-    chunk's own pairs' `scores` (`chunk_scores`, registers or a tile in the values' dtype) against the value
-    block ('local')."""
-    out = jnp.zeros((gate.shape[0], value.shape[-1]), jnp.float32)
+    blocks `queries(c)` and `entered(c)` (the memory the chunk entered) summed into fp32 ('memory'), each row
+    scaled by its prefix's decay `grown` (`raised` of the prefix's halves, a chunk's once for every value
+    block's), and the chunk's own pairs' `scores` (`chunk_scores`, registers or a tile in the values' dtype)
+    against the value block ('local')."""
+    out = jnp.zeros((grown.shape[0], value.shape[-1]), jnp.float32)
     for c in range(columns):
         out += issue("memory", queries(c), entered(c))
-    out = out * raised(gate, low)[:, None]
+    out = out * grown[:, None]
     return out * scale + issue("local", scores, value) * scale
 
 
