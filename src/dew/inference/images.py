@@ -638,7 +638,8 @@ class TextToImage:
         plan, process = settled.plan, settled.process
         given = plan.place(plan.pad(settled.tokens))
         if "given" not in settled.encoded:
-            given = _encode(plan.sharding)(self.inputs.encoders, self.variables, given)
+            given = program(_encoded, static_argnums=(0,), in_shardings=(None, plan.sharding),
+                            out_shardings=plan.sharding)(self.inputs.encoders, self.variables, given)
         if settled.null_tokens is None:
             null = {}
         elif "null" in settled.encoded:
@@ -648,8 +649,9 @@ class TextToImage:
         else:
             null = self._unconditional(settled.null_tokens, plan)
         if not settled.samples:
-            return given, null, _noise(plan.sharding)(process, plan.keys(settled.request),
-                                                      settled.shape)
+            noise = program(_noised, static_argnums=(0, 2), in_shardings=(plan.sharding,),
+                            out_shardings=plan.sharding)
+            return given, null, noise(process, plan.keys(settled.request), settled.shape)
         start = process.times(settled.count)[0] if settled.times is None else settled.times[0]
         starting = program(_image_start, *([] if self.autoencoder is None else [self.autoencoder.model]),
                            static_argnums=(0, 1, 2),
@@ -714,7 +716,8 @@ class TextToImage:
             plan = RowPlan.over(mesh, prepared.rows)
             walk = jax.random.fold_in(request, 1)
             grid = _default_grid(process, count) if times is None else times
-            initial = _initial(plan.sharding)(solver, process, grid, prepared.noise, walk)
+            initial = program(_initial, static_argnums=(0, 1, 2), in_shardings=(plan.sharding, None))(
+                solver, process, grid, prepared.noise, walk)
             models = sampling_modules(self.model, chosen, self.autoencoder)
             walked = program(_walk, *models, static_argnums=(0, 1, 2, 3, 4, 5),
                              in_shardings=(None, None, None, None, None, plan.sharding, None, plan.sharding,
@@ -815,12 +818,10 @@ def _image_start(autoencoder, process, shape, params, samples, keys, encode_key,
 
 
 
-@functools.cache
-def _encode(rows: jax.sharding.NamedSharding | None):
-    def encode(encoders, params, tokens):
-        # A task without conditions holds no encoder weights.
-        return encode_conditions(encoders, params["encoders"] if encoders else {}, tokens)
-    return jax.jit(encode, static_argnums=(0,), in_shardings=(None, rows), out_shardings=rows)
+def _encoded(encoders, params, tokens):
+    """The conditions' encodings of `tokens` (`encode_conditions`), each row's where its rows sit."""
+    # A task without conditions holds no encoder weights.
+    return encode_conditions(encoders, params["encoders"] if encoders else {}, tokens)
 
 
 def _encoded_rows(conditions: Mapping[str, Conditioning]) -> int:
@@ -831,11 +832,9 @@ def _encoded_rows(conditions: Mapping[str, Conditioning]) -> int:
     return counts.pop()
 
 
-@functools.cache
-def _noise(rows: jax.sharding.NamedSharding | None):
-    def noise(process, keys, shape):
-        return jax.vmap(lambda key: process.noise(key, shape))(keys)
-    return jax.jit(noise, static_argnums=(0, 2), in_shardings=(rows,), out_shardings=rows)
+def _noised(process, keys, shape):
+    """Each row's starting noise of `shape`, drawn under its own key."""
+    return jax.vmap(lambda key: process.noise(key, shape))(keys)
 
 
 @functools.lru_cache(maxsize=64)
@@ -844,15 +843,12 @@ def _default_grid(process: Process, count: int) -> tuple[float, ...]:
     return _time_grid(process.times(count))
 
 
-@functools.cache
-def _initial(rows: jax.sharding.NamedSharding | None):
+def _initial(solver, process, grid, x_T, key):
     """The solver's state before a walk's first step, on the concrete `grid`: its checks and tables
     read the grid's values, so this small program is a grid's own and the walk's is every grid's."""
-    def initial(solver, process, grid, x_T, key):
-        with jax.ensure_compile_time_eval():
-            times = jnp.asarray(grid, jnp.float32)
-        return solver.init(x_T, times, process, key=key)
-    return jax.jit(initial, static_argnums=(0, 1, 2), in_shardings=(rows, None))
+    with jax.ensure_compile_time_eval():
+        times = jnp.asarray(grid, jnp.float32)
+    return solver.init(x_T, times, process, key=key)
 
 
 def _walk(model, process, autoencoder, finish, final_denoise, decode,

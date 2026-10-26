@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import copy
 import dataclasses
+import functools
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Mapping
 from typing import Self
@@ -11,6 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
 
+from dew.nn.kernels.options import program
 from dew.objectives.base import Variables
 
 type RecordValue = float | np.ndarray | None
@@ -296,18 +298,26 @@ class AutoEncoder(ABC):
         return self.decode(params, self.encode(params, x, key=key))
 
 
+def _encoded(model: nn.Module, params, image, key=None, noise=None):
+    """One batch of frames encoded by a flax autoencoder module's `encode`."""
+    return model.apply({"params": params}, image, key, noise, method=model.encode)
+
+
+def _decoded(model: nn.Module, params, latent):
+    """One batch of latents decoded by a flax autoencoder module's `decode`."""
+    return model.apply({"params": params}, latent, method=model.decode)
+
+
 class ModuleAutoEncoder[M: nn.Module](AutoEncoder):
     """A frozen flax autoencoder module and the params it loaded. The
     module's `encode(x, key)` and `decode(z)` each take one batch of frames,
-    and each runs as one jitted `apply`."""
+    and each runs as one program over the module (`program`)."""
 
     def __init__(self, model: M, params: Variables):
         self.model = model
         self.params = params
-        self.encode_single_frame = jax.jit(lambda params, image, key=None, noise=None: model.apply(
-            {"params": params}, image, key, noise, method=model.encode))
-        self.decode_single_frame = jax.jit(lambda params, latent: model.apply(
-            {"params": params}, latent, method=model.decode))
+        self.encode_single_frame = functools.partial(program(_encoded, model, static_argnums=0), model)
+        self.decode_single_frame = functools.partial(program(_decoded, model, static_argnums=0), model)
 
     def encode_batch(self, params, x, key=None, noise=None):
         return self.encode_single_frame(params, x, key, noise)
