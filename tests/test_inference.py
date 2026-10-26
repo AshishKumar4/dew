@@ -8,8 +8,8 @@ trainer has just written.
 """
 
 import dataclasses
-import types
 import json
+import types
 from pathlib import Path
 
 import jax
