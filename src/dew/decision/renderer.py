@@ -83,7 +83,9 @@ def render(chunks: Sequence[Chunk], encoder: Encoder, unit: Unit) -> Rendered:
         elif unit == "whole":
             run.append(chunk)
         else:
-            ids = encoder.encode(chunk.text, add_special_tokens=False) if chunk.text else []
+            # Every text chunk is encoded, an empty one too, as a release encodes each piece it
+            # writes; an absent segment is a chunk of no ids.
+            ids = list(encoder.encode(chunk.text, add_special_tokens=False))
             for key, start, end in chunk.marks:
                 if (start, end) != (0, len(chunk.text)):
                     raise ValueError(f"mark {key!r} covers part of a piece, which a layout of pieces encodes "

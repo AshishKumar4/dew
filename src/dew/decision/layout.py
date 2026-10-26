@@ -1195,8 +1195,8 @@ class JointLayout(Layout):
             else:
                 chunk = Chunk(ids=())
             laid_out.append((part, chunk))
-        room = self.max_len - sum(len(pieces.encode(chunk.text)) if chunk.ids is None else len(chunk.ids)
-                                  for segment, chunk in laid_out if not isinstance(segment, State))
+        # The row without its state, each copy a chunk of no ids, rendered as the row is.
+        room = self.max_len - len(rendered_chunks([chunk for _, chunk in laid_out], pieces, "pieces").tokens)
         copies = [segment for segment, _ in laid_out if isinstance(segment, State)]
         counts = iter(allocated([whole] * len(copies), copies, room, self.max_state_tokens))
         chunks = [Chunk(ids=_kept(state_ids, next(counts), segment.keep)) if isinstance(segment, State)
