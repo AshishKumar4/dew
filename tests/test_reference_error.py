@@ -14,6 +14,7 @@ from reference_error import (
     REDRAW,
     GateFailure,
     Inconclusive,
+    as_given,
     assert_as_exact,
     assert_as_exact_as_the_reference,
     assert_leaves_as_exact,
@@ -581,9 +582,12 @@ def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
         return (np.zeros(64, np.float32), np.full(64, 2.0 if seed % 2 == 0 else 0.1, np.float32),
                 np.ones(64, np.float32))
 
+    # NumPy arms, as given: the error law is set on the host, seed by seed.
+    @as_given
     def dew(x, mine, theirs):
         return {"y": x + mine}
 
+    @as_given
     def reference(x, mine, theirs):
         return {"y": x + theirs}
 
@@ -605,9 +609,12 @@ def _set_errors(even: float, odd: float):
         return (np.zeros(64, np.float32), np.full(64, np.sqrt(even if seed % 2 == 0 else odd), np.float32),
                 np.ones(64, np.float32))
 
+    # NumPy arms, as given: the error law is set on the host, seed by seed.
+    @as_given
     def dew(x, mine, theirs):
         return {"y": x + mine}
 
+    @as_given
     def reference(x, mine, theirs):
         return {"y": x + theirs}
 
