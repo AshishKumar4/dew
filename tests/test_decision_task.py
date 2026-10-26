@@ -723,27 +723,13 @@ def test_runs_of_other_task_settings_or_a_single_run_do_not_average(decide, tmp_
         Decide.averaged(runs)
 
 
-def released_joint(directory: Path) -> Decide:
-    """The tiny joint-head release (`test_decision_joint_checkpoint`), its Qwen 3.5 backbone beside its
-    head, laid out in rows of 2048 tokens, which the joint schema of Laya's questions needs."""
-    from dew.decision import JointLayout
-
-    joint = Path(__file__).parent / "fixtures" / "joint_checkpoint" / "tiny"
-    backbone = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
-    directory.mkdir()
-    for source in [*backbone.iterdir(), joint / "joint_head_config.json", joint / "joint_head.safetensors"]:
-        (directory / source.name).symlink_to(source.resolve())
-    released = Decide.from_pretrained(directory, attention_impl="xla")
-    return replace(released, layout=JointLayout(max_len=2048))
-
-
-@pytest.mark.parametrize("kind", ["marker", "state-first", "joint"])
+@pytest.mark.parametrize("kind", ["marker", "state-first"])
 def test_an_averaged_task_of_any_layout_saves_reloads_and_serves_as_it_was(decide, tmp_path, kind):
     """An average of runs, its temperatures refit on held-out answers, saves to a directory of its own
     as a run (`save`), which `from_run` and `dew.pipeline` read back with its weights, calibration and
-    provenance, answering every case as the task it was: for every layout, Laya's markers, the state
-    first and the joint release's. Saving it there again keeps it; a run's own directory, which holds
-    other weights, refuses it."""
+    provenance, answering every case as the task it was: under Laya's markers and a layout of the state
+    first (the joint release's in test_decision_joint_checkpoint). Saving it there again keeps it; a
+    run's own directory, which holds other weights, refuses it."""
     import dataclasses
 
     from dew.decision import StateFirstLayout
@@ -752,8 +738,6 @@ def test_an_averaged_task_of_any_layout_saves_reloads_and_serves_as_it_was(decid
     if kind == "state-first":
         decide = replace(decide, layout=StateFirstLayout(max_len=decide.layout.max_len,
                                                          head_max_len=decide.layout.head_max_len))
-    elif kind == "joint":
-        decide = released_joint(tmp_path / "release")
     runs = trained_runs(decide, tmp_path, 2)
     held_out = answered() * 10
     task = Decide.averaged(runs, calibrate_on=held_out)
