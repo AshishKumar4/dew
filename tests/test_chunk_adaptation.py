@@ -351,6 +351,22 @@ def test_a_level_that_never_steps_scores_as_the_plain_objective():
                     "a level that never steps", seeds=OBJECTIVE_SEEDS)
 
 
+@pytest.mark.parametrize("select", [(), ("up",)], ids=["every-part", "up"])
+@pytest.mark.parametrize("rate", [0.0, 0.5])
+def test_a_frozen_tree_steps_as_its_dict_does(select, rate):
+    """Variables held as a `FrozenDict`, as a loaded or restored tree may be, step and score as the same
+    variables as a dict do, bit for bit, whatever parts step: the scan's trees keep the level's own
+    container, where a mask built as a dict beside a frozen level refused the tree map."""
+    from flax.core import freeze
+
+    objective = LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(window=3, rate=rate, select=select))
+    variables = drawn_variables(0, scale=0.25)
+    tokens = np.random.default_rng(0).integers(0, VOCAB, (ROWS, LENGTH + 1)).astype(np.int32)
+    held = objective.token_scores(variables, tokens).losses
+    frozen = objective.token_scores(freeze(variables), tokens).losses
+    np.testing.assert_array_equal(np.asarray(frozen), np.asarray(held))
+
+
 def test_a_run_trains_the_level_and_resumes_as_it_ran(tmp_path):
     """A run of the adapted objective trains through the Trainer, the level's start among its
     parameters, and a run resumed from its checkpoint ends where the uninterrupted one does, bit for
