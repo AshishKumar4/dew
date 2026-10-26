@@ -1,13 +1,15 @@
-"""CPU worker sessions, pool reports and process-group cleanup."""
+"""CPU worker sessions, pool reports, process-group cleanup and the local HTTP server a pool reads."""
 
 import argparse
 import contextlib
+import http.server
 import json
 import os
 import signal
 import socket
 import subprocess
 import sys
+import threading
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from types import TracebackType
@@ -75,6 +77,26 @@ def serve_mode(modes: Mapping[str, Callable], args) -> None:
     prepare_worker(args)
     args.out.parent.mkdir(parents=True, exist_ok=True)
     args.out.write_text(json.dumps(modes[args.mode](args)))
+
+
+@contextlib.contextmanager
+def serving(handle):
+    """A local HTTP server answering each GET with `handle(request)`, and its address."""
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            handle(self)
+
+        def log_message(self, *arguments):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"127.0.0.1:{server.server_port}"
+    finally:
+        server.shutdown()
+        server.server_close()
 
 
 def free_port() -> int:
