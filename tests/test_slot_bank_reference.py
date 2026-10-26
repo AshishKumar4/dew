@@ -19,48 +19,62 @@ from dew.interop import Pretrained
 SOURCE = Path(__file__).parent / "fixtures/hf/qwen38-dense-tiny"
 
 
-@pytest.mark.parametrize("changed", [None, "pool", "source", "tokenizer", "device", "dtype", "phase"])
-def test_a_runtime_verdict_refuses_records_from_a_different_experiment(tmp_path, changed):
-    """A verdict judges the three phases' records only where each was recorded over this pool, from this
-    source's bytes (its tokenizer files among them), at the declared device, dtype and phase; any one of
-    them changed refuses the verdict before it writes one."""
+def recorded_runs(tmp_path, options, logits, *, count=8):
+    """A verdict's local source, request pool and three phase records over it, on the CPU at float32:
+    `count` verdict draws and their redraw, twice `count` pilots from SIZING_FROM, two questions of
+    `options` options a request, and each question's logits `logits(phase, seed, question)`."""
     from reference_error import REDRAW, SIZING_FROM
 
     source = tmp_path / "source"
     source.mkdir()
-    config = source / "config.json"
-    config.write_text('{"model_type":"qwen3_5"}')
-    count = 8
+    (source / "config.json").write_text('{"model_type":"qwen3_5"}')
     verdict, pilot = list(range(count * (1 + REDRAW))), list(range(SIZING_FROM, SIZING_FROM + 2 * count))
-    # One option a question: its log-probability is exactly zero in every precision, so the drawn
-    # errors are zero and the admitted control sizes at its fewest seeds.
     pool = {"count": count, "verdict": verdict, "pilot": pilot, "sizing_from": SIZING_FROM,
-            "requests": {str(seed): {"questions": {f"case_{seed}_{index}": {"criteria": ["only"]}
-                                                   for index in range(2)}}
-                         for seed in (*verdict, *pilot)}}
+            "requests": {str(seed): {"questions": {
+                f"case_{seed}_{index}": {"criteria": [f"option {option}" for option in range(options)]}
+                for index in range(2)}} for seed in (*verdict, *pilot)}}
     pool_file = tmp_path / "pool.json"
     pool_file.write_text(json.dumps(pool))
-    identity = {"files": {
-        "config.json": hashlib.sha256(config.read_bytes()).hexdigest()}}
+    identity = {"files": {"config.json": hashlib.sha256((source / "config.json").read_bytes()).hexdigest()}}
     for phase in ("native", "author", "truth"):
-        seeds = pool["verdict"] if phase == "native" else [*pool["pilot"], *pool["verdict"]]
         dtype = "float64" if phase == "truth" else "float32"
-        np.savez(tmp_path / f"{phase}.npz", **{name: np.zeros(1, dtype) for seed in seeds
-                                                for name in pool["requests"][str(seed)]["questions"]})
-        metadata = {"phase": phase, "source": identity,
+        np.savez(tmp_path / f"{phase}.npz", **{
+            name: np.asarray(logits(phase, seed, index), dtype) for seed in (*pilot, *verdict)
+            for index, name in enumerate(pool["requests"][str(seed)]["questions"])})
+        metadata = {"phase": phase, "source": identity, "commit": "0" * 40,
                     "pool_sha256": hashlib.sha256(pool_file.read_bytes()).hexdigest(),
                     "compute_dtype": dtype, "storage": "auto" if phase == "native" else dtype,
                     "parameter_dtypes": [dtype], "platforms": ["cpu"], "device": "cpu",
                     "precision": "ieee", "floating_operations": 1, "cuda_floating_operations": 0}
         (tmp_path / f"{phase}.json").write_text(json.dumps(metadata))
-    args = SimpleNamespace(source=source, pool=pool_file, records=tmp_path, dtype="float32", device="cpu",
-                           output=tmp_path / "verdict.json")
+    return SimpleNamespace(source=source, pool=pool_file, records=tmp_path, dtype="float32", device="cpu",
+                           output=tmp_path / "verdict.json"), pool
+
+
+@pytest.mark.parametrize("changed", [None, "pool", "source", "tokenizer", "device", "dtype", "phase",
+                                     "commit", "pilots"])
+def test_a_runtime_verdict_refuses_records_from_a_different_experiment(tmp_path, changed):
+    """A verdict judges the three phases' records only where each was recorded over this pool, from this
+    source's bytes (its tokenizer files among them), at the declared device, dtype and phase, native's
+    pilots and verdict draws in one record that names its commit; any one of them changed refuses the
+    verdict before it writes one."""
+    # One option a question: its log-probability is exactly zero in every precision, so the drawn
+    # errors are zero and the admitted records size at their fewest seeds.
+    args, pool = recorded_runs(tmp_path, 1, lambda phase, seed, question: np.zeros(1))
     if changed == "pool":
-        pool_file.write_text(json.dumps({**pool, "population": "a different request set"}))
+        args.pool.write_text(json.dumps({**pool, "population": "a different request set"}))
     elif changed == "source":
-        config.write_text('{"model_type":"a different source"}')
+        (args.source / "config.json").write_text('{"model_type":"a different source"}')
     elif changed == "tokenizer":
-        (source / "vocab.txt").write_text("a changed tokenizer\n")
+        (args.source / "vocab.txt").write_text("a changed tokenizer\n")
+    elif changed == "commit":
+        metadata = json.loads((tmp_path / "native.json").read_text())
+        del metadata["commit"]
+        (tmp_path / "native.json").write_text(json.dumps(metadata))
+    elif changed == "pilots":
+        with np.load(tmp_path / "native.npz") as held:
+            verdict = {name for seed in pool["verdict"] for name in pool["requests"][str(seed)]["questions"]}
+            np.savez(tmp_path / "native.npz", **{name: held[name] for name in verdict})
     elif changed is not None:
         filename = tmp_path / "author.json"
         metadata = json.loads(filename.read_text())
@@ -73,6 +87,32 @@ def test_a_runtime_verdict_refuses_records_from_a_different_experiment(tmp_path,
             assert args.output.is_file()
         else:
             with pytest.raises(ValueError):
+                tool.verdict(args, pool)
+            assert not args.output.exists()
+
+
+@pytest.mark.parametrize("native", ["tracking", "worse", "independent"])
+def test_a_runtime_verdict_sizes_native_paired_with_the_author_on_their_shared_rounding(tmp_path, native):
+    """The author's error from the float64 truth spans three decades across draws, so the author
+    compared with itself resolves nothing on the pilots it holds. Native read the same weights and
+    inputs, its error the author's own a draw, so paired with the author it sizes at the fewest seeds
+    and the verdict judges it there: within the author's error it is green, at three times it fails,
+    and an error that does not track the author's leaves the count unresolved."""
+    def logits(phase, seed, question):
+        rng = np.random.default_rng([0x1510, seed, question])
+        truth, scale = rng.standard_normal(2), 10 ** rng.uniform(-4, -1)
+        apart = 10 ** rng.uniform(-4, -1)
+        error = {"truth": 0.0, "author": scale, "native": {"tracking": 1.01 * scale, "worse": 3 * scale,
+                                                           "independent": apart}[native]}[phase]
+        return truth + error * np.asarray([1.0, -1.0])
+
+    args, pool = recorded_runs(tmp_path, 2, logits)
+    with run_from("slot_runtime_qualification", "tools") as tool:
+        if native == "tracking":
+            tool.verdict(args, pool)
+            assert json.loads(args.output.read_text())["verdict"] == "green"
+        else:
+            with pytest.raises(AssertionError):
                 tool.verdict(args, pool)
             assert not args.output.exists()
 
