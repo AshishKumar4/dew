@@ -807,7 +807,7 @@ def test_a_tier_3_models_final_states_and_head_are_transformers(case, tmp_path):
                              position_ids=torch.from_numpy(positions).long(), output_hidden_states=True)
             # The last of the hidden states is the final norm's output, the states the head reads.
             return {"states": out.hidden_states[-1].double().numpy(), "logits": out.logits.double().numpy()}
-        return run
+        return as_given(run)
 
     reference = copy.deepcopy(model)
     reference.set_attn_implementation("eager")
@@ -886,7 +886,7 @@ def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_pre
                 real = int(valid[row].sum())
                 rows.append(logits[real - 1:real + steps])
             return np.stack(rows)
-        return run
+        return as_given(run)
 
     assert_as_exact(ours, theirs(reference), draw, f"{family} cached logits ({stated})",
                     seeds=DECODE_SEEDS[family], truth_fn=theirs(wide, float64))
@@ -1024,7 +1024,7 @@ def test_a_rotary_that_recomputes_its_tables_runs_each_packed_document_as_transf
                                 .double().numpy())
                 start += length
             return np.concatenate(rows, axis=1)
-        return run
+        return as_given(run)
 
     reference = copy.deepcopy(model)
     reference.set_attn_implementation("eager")
@@ -1086,7 +1086,7 @@ def test_a_rotary_that_recomputes_its_tables_decodes_as_transformers_generates(r
                         logits.append(out.logits[0, -1])
                 rows.append(torch.stack(logits).double().numpy())
             return np.stack(rows)
-        return run
+        return as_given(run)
 
     reference = copy.deepcopy(model)
     reference.set_attn_implementation("eager")
@@ -1129,7 +1129,7 @@ def _longcat(tmp_path, config: dict, **load):
         def run(tokens):
             with precision(), torch.no_grad():
                 return source(torch.from_numpy(tokens).long()).logits.double().numpy()
-        return run
+        return as_given(run)
 
     return model, reference, wide, ours, theirs
 
