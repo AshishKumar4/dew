@@ -85,7 +85,9 @@ def test_a_run_reads_its_leading_maps_back_from_the_records_an_earlier_run_made(
 def test_a_chain_reads_the_same_records_and_plan_with_or_without_its_automatic_cache(how, rejects):
     """An automatic cache holds what its maps make, a rejection included, so a run reads the same
     records in the same order whether it fills the cache, reads it back or opts out, and its plan,
-    which names no automatic cache, is the same: a position one run saves resumes in either."""
+    which names no automatic cache, is the same: a position one run saves resumes in either. An
+    indexed read caches no map that rejects, as a cache that drops records is read per share where
+    the chain written reads one global order."""
     def chain():
         return mapped(Counted(rejects=rejects))
 
@@ -96,7 +98,8 @@ def test_a_chain_reads_the_same_records_and_plan_with_or_without_its_automatic_c
         return loader.plan.record()
 
     uncached = read(chain(), how, cache=False, passes=2)
-    assert read(chain(), how, passes=2) == uncached and generations()
+    assert read(chain(), how, passes=2) == uncached
+    assert bool(generations()) == (how == "memory" or not rejects)
     assert read(chain(), how, passes=2) == uncached
     assert plan(cache=True) == plan(cache=False)
 

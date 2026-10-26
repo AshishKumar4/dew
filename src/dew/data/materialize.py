@@ -40,6 +40,7 @@ from dew.data.lowering import (
 )
 from dew.data.mixing import CorpusCounts
 from dew.data.pipeline import (
+    Artifact,
     FlatMap,
     Map,
     Mixture,
@@ -149,6 +150,10 @@ def _memory_inputs(
     rows: list[tuple[tuple[int, ...], Record]] = []
     consumed = 0
     if artifact_at is not None:
+        # A cache the compiler placed numbers its rows as the maps it stands for do (`_memory_stages`):
+        # by input, as no map expands one (`dew.data.compile._automatic`).
+        stage = pipeline.stages[artifact_at]
+        automatic = isinstance(stage, Artifact) and stage.automatic
         filled, manifest, prefix = _fill(pipeline, source, artifact_at, "memory")
         cached = filled.mapped(_cache_inputs(source, stored), manifest, transform=prefix, source=source)
         try:
@@ -165,6 +170,9 @@ def _memory_inputs(
                 for child, value in enumerate(_CachedOutputs().flat_map(outputs)):
                     if isinstance(value, Rejected):
                         counter.rejected[value.reason] += 1
+                    elif automatic:
+                        rows.append((source.identifiers[index] if isinstance(source, _Memory) else (index,),
+                                     value))
                     else:
                         rows.append(((index, child), value))
             cached.finish()
