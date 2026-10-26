@@ -1,7 +1,7 @@
 """Cooldown branches of a run (Hägele et al. 2024, "Scaling Laws and Compute-Optimal Training Beyond Fixed
 Training Durations", arXiv:2405.18392): at chosen points of a run on a constant or slowly decaying rate,
 a branch from the run's state trains on with its rate decayed to zero, is scored by the run's validation
-suites as `cooldown/<split>/<metric>`, and is discarded, the run continuing as though none ran. A
+suites as `cooldown_<split>/<metric>`, and is discarded, the run continuing as though none ran. A
 warmup-stable-decay schedule (`dew.optim.Linear`'s `decay_start`) so reads what a run annealed at each
 point would score, without a run for each."""
 

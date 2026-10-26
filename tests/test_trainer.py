@@ -1252,7 +1252,7 @@ def cooldown_run(schedule, steps: int, accumulation: int, tracker=None, cooldown
 @pytest.mark.parametrize("accumulation", [1, 2])
 def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the_run_as_it_was(accumulation):
     """A linear cooldown of four updates from the fourth of a warmup-stable-decay run is the run whose
-    decay begins there: the branch's `cooldown/val/loss`, recorded at the step it branched from, is that
+    decay begins there: the branch's `cooldown_val/loss`, recorded at the step it branched from, is that
     run's final `val/loss` bit for bit (its rates, 2^-4 times 1, 3/4, 1/2 and 1/4, exact), and the run
     it branched from ends where a run with no cooldown ends, its parameters bit for bit."""
     from dew.optim import Linear
@@ -1264,8 +1264,8 @@ def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the
     tracker = RecordingTracker()
     branched = cooldown_run(stable, 3 * at, accumulation, tracker,
                             Cooldowns(at=(at,), length=at, shape="linear"))
-    cooled = {step: scalars["cooldown/val/loss"] for step, scalars in tracker.scalars
-              if "cooldown/val/loss" in scalars}
+    cooled = {step: scalars["cooldown_val/loss"] for step, scalars in tracker.scalars
+              if "cooldown_val/loss" in scalars}
     decayed = RecordingTracker()
     cooldown_run(Linear(peak, decay_start=4, decay_steps=8), 2 * at, accumulation, decayed)
     finals = [scalars["val/loss"] for _, scalars in decayed.scalars if "val/loss" in scalars]

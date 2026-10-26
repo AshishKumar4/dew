@@ -1305,7 +1305,7 @@ class Trainer(Generic[Loss, Effects]):
         one included, or without `Checkpoints` from the copy it held (`HeldBest`). Its optimizer state
         and the rest stay the final step's, so it is the best model, not a point to resume training
         from, which the run's checkpoints are. `cooldowns` branch the run into cooldowns, each scored by
-        every suite as `cooldown/<split>/<metric>` and discarded (`dew.training.cooldown.Cooldowns`).
+        every suite as `cooldown_<split>/<metric>` and discarded (`dew.training.cooldown.Cooldowns`).
 
         Every `checkpoint_every` steps (or "5%", `FitPlan.cadences`), the state and data position are written;
         `checkpoint_final=True` also writes the final state, independently of that cadence. A
@@ -1797,7 +1797,7 @@ class Trainer(Generic[Loss, Effects]):
                 position: bytes | None, branch: Branch) -> None:
         """Train the cooldown `branch` from `state`, on the run's batches from its data `position`, by the
         run's own compiled steps at its rate times the branch's decay (`scaled_rates`); score every
-        suite on it as `cooldown/<split>` at the run's step, and discard it, the run's state and stream
+        suite on it as `cooldown_<split>` at the run's step, and discard it, the run's state and stream
         left as they were (`dew.training.cooldown`)."""
         if position is None:
             raise ValueError("a cooldown branch reads on from the run's data position, and this stream "
@@ -1826,7 +1826,7 @@ class Trainer(Generic[Loss, Effects]):
                 branched.current += 1
         finally:
             branched.train.close()
-        suites = {f"cooldown/{name}": suite for name, suite in plan.suites.items()}
+        suites = {f"cooldown_{name}": suite for name, suite in plan.suites.items()}
         self._evaluation(dataclasses.replace(plan, suites=suites, summaries=()),
                          dataclasses.replace(cooled, step=state.step), shardings, {})
         run.other += time.perf_counter() - began
