@@ -15,19 +15,19 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew import records
+from dew import _records
 from dew._model_types import SANDWICH_NORMS
+from dew.batch import Variables, coordinates
 from dew.interop.weights import native_layouts, placed
 from dew.nn.attention import RMSNorm
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.blocks import table_rows
 from dew.nn.dense import Dense
-from dew.nn.inputs import AttentionMetadata, coordinates
+from dew.nn.inputs import AttentionMetadata
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import float32_dot_general
-from dew.objectives.base import Variables
 from dew.registry import Record
 
 from .common import (
@@ -74,9 +74,9 @@ class Gemma4ClippableLinear(Dense):
 
     use_clipped_linears: bool = False
 
-    @nn.compact
-    def __call__(self, inputs):
-        return clipped_linear(self, super().__call__, inputs, self.use_clipped_linears)
+    @nn.nowrap
+    def _envelope(self, linear, inputs):
+        return clipped_linear(self, linear, inputs, self.use_clipped_linears)
 
 
 class Gemma4VisionTransformer(nn.Module):
@@ -221,7 +221,7 @@ class Gemma4Vision(TowerBase):
         return TowerGeometry(patch_size=self.patch_size, block_size=self.pooling_kernel_size)
 
 
-class Gemma4ProjectorModule(nn.Module):
+class Gemma4Projector(ProjectorBase):
     """Soft tokens to text width: a scale-free RMS norm, then the map.
 
     The reference keeps this beside the tower (modeling_gemma4.py,
@@ -243,17 +243,6 @@ class Gemma4ProjectorModule(nn.Module):
 
     def __call__(self, image_features) -> jax.Array:
         return self.projection(self.pre_norm(image_features))
-
-
-@dataclasses.dataclass(frozen=True)
-class Gemma4Projector(ProjectorBase):
-    """Gemma 4's projector fields: the decoder width and the norm epsilon."""
-
-    text_width: int
-    norm_eps: float = 1e-6
-
-    def build(self) -> nn.Module:
-        return Gemma4ProjectorModule(text_width=self.text_width, norm_eps=self.norm_eps)
 
 
 _GEMMA4_VISION_TENSORS = {
@@ -380,18 +369,18 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Record:
     return {
         "class": "gemma4", "fields": {
         **geometry,
-        "num_key_value_heads": records.integer(
+        "num_key_value_heads": _records.integer(
             vision.get("num_key_value_heads", heads), "num_key_value_heads"
         ),
-        "head_dim": records.integer(vision.get("head_dim", geometry["hidden_size"] // heads), "head_dim"),
-        "patch_size": records.integer(vision.get("patch_size", 16), "patch_size"),
-        "pooling_kernel_size": records.integer(vision.get("pooling_kernel_size", 3), "pooling_kernel_size"),
-        "position_embedding_size": records.integer(
+        "head_dim": _records.integer(vision.get("head_dim", geometry["hidden_size"] // heads), "head_dim"),
+        "patch_size": _records.integer(vision.get("patch_size", 16), "patch_size"),
+        "pooling_kernel_size": _records.integer(vision.get("pooling_kernel_size", 3), "pooling_kernel_size"),
+        "position_embedding_size": _records.integer(
             vision.get("position_embedding_size", 10240), "position_embedding_size"
         ),
         "hidden_act": activation_name(vision, ("gelu_pytorch_tanh", "gelu"), "gelu_pytorch_tanh",
                                       ("hidden_activation", "hidden_act")),
-        "rms_norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
+        "rms_norm_eps": _records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
         "rope_theta": rope_base(vision, 100.0, axial=True),
         "standardize": bool(vision.get("standardize", False)),
         "use_clipped_linears": bool(vision.get("use_clipped_linears", False)),
@@ -427,7 +416,7 @@ def translate_gemma4_projector_config(vision: Mapping[str, object],
     return {
         "class": "gemma4", "fields": {
         "text_width": int(text_width),
-        "norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
+        "norm_eps": _records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
     }}
 
 

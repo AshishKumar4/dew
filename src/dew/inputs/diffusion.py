@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
+from dew.batch import Variables
 from dew.diffusion.process import DenoisingCondition
 from dew.inputs.encoders import ConditionEncoder, ConditionWork
 from dew.nn.blocks import torch_nearest_resize
@@ -23,7 +24,6 @@ from dew.nn.precision import accumulated
 from dew.nn.protocols import LayerStates
 from dew.nn.safety import CLIPSafetyHead
 from dew.nn.text_encoders import CLIPTextTransformer, CLIPTowerOutput, T5EncoderTransformer
-from dew.objectives.base import Variables
 from dew.registry import dtype_name
 
 if TYPE_CHECKING:
@@ -348,7 +348,7 @@ class DiffusionConditioner(ConditionEncoder[str | Mapping[str, object]]):
         ids = tokens["input_ids"][:, 0] if self.stacked else tokens["input_ids"]
         return tuple(self.tokenizers[0].batch_decode(np.asarray(ids), skip_special_tokens=True))
 
-    def to_json(self):
+    def recorded_fields(self):
         return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.towers[0].dtype),
                 "param_dtype": self.param_dtype, "height": self.height, "width": self.width}
 
@@ -417,7 +417,7 @@ class _LanguageText(ConditionEncoder[str | Mapping[str, object]]):
     def captions(self, tokens):
         return tuple(self.tokenizer.batch_decode(np.asarray(tokens["input_ids"]), skip_special_tokens=True))
 
-    def to_json(self):
+    def recorded_fields(self):
         return {"checkpoint": self.checkpoint, "dtype": dtype_name(self.tower.dtype),
                 "param_dtype": self.param_dtype, "tokens": self.tokens}
 

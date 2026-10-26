@@ -20,7 +20,7 @@ from jax.experimental.layout import Format
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, Sharding, SingleDeviceSharding
 from jax.tree_util import KeyPath
 
-from dew.objectives.base import Variables
+from dew.batch import Variables
 from dew.training.distributed import Placement
 
 
@@ -273,6 +273,10 @@ def place_leaf(value, target: Sharding | Format) -> jax.Array:
                 value.release()
     if isinstance(value, jax.Array) and isinstance(target, NamedSharding) and (
             isinstance(value.sharding, NamedSharding) or jnp.issubdtype(value.dtype, jax.dtypes.prng_key)):
+        source = value.sharding
+        if isinstance(source, NamedSharding) and source.mesh == target.mesh and source.spec != target.spec:
+            # Same-mesh resharding changes indices; transfer preserves them between companion devices.
+            return jax.block_until_ready(jax.device_put(value, target))
         return transfer(value, target)
     if isinstance(value, HostSource):
         # make_array_from_callback would hold every addressable shard on

@@ -13,7 +13,7 @@ from collections.abc import Mapping
 
 import numpy as np
 
-from dew import records
+from dew import _records
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
@@ -77,8 +77,8 @@ def _v41_modes(text: Mapping[str, object], layers: int) -> tuple[tuple[int, ...]
     if not isinstance(ratios, (list, tuple)) or len(ratios) < layers or any(
             type(rate) is not int or rate < 0 for rate in ratios):
         refuse('compress_ratios', 'expected a non-negative compress ratio for every layer')
-    kv_sources = set(records.integers(text.get('kv_source_layer_ids', ()), 'kv_source_layer_ids'))
-    index_sources = set(records.integers(text.get('index_source_layer_ids', ()), 'index_source_layer_ids'))
+    kv_sources = set(_records.integers(text.get('kv_source_layer_ids', ()), 'kv_source_layer_ids'))
+    index_sources = set(_records.integers(text.get('index_source_layer_ids', ()), 'index_source_layer_ids'))
     modes, latest_kv, latest_index = [], None, None
     for layer, rate in enumerate(ratios[:layers]):
         if rate == 0:
@@ -287,10 +287,10 @@ def _v41_engram(text: Mapping[str, object], seen: set[str]) -> EngramFields | No
               'engram_vocab_size', 'engram_n_heads', 'engram_head_dim',
               'engram_compressed_vocab_size', 'engram_pad_token_id')
     seen.update(fields)
-    layers = records.integers(text.get('engram_layer_ids', ()), 'engram_layer_ids')
+    layers = _records.integers(text.get('engram_layer_ids', ()), 'engram_layer_ids')
     if not layers:
         return None
-    embeddings = records.integers(text.get('engram_num_embeddings', ()), 'engram_num_embeddings')
+    embeddings = _records.integers(text.get('engram_num_embeddings', ()), 'engram_num_embeddings')
     return native_fields(Engram)(layer_ids=layers, num_embeddings=embeddings,
             max_ngram_size=record_int(text, 'engram_max_ngram_size'),
             vocab_size=record_int(text, 'engram_vocab_size'),

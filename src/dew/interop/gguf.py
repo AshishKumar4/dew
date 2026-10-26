@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING
 import ml_dtypes
 import numpy as np
 
-from dew import records
+from dew import _records
 
 if TYPE_CHECKING:
     from gguf import GGUFReader, ReaderTensor
@@ -82,10 +82,10 @@ a rotary over part of each head, or keys and values wider or narrower than
 it, would compute another model."""
 
 
-def _parse(reader: GGUFReader, key: str) -> records.JSON:
+def _parse(reader: GGUFReader, key: str) -> _records.JSON:
     """One metadata value as gguf decodes it (`ReaderField.contents`), and as
     transformers reads it: a one-element array is its element."""
-    value = records.json_value(reader.fields[key].contents(), key)
+    value = _records.json_value(reader.fields[key].contents(), key)
     return value[0] if isinstance(value, list) and len(value) == 1 else value
 
 
@@ -141,9 +141,9 @@ def _config(reader: GGUFReader) -> tuple[str, Mapping[str, object]]:
         fields.update(_gemma_attention(architecture, fields))
     config = AutoConfig.for_model(_model_type(architecture), **fields).to_diff_dict()
     table = GGUF_TO_TRANSFORMERS_MAPPING["config"][section]
-    head_dim = config.get("head_dim") or records.integer(
+    head_dim = config.get("head_dim") or _records.integer(
         config["hidden_size"], "hidden_size"
-    ) // records.integer(config["num_attention_heads"], "num_attention_heads")
+    ) // _records.integer(config["num_attention_heads"], "num_attention_heads")
     for key in reader.fields:
         name = key.removeprefix(f"{prefix}.")
         if name == key or name in extra or (table.get(name, -1) is not None and name in table):
@@ -167,10 +167,10 @@ def _gemma_attention(architecture: str, fields: Mapping[str, object]) -> Mapping
     (`f_attention_scale`, src/models/gemma2.cpp and gemma3.cpp), where the config class would default
     it to 256; and a Gemma 3 file without a positive sliding window attends every layer whole, which
     is how its converter writes a model of `sliding_window_pattern` 1 (conversion/gemma.py:156-157)."""
-    layers, hidden = records.integer(fields["num_hidden_layers"], "num_hidden_layers"), \
-        records.integer(fields["hidden_size"], "hidden_size")
-    heads = records.integer(fields["num_attention_heads"], "num_attention_heads")
-    width = records.integer(fields.get("head_dim", hidden // heads), "head_dim")
+    layers, hidden = _records.integer(fields["num_hidden_layers"], "num_hidden_layers"), \
+        _records.integer(fields["hidden_size"], "hidden_size")
+    heads = _records.integer(fields["num_attention_heads"], "num_attention_heads")
+    width = _records.integer(fields.get("head_dim", hidden // heads), "head_dim")
     stated: dict[str, object] = {
         "query_pre_attn_scalar": hidden // heads if layers == _GEMMA_27B[architecture] else width}
     if architecture == "gemma3" and not fields.get("sliding_window"):

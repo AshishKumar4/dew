@@ -14,7 +14,7 @@ import numpy as np
 
 from dew import Trainer
 from dew.data.dataset import Loader
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.data import ByteTokenizer
 from dew.inference import RunProcessor
 from dew.nn.backbones import CausalTransformer
@@ -373,7 +373,7 @@ Measured on the same A100 with a randomly initialized 12-layer, 1024-wide bf16 d
 
 ### Serving on a mesh
 
-A server runs on the mesh its task's weights are placed on. `Server.from_task` over such a task runs one step program over every device, and it places its own state with the same rule table that places the weights (`dew.nn.sharding.DEFAULT_RULES`). The slots are split the way a batch's rows are (`activation_batch`: the data, expert and fsdp axes), so each group of devices keeps its own rows and their dense cache, or its own part of a paged pool. A request is seated in a group that has room for it and, with a prefix cache, in the group that already holds its prefix. The tensor axis splits the heads, the MLP and the vocabulary as in training, and the cache's heads are split over it too. The number of slots, the admission and a paged pool's page count must all be multiples of the number of groups.
+A server runs on the mesh its task's weights are placed on. `Server.from_task` over such a task runs one step program over every device, and it places its own state with the same rule table that places the weights (`dew.mesh.DEFAULT_RULES`). The slots are split the way a batch's rows are (`activation_batch`: the data, expert and fsdp axes), so each group of devices keeps its own rows and their dense cache, or its own part of a paged pool. A request is seated in a group that has room for it and, with a prefix cache, in the group that already holds its prefix. The tensor axis splits the heads, the MLP and the vocabulary as in training, and the cache's heads are split over it too. The number of slots, the admission and a paged pool's page count must all be multiples of the number of groups.
 
 The server refuses a mesh whose sequence axis is larger than one, because the decoder refuses to decode under such an axis: the axis splits a sequence's positions, and the cache holds whole sequences. It refuses a stage axis larger than one because the decoder refuses to decode through the training pipeline, and a mesh over several processes because one process schedules all the rows.
 

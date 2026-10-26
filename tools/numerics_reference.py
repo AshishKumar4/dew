@@ -58,9 +58,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import transformers
-from torch_precision import float64
 from safetensors.torch import load_file
+from torch_precision import float64
 from transformers import AutoModelForCausalLM
 from transformers.generation.logits_process import TemperatureLogitsWarper, TopKLogitsWarper, TopPLogitsWarper
 
