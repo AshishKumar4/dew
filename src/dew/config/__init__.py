@@ -1753,7 +1753,7 @@ class DecoderRunConfig(RunConfig):
         return (self.loop_steps is not None or self.loop_layers is not None
                 or self.loop_backprop_steps is not None or self.loop_remat)
 
-    def looped(self, start: Pretrained) -> Pretrained:
+    def looped(self, start: "Pretrained") -> "Pretrained":
         """`start` with its block run as the run asks (`looping`), as loaded where it asks nothing."""
         if not self.loops:
             return start
@@ -1761,8 +1761,8 @@ class DecoderRunConfig(RunConfig):
                        remat=self.loop_remat or None)
 
 
-def looping(start: Pretrained, steps: int | None, layers: tuple[int, int] | None, *,
-            backprop_steps: int | None = None, remat: bool | None = None) -> Pretrained:
+def looping(start: "Pretrained", steps: int | None, layers: tuple[int, int] | None, *,
+            backprop_steps: int | None = None, remat: bool | None = None) -> "Pretrained":
     """A loaded checkpoint whose block runs `steps` passes: a looped one's own block, or `layers`,
     which gives a decoder with no loop one over its own layers. Refused where neither names a block,
     or a new block's passes are not stated. `backprop_steps` and `remat` choose
