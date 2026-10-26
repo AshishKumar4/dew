@@ -410,8 +410,9 @@ class Pretrained:
         a decoder already loads as it is; a pipeline or a fallback has no language model to take.
 
         `prediction_depths` keeps the first that many of a decoder's multi-token prediction depths
-        (DeepSeek V3's, GLM's and Qwen3.5's `mtp` blocks, a DSpark drafter's stages): None the ones the
-        checkpoint holds, 0 none, `n` the first `n`. The load reads the source as a checkpoint of those
+        (DeepSeek V3's, GLM's and Qwen3.5's `mtp` blocks): None the ones the checkpoint holds, 0
+        none, `n` the first `n`; a DSpark drafter, whose stages draft as one, is kept whole or at 0
+        not at all. The load reads the source as a checkpoint of those
         alone (`_kept_depths`): the others are neither built nor their tensors read, and it saves as
         that checkpoint. A source that holds fewer keeps what it holds; one with none holds none.
 
@@ -1842,10 +1843,11 @@ def _trunk_layers(config: Mapping[str, object]) -> int:
 
 def _kept_depths(config: Mapping[str, object], kept: int) -> dict:
     """`config` as the config of a checkpoint holding its first `kept` prediction depths alone: each
-    depth count it states (`DEPTH_COUNTS`, at its top or in its `text_config`) at most `kept`, and a
-    DSpark drafter's stages, which its `compress_ratios` list past the trunk's layers, cut to `kept`,
-    none at 0 (`dew.interop.families.deepseek`). A load reads, builds and saves the source this
-    config states (`Pretrained.load(prediction_depths=)`)."""
+    depth count it states (`DEPTH_COUNTS`, at its top or in its `text_config`) at most `kept`. A DSpark
+    drafter's stages, which its `compress_ratios` list past the trunk's layers, draft as one, its heads
+    on its last stage (`dew.interop.families.deepseek`), so it is kept whole or, at 0, not at all;
+    a count between is refused. A load reads, builds and saves the source this config states
+    (`Pretrained.load(prediction_depths=)`)."""
     written = copy.deepcopy(dict(config))
     for scope in _scopes(written):
         for counted in DEPTH_COUNTS:
@@ -1853,9 +1855,12 @@ def _kept_depths(config: Mapping[str, object], kept: int) -> dict:
                 scope[counted] = kept
         ratios, layers = scope.get("compress_ratios"), scope.get("num_hidden_layers")
         if scope.get("dspark_block_size") and isinstance(ratios, list) and isinstance(layers, int):
-            scope["compress_ratios"] = ratios[:layers + kept]
+            stages = len(ratios) - layers
+            if 0 < kept < stages:
+                raise ValueError(f"a DSpark drafter's {stages} stages draft as one, its heads on the last: "
+                                 f"prediction_depths keeps all of them or none (0), not {kept}")
             if not kept:
-                scope["dspark_block_size"] = 0
+                scope["compress_ratios"], scope["dspark_block_size"] = ratios[:layers], 0
     return written
 
 

@@ -1263,7 +1263,9 @@ def test_a_local_checkpoint_cadence_may_be_a_share_of_the_run(tmp_path):
     tracker = RecordingTracker()
     checkpoints = Checkpoints(str(tmp_path / "run"), local_directory=str(tmp_path / "local"),
                               local_every="25%")
-    make_trainer(tracker=tracker, checkpoints=checkpoints).fit(dataset(), steps=8, log_every=4)
+    trainer = Trainer(Regression(), optax.sgd(0.1), key=jax.random.key(0), tracker=tracker,
+                      layout=Layout(min_shard=1, tolerance=1.0), checkpoints=checkpoints)
+    trainer.fit(dataset(), steps=8, log_every=4)
     local = [step for step, value in tracker.artifacts
              if isinstance(value, CheckpointRequested) and value.local]
     assert local == [2, 4, 6, 8]
