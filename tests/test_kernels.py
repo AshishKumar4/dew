@@ -18,9 +18,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from attention_oracle import attention_terms, exact_attention, kept, qkv, value_and_grads
+from attention_oracle import attention_and_grads, attention_terms, exact_attention, kept, qkv, value_and_grads
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference, distance, with_gradients
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, distance, with_gradients
 
 from dew.nn import kernels
 from dew.nn.attention import NormalAttention, scaled_dot_product_attention, weighted_values
@@ -219,6 +219,41 @@ def test_triton_trains_and_agrees_with_xla(q_len, kv_len, heads, kv_heads, head_
     for got, want in zip(fused, reference, strict=True):
         assert got.shape == want.shape
         assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
+
+
+LARGE_LOGIT_SEEDS = 16
+"""The seeds of the triton route's large-logit site, sized by `seeds_for` (paired) on an A100."""
+
+
+@on_gpu
+def test_triton_trains_at_large_logits_on_par_with_xla():
+    """tokamax's kernel, as 'triton' runs it, at logits near 1e4 (a channel of each query and key drawn
+    near 256, as a small DiT's trained projections give them, the rest small): its output and its query,
+    key and value gradients on par with the xla kernel's from float64 (check 1). Its dK/dV sweep scales
+    the keys where its forward and dQ scale the queries, so its scores there round apart from the
+    forward's residuals by tens of units, and the weights it rebuilds from them were off by e^76 (row
+    1676: a MeanFlow step's key and value gradients 1e35 to 1e62 times xla's error); the route hands it
+    the queries scaled once (`triton_attention`)."""
+    pytest.importorskip("tokamax")
+    shape = (2, 64, 2, 32)
+
+    def draw(seed):
+        streams = jax.random.split(jax.random.PRNGKey(seed), 5)
+        query, key, value = (jax.random.normal(stream, shape, jnp.float32) for stream in streams[:3])
+        query = query.at[..., 0].set(jax.random.uniform(streams[3], shape[:3], minval=200, maxval=300))
+        key = key.at[..., 0].set(jax.random.uniform(streams[4], shape[:3], minval=200, maxval=300))
+        return tuple(x.astype(jnp.bfloat16) for x in (query, key, value))
+
+    def pulled(implementation):
+        step = attention_and_grads(implementation)
+
+        def run(query, key, value):
+            (_, out), grads = step(query, key, value, None)
+            return (out, *grads)
+
+        return run
+
+    assert_as_exact(pulled("triton"), pulled("xla"), draw, "triton at large logits", seeds=LARGE_LOGIT_SEEDS)
 
 
 @on_gpu
