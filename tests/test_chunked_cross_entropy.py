@@ -25,7 +25,7 @@ import numpy as np
 import optax
 import pytest
 from confident_support import confident, label_derivative, log_partition, log_softmax
-from reference_error import assert_as_exact, with_gradients
+from reference_error import assert_as_exact, seeds_for, with_gradients
 from residual_orders import order
 from sharded import collectives
 
@@ -1432,3 +1432,64 @@ def test_a_vocabulary_split_heads_unlikely_target_keeps_its_log_partition_share(
     assert_as_exact(vocabulary_split(gradient), softmax,
                     lambda seed: confident(margin, seed, lead, width=8, count=4),
                     f"vocabulary-split at margin {margin}, {tile}", seeds=CONFIDENT_SEEDS)
+
+
+def unconfident(seed: int, width: int = 7, count: int = 3) -> tuple[np.ndarray]:
+    """`count` rows of `width` float32 logits, each a standard normal draw: no column stands out, so a
+    target is seldom likelier than a half."""
+    return (np.random.default_rng([width, seed]).standard_normal((count, width)).astype(np.float32),)
+
+
+def written_gradient(targets: np.ndarray):
+    """Autodiff's gradient of the cross entropy written out from `jax.nn.log_softmax`, the reference a
+    target no likelier than a half takes: its entry `p - 1`, rounded once (`test_categorical`)."""
+    return jax.jit(jax.grad(
+        lambda logits: -jnp.take_along_axis(jax.nn.log_softmax(logits), targets[:, None], axis=-1).sum()))
+
+
+@pytest.mark.parametrize("path", ["tiled", "whole", "fused", "logits"])
+def test_an_unconfident_targets_logit_gradient_is_on_par_with_autodiffs(path):
+    """Every head's gradient of an unconfident target's loss with respect to the logits is on par from
+    float64 with autodiff's of the cross entropy written out (check 1): below a half a target's entry is
+    its share less one, rounded once, where the rest of the row summed carries each class's rounding of
+    the partition (`dew.nn.categorical.label_entry`, the rule every head reads)."""
+    targets = np.arange(3, dtype=np.int32)
+    head = identity_head()
+
+    def loss(logits):
+        if path == "logits":
+            return chunked.logits_cross_entropy(logits, targets)[0].sum()
+        if path == "fused":
+            return fused_head_loss(logits, head, targets, jnp.ones(targets.shape))[0]
+        tile = (3, 3) if path == "tiled" else None
+        return chunked_cross_entropy(logits, head, targets, 1, tile=tile)[0].sum()
+
+    gradient, reference = jax.jit(jax.grad(loss)), written_gradient(targets)
+    label = f"{path} at an unconfident target"
+    with jax.default_matmul_precision("highest"):
+        seeds = seeds_for(reference, unconfident, label, dew_fn=gradient)
+        assert_as_exact(gradient, reference, unconfident, label, seeds=seeds)
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("tile", [None, (2, 2)], ids=["whole", "tiled"])
+def test_a_vocabulary_split_heads_unconfident_target_gradient_is_on_par_with_autodiffs(tile):
+    """Split over the vocabulary on a mesh, the head's gradient of an unconfident target's loss with respect
+    to the logits is on par from float64 with autodiff's of the cross entropy written out (check 1), as one
+    device's is: the target's shard takes its share less one, its share of the partition summed over every
+    shard."""
+    targets = np.arange(4, dtype=np.int32) * 2
+
+    def loss(logits, matrix):
+        head = OutputTable(matrix, vocab_major=False, precision=jax.lax.Precision.HIGHEST)
+        return chunked_cross_entropy(logits, head, targets, 1, tile=tile)[0].sum()
+
+    split, reference = vocabulary_split(jax.jit(jax.grad(loss))), written_gradient(targets)
+    label = f"vocabulary-split at an unconfident target, {tile}"
+
+    def draw(seed):
+        return unconfident(seed, width=8, count=4)
+
+    with jax.default_matmul_precision("highest"):
+        seeds = seeds_for(reference, draw, label, dew_fn=split)
+        assert_as_exact(split, reference, draw, label, seeds=seeds)
