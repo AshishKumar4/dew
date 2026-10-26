@@ -1081,10 +1081,12 @@ def _numpy_kl(difference, variance, mean_tangent, variance_tangent, cotangent):
 
 def _kl_grid():
     """Rows over float32's exponent range in the offset, the variance, the mean's tangent, the
-    variance's and the cotangent, each at eight exponents from -126 to 126, an inexact significand
+    variance's and the cotangent, each at eight exponents from -124 to 125, an inexact significand
     each, two elements a row: their offsets and tangents apart, or equal offsets whose tangents
     cancel."""
-    levels = (-126, -80, -40, -1, 0, 40, 80, 126)
+    # From -124, so a row's smaller element (0.6 of the least) is still normal: XLA:CPU reads a subnormal
+    # input as zero, which no float64 truth of the input's own value does.
+    levels = (-124, -80, -40, -1, 0, 40, 80, 125)
     grid = np.asarray(list(itertools.product(levels, repeat=5)))
     significands = (1.3, 1.7, 1.1, 1.9, 1.5)
     offset, variance, tangent, stretch, cotangent = (np.ldexp(np.float32(significand), grid[:, index])
@@ -1173,20 +1175,21 @@ def test_a_transitions_kl_and_its_derivatives_hold_at_float32s_edges(edge):
     _, pullback = jax.vjp(lambda at: kl(at, *primals[1:]), primals[0])
     pulled_back = np.asarray(pullback(jnp.asarray(cotangent))[0])[:, 0, :2]
     difference = -offsets
-    divergence = np.sum(difference**2, axis=1) / np.float32(2) / variance
+    numpy = _numpy_kl(difference, variance, mean_tangent, variance_tangent, cotangent)
     wide = [value.astype(np.float64) for value in
             (difference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent)]
     wide_divergence = np.sum(wide[0] ** 2, axis=1) / (2 * wide[1])
     outputs = {
-        "KL": (value, divergence, wide_divergence),
-        "JVP along the mean": (moved_mean, np.sum(np.float32(2) * difference * mean_tangent, axis=1)
-                               / np.float32(2) / variance, np.sum(wide[0] * wide[2], axis=1) / wide[1]),
+        "KL": (value, numpy["KL"], wide_divergence),
+        "JVP along the mean": (moved_mean, numpy["JVP along the mean"],
+                               np.sum(wide[0] * wide[2], axis=1) / wide[1]),
         "JVP along the reference": (moved_reference,
-                                    -np.sum(np.float32(2) * difference * reference_tangent, axis=1)
-                                    / np.float32(2) / variance, -np.sum(wide[0] * wide[3], axis=1) / wide[1]),
-        "JVP along the variance": (moved_variance, -(divergence * variance_tangent) / variance,
+                                    -_numpy_kl(difference, variance, reference_tangent, variance_tangent,
+                                               cotangent)["JVP along the mean"],
+                                    -np.sum(wide[0] * wide[3], axis=1) / wide[1]),
+        "JVP along the variance": (moved_variance, numpy["JVP along the variance"],
                                    -wide_divergence * wide[4] / wide[1]),
-        "VJP to the mean": (pulled_back, cotangent[:, None] * difference / variance[:, None],
+        "VJP to the mean": (pulled_back, numpy["VJP to the mean"],
                             wide[5][:, None] * wide[0] / wide[1][:, None]),
     }
     for name, (dew, reference, truth) in outputs.items():

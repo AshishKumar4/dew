@@ -109,22 +109,22 @@ def _exponent(x: jax.Array) -> jax.Array:
     """Each `|x|`'s binary exponent `e`, `2**e <= |x| < 2**(e + 1)` where `x` is a normal number, read
     from its bits: a zero, or a subnormal, which XLA:CPU reads as zero, gives the least normal's less
     one, and an infinity or a NaN the largest's plus one."""
-    info = jnp.finfo(x.dtype)
-    unsigned = jnp.uint32 if info.bits == 32 else jnp.uint64
-    field = (jax.lax.bitcast_convert_type(jnp.abs(x), unsigned) >> info.nmant) & ((1 << info.nexp) - 1)
-    return field.astype(jnp.int32) - (info.maxexp - 1)
+    limits = jnp.finfo(x.dtype)
+    unsigned = jnp.uint32 if limits.bits == 32 else jnp.uint64
+    field = (jax.lax.bitcast_convert_type(jnp.abs(x), unsigned) >> limits.nmant) & ((1 << limits.nexp) - 1)
+    return field.astype(jnp.int32) - (limits.maxexp - 1)
 
 
 def _scaled(x: jax.Array, power: jax.Array) -> jax.Array:
     """`x * 2**power`, exact where the result is a normal number: the power in parts each a normal
     number's, all of its sign, applied in turn, so each partial product lies between `x` and the
     result and leaves no range the result keeps."""
-    info = jnp.finfo(x.dtype)
-    unsigned = jnp.uint32 if info.bits == 32 else jnp.uint64
+    limits = jnp.finfo(x.dtype)
+    unsigned = jnp.uint32 if limits.bits == 32 else jnp.uint64
     power = jnp.asarray(power, jnp.int32)
     for _ in range(4):
-        part = jnp.clip(power, info.minexp, info.maxexp - 1)
-        biased = (part + (info.maxexp - 1)).astype(unsigned) << info.nmant
+        part = jnp.clip(power, limits.minexp, limits.maxexp - 1)
+        biased = (part + (limits.maxexp - 1)).astype(unsigned) << limits.nmant
         x = x * jax.lax.bitcast_convert_type(biased, x.dtype)
         power = power - part
     return x
