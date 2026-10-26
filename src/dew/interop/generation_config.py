@@ -343,6 +343,12 @@ def _cache_capacity(config: Mapping[str, object], generation_config: Mapping[str
         raise ValueError(f"max_cache_len {value} exceeds the model's max_seq_len {capacity}")
 
 
+TRANSFORMERS_TOP_K = 50
+"""The cut transformers' `generate` samples from where a source leaves `top_k` unset: its documented
+default (`GenerationConfig`, configuration_utils.py, 5.17.0), which its generation preparation installs
+as a `TopKLogitsWarper`. A stated 0 asks for no cut."""
+
+
 def _source_sampling(config: Mapping[str, object], generation_config: Mapping[str, object],
                      do_sample: bool) -> Sampling:
     """Return the policy a source declares, every common control in it."""
@@ -360,7 +366,8 @@ def _source_sampling(config: Mapping[str, object], generation_config: Mapping[st
     stop = read("stop_strings")
     return Sampling(
         temperature=_records.number(temperature, "temperature") if do_sample else 0.0,
-        top_k=(_records.integer(top_k, "top_k") or None) if do_sample and top_k is not None else None,
+        top_k=((TRANSFORMERS_TOP_K if top_k is None else _records.integer(top_k, "top_k") or None)
+               if do_sample else None),
         eos_token_ids=eos,
         pad_token_id=pad_id(config, generation_config),
         top_p=_probability_control(config, generation_config, "top_p", Sampling.top_p)
@@ -537,9 +544,9 @@ def generation_config_of(sampling: Sampling, max_new_tokens: int | None = None) 
     """The generation_config.json transformers reads `sampling` from, and
     `source_decoding` reads back as the same policy: the inverse of
     `_source_sampling`. A top_k of None is written 0, which both read as no
-    cut (transformers' own default is 50). transformers has no presence or
-    frequency penalty, so a policy using one is refused, not exported
-    without it."""
+    cut, since an unset one reads as transformers' default (`TRANSFORMERS_TOP_K`).
+    transformers has no presence or frequency penalty, so a policy using one
+    is refused, not exported without it."""
     dropped = [name for name in ("presence_penalty", "frequency_penalty") if getattr(sampling, name) != 0.0]
     if dropped:
         raise ValueError(f"transformers' generation config has no {' or '.join(dropped)}; "
