@@ -12,7 +12,7 @@ import pytest
 from steady_state import guarded
 
 import dew
-from dew.telemetry.profile import active_profile
+from dew.telemetry.profile import active_profile, program_kernels
 
 
 @pytest.fixture
@@ -45,13 +45,14 @@ def test_manual_context_and_restart_preserve_each_native_capture(tmp_path, nativ
     sentinel = tmp_path / "existing.txt"
     sentinel.write_text("keep")
     profiler = dew.Profiler(tmp_path)
-    assert profiler.directory == tmp_path and not profiler.running
+    assert profiler.directory == tmp_path and not profiler.running and profiler.captures == ()
     assert captures(tmp_path) == []
     assert profiler.start() is profiler
     with jax.profiler.TraceAnnotation("manual_capture_marker"):
         result = work()
     profiler.stop()
     first = captures(tmp_path)[0]
+    assert profiler.captures == (first,)
     before = {path: path.read_bytes() for path in first.rglob("*") if path.is_file()}
     with profiler as entered:
         assert entered is profiler and active_profile() is profiler
@@ -59,6 +60,7 @@ def test_manual_context_and_restart_preserve_each_native_capture(tmp_path, nativ
             result = work()
     assert not profiler.running and active_profile() is None
     assert len(captures(tmp_path)) == 2
+    assert profiler.captures[0] == first and set(profiler.captures) == set(captures(tmp_path))
     assert sentinel.read_text() == "keep"
     assert all(path.read_bytes() == content for path, content in before.items())
     assert "manual_capture_marker" in event_names(first)
@@ -230,3 +232,21 @@ def test_empty_native_tool_discovery_is_an_export_failure(tmp_path, native_repor
     assert record["reports"][0]["status"] == "error"
     assert list(capture.glob("plugins/profile/*/*.xplane.pb"))
     assert active_profile() is None
+
+
+def test_a_captures_kernels_are_filed_under_the_programs_that_ran_them(tmp_path):
+    """`program_kernels` files each kernel_stats row under the first named program its op name holds, the
+    rest under '', longest total time first; a capture whose export wrote no kernel_stats raises naming it."""
+    capture = tmp_path / "capture-x"
+    (capture / "reports").mkdir(parents=True)
+    rows = [("a", "jit(step)/a", 3.0), ("b", "jit(step_eval)/b", 9.0), ("c", "jit(step)/c", 5.0),
+            ("d", "jit(other)/d", 1.0)]
+    table = {"cols": [{"id": "kernel_name"}, {"id": "op_name"}, {"id": "total_duration_us"}],
+             "rows": [{"c": [{"v": name}, {"v": op}, {"v": time}]} for name, op, time in rows]}
+    (capture / "reports" / "kernel_stats.json").write_text(json.dumps([table]))
+    found = program_kernels(capture, ["step_eval", "step"])
+    assert [row["kernel_name"] for row in found["step_eval"]] == ["b"]
+    assert [row["kernel_name"] for row in found["step"]] == ["c", "a"]
+    assert [row["kernel_name"] for row in found[""]] == ["d"]
+    with pytest.raises(FileNotFoundError):
+        program_kernels(tmp_path / "capture-y", ["step"])

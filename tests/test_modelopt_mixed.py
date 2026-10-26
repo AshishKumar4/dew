@@ -174,3 +174,111 @@ def test_a_modelopt_nvfp4_model_with_experts_is_read_by_its_stored_layers(tmp_pa
     save_hf_layout(decoded, config, tmp_path / 'decoded')
     weights_only = Pretrained.load(tmp_path / 'decoded', **load)
     assert np.abs(logits - np.asarray(weights_only.model.apply(weights_only.variables, ids))).max() > 0
+
+
+def fp8(name: str, weight: np.ndarray, input_scale: float, weight_scale: float | None = None
+        ) -> dict[str, np.ndarray]:
+    """`weight` as ModelOpt's FP8 exporter stores it: E4M3 codes under one float32 scale (amax/448
+    where not given), beside the static input multiplier it calibrated."""
+    import ml_dtypes
+
+    stem = name.removesuffix('.weight')
+    scale = np.abs(weight).max() / 448 if weight_scale is None else weight_scale
+    grid = {stem + '.weight_scale': np.asarray(scale, np.float32),
+            stem + '.input_scale': np.asarray(input_scale, np.float32),
+            name: np.zeros(weight.shape, ml_dtypes.float8_e4m3fn)}
+    quantization = {'quant_method': 'modelopt', 'quant_algo': 'FP8'}
+    codec = codecs.source_quantization({'quantization_config': quantization}, grid=grid)
+    assert codec is not None
+    return codec.encode(name, weight)
+
+
+def test_a_modelopt_fp8_model_with_fused_projections_quantizes_every_member_input(tmp_path):
+    """Phi-3 stores its query, key and value as one `qkv_proj`, and its gate and up as one
+    `gate_up_proj`. Written as ModelOpt FP8, each fused weight's one input scale quantizes the one
+    input its members read: the loaded model holds that scale at every member Linear and none
+    elsewhere, computes bit for bit what the decoded weights compute under those sites' FP8 input
+    QDQ, and exports the scale to load back the same model."""
+    from flax.traverse_util import flatten_dict, unflatten_dict
+
+    from dew.interop.safetensors_io import save_hf_layout
+    from dew.quantization import INPUT_SCALES, QUANTIZATION, InputQuantization
+
+    source = FIXTURE.parents[2] / 'hf' / 'phi3-tiny'
+    stored, config = read_weights(source), json.loads((source / 'config.json').read_text())
+    scales = {'qkv_proj': 0.05, 'o_proj': 0.03, 'gate_up_proj': 0.07, 'down_proj': 0.02}
+    tensors, decoded = dict(stored), dict(stored)
+    for name, weight in stored.items():
+        projection = name.split('.')[-2]
+        if name.startswith('model.layers.') and projection in scales:
+            encoded = fp8(name, np.asarray(weight, np.float32), scales[projection])
+            tensors.update(encoded)
+    producer = json.loads((FIXTURE / 'config.json').read_text())['quantization_config']['producer']
+    quantization = {'quant_algo': 'FP8', 'kv_cache_quant_algo': None, 'producer': producer,
+                    'quant_method': 'modelopt'}
+    save_hf_layout(tensors, {**config, 'quantization_config': quantization}, tmp_path / 'fp8')
+    (tmp_path / 'fp8' / 'hf_quant_config.json').write_text(json.dumps(
+        {'producer': producer, 'quantization': {'quant_algo': 'FP8', 'kv_cache_quant_algo': None}}))
+    codec = codecs.source_quantization(json.loads((tmp_path / 'fp8' / 'config.json').read_text()))
+    assert codec is not None
+    for name in codec.names(tensors):
+        decoded[name] = codec.decode(tensors, name)
+    save_hf_layout(decoded, config, tmp_path / 'decoded')
+
+    load = {'dtype': 'float32', 'attention_impl': 'reference'}
+    quantized = Pretrained.load(tmp_path / 'fp8', **load)
+    dense = Pretrained.load(tmp_path / 'decoded', **load)
+    members = {'q_proj': 'qkv_proj', 'k_proj': 'qkv_proj', 'v_proj': 'qkv_proj', 'o_proj': 'o_proj',
+               'gate_proj': 'gate_up_proj', 'up_proj': 'gate_up_proj', 'down_proj': 'down_proj'}
+    expected = {path[:-1]: np.float32(scales[members[path[-2]]])
+                for path in flatten_dict(dense.variables['params'])
+                if path[-1] == 'kernel' and len(path) > 1 and path[-2] in members}
+    held = flatten_dict(quantized.variables[QUANTIZATION])
+    assert {path[:-1]: np.float32(value) for path, value in held.items()} == expected
+    assert {path[-1] for path in held} == {INPUT_SCALES['fp8']}
+
+    scheme = InputQuantization(e4m3_scale=False, format='compressed-tensors',
+                               sites=tuple(sorted(('/'.join(path), 'fp8') for path in expected)))
+    under = scheme.apply(dense.model)
+    variables = {**dense.variables, QUANTIZATION: unflatten_dict(
+        {(*path, INPUT_SCALES['fp8']): np.float32(value) for path, value in expected.items()})}
+    ids = np.load(source / 'input_ids.npy')
+    logits = np.asarray(quantized.model.apply(quantized.variables, ids))
+    np.testing.assert_array_equal(logits, np.asarray(under.apply(variables, ids)))
+    assert not np.array_equal(logits, np.asarray(dense.model.apply(dense.variables, ids)))
+
+    quantized.save(tmp_path / 'export')
+    exported = read_weights(tmp_path / 'export')
+    for name, value in scales.items():
+        block = 'mlp' if name in ('gate_up_proj', 'down_proj') else 'self_attn'
+        np.testing.assert_array_equal(exported[f'model.layers.0.{block}.{name}.input_scale'],
+                                      np.asarray(value, np.float32))
+    reloaded = Pretrained.load(tmp_path / 'export', **load)
+    np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)), logits)
+
+
+def test_a_fused_and_a_stored_member_with_unequal_input_scales_are_refused(tmp_path):
+    """A fused tensor beside an equal member stored apart binds that member's Linear twice: with
+    unequal input scales, one calibration would be dropped, so the load is refused."""
+    from dew.interop.safetensors_io import save_hf_layout
+
+    source = FIXTURE.parents[2] / 'hf' / 'phi3-tiny'
+    stored, config = read_weights(source), json.loads((source / 'config.json').read_text())
+    tensors = dict(stored)
+    fused = 'model.layers.0.mlp.gate_up_proj.weight'
+    weight = np.asarray(stored[fused], np.float32)
+    encoded = fp8(fused, weight, 0.07)
+    tensors.update(encoded)
+    # The member under the fused tensor's own weight scale decodes to the fused tensor's half exactly,
+    # so only the input scales differ.
+    member = weight[weight.shape[0] // 2:]
+    shared = float(encoded['model.layers.0.mlp.gate_up_proj.weight_scale'])
+    tensors.update(fp8('model.layers.0.mlp.up_proj.weight', member, 0.03, weight_scale=shared))
+    producer = json.loads((FIXTURE / 'config.json').read_text())['quantization_config']['producer']
+    quantization = {'quant_algo': 'FP8', 'kv_cache_quant_algo': None, 'producer': producer,
+                    'quant_method': 'modelopt'}
+    save_hf_layout(tensors, {**config, 'quantization_config': quantization}, tmp_path)
+    (tmp_path / 'hf_quant_config.json').write_text(json.dumps(
+        {'producer': producer, 'quantization': {'quant_algo': 'FP8', 'kv_cache_quant_algo': None}}))
+    with pytest.raises(ValueError):
+        Pretrained.load(tmp_path, dtype='float32', attention_impl='reference')
