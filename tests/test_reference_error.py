@@ -644,6 +644,21 @@ def test_a_small_row_the_reference_measures_is_judged_at_its_own_size():
     assert raised.type is GateFailure
 
 
+def _tiny_row_recording(live):
+    """A recording's draw and evaluation of `live` (`_tiny_row`'s reference): each seed's inputs by name,
+    and the reference's float32 outputs beside their float64 truth."""
+    def draw(seed):
+        x, w = _draw(seed)
+        return {"x": x, "w": w}
+
+    def evaluate(inputs):
+        with jax.enable_x64(new_val=False):
+            reference = jax.tree.map(np.asarray, live(inputs["x"], inputs["w"]))
+        truth = jax.tree.map(np.asarray, live(*(np.asarray(inputs[n], np.float64) for n in ("x", "w"))))
+        return reference, truth
+    return draw, evaluate
+
+
 def test_a_summarized_recording_keeps_the_zero_rows_rule_for_its_small_rows():
     """A recording that keeps its reference's evidence and its truth's sketch alone (`record_case`'s
     summary) keeps no row's own size, and its sketch holds the truth at its leaf's scale, not a tiny
@@ -653,19 +668,10 @@ def test_a_summarized_recording_keeps_the_zero_rows_rule_for_its_small_rows():
 
     recorder = load("recorded_references")
     dew, live = _tiny_row(4)
-
-    def draw(seed):
-        x, w = _draw(seed)
-        return {"x": x, "w": w}
+    draw, evaluate = _tiny_row_recording(live)
 
     def as_inputs(fn):
         return lambda inputs: fn(inputs["x"], inputs["w"])
-
-    def evaluate(inputs):
-        with jax.enable_x64(new_val=False):
-            reference = jax.tree.map(np.asarray, live(inputs["x"], inputs["w"]))
-        truth = jax.tree.map(np.asarray, live(*(np.asarray(inputs[n], np.float64) for n in ("x", "w"))))
-        return reference, truth
 
     with jax.enable_x64(new_val=True):
         recorded = recorder.record_case("site", draw, evaluate, as_inputs(live), summary=True)
@@ -688,16 +694,7 @@ def test_a_recording_made_in_shards_is_the_recording_one_run_makes():
 
     recorder = load("recorded_references")
     _, live = _tiny_row(4)
-
-    def draw(seed):
-        x, w = _draw(seed)
-        return {"x": x, "w": w}
-
-    def evaluate(inputs):
-        with jax.enable_x64(new_val=False):
-            reference = jax.tree.map(np.asarray, live(inputs["x"], inputs["w"]))
-        truth = jax.tree.map(np.asarray, live(*(np.asarray(inputs[n], np.float64) for n in ("x", "w"))))
-        return reference, truth
+    draw, evaluate = _tiny_row_recording(live)
 
     with jax.enable_x64(new_val=True):
         whole = recorder.record_case("site", draw, evaluate, lambda inputs: live(inputs["x"], inputs["w"]),
