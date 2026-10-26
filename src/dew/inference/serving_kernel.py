@@ -563,7 +563,7 @@ def _restored(resident: Slots, carried: Slots, states: Variables, slots: jax.Arr
         return leaf if held is None else leaf.at[slots].set(held[entries].astype(leaf.dtype), mode="drop")
 
     cache = jax.tree.map(restored, states, state.decoder.cache, is_leaf=lambda x: x is None)
-    return split_donated(state.replace(decoder=state.decoder.replace(cache=cache)))
+    return split_donated(dataclasses.replace(state, decoder=dataclasses.replace(state.decoder, cache=cache)))
 
 
 def _captured(states: Variables, resident: Slots, carried: Slots, slots: jax.Array,

@@ -606,11 +606,12 @@ class Server:
         rows = self.rows
         if isinstance(rows, PagedRows) and rows.stateful:
             entries = rows.states * self.groups
-            self._states = jax.tree_util.tree_map_with_path(
+            states = jax.tree_util.tree_map_with_path(
                 lambda path, leaf: jax.device_put(jnp.zeros((entries, *leaf.shape[1:]), leaf.dtype),
                                                   leaf.sharding) if row_state(path) else None,
                 self.cache)
-            self._restored, self._captured = state_programs(formats, self._states)
+            self._states = states
+            self._restored, self._captured = state_programs(formats, states)
 
     def _context(self) -> contextlib.AbstractContextManager[None]:
         """The mesh the model traces under, so a layer that reads it, such as an expert exchange, finds it."""
