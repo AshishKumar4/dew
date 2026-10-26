@@ -10,16 +10,21 @@ layers over a width of 16, four query heads of 8 over two key/value heads,
 its norms' statistics over two groups (the 3.7B's layernorm_num_groups) and
 its rotary the 0.9B's YaRN, with fp32 and float64 logits, left-padded logits
 and the cached greedy continuation. k2-horizon-{0.9b,3.7b,7b}/ pin the
-released configs, which the translation is held to.
+released configs, which the translation is held to. `--padding` records
+instead the rows the release's own token lookup leaves untrained under
+k2-horizon-tiny's config with its pad id stated, left out and null
+(`reference_source.record_padding`), as padding.json there.
 """
 
+import json
 import shutil
+import sys
 from pathlib import Path
 
 import numpy as np
 import torch
 from huggingface_hub import hf_hub_download
-from reference_source import hub_modules
+from reference_source import config_lookups, hub_modules, record_padding
 from torch_precision import float64, float64_twin
 
 from dew.interop.verify import probe_ids, scatter_weights
@@ -92,5 +97,12 @@ def write_released() -> None:
 
 
 if __name__ == '__main__':
-    write_tiny(remote())
-    write_released()
+    if sys.argv[1:] == ['--padding']:
+        modeling = remote()
+        record_padding(*config_lookups(lambda fields: modeling.K2HorizonConfig(**fields),
+                                       modeling.K2HorizonForCausalLM),
+                       json.loads((FIXTURES / 'k2-horizon-tiny' / 'config.json').read_text()),
+                       FIXTURES / 'k2-horizon-tiny')
+    else:
+        write_tiny(remote())
+        write_released()

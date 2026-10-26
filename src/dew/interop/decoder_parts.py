@@ -1850,8 +1850,11 @@ class DecoderFamily:
     from its lookups: `translate_family_config` reads pad_token_id into
     `CausalTransformer.padding_idx`, the class's own default among `defaults`, and the export
     writes it back (ledger 1593). A family whose source passes none (GPT-NeoX, Falcon, BLOOM,
-    Nemotron-H) or whose source this table has not read (released remote code) leaves it False
-    and trains the row."""
+    Nemotron-H, dense LLaDA, MiMo-V2, K2 Horizon) leaves it False and trains the row, and so does
+    one whose reader reads the pad id itself from the config its source's table is built from: a
+    wrapper's text config (Kimi K2.5's, through DeepSeek V3's reader, and K3's, through the reader
+    Kimi Linear shares), or a config of the mixture-of-experts LLaDA sources, whose model_type 'llada'
+    also names the dense one."""
 
     def readings(self, tensors: Mapping[str, np.ndarray],
                  config: Mapping[str, object]) -> tuple[Reading, ...]:
