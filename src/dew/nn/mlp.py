@@ -14,6 +14,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn.dense import Dense
+from dew.nn.dropout import Dropout
 
 from .activations import (
     UNGATED,
@@ -168,7 +169,7 @@ class GatedMLP(nn.Module):
             self.up_proj = dense(projections['up_proj'][1], name='up_proj')
         self.down_proj = dense(projections['down_proj'][1], name='down_proj', **normal_kernel(
             self.init_std if self.output_init_std is None else self.output_init_std))
-        self.dropout = nn.Dropout(rate=self.dropout_rate)
+        self.dropout = Dropout(rate=self.dropout_rate)
         if self.ngpt is not None:
             if not self._gated() or self.swiglu_limit is not None or self.activation_sparsity:
                 raise ValueError("an nGPT feed-forward is a plain gated product: it takes no clamp, "

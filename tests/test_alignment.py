@@ -13,13 +13,14 @@ from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference, assert_as_exact_over_orders, distance
 
 from dew.diffusion import presets
+from dew.inference import TextToImage
 from dew.inputs import Field, InputSpec
 from dew.nn.backbones import SimpleDiT
 from dew.nn.scan_orders import patchify
 from dew.objectives.base import Step
 from dew.objectives.diffusion import Alignment, DiffusionObjective
 from dew.objectives.diffusion.alignment import ALIGNMENT, REPRESENTATION, spatial_zscore
-from dew.sampling import Euler, TextToImage
+from dew.sampling import Euler
 
 CASES = np.load(Path(__file__).resolve().parent / "fixtures" / "repa" / "losses.npz")
 SETTINGS = json.loads(str(CASES["settings"]))

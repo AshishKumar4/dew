@@ -47,6 +47,8 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.nn.dropout import Dropout
+
 from .activations import GatedActivation
 from .attention import projected_heads, projected_output, scaled_dot_product_attention
 from .flops import counted_flops, cross_attention_flops, projection_flops
@@ -235,7 +237,7 @@ class GatedCrossAttention(nn.Module):
         output = projected_output(constrain(attended, HEADS), "o_proj", self.emb_features, flat=True,
                                   bias=False, dtype=self.dtype, precision=self.precision)
         present = (lengths > 0).reshape((-1,) + (1,) * (stream.ndim - 1))
-        dropout = nn.Dropout(rate=self.dropout_rate)
+        dropout = Dropout(rate=self.dropout_rate)
 
         def joined(stream: jax.Array, name: str, branch: jax.Array) -> jax.Array:
             # The gate in at least float32, and in its own float64 where a run widens it.
