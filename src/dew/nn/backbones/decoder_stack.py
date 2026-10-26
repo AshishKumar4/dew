@@ -500,7 +500,7 @@ class PipelineStage(nn.Module):
     a leading stage axis, which the `StackView` outside stacks and unstacks.
     Layer `j` of a stage is `layers_j` here and `layers_{stage * count + j}` in
     the stored tree, where `count` is the number of layers per stage. `specs`
-    `groups` describe stage 0, and every stage repeats them.
+    and `groups` describe stage 0, and every stage repeats them.
     """
     block: Block
     specs: tuple[LayerSpec, ...]
