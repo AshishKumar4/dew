@@ -120,6 +120,17 @@ def _picks(tiles: Tiles, fp32: Tiles | None = None) -> Mapping[str, Tiles]:
     return {"bfloat16": tiles, "float32": tiles if fp32 is None else fp32}
 
 
+def _row_block(batch: int, length: int, chunk: int, width: int, bm: int, bn: int):
+    """A chunk-scan program's row block (`_chunk_scan_kernel`'s and `_dx_kernel`'s grid): its block of `bm`
+    rows `m` and head `h` (program axes 0 and 2, axis 0 also counting `width // bn` column blocks), its
+    chunk `c` (axis 1, over the batch), the chunk's first token, the tokens it holds (`_limit`) and the
+    block's rows."""
+    m, h = pl.program_id(0) // (width // bn), pl.program_id(2)
+    c = pl.program_id(1) // batch
+    start = c * chunk
+    return m, h, c, start, _limit(c, length, chunk), pl.ds(start + m * bm, bm)
+
+
 def _limit(c, length: int, chunk: int):
     """The tokens chunk `c` of a row holds (mamba_ssm's `chunk_size_limit`): the constant `chunk` where
     whole chunks tile the rows, so that no load or store takes a mask."""
@@ -446,12 +457,7 @@ def _chunk_scan_kernel(cb_ref, x_ref, dt_ref, da_ref, c_ref, states_ref, d_ref, 
     causal `sum_k CB_mk exp(min(acs_m - acs_k, 0)) dt_k x_k` over the chunk's rows, each `CB` block
     weighted in fp32 and rounded to `x`'s dtype before its product; then `D x`; stored fp32."""
     *seq, out_ref = refs
-    columns = width // bn
-    m, h = pl.program_id(0) // columns, pl.program_id(2)
-    c = pl.program_id(1) // batch
-    start = c * chunk
-    limit = _limit(c, length, chunk)
-    rows = pl.ds(start + m * bm, bm)
+    m, h, c, start, limit, rows = _row_block(batch, length, chunk, width, bm, bn)
     da_m = da_ref[rows]
     scale = jnp.exp(da_m)
     if seq:
@@ -655,12 +661,7 @@ def _dx_kernel(x_ref, cb_ref, dout_ref, dt_ref, da_ref, d_ref, b_ref, dstates_re
     `dt_m`, plus `D dout_m`; `dt`'s gradient `sum_p (...) x_m` and `D`'s `sum_p dout x` per row, for
     XLA to sum."""
     *seq, dx_ref, ddt_ref, dd_ref = refs
-    columns = width // bn
-    m, h = pl.program_id(0) // columns, pl.program_id(2)
-    c = pl.program_id(1) // batch
-    start = c * chunk
-    limit = _limit(c, length, chunk)
-    rows = pl.ds(start + m * bm, bm)
+    m, h, _, start, limit, rows = _row_block(batch, length, chunk, width, bm, bn)
     taken = _from(limit, m * bm)
     da_m = da_ref[rows]
     scale = jnp.exp(jnp.minimum(da_ref[start + chunk - 1] - da_m, 0.0))
