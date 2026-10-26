@@ -2033,6 +2033,10 @@ def _query_key(q, k, corrected, do, dv, h, dh, ds, hi, lo, taken, call: _Call, *
                 jnp.sum(column("entered", memories, j).value().astype(jnp.float32)
                         * column("leaving", memories, j).value().astype(jnp.float32), axis=1)
                 for j in range(blocks)))
+            # The step's reduce-adds ('dq', 'dk', `Family.added`) waited on by design, not by 'dw''s store
+            # being emitted after them: Mosaic GPU waits on no copy at a kernel's exit (template numerics
+            # review 2026-10-26, P3-4).
+            family.store_wait(0)
             return carry, accumulators
 
         _walk(streams, views, step, call, steps=group)
