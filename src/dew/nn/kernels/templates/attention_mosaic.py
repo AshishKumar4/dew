@@ -141,10 +141,24 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         return BUNDLES[config.family].registers(config.consumers)
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
-        # Interpreted only in a CPU process (`grouped_matmul._Mosaic.eligible`): the interpreter's callbacks
-        # are ordered effects, which a GPU process's lowering cannot carry.
-        interpretable = not ba.arguments["interpret"] or jax.default_backend() == "cpu"
-        return interpretable and self.derived(ba, target) is not None
+        return self.declined(ba, target) is None
+
+    def declined(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> str | None:
+        """Why the launch runs no call of `ba` on `target`, or None: its family has no bundle here, the call
+        is one it does not take (`refusal`, each reason with its ledger row), it is interpreted in a GPU
+        process (`grouped_matmul._Mosaic.eligible`: the interpreter's callbacks are ordered effects, which a
+        GPU process's lowering cannot carry), or no config fits the device (`derived`)."""
+        name = generation.family(target.generation)
+        family = BUNDLES.get(name or "")
+        if family is None:
+            return f"the Mosaic mainloop has no bundle for {name or target.generation} yet"
+        if (reason := self.refusal(ba, family)) is not None:
+            return reason
+        if ba.arguments["interpret"] and jax.default_backend() != "cpu":
+            return "an interpreted Mosaic launch runs in a CPU process alone"
+        if self.derived(ba, target) is None:
+            return f"no config of the Mosaic mainloop fits {target.generation}'s block and registers"
+        return None
 
     def legal(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> bool:
         """Whether a launch of `ba` runs at `config` on `target`: the target's family's bundle (`BUNDLES`),
@@ -309,13 +323,22 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     return op(*args, residuals=residuals, interpret=interpret)
 
 
+def forward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
+                     hooks: Hooks | None = None, *, scale: float | None = None, natural: bool = NATURAL,
+                     residuals: bool = False) -> str | None:
+    """Why `forward` runs no call of these arrays compiled on this device, or None
+    (`MosaicForward.declined`)."""
+    op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
+    return op.declined(op.bind(*args, residuals=residuals, interpret=False), generation.gpu_target())
+
+
 def forward_takes(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                   hooks: Hooks | None = None, *, scale: float | None = None, natural: bool = NATURAL,
                   residuals: bool = False) -> bool:
-    """Whether `forward` runs the call compiled on this device (`MosaicForward.eligible`): its family has a
+    """Whether `forward` runs the call compiled on this device (`forward_declined`): its family has a
     bundle here, the call is one this mainloop takes (`refused`) and a config fits the device."""
-    op, args = _forward_call(query, key, value, spans, hooks, scale=scale, natural=natural)
-    return op.eligible(op.bind(*args, residuals=residuals, interpret=False), generation.gpu_target())
+    return forward_declined(query, key, value, spans, hooks, scale=scale, natural=natural,
+                            residuals=residuals) is None
 
 
 def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
@@ -360,9 +383,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     """The template's backward on this mainloop (`gradients`) over the call's own arrays (`backward` gives
     them): its queries, keys, values and output cotangent, its spans' arrays, its score hook's parameters, its
     initial state (`Initial`, or None) and a training forward's residuals (`forward`'s). Returns its
-    gradients (`Gradients`). Its config comes from the family's facts and the call's extents (`derived`),
-    legal within the device's block and a consumer's registers (`legal`); its cost (both launches') reports
-    its predicted time."""
+    gradients (`Gradients`). Its config comes from the family's facts and the call's extents (`derived`: two
+    launches), legal within the device's block and a consumer's registers (`legal`)."""
 
     HOOKS = ("score_mod",)
     DIFFERENTIATED = True
@@ -455,7 +477,7 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     `residuals` (its maxima, denominators, anchor keys and split sums): D about each query's anchor from the
     split sums (`algebra.split_delta`), a dQ launch and a dK/dV launch, and `dq_finish`'s refinement between
     them, in the form `accurate` names; or the fast form's one launch (`BackwardTiles.fused`,
-    `_launch_backward`), a schedule the cost model ranks beside the two launches for a hookless call. Every
+    `_launch_backward`), which a hookless call runs where a pin or an opt-in tuning run names it. Every
     call form of bf16 operands, under every score hook and the initial state. The output hook is no part of
     it: a differentiated call applies `output_mod` past the kernel, where its own derivative runs, and passes
     `dout` before it. `interpret` runs it on the CPU, as a GPU of the family `generation.assumed` names."""
@@ -464,14 +486,24 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     return op(*args, interpret=interpret)
 
 
+def backward_declined(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
+                      hooks: Hooks | None, dout: jax.Array, *,
+                      residuals: tuple[jax.Array, jax.Array, jax.Array, Split], scale: float | None = None,
+                      natural: bool = NATURAL, accurate: bool = ACCURATE) -> str | None:
+    """Why `backward` runs no call of these arrays compiled on this device, or None
+    (`MosaicBackward.declined`)."""
+    op, args = _backward_call(query, key, value, spans, hooks, dout, residuals, scale=scale, natural=natural,
+                              accurate=accurate)
+    return op.declined(op.bind(*args, interpret=False), generation.gpu_target())
+
+
 def backward_takes(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
                   dout: jax.Array, *, residuals: tuple[jax.Array, jax.Array, jax.Array, Split],
                   scale: float | None = None, natural: bool = NATURAL, accurate: bool = ACCURATE) -> bool:
-    """Whether `backward` runs the call compiled on this device (`MosaicBackward.eligible`): its family has
-    a bundle here, the call is one this mainloop takes (`refused`) and a config fits the device."""
-    op, args = _backward_call(query, key, value, spans, hooks, dout, residuals, scale=scale, natural=natural,
-                              accurate=accurate)
-    return op.eligible(op.bind(*args, interpret=False), generation.gpu_target())
+    """Whether `backward` runs the call compiled on this device (`backward_declined`): its family has a
+    bundle here, the call is one this mainloop takes (`refused`) and a config fits the device."""
+    return backward_declined(query, key, value, spans, hooks, dout, residuals=residuals, scale=scale,
+                             natural=natural, accurate=accurate) is None
 
 
 def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,

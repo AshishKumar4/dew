@@ -468,10 +468,12 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
     everywhere: on an H100 at llama-d128 bf16 2 x 4096, 32 heads, the one launch takes 2.53 ms causal and 4.87
     full, two launches 2.67 and 4.35 (the one launch's dQ reductions, each consumer's 64 keys reducing its own
     tile into global memory, twice FlashAttention-3's traffic, cost most where every key block reads every
-    query), and the one launch holds 384 MB of temporaries against 258 (its dQ in fp32), so the cost model
-    ranks them (`MosaicBackward.cost`). Returns what `gradients` takes: dQ, the softmax's rows, each query's
-    anchor key, the dQ parameters' gradients (`DQ_GRADS`; a head's as per-query sums `[1, B, H, 1]`, which
-    `gradients` sums over the batch), then dK, dV and the dK/dV parameters' (`DKV_GRADS`)."""
+    query), and the one launch holds 384 MB of temporaries against 258 (its dQ in fp32), so the derived
+    config is two launches, deterministic and of the least memory, and the one launch runs where a pin or an
+    opt-in tuning run names it (`MosaicBackward.derived`). Returns what `gradients` takes: dQ, the softmax's
+    rows, each query's anchor key, the dQ parameters' gradients (`DQ_GRADS`; a head's as per-query sums
+    `[1, B, H, 1]`, which `gradients` sums over the batch), then dK, dV and the dK/dV parameters'
+    (`DKV_GRADS`)."""
     del scale
     width, value_width = query.shape[-1], value.shape[-1]
     _, state_total = algebra.off_anchor_start(peak0, total0, maximum, value_width, shift)

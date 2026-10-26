@@ -98,14 +98,15 @@ def _forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
              scale: float | None, *, residuals: bool):
     """The forward on the first mainloop that takes the call here: Mosaic GPU's (the template), Triton's,
     the plain-JAX one's."""
-    if _on_gpu() and attention_mosaic.forward_takes(query, key, value, spans, hooks, scale=scale,
-                                                    residuals=residuals):
-        _report('forward', 'mosaic')
+    declined = attention_mosaic.forward_declined(query, key, value, spans, hooks, scale=scale,
+                                                 residuals=residuals) if _on_gpu() else None
+    if _on_gpu() and declined is None:
+        _report('mosaic')
         return attention_mosaic.forward(query, key, value, spans, hooks, scale=scale, residuals=residuals)
     if _on_gpu() and attention_triton.refused(spans) is None:
-        _report('forward', 'triton')
+        _report('triton', declined)
         return attention_triton.forward(query, key, value, spans, hooks, scale=scale, residuals=residuals)
-    _report('forward', 'portable')
+    _report('portable', declined)
     return attention_portable.attend(query, key, value, spans, hooks, block_q=PLAIN_TILE, block_k=PLAIN_TILE,
                                      pad=PLAIN_TILE, scale=scale, residuals=residuals)
 
@@ -125,25 +126,26 @@ def _backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     """The backward from the forward's residuals on the first mainloop that takes the call here: Mosaic
     GPU's, Triton's, the plain-JAX one's."""
     call = (query, key, value, spans, hooks, dout)
-    if _on_gpu() and attention_mosaic.backward_takes(*call, residuals=residuals, scale=scale):
-        _report('backward', 'mosaic')
+    declined = (attention_mosaic.backward_declined(*call, residuals=residuals, scale=scale) if _on_gpu()
+                else None)
+    if _on_gpu() and declined is None:
+        _report('mosaic')
         return attention_mosaic.backward(*call, residuals=residuals, scale=scale)
     if _on_gpu() and attention_triton.refused(spans) is None:
-        _report('backward', 'triton')
+        _report('triton', declined)
         return attention_triton.backward(*call, residuals=residuals, scale=scale)
-    _report('backward', 'portable')
+    _report('portable', declined)
     return attention_portable.backward(*call, block_q=PLAIN_TILE, block_k=PLAIN_TILE, pad=PLAIN_TILE,
                                        residuals=residuals, scale=scale)
 
 
-def _report(pass_name: str, kernel: str) -> None:
+def _report(kernel: str, declined: str | None = None) -> None:
     """Report the mainloop a pass of the template runs (`generation.route`, 'attention_mainloop'): Mosaic
-    GPU's on a GPU, else the plain-JAX one's, each off it naming why (`attention_mosaic.forward_takes`,
-    `backward_takes`)."""
+    GPU's on a GPU, else the plain-JAX one's; a GPU pass off Mosaic's names why it `declined` the call
+    (`attention_mosaic.forward_declined`, `backward_declined`: each refusal's own reason and ledger row),
+    undeclared, so the kernel-route audit holds it unexplained until a row or a fix answers it."""
     preferred = 'mosaic' if _on_gpu() else 'portable'
-    refusal = None if kernel == preferred else generation.Refusal(
-        'mosaic', f"the Mosaic mainloop does not take this call's {pass_name} on this device "
-                  f"(`attention_mosaic.{pass_name}_takes`)", generation.INHERENT)
+    refusal = None if declined is None else generation.Refusal('mosaic', declined)
     generation.route('attention_mainloop', kernel=kernel, preferred=preferred, refusal=refusal)
 
 
