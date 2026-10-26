@@ -82,6 +82,22 @@ def test_an_untrained_re_export_writes_the_same_values(dtype):
     assert set(before[moved].tolist()) <= {8} and set(after[moved].tolist()) <= {0}
 
 
+@pytest.mark.parametrize("param_dtype, kept", [("auto", ml_dtypes.bfloat16), ("float32", np.float32),
+                                                ("bfloat16", ml_dtypes.bfloat16), ("float16", np.float16)])
+def test_mxfp4_decodes_into_its_kept_dtype_as_float32_then_a_cast_does(param_dtype, kept):
+    """GPT OSS's MXFP4 experts decode straight into the dtype the load keeps them in (the bf16 they
+    decode to under `auto`), each expert on its own: every value, signed zeros, the subnormal scales of
+    byte 0 and the NaN of byte 255 included, is the float32 decode's cast to that dtype, bit for bit."""
+    rng = np.random.default_rng(0x1718)
+    blocks = rng.integers(0, 256, (3, 5, 4, codecs.GROUP // 2), dtype=np.uint8)
+    scales = rng.integers(0, 256, (3, 5, 4), dtype=np.uint8)
+    scales[0, 0, :3] = [0, 254, 255]
+    reference = codecs.decode_e2m1(blocks.reshape(3, 5, 4 * codecs.GROUP // 2), scales).swapaxes(1, 2)
+    decoded = codecs.MXFP4.dequantize({"w_blocks": blocks, "w_scales": scales}, param_dtype=param_dtype)["w"]
+    assert decoded.dtype == np.dtype(kept) and decoded.flags.c_contiguous
+    np.testing.assert_array_equal(decoded.view(np.uint8), reference.astype(kept).view(np.uint8))
+
+
 def test_a_group_rounding_past_the_largest_power_of_two_is_refused():
     """3e38 has mantissa fraction 0.76 over 2 ** 127, so it rounds up to
     2 ** 128, past float32, whose exponent byte would be E8M0's NaN."""

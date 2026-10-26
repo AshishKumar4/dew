@@ -69,7 +69,7 @@ import numpy as np
 from numpy.typing import ArrayLike, DTypeLike
 
 from dew import _records
-from dew.interop.weights import checkpoint_array
+from dew.interop.weights import checkpoint_array, checkpoint_dtype
 from dew.nn.fake_quant import E2M1, E2M1_MIDPOINTS
 from dew.nn.precision import correctly_rounded_divide
 
@@ -167,16 +167,32 @@ def _mxfp4_arrays(blocks: ArrayLike, scales: ArrayLike) -> tuple[np.ndarray, np.
     return blocks, scales
 
 
-def dequantize_mxfp4(blocks: ArrayLike, scales: ArrayLike) -> np.ndarray:
-    """Packed [expert, output, group, 16] blocks and E8M0 scales to float32 [expert, input, output].
+_EXACT_E2M1 = (np.dtype(np.float32), np.dtype(ml_dtypes.bfloat16))
+"""The dtypes that hold every E2M1 value times every E8M0 scale exactly, the subnormal 2 ** -128 included."""
+
+
+def dequantize_mxfp4(blocks: ArrayLike, scales: ArrayLike, dtype: DTypeLike = np.float32) -> np.ndarray:
+    """Packed [expert, output, group, 16] blocks and E8M0 scales to [expert, input, output] in `dtype`.
 
     transformers' `convert_moe_packed_tensors`: the low nibble precedes the
-    high nibble, and every value is exact in the bf16 it decodes to.
+    high nibble, and every value is exact in the bf16 it decodes to. Each
+    expert decodes on its own, straight into `dtype` where it holds every
+    value (`_EXACT_E2M1`), else in float32 and rounded once as a cast does,
+    and is laid out transposed into one contiguous array: no float32 copy of
+    the whole weight, nor a strided cast of it.
     """
     blocks, scales = _mxfp4_arrays(blocks, scales)
-    return decode_e2m1(blocks.reshape(*scales.shape[:2], blocks.shape[2] * blocks.shape[3]), scales).swapaxes(
-        1, 2
-    )
+    codes = _bytes(blocks, _CODE_DTYPES)
+    kept = np.dtype(dtype)
+    work = kept if kept in _EXACT_E2M1 else np.dtype(np.float32)
+    table = _E2M1_BYTES.astype(work)
+    experts, outputs, groups, _ = codes.shape
+    decoded = np.empty((experts, groups * GROUP, outputs), kept)
+    for expert in range(experts):
+        values = table[codes[expert]].reshape(outputs, groups, GROUP)
+        values *= e8m0_scales(scales[expert]).astype(work)[..., None]
+        decoded[expert] = values.reshape(outputs, groups * GROUP).T
+    return decoded
 
 
 def quantize_mxfp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
@@ -230,6 +246,9 @@ class SourceQuantization:
     partners: Callable[[str], tuple[str, ...]]
     decode: Callable[[Mapping[str, np.ndarray], str], np.ndarray]
     encode: Callable[[str, np.ndarray], dict[str, np.ndarray]]
+    decode_kept: Callable[[Mapping[str, np.ndarray], str, str], np.ndarray] | None = None
+    """A weight decoded straight into the dtype `param_dtype` keeps it in, for a format that decodes
+    faster so than in float32 and rounds alike; None decodes in float32 and casts."""
     scale_dtype: Callable[[Mapping[str, np.ndarray]], str | None] = lambda tensors: None
     grid: Callable[[str], tuple[str, ...]] = lambda name: ()
     input_scale_dtype: Literal['unrounded', 'float8_e4m3fn'] | None = None
@@ -258,7 +277,8 @@ class SourceQuantization:
         out = dict(tensors)
         names = self.names(tensors)
         for name in names:
-            out[name] = checkpoint_array(self.decode(tensors, name), param_dtype)
+            out[name] = (checkpoint_array(self.decode(tensors, name), param_dtype) if self.decode_kept is None
+                         else self.decode_kept(tensors, name, param_dtype))
             for partner in self.partners(name):
                 # An optional part (compressed-tensors' act-order index) may be absent.
                 out.pop(partner, None)
@@ -313,7 +333,12 @@ MXFP4 = SourceQuantization(
     lambda name: tuple(name + suffix for suffix in MXFP4_SUFFIXES),
     lambda tensors, name: dequantize_mxfp4(*(tensors[name + suffix] for suffix in MXFP4_SUFFIXES)),
     lambda name, weight: dict(zip((name + suffix for suffix in MXFP4_SUFFIXES), quantize_mxfp4(weight),
-                                  strict=True)))
+                                  strict=True)),
+    # Kept in the bf16 the blocks decode to where `param_dtype` keeps a weight's own (`AUTO`), as
+    # transformers holds it.
+    decode_kept=lambda tensors, name, param_dtype: dequantize_mxfp4(
+        *(tensors[name + suffix] for suffix in MXFP4_SUFFIXES),
+        checkpoint_dtype(np.dtype(ml_dtypes.bfloat16), param_dtype)))
 """GPT OSS's MXFP4 (`quant_method: mxfp4`), [E, in, out] weights under their stems."""
 
 
