@@ -1079,7 +1079,7 @@ def test_the_fused_step_compiles_on_tritons_compiler_within_each_gpus_block(targ
 def test_a_decode_token_reports_the_fused_step_as_its_route_where_its_target_takes_it():
     """A gated delta net's decode token traced for an A100 on this CPU, the generation's choice
     'delta_decode' set to 'fused', reports the fused step as its route; with no choice, the step
-    kernel, as the rule's row names the port, and at widths the step kernel's blocks do not take the
+    kernel, the selector's preference (no row read), and at widths the step kernel's blocks do not take the
     portable recurrence with the refusal's code, where the fused step chosen raises, naming its own
     (`selection.KernelRefused`); and with the rule's math chosen, the portable recurrence, so an
     unfused reference decodes unfused."""
