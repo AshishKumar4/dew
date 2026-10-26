@@ -10,6 +10,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from flax import linen as nn
+from flax.typing import Dtype
 from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.inputs import PLAIN_CALL, AttentionMetadata, MixerCall, coordinates
@@ -51,6 +53,10 @@ CONFIGURATIONS = {
                          "objective": Objective("dot"), "chunk": 1},
     # The delta rule: a linear memory on the l2 objective, every token (Miras Eq 9, DeltaNet).
     "delta_rule": {"network": LinearMemory(), "chunk": 1},
+    # Gated linear attention: the dot-product bias with a retention gate (Miras Eq 8), whose gradient
+    # is the same at every state, so its chunk changes nothing.
+    "gated_linear_attention": {"network": LinearMemory(), "objective": Objective("dot"),
+                               "retention": Gate(bias=-2.0)},
     # A continuum-memory level (Nested Learning Sec 7.1): an existing gated MLP over its block's input,
     # reconstructing it, its parameters stepped at the end of every chunk (Eq 71), at a hundredth.
     "cms": {"network": GatedMLP(hidden_features=2 * WIDTH, out_features=WIDTH), "commit": "chunk", "heads": 1,
@@ -240,6 +246,38 @@ def test_an_l2_linear_memory_runs_the_gated_delta_rule():
     assert routes(layer("delta_rule").clone(chunk=CHUNK)) == []
 
 
+class Product(nn.Module):
+    """`k W`, a linear memory's function as a network of this test's own, which the layer runs on its
+    general path rather than the shared recurrence."""
+
+    dtype: Dtype | None = None
+
+    @nn.compact
+    def __call__(self, x: jax.Array) -> jax.Array:
+        kernel = self.param("kernel", nn.initializers.lecun_normal(), (x.shape[-1], x.shape[-1]))
+        return jnp.dot(x, kernel.astype(self.dtype or x.dtype))
+
+
+def on_the_general_path(params: dict) -> dict:
+    """A linear memory's weights as the same memory over `Product` holds them."""
+    initial = params["params"]["initial"]
+    return {"params": {**params["params"], "initial": {"kernel": initial["kernel"]["kernel"]}}}
+
+
+@pytest.mark.parametrize("name", ["linear_attention", "gated_linear_attention", "delta_rule"])
+def test_a_linear_memory_on_the_recurrence_is_its_general_path(name):
+    """Each linear memory the shared recurrence runs computes what the same memory computes on the
+    general path, over rows of two packed documents, W_0 restarting each: on par against float64
+    (check 1)."""
+    module = layer(name)
+    general = module.clone(network=Product())
+    segments = np.where(np.arange(LENGTH) < 5, 1, 2).astype(np.int32)
+    call = packed(np.broadcast_to(segments, (ROWS, LENGTH)))
+    reference = jax.jit(lambda x, params: general.apply(on_the_general_path(params), x, call))
+    assert_as_exact(applied(module, call), reference, drawn(module), f"{name} on the recurrence",
+                    seeds=MEMORY_SEEDS, truth_fn=written(module, dtype=jnp.float64, segments=segments))
+
+
 def test_a_self_generated_target_carries_the_outer_gradient():
     """The self-modifying memory trains through its own target: the gradients of its stream and of
     every parameter, the value projection's included, which reaches the output only through the target
@@ -303,7 +341,7 @@ def test_logical_positions_leave_a_documents_chunks_in_place():
                                   np.asarray(module.apply(params, x, packed(segments))))
 
 
-@pytest.mark.parametrize("name", ["titans", "cms"])
+@pytest.mark.parametrize("name", ["titans", "cms", "gated_linear_attention", "delta_rule"])
 def test_a_decode_continues_the_full_pass(name):
     """A prefill and then one token a call, through the cache, reads each token as the full pass does,
     momentum, chunk boundaries and a level's network as its last scheduled update committed it carried
@@ -326,12 +364,13 @@ def test_a_decode_continues_the_full_pass(name):
                     truth_fn=written(module, dtype=jnp.float64))
 
 
-def test_a_cached_prefill_starts_each_packed_document_afresh():
+@pytest.mark.parametrize("name", ["titans", "gated_linear_attention"])
+def test_a_cached_prefill_starts_each_packed_document_afresh(name):
     """A cached prefill of packed documents starts each from the initial network, its chunks counted
     from its own first token, and the calls after it continue its last document: a prefill of a
     three-token document and five tokens of the next, then that document's last four one call each,
     reads each token as the full packed pass does, on par against float64 (check 1)."""
-    module = layer("titans")
+    module = layer(name)
     decode = MixerCall(decode=True)
     segments = np.where(np.arange(LENGTH) < 3, 1, 2).astype(np.int32)
     prefill = MixerCall(decode=True, metadata=AttentionMetadata(coordinates=coordinates(
@@ -348,7 +387,7 @@ def test_a_cached_prefill_starts_each_packed_document_afresh():
         return jnp.concatenate(reads, axis=1)
 
     full = applied(module, packed(np.broadcast_to(segments, (ROWS, LENGTH))))
-    assert_as_exact(decoded, full, drawn(module), "packed cached memory", seeds=MEMORY_SEEDS,
+    assert_as_exact(decoded, full, drawn(module), f"packed cached {name} memory", seeds=MEMORY_SEEDS,
                     truth_fn=written(module, dtype=jnp.float64, segments=segments))
 
 
