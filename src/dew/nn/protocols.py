@@ -742,26 +742,32 @@ def whole_block(chunks: tuple[int | None, ...]) -> bool:
     return any(chunk is None for chunk in chunks)
 
 
+def refuse_block_reading(model: nn.Module, reading: str) -> None:
+    """Refuse `reading` blocks (a prefix run's, a batch's) where `model` cannot read them whole: it needs a
+    trunk layer that reads blocks (`block_chunks_of`) with no attention chunk (`whole_block`). The loss drops
+    the targets inside a block, which the trunk sees only where a layer reads the whole block. A prefix run
+    and a batch that carries its own blocks are both admitted by this one rule."""
+    chunks = block_chunks_of(model)
+    if not chunks:
+        raise ValueError(f"{reading} needs a trunk layer that reads blocks "
+                         f"(AttentionMixer.bidirectional_blocks), and {type(model).__name__} has none")
+    if not whole_block(chunks):
+        raise ValueError(f"{reading} is read whole only by a layer with no attention chunk, and every layer "
+                         f"of {type(model).__name__} that reads blocks has one ({list(chunks)}), which cuts "
+                         "a block that crosses its multiples")
+
+
 def refuse_prefix(model: nn.Module, prefix: int | Literal["prompt"] | None, *, longest: int | None) -> None:
     """Refuse a prefix run the model or its values cannot take. A prefix is "prompt" or a positive number of
-    tokens, at most `longest` where a longest row is declared. Its blocks are read whole only by a trunk layer
-    that reads blocks (`block_chunks_of`) with no attention chunk (`whole_block`): the loss drops the targets
-    inside a block, which the trunk sees only where a layer reads the whole block."""
+    tokens, at most `longest` where a longest row is declared, and its blocks are read as a batch's are
+    (`refuse_block_reading`)."""
     if prefix is None:
         return
     if prefix != "prompt" and (type(prefix) is not int or prefix < 1):
         raise ValueError(f"prefix is 'prompt' or a positive number of tokens, got {prefix!r}")
     if isinstance(prefix, int) and longest is not None and prefix > longest:
         raise ValueError(f"prefix {prefix} is more tokens than the longest row, {longest}")
-    chunks = block_chunks_of(model)
-    if not chunks:
-        raise ValueError("prefix needs a trunk layer that reads blocks "
-                         "(AttentionMixer.bidirectional_blocks), and "
-                         f"{type(model).__name__} has none")
-    if not whole_block(chunks):
-        raise ValueError(f"a prefix's blocks are read whole only by a layer with no attention chunk, and "
-                         f"every layer of {type(model).__name__} that reads blocks has one ({list(chunks)}), "
-                         "which cuts a block that crosses its multiples")
+    refuse_block_reading(model, "a prefix's blocks")
 
 
 @runtime_checkable

@@ -71,10 +71,9 @@ from dew.nn.protocols import (
     Lacks,
     LayerStates,
     TokenModel,
-    block_chunks_of,
     head_table,
+    refuse_block_reading,
     refuse_prefix,
-    whole_block,
 )
 from dew.nn.sharding import LOGITS, constrain
 from dew.nn.visibility import prefix_groups, same_group
@@ -462,17 +461,6 @@ def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, 
         counted = counted & ~same_group(blocks[:, :-span], blocks[:, span:])
     return counted
 
-def _refuse_cut_blocks(model: nn.Module) -> None:
-    """Refuse blocks `model` may read in part: a block is read whole only by a trunk layer that reads
-    blocks with no attention chunk (`whole_block`). The loss drops every target in its source's block, so a
-    chunk that cut the block would drop one its source never saw."""
-    chunks = block_chunks_of(model)
-    if not whole_block(chunks):
-        raise ValueError(f"a batch's blocks are read whole only by a layer with no attention chunk, and "
-                         f"every layer that reads them has one ({list(chunks)}), which cuts a block that "
-                         "crosses its multiples")
-
-
 class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
     """Scores a causal decoder's tokens: the machinery the LM, preference and
     policy losses share, without a loss of its own.
@@ -720,7 +708,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
     def _refuse_blocks(self, prepared: ModelInputs, depths: bool) -> None:
         """Refuse a batch's blocks where no trunk layer reads them, where prediction depths would read
         them beyond their source, which `scored_targets` does not account for, or where a layer's chunk could
-        cut one (`_refuse_cut_blocks`): a batch's blocks are runs of any place in a row, a prefix run's
+        cut one (`refuse_block_reading`): a batch's blocks are runs of any place in a row, a prefix run's
         among them, since its batch may carry blocks of its own. The check is static, since a trace cannot
         read the runs' places."""
         if BLOCKS_FIELD not in prepared.token_fields:
@@ -728,11 +716,7 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         if depths:
             raise ValueError("a batch's blocks train the trunk's targets alone: a prediction depth reads "
                              "blocks beyond its own source, so depths are refused with blocks")
-        chunks = block_chunks_of(self.model)
-        if not chunks:
-            raise ValueError("the batch's blocks reach a model none of whose trunk layers reads blocks "
-                             "(AttentionMixer.bidirectional_blocks), where they would drop targets")
-        _refuse_cut_blocks(self.model)
+        refuse_block_reading(self.model, "a batch's blocks")
 
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      segment_ids=None, positions=None, routing: bool = False,
