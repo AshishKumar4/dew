@@ -227,22 +227,29 @@ class Pixels:
         return {"image": np.frombuffer(row["bytes"], np.uint8).reshape(RES, RES, 3)}
 
 
-def online_pipeline(records: int, address: str):
-    """`elastic_loader`'s records fetched over HTTP from the pool's server at `address`, a url each."""
+def online_pipeline(records: int, address: str, *, shared: bool, repeat: bool = True):
+    """`elastic_loader`'s records fetched over HTTP from the pool's server at `address`, a url each, in
+    either order a fetch is read in: the catalog shuffled and each process fetching its own share of it
+    (`shared`), or every process fetching the catalog as a memory read does and shuffling what it kept,
+    one global order."""
     from dew.data import Memory
     from dew.data.pipeline import Pipeline
     from dew.data.sources.urls import Fetch
 
-    return Pipeline(Memory([{"url": f"http://{address}/{index}"} for index in range(records)])).filter_map(
-        Fetch(output="bytes"), Pixels())
+    catalog = Pipeline(Memory([{"url": f"http://{address}/{index}"} for index in range(records)]))
+    fetched = (Fetch(output="bytes"), Pixels())
+    if shared:
+        ordered = catalog.shuffle(0)
+        return (ordered.repeat() if repeat else ordered).filter_map(*fetched)
+    ordered = catalog.filter_map(*fetched).shuffle(0)
+    return ordered.repeat() if repeat else ordered
 
 
-def online_loader(records: int, workers: int, address: str):
-    """`elastic_loader` over records fetched from the pool's server (`online_pipeline`), compiled to a
-    global order whose saved position is a global record count."""
+def online_loader(records: int, workers: int, address: str, *, shared: bool):
+    """`elastic_loader` over records fetched from the pool's server (`online_pipeline`)."""
     from dew.data.compile import compile
 
-    return compile(online_pipeline(records, address).shuffle(0).repeat().batch(BATCH), seed=0,
+    return compile(online_pipeline(records, address, shared=shared).batch(BATCH), seed=0,
                    loading=Loading(workers=workers, threads=2, read_buffer=8, worker_buffer=2)).train
 
 
@@ -417,24 +424,21 @@ def mode_data(args) -> dict:
 
 
 def mode_online_data(args) -> dict:
-    """The first pass of a training order over records fetched from the pool's server, each process
-    reading its share of one global order: the records it read, by the image each url's bytes hold,
-    and the plan's lowering. A training order reads on past its pass, so the pass is its batches."""
-    import itertools
-
+    """One pass over records fetched from the pool's server, each process fetching its share of the
+    shuffled catalog (`online_pipeline`): the records it read, by the image each url's bytes hold,
+    and the plan's lowering."""
     import jax
 
     from dew.data.compile import compile
     from dew.data.dataset import DataPartition
     from dew.training import MeshSpec
 
-    data = compile(online_pipeline(args.records, args.online).shuffle(0).batch(BATCH), seed=0,
+    data = compile(online_pipeline(args.records, args.online, shared=True, repeat=False).batch(BATCH), seed=0,
                    loading=Loading(workers=args.workers, threads=2, read_buffer=8, worker_buffer=2))
     partition = DataPartition.of(MeshSpec().build())
     stream = data.train(partition)
     try:
-        records = [record for batch in itertools.islice(stream, args.records // BATCH)
-                   for record in batch_records(batch)]
+        records = [record for batch in stream for record in batch_records(batch)]
     finally:
         stream.close()
     return {"process_index": jax.process_index(), "records": records,
@@ -665,7 +669,7 @@ def mode_fit(args) -> dict:
     restored_step, restored = restored_state(trainer)
     rows = BATCH // args.processes
     if args.online:
-        open_train = online_loader(args.records, args.workers, args.online)
+        open_train = online_loader(args.records, args.workers, args.online, shared=args.shared)
     elif args.elastic:
         open_train = elastic_loader(args.records, args.workers)
     else:
@@ -2344,8 +2348,10 @@ def parse_args(argv=None):
     parser.add_argument("--elastic", action="store_true",
                         help="read the training records through a compiled global order, whose "
                              "saved position is a global record count")
-    parser.add_argument("--online", help="host:port of the server whose urls the records are fetched from, "
-                                         "through a compiled global order (`online_loader`)")
+    parser.add_argument("--online", help="host:port of the server whose urls the records are fetched from "
+                                         "(`online_loader`)")
+    parser.add_argument("--shared", action="store_true",
+                        help="each process fetches its own share of the shuffled catalog (`online_pipeline`)")
     parser.add_argument("--profile-dir", help="directory the scheduled profile window writes")
     parser.add_argument("--cell", help="read,cache|nocache|published,rejecting|all,packed|rows for the "
                                        "matrix mode")
