@@ -47,6 +47,7 @@ every registered model built tiny by tests/tiny_models.py's `build_model`
 and `tiny_inputs`, which that file's registry-wide parametrization needs.
 """
 
+import contextlib
 import dataclasses
 import functools
 import json
@@ -59,7 +60,7 @@ import numpy as np
 import pytest
 from flax.traverse_util import flatten_dict, unflatten_dict
 from model_support import float64_twin
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, widened
 from test_architectures import CASES as ARCHITECTURES, MASK, TEXT_FEATURES, TEXT_TOKENS, VOCAB
 from tiny_models import build_model, tiny_inputs
 
@@ -493,6 +494,32 @@ def _decoding(name: str) -> dict:
     return {"method": "encode"} if name in OWN else {"decode": True}
 
 
+CACHED_SEEDS = 8
+"""Check 1's declared seeds for a decoder's cached scores against another program's (a cache capacity, packed
+projections), sized by `seeds_for` on armada."""
+
+
+def _continued(model):
+    """Check 1's draw for a decoder's cached scores: `ROWS` prompts of `LENGTH` tokens and the `STEPS`
+    tokens each continues by, drawn uniformly from its vocabulary, so no step's scores rest on an argmax."""
+    def draw(seed):
+        rng = np.random.default_rng([0x2B, seed])
+        return (rng.integers(0, model.vocab_size, (ROWS, LENGTH)).astype(np.int32),
+                rng.integers(0, model.vocab_size, (ROWS, STEPS)).astype(np.int32))
+    return draw
+
+
+def _scored(model, variables, *, wide: bool = False, **call):
+    """A drawn prompt's logits and each forced step's through the cache (`_greedy`), a host loop of the
+    model's own calls the gate runs as given: with `wide`, under x64, the float64 twin's truth."""
+    @as_given
+    def run(tokens, forced):
+        with jax.enable_x64(new_val=True) if wide else contextlib.nullcontext():
+            scores = _greedy(model, variables, jnp.asarray(tokens), forced=jnp.asarray(forced), **call)[2]
+            return [np.asarray(score, np.float64 if wide else score.dtype) for score in scores]
+    return run
+
+
 @pytest.mark.parametrize("name", PATHS)
 def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name):
     """The resized model reads the same variables to the model's logits, and
@@ -505,14 +532,16 @@ def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name)
     same(sized.apply(variables, read.tokens, method="logits"), read.logits)
     if not model.causal:
         return
-    cache, drawn, scores = _greedy(model, variables, read.tokens, **_decoding(name))
-    sized_cache, sized_drawn, sized_scores = _greedy(sized, variables, read.tokens, **_decoding(name))
+    cache, drawn, _ = _greedy(model, variables, read.tokens, **_decoding(name))
+    sized_cache, sized_drawn, _ = _greedy(sized, variables, read.tokens, **_decoding(name))
     assert jax.tree.structure(sized_cache) == jax.tree.structure(cache)
     assert (any(CAPACITY in leaf.shape for leaf in jax.tree.leaves(sized_cache))
             == any(model.max_seq_len in leaf.shape for leaf in jax.tree.leaves(cache)))
     np.testing.assert_array_equal(np.asarray(sized_drawn), np.asarray(drawn))
-    as_exact(sized_scores, scores, lambda: _greedy(float64_twin(model), widened(variables), read.tokens,
-                                                   forced=drawn, **_decoding(name))[2], "cached logits")
+    call = _decoding(name)
+    assert_as_exact(_scored(sized, variables, **call), _scored(model, variables, **call), _continued(model),
+                    f"{name} cached logits at a capacity", seeds=CACHED_SEEDS,
+                    truth_fn=_scored(float64_twin(model), widened(variables), wide=True, **call))
 
 
 def _flat(tree) -> np.ndarray:
@@ -743,24 +772,20 @@ def test_packed_projections_serve_the_models_numbers(name):
                    for member, width in zip(group.members, group.widths, strict=True))
     packed = _packed(variables, groups)
     assert model.inference_projection_groups(packed) == groups
+    label = f"{name} packed"
     if not model.causal:
-        def logits_truth():
-            return [float64_twin(model).apply(widened(variables), read.tokens, method="logits")]
+        def logits(model, variables):
+            return lambda tokens, forced: model.apply(variables, tokens, method="logits")
 
-        as_exact([model.apply(packed, read.tokens, method="logits")], [read.logits], logits_truth,
-                 f"{name} packed")
+        assert_as_exact(logits(model, packed), logits(model, variables), _continued(model), label,
+                        seeds=CACHED_SEEDS, truth_fn=logits(float64_twin(model), widened(variables)))
         return
-    _, drawn, scores = _greedy(model, variables, read.tokens, decode=True)
-    _, packed_drawn, packed_scores = _greedy(model, packed, read.tokens, decode=True)
+    _, drawn, _ = _greedy(model, variables, read.tokens, decode=True)
+    _, packed_drawn, _ = _greedy(model, packed, read.tokens, decode=True)
     same(packed_drawn, drawn)
-
-    def truth():
-        wide, wide_variables = float64_twin(model), widened(variables)
-        return [wide.apply(wide_variables, read.tokens, method="logits"),
-                *_greedy(wide, wide_variables, read.tokens, forced=drawn, decode=True)[2]]
-
-    as_exact([model.apply(packed, read.tokens, method="logits"), *packed_scores], [read.logits, *scores],
-             truth, f"{name} packed")
+    assert_as_exact(_scored(model, packed, decode=True), _scored(model, variables, decode=True),
+                    _continued(model), label, seeds=CACHED_SEEDS,
+                    truth_fn=_scored(float64_twin(model), widened(variables), wide=True, decode=True))
 
 
 def _request() -> ModelInputs:
