@@ -20,7 +20,7 @@ from jax.extend.core import ClosedJaxpr, Jaxpr, Literal
 from jax.sharding import NamedSharding, PartitionSpec as P
 from model_support import largest_difference
 from optim_support import LR, decoder_params, drawn_tree
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations, without_ynn
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, equations
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.dit import SimpleDiT
@@ -116,7 +116,7 @@ def assert_updates_as(solver, reference, params, paths, label, *, flatten=None, 
             steps.append(reference.update(grad, reference.init(param), param)[0])
         return steps
 
-    assert_as_exact(without_ynn(dew), without_ynn(alone), lambda seed: drawn_tree(params, seed), label,
+    assert_as_exact(dew, alone, lambda seed: drawn_tree(params, seed), label,
                     seeds=seeds, truth_fn=alone)
 
 
@@ -241,8 +241,7 @@ def test_both_groups_step_with_the_one_schedule():
             return taken
         return walked
 
-    assert_as_exact(without_ynn(steps(scheduled, lambda step: 1.0)),
-                    without_ynn(steps(unscaled, lambda step: reported[step])),
+    assert_as_exact(steps(scheduled, lambda step: 1.0), steps(unscaled, lambda step: reported[step]),
                     lambda seed: drawn_tree(decoder_params(), seed), "one schedule over both groups",
                     seeds=UPDATE_SEEDS,
                     truth_fn=jax.jit(steps(unscaled, lambda step: rate(jnp.asarray(step, jnp.float64)))))
@@ -316,7 +315,7 @@ def test_an_expert_stack_placed_over_the_mesh_is_orthogonalized_one_expert_at_a_
     def reference(params, grads):
         return alone.update(grads, alone.init(params), params)[0]
 
-    assert_as_exact(placed, without_ynn(reference), draw, f"an expert stack over {spec}", seeds=UPDATE_SEEDS,
+    assert_as_exact(as_given(placed), reference, draw, f"an expert stack over {spec}", seeds=UPDATE_SEEDS,
                     truth_fn=reference)
 
 
@@ -502,7 +501,7 @@ def test_the_clip_matches_the_paper_equations():
             params['layers_0']['self_attn'][proj]['kernel'] + grads['layers_0']['self_attn'][proj]['kernel'],
             gamma, 4)} for proj in ('q_proj', 'k_proj')}}}
 
-    assert_as_exact(without_ynn(applied), without_ynn(paper), lambda seed: qk_tree(seed=seed),
+    assert_as_exact(applied, paper, lambda seed: qk_tree(seed=seed),
                     "the clip against the paper", seeds=CLIP_SEEDS, truth_fn=paper)
 
 
@@ -579,6 +578,7 @@ def test_a_gated_query_clips_its_query_half_and_bounds_the_logits():
         groups = np.asarray(maxima(model, variables, tokens)[1]).reshape(2, 2).max(axis=1)
         return variables, tokens, np.float32(np.mean(groups))
 
+    @as_given
     def read_after(variables, ids, tau):
         stats, _ = maxima(model, variables, ids)
         tx = scale_by_qk_clip(float(tau))
@@ -704,7 +704,7 @@ def test_the_threshold_rides_optimizer_opts():
 
     # The truth's Muon keeps its momentum in the parameters' float64, where the config's holds float32.
     wide = muon_solver(optimizer_opts={'mu_dtype': None})
-    assert_as_exact(without_ynn(clipped), without_ynn(paper(muon)), lambda seed: qk_tree(seed=seed),
+    assert_as_exact(clipped, paper(muon), lambda seed: qk_tree(seed=seed),
                     "the clip at a configured threshold", seeds=THRESHOLD_SEEDS, truth_fn=paper(wide))
 
 
@@ -1061,13 +1061,17 @@ def test_a_scheduled_rate_is_as_near_float64_as_optaxs(name):
             rates[f"step {step}"] = stepped_rate["w"]
         return rates
 
+    @as_given
     def truth(multipliers):
         built = [optax_schedule(name, rate_fields(name, float(multiplier))) for multiplier in multipliers]
         # optax counts in int32, which divides to float32: a float64 count keeps the schedule float64.
         return {f"step {step}": jnp.stack([values(jnp.asarray(step, jnp.float64)) for values in built])
                 for step in range(10)}
 
-    assert_as_exact(dew, optax_rates, draw, f"the {name} rate", seeds=RATE_SEEDS, truth_fn=truth)
+    # Each arm builds its schedules from the draw's multipliers on the host and reads their rates off
+    # its runs' states, as given.
+    assert_as_exact(as_given(dew), as_given(optax_rates), draw, f"the {name} rate", seeds=RATE_SEEDS,
+                    truth_fn=truth)
 
 
 @pytest.mark.parametrize("name", ["constant", "cosine"])

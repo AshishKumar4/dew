@@ -4,7 +4,7 @@ compared with itself does not, and a fault still fails at the count they declare
 
 import numpy as np
 import pytest
-from reference_error import GateFailure, assert_as_exact, seeds_for
+from reference_error import GateFailure, as_given, assert_as_exact, seeds_for
 
 
 @pytest.fixture(scope="module")
@@ -18,6 +18,7 @@ def heavy():
 
 def _summed(order):
     """The rows' float32 sums with their terms in `order`'s permutation, one rounding a term."""
+    @as_given
     def summed(x):
         terms = np.asarray(x, np.float32)[:, np.random.default_rng(order).permutation(x.shape[1])]
         return {"sum": np.cumsum(terms, axis=1, dtype=np.float32)[:, -1]}
@@ -45,6 +46,7 @@ def test_a_fault_fails_at_the_paired_count(heavy):
     reference, twin = _summed(0), _summed(1)
     seeds = seeds_for(reference, heavy, "heavy sums", truth_fn=_truth, dew_fn=twin)
 
+    @as_given
     def coarse(x):
         return twin(np.asarray(x).astype(ml_dtypes.bfloat16).astype(np.float32))
 
@@ -62,6 +64,7 @@ def test_a_sizing_evaluates_each_draw_once_however_many_doublings_it_takes(heavy
     calls = collections.Counter()
 
     def counted(name, fn):
+        @as_given
         def run(x):
             calls[name] += 1
             return fn(x)

@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, without_ynn
+from reference_error import assert_as_exact
 from test_decision_objective import SPECIALS, TOKENIZER
 
 from dew.batch import part, thaw
@@ -94,7 +94,7 @@ def test_the_tied_readout_is_the_backbones_own_logit_at_each_label():
         answer = jnp.take_along_axis(logits, batch.readout[..., None], axis=1)
         return jnp.take(answer, jnp.asarray([label for (label,) in ids()]), axis=-1)
 
-    assert_as_exact(without_ynn(decision.logits), without_ynn(full), draw, "tied readout",
+    assert_as_exact(decision.logits, full, draw, "tied readout",
                     seeds=READOUT_SEEDS)
 
 
@@ -122,7 +122,7 @@ def test_a_lora_adapted_heads_readout_is_its_own_logits_at_the_labels():
         answer = jnp.take_along_axis(logits, batch.readout[..., None], axis=1)
         return jnp.take(answer, jnp.asarray([label for (label,) in ids()]), axis=-1)
 
-    assert_as_exact(without_ynn(decision.logits), without_ynn(full), draw, "adapted readout",
+    assert_as_exact(decision.logits, full, draw, "adapted readout",
                     seeds=READOUT_SEEDS)
 
 
@@ -166,7 +166,7 @@ def test_an_untied_readout_drawn_from_a_table_is_its_tied_readout():
         found = table.columns(answers, np.asarray(GROUPED).reshape(-1).tolist(), exact=True)
         return tied.apply({}, states, batch, table, tied=found.reshape(*answers.shape[:2], 3, 2))
 
-    assert_as_exact(without_ynn(drawn), without_ynn(columns), draw, "untied drawn", seeds=READOUT_SEEDS)
+    assert_as_exact(drawn, columns, draw, "untied drawn", seeds=READOUT_SEEDS)
 
 
 def test_a_runs_untied_readout_starts_as_its_tied_readout():
@@ -186,7 +186,7 @@ def test_a_runs_untied_readout_starts_as_its_tied_readout():
     def as_tied(values, batch):
         return tied.logits({"params": {"backbone": values["params"]["backbone"], "head": {}}}, batch)
 
-    assert_as_exact(without_ynn(objective.model.logits), without_ynn(as_tied), draw, "untied at its start",
+    assert_as_exact(objective.model.logits, as_tied, draw, "untied at its start",
                     seeds=READOUT_SEEDS)
 
 
@@ -223,7 +223,7 @@ def test_a_slot_heads_scores_are_the_releases_law_with_its_query_and_key_trained
         logits = score + jnp.einsum("bqh,bqkh->bqk", query, key) / np.sqrt(8)
         return jnp.where(batch.options, logits, -jnp.inf)
 
-    assert_as_exact(without_ynn(dew), without_ynn(law), draw, "slot head law", seeds=READOUT_SEEDS)
+    assert_as_exact(dew, law, draw, "slot head law", seeds=READOUT_SEEDS)
 
 
 def test_a_slot_head_reads_none_of_the_tokens_its_options_lines_leave_out():
