@@ -1,8 +1,10 @@
 # The canonical mma.sync Family (design note)
 
-Owner: NecessaryStoat (GEMM templates, the shared Mosaic toolkit). Status: revised after review
-(ElatedFrog), for review before code. Branch: `feat/mma-sync-family`, on J (`feat/mma-sync-bundle`
-c5e14d67d).
+Owner: NecessaryStoat (GEMM templates, the shared Mosaic toolkit). Status: superseded where it plans two
+consumers. Two consumer warpgroups in one program, with JAX's collective cp.async pipeline, took 1.04 to 1.50
+of one consumer's time on an A100 (CONSUMERS1), however lean the shared copy. Two one-warpgroup programs a
+multiprocessor took 0.73 to 0.89 (CONSUMERS3, `mosaic.Family.programs`). The two-consumer branches are
+deleted; the rest records the design as reviewed (ElatedFrog) on `feat/mma-sync-family`.
 
 ## 1. Goal and scope
 
