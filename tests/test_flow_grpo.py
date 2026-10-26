@@ -1106,33 +1106,36 @@ def _below_normal(values):
     return (values.astype(np.float32).view(np.uint32) >> 23 & 0xFF) == 0
 
 
-def _assert_kl_outputs(dew, plain, truth, bounds, label):
-    """Each output of `_kl_derivatives` against the float64 truth, as the gate rules (rows 1722 and
-    1778): where the plain float32 arm (`_plain_kl`) is finite, on par with it (check 1, its rows and
-    zero rows included); where it overflows, finite wherever the truth is a normal float32 and within
-    the derived bound of the truth (`_kl_bounds`); infinite of its sign past the largest float32, and
-    zero or subnormal below the least, by the truth's place in float32's range (`_kinds`). A row is
-    judged whole, a VJP to the mean's coordinates together, so one row's error is not pooled into
-    another's. Near either end (`edge`) a value is the bound's, or the end's: infinite of its sign
-    above, zero or subnormal below."""
-    def rows(mask):
-        return np.all(mask, axis=tuple(range(1, mask.ndim))) if mask.ndim > 1 else mask
+BAND = 16
+"""The binades one check-1 leaf of the KL's outputs spans: rows whose truths lie further apart are
+judged as leaves of their own, so a small row is not read as a large one's float64 zero."""
 
+
+def _assert_kl_outputs(dew, plain, truth, bounds, label):
+    """Each output of `_kl_derivatives` against the float64 truth, element by element as the gate rules
+    (rows 1722 and 1778): where the plain float32 arm (`_plain_kl`) is finite, on par with it (check 1,
+    unscaled, its rows whole and its zero rows included, each band of `BAND` binades of the rows' sizes a
+    leaf of its own, an element the plain arm leaves out of a row taking the truth in both arms); where
+    it overflows, finite wherever the truth is a normal float32 and within the derived bound of the
+    truth (`_kl_bounds`); infinite of its sign past the largest float32, zero or subnormal below the
+    least, by the truth's place in float32's range (`_kinds`); and near either end (`edge`), the bound's
+    or the end's: infinite of its sign above, zero or subnormal below."""
     for name, exact in truth.items():
         value, reference, kinds = np.asarray(dew[name]), np.asarray(plain[name]), _kinds(exact)
-        held = rows(np.isfinite(reference) & (kinds != "over"))
+        held = np.isfinite(reference) & (kinds != "over")
+        mine, theirs = np.where(held, value, exact), np.where(held, reference, exact)
+        axes = tuple(range(1, exact.ndim))
+        size = np.max(np.abs(exact), axis=axes) if axes else np.abs(exact)
+        band = np.frexp(size)[1] // BAND
         # Where the plain arm and Dew both give the float64 value there is no error to compare.
-        measured = held & ~rows((value == exact) & (reference == exact))
-        if measured.any():
-            # Each row over its own truth's largest power of two, exactly: the rows' sizes span
-            # float32's whole range, and a row is judged against its own size, not the leaf's.
-            scale = np.ldexp(1.0, -np.frexp(np.max(np.abs(exact[measured]).reshape(int(measured.sum()), -1),
-                                                   axis=1))[1])
-            scale = scale.reshape((-1,) + (1,) * (exact.ndim - 1))
-            assert_as_exact_as_the_reference(value[measured] * scale, reference[measured] * scale,
-                                             exact[measured] * scale, f"{label}: {name}")
+        apart = (mine != exact) | (theirs != exact)
+        measured = np.any(apart, axis=axes) if axes else apart
+        for level in np.unique(band[measured]):
+            rows = measured & (band == level)
+            assert_as_exact_as_the_reference(mine[rows], theirs[rows], exact[rows],
+                                             f"{label}: {name}, rows near 2**{level * BAND}")
         magnitudes, roundings = bounds[name]
-        unheld = ~held & rows((kinds == "normal") | (exact == 0))
+        unheld = ~np.isfinite(reference) & ((kinds == "normal") | (exact == 0))
         assert np.all(np.isfinite(value[unheld])), name
         assert_fp32_reduction_bound(value[unheld], exact[unheld], magnitudes[unheld], roundings)
         over = kinds == "over"
@@ -1140,8 +1143,7 @@ def _assert_kl_outputs(dew, plain, truth, bounds, label):
         assert np.all(_below_normal(value[kinds == "below"])), name
         edge = kinds == "edge"
         top = edge & (np.abs(exact) > 1)
-        ended = top & np.isinf(value) & (np.sign(value) == np.sign(exact))
-        bounded = top & ~ended
+        bounded = top & ~(np.isinf(value) & (np.sign(value) == np.sign(exact)))
         assert np.all(np.isfinite(value[bounded])), name
         assert_fp32_reduction_bound(value[bounded], exact[bounded], magnitudes[bounded], roundings)
         bottom = edge & ~top & ~_below_normal(value)
