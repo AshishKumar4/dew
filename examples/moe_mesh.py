@@ -43,6 +43,7 @@ from dew import Layout, MeshSpec, Trainer
 from dew.data import ByteTokenizer, Memory, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
+from dew.distributed.batches import DevicePrefetchIterator, batch_shardings
 from dew.inference import RunProcessor, TextGeneration
 from dew.inference.serving import Server
 from dew.mesh import logical_spec
@@ -52,7 +53,6 @@ from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
 from dew.optim import OptimConfig
 from dew.sampling import Sampling
-from dew.training.distributed import DevicePrefetchIterator, batch_shardings
 
 
 @dataclass

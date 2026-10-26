@@ -45,7 +45,7 @@ def unresolved_page(gen_api, documented, page, text: str) -> list[str]:
     return gen_api.unresolved_in(page.name, page, *documented)
 
 
-NO_BUILD_MESH = "`MeshSpec.build_mesh`: dew.training.distributed.MeshSpec has no build_mesh"
+NO_BUILD_MESH = "`MeshSpec.build_mesh`: dew.distributed.placement.MeshSpec has no build_mesh"
 
 
 def test_a_docs_page_carries_its_imports_from_block_to_block(gen_api, documented, tmp_path):
@@ -78,9 +78,9 @@ def test_each_scope_reads_the_instances_and_aliases_it_binds_itself(gen_api, doc
                            "```python\nother = MeshSpec(mesh.build_mesh())\napi.Sampling\n\n"
                            "def make():\n    from dew import training as api\n    spec = MeshSpec()\n"
                            "    spec.not_here\n    return api.Sampling\n```\n") == [
-        "`spec.not_here`: dew.training.distributed.MeshSpec has no not_here",
+        "`spec.not_here`: dew.distributed.placement.MeshSpec has no not_here",
         "`api.Sampling`: dew.training has no public Sampling",
-        "`mesh.build_mesh`: dew.training.distributed.MeshSpec has no build_mesh"]
+        "`mesh.build_mesh`: dew.distributed.placement.MeshSpec has no build_mesh"]
 
 
 def test_an_instance_of_a_dew_class_is_held_to_its_members_across_cells(gen_api, documented, tmp_path):

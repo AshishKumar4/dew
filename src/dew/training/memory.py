@@ -21,13 +21,13 @@ from dew._records import JSON, integers, json_value
 from dew.batch import Batch, Variables
 from dew.data.dataset import rows_of
 from dew.devices import gpu_free_bytes, xla_flag
+from dew.distributed.placement import parameter_axes
 from dew.mesh import mesh_axes
 from dew.nn.kernels.generation import backend, device_generation, gpu_target
 from dew.nn.kernels.options import compiler_options
 from dew.nn.protocols import Recomputing, TritonGemm
 from dew.objectives.base import Objective
 from dew.state import TrainState
-from dew.training.distributed import parameter_axes
 
 _log = logging.getLogger(__name__)
 
