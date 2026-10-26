@@ -42,6 +42,7 @@ from flax import struct
 from jax.tree_util import Partial
 from typing_extensions import TypeIs, TypeVar
 
+from dew._distributions import counter_key
 from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.nn import categorical
 from dew.nn.kernels.options import compiler_options
@@ -58,12 +59,12 @@ if TYPE_CHECKING:
 
     from dew.data.pipeline import DeviceStep, ObjectiveData
     from dew.data.text import Tokenizer
+    from dew.inference.images import TextToImage
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, TextGeneration
     from dew.inputs import InputSpec
     from dew.nn.autoencoders import AutoEncoder
     from dew.nn.backbones.decoder_stack import DecoderBank
     from dew.sampling.guidance import Guidance
-    from dew.sampling.pipelines import TextToImage
     from dew.training.distributed import Layout, MeshSpec
     from dew.training.state import TrainState
 
@@ -241,13 +242,6 @@ def stream(name: str) -> int:
     return fold
 
 
-def example_stream(key: jax.Array) -> jax.Array:
-    """A counter-based key (threefry2x32) of `key`'s bits, whatever `key`'s implementation: a mapped
-    draw under it is each mapped key's own, where an RBG key maps every draw from its first key
-    (https://docs.jax.dev/en/latest/jax.random.html#advanced-rng-configuration)."""
-    return jax.random.wrap_key_data(jax.random.bits(key, (2,), jnp.uint32), impl="threefry2x32")
-
-
 @struct.dataclass
 class Step:
     """What the trainer tells an objective about the current step.
@@ -331,7 +325,7 @@ class Step:
         folded with `name` (`stream`): `[rows, *shape]`, the same values an example draws on any layout,
         as `jax.random`'s draws take them. `dtype` is the draw's own, never a model's, so a float64 twin
         draws what the run drew; None leaves it out, and `shape` None calls `draw(key)`, a draw that fixes
-        both. The key is the example's place folded into `example_stream` of the update's key, or of the
+        both. The key is the example's place folded into `counter_key` of the update's key, or of the
         attempt's outside a run. With a `tape` holding `name`, its rows for these examples instead,
         at the draw's dtype."""
         examples = self.examples(rows)
@@ -360,7 +354,7 @@ class Step:
         if self.tape is not None and name in self.tape:
             like = jax.eval_shape(drawn, jax.random.key(0))
             return self._taped(self.tape[name], name, examples, like.shape).astype(like.dtype)
-        key = jax.random.fold_in(example_stream(self.key if self.example_key is None else self.example_key),
+        key = jax.random.fold_in(counter_key(self.key if self.example_key is None else self.example_key),
                                  stream(name))
         return jax.vmap(lambda example: drawn(jax.random.fold_in(key, example)))(examples)
 

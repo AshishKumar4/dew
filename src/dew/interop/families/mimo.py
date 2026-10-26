@@ -33,12 +33,16 @@ from dew.interop.decoder_parts import (
     DecoderFamily,
     DecoderFields,
     KindFields,
+    Ramp,
     Renames,
     Ropes,
     base_config,
     decoder_kinds,
     grouped_qkv,
+    nested_ramp,
+    partial_rope_entry,
     plain_partial_rope,
+    ramp_field,
     refuse,
     renamed_name,
     renamed_path,
@@ -65,20 +69,26 @@ def _default_layers(layers: int) -> tuple[str, ...]:
 _FLASH_THETAS = {'full_attention': 5_000_000.0, 'sliding_attention': 10_000.0}
 
 
-def _rope(hf: Mapping[str, object], kind: str) -> tuple[float, float]:
-    """One kind's (rope_theta, partial_rotary_factor): a `rope_parameters`
-    entry, which states its base, or the released flat fields with the reference's defaults."""
+def _rope(hf: Mapping[str, object], kind: str) -> tuple[float, float, Ramp | None]:
+    """One kind's (rope_theta, partial_rotary_factor, ramp): a `rope_parameters` entry, which states
+    its base, or the released flat fields with the reference's defaults and no ramp."""
     nested = hf.get('rope_parameters')
     if nested is not None:
         entry = records.record(records.record(nested, 'rope_parameters').get(kind),
                                f'rope_parameters {kind}')
-        # MiMoV2FlashRotaryEmbedding indexes each entry's base and defaults its factor
-        # (modeling_mimo_v2_flash.py:109-110).
-        return plain_partial_rope({'rope_parameters': entry}, None, default_factor=0.334,
-                                  reference='MiMoV2FlashRotaryEmbedding')
+        # MiMoV2FlashRotaryEmbedding indexes each entry's base and builds the kind's rope_type over
+        # the rotated dims (modeling_mimo_v2_flash.py:80-111): its plain initializer defaults an
+        # omitted fraction to 0.334, the scaled ones (`_compute_yarn_parameters`) to the whole head,
+        # and a nested record's YaRN always truncates (`nested_ramp`).
+        stated = hf.get('max_position_embeddings')
+        plain = entry.get('rope_type', entry.get('type', 'default')) in ('default', 'none')
+        theta, factor, ramp = partial_rope_entry(
+            entry, f'rope_parameters.{kind}', default_factor=0.334 if plain else 1.0,
+            max_pos=None if stated is None else records.integer(stated, 'max_position_embeddings'))
+        return theta, factor, nested_ramp(ramp)
     theta = hf.get('rope_theta' if kind == 'full_attention' else 'swa_rope_theta', _FLASH_THETAS[kind])
     return (records.number(theta, 'rope_theta'),
-            records.number(hf.get('partial_rotary_factor', 0.334), 'partial_rotary_factor'))
+            records.number(hf.get('partial_rotary_factor', 0.334), 'partial_rotary_factor'), None)
 
 
 def _check_released(hf: Mapping[str, object], used: set[str], *, layers: tuple[str, ...],
@@ -119,7 +129,8 @@ def _mimo_v2_flash_config(hf: Mapping[str, object], used: set[str]) -> DecoderFi
     sparse = tuple(index for index, kind in enumerate(schedule) if kind == 'sparse')
     kv_heads = records.integer(hf.get('num_key_value_heads', 4), 'num_key_value_heads')
     _check_released(hf, used, layers=layers, sparse=sparse, kv_heads=kv_heads)
-    (full_theta, full_factor), (local_theta, local_factor) = (_rope(hf, kind) for kind in _KINDS)
+    (full_theta, full_factor, full_ramp), (local_theta, local_factor, local_ramp) = (
+        _rope(hf, kind) for kind in _KINDS)
     used.update(('layer_types', 'mlp_layer_types', 'rope_parameters', 'rope_theta', 'partial_rotary_factor',
                  'v_head_dim', 'attention_value_scale', 'norm_topk_prob', 'attention_dropout'))
     config = base_config({**hf, 'head_dim': hf.get('head_dim', 192), 'num_key_value_heads': kv_heads,
@@ -134,6 +145,9 @@ def _mimo_v2_flash_config(hf: Mapping[str, object], used: set[str]) -> DecoderFi
         # and gives it the sinks (modeling_mimo_v2_flash.py:348, 363).
         kinds['sliding_attention'].update(num_kv_heads=2 * kv_heads, sinks=True,
                                           partial_rotary_factor=local_factor)
+    for kind, ramp in zip(_KINDS, (full_ramp, local_ramp), strict=True):
+        if ramp is not None and kind in layers:
+            kinds.setdefault(kind, native_fields(LayerKind)())[ramp_field(ramp)] = ramp
     return _attention_and_experts(
         config, hf, used, kinds, value_dim=records.integer(hf.get('v_head_dim', 128), 'v_head_dim'),
         scale=0.707, factor=full_factor, count=count, sparse=sparse)
@@ -216,6 +230,8 @@ MIMO_V2_FLASH = DecoderFamily(
     _mimo_v2_flash_export, weight_path=_mimo_v2_flash_path, export_path=partial(renamed_name, _NAMES),
     # Its experts are stored one tensor each, so a save writes them back through the source's own names.
     preserve_source_layout=True,
+    padding_idx=True,
+    defaults={'max_position_embeddings': 131072},
 )
 
 

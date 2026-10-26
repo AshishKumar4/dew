@@ -102,7 +102,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_data_mixtures.py": {
-   "comparisons": 4,
+   "comparisons": 3,
    "lane": "Training"
   },
   "tests/test_dc_ae.py": {
@@ -145,10 +145,6 @@
    "comparisons": 16,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_decoder_remat.py": {
-   "comparisons": 19,
-   "lane": "Training"
-  },
   "tests/test_decoding_components.py": {
    "comparisons": 8,
    "lane": "Training"
@@ -177,10 +173,6 @@
    "comparisons": 7,
    "lane": "Training"
   },
-  "tests/test_discrete.py": {
-   "comparisons": 8,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_disk_banks.py": {
    "comparisons": 2,
    "lane": "Models, Serving & RL"
@@ -194,7 +186,7 @@
    "lane": "Training"
   },
   "tests/test_dory.py": {
-   "comparisons": 3,
+   "comparisons": 2,
    "lane": "Recurrence & Dory"
   },
   "tests/test_dpo.py": {
@@ -229,16 +221,12 @@
    "comparisons": 19,
    "lane": "Recurrence & Dory"
   },
-  "tests/test_fla_kda.py": {
-   "comparisons": 1,
-   "lane": "Recurrence & Dory"
-  },
   "tests/test_flaxdiff.py": {
    "comparisons": 6,
    "lane": "Models, Serving & RL"
   },
   "tests/test_flow_matching.py": {
-   "comparisons": 8,
+   "comparisons": 2,
    "lane": "Training"
   },
   "tests/test_flux_source.py": {
@@ -385,10 +373,6 @@
    "comparisons": 5,
    "lane": "Training"
   },
-  "tests/test_lm_objective.py": {
-   "comparisons": 38,
-   "lane": "Training"
-  },
   "tests/test_lm_recipe.py": {
    "comparisons": 6,
    "lane": "Models, Serving & RL"
@@ -399,10 +383,6 @@
   },
   "tests/test_lora.py": {
    "comparisons": 26,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_lora_peft.py": {
-   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_lpips.py": {
@@ -421,10 +401,6 @@
    "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_mamba_ssd.py": {
-   "comparisons": 2,
-   "lane": "Recurrence & Dory"
-  },
   "tests/test_masked_diffusion.py": {
    "comparisons": 2,
    "lane": "Models, Serving & RL"
@@ -434,7 +410,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_mdlm_reference.py": {
-   "comparisons": 5,
+   "comparisons": 2,
    "lane": "Training"
   },
   "tests/test_mean_flow.py": {
@@ -518,7 +494,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_optim.py": {
-   "comparisons": 18,
+   "comparisons": 2,
    "lane": "Training"
   },
   "tests/test_optim_schedules.py": {

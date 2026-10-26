@@ -32,6 +32,7 @@ import numpy as np
 import optax
 
 from dew.hashing import fmix32
+from dew.nn.kernels.generation import backend
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import LogicalAxes, declarations, declared_axes
 
@@ -354,6 +355,162 @@ def _muonclip_groups(learning_rate, qk_clip_threshold: float = 100.0, **opts):
     return optax.chain(
         _muon_groups(learning_rate, **opts),
         scale_by_qk_clip(qk_clip_threshold))
+
+
+NEWTON_SCHULZ = (3.4445, -4.7750, 2.0315)
+"""Muon's quintic Newton-Schulz coefficients, Jordan's (modded-nanogpt), optax's default."""
+
+
+def newton_schulz(update: jax.Array, steps: int = 5,
+                  dimension_numbers: optax.contrib.MuonDimensionNumbers | None = None) -> jax.Array:
+    """`update` orthogonalized by Muon's quintic Newton-Schulz: each matrix over its Frobenius norm (plus
+    1e-8), the wide way round, then `a X + (b A + c A A) X` with `A = X X^T`, `steps` times (`NEWTON_SCHULZ`).
+
+    A rank-2 update is one matrix, its rows the reduction axis (a Linen kernel's); `dimension_numbers` name
+    another update's reduction and output axes as Muon's do, its other axes a stack of matrices. On the
+    CPU each matrix iterates alone (`jax.lax.map`): batched, XLA:CPU's products leave the iteration, which
+    grows small singular values about 3.44 times a step, ten times further from float64; a GPU's batched
+    ones round as one matrix's (an A100: 5.2e-6 either way), and keep the stack in one program (ledger 1650).
+    """
+    numbers = optax.contrib.MuonDimensionNumbers() if dimension_numbers is None else dimension_numbers
+    reduction, output = (tuple(int(axis) % update.ndim for axis in np.atleast_1d(axes))
+                         for axes in (numbers.reduction_axis, numbers.output_axis))
+    stacked = tuple(axis for axis in range(update.ndim) if axis not in reduction + output)
+    order = stacked + reduction + output
+    sizes = tuple(math.prod(update.shape[axis] for axis in axes) for axes in (stacked, reduction, output))
+    def orthogonalized(matrix):
+        return _newton_schulz_matrix(matrix, steps)
+
+    stack = update.transpose(order).reshape(sizes)
+    matrices = jax.lax.map(orthogonalized, stack) if backend() == "cpu" else jax.vmap(orthogonalized)(stack)
+    return matrices.reshape([update.shape[axis] for axis in order]).transpose(np.argsort(order))
+
+
+def _newton_schulz_matrix(matrix: jax.Array, steps: int) -> jax.Array:
+    a, b, c = (jnp.asarray(value, matrix.dtype) for value in NEWTON_SCHULZ)
+    wide = matrix.T if matrix.shape[0] > matrix.shape[1] else matrix
+    wide = wide / (jnp.linalg.norm(wide) + jnp.asarray(1e-8, matrix.dtype))
+    for _ in range(steps):
+        gram = wide @ wide.T
+        wide = a * wide + (b * gram + c * gram @ gram) @ wide
+    return wide.T if matrix.shape[0] > matrix.shape[1] else wide
+
+
+class M3State(NamedTuple):
+    """`scale_by_m3`'s state: the updates made so far, the fast momentum `M1`, the second moment `V`, the slow
+    momentum `M2`, the gradients of the chunk in progress summed, and `M2` orthogonalized as the chunk
+    began, `O2`."""
+    updates: jax.Array
+    fast: optax.Updates
+    second: optax.Updates
+    slow: optax.Updates
+    chunk: optax.Updates
+    slow_direction: optax.Updates
+
+
+def scale_by_m3(*, beta1: float, beta2: float, beta3: float, alpha: float, eps: float, frequency: int,
+                ns_steps: int = 5, weight_dimension_numbers=None) -> optax.GradientTransformation:
+    """Multi-scale Momentum Muon, M3 (Behrouz et al., Nested Learning, arXiv 2512.24695, Algorithm 1):
+    the direction `(O1 + alpha O2) / sqrt(V + eps)`, which `optax.scale_by_learning_rate` steps by.
+
+    Each update adds `beta1 g` to the fast momentum `M1` and `beta2 g**2` to the second moment `V`, the
+    algorithm's sums, neither decaying, and orthogonalizes `M1` by `ns_steps` Newton-Schulz iterations,
+    Muon's (`newton_schulz`, each leaf shaped by its `weight_dimension_numbers`, a tree or a function of
+    the updates as Muon's are; a leaf with none is one matrix, its rows the reduction). Its state is
+    kept in float32 at least (`at_least_fp32`), so a bfloat16 matrix's momenta and gradients sum without
+    rounding to its width, and the directions come back in that dtype. Once every
+    `frequency` updates the slow momentum `M2` adds `beta3` times the chunk's gradients and is
+    orthogonalized, `O2`, which the next chunk's updates read: the first chunk's is zero. The algorithm's
+    sum, over `i = (k-1) f .. k f`, and eq. 75's, over `i = t - C .. t`, each hold f + 1 gradients, the one
+    at a chunk's boundary in two chunks; here each enters `M2` once, with its own chunk's. The paper states
+    no values for its factors, so each is the caller's.
+    """
+    if frequency < 1:
+        raise ValueError(f"M3 updates its slow momentum once every `frequency` updates, got {frequency}")
+
+    def orthogonalized(moment):
+        if weight_dimension_numbers is None:
+            return jax.tree.map(lambda leaf: newton_schulz(leaf, ns_steps), moment)
+        numbers = (weight_dimension_numbers(moment) if callable(weight_dimension_numbers)
+                   else weight_dimension_numbers)
+        return jax.tree.map(lambda leaf, shape: newton_schulz(leaf, ns_steps, shape), moment, numbers,
+                            is_leaf=lambda node: node is None)
+
+    def init_fn(params) -> M3State:
+        zeros = jax.tree.map(lambda param: jnp.zeros(param.shape, at_least_fp32(param.dtype)), params)
+        return M3State(jnp.zeros([], jnp.int32), zeros, zeros, zeros, zeros, zeros)
+
+    def update_fn(updates, state, params=None):
+        del params
+        updates = jax.tree.map(lambda gradient, moment: gradient.astype(moment.dtype), updates, state.fast)
+        count = jnp.asarray(optax.safe_increment(state.updates))
+        fast = jax.tree.map(lambda moment, gradient: moment + beta1 * gradient, state.fast, updates)
+        second = jax.tree.map(lambda moment, gradient: moment + beta2 * jnp.square(gradient), state.second,
+                              updates)
+        direction = jax.tree.map(lambda fast, slow, second: (fast + alpha * slow) / jnp.sqrt(second + eps),
+                                 orthogonalized(fast), state.slow_direction, second)
+        chunk = jax.tree.map(jnp.add, state.chunk, updates)
+
+        def closed(chunk):
+            slow = jax.tree.map(lambda moment, summed: moment + beta3 * summed, state.slow, chunk)
+            return slow, optax.tree.zeros_like(chunk), orthogonalized(slow)
+
+        # The slow momentum and its orthogonalization run once a chunk, not every update.
+        slow, chunk, slow_direction = jax.lax.cond(
+            count % frequency == 0, closed, lambda chunk: (state.slow, chunk, state.slow_direction), chunk)
+        return direction, M3State(count, fast, second, slow, chunk, slow_direction)
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+class DeltaState(NamedTuple):
+    """`delta_gradient_descent`'s state: the updates made so far, which a scheduled rate reads."""
+    updates: jax.Array
+
+
+def delta_gradient_descent(learning_rate: float | optax.Schedule) -> optax.GradientTransformationExtraArgs:
+    """Delta gradient descent (Behrouz et al., Nested Learning, arXiv 2512.24695, eqs. 56-57): each
+    matrix steps to the minimizer of `|W x - u|**2 / 2 + |W - W_t|**2 / (2 eta)`, where `x` is the step's
+    input and `u = -dL/dy` its output's negative gradient, so the step forgets what `W_t` held along `x`.
+
+    By Sherman-Morrison the minimizer is `W_t (I - eta' x x^T) - eta' dL/dW` with
+    `eta' = eta / (1 + eta |x|**2)`, the paper's `eta / (1 + eta)` at its normalized `|x| = 1`. A kernel
+    holds its input on axis 0, as a Linen kernel does (`y = x K`), so its step is
+    `-eta' (x (x^T K) + dL/dK)` over its other axes. The update takes `inputs`, a tree of `x` per leaf,
+    the parameters' structure with None where a leaf has none: that leaf steps by gradient descent, the
+    rule at `x = 0`. An update given no inputs, or no parameters, is refused rather than run as plain
+    gradient descent.
+    """
+
+    def init_fn(params) -> DeltaState:
+        del params
+        return DeltaState(jnp.zeros([], jnp.int32))
+
+    def update_fn(updates, state, params=None, *, inputs=None, **extra_args):
+        # A chain hands every transform each extra argument; the others' are not this one's.
+        del extra_args
+        if params is None or inputs is None:
+            raise ValueError("delta gradient descent steps by each matrix's input and its weights: an update "
+                             "takes `params` and `inputs` (None for a leaf with no input)")
+        rate = jnp.asarray(learning_rate(state.updates) if callable(learning_rate) else learning_rate)
+
+        def stepped(x, gradient, kernel):
+            # A leaf another transform of an `optax.partition` steps reaches this one masked.
+            if isinstance(gradient, optax.MaskedNode):
+                return gradient
+            if x is None:
+                return -rate * gradient
+            if x.shape != kernel.shape[:1]:
+                raise ValueError(f"an input of shape {x.shape} is not the input axis of a kernel shaped "
+                                 f"{kernel.shape}")
+            shrunk = rate / (1 + rate * jnp.sum(jnp.square(x)))
+            along = jnp.tensordot(x, jnp.tensordot(x, kernel, axes=(0, 0)), axes=0)
+            return -shrunk * (along + gradient)
+
+        stepped_updates = jax.tree.map(stepped, inputs, updates, params, is_leaf=lambda leaf: leaf is None)
+        return stepped_updates, DeltaState(jnp.asarray(optax.safe_increment(state.updates)))
+
+    return optax.GradientTransformationExtraArgs(init_fn, update_fn)
 
 
 def stochastic_round_bf16(x: jax.Array, seed: jax.Array) -> jax.Array:
@@ -1118,5 +1275,6 @@ class Exponential(ScheduleBase):
         return lambda count: self.offset + decay(count)
 
 
-__all__ = ["Cosine", "Exponential", "Linear", "OneCycle", "ParamGroup", "Power", "PowerProfilesState",
-           "PowerTail", "ScheduleBase"]
+__all__ = ["NEWTON_SCHULZ", "Cosine", "DeltaState", "Exponential", "Linear", "M3State", "OneCycle",
+           "ParamGroup", "Power", "PowerProfilesState", "PowerTail", "ScheduleBase", "delta_gradient_descent",
+           "newton_schulz", "scale_by_m3"]
