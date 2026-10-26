@@ -116,7 +116,7 @@ def _keeping_gradients(optimizer):
 
 
 def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1, split=None,
-             mixture=False, rows=8, ragged=False, scanned=False, remat=None):
+             mixture=False, rows=8, ragged=False, scanned=False, remat=None, longer=None):
     """A tied bf16 decoder over fp32 parameters, trained `steps` steps on
     one batch and then `padded` steps on a batch of padding alone, with
     `copies` on or off on this device's generation, on `mesh` with every
@@ -127,7 +127,9 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
     as many tokens, whether a window reads steps or a step's parts. A
     `scanned` decoder of four layers runs them as one scan over their
     stacked weights, each layer's stored apart, and each block recomputes
-    as `remat` names. Returns the state, each step's loss and the trainer."""
+    as `remat` names. With `longer`, every other step reads a batch of that
+    many rows, whose shape the trainer plans apart. Returns the state, each
+    step's loss and the trainer, its plan the last shape's."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import TEXT_KEY, LMObjective
     from dew.training import Layout, MeshSpec, Trainer
@@ -137,16 +139,21 @@ def _trained(optimizer, *, copies, steps=3, mesh=None, padded=0, accumulation=1,
                               mixture={"experts": 4, "top_k": 2} if mixture else None)
     objective = LMObjective(model, seq_len=8, pad_id=0, aux_loss_alpha=.01 if mixture else None)
     batch = {TEXT_KEY: jnp.asarray(np.random.default_rng(0).integers(1, 64, (rows, 9)), jnp.int32)}
+    long = longer and {TEXT_KEY: jnp.asarray(np.random.default_rng(1).integers(1, 64, (longer, 9)),
+                                             jnp.int32)}
     with chosen(narrow_copies='on' if copies else 'off'):
         trainer = Trainer(objective, optimizer, key=jax.random.key(0), mesh=mesh or MeshSpec(),
                           layout=Layout(min_shard=1, tolerance=1.0), accumulation=accumulation, split=split)
         state = trainer.initial_state()
-        step = trainer.compile(state, batch)
+        steps_by = {False: (trainer.compile(state, batch), None)}
+        if long:
+            steps_by[True] = (trainer.compile(state, long), long)
     shorter = {TEXT_KEY: batch[TEXT_KEY].at[::2, -3:].set(0)}
     trained = [shorter if ragged and index % 2 == 0 else batch for index in range(steps)]
     losses = []
-    for current in trained + [{TEXT_KEY: jnp.zeros_like(batch[TEXT_KEY])}] * padded:
-        state, loss, *_ = step(state, current)
+    for index, current in enumerate(trained + [{TEXT_KEY: jnp.zeros_like(batch[TEXT_KEY])}] * padded):
+        step, read = steps_by[bool(long) and index % 2 == 1]
+        state, loss, *_ = step(state, current if read is None else read)
         losses.append(np.asarray(loss))
     return state, losses, trainer
 
@@ -290,7 +297,7 @@ def test_a_step_that_fits_only_without_its_copies_drops_them_before_it_recompute
     """The narrow copies are the fit ladder's first rung. In the geometry of row 1661's run, a window of
     two steps under full recomputation, the backward adds each gradient into the window's sum as it is
     made, so the copies, two bytes a parameter held all run, are bytes the step gives back: one that
-    does not fit with them drops them before it recomputes more or splits, and its plan says so
+    does not fit with them drops them before it recomputes more, and its plan says so
     (`narrow`), on devices whose free bytes lie between its footprints with and without them."""
     free = 2 ** 39
     monkeypatch.setattr(jax.Device, "memory_stats",
@@ -336,6 +343,31 @@ def test_a_plan_a_rung_above_its_dropped_copies_takes_them_back_where_they_fit(m
     assert [{key: probe[key] for key in rung} for probe in (fitted, last)] == [planned, planned]
     assert [(probe["narrow"], probe["fits"]) for probe in (fitted, last)] == [(False, True), (True, True)]
     assert plan["narrow"] and state.compute is not None
+
+
+def test_a_run_whose_shapes_plan_their_copies_apart_steps_each_as_its_plan_reads(monkeypatch):
+    """Each shape a run meets plans its copies itself (`_at_base_rung`): where a longer batch fits only
+    without them and a shorter one with them, the steps take turns, each reading the state as its own plan
+    compiled it, the copies dropped before the longer batch's step and built again before the shorter's,
+    and under plain SGD the run lands bitwise on the parameters and losses of one without copies."""
+    free = 2 ** 39
+    monkeypatch.setattr(jax.Device, "memory_stats",
+                        lambda device: {"bytes_limit": 2 ** 40, "bytes_in_use": 2 ** 40 - free})
+
+    def trained(*, copies, rows=8, longer=None, steps=0):
+        return _trained(optax.sgd(0.5), copies=copies, steps=steps, accumulation=2, split=1, remat="full",
+                        rows=rows, longer=longer)
+
+    def used(rows, *, copies):
+        return free - trained(copies=copies, rows=rows)[2].plan["probes"][0]["headroom"]
+
+    shorter, longer, longer_without = used(8, copies=True), used(64, copies=True), used(64, copies=False)
+    free = max(shorter, longer_without)
+    assert free < longer
+    narrow, losses, trainer = trained(copies=True, longer=64, steps=3)
+    assert not trainer.plan["narrow"] and narrow.compute is not None
+    plain, plain_losses, _ = trained(copies=False, longer=64, steps=3)
+    _assert_plain_update(narrow, losses, plain, plain_losses)
 
 
 def test_a_restored_state_drops_its_templates_copies():
