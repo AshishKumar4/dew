@@ -295,14 +295,13 @@ class QuantizedProducts:
 def quantized_products(module: nn.Module, name: str) -> QuantizedProducts:
     """How the Qwix quantization the call runs under (`QUANTIZED_TRACE`) changes the products of the
     bound `module`'s submodule `name` and the modules under it (`QuantizedProducts`), as its policy's
-    rules select their paths: the submodule's own, and the scope of each parameter it holds. A trace
-    with no policy Dew knows (a provider of the caller's own, `quantize_with`) may change any, both
-    ways."""
-    trace = QUANTIZED_TRACE.value
+    rules select their paths: the submodule's own, and the scope of each parameter it holds."""
+    trace: QuantizedTrace | None = QUANTIZED_TRACE.value
     if trace is None:
         return QuantizedProducts(inputs=False, weights=False)
-    policy = trace.policy if isinstance(trace, QuantizedTrace) else None
+    policy = trace.policy
     if policy is None:
+        # A trace that names no policy (a provider of the caller's own) may quantize anything.
         return QuantizedProducts(inputs=True, weights=True)
     scope = (*module.path, name)
     params = flatten_dict(dict(module.variables.get("params", {}).get(name, {})))
