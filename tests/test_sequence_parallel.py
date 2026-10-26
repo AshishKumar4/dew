@@ -24,7 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import two_documents
-from reference_error import FEWEST_SEEDS, assert_as_exact, with_gradients
+from reference_error import FEWEST_SEEDS, as_given, assert_as_exact, with_gradients
 from token_support import token_rows
 
 from dew.nn.attention import (
@@ -179,6 +179,7 @@ def test_row_arguments_split_as_the_query_rows_do_where_the_heads_contend_for_th
     mesh = MeshSpec(tensor=2, expert=2, sequence=2).build()
     exchanged = jax.jit(lambda q, k, v: through(exchange, q, k, v, **call))
 
+    @as_given
     def split(query, key, value):
         # The exchange under the mesh and the contending rules; the whole sequence outside them.
         with jax.set_mesh(mesh), nn.logical_axis_rules((*HEADS_BEFORE_ROWS, *DEFAULT_RULES)):
@@ -232,6 +233,7 @@ def test_a_dropping_call_drops_what_one_device_drops(name, exchange):
     mesh = SPLIT.build()
     exchanged = jax.jit(with_gradients(lambda q, k, v: through(exchange, q, k, v, **call)))
 
+    @as_given
     def split(*arrays):
         with jax.set_mesh(mesh):
             return exchanged(*arrays)
@@ -265,6 +267,7 @@ def test_the_entry_drops_over_a_split_sequence():
     mesh = SPLIT.build()
     entry = jax.jit(with_gradients(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call)))
 
+    @as_given
     def split(*arrays):
         with jax.set_mesh(mesh):
             return entry(*arrays)
