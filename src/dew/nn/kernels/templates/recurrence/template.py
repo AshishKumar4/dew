@@ -69,19 +69,6 @@ def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target
     return _PLANS[key]
 
 
-def _launch_cost(launch: mainloop.Launch, target: generation.GpuTarget) -> cost.Cost:
-    """The cost model's reading of a planned launch on `target`: its programs, as many on a multiprocessor
-    at once as its shared memory and its threads' registers allow (`cost.resident`, each thread at the
-    registers a thread has: the mainloop's launches hold 158 to 255, ptxas's count on an A100), each
-    streaming its steps' tiles through shared memory with its chunks in flight, issuing its tensor products
-    (16-bit: an fp32 call's are its operands' bf16 parts') and its exponentials, and its bytes in global
-    memory."""
-    return cost.Cost(programs=launch.programs, device_bytes=launch.device_bytes, program_flops=launch.flops,
-                     program_staged=launch.steps * launch.step_bytes,
-                     program_exponentials=launch.exponentials, steps=launch.steps, stages=launch.stages,
-                     resident=cost.resident(target, launch.shared, launch.threads, cost.THREAD_REGISTERS))
-
-
 @dataclasses.dataclass(frozen=True)
 class Mosaic(base.Template[mainloop.Tiles]):
     """The chunked rule on the recurrence template's mainloop (`recurrence_chunk.mosaic_rule`), its config
@@ -260,13 +247,6 @@ class Mosaic(base.Template[mainloop.Tiles]):
                      target: generation.GpuTarget) -> int:
         # The forward's launches: the fast backward's are held where its rule takes them.
         return max(launch.shared for launch in self._launches(ba, config, target, backward=False))
-
-    def cost(self, ba: tokamax.BoundArguments, config: mainloop.Tiles, target: generation.GpuTarget) -> float:
-        """The forward's launches' seconds at `config` on `target`, summed (each `cost.seconds`). No one
-        record holds them all, so the template states no `costed` (`templates.features` reads that as the
-        whole operation's); its launches' records are `_launches`'."""
-        return sum(cost.seconds(_launch_cost(launch, target), target)
-                   for launch in self._launches(ba, config, target, backward=False))
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         """Whether the mainloop runs the call on `target`: 16-bit or fp32 operands, a decay a key dimension's
