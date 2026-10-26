@@ -4,9 +4,11 @@ that split it differently, against one device on the eight-device CPU mesh.
 tools/layout_parity.py judges a layout's step-one loss and gradient against
 one device's, each leaf within FLOOR_FACTOR of the reference's own deviation
 under reassociating its sums (its rows reordered and pooled, and the step's
-distance from fp64), and holds the layout's FLOPs to an even split. A cell
-works, or is refused by design with its reason, as a stage axis over a model
-that runs no pipeline is; any other status is a defect. The models are the
+distance from fp64), and holds the layout's FLOPs to an even split. Each cell
+states what it does: it works, or it is refused by design for the reason
+REFUSED gives. A supported cell that refuses fails, and so does a refused
+cell that runs, so a refusal is never read as a pass and a lifted one is
+never left unclaimed. The models are the
 tool's zoo, sized so every layout divides them. Each row lists the layouts that
 split its model in a way no other row covers: a pair's second axis, a packed or
 masked column under a sequence split, a bidirectional exchange, a vision tower
@@ -44,6 +46,8 @@ CELLS: dict[str, tuple[str, ...]] = {
     "mla_dpo": ("fsdp4", "sequence4"),
     "hybrid_sft": ("sequence4", "stage4", "data4_explicit"),
     "mamba1_packed": ("fsdp2_explicit",),
+    "dense_packed": ("sequence4",),
+    "rigel_packed": ("sequence4",),
     "mmdit": ("tensor4", "fsdp2_tensor2"),
     "dit": ("sequence4", "tensor4", "fsdp2_explicit"),
     "unet": ("tensor4", "fsdp2_tensor2", "sequence4"),
@@ -53,6 +57,12 @@ CELLS: dict[str, tuple[str, ...]] = {
 CELLS_ON_FOUR: dict[str, tuple[str, ...]] = {
     "dense": ("stage4", "stage2_sequence2"),
 }
+EXCHANGE: dict[str, tuple[str, ...]] = {"moe_grpo": ("expert4", "expert2_fsdp2")}
+"""The cells a mixture runs with its expert exchange dispatch, which needs an expert axis."""
+REFUSED: dict[tuple[str, str], str] = {
+    ("hybrid_sft", "stage4"): "ledger 1436: its layer pattern does not repeat every L / stages layers",
+}
+"""The cells refused by design, each with its reason."""
 
 
 @pytest.fixture(scope="session")
@@ -70,18 +80,22 @@ def references(tmp_path_factory):
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize(("model", "layout", "devices"), [
-    *(pytest.param(model, layout, None, id=f"{model}-{layout}")
+@pytest.mark.parametrize(("model", "layout", "devices", "mixture"), [
+    *(pytest.param(model, layout, None, {}, id=f"{model}-{layout}")
       for model, layouts in sorted(CELLS.items()) for layout in layouts),
-    *(pytest.param(model, layout, 4, id=f"{model}-{layout}-on-four")
-      for model, layouts in sorted(CELLS_ON_FOUR.items()) for layout in layouts)])
-def test_each_layout_of_a_model_matches_one_device_or_is_refused(model, layout, devices, references):
+    *(pytest.param(model, layout, 4, {}, id=f"{model}-{layout}-on-four")
+      for model, layouts in sorted(CELLS_ON_FOUR.items()) for layout in layouts),
+    *(pytest.param(model, layout, None, {"dispatch": "exchange"}, id=f"{model}-{layout}-exchange")
+      for model, layouts in sorted(EXCHANGE.items()) for layout in layouts)])
+def test_each_layout_of_a_model_matches_one_device_or_is_refused_as_stated(model, layout, devices, mixture,
+                                                                           references):
     tool, held = references
     with jax.enable_x64(new_val=True):
-        rows = tool.run([model], (layout,), dtype="float32", steps=1, anchor=True, mixture={},
+        rows = tool.run([model], (layout,), dtype="float32", steps=1, anchor=True, mixture=mixture,
                         objective={}, references=held, speak=lambda line: None,
                         keep=lambda rows: None, devices=devices)
-    assert tool.verdict(rows) == 0, [
+    stated = "refused" if (model, layout) in REFUSED else "works"
+    assert [row["status"] for row in rows] == [stated], [
         {key: row.get(key) for key in ("layout", "status", "worst_leaf", "worst_ratio", "loss_error",
                                        "loss_bound", "flops_ratio", "reason", "error")}
         for row in rows]
