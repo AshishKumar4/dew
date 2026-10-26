@@ -11,6 +11,7 @@ import pytest
 from jax.experimental import checkify
 from model_support import greedy_walk as walk, initialized_decoder
 
+from dew._distributions import row_draw
 from dew.sampling import Beam, Sample, Sampling, decoding, generate
 from dew.sampling.decoding import StepState
 from dew.sampling.strategies import draw
@@ -415,3 +416,15 @@ def test_sampling_defaults_and_explicit_policies_generate_the_same_outputs(model
     b = generate(module, params, prompt, 3, key=jax.random.key(0), sampling=sampling, logits=explicit)
     for field in ("tokens", "lengths", "terminated", "behavior_log_probs", "raw_log_probs"):
         np.testing.assert_array_equal(np.asarray(getattr(a, field)), np.asarray(getattr(b, field)))
+
+
+@pytest.mark.parametrize("impl", ["rbg", "unsafe_rbg", "threefry2x32"])
+def test_a_rows_draw_is_its_own_under_any_key_implementation(impl):
+    """Each row's token is drawn under its own key, the same whatever rows it is drawn beside: `vmap`
+    draws every row of an RBG key implementation from the first key's stream, which a row drawn by
+    itself never reads."""
+    keys = jax.random.split(jax.random.key(3, impl=impl), 8)
+    scores = jnp.zeros((8, 4096), jnp.float32)
+    drawn = jax.jit(row_draw)
+    alone = np.concatenate([np.asarray(drawn(keys[row:row + 1], scores[row:row + 1])) for row in range(8)])
+    np.testing.assert_array_equal(np.asarray(drawn(keys, scores)), alone)
