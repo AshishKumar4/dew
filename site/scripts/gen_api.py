@@ -70,7 +70,7 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
                 "dew.nn.backbones.qwen_image", "dew.nn.backbones.sd3", "dew.nn.backbones.wan",
                 "dew.nn.backbones.z_image", "dew.nn.mp",
                 "dew.nn.diffusion_gemma", "dew.nn.gemma3n", "dew.nn.multimodal", "dew.nn.cross_attention",
-                "dew.nn.autoencoders", "dew.nn.autoencoders.pretrained", "dew.nn.categorical", "dew.nn.inputs", "dew.nn.mlp", "dew.nn.protocols", "dew.nn.kernels", "dew.nn.sharding",
+                "dew.nn.autoencoders", "dew.nn.autoencoders.pretrained", "dew.nn.categorical", "dew.nn.inputs", "dew.nn.mixers.attention", "dew.nn.mlp", "dew.nn.protocols", "dew.nn.kernels", "dew.nn.sharding",
                 "dew.lora"]),
     ("Diffusion and sampling", ["dew.diffusion", "dew.diffusion.process", "dew.diffusion.schedules",
                                 "dew.diffusion.schedules.source", "dew.diffusion.schedules.source_grids",
