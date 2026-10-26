@@ -263,12 +263,14 @@ class DiskBankStats:
 class SafetensorsBanks(LayerBanks):
     """Reads a local HF decoder checkpoint without materializing its layer stack.
 
-    It translates the weights with the ordinary decoder's `SourceLeaf`
-    recipes over read-only memory maps, including expert stacking,
-    transposition and the cast to `param_dtype` (by default the
-    checkpoint's dtype). Quantized checkpoints are refused, because their
-    codec may dequantize the entire checkpoint before translation, which
-    would break the memory bound below.
+    The checkpoint is a decoder, a media wrapper around one, or the native
+    backbone a release with a separately stored readout describes (a slot
+    decision release). It translates the weights through `Pretrained.load`'s
+    own native reader, with its `SourceLeaf` recipes over read-only memory
+    maps, including expert stacking, transposition and the cast to
+    `param_dtype` (by default the checkpoint's dtype). Quantized checkpoints
+    are refused, because their codec may dequantize the entire checkpoint
+    before translation, which would break the memory bound below.
 
     The cache keeps complete layers in read order until `cache_bytes` is
     full, and holds them until `close`. A sequential decoder visits every
@@ -286,32 +288,63 @@ class SafetensorsBanks(LayerBanks):
 
     def __init__(self, directory: str | Path, *, cache_bytes: int = 0,
                  param_dtype: DTypeLike | Literal["auto"] = "auto", read_ahead: bool = True):
-        from dew.interop.decoder_parts import DecoderFamily, check_decoder_tree
-        from dew.interop.hf_decoders import families, translate_config, translate_weights
+        from dew.interop.composite import NativeComponent
+        from dew.interop.decoder_parts import DecoderFamily
+        from dew.interop.hf_decoders import families
+        from dew.interop.pretrained import (
+            DecoderRoute,
+            WrapperRoute,
+            _composite_description,
+            _load_native_source,
+            source_route,
+        )
         from dew.interop.safetensors_io import read_weights
-        from dew.registry import dtype_name, models
+        from dew.interop.sources import SourceReference
+        from dew.registry import dtype_name
 
         if cache_bytes < 0:
             raise ValueError("cache_bytes must be nonnegative")
         folder = Path(directory)
-        config = _records.record(json.loads((folder / "config.json").read_text()), "config.json")
+        # A release with a separately stored readout banks the native backbone it describes.
+        description = _composite_description(folder)
+        component = (NativeComponent(_records.record(json.loads((folder / "config.json").read_text()),
+                                                     "config.json"))
+                     if description is None else description.backbone)
+        if component is None:
+            raise ValueError("disk banks require a native backbone, not a standalone readout")
+        config = component.config
         self.config: Mapping[str, object] = MappingProxyType(config)
-        if self.config.get("quantization_config") or self.config.get("expert_dtype"):
+        sections = [config]
+        if "text_config" in config:
+            sections.append(_records.record(config["text_config"], "text_config"))
+        if any(section.get("quantization_config") or section.get("expert_dtype") for section in sections):
             raise ValueError("disk banks require unquantized safetensors; a whole-model codec is not bounded")
-        record = translate_config(self.config)
-        family = _records.text(self.config.get("model_type"), "model_type")
+
+        def unregistered(_config):
+            raise ValueError("disk banks require a registered native decoder family")
+
+        match source_route(config, verified=unregistered):
+            case DecoderRoute():
+                family = _records.text(config.get("model_type"), "model_type")
+            case WrapperRoute(wrapper=wrapper):
+                family = wrapper["text_model_type"]
+            case _:
+                raise ValueError("disk banks require a native decoder or its media wrapper")
         if families()[family].prepare is not DecoderFamily.prepare or families()[family].packed:
             raise ValueError("disk banks require a family with lazy tensor translation; "
                              "this family's preparation can materialize checkpoint weights")
-        tensors = read_weights(folder)
-        self._variables: Variables = translate_weights(
-            tensors, record, family, param_dtype="auto" if param_dtype == "auto" else dtype_name(param_dtype),
-            lazy=True)
+        # The loader's own translation and tree check, over the safetensors alone: a pickle shard set
+        # would be read whole before the first row.
+        backbone, _ = _load_native_source(
+            SourceReference(str(folder)), folder, gguf_file=None, component=component,
+            tensors=component.own_tensors(read_weights(folder / component.weights_folder)),
+            placed=lambda variables: variables, streaming=True, dtype="float32",
+            param_dtype="auto" if param_dtype == "auto" else dtype_name(param_dtype),
+            attention_impl="reference", max_seq_len=None)
+        self._variables: Variables = backbone.variables
         self._shapes = jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), self._variables
         )
-        check_decoder_tree(self._shapes, models.build(
-            "causal_transformer", {**record, "dtype": "float32", "attention_impl": "reference"}))
         self.cache_limit = cache_bytes
         self.read_ahead = read_ahead
         self._cache: dict[tuple[tuple[str, ...], int], Variables] = {}
