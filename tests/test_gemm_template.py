@@ -958,6 +958,21 @@ def test_the_hooked_tpu_launches_lower_for_a_v5e(launch, side_dtype):
                 lowering_platforms=("tpu",))
 
 
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+def test_a_cuda_call_naming_xla_runs_its_program(generation_name):
+    """A bf16 product the GPU's launches take, with `generation.chosen` naming XLA, lowers for the GPU to
+    XLA's program, the route `xla` and no launch (the audit's forced-xla route, ledger 1702 (a))."""
+    x = jax.ShapeDtypeStruct((256, 128), jnp.bfloat16)
+    w = jax.ShapeDtypeStruct((2, 128, 256), jnp.bfloat16)
+    sizes = jnp.asarray([128, 128], jnp.int32)
+    with (generation.assumed(generation_name), generation.chosen(grouped_matmul="xla"),
+          generation.routes() as taken, tuning.seen() as launches):
+        text = jax.jit(lambda x, w: template.gemm(x, w, sizes, out_dtype=jnp.bfloat16)).trace(x, w).lower(
+            lowering_platforms=("cuda",)).as_text()
+    assert _kernels(taken) == {"xla"} and not list(launches)
+    assert "mosaic_gpu" not in text and "triton" not in text
+
+
 @runs("v5e")
 @pytest.mark.parametrize("product", ["gemm", "gemm_t"])
 def test_a_tpu_lowers_xlas_program_for_a_call_no_launch_takes(product):

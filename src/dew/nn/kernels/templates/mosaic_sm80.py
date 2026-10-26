@@ -299,12 +299,16 @@ class Mma(mosaic.Family):
         # MMA-layout tile stored from registers writes partial 32-byte sectors, which JAX 0.12's global
         # transfers refuse, and its row-sliced copies lay out whole ones. Its copies go through registers,
         # done when they return: nothing stays in flight (`wait` asks nothing of it).
+        # A vector (a row's per-row statistics, attention's `[bq]` and `[bk]`) is copied out whole.
         del wait
         for part, view in zip(parts, views, strict=True):
             if smem is None:
                 view[...] = part.astype(view.dtype)
                 continue
             plgpu.store(smem, part.astype(smem.dtype), optimized=False)
+            if len(smem.shape) == 1:
+                mosaic.copied(smem, view)
+                continue
             rows = smem.shape[0]
             mosaic.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=mosaic.copied)
 
