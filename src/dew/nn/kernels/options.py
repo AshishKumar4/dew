@@ -55,12 +55,14 @@ def quantizations(*models: Held) -> list[QuantizedDtypes]:
     a tuple's or a mapping's entries, at any depth, so a quantized text encoder inside a condition's
     encoder counts as the denoiser beside it does. Arrays and their trees are not walked."""
     found: list[QuantizedDtypes] = []
-    seen: set[int] = set()
+    # Each object visited, held until the walk ends: a mapping's values may be made as they are read
+    # (a FrozenDict's nested ones), and a freed one's id could name a later, unvisited value.
+    seen: dict[int, Held] = {}
 
     def walk(value: Held) -> None:
         if id(value) in seen or isinstance(value, (jax.Array, np.ndarray, str, bytes, int, float, type)):
             return
-        seen.add(id(value))
+        seen[id(value)] = value
         if isinstance(value, Quantized):
             found.append(type(value)._dew_quantization)
         if isinstance(value, Mapping):
