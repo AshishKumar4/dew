@@ -18,6 +18,7 @@ from numpy.typing import NDArray
 
 from dew.artifacts import ImageGrid
 from dew.inputs import unit_range
+from dew.nn.kernels.options import program
 from dew.objectives.base import Shown
 
 from .common import metric_device
@@ -126,9 +127,20 @@ class FIDStats:
     real: GaussianStats
 
 
+def _activations(model, variables, images):
+    """Each of `images`' pool3 features, resized to 299 x 299 as pytorch-fid resizes it."""
+    # pytorch-fid's F.interpolate(bilinear, align_corners=False) does not
+    # antialias; jax.image.resize does unless told not to.
+    resized = jax.image.resize(images, (images.shape[0], 299, 299, 3), method='bilinear', antialias=False)
+    features = model.apply(variables, resized)
+    assert isinstance(features, jax.Array)
+    return features.reshape(features.shape[0], -1)
+
+
 @functools.cache
 def _get_activations(weights: str | None = None):
-    """Return the jitted pool3 feature extractor, built on first use.
+    """Return the pool3 feature extractor, built on first use, its program the process's one
+    (`program`).
 
     Building it loads the ~90 MB of InceptionV3 weights, once per process and
     per weights, which every metric shares; constructing a metric opens nothing.
@@ -136,18 +148,7 @@ def _get_activations(weights: str | None = None):
     _log.info("loading InceptionV3 FID weights from %s (cached for reuse)",
               "the hub" if weights is None else weights)
     model, variables = _extractor(weights)
-
-    @jax.jit
-    def activations(images):
-        # pytorch-fid's F.interpolate(bilinear, align_corners=False) does not
-        # antialias; jax.image.resize does unless told not to.
-        resized = jax.image.resize(images, (images.shape[0], 299, 299, 3), method='bilinear',
-                                   antialias=False)
-        features = model.apply(variables, resized)
-        assert isinstance(features, jax.Array)
-        return features.reshape(features.shape[0], -1)
-
-    return activations
+    return functools.partial(program(_activations, model, static_argnums=0), model, variables)
 
 
 def _pooled_stats(batches: Iterable[ArrayLike], *, population: str,
