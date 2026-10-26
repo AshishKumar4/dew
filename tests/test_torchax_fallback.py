@@ -960,21 +960,27 @@ def _moving_ropes() -> dict:
                      "short_factor": (1 + rng.random(pairs)).tolist(),
                      "long_factor": (2 + 4 * rng.random(pairs)).tolist()},
         "dynamic": {"rope_type": "dynamic", "rope_theta": 10000.0, "factor": 3.0},
+        # LongRoPE at a stated zero amplitude, which transformers' validator admits.
+        "longrope-silent": {"rope_type": "longrope", "rope_theta": 10000.0,
+                            "original_max_position_embeddings": 8, "attention_factor": 0.0,
+                            "short_factor": (1 + rng.random(pairs)).tolist(),
+                            "long_factor": (2 + 4 * rng.random(pairs)).tolist()},
     }
 
 
 def _moving_model(rope: str):
-    fields = {**COHERE, "max_position_embeddings": 32 if rope == "longrope" else 8,
+    fields = {**COHERE, "max_position_embeddings": 8 if rope == "dynamic" else 32,
               "rope_parameters": _moving_ropes()[rope]}
     torch.manual_seed(0)
     return transformers.CohereForCausalLM(transformers.CohereConfig(**fields)).eval()
 
 
-MOVING_SEEDS = {"longrope documents": 8, "dynamic documents": 8, "longrope steps": 8, "dynamic steps": 8}
+MOVING_SEEDS = {"longrope documents": 8, "dynamic documents": 8, "longrope-silent documents": 8,
+                "longrope steps": 8, "dynamic steps": 8}
 """The functional rotaries' declared check-1 seeds, sized by `seeds_for` on armada."""
 
 
-@pytest.mark.parametrize("rope", ["longrope", "dynamic"])
+@pytest.mark.parametrize("rope", ["longrope", "dynamic", "longrope-silent"])
 def test_a_rotary_that_recomputes_its_tables_runs_each_packed_document_as_transformers_does(rope, tmp_path):
     """A source whose rotary transformers recomputes from each call's positions (LongRoPE's tables
     switching, dynamic NTK's base growing, past the original context) runs in tier 3 with those tables
@@ -985,7 +991,7 @@ def test_a_rotary_that_recomputes_its_tables_runs_each_packed_document_as_transf
     model.save_pretrained(tmp_path)
     with pytest.warns(TransformersTierWarning):
         loaded = Pretrained.load(tmp_path, dtype="float32")
-    assert loaded.model.cache_rebuild_position == (8 if rope == "longrope" else None)
+    assert loaded.model.cache_rebuild_position == (None if rope == "dynamic" else 8)
     with float64():
         wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
                                                              attn_implementation="eager").eval()
@@ -1132,3 +1138,77 @@ def test_experts_transformers_loops_over_run_at_static_shapes_as_transformers_co
     assert identity.any() and not identity.all()
     assert_as_exact(ours, theirs(reference), draw, "longcat logits", seeds=LONGCAT_SEEDS,
                     truth_fn=theirs(wide, float64))
+
+
+def test_a_documents_reach_is_its_largest_place_in_any_order():
+    """A document's reach is the largest of its tokens' places, which transformers' rotary reads as a
+    call's largest position, whatever their order; a padding slot reads the next document's."""
+    from dew.nn.inputs import document_reach
+
+    reach = document_reach(jnp.asarray([[1, 1, 1, 0, 2, 2]]), None, jnp.asarray([[0, 9, 4, 0, 0, 1]]))
+    np.testing.assert_array_equal(np.asarray(reach), [[9, 9, 9, 1, 1, 1]])
+
+
+def test_a_longrope_tier_3_model_generates_across_its_original_context(tmp_path):
+    """A tier-3 LongRoPE model generates past its original context through the sampler's rebuild
+    (`cache_rebuild_position`): the crossing step recomputes the prefix at the long table, and the
+    greedy tokens are the model's full forward's argmax at each step."""
+    from dew.inference import TextGeneration
+    from dew.sampling import Sampling
+
+    model = _moving_model("longrope")
+    model.save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32", max_seq_len=16)
+    prompt = np.random.default_rng(0x1497).integers(0, model.config.vocab_size, (2, 6)).astype(np.int32)
+    task = TextGeneration(loaded.model, loaded.variables, sampling=Sampling(temperature=0.0))
+    generated = np.asarray(task(prompt.tolist(), 6, key=0).tokens)
+    full = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(generated)))
+    np.testing.assert_array_equal(generated[:, 6:], full[:, 5:-1].argmax(-1))
+
+
+def test_a_rotary_whose_table_forward_is_no_cos_and_sin_layout_is_refused():
+    """A rotary `dynamic_rope_update` wraps whose table forward returns no cos and sin laid out by
+    frequency (DeepSeek-V2's complex `freqs_cis`) is refused by name, not computed otherwise."""
+    from dew.interop.torchax_fallback import functional_rotaries
+
+    dynamic = {"rope_type": "dynamic", "rope_theta": 10000.0, "factor": 2.0}
+    config = transformers.DeepseekV2Config(**TINY, num_key_value_heads=4, kv_lora_rank=16, q_lora_rank=32,
+                                           qk_nope_head_dim=8, qk_rope_head_dim=8, v_head_dim=8,
+                                           n_routed_experts=4, num_experts_per_tok=2,
+                                           moe_intermediate_size=32, first_k_dense_replace=1,
+                                           rope_parameters=dynamic)
+    with pytest.raises(ValueError):
+        functional_rotaries(transformers.DeepseekV2ForCausalLM(config).eval())
+
+
+IDENTITY_SEEDS = 8
+"""The identity-only Longcat's declared check-1 seeds, sized by `seeds_for` on armada."""
+
+
+def test_identity_experts_alone_run_as_transformers_runs_them(tmp_path):
+    """A Longcat Flash of identity experts alone holds no projections, and tier 3 passes each routed
+    token through, weighted, as transformers does: its logits hold check 1, the float64 twin the truth."""
+    torch.manual_seed(0)
+    model = transformers.LongcatFlashForCausalLM(transformers.LongcatFlashConfig(
+        **{**LONGCAT, "n_routed_experts": 0, "zero_expert_num": 3})).eval()
+    model.save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
+    with float64():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager").eval()
+        wide.load_state_dict(model.state_dict())
+    forward = jax.jit(loaded.model.apply)
+
+    def theirs(source, precision=contextlib.nullcontext):
+        def run(tokens):
+            with precision(), torch.no_grad():
+                return source(torch.from_numpy(tokens).long()).logits.double().numpy()
+        return run
+
+    reference = copy.deepcopy(model)
+    reference.set_attn_implementation("eager")
+    assert_as_exact(lambda tokens: np.asarray(forward(loaded.variables, tokens), np.float64),
+                    theirs(reference), token_draw(0x1498, LONGCAT["vocab_size"], (2, 12)),
+                    "identity-only longcat logits", seeds=IDENTITY_SEEDS, truth_fn=theirs(wide, float64))
