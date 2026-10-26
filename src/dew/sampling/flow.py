@@ -23,7 +23,7 @@ from jax.typing import ArrayLike
 from dew.diffusion.process import Denoiser, Process
 from dew.diffusion.schedules import RectifiedFlow, expand
 from dew.nn.kernels.generation import linear_tangent
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, divided
 
 from .guidance import Guidance, Walk
 from .sample import sample
@@ -255,7 +255,9 @@ def _kl_pullback(saved, operands, cotangent):
     variance = operands[2]
     (scale, scale_power), (part, part_power) = _split(cotangent), _split(difference)
     level, spread = _split(variance)
-    pulled = _scaled(expand(scale / level, part) * part,
+    # The plain order, the product then the division, and the division IEEE's (`divided`), where
+    # XLA:CPU takes a division by a broadcast as a product with its reciprocal.
+    pulled = _scaled(divided(expand(scale, part) * part, expand(level, part)),
                      expand(scale_power - spread, part) + part_power + shift)
     to_variance = _quotient(-(scale * quotient), scale_power + power, variance)
     return pulled, -pulled, _scaled(*to_variance)
