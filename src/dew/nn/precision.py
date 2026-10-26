@@ -703,7 +703,15 @@ def running_sum(shape: tuple[int, ...], dtype: DTypeLike) -> jax.Array:
     pair and the plain sum beside it, where loops compensate (`compensates_loops`), else `[1, *shape]`,
     the plain sum alone. Its leading axis is the form's, so a loop slices and updates the sum's own
     axes one past theirs."""
-    return jnp.zeros((3 if compensates_loops() else 1, *shape), dtype)
+    return paired_sum(shape, dtype) if compensates_loops() else jnp.zeros((1, *shape), dtype)
+
+
+def paired_sum(shape: tuple[int, ...], dtype: DTypeLike) -> jax.Array:
+    """An empty running sum of `shape` that is a double-float pair on every backend, the plain sum
+    beside it (`added_to`, `running_total`): for partials of a product Dew splits where its reference
+    takes the product whole, so the sum's error is the partials' own, whether XLA takes the addition
+    into a GEMM's epilogue or cuBLAS splits a product's sum by its shape (row 1725)."""
+    return jnp.zeros((3, *shape), dtype)
 
 
 def added_to(running: jax.Array, term: jax.Array) -> jax.Array:
