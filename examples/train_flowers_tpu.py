@@ -169,7 +169,7 @@ def main(config: Config) -> Path:
         config = replace(config, clip_model=str(SMOKE_CLIP), inception_weights=str(SMOKE_INCEPTION))
     run = smoke_config(config, config.out) if config.smoke else slice_config(config)
     prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
-                    run.trainer.compilation_cache_dir, layout=run.trainer.layout)
+                    run.trainer.compilation_cache_dir)
     if not config.smoke:
         # Only now: counting devices opens the backend, which has to come
         # after the slice's processes join, and a pool's count is every
