@@ -212,7 +212,7 @@ def test_a_record_whose_packed_fields_differ_in_length_is_refused(read, policy):
     def records(others: tuple[int, int]) -> Memory:
         return Memory([{"text": np.arange(start, start + length, dtype=np.int32),
                         "other": np.arange(100 + start, 100 + start + other, dtype=np.int32)}
-                       for start, length, other in zip((10, 20), (6, 5), others, strict=True)])
+                       for start, length, other in zip((10, 20), (3, 4), others, strict=True)])
 
     def windows(source: Memory) -> list[tuple[list[int], list[int]]]:
         chain = Pipeline(source).pack(4, fields=("text", "other"), policy=policy).batch(1)
@@ -223,8 +223,8 @@ def test_a_record_whose_packed_fields_differ_in_length_is_refused(read, policy):
         finally:
             stream.close()
 
-    for text, other in windows(records((6, 5))):
+    for text, other in windows(records((3, 4))):
         assert [token + 100 if token else 0 for token in text] == other
     with pytest.raises(ValueError):
-        windows(records((3, 7)))
+        windows(records((1, 4)))
 
