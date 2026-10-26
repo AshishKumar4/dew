@@ -23,6 +23,7 @@ fold's reach, and its overflowed rows again shifting under headroom). Its legali
 
 import dataclasses
 import functools
+from collections.abc import Callable
 from typing import NamedTuple
 
 import jax
@@ -153,8 +154,9 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
                      ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, Split]:
     """`MosaicForward`'s training launches at `tiles`, two a form: a walk of the logits alone for each row's
     anchor, its first key at the keys' largest logit (`_peak_consumer`), then the algebra's training step
-    at that anchor (`algebra.Anchored`) taken in place, the split sums `B` and the rows' sums its residuals,
-    with no value row kept or picked; the output is `B` and the anchor's own term over the denominator
+    at that anchor and maximum (`algebra.anchored_step`) taken in place, the split sums `B` and the rows'
+    sums its residuals, with no value row kept or picked; the output is `B` and the anchor's own term over the
+    denominator
     (`algebra.split_output`, `output_of`), its value row gathered in XLA.
 
     A program walks its keys once, so the default's guards compose over whole launches
@@ -286,7 +288,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     (`algebra.walked_launches`). The plain walk's running sums are the family's accumulator, issued into in
     place; the guarded walk (`guard`, its rows `live` shifting) carries them, each tile's product fresh
     (`algebra.stepped`). With `residuals` the walk is the training step's at the `anchors` a peak walk found
-    (`algebra.Anchored`): the accumulator holds the split sums, every key's weighted values but the
+    (`algebra.anchored_step`): the accumulator holds the split sums, every key's weighted values but the
     anchor's, which it stores with the rows' sums and status, no output (the output's anchor term joins in
     XLA, `_trained_forward`)."""
     row, head, kv_head = place
@@ -344,8 +346,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
             return algebra.plain_step(spec, carry, keys), accumulators
         # The sums are the accumulator's, which the step takes the tile into (`Keys.accumulate`).
         state = algebra.Partial(accumulators[0], *carry)
-        accumulate = functools.partial(family.rescaled_products, interpret=interpret)
-        state = algebra.plain_step(spec, state, algebra.Keys(coords, logits, load, dot, accumulate, products))
+        keys = algebra.Keys(coords, logits, load, dot, _accumulated(family, interpret), products)
+        state = algebra.plain_step(spec, state, keys)
         return (state.m, state.total), (state.acc,)
 
     trained = None
@@ -383,36 +385,44 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         family.stored((family.as_row(key),), (residuals.keys,), smem=residuals.keys_smem)
 
 
+def _accumulated(family: mosaic.Family, interpret: bool) -> Callable:
+    """`algebra.Keys.accumulate` on the family's accumulator: the tile's products issued into it in place,
+    after its factor where the step gives one (`Family.rescaled_products`)."""
+    def accumulate(acc, scale, parts, value):
+        if scale is None:
+            return family.register_products(acc, parts, value, interpret)
+        return family.rescaled_products(acc, scale, parts, value, interpret)
+
+    return accumulate
+
+
 def _trained(spec: algebra.Forward, family: mosaic.Family, start: algebra.Partial, known: algebra.Argmax,
              scored, value_of, reach, streams, first, *, interpret: bool) -> tuple[algebra.Partial, tuple]:
     """A training forward consumer's walk of its key tiles `reach` (`[lo, hi)`, the streams' steps from
-    `first`) from `start` at the anchors `known` (`algebra.Anchored`): `algebra.training_step`, its split sums
-    in the family's accumulator, taken in place (`Keys.accumulate`). `scored(index, slots)` gives a tile's
-    place, coordinates, logits and products, and `value_of(slots)` its value slot. Returns the state with the
-    split sums as its sums, and what the walk leaves beside them: the anchor's own weight, the other keys'
-    weights' sum and the anchor keys."""
-    rows, width = start.acc.shape
+    `first`) from `start` at the anchors and keys' largest logits `known` (`algebra.anchored`): each tile
+    `algebra.anchored_step`, its split sums the family's accumulator, which takes each tile's product in place
+    and no factor. `scored(index, slots)` gives a tile's place, coordinates, logits and products, and
+    `value_of(slots)` its value slot. Returns the state with the split sums as its sums, and what the walk
+    leaves beside them: the anchor's own weight, the other keys' weights' sum and the anchor keys."""
+    state, arg, own, others_total = algebra.anchored(spec, start, known)
 
     def dot(lhs, rhs):
         return family.registers_product(lhs, rhs, interpret)
 
     def step(index, slots, carry, accumulators):
-        m, total, arg, own, others_total = carry
+        total, own, others_total = carry
         _, coords, logits, products = scored(index, slots)
-
-        accumulate = functools.partial(family.rescaled_products, interpret=interpret)
-        keys = algebra.Keys(coords, logits, functools.partial(value_of, slots), dot, accumulate, products)
+        keys = algebra.Keys(coords, logits, functools.partial(value_of, slots), dot,
+                            _accumulated(family, interpret), products)
         # The sums are the accumulator's, which the step takes the tile into (`Keys.accumulate`).
-        state = algebra.Partial(accumulators[0], m, total)
-        (state, arg, own, others_total), _ = algebra.training_step(
-            spec, (state, arg, own, others_total), keys, algebra.Anchored())
-        return (state.m, state.total, arg, own, others_total), (state.acc,)
+        walked = algebra.Partial(accumulators[0], state.m, total)
+        walked, _, own, others_total = algebra.anchored_step(spec, (walked, arg, own, others_total), keys)
+        return (walked.total, own, others_total), (walked.acc,)
 
-    nothing = family.zeros((rows,))
-    (m, total, arg, own, others_total), (acc,) = family.walk(
-        streams, ((step, *reach),), (start.m, start.total, known, nothing, nothing), ((rows, width),),
-        interpret, first=first, initial=(start.acc,))
-    return algebra.Partial(acc, m, total), (own, others_total, arg.key)
+    (total, own, others_total), (acc,) = family.walk(
+        streams, ((step, *reach),), (state.total, own, others_total), (state.acc.shape,), interpret,
+        first=first, initial=(state.acc,))
+    return algebra.Partial(acc, state.m, total), (own, others_total, arg.key)
 
 
 def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, peak_views: tuple, q_smem,
@@ -420,7 +430,7 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
                    spans: _Spans | None, hooked: _Hooked, place: tuple, *, hooks: Hooks,
                    interpret: bool) -> None:
     """A peak walk's query block (batch row and head `place`): each row's keys' largest logit, in the walk's
-    units, and the first key that holds it (`algebra.argmax`, the training walk's anchor, `algebra.Anchored`),
+    units, and the first key that holds it (`algebra.argmax`, the training walk's anchor, `algebra.anchored`),
     over the key tiles it reads through the family's key stream, the logits under the score hook as the
     training walk forms them (`_scored`), stored through the row stages to
     `peak_views`. Its turns on the tensor cores and the slots its partner alone reads are the training walk's

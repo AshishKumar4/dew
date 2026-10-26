@@ -443,12 +443,12 @@ ANCHORED_SEEDS = 8
 
 @pytest.mark.parametrize("natural", [False, True], ids=["folded", "natural"])
 def test_a_training_walk_at_its_anchor_known_is_on_par_with_the_gathering_walk(natural):
-    """`algebra.training_step` at each row's anchor known before the walk (`Anchored`, from a walk of
-    `argmax` over the logits alone), as Mosaic's training forward runs it, its split sums in the mainloop's
-    accumulator (`Keys.accumulate`), against the step that finds the anchor as it walks and gathers the old
-    anchor's value row where it moves (the plain-JAX and Triton mainloops'): the same maxima and anchor
-    keys, and its split sums, own weight and row sums on par (check 1 against their float64 values), over
-    bf16 key tiles whose maximum moves, ties among them."""
+    """The training walk at each row's anchor and maximum known before it (`algebra.anchored`, from a walk of
+    `argmax` over the logits alone; `anchored_step`), as Mosaic's training forward runs it, its split sums in
+    the mainloop's accumulator (`Keys.accumulate`), unscaled, against the step that finds the anchor as it
+    walks and gathers the old anchor's value row where it moves (`training_step`, the plain-JAX and Triton
+    mainloops'): the same maxima and anchor keys, and its split sums, own weight and row sums on par (check 1
+    against their float64 values), over bf16 key tiles whose maximum moves, ties among them."""
     queries, width, tile, tiles = 16, 32, 16, 4
     spec = algebra.Forward("full", tiles * tile, ids=False, scale=1.0, natural=natural)
 
@@ -479,17 +479,19 @@ def test_a_training_walk_at_its_anchor_known_is_on_par_with_the_gathering_walk(n
             return values[key]
 
         def accumulated(acc, scale, parts, value):
-            return scale(acc) + algebra.summed_products(parts, value, dot)
+            assert scale is None
+            return acc + algebra.summed_products(parts, value, dot)
 
-        rows: algebra.Gathered | algebra.Anchored = gathered_rows
-        accumulate = None
         if anchored:
             for index in range(tiles):
                 arg = algebra.argmax(arg, logits[index], index * tile + jnp.arange(tile)[None, :])
-            rows, accumulate = algebra.Anchored(), accumulated
-        carry = (start, arg, nothing, nothing)
-        for index in range(tiles):
-            carry, _ = algebra.training_step(spec, carry, keys_at(logits, values, index, accumulate), rows)
+            carry = algebra.anchored(spec, start, arg)
+            for index in range(tiles):
+                carry = algebra.anchored_step(spec, carry, keys_at(logits, values, index, accumulated))
+        else:
+            carry = (start, arg, nothing, nothing)
+            for index in range(tiles):
+                carry, _ = algebra.training_step(spec, carry, keys_at(logits, values, index), gathered_rows)
         state, arg, own, others_total = carry
         return state.acc, state.total, own, others_total, state.m, arg.peak, arg.key
 
