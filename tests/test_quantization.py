@@ -1481,6 +1481,41 @@ def image_flow():
     assert_computed_as_on_the_host(run, "an int8 image task's latents")
 
 
+def test_an_image_task_encodes_through_an_int8_text_tower_as_the_host_does():
+    """An image task's prompt encoding compiles for the towers it runs (`_encoder`, `compiler_options`): a
+    prompt encoded by a T5 tower quantized to int8, widened past the contractions cuBLAS refuses, is as
+    exact as the host's encoding, while the denoiser beside it stays in float. With Triton's GEMMs open to
+    XLA (`with_triton_gemms`)."""
+    with_triton_gemms(int8_tower_flow)
+
+
+def int8_tower_flow():
+    import tempfile
+
+    from dew.inputs.encoders import T5Text
+
+    with tempfile.TemporaryDirectory() as root:
+        task = flux_source(Path(root))
+    keyword, encoder = next((keyword, encoder) for keyword, encoder in task.inputs.encoders
+                            if isinstance(encoder, T5Text))
+    tokens = encoder.tokenize(["a red bird"])
+    wide = encoder.transformer.clone(d_model=64, d_ff=128, head_dim=32)
+    params = wide.init(jax.random.key(3), jnp.asarray(tokens["input_ids"]),
+                       jnp.asarray(tokens["attention_mask"]))
+    tower = Quantization(dtype="int8").apply(wide)
+    held = jax.device_get({**task.variables, "encoders": {**task.variables["encoders"], keyword: params}})
+
+    def run(dtype):
+        condition = task.inputs.conditions[keyword]
+        encoding = dataclasses.replace(encoder, transformer=tower.clone(dtype=dtype))
+        inputs = dataclasses.replace(task.inputs, conditions={
+            **task.inputs.conditions, keyword: dataclasses.replace(condition, encoder=encoding)})
+        walked = dataclasses.replace(task, inputs=inputs, variables=placed(held, dtype))
+        return walked.prepare("a red bird", key=0, steps=2).conditions[keyword].hidden
+
+    assert_computed_as_on_the_host(run, "an int8 text tower's encoding")
+
+
 def test_an_int8_guide_walks_as_the_host_does():
     """A float image task autoguided by its own denoiser quantized to int8 (`Autoguidance`) walks a
     prompt's latents as the same task does on the host: the walk compiles for the guide it runs as
