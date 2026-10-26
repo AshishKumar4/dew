@@ -451,8 +451,8 @@ class Tokenize(grain.MapTransform):
     def costly(self) -> bool:
         """Whether encoding costs more than reading the ids back from a cache
         (`dew.data.pipeline.Costly`): a learned tokenizer's does, Dew's bytes' do not. On an 8-core
-        armada host a 4,000-token BPE took 1.1-1.2 s for 2000 documents of 700 words by index,
-        against 0.7 s read back, and 3.2 s in a memory read, against 0.4 s."""
+        armada host a 4,000-token BPE took 3.3-3.4 s for 2000 documents of 700 words by index or in
+        a memory read, against 0.5 s read back."""
         return self.tokenizer != "byte"
 
     def map(self, element: Batch) -> Batch:
