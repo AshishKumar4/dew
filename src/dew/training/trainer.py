@@ -278,6 +278,14 @@ _DEFAULT_MESH = MeshSpec()
 _DEFAULT_LAYOUT = Layout()
 
 
+def loss_scale(dynamic_scale: bool | dynamic_scale_lib.DynamicScale) -> dynamic_scale_lib.DynamicScale | None:
+    """The dynamic loss scale a trainer's `dynamic_scale` asks for: Flax's at its defaults for True,
+    the one given (its growth interval and factors), or none."""
+    if isinstance(dynamic_scale, dynamic_scale_lib.DynamicScale):
+        return dynamic_scale
+    return dynamic_scale_lib.DynamicScale() if dynamic_scale else None
+
+
 class Trainer(Generic[Loss, Effects]):
     """Runs an `Objective`: gradients, sharding, EMA, checkpoints and logging."""
 
@@ -338,9 +346,7 @@ class Trainer(Generic[Loss, Effects]):
         self._microbatches = microbatches
         self.accumulation = accumulation
         self.split = split
-        # Flax's dynamic loss scale, at its defaults or as given (its growth interval and factors).
-        self._loss_scale = (dynamic_scale if isinstance(dynamic_scale, dynamic_scale_lib.DynamicScale)
-                            else dynamic_scale_lib.DynamicScale() if dynamic_scale else None)
+        self._loss_scale = loss_scale(dynamic_scale)
         self.dynamic_scale = self._loss_scale is not None
         self.checkpoints = checkpoints
         self.tracker = tracker
