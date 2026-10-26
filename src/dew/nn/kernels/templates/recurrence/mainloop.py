@@ -592,6 +592,31 @@ def _landed(landing: dict) -> dict:
     return {name: plgpu.SMEM(shape, dtype) for name, (shape, dtype) in landing.items()}
 
 
+def _persisted(call: _Call, blocks: dict, staging: tuple, tiles: int, threads: int, *, reduces: bool
+               ) -> tuple[int, int]:
+    """A persistent launch's `(stages, programs)`: as many programs as the device's multiprocessors hold at
+    once (`cost.resident`, each thread at a thread's registers, `cost.THREAD_REGISTERS`, as the cost model
+    reads a launch: ptxas's count passes the stated, an H100's states launch's 138 registers against 123,
+    which held it to one program a multiprocessor, SE-family-h100-8def67e3e; `Family.persist`), at most its
+    `tiles`, and its streams' rings two deep where they run on (`mosaic.RingFamily`'s) and a multiprocessor
+    holds as many programs two deep as one, so a tile's loads go out under the last tile's work: a launch of
+    one-step tiles whose program holds a multiprocessor's registers alone (each launch's 255 registers a
+    thread an H100 holds one of, long-scoreboard stalls 51 to 73% of its time, SE-family-h100-80a38c02d). An
+    A100's launches held one program each, a quarter of the warps fla's held, with registers for two
+    (SE-family-a100-8c5b5b16a)."""
+    family = call.family
+
+    def shared(depth: int) -> int:
+        return _allocated(family, {"walked": family.streams(blocks, depth, 1)}, staging, reduces=reduces)
+
+    def holding(depth: int) -> int:
+        return cost.resident(call.target, shared(depth), threads, cost.THREAD_REGISTERS)
+
+    stages = 2 if (isinstance(family, mosaic.RingFamily) and shared(2) <= family.most_shared
+                   and holding(2) == holding(1)) else 1
+    return stages, min(tiles, (call.target.multiprocessors or 1) * holding(stages))
+
+
 def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, stages: int, live,
             work: Work, held: _Held, staging: tuple = (), once: dict | None = None,
             landing: dict | None = None, persistent: bool = False, reduces: bool = True):
@@ -603,33 +628,16 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     Where `planned` collects launches, the launch's record instead (`Launch`, its `work`), and zeros.
 
     A `persistent` launch runs `grid`'s tiles on as many programs as the device's multiprocessors hold at
-    once (`cost.resident`, each thread at a thread's registers, `cost.THREAD_REGISTERS`, as the cost model
-    reads a launch: ptxas's count passes the stated, an H100's states launch's 138 registers against 123,
-    which held it to one program a multiprocessor, SE-family-h100-8def67e3e; `Family.persist`), its
-    streams' rings running on across them, two deep where they do (`mosaic.RingFamily`'s) and a
-    multiprocessor holds as many programs two deep as one, so a tile's loads go out under the last tile's
-    work: a launch of one-step tiles whose program holds a multiprocessor's registers alone (each launch's
-    255 registers a thread an H100 holds one of, long-scoreboard stalls 51 to 73% of its time,
-    SE-family-h100-80a38c02d). An A100's launches held one program each, a quarter of the warps fla's held,
-    with registers for two (SE-family-a100-8c5b5b16a). Its program gives its tile's walk (`_walk`) for the
-    grid's indices `_axis` reads. A program that
-    `reduces` none takes no reduction scratch (`_allocated`; the compile gate holds its plan's shared memory
-    to at least the compiled kernel's)."""
+    once, its streams' rings running on across them (`_persisted`); its program gives its tile's walk
+    (`_walk`) for the grid's indices `_axis` reads. A program that `reduces` none takes no reduction scratch
+    (`_allocated`; the compile gate holds its plan's shared memory to at least the compiled kernel's)."""
     family = call.family
     landed = _landed(landing or {})
     staging = (*staging, landed)
     tiles = math.prod(grid)
     threads = 128 * family.warpgroups(1)
     if persistent:
-        def shared(depth: int) -> int:
-            return _allocated(family, {"walked": family.streams(blocks, depth, 1)}, staging, reduces=reduces)
-
-        def holding(depth: int) -> int:
-            return cost.resident(call.target, shared(depth), threads, cost.THREAD_REGISTERS)
-
-        stages = 2 if (isinstance(family, mosaic.RingFamily) and shared(2) <= family.most_shared
-                       and holding(2) == holding(1)) else 1
-        programs = min(tiles, (call.target.multiprocessors or 1) * holding(stages))
+        stages, programs = _persisted(call, blocks, staging, tiles, threads, reduces=reduces)
     else:
         programs = tiles
     # The walked streams and those loaded once, each its own allocation (a pipelined family's stages are
