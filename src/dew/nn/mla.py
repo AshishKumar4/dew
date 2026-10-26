@@ -55,7 +55,13 @@ from dew.nn.precision import (
 )
 from dew.nn.rope import YarnScaling, deinterleaved, rotary_freqs, rotate, yarn_query_scale
 from dew.nn.sharding import RESIDUAL, constrain, down_projection, logical_axes
-from dew.nn.sparse_selection import index_scores, selection_mask, sparse_latent_attention, top_k_selection
+from dew.nn.sparse_selection import (
+    index_agreements,
+    index_scores,
+    selection_mask,
+    sparse_latent_attention,
+    top_k_selection,
+)
 from dew.quantization import quantized_products
 
 
@@ -170,10 +176,17 @@ class IndexerFront:
         batch, length = q_resid.shape[:2]
         return self.wq_b(jax.lax.stop_gradient(q_resid)).reshape(batch, length, self.n_heads, self.head_dim)
 
+    def agreements(self, query, keys):
+        """Each head's agreement of `query` with `keys` before its relu `[B, S, H, T]`
+        (`index_agreements`): how near zero a key every head disagrees with sits, which a selection's
+        margin reads."""
+        return index_agreements(query, keys, self.precision)
+
     def scored(self, query, keys, hidden):
-        """`query`'s scores against `keys` `[B, S, T]`, its heads weighted by `weights_proj` of the
-        detached `hidden` (`index_scores`)."""
-        return index_scores(query, keys, self.weights_proj(jax.lax.stop_gradient(hidden)), self.precision)
+        """`query`'s scores against `keys` `[B, S, T]`, its heads' agreements weighted by
+        `weights_proj` of the detached `hidden` (`index_scores`)."""
+        return index_scores(self.agreements(query, keys), self.weights_proj(jax.lax.stop_gradient(hidden)),
+                            self.head_dim, self.precision)
 
 
 @logical_axes({
