@@ -23,7 +23,8 @@ import jax
 import numpy as np
 from flax import linen as nn
 
-from dew import records
+from dew import _records
+from dew.batch import Variables
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import Origin, SourceGrid, SourceSchedule
 from dew.inference.loading import place
@@ -45,7 +46,6 @@ from dew.interop.streaming import LazyTree, WeightLayout
 from dew.interop.weights import AUTO, ParamTree, source_alias
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import Variables
 from dew.registry import dtype_name, from_record, resolve_dtype
 from dew.sampling.guidance import CFG
 
@@ -129,7 +129,7 @@ def _call_policy(index: Mapping[str, object], denoiser: _Denoiser) -> _Call:
     if found.family != expected.family:
         raise ValueError(f"The declared pipeline {published!r} is a {found.family} pipeline, and "
                          f"this directory's denoiser belongs to {denoiser.pipeline!r}")
-    if published == "Flux2KleinPipeline" and records.boolean(
+    if published == "Flux2KleinPipeline" and _records.boolean(
         index.get("is_distilled", False), "is_distilled"
     ):
         # A step-distilled [klein] ignores its guidance scale.
@@ -363,7 +363,7 @@ def assemble_pipeline(directory: Path, index: Mapping[str, object], *, dtype: st
     components.update({denoiser.component: denoiser.config, "vae": vae_config})
     height, width = _geometry(index, size)
     # AutoencoderKLWan declares no channel count; it reads RGB.
-    channels = records.integer(vae_config.get("in_channels", 3), "in_channels")
+    channels = _records.integer(vae_config.get("in_channels", 3), "in_channels")
     if denoiser.frames is None:
         sample = Field("image", (height, width, channels))
     else:
@@ -480,7 +480,7 @@ def _unet_denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -
         patch=1,
         latent_input=model.in_channels,
         sample_size=_square(config),
-        context_width=records.integer(config.get("cross_attention_dim", 1280), "cross_attention_dim"),
+        context_width=_records.integer(config.get("cross_attention_dim", 1280), "cross_attention_dim"),
         pipeline="StableDiffusionXLPipeline" if pooled else "StableDiffusionPipeline",
     )
 
@@ -680,7 +680,7 @@ def _component_config(directory: Path, name: str) -> dict:
 
 def _square(config: Mapping[str, object], default: int | None = None) -> tuple[int, int]:
     """A config's `sample_size`, one side of the square its pipeline renders."""
-    side = records.integer(config["sample_size"] if default is None else config.get("sample_size", default),
+    side = _records.integer(config["sample_size"] if default is None else config.get("sample_size", default),
                            "sample_size")
     return side, side
 
@@ -807,21 +807,21 @@ def _qwen_vl_text_config(config: Mapping[str, object]) -> dict:
     """
     if config.get("model_type") != "qwen3_vl":
         raise ValueError(f"Qwen-Image's text encoder is a qwen3_vl model, not {config.get('model_type')!r}")
-    text = dict(records.record(config["text_config"], "text_config"))
+    text = dict(_records.record(config["text_config"], "text_config"))
     if text.get("model_type") != "qwen3_vl_text":
         raise ValueError(f"A qwen3_vl text_config is qwen3_vl_text, not {text.get('model_type')!r}")
-    half = records.integer(text["head_dim"], "head_dim") // 2
+    half = _records.integer(text["head_dim"], "head_dim") // 2
     for key in ("rope_parameters", "rope_scaling"):
         entry = text.get(key)
         if isinstance(entry, Mapping):
             entry = dict(entry)
-            section = records.integers(entry.pop("mrope_section"), "mrope_section")
-            records.boolean(entry.pop("mrope_interleaved", False), "mrope_interleaved")
+            section = _records.integers(entry.pop("mrope_section"), "mrope_section")
+            _records.boolean(entry.pop("mrope_interleaved", False), "mrope_interleaved")
             if sum(section) != half:
                 raise ValueError(f"mrope_section {section} must cover the {half} channel pairs")
             text[key] = entry
     return {**text, "model_type": "qwen3",
-            "tie_word_embeddings": records.boolean(config.get("tie_word_embeddings", False),
+            "tie_word_embeddings": _records.boolean(config.get("tie_word_embeddings", False),
                                                    "tie_word_embeddings")}
 
 
@@ -972,16 +972,16 @@ def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], co
     from dew.data.text import pin_tokenizer
 
     config = _component_config(directory, "text_encoder")
-    kind = records.text(config.get("model_type"), "model_type")
+    kind = _records.text(config.get("model_type"), "model_type")
     pinned = pin_tokenizer(str(directory / "tokenizer"))
     known = _FLUX2_TEXT if pipeline == "flux2" else {"qwen3": _FLUX2_TEXT["qwen3"]}
     if kind not in known:
         raise ValueError(f"The {pipeline} text encoder is one of {sorted(known)}, not {kind!r}")
     template, layers = known[kind]
     multimodal = kind == "mistral3"
-    text = dict(records.record(config["text_config"], "text_config")) if multimodal else config
+    text = dict(_records.record(config["text_config"], "text_config")) if multimodal else config
     if multimodal:
-        text["tie_word_embeddings"] = records.boolean(config.get("tie_word_embeddings", False),
+        text["tie_word_embeddings"] = _records.boolean(config.get("tie_word_embeddings", False),
                                                       "tie_word_embeddings")
     record = decoders.translate_config(text)
     named = dtype_name(compute)
@@ -996,7 +996,7 @@ def _hidden_states_conditioning(directory: Path, index: Mapping[str, object], co
         raise ValueError(f"{pipeline} reads hidden state {max(layers)}, which a {decoder.num_layers}-layer "
                          "encoder does not have before its final norm")
     encoder, layouts, retained = _bind_language_model(
-        directory, record, records.text(text["model_type"], "model_type"), _hidden_states_name(multimodal),
+        directory, record, _records.text(text["model_type"], "model_type"), _hidden_states_name(multimodal),
         lambda bound: HiddenStatesConditioner(
             decoder, pinned.transformers(), bound, str(directory),
             template=template, layers=layers, thinking=pipeline == "z_image", tokens=tokens,

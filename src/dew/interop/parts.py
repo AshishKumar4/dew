@@ -29,7 +29,7 @@ from functools import cache
 from types import FunctionType, MethodType, NoneType
 from typing import TYPE_CHECKING
 
-from dew import records
+from dew import _records
 from dew.interop import decoder_parts
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import ACTIVATIONS, PLAIN_SPELLING, DecoderFields
@@ -454,10 +454,10 @@ def _read_windowed_model(view: PartView) -> Mapping[str, object]:
     window = view.config.sliding_window
     fields = dict(_read_llama_model(view))
     if window is not None:
-        layers = records.integer(fields['num_layers'], 'num_layers')
+        layers = _records.integer(fields['num_layers'], 'num_layers')
         fields.update(layer_types=('sliding_attention',) * layers,
                       kinds={'sliding_attention': native_fields(LayerKind)(
-                          window=records.integer(window, 'sliding_window'))})
+                          window=_records.integer(window, 'sliding_window'))})
     return fields
 
 
@@ -465,13 +465,13 @@ def _read_layer_typed_model(view: PartView) -> Mapping[str, object]:
     """Qwen2's model: each layer attends under its config layer type's mask, a window where it is
     `sliding_attention` (`create_sliding_window_causal_mask` at the config's sliding_window)."""
     fields = dict(_read_llama_model(view))
-    types = tuple(records.strings(view.config.layer_types, 'layer_types'))[:fields['num_layers']]
+    types = tuple(_records.strings(view.config.layer_types, 'layer_types'))[:fields['num_layers']]
     if set(types) - {'full_attention', 'sliding_attention'}:
         raise Ambiguous(f"the layer types {sorted(set(types))} are not attention's full or sliding masks")
     fields['layer_types'] = types
     if 'sliding_attention' in types:
         fields['kinds'] = {'sliding_attention': native_fields(LayerKind)(
-            window=records.integer(view.config.sliding_window, 'sliding_window'))}
+            window=_records.integer(view.config.sliding_window, 'sliding_window'))}
     return fields
 
 
@@ -714,7 +714,7 @@ class _Assembler:
             if key == _LAYER:
                 if layer is None:
                     raise Ambiguous(f"{where} routes outside a layer")
-                self.layers.setdefault(layer, {}).update(records.record(value, _LAYER))
+                self.layers.setdefault(layer, {}).update(_records.record(value, _LAYER))
             elif key in self.fields and self.fields[key] != value:
                 raise Ambiguous(f"{where} states {key}={value!r} where another part states "
                                 f"{self.fields[key]!r}")
@@ -784,10 +784,10 @@ def assemble(model: PreTrainedModel) -> Assembly:
         if len(routes) != 1:
             raise Ambiguous("the routed layers route differently")
         mixture = dict(routes.pop())
-        width = records.integer(mixture['expert_features'], 'expert_features')
+        width = _records.integer(mixture['expert_features'], 'expert_features')
         fields['mixture'] = native_fields(Mixture)(
-            experts=records.integer(mixture['experts'], 'experts'),
-            top_k=records.integer(mixture['top_k'], 'top_k'),
+            experts=_records.integer(mixture['experts'], 'experts'),
+            top_k=_records.integer(mixture['top_k'], 'top_k'),
             norm_topk_prob=bool(mixture['norm_topk_prob']), expert_features=width,
             layers=None if len(routed) == fields['num_layers'] else tuple(routed))
         fields.setdefault('mlp_features', width)

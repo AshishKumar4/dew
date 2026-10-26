@@ -32,14 +32,20 @@ REFERENCE = f"https://huggingface.co/{REPO}/blob/{REVISION}/serve.patch; transfo
 LICENSE = "MIT AND Apache-2.0"
 
 
-def release_blocks():
-    """The release's own module-level block context and transformers mask adapter."""
+def release_source() -> tuple[Path, str]:
+    """The verified patch and the complete readout module it adds."""
     filename = verified(f"https://huggingface.co/{REPO}/raw/{REVISION}/serve.patch",
                         CACHE / REPO / REVISION / "serve.patch", PATCH_SHA256)
     section = filename.read_text().split("diff --git a/qev/readout.py b/qev/readout.py\n", 1)[1]
     section = section.split("\ndiff --git ", 1)[0]
     source = "\n".join(line[1:] for line in section.splitlines()
                        if line.startswith("+") and not line.startswith("+++"))
+    return filename, source
+
+
+def release_blocks():
+    """The release's own module-level block context and transformers mask adapter."""
+    filename, source = release_source()
     return defined_in(source, ("_BLOCKS", "install_noncausal", "blocks", "block_ids"),
                       {"torch": torch, "contextlib": contextlib, "contextvars": contextvars,
                        "importlib": importlib, "Sequence": Sequence}, filename=str(filename))
@@ -162,7 +168,7 @@ def main():
     (args.output / "source.json").write_text(json.dumps(provenance, indent=2) + "\n")
 
 
-def calibrate(directory: Path):
+def calibrate(directory: Path, sites: tuple[str, ...] = ("blocks",)):
     """Declare the recorded site's seeds with the gate's reference-vs-reference sizing, retaining
     enough recorded draws for its redraw policy. No candidate implementation is measured."""
     sys.path.insert(0, str(ROOT / "tests"))
@@ -170,15 +176,20 @@ def calibrate(directory: Path):
 
     path = directory / "reference.npz"
     arrays = recording(path)
-    capacity = len(arrays["blocks.reference.logits"]) // (1 + REDRAW)
-    draw, reference, truth = indexed_recording(arrays, "blocks", capacity)
-    count = seeds_for(reference, draw, "Qwen3.5 block attention", most=capacity, truth_fn=truth)
-    arrays["blocks.seeds"] = np.asarray(count, np.int64)
+    counts, capacities = {}, {}
+    for site in sites:
+        values = next(value for name, value in arrays.items() if name.startswith(f"{site}.reference."))
+        capacity = len(values) // (1 + REDRAW)
+        draw, reference, truth = indexed_recording(arrays, site, capacity)
+        count = seeds_for(reference, draw, site, most=capacity, truth_fn=truth)
+        arrays[f"{site}.seeds"] = np.asarray(count, np.int64)
+        counts[site], capacities[site] = count, capacity
+        print(f"{site}: {count} declared seeds, {capacity} recorded with redraw")
     save(path, arrays, reference=REFERENCE, license=LICENSE)
     provenance = json.loads((directory / "source.json").read_text())
-    provenance.update(seeds=count, recorded_seed_capacity=capacity, sizing_revision=git_head(ROOT))
+    provenance.update(declared_seeds=counts, recorded_seed_capacity=capacities,
+                      sizing_revision=git_head(ROOT))
     (directory / "source.json").write_text(json.dumps(provenance, indent=2) + "\n")
-    print(f"Qwen3.5 block attention: {count} declared seeds, {capacity} recorded with redraw")
 
 
 if __name__ == "__main__":

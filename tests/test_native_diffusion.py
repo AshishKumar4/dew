@@ -200,13 +200,14 @@ def test_a_resized_xl_conditioning_rebuilds_from_its_record_at_its_own_size(save
     own size back."""
     from dew.inputs import Condition
     from dew.interop.pretrained import load_diffusion_source
+    from dew.registry import to_record
 
     source = load_diffusion_source(str(saved_pipelines / "xl"), dtype="float32", attention_impl="xla",
                                    size=(64, 48))
     condition = source.inputs.conditions["conditioning"]
     assert condition.encoder.time_id_values == (64, 48, 0, 0, 64, 48)
     assert source.inputs.sample.shape[:2] == (64, 48)
-    reloaded = Condition.from_json(condition.to_json(), params=condition.encoder.params)
+    reloaded = Condition.bound(to_record(condition, Condition), params=condition.encoder.params)
     assert reloaded.encoder.time_id_values == condition.encoder.time_id_values
 
 

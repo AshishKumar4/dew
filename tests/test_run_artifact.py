@@ -10,7 +10,6 @@ import optax
 import pytest
 
 from dew.checkpoints import Checkpoints
-from dew.config import ModelConfig
 from dew.data import Loading, Memory
 from dew.data.compile import compile
 from dew.data.dataset import Loader
@@ -20,7 +19,7 @@ from dew.diffusion.process import Process
 from dew.inference.projections import unpacked
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.lm import LMObjective
-from dew.registry import from_record, to_record
+from dew.registry import ModelConfig, from_record, to_record
 from dew.training import Trainer
 
 
@@ -125,10 +124,10 @@ def test_an_adapted_policy_run_loads_and_saves_the_policy_it_trained(kind, tmp_p
     rebuild write the files the trained adapter writes, byte for byte, and
     the loaded task and bundle hold the base draw bitwise under `frozen`
     and compute what the trained policy computes."""
+    from dew.batch import FROZEN, part
     from dew.inference import TextGeneration
     from dew.interop import Pretrained
     from dew.lora import Adapter, LoRA
-    from dew.objectives.base import FROZEN, part
     from dew.objectives.rl import DPOObjective, PPOObjective, ValueHead
 
     base = model()
@@ -233,7 +232,7 @@ def test_task_from_pretrained_selects_the_requested_snapshot(tmp_path, monkeypat
     from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
     from dew.nn.diffusion_gemma import DiffusionGemma
     from dew.objectives.diffusion import BlockDiffusionObjective, MaskedDiffusionObjective
-    from dew.training import TrainState
+    from dew.state import TrainState
 
     if kind == "text":
         objective, task_type = LMObjective(model(), 8, ema_decay=None), TextGeneration
@@ -290,7 +289,7 @@ def test_builtin_autoencoder_record_uses_the_saved_parameters():
                            dtype=jnp.float32)
     variables = module.init(jax.random.key(0), image)
     original = StableDiffusionVAE(model=module, params=variables['params'], dtype=jnp.float32)
-    rebuilt = AutoEncoder.from_json(original.to_json(), params=original.params)
+    rebuilt = AutoEncoder.bound(to_record(original, AutoEncoder), params=original.params)
     np.testing.assert_array_equal(original.encode(original.params, image),
                                   rebuilt.encode(rebuilt.params, image))
     latent = original.encode(original.params, image)

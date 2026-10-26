@@ -15,30 +15,32 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.core import meta
 
-from dew.nn.dense import Dense
+from dew.cache import INTERCEPTED
+from dew.nn.dense import _plain_dense
 from dew.nn.precision import biased, float32_dot_general
 
-from ..registry import wrapper_layers
 from .kernels.generation import first_refusal, measured_kernel, ran_kernel
 
 
-def _intercepted() -> bool:
-    """Whether the running call is a wrapped model's (`dew.registry.WrapperClass`: an adapter, an
-    input quantization, Dew's Qwix training) or a Qwix-quantized one's, which intercept their
-    layers' own calls. It reads the outermost module whose method is running: Flax keeps them on
-    a stack, which its lifted transforms (`nn.scan`) leave whole where a scanned layer's parents
-    stop at the scan, and which no public call reads; Qwix reads it the same way
-    (qwix/_src/model.py, `_is_in_nn_module`)."""
+def _direct_qwix_interception() -> bool:
+    """Direct Qwix calls expose no public running-provider query. Keep their active ancestor check
+    here until Flax or Qwix exposes it; lifted transforms retain this stack when parents change.
+    A quantized child may run below an ordinary parent, so every active ancestor matters."""
     from flax.linen.module import _context
 
-    root = type(next(module for module in _context.module_stack if module is not None))
-    return bool(wrapper_layers(root)[1]) or any("_unquantized_type" in vars(layer) for layer in root.__mro__)
+    return any("_unquantized_type" in vars(layer) for module in _context.module_stack if module is not None
+               for layer in type(module).__mro__)
+
+
+def _intercepted() -> bool:
+    """A Dew interception scope, or a direct Qwix scope outside Dew's wrapper entry points."""
+    return INTERCEPTED.value or _direct_qwix_interception()
 
 
 def join_refusal(projections: Sequence[nn.Module]) -> str | None:
     """Why one GEMM cannot stand in for `projections`' own calls, or None."""
     return first_refusal(
-        (all(type(projection) is Dense for projection in projections),
+        (all(_plain_dense(projection) for projection in projections),
          "a projection is not a plain Dense, whose call the join reproduces"),
         (all(projection.dot_general in (None, float32_dot_general) and projection.dot_general_cls is None
              for projection in projections),

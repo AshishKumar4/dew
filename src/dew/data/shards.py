@@ -10,7 +10,7 @@ from collections.abc import Callable, Mapping
 import grain.experimental as experimental
 import grain.python as grain
 
-from dew.records import boolean, record
+from dew._records import boolean, record
 
 from .dataset import LONG_RUN, DataPartition, Loading, logged_run
 from .sources.base import Shard, ShardManifest

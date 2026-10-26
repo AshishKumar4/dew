@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING
 import grain.python as grain
 import numpy as np
 
-from dew.data.dataset import Batch
+from dew.batch import Batch
 from dew.data.facts import shaped
 from dew.data.images import resized_to
 from dew.data.pipeline import Rejected
@@ -163,7 +163,7 @@ class Row(grain.MapTransform):
     caption: str = ""
 
     def map(self, element: Batch) -> Batch:
-        from dew.records import text
+        from dew._records import text
 
         path = text(element.get("video_path", element.get("path")), "video_path")
         return {"mp4": path, "caption": element.get("caption", self.caption)}

@@ -24,8 +24,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from dew._records import JSON
 from dew.objectives.rl.sessions import Status, Task
-from dew.records import JSON
 
 from .gateway import Recorded, engine_failure, number, refused_prompt
 from .harness import Judged, Trial

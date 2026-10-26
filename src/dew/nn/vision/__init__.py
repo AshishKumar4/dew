@@ -51,7 +51,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
-from dew.objectives.base import Variables
+from dew.batch import Variables
 
 from .common import (
     ProjectorBase as ProjectorBase,
@@ -62,41 +62,22 @@ from .common import (
     projector_layout as projector_layout,
     tower_layout as tower_layout,
 )
-from .deepseek_v41 import (
-    DeepseekV41Projector as DeepseekV41Projector,
-    DeepseekV41ProjectorModule as DeepseekV41ProjectorModule,
-    DeepseekV41Vision as DeepseekV41Vision,
-)
-from .gemma3n import (
-    Gemma3nProjector as Gemma3nProjector,
-    Gemma3nProjectorModule as Gemma3nProjectorModule,
-    Gemma3nVision as Gemma3nVision,
-)
+from .deepseek_v41 import DeepseekV41Projector as DeepseekV41Projector, DeepseekV41Vision as DeepseekV41Vision
+from .gemma3n import Gemma3nProjector as Gemma3nProjector, Gemma3nVision as Gemma3nVision
 from .gemma4 import (
     Gemma4Projector as Gemma4Projector,
-    Gemma4ProjectorModule as Gemma4ProjectorModule,
     Gemma4Vision as Gemma4Vision,
     Gemma4VisionTransformer as Gemma4VisionTransformer,
 )
 from .llama4 import (
     Llama4Projector as Llama4Projector,
-    Llama4ProjectorModule as Llama4ProjectorModule,
     Llama4Vision as Llama4Vision,
     Llama4VisionTransformer as Llama4VisionTransformer,
 )
 from .mimo import MiMoProjector as MiMoProjector, MiMoVision as MiMoVision
-from .muse_glimmer import (
-    MuseGlimmerProjector as MuseGlimmerProjector,
-    MuseGlimmerProjectorModule as MuseGlimmerProjectorModule,
-    MuseGlimmerVision as MuseGlimmerVision,
-)
+from .muse_glimmer import MuseGlimmerProjector as MuseGlimmerProjector, MuseGlimmerVision as MuseGlimmerVision
 from .qwen35 import Qwen35Projector as Qwen35Projector, Qwen35Vision as Qwen35Vision
-from .siglip import (
-    GemmaProjector as GemmaProjector,
-    GemmaProjectorModule as GemmaProjectorModule,
-    SiglipVision as SiglipVision,
-    SiglipVisionTransformer as SiglipVisionTransformer,
-)
+from .siglip import GemmaProjector as GemmaProjector, SiglipVision as SiglipVision
 from .vit import (
     MergeProjector as MergeProjector,
     VisionTransformer as VisionTransformer,
