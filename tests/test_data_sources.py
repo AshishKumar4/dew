@@ -1851,6 +1851,32 @@ def test_artifact_codec_preserves_extended_numpy_dtypes():
     assert restored["scalar"] == values["scalar"]
 
 
+@pytest.mark.parametrize("value", [
+    np.arange(24, dtype=np.uint8).reshape(2, 3, 4),
+    np.asfortranarray(np.arange(12, dtype=np.float32).reshape(3, 4)),
+    np.arange(6, dtype=">i4"),
+    np.asarray(3.5, dtype=np.float64),
+    np.zeros((0, 5), dtype=np.int16),
+    np.asarray([True, False]),
+    np.asarray(["ab", "cde"]),
+    np.asarray([b"ab", b"c"]),
+    np.asarray([1, 2], dtype="datetime64[ns]"),
+    np.zeros(2, dtype=[("x", "<f4"), ("y", "<i8")]),
+    np.arange(2 ** 17, dtype=np.int64).reshape(256, 512),
+], ids=["uint8-3d", "fortran", "big-endian", "0d", "empty", "bool", "unicode", "bytes", "datetime",
+        "structured", "long-header-free"])
+def test_artifact_codec_reads_back_every_array_as_saved(value):
+    """Every array a record holds reads back as it was saved, its dtype, shape, memory order and
+    values, whether its header is read straight or by `np.load`, and owns its writable memory."""
+    from dew.data.sources.codec import decode, encode
+
+    restored = decode(encode({"value": value}))["value"]
+    assert restored.dtype == value.dtype and restored.shape == value.shape
+    assert restored.flags.f_contiguous == value.flags.f_contiguous or value.ndim < 2
+    assert restored.flags.writeable
+    np.testing.assert_array_equal(restored, value)
+
+
 def test_content_fingerprint_preserves_array_identity_and_sequence_order():
     from dew.data.sources.codec import content_fingerprint, decode, encode
 

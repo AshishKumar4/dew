@@ -25,7 +25,7 @@ from dew.data.sources.base import Read, Shard, ShardManifest, Source, _indexed_m
 from dew.data.sources.codec import decode, fingerprint
 from dew.data.sources.index import ArrayIndex
 from dew.data.sources.records import ArrayRecords
-from dew.data.storage import Store, Versioned
+from dew.data.storage import Store, Versioned, local
 
 if TYPE_CHECKING:
     from dew.data.cache import Cache
@@ -468,7 +468,9 @@ class Generation:
         def opened(path: str) -> ArrayRecords:
             root = Store(self.manifest["root"], self.storage_options)
             if path not in verified:
-                _checked(root.cached(), self.manifest["shards"][path])
+                # A remote shard is checked as its mirror holds it, which its reader then reads; a
+                # local one in place, where a mirror would copy it beside itself.
+                _checked(root if local(root.resolve()[0]) else root.cached(), self.manifest["shards"][path])
                 verified.add(path)
             return ArrayRecords((root.child(path).url,), self.storage_options)
 

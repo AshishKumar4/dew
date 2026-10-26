@@ -9,6 +9,7 @@ import importlib
 import io
 import json
 import math
+import re
 import struct
 from collections.abc import Iterable, Mapping
 from decimal import Decimal
@@ -46,8 +47,33 @@ def _dtype(value: np.ndarray) -> dict[str, str]:
     return {}
 
 
+_NPY_HEADER = re.compile(rb"\{'descr': '([<>|=][a-zA-Z][0-9]*)', 'fortran_order': (True|False), "
+                         rb"'shape': \(([0-9, ]*)\), \}")
+"""The header `np.save` writes for an array of one plain dtype, which `_saved` reads without
+evaluating it: a record's arrays are read back one by one, and `np.load` evaluates each header as
+Python (`ast.literal_eval`), a tenth of a millisecond each."""
+
+
+def _saved(encoded: bytes) -> np.ndarray:
+    """The array `np.save` wrote as `encoded`: one of a plain dtype read straight from its bytes, any
+    other (a structured dtype's header names its fields) by `np.load`."""
+    if encoded[:6] == b"\x93NUMPY" and encoded[6] in (1, 2, 3):
+        width = 2 if encoded[6] == 1 else 4
+        size = int.from_bytes(encoded[8:8 + width], "little")
+        start = 8 + width + size
+        header = _NPY_HEADER.fullmatch(encoded[8 + width:start].rstrip())
+        if header is not None:
+            descr, order, dims = header.groups()
+            shape = tuple(int(dim) for dim in dims.split(b",") if dim.strip())
+            dtype = np.dtype(descr.decode())
+            count = math.prod(shape)
+            values = np.frombuffer(encoded, dtype, count=count, offset=start)
+            return values.reshape(shape, order="F" if order == b"True" else "C").copy(order="K")
+    return np.load(io.BytesIO(encoded), allow_pickle=False)
+
+
 def _array(node: dict, leaves: Mapping[str, bytes], kind: str) -> np.ndarray:
-    value = np.load(io.BytesIO(leaves[str(node[kind])]), allow_pickle=False)
+    value = _saved(leaves[str(node[kind])])
     if "dtype" in node:
         value = value.view(np.dtype(node["dtype"]))
     return value
