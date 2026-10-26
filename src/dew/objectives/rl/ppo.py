@@ -12,6 +12,7 @@ from flax import linen as nn, struct
 
 from dew._coordination import agreed, from_every_process
 from dew.batch import Variables, part
+from dew.distributed.batches import shard_batch
 from dew.inference.tasks import Processor, TextGeneration, TextSettings
 from dew.nn.dense import Dense
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
@@ -35,7 +36,6 @@ from dew.rl.advantage import gae_advantages, masked_whiten
 from dew.rl.surrogate import clipped_value_loss_terms
 from dew.sampling.text import Generation, Sampling
 from dew.state import TrainState
-from dew.training.distributed import shard_batch
 
 from .episodes import EpisodeCollector, EpisodeInference
 from .grpo import GRPOObjective, onto_ids

@@ -120,6 +120,7 @@ def build(args: argparse.Namespace) -> Run:
     from work import measure
 
     from dew.batch import coordinates
+    from dew.distributed.batches import batch_shardings
     from dew.interop import Pretrained
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.multimodal import MultimodalTransformer
@@ -127,7 +128,6 @@ def build(args: argparse.Namespace) -> Run:
     from dew.objectives.routing import ExpertBalance
     from dew.optim import Cosine, OptimConfig, ParamGroup
     from dew.training import MeshSpec, Trainer
-    from dew.training.distributed import batch_shardings
     from dew.training.planning import Timer
 
     data = np.load(args.data)

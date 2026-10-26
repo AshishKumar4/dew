@@ -22,11 +22,11 @@ def mode_prefix_generation(args) -> dict:
     from block_support import model as block_model
 
     from dew.distributed import PeerFailure
+    from dew.distributed.batches import shard_batch
     from dew.inference import TextGeneration
     from dew.nn.inputs import ModelInputs, mesh_of
     from dew.nn.mixers import AttentionMixer
     from dew.training import Layout, MeshSpec
-    from dew.training.distributed import shard_batch
 
     rank, processes = jax.process_index(), jax.process_count()
     model = block_model(1, full_attention={"mixer": AttentionMixer(bidirectional_blocks=True)})
