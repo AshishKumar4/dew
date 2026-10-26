@@ -1391,21 +1391,50 @@ def source_route(config: Mapping[str, object], *,
     modeling code the load opted into running (`trust_remote_code`)."""
     source_quantization(config)
     decoder_parts.refuse_drafter(config)
+    if (route := _native_route(config)) is not None:
+        return route
+    match verified(config) if remote is None else verified(config, remote=remote):
+        case verify.VerifiedMapping() as mapping:
+            return VerifiedRoute(mapping)
+        case verify.Unmapped() as unmapped:
+            from dew.interop import torchax_fallback
+
+            torchax_fallback.refuse_quantized(config)
+            return TorchRoute((admitted or torchax_fallback.admitted)(unmapped))
+
+
+def _native_route(config: Mapping[str, object]) -> DecoderRoute | WrapperRoute | DiffusionGemmaRoute | None:
+    """The route of a source Dew translates itself, on its config alone: DiffusionGemma, a media wrapper
+    or a registered decoder family; None for an unregistered model_type (tiers 2 and 3)."""
     family = config.get("model_type")
     if family == "diffusion_gemma":
         return DiffusionGemmaRoute()
     if _media_wrapper(config):
         return WrapperRoute(decoders.translate_wrapper_config(config))
     if isinstance(family, str) and family not in decoders.families():
-        match verified(config) if remote is None else verified(config, remote=remote):
-            case verify.VerifiedMapping() as mapping:
-                return VerifiedRoute(mapping)
-            case verify.Unmapped() as unmapped:
-                from dew.interop import torchax_fallback
-
-                torchax_fallback.refuse_quantized(config)
-                return TorchRoute((admitted or torchax_fallback.admitted)(unmapped))
+        return None
     return DecoderRoute(decoders.translate_config(config))
+
+
+def _lazy_route(config: Mapping[str, object]) -> DecoderRoute | WrapperRoute:
+    """The route of a source read one tensor at a time (`native_backbone`): an unquantized registered
+    decoder or its media wrapper, of a family whose preparation leaves its tensors as they are stored.
+    Any other source is refused on its config, before any weight is read or any verification runs."""
+    if source_quantization(config) is not None:
+        raise ValueError("a lazy read takes unquantized safetensors; a whole-model codec is not bounded")
+    decoder_parts.refuse_drafter(config)
+    match _native_route(config):
+        case DecoderRoute() | WrapperRoute() as route:
+            text = _records.text(route.wrapper["text_model_type"] if isinstance(route, WrapperRoute)
+                                 else config["model_type"], "model_type")
+            entry = decoders.family_entry(text)
+            if entry.prepare is not decoder_parts.DecoderFamily.prepare or entry.packed:
+                raise ValueError(f"a lazy read takes a family whose tensors translate as they are stored; "
+                                 f"{text}'s preparation can materialize checkpoint weights")
+            return route
+        case _:
+            raise ValueError(f"a lazy read takes a registered native decoder or its media wrapper, not "
+                             f"{config.get('model_type')!r}")
 
 
 def _media_wrapper(config: Mapping[str, object]) -> bool:
@@ -1548,10 +1577,9 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
     component = description.backbone
     head_source = description.head
     directory = source.directory(root)
-    backbone, prefix = None, ""
+    backbone = None
     shared: Mapping[str, np.ndarray] = {}
     if component is not None:
-        prefix = component.tensor_prefix
         # The route of the config the backbone translates, a mamba_ssm one's normalized as
         # `_load_native_source` normalizes it. The transformers forward reads its backbone's weights
         # itself, and none without them; the shared file is read for it only where the head is stored
@@ -1559,7 +1587,7 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
         routed = (mamba2.config_from_mamba_ssm(component.config) if mamba2.is_mamba_ssm(component.config)
                   else component.config)
         forwarded = isinstance(source_route(routed), TorchRoute)
-        reads_shared = not forwarded or bool(head_source.weight_file is None and prefix)
+        reads_shared = not forwarded or bool(head_source.weight_file is None and component.tensor_prefix)
         if weights or reads_shared:
             weight_source = source.component(component.weights_folder)
             root = weight_source.weights(root)
@@ -1578,7 +1606,7 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
         _unread_overrides(overrides, "a release without a native backbone")
     missing = False
     if head_source.weight_file is None:
-        head_tensors = {name: tensor for name, tensor in shared.items() if not name.startswith(prefix)}
+        head_tensors = {} if component is None else component.other_tensors(shared)
     else:
         path = (source.file(root, head_source.weight_file) if head_source.initialize is None
                 else source.optional_file(root, head_source.weight_file))
@@ -1649,6 +1677,76 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, text_only: boo
     return config, route, language
 
 
+class _Translated(NamedTuple):
+    """A native source translated (`_translated`): its model bound, and what `save` needs to write a
+    quantized source back (`_decoded`)."""
+
+    built: _Built
+    quantized_tensors: tuple[str, ...]
+    scale_dtype: str | None
+    grid: dict[str, np.ndarray]
+
+
+def _translated(config: Mapping[str, object],
+                route: DecoderRoute | WrapperRoute | DiffusionGemmaRoute | VerifiedRoute,
+                tensors: Mapping[str, np.ndarray], directory: Path, *, dtype: str, param_dtype: str,
+                attention_impl: str, max_seq_len: int | None, streaming: bool) -> _Translated:
+    """`config`'s native model and variables over `tensors`, as `route` reads them: a quantized source's
+    weights decoded, the decoder, media wrapper or DiffusionGemma translated and checked against its
+    tree, and any stored input scales bound. No processor, generation config or bundle is built."""
+    tensors, quantized_tensors, scale_dtype, grid, checked = _decoded(
+        tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype,
+        media=isinstance(route, WrapperRoute))
+    match route:
+        case DiffusionGemmaRoute():
+            from dew.interop import diffusion_gemma
+
+            model = diffusion_gemma.build(
+                config, dtype=dtype, attention_impl=attention_impl, max_seq_len=max_seq_len
+            )
+            # The vision layouts are the export's alone: the bundle's own are derived from its tree, as
+            # every adapter (LoRA's projections) reads them.
+            variables, vision = diffusion_gemma.translate_weights(tensors, config, param_dtype=param_dtype,
+                                                                  lazy=streaming,
+                                                                  checked=checked)
+            built = _Built(model, variables, config,
+                           {**config, "dtype": dtype, "attention_impl": attention_impl}, (), {},
+                           partial(diffusion_gemma.export_weights, vision=vision))
+        case WrapperRoute(wrapper=wrapper):
+            built = _wrapper_source(
+                config, wrapper, tensors, directory, dtype=dtype, attention_impl=attention_impl,
+                max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming, checked=checked)
+        case DecoderRoute() | VerifiedRoute():
+            built = _decoder_source(
+                config, tensors, directory, route, dtype=dtype, attention_impl=attention_impl,
+                max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming,
+                quantized=source_quantization(config) is not None, checked=checked)
+    model, variables = _input_quantization(built.model, built.variables, built.layouts, config, grid)
+    return _Translated(built._replace(model=model, variables=variables), quantized_tensors, scale_dtype, grid)
+
+
+def native_backbone(directory: str | Path, *, param_dtype: str) -> tuple[Mapping[str, object], Variables]:
+    """The native backbone a local source holds, its config and variables, every leaf a `SourceLeaf`
+    that reads its tensor from the read-only memory-mapped safetensors only when it is read: a decoder,
+    a media wrapper around one, or the backbone a release with a separately stored readout describes,
+    translated and checked as `Pretrained.load` translates it, with no processor, generation config or
+    bundle. Its route is a lazy one (`_lazy_route`); a source without safetensors weights is refused
+    before any translation. `param_dtype` is a dtype name or 'auto'."""
+    from dew.interop.safetensors_io import read_weights
+
+    folder = Path(directory)
+    description = _composite_description(folder)
+    component = (NativeComponent(_source_config(str(folder), folder, None, None)[0]) if description is None
+                 else description.backbone)
+    if component is None:
+        raise ValueError(f"{folder} holds a standalone readout and no native backbone")
+    translated = _translated(component.config, _lazy_route(component.config),
+                             component.own_tensors(read_weights(folder / component.weights_folder)), folder,
+                             dtype="float32", param_dtype=param_dtype, attention_impl="reference",
+                             max_seq_len=None, streaming=True)
+    return component.config, translated.built.variables
+
+
 def _load_native_source(source: sources.SourceReference, root: Path, *,
                         gguf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
                         dtype: str, param_dtype: str, attention_impl: str,
@@ -1694,35 +1792,10 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
     if language is not None:
         tensors = _language_model_tensors(tensors, language)
-    tensors, quantized_tensors, scale_dtype, grid, checked = _decoded(
-        tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype,
-        media=isinstance(route, WrapperRoute))
-    built: Mapping[str, object]
-    match route:
-        case DiffusionGemmaRoute():
-            from dew.interop import diffusion_gemma
-
-            model = diffusion_gemma.build(
-                config, dtype=dtype, attention_impl=attention_impl, max_seq_len=max_seq_len
-            )
-            # The vision layouts are the export's alone: the bundle's own are derived from its tree, as
-            # every adapter (LoRA's projections) reads them.
-            variables, vision = diffusion_gemma.translate_weights(tensors, config, param_dtype=param_dtype,
-                                                                  lazy=streaming,
-                                                                  checked=checked)
-            record, layouts, retained = config, (), {}
-            built = {**config, "dtype": dtype, "attention_impl": attention_impl}
-            export_adapter = partial(diffusion_gemma.export_weights, vision=vision)
-        case WrapperRoute(wrapper=wrapper):
-            model, variables, record, built, layouts, retained, export_adapter = _wrapper_source(
-                config, wrapper, tensors, directory, dtype=dtype, attention_impl=attention_impl,
-                max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming, checked=checked)
-        case DecoderRoute() | VerifiedRoute():
-            model, variables, record, built, layouts, retained, export_adapter = _decoder_source(
-                config, tensors, directory, route, dtype=dtype, attention_impl=attention_impl,
-                max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming,
-                quantized=source_quantization(config) is not None, checked=checked)
-    model, variables = _input_quantization(model, variables, layouts, config, grid)
+    translated = _translated(config, route, tensors, directory, dtype=dtype, param_dtype=param_dtype,
+                             attention_impl=attention_impl, max_seq_len=max_seq_len, streaming=streaming)
+    model, variables, record, built, layouts, retained, export_adapter = translated.built
+    quantized_tensors, scale_dtype, grid = translated[1:]
     resolved_commit = commit
     if component is None and commit is not None:
         resolved_commit = root.name
