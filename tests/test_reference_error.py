@@ -756,14 +756,14 @@ def test_a_recorded_truth_over_windows_counts_one_window_and_checks_every_one():
                     truth(0, widened(draw(0)))
 
 
-def _recorded_pairs(dew, reference, count: int):
-    """`dew` and `reference` recorded at `count` pilot seeds from SIZING_FROM on, each looked up by its
-    seed, with the float64 product's truth, and the seeds each lookup was asked for."""
+def _recorded_pairs(dew, reference, count: int, missing=()):
+    """`dew` and `reference` recorded at `count` pilot seeds from SIZING_FROM on but the `missing` ones,
+    each looked up by its seed, with a truth of zero, and the seeds the reference was asked for."""
     from reference_error import SIZING_FROM
 
     pilots = range(SIZING_FROM, SIZING_FROM + count)
     mine = {seed: dew(seed) for seed in pilots}
-    theirs = {seed: reference(seed) for seed in pilots}
+    theirs = {seed: reference(seed) for seed in pilots if seed not in missing}
     asked = []
 
     def recorded(seed):
@@ -807,6 +807,13 @@ def test_a_recorded_reference_with_pilots_sizes_paired_on_them_alone():
     assert max(asked) < SIZING_FROM + 24
     with pytest.raises(KeyError):
         recorded_pilots(reference, draw, 25)
+    holed, _, _, _ = _recorded_pairs(unit, unit, 24, missing={SIZING_FROM + 5})
+    with pytest.raises(KeyError):
+        recorded_pilots(holed, draw, 24)
+    # Arms that agree exactly resolve at once, at the ceiling itself.
+    same, same_dew, zero, _ = _recorded_pairs(unit, unit, 24)
+    assert seeds_for(recorded_pilots(same, draw, 24), draw, "at the ceiling", start=24, dew_fn=same_dew,
+                     truth_fn=zero) == 24
     with pytest.raises(AssertionError):
         seeds_for(held, draw, "start past the pilots", start=32, dew_fn=dew, truth_fn=truth)
     with pytest.raises(ValueError):
