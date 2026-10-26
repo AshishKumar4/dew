@@ -29,12 +29,9 @@ from dew.decision.layout import (
     question_owners,
     with_context,
 )
-from dew.decision.questions import KINDS, Choice, Question, Score
+from dew.decision.questions import Choice, Question
 
 NONE_OF_THE_ABOVE = "none of the above"
-
-_SCORE = KINDS.index(Score)
-
 
 @dataclass(frozen=True)
 class Encoding:
