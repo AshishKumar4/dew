@@ -46,13 +46,13 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import SingleDeviceSharding
 
-from dew._coordination import agreed, byte_groups, collective_host
+from dew._coordination import agreed, byte_groups
 from dew._records import JSON
 from dew.batch import Variables
 from dew.devices import primary_context
 from dew.nn.inputs import mesh_of
 
-from .rollouts import _on_every, _post, _served, _vllm_publication
+from .rollouts import _on_every, _post, _published, _vllm_publication
 
 if TYPE_CHECKING:
     import httpx
@@ -225,7 +225,9 @@ class NCCLPush:
     describes the handshake and the push in full.
 
     - `source` is the `Pretrained` the replicas were launched from; its
-      `export` gives the tensors.
+      `export` gives the tensors, of the trained tree and of every other tree
+      the source exports (a decision release's readout), each gathered from
+      the pool to process 0 first.
     - `engines` are the replicas' root URLs, not their `/v1` API URLs.
     - `library` is the engine's own libnccl.so.2, because NCCL refuses a
       peer of another version when the group opens.
@@ -267,11 +269,11 @@ class NCCLPush:
         # Process 0 holds the gathered policy, so it sends, from its first device of the mesh.
         sender = jax.local_devices()[0] if mesh is None else next(
             device for device in mesh.devices.flat if device.process_index == 0)
-        served = collective_host(_served(variables, jnp.dtype(self.dtype)), phase="weight push gather",
-                                 held_by="first")
+        # Every tree the source exports, a decision release's readout beside the trained backbone.
+        published = _published(self.source, variables, jnp.dtype(self.dtype), phase="weight push gather")
         self.timings["gather"] = time.perf_counter() - began
-        agreed("weight push", lambda: None if served is None else self._push(
-            served, SingleDeviceSharding(sender), sender.local_hardware_id, version))
+        agreed("weight push", lambda: None if published is None else self._push(
+            published, SingleDeviceSharding(sender), sender.local_hardware_id, version))
         self.timings["total"] = time.perf_counter() - began
 
     def close(self) -> None:
@@ -288,9 +290,9 @@ class NCCLPush:
                 self._library.abort(comm)
         self._groups.clear()
 
-    def _push(self, served: Variables, target: SingleDeviceSharding, ordinal: int, version: int) -> None:
+    def _push(self, published: Pretrained, target: SingleDeviceSharding, ordinal: int, version: int) -> None:
         began = time.perf_counter()
-        exported = self.source.export(served)
+        exported = published.export()
         names = sorted(exported)
         tensors = [exported[name] for name in names]
         self.timings["export"] = time.perf_counter() - began

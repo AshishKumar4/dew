@@ -2204,6 +2204,29 @@ def matrix_data(read: str, cached: str, rejecting: bool, packed: bool, cache_dir
                    loading=Loading(workers=0, threads=1, read_buffer=1))
 
 
+def mode_decision_publish(args) -> dict:
+    """The slot release at `--release`, placed over the pool's devices with its readout partitioned
+    across the processes (`Layout(min_shard=1)`), published as both publishers gather it: written by
+    `SafetensorsReload` into `--run-dir`, and exported as `NCCLPush` sends it, into the `.npz` beside
+    the report. Every process takes part; process 0 writes both."""
+    import jax
+    import jax.numpy as jnp
+
+    from dew.inference.rollouts import SafetensorsReload, _published
+    from dew.interop import Pretrained
+    from dew.training import Layout, MeshSpec
+
+    mesh = MeshSpec(fsdp=jax.device_count()).build()
+    placed = Pretrained.load(args.release, dtype="float32", attention_impl="xla", mesh=mesh,
+                             layout=Layout(min_shard=1, tolerance=1.0))
+    SafetensorsReload(placed, Path(args.run_dir), (), "vllm", dtype="float32").write(placed.variables)
+    published = _published(placed, placed.variables, jnp.dtype("float32"), phase="push gather")
+    if published is not None:
+        np.savez(args.out.with_suffix(".npz"), **published.export())
+    leaves = jax.tree.leaves(placed.head_variables)
+    return {"partitioned": any(not leaf.is_fully_addressable for leaf in leaves)}
+
+
 def mode_matrix(args) -> dict:
     """Train one cell of the data matrix (`--cell read,cache,rejecting,packed`)
     for `--steps`, from where the run directory's checkpoint left it. `batches`
@@ -2231,6 +2254,7 @@ def mode_matrix(args) -> dict:
 
 
 MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget,
+         "decision_publish": mode_decision_publish,
          "host_training": mode_host_training, "step_fits": mode_step_fits,
          "whole_validation": mode_whole_validation, "host_fields": mode_host_fields,
          "topology": mode_topology, "data": mode_data, "packed": mode_packed,
@@ -2281,6 +2305,7 @@ def parse_args(argv=None):
     parser.add_argument("--elastic", action="store_true",
                         help="read the training records through a compiled global order, whose "
                              "saved position is a global record count")
+    parser.add_argument("--release", help="the decision release the decision_publish mode places and publishes")
     parser.add_argument("--profile-dir", help="directory the scheduled profile window writes")
     parser.add_argument("--cell", help="read,cache|nocache|published,rejecting|all,packed|rows for the "
                                        "matrix mode")
