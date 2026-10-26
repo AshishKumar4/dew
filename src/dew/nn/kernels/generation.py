@@ -831,7 +831,11 @@ def linear_map(apply: Callable, pullback: Callable, residuals, moving):
     derivative in `residuals` (a higher order's)."""
     import jax
 
-    out_aval = jax.tree.map(jax.typeof, jax.eval_shape(apply, residuals, moving))
+    # The output's type as `apply` traces it, its sharding included: a shape and dtype alone
+    # (`jax.eval_shape`'s) drop an explicit axis's, and reverse mode would hand the pullback its cotangent
+    # unsharded (row 1759).
+    traced, shapes = jax.make_jaxpr(apply, return_shape=True)(residuals, moving)
+    out_aval = jax.tree.unflatten(jax.tree.structure(shapes), traced.out_avals)
     in_avals = jax.tree.map(jax.typeof, (residuals, moving))
     return _linear_primitive()(apply, pullback, in_avals, out_aval)(residuals, moving)
 
