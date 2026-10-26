@@ -145,8 +145,9 @@ def _automatically(stage: Stage) -> bool:
 def _automatic(pipeline: Pipeline, read: Read, root: str | None) -> Pipeline:
     """`pipeline` with a cache at `root` after its leading deterministic record maps, where such a
     cache could stand and the chain writes none: each corpus of a mixture or phases its own. The
-    maps are the ones a cache keys (`_cacheable`) and reads again unchanged (none `_volatile`); the
-    cache stands for them only in a memory or indexed read, by each input's place in a store whose
+    maps are the ones a cache keys (`_cacheable`) and reads again unchanged (none `_volatile`), and
+    in an indexed read none that rejects, which a cache would read per share; the cache stands for
+    them only in a memory or indexed read, by each input's place in a store whose
     content is named, in a clean checkout whose steps are exact (`Manifest`), and nowhere else, so a
     chain no cache could serve reads as it is written, never refused. It holds the records the maps
     make, and fills, publishes, replays and evicts as `cache(url)` does (`Cache`), so a run reads the
@@ -161,7 +162,10 @@ def _automatic(pipeline: Pipeline, read: Read, root: str | None) -> Pipeline:
     if any(isinstance(stage, Artifact) for stage in _steps(pipeline)):
         return pipeline
     def kept(stage: Stage) -> bool:
-        return isinstance(stage, (Map, MapWithIndex)) and _cacheable(stage) and not _volatile(stage)
+        # An indexed read reads a cache that drops records as a stream, per share (`_indexed_cache`),
+        # where the chain written reads them in one global order: its prefix keeps every record.
+        return (isinstance(stage, (Map, MapWithIndex)) and _cacheable(stage) and not _volatile(stage)
+                and not (read == "indexed" and stage.rejects))
 
     at = next((index for index, stage in enumerate(pipeline.stages) if not kept(stage)), len(pipeline.stages))
     if not at or not pipeline.source.supports(read):
