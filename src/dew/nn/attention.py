@@ -1020,8 +1020,11 @@ def gathered_keys_attention(kernel, query, key, value, shards: int, *, causal,
             bias = jnp.pad(bias, ((0, 0),) * (bias.ndim - 2) + ((0, padding), (0, 0)))
 
     # A key length the shards do not divide takes no sequence axis, and
-    # arrives whole instead of gathered.
+    # arrives whole instead of gathered; so do no keys, whose all-gather
+    # does not lower.
     queries, keys = logical_spec(HEADS, query.shape), logical_spec(KV_HEADS, key.shape)
+    if not kv_len:
+        keys = P(_entry(keys, 0), None, *keys[2:])
     gathered = SEQUENCE_AXIS in mesh_axes(_entry(keys, 1))
     extras = {}
     for name, x in (('mask', mask), ('bias', bias)):
