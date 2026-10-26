@@ -270,6 +270,14 @@ _DEFAULT_MESH = MeshSpec()
 _DEFAULT_LAYOUT = Layout()
 
 
+def loss_scale(dynamic_scale: bool | dynamic_scale_lib.DynamicScale) -> dynamic_scale_lib.DynamicScale | None:
+    """The dynamic loss scale a trainer's `dynamic_scale` asks for: Flax's at its defaults for True,
+    the one given (its growth interval and factors), or none."""
+    if isinstance(dynamic_scale, dynamic_scale_lib.DynamicScale):
+        return dynamic_scale
+    return dynamic_scale_lib.DynamicScale() if dynamic_scale else None
+
+
 class Trainer(Generic[Loss, Effects]):
     """Runs an `Objective`: gradients, sharding, EMA, checkpoints and logging."""
 
@@ -284,7 +292,7 @@ class Trainer(Generic[Loss, Effects]):
         microbatches: int | None = None,
         accumulation: int = 1,
         split: int | None = None,
-        dynamic_scale: bool = False,
+        dynamic_scale: bool | dynamic_scale_lib.DynamicScale = False,
         checkpoints: Checkpoints | None = None,
         tracker: Tracker | None = None,
         step: Callable[[Objective[Loss, Effects], optax.GradientTransformation], StepFn] | None = None,
@@ -330,7 +338,8 @@ class Trainer(Generic[Loss, Effects]):
         self._microbatches = microbatches
         self.accumulation = accumulation
         self.split = split
-        self.dynamic_scale = dynamic_scale
+        self._loss_scale = loss_scale(dynamic_scale)
+        self.dynamic_scale = self._loss_scale is not None
         self.checkpoints = checkpoints
         self.tracker = tracker
         self.step = step
@@ -448,8 +457,9 @@ class Trainer(Generic[Loss, Effects]):
             step=jnp.zeros((), jnp.int32),
             microstep=jnp.zeros((), jnp.int32),
             updates=jnp.zeros((), jnp.int32),
-            scale=(jax.tree.map(jnp.asarray, dynamic_scale_lib.DynamicScale())
-                   if self.dynamic_scale else None),
+            # A state of its own, the given scale's leaves copied: the step donates the state.
+            scale=None if self._loss_scale is None else jax.tree.map(
+                lambda leaf: jnp.array(leaf, copy=True), self._loss_scale),
             window_size=jnp.asarray(self.accumulation, jnp.int32),
             variables=params,
             opt_state=self._boxed_init(initialized, params["params"]),

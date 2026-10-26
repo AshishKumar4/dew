@@ -2,7 +2,6 @@
 
 Replay and effect commits are Dew transaction policies; Optax and Flax oracle their arithmetic.
 """
-import dataclasses
 
 import jax
 import jax.numpy as jnp
@@ -11,6 +10,7 @@ import optax
 import pytest
 from affine_run import raw_leaf
 from flax import struct
+from flax.training import dynamic_scale as dynamic_scale_lib
 from reference_error import assert_as_exact
 
 from dew.batch import under
@@ -74,15 +74,13 @@ def batches():
                  "bad": jnp.array(bad), "active": jnp.array(1)}
             for mask, bad in [([1., 0.], False), ([1., 1.], True), ([.5, 1.], False), ([1., 1.], False)]]
 
-class ShortScaleTrainer(Trainer[Ratio | Terms, None]):
-    def initial_state(self, initializer=None, key=None):
-        state = super().initial_state(initializer, key)
-        return dataclasses.replace(state, scale=dataclasses.replace(state.scale, growth_interval=1))
+SHORT_SCALE = dynamic_scale_lib.DynamicScale(growth_interval=1)
+"""A dynamic loss scale that grows after every finite step, so a few steps reach its growth."""
 
 
 def trainer(composite=False, k=2, checkpoints=None):
-    return ShortScaleTrainer(Tiny(composite), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9),
-                   accumulation=k, dynamic_scale=True, checkpoints=checkpoints)
+    return Trainer(Tiny(composite), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9),
+                   accumulation=k, dynamic_scale=SHORT_SCALE, checkpoints=checkpoints)
 
 
 def test_a_commit_counts_the_tokens_of_its_windows_microbatches_alone():
@@ -335,6 +333,21 @@ def test_an_accumulating_step_updates_the_optimizer_in_its_commit_alone():
                         if instruction.op not in moving
                         and any(".mu" in read or ".nu" in read for read in instruction.reads))
     assert not speculated, speculated
+
+
+def test_a_given_loss_scale_starts_each_state_of_its_own():
+    """A trainer given its dynamic loss scale (`Trainer(dynamic_scale=...)`) starts each state from
+    a copy of it: the step donates its state, so a scale of arrays, as Flax's updates leave one, is
+    still whole after a step for the next state and for another trainer given it."""
+    scale = jax.tree.map(jnp.asarray, dynamic_scale_lib.DynamicScale(growth_interval=1))
+    first = Trainer(Tiny(), optax.sgd(.03), key=jax.random.PRNGKey(9), dynamic_scale=scale)
+    state = first.initial_state()
+    batch = batches()[0]
+    first.compile(state, batch)(state, batch)
+    again = Trainer(Tiny(), optax.sgd(.03), key=jax.random.PRNGKey(9), dynamic_scale=scale)
+    for trainer in (first, again):
+        held = trainer.initial_state().scale
+        np.testing.assert_array_equal(np.asarray(held.scale), np.asarray(scale.scale))
 
 
 CLIPPED_STEP_SEEDS = 64
