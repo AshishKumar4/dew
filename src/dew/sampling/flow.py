@@ -21,7 +21,7 @@ from flax import struct
 from jax.typing import ArrayLike
 
 from dew.diffusion.process import Denoiser, Process
-from dew.diffusion.schedules import RectifiedFlow, expand
+from dew.diffusion.schedules import RectifiedFlow, divided, expand
 from dew.nn.precision import at_least_fp32
 
 from .guidance import Guidance, Walk
@@ -78,6 +78,8 @@ class GaussianTransition:
         # The form of JAX's isotropic `multivariate_normal.logpdf` (a scalar covariance): log(2 pi) and
         # the log variance summed apart, so a variance near float32's largest does not overflow 2 pi
         # times it. Each row has its own variance, which that function would take one row at a time.
+        # Halved after the sum, the density itself: a draw's error over its own variance is its
+        # chi-squared count, which no transition's draw takes near float32's largest.
         log_prob = -0.5 * (error / safe_variance
                            + dimensions * (jnp.log(2 * math.pi) + jnp.log(safe_variance)))
         return jnp.where(variance > 0, log_prob, jnp.nan)
@@ -94,13 +96,41 @@ class GaussianTransition:
         reference_mean = jnp.asarray(reference_mean, mean.dtype)
         if reference_mean.shape != mean.shape:
             raise ValueError("reference and policy transition means must share one shape")
-        error = jnp.square(mean - reference_mean).sum(axis=tuple(range(1, mean.ndim)))
+        difference = mean - reference_mean
         safe_variance = jnp.where(variance > 0, variance, 1)
+        error = jnp.square(difference).sum(axis=tuple(range(1, mean.ndim)))
         deterministic = jnp.where(error == 0, 0.0, jnp.inf)
-        # Halved before the division, an exact power of two: twice a variance near float32's largest
-        # overflows, as does an error over a variance near its least, where half the quotient fits.
-        return jnp.where(variance > 0, error / 2 / safe_variance,
+        return jnp.where(variance > 0, _gaussian_kl(difference, safe_variance),
                          jnp.where(variance == 0, deterministic, jnp.nan))
+
+
+@jax.custom_jvp
+def _gaussian_kl(difference: jax.Array, variance: jax.Array) -> jax.Array:
+    """`|difference|**2 / (2 variance)`, one row a `variance`, as one division of operands in range: the
+    variance doubled where that is finite, else the squared error halved, an error over so wide a
+    variance far above float32's least. Halving the error alone left half an error near its least below
+    the normal range, which XLA:CPU flushes to zero (a KL of 0 where it is 0.5), and halving the
+    quotient after overflowed where half of it fits. Its derivative is `_gaussian_kl_jvp`'s."""
+    error = jnp.square(difference).sum(axis=tuple(range(1, difference.ndim)))
+    doubled = 2 * variance
+    wide = doubled == jnp.inf
+    return jnp.where(wide, error * 0.5, error) / jnp.where(wide, variance, doubled)
+
+
+@_gaussian_kl.defjvp
+def _gaussian_kl_jvp(primals, tangents):
+    """The KL's derivative as each element's slope `difference / variance`, one division an element,
+    against the tangent, so neither a tangent over a variance near float32's least (`4 / 2**-126`,
+    whose half fits) nor a cotangent over one near its largest leaves the range before the slope meets
+    it; a variance's tangent moves it by `-KL / variance`, taken as the tangent over the variance first,
+    so an untouched variance's zero tangent is a zero term whatever the KL's size."""
+    (difference, variance), (difference_tangent, variance_tangent) = primals, tangents
+    value = _gaussian_kl(difference, variance)
+    # IEEE division (`divided`): XLA:CPU takes a division by a broadcast as a product with its
+    # reciprocal, which a variance near float32's largest takes below the normal range.
+    slope = divided(difference, expand(variance, difference))
+    moved = (slope * difference_tangent).sum(axis=tuple(range(1, difference.ndim)))
+    return value, moved - value * (variance_tangent / variance)
 
 
 def flow_transition(x: ArrayLike, velocity: ArrayLike, sigma: ArrayLike,

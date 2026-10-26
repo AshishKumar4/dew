@@ -44,7 +44,7 @@ from typing_extensions import TypeIs, TypeVar
 from dew._distributions import counter_key
 from dew._records import JSON
 from dew.artifacts import Artifact, Artifacts, TokenScores
-from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, everything, part
+from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, dicts, everything, part
 from dew.nn import categorical
 from dew.nn.kernels.options import compiler_options
 from dew.nn.precision import accumulated, at_least_fp32, compensated_sum, weighted_total
@@ -272,6 +272,10 @@ class Step:
     witness: Witness | None = struct.field(pytree_node=False, default=None)
     """The evaluation's collector of what `sample` and `boundary` produce, which `Objective._loss` opens
     inside the trace of a recording step (`record`); None otherwise."""
+    qk_stats: bool = struct.field(pytree_node=False, default=False)
+    """Whether the run's optimizer reads the step's attention logit maxima (`dew.optim.clips_qk`, its
+    QK-Clip): the objective opens the `qk` collection in the model calls it trains through and returns
+    what they sowed (`Aux.qk_stats`). Static, as opening a collection changes the program."""
 
     def places(self, rows: int) -> tuple[jax.Array, int]:
         """The places among the update's examples of a batch's `rows` rows (`examples`) and how many
@@ -399,8 +403,9 @@ class Aux(Generic[Effects]):
     one-tuple of an fp32 `[rows, heads]` array of per-head logit maxima, and
     an MLA layer also holds `qk_nope`, an int scalar giving its nope width.
     Rows are the batch's rows, with microbatches concatenated under a
-    pipeline. It is None when the loss never opened the collection, and then
-    the clip does nothing."""
+    pipeline. It is None where the step asked for none (`Step.qk_stats`),
+    and empty where it asked and no layer sowed any; a run whose optimizer
+    clips by it refuses a step that returns None."""
     effects: Effects | None = None
     """Additive observations that `Objective.apply_effects` applies once per optimizer commit."""
     record: Evaluated | Recorded | None = None
@@ -721,7 +726,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         The constructor keeps the model as `model`, the module the objective
         trains, which `program_key` names by default. A loaded task's tree, its
         projections packed for serving, is held as the model's own tree
-        (`dew.inference.projections.unpacked`).
+        (`dew.inference.projections.unpacked`), and a tree of Flax `FrozenDict`s
+        (a loaded task's) as dicts (`dew.batch.dicts`).
         """
         from dew.inference.projections import unpacked
 
@@ -731,7 +737,8 @@ class Objective(ABC, Generic[Loss, Effects]):
             model = source.model
         else:
             model = source
-        self.variables = None if variables is OMITTED or variables is None else unpacked(model, variables)
+        self.variables = None if variables is OMITTED or variables is None else dicts(
+            unpacked(model, variables))
         self.processor = None if processor is OMITTED else processor
         return model
 

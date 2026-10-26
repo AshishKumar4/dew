@@ -11,13 +11,15 @@ never separates a pair; the loss reads them in TRL's stacked order.
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
 
 from dew.artifacts import TokenScores
-from dew.batch import Variables
+from dew.batch import VALID_ROWS, Variables
 from dew.data.preferences import IDS_KEY, MASK_KEY
 from dew.inputs import Field, InputSpec
 from dew.objectives.base import Aux, EMASpec
+from dew.objectives.routing import ExpertBalance
 from dew.rl.surrogate import preference_logsigmoid_terms
 
 from ..lm.objective import TokenScorer
@@ -32,6 +34,10 @@ class DPOObjective(TokenScorer):
     one less than the row width; the completion mask says which targets
     count. Validation scores the chosen responses' perplexity under the
     policy.
+
+    `balance` trains the routers of a mixture as `ExpertBalance` describes
+    (`dew.objectives.routing`), over the completion tokens each half's forward
+    reads: both halves of every pair route, and the counts sum over them.
     """
 
     ema_is_reference = True
@@ -43,10 +49,11 @@ class DPOObjective(TokenScorer):
     scored_fields = (IDS_KEY, MASK_KEY)
     """Validation scores the chosen responses of the pairs alone, for their perplexity."""
 
-    def __init__(self, model, seq_len: int, beta: float = 0.1, **options):
+    def __init__(self, model, seq_len: int, beta: float = 0.1, *, balance: ExpertBalance | None = None,
+                 **options):
         if beta <= 0:
             raise ValueError(f"beta scales the KL term, so it is positive, got {beta}")
-        super().__init__(model, seq_len, **options)
+        super().__init__(model, seq_len, balance=balance, **options)
         self.ema = EMASpec.constant(1.0)
         # The batch is `input_ids` pairs, chosen then rejected, not text windows.
         self.inputs = InputSpec(sample=Field(IDS_KEY, (2, seq_len + 1)))
@@ -97,18 +104,43 @@ class DPOObjective(TokenScorer):
         # The policy and its reference score both halves in one forward each, through the same
         # function, so a policy equal to its reference earns zero rewards wherever the two compile alike.
         pairs = jnp.concatenate((chosen_ids, rejected_ids))
-        policy = self.token_scores(variables, pairs, qk_stats=self.qk_stats, predict=predict)
+        policy = self.token_scores(variables, pairs, qk_stats=step.qk_stats, predict=predict,
+                                   routing=self.balance is not None)
         policy_chosen, policy_rejected = jnp.split(-policy.losses, 2)
         ref_chosen, ref_rejected = jnp.split(-self.token_scores(step.ema, pairs).losses, 2)
         terms, (pair_chosen, pair_rejected) = preference_logsigmoid_terms(
             policy_chosen, policy_rejected, ref_chosen, ref_rejected,
             chosen_mask, rejected_mask, self.beta)
         accuracy, _ = self.accuracy((pair_chosen > pair_rejected).astype(jnp.float32), batch).mean()
-        return self.row_mean(terms, batch), Aux[Variables]({
+        statistics = self.row_mean(terms, batch)
+        reported = {
             "rewards/chosen": pair_chosen.mean(),
             "rewards/rejected": pair_rejected.mean(),
             "accuracy": accuracy,
-        }, qk_stats=policy.qk), policy
+        }
+        effects = None
+        if self.balance is not None:
+            statistics, effects, metrics = self.balance.compose(
+                variables, statistics, policy.routing or {}, self._routed_batch(batch),
+                self._routed_queries(batch), {})
+            reported.update(metrics)
+        return statistics, Aux[Variables](reported, qk_stats=policy.qk, effects=effects), policy
+
+    def _routed_queries(self, batch) -> jax.Array:
+        """The router positions that count, `[2 * pairs, seq_len]`: each half's completion tokens among its
+        inputs, the chosen halves first as `pairs` stacks them, and none in a repeat row (`VALID_ROWS`)."""
+        mask = jnp.asarray(batch[MASK_KEY])
+        rows = self.row_weights(batch, mask.shape[0]) > 0
+        completed = jnp.concatenate((mask[:, 0, :-1], mask[:, 1, :-1])) != 0
+        return completed & jnp.concatenate((rows, rows))[:, None]
+
+    def _routed_batch(self, batch):
+        """The batch with each pair's row weight on both of its halves' rows, the rows the routers' statistics
+        count (`ExpertBalance.compose`); a batch without `VALID_ROWS` is read as it is."""
+        if VALID_ROWS not in batch:
+            return batch
+        rows = self.row_weights(batch, batch[IDS_KEY].shape[0])
+        return {**batch, VALID_ROWS: jnp.concatenate((rows, rows))}
 
     def _evaluation_scores(self, params, batch, step) -> TokenScores:
         """The chosen responses' per-token cross entropies, with the shifted

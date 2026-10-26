@@ -51,7 +51,7 @@ from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import DPOObjective, GRPOObjective, sessions
-from dew.registry import models, projectors, resolve_dtype, towers
+from dew.registry import models, projectors, read_arguments, resolve_dtype, towers
 from dew.state import TrainState
 from dew.telemetry.benchmark import carried
 from dew.training import Layout, MeshSpec, Trainer
@@ -142,11 +142,12 @@ def image_tokens(case: Case) -> int:
     return features.shape[1]
 
 
-def objective_keywords(case: Case) -> dict[str, Any]:
+def objective_keywords(case: Case, constructor: Callable[..., Objective]) -> Mapping[str, Any]:
     """The case's own objective keywords (`Case.objective`), with its head chunking where it names one:
-    what every language-model objective it builds, a decoder's or a canvas's, is given."""
+    what every language-model objective it builds, a decoder's or a canvas's, is given, each read against
+    `constructor`'s arguments as a run's record is (`dew.registry.read_arguments`)."""
     chunks: dict[str, Any] = {} if case.head_chunks is None else {"head_chunks": case.head_chunks}
-    return {**chunks, **case.objective}
+    return read_arguments(constructor, {**chunks, **case.objective})
 
 
 def decoder_objective(
@@ -156,19 +157,20 @@ def decoder_objective(
     with its own head chunking where it names one and its further objective
     keywords. Masked diffusion corrupts to the vocabulary's last id, which
     `global_batch` never draws."""
-    keywords = objective_keywords(case)
     match case.decoder_objective:
         case "lm":
-            return LMObjective(model, case.seq_len, **keywords)
+            return LMObjective(model, case.seq_len, **objective_keywords(case, LMObjective))
         case "sft":
-            return LMObjective(model, case.seq_len, loss_role=Role.ASSISTANT, **keywords)
+            return LMObjective(model, case.seq_len, loss_role=Role.ASSISTANT,
+                               **objective_keywords(case, LMObjective))
         case "dpo":
-            return DPOObjective(model, case.seq_len, **keywords)
+            return DPOObjective(model, case.seq_len, **objective_keywords(case, DPOObjective))
         case "grpo":
-            return GRPOObjective(model, case.seq_len, **keywords)
+            return GRPOObjective(model, case.seq_len, **objective_keywords(case, GRPOObjective))
         case "mdlm":
             vocab = _count(case.config, "vocab_size", case.architecture)
-            return MaskedDiffusionObjective(model, MDLM(mask_id=vocab - 1)(), case.seq_len, **keywords)
+            return MaskedDiffusionObjective(model, MDLM(mask_id=vocab - 1)(), case.seq_len,
+                                            **objective_keywords(case, MaskedDiffusionObjective))
 
 
 def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
@@ -209,7 +211,8 @@ def build_objective(case: Case, attention_impl: AttentionImpl = 'auto', *,
             raise ValueError(f"{case.label} trains canvases, which BlockDiffusionObjective scores; "
                              f"it names decoder_objective={case.decoder_objective!r}")
         objective = BlockDiffusionObjective(
-            model, prompt_length=prompt, canvas_size=width, num_canvases=count, **objective_keywords(case))
+            model, prompt_length=prompt, canvas_size=width, num_canvases=count,
+            **objective_keywords(case, BlockDiffusionObjective))
     elif case.media is not None:
         family, tower, projector, token = media_values(case)
         # The decoder carries the attention kernel; the wrapper reads none.

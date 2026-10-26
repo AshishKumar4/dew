@@ -2,45 +2,32 @@
 
 import dataclasses
 import functools
-from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Sequence
 from typing import TYPE_CHECKING
 
-import grain.python as pygrain
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
 
-from dew._records import integer, record
 from dew.artifacts import Decisions
-from dew.batch import FROZEN, Batch, Variables, part
-from dew.data.pipeline import Configured, ObjectiveData, Pack, Rejected
+from dew.batch import FROZEN, Batch, Variables, dicts, part
+from dew.data.pipeline import Configured, ObjectiveData
 from dew.data.text import HFTokenizer, Tokenizer
 from dew.decision.calibration import Temperatures
-from dew.decision.data import Example
 from dew.decision.head import DecisionHead, Head
 from dew.decision.layout import (
     OPTION_TILE,
-    OPTIONS,
-    QUESTION_FIELDS,
     Bounds,
     DecisionInputs,
-    Encoded,
     JointLayout,
     Layout,
-    QuestionField,
-    QuestionLayout,
     Specials,
-    compacted,
     default_layout,
-    labelled_rows,
-    question_fields,
-    question_owners,
-    with_context,
 )
 from dew.decision.model import DecisionModel
-from dew.decision.questions import KINDS, Choice, Question, Score
+from dew.decision.questions import KINDS, Score
+from dew.decision.rows import ConfigureLayout, Fit, PackedRows, QuestionRows, _rows, packing
 from dew.decision.scoring import LogLoss, ScoringRule
 from dew.decision.task import Decide, DecideSettings, Weights, laid_out
 from dew.inference.loading import RunProcessor
@@ -69,167 +56,7 @@ from dew.objectives.base import (
 if TYPE_CHECKING:
     from dew.state import TrainState
 
-NONE_OF_THE_ABOVE = "none of the above"
-
 _SCORE = KINDS.index(Score)
-
-
-@dataclass(frozen=True)
-class Encoding:
-    """How a labelled example becomes the row a step packs and trains on.
-
-    A row is its own tokens, at most `max_len`, one slot per question it lays
-    out and `width` option slots each. A layout of one row per question lays
-    out one answered question; a joint layout lays out every question of the
-    example, scoring the answered ones. With `shuffle`, a choice's options are
-    laid out in a fresh random order every time the row is read (Laya's
-    `--shuffle-options`), while a score's levels and a noul's two answers keep
-    their order, and a joint row asks its questions in a fresh order too.
-    With `none_of_the_above` p, a choice with a single right answer gains a
-    "none of the above" option with probability p, and half of those also
-    lose their right option, which makes "none of the above" the right
-    answer. That teaches the model to say
-    that no option fits instead of picking the nearest wrong one. Each scored
-    slot's target is its gold distribution (`Example.distribution`) in the
-    order the row shows the options. A reader passes the state's `tokens` it
-    fitted the example with (`Fit`), which the row lays out again.
-
-    With a `context_length`, a row also carries its example's context as
-    `context`, the tokens of its text (`render`), a context longer than
-    `context_length` refused (`Fit`), and none for an example without one.
-    """
-
-    layout: Layout
-    tokenizer: Tokenizer
-    specials: Specials
-    width: int
-    shuffle: bool = True
-    none_of_the_above: float = 0.0
-    context_length: int | None = None
-    grouped: bool = False
-    """Whether each row carries its questions' consistency groups (`_grouped`), an objective with a
-    consistency term's rows; every row then carries them, an example of none with none in each."""
-
-    def __call__(self, example: Example, names: Sequence[str], rng: np.random.Generator | None,
-                 tokens: np.ndarray | None = None) -> Batch:
-        labels = example.labels()
-        if rng is not None and self.shuffle and self.layout.joint:
-            names = [names[int(index)] for index in rng.permutation(len(names))]
-        asked: dict[str, Question] = {}
-        golds: dict[str, np.ndarray] = {}
-        dropped: dict[str, str | None] = {}
-        for name in names:
-            question = example.questions[name]
-            gold = example.distribution(name) if name in labels else None
-            if (
-                name in example.answers
-                and isinstance(question, Choice)
-                and rng is not None
-                and rng.random() < self.none_of_the_above
-            ):
-                original = question
-                question, label = _none_of_the_above(question, labels[name], drop=rng.random() < 0.5)
-                gold = np.eye(len(question.options))[label]
-                gone = [key for key in original.options if key not in question.options]
-                # The augmentation's own option: it stands for the option it replaced, or for none.
-                dropped[name] = gone[0] if gone else None
-            asked[name] = question
-            if gold is not None:
-                golds[name] = gold
-        orders = (
-            {
-                name: [int(slot) for slot in rng.permutation(len(question.options))]
-                for name, question in asked.items()
-                if isinstance(question, Choice)
-            }
-            if rng is not None and self.shuffle
-            else None
-        )
-        rows = self.layout.rows(self.tokenizer, self.specials, example.state, asked, orders=orders,
-                                tokens=None if tokens is None else tokens.tolist())
-        # A run over a backbone that reads no context leaves an example's own context unread.
-        rows = with_context(rows, self.tokenizer, None if self.context_length is None else example.context,
-                            self.context_length)
-        if len(rows) != 1:
-            raise ValueError(f"an encoding lays out one row, and the layout gave {len(rows)}")
-        encoded = rows[0]
-        length = self.layout.max_len
-        if not self.layout.fits(encoded):
-            raise ValueError(f"the row needs {len(encoded.tokens)} tokens, more than max_len={length}")
-        for laid in encoded.questions:
-            count = len(asked[laid.name].options)
-            if len(laid.options) != count:
-                raise ValueError(
-                    f"{count - len(laid.options)} of question {laid.name!r}'s {count} options "
-                    f"fall past max_len={length}; raise it or shorten the question"
-                )
-            if count > self.width:
-                raise ValueError(f"a question of {count} options outgrows the encoding's {self.width} slots")
-        questions = len(encoded.questions)
-        row: Batch = {
-            "tokens": np.asarray(encoded.tokens, np.int32),
-            **question_fields(encoded, questions, self.width, labelled_rows([encoded])),
-            **{field.name: field.empty(questions, self.width) for field in TRAINING_FIELDS
-               if field.when == "trained"},
-        }
-        if self.grouped:
-            row["groups"], row["canonical"] = _grouped(example, encoded, asked, dropped, self.width)
-        for slot, laid in enumerate(encoded.questions):
-            count = len(laid.options)
-            if laid.name in golds:
-                shown = golds[laid.name][list(laid.order)]
-                row["targets"][slot, :count] = shown
-                row["labels"][slot] = int(np.argmax(shown))
-                row["scored"][slot] = True
-        if encoded.positions is not None and encoded.slots is not None:
-            row["positions"] = np.asarray(encoded.positions, np.int32)
-            row["slots"] = np.asarray(encoded.slots, np.int32)
-        if encoded.blocks is not None:
-            row["blocks"] = np.asarray(encoded.blocks, np.int32)
-        if self.context_length is not None:
-            row["context"] = np.asarray(encoded.context or (), np.int32)
-        return row
-
-
-
-def _grouped(example: Example, encoded: Encoded, asked: Mapping[str, Question],
-             dropped: Mapping[str, str | None], width: int) -> tuple[np.ndarray, np.ndarray]:
-    """The row's consistency fields along its questions: each question's group in the example
-    (`Example.groups`), -1 for none, and each of its option slots' canonical option in that group,
-    the slot as the row shows it (`Laid.order`), -1 for padding and for an option the group does not
-    map. A "none of the above" the augmentation added (`dropped` names the question) that stands for
-    the option it dropped maps to that option's canonical one, and one added beside every option to
-    none; a question's own option of that name maps as its group says."""
-    groups, canonical = (field.empty(len(encoded.questions), width) for field in TRAINING_FIELDS
-                         if field.when == "grouped")
-    for slot, laid in enumerate(encoded.questions):
-        found = example.group_of(laid.name)
-        if found is None:
-            continue
-        index, group = found
-        keys = sorted(set(next(iter(group.members.values())).values()))
-        mapped = group.members[laid.name]
-        groups[slot] = index
-        options = asked[laid.name].options
-        for shown, option in enumerate(laid.order):
-            key = options[option]
-            if key == NONE_OF_THE_ABOVE and laid.name in dropped:
-                key = dropped[laid.name]
-            if key is not None and key in mapped:
-                canonical[slot, shown] = keys.index(mapped[key])
-    return groups, canonical
-
-
-def _none_of_the_above(question: Choice, label: int, *, drop: bool) -> tuple[Choice, int]:
-    """`question` with a "none of the above" option last, and without its
-    right option when `drop`; the new label."""
-    described = dict(zip(question.options, question.descriptions, strict=True))
-    right = question.options[label]
-    if drop:
-        described.pop(right)
-    described[NONE_OF_THE_ABOVE] = "none of the other options fits"
-    options = list(described)
-    return Choice(question.instructions, described), options.index(NONE_OF_THE_ABOVE if drop else right)
 
 
 def _tokenizer_of(processor: TaskProcessor | None) -> Tokenizer | None:
@@ -250,258 +77,6 @@ def _tokenizer_of(processor: TaskProcessor | None) -> Tokenizer | None:
             return HFTokenizer(str(tokenizer.name_or_path), local_files_only=True)
         case _:
             return None
-
-
-@dataclass(frozen=True)
-class FittedRow:
-    example: Example
-    names: tuple[str, ...]
-    length: int
-    truncated: bool
-    tokens: np.ndarray
-    """The state's tokens, which the encoding lays out again, as int32: a read
-    held in memory keeps them for every example."""
-
-
-@dataclass(frozen=True)
-class Fit(pygrain.MapTransform):
-    layout: Layout
-    tokenizer: Tokenizer
-    specials: Specials
-    head: Head
-    context_length: int | None = None
-    """The most context tokens the backbone's cross-attention reads, or None where it reads none: an
-    example whose context is longer refuses the run (ValueError) where the data reads it, which the
-    data plan's compile meets before training for data read into memory and a streamed or indexed
-    read meets at that record, so no example is silently cut or dropped."""
-    grouped: bool = False
-    """Whether the objective reads consistency groups, whose members a layout of a question a row lays
-    out in different rows: an example with groups under one refuses the run (ValueError)."""
-    rejects = True
-
-    def map(self, element: Batch) -> Batch | Rejected:
-        example = Example.of(element.get("example", element))
-        labels = example.labels()
-        if not labels:
-            return Rejected("unlabelled")
-        asked = example.questions if self.layout.joint else {name: example.questions[name] for name in labels}
-        state = self.layout.state(self.tokenizer, self.specials, example.state)
-        laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked, tokens=state)
-        if not all(map(self.layout.fits, laid)):
-            return Rejected("unfit")
-        if self.context_length is not None:
-            with_context(laid, self.tokenizer, example.context, self.context_length)
-        if self.grouped and example.groups and not self.layout.joint:
-            raise ValueError(f"an example's consistency groups {[group.name for group in example.groups]} "
-                             "stand in one row, and a layout of a question a row lays their members out "
-                             "apart; group them under a joint layout, or train without consistency")
-        self.head.validate_rows(laid)
-        tokens = np.asarray(state, np.int32)
-        fitted = tuple(
-            FittedRow(
-                example,
-                tuple(question.name for question in row.questions),
-                len(row.tokens),
-                row.state_kept < row.state_tokens,
-                tokens,
-            )
-            for row in laid
-        )
-        return (
-            {
-                "decision": fitted[0],
-                "_dew_length": fitted[0].length,
-                "_dew_truncated": fitted[0].truncated,
-                "_dew_bounds": {
-                    "slots": {
-                        "questions": len(asked),
-                        "options": max(len(question.options) for question in asked.values()),
-                    }
-                },
-            }
-            if self.layout.joint
-            else {"decision_rows": fitted}
-        )
-
-
-@dataclass(frozen=True)
-class QuestionRows:
-    def flat_map(self, element: Batch) -> Sequence[Batch]:
-        return tuple(
-            {"decision": row, "_dew_length": row.length, "_dew_truncated": row.truncated}
-            | {
-                "_dew_bounds": {
-                    "slots": {
-                        "questions": 1,
-                        "options": max(len(row.example.questions[name].options) for name in row.names),
-                    }
-                }
-            }
-            for row in element["decision_rows"]
-        )
-
-
-def _fitted(element: Batch) -> FittedRow:
-    fitted = element["decision"]
-    if not isinstance(fitted, FittedRow):
-        raise ValueError("decision encoding needs the fitted decision row")
-    return fitted
-
-
-@dataclass(frozen=True)
-class LayoutRows(pygrain.RandomMapTransform):
-    encoding: Encoding
-
-    def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
-        fitted = _fitted(element)
-        return self.encoding(fitted.example, fitted.names, rng, fitted.tokens)
-
-
-@dataclass(frozen=True)
-class EvaluateRows(pygrain.MapTransform):
-    encoding: Encoding
-
-    def map(self, element: Batch) -> Batch:
-        fitted = _fitted(element)
-        return self.encoding(fitted.example, fitted.names, None, fitted.tokens)
-
-
-@dataclass(frozen=True)
-class ConfigureLayout:
-    layout: Layout
-    tokenizer: Tokenizer
-    specials: Specials
-    shuffle: bool
-    none_of_the_above: float
-    train: bool
-    context_length: int | None = None
-    grouped: bool = False
-
-    def __call__(self, metadata: Mapping[str, object]) -> LayoutRows | EvaluateRows:
-        slots = record(metadata["slots"], "decision slots")
-        width = integer(slots.get("options"), "slots.options") + int(self.none_of_the_above > 0)
-        if width < 1:
-            raise ValueError("decision source slot maxima must be positive")
-        encoding = Encoding(self.layout, self.tokenizer, self.specials, width, self.shuffle,
-                            self.none_of_the_above, self.context_length, self.grouped)
-        return LayoutRows(encoding) if self.train else EvaluateRows(encoding)
-
-
-TRAINING_FIELDS = (QuestionField("labels", (), np.int32, when="trained"),
-                   QuestionField("scored", (), np.bool_, when="trained"),
-                   QuestionField("targets", (OPTIONS,), np.float32, when="trained"),
-                   QuestionField("groups", (), np.int32, fill=-1, when="grouped"),
-                   QuestionField("canonical", (OPTIONS,), np.int32, fill=-1, when="grouped"))
-"""The fields along a training row's questions beside the model's (`QUESTION_FIELDS`): each question's
-gold `labels`, whether it is `scored`, its soft `targets` over its option slots, and, where its
-questions stand in consistency groups (`Example.groups`), each one's group and each option slot's
-`canonical` option, -1 for none."""
-
-
-def _along(layout: Layout, grouped: bool = False) -> tuple[str, ...]:
-    """The fields along the questions of `layout`'s training rows (`QUESTION_FIELDS`,
-    `TRAINING_FIELDS`): its readout's where its options stand under labels, and their consistency
-    groups' where they carry them (`grouped`)."""
-    labelled = isinstance(layout, QuestionLayout) and layout.labels is not None
-    carried = ("always", "trained", *(("labelled",) if labelled else ()), *(("grouped",) if grouped else ()))
-    declared = (*QUESTION_FIELDS, *TRAINING_FIELDS)
-    # The model's and training's fields, then the labelled readout, then the groups, as rows carry them.
-    return tuple(field.name for when in carried for field in declared if field.when == when)
-
-
-def _along_fields(element: Batch, when: tuple[str, ...] = ("always", "trained")) -> tuple[str, ...]:
-    """The declared fields along the questions (`QUESTION_FIELDS`, `TRAINING_FIELDS`) that `element`
-    carries and a row carries `when`, in their declared order."""
-    return tuple(field.name for field in (*QUESTION_FIELDS, *TRAINING_FIELDS)
-                 if field.name in element and field.when in when)
-
-
-def packing(layout: Layout, bounds: Bounds, context_length: int | None = None, grouped: bool = False) -> Pack:
-    """Rows of `layout` packed first-fit into windows of its `max_len`, each
-    window's rows, questions and options within `bounds` (`Layout.bounds`),
-    and with a `context_length` each row's context along an axis of that
-    many tokens."""
-    parallel = isinstance(layout, QuestionLayout) and layout.parallel
-    blocked = isinstance(layout, QuestionLayout) and layout.blocks
-    along = tuple((name, bounds.questions) for name in _along(layout, grouped))
-    if context_length is not None:
-        along = (*along, ("context", context_length))
-    fields = ("tokens", *(("positions", "slots") if parallel else ()), *(("blocks",) if blocked else ()))
-    return Pack(layout.max_len, fields, segments=bounds.segments, along=along)
-
-
-def _rows(batch: Batch, spans_in_context: bool = False) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
-    """Each packed row's tokens, questions and options, window by window: a question the row its span
-    starts in, or, where the spans are the context's, the window's one row (`question_owners`)."""
-    segments = np.asarray(batch["segments"])
-    owners = question_owners(segments, batch["spans"], np.asarray(batch["questions"]), spans_in_context)
-    options = np.sum(np.asarray(batch["options"], bool), axis=-1)
-    counted = []
-    for window, owner, option in zip(segments, owners, options, strict=True):
-        rows = int(window.max()) + 1
-        counted.append(np.stack([np.bincount(window, minlength=rows), np.bincount(owner, minlength=rows),
-                                 np.bincount(owner, weights=option, minlength=rows).astype(np.int64)])[:, 1:])
-    lengths, questions, real = np.concatenate(counted, axis=1)
-    return lengths, questions, real
-
-
-def _window_groups(element: Batch, owners: np.ndarray, options: np.ndarray
-                   ) -> tuple[np.ndarray, np.ndarray]:
-    """A window's consistency groups numbered apart across its rows, each row's group `g` the window's
-    own index of `(row, g)`, and the padding the packer added back at -1: a question slot of no row is
-    in no group, and an option slot of no option maps to no canonical option."""
-    groups = np.asarray(element["groups"]).astype(np.int64)
-    real = (owners > 0) & (groups >= 0)
-    keys = np.where(real, owners.astype(np.int64) * (groups.shape[-1] + 1) + groups, -1)
-    numbered = np.full(groups.shape, -1, np.int32)
-    if real.any():
-        _, index = np.unique(keys[real], return_inverse=True)
-        numbered[real] = index.astype(np.int32)
-    canonical = np.where(options & (owners > 0)[..., None], np.asarray(element["canonical"]), -1)
-    return numbered, canonical.astype(np.int32)
-
-
-@dataclass(frozen=True)
-class PackedRows(pygrain.MapTransform):
-    """A window of packed rows (`packing`) as `DecisionInputs` reads it: each
-    row's spans moved to where it starts in the window, and with
-    `option_slots` the window's real options compacted to that many slots
-    (`compacted`). Every window is `max_length` tokens, which a token budget
-    divides into rows."""
-
-    max_length: int
-    option_slots: int | None = None
-
-    def map(self, element: Batch) -> Batch:
-        segments = np.asarray(element["tokens_segment_ids"])
-        owners = np.asarray(element["kinds_segment_ids"])
-        starts = np.concatenate([[0], np.cumsum(np.bincount(segments)[1:])]).astype(np.int32)
-        moved = np.where(owners > 0, starts[np.maximum(owners - 1, 0)], 0)
-        options = np.asarray(element["options"])
-        laid = {name: element[name] for name in ("tokens", *_along_fields(element))} | {
-            "segments": segments,
-            "positions": element["positions"] if "slots" in element else element["tokens_positions"],
-            "spans": element["spans"] + moved[:, None],
-            "option_spans": element["option_spans"] + (moved[:, None] * options)[..., None],
-        }
-        if "readout" in element:
-            # A question's answer cue moves with its row in the window, as its spans do.
-            laid["readout"] = element["readout"] + moved
-        if "groups" in element:
-            # A group's members are found again among the window's questions.
-            laid["groups"], laid["canonical"] = _window_groups(element, owners, options)
-        if "slots" in element:
-            laid["slots"] = element["slots"]
-        if "blocks" in element:
-            # Each row keeps its own blocks where the window packed it; the padding is in none.
-            laid["blocks"] = np.where(segments > 0, np.asarray(element["blocks"]), -1).astype(np.int32)
-        if "context" in element:
-            # A conditioned window holds one row (`DecisionObjective.bounds`), whose context it is.
-            laid["context"] = element["context"]
-            laid["context_lengths"] = np.int32(np.count_nonzero(np.asarray(element["context_segment_ids"])))
-        if self.option_slots is not None:
-            laid["option_slots"], laid["slotted"] = compacted(options, self.option_slots)
-        return laid
 
 
 @struct.dataclass
@@ -695,7 +270,7 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
         self.tokenizer = tokenizer
         self.specials = specials or Specials.of(tokenizer)
         self.loss_rule = LogLoss() if loss is None else loss
-        self.variables = held
+        self.variables = dicts(held)
         self.label_smoothing = label_smoothing
         if not consistency >= 0.0:
             raise ValueError(f"consistency weighs a divergence, so it is nonnegative, got {consistency}")
@@ -851,13 +426,16 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
                                    self.none_of_the_above, train=True, context_length=self.context_length,
                                    grouped=grouped)
         evaluating = dataclasses.replace(training, train=False)
-        fit = Fit(self.layout, self.tokenizer, self.specials, self.model.head, self.context_length, grouped)
-        expand = () if self.layout.joint else (QuestionRows(),)
+        fit = Fit(self.layout, self.tokenizer, self.specials, self.model.head, self.context_length, grouped,
+                  self.bounds, self.none_of_the_above)
+        held = dataclasses.replace(fit, none_of_the_above=0.0)
+        # Rows a record spreads into: a layout of a question a row's, or grouped examples' apart.
+        expand = (QuestionRows(),)
         options = self.bounds.options if self.layout.joint else None
         compact = None if options is None else -(-options // OPTION_TILE) * OPTION_TILE
         return ObjectiveData(
             train=(fit, *expand, Configured(training, needs=("slots",), scope="run", random=True)),
-            evaluate=(fit, *expand, Configured(evaluating, needs=("slots",), scope="run")),
+            evaluate=(held, *expand, Configured(evaluating, needs=("slots",), scope="run")),
             pack=packing(self.layout, self.bounds, self.context_length, grouped),
             packed=(PackedRows(self.layout.max_len, compact),),
         )

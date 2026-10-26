@@ -16,7 +16,7 @@ rules. `Pretrained.load` reads released Laya and joint-head sources, and
 """
 
 from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures, bucket
-from dew.decision.data import Example, Group, corpus, decisions, mixture
+from dew.decision.data import Example, Group, GroupedExamples, corpus, decisions, mixture
 from dew.decision.head import DecisionHead, Head, JointSchemaHead, LabelReadout, SlotReadout
 from dew.decision.laya import LayaCheckpoint
 from dew.decision.layout import (
@@ -44,7 +44,7 @@ from dew.decision.layout import (
 )
 from dew.decision.metrics import AURC, ECE, Accuracy, Answered
 from dew.decision.model import DecisionModel
-from dew.decision.objective import NONE_OF_THE_ABOVE, DecisionObjective, Encoding
+from dew.decision.objective import DecisionObjective
 from dew.decision.questions import (
     KINDS,
     Answer,
@@ -61,6 +61,7 @@ from dew.decision.questions import (
     TopProbability,
     kind_of,
 )
+from dew.decision.rows import NONE_OF_THE_ABOVE, Encoding
 from dew.decision.scoring import Brier, Combined, LogLoss, RankedProbability, ScoringRule, Spherical
 from dew.decision.task import TASK_FILE, Budget, Decide, Usage, Weights
 
@@ -94,6 +95,7 @@ __all__ = [
     "Example",
     "Framing",
     "Group",
+    "GroupedExamples",
     "Head",
     "Instructions",
     "JevConfidence",

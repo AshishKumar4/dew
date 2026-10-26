@@ -90,10 +90,13 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
     # 1e-2 between two correct implementations.
     environ.setdefault("JAX_DEFAULT_MATMUL_PRECISION", "highest")
     # The arithmetic the suite holds a CPU to (`dew.nn.precision.WIDE_CPU_ARITHMETIC`): float32
-    # products summed in float64 and a loop's running sum of them compensated, a row's logsumexp in
-    # levels of short blocks, a float64 division as written.
+    # products summed in float64, a loop's running sum of them compensated, and a row's reductions in
+    # float64 (`widened_reduction`).
     # Dew's test setting, never the library's default.
     environ.setdefault("DEW_WIDE_CPU_ARITHMETIC", "1")
+    # A frontier's first plan, untimed (`dew.training.planning.UNTIMED_FRONTIER`): two pools a run and
+    # its resume would otherwise each time their own. Dew's test setting, never the library's default.
+    environ.setdefault("DEW_UNTIMED_FRONTIER", "1")
 
 
 def configured(environ: Mapping[str, str]) -> dict[str, str]:

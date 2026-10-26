@@ -17,6 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
+from flax.core import FrozenDict
 
 type Variables = Mapping[str, Any]
 """A Flax variables dict: the `params` collection plus any other collection
@@ -91,6 +92,10 @@ VALIDITY_FIELD = "attention_mask"
 COORDINATES_FIELD = "coordinates"
 """The token field that holds the tokens' `Coordinates`, which a decoder reads in place of the
 validity field, `segment_ids` and `positions`."""
+
+BLOCKS_FIELD = "block_groups"
+"""The token field that numbers the tokens' blocks, which the attention layers that read blocks see whole
+(`AttentionMetadata.block_groups`, `dew.nn.visibility.prefix_blocks`)."""
 
 
 def token_id(value: object, *, where: str) -> int:
@@ -294,7 +299,7 @@ def shifted_span(shape: tuple[int, ...], shift: int, *, valid=None, segments=Non
 
 
 def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, depth: int = 0,
-                   roles=None, role: int | None = None):
+                   roles=None, role: int | None = None, blocks=None):
     """Whether each target the loss scores at prediction `depth` counts, as
     `[B, S - 1 - depth]` booleans, in `xp` (numpy for the host's FLOP
     geometry and the data's target counts, jax.numpy for the loss): the
@@ -302,7 +307,10 @@ def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, 
     not padding, when the attention mask keeps every position from the state
     to it, in a packed batch when the state and it share a document (segment
     0 is padding), and with a `role` (`loss_role`) when `roles`, one per
-    token, give the target that role."""
+    token, give the target that role. With `blocks`, each token's block (-1 none), a target in its state's
+    block does not count. Blocks are contiguous runs (`AttentionMetadata.block_groups`), so this is exact
+    for the trunk's targets (`depth` 0): a prediction depth reads blocks beyond its own source, so
+    `token_scores` refuses depths with blocks."""
     span = depth + 1
     counted = shifted_span(tokens.shape, span, valid=attention_mask, segments=segment_ids, xp=xp)
     if pad_id is not None:
@@ -311,6 +319,10 @@ def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, 
         counted = counted & (segment_ids[:, span:] != 0)
     if role is not None and roles is not None:
         counted = counted & (roles[:, span:] == role)
+    if blocks is not None:
+        # The state's block holds the target (`dew.nn.visibility.same_group`, which this module sits below).
+        source = blocks[:, :-span]
+        counted = counted & ~((source == blocks[:, span:]) & (source >= 0))
     return counted
 
 
@@ -413,6 +425,26 @@ def thaw(variables: Variables) -> Variables:
     return {**rest, "params": merge(variables[FROZEN], variables["params"])}
 
 
+def dicts[Tree](tree: Tree) -> Tree:
+    """`tree` (a variables tree, or a state holding several) with every container mapping a dict: a tree
+    that holds a mapping of the kinds Flax's `unfreeze` makes dicts of (a `FrozenDict`, a dict of
+    another type, an `OrderedDict`) anywhere, under a mapping, a sequence or any other node, rebuilt
+    over the same leaves with each one a dict, any other the caller's own tree. `unfreeze` itself stops
+    at a list. A record that is a mapping of its own kind (an optimizer's `nnx.State`) stays as it is,
+    its contents read the same way. The trees an objective holds, the state's and a step's
+    written-back collections are dicts, so that a placement writing each placed leaf into the dict
+    that held it (`dew.distributed.host.stream`) writes into the objective's tree, and every tree of a
+    step has the state's structure."""
+    nodes = jax.tree.leaves(
+        tree, is_leaf=lambda node: isinstance(node, (dict, FrozenDict)) and type(node) is not dict)
+    if not any(isinstance(node, (dict, FrozenDict)) and type(node) is not dict for node in nodes):
+        return tree
+    return jax.tree.map(
+        lambda node: ({key: dicts(value) for key, value in node.items()}
+                      if isinstance(node, (dict, FrozenDict)) and type(node) is not dict else node),
+        tree, is_leaf=lambda node: isinstance(node, (dict, FrozenDict)) and type(node) is not dict)
+
+
 def part(variables: Variables, name: str) -> Variables:
     """Cut the `name` subtree out of every collection that holds one: one
     module's own tree out of an objective's that nests several under each
@@ -421,7 +453,38 @@ def part(variables: Variables, name: str) -> Variables:
     return {collection: subtree[name] for collection, subtree in variables.items() if name in subtree}
 
 
+def leaves_by_path(tree: Variables) -> dict[tuple[str, ...], jax.Array]:
+    """Every leaf of a variables subtree, by its dict-key path."""
+    return {tuple(entry.key for entry in path): leaf
+            for path, leaf in jax.tree_util.tree_leaves_with_path(tree)}
+
+
+def sown_nodes(tree, *markers: str) -> list[tuple[tuple[str, ...], Mapping]]:
+    """Find every node of a sown collection that holds all of `markers`, with
+    its path: the module path that sowed it.
+
+    A sown collection nests by module path, so what a layer sowed is the
+    branch that names the keys it sowed under. The search stops at such a
+    branch rather than descending into the arrays below it, and walks the
+    children it does descend into in sorted key order.
+    """
+    found: list[tuple[tuple[str, ...], Mapping]] = []
+
+    def visit(node, path: tuple[str, ...]) -> None:
+        if not isinstance(node, Mapping):
+            return
+        if all(marker in node for marker in markers):
+            found.append((path, node))
+            return
+        for key in sorted(node):
+            visit(node[key], (*path, key))
+
+    visit(tree, ())
+    return found
+
+
 __all__ = [
+    "BLOCKS_FIELD",
     "COORDINATES_FIELD",
     "EXAMPLE_ROWS",
     "FROZEN",
@@ -434,10 +497,12 @@ __all__ = [
     "PathFilter",
     "Variables",
     "coordinates",
+    "dicts",
     "document_ranks",
     "document_starts",
     "everything",
     "freeze",
+    "leaves_by_path",
     "merge",
     "padded_rows",
     "part",
@@ -446,6 +511,7 @@ __all__ = [
     "scored_targets",
     "select",
     "shifted_span",
+    "sown_nodes",
     "thaw",
     "token_id",
     "token_ids",

@@ -31,7 +31,7 @@ from dew.decision import (
 )
 from dew.decision.head import DecisionHead, JointSchemaHead, LabelReadout
 from dew.decision.layout import OPTION_TILE, QUESTION_FIELDS, DecisionInputs, Labels, compacted
-from dew.decision.objective import TRAINING_FIELDS
+from dew.decision.rows import TRAINING_FIELDS
 from dew.decision.task import laid_out
 from dew.interop import Pretrained
 from dew.nn.backbones.causal_transformer import CausalTransformer
