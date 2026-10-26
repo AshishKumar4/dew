@@ -245,7 +245,8 @@ def _row_terms(logits, predict: bool, labels) -> tuple[
 
     # Dew's CPU test setting takes the row's sums in float64 (`widened_reduction`); a run, one fused pass.
     terms = widened_reduction(reduced, *operands)
-    return terms[0] + jnp.log(terms[1]), ((terms[0], terms[3]) if predict else None), terms[:3]
+    maximum, total, rest = terms[:3]
+    return maximum + jnp.log(total), ((maximum, terms[3]) if predict else None), (maximum, total, rest)
 
 
 class _ChunkTerms(NamedTuple):
