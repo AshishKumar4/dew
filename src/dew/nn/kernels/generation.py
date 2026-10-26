@@ -114,11 +114,15 @@ class Architecture:
     MMA, Blackwell's tensor memory columns (PTX ISA, tcgen05.alloc), and what only a measurement
     states: the global-memory load latency in multiprocessor clocks and the bytes the L2 serves a
     multiprocessor a clock; on a TPU the scoped VMEM limit at XLA's default, the VMEM a kernel may raise
-    its limit to (`vmem_bytes`), and a grid step's fixed seconds."""
+    its limit to (`vmem_bytes`), and a grid step's fixed seconds. `tma`: JAX's Mosaic GPU pipelines move
+    a block into shared memory by TMA, which it picks from compute capability 9.0 on (its `emit_pipeline`
+    and `copy_gmem_to_smem`), where below it they copy by cp.async. A family of None is no template's:
+    its devices' facts serve the rest of Dew (MFU's peaks)."""
 
-    family: str
+    family: str | None
     tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
     wgmma: bool = False
+    tma: bool = False
     tmem_columns: int | None = None
     load_latency: float | None = None
     l2_bytes_per_clock: float | None = None
@@ -143,15 +147,17 @@ _AMPERE = Architecture('mma.sync', {'16bit': 2048, 'tf32': 1024, 'fp32': 128}, l
                        l2_bytes_per_clock=35.7)
 _AMPERE_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256}, load_latency=541.5,
                                 l2_bytes_per_clock=38.8)
-_TURING = Architecture('mma.sync', {'16bit': 1024, 'fp32': 128}, load_latency=541.5, l2_bytes_per_clock=38.8)
-_HOPPER = Architecture('wgmma', {'16bit': 4096, 'tf32': 2048, 'fp32': 256}, wgmma=True, load_latency=478.8,
-                       l2_bytes_per_clock=54.6)
+# Turing's MMA takes no bf16 operands, which every template computes in: it is outside every family.
+_TURING = Architecture(None, {'16bit': 1024, 'fp32': 128}, load_latency=541.5, l2_bytes_per_clock=38.8)
+_HOPPER = Architecture('wgmma', {'16bit': 4096, 'tf32': 2048, 'fp32': 256}, wgmma=True, tma=True,
+                       load_latency=478.8, l2_bytes_per_clock=54.6)
 # Blackwell's tcgen05 family: no member measured, its latency and L2 Hopper's.
-_BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, 'fp32': 256}, tmem_columns=512,
+_BLACKWELL = Architecture('tcgen05', {'16bit': 8192, 'tf32': 4096, 'fp32': 256}, tmem_columns=512, tma=True,
                           load_latency=478.8, l2_bytes_per_clock=54.6)
-# Consumer Blackwell (RTX 50, RTX PRO 6000) runs sm80's mma.sync forms: Ada's rates and measured values.
-_BLACKWELL_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256}, load_latency=541.5,
-                                   l2_bytes_per_clock=38.8)
+# Consumer Blackwell (RTX 50, RTX PRO 6000) runs sm80's mma.sync forms, its blocks moved by TMA: Ada's rates
+# and measured values.
+_BLACKWELL_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp32': 256}, tma=True,
+                                   load_latency=541.5, l2_bytes_per_clock=38.8)
 # A TPU's: its MXU's FLOPs a clock (v5e 197 TF over 1.5 GHz -> 131072), the scoped VMEM limit at XLA's
 # default (v5e 16 MiB, read from a Mosaic kernel's refusal: "limit 16.00M"; v6e's pending GEMMTPU-VMEM's),
 # and a grid step's fixed seconds, the slope of time over 1 to 65536 Pallas grid steps each issuing one
@@ -188,7 +194,8 @@ def architecture(generation: str) -> Architecture | None:
 
 def family(generation: str) -> str | None:
     """The instruction family a template's mainloop claims `generation` by ('mma.sync', 'wgmma',
-    'tcgen05', 'tpu'), seen or unseen: a claim is a family, never a list of devices."""
+    'tcgen05', 'tpu'), seen or unseen: a claim is a family, never a list of devices; None outside every
+    family (a Turing GPU, a CPU)."""
     found = architecture(generation)
     return None if found is None else found.family
 

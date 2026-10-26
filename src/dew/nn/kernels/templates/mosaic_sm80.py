@@ -78,6 +78,10 @@ class Mma(mosaic.Family):
     # one program took 1.04 to 1.50 of one's time on an A100 (CONSUMERS1), their shared copies leaner or
     # not, where two programs took 0.73 to 0.89 (CONSUMERS3).
     consumers = 1
+    # Its kernels take hooks and exact sums (their side loads, vector reads and running sum lower), but
+    # its register model does not count what they hold, and its derived tiles spilled (ns-regs2: sm86's
+    # normed forward 16 bytes, exact sums 136).
+    counts_hooks = False
     bounded_loads = False
     role_rows = 4 * 16
     operands_in_registers = True

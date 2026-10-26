@@ -282,7 +282,7 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
     as XLA's ragged dot from float64."""
     target = UNSEEN[unseen]
     canonical = generation.TARGETS[target.generation]
-    family = "wgmma" if target.wgmma else "mma.sync"
+    family = generation.family(target.generation)
     # mma.sync's tiles run the product and the input gradient; the kernel gradient is warpgroup MMA's.
     launched = {"MosaicGmm", "MosaicTgmm"} if target.wgmma else {"MosaicGmm"}
 

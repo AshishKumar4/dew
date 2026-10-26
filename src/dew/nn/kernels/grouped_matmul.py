@@ -668,13 +668,12 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     def eligible(self, ba, target) -> bool:
         first, second = (value.dtype for name, value in ba.arguments.items()
                          if name in ('tokens', 'kernel', 'cotangent'))
-        # Hooked and exactly summed calls run on warpgroup MMA alone: mma.sync's kernels take them (its
-        # side loads, vector reads and running sum lower), but its register model does not yet count what
-        # they hold, and its derived tiles spilled (ns-regs2: sm86's normed forward 16 bytes, exact sums 136).
+        # A hooked or exactly summed call runs where its bundle's register model counts what they hold.
         special = ba.arguments['hooks'] != NO_HOOKS or ba.arguments.get('exact_sums')
+        family = self._family(ba, target)
         return (first == second and jnp.dtype(first).itemsize == 2
-                and _rated(target, first) and self._family(ba, target) is not None
-                and (target.wgmma or not special)
+                and _rated(target, first) and family is not None
+                and (family.counts_hooks or not special)
                 and self._hooks_lower(ba, first, target)
                 and (self.EXACT_SUMS or not ba.arguments.get('exact_sums'))
                 and self.derived(ba, target) is not None)
@@ -685,7 +684,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # 192 x 128 forward and 156 at a normed 128 x 192 kernel gradient the plain estimate held: the
         # compile gate's H100 run).
         dtype = ba.arguments['tokens'].dtype
-        family, block = _bundle(config, dtype), (config.block_m, config.block_n, config.block_k)
+        family, block = mosaic_gpu.family_of(config, dtype), (config.block_m, config.block_n, config.block_k)
         # A transposed matrix (the input gradient's) is loaded a step deep and sliced in registers
         # (`mosaic_sm80.Mma.products`, `mosaic.tile_registers`).
         transposed = bool(ba.arguments.get('trans_rhs', False))
@@ -699,21 +698,13 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
 
     def register_budget(self, config: mosaic_gpu.Tiles) -> int:
         # Its family's budget a consumer, whatever the operands' dtype (`mosaic.Family.registers`).
-        return _bundle(config, jnp.bfloat16).registers(config.warpgroups)
+        return mosaic_gpu.family_of(config, jnp.bfloat16).registers(config.warpgroups)
 
     def _family(self, ba, target) -> mosaic.Family | None:
-        """The bundle the launch runs on `target`: Hopper's warpgroup MMA where it has it, Ampere's
-        mma.sync on a CUDA GPU without it where the launch takes it (`_families`), none on any other
-        device (a TPU's launches are its own; a CPU interprets a GPU's only where `generation.assumed`
-        names it)."""
-        if generation.capability(target.generation) is None:
-            return None
-        wanted = 'wgmma' if target.wgmma else 'mma.sync'
-        return next((family for family in self._families(ba) if family.name == wanted), None)
-
-    def _families(self, ba) -> tuple[mosaic.Family, ...]:
-        """The bundles the launch takes at its operands' dtype (`bundles.families`)."""
-        return bundles.families(ba.arguments['tokens'].dtype)
+        """The bundle the launch runs on `target`: its instruction family's (`bundles.of`), none where the
+        family has none (a TPU's launches are their own; a CPU interprets a GPU's only where
+        `generation.assumed` names it)."""
+        return bundles.of(target.generation, ba.arguments['tokens'].dtype)
 
     @abc.abstractmethod
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
@@ -735,7 +726,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # The derived tile with one of its choices moved a step either way: a stage more or fewer, the
         # band halved or doubled, the columns or the rows the next block either side (a column unit, a
         # role of rows).
-        family = _bundle(config, ba.arguments['tokens'].dtype)
+        family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
         unit = family.column_unit(ba.arguments['tokens'].dtype)
         role = family.role_rows * config.warpgroups
         band = config.grid_block_n
@@ -817,7 +808,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         streams = [config.block_m * config.block_k * size, config.block_k * config.block_n * size,
                    *(_side_tile_bytes((side,), (axes,), extents)
                      for side, axes in zip(prologue_sides, hooks.prologue_axes, strict=True))]
-        family = _bundle(config, ba.arguments['tokens'].dtype)
+        family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
         staged = [config.block_m * family.output_columns(config.block_n, (dtype,)) * out
                   for dtype, out in zip(hooks.out_dtypes or (ba.arguments['out_dtype'],), outs, strict=True)]
         sides = [2 * _side_tile_bytes((side,), (axes,), extents)
@@ -847,7 +838,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # the stage of `lhs` and its side tiles and writes the stage back before the MMA may read it
         # (a commit to shared memory): serial with the MMAs, not beside them
         # (GMMSB-h100-main: a gated prologue at 3.7x the Triton launch's time).
-        family = _bundle(config, tokens.dtype)
+        family = mosaic_gpu.family_of(config, tokens.dtype)
         # A step's stage written (its rows' and columns' blocks), and read by the products: each of the
         # family's instructions spans `rows` output rows and the tile's columns, reading its rows' slice
         # and the columns' whole block, so the columns' block is read once a `rows` of the tile (an H100's
@@ -982,7 +973,7 @@ class MosaicTgmm(_Mosaic):
         consumer's live set (`mosaic.tile_registers`) within its family's registers."""
         if not super().legal(ba, config, target):
             return False
-        family = _bundle(config, ba.arguments['tokens'].dtype)
+        family = mosaic_gpu.family_of(config, ba.arguments['tokens'].dtype)
         if family.operands_in_registers and config.block_k % family.role_rows:
             return False
         if not ba.arguments.get('exact_sums'):
@@ -1499,7 +1490,8 @@ def _cell(case: "GroupedCase") -> tuple[str, str, str] | None:
     exactly summed or not, or an input gradient or a forward) and whether it is dense; None off a CUDA
     GPU."""
     target = case.call.target
-    if generation.capability(target.generation) is None:
+    family = generation.family(target.generation)
+    if generation.capability(target.generation) is None or family is None:
         return None
     arguments = next(iter(case.call.bound.values()))[1].arguments
     if 'trans_rhs' not in arguments:
@@ -1507,7 +1499,7 @@ def _cell(case: "GroupedCase") -> tuple[str, str, str] | None:
     else:
         product = 'input_gradient' if arguments['trans_rhs'] else 'forward'
     shape = 'dense' if arguments.get('dense') else 'grouped'
-    return ('wgmma' if target.wgmma else 'mma.sync', product, shape)
+    return (family, product, shape)
 
 
 def _old_route_reason(case: "GroupedCase") -> str:
@@ -1532,14 +1524,6 @@ NAMED = _Need('named', lambda case: False,
               row="no production route", kind='measured')
 """What keeps CUTLASS's launches off every call that does not name them: a vendored kernel that was never a
 production route, which no measurement ranks against the template's."""
-
-
-"""The bundles by name, as a tile names its (`mosaic_gpu.Tiles.family`), for their class-wide facts."""
-
-
-def _bundle(config: mosaic_gpu.Tiles, dtype) -> mosaic.Family:
-    """The bundle `config` runs on, for operands of `dtype` (`mosaic_gpu.family_of`)."""
-    return mosaic_gpu.family_of(config, dtype)
 
 
 _GMMS = (MosaicGmm(), MosaicTpuGmm(), Gmm(), CutlassGmm())
@@ -1568,7 +1552,7 @@ def launched(launches, arguments, options, *, product: Product, whole: bool):
     """The launch of `launches` that runs the call (`arguments`, `options`) as `GROUPED` selects it,
     ready to call, or None where XLA's program takes it. A CPU process's GPU branch, which runs only where
     a lowering for the GPU takes it, takes a chosen implementation where it can and the order's next
-    launch where it cannot (mma.sync's where this JAX lowers none: `_families`); every branch a process
+    launch where it cannot (mma.sync's where this JAX lowers none: `_family`); every branch a process
     runs insists on it."""
     case = grouped_case(launches, arguments, options, product=product, whole=whole)
     unrun = not options['interpret'] and jax.default_backend() == 'cpu'

@@ -491,6 +491,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     """Whether its copies move a one-dimensional block untiled (TMA's), where cp.async spreads a copy over a
     warpgroup's threads, 128 elements at least ('CP_ASYNC requires the number of elements to be a multiple
     of 128', R9-gpu-a100): a step reads a side vector it does not copy from global memory instead."""
+    counts_hooks: bool = True
+    """Whether its register model counts what a template's hooks and exact sums hold (side operands' tiles,
+    a running sum), so a hooked or exactly summed call derives a tile that spills nothing; where not
+    (mma.sync's), such a call is not its launch's."""
     most_shared: int
     """The most shared memory a block of any GPU of the family holds (CUDA's opt-in limit), which bounds
     the stages a generated tile takes; a GPU's own (`generation.shared_budget`) bounds the tiles its
