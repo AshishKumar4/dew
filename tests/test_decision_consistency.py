@@ -111,9 +111,9 @@ PARAPHRASED = GroupedExamples(
                                            "team": Choice("Which team?", ["billing", "tech", "sales"])},
              {"team": "billing"}),
      Example("charged twice, the customer was", {"other": Noul("Is this about something else?")}, {})),
-    groups=(("billing", {(0, "billing"): {"true": "yes", "false": "no"},
-                         (1, "charge"): {"true": "yes", "false": "no"},
-                         (2, "other"): {"true": "no", "false": "yes"}}),))
+    groups=(Group("billing", {"0.billing": {"true": "yes", "false": "no"},
+                              "1.charge": {"true": "yes", "false": "no"},
+                              "2.other": {"true": "no", "false": "yes"}}),))
 """One question asked in three rows of their own: paraphrased, its state reworded, and negated, one
 member unlabelled; and an ungrouped question beside one of them."""
 
@@ -173,8 +173,8 @@ def test_a_unit_no_window_holds_is_rejected_and_one_without_a_label_is_too():
     assert not isinstance(unit, Rejected) and "decision_unit" in unit
     long = GroupedExamples(tuple(Example("charged " * 200, {"billing": Noul("Is this about billing?")},
                                          {"billing": "true"}) for _ in range(3)),
-                           groups=(("billing", {(index, "billing"): {"true": "yes", "false": "no"}
-                                                for index in range(3)}),))
+                           groups=(Group("billing", {f"{index}.billing": {"true": "yes", "false": "no"}
+                                                     for index in range(3)}),))
     assert isinstance(fit.map({"example": long}), Rejected)
     unlabelled = dataclasses.replace(PARAPHRASED, examples=tuple(
         dataclasses.replace(example, answers={}) for example in PARAPHRASED.examples))
@@ -185,14 +185,14 @@ def test_grouped_examples_name_questions_they_ask_once_each():
     """A group names questions the examples ask (`<index>.<question>` in a row's fields), none an
     example already groups, each mapping its options onto the group's canonical keys."""
     with pytest.raises(ValueError):
-        GroupedExamples(PARAPHRASED.examples, groups=(("billing", {(3, "billing"): {}, (0, "billing"): {}}),))
+        GroupedExamples(PARAPHRASED.examples, groups=(Group("billing", {"3.billing": {}, "0.billing": {}}),))
     with pytest.raises(ValueError):
         GroupedExamples((NEGATED, PARAPHRASED.examples[0]),
-                        groups=(("billing", {(0, "billing"): {"true": "yes", "false": "no"},
-                                             (1, "billing"): {"true": "yes", "false": "no"}}),))
-    row = {"examples": [{"state": "a", "questions": {"q": {"kind": "noul", "instructions": "q?"}},
+                        groups=(Group("billing", {"0.billing": {"true": "yes", "false": "no"},
+                                                  "1.billing": {"true": "yes", "false": "no"}}),))
+    row = {"examples": [{"state": "a", "questions": {"q": {"type": "noul", "instructions": "q?"}},
                          "answers": {"q": "true"}},
-                        {"state": "b", "questions": {"q": {"kind": "noul", "instructions": "q?"}}}],
+                        {"state": "b", "questions": {"q": {"type": "noul", "instructions": "q?"}}}],
            "groups": {"same": {"0.q": {"true": "yes", "false": "no"}, "1.q": {"true": "yes", "false": "no"}}}}
     grouped = GroupedExamples.of(row)
     assert grouped.group_of(1, "q") == (0, {"true": "yes", "false": "no"})
