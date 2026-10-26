@@ -15,6 +15,7 @@ leaves, so the production join and the rendezvous right after it are what
 every pool test runs.
 """
 
+import collections
 import json
 import os
 import re
@@ -22,6 +23,7 @@ import select
 import shutil
 import signal
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -34,6 +36,7 @@ from process_support import (
     report_of,
     run_pool,
     run_worker,
+    serving,
     spawn,
     stuck,
     terminate,
@@ -554,7 +557,7 @@ def elastic_checkpoint(tmp_path_factory):
     assert len(positions) == 1, "the processes saved different global positions"
     saved = json.loads(positions.pop())[ENVELOPE]
     assert saved["records"] == POOL_STEPS * worker.BATCH
-    return {"run_dir": directory / "run", "reports": reports}
+    return {"run_dir": directory / "run", "reports": reports, "out": directory / "out"}
 
 
 @pytest.mark.distributed
@@ -585,6 +588,93 @@ def test_a_pool_position_resumes_on_another_process_count(tmp_path, elastic_chec
         assert report["restored_step"] == POOL_STEPS
         assert json.loads(report["restored_dataset_state"])[ENVELOPE]["records"] == (
             POOL_STEPS * worker.BATCH)
+        assert report["step"] == 2 * POOL_STEPS
+        assert report["dataset_state"] == whole[index]["dataset_state"]
+        assert_same_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
+                               dumped_params(tmp_path / "whole" / f"process{index}.json"))
+
+
+class Served:
+    """A pool's server: each record's url answered with its image (`worker.served_image`), a pure
+    function of the path, so processes that fetch at once read what one would; and the GETs it
+    answered, by path."""
+
+    def __init__(self):
+        self.answered: collections.Counter[str] = collections.Counter()
+        self._lock = threading.Lock()
+
+    def __call__(self, request):
+        body = worker.served_image(int(request.path.strip("/")))
+        with self._lock:
+            self.answered[request.path] += 1
+        request.send_response(200)
+        request.send_header("Content-Length", str(len(body)))
+        request.end_headers()
+        request.wfile.write(body)
+
+
+ONLINE = {"NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}
+"""The workers reach the parent's server directly, past any proxy their environment names."""
+
+
+@pytest.mark.distributed
+def test_processes_fetch_disjoint_shares_of_one_online_order(tmp_path):
+    """Two processes read one global order of records fetched over HTTP: their shares cover the
+    corpus once, and the server answers each url once, so no record is fetched by both."""
+    served = Served()
+    with serving(served) as address:
+        reports = run_pool("online_data", tmp_path / "out", 2, online=address, records=RECORDS,
+                           environment=ONLINE)
+    shards = [report["records"] for report in reports]
+    assert not set(shards[0]) & set(shards[1]), "both processes read the same record"
+    assert sorted(shards[0] + shards[1]) == list(range(RECORDS))
+    assert [report["lowering"] for report in reports] == ["global", "global"]
+    assert served.answered == {f"/{index}": 1 for index in range(RECORDS)}
+
+
+@pytest.fixture(scope="module")
+def online_server():
+    with serving(Served()) as address:
+        yield address
+
+
+@pytest.fixture(scope="module")
+def online_checkpoint(tmp_path_factory, online_server):
+    """`elastic_checkpoint`'s fit over the same records fetched from the pool's server, saved."""
+    directory = tmp_path_factory.mktemp("online-checkpoint")
+    reports = run_pool("fit", directory / "out", 2, name="online", online=online_server,
+                       run_dir=directory / "run", fsdp_size=1, steps=POOL_STEPS, records=RECORDS,
+                       environment=ONLINE)
+    positions = {report["dataset_state"] for report in reports}
+    assert len(positions) == 1, "the processes saved different global positions"
+    assert json.loads(positions.pop())[ENVELOPE]["records"] == POOL_STEPS * worker.BATCH
+    return {"run_dir": directory / "run", "out": directory / "out"}
+
+
+@pytest.mark.distributed
+def test_an_online_pool_trains_on_what_its_records_hold(online_checkpoint, elastic_checkpoint):
+    """Records fetched over HTTP by two processes train the pool as the same records held in memory
+    do: the same global batches in the same steps, to the same parameters bit for bit."""
+    for index in range(2):
+        assert_identical_parameters(dumped_params(online_checkpoint["out"] / f"process{index}.json"),
+                                    dumped_params(elastic_checkpoint["out"] / f"process{index}.json"))
+
+
+@pytest.mark.distributed
+@pytest.mark.parametrize("processes", [1, 4])
+def test_an_online_pool_position_resumes_on_another_process_count(tmp_path, online_server,
+                                                                   online_checkpoint, processes):
+    """An online run that two processes saved resumes on one process or four, fetching from where
+    the saved global count stopped: the resumed pool lands where a pool of its size that nobody
+    stopped does, at the same position, on the same parameters."""
+    directory = tmp_path / "resumed-run"
+    shutil.copytree(online_checkpoint["run_dir"], directory)
+    flags = {"name": "online", "online": online_server, "fsdp_size": 1, "steps": 2 * POOL_STEPS,
+             "records": RECORDS, "environment": ONLINE}
+    resumed = run_pool("fit", tmp_path / "resumed", processes, run_dir=directory, **flags)
+    whole = run_pool("fit", tmp_path / "whole", processes, run_dir=tmp_path / "whole-run", **flags)
+    for index, report in enumerate(resumed):
+        assert report["restored_step"] == POOL_STEPS
         assert report["step"] == 2 * POOL_STEPS
         assert report["dataset_state"] == whole[index]["dataset_state"]
         assert_same_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),

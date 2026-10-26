@@ -211,6 +211,41 @@ def elastic_loader(records: int, workers: int):
                    loading=Loading(workers=workers, threads=2, read_buffer=8, worker_buffer=2)).train
 
 
+def served_image(index: int) -> bytes:
+    """The bytes a pool's server answers record `index`'s url with: its image, as `elastic_loader`'s
+    records hold it."""
+    return np.full((RES, RES, 3), index, np.uint8).tobytes()
+
+
+@dataclasses.dataclass(frozen=True)
+class Pixels:
+    """A fetched record's bytes read back as its image."""
+
+    identity = "pixels@1"
+
+    def __call__(self, row):
+        return {"image": np.frombuffer(row["bytes"], np.uint8).reshape(RES, RES, 3)}
+
+
+def online_pipeline(records: int, address: str):
+    """`elastic_loader`'s records fetched over HTTP from the pool's server at `address`, a url each."""
+    from dew.data import Memory
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources.urls import Fetch
+
+    return Pipeline(Memory([{"url": f"http://{address}/{index}"} for index in range(records)])).filter_map(
+        Fetch(output="bytes"), Pixels())
+
+
+def online_loader(records: int, workers: int, address: str):
+    """`elastic_loader` over records fetched from the pool's server (`online_pipeline`), compiled to a
+    global order whose saved position is a global record count."""
+    from dew.data.compile import compile
+
+    return compile(online_pipeline(records, address).shuffle(0).repeat().batch(BATCH), seed=0,
+                   loading=Loading(workers=workers, threads=2, read_buffer=8, worker_buffer=2)).train
+
+
 def batch_records(batch) -> list[int]:
     """The record ids a batch out of `indexed_loader` holds."""
     return [int(value) for value in np.asarray(batch["image"])[:, 0, 0, 0]]
@@ -379,6 +414,30 @@ def mode_data(args) -> dict:
         "global_batch_size": data.batch,
         "train_len": data.records,
     }
+
+
+def mode_online_data(args) -> dict:
+    """One pass over records fetched from the pool's server, each process reading its share of one
+    global order: the records it read, by the image each url's bytes hold, and the plan's lowering."""
+    import jax
+
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+    from dew.training import MeshSpec
+
+    data = compile(online_pipeline(args.records, args.online).shuffle(0).batch(BATCH), seed=0,
+                   loading=Loading(workers=args.workers, threads=2, read_buffer=8, worker_buffer=2))
+    partition = DataPartition.of(MeshSpec().build())
+    records, batches = [], 0
+    stream = data.train(partition)
+    try:
+        for batch in stream:
+            records.extend(batch_records(batch))
+            batches += 1
+    finally:
+        stream.close()
+    return {"process_index": jax.process_index(), "records": records, "batches": batches,
+            "lowering": None if data.plan is None else data.plan.lowering}
 
 
 def mode_packed(args) -> dict:
@@ -604,7 +663,9 @@ def mode_fit(args) -> dict:
     # Where the checkpoint on disk left this run, read before fit trains past it.
     restored_step, restored = restored_state(trainer)
     rows = BATCH // args.processes
-    if args.elastic:
+    if args.online:
+        open_train = online_loader(args.records, args.workers, args.online)
+    elif args.elastic:
         open_train = elastic_loader(args.records, args.workers)
     else:
         loader = indexed_loader(args.records, rows)
@@ -2233,7 +2294,8 @@ def mode_matrix(args) -> dict:
 MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget,
          "host_training": mode_host_training, "step_fits": mode_step_fits,
          "whole_validation": mode_whole_validation, "host_fields": mode_host_fields,
-         "topology": mode_topology, "data": mode_data, "packed": mode_packed,
+         "topology": mode_topology, "data": mode_data, "online_data": mode_online_data,
+         "packed": mode_packed,
          "masked_generation": mode_masked_generation,
          "packed_fit": mode_packed_fit, "reads": mode_reads,
          "inference_pipeline": mode_inference_pipeline,
@@ -2281,6 +2343,8 @@ def parse_args(argv=None):
     parser.add_argument("--elastic", action="store_true",
                         help="read the training records through a compiled global order, whose "
                              "saved position is a global record count")
+    parser.add_argument("--online", help="host:port of the server whose urls the records are fetched from, "
+                                         "through a compiled global order (`online_loader`)")
     parser.add_argument("--profile-dir", help="directory the scheduled profile window writes")
     parser.add_argument("--cell", help="read,cache|nocache|published,rejecting|all,packed|rows for the "
                                        "matrix mode")
