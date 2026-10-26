@@ -111,7 +111,7 @@ class AttentionCase:
     generic paths take as their mask; `mask` is an arbitrary mask only the generic path takes.
     `arithmetic` is a call asking what only the
     reference path computes (`reference_only`), `narrows` one jax.nn's xla kernel would compute
-    below its precision or the reference's (`_xla_kernel_narrows`, `_xla_kernel_on_cpu`), `folds`
+    below its precision (`_xla_kernel_narrows`), `folds`
     one of few query positions `folded_attention` reads on a GPU, and `splash_mask` one whose mask
     splash's descriptor describes, formed only where splash may run, under a name that may choose it
     on a TPU (`TPU_BACKEND`), and False elsewhere."""
@@ -393,7 +393,7 @@ XLA_SUPPORTS = (
     _Need('softcap', lambda case: case.softcap is None, "jax.nn's attention has no softcap",
                 row=INHERENT, kind='handoff'),
     _Need('narrows', lambda case: not case.narrows,
-                "jax.nn's xla kernel would compute the call below its precision or a CPU's reference path",
+                "jax.nn's xla kernel would compute the call below its query's precision",
                 row=INHERENT, kind='handoff'),
     _Need('arithmetic', lambda case: not case.arithmetic,
                 "the call asks for arithmetic only the reference path computes (`reference_only`)",
@@ -450,17 +450,16 @@ the list shrinks as the template wins."""
 
 
 def _attention_preferred(case: AttentionCase) -> str:
-    """The kernel `case` runs: splash on a TPU and xla on a CPU, where its calls take the reference path
-    (`_xla_kernel_on_cpu`); on a GPU xla for a query no fused kernel takes the dtype of (the Mosaic
-    template takes 16-bit operands alone, so no family routes it another); on a family whose Mosaic
-    template has a routed mainloop, its declared old route where that takes the call
+    """The kernel `case` runs: splash on a TPU and xla on a CPU; on a GPU xla for a query no fused kernel
+    takes the dtype of (the Mosaic template takes 16-bit operands alone, so no family routes it another); on a
+    family whose Mosaic template has a routed mainloop, its declared old route where that takes the call
     (`OLD_ROUTES`), else the template, which hands a call it does not take to the next kernel by legality;
-    elsewhere its row's ('attention', cuDNN by default), and the narrow heads' row's ('attention_narrow')
-    for heads at most 64 wide with no window, mask, bias, documents, key lengths or key starts
-    (`_narrow`): by default tokamax's Triton kernel, measured faster than cuDNN there on an L4 and an RTX
-    4080; the A10's and A100's rows name flash, measured faster than both (`generation.TARGETS`). A call
-    with block groups, key validity or counted places, which no old kernel's spans express, takes the
-    generic path there by legality, over the mask its spans mean (ledger 1537)."""
+    elsewhere its row's ('attention', cuDNN by default), and the narrow heads' row's ('attention_narrow') for
+    heads at most 64 wide with no window, mask, bias, documents, key lengths or key starts (`_narrow`): by
+    default tokamax's Triton kernel, measured faster than cuDNN there on an L4 and an RTX 4080; the A10's and
+    A100's rows name flash, measured faster than both (`generation.TARGETS`). A call with block groups, key
+    validity or counted places, which no old kernel's spans express, takes the generic path there by legality,
+    over the mask its spans mean (ledger 1537)."""
     backend = generation.backend()
     if backend != 'gpu':
         return 'tpu' if backend == 'tpu' else 'xla'

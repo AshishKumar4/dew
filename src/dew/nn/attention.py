@@ -1724,15 +1724,6 @@ def _xla_kernel_narrows(query) -> bool:
         query.dtype == jnp.bfloat16 and generation.backend() == 'gpu' and not bf16_dot_runs())
 
 
-def _xla_kernel_on_cpu() -> bool:
-    """Whether jax.nn's xla attention would run this call on a CPU, where 'auto' and 'xla' take the
-    reference path. jax's sums fp32 products in fp32, as XLA:CPU's dot does, where Dew's tests sum a
-    CPU's in float64 (`precision.accumulated`), and it differentiates the softmax through rowsum(dO * O),
-    which leaves a query that reads one key a rounding's gradient where the softmax's own derivative,
-    the reference path's, is exactly zero."""
-    return generation.backend() == 'cpu'
-
-
 def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_softmax=True, softcap=None,
                    sinks=None, causal=False, sliding_window=None, mask=None, bias=None, segment_ids=None,
                    max_segments=None, key_value_seq_lengths=None, key_value_seq_starts=None,
@@ -1756,7 +1747,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         mask=mask is not None, bias=bias is not None,
         sinks=sinks is not None, softcap=softcap,
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax),
-        narrows=_xla_kernel_narrows(query) or _xla_kernel_on_cpu(),
+        narrows=_xla_kernel_narrows(query),
         folds=folds(query, key, bias, mask, causal, sliding_window),
         splash_mask=False, shards=sequence_shards(), dropout=dropout)
     # Splash's descriptor reads a concrete mask on the host, so it is built only where splash may run,
