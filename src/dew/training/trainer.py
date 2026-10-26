@@ -98,9 +98,9 @@ from dew.telemetry.records import (
     Record,
     StepCompiled,
 )
-from dew.training._fit import FitPlan, FitRun, declarations, waited_read
+from dew.training._fit import FitPlan, FitRun, declarations, falls, waited_read
 from dew.training._lowering import Lowered
-from dew.training.budget import Pause, Plateau, run_length, run_steps
+from dew.training.budget import Pause, Plateau, every_step, recorded, run_length, run_steps
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
     PREFETCH_DEPTH,
@@ -136,7 +136,7 @@ from dew.training.distributed import (
     traced_start,
 )
 from dew.training.evaluation import EvalSuite, Evaluation, Summary
-from dew.training.interval import Interval, held
+from dew.training.interval import Cadence, Interval, Tokens, held
 from dew.training.memory import (
     climb_to,
     device_tokens,
@@ -233,7 +233,7 @@ def _reported(rollout: Rollout | None, metrics: Sequence[Metric]) -> dict[str, S
 
 
 def _suites(dataset: Loader, validation: Mapping[str, Reader | EvalSuite] | None,
-            metrics: Sequence[Metric], eval_every: int | None) -> dict[str, EvalSuite]:
+            metrics: Sequence[Metric], eval_every: Cadence) -> dict[str, EvalSuite]:
     """Every split `fit` validates, by name, with its metrics and cadence
     resolved: `dataset.val` alone is the one suite `val`."""
     if validation is None:
@@ -1312,9 +1312,9 @@ class Trainer(Generic[Loss, Effects]):
         epochs: int | None = None,
         tokens: int | None = None,
         examples: int | None = None,
-        log_every: int = 100,
-        eval_every: int | None = None,
-        checkpoint_every: int | datetime.timedelta | None = None,
+        log_every: int | str = 100,
+        eval_every: int | str | None = None,
+        checkpoint_every: int | str | datetime.timedelta | None = None,
         checkpoint_final: bool = True,
         metrics: Sequence[Metric] = (),
         preview: bool = False,
@@ -1361,6 +1361,14 @@ class Trainer(Generic[Loss, Effects]):
         duration is checked at each `log_every` step, so they are written at the first log step
         after that much time, and every `checkpoints.local_every` steps to the local directory.
 
+        `log_every`, `eval_every`, `checkpoint_every` and an `EvalSuite`'s own `every` may each be a
+        share of the run, such as "5%", resolved once against its planned length: the whole updates
+        nearest that share of its steps, epochs or examples, and at least one; of a token budget
+        alone, each time its committed tokens pass a multiple of that share of them
+        (`dew.training.budget.every_step`). The start's record holds what they resolved to
+        (`FitStarted.cadences`), with each schedule's warmup, which may be a share too
+        (`dew.optim.Cosine.warmup_steps`).
+
         A preemption notice (a scheduler's SIGTERM; `PreemptionNotice`) stops the run
         at the next step every process agrees on. That step's state and data position
         are written, the final validation is skipped, and fit raises `Preempted`,
@@ -1385,9 +1393,10 @@ class Trainer(Generic[Loss, Effects]):
         steps = run_steps(loader, steps, epochs, tokens, self.accumulation, examples)
         count_compilation_cache()
         self._schedule(None if steps is None else steps // self.accumulation)
-        suites = _suites(loader, validation, metrics, eval_every)
+        logged, evaluated, saved, suites = self._cadenced(
+            loader, validation, metrics, steps, tokens, (log_every, eval_every, checkpoint_every))
         declared = declarations(suites, metrics, summaries := self._summaries(summaries, suites))
-        selection, plateau, pause = self._fit_policies(best, stop, declared, checkpoint_every, steps, tokens)
+        selection, plateau, pause = self._fit_policies(best, stop, declared, saved, steps, tokens)
         self._preflight(loader, plateau, suites, preview=preview,
                         loss=(self.checkpoints is not None or restore_best) and not selection)
         preview = preview and self.tracker is not None
@@ -1401,8 +1410,8 @@ class Trainer(Generic[Loss, Effects]):
         tracer = profiler if profiler is not None else telemetry_profile.active_profile()
         try:
             plan = FitPlan(
-                dataset=loader, steps=steps, log_every=log_every, eval_every=eval_every, tokens=tokens,
-                checkpoint_every=checkpoint_every, checkpoint_final=checkpoint_final,
+                dataset=loader, steps=steps, log_every=logged, eval_every=evaluated, tokens=tokens,
+                checkpoint_every=saved, checkpoint_final=checkpoint_final,
                 local_every=None if checkpoints is None else checkpoints.local_every,
                 metrics=metrics, preview=preview, best=selection, stop=plateau, suites=suites, pause=pause,
                 held_best=restore_best and checkpoints is None, observe=observe, summaries=summaries,
@@ -1423,6 +1432,36 @@ class Trainer(Generic[Loss, Effects]):
         if run.preempted is not None:
             raise Preempted(run.preempted)
         return trained
+
+    def _cadenced(self, loader: Loader, validation: Mapping[str, Reader | EvalSuite] | None,
+                  metrics: Sequence[Metric], steps: int | None, tokens: int | None,
+                  written: tuple[int | str, int | str | None, int | str | datetime.timedelta | None]
+                  ) -> tuple[int | Tokens, Cadence, Cadence | datetime.timedelta, dict[str, EvalSuite]]:
+        """`fit`'s log, validation and checkpoint cadences and its suites', each written as steps, a
+        duration or a share of the run ("5%"), resolved once against the run's planned length of
+        `steps` or `tokens` (`every_step`)."""
+        def cadence(value, name: str) -> Cadence:
+            return every_step(value, steps, tokens, self.accumulation, name=name)
+
+        log_every, eval_every, checkpoint_every = written
+        logged, evaluated = cadence(log_every, "log_every"), cadence(eval_every, "eval_every")
+        if not logged:
+            raise ValueError(f"log_every must be a positive cadence, got {log_every!r}")
+        saved = checkpoint_every if isinstance(checkpoint_every, datetime.timedelta) else cadence(
+            checkpoint_every, "checkpoint_every")
+        suites = {name: dataclasses.replace(suite, every=cadence(suite.every, f"{name}'s every"))
+                  for name, suite in _suites(loader, validation, metrics, evaluated).items()}
+        return logged, evaluated, saved, suites
+
+    def _cadences(self, plan: FitPlan) -> dict[str, JSON]:
+        """The cadences and schedule warmups `plan` resolved, as the run's start records them."""
+        suites = {f"{name}.every": recorded(suite.every) for name, suite in plan.suites.items()
+                  if suite.every != plan.eval_every}
+        warmups = {} if self._config is None else self._config.warmups(
+            None if plan.steps is None else plan.steps // self.accumulation)
+        return {"log_every": recorded(plan.log_every), "eval_every": recorded(plan.eval_every),
+                "checkpoint_every": recorded(plan.checkpoint_every), **suites,
+                **{f"warmup_steps.{name}": value for name, value in warmups.items()}}
 
     def _schedule(self, updates: int | None) -> None:
         """The configured optimizer, built for `updates` updates; its state holds the rate it logs."""
@@ -1462,6 +1501,8 @@ class Trainer(Generic[Loss, Effects]):
         compiled: dict[Signature, tuple[CompiledStep, StepFlops | None]] = {}
         seen = 0
         run.notice = PreemptionNotice()
+        # The tokens a resumed run committed before it, from which a cadence on the token clock counts.
+        run.committed = plan.real(interval)
         while not plan.ended(run.current, plan.real(interval)):
             # The window's capture opens before this iteration's first read, so the step row records
             # the read it waits on rather than a compile that ran before capture began.
@@ -1598,7 +1639,7 @@ class Trainer(Generic[Loss, Effects]):
             sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
             jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape),
             split_share(state.variables),
-            seed=self.seed, tokens=plan.tokens)
+            seed=self.seed, tokens=plan.tokens, cadences=self._cadences(plan))
         self._refusal = None
         self._report(started, current)
         if plan.dataset.held_out:
@@ -1682,27 +1723,30 @@ class Trainer(Generic[Loss, Effects]):
         notice stops the run at this step, whose checkpoint is then written."""
         current, checkpoints = run.current, self.checkpoints
         real = plan.real(interval)
+        # The committed tokens before this step, which a cadence on the token clock reads (`falls`).
+        before, run.committed = run.committed, real
         record, aux = taken_record(aux)
         if record is not None:
             self.records.append(record)
         aux = {name: value for name, value in aux.items() if name not in (TRAINING_FLOPS, TOKENS)}
         run.training = {'train/loss': loss, **{f'train/{name}': value for name, value in aux.items()}}
         run.stepped = (loss, aux, accepted)
-        if current % plan.log_every == 0:
+        logged = falls(plan.log_every, current, real, before)
+        if logged:
             self._take(plan, run, interval, state)
 
         if isinstance(plan.checkpoint_every, datetime.timedelta):
             # The clock is read at the log interval, where the step is already waited on, so a pool's
             # processes agree on it there rather than gathering behind every step.
             run.checkpoint_due = False
-            if current % plan.log_every == 0:
+            if logged:
                 elapsed = time.perf_counter() - run.last_checkpoint
                 due = elapsed >= plan.checkpoint_every.total_seconds()
                 run.checkpoint_due = agree_process_phase(None, phase="checkpoint clock", available=due) > 0
         else:
-            run.checkpoint_due = bool(plan.checkpoint_every and current % plan.checkpoint_every == 0)
-        due = plan.due(current)
-        evaluation_due = bool(due) or bool(plan.eval_every and current % plan.eval_every == 0)
+            run.checkpoint_due = falls(plan.checkpoint_every, current, real, before)
+        due = plan.due(current, real, before)
+        evaluation_due = bool(due) or falls(plan.eval_every, current, real, before)
         # A run's last step, its budget's or the step after which its stream runs out, is scored and saved
         # once, by `_wind_down`, with every suite: never here before a rarer suite has. Only a step that
         # evaluates or pauses could save first (a ranked save scores every suite), so only there is the

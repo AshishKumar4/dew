@@ -46,7 +46,7 @@ from etils import epath
 import dew.io
 from dew import registry
 from dew._coordination import agree_process_phase, agreed
-from dew._records import JSON, duration, record, recorded_duration
+from dew._records import JSON, duration, is_share, record, recorded_duration
 from dew.cache import dew_cache_dir
 from dew.checkpoints import RUN_FILE, Checkpoints, Keep
 from dew.config.sweep import RandomSearch, Search, Space, read_ledger, write_ledger
@@ -298,23 +298,39 @@ def _keep_argument():
     )
 
 
-def _cadence_argument():
+def _cadence_argument(*, timed: bool = True):
+    """A cadence's command-line form: steps, `epoch`, a share of the run such as `5%`, None, and with
+    `timed` a duration such as `30m`."""
     def read(given):
         value = given[0]
         if value == 'None':
             return None
-        if value == 'epoch':
+        if value == 'epoch' or is_share(value):
             return value
-        return int(value) if value.isdecimal() else duration(value)
+        return int(value) if value.isdecimal() or not timed else duration(value)
     return tyro.constructors.PrimitiveConstructorSpec(
         nargs=1,
-        metavar="STEPS|DURATION|epoch",
+        metavar="STEPS|DURATION|SHARE%|epoch" if timed else "STEPS|SHARE%|epoch",
         instance_from_str=read,
         is_instance=lambda value: value is None or isinstance(value, (int, str, datetime.timedelta)),
         str_from_instance=lambda value: [
             recorded_duration(value) if isinstance(value, datetime.timedelta) else str(value)
         ],
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class SourceOptions:
+    """What a run builds of the source it starts from: `Pretrained.load`'s keywords for its parts,
+    beside where it reads them (`TrainerConfig.source_placement`), every run kind's alike
+    (`RunConfig.source_keywords`)."""
+
+    text_only: bool = False
+    """A multimodal wrapper's language model alone: no tower, projector or audio encoder built, nor
+    their tensors read (`Pretrained.load`'s `text_only`)."""
+    prediction_depths: int | None = None
+    """The first that many multi-token prediction depths, 0 for none; None the checkpoint's own
+    (`Pretrained.load`'s `prediction_depths`)."""
 
 
 class SourcePlacement(TypedDict, total=False):
@@ -325,6 +341,14 @@ class SourcePlacement(TypedDict, total=False):
     on_host: bool
     mesh: MeshSpec
     layout: Layout
+
+
+class SourceOptionsKeywords(SourcePlacement, total=False):
+    """`Pretrained.load`'s keywords for a run's source: what it builds of it (`SourceOptions`) and
+    where it reads it (`SourcePlacement`, `RunConfig.source_keywords`)."""
+
+    text_only: bool
+    prediction_depths: int | None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -360,16 +384,19 @@ class TrainerConfig:
     stop: Annotated[Pause, tyro.conf.subcommand("pause")] | None = None
     """End the run at a fraction of its length, to resume it later as if it had never stopped
     (`Pause`): `--trainer.stop.fraction 0.5`."""
-    log_every: int = 100
-    eval_every: int | Literal["epoch"] | None = "epoch"
+    log_every: Annotated[int | str, _cadence_argument(timed=False)] = 100
+    """The steps between logs, or a share of the run such as "1%" (`eval_every`)."""
+    eval_every: Annotated[int | str | None, _cadence_argument(timed=False)] = "epoch"
     """The steps between validation passes.
 
-    It is a number of steps, "epoch" for one pass over the data, or None to never
-    validate. "epoch" over a stream that reports no record count raises a
-    ValueError, since such a stream has no pass.
+    It is a number of steps, "epoch" for one pass over the data, a share of the
+    run such as "5%", resolved once against its planned length in steps, epochs,
+    examples or tokens (`dew.training.Trainer.fit`), or None to never validate.
+    "epoch" over a stream that reports no record count raises a ValueError, since
+    such a stream has no pass.
     """
     checkpoint_every: Annotated[int | str | datetime.timedelta | None, _cadence_argument()] = "epoch"
-    """The steps between checkpoints, with the same three choices as `eval_every`.
+    """The steps between checkpoints, with the same choices as `eval_every`, or a duration such as 30m.
 
     A stream whose iterator cannot report its read position must train with None;
     the trainer refuses any other value for it.
@@ -486,7 +513,13 @@ class TrainerConfig:
         if self.publish and (self.wandb is None or not self.checkpoint_final):
             raise ValueError("trainer.publish requires trainer.wandb and trainer.checkpoint_final")
         run_length(self.steps, self.epochs, self.tokens, self.examples, required=False)
-        if isinstance(self.checkpoint_every, str) and self.checkpoint_every != 'epoch':
+        if isinstance(self.log_every, str) and not is_share(self.log_every):
+            raise ValueError(f"--trainer.log-every is steps or a share such as 1%, not {self.log_every!r}")
+        if isinstance(self.eval_every, str) and self.eval_every != 'epoch' and not is_share(self.eval_every):
+            raise ValueError(f"--trainer.eval-every is steps, epoch or a share such as 5%, not "
+                             f"{self.eval_every!r}")
+        if isinstance(self.checkpoint_every, str) and self.checkpoint_every != 'epoch' and not is_share(
+                self.checkpoint_every):
             object.__setattr__(self, 'checkpoint_every', duration(self.checkpoint_every))
         if isinstance(self.keep, Mapping):
             object.__setattr__(self, 'keep', from_record(Keep, self.keep, dtypes=False))
@@ -560,11 +593,11 @@ class TrainerConfig:
         # A window the run ends inside is never committed, as the trainer counts its updates.
         return None if steps is None else steps // trainer.accumulation
 
-    def eval_interval(self, dataset: Loader) -> int | None:
+    def eval_interval(self, dataset: Loader) -> int | str | None:
         """Return the steps between validation passes over `data`, or None for never."""
         return self._interval(self.eval_every, dataset, "eval-every")
 
-    def checkpoint_interval(self, dataset: Loader) -> int | datetime.timedelta | None:
+    def checkpoint_interval(self, dataset: Loader) -> int | str | datetime.timedelta | None:
         """Return the steps, or a recorded duration such as 30m, between checkpoints."""
         value = self.checkpoint_every
         if isinstance(value, datetime.timedelta):
@@ -573,8 +606,9 @@ class TrainerConfig:
             return value
         return self._interval(self.checkpoint_every, dataset, "checkpoint-every")
 
-    def _interval(self, value, dataset: Loader, field_name: str) -> int | None:
-        if value is None or isinstance(value, int):
+    def _interval(self, value, dataset: Loader, field_name: str) -> int | str | None:
+        """Steps for `epoch`; steps, a share of the run (which `fit` resolves) or None as given."""
+        if value is None or isinstance(value, int) or is_share(value):
             return value
         if dataset.steps_per_epoch is None:
             raise ValueError(
@@ -884,6 +918,9 @@ class RunConfig:
     stage or the training batch."""
     data_seed: int = 0
     """The seed of the data's order and of its random steps."""
+    source: SourceOptions = dataclasses.field(default_factory=SourceOptions)
+    """What the run builds of the source it starts from (`--source.text-only`,
+    `--source.prediction-depths`), where it starts from one (`pretrained`)."""
     optim: OptimConfig = dataclasses.field(default_factory=OptimConfig)
     trainer: TrainerConfig = dataclasses.field(default_factory=TrainerConfig)
     objective: ObjectiveConfig | None = None
@@ -1023,6 +1060,13 @@ class RunConfig:
         """The run's class record: its class by its alias in `dew.registry.runs`, or by its import path
         where the table holds none, and its fields (`to_dict`)."""
         return {"class": registry.runs.name_of(type(self)), "fields": self.to_dict()}
+
+    def source_keywords(self, *, frozen: bool) -> SourceOptionsKeywords:
+        """`Pretrained.load`'s keywords for the source the run starts from: what it builds of it
+        (`source`) and where it reads it (`TrainerConfig.source_placement`, `frozen` where the run
+        keeps the source as it is). Every run kind that starts from a source loads it with these."""
+        return {"text_only": self.source.text_only, "prediction_depths": self.source.prediction_depths,
+                **self.trainer.source_placement(frozen=frozen)}
 
     def check_resume(self, saved: Mapping[str, object]) -> None:
         """Refuse to resume the run whose record is `saved` as this one where they train different
@@ -1441,5 +1485,6 @@ def looping(start: "Pretrained", steps: int | None, layers: tuple[int, int] | No
     return dataclasses.replace(start, model=looped)
 
 
-__all__ = ["DecoderRunConfig", "MetricConfig", "ObjectiveConfig", "Prepared", "RunConfig", "TrainerConfig",
+__all__ = ["DecoderRunConfig", "MetricConfig", "ObjectiveConfig", "Prepared", "RunConfig", "SourceOptions",
+           "TrainerConfig",
            "flag_selected", "looping"]

@@ -55,6 +55,21 @@ def duration(value: str) -> datetime.timedelta:
     return datetime.timedelta(microseconds=micros)
 
 
+def is_share(value: object) -> bool:
+    """Whether `value` is written as a share of a run, such as `5%` (`share`)."""
+    return isinstance(value, str) and value.endswith("%")
+
+
+def share(value: str) -> float:
+    """The fraction of a run a share such as `5%` or `0.5%` names: above none of it, at most all."""
+    match = re.fullmatch(r'(\d+(?:\.\d+)?)%', value)
+    fraction = None if match is None else float(match[1]) / 100
+    if fraction is None or not 0 < fraction <= 1:
+        raise ValueError(f"a share of a run is a percentage above 0 and at most 100, such as 5%, not "
+                         f"{value!r}")
+    return fraction
+
+
 def recorded_duration(value: datetime.timedelta) -> str:
     """One canonical spelling, preserving timedelta's microsecond precision."""
     micros = (value.days * 86400 + value.seconds) * 1_000_000 + value.microseconds

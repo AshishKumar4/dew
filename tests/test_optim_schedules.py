@@ -12,8 +12,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import pytest
 
-from dew.optim import Cosine, Exponential, OneCycle, OptimConfig, ParamGroup, stepped
+from dew.optim import Cosine, Exponential, Linear, OneCycle, OptimConfig, ParamGroup, Power, stepped
 
 TORCH = np.load(Path(__file__).resolve().parent / "fixtures" / "torch_optim" / "reference.npz")
 EPOCHS, PER_EPOCH = 6, 2
@@ -145,3 +146,27 @@ def test_a_bounded_group_clamps_its_parameters_and_no_others():
     # The clamp is exact: the bounds themselves, where the step overshot them.
     np.testing.assert_array_equal(moved["delay"], [0.0, 3.0])
     np.testing.assert_allclose(moved["kernel"], [-0.45, 3.45], rtol=1e-5)
+
+
+@pytest.mark.parametrize("schedule", [
+    lambda warmup: Cosine(1.0, warmup_steps=warmup, decay_steps=100),
+    lambda warmup: Linear(1.0, warmup_steps=warmup, decay_steps=100),
+    lambda warmup: Power(1.0, warmup_steps=warmup, a=0.5),
+], ids=["cosine", "linear", "power"])
+def test_a_warmup_may_be_a_share_of_the_run(schedule):
+    """A warmup written as a share of the run is the whole updates nearest that share of its updates,
+    and the schedule it makes is the one written with those updates: 5% of 200 is 10, and of a
+    cosine's own 100-step horizon 5 where the run states none."""
+    shared, written = schedule("5%"), schedule(10)
+    for step in (0, 3, 9, 10, 11, 50, 99):
+        assert float(shared.values(200)(step)) == float(written.values(200)(step))
+    assert shared.warmup(200) == 10
+    if isinstance(shared, Cosine):
+        assert shared.warmup(None) == 5
+
+
+@pytest.mark.parametrize("warmup", ["0%", "101%", "5", "five%"])
+def test_a_warmup_that_is_neither_steps_nor_a_share_is_refused(warmup):
+    with pytest.raises(ValueError):
+        Cosine(1.0, warmup_steps=warmup, decay_steps=100).values(200)
+
