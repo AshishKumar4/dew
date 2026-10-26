@@ -6,8 +6,9 @@ name: CI
 
 on:
   push:
-    # ci/** is where a branch goes for its own run before it lands.
-    branches: [ "main", "ci/**" ]
+    # ci/** is where a branch goes for its own run before it lands; base/kernels, where the template lanes push
+    # straight, runs on each push, its reds fixed forward by the lane that pushed (owner, 2026-10-26).
+    branches: [ "main", "ci/**", "base/kernels" ]
   pull_request:
     branches: [ "main" ]
   workflow_dispatch:
@@ -139,8 +140,9 @@ jobs:
   # What the run's suite covers (tools/armada/ci.py policy), read before the test job starts, as its armada
   # group depends on it: the daily run and a land-queue train's full run (ci/full-*) run every file; any other
   # run reruns what its change reaches, and the whole suite where it cannot place it: from main, for a fix on a
-  # train (ci/fix-*) from the train's tip it fixes, its first parent, and for a base/<producer> promote
-  # (ci/base-<sha>-*) from the producer branch's tip it merges onto, <sha>.
+  # train (ci/fix-*) from the train's tip it fixes, its first parent, for a base/<producer> promote
+  # (ci/base-<sha>-*) from the producer branch's tip it merges onto, <sha>, and for a push to base/kernels from
+  # the tip it moved from (main where it is new).
   scope:
     runs-on: ubuntu-latest
     outputs:
@@ -152,11 +154,13 @@ jobs:
     - id: policy
       env:
         DEW_TEST_CACHE: ${{ (github.event_name == 'schedule' || startsWith(github.ref_name, 'ci/full-')) && 'off' || '' }}
+        BEFORE: ${{ github.event.before }}
       run: |
         if [ -z "$DEW_TEST_CACHE" ]; then
           case "$GITHUB_REF_NAME" in
             ci/fix-*) from=HEAD^1 ;;
             ci/base-*) from=${GITHUB_REF_NAME#ci/base-}; from=${from%%-*} ;;
+            base/kernels) from=$BEFORE; git cat-file -e "$from^{commit}" 2>/dev/null || from=origin/main ;;
             *) from=origin/main ;;
           esac
           DEW_TEST_CACHE=$(python3 tools/armada/ci.py policy "$from")
@@ -196,7 +200,7 @@ jobs:
     # runs' suites fill the deployment's fleet, and the gangs, which need
     # four containers at once, then wait out their deadline (armada#49). The
     # land queue's one train at a time takes `armada`. A base/<producer>
-    # promote (ci/base-*) takes a group of its own, whether it reruns what its
+    # promote (ci/base-*), and a push to base/kernels, take a group of their own, whether it reruns what its
     # change reaches or the whole suite, and so does the whole suite on main,
     # every fifth publish, in the background (ci/full-whole-*): both run no
     # gangs, which every train runs, and each takes a bounded share of the
@@ -207,11 +211,12 @@ jobs:
     concurrency:
       group: >-
         ${{ (startsWith(github.ref_name, 'ci/full-whole-') && 'armada-whole')
-        || (startsWith(github.ref_name, 'ci/base-') && 'armada-base')
+        || ((startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels') && 'armada-base')
         || 'armada' }}
       cancel-in-progress: false
       queue: max
-    timeout-minutes: ${{ (startsWith(github.ref_name, 'ci/full-whole-') || startsWith(github.ref_name, 'ci/base-')) && 110 || 60 }}
+    timeout-minutes: ${{ (startsWith(github.ref_name, 'ci/full-whole-') || startsWith(github.ref_name, 'ci/base-')
+      || github.ref_name == 'base/kernels') && 110 || 60 }}
     steps:
     - uses: actions/checkout@v4
       with:
@@ -232,7 +237,7 @@ jobs:
         PROVEN: ${{ needs.proven.outputs.run }}
         BACKGROUND_POOL: >-
           ${{ (startsWith(github.ref_name, 'ci/full-whole-') && '20')
-          || (startsWith(github.ref_name, 'ci/base-') && '24') || '' }}
+          || ((startsWith(github.ref_name, 'ci/base-') || github.ref_name == 'base/kernels') && '24') || '' }}
       run: |
         armada=armada
         # The test cache's policy, as the scope job read it.
@@ -240,8 +245,8 @@ jobs:
         # Each client runs in a session of its own, so the interrupt a cancelled run sends this shell
         # reaches it and it cancels its armada job; the shell waits on them, where a trap runs.
         trap 'for group in ${gangs:-} ${suite:-}; do kill -INT -- "-$group" 2>/dev/null || true; done' INT TERM
-        # A base/<producer> promote and the background whole suite run no gangs: main's trains run them.
-        case "$GITHUB_REF_NAME" in ci/base-*|ci/full-whole-*) gangless=1 ;; *) gangless= ;; esac
+        # A base/<producer> promote, a push to base/kernels and the background whole suite run no gangs: main's trains run them.
+        case "$GITHUB_REF_NAME" in ci/base-*|base/kernels|ci/full-whole-*) gangless=1 ;; *) gangless= ;; esac
         if [ -z "$PROVEN" ] && [ -z "$gangless" ]; then
           # A gang member lost before the start fails it within 300 s (armada#22).
           items=$(python3 tools/armada/ci.py gangs)
