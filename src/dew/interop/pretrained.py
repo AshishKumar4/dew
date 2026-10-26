@@ -10,9 +10,11 @@ that write every tensor back, so `Pretrained.save` restores what it read.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 import os
+import re
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import partial
@@ -408,9 +410,10 @@ class Pretrained:
         a decoder already loads as it is; a pipeline or a fallback has no language model to take.
 
         `prediction_depths` keeps the first that many of a decoder's multi-token prediction depths
-        (its `mtp_*` blocks, DeepSeek V3's and Qwen3.5's): None the ones the checkpoint holds, 0 none,
-        `n` the first `n`. The others are neither built nor their tensors read, and the source saves
-        without them. A source that holds fewer keeps what it holds; one with none holds none.
+        (DeepSeek V3's, GLM's and Qwen3.5's `mtp` blocks, a DSpark drafter's stages): None the ones the
+        checkpoint holds, 0 none, `n` the first `n`. The load reads the source as a checkpoint of those
+        alone (`_kept_depths`): the others are neither built nor their tensors read, and it saves as
+        that checkpoint. A source that holds fewer keeps what it holds; one with none holds none.
 
         Without `weights`, the variables are their shapes and dtypes alone
         (`jax.ShapeDtypeStruct`), read from the source's headers through the same
@@ -1352,15 +1355,14 @@ class _Built(NamedTuple):
 def _wrapper_source(config: Mapping[str, object], record: decoder_parts.WrapperFields,
                     tensors: Mapping[str, np.ndarray], directory: Path, *, dtype: str, attention_impl: str,
                     max_seq_len: int | None, param_dtype: str, lazy: bool,
-                    checked: decoders.Checked, depths: int | None = None) -> _Built:
+                    checked: decoders.Checked) -> _Built:
     """A multimodal wrapper, `record` its translated config: the decoder under its text_config and the
-    towers beside it; `checked` the spellings the load checked equal before decoding, and `depths`
-    the prediction depths the load keeps (`Pretrained.load(prediction_depths=)`), the others unread."""
+    towers beside it; `checked` the spellings the load checked equal before decoding."""
     text_fields = _wrapper_text_fields(config, record, max_seq_len)
     parts, language, media = decoders.read_wrapper(tensors, record, param_dtype=param_dtype, lazy=lazy,
-                                                   checked=checked, depths=depths)
+                                                   checked=checked)
     for fields in (text_fields, record['text']):
-        decoders.held_depths(fields, parts["language_model"]["params"], depths)
+        decoders.held_depths(fields, parts["language_model"]["params"])
     text = NativeFields(CausalTransformer, {**text_fields, "dtype": dtype, "attention_impl": attention_impl})
     wrapper: decoder_parts.WrapperFields = {**record, "text": text}
     language_model = from_record(CausalTransformer, wrapper["text"])
@@ -1500,11 +1502,10 @@ def _spelled_source_weights(spelling: Mapping[str, str], model: CausalTransforme
 def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarray], directory: Path,
                     route: DecoderRoute | VerifiedRoute, *, dtype: str, attention_impl: str,
                     max_seq_len: int | None, param_dtype: str, lazy: bool, quantized: bool,
-                    checked: decoders.Checked, depths: int | None = None) -> _Built:
+                    checked: decoders.Checked) -> _Built:
     """A decoder of a registered family, or of one it was verified as (tier 2), as `route` read it.
     `quantized` says the source ships weights in a quantization format; `checked` names the
-    spellings the load checked equal before decoding; `depths` the prediction depths the load keeps
-    (`Pretrained.load(prediction_depths=)`), the others read lazily and dropped unread."""
+    spellings the load checked equal before decoding."""
     match route:
         case DecoderRoute(record=translated):
             verified = None
@@ -1518,9 +1519,9 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     if max_seq_len is not None:
         record["max_seq_len"] = max_seq_len
     placed, readings = decoders.read_decoder(tensors, record, family, param_dtype=param_dtype, lazy=lazy,
-                                             checked=checked, depths=depths)
+                                             checked=checked)
     variables = decoders.with_constants(placed, record, directory)
-    decoders.held_depths(record, variables["params"], depths)
+    decoders.held_depths(record, variables["params"])
     built = {**record, "dtype": dtype, "attention_impl": attention_impl}
     model = from_record(CausalTransformer, built)
     decoder_parts.check_decoder_tree(variables, model)
@@ -1634,7 +1635,7 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
         pinned = source.component(component.config_folder)
         remote = None if code is None else pinned.directory(code)
         routed = _routed(_native_config(component.config, overrides), remote=remote, pinned=pinned,
-                         text_only=False, overrides=overrides)
+                         text_only=False, overrides=overrides, prediction_depths=prediction_depths)
         forwarded = isinstance(routed.route, TorchRoute)
         reads_shared = not forwarded or bool(head_source.weight_file is None and component.tensor_prefix)
         if weights or reads_shared:
@@ -1717,13 +1718,17 @@ class _Routed(NamedTuple):
 
 
 def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: sources.SourceReference | None,
-            text_only: bool, overrides: Mapping[str, object] | None) -> _Routed:
+            text_only: bool, overrides: Mapping[str, object] | None,
+            prediction_depths: int | None = None) -> _Routed:
     """A native source's config, its route and, where `text_only` takes a wrapper's language model
     alone, that model's wrapper fields, decided before any weight downloads, on the config alone: a
     format the codec cannot read, a family's refusal, an unregistered decoder checked against
     transformers (tiers 2 and 3). The language model reads as its text family's checkpoint
     (`decoders.language_model_config`); a route that reads no `overrides` refuses them. `remote` and
-    `pinned` are `source_route`'s."""
+    `pinned` are `source_route`'s. Where `prediction_depths` is given, the config is the checkpoint's
+    of that many depths (`_kept_depths`), which the load reads and saves."""
+    if prediction_depths is not None:
+        config = _kept_depths(config, prediction_depths)
     route = source_route(config, remote=remote, pinned=pinned)
     language = route.wrapper if text_only and isinstance(route, WrapperRoute) else None
     if language is not None:
@@ -1758,8 +1763,7 @@ class _Translated(NamedTuple):
 def _translated(config: Mapping[str, object],
                 route: DecoderRoute | WrapperRoute | DiffusionGemmaRoute | VerifiedRoute,
                 tensors: Mapping[str, np.ndarray], directory: Path, *, dtype: str, param_dtype: str,
-                attention_impl: str, max_seq_len: int | None, streaming: bool,
-                prediction_depths: int | None = None) -> _Translated:
+                attention_impl: str, max_seq_len: int | None, streaming: bool) -> _Translated:
     """`config`'s native model and variables over `tensors`, as `route` reads them: a quantized source's
     weights decoded, the decoder, media wrapper or DiffusionGemma translated and checked against its
     tree, and any stored input scales bound. No processor, generation config or bundle is built."""
@@ -1784,13 +1788,12 @@ def _translated(config: Mapping[str, object],
         case WrapperRoute(wrapper=wrapper):
             built = _wrapper_source(
                 config, wrapper, tensors, directory, dtype=dtype, attention_impl=attention_impl,
-                max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming, checked=checked,
-                depths=prediction_depths)
+                max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming, checked=checked)
         case DecoderRoute() | VerifiedRoute():
             built = _decoder_source(
                 config, tensors, directory, route, dtype=dtype, attention_impl=attention_impl,
                 max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming,
-                quantized=source_quantization(config) is not None, checked=checked, depths=prediction_depths)
+                quantized=source_quantization(config) is not None, checked=checked)
     model, variables = _input_quantization(built.model, built.variables, built.layouts, config, grid)
     return _Translated(built._replace(model=model, variables=variables), quantized_tensors, scale_dtype, grid)
 
@@ -1815,6 +1818,58 @@ def native_backbone(directory: str | Path, *, param_dtype: str) -> tuple[Mapping
                              dtype="float32", param_dtype=param_dtype, attention_impl="reference",
                              max_seq_len=None, streaming=True)
     return component.config, translated.built.variables
+
+
+DEPTH_COUNTS = ("num_nextn_predict_layers", "mtp_num_hidden_layers", "num_mtp_layers", "n_mtp_layers")
+"""The fields a source's config counts its multi-token prediction depths by, family by family."""
+
+_LAYER = re.compile(r"(?:model\.|model\.language_model\.|language_model\.model\.|)layers\.(\d+)\."
+                    r"|blk\.(\d+)\.")
+_DEPTH = re.compile(r"(?:model\.)?mtp\.(?:layers\.)?(\d+)\.")
+
+
+def _scopes(config: dict) -> list[dict]:
+    """The scopes a decoder's fields are stated in: `config`'s top, then its `text_config` if any."""
+    text = config.get("text_config")
+    return [config, *([text] if isinstance(text, dict) else [])]
+
+
+def _trunk_layers(config: Mapping[str, object]) -> int:
+    """The decoder layers of `config`'s trunk, its prediction depths' and drafter stages' apart."""
+    layers = [scope.get("num_hidden_layers") for scope in _scopes(dict(config))]
+    return next((count for count in reversed(layers) if isinstance(count, int)), 0)
+
+
+def _kept_depths(config: Mapping[str, object], kept: int) -> dict:
+    """`config` as the config of a checkpoint holding its first `kept` prediction depths alone: each
+    depth count it states (`DEPTH_COUNTS`, at its top or in its `text_config`) at most `kept`, and a
+    DSpark drafter's stages, which its `compress_ratios` list past the trunk's layers, cut to `kept`,
+    none at 0 (`dew.interop.families.deepseek`). A load reads, builds and saves the source this
+    config states (`Pretrained.load(prediction_depths=)`)."""
+    written = copy.deepcopy(dict(config))
+    for scope in _scopes(written):
+        for counted in DEPTH_COUNTS:
+            if isinstance(scope.get(counted), int) and scope[counted] > kept:
+                scope[counted] = kept
+        ratios, layers = scope.get("compress_ratios"), scope.get("num_hidden_layers")
+        if scope.get("dspark_block_size") and isinstance(ratios, list) and isinstance(layers, int):
+            scope["compress_ratios"] = ratios[:layers + kept]
+            if not kept:
+                scope["dspark_block_size"] = 0
+    return written
+
+
+def _unkept_depth(name: str, trunk: int, kept: int) -> bool:
+    """Whether the source tensor `name` belongs to a prediction depth past the first `kept`: a decoder
+    layer past its `trunk`'s (DeepSeek V3's, GLM's, a GGUF's `blk.N`), a numbered `mtp.` block
+    (Qwen3.5's, DeepSeek V4's), or with no depth kept the part every depth shares (Qwen3.5's `mtp.fc`)."""
+    layer = _LAYER.match(name)
+    if layer is not None:
+        return int(layer[1] or layer[2]) - trunk >= kept
+    if not name.startswith(("mtp.", "model.mtp.")):
+        return False
+    depth = _DEPTH.match(name)
+    return (depth is None and not kept) or (depth is not None and int(depth[1]) >= kept)
 
 
 def _load_native_source(source: sources.SourceReference, root: Path, *,
@@ -1851,7 +1906,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     config = _native_config(config, overrides)
     family = config.get("model_type")
     if routed is None:
-        routed = _routed(config, remote=remote, pinned=pinned, text_only=text_only, overrides=overrides)
+        routed = _routed(config, remote=remote, pinned=pinned, text_only=text_only, overrides=overrides,
+                         prediction_depths=prediction_depths)
     config, route, language = routed
     if isinstance(route, TorchRoute):
         from dew.interop import torchax_fallback
@@ -1866,11 +1922,14 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
         tensors = sources.load_shards(directory)
     if mamba_ssm:
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
+    if prediction_depths is not None:
+        trunk = _trunk_layers(config)
+        tensors = {name: tensor for name, tensor in tensors.items()
+                   if not _unkept_depth(name, trunk, prediction_depths)}
     if language is not None:
         tensors = _language_model_tensors(tensors, language)
     translated = _translated(config, route, tensors, directory, dtype=dtype, param_dtype=param_dtype,
-                             attention_impl=attention_impl, max_seq_len=max_seq_len, streaming=streaming,
-                             prediction_depths=prediction_depths)
+                             attention_impl=attention_impl, max_seq_len=max_seq_len, streaming=streaming)
     model, variables, record, built, layouts, retained, export_adapter = translated.built
     quantized_tensors, scale_dtype, grid = translated[1:]
     resolved_commit = commit

@@ -286,38 +286,65 @@ def _misshapen_depths(source: Path, target: Path, depth: str) -> Path:
     return target
 
 
-@pytest.mark.parametrize(("fixture", "depth"), [("glm4-moe-tiny", "model.layers.2."),
-                                              ("qwen38-dense-tiny", "mtp.")])
-def test_a_load_builds_and_reads_only_the_prediction_depths_it_keeps(tmp_path, fixture, depth):
-    """`prediction_depths=0` builds a decoder's trunk alone: its depth is neither built nor read, its
-    copies of the trunk's embedding and head unchecked, so a copy whose depth no decoder could read
-    loads as the source does, to the same trunk logits, and saves its trunk alone, reloading to the
-    same model. A count at least the checkpoint's keeps every depth it holds."""
+@pytest.mark.parametrize(("fixture", "depth", "text_only"), [("glm4-moe-tiny", "model.layers.2.", False),
+                                                             ("qwen38-dense-tiny", "mtp.", True),
+                                                             ("qwen38-dense-tiny", "mtp.", False)],
+                         ids=["glm", "qwen-text", "qwen-wrapper"])
+def test_a_load_builds_and_reads_only_the_prediction_depths_it_keeps(tmp_path, fixture, depth, text_only):
+    """`prediction_depths=0` builds a decoder's trunk alone, a wrapper's around it: its depth is neither
+    built nor read, so a copy whose depth no decoder could read loads as the source does, to the same
+    logits, and saves as a checkpoint of its trunk, reloading to the same model. A count at least the
+    checkpoint's keeps every depth it holds."""
     from dew.interop import Pretrained
 
+    def load(directory, **options):
+        return Pretrained.load(directory, dtype="float32", attention_impl="reference", text_only=text_only,
+                               **options)
+
+    def decoder(loaded):
+        return loaded.model if text_only or fixture.startswith("glm") else loaded.model.language_model
+
     source = FIXTURES / fixture
-    whole = Pretrained.load(source, dtype="float32", attention_impl="reference", text_only=True)
-    assert whole.model.num_nextn_predict_layers == 1
-    every = Pretrained.load(source, dtype="float32", attention_impl="reference", text_only=True,
-                            prediction_depths=2)
-    assert every.model == whole.model
-    kept = 0
+    whole = load(source)
+    assert decoder(whole).num_nextn_predict_layers == 1
+    assert load(source, prediction_depths=2).model == whole.model
     misshapen = _misshapen_depths(source, tmp_path / "misshapen", depth)
     with pytest.raises(ValueError):
-        Pretrained.load(misshapen, dtype="float32", attention_impl="reference", text_only=True)
-    loaded = Pretrained.load(misshapen, dtype="float32", attention_impl="reference", text_only=True,
-                             prediction_depths=kept)
-    assert loaded.model.num_nextn_predict_layers == kept
-    assert sorted(name for name in loaded.variables["params"] if str(name).startswith("mtp_")) == [
-        f"mtp_{index}" for index in range(kept)]
-    ids = jnp.arange(8, dtype=jnp.int32)[None] % loaded.model.vocab_size
+        load(misshapen)
+    loaded = load(misshapen, prediction_depths=0)
+    assert decoder(loaded).num_nextn_predict_layers == 0
+    import jax
+
+    leaves = jax.tree_util.tree_flatten_with_path(loaded.variables)[0]
+    paths = [jax.tree_util.keystr(path) for path, _ in leaves]
+    assert not any("mtp_" in path for path in paths)
+    ids = jnp.arange(8, dtype=jnp.int32)[None] % decoder(loaded).vocab_size
     np.testing.assert_array_equal(np.asarray(loaded.model.apply(loaded.variables, ids)),
                                   np.asarray(whole.model.apply(whole.variables, ids)))
     loaded.save(tmp_path / "saved")
-    reloaded = Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="reference")
-    assert reloaded.model.num_nextn_predict_layers == kept
+    reloaded = load(tmp_path / "saved")
+    assert decoder(reloaded).num_nextn_predict_layers == 0
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
                                   np.asarray(loaded.model.apply(loaded.variables, ids)))
+
+
+@pytest.mark.parametrize(("fixture", "kept", "stages"), [("deepseek-v4-dspark-tiny", 0, 3),
+                                                         ("deepseek-v41-tiny", 1, 3)])
+def test_a_drafters_stages_are_the_prediction_depths_a_load_keeps(tmp_path, fixture, kept, stages):
+    """A DSpark drafter's stages are the depths `prediction_depths` counts: a load keeps the first that
+    many, none at 0, and saves as a checkpoint of those, reloading to them."""
+    from dew.interop import Pretrained
+
+    def drafted(loaded) -> int:
+        dspark = loaded.model.dspark
+        return 0 if dspark is None else dspark.stages
+
+    source = FIXTURES / fixture
+    assert drafted(Pretrained.load(source, dtype="float32", attention_impl="reference")) == stages
+    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference", prediction_depths=kept)
+    assert drafted(loaded) == kept
+    loaded.save(tmp_path / "saved")
+    assert drafted(Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="reference")) == kept
 
 
 @pytest.mark.parametrize("depths", [-1, True])
