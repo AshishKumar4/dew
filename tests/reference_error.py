@@ -518,8 +518,8 @@ def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[tup
     sized = sizes > 0
     over = []
     if sized.any():
-        row = float(np.max(mine[sized] / sizes[sized]))
-        their_row = float(np.max(theirs[sized] / sizes[sized]))
+        row = float(np.max(_over(mine[sized], sizes[sized])))
+        their_row = float(np.max(_over(theirs[sized], sizes[sized])))
         allowed = max(their_row, floor)
         if not within(row, ROW_FACTOR * allowed):
             over.append(("row", log_ratio(row, allowed), f"the worst row is {row:.3e} from "
@@ -632,6 +632,28 @@ def _logs(values) -> np.ndarray:
     values = np.asarray(values, np.float64)
     with np.errstate(divide="ignore"):
         return np.where(values > 0, np.log(np.where(values > 0, values, 1.0)), LOG_ZERO)
+
+
+LOG_LARGEST = math.log(np.finfo(np.float64).max)
+"""The log of float64's largest value: a quotient of finite evidence past it is held there (`_over`)."""
+
+
+def _over(numerators, denominators) -> np.ndarray:
+    """Each nonnegative finite numerator over its positive denominator, from their logs (`_logs`) and held
+    at float64's largest, so a quotient of finite evidence (an error of 1e154 over a row of 1e-160) is
+    finite and keeps its order against every quotient float64 holds; zero over anything is zero."""
+    numerators, denominators = np.asarray(numerators, np.float64), np.asarray(denominators, np.float64)
+    quotient = np.exp(np.minimum(_logs(numerators) - _logs(denominators), LOG_LARGEST))
+    return np.where(numerators > 0, quotient, 0.0)
+
+
+def _root_mean_square(values) -> float:
+    """The root mean square of finite values, scaled by their largest first, so no square overflows."""
+    values = np.abs(np.asarray(values, np.float64))
+    largest = float(np.max(values)) if values.size else 0.0
+    if not largest > 0:
+        return 0.0
+    return largest * math.sqrt(float(np.mean(np.square(values / largest))))
 
 
 def log_sum(values) -> float:
@@ -790,17 +812,18 @@ def pooled_zero_rows(evidence: list[ZeroRows]) -> list[tuple[int, float, float]]
     zero-row-10x`): 0 of 15,000 runs failed at 8 seeds (a red rate at most 4.6e-4 at 99.9%) and 0 of
     3,000 at 40 (at most 2.3e-3), and the 10x row failed every run at both. Judged seed by seed, the
     same pairs failed on 6.6% of runs of 8 seeds and 42% of 64."""
-    mine: dict[int, float] = {}
-    theirs: dict[int, float] = {}
-    seen: dict[int, int] = {}
+    mine: dict[int, list[float]] = {}
+    theirs: dict[int, list[float]] = {}
     for rows, my_errors, their_errors in evidence:
         for row, my_error, their_error in zip(rows.tolist(), my_errors.tolist(), their_errors.tolist(),
                                               strict=True):
-            mine[row] = mine.get(row, 0.0) + my_error ** 2
-            theirs[row] = theirs.get(row, 0.0) + their_error ** 2
-            seen[row] = seen.get(row, 0) + 1
-    return [(row, float(np.sqrt(mine[row] / seen[row])), float(np.sqrt(theirs[row] / seen[row])))
-            for row in sorted(mine) if not mine[row] <= ROW_FACTOR ** 2 * theirs[row]]
+            mine.setdefault(row, []).append(my_error)
+            theirs.setdefault(row, []).append(their_error)
+    # Each row's errors pooled as a scaled root mean square and compared by their logs, so errors near
+    # float64's largest pool and order without a square or a product overflowing.
+    pooled = [(row, _root_mean_square(mine[row]), _root_mean_square(theirs[row])) for row in sorted(mine)]
+    return [(row, my_rms, their_rms) for row, my_rms, their_rms in pooled
+            if not _logs(my_rms) <= math.log(ROW_FACTOR) + _logs(their_rms)]
 
 
 SKETCH = 32
@@ -892,7 +915,7 @@ def leaf_summary(reference, truth) -> RecordedLeaf:
     own = (np.sqrt(np.mean(np.square(truth.reshape(-1, truth.shape[-1])), axis=1)) if truth.ndim >= 2
            else np.zeros(0))
     return RecordedLeaf(float(np.mean(np.square(reference - truth))),
-                        float(np.max(rows[sized] / sizes[sized])) if sized.any() else 0.0,
+                        float(np.max(_over(rows[sized], sizes[sized]))) if sized.any() else 0.0,
                         np.flatnonzero(~sized), rows[~sized],
                         finite=bool(np.isfinite(reference).all() and np.isfinite(truth).all()), dtype=dtype,
                         zero_sizes=own[~sized])
@@ -1021,7 +1044,8 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     for at, error in zip(mine.zero_rows.tolist(), mine.zero_errors.tolist(), strict=True):
         size = sizes.get(at, 0.0)
         if at_zero[at] < size:
-            worst, their_worst = max(worst, error / size), max(their_worst, at_zero[at] / size)
+            worst = max(worst, float(_over(error, size)))
+            their_worst = max(their_worst, float(_over(at_zero[at], size)))
         else:
             zero.append((at, error, at_zero[at]))
     rows, errors, their_errors = (np.asarray(column, dtype) for column, dtype in zip(

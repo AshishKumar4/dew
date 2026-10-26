@@ -183,3 +183,21 @@ def test_a_test_the_gate_fails_reports_its_findings_as_a_junit_property(tmp_path
     with pytest.raises(GateFailure) as raised:
         three_times("call")
     assert found["test_call"][0]["measure"] == raised.value.findings[0].measure
+
+
+def test_a_measure_is_finite_where_the_evidence_is_finite_even_past_float64s_largest_quotient():
+    """Row 1628: a sized row's error over its size and the zero rows' pooled squares overflowed from
+    finite evidence (an error of 1e154 over a row of 1e-160), and the promotion matcher refuses a
+    non-finite measure. Each now comes from logs or a scaled sum: the measure is finite, and the row still
+    fails."""
+    from reference_error import pooled_zero_rows, rows_over
+
+    truth = np.asarray([[1e-160, 1e-160], [1.0, 1.0]])
+    reference = np.asarray([[0.0, 0.0], [1.0, 1.0]])
+    dew = np.asarray([[1e154, 1e154], [1.0, 1.0]])
+    found = rows_over(dew, reference, truth)
+    assert found and all(np.isfinite(measure) for _, measure, _ in found), found
+    rows = np.asarray([0]), np.asarray([1e155]), np.asarray([1e-10])
+    pooled = pooled_zero_rows([rows, rows])
+    assert pooled and all(np.isfinite(value) for row in pooled for value in row[1:]), pooled
+
