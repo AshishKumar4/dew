@@ -21,7 +21,7 @@ from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.moe import Router, global_router_loss
 from dew.objectives.base import Step
 from dew.objectives.lm import TEXT_KEY, LMObjective
-from dew.objectives.lm.objective import router_moments
+from dew.objectives.routing import ExpertBalance, router_moments
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "moe"
 CONFIG = json.loads((FIXTURES / "config.json").read_text())["deepseek_v2"]
@@ -70,7 +70,7 @@ def test_the_objective_adds_every_sparse_layers_balance_loss():
                                               score_function="softmax"))
     tokens = jax.random.randint(jax.random.PRNGKey(1), (2, 9), 0, 32)
     plain = LMObjective(model, 8)
-    balanced = LMObjective(model, 8, aux_loss_alpha=0.05, seq_aux=False)
+    balanced = LMObjective(model, 8, balance=ExpertBalance(aux_loss_alpha=0.05, seq_aux=False))
     params = plain.init(jax.random.PRNGKey(0))
     step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)
     base, _ = plain.scalar_loss(params, {TEXT_KEY: tokens}, step)
