@@ -294,10 +294,12 @@ class Mma(mosaic.Family):
             layout = self.lhs if len(ref.shape) > 1 else self.column
             ref[...] = plgpu.load(view, layout=layout, optimized=False)
 
-    def stored(self, parts, views, *, smem) -> None:
+    def stored(self, parts, views, *, smem, wait: bool = True) -> None:
         # Through `smem` where given, copied out in row blocks as `persist`'s stores are (`store_rows`): an
         # MMA-layout tile stored from registers writes partial 32-byte sectors, which JAX 0.12's global
-        # transfers refuse, and its row-sliced copies lay out whole ones.
+        # transfers refuse, and its row-sliced copies lay out whole ones. Its copies go through registers,
+        # done when they return: nothing stays in flight (`wait` asks nothing of it).
+        del wait
         for part, view in zip(parts, views, strict=True):
             if smem is None:
                 view[...] = part.astype(view.dtype)
