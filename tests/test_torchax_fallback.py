@@ -879,10 +879,9 @@ def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_pre
                     truth_fn=theirs(wide, float64))
 
     prompt, _, _ = draw(0)
-    generated = TextGeneration(loaded.model, loaded.variables)(prompt, steps, key=0)
+    generated = np.asarray(TextGeneration(loaded.model, loaded.variables)(prompt, steps, key=0).tokens)
     full = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(generated)))
-    np.testing.assert_array_equal(np.asarray(generated)[:, prompt.shape[1]:],
-                                  full[:, prompt.shape[1] - 1:-1].argmax(-1))
+    np.testing.assert_array_equal(generated[:, prompt.shape[1]:], full[:, prompt.shape[1] - 1:-1].argmax(-1))
 
 
 def test_a_tier_3_model_on_transformers_attention_refuses_a_cache(tmp_path):
