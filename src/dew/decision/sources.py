@@ -25,7 +25,7 @@ from . import joint_checkpoint
 from .calibration import Calibration, Temperatures
 from .head import DecisionHead, Head, JointSchemaHead
 from .joint_checkpoint import HEAD_CONFIG, HEAD_WEIGHTS, _path, _shaped
-from .laya import CONFIG_FILE, IN_PROJ, _head_path, _token
+from .laya import CONFIG_FILE, IN_PROJ, _head_path, _token, laya_tensors
 from .layout import JointLayout, Layout, MarkerLayout, Specials
 from .model import DecisionModel
 from .task import Decide
@@ -54,8 +54,9 @@ class DecisionHeadSource(HeadComponent):
 class PretrainedDecision(Pretrained):
     """A native backbone bundle with its readout and declared decision task.
     Inherited adaptation operates on the backbone; the readout retains its own variables. The release
-    is the backbone and its readout together, which `save` writes: its tensors are not one flat set, so
-    `export` refuses them, and `backbone` is the backbone alone, whose `export` and `save` are its own."""
+    is the backbone and its readout together: `save` writes both in the format it was read from, and
+    `export` returns every tensor that release holds, the readout's beside the backbone's, by its name
+    in the release's files, which a weight push (`NCCLPush`) sends; `backbone` is the backbone alone."""
 
     head: Head
     head_variables: Variables
@@ -65,6 +66,8 @@ class PretrainedDecision(Pretrained):
     decision_tokenizer: HFTokenizer
     writer: Callable[..., None] = dataclasses.field(repr=False, compare=False)
     """The release format's writer, the source codec's own: `save` writes the format it was read from."""
+    exporter: Callable[..., Mapping[str, np.ndarray]] = dataclasses.field(repr=False, compare=False)
+    """The release format's tensors, `writer`'s own: `export` returns what `save` writes."""
 
     def map_variables(self, transform: Callable[[Variables], Variables]) -> Self:
         return dataclasses.replace(self, variables=transform(self.variables),
@@ -77,9 +80,9 @@ class PretrainedDecision(Pretrained):
         return Pretrained(**held)
 
     def export(self, variables: Mapping[str, object] | None = None) -> Mapping[str, np.ndarray]:
-        raise ValueError("a decision release writes its backbone and its readout apart, which no one "
-                         "flat set of tensors holds: save it, or export its backbone alone "
-                         "(`backbone().export()`)")
+        """Every tensor the release `save` writes, the readout's beside the backbone's, by its name in the
+        release's files; `variables`, a trainer's split of the backbone's, in place of the bundle's."""
+        return self.exporter(self, variables)
 
     def pipeline(self) -> Decide:
         return Decide.of(self.packed())
@@ -92,8 +95,8 @@ class PretrainedDecision(Pretrained):
     @classmethod
     def from_components(cls, backbone: Pretrained, head: Head, head_variables: Variables,
                         directory: Path, tokenizer_folder: str, *, layout: Layout,
-                        calibration: Calibration, strict_specials: bool,
-                        writer: Callable[..., None]) -> Self:
+                        calibration: Calibration, strict_specials: bool, writer: Callable[..., None],
+                        exporter: Callable[..., Mapping[str, np.ndarray]]) -> Self:
         tokenizer = HFTokenizer(str(directory / tokenizer_folder), local_files_only=True)
         if strict_specials:
             hf = tokenizer.tokenizer
@@ -106,12 +109,29 @@ class PretrainedDecision(Pretrained):
         inherited = {field.name: getattr(backbone, field.name) for field in dataclasses.fields(Pretrained)}
         inherited["source"] = directory
         return cls(**inherited, head=head, head_variables=head_variables, layout=layout, specials=specials,
-                   calibration=calibration, decision_tokenizer=tokenizer, writer=writer)
+                   calibration=calibration, decision_tokenizer=tokenizer, writer=writer, exporter=exporter)
 
 
 def _save_laya(bundle: PretrainedDecision, directory: str | Path, *,
                max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
     Decide.of(bundle).save_pretrained(directory, max_shard_size=max_shard_size)
+
+
+def _export_laya(bundle: PretrainedDecision, variables: Mapping[str, object] | None) -> dict[str, np.ndarray]:
+    held = bundle if variables is None else dataclasses.replace(bundle, variables=dict(variables))
+    task = Decide.of(held)
+    return laya_tensors(task.model, task.variables)[0]
+
+
+def joined_release(backbone: Mapping[str, np.ndarray], readout: Mapping[str, np.ndarray], files: str
+                   ) -> dict[str, np.ndarray]:
+    """A release's backbone tensors and its readout's, which it writes apart (`files`), as one set by
+    name; a name both hold is refused, since one set cannot hold the two tensors under it."""
+    shared = backbone.keys() & readout.keys()
+    if shared:
+        raise ValueError(f"the release's backbone and readout ({files}) both name {sorted(shared)}, which "
+                         "one set of tensors by name cannot hold; save the release instead")
+    return {**backbone, **readout}
 
 
 class DecisionSource(SourceKind):
@@ -142,7 +162,7 @@ class DecisionSource(SourceKind):
             calibration = Calibration(Temperatures(
                 dict(zip(("choice", "score", "noul"), (_records.number(x, "temperature") for x in values),
                          strict=True)), {key: _records.number(value, key) for key, value in buckets.items()}))
-            tokenizer_folder, strict_specials, writer = "tokenizer", True, _save_laya
+            tokenizer_folder, strict_specials, writer, exporter = "tokenizer", True, _save_laya, _export_laya
         elif (directory / HEAD_CONFIG).is_file():
             config = _records.record(json.loads((directory / HEAD_CONFIG).read_text()), HEAD_CONFIG)
             if _records.number(config.get("dropout", 0.0), "dropout"):
@@ -156,9 +176,10 @@ class DecisionSource(SourceKind):
                                       _path, IN_PROJ, HEAD_WEIGHTS,
                                       partial(_shaped, fields["hidden_size"]))
             layout, calibration = JointLayout(), Calibration()
-            tokenizer_folder, strict_specials, writer = "", False, joint_checkpoint.save
+            tokenizer_folder, strict_specials = "", False
+            writer, exporter = joint_checkpoint.save, joint_checkpoint.export
         else:
             return None
         return CompositeSource(backbone, head, PretrainedDecision.from_components, tokenizer_folder,
                                {"layout": layout, "calibration": calibration,
-                                "strict_specials": strict_specials, "writer": writer})
+                                "strict_specials": strict_specials, "writer": writer, "exporter": exporter})

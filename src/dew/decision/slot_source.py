@@ -130,14 +130,32 @@ class SlotSource(SourceKind):
         if mode == "head":
             import torch
 
-            params = bundle.head_variables["params"]
-            tensors = {}
-            for name, path in _PATHS.items():
-                host = np.array(jax.device_get(params[path[0]]), copy=True, order="C")
-                tensors[name] = torch.frombuffer(host, dtype=getattr(torch, str(host.dtype))).reshape(
-                    host.shape)
+            tensors = {name: torch.frombuffer(host, dtype=getattr(torch, str(host.dtype))).reshape(host.shape)
+                       for name, host in SlotSource.readout(bundle).items()}
             torch.save(tensors, root / "readout_head.pt")
         (root / "readout.json").write_text(json.dumps(readout, indent=2) + "\n")
+
+    @staticmethod
+    def readout(bundle: PretrainedDecision) -> dict[str, np.ndarray]:
+        """The slot-and-pointer head's tensors under the release's names (`readout_head.pt`), host
+        arrays in C order; none for the tied label readout, which reads the backbone's own head."""
+        if _records.text(_records.record(bundle.head.record(), "head")["class"], "head.class") != import_path(
+                SlotReadout):
+            return {}
+        params = bundle.head_variables["params"]
+        return {name: np.array(jax.device_get(params[path[0]]), copy=True, order="C")
+                for name, path in _PATHS.items()}
+
+    @staticmethod
+    def export(bundle: PretrainedDecision, variables: Mapping[str, object] | None = None
+               ) -> dict[str, np.ndarray]:
+        """Every tensor of the slot release `save` writes: the backbone's under their checkpoint names
+        and the slot-and-pointer head's under the release's (`readout_head.pt`), with `variables` in
+        place of the backbone's."""
+        from dew.decision.sources import joined_release
+
+        return joined_release(bundle.backbone().export(variables), SlotSource.readout(bundle),
+                              "the backbone's shards and readout_head.pt")
 
     @staticmethod
     def layout(*, max_len: int = 32768, keep: Literal["start", "end", "all"] = "all",
@@ -210,4 +228,4 @@ class SlotSource(SourceKind):
         layout = SlotSource.layout(labels=labels, blocks=attention == "noncausal")
         return CompositeSource(NativeComponent(config), head, PretrainedDecision.from_components, "",
                                {"layout": layout, "calibration": Calibration(), "strict_specials": False,
-                                "writer": SlotSource.save})
+                                "writer": SlotSource.save, "exporter": SlotSource.export})
