@@ -1204,6 +1204,16 @@ MOST_SEEDS = 512
 takes larger inputs or fewer shared factors, not more seeds."""
 
 
+def recorded_pilots(reference_fn, count: int):
+    """`reference_fn`, a recorded reference (one `.recorded`), marked as holding `count` pilot draws from
+    SIZING_FROM on, disjoint from every verdict's seeds and recorded with Dew's arm and the truth from
+    the same inputs: the draws a paired sizing of it takes (`seeds_for`)."""
+    if not getattr(reference_fn, "recorded", False):
+        raise ValueError("pilots belong to a recorded reference; a live one draws its own from SIZING_FROM")
+    reference_fn.pilots = range(SIZING_FROM, SIZING_FROM + count)
+    return reference_fn
+
+
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = MOST_SEEDS,
               truth_fn=None, dew_fn=None) -> int:
     """The seeds a site declares: the fewest, doubling from `start`, for which the pooled ratio's
@@ -1218,17 +1228,22 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     validated). The width asked of it is PARITY
     either way. Paired sizing holds out its draws only where `draw` keys an independent stream by the
     whole seed: a draw that enumerates finitely or by a modulus (`(arange(n) + seed) % vocab`) repeats a
-    verdict's inputs at SIZING_FROM and needs a pilot stream of its own first, and a recorded reference
-    (`indexed_recording`), which holds its recorded seeds alone, is refused: its site keeps its
-    recorded count. Fails past `most`, where the site needs larger inputs or fewer shared factors, not
-    more seeds.
+    verdict's inputs at SIZING_FROM and needs a pilot stream of its own first. A recorded reference
+    (`indexed_recording`), which holds its recorded seeds alone, is refused, its site keeping its
+    recorded count, unless its recording holds pilot draws of their own from SIZING_FROM on, recorded
+    with Dew's arm and the truth (`recorded_pilots`): its paired sizing then takes those pilots alone,
+    up to as many as are held. Fails past `most`, where the site needs larger inputs or fewer shared
+    factors, not more seeds.
 
     Each draw is evaluated once however many doublings the sizing takes: a count's draws are its
     predecessor's and the seeds it adds, the reference compared with itself takes its seeds 0 to twice
     the count (the first half against the second), and the reference on the same inputs runs once."""
     if dew_fn is not None and getattr(reference_fn, "recorded", False):
-        raise ValueError(f"{label}: a recorded reference holds its recorded seeds alone, never a paired "
-                         f"sizing's from SIZING_FROM; its site keeps its recorded count")
+        pilots = getattr(reference_fn, "pilots", None)
+        if pilots is None:
+            raise ValueError(f"{label}: a recorded reference holds its recorded seeds alone, never a paired "
+                             f"sizing's from SIZING_FROM; its site keeps its recorded count")
+        most = min(most, len(pilots))
     count, drawn = max(start, FEWEST_SEEDS), None
     first = 0 if dew_fn is None else SIZING_FROM
     while count <= most:
