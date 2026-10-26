@@ -782,6 +782,7 @@ def test_a_tier_3_models_final_states_and_head_are_transformers(case, tmp_path):
                                     method="hidden_states", **keys)
         return hidden, loaded.model.apply(variables, hidden, method="logits_from_hidden")
 
+    @as_given
     def ours(tokens, visible, positions):
         hidden, logits = ours_jitted(loaded.variables, tokens, visible, positions)
         return {"states": np.asarray(hidden, np.float64), "logits": np.asarray(logits, np.float64)}
@@ -873,6 +874,7 @@ def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_pre
         valid[0, :int(rng.integers(1, 4))] = False
         return prompt, valid, rng.integers(0, vocab, (2, steps)).astype(np.int32)
 
+    @as_given
     def ours(prompt, valid, continued):
         return np.asarray(decoded(loaded.variables, prompt, valid, continued), np.float64)
 
@@ -1011,6 +1013,7 @@ def test_a_rotary_that_recomputes_its_tables_runs_each_packed_document_as_transf
 
     segments = np.concatenate([np.full(length, index + 1) for index, length in enumerate(lengths)])[None]
 
+    @as_given
     def ours(tokens):
         return np.asarray(forward(loaded.variables, tokens.astype(np.int32), segments), np.float64)
 
@@ -1068,6 +1071,7 @@ def test_a_rotary_that_recomputes_its_tables_decodes_as_transformers_generates(r
         valid[0, :2] = False
         return prompt, valid, rng.integers(0, vocab, (2, steps)).astype(np.int32)
 
+    @as_given
     def ours(prompt, valid, continued):
         return np.asarray(decoded(loaded.variables, prompt, valid, continued), np.float64)
 
@@ -1122,6 +1126,7 @@ def _longcat(tmp_path, config: dict, **load):
     reference.set_attn_implementation("eager")
     forward = jax.jit(loaded.model.apply)
 
+    @as_given
     def ours(tokens):
         return np.asarray(forward(loaded.variables, tokens), np.float64)
 
