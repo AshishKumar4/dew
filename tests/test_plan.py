@@ -152,15 +152,15 @@ def test_the_fit_ladder_tiles_a_masked_diffusion_head_before_it_recomputes_more(
         return MaskedDiffusionObjective(model, MDLM(mask_id=63)(), seq_len=SEQ)
 
     climbing = objective()
-    rungs = [rung_record(climbing, xla_defaults=False)]
+    rungs = [rung_record(climbing, xla_defaults=False, narrow=True)]
     while len(rungs) < 4 and recompute_more(climbing):
-        rungs.append(rung_record(climbing, xla_defaults=False))
+        rungs.append(rung_record(climbing, xla_defaults=False, narrow=True))
     tile = list(chunked_tile())
     assert [(rung["head_tile"], rung["head_fused"], rung["remat"]) for rung in rungs] == [
         (None, False, None), (tile, False, None), (None, False, "minimal"), (tile, False, "minimal")]
     resumed = objective()
     climb_to(resumed, rungs[1])
-    assert rung_record(resumed, xla_defaults=False) == rungs[1]
+    assert rung_record(resumed, xla_defaults=False, narrow=True) == rungs[1]
 
 
 def test_a_microbatch_is_every_splitth_row():
