@@ -623,9 +623,10 @@ def test_group_norm_is_as_exact_as_torch_s_where_a_group_s_mean_dwarfs_its_sprea
                                                           strict=True))})
         return np.asarray(drawn), moved
 
+    @jax.jit
     def dew(drawn, moved):
         value, pullback = jax.vjp(lambda x: ours.apply(moved, x), drawn)
-        return {"value": np.asarray(value), "gradient": np.asarray(pullback(cotangent)[0])}
+        return {"value": value, "gradient": pullback(cotangent)[0]}
 
     def torch_s(drawn, moved):
         x = torch.tensor(np.moveaxis(drawn, -1, 1), requires_grad=True)
@@ -640,7 +641,7 @@ def test_group_norm_is_as_exact_as_torch_s_where_a_group_s_mean_dwarfs_its_sprea
         value, pullback = jax.vjp(lambda x: wide.apply(moved, x), drawn)
         return {"value": np.asarray(value), "gradient": np.asarray(pullback(cotangent.astype(np.float64))[0])}
 
-    assert_as_exact(jax.jit(dew), torch_s, draw, "offset group norm", seeds=OFFSET_GROUP_NORM_SEEDS,
+    assert_as_exact(dew, torch_s, draw, "offset group norm", seeds=OFFSET_GROUP_NORM_SEEDS,
                     truth_fn=truth)
 
 
