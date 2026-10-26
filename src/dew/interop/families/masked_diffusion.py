@@ -270,9 +270,16 @@ def _llada_moe_config(hf_config: Mapping[str, object], used: set[str], *,
     The 7B code fixes norm_topk_prob=False and never reads its scaling;
     v2 softmaxes the selected logits and scales them. Its grouped router
     class is not the class its DecoderLayer instantiates.
+
+    Both tables pad config.pad_token_id (modeling_lladamoe.py:895-898 at
+    daccaf1, modeling_lladamoe_v2.py:1094-1097 at 2a513f7), which both
+    config classes default to 1. Read here rather than by the family, since
+    model_type 'llada' also names dense LLaDA, whose table pads nothing.
     """
     config = _moe_decoder(hf_config, used, qk_norm=bool(hf_config.get('qk_layernorm')),
                            intermediate=record_int(hf_config, 'dense_intermediate_size'), rope_defaults=None)
+    pad = hf_config.get('pad_token_id', 1)
+    config['padding_idx'] = None if pad is None else _records.integer(pad, 'pad_token_id')
     used.update(('dense_intermediate_size', 'expert_intermediate_size',
                  'shared_expert_intermediate_size', 'moe_layer_freq', 'qk_layernorm',
                  'clip_qkv', 'num_experts', 'num_experts_per_tok', 'norm_topk_prob',
@@ -479,6 +486,7 @@ def _llada_moe_export(model: CausalTransformer) -> Mapping[str, object]:
         'moe_router_score_function': 'softmax', 'norm_topk_prob': mixture.norm_topk_prob,
         'routed_scaling_factor': mixture.scaling, 'qk_layernorm': model.qk_norm,
         'partial_rotary_factor': model.partial_rotary_factor or 1.0,
+        'pad_token_id': model.padding_idx,
     }
 
 
@@ -561,6 +569,10 @@ DREAM = DecoderFamily(
     _mask_token_export,
     preserve_source_layout=True,
     bidirectional=True,
+    # DreamBaseModel's table pads config.pad_token_id (modeling_dream.py:602-605 at 6572adb), whose
+    # DreamConfig default is 151643.
+    defaults={'pad_token_id': 151643},
+    padding_idx=True,
 )
 
 LLADA = DecoderFamily(
@@ -611,4 +623,9 @@ LLADA2_MOE = DecoderFamily(
     export_nulls=('num_shared_experts',),
     preserve_source_layout=True,
     bidirectional=True,
+    # LLaDA2MoeModel's table pads config.pad_token_id (modeling_llada2_moe.py:750-754 of LLaDA2.0 at
+    # dad945c, :761-765 of 2.1 at 20e64e2, :770-774 of 2.2 at 9b78da3), whose LLaDA2MoeConfig default
+    # is 126081.
+    defaults={'pad_token_id': 126081},
+    padding_idx=True,
 )

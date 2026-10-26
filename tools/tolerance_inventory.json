@@ -582,7 +582,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_released_checkpoints.py": {
-   "comparisons": 4,
+   "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
   "tests/test_reporting.py": {
