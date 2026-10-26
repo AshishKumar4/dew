@@ -144,7 +144,7 @@ class Writer(Protocol):
 
 
 @dataclasses.dataclass(frozen=True)
-class Parquet:
+class _Parquet:
     """Arrow's Parquet dataset writer (`pyarrow.dataset.write_dataset`), the writer of
     `export(format="parquet")`: a file of each batch of the stream, numbered in its order, so a
     read of the export's files by path reads the rows in it, each partition column a Hive
@@ -230,7 +230,7 @@ def export(
     """Write immutable shards, then conditionally commit their manifest and _SUCCESS.
 
     ArrayRecord shards are Dew's own, one of `rows_per_shard` records each. Parquet is Arrow's
-    writer (`Parquet`), each partition column a Hive directory; any other `Writer`, a native one
+    writer (`_Parquet`), each partition column a Hive directory; any other `Writer`, a native one
     of the caller's, writes the rows as one Arrow stream. Each export owns a UUID directory, so
     racing exporters cannot share shards, and commits only once its writer has written them all.
     """
@@ -275,7 +275,7 @@ def export(
                 files.append(_array_shard(root, writer, number, batch, index))
             written: Format = "array_record"
         else:
-            native = Parquet(partitioning) if format == "parquet" else format
+            native = _Parquet(partitioning) if format == "parquet" else format
             stream = _streamed(counted())
             if stream is not None:
                 fs, directory = target.resolve()

@@ -660,15 +660,19 @@ class Files(Dataset):
         than parts is refused."""
         sizes = [integer(self._header(url)["size"], "file bytes") for url in self.paths]
         total = max(sum(sizes), 1)
-        # Each file at least one part, the rest by its share of the bytes, largest remainders first.
+        # Each file that holds bytes at least one part, the rest by its share of the bytes, largest
+        # remainders first.
         shares = [count * size / total for size in sizes]
-        parts = [max(1, math.floor(share)) for share in shares]
-        for index in sorted(range(len(sizes)), key=lambda index: parts[index] - shares[index]):
+        parts = [max(1, math.floor(share)) if size else 0 for share, size in zip(shares, sizes, strict=True)]
+        for index in sorted((index for index, size in enumerate(sizes) if size),
+                            key=lambda index: parts[index] - shares[index]):
             if sum(parts) >= count:
                 break
             parts[index] += 1
         shards = []
         for number, (url, size, cuts) in enumerate(zip(self.paths, sizes, parts, strict=True)):
+            if not cuts:
+                continue
             fs, path, _ = Store(url, self.storage_options).readable()
             with _open_lines(fs, path) as file:
                 starts = sorted({_line_start(file, size * cut // cuts) for cut in range(cuts)} - {size})
