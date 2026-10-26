@@ -30,8 +30,6 @@ def hold_progress_lock() -> None:
     bars.get_lock()
 
 
-@dataclass(frozen=True)
-
 def split_files(paths: Sequence[str], split: str) -> list[str]:
     """The `paths` of a repository listing that `datasets` gives `split`, by its default patterns
     (`datasets.data_files.get_data_patterns`), resolved as it resolves them (`resolve_pattern`), over
@@ -53,6 +51,8 @@ def split_files(paths: Sequence[str], split: str) -> list[str]:
         fs.rm(root, recursive=True)
     return sorted(url.split(root + "/", 1)[1] for url in resolved)
 
+
+@dataclass(frozen=True)
 class Hub(Dataset):
     """A pinned split of a Hub dataset: `name` is its configuration, as
     `datasets.load_dataset(repo, name=)` takes it, and `columns` the fields
