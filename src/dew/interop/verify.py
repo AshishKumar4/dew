@@ -546,9 +546,15 @@ def _built(model_type: str, convention: str, family: decoder_parts.DecoderFamily
 
 def _agreement(convention: str, family: decoder_parts.DecoderFamily, model: nn.Module,
                record: decoder_parts.DecoderFields, inert: set[str], name: str, expected: np.ndarray,
-               checkpoint: Path, layers: int) -> tuple[float, float]:
+               checkpoint: Path, layers: int, pad: int | None) -> tuple[float, float]:
     """One candidate against the reference's saved checkpoint: its error and
-    the bound, or `_Mismatch` naming how it differs."""
+    the bound, or `_Mismatch` naming how it differs. `pad` is the row the
+    reference's own table pads (its `padding_idx`), which takes no gradient
+    there (ledger 1593) and which eval logits do not show, so the candidate
+    pads that row or is no reading of the reference."""
+    if record.get('padding_idx') != pad:
+        raise _Mismatch(f"{convention} pads row {record.get('padding_idx')} of the token table where "
+                        f"{name}'s table pads {pad}")
     tensors = sources.load_shards(checkpoint)
     unmapped = _unmapped(tensors, record, family)
     if unmapped:
@@ -820,13 +826,19 @@ def _verified(hf_config: Mapping[str, object], source: ModelSource) -> VerifiedM
                 reasons[PARTS] = f"Dew builds no decoder of its assembled parts ({refused})"
             else:
                 sized.insert(0, (PARTS, parts.family(model_type, assembly), model, record, set()))
+        # The row the source's table pads, nn.Embedding's notion (Gemma's scaled table is one); a lookup
+        # of another kind has no padding_idx to pad by. The reference ran, so torch is installed.
+        import torch
+
+        lookup = reference.get_input_embeddings()
+        pad = lookup.padding_idx if isinstance(lookup, torch.nn.Embedding) else None
         if sized:
             with tempfile.TemporaryDirectory() as scratch:
                 reference.save_pretrained(scratch)
                 for convention, family, model, record, inert in sized:
                     try:
                         error, bound = _agreement(convention, family, model, record, inert, name, expected,
-                                                  Path(scratch), layers)
+                                                  Path(scratch), layers, pad)
                         if convention == PARTS:
                             assert assembly is not None
                             _trained(reference, assembly, family, record, name)

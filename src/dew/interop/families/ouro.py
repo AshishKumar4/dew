@@ -84,4 +84,7 @@ OURO = DecoderFamily(
     weight_path=partial(renamed_path, _NAMES, leaves=_GATE),
     export_path=partial(renamed_name, _NAMES, leaves=_GATE, sandwich_norms=True),
     preserve_source_layout=False,
+    # OuroModel's table pads config.pad_token_id (modeling_ouro.py:496-500), which OuroConfig leaves
+    # to the base class's None.
+    padding_idx=True,
 )
