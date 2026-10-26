@@ -355,7 +355,8 @@ def prefixed_fields(fields: Mapping[str, jax.Array | Coordinates], shape: tuple[
     else:
         laid = fields.get(COORDINATES_FIELD)
         given = laid.positions if isinstance(laid, Coordinates) else fields.get("positions")
-        places = (coordinates(shape, segments=ids, valid=real, xp=xp).positions if given is None
+        rows = (shape[0], shape[1])
+        places = (coordinates(rows, segments=ids, valid=real, xp=xp).positions if given is None
                   else xp.broadcast_to(xp.asarray(given), shape))
         groups = prefix_blocks(segments, places, prefix, xp=xp)
     return {**fields, BLOCKS_FIELD: groups}

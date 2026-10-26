@@ -173,7 +173,8 @@ def test_a_document_runs_on_across_a_hole_in_its_validity(prefix):
     objective = LMObjective(decoder, SEQ, prefix=prefix)
     tokens = jax.random.randint(jax.random.key(1), (1, ROW), 0, VOCAB)
     params = decoder.init(jax.random.key(0), tokens[:, :-1])
-    bare = {TEXT_KEY: tokens, "text_attention_mask": HOLED, ROLES_KEY: HOLED_ROLES}
+    bare = {TEXT_KEY: ModelInputs(tokens, token_fields={"attention_mask": jnp.asarray(HOLED)}),
+            ROLES_KEY: HOLED_ROLES}
     given = {**bare, "text_block_groups": np.asarray(HOLED_BLOCKS[prefix], np.int32)}
     step = Step(jnp.asarray(0), jax.random.key(2), None)
 
