@@ -12,18 +12,17 @@ https://github.com/yifan123/flow_grpo/blob/879042cf5707f8b90daa98d147d7deac2317c
 
 from __future__ import annotations
 
-import functools
 import math
 from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
 from flax import struct
-from jax.custom_derivatives import SymbolicZero, linear_call
 from jax.typing import ArrayLike
 
 from dew.diffusion.process import Denoiser, Process
 from dew.diffusion.schedules import RectifiedFlow, divided, expand
+from dew.nn.kernels.generation import linear_tangent
 from dew.nn.precision import at_least_fp32
 
 from .guidance import Guidance, Walk
@@ -106,58 +105,58 @@ class GaussianTransition:
                          jnp.where(variance == 0, deterministic, jnp.nan))
 
 
-@jax.custom_jvp
-def _gaussian_kl(difference: jax.Array, variance: jax.Array) -> jax.Array:
+def _divergence(difference: jax.Array, variance: jax.Array) -> jax.Array:
     """`|difference|**2 / (2 variance)`, one row a `variance`, as one division of operands in range: the
     variance doubled where that is finite, else the squared error halved, an error over so wide a
     variance far above float32's least. Halving the error alone left half an error near its least below
     the normal range, which XLA:CPU flushes to zero (a KL of 0 where it is 0.5), and halving the
-    quotient after overflowed where half of it fits. Its derivative is `_gaussian_kl_jvp`'s."""
+    quotient after overflowed where half of it fits. Its derivatives are `_gaussian_kl`'s."""
     error = jnp.square(difference).sum(axis=tuple(range(1, difference.ndim)))
     doubled = 2 * variance
     wide = doubled == jnp.inf
     return jnp.where(wide, error * 0.5, error) / jnp.where(wide, variance, doubled)
 
 
-@functools.partial(_gaussian_kl.defjvp, symbolic_zeros=True)
-def _gaussian_kl_jvp(primals, tangents):
-    """The KL's derivative as one linear map in two orders (`linear_call`), each keeping its steps in
-    float32's range where the result is. Forward mode sums the difference's tangent against the
-    difference before one division by the variance (`divided`), so a cancelling tangent (`[16, -16]`
-    at a difference of 0.5 over 2**-126) sums to its 0 rather than to two overflowing products; its
-    transpose, reverse mode, takes each element's slope `difference / variance` against the
-    cotangent, so a cotangent over a variance near float32's largest (whose `1 / (2 variance)` is
-    below the normal range) meets the slope, which is not. The variance's coefficient `-KL /
-    variance` is two factors of about its root each (`_halves`), the tangent or the cotangent meeting
-    one and then the other, so neither a tangent over the variance first (`2**-126 / 2**32`) nor the
-    coefficient alone (`2**249` at the least) leaves the range the term keeps. A tangent JAX knows
-    is zero (a symbolic zero) takes no part."""
-    difference, variance = primals
-    value = _gaussian_kl(difference, variance)
-    live = tuple(index for index, tangent in enumerate(tangents) if not isinstance(tangent, SymbolicZero))
-    if not live:
-        return value, jnp.zeros_like(value)
+@jax.custom_jvp
+def _directional(difference: jax.Array, variance: jax.Array) -> jax.Array:
+    """`_divergence` whose forward mode keeps its steps in float32's range where its result is: the
+    difference's tangent summed against the difference before one division by the variance
+    (`divided`), so a cancelling tangent (`[16, -16]` at a difference of 0.5 over 2**-126) sums to its
+    0 rather than to two overflowing products; the variance's coefficient `-KL / variance` as two
+    factors of about its root each (`_halves`), the tangent meeting one and then the other, so
+    neither a tangent over the variance first (`2**-126 / 2**32`) nor the coefficient alone (`2**249`
+    at the least) leaves the range the term keeps."""
+    return _divergence(difference, variance)
+
+
+@_directional.defjvp
+def _directional_jvp(primals, tangents):
+    """`_directional`'s tangent: the difference's summed before its division, the variance's through its
+    coefficient's halves."""
+    (difference, variance), (difference_tangent, variance_tangent) = primals, tangents
+    value = _divergence(difference, variance)
     held, spread = _halves(value, variance)
-    axes = tuple(range(1, difference.ndim))
+    along = divided((difference * difference_tangent).sum(axis=tuple(range(1, difference.ndim))), variance)
+    return value, along - held * variance_tangent * spread
 
-    def forward(residuals, moving):
-        difference, variance, held, spread = residuals
-        terms = dict(zip(live, moving, strict=True))
-        moved = jnp.zeros_like(held)
-        if 0 in terms:
-            moved = moved + divided((difference * terms[0]).sum(axis=axes), variance)
-        if 1 in terms:
-            moved = moved - held * terms[1] * spread
-        return moved
 
-    def transposed(residuals, cotangent):
-        difference, variance, held, spread = residuals
-        slope = divided(difference, expand(variance, difference))
-        pulled = {0: slope * expand(cotangent, difference), 1: -(cotangent * spread) * held}
-        return [pulled[index] for index in live]
+def _kl_pullback(saved, operands, cotangent):
+    """The KL's reverse mode: each element's slope `difference / variance` against the cotangent, so a
+    cotangent over a variance near float32's largest (whose `1 / (2 variance)` is below the normal
+    range) meets the slope, which is not; and the variance's coefficient's halves (`_halves`) one after
+    the other."""
+    del saved
+    difference, variance = operands
+    held, spread = _halves(_divergence(difference, variance), variance)
+    slope = divided(difference, expand(variance, difference))
+    return slope * expand(cotangent, difference), -(cotangent * spread) * held
 
-    return value, linear_call(forward, transposed, (difference, variance, held, spread),
-                              [tangents[index] for index in live])
+
+_gaussian_kl = linear_tangent(lambda difference, variance: (_divergence(difference, variance), ()),
+                              _kl_pullback, _directional)
+"""`_divergence` differentiated through Dew's seam (`dew.nn.kernels.generation.linear_tangent`): its
+forward mode `_directional`'s, its reverse mode `_kl_pullback`'s, each order keeping its steps in
+range."""
 
 
 def _halves(numerator: jax.Array, divisor: jax.Array) -> tuple[jax.Array, jax.Array]:
