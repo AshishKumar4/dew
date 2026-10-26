@@ -1200,15 +1200,16 @@ def _output_held(call: _Call, bv: int) -> _Held:
     """What `_output`'s consumer thread holds: a value block's memory and local products' fp32 sums beside
     its values (and, where products read registers, a key block's queries and memory slice and the scores);
     under a decay a head the first step's scores too, their sum, their pairs' decays and their masks (an
-    fp32 call's split into parts); under one a key dimension a key block's prefix halves and the scores in
-    fp32."""
+    fp32 call's split into parts), held with the value block's tiles, the step's whole set (as its phases
+    alone, a 64-wide value block's output spilled 16 bytes a thread on an A100's at 200 stated registers);
+    under one a key dimension a key block's prefix halves and the scores in fp32."""
     held, memories = call.held, call.memories
     values = [_f32(CHUNK, bv)] * 2 + _held(held, CHUNK, bv) + _fragments(
         call, (call.given, CHUNK, call.block), (memories, call.block, bv), (held, CHUNK, CHUNK))
     if call.per_key:
         return _Held(phases=(values + [_f32(CHUNK, call.block)] * 2 + [_f32(CHUNK, CHUNK)],))
-    return _Held(phases=(values, [_f32(CHUNK, bv)] + [_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK)
-                         + (_held(held, CHUNK, CHUNK) if held.parts > 1 else [])))
+    return _Held(phases=(values + [_f32(CHUNK, bv)] + [_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK)
+                         + (_held(held, CHUNK, CHUNK) if held.parts > 1 else []),))
 
 
 def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, scale: float, out_dtype,

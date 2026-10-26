@@ -391,6 +391,13 @@ def compiled_cases(target: str, plans: dict, refused: list) -> list:
                 assert not template.MOSAIC.eligible(bound, facts)
                 return []
             variants = template.MOSAIC.variants(bound)
+            if training and not mainloop.backward_holds(
+                    *args, tiles=derived, family=family, shared=generation.shared_budget(facts),
+                    starts=starts, max_segments=8 if packed else None):
+                # The rule's gradient is the port's or the portable math's where the fast backward's
+                # launches do not hold (`mainloop.backward_holds`): no launch of it to compile.
+                refused.append(f"{name} {jnp.dtype(dtype).name} fast backward{' packed' if packed else ''}")
+                return []
         assert variants[0] == derived, f"{name} on {target}: variants {variants} lead with no {derived}"
         return [case(name, dtype, args, starts, bound, tiles, training=training, packed=packed)
                 for tiles in (variants[:1] if training or packed else variants)]
@@ -506,5 +513,5 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_shared_memory(target):
     failed = resource_failures(found, plans, mainloop.FAMILIES[generation.family(target)])
     if mainloop.stores(mainloop.FAMILIES[generation.family(target)], jnp.bfloat16):
         failed += [f"{case}: no tiles derived" for case in refused
-                   if case.startswith("qwen3.5-27b-gdn bfloat16")]
+                   if case.startswith("qwen3.5-27b-gdn bfloat16") and "fast backward" not in case]
     assert not failed, "\n".join(failed)
