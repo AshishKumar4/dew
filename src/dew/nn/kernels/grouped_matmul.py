@@ -671,8 +671,13 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # Interpreted only in a CPU process: the interpreter's callbacks are ordered effects, which a GPU
         # process's lowering of the platform choice cannot carry in the CPU branch it does not take.
         interpretable = not ba.arguments['interpret'] or jax.default_backend() == 'cpu'
+        # Hooked and exactly summed calls run on warpgroup MMA alone: mma.sync's kernels take them (its
+        # side loads, vector reads and running sum lower), but its register model does not yet count what
+        # they hold, and its derived tiles spilled (ns-regs2: sm86's normed forward 16 bytes, exact sums 136).
+        special = ba.arguments['hooks'] != NO_HOOKS or ba.arguments.get('exact_sums')
         return (first == second and jnp.dtype(first).itemsize == 2 and interpretable
                 and _rated(target, first) and self._family(ba, target) is not None
+                and (generation.effective(target).wgmma or not special)
                 and self._hooks_lower(ba, first, target)
                 and self._stored(ba, target)
                 and (self.EXACT_SUMS or not ba.arguments.get('exact_sums'))
@@ -972,14 +977,19 @@ class MosaicTgmm(_Mosaic):
         return rows % config.block_m == 0 and width % config.block_n == 0
 
     def legal(self, ba, config: mosaic_gpu.Tiles, target) -> bool:
-        """`_Mosaic.legal`, and with `exact_sums` a second fp32 accumulator, the running sum beside a
-        step's, in each consumer's live set (`mosaic.tile_registers`) within its family's registers."""
+        """`_Mosaic.legal`, a family whose products read registers loading its transposed stage in whole
+        roles of rows (the step, `block_k`: a 32-row stage failed to cast to the 64-row layout, ns-regs2),
+        and with `exact_sums` a second fp32 accumulator, the running sum beside a step's, in each
+        consumer's live set (`mosaic.tile_registers`) within its family's registers."""
         if not super().legal(ba, config, target):
+            return False
+        family = _bundle(config, ba.arguments['tokens'].dtype)
+        if family.operands_in_registers and config.block_k % family.role_rows:
             return False
         if not ba.arguments.get('exact_sums'):
             return True
         dtype = ba.arguments['tokens'].dtype
-        family, block = _bundle(config, dtype), (config.block_m, config.block_n, config.block_k)
+        block = (config.block_m, config.block_n, config.block_k)
         running = -(-config.block_m * config.block_n // config.warpgroups // mosaic.THREADS)
         return (mosaic.tile_registers(family, config.warpgroups, block, dtype) + running
                 <= family.registers(config.warpgroups))
