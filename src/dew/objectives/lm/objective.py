@@ -77,6 +77,7 @@ from dew.nn.protocols import (
     DecoderTraining,
     Lacks,
     LayerStates,
+    SteppedInContext,
     TokenModel,
     head_table,
     refuse_block_reading,
@@ -97,6 +98,7 @@ from dew.objectives.base import (
     merge_totals,
     model_rngs,
 )
+from dew.objectives.lm.adaptation import ChunkAdaptation, adapted_scores
 from dew.objectives.lm.chunked import (
     final_read,
     fused_head_loss,
@@ -472,6 +474,10 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
     """Whether `token_scores` marks each prediction by default (`LMObjective`'s token accuracy).
     A policy or preference loss reports none, and asks for the marks where it scores them."""
 
+    adaptation: ChunkAdaptation | None = None
+    """How the model's continuum level steps in context by the loss it scores (`LMObjective`);
+    None reads the level as it is trained."""
+
     scored_fields: ClassVar[tuple[str, ...] | None] = None
     """The batch fields `_evaluation_scores` reads, which alone enter its compiled program (`evaluate`),
     so a batch's other fields (rollouts, rewards) neither enter it nor key it; None passes the batch whole."""
@@ -516,6 +522,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
             return f"{type(model).__name__} does not declare logits_flops for the LM head"
         if self.mtp_weight and not isinstance(model, CountedPredictions):
             return f"{type(model).__name__} does not declare prediction_flops for its MTP depths"
+        if self.adaptation is not None:
+            return "a continuum level stepped in context has no count of its windows' gradients"
         return None
 
     def _token_geometry(self, batch: Batch) -> tuple[np.ndarray, Mapping[str, jax.Array | Coordinates]]:
@@ -673,13 +681,21 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
 
         A rollout uses one snapshot of the policy and draws every completion from it;
         the result records the actual and raw-policy likelihoods that the objective's
-        ratio needs.
+        ratio needs. An objective that steps its level in context (`adaptation`) has no
+        generation that steps it, so it refuses (ValueError) rather than draw from the
+        level it starts with.
         """
+        if self.adaptation is not None:
+            raise ValueError("an objective that steps its continuum level in context scores what no "
+                             "generation draws yet: a generation reads the level it starts with")
         return TextGeneration(self.model, params, sampling=self.sampled(sampling), prefix=self.prefix)
 
-    def task_settings(self) -> TextSettings:
+    def task_settings(self) -> TextSettings | None:
         """The decoder's row length, preview budget, sampling policy (`sampled`), and tokenizer or
-        source processor."""
+        source processor. None for an objective that steps its level in context (`adaptation`), which
+        no generation task serves yet: its saved runs restore their trained state, and build no task."""
+        if self.adaptation is not None:
+            return None
         samples = self.samples
         return TextSettings(seq_len=self.seq_len,
                             max_new_tokens=0 if samples is None else samples.max_new_tokens,
@@ -774,16 +790,8 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         table = self.fused_head(self.model, params) if z_loss is not None else None
         dtype = at_least_fp32(hidden.dtype)
         weights = self._row_weights(prepared, roles, dtype)
-        total = None
-        whole = model_logits(self.model, params, hidden) if logits else None
-        if whole is not None:
-            losses, predicted, log_z = logits_cross_entropy(whole, targets, predict=predict)
-        elif table is not None:
-            total, (losses, predicted, log_z) = fused_head_loss(
-                hidden, table, targets, weights, z_loss=float(z_loss or 0.0), tile=self.head_tile,
-                predict=predict)
-        else:
-            losses, predicted, log_z = self.head_terms(self.model, params, hidden, targets, predict=predict)
+        total, (losses, predicted, log_z), whole = self._head_scores(
+            params, hidden, targets, weights, prepared, table, predict=predict, z_loss=z_loss, logits=logits)
         weights = weights.astype(losses.dtype)
         correct = None if predicted is None else (predicted == targets).astype(losses.dtype)
         depth_scores = []
@@ -816,6 +824,27 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
                 depth_scores.append((depth_losses, depth_weights, depth_total))
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls, total,
                       whole)
+
+    def _head_scores(self, params, hidden, targets, weights, prepared, table, *, predict: bool,
+                     z_loss: float | None, logits: bool):
+        """The head's scores of `targets` from final states `hidden`: the weighted sum where a fused
+        head took it (`table`), each target's loss, top-1 column and log partition, and the whole
+        logits where asked; through the continuum level stepped in context (`adaptation`), the
+        whole logits, the fused head or the tiled head."""
+        if self.adaptation is not None:
+            # The level steps window by window over these targets, weighted as the loss weighs them.
+            adapted = adapted_scores(self.model, params, hidden, targets, weights,
+                                     prepared.slice_tokens(stop=-1).token_fields, self.adaptation,
+                                     predict=predict, logits=logits)
+            return None, (adapted.losses, adapted.predicted, adapted.log_z), adapted.logits
+        if logits:
+            whole = model_logits(self.model, params, hidden)
+            return None, logits_cross_entropy(whole, targets, predict=predict), whole
+        if table is not None:
+            total, scores = fused_head_loss(hidden, table, targets, weights, z_loss=float(z_loss or 0.0),
+                                            tile=self.head_tile, predict=predict)
+            return total, scores, None
+        return None, self.head_terms(self.model, params, hidden, targets, predict=predict), None
 
     def _row_weights(self, prepared, roles, dtype):
         """Weight the targets the row itself scores (`scored_targets`), and
@@ -978,6 +1007,11 @@ class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
         return text_preview("LM preview", setup, generate, None if settings is None else settings.decode)
 
 
+def _steps_in_context(model) -> bool:
+    """Whether `model` holds a level an objective steps in context (`SteppedInContext`)."""
+    return isinstance(model, SteppedInContext) and model.in_context
+
+
 class LMObjective(TokenScorer):
     """Trains a next-token model with shifted cross entropy, teacher-forced scoring and optional previews.
 
@@ -1069,6 +1103,15 @@ class LMObjective(TokenScorer):
 
     `token_accuracy` reports the argmax accuracy; False skips the pass
     over every logit it costs (0.77 ms of the head's 8.0 on a TPU v6e).
+
+    `adaptation` steps the model's continuum level (`CausalTransformer.continuum`) in context by
+    this loss's own next-token targets, Nested Learning's test-time training over the task loss
+    (`dew.objectives.lm.adaptation.ChunkAdaptation`): every `window` tokens of a document, the level
+    steps by `rate` times the summed gradient of their weighted losses, and the next window reads
+    it; training learns the level's start through every step. Evaluation and validation score the
+    same way. A preview, a rollout policy and a saved run's task would draw from the level's start,
+    which no generation steps yet, so an objective with `adaptation` takes no `samples`, refuses
+    `policy` and records no task.
     """
 
     def __init__(
@@ -1090,6 +1133,7 @@ class LMObjective(TokenScorer):
         indexer: IndexerTraining | None = None,
         token_accuracy: bool = True,
         processor: Processor | None | Omitted = OMITTED,
+        adaptation: ChunkAdaptation | None = None,
     ):
         """Build the objective; the class docstring describes each argument."""
         super().__init__(model, seq_len, head_chunks=head_chunks, head_tile=head_tile, samples=samples,
@@ -1102,6 +1146,14 @@ class LMObjective(TokenScorer):
                              "blocks beyond its own source, so mtp_weight is refused with prefix")
         self.prefix = prefix
         _check_terms(self.model, mtp_weight=mtp_weight, z_loss=z_loss)
+        if adaptation is not None:
+            if not _steps_in_context(self.model):
+                raise ValueError("adaptation steps a continuum level, which this model does not have "
+                                 "(CausalTransformer.continuum, `SteppedInContext`)")
+            if samples is not None:
+                raise ValueError("adaptation scores through a level stepped in context, which a preview's "
+                                 "generation does not step; train it without samples")
+        self.adaptation = adaptation
         self.loss_role = loss_role
         self.mtp_weight = mtp_weight
         self.z_loss = z_loss
