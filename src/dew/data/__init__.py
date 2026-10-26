@@ -12,14 +12,13 @@ datasets. The stage libraries (`images`, `video`, `audio`, `text`, `chat`,
 
 from . import audio, chat, images, preferences, presets, prompts, text, video
 from .chat import Role
-from .dataset import Batch, Loading
+from .dataset import Loading
 from .pipeline import Dataset, Rejected, concat, mix, phases
 from .sources import TFDS, Concatenate, Files, Hub, Memory, Source, from_grain, from_hf, from_iter, from_torch
 from .text import ByteTokenizer, HFTokenizer
 
 __all__ = [
     "TFDS",
-    "Batch",
     "ByteTokenizer",
     "Concatenate",
     "Dataset",

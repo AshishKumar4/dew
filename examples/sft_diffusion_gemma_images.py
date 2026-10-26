@@ -34,16 +34,16 @@ import numpy as np
 import tyro
 
 import dew
-from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
+from dew.batch import VALID_ROWS
+from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
 from dew.data import ByteTokenizer, Concatenate, Dataset, Files, Hub, Loading, Source, images, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader
 from dew.interop.diffusion_gemma import build
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import VALID_ROWS
 from dew.objectives.lm import Perplexity
-from dew.optim import Cosine
-from dew.records import record as read_record, strings
+from dew.optim import Cosine, OptimConfig
+from dew.registry import ModelConfig
 from dew.training import MeshSpec, prepare_process
 
 EOS, PAD, IMAGE = 256, 257, 258
@@ -193,8 +193,7 @@ def sized(config: Config) -> Config:
 
 def class_names(parts: dict[str, Source]) -> tuple[str, ...]:
     """The label names the dataset's Hugging Face schema records, as its source reads them."""
-    names = read_record(parts["train"].metadata().get("class_names", {}), "class names").get("label")
-    return tuple(name.strip() for name in strings(names, "class_names.label"))
+    return tuple(name.strip() for name in parts["train"].metadata()["class_names"]["label"])
 
 
 def caption_data(config: Config, parts: dict[str, Source], labels: tuple[str, ...]) -> Loader:
@@ -253,7 +252,7 @@ def main(config: Config) -> Path:
     run = RunConfig(
         model=ModelConfig.from_model(model), data=train, validation=test,
         objective=ObjectiveConfig("block_diffusion", {"prompt_length": config.prompt_tokens,
-                                                      "pad_token_id": PAD}),
+                                                      "pad_token_id": PAD, "eos_token_ids": (EOS,)}),
         optim=OptimConfig(weight_decay=0.05, clip_grads=1.0, learning_rate=Cosine(
             peak_value=config.learning_rate, warmup_steps=config.warmup_steps,
             end_value=config.learning_rate / 20)),
@@ -277,8 +276,8 @@ def main(config: Config) -> Path:
     # canvas task its objective saved, and it captions every test image, as
     # the trained model in this process does.
     run_dir = Path(run.trainer.checkpoint_dir) / name
-    restored = replace(dew.pipeline(str(run_dir)), eos_token_ids=(EOS,), pad_token_id=PAD)
-    live = replace(objective.pipeline(state), eos_token_ids=(EOS,), pad_token_id=PAD)
+    restored = dew.pipeline(str(run_dir))
+    live = objective.pipeline(state)
     captions = captioned(restored, data, config, labels)
     report = {"dataset": config.dataset, "train_images": data.records, "test_images": len(captions),
               "classes": len(labels), "device": jax.devices()[0].device_kind, "steps": config.steps,

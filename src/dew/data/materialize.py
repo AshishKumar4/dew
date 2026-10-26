@@ -24,8 +24,10 @@ from typing import ClassVar
 import grain.python as pygrain
 import numpy as np
 
+from dew._records import JSON, integer, json_value, record
+from dew.batch import Batch
 from dew.data.analysis import _analyzed, _identity, _label, _name
-from dew.data.dataset import Batch, Ranges, Records
+from dew.data.dataset import Ranges, Records
 from dew.data.lowering import (
     _cache_inputs,
     _CachedOutputs,
@@ -54,7 +56,6 @@ from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _uncounted
 from dew.data.steps.generic import Fields
 from dew.data.steps.text import CountRule, CountTargets, LayoutRule, ValidTargets, counted_window
-from dew.records import JSON, integer, json_value, record
 
 _log = logging.getLogger(__name__)
 

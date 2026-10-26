@@ -19,11 +19,12 @@ from typing import TYPE_CHECKING
 from etils import epath
 from filelock import FileLock
 
+from dew.batch import Batch
 from dew.cache import dew_cache_dir
 from dew.data.pipeline import Dataset
 from dew.files import published
 
-from ..dataset import Batch, Records
+from ..dataset import Records
 from .base import Read, ShardManifest, _indexed_manifest, preparing
 
 if TYPE_CHECKING:  # tensorflow_datasets is imported on use, not at import
@@ -47,7 +48,7 @@ def _decoder_record(value: object) -> Mapping[str, object] | None:
         return None
     if isinstance(value, Mapping):
         return {name: _decoder_record(decoder) for name, decoder in value.items()}
-    from dew.records import json_value
+    from dew._records import json_value
 
     try:
         settings = {
@@ -414,7 +415,7 @@ class TFDS(Dataset):
         return tuple(indexed[index] for index in range(len(indexed))) if read == "memory" else indexed
 
     def manifest(self) -> ShardManifest:
-        return _indexed_manifest(self, self.describe(), str(self.builder.data_path), self.shard_rows)
+        return _indexed_manifest(self, str(self.builder.data_path), self.shard_rows)
 
     def stated(self) -> Mapping[str, object]:
         """Its builder's info, no data source opened: the dataset's name and version, its class

@@ -59,6 +59,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
+from dew.mesh import SEQUENCE_AXIS, LayoutRefused, logical_spec
 from dew.nn.attention import repeat_kv_heads, unweighted_rmsnorm
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
@@ -71,14 +72,7 @@ from dew.nn.linear import DepthwiseConv1d, causal_conv1d, held_conv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
 from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum
-from dew.nn.sharding import (
-    SEQUENCE_AXIS,
-    LayoutRefused,
-    logical_axes,
-    logical_spec,
-    manual_map,
-    sequence_shards,
-)
+from dew.nn.sharding import logical_axes, manual_map, sequence_shards
 
 CHUNK_SIZE = 256
 """The reference's default `chunk_size` (configuration_mamba2.py). The

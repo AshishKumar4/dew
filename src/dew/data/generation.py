@@ -15,7 +15,9 @@ from typing import TYPE_CHECKING, Protocol
 
 import numpy as np
 
-from dew.data.dataset import Batch, Records
+from dew._records import JSON
+from dew.batch import Batch
+from dew.data.dataset import Records
 from dew.data.pipeline import Record, Rejected
 from dew.data.plan import array_digest
 from dew.data.retention import LocalRetention
@@ -24,7 +26,6 @@ from dew.data.sources.codec import decode, fingerprint
 from dew.data.sources.index import ArrayIndex
 from dew.data.sources.records import ArrayRecords
 from dew.data.storage import Store, Versioned
-from dew.records import JSON
 
 if TYPE_CHECKING:
     from dew.data.cache import Cache
@@ -52,6 +53,10 @@ def _json(value: JSON | Mapping[str, object]) -> bytes:
 
 ROW_PAGE = 4096
 """The dense rows a generation's row index holds in each of its pages (`index/rows-*.json`)."""
+GENERATION_SCHEMA = 2
+"""How a generation's manifest and a fill's segments name inputs and digests: by the shards' places,
+which a store mounted elsewhere keeps, and arrays by their dtypes' names (`dew._hashing.array_header`),
+since 2. Another schema's is refused, not read under names it was not written with."""
 
 
 def input_page(row_key: str) -> str:
@@ -189,7 +194,7 @@ def _publish(
     metadata["count_rules"] = [list(rule) for rule in sorted(distinct, key=repr)]
     referenced = {entry["shard"] for entry in completions.values()}
     definition = {
-        "schema": 1,
+        "schema": GENERATION_SCHEMA,
         "manifest": key.key,
         "dependency": json.loads(key.canonical),
         "root": root.url,
@@ -285,6 +290,10 @@ def _segment(root: Store, segment: Mapping[str, object], completions: dict, shar
     shard's records, its completions and shard added to those of the writers read before it."""
     payload = _checked(root, segment)
     record = json.loads(payload)
+    if record.get("schema") != GENERATION_SCHEMA:
+        raise ValueError(f"the cache segment {segment['path']} was written under schema "
+                         f"{record.get('schema')!r}, and this Dew reads schema {GENERATION_SCHEMA}, whose "
+                         "inputs and digests are named otherwise; fill the cache again")
     _checked(root, record["shard"])
     with closing(ArrayRecords((root.child(record["shard"]["path"]).url,), root.storage_options)) as rows:
         if sorted(entry["record"] for entry in record["completions"]) != list(range(len(rows))):
@@ -419,8 +428,11 @@ class Generation:
             record = json.loads(payload)
         except ValueError as error:
             raise ValueError(f"committed cache manifest is corrupt: {manifest.url}") from error
-        if not isinstance(record, dict) or record.get("schema") != 1:
-            raise ValueError(f"unknown cache generation schema at {self.url}")
+        if not isinstance(record, dict) or record.get("schema") != GENERATION_SCHEMA:
+            schema = record.get("schema") if isinstance(record, dict) else None
+            raise ValueError(f"the cache generation at {self.url} was written under schema {schema!r}, and "
+                             f"this Dew reads schema {GENERATION_SCHEMA}, whose inputs and digests are named "
+                             "otherwise; fill the cache again")
         _, path, scheme = Store(self.url, self.storage_options)._backend()
         if scheme == "file":
             LocalRetention.touched(Path(path))
@@ -552,7 +564,7 @@ class _GenerationSource:
         return self.generation
 
     def manifest(self) -> ShardManifest:
-        return _indexed_manifest(self, self.generation.url, self.generation.url, 4096)
+        return _indexed_manifest(self, self.generation.url, 4096)
 
     def metadata(self) -> Mapping[str, object]:
         metadata = self.generation.manifest["metadata"]

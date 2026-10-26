@@ -10,7 +10,7 @@ from collections.abc import Iterator, Mapping, Sequence
 
 import jax
 
-from dew.coordination import agreed_next
+from dew._coordination import agreed_next
 from dew.data.dataset import Loader
 from dew.objectives.base import Batch, Metric
 from dew.telemetry.profile import region

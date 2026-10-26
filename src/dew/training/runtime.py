@@ -21,8 +21,8 @@ from typing import TYPE_CHECKING
 import jax
 from jax.experimental import multihost_utils
 
+from dew._coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
 from dew.cache import enable_compilation_cache, persist_compilations
-from dew.coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
 from dew.devices import apply_xla_flags, cuda_plugin, preallocate_gpu_pool, refuse_cpu_only_jax, xla_flag
 from dew.logging import configure as configure_logging
 from dew.pool import (
@@ -40,7 +40,7 @@ from dew.pool import (
 _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
-    from dew.config import Wandb
+    from dew.training.tracker import Wandb
 
 
 EXECUTION_TIMEOUT = "30m"
@@ -65,7 +65,7 @@ def prepare_process(wandb: Wandb | None = None,
     """Set the environment variables and XLA flags, raise the soft file
     descriptor limit, and join the JAX process pool.
 
-    `wandb` is the run's `dew.config.Wandb`, or None for a run without a
+    `wandb` is the run's `dew.training.tracker.Wandb`, or None for a run without a
     tracker. Only its offline switch is read, and it has to be read before
     wandb opens a run. `multi_host=True` requires a pool, False never joins
     one, and None joins the pool the environment describes, if any.

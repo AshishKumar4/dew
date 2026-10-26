@@ -21,7 +21,6 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.config import OptimConfig
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
@@ -29,7 +28,7 @@ from dew.nn.mixers import AttentionMixer
 from dew.nn.mixers.mamba2 import Mamba2Mixer
 from dew.nn.moe import global_router_loss
 from dew.objectives.lm.objective import _router_scores, router_moments, router_z_terms
-from dew.optim import ParamGroup, Power, linear_schedule, param_labels, power_schedule
+from dew.optim import OptimConfig, ParamGroup, Power, linear_schedule, param_labels, power_schedule
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "lm_engine"
 COEF = 0.01  # the fixture's router_aux_loss_coef

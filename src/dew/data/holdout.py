@@ -11,7 +11,8 @@ from typing import ClassVar, Protocol, runtime_checkable
 
 import numpy as np
 
-from dew.data.dataset import Batch, Records
+from dew.batch import Batch
+from dew.data.dataset import Records
 from dew.data.generation import Generation, RowId, _GenerationSource, _row_key, _shard_inputs, _source_ids
 from dew.data.pipeline import Dataset, Pipeline, with_stores
 from dew.data.sources.base import (
@@ -285,8 +286,7 @@ class SelectedGeneration(View[Source]):
 
     def manifest(self) -> ShardManifest:
         # A worker reads the placed rows alone (`_Placed`), not the store that placed them.
-        return _indexed_manifest(self, f"{self.generation.url}#selected", self.generation.url, 4096,
-                                 _Placed(self.generation, self._dense))
+        return _indexed_manifest(self, self.generation.url, 4096, _Placed(self.generation, self._dense))
 
     def metadata(self) -> Mapping[str, object]:
         """The selections' facts, as uncached (what they hold out included), with this part's rows and

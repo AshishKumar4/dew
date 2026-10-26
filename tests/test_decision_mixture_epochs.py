@@ -11,12 +11,12 @@ from reader_support import assert_resumes_where_it_stopped
 from test_decision_objective import INTENT, LAYOUT, SPECIALS, TOKENIZER, tiny_backbone
 from test_decision_packing import alone, rows_of
 
+from dew.batch import VALID_ROWS
 from dew.data import Loading, Memory
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import Pipeline, mix
 from dew.decision import DecisionObjective, Example, decisions
-from dew.objectives.base import VALID_ROWS
 
 RECORDS, HELD = 12, 4
 """Each corpus's records, and how many of its first ones the slice holds out."""

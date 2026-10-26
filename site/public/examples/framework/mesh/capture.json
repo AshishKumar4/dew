@@ -1,7 +1,7 @@
 {
 	"about": "The screen mesh.py left on a terminal, written by site/scripts/capture_snippets.py.",
 	"arguments": [],
-	"script_sha256": "d1a6a6a47ca6ea3d3ccdc26894e9ea364b72f232f3bf5b82def7ee36f9730124",
+	"script_sha256": "76483d4bbf212d806ff8f6004713f013836789fe62356b9520f4798daf1ff8a6",
 	"meta": {
 		"where": "a 4-vCPU Cloudflare container",
 		"python": "3.12.15",

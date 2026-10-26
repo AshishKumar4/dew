@@ -50,7 +50,7 @@ def test_public_generation_override_keeps_canvas_semantics():
 
 
 def test_block_generation_reads_its_ids_as_every_parser_of_ids_does():
-    """A NumPy pad id generates as the Python one does (`dew.nn.inputs.token_id`), and a fraction or
+    """A NumPy pad id generates as the Python one does (`dew.batch.token_id`), and a fraction or
     a flag where an id goes is refused before the loop runs."""
     bundle = Pretrained.load(str(FIXTURE), dtype="float32", attention_impl="xla", max_seq_len=32)
     process = BlockProcess(canvas_length=4, vocab_size=64, max_steps=4)
@@ -67,10 +67,10 @@ def test_public_pipeline_source_storage_and_saved_block_compute_are_independent(
     import optax
 
     import dew
+    from dew.batch import FROZEN
     from dew.inference import BlockGeneration
     from dew.inference.loading import place
     from dew.nn.diffusion_gemma import DiffusionGemma
-    from dew.objectives.base import FROZEN
     from dew.objectives.diffusion.block import BlockDiffusionObjective
     from dew.training import Checkpoints, Trainer
 
