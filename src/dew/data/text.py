@@ -447,6 +447,14 @@ class Tokenize(grain.MapTransform):
     def dependencies(self) -> Mapping[str, object]:
         return {"tokenizer": self.vocabulary.dependencies()}
 
+    @property
+    def costly(self) -> bool:
+        """Whether encoding costs more than reading the ids back from a cache
+        (`dew.data.pipeline.Costly`): a learned tokenizer's does, Dew's bytes' do not. On an 8-core
+        armada host a 4,000-token BPE took 1.1-1.2 s for 2000 documents of 700 words by index,
+        against 0.7 s read back, and 3.2 s in a memory read, against 0.4 s."""
+        return self.tokenizer != "byte"
+
     def map(self, element: Batch) -> Batch:
         value = element[self.field]
         if not isinstance(value, str):

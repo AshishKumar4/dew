@@ -81,6 +81,7 @@ from dew.data.pipeline import (
     Batched,
     BatchStage,
     Configured,
+    Costly,
     Dataset,
     DeviceStep,
     Expansion,
@@ -143,15 +144,18 @@ def _automatically(stage: Stage) -> bool:
 
 
 def _automatic(pipeline: Pipeline, read: Read, root: str | None) -> Pipeline:
-    """`pipeline` with a cache at `root` after its leading deterministic record maps, where such a
-    cache could stand and the chain writes none: each corpus of a mixture or phases its own. The
-    maps are the ones a cache keys (`_cacheable`) and reads again unchanged (none `_volatile`); the
-    cache stands for them only in a memory or indexed read, by each input's place in a store whose
-    content is named, in a clean checkout whose steps are exact (`Manifest`), and nowhere else, so a
-    chain no cache could serve reads as it is written, never refused. It holds the records the maps
-    make, and fills, publishes, replays and evicts as `cache(url)` does (`Cache`), so a run reads the
-    same records with or without it (`Artifact.automatic`), and a run of the same maps over the same
-    records reads them back. Its root is the run's to name or refuse (`automatic_root`)."""
+    """`pipeline` with a cache at `root` after its leading deterministic record maps, where one of them
+    costs more to run than its records cost to read back (`Costly`: a decode, a learned tokenizer)
+    and the chain writes no cache: each corpus of a mixture or phases its own. The maps are the ones
+    a cache keys (`_cacheable`) and reads again unchanged (none `_volatile`), and in an indexed read
+    none that rejects, whose cache a read by index reads back as a stream, slower than it reruns
+    them. It stands for them only in a memory or indexed read, by each input's place in a store
+    whose content is named, in a clean checkout whose steps are exact (`Manifest`), and nowhere
+    else, so a chain no cache could serve reads as it is written, never refused. It holds the
+    records the maps make, and fills, publishes, replays and evicts as `cache(url)` does (`Cache`),
+    so a run reads the same records with or without it (`Artifact.automatic`), and a run of the
+    same maps over the same records reads them back once one has read them whole. Its root is the
+    run's to name or refuse (`automatic_root`)."""
     from dew.data.cache import Cache
 
     if root is None or read == "streamed":
@@ -160,17 +164,23 @@ def _automatic(pipeline: Pipeline, read: Read, root: str | None) -> Pipeline:
         return with_children(pipeline, lambda child: _automatic(child, read, root))
     if any(isinstance(stage, Artifact) for stage in _steps(pipeline)):
         return pipeline
+
     def kept(stage: Stage) -> bool:
-        return isinstance(stage, (Map, MapWithIndex)) and _cacheable(stage) and not _volatile(stage)
+        return (isinstance(stage, (Map, MapWithIndex)) and _cacheable(stage) and not _volatile(stage)
+                and not (read == "indexed" and stage.rejects))
 
     at = next((index for index, stage in enumerate(pipeline.stages) if not kept(stage)), len(pipeline.stages))
-    if not at or not pipeline.source.supports(read):
+    prefix = pipeline.stages[:at]
+    steps = [stage.step for stage in prefix if isinstance(stage, (Map, MapWithIndex))]
+    if not any(isinstance(step, Costly) and step.costly for step in steps):
         return pipeline
-    key = _cache_key(pipeline.source, pipeline.stages[:at], read)
+    if not pipeline.source.supports(read):
+        return pipeline
+    key = _cache_key(pipeline.source, prefix, read)
     if key is None or not (key.clean and key.exact):
         return pipeline
     cached = Artifact(Cache(root), automatic=True)
-    return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], cached, *pipeline.stages[at:]))
+    return dataclasses.replace(pipeline, stages=(*prefix, cached, *pipeline.stages[at:]))
 
 
 def _cache_references(pipeline: Pipeline, read: Read) -> tuple[str, ...]:
