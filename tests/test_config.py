@@ -650,3 +650,14 @@ def test_a_trainers_cadences_may_be_shares_of_the_run_on_the_command_line():
         with pytest.raises((ValueError, SystemExit)):
             LMRunConfig.cli([*flags, "--trainer.multi-host", "False"])
 
+
+def test_a_decision_run_chooses_its_head_by_its_subcommand():
+    """`head:letters` and `head:joint-shape` choose a decision run's head on its command line, each with
+    its own flags, and none keeps Laya's."""
+    from dew.decision.config import DecisionRunConfig, JointShape, Letters
+
+    run = DecisionRunConfig.cli(["--trainer.multi-host", "False", "head:letters", "--head.count", "4"])
+    assert run.head == Letters(count=4)
+    joint = DecisionRunConfig.cli(["--trainer.multi-host", "False", "head:joint-shape", "--head.layers", "2"])
+    assert joint.head == JointShape(layers=2)
+    assert DecisionRunConfig.cli(["--trainer.multi-host", "False"]).head is None

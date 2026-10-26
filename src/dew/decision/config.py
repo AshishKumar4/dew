@@ -30,12 +30,12 @@ from dew.decision.head import DecisionHead, JointSchemaHead, LabelReadout
 from dew.decision.laya import LAYA
 from dew.decision.layout import Framing, Labels, Layout, QuestionLayout, Schema, Segment, default_layout
 from dew.decision.model import DecisionModel
-from dew.decision.objective import DecisionObjective, tokenizer_of
+from dew.decision.objective import DecisionObjective
 from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
 from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.cross_attention import ContextEncoder, CrossAttention
-from dew.nn.protocols import RematChoosing
+from dew.nn.protocols import RematChoosing, block_chunks_of
 from dew.optim import OptimConfig
 from dew.registry import ModelConfig, import_path, record_argument
 from dew.state import TrainState
@@ -62,9 +62,10 @@ class JointShape:
 class Letters:
     """The letter readout (`LabelReadout`): each option scored by the backbone's own logit at its
     label's token, read at the row's answer cue, as a slot release reads it; its rows lettered as
-    `labels` letter them, a question of up to `count` options, each label one token of the
-    backbone's tokenizer. `untied` gives each label a trainable output row of its own, drawn from the
-    backbone's."""
+    `labels` letter them, each label one token of the run's tokenizer. The head holds `count`
+    labels, and its rows letter no more: a question of more options, one the objective's
+    none-of-the-above adds among them, is refused where its row is laid out. `untied` gives each
+    label a trainable output row of its own, drawn from the backbone's."""
 
     labels: Labels = dataclasses.field(default_factory=Labels)
     count: int = 26
@@ -191,26 +192,26 @@ class DecisionRunConfig(DecoderRunConfig):
             start = start.with_cross_attention(blocks, key=jax.random.fold_in(
                 jax.random.key(self.trainer.key), 1))
         start = start if self.lora is None else start.adapt(self.lora, key=self.trainer.key)
-        labels = self.head.labels if isinstance(self.head, Letters) else None
         if isinstance(start, PretrainedDecision):
+            # A release lays its rows out as it states, its blocks where its overrides read them.
             start = Decide.of(start)
-            derived["layout"] = _laid(_budgeted(start.layout, budgets), self.source.blocked, labels)
+            derived["layout"] = _budgeted(start.layout, budgets)
         else:
-            width, head_dtype = DecisionModel.head_size(start.model)
+            labels = None
             if isinstance(self.head, JointShape):
+                width, head_dtype = DecisionModel.head_size(start.model)
                 derived["head"] = JointSchemaHead(hidden_size=width, dtype=head_dtype,
                                                   **dataclasses.asdict(self.head))
             elif isinstance(self.head, Letters):
-                tokenizer = tokenizer_of(start.text_processor)
-                if tokenizer is None:
-                    raise ValueError(f"the letter readout reads its labels' tokens, and {self.pretrained} "
-                                     "has no tokenizer")
-                derived["head"] = LabelReadout(features=width, label_ids=self.head.labels.ids(
-                    tokenizer, self.head.count), untied=self.head.untied, dtype=head_dtype)
+                # Its ids are its labels' under the objective's tokenizer, which lays the rows out too.
+                letters, (width, head_dtype) = self.head.labels, DecisionModel.head_size(start.model)
+                labels = dataclasses.replace(letters, names=letters.names_for(self.head.count))
+                derived["head"] = LabelReadout(features=width, label_ids=(), untied=self.head.untied,
+                                               dtype=head_dtype)
             head = derived.get("head", DecisionHead)
             # Lettered rows lie one question to a row, as the backbone's order asks.
             layout = _fresh_layout(start.model.causal, head.one_question or labels is not None, budgets)
-            derived["layout"] = _laid(layout, self.source.blocked, labels)
+            derived["layout"] = _laid(layout, bool(block_chunks_of(start.model)), labels)
         objective = self.objective.build(backbone=start, **derived)
         assert isinstance(objective, DecisionObjective), "a decision run's objective is a DecisionObjective"
         summary: dict[str, object] = {"pretrained": self.pretrained}
@@ -263,9 +264,10 @@ def _fresh_layout(causal: bool, one_question: bool, budgets: Budgets) -> Layout:
 
 
 def _laid(layout: Layout, blocked: bool, labels: Labels | None) -> Layout:
-    """`layout` with its rows in blocks where the run's source reads them whole (`SourceOptions.blocked`)
-    and lettered by `labels` where the run reads letters; a layout whose rows can do neither, a joint
-    row of every question, is refused."""
+    """A fresh head's `layout` with its rows in blocks where the backbone reads blocks whole
+    (`blocked`, `block_chunks_of`, as the load's overrides or the checkpoint's own made it) and
+    lettered by `labels` where the run reads letters; a layout whose rows can do neither, a joint row
+    of every question, is refused."""
     stated = {**({"blocks": True} if blocked else {}), **({} if labels is None else {"labels": labels})}
     if stated and not isinstance(layout, QuestionLayout):
         raise ValueError(f"{type(layout).__name__} lays every question in one row, which lies in no blocks "

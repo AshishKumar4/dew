@@ -361,10 +361,12 @@ def test_a_decision_run_builds_its_source_as_its_source_options_say():
 
 
 def test_a_decision_run_reads_letters_as_its_letter_readout():
-    """`--head:letters` reads each option as the fresh backbone's own logit at its label's token, at the
+    """`head:letters` reads each option as the fresh backbone's own logit at its label's token, at the
     answer cue of a row lettered as its labels letter it, as a slot release reads it: the run's head
-    is the letter readout of the labels' token ids, and its rows a question to a row, lettered, each
-    bare letter one token of the fixture's byte-level vocabulary."""
+    is the letter readout of its labels' token ids under the objective's tokenizer, and its rows a
+    question to a row, lettered by those labels alone, each bare letter one token of the fixture's
+    byte-level vocabulary. A question of more options than the head holds labels is refused."""
+    from dew.data.dataset import DataPartition
     from dew.decision.config import Letters
     from dew.decision.head import LabelReadout
     from dew.decision.layout import Labels, QuestionLayout
@@ -381,7 +383,11 @@ def test_a_decision_run_reads_letters_as_its_letter_readout():
     tokenizer = tokenizer_of(Pretrained.load(str(QWEN), dtype="float32").text_processor)
     assert tokenizer is not None
     assert isinstance(head, LabelReadout) and head.label_ids == labels.ids(tokenizer, 4)
-    assert isinstance(layout, QuestionLayout) and layout.labels == labels
+    assert isinstance(layout, QuestionLayout)
+    assert layout.labels == dataclasses.replace(labels, names=labels.names_for(4))
+    with pytest.raises(ValueError):
+        _, few = dataclasses.replace(run, head=Letters(labels=labels, count=2)).prepare().train("x")
+        next(iter(few.train(DataPartition())))
 
 
 def test_a_decision_run_lays_its_rows_in_blocks_its_source_reads_whole():

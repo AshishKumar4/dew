@@ -22,7 +22,8 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import _records
 from dew._records import JSON
-from dew.decision.layout import DecisionInputs, Encoded
+from dew.data.text import Tokenizer
+from dew.decision.layout import DecisionInputs, Encoded, Labels
 from dew.decision.questions import KINDS, Choice, Noul, Score
 from dew.nn.activations import gelu_exact_torch
 from dew.nn.attention import NormalAttention, l2_normalized
@@ -72,6 +73,13 @@ class Head(nn.Module):
         """The label ids, `[K][V]`, at which the head reads the backbone's own logits (`tied`), or
         None where it reads none."""
         return None
+
+    @nn.nowrap
+    def labelled(self, labels: Labels, tokenizer: Tokenizer) -> "Head":
+        """The head reading `labels` as `tokenizer` spells them, where it reads labels and was drawn
+        before its tokenizer was known, with no ids (a run's letter readout, `LabelReadout`); itself
+        otherwise."""
+        return self
 
     @nn.nowrap
     def validate_rows(self, rows: Sequence[Encoded]) -> None:
@@ -516,6 +524,14 @@ class LabelReadout(Head):
     @nn.nowrap
     def tied_labels(self) -> tuple[tuple[int, ...], ...] | None:
         return None if self.untied else self.label_ids
+
+    @nn.nowrap
+    def labelled(self, labels: Labels, tokenizer: Tokenizer) -> "LabelReadout":
+        if self.label_ids:
+            return self
+        if labels.names is None:
+            raise ValueError("a letter readout drawn with no label ids reads labels that name their count")
+        return self.clone(label_ids=labels.ids(tokenizer, len(labels.names)))
 
     @nn.nowrap
     def validate_rows(self, rows: Sequence[Encoded]) -> None:

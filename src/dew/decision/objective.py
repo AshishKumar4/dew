@@ -22,6 +22,7 @@ from dew.decision.layout import (
     DecisionInputs,
     JointLayout,
     Layout,
+    QuestionLayout,
     Specials,
     default_layout,
 )
@@ -258,6 +259,9 @@ class DecisionObjective(Objective[Ratio | DecisionStatistics]):
         if head is None:
             width, dtype = DecisionModel.head_size(module)
             head = DecisionHead(width, dtype=dtype)
+        if isinstance(layout, QuestionLayout) and layout.labels is not None:
+            # A head that reads labels and was drawn with none reads the layout's, by this tokenizer.
+            head = head.labelled(layout.labels, tokenizer)
         self.model = DecisionModel(module, head, context_encoder or "table")
         if layout is None:
             if not isinstance(module, TokenModel):
