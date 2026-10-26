@@ -27,7 +27,6 @@ import functools
 import json
 import operator
 import os
-import re
 import tempfile
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import asdict
@@ -477,12 +476,8 @@ def language_model_names(names: Collection[str], read: Callable[[str], np.ndarra
 
 def _text_aliases(names: Collection[str], read: Callable[[str], np.ndarray], config,
                   tied_head_names: tuple[str, str] = ('lm_head.weight', 'model.embed_tokens.weight'),
-                  checked: Checked = NOTHING_CHECKED,
-                  depths: int | None = None) -> tuple[tuple[str, str], ...]:
+                  checked: Checked = NOTHING_CHECKED) -> tuple[tuple[str, str], ...]:
     """Check tied-head/MTP values and return the verified source relationships.
-
-    A depth past the first `depths` a load keeps (`read_decoder`) is not read: its copies are
-    returned unchecked, so the tree drops them as it drops every copy.
 
     `tied_head_names` is the family's own spelling of the head and the
     embedding, which is not `lm_head.weight` everywhere: DeepSeek V4 stores
@@ -507,10 +502,6 @@ def _text_aliases(names: Collection[str], read: Callable[[str], np.ndarray], con
             if reference == name:
                 # This copy stands in for the trunk's embedding (`_tied_names`),
                 # so it is the one the tree takes, not a copy of it.
-                continue
-            if _unkept_copy(name, config, depths):
-                # A depth the load does not keep: its copy is dropped as a copy, unread.
-                aliases.append((name, reference))
                 continue
             if reference not in names or not _equal(read, name, reference, checked):
                 raise ValueError(f"{name} differs from {shared}, which the depth shares")
@@ -629,7 +620,6 @@ def read_wrapper(
     param_dtype: str = "float32",
     lazy: bool = False,
     checked: Checked = NOTHING_CHECKED,
-    depths: int | None = None,
 ) -> tuple[Variables, tuple[Reading, ...], tuple[WeightLayout, ...]]:
     """Map wrapper weights into language, tower, projector and audio trees,
     and return them with the language model's readings (`read_decoder`),
@@ -640,15 +630,13 @@ def read_wrapper(
     text family's own map, including the top-level tied head copy, and the
     tower and projector halves ride theirs. `lazy` leaves the language
     model's leaves unread; the towers and projectors are small and read
-    whole. `checked` names the spellings the load already checked equal, and `depths` the
-    language model's prediction depths the load keeps (`read_decoder`).
+    whole. `checked` names the spellings the load already checked equal.
     """
     sources, aliases = _wrapper_sources(hf_tensors, hf_tensors.__getitem__, record, checked)
     tables = {group: {local: hf_tensors[name] for local, name in held.items()}
               for group, held in sources.items()}
     language, readings = read_decoder(tables["language_model"], record["text"], param_dtype=param_dtype,
-                                      lazy=lazy, checked=_renamed(checked, sources["language_model"]),
-                                      depths=depths)
+                                      lazy=lazy, checked=_renamed(checked, sources["language_model"]))
     variables = {"language_model": language}
     placed = {}
     if record["tower"] is not None:
@@ -729,45 +717,22 @@ def _stack_experts(params: LazyTree) -> None:
         mlp['experts'] = stacked
 
 
-def held_depths(fields: dict, params: Mapping[str, object], kept: int | None = None) -> None:
+def held_depths(fields: dict, params: Mapping[str, object]) -> None:
     """Set `fields` to build the prediction depths `params`, translated
     weights, hold. A released config names its depths whether or not its
     checkpoint holds them, and transformers builds and saves the trunk alone
     (re-saves of DeepSeek-V3 and Qwen3.5), so a checkpoint holding none of
     the depths its config names is the trunk it holds; one holding some
-    loads them, and refuses a missing one. Where a load keeps only the first
-    `kept` depths (`Pretrained.load(prediction_depths=)`, which `read_decoder`
-    dropped the others of), the fields build no more than those."""
-    declared = int(fields.get("num_nextn_predict_layers") or 0)
-    held = declared if any(_depth_index(name) is not None for name in params) else 0
-    if kept is not None:
-        held = min(held, kept)
-    if declared and not held:
+    loads them, and refuses a missing one."""
+    if fields.get("num_nextn_predict_layers") and not any(str(name).startswith("mtp_") for name in params):
         # The trunk alone: no depth, nor the kinds and residual streams only depths build.
         dspark = fields.get("dspark")
-        kept_kinds = {*fields.get("layer_types", ()),
-                      *([dspark["layer_type"]] if isinstance(dspark, Mapping) else [])}
+        kept = {*fields.get("layer_types", ()),
+                *([dspark["layer_type"]] if isinstance(dspark, Mapping) else [])}
         fields.update(num_nextn_predict_layers=0, mtp_layer_type=None, mtp_feedforward_type=None,
                       mtp_hyper_connections=None)
         if isinstance(fields.get("kinds"), Mapping):
-            fields["kinds"] = {name: kind for name, kind in fields["kinds"].items() if name in kept_kinds}
-    elif held < declared:
-        fields["num_nextn_predict_layers"] = held
-
-
-def _unkept_copy(name: str, config, depths: int | None) -> bool:
-    """Whether `name` is a depth's copy of the trunk's embedding or head (`model.layers.<depth>.*`,
-    past the trunk's layers) of a depth past the first `depths` a load keeps."""
-    parts = name.split(".")
-    return (depths is not None and len(parts) >= 4 and parts[:2] == ["model", "layers"] and parts[2].isdigit()
-            and parts[3:] in (["embed_tokens", "weight"], ["shared_head", "head", "weight"])
-            and int(parts[2]) - int(config["num_layers"]) >= depths)
-
-
-def _depth_index(name: str) -> int | None:
-    """The prediction depth a parameter named `mtp_<depth>` holds, else None."""
-    match = re.fullmatch(r"mtp_(\d+)", str(name))
-    return None if match is None else int(match[1])
+            fields["kinds"] = {name: kind for name, kind in fields["kinds"].items() if name in kept}
 
 
 def translate_weights(
@@ -793,7 +758,6 @@ def read_decoder(
     param_dtype: str = "float32",
     lazy: bool = False,
     checked: Checked = NOTHING_CHECKED,
-    depths: int | None = None,
 ) -> tuple[Variables, tuple[Reading, ...]]:
     """Map HF tensors into a CausalTransformer tree, with parameters in FP32 by
     default, and return it with the readings it placed (`DecoderFamily.readings`),
@@ -816,8 +780,6 @@ def read_decoder(
     and cast only when it is placed (`dew.interop.streaming`); `prepare` and an
     interleaved split still run here. Otherwise each leaf is read whole here.
 
-    `depths` keeps the first that many prediction depths (`mtp_*`), the others' leaves dropped
-    before any is read (`held_depths`).
     `model_type` names the source's own family when the caller read it from a
     config.json. Without it, the family comes from the record, which describes
     what the backbone would be built from, so it cannot tell apart two families
@@ -831,7 +793,7 @@ def read_decoder(
     # tensors the tree already takes, so they are dropped here; any other
     # second tensor for a filled leaf is refused where it is placed.
     copies = {copy for copy, _ in _text_aliases(hf_tensors, hf_tensors.__getitem__, config,
-                                                 _tied_names(family, config, hf_tensors), checked, depths)}
+                                                 _tied_names(family, config, hf_tensors), checked)}
     readings = family.readings(hf_tensors, config)
     # params is always a collection, mapped tensors or not. A checkpoint
     # whose every tensor maps to nothing is an empty tree.
@@ -852,20 +814,6 @@ def read_decoder(
             name,
         )
     _stack_experts(params)
-    if depths is not None:
-        def dropped(name: str) -> bool:
-            index = _depth_index(name)
-            return index is not None and index >= depths
-
-        # Every collection a depth holds leaves of (its parameters, its routers' correction biases).
-        for collection in variables.values():
-            if isinstance(collection, dict):
-                for name in [name for name in collection if dropped(name)]:
-                    del collection[name]
-        # Nor does the source the load binds name them, so a save writes the depths it kept alone.
-        readings = tuple(reading for reading in readings if not _unkept_copy(reading.name, config, depths)
-                         and not any(part.path is not None and len(part.path) > 1 and dropped(part.path[1])
-                                     for part in reading.parts))
     return (variables if lazy else materialize(variables)), readings
 
 
