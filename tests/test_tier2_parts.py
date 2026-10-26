@@ -443,15 +443,15 @@ def test_a_backward_its_forward_does_not_show_is_not_assembled(tmp_path):
         verify_mapping(config, remote=tmp_path / "frozen")
 
 
-def _slot_release(tmp_path):
-    """The renamed source's repository alone, and a local slot release over it: the same repository, its
-    remote code included, with a tokenizer and a slot readout beside it."""
+def _slot_release(tmp_path, edit=lambda code: code):
+    """The renamed source's repository alone (`edit` of its modeling code), and a local slot release over
+    it: the same repository, its remote code included, with a tokenizer and a slot readout beside it."""
     import shutil
 
     from test_slot_sources import BACKBONE
 
     alone, release = tmp_path / "renamed", tmp_path / "release"
-    write_source(alone, "renamed")
+    write_source(alone, "renamed", edit)
     shutil.copytree(alone, release)
     for name in ("tokenizer.json", "tokenizer_config.json"):
         shutil.copy(BACKBONE / name, release / name)
@@ -474,22 +474,39 @@ def test_a_slot_release_over_a_model_of_parts_loads_its_backbone_by_its_own_code
                                   np.asarray(backbone.model.apply(backbone.variables, ids)))
 
 
+def _counted(path):
+    """An edit of the renamed Llama whose causal LM, once built, appends a line to `path` at each of its
+    forwards: the lines count the times the source's code runs."""
+    def edit(code: str) -> str:
+        changed = code.replace(
+            "        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)\n",
+            "        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)\n"
+            "        def counted(module, inputs, output):\n"
+            f"            with open({str(path)!r}, 'a') as file:\n"
+            "                file.write('forward\\n')\n"
+            "        self.register_forward_hook(counted)\n", 1)
+        assert changed != code
+        return changed
+    return edit
+
+
 @pytest.mark.parametrize("kind", ["alone", "release"])
-def test_one_load_of_local_remote_code_probes_it_once(tmp_path, monkeypatch, kind):
+def test_one_load_of_local_remote_code_probes_it_once(tmp_path, kind):
     """A load verifies the remote code it runs once: a local repository's code, which no commit names,
-    has no recorded verification to read back, so each probe of it runs the source, and a slot release
-    over it routes its backbone before reading its weights and loads it by that one verification, as the
-    backbone alone does."""
-    from dew.interop import verify
+    has no recorded verification to read back, so each probe of it runs the source again. One load of the
+    repository alone, and of a slot release over it, which routes its backbone before reading its
+    weights, runs the source's forwards as often as one probe of it does (`verify_mapping`), and Dew's
+    own load runs none."""
+    forwards = tmp_path / "forwards"
+    sources = dict(zip(("alone", "release"), _slot_release(tmp_path, _counted(forwards)), strict=True))
 
-    probes = []
-    probe = verify._verified
+    def ran(run) -> int:
+        forwards.unlink(missing_ok=True)
+        run()
+        return len(forwards.read_text().splitlines()) if forwards.exists() else 0
 
-    def counted(*args, **kwargs):
-        probes.append(args)
-        return probe(*args, **kwargs)
-
-    monkeypatch.setattr(verify, "_verified", counted)
-    source = dict(zip(("alone", "release"), _slot_release(tmp_path), strict=True))[kind]
-    Pretrained.load(source, dtype="float32", attention_impl="reference", trust_remote_code=True)
-    assert len(probes) == 1
+    config = json.loads((sources["alone"] / "config.json").read_text())
+    probe = ran(lambda: verify_mapping(config, remote=sources["alone"]))
+    assert probe > 0
+    assert ran(lambda: Pretrained.load(sources[kind], dtype="float32", attention_impl="reference",
+                                       trust_remote_code=True)) == probe
