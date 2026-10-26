@@ -1,6 +1,6 @@
 """Record tiny Qwen 3.5 block-attention draws from the release's mask adapter and transformers.
 
-Run in the declared transformers-5.19 reference environment, on armada. The
+Run in the reference environment (`TRANSFORMERS`'s pin), on armada. The
 release's pinned serve.patch supplies install_noncausal/blocks; no attention
 mask is transcribed here. The generator writes a native checkpoint, paired
 fp32/float64 logits and source.json with exact package/source provenance.
@@ -30,22 +30,35 @@ REVISION = "b3f8a93462fb1051a9de031e94a7ff380e254072"
 PATCH_SHA256 = "f234c125f1d38d82104b9e1f24e75bde51e4401928acfba2fbf5c59ef2fb46b8"
 REFERENCE = f"https://huggingface.co/{REPO}/blob/{REVISION}/serve.patch; transformers"
 LICENSE = "MIT AND Apache-2.0"
+TRANSFORMERS = ROOT / "locks/reference/transformers519-v1.override.txt"
+"""The transformers the release's patch is recorded against: its one pin, which the reference
+environments install as an override."""
 
 
-def release_source() -> tuple[Path, str]:
-    """The verified patch and the complete readout module it adds."""
-    filename = verified(f"https://huggingface.co/{REPO}/raw/{REVISION}/serve.patch",
-                        CACHE / REPO / REVISION / "serve.patch", PATCH_SHA256)
+def require_reference_transformers() -> None:
+    """Refuse a process whose transformers is not the reference's (`TRANSFORMERS`)."""
+    from packaging.requirements import Requirement
+
+    pin = Requirement(TRANSFORMERS.read_text().strip())
+    installed = importlib.metadata.version(pin.name)
+    if not pin.specifier.contains(installed):
+        raise RuntimeError(f"this reference is {pin}, got {pin.name} {installed}")
+
+
+def release_source() -> Path:
+    """The verified patch."""
+    return verified(f"https://huggingface.co/{REPO}/raw/{REVISION}/serve.patch",
+                    CACHE / REPO / REVISION / "serve.patch", PATCH_SHA256)
+
+
+def release_blocks():
+    """The release's own module-level block context and transformers mask adapter, from the readout
+    module its patch adds."""
+    filename = release_source()
     section = filename.read_text().split("diff --git a/qev/readout.py b/qev/readout.py\n", 1)[1]
     section = section.split("\ndiff --git ", 1)[0]
     source = "\n".join(line[1:] for line in section.splitlines()
                        if line.startswith("+") and not line.startswith("+++"))
-    return filename, source
-
-
-def release_blocks():
-    """The release's own module-level block context and transformers mask adapter."""
-    filename, source = release_source()
     return defined_in(source, ("_BLOCKS", "install_noncausal", "blocks", "block_ids"),
                       {"torch": torch, "contextlib": contextlib, "contextvars": contextvars,
                        "importlib": importlib, "Sequence": Sequence}, filename=str(filename))
@@ -107,9 +120,7 @@ def main():
         return
     if args.seeds is None or args.redraw is None or args.seeds <= 0 or args.redraw < 0:
         parser.error("seeds must be positive and redraw nonnegative")
-    version = importlib.metadata.version("transformers")
-    if version != "5.19.0":
-        raise RuntimeError(f"this reference is transformers 5.19.0, got {version}")
+    require_reference_transformers()
     torch.set_num_threads(1)
     torch.set_float32_matmul_precision("highest")
     torch.backends.cuda.matmul.allow_tf32 = False

@@ -44,7 +44,7 @@ from dew.decision.layout import (
 )
 from dew.decision.metrics import AURC, ECE, Accuracy, Answered
 from dew.decision.model import DecisionModel
-from dew.decision.objective import NONE_OF_THE_ABOVE, DecisionObjective, Encoding
+from dew.decision.objective import DecisionObjective
 from dew.decision.questions import (
     KINDS,
     Answer,
@@ -61,6 +61,7 @@ from dew.decision.questions import (
     TopProbability,
     kind_of,
 )
+from dew.decision.rows import NONE_OF_THE_ABOVE, Encoding
 from dew.decision.scoring import Brier, Combined, LogLoss, RankedProbability, ScoringRule, Spherical
 from dew.decision.task import TASK_FILE, Budget, Decide, Usage, Weights
 

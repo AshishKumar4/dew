@@ -556,3 +556,47 @@ def test_param_groups_with_schedules_momentum_and_bounds_round_trip():
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
     assert loaded == config
     assert loaded.optim.param_groups[0].bounds == (0.0, 24.0)
+
+
+def test_every_kind_of_run_scores_its_own_metrics_unless_it_names_each_splits():
+    """`val_metrics` is every run's (`RunConfig`). Where it names none, each split scores the kind's own
+    (`default_metrics`): a language model its perplexity, a decision run its held-out suite, a JEPA run
+    its probes. Where it names them, each split scores those that name it or no split
+    (`MetricConfig.split`), a split none names scores none, and a metric of a split the run does not
+    validate is refused; the record round trips through the command line and run.json alike."""
+    import types
+
+    from dew.config import MetricConfig
+    from dew.config.jepa import JepaRunConfig
+    from dew.config.lm import LMRunConfig
+    from dew.decision.config import DecisionRunConfig
+    from dew.decision.metrics import AURC, ECE, Accuracy
+    from dew.decision.scoring import Brier, LogLoss
+    from dew.objectives.jepa.probes import KnnProbe, LinearProbe
+    from dew.objectives.lm.objective import Perplexity
+
+    def kinds(metrics):
+        return [type(metric) for metric in metrics]
+
+    assert kinds(LMRunConfig().validation_metrics(validates=True)) == [Perplexity]
+    assert LMRunConfig().validation_metrics(validates=False) == ()
+    assert kinds(DecisionRunConfig().validation_metrics(validates=True)) == [Accuracy, ECE, AURC, LogLoss]
+    assert kinds(JepaRunConfig(probe_classes=7).validation_metrics(validates=True)) == [LinearProbe, KnnProbe]
+    linear, knn = JepaRunConfig(probe_classes=7, knn_k=5).validation_metrics(validates=False)
+    assert (linear.num_classes, knn.num_classes, knn.k) == (7, 7, 5)
+    splits = {"val": object(), "test": object()}
+    stream = types.SimpleNamespace(val=None)
+    assert LMRunConfig().suites(stream, splits) is None
+    flag = '[{"name": "accuracy"}, {"name": "brier", "split": "test"}]'
+    named = DecisionRunConfig.cli(["--val-metrics", flag])
+    assert named.val_metrics == (MetricConfig("accuracy"), MetricConfig("brier", split="test"))
+    suites = named.suites(stream, splits)
+    assert {split: (suite.data, kinds(suite.metrics)) for split, suite in suites.items()} == {
+        "val": (splits["val"], [Accuracy]), "test": (splits["test"], [Accuracy, Brier])}
+    assert DecisionRunConfig.from_dict(named.to_dict()) == named
+    only = LMRunConfig(val_metrics=[MetricConfig("perplexity", split="test")]).suites(stream, splits)
+    assert {split: kinds(suite.metrics) for split, suite in only.items()} == {"val": [], "test": [Perplexity]}
+    assert LMRunConfig(val_metrics=[]).suites(types.SimpleNamespace(val=None), None) == {}
+    for stray in ([MetricConfig("brier", split="holdout")], [MetricConfig("brier")]):
+        with pytest.raises(ValueError):
+            LMRunConfig(val_metrics=stray).suites(stream, splits if stray[0].split else None)
