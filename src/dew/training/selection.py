@@ -21,8 +21,8 @@ class Best:
     """Keeps the `top` best evaluations by a metric, a recorded metric name, or a custom score.
 
     A name refers to one of the metric objects passed to `fit`, or to a `Summary` as
-    `summary/<name>`. `mode` sets the direction, 'min' or 'max'. When it is None, a custom score is
-    minimized, and a named metric or a metric object takes its direction
+    `evaluation/summary/<name>`. `mode` sets the direction, 'min' or 'max'. When it is None, a custom
+    score is minimized, and a named metric or a metric object takes its direction
     from its `Shown` declaration. An evaluation whose score is not better
     than `threshold` is not ranked.
     """
@@ -71,12 +71,13 @@ class Best:
                     selection, mode="max" if metric.shown.better == "higher" else "min"
                 )
             return dataclasses.replace(selection, split='train')
-        # A summary is ranked under its own split, which no other selection defaults to.
+        # A summary is ranked in its namespace, which no split can be named, so no other selection's
+        # split defaults to it. A recorded name's split is all before its last '/', as a namespace is.
         splits = tuple(split for split in scored if split != Summary.SPLIT)
         if isinstance(metric, Summary) and selection.split is None:
             selection = dataclasses.replace(selection, split=Summary.SPLIT)
-        if metric is None and selection.split is None and selection.metric.partition('/')[0] in scored:
-            selection = dataclasses.replace(selection, split=selection.metric.partition('/')[0])
+        if metric is None and selection.split is None and selection.metric.rpartition('/')[0] in scored:
+            selection = dataclasses.replace(selection, split=selection.metric.rpartition('/')[0])
         if selection.split is None:
             if len(splits) != 1 and (metric is None or isinstance(metric, Metric)):
                 raise ValueError("Best(metric, split=...) is required with several validation splits")

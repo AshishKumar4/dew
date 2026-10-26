@@ -265,7 +265,7 @@ class Metrics(Mapping):
         self._values = values
 
     def __getitem__(self, key):
-        from dew.objectives.base import recorded_name
+        from dew.training.evaluation import recorded_name
         return self._values[key if isinstance(key, str) else recorded_name(key, self._values)]
 
     def __iter__(self):
