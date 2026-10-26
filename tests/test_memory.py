@@ -532,6 +532,15 @@ def test_a_memory_decoder_trains_scans_remats_and_decodes():
                     seeds=SEEDS["memory decoder decode"], truth_fn=last(wide))
 
 
+def test_a_memory_refuses_a_bidirectional_decoder():
+    """A memory reads each token's prefix alone, so a decoder that asks its layers for the whole row
+    (`causal=False`, a masked diffusion model's) refuses to build one; the same decoder causal builds."""
+    ids = jnp.zeros((2, LENGTH), jnp.int32)
+    decoder().init(jax.random.key(0), ids)
+    with pytest.raises(ValueError):
+        decoder(causal=False).init(jax.random.key(0), ids)
+
+
 def test_muon_steps_each_memory_heads_matrices_on_their_own():
     """A memory decoder trains under Muon: each head's inner matrices are matrices Muon orthogonalizes on
     their own, by Linen's kernel convention (inputs into outputs), its biases take AdamW's update, and
