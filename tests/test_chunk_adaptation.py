@@ -62,10 +62,11 @@ MODEL = decoder()
 
 CORNER_WINDOWS = {1: 32, 2: 8, 3: 8}
 """The draws a seed pools (`windows`) where the inner step diverges, 0.5 N(0, 1) weights stepped by a
-half, by window: a window of one token steps eleven times a row, three tokens three times. Over 8 seeds of 64 rows its median row's rate times curvature is 4 to 8 at a window of three and
-1.7 to 3.3 at one, past gradient descent's 2 (the configurations below it peak at 1.64), and a row's
-rounding grows by up to 10^4 over its windows, so one draw's error is too heavy-tailed for its
-paired ratio to narrow within 512 seeds: each seed pools this many independent draws."""
+half, by window: a one-token window steps eleven times a row, a three-token one three times. Over 8
+seeds of 64 rows its median row's rate times curvature is 4 to 8 at a window of three and 1.7 to 3.3
+at one, past gradient descent's 2 (the configurations below it peak at 1.64), and a row's rounding
+grows by up to 10^4 over three windows and 10^13 over eleven, so one draw's error is too heavy-tailed
+for its paired ratio to narrow within 512 seeds: each seed pools this many independent draws."""
 
 
 def corner(rate: float, scale: float, window: int) -> bool:
