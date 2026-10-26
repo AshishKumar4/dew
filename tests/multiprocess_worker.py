@@ -211,6 +211,46 @@ def elastic_loader(records: int, workers: int):
                    loading=Loading(workers=workers, threads=2, read_buffer=8, worker_buffer=2)).train
 
 
+def served_image(index: int) -> bytes:
+    """The bytes a pool's server answers record `index`'s url with: its image, as `elastic_loader`'s
+    records hold it."""
+    return np.full((RES, RES, 3), index, np.uint8).tobytes()
+
+
+@dataclasses.dataclass(frozen=True)
+class Pixels:
+    """A fetched record's bytes read back as its image."""
+
+    identity = "pixels@1"
+
+    def __call__(self, row):
+        return {"image": np.frombuffer(row["bytes"], np.uint8).reshape(RES, RES, 3)}
+
+
+def online_pipeline(records: int, address: str, *, shared: bool):
+    """`elastic_loader`'s records fetched over HTTP from the pool's server at `address`, a url each, in
+    either order a fetch is read in: the catalog shuffled and each process fetching its own share of it
+    (`shared`), or every process fetching the catalog as a memory read does and shuffling what it kept,
+    one global order."""
+    from dew.data import Memory
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources.urls import Fetch
+
+    catalog = Pipeline(Memory([{"url": f"http://{address}/{index}"} for index in range(records)]))
+    fetched = (Fetch(output="bytes"), Pixels())
+    if shared:
+        return catalog.shuffle(0).repeat().filter_map(*fetched)
+    return catalog.filter_map(*fetched).shuffle(0).repeat()
+
+
+def online_loader(records: int, workers: int, address: str, *, shared: bool):
+    """`elastic_loader` over records fetched from the pool's server (`online_pipeline`)."""
+    from dew.data.compile import compile
+
+    return compile(online_pipeline(records, address, shared=shared).batch(BATCH), seed=0,
+                   loading=Loading(workers=workers, threads=2, read_buffer=8, worker_buffer=2)).train
+
+
 def batch_records(batch) -> list[int]:
     """The record ids a batch out of `indexed_loader` holds."""
     return [int(value) for value in np.asarray(batch["image"])[:, 0, 0, 0]]
@@ -379,6 +419,31 @@ def mode_data(args) -> dict:
         "global_batch_size": data.batch,
         "train_len": data.records,
     }
+
+
+def mode_online_data(args) -> dict:
+    """The first pass of records fetched from the pool's server, each process fetching its share of the
+    shuffled catalog (`online_pipeline`): the records it read, by the image each url's bytes hold, and
+    the plan's lowering. A training order reads on past its pass, so the pass is its batches."""
+    import itertools
+
+    import jax
+
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition
+    from dew.training import MeshSpec
+
+    data = compile(online_pipeline(args.records, args.online, shared=True).batch(BATCH), seed=0,
+                   loading=Loading(workers=args.workers, threads=2, read_buffer=8, worker_buffer=2))
+    partition = DataPartition.of(MeshSpec().build())
+    stream = data.train(partition)
+    try:
+        records = [record for batch in itertools.islice(stream, args.records // BATCH)
+                   for record in batch_records(batch)]
+    finally:
+        stream.close()
+    return {"process_index": jax.process_index(), "records": records,
+            "lowering": None if data.plan is None else data.plan.lowering}
 
 
 def mode_packed(args) -> dict:
@@ -604,7 +669,9 @@ def mode_fit(args) -> dict:
     # Where the checkpoint on disk left this run, read before fit trains past it.
     restored_step, restored = restored_state(trainer)
     rows = BATCH // args.processes
-    if args.elastic:
+    if args.online:
+        open_train = online_loader(args.records, args.workers, args.online, shared=args.shared)
+    elif args.elastic:
         open_train = elastic_loader(args.records, args.workers)
     else:
         loader = indexed_loader(args.records, rows)
@@ -625,8 +692,15 @@ def mode_fit(args) -> dict:
         # The source's last batch trains the step `block_after` past where the run restored.
         observe = Observe(1, blocked(checkpoints, loader, (restored_step or 0) + args.block_after,
                                      Path(args.notify)))
-    state = trainer.fit(Loader(open_train, val=None, batch=BATCH, records=args.records),
-                        steps=args.steps, log_every=1, checkpoint_every=args.save_every, observe=observe)
+    try:
+        state = trainer.fit(Loader(open_train, val=None, batch=BATCH, records=args.records),
+                            steps=args.steps, log_every=1, checkpoint_every=args.save_every, observe=observe)
+    except ValueError as refusal:
+        if not args.refusal:
+            raise
+        # A refusal the run expects: what it refused with, and the steps it observed and saved first.
+        return {"refused": type(refusal).__name__, "written_steps": checkpoints.committed(),
+                "observed": [] if observe is None else [step for step, _ in observe.values]}
     dump_params(args.out.with_suffix(".npz"), state.variables)
     if observe is not None:
         # Each observation is already whole on this host: written as it is, gathered by nothing.
@@ -2258,7 +2332,8 @@ MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget,
          "decision_publish": mode_decision_publish,
          "host_training": mode_host_training, "step_fits": mode_step_fits,
          "whole_validation": mode_whole_validation, "host_fields": mode_host_fields,
-         "topology": mode_topology, "data": mode_data, "packed": mode_packed,
+         "topology": mode_topology, "data": mode_data, "online_data": mode_online_data,
+         "packed": mode_packed,
          "masked_generation": mode_masked_generation,
          "packed_fit": mode_packed_fit, "reads": mode_reads,
          "inference_pipeline": mode_inference_pipeline,
@@ -2307,6 +2382,12 @@ def parse_args(argv=None):
                         help="read the training records through a compiled global order, whose "
                              "saved position is a global record count")
     parser.add_argument("--release", help="the decision release decision_publish places and publishes")
+    parser.add_argument("--online", help="host:port of the server whose urls the records are fetched from "
+                                         "(`online_loader`)")
+    parser.add_argument("--refusal", action="store_true",
+                        help="fit reports the ValueError it is refused with instead of raising it")
+    parser.add_argument("--shared", action="store_true",
+                        help="each process fetches its own share of the shuffled catalog (`online_pipeline`)")
     parser.add_argument("--profile-dir", help="directory the scheduled profile window writes")
     parser.add_argument("--cell", help="read,cache|nocache|published,rejecting|all,packed|rows for the "
                                        "matrix mode")
