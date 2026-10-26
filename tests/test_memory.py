@@ -250,15 +250,21 @@ def test_an_l2_linear_memory_runs_the_gated_delta_rule():
     assert routes(layer("delta_rule").clone(chunk=CHUNK)) == []
 
 
-@pytest.mark.parametrize(("dtype", "features", "kernel"), [
-    ("float32", FEATURES, "step"), ("float64", FEATURES, "xla"), ("float32", 12, "xla")],
-    ids=["fp32", "float64", "width_12"])
-def test_a_cached_linear_memorys_token_takes_the_shared_decode_dispatch(dtype, features, kernel):
+@pytest.mark.parametrize(("dtype", "features", "chosen", "kernel", "verdict"), [
+    ("float32", FEATURES, {}, "step", "kernel"),
+    ("float64", FEATURES, {}, "xla", "inherent"),
+    ("float32", 12, {}, "xla", "gap: roadmap: recurrence step widths"),
+    ("float32", FEATURES, {"delta_decode": "fused"}, "step", "inherent")],
+    ids=["fp32", "float64", "width_12", "fused_chosen"])
+def test_a_cached_linear_memorys_token_takes_the_shared_decode_dispatch(dtype, features, chosen, kernel,
+                                                                        verdict):
     """A linear memory's cached token, traced for an H100, steps through the shared decode dispatch: the
     recurrence's step kernel where it takes the state, fp32 of power-of-two widths, else the portable
     step, so a float64 memory keeps its own precision and a head width the kernel's blocks do not take
-    never reaches its launch."""
+    never reaches its launch; with the fused step chosen, which a memory has nothing to fuse into, the
+    step. Each route off the preferred kernel says why, as the kernel-route audit reads it."""
     from dew.nn.kernels import generation
+    from tools import kernel_routes
 
     module = layer("delta_rule", dtype=jnp.dtype(dtype)).clone(head_features=features)
     decode = MixerCall(decode=True)
@@ -267,10 +273,11 @@ def test_a_cached_linear_memorys_token_takes_the_shared_decode_dispatch(dtype, f
         params = jax.eval_shape(module.init, jax.random.key(0), x)
         _, cache = jax.eval_shape(lambda held, x: module.apply(held, x, decode, mutable=["cache"]),
                                   params, x)
-        with generation.assumed("sm90"), generation.routes() as found:
+        with generation.assumed("sm90"), generation.chosen(**chosen), generation.routes() as found:
             jax.eval_shape(lambda held, cached, x: module.apply({**held, **cached}, x, decode,
                                                                 mutable=["cache"]), params, cache, x)
-    assert [route.kernel for route in found if route.choice == "delta_decode"] == [kernel]
+    [route] = [route for route in found if route.choice == "delta_decode"]
+    assert (route.kernel, kernel_routes.verdict(route)) == (kernel, verdict)
 
 
 class Product(nn.Module):

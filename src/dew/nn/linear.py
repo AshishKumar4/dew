@@ -48,7 +48,7 @@ from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, Coordinates, MixerCall, coordinates_of, valid_order
 from .joined import joined_dense, joins
 from .kernels import generation
-from .kernels.generation import Refusal, first_refusal, measured_kernel, refused, route, triton_runs
+from .kernels.generation import INHERENT, Refusal, first_refusal, measured_kernel, route, triton_runs
 from .kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule, on_the_port, recurrent_delta_rule
 from .precision import L2NORM_EPS, asks_default_precision, at_least_fp32, float32_dot_general, l2norm
 from .sharding import (
@@ -428,7 +428,7 @@ def _masked_conv1d(x, kernel, valid, state=None, bias=None, segments=None, parts
 def decode_gated_delta_rule(query, key, value, g, beta, state, active=None):
     """`recurrent_gated_delta_rule` for one decode token `[B, 1, H, D]`
     through the recurrence's decode step (`dew.nn.kernels.recurrence.step`), which reads and writes
-    the state once (CUDA, where `recurrence.fits` the state). A row `active`
+    the state once (CUDA, where no `recurrence.refusal` turns the state down). A row `active`
     `[B]` marks False keeps its state untouched and outputs zeros. On a mesh
     the step runs per shard (`manual_map`), each shard's rows and heads with
     their state, as `fla_rule` runs: the kernel has no partitioning rule, and
@@ -462,32 +462,34 @@ def stepped_per_shard(hooks: recurrence.Hooks, operands: recurrence.Step) -> tup
         operands.query, operands.key, operands.value, operands.log_decay, operands.beta, state, active)
 
 
-def step_refusal(hooks: recurrence.Hooks, state: jax.Array | jax.ShapeDtypeStruct) -> Refusal | None:
-    """Why the recurrence's step kernel turns a decode token's `state` down (`recurrence.fits`), or
-    None where it takes it."""
-    return refused((recurrence.fits(hooks, state), 'step_widths',
-                    "the step kernel takes a state of power-of-two widths in fp32 or bf16 on a GPU of sm80 "
-                    "or later"))
+def decode_kernel(state: jax.Array | jax.ShapeDtypeStruct, *, tangent: bool, fuses: bool) -> str:
+    """The kernel a decode token over `state` `[B, Hv, Dk, Dv]` runs on the target, reported as its
+    route ('delta_decode'): its row's choice, else the step kernel where the rule's own row names the
+    port and the portable recurrence ('xla') where it names the math, so a caller choosing the rule's
+    math (`generation.chosen`) decodes unfused. The fused step (`recurrence.step` with a layer's conv,
+    gates and norm) is a caller's that has those to fuse (`fuses`), the step (`recurrence.step` alone)
+    any caller's; a state no launch takes (`recurrence.refusal`, `tangent` for a token traced for
+    `jax.jvp`) takes the portable recurrence."""
+    preferred = measured_kernel(
+        'delta_decode', 'step' if measured_kernel('gated_delta_rule', 'xla') == 'fla' else 'xla')
+    if preferred not in ('fused', 'step'):
+        return route('delta_decode', kernel='xla', preferred=preferred).kernel
+    if (refusal := recurrence.refusal(state, tangent=tangent)) is not None:
+        return route('delta_decode', kernel='xla', preferred=preferred, refusal=refusal).kernel
+    if preferred == 'fused' and not fuses:
+        return route('delta_decode', kernel='step', preferred=preferred, refusal=Refusal(
+            'unfused', "the caller has no conv, gates or gated norm for the fused step to take; its token "
+            "runs the step alone", INHERENT)).kernel
+    return route('delta_decode', kernel=preferred, preferred=preferred).kernel
 
 
 def decode_step(hooks: recurrence.Hooks, operands: recurrence.Step, *, tangent: bool
                 ) -> tuple[jax.Array, jax.Array]:
-    """A decode token's `(output, state')` through the shared recurrence, reported as `delta_decode`'s
-    route: the step kernel per shard (`stepped_per_shard`) where the target prefers it and it takes the
-    state (`step_refusal`), else the portable step (`recurrence.step_reference`), in the operands'
-    own precision, which the compiler partitions. A token traced for forward-mode derivatives
-    (`tangent`) takes the portable step, as the kernel updates its state in place, which takes none."""
-    preferred = measured_kernel(
-        'delta_decode', 'step' if measured_kernel('gated_delta_rule', 'xla') == 'fla' else 'xla')
-    refusal = None
-    if preferred in ('fused', 'step'):
-        refusal = (refused((not tangent, 'forward_mode', "a JVP trace needs forward-mode derivatives; the "
-                            "step kernel updates its state in place, which takes none"))
-                   or step_refusal(hooks, operands.state))
-        if refusal is None:
-            route('delta_decode', kernel='step', preferred=preferred)
-            return stepped_per_shard(hooks, operands)
-    route('delta_decode', kernel='xla', preferred=preferred, refusal=refusal)
+    """A decode token's `(output, state')` through the shared recurrence: the step kernel per shard
+    (`stepped_per_shard`) where `decode_kernel` picks it, else the portable step
+    (`recurrence.step_reference`) in the operands' own precision, which the compiler partitions."""
+    if decode_kernel(operands.state, tangent=tangent, fuses=False) == 'step':
+        return stepped_per_shard(hooks, operands)
     out, _, state = recurrence.step_reference(hooks, operands)
     return out, state
 
@@ -679,39 +681,12 @@ class GatedDeltaNet(nn.Module):
         return stored, jnp.promote_types(operand, stored)
 
     def _decode_kernel(self, x, operand) -> str:
-        """The kernel a decode token runs on the target, reported as its route ('delta_decode'): the
-        fused step (`recurrence.step` with the layer's conv, gates and norm, `_fused_token`), the step
-        (`recurrence.step` alone, `decode_gated_delta_rule`) between the layer's
-        own conv and norm, or the portable recurrence ('xla'). Its row's choice, else the step
-        kernel where the rule's own row names the port and the portable recurrence where it names
-        the math, so a caller choosing the rule's math (`generation.chosen`) decodes unfused; a kernel
-        the token's state does not fit hands it to the next. Both kernels update the state in place, which
-        JAX's Pallas gives no tangent, so a token traced for `jax.jvp` (`FORWARD_MODE`) takes the
-        recurrence."""
+        """The kernel a decode token runs (`decode_kernel`): the fused step with the layer's conv,
+        gates and norm (`_fused_token`), the step alone between them (`decode_gated_delta_rule`), or
+        the portable recurrence ('xla')."""
         state = jax.ShapeDtypeStruct((x.shape[0], self.num_v_heads, self.head_k_dim, self.head_v_dim),
                                      self._stored(operand)[0])
-        preferred = measured_kernel(
-            'delta_decode', 'step' if measured_kernel('gated_delta_rule', 'xla') == 'fla' else 'xla')
-        if preferred in ('fused', 'step') and (refusal := refused(
-                (not FORWARD_MODE.get() and not isinstance(x, JVPTracer), 'forward_mode',
-                 "a JVP trace needs forward-mode derivatives; the decode kernels update their state in "
-                 "place, which takes none"))):
-            return route('delta_decode', kernel='xla', preferred=preferred, refusal=refusal).kernel
-        refusal = None
-        if preferred == 'fused':
-            refusal = refused(
-                (triton_runs(), 'capability', "the fused step needs a GPU of sm80 or later"),
-                (recurrence.fits(self._fused_hooks(), state), 'widths',
-                 "the state's widths are not powers of two the fused step's blocks take"),
-            )
-            if refusal is None:
-                return route('delta_decode', kernel='fused', preferred=preferred).kernel
-        if preferred in ('fused', 'step'):
-            stepping = step_refusal(STEP, state)
-            if stepping is None:
-                return route('delta_decode', kernel='step', preferred=preferred, refusal=refusal).kernel
-            refusal = refusal or stepping
-        return route('delta_decode', kernel='xla', preferred=preferred, refusal=refusal).kernel
+        return decode_kernel(state, tangent=FORWARD_MODE.get() or isinstance(x, JVPTracer), fuses=True)
 
     def _fused_hooks(self) -> recurrence.Hooks:
         """The decode token whole in the recurrence's step: the conv and its silu, the queries' and
