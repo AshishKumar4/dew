@@ -22,6 +22,7 @@ causal convolution that doubles the channels. The decoder clamps pixels to
 """
 from __future__ import annotations
 
+import functools
 import math
 from collections.abc import Mapping
 from itertools import pairwise
@@ -38,6 +39,7 @@ from dew import _records
 from dew.batch import Variables
 from dew.interop.components import bind_component
 from dew.interop.weights import indexed_path
+from dew.nn.kernels.options import program
 
 from ..activations import silu
 from ..attention import l2_normalized, scaled_dot_product_attention
@@ -293,6 +295,16 @@ class _Decoder(nn.Module):
         return _causal(self, 3, 3, 3, "conv_out", x)
 
 
+def _posterior(model: WanVAE, params, video, key=None, noise=None):
+    """A video's posterior draw: the whole video's moments, its chunks assembled, and its noise whole."""
+    return posterior_latent(chunked_moments(model, {"params": params}, video), key, noise)
+
+
+def _chunk_decoded(model: WanVAE, params, latents):
+    """A video's latents decoded chunk by chunk (`chunked_decode`)."""
+    return chunked_decode(model, {"params": params}, latents)
+
+
 class WanVAEFields(TypedDict):
     base: int
     latent: int
@@ -442,10 +454,8 @@ class WanAutoencoder(AutoEncoder):
                 f"must both hold one value per latent channel {expected}"
             )
         self.normalization = LatentNormalization({'latents_mean': mean, 'latents_std': std}, mean, 1.0 / std)
-        # The posterior's draw reads the whole video's moments, its chunks assembled, and its noise whole.
-        self._encode = jax.jit(lambda params, video, key=None, noise=None: posterior_latent(
-            chunked_moments(model, {"params": params}, video), key, noise))
-        self._decode = jax.jit(lambda params, latents: chunked_decode(model, {"params": params}, latents))
+        self._encode = functools.partial(program(_posterior, model, static_argnums=0), model)
+        self._decode = functools.partial(program(_chunk_decoded, model, static_argnums=0), model)
 
     def record_arguments(self) -> dict:
         return dict(self.normalization.record)
