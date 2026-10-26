@@ -837,7 +837,7 @@ def fused_operands(name, dtype, draw: int = 0):
     return first, second, (0.7 + 0.2 * jax.random.normal(drawn_key(79, draw), (96,))).astype(jnp.bfloat16)
 
 
-@pytest.mark.parametrize("composition", ["jvp_grad", "grad_jvp", "jvp_staged", "vmap_grad"])
+@pytest.mark.parametrize("composition", ["jvp_grad", "grad_jvp", "jvp_staged", "vmap_grad", "grad_vmap"])
 @pytest.mark.parametrize("name, dtype", [("swiglu", jnp.bfloat16), ("packed", jnp.float32),
                                          ("rms", jnp.bfloat16), ("stream", jnp.float32),
                                          ("unweighted", jnp.bfloat16), ("gated", jnp.float32),
@@ -845,10 +845,11 @@ def fused_operands(name, dtype, draw: int = 0):
 def test_a_fused_kernel_differentiates_at_every_order_through_its_portable_arithmetic(name, dtype,
                                                                                      composition):
     """Each fused norm and SiLU product (interpreted here) differentiated at a second order, forward
-    over reverse and reverse over forward, staged by a jit, and a gradient mapped over rows, by the
-    first operand alone and under a score that squares the output, so the cotangent varies: each is the
-    portable arithmetic's own composition, within the float64 gate of it, while the first level's value
-    and, where the composition takes a gradient of the call, its backward run the kernels."""
+    over reverse and reverse over forward, staged by a jit, a gradient mapped over rows and the gradient
+    of a map over rows (the linear map's batch, `generation.linear_map`), by the first operand alone and
+    under a score that squares the output, so the cotangent varies: each is the portable arithmetic's
+    own composition, within the float64 gate of it, while the first level's value and, where the
+    composition takes a gradient of the call, its backward run the kernels."""
     def draw(draw):
         # The score's cotangent, one, held in the draw as the gate takes it.
         operands = fused_operands(name, dtype, draw)
@@ -886,14 +887,18 @@ def test_a_fused_kernel_differentiates_at_every_order_through_its_portable_arith
             if composition == "jvp_staged":
                 return jax.jvp(jax.jit(lambda first: fused(first, *rest)), (first,), (tangent,))[1]
             # The rows map, a norm's weight is every row's.
-            return jax.vmap(gradient(score, one), in_axes=(0, 0, None)[:1 + len(rest)])(first, *rest)
+            rows = (0, 0, None)[:1 + len(rest)]
+            if composition == "grad_vmap":
+                return gradient(lambda first, *rest: jax.vmap(score, in_axes=rows)(first, *rest).sum(), one)(
+                    first, *rest)
+            return jax.vmap(gradient(score, one), in_axes=rows)(first, *rest)
 
         return run
 
     forward = "swiglu_forward" if name in ("swiglu", "packed") else "rms_norm_forward"
     launched = kernels(composed(kernel=True), operands[0], tangent, one, *operands[1:])
     assert forward in launched
-    if composition in ("jvp_grad", "vmap_grad"):
+    if composition in ("jvp_grad", "vmap_grad", "grad_vmap"):
         assert forward.replace("forward", "backward") in launched
     # Exact by construction (a stream's tangent is its addends'), or on par over the draws: check 1,
     # which holds Dew exact where the reference is on every draw.
