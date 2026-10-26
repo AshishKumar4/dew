@@ -437,9 +437,10 @@ def test_a_prefix_page_is_shared_only_between_prompts_whose_blocks_lie_alike():
 def test_a_served_prefix_run_refuses_a_prompt_carrying_its_own_blocks():
     """A prefix run makes each prompt's blocks itself, so a prompt served under it carrying blocks of its own
     is refused rather than one of the two ignored."""
-    server = Server.from_task(TextGeneration(blocky().clone(max_seq_len=128), greedy_blocky().variables,
-                                             sampling=Sampling(temperature=0, pad_token_id=0), prefix=PREFIX),
-                              slots=2, capacity=64)
+    decoder = blocky().clone(max_seq_len=128)
+    task = TextGeneration(decoder, decoder.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)),
+                          sampling=Sampling(temperature=0, pad_token_id=0), prefix=PREFIX)
+    server = Server.from_task(task, slots=2, capacity=64)
     with pytest.raises(ValueError):
         server.submit(carried(SERVED_PROMPTS[0], CARRIED_BLOCKS[0]), 2)
 
