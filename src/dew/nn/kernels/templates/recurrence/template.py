@@ -13,7 +13,6 @@ launches' seconds.
 """
 
 import dataclasses
-import functools
 from typing import ClassVar
 
 import jax
@@ -21,18 +20,12 @@ import jax.numpy as jnp
 import tokamax
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import base, cost, mosaic
+from dew.nn.kernels.templates import base, bundles, cost, mosaic
 from dew.nn.kernels.templates.recurrence import mainloop
 
 INTERPRETED_GENERATION = "sm90"
 """The generation whose facts rank a call's configs off a GPU of a family a bundle claims (a CPU): the
 interpreted bundle's (`mainloop.INTERPRETED`, wgmma's)."""
-
-
-def claimed(target: generation.GpuTarget) -> str | None:
-    """The instruction family of `target` a bundle of the mainloop claims (`mainloop.FAMILIES`), or None."""
-    name = generation.family(target.generation)
-    return name if name in mainloop.FAMILIES else None
 
 
 def _widths(ba: tokamax.BoundArguments, family: mosaic.Family) -> tuple[int, int, jnp.dtype]:
@@ -45,19 +38,35 @@ def _widths(ba: tokamax.BoundArguments, family: mosaic.Family) -> tuple[int, int
             jnp.dtype(dtype))
 
 
-def bundle(target: generation.GpuTarget) -> mosaic.Family | None:
-    """The mainloop's bundle for `target`'s instruction family, None where none claims it."""
-    name = claimed(target)
-    return None if name is None else mainloop.FAMILIES[name]
+def _dtype(ba: tokamax.BoundArguments) -> jnp.dtype:
+    """The call's operands' common dtype."""
+    return jnp.dtype(jnp.result_type(*(ba.arguments[name].dtype for name in ("query", "key", "value"))))
 
 
-@functools.cache
-def _planned(shapes: tuple, tiles: mainloop.Tiles, family: str, max_segments: int | None, delta: bool,
-             backward: bool, floor: float | None) -> tuple[mainloop.Launch, ...]:
-    """`mainloop.planned` of a call over `shapes` (`jax.ShapeDtypeStruct`s or None) by `family`'s bundle."""
-    *operands, starts = shapes
-    return mainloop.planned(*operands, tiles=tiles, family=mainloop.FAMILIES[family], starts=starts,
-                            max_segments=max_segments, delta=delta, backward=backward, floor=floor)
+def bundle(target: generation.GpuTarget, dtype=jnp.bfloat16) -> mosaic.Family | None:
+    """The mainloop's bundle for `target`'s instruction family and a call of `dtype` (`bundles.of`), None
+    where none claims it."""
+    return bundles.of(target.generation, mainloop.bundle_dtype(dtype))
+
+
+_PLANS: dict = {}
+"""`_planned`'s plans by their call, tiles, bundle and target's facts."""
+
+
+def _planned(shapes: tuple, tiles: mainloop.Tiles, family: mosaic.Family, target: generation.GpuTarget,
+             max_segments: int | None, delta: bool, backward: bool,
+             floor: float | None) -> tuple[mainloop.Launch, ...]:
+    """`mainloop.planned` of a call over `shapes` (`jax.ShapeDtypeStruct`s or None) by `family`'s bundle on
+    `target`, cached by the facts a plan reads of it (two targets of one family share no plan: an sm87's and
+    an sm80's multiprocessors and shared memory differ)."""
+    facts = (target.generation, target.device_kind, target.shared_limit, target.multiprocessors)
+    key = (shapes, tiles, family, facts, max_segments, delta, backward, floor)
+    if key not in _PLANS:
+        *operands, starts = shapes
+        _PLANS[key] = mainloop.planned(*operands, tiles=tiles, family=family, starts=starts,
+                                       max_segments=max_segments, delta=delta, backward=backward, floor=floor,
+                                       target=target)
+    return _PLANS[key]
 
 
 def _launch_cost(launch: mainloop.Launch, target: generation.GpuTarget) -> cost.Cost:
@@ -112,10 +121,10 @@ class Mosaic(base.Template[mainloop.Tiles]):
         dtype = jnp.result_type(*(arguments[name].dtype for name in names[:3]))
         per_head = arguments["g"].ndim == 3
         fast = backward and arguments.get("delta", True) and per_head and dtype != jnp.float32
-        family = claimed(target)
+        family = bundle(target, dtype)
         assert family is not None, f"no bundle of the mainloop claims {target.generation}"
-        return _planned(shapes, config, family, arguments.get("max_segments"), arguments.get("delta", True),
-                        bool(fast), arguments.get("floor"))
+        return _planned(shapes, config, family, target, arguments.get("max_segments"),
+                        arguments.get("delta", True), bool(fast), arguments.get("floor"))
 
     GENERATES: ClassVar[bool] = True
 
@@ -155,7 +164,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         - stages: the deepest ring of the states launch's steps of which a multiprocessor holds as many
           programs as one stage's (`states_held`, `_staged`), one where none of two or more is legal.
         None where no block is legal: the launch refuses the call."""
-        family = bundle(target)
+        family = bundle(target, _dtype(ba))
         if family is None:
             return None
         _, columns, _ = _widths(ba, family)
@@ -185,7 +194,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         a call taking none, `_launches`', holds)."""
         forward = self._launches(ba, tiles, target, backward=False)
         both = self._launches(ba, tiles, target, backward=True)
-        family = bundle(target)
+        family = bundle(target, _dtype(ba))
         assert family is not None
         return mainloop.holds(both[len(forward):], family, generation.shared_budget(target))
 
@@ -194,7 +203,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         """The programs of the states launch at `tiles` a multiprocessor of `target` holds at once
         (`mainloop.held_programs`, as its persistent launches')."""
         states = self._states(ba, tiles, target)
-        family = bundle(target)
+        family = bundle(target, _dtype(ba))
         assert family is not None
         return mainloop.held_programs(family, target, states.shared)
 
@@ -218,7 +227,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         (`states_held`; `mosaic.deepest`, within `Family.most_shared` over a step's bytes), else one stage;
         None where no output block is legal beside it. The ring deepest alone held an A100's states launch
         to one program a multiprocessor, where its registers held three (SE-family-a100-8c5b5b16a)."""
-        family = bundle(target)
+        family = bundle(target, _dtype(ba))
         assert family is not None
         shallowest = next((tiles for tiles in (mainloop.Tiles(block, 1, None if wide == block else wide)
                                                for wide in self._blocks(ba, family))
@@ -238,7 +247,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         the next value block either side of it at its stage rule (`_staged`), and its block one stage
         shallower (or two deep where it takes one)."""
         target = self.launched()
-        family = bundle(target)
+        family = bundle(target, _dtype(ba))
         assert family is not None
         blocks = self._blocks(ba, family)
         at = blocks.index(config.block_v)
@@ -270,10 +279,10 @@ class Mosaic(base.Template[mainloop.Tiles]):
             target = self.launched()
         arguments = ba.arguments
         dtype = jnp.result_type(*(arguments[name].dtype for name in ("query", "key", "value")))
+        if dtype not in (jnp.bfloat16, jnp.float16, jnp.float32):
+            return False
         factored = arguments["g"].ndim == 3 or mainloop.per_key_refusal(dtype, arguments.get("floor")) is None
-        family = bundle(target)
-        if not (dtype in (jnp.bfloat16, jnp.float16, jnp.float32) and factored and family is not None
-                and target.tensor_rate("16bit") is not None):
+        if not (factored and bundle(target, dtype) is not None and target.tensor_rate("16bit") is not None):
             return False
         return bool(self.fits(ba, target))
 
