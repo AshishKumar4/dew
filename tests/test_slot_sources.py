@@ -11,8 +11,8 @@ import pytest
 from sharded import assert_sharded
 
 from dew.decision import Choice, Decide
+from dew.distributed.placement import Layout, MeshSpec
 from dew.interop import Pretrained
-from dew.training.distributed import Layout, MeshSpec
 
 BACKBONE = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
 REFERENCE = Path(__file__).parent / "fixtures" / "slot_readout" / "tiny"

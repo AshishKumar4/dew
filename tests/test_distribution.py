@@ -25,8 +25,8 @@ import numpy as np
 import pytest
 from lane_environment import outside_any_cluster
 
+from dew.distributed.placement import parameter_axes
 from dew.training import MeshSpec
-from dew.training.distributed import parameter_axes
 
 # Needs the eight simulated CPU devices conftest configures, except the tests
 # that name fewer: those of stand-in devices need none, and a four-GPU run
@@ -651,10 +651,11 @@ def test_a_link_figure_is_kept_for_its_placement_and_carried_by_a_checkpoint(tmp
     import optax
     from jax.sharding import Mesh
 
+    from dew.distributed.placement import link_topology
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
     from dew.training import Trainer
-    from dew.training.distributed import link_bandwidth, link_topology
+    from dew.training.distributed import link_bandwidth
 
     devices = np.asarray(jax.devices()[:4])
     paired = Mesh(devices.reshape(2, 2), ("data", "tensor"))
@@ -903,29 +904,19 @@ def test_the_readers_of_one_share_train_on_the_rows_its_first_reader_sampled(tmp
 
 @pytest.mark.mesh(devices=2)
 def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
-    """A pool runs twice over one persistent compilation cache, and the second
-    run loads its step on every process. jax 0.11.2 keyed an executable by the
-    compiling process's topology fingerprint, which on a GPU describes the
-    device down to its NVLink links, and only process 0 writes entries. On the
-    box, whose GPUs 0 and 1 share NVLink and 2 and 3 do not, a pool of GPUs 1
-    and 2 loaded the step on one process and compiled it on the other, whose
-    sharded autotuning then waited for ever for its peer's share. Each process
-    here reports a fingerprint of its own, as those two did, whatever devices
-    the run has; Dew's JAX build (constraints.txt) hashes the fingerprints of
-    every process a computation spans."""
+    """A pool runs twice over one persistent compilation cache: process 0 writes
+    the entries, and its second run loads its step. Another process loads it
+    where its key is process 0's. JAX keys an executable by its process's
+    topology fingerprint: on a GPU, whose pool shares one topology (jaxlib 0.12
+    starts none whose fingerprints differ, openxla/xla#49677;
+    docs/guides/multi-node.md), every process does; on the CPU, where a
+    process's topology is its own devices, the others compile the step again,
+    as upstream JAX does (Main, 2026-10-26: no fork code for the CPU alone)."""
     cache, records = tmp_path / "cache", tmp_path / "records"
     program = (
         "import json, sys\n"
         "from pathlib import Path\n"
         "import jax\n"
-        "from jax._src.lib import xla_client\n"
-        "topology_of = xla_client.get_topology_for_devices\n"
-        "class Apart:\n"
-        "    def __init__(self, topology):\n"
-        "        self.topology = topology\n"
-        "    def fingerprint(self):\n"
-        "        return self.topology.fingerprint() ^ (jax.process_index() + 1)\n"
-        "xla_client.get_topology_for_devices = lambda devices: Apart(topology_of(devices))\n"
         "events = []\n"
         "jax.monitoring.register_event_listener(lambda event, **_: events.append(event))\n"
         "jax.config.update('jax_explain_cache_misses', True)\n"
@@ -951,7 +942,7 @@ def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
         "step = events[before:]\n"
         "Path(sys.argv[2], f'{jax.process_index()}.json').write_text(json.dumps(\n"
         "    [step.count('/jax/compilation_cache/compile_requests_use_cache'),\n"
-        "     step.count('/jax/compilation_cache/cache_hits')]))\n"
+        "     step.count('/jax/compilation_cache/cache_hits'), jax.default_backend()]))\n"
     )
     runs, logged = [], []
     for run in range(2):
@@ -965,7 +956,11 @@ def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
         # it wrote or could not, which says why a second run loads nothing.
         logged += [f"run {run}: {line}" for line in (done.stdout + done.stderr).splitlines()
                    if "cache" in line.lower()]
-    # [lookups, hits] a process: the first run compiles every lookup, the second loads it.
-    compiled = runs[0][0][0]
-    assert compiled > 0 and runs == [[[compiled, 0]] * 2, [[compiled, compiled]] * 2], (
+    # [lookups, hits, backend] a process: the first run compiles every lookup; the
+    # second loads them on process 0, and on process 1 where it keys as process 0.
+    compiled, backend = runs[0][0][0], runs[0][0][2]
+    keyed_alike = backend != "cpu"
+    assert compiled > 0 and runs == [
+        [[compiled, 0, backend]] * 2,
+        [[compiled, compiled, backend], [compiled, compiled if keyed_alike else 0, backend]]], (
         runs, "\n".join(logged))

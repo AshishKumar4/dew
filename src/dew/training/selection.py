@@ -158,8 +158,8 @@ class HeldBest:
         """Hold `state`'s model state where its first ranking beats the held one (`Ranking.score`)."""
         score = ranking[0].score if ranking else None
         if score is not None and (self.score is None or score < self.score):
+            from dew.distributed.host import snapshot
             from dew.state import MODEL_STATE
-            from dew.training.host import snapshot
             self.score, self.restore = score, snapshot({name: getattr(state, name) for name in MODEL_STATE})
 
     def state(self, final: TrainState) -> TrainState:
