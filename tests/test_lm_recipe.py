@@ -774,3 +774,38 @@ def test_a_trained_block_diffusion_tree_saves_back_over_its_source(tmp_path):
     step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.key(1), ema=None)
     np.testing.assert_array_equal(restored.scalar_loss(rebuilt, batch, step)[0],
                                   objective.scalar_loss(state.variables, batch, step)[0])
+
+
+def test_a_pretrained_run_loops_its_decoder_as_a_decision_run_does(tmp_path):
+    """`--loop-steps 2 --loop-layers 0 1` give a --pretrained decoder with no loop one over its own
+    block, as they do a decision run's (`DecoderRunConfig`): the objective trains the looped decoder
+    over the checkpoint's weights as they were, and the run's record holds the loop, which a resume
+    takes again. A fresh decoder's run refuses them: its model states its own loop."""
+    from dew.interop import Pretrained
+    from dew.nn.backbones.decoder_stack import Loop
+
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    checkpoint = export_tiny_decoder(tmp_path / "checkpoint")
+    config = Started.cli(recipe_args(tokens, "--pretrained", str(checkpoint), "--trainer.steps", "1",
+                                     "--max-new-tokens", "0", "--loop-steps", "2", "--loop-layers", "0", "1"),
+                         default=Started(data=windows(tokens), validation=windows(tokens, held=True)))
+    objective = config.prepare().train("looped")
+    assert objective.model.loop == Loop(2, step_norm=False, layers=(0, 1))
+    loaded = Pretrained.load(checkpoint, dtype="float32")
+    for mine, theirs in zip(jax.tree.leaves(objective.held_variables()["params"]),
+                            jax.tree.leaves(loaded.variables["params"]), strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
+    recorded = LMRunConfig.from_dict(config.to_dict())
+    assert (recorded.loop_steps, recorded.loop_layers) == (2, (0, 1))
+    with pytest.raises(ValueError):
+        LMRunConfig(loop_steps=2)
+
+
+def test_a_run_that_names_no_metrics_and_validates_nothing_trains(tmp_path):
+    """`--val-metrics '[]'` scores no metric: a run whose data holds no validation split trains with no
+    suite at all, as one that names none does, rather than an empty set of splits."""
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    config = dataclasses.replace(run_config(tokens, "--trainer.steps", "2", "--val-metrics", "[]"),
+                                 validation=None)
+    assert config.val_metrics == ()
+    assert int(config.run().step) == 2

@@ -227,11 +227,11 @@ class Pixels:
         return {"image": np.frombuffer(row["bytes"], np.uint8).reshape(RES, RES, 3)}
 
 
-def online_pipeline(records: int, address: str, *, shared: bool):
+def online_pipeline(records: int, address: str, *, shared: bool, epochs: int | None = None):
     """`elastic_loader`'s records fetched over HTTP from the pool's server at `address`, a url each, in
     either order a fetch is read in: the catalog shuffled and each process fetching its own share of it
     (`shared`), or every process fetching the catalog as a memory read does and shuffling what it kept,
-    one global order."""
+    one global order; `epochs` passes of it, or passes without end."""
     from dew.data import Memory
     from dew.data.pipeline import Pipeline
     from dew.data.sources.urls import Fetch
@@ -239,8 +239,8 @@ def online_pipeline(records: int, address: str, *, shared: bool):
     catalog = Pipeline(Memory([{"url": f"http://{address}/{index}"} for index in range(records)]))
     fetched = (Fetch(output="bytes"), Pixels())
     if shared:
-        return catalog.shuffle(0).repeat().filter_map(*fetched)
-    return catalog.filter_map(*fetched).shuffle(0).repeat()
+        return catalog.shuffle(0).repeat(epochs).filter_map(*fetched)
+    return catalog.filter_map(*fetched).shuffle(0).repeat(epochs)
 
 
 def online_loader(records: int, workers: int, address: str, *, shared: bool):
@@ -422,24 +422,21 @@ def mode_data(args) -> dict:
 
 
 def mode_online_data(args) -> dict:
-    """The first pass of records fetched from the pool's server, each process fetching its share of the
-    shuffled catalog (`online_pipeline`): the records it read, by the image each url's bytes hold. A
-    training order reads on past its pass, so the pass is its batches."""
-    import itertools
-
+    """One pass of records fetched from the pool's server, each process fetching its share of the
+    shuffled catalog (`online_pipeline`) to its end: the records it read, by the image each url's bytes
+    hold."""
     import jax
 
     from dew.data.compile import compile
     from dew.data.dataset import DataPartition
     from dew.training import MeshSpec
 
-    data = compile(online_pipeline(args.records, args.online, shared=True).batch(BATCH), seed=0,
+    data = compile(online_pipeline(args.records, args.online, shared=True, epochs=1).batch(BATCH), seed=0,
                    loading=Loading(workers=args.workers, threads=2, read_buffer=8, worker_buffer=2))
     partition = DataPartition.of(MeshSpec().build())
     stream = data.train(partition)
     try:
-        records = [record for batch in itertools.islice(stream, args.records // BATCH)
-                   for record in batch_records(batch)]
+        records = [record for batch in stream for record in batch_records(batch)]
     finally:
         stream.close()
     return {"process_index": jax.process_index(), "records": records}
