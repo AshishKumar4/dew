@@ -1167,7 +1167,8 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
                        shapes={"params": _shapes(params), "buffers": _shapes(buffers)})
     # The decode cache's slots: the load's, else the source's own context as its config class reads it
     # (an alias, CTRL's `n_positions`, included).
-    context = getattr(model.config, "max_position_embeddings", None)
+    named = type(model.config).attribute_map.get("max_position_embeddings", "max_position_embeddings")
+    context = model.config.to_dict().get(named)
     capacity = (max_seq_len if max_seq_len is not None
                 else context_lengths({"max_position_embeddings": context})[0])
     built = {"dtype": resolve_dtype(dtype), "max_seq_len": capacity}
