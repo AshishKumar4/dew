@@ -14,6 +14,7 @@ from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.inputs import PLAIN_CALL, AttentionMetadata, MixerCall, coordinates
 from dew.nn.memory import Gate, InContextMemory, LinearMemory, MLPMemory, Objective, ResidualMemory
+from dew.nn.mlp import GatedMLP
 from dew.nn.precision import L2NORM_EPS
 
 WIDTH, HEADS, FEATURES, LENGTH, CHUNK, ROWS = 32, 2, 16, 12, 4, 8
@@ -48,6 +49,11 @@ CONFIGURATIONS = {
     # Linear attention: a linear memory on the dot-product bias, every token (Nested Learning Eq 14-18).
     "linear_attention": {"network": LinearMemory(),
                          "objective": Objective("dot"), "chunk": 1},
+    # A continuum-memory level (Nested Learning Sec 7.1): an existing gated MLP over its block's input,
+    # reconstructing it, its parameters stepped every chunk's tokens (Eq 71) at a hundredth.
+    "cms": {"network": GatedMLP(hidden_features=2 * WIDTH, out_features=WIDTH), "heads": 1,
+            "head_features": None, "project_query": False, "project_key": False, "project_value": False,
+            "output": False, "normalize": False, "learning_rate": Gate(scale=0.01)},
 }
 """Each configuration with its paper's queries and keys l2-normalized (Titans Sec 4.4, TTT's views) and
 a step size of `STEP` times a sigmoid, the stable range the papers train in: an unnormalized key under
@@ -58,8 +64,9 @@ near zero, so narrower heads leave the norm's rounding too heavy-tailed for any 
 
 
 def layer(name: str, dtype=jnp.float32) -> InContextMemory:
-    fields = {"chunk": CHUNK, "normalize": True, "learning_rate": Gate(scale=STEP), **CONFIGURATIONS[name]}
-    return InContextMemory(heads=HEADS, head_features=FEATURES, dtype=dtype, **fields)
+    fields = {"heads": HEADS, "head_features": FEATURES, "chunk": CHUNK, "normalize": True,
+              "learning_rate": Gate(scale=STEP), **CONFIGURATIONS[name]}
+    return InContextMemory(dtype=dtype, **fields)
 
 
 def huber(error, delta):
@@ -87,12 +94,19 @@ def paper_loss(kind: str, objective: Objective):
     return losses[kind]
 
 
-def written(module: InContextMemory, *, dtype, segments=None, gradient=None):
+COMMITTED = {"cms"}
+"""The configurations whose paper commits a chunk's steps at its end: a continuum-memory level's
+parameters stay as they are between its scheduled updates (Nested Learning Eq 71), so each token reads
+the network as its chunk found it."""
+
+
+def written(module: InContextMemory, *, dtype, segments=None, gradient=None, committed=False):
     """The paper's update as a function of the stream, token by token, in `dtype` (float64 for the
-    truth): the views and gates from the layer's projections, the state in at least float32, each
-    gradient at its chunk's start counted from its document's first token (`segments` `[S]`, one
-    document where None) of the loss its paper writes for the layer's objective (`paper_loss`), the
-    network's `slow` parameters left at W_0, and the readout at `dtype`."""
+    truth): the views and gates from the layer's projections (or the stream itself), the state in at
+    least float32, each gradient at its chunk's start counted from its document's first token
+    (`segments` `[S]`, one document where None) of the loss its paper writes for the layer's objective
+    (`paper_loss`), the network's `slow` parameters left at W_0, and the readout at `dtype` of the
+    state each token updated, or, where `committed`, of the state its chunk started from."""
     wide = jnp.promote_types(dtype, jnp.float32)
     grad_net, read_net = module.network.clone(dtype=wide), module.network.clone(dtype=dtype)
     loss = paper_loss(module.objective.kind, module.objective)
@@ -102,7 +116,7 @@ def written(module: InContextMemory, *, dtype, segments=None, gradient=None):
         if spec is None:
             return None
         if spec.value is not None:
-            return jnp.full((x.shape[0], HEADS), spec.value, wide)
+            return jnp.full((x.shape[0], module.heads), spec.value, wide)
         return spec.scale * jax.nn.sigmoid((x @ p[name]["kernel"] + p[name]["bias"]).astype(wide))
 
     def one_head(network0, q, k, v, theta, mu, alpha):
@@ -127,7 +141,7 @@ def written(module: InContextMemory, *, dtype, segments=None, gradient=None):
                  if gradient is None else gradient(loss, apply, start, k_t, target))
             momentum = jax.tree.map(lambda s, gl: mu_t * s - theta_t * gl, momentum, g)
             state = jax.tree.map(lambda w, s: (1 - alpha_t) * w + s, state, momentum)
-            cast = jax.tree.map(lambda leaf: leaf.astype(dtype), {**fixed, **state})
+            cast = jax.tree.map(lambda leaf: leaf.astype(dtype), {**fixed, **(start if committed else state)})
             return (state, momentum, start, place + 1), read_net.apply({"params": cast}, q_t)
 
         carry = (head0, jax.tree.map(jnp.zeros_like, head0), head0, 0)
@@ -140,8 +154,10 @@ def written(module: InContextMemory, *, dtype, segments=None, gradient=None):
         initial = jax.tree.map(lambda leaf: jnp.asarray(leaf, wide), params["params"]["initial"])
         x = jnp.asarray(x, dtype)
         batch = x.shape[0]
-        q, k, v = ((x @ p[f"{name}_proj"]["kernel"]).reshape(batch, LENGTH, HEADS, FEATURES)
-                   for name in ("q", "k", "v"))
+        q, k, v = ((x @ p[f"{name}_proj"]["kernel"]).reshape(batch, LENGTH, module.heads, -1) if projected
+                   else x[:, :, None] for name, projected in (("q", module.project_query),
+                                                              ("k", module.project_key),
+                                                              ("v", module.project_value)))
         if module.normalize:
             q, k = (unit(view) for view in (q, k))
         q, k, v = q.astype(dtype), k.astype(wide), v.astype(wide)
@@ -156,7 +172,8 @@ def written(module: InContextMemory, *, dtype, segments=None, gradient=None):
         theta, mu, alpha = jax.vmap(gates)(x)
         per_head = jax.vmap(one_head, in_axes=(0, 1, 1, 1, 1, 1, 1), out_axes=1)
         reads = jax.vmap(per_head, in_axes=(None, 0, 0, 0, 0, 0, 0))(initial, q, k, v, theta, mu, alpha)
-        return reads.reshape(batch, LENGTH, -1) @ p["o_proj"]["kernel"]
+        reads = reads.reshape(batch, LENGTH, -1)
+        return reads @ p["o_proj"]["kernel"] if module.output else reads
 
     return run
 
@@ -192,9 +209,10 @@ def applied(module: InContextMemory, call: MixerCall = PLAIN_CALL):
 def test_a_memory_follows_its_papers_update(name):
     """Each configuration computes its paper's update and readout token by token (`written`), on par
     with that written-out update in float32, against float64 (check 1)."""
-    module = layer(name)
-    assert_as_exact(applied(module), written(module, dtype=jnp.float32), drawn(module), f"{name} memory",
-                    seeds=MEMORY_SEEDS, truth_fn=written(module, dtype=jnp.float64))
+    module, committed = layer(name), name in COMMITTED
+    assert_as_exact(applied(module), written(module, dtype=jnp.float32, committed=committed), drawn(module),
+                    f"{name} memory", seeds=MEMORY_SEEDS,
+                    truth_fn=written(module, dtype=jnp.float64, committed=committed))
 
 
 def test_yaads_objective_switches_by_the_whole_errors_norm():
@@ -385,7 +403,6 @@ def test_a_memory_layer_kind_records_and_rebuilds():
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.layer_plan import LayerKind
     from dew.nn.mixers.memory import InContextMemoryMixer
-    from dew.nn.mlp import GatedMLP
     from dew.registry import to_record
 
     heads = InContextMemory(network=MLPMemory(hidden=(24,), activation="gelu"), heads=4, head_features=8,
