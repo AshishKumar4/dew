@@ -501,8 +501,9 @@ def test_a_dense_gradient_takes_a_padded_tile_where_no_dividing_one_fits():
 @pytest.mark.skipif(not generation.triton_runs(), reason="needs a GPU the Pallas kernels compile for")
 def test_a_dense_products_exact_sums_survive_one_row_tile():
     """At the highest precision, a dense fp32 product of one row tile and many depth steps (its first grid
-    axis one program, where a program id is a constant) sums each step's product by an IEEE add: its
-    error holds check 1 against XLA's IEEE sums, which a tensor core's truncating accumulation does not."""
+    axis one program, where a program id is a constant) through Triton's launch, named (a dense cell runs
+    XLA's dot unnamed, `grouped_matmul.OLD_ROUTES`), sums each step's product by an IEEE add: its error
+    holds check 1 against XLA's IEEE sums, which a tensor core's truncating accumulation does not."""
     draw = _dense_draw(64, 4096, 128)
 
     def dew(x, w):
@@ -514,7 +515,7 @@ def test_a_dense_products_exact_sums_survive_one_row_tile():
     def truth(x, w):
         return jnp.dot(x.astype(jnp.float64), w.astype(jnp.float64))
 
-    with generation.routes() as taken:
+    with generation.chosen(grouped_matmul="triton"), generation.routes() as taken:
         assert_as_exact(jax.jit(dew), jax.jit(xla), draw, "dense exact sums, one row tile", seeds=SEEDS,
                         truth_fn=truth)
     assert {route.kernel for route in taken if route.choice == 'grouped_matmul'} == {'triton'}
@@ -1474,6 +1475,7 @@ def test_a_paired_product_without_an_epilogue_is_refused():
                          transpose_rhs=False, interpret=True)
 
 
+@lowers("sm90")
 def test_a_hook_that_broadcasts_a_side_operand_lowers_for_hopper_through_triton():
     """Mosaic's layout inference finds no layout for a side operand given back with its dimension of
     one, so the Mosaic launches refuse such a hook: a Hopper call's every launch with one, the forward's
