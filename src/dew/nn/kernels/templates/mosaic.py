@@ -688,7 +688,8 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         # launch context first and takes the tile and its scratch.
         summed: Callable[..., jax.Array] = plgpu.inline_mgpu(
             arg_types=(self.layout, plgpu.RefType()),
-            return_type=plgpu.ShapeDtypeStruct((value.shape[1],), jnp.float32, layout=self.column))(sums)
+            return_type=plgpu.ShapeDtypeStruct((value.shape[1],), jnp.dtype(jnp.float32),
+                                               layout=self.column))(sums)
         return summed(value, scratch)
 
     def as_row(self, vector: jax.Array) -> jax.Array:
