@@ -175,7 +175,7 @@ def main():
     sys.path[:0] = [str(ROOT), str(ROOT / "tests")]
     import numpy as np
     import torch
-    from reference_error import FEWEST_SEEDS, MOST_SEEDS, seeds_for
+    from reference_error import FEWEST_SEEDS, MOST_SEEDS, as_given, seeds_for
     from reference_source import git_head
 
     parser = argparse.ArgumentParser(description=__doc__)
@@ -210,7 +210,7 @@ def main():
             # The reference-vs-itself control asks for the same output twice in immediate succession.
             return reference(*draw(seed))
 
-        count = seeds_for(lambda seed: observed(int(seed)),
+        count = seeds_for(as_given(lambda seed: observed(int(seed))),
                           lambda seed: (np.asarray(seed, np.int64),), args.site,
                           start=args.start, most=args.most, truth_fn=lambda seed: truth(*draw(int(seed))))
         weights = hashlib.sha256((source / "model.safetensors").read_bytes()).hexdigest()
