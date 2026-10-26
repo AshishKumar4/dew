@@ -7,10 +7,11 @@ fallback="torchax")` takes it for any source. It builds the model with
 transformers on the host and hands its forward to torchax, which runs every
 torch op as a JAX op, so the model jits, differentiates and shards like any
 other JAX function. Dew knows nothing about the architecture: no Dew
-kernels, no logical sharding declarations, no cached decoding. What Dew
+kernels but its attention's, no logical sharding declarations. What Dew
 supplies is the seam: a Flax module over the torch forward, the parameters
-split from the buffers, and a `Layout` that places tensors by their torch
-names.
+split from the buffers, Dew's attention and decode cache where the model asks
+transformers' attention interface for its attention, and a `Layout` that
+places tensors by their torch names.
 
 The split is `JittableModule`'s. Its `params` are the trainable
 `nn.Parameter`s and go under the `params` collection, the one the optimizer
@@ -174,7 +175,8 @@ mask, recording what each call asks (`_Probe`)."""
 _PLUMBING = frozenset({"position_ids", "cache_position", "position_embeddings", "use_cache",
                        "output_attentions", "past_key_values", "past_key_value", "layer_idx", "is_causal"})
 """Keywords transformers' attention modules pass beside the computation's own, which name nothing the
-attention computes: positions are already in the rotated queries and keys, and tier 3 runs no cache."""
+attention computes: positions are already in the rotated queries and keys, and a decoding call's cache is
+Dew's (`_Cached`), not transformers'."""
 
 _COMPUTED = frozenset({"sliding_window", "softcap", "s_aux"})
 """The keywords Dew's attention computes (`_dew_attention`): a window over the most recent keys, a
@@ -1162,9 +1164,9 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
         f"{name_or_dir} loads as tier 3 ({why}): transformers {versions['transformers']}'s "
         f"PyTorch forward lowered by torchax {versions['torchax']}, pinned to torch "
         f"{versions['torch']}; "
-        + ("its attention on Dew's, packed rows included; " if attends
-           else "its attention transformers' own, no packing; ")
-        + "no sharding rules beyond TorchLayout's name table or KV-cache generation; the load holds the "
+        + ("its attention on Dew's, packed rows and Dew's decode cache included; " if attends
+           else "its attention transformers' own, no packing or decode cache; ")
+        + "no sharding rules beyond TorchLayout's name table; the load holds the "
         "torch model on the host, at least 2x the checkpoint", TransformersTierWarning, stacklevel=3)
     built = {**config, "dtype": dtype, "fallback": "torchax", **versions}
     return PretrainedFallback(module, {"params": params, "buffers": buffers}, processor, config, directory,
