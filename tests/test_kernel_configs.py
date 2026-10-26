@@ -18,7 +18,7 @@ from generation_support import COMPILES_FOR_TPU, generations, lowers
 from kernel_compile import compile_kernels, failures
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, grouped_matmul, recurrence, tuning
-from dew.nn.kernels.templates import mosaic_sm80, mosaic_sm90
+from dew.nn.kernels.templates import bundles
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 
 
@@ -265,25 +265,23 @@ def _gemm_mainloop_cases(generation_name: str, *, every_consumer_count: bool = F
     return cases
 
 
-@pytest.mark.parametrize("generation_name", generations("sm80", "sm86", "sm89", "sm90"))
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm86", "sm89", "sm90", "sm100", "sm120"))
 def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(generation_name):
     """Every GEMM Mosaic GPU mainloop a generation runs (`_gemm_mainloop_cases`: warpgroup MMA's forward,
-    input and kernel gradients and hooked forms on an H100; mma.sync's forward and input gradient on an
-    A100, an A10 and an L4 where this JAX's layout inference places its tiles), at the tile its launch
-    derives from the generation's facts, compiled by Mosaic for a compile-only device of the generation on
-    this CPU through ptxas: within the block's shared memory, spilling nothing (a derived tile holds its
-    registers: `Template.legal`)."""
+    input and kernel gradients and hooked forms on an H100; mma.sync's forward, input and kernel gradients
+    on an A100, an A10 and an L4), at the tile its launch derives from the generation's facts, compiled by
+    Mosaic for a compile-only device of the generation on this CPU through ptxas: within the block's shared
+    memory, spilling nothing (a derived tile holds its registers: `Template.legal`). A GPU whose family has
+    no bundle (`bundles.of`: a B200's tcgen05, consumer Blackwell's TMA-fed mma.sync) runs none."""
     from kernel_compile import compile_mosaic_kernels
 
-    if not generation.gpu_target(generation_name).wgmma and not mosaic_sm80.staging_solved():
-        # A CPU interprets mma.sync's tiles at any JAX; lowered for the GPU, they need its layout inference.
-        pytest.skip("this JAX's layout inference places no mma.sync tile but its 128x256 (STAGING_SOLVED)")
     cases = _gemm_mainloop_cases(generation_name)
     # Every form the generation's family runs derives a tile at these shapes: an eligibility regression
     # fails here rather than leaving the gate fewer cases.
-    forms = {"forward", "input gradient", "kernel gradient"}
-    if generation.gpu_target(generation_name).wgmma:
-        # Hooked and exactly summed calls run on warpgroup MMA alone (`grouped_matmul._Mosaic.eligible`).
+    family = bundles.of(generation_name, jnp.bfloat16)
+    forms = set() if family is None else {"forward", "input gradient", "kernel gradient"}
+    if family is not None and family.counts_hooks:
+        # Hooked and exactly summed calls run where the bundle's register model counts what they hold.
         forms |= {"kernel gradient exact fp32", "normed biased forward", "normed kernel gradient"}
     assert {case.name.split(" Tiles(")[0] for case in cases} == forms
     found = compile_mosaic_kernels(cases, generation_name)
@@ -314,12 +312,12 @@ def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name):
     block, spilling nothing. No version guard skips it: a JAX that breaks the contract fails here."""
     from kernel_compile import compile_mosaic_kernels
 
-    family = (mosaic_sm90.WGMMA if generation.gpu_target(generation_name).wgmma
-              else mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16)))
+    family = bundles.of(generation_name, jnp.bfloat16)
+    assert family is not None
     cases = _gemm_mainloop_cases(generation_name, every_consumer_count=True)
     forms = {"forward", "input gradient", "kernel gradient", "forward bf16"}
-    if family.name == "wgmma":
-        # Hooked and exactly summed calls run on warpgroup MMA alone (`grouped_matmul._Mosaic.eligible`).
+    if family.counts_hooks:
+        # Hooked and exactly summed calls run where the bundle's register model counts what they hold.
         forms |= {"kernel gradient exact fp32", "normed biased forward", "normed kernel gradient"}
     counts = sorted({1, family.consumers})
     expected = {f"{form} x{count}" for form in forms for count in counts}
