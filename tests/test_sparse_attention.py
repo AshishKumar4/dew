@@ -33,7 +33,7 @@ from dew.quantization import QUANTIZATION, InputQuantization
 
 HEADS, RANK, NOPE, ROPE, VALUE = 4, 24, 16, 8, 12
 SEEDS = {'selection': 8, 'packed selection': 8, 'sparse layer': 8, 'dropped-out adapter': 16,
-         'act-quantized kv_b_proj': 8}
+         'act-quantized kv_b_proj': 8, 'weight-quantized kv_b_proj': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 
 
@@ -211,19 +211,41 @@ def test_a_quantized_kv_b_proj_keeps_the_masked_kernel(quantized):
         np.testing.assert_array_equal(np.asarray(sparse), np.asarray(masked))
 
 
-def test_an_act_quantized_kv_b_proj_keeps_the_masked_kernel():
-    """Qwix's fake-quantized products at kv_b_proj (`dew.quantization.Quantization`) round its input, the
-    latents themselves. The absorbed path applies kv_b_proj to the identity, where the rounding would
-    land on the identity instead, so such a call runs the masked kernel: on par (check 1) with the same
-    call with `qk` open, its truth that call in float64, each seed drawing its own weights."""
-    pytest.importorskip("qwix")
-    from dew.quantization import Quantization
-
-    layer = MultiHeadLatentAttention(
+def latent_layer() -> MultiHeadLatentAttention:
+    """The V3.2 layer the quantized kv_b_proj checks run, its selection narrower than its keys."""
+    return MultiHeadLatentAttention(
         emb_features=32, num_heads=HEADS, max_seq_len=64, q_lora_rank=16, kv_lora_rank=RANK,
         qk_nope_head_dim=NOPE, qk_rope_head_dim=ROPE, v_head_dim=VALUE,
         index_topk=5, index_n_heads=2, index_head_dim=16, attention_impl="reference")
-    model = Quantization(patterns=("kv_b_proj",)).apply(layer)
+
+
+def produced_shapes(jaxpr) -> set[tuple[int, ...]]:
+    """Every shape an equation of `jaxpr`, or of a program nested in one, produces."""
+    shapes = set()
+    for equation in jaxpr.eqns:
+        shapes |= {tuple(var.aval.shape) for var in equation.outvars if hasattr(var.aval, "shape")}
+        for parameter in equation.params.values():
+            for nested in parameter if isinstance(parameter, tuple | list) else (parameter,):
+                program = getattr(nested, "jaxpr", nested)
+                if hasattr(program, "eqns"):
+                    shapes |= produced_shapes(program)
+    return shapes
+
+
+@pytest.mark.parametrize("weight_only", [False, True], ids=["act", "weight"])
+def test_a_qwix_quantized_kv_b_proj_attends_as_its_latents_allow(weight_only):
+    """Qwix's fake-quantized products at kv_b_proj (`dew.quantization.Quantization`). Quantizing their
+    activations rounds kv_b_proj's input, the latents themselves; the absorbed path applies kv_b_proj
+    to the identity, where the rounding would land on the identity instead, so such a call runs the
+    masked kernel, whose logits are `[B, H, S, T]`. Weight-only, the product stays linear in the
+    latents, and the absorbed path reads the quantized matrix itself, so the call stays on the
+    selection and holds no such logits. Either is on par (check 1) with the same call with `qk` open,
+    its truth that call in float64, each seed drawing its own weights."""
+    pytest.importorskip("qwix")
+    from dew.quantization import Quantization
+
+    layer = latent_layer()
+    model = Quantization(patterns=("kv_b_proj",), weight_only=weight_only).apply(layer)
     init = jax.jit(layer.init)
 
     def draw(seed):
@@ -232,9 +254,27 @@ def test_an_act_quantized_kv_b_proj_keeps_the_masked_kernel():
     def masked(variables, hidden):
         return model.apply(variables, hidden, mutable=["qk"])[0]
 
-    assert_as_exact(jax.jit(model.apply), jax.jit(masked), draw, 'act-quantized kv_b_proj',
-                    seeds=SEEDS['act-quantized kv_b_proj'],
+    traced = jax.make_jaxpr(model.apply)(*draw(0))
+    assert ((2, HEADS, 21, 21) in produced_shapes(traced.jaxpr)) == (not weight_only)
+    label = 'weight-quantized kv_b_proj' if weight_only else 'act-quantized kv_b_proj'
+    assert_as_exact(jax.jit(model.apply), jax.jit(masked), draw, label, seeds=SEEDS[label],
                     truth_fn=lambda variables, hidden: masked(widened(variables), hidden))
+
+
+def test_a_provider_dew_did_not_configure_keeps_kv_b_proj_on_the_masked_kernel():
+    """A model quantized through `quantize_with` by a provider of its caller's own, under the caller's
+    opaque cache key (here 7), computes under no Dew quantization whose rules a layer can read, so MLA
+    takes kv_b_proj to be quantized however the provider may: it runs the masked kernel, computing the
+    same call with `qk` open bit for bit."""
+    qwix = pytest.importorskip("qwix")
+    from dew.quantization import quantize_with
+
+    layer = latent_layer()
+    provider = qwix.QtProvider([qwix.QtRule(module_path="kv_b_proj", weight_qtype="int8", act_qtype="int8")])
+    model = quantize_with(layer, provider, key=7)
+    variables, hidden = layer.init(jax.random.key(3), jnp.zeros((2, 21, 32))), hidden_draw(0)[0]
+    np.testing.assert_array_equal(np.asarray(model.apply(variables, hidden)),
+                                  np.asarray(model.apply(variables, hidden, mutable=["qk"])[0]))
 
 
 def test_memory_follows_the_selection_not_the_sequence():

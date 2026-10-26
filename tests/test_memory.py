@@ -625,6 +625,41 @@ def test_an_adapter_on_a_memorys_inner_kernels_trains_drops_and_merges(name):
                     f"adapted {name} memory", seeds=SEEDS["adapted memory"], truth_fn=merged(wide))
 
 
+def test_a_cached_linear_memory_keeps_one_cache_across_dropout_routes():
+    """An adapter whose dropout draws on a linear memory's heads takes the memory off the shared
+    recurrence on a call carrying the dropout stream (a training forward) and leaves it there on a call
+    without, so the two compute by different paths; the memory's decode cache holds one representation
+    for both. A decoder's cache allocated without the stream (`init_cache`), then a prefill and a
+    token-by-token decode under it, compute bit for bit what the same calls compute from a cache
+    allocated under the stream; and a cache allocated under it, continued without it, what one allocated
+    without it does."""
+    from dew.lora import LoRA
+    from dew.objectives.base import training_rngs
+
+    model = decoder(layer("gated_linear_attention"))
+    lora = LoRA(rank=2, modules=("kernel",), dropout=0.5)
+    variables, ids = factor_draw(model, lora)(0)
+    adapted = lora.apply(model, model.init(jax.random.key(0), jnp.asarray(ids)), key=0).model
+
+    @jax.jit
+    def cached(allocating, continuing):
+        cache = adapted.apply(variables, ROWS, method=adapted.init_cache, mutable=["cache"],
+                              rngs=allocating)[1]
+        logits, cache = adapted.apply({**variables, **cache}, ids[:, :6], decode=True, mutable=["cache"],
+                                      rngs=continuing)
+        reads = [logits]
+        for t in range(6, LENGTH):
+            logits, cache = adapted.apply({**variables, **cache}, ids[:, t:t + 1], decode=True,
+                                          mutable=["cache"], rngs=continuing)
+            reads.append(logits)
+        return jnp.concatenate(reads, axis=1)
+
+    dropped = training_rngs(jax.random.key(5))
+    np.testing.assert_array_equal(np.asarray(cached(None, dropped)),
+                                  np.asarray(cached(training_rngs(jax.random.key(7)), dropped)))
+    np.testing.assert_array_equal(np.asarray(cached(dropped, None)), np.asarray(cached(None, None)))
+
+
 SCALE = 0.125
 """The FP8 input scale of the quantized checks' inner sites: inputs of a unit's spread take E4M3's
 coarse steps at 8 to 16 times it."""
