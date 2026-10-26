@@ -20,7 +20,6 @@ import tyro
 
 from dew.checkpoints import Checkpoints
 from dew.config import MetricConfig, ModelConfig, ObjectiveConfig, Prepared, RunConfig, media_field
-from dew.data.compile import fitted
 from dew.data.dataset import record_argument
 from dew.diffusion.presets import EDM, Flow, build_process
 from dew.diffusion.process import Process
@@ -391,7 +390,7 @@ class DiffusionRunConfig(RunConfig):
         run = self.pinned()
         objective = run.build()
         # Compiled once: `train` reads the run's length and cadences off this loader and trains on it.
-        dataset, held = fitted(run.chain(), run.validation, objective=objective.data(), seed=run.data_seed)
+        dataset, held = run.compiled(objective.data(), run.chain(), run.validation)
         metrics = run.build_eval_metrics(bool(held))
         rollout = None
         if isinstance(objective, FlowGRPOObjective) and run.rollout is not None:

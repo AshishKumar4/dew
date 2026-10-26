@@ -23,6 +23,7 @@ from dew.config.diffusion import DiffusionRunConfig
 from dew.data import Loading, presets
 from dew.data.compile import fitted
 from dew.data.dataset import DataPartition
+from dew.data.images import CAPTIONS
 from dew.data.sources.files import Files
 from dew.inputs import AudioCondition, Condition, HFAudio
 from dew.objectives.base import Step
@@ -153,7 +154,9 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
     assert DiffusionRunConfig.from_dict(config.to_dict()).to_dict() == config.to_dict()
     dataset, _ = fitted(data, None, objective=objective.data())
     batch = next(dataset.train(DataPartition()))
-    assert set(batch) == {"video", "audio", "audio_valid"} and set(batch["audio"]) == {"input_values"}
+    # The clips' captions ride beside as host text, which no compiled step takes (`EncodeCaptions(keep=...)`).
+    assert set(batch) == {"video", "audio", "audio_valid", CAPTIONS}
+    assert set(batch["audio"]) == {"input_values"}
 
     keys = jax.random.split(jax.random.PRNGKey(7), 64)
     scored = jax.jit(lambda variables, key: objective.loss(
