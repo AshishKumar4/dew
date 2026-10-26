@@ -860,26 +860,69 @@ def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_mode
                     seeds=PACKED_SEEDS, truth_fn=truth)
 
 
-def test_an_objective_over_a_quantized_packed_task_holds_its_served_tree():
-    """A task's tree quantized for serving computes only as its served model, which reads its
-    projections packed: an objective built over it, a distillation teacher's, holds that tree as it
-    is, and computes the served task's logits."""
+SPLIT_SEEDS = 16
+"""The split quantized tree's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on
+armada."""
+
+
+def test_an_objective_over_a_quantized_packed_task_holds_the_canonical_tree():
+    """A task's tree quantized for serving holds its projections packed; an objective built over it, a
+    distillation teacher's, holds the model's canonical tree (`dew.inference.projections.unpacked`), each
+    member the packed kernel's columns quantized as they were (`split_columns`), and computes logits on
+    par (check 1) with the served task's over drawn prompts, from the quantized model's own float64
+    value: the unquantized model in float64 over the served packed weights dequantized exactly. A
+    rule that quantizes activations and names the packed site alone keeps that group packed, its members
+    named by no rule: the objective's forward is the served task's."""
     from pathlib import Path
 
     import dew
+    from dew.interop import Pretrained
     from dew.objectives.lm import LMObjective
+    from dew.quantization import Annotated
 
-    pytest.importorskip("qwix")
+    qwix = pytest.importorskip("qwix")
     directory = Path(__file__).parent / "fixtures/hf/llama-tiny"
     served = dew.pipeline(str(directory), dtype="float32").quantized(
         Quantization(weight_only=True, patterns=(".*_proj",)))
     assert "qkv_proj" in served.variables["params"]["layers_0"]["self_attn"]
     held = LMObjective(served.model, 3, variables=served.variables).variables
-    for ours, theirs in zip(jax.tree.leaves(held), jax.tree.leaves(served.variables), strict=True):
-        assert ours is theirs
-    tokens = jnp.asarray([[1, 2, 3]], jnp.int32)
-    np.testing.assert_array_equal(served.model.apply(held, tokens),
-                                  served.model.apply(served.variables, tokens))
+    layer, packed_layer = held["params"]["layers_0"], served.variables["params"]["layers_0"]
+    assert "qkv_proj" not in layer["self_attn"] and "gate_up_proj" not in layer["mlp"]
+    for (block, packed_name), names in ((("self_attn", "qkv_proj"), ("q_proj", "k_proj", "v_proj")),
+                                        (("mlp", "gate_up_proj"), ("gate_proj", "up_proj"))):
+        if packed_name not in packed_layer[block]:
+            continue
+        members = [qwix.dequantize(layer[block][name]["kernel"].array) for name in names]
+        np.testing.assert_array_equal(np.concatenate(members, axis=-1),
+                                      qwix.dequantize(packed_layer[block][packed_name]["kernel"].array))
+    canonical = Pretrained.load(directory, dtype="float32").model
+    wide = canonical.clone(dtype=jnp.float64)
+    vocab = canonical.vocab_size
+
+    def draw(seed):
+        return (np.random.default_rng([0x1313, seed]).integers(1, vocab, size=(2, 5)).astype(np.int32),)
+
+    def exact(tokens):
+        """The served packed tree's float64 logits: each quantized kernel's integers times its scales."""
+        def value(node):
+            if isinstance(node, Annotated):
+                return np.asarray(qwix.dequantize(node.array.astype(jnp.float64)), np.float64)
+            floating = np.issubdtype(np.asarray(node).dtype, np.floating)
+            return np.asarray(node, np.float64) if floating else node
+        weights = jax.tree.map(value, dict(served.variables),
+                               is_leaf=lambda node: isinstance(node, Annotated))
+        return np.asarray(wide.apply(weights, tokens))
+
+    assert_as_exact(lambda tokens: np.asarray(served.model.apply(held, tokens)),
+                    lambda tokens: np.asarray(served.model.apply(served.variables, tokens)), draw,
+                    "split quantized tree", seeds=SPLIT_SEEDS, truth_fn=exact)
+    packed_only = dew.pipeline(str(directory), dtype="float32").quantized(
+        Quantization(patterns=(".*/qkv_proj",)))
+    kept = LMObjective(packed_only.model, 3, variables=packed_only.variables).variables
+    assert "qkv_proj" in kept["params"]["layers_0"]["self_attn"]
+    tokens = draw(0)[0]
+    np.testing.assert_array_equal(packed_only.model.apply(kept, tokens),
+                                  packed_only.model.apply(packed_only.variables, tokens))
 
 
 def test_a_quantized_multimodal_task_keeps_its_processor_and_media():
