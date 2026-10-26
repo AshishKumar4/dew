@@ -31,7 +31,6 @@ import numpy as np
 import optax
 
 from dew.hashing import fmix32
-from dew.nn.kernels.generation import backend
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import LogicalAxes, declarations, declared_axes
 
@@ -415,39 +414,19 @@ NEWTON_SCHULZ = (3.4445, -4.7750, 2.0315)
 """Muon's quintic Newton-Schulz coefficients, Jordan's (modded-nanogpt), optax's default."""
 
 
-def newton_schulz(update: jax.Array, steps: int = 5,
-                  dimension_numbers: optax.contrib.MuonDimensionNumbers | None = None) -> jax.Array:
-    """`update` orthogonalized by Muon's quintic Newton-Schulz: each matrix over its Frobenius norm (plus
-    1e-8), the wide way round, then `a X + (b A + c A A) X` with `A = X X^T`, `steps` times (`NEWTON_SCHULZ`).
-
-    A rank-2 update is one matrix, its rows the reduction axis (a Linen kernel's); `dimension_numbers` name
-    another update's reduction and output axes as Muon's do, its other axes a stack of matrices. On the
-    CPU each matrix iterates alone (`jax.lax.map`): batched, XLA:CPU's products leave the iteration, which
-    grows small singular values about 3.44 times a step, ten times further from float64; a GPU's batched
-    ones round as one matrix's (an A100: 5.2e-6 either way), and keep the stack in one program (ledger 1650).
-    """
+def _orthogonalized(update: jax.Array, steps: int,
+                    dimension_numbers: optax.contrib.MuonDimensionNumbers | None) -> jax.Array:
+    """`update` orthogonalized by Muon's `steps` quintic Newton-Schulz iterations (`NEWTON_SCHULZ`), optax's
+    own: its Muon transform with no momentum (`scale_by_muon`, `beta` 0 and no Nesterov step) hands back
+    the update it is given orthogonalized, bit for bit its `orthogonalize_via_newton_schulz`, which optax
+    0.2.8 does not export. A leaf with no `dimension_numbers` is one matrix, its rows the reduction axis
+    (a Linen kernel's), its other axes a stack of such matrices."""
     numbers = optax.contrib.MuonDimensionNumbers() if dimension_numbers is None else dimension_numbers
-    reduction, output = (tuple(int(axis) % update.ndim for axis in np.atleast_1d(axes))
-                         for axes in (numbers.reduction_axis, numbers.output_axis))
-    stacked = tuple(axis for axis in range(update.ndim) if axis not in reduction + output)
-    order = stacked + reduction + output
-    sizes = tuple(math.prod(update.shape[axis] for axis in axes) for axes in (stacked, reduction, output))
-    def orthogonalized(matrix):
-        return _newton_schulz_matrix(matrix, steps)
-
-    stack = update.transpose(order).reshape(sizes)
-    matrices = jax.lax.map(orthogonalized, stack) if backend() == "cpu" else jax.vmap(orthogonalized)(stack)
-    return matrices.reshape([update.shape[axis] for axis in order]).transpose(np.argsort(order))
-
-
-def _newton_schulz_matrix(matrix: jax.Array, steps: int) -> jax.Array:
-    a, b, c = (jnp.asarray(value, matrix.dtype) for value in NEWTON_SCHULZ)
-    wide = matrix.T if matrix.shape[0] > matrix.shape[1] else matrix
-    wide = wide / (jnp.linalg.norm(wide) + jnp.asarray(1e-8, matrix.dtype))
-    for _ in range(steps):
-        gram = wide @ wide.T
-        wide = a * wide + (b * gram + c * gram @ gram) @ wide
-    return wide.T if matrix.shape[0] > matrix.shape[1] else wide
+    muon = optax.contrib.scale_by_muon(NEWTON_SCHULZ, steps, beta=0.0, nesterov=False,
+                                       weight_dimension_numbers=numbers)
+    orthogonal, _ = muon.update(update, muon.init(update))
+    assert isinstance(orthogonal, jax.Array), "one array's update is an array"
+    return orthogonal
 
 
 class M3State(NamedTuple):
@@ -469,7 +448,7 @@ def scale_by_m3(*, beta1: float, beta2: float, beta3: float, alpha: float, eps: 
 
     Each update adds `beta1 g` to the fast momentum `M1` and `beta2 g**2` to the second moment `V`, the
     algorithm's sums, neither decaying, and orthogonalizes `M1` by `ns_steps` Newton-Schulz iterations,
-    Muon's (`newton_schulz`, each leaf shaped by its `weight_dimension_numbers`, a tree or a function of
+    Muon's (`_orthogonalized`, each leaf shaped by its `weight_dimension_numbers`, a tree or a function of
     the updates as Muon's are; a leaf with none is one matrix, its rows the reduction). Its state is
     kept in float32 at least (`at_least_fp32`), so a bfloat16 matrix's momenta and gradients sum without
     rounding to its width, and the directions come back in that dtype. Once every
@@ -484,10 +463,10 @@ def scale_by_m3(*, beta1: float, beta2: float, beta3: float, alpha: float, eps: 
 
     def orthogonalized(moment):
         if weight_dimension_numbers is None:
-            return jax.tree.map(lambda leaf: newton_schulz(leaf, ns_steps), moment)
+            return jax.tree.map(lambda leaf: _orthogonalized(leaf, ns_steps, None), moment)
         numbers = (weight_dimension_numbers(moment) if callable(weight_dimension_numbers)
                    else weight_dimension_numbers)
-        return jax.tree.map(lambda leaf, shape: newton_schulz(leaf, ns_steps, shape), moment, numbers,
+        return jax.tree.map(lambda leaf, shape: _orthogonalized(leaf, ns_steps, shape), moment, numbers,
                             is_leaf=lambda node: node is None)
 
     def init_fn(params) -> M3State:
@@ -1553,4 +1532,4 @@ class Exponential(ScheduleBase):
 
 __all__ = ["NEWTON_SCHULZ", "BoundsState", "Cosine", "DeltaState", "Exponential", "Linear", "M3State",
            "OneCycle", "ParamGroup", "Power", "PowerProfilesState", "PowerTail", "QKClipState",
-           "ScheduleBase", "delta_gradient_descent", "newton_schulz", "scale_by_m3", "stepped"]
+           "ScheduleBase", "delta_gradient_descent", "scale_by_m3", "stepped"]
