@@ -3,6 +3,7 @@ the short conv's kernels at their training shapes, compiles for its GPU within t
 memory, and the port's dots refuse mixed dtypes. None runs a kernel, so the GPU tier, whose kernel tests
 are the verdict, runs none of them: the file carries no `kernel` mark."""
 
+import dataclasses
 import functools
 import tempfile
 from pathlib import Path
@@ -17,7 +18,8 @@ from generation_support import COMPILES_FOR_TPU, generations, lowers
 from kernel_compile import compile_kernels, failures
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, grouped_matmul, recurrence, tuning
-from dew.nn.kernels.templates import mosaic_sm80
+from dew.nn.kernels.templates import mosaic_sm80, mosaic_sm90
+from dew.nn.kernels.templates.gemm import mosaic_gpu
 
 
 def test_the_compiled_shapes_reach_the_widest_keys_and_values_the_port_takes():
@@ -196,12 +198,15 @@ GEMM_ROWS, GEMM_DEPTH, GEMM_WIDTH, GEMM_GROUPS = 4096, 2048, 1536, 8
 a few tiles a group (the kernels' resources do not grow with them)."""
 
 
-def _gemm_mainloop_cases(generation_name: str) -> list:
+def _gemm_mainloop_cases(generation_name: str, *, every_consumer_count: bool = False) -> list:
     """Each GEMM Mosaic mainloop a `generation_name` GPU runs, at the one tile its launch derives from the
-    generation's facts (`Template.derived`): the forward and the input gradient (`MosaicGmm`), the kernel
-    gradient (`MosaicTgmm`) in bf16 and in fp32 with exact sums, the forward with an RMS norm's prologue
-    and a bias epilogue and the kernel gradient with the prologue, on either family; each a family's
-    mainloop only where it takes the call (`Template.eligible`)."""
+    generation's facts (`Template.derived`): the forward and the input gradient (`MosaicGmm`, fp32 outputs,
+    which every family stores: `mosaic.Family.stores`), the kernel gradient (`MosaicTgmm`) in bf16 and in
+    fp32 with exact sums, the forward with an RMS norm's prologue and a bias epilogue and the kernel
+    gradient with the prologue, on either family where it stores the outputs; each a family's
+    mainloop only where it takes the call (`Template.eligible`). With `every_consumer_count`, also the
+    forward with bf16 outputs, and each form at one consumer and at the family's most (`Family.consumers`)
+    where that tile is legal, each case named with its count (`x1`, `x2`)."""
     from test_gemm_template import biased, normed
 
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
@@ -229,6 +234,10 @@ def _gemm_mainloop_cases(generation_name: str) -> list:
          (bf16((rows, depth)), bf16((rows, width)), sizes, (f32((rows,)), f32((depth,)))),
          {**plain, "out_dtype": "float32", "hooks": norm}),
     ]
+    if every_consumer_count:
+        calls.append(("forward bf16", grouped_matmul.MosaicGmm(),
+                      (bf16((rows, depth)), bf16((groups, depth, width)), sizes),
+                      {**plain, "out_dtype": "bfloat16", "trans_rhs": False}))
     cases = []
     with generation.assumed(generation_name):
         target = generation.gpu_target()
@@ -237,9 +246,19 @@ def _gemm_mainloop_cases(generation_name: str) -> list:
             if not launch.eligible(ba, target):
                 continue
             config = launch.derived(ba, target)
-            configured = functools.partial(launch.replace(config=config), **options)
-            cases.append(support.KernelCase(f"{name} {config}",
-                                            lambda configured=configured, args=args: (configured, args)))
+            configs = {f"{name} {config}": config}
+            if every_consumer_count:
+                family = mosaic_gpu.family_of(config, jnp.bfloat16)
+                configs = {}
+                for consumers in sorted({1, family.consumers}):
+                    rows_ = max(config.block_m, family.role_rows * consumers)
+                    tile = dataclasses.replace(config, warpgroups=consumers, block_m=rows_)
+                    if launch.legal(ba, tile, target):
+                        configs[f"{name} x{consumers} {tile}"] = tile
+            for label, config in configs.items():
+                configured = functools.partial(launch.replace(config=config), **options)
+                cases.append(support.KernelCase(label,
+                                                lambda configured=configured, args=args: (configured, args)))
     return cases
 
 
@@ -276,6 +295,38 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
                               f"{record['limit']}), {kernel['spilled']} bytes spilled, "
                               f"unread {kernel['unread']}")
     assert not failed, "\n".join(failed)
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name):
+    """The whole contract a Mosaic GPU Family bundle offers its templates, compiled through ptxas for a
+    compile-only GPU of the generation on this CPU with the JAX this checkout pins, before any consumer
+    adopts a Family head: plain and transposed right operands (the forward and the input gradient), fixed
+    and streamed side vectors (the normed prologue's row and depth vectors, the epilogue's column vector),
+    bf16 and fp32 stores, the running sum (exact sums), and each form at one consumer and at the family's
+    most (`_gemm_mainloop_cases(every_consumer_count=True)`). A form the family refuses by a stated fact
+    (`Family.stores`) is left out; every other form and count must be present and lower, within the block,
+    spilling nothing. No version guard skips it: a JAX that breaks the contract fails here."""
+    from kernel_compile import compile_mosaic_kernels
+
+    family = (mosaic_sm90.WGMMA if generation.gpu_target(generation_name).wgmma
+              else mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16)))
+    cases = _gemm_mainloop_cases(generation_name, every_consumer_count=True)
+    forms = {"forward", "input gradient", "kernel gradient", "kernel gradient exact fp32",
+             "normed biased forward", "normed kernel gradient", "forward bf16"}
+    if not family.stores(jnp.bfloat16):
+        forms -= {"kernel gradient", "normed biased forward", "forward bf16"}
+    counts = sorted({1, family.consumers})
+    expected = {f"{form} x{count}" for form in forms for count in counts}
+    got = {case.name.split(" Tiles(")[0] for case in cases}
+    assert got == expected, (sorted(expected - got), sorted(got - expected))
+    found = compile_mosaic_kernels(cases, generation_name)
+    failed = failures([record for record in found
+                       if "error" in record or record["shared"] > record["limit"]
+                       or not record.get("kernels")])
+    failed += [f"{record['name']} {kernel['kernel']}: {kernel['spilled']} bytes spilled"
+               for record in found for kernel in record.get("kernels", ()) if kernel["spilled"] > 0]
+    assert len(found) == len(cases) and not failed, "\n".join(failed)
 
 
 @pytest.mark.parametrize("tpu", ["v5e", "v6e"])
