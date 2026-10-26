@@ -755,6 +755,7 @@ def test_lm_training_with_small_vocabularies_matches_the_unchunked_head(chunks):
     compiled = trainer.compile(initial, {"text": draw(0)[0]})
     scores = jax.jit(lambda ids: objective.token_scores(initial.variables, ids).losses)
 
+    @as_given
     def trained(ids, cotangent):
         del cotangent  # One, the trainer's own.
         state, _, _, _, accepted, _ = compiled(jax.tree.map(jnp.copy, initial), {"text": ids})
