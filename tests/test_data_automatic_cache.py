@@ -234,6 +234,20 @@ def test_an_automatic_cache_whose_storage_fails_reads_on_uncached(monkeypatch, f
     assert not generations()
 
 
+@pytest.mark.parametrize("how", READS)
+def test_an_automatic_cache_whose_published_records_are_gone_computes_them(how):
+    """A generation an automatic cache published whose shards are gone (a disk cleaned, a file
+    removed) is read on: each record it cannot give is computed from its input, as with no cache."""
+    first = read(mapped(Counted()), how)
+    root = Path(automatic_root(Loading()) or "")
+    shards = [path for path in root.rglob("*") if path.is_file() and "shards" in path.parts]
+    assert shards
+    for shard in shards:
+        shard.unlink()
+    step = Counted()
+    assert read(mapped(step), how) == first and step.calls
+
+
 def test_a_run_or_a_process_opts_out_of_its_automatic_cache(monkeypatch, tmp_path):
     """`Loading(cache=False)` keeps a run from caching, and `DEW_DATA_CACHE=off` every run of the
     process: the map runs on each, and nothing is written."""

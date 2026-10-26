@@ -143,7 +143,7 @@ class Cache:
     which a run never needs, then looks nothing up, stops admitting and its records are computed,
     as they are with no cache (`read_on`). A cache a chain names stops the run."""
 
-    def read_on(self, error: OSError | sqlite3.Error, doing: str) -> bool:
+    def read_on(self, error: OSError | sqlite3.Error | ValueError, doing: str) -> bool:
         """Whether this cache reads on uncached after its storage raised `error` while `doing`: it is
         `optional`, and logs that it does."""
         if not self.optional:
@@ -224,7 +224,10 @@ class Cache:
                 raise
             return computed
         if published is not None:
-            return _Mapped(grain.MapDataset.range(len(parent)).map(_Published(published, transform)))
+            # An optional cache's replay computes a record its generation cannot give (`Cache.read_on`).
+            replay = (_Published(published, transform, self, parent) if self.optional
+                      else _Published(published, transform))
+            return _Mapped(grain.MapDataset.range(len(parent)).map(replay))
         return _CachedMap(parent, self, key, transform, source, tuple(missing))
 
     def streamed(
@@ -247,7 +250,8 @@ class Cache:
                 raise
             return computed
         return _CachedReader(reader, self, key, transform,
-                             None if published is None else _Published(published, transform))
+                             None if published is None
+                             else _Published(published, transform, self if self.optional else None))
 
     def generation(self, key: DependencyManifest) -> Generation | None:
         root = self._root(key)
@@ -283,13 +287,30 @@ class _Published:
 
     generation: Generation
     transform: Transform | None
+    optional: Cache | None = None
+    """The optional cache it replays (`Cache.read_on`), whose records are computed from their inputs
+    where its generation cannot be read; None replays or refuses."""
+    inputs: grain.MapDataset | None = None
+    """The inputs by index a replay by index computes a record from where it reads on."""
 
     def __call__(self, row_id: RowId) -> CachedValue:
-        outputs = self.generation.outputs(row_id)
+        try:
+            outputs = self.generation.outputs(row_id)
+        except (OSError, sqlite3.Error, ValueError) as error:
+            if (self.inputs is None or self.optional is None or not isinstance(row_id, int)
+                    or not self.optional.read_on(error, "replays nothing")):
+                raise
+            outputs = _transformed(row_id, self.inputs[row_id], self.transform)
         return outputs if self.transform is not None else outputs[0]
 
     def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> CachedValue:
-        return self(row_id)
+        try:
+            return self(row_id)
+        except (OSError, sqlite3.Error, ValueError) as error:
+            if self.optional is None or not self.optional.read_on(error, "replays nothing"):
+                raise
+            outputs = _transformed(ordinal, value, transform)
+            return outputs if transform is not None else outputs[0]
 
     def finish(self) -> None:
         pass
