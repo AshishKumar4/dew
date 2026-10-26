@@ -193,6 +193,8 @@ class GroupInfo:
         its group's first and past-last row) rather than walked over every group's length in each tile."""
         tile = jnp.int32(tile)
         group, block_start, group_start, group_end = (table[tid, column] for column in range(4))
+        # Mosaic's copies and stores read a slice's start as a multiple of the rows its tiling takes.
+        block_start = pl.multiple_of(block_start, TMA_ROWS)
         actual_start = jnp.maximum(group_start, block_start)
         actual_end = jnp.minimum(group_end, block_start + tile)
         start_within_block = actual_start - block_start
