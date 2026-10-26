@@ -17,7 +17,10 @@ lands one fp32 ulp (4.8e-7) from torch's; `LOSS` is two.
 import contextlib
 import copy
 import dataclasses
+import json
 import math
+import shutil
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -868,6 +871,109 @@ def test_a_tier_3_models_final_states_and_head_are_transformers(case, tmp_path):
 
     assert_as_exact(ours, theirs(reference, torch.float32), slotted_rows, f"tier 3 final states {case}",
                     seeds=STATES_SEEDS[case], truth_fn=truth)
+
+
+SLOT_TOKENIZER = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
+"""The tokenizer and chat template a tier-3 slot release ships: the tiny Qwen's, byte-level."""
+SLOT_HEAD = 8
+SLOT_SEEDS = 8
+"""The tier-3 slot release's declared check-1 seeds, sized by `seeds_for` on armada."""
+SLOT_WORDS = ("refund", "late", "order", "broken", "account", "charge", "screen", "login")
+
+
+def tier3_slot_release(directory):
+    """A slot release (`SlotReadout`, its stored head) over a tiny Cohere, a type no registered family
+    computes, so its backbone loads as tier 3, with the tiny Qwen's tokenizer and template; the Cohere
+    is sized to that vocabulary and its special ids. Its torch model and its stored head."""
+    text = json.loads((SLOT_TOKENIZER / "config.json").read_text())["text_config"]
+    torch.manual_seed(0)
+    model = transformers.CohereForCausalLM(transformers.CohereConfig(
+        **COHERE, vocab_size=text["vocab_size"], pad_token_id=text["pad_token_id"],
+        bos_token_id=text["bos_token_id"], eos_token_id=text["eos_token_id"])).eval()
+    model.save_pretrained(directory)
+    for name in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
+        shutil.copy(SLOT_TOKENIZER / name, directory / name)
+    (directory / "readout.json").write_text(json.dumps({"readout": "head", "head_dim": SLOT_HEAD,
+                                                        "n_slots": len(SLOT_WORDS)}))
+    rng, width = np.random.default_rng(0x1657), COHERE["hidden_size"]
+    shapes = {"slot": (len(SLOT_WORDS), width), "q.weight": (SLOT_HEAD, width),
+              "k.weight": (SLOT_HEAD, width)}
+    stored = {name: (rng.standard_normal(shape) * width ** -0.5).astype(np.float32)
+              for name, shape in shapes.items()}
+    torch.save({name: torch.from_numpy(value) for name, value in stored.items()},
+               directory / "readout_head.pt")
+    return model, stored
+
+
+def slot_request(seed):
+    """A drawn request body: a state of drawn words, and a choice among two to four drawn words."""
+    rng = np.random.default_rng([0x1657, int(seed)])
+    state = " ".join(str(word) for word in rng.choice(SLOT_WORDS, int(rng.integers(3, 9))))
+    options = [str(word) for word in rng.choice(SLOT_WORDS, int(rng.integers(2, 5)), replace=False)]
+    return {"state": state, "questions": {"pick": {"type": "choice", "instructions": "Which one?",
+                                                   "criteria": dict.fromkeys(options)}}}
+
+
+def test_a_slot_release_over_a_tier_3_backbone_scores_and_serves_by_transformers_states(tmp_path):
+    """A slot release whose backbone no registered family computes loads it as tier 3 and decides
+    over it: each option's score is the release's law (`SlotReadout`: `<slot_i, h> + <q h, k m_i> /
+    sqrt(head_dim)`, `h` the answer cue's state, `m_i` the mean over option i's line) over transformers'
+    own final states of the row, as exact as transformers' float32 from its float64 twin (check 1), and
+    the scoring server answers a request as the task does alone."""
+    from dew.decision import Question
+    from dew.inference import ScoringServer
+
+    model, stored = tier3_slot_release(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        bundle = Pretrained.load(tmp_path, dtype="float32")
+    assert type(bundle.model).__name__ == "TorchCausalLM"
+    task = bundle.pipeline()
+    with float64():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager").eval()
+        wide.load_state_dict(model.state_dict())
+    reference = copy.deepcopy(model)
+    reference.set_attn_implementation("eager")
+
+    def row(seed):
+        request = slot_request(seed)
+        questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
+        [laid] = task.layout.rows(task.tokenizer, task.specials, request["state"], questions)
+        return laid
+
+    def ours(seed):
+        encoded = row(seed)
+        [scores] = task.scored([encoded])
+        return {"scores": np.asarray(scores[0, :len(encoded.questions[0].options)], np.float64)}
+
+    def theirs(source, dtype):
+        def run(seed):
+            encoded = row(seed)
+            [question] = encoded.questions
+            with torch.no_grad():
+                out = source(input_ids=torch.tensor([encoded.tokens]), output_hidden_states=True)
+            # The last of the hidden states is the final norm's output, the states the head reads.
+            states = out.hidden_states[-1][0]
+            answer = states[question.readout]
+            lines = torch.stack([states[start:end].mean(0) for start, end in question.options])
+            head = {name: torch.from_numpy(value).to(dtype) for name, value in stored.items()}
+            scores = (head["slot"][:len(question.options)] @ answer
+                      + lines @ head["k.weight"].T @ (head["q.weight"] @ answer) / math.sqrt(SLOT_HEAD))
+            return {"scores": scores.double().numpy()}
+        return run
+
+    def truth(seed):
+        with float64():
+            return theirs(wide, torch.float64)(seed)
+
+    assert_as_exact(ours, theirs(reference, torch.float32), lambda seed: (np.asarray(seed, np.int64),),
+                    "tier 3 slot release", seeds=SLOT_SEEDS, truth_fn=truth)
+
+    request = slot_request(0)
+    server = ScoringServer.from_task(*task.scoring())
+    answered = server.submit(request)
+    server.step()
+    assert answered.result() == task.systemone(request)
 
 
 DECODE_SEEDS = {"cohere": 8, "cohere2": 8}
