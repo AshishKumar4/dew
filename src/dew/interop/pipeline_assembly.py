@@ -52,7 +52,7 @@ from dew.sampling.guidance import CFG
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
-    from dew.training.distributed import Layout, MeshSpec
+    from dew.distributed.placement import Layout, MeshSpec
 
 
 def native_variables(parts: Mapping[str, Mapping[str, ParamTree]]) -> dict[str, dict[str, ParamTree]]:
