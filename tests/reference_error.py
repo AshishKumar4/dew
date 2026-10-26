@@ -162,11 +162,22 @@ def over_windows(fn):
     XLA compiles (its fusions, its reductions' order, its dots' batching, a kernel's route), which XLA
     holds to no common bits with one draw's, so check 1 would judge a program users never run. Pass a
     JAX arm jitted (`jax.jit(fn)`, `without_ynn(fn)`), so it compiles once a signature and every window
-    calls that program; a torch or NumPy reference as it is."""
+    calls that program; a torch or NumPy reference as it is. The loop keeps `fn` (`window_fn`), which
+    a recorded truth's rounding count traces on one window (`indexed_recording`)."""
     def run(*arguments):
         return _stack_host([fn(*jax.tree.map(lambda leaf, index=index: leaf[index], arguments))
                             for index in range(_window_count(arguments))])
+    run.window_fn = fn
     return run
+
+
+def _one_draws_program(fn, arguments):
+    """`fn` and its `arguments` as one draw's program reads them: a window loop's (`over_windows`) own
+    function on its first window's arguments, any other function on them all."""
+    window_fn = getattr(fn, "window_fn", None)
+    if window_fn is None:
+        return fn, arguments
+    return window_fn, jax.tree.map(lambda leaf: leaf[0], arguments)
 
 
 WITHOUT_YNN = {"xla_cpu_experimental_ynn_fusion_type": ""}
@@ -1497,7 +1508,9 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
         index = int(index)
         computed = truth_fn(inputs)
         if not roundings:
-            roundings["count"] = chain_roundings(jax.make_jaxpr(truth_fn)(inputs))
+            # One draw's roundings, a window loop's its window's: each window is a draw of its own.
+            program, arguments = _one_draws_program(truth_fn, (inputs,))
+            roundings["count"] = chain_roundings(jax.make_jaxpr(program)(*arguments))
         eps = float(np.finfo(np.float64).eps)
         if set(computed) != set(sketch):
             raise AssertionError(f"{site}: `truth_fn` gives the leaves {sorted(computed)}, the recording "
