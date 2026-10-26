@@ -156,7 +156,7 @@ def test_a_backbone_with_fresh_context_layers_scores_every_row_as_its_source_doe
             return scored(wide["task"], [(drawn(seed)[0], None)])
 
     for read in (as_given(lambda seed: scored(reading, [(drawn(seed)[0], None)])),
-                 lambda seed: scored(reading, [drawn(seed)])):
+                 as_given(lambda seed: scored(reading, [drawn(seed)]))):
         assert_as_exact(read, as_given(lambda seed: scored(asked_task, [(drawn(seed)[0], None)])),
                         lambda seed: (np.int64(seed),), "shut gates against the source", seeds=FRESH_SEEDS,
                         truth_fn=truth)

@@ -262,7 +262,6 @@ def test_two_requests_of_alike_images_join_one_pass_each_scored_as_alone(tmp_pat
             decide.processor, [(row.encoded, row.media) for row in rows])))
         return [scores[index, :len(row.questions)] for index, row in enumerate(encoded)]
 
-    @as_given
     def scored(reading, held, seed, *, together: bool) -> np.ndarray:
         rows = rows_of(reading, seed)
         outputs = joined(reading, held, rows) if together else [

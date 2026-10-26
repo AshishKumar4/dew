@@ -595,7 +595,7 @@ def test_a_task_whose_weights_span_a_mesh_scores_on_that_mesh(decide):
     assert_as_exact(as_given(lambda variables: held_logits(spread(variables))), alone, draw,
                     "scored on a mesh",
                     seeds=MESH_SEEDS, truth_fn=truth)
-    assert_as_exact(lambda variables: evaluated(spread(variables)),
+    assert_as_exact(as_given(lambda variables: evaluated(spread(variables))),
                     lambda variables: evaluated(replace(task, variables=variables)), draw,
                     "evaluated on a mesh", seeds=MESH_SEEDS,
                     truth_fn=lambda variables: evaluated(replace(wide, variables=variables)))

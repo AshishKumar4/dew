@@ -222,6 +222,7 @@ def test_padding_and_cached_likelihoods_match_unpadded_full_forwards(kind):
     np.testing.assert_array_equal(result.terminated, [False, False])
     objective = GRPOObjective(model, seq_len=6)
 
+    @as_given
     def rescored(prompt, lengths, key, tokens):
         rows = np.concatenate([prompt, tokens], axis=1)
         padding = prompt.shape[1] - lengths
@@ -278,6 +279,7 @@ def test_right_padding_and_logical_positions_survive_cached_generation(kind):
                           sampling=greedy)
         return tokens, positions, np.asarray(result.tokens)[:, 4:]
 
+    @as_given
     def cached(tokens, positions, drawn):
         result = generate(model, params, inputs(tokens, positions), steps, key=jax.random.key(1),
                           sampling=greedy)

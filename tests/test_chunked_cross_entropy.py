@@ -1254,7 +1254,7 @@ def test_a_confident_targets_logit_gradient_is_the_rest_of_the_rows_eq_7(path, m
         return chunked_cross_entropy(logits, head, targets, 1, tile=tile)[0].sum()
 
     gradient = jax.jit(jax.grad(loss))
-    assert_as_exact(gradient, lambda logits: label_derivative(logits, label),
+    assert_as_exact(gradient, as_given(lambda logits: label_derivative(logits, label)),
                     lambda seed: confident(margin, seed, label),
                     f"{path} at margin {margin}, column {label}", seeds=CONFIDENT_SEEDS)
     (rows,) = confident(margin, 0, label)
