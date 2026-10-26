@@ -20,8 +20,7 @@ class InContextMemoryMixer(MixerBase):
 
     memory: InContextMemory
 
-    @property
-    def residuals(self) -> tuple[str, ...]:
+    def marks(self) -> tuple[str, ...]:
         """The residuals the memory's path marks (`InContextMemory.residuals`)."""
         return self.memory.residuals
 

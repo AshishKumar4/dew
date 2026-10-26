@@ -740,11 +740,12 @@ def test_a_memory_refuses_a_bidirectional_decoder():
 
 
 def test_a_memory_decoder_names_and_climbs_to_the_residuals_its_path_marks(capsys):
-    """A memory kind declares the residuals its path marks (`MixerBase.residuals`), each of which a
-    policy saving it alone keeps for the backward beyond what a policy saving nothing keeps: a linear
-    memory on the delta rule, which runs the rule's port, its decay, inverse and memory, so its
-    decoder's remat ladder takes the rung recomputing the rule's memory alone; Titans' memory its chunk
-    scan's carry, which its scan keeps chunk by chunk, and a ladder without that rung."""
+    """A memory kind marks the residuals its configured path marks (`MixerBase.marks`), each of which a
+    policy saving it alone keeps for the backward beyond what a policy saving nothing keeps, and its
+    decoder's remat ladder skips by them: a linear memory on the delta rule, which runs the rule's
+    port, its decay, inverse and memory, so its ladder takes the rung recomputing the rule's memory
+    alone; Titans' memory its chunk scan's carry, which its scan keeps chunk by chunk, and a ladder
+    without that rung."""
     from jax.ad_checkpoint import print_saved_residuals
     from model_support import TINY_DECODER
 
@@ -768,11 +769,12 @@ def test_a_memory_decoder_names_and_climbs_to_the_residuals_its_path_marks(capsy
             return capsys.readouterr().out
 
         nothing = saved(())
-        assert kind.residuals and all(saved((name,)) != nothing for name in kind.residuals)
+        marked = kind.marks()
+        assert marked and all(saved((name,)) != nothing for name in marked)
         climbed = [model]
         while (stronger := climbed[-1].recompute_more()) is not None:
             climbed.append(stronger)
-        return kind.residuals, [rung.recompute_record() for rung in climbed]
+        return marked, [rung.recompute_record() for rung in climbed]
 
     with chosen(gated_delta_rule="fla"):
         delta, delta_rungs = kept(layer("delta_rule"))
