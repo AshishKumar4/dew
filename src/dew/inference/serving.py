@@ -82,7 +82,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
 from dew._hashing import array_fingerprint
-from dew.batch import BLOCKS_FIELD, Variables
+from dew.batch import Variables
 from dew.inference.engine import Timed, normalized, reloaded, settled
 from dew.inference.pages import Pages
 from dew.inference.projections import pack_projections, packed_layout
@@ -125,7 +125,7 @@ from dew.nn.inputs import (
 from dew.nn.kernels.options import compiler_options
 from dew.nn.kv_cache import GROUPS, POOLED, ROW_CURSORS, TABLE, KVCache, is_paged, leaf_name
 from dew.nn.protocols import CrossAttending, Layered, ProjectionGroup, Serving
-from dew.nn.visibility import served_blocks
+from dew.nn.visibility import with_served_blocks
 from dew.sampling.decoding import Finishing, LogitsTransform, StopStrings
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import Sample
@@ -257,12 +257,13 @@ class _Row:
     """The real tokens of the context a cross-attention decoder reads beside the prompt,
     `[length, features]`; None for none. Every piece of the prompt carries it."""
     salt: bytes = b""
-    """What the prompt's keys depend on beside its tokens, its context's digest, under which its
-    prefix pages are named (`dew.inference.pages`); empty for none."""
+    """What the prompt's keys depend on beside its tokens, its context's digest and its groups with the
+    tokens up to its last grouped one, under which its prefix pages are named (`dew.inference.pages`);
+    empty for none."""
     groups: dict[str, np.ndarray] = field(default_factory=dict)
     """The groups of the prompt's tokens each group field the model reads holds (`dew.nn.kv_cache.GROUPS`),
-    -1 for a token in none: the blocks the server's prefix run makes (`served_blocks`) and the groups the
-    prompt carries. Empty where the row reads its prompt causally."""
+    -1 for a token in none: the groups the prompt carries, and the blocks the server's prefix run makes
+    where it carries none (`with_served_blocks`). Empty where the row reads its prompt causally."""
 
 
 def _seated_in(group: int, free: list[list[int]], taken: list[int], row: _Row) -> tuple[int, _Row]:
@@ -775,48 +776,44 @@ class Server:
             raise ValueError("a served prompt cannot carry noncanonical positions")
         self.rows.refuse(int(valid[0].sum()), budget)
         tokens = ids[0][valid[0]].astype(np.int32)
-        groups = self._groups_of(tokens, {name: np.asarray(fields[name])[0][valid[0]].astype(np.int32)
-                                          for name in GROUPS if name in fields})
+        # The prompt's own blocks, or the prefix run's where it carries none (`with_served_blocks`, which
+        # refuses a prompt shorter than an int prefix); a group field no layer reads is not slotted, as the
+        # model's call reads none of it.
+        fields = with_served_blocks(fields, valid, self.prefix)
+        groups = {name: np.asarray(fields[name])[0][valid[0]].astype(np.int32)
+                  for name in GROUPS if name in fields and name in self.group_fields}
         salt = b""
         if context is not None or groups:
             hasher = hashlib.blake2b(digest_size=16)
             if context is not None:
                 # The context's dtype too, so equal bytes of another dtype salt apart.
                 array_fingerprint(hasher, np.asarray(context))
-            for name, held in groups.items():
-                # A group's keys depend on the whole group, so its prefix pages are shared only with a prompt
-                # whose groups lie alike and hold the same tokens.
-                hasher.update(name.encode())
-                hasher.update(held.tobytes())
-                hasher.update(tokens[held >= 0].tobytes())
+            if groups:
+                # A token's keys read its whole group, wherever its members lie, and what each member reads,
+                # so a prompt's keys depend on its tokens and groups up to its last grouped token: its prefix
+                # pages are shared only with a prompt that agrees with it there.
+                grouped = np.any([held >= 0 for held in groups.values()], axis=0)
+                reach = int(np.flatnonzero(grouped)[-1]) + 1 if grouped.any() else 0
+                for name, held in groups.items():
+                    hasher.update(name.encode())
+                    hasher.update(held[:reach].tobytes())
+                hasher.update(tokens[:reach].tobytes())
             salt = hasher.digest()
         return _Row(tokens, budget, seed, fold, Ticket(), context=context, salt=salt, groups=groups)
 
-    def _groups_of(self, prompt: np.ndarray, carried: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
-        """The groups of a request's prompt the model reads (`_Row.groups`): those it carries, and the blocks
-        the prefix run makes (`served_blocks`, which refuses a prompt shorter than an int prefix). A group
-        field no layer reads is not slotted, as the model's call reads none of it."""
-        groups = {name: held for name, held in carried.items() if name in self.group_fields}
-        if self.prefix is not None:
-            if BLOCKS_FIELD in carried:
-                raise ValueError("a served prefix run makes each prompt's blocks; a prompt served under it "
-                                 f"carries no {BLOCKS_FIELD}")
-            groups[BLOCKS_FIELD] = served_blocks(np.ones((1, len(prompt)), bool), self.prefix)[0]
-        return groups
-
     def _piece_end(self, row: _Row) -> int:
         """Where the row's next prefill piece ends: the prompt's end, or `chunk` tokens on when the rows
-        prefill in pieces, and on past `chunk` to the end of a group the cut would split, a prefix block or
-        an image. A layer reads a group whole, so its tokens' keys and values are computed in one piece: a
-        group longer than `chunk` is one longer piece."""
+        prefill in pieces, and on past `chunk` to the last member of a group the cut would split, a block
+        or an image. A layer reads a group whole, so its tokens' keys and values are computed in one piece:
+        a group longer than `chunk` is one longer piece."""
         length, chunk = len(row.prompt), self.rows.chunk
         end = length if chunk is None else min(length, row.prefilled + chunk)
-        split = True
-        while split:
-            split = False
-            for held in row.groups.values():
-                if end < length and held[end] >= 0 and held[end] == held[end - 1]:
-                    end, split = int(np.flatnonzero(held == held[end])[-1]) + 1, True
+        # A group's members need not be adjacent: the cut moves past the last member of every group with
+        # members on both sides of it, until none straddles it.
+        spans = [(int(members[0]), int(members[-1])) for held in row.groups.values()
+                 for group in np.unique(held[held >= 0]) for members in [np.flatnonzero(held == group)]]
+        while (last := max((last for first, last in spans if first < end <= last), default=None)) is not None:
+            end = last + 1
         return end
 
     def _request_context(self, embeddings: ArrayLike, lengths: ArrayLike | None) -> np.ndarray:
