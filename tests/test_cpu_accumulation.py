@@ -269,8 +269,8 @@ def test_a_portable_recurrence_product_sums_in_float64():
 
 @pytest.mark.parametrize("wide", [True, False], ids=["test setting", "library"])
 def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
-    """Each site of the wide CPU arithmetic, a float32 product and a bias's spread, a row's logsumexp
-    and a float64 division, traces a platform choice in a process running Dew's test setting
+    """Each site of the wide CPU arithmetic, a float32 product and a bias's spread and a row's logsumexp
+    (`widened_reduction`), traces a platform choice in a process running Dew's test setting
     (`WIDE_CPU_ARITHMETIC`), and in a library process, which sets nothing, the plain computation:
     no platform choice and no float64 beside a float32 computation. Each is traced afresh, as a
     process with either setting traces it."""
@@ -306,9 +306,9 @@ def test_wide_cpu_arithmetic_is_the_test_settings_alone(wide, monkeypatch):
         "logsumexp": traced(lambda states, table: chunked_cross_entropy(
             states, OutputTable(table, vocab_major=True), targets, 1, tile=None)[0], states, table),
     }
-    with jax.enable_x64(new_val=True):
-        division = traced(divided, np.ones(3, np.float64), np.float64(3.0))
     for name, found in sites.items():
         assert chosen(found) == wide, name
         assert float64(found) == wide, name
-    assert chosen(division) == wide
+    # A float64 division is the plain division under either setting.
+    with jax.enable_x64(new_val=True):
+        assert not chosen(traced(divided, np.ones(3, np.float64), np.float64(3.0)))
