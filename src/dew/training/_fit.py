@@ -1,5 +1,6 @@
-"""One `Trainer.fit` call's records: what it was asked for (`FitPlan`), what its loop carries from step
-to step (`FitRun`), and how the loop reads its training stream (`waited_read`)."""
+"""One `Trainer.fit` call's records: what it was asked for (`FitPlan`, its validation splits resolved by
+`validation_suites`), what its loop carries from step to step (`FitRun`), and how the loop reads its
+training stream (`waited_read`)."""
 
 from __future__ import annotations
 
@@ -13,7 +14,7 @@ from jax.sharding import Mesh
 
 from dew._coordination import agreed_next
 from dew.batch import Batch
-from dew.data.dataset import Loader
+from dew.data.dataset import Loader, Reader
 from dew.data.pipeline import Dataset
 from dew.distributed.batches import DevicePrefetchIterator, Signature
 from dew.distributed.placement import MeshSpec
@@ -25,6 +26,26 @@ from dew.training.interval import Interval, Taken
 from dew.training.observe import Observe
 from dew.training.runtime import PreemptionNotice
 from dew.training.selection import Best, HeldBest
+
+
+def validation_suites(dataset: Loader, validation: Mapping[str, Reader | EvalSuite] | None,
+                      metrics: Sequence[Metric], eval_every: int | None) -> dict[str, EvalSuite]:
+    """Every split `fit` validates, by name, with its metrics and cadence
+    resolved: `dataset.val` alone is the one suite `val`."""
+    if validation is None:
+        if metrics and dataset.val is None:
+            # Else the metrics would never be scored, and the run would not say so.
+            raise ValueError("metrics score validation data: give the dataset a val split, or validation=")
+        # `val` is read only when a pass is scheduled; a dataset need not hold one.
+        validation = {"val": dataset.val} if (eval_every or metrics) and dataset.val is not None else {}
+    elif not validation:
+        raise ValueError("validation must contain a split")
+    suites = {}
+    for name, entry in validation.items():
+        suite = entry if isinstance(entry, EvalSuite) else EvalSuite(entry)
+        suites[name] = EvalSuite(suite.data, tuple(suite.metrics) or tuple(metrics),
+                                 eval_every if suite.every is None else suite.every)
+    return suites
 
 
 def split_metrics(suites: Mapping[str, EvalSuite]) -> dict[str, tuple[Metric, ...]]:

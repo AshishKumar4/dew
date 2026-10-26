@@ -7,7 +7,6 @@ a batch's rows split over, and the logical axes no rule names. Each claim is hel
 those bytes overflow is refused, as a CPU mesh standing in for GPUs states it.
 """
 
-
 import jax
 import numpy as np
 import optax
