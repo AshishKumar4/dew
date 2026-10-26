@@ -44,6 +44,7 @@ from ..dit import (
 from ..flops import MissingFlopsCount, counted_flops, patch_lengths, projection_flops, real_lengths
 from ..scan_orders import ScanOrder
 from ..sharding import constrain, down_projection, explicit_spec, rows_like, rows_taken
+from .decoder_stack import pipelined_blocks, pipelines
 from .dit import gather_tokens
 
 
@@ -62,25 +63,47 @@ class TokenStack(_JepaStackOptions):
 
     @nn.nowrap
     def _blocks(self) -> list[ModulatedBlock]:
-        pattern = build_block_pattern(self.num_layers, self.ssm_attention_ratio)
-        return [
-            ModulatedBlock(
-                features=self.features,
-                num_heads=self.num_heads,
-                mixer='ssm' if kind == 'ssm' else 'attention',
-                modulated=False,
-                gelu_approximate=False,
-                **self._block_options(),
-                ssm_state_dim=self.ssm_state_dim,
-                bidirectional_ssm=self.bidirectional_ssm,
-                name=f"block_{i}",
-            ) for i, kind in enumerate(pattern)
-        ]
+        return [self._block(index, kind) for index, kind in enumerate(self.kinds())]
+
+    @nn.nowrap
+    def kinds(self) -> list[str]:
+        """Each block's mixer, in order."""
+        return build_block_pattern(self.num_layers, self.ssm_attention_ratio)
+
+    @nn.nowrap
+    def _block(self, index: int, kind: str) -> ModulatedBlock:
+        return ModulatedBlock(
+            features=self.features,
+            num_heads=self.num_heads,
+            mixer='ssm' if kind == 'ssm' else 'attention',
+            modulated=False,
+            gelu_approximate=False,
+            **self._block_options(),
+            ssm_state_dim=self.ssm_state_dim,
+            bidirectional_ssm=self.bidirectional_ssm,
+            name=f"block_{index}",
+        )
 
     def __call__(self, tokens, freqs_cis=None, train: bool = False):
-        for block in self.blocks:
-            tokens = block(tokens, conditioning=None, freqs_cis=freqs_cis, train=train)
-        return tokens
+        """The blocks over `tokens`, as a pipeline over the stage axis where the mesh in context
+        has one that splits them (`pipelines`)."""
+        kinds = self.kinds()
+        if pipelines(self, kinds):
+            return pipelined_blocks(self, ("block_",), len(kinds), tokens,
+                                    lambda index: self._block(index, kinds[index]),
+                                    lambda blocks, x, _: run_blocks(blocks, x, freqs_cis, train))
+        return self.run(tokens, freqs_cis, train)
+
+    def run(self, tokens, freqs_cis=None, train: bool = False):
+        """The blocks over `tokens` in the plain loop."""
+        return run_blocks(self.blocks, tokens, freqs_cis, train)
+
+
+def run_blocks(blocks, tokens, freqs_cis, train: bool):
+    """Unmodulated `blocks` over `tokens`, in order."""
+    for block in blocks:
+        tokens = block(tokens, conditioning=None, freqs_cis=freqs_cis, train=train)
+    return tokens
 
 
 class FactorizedTokenStack(_JepaStackOptions):
@@ -111,25 +134,47 @@ class FactorizedTokenStack(_JepaStackOptions):
                 + temporal.model_flops(np.repeat(frames, patches)))
 
     def setup(self):
-        def stack(name, num_layers, ratio):
-            options = self._stack_options()
-            options['ssm_attention_ratio'] = ratio
-            return TokenStack(
-                features=self.features, num_layers=num_layers, **options, name=name)
-
         # one spatial and one temporal block per layer, built as single-block
         # stacks so the two halves can be interleaved
-        pattern = build_block_pattern(self.num_layers, self.ssm_attention_ratio)
-        self.spatial = [stack(f"spatial_{i}", 1, "all-ssm" if kind == 'ssm' else "all-attn")
-                        for i, kind in enumerate(pattern)]
-        self.temporal = [stack(f"temporal_{i}", 1, "all-attn") for i in range(self.num_layers)]
+        layers = [self._layer(index, kind) for index, kind in enumerate(self.kinds())]
+        self.spatial = [spatial for spatial, _ in layers]
+        self.temporal = [temporal for _, temporal in layers]
+
+    @nn.nowrap
+    def kinds(self) -> list[str]:
+        """Each layer's spatial mixer, in order; every temporal one attends."""
+        return build_block_pattern(self.num_layers, self.ssm_attention_ratio)
+
+    @nn.nowrap
+    def _layer(self, index: int, kind: str) -> tuple[TokenStack, TokenStack]:
+        """Layer `index`'s spatial and temporal single-block stacks, `spatial_{index}` and
+        `temporal_{index}`."""
+        def stack(name, ratio):
+            options = self._stack_options()
+            options['ssm_attention_ratio'] = ratio
+            return TokenStack(features=self.features, num_layers=1, **options, name=name)
+
+        return (stack(f"spatial_{index}", "all-ssm" if kind == 'ssm' else "all-attn"),
+                stack(f"temporal_{index}", "all-attn"))
 
     def __call__(self, tokens, train: bool = False):
+        """The layers over a clip's `[B, T, N, F]` tokens, as a pipeline over the stage axis where
+        the mesh in context has one that splits them (`pipelines`)."""
+        kinds = self.kinds()
+        if pipelines(self, kinds):
+            return pipelined_blocks(self, ("spatial_", "temporal_"), len(kinds), tokens,
+                                    lambda index: self._layer(index, kinds[index]),
+                                    lambda layers, x, _: self._walk(layers, x, train))
+        return self._walk(list(zip(self.spatial, self.temporal, strict=True)), tokens, train)
+
+    @nn.nowrap
+    def _walk(self, layers, tokens, train: bool):
+        """`layers`' spatial and temporal stacks over `[B, T, N, F]` tokens, each in its plain loop."""
         B, T, N, F = tokens.shape
         tokens = factorized_walk(tokens.reshape(B * T, N, F), T, self.features // self.num_heads, [
-            (lambda x, stack=spatial: stack(x, train=train),
-             lambda x, rotation, stack=temporal: stack(x, freqs_cis=rotation, train=train))
-            for spatial, temporal in zip(self.spatial, self.temporal, strict=True)])
+            (lambda x, stack=spatial: stack.run(x, train=train),
+             lambda x, rotation, stack=temporal: stack.run(x, freqs_cis=rotation, train=train))
+            for spatial, temporal in layers])
         return tokens.reshape(B, T, N, F)
 
 

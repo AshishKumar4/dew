@@ -142,6 +142,27 @@ def microbatches() -> int:
     return pipeline_stages() if schedule.count is None else schedule.count
 
 
+_STAGED: contextvars.ContextVar[bool] = contextvars.ContextVar('pipeline_stage', default=False)
+
+
+@contextlib.contextmanager
+def pipeline_stage() -> Iterator[None]:
+    """Trace one stage's body inside a pipeline over the stage axis, whose vmap places the stage axis
+    (`dew.nn.backbones.decoder_stack.run_pipeline`)."""
+    token = _STAGED.set(True)
+    try:
+        yield
+    finally:
+        _STAGED.reset(token)
+
+
+def in_pipeline_stage() -> bool:
+    """Whether a pipeline stage's body is tracing (`pipeline_stage`): the stage axis is its vmap's
+    there, and an automatic mesh axis like any other everywhere else, where whatever runs outside
+    the pipeline runs on every stage."""
+    return _STAGED.get()
+
+
 @dataclasses.dataclass
 class Link:
     """A mesh axis's interconnect, one device's dense bf16 peak, and whether a projection split over the axis.
