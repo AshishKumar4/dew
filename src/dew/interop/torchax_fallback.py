@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import contextlib
 import contextvars
+import copy
 import fnmatch
 import functools
 import importlib.metadata
@@ -155,7 +156,7 @@ def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
     # any layer drop run only there, and a draw on the host would be fixed for every step.
     from torchax.interop import JittableModule, extract_all_buffers
 
-    functional_rotaries(model)
+    functional_parts(model)
     jittable = JittableModule(model)
     params = {name: host_view(leaf, name) for name, leaf in jittable.params.items()}
     buffers = {name: host_view(leaf, name) for name, leaf in extract_all_buffers(model)[1].items()}
@@ -456,15 +457,17 @@ def _moving_rotary_code():
     return wrapper.__code__
 
 
-def _recomputes_tables(module: torch.nn.Module) -> bool:
-    """Whether `module`'s class forward is `dynamic_rope_update`'s wrapper, under any decorator around
-    it (`torch.no_grad()`'s)."""
+def _table_forward(module: torch.nn.Module) -> FunctionType | None:
+    """The forward `dynamic_rope_update` wraps in `module`'s class forward, under any decorator around it
+    (`torch.no_grad()`'s): the one that turns the rotary's current table into cos and sin; None where
+    the class forward is not so wrapped."""
     function = type(module).forward
     while isinstance(function, FunctionType):
+        wrapped = vars(function).get("__wrapped__")
         if function.__code__ is _moving_rotary_code():
-            return True
-        function = vars(function).get("__wrapped__")
-    return False
+            return wrapped if isinstance(wrapped, FunctionType) else None
+        function = wrapped
+    return None
 
 
 def functional_rotaries(model: torch.nn.Module) -> int | None:
@@ -476,7 +479,8 @@ def functional_rotaries(model: torch.nn.Module) -> int | None:
     names), or None. A rotary that recomputes per layer kind is refused by name."""
     rebuild = None
     for name, module in list(model.named_modules()):
-        if not _recomputes_tables(module):
+        forward = _table_forward(module)
+        if forward is None:
             continue
         rope_type = vars(module)["rope_type"]
         if not isinstance(rope_type, str):
@@ -487,7 +491,7 @@ def functional_rotaries(model: torch.nn.Module) -> int | None:
         if rope_type not in _MOVING:
             continue
         parent, _, attribute = name.rpartition(".")
-        replacement = _functional_rotary()(module)
+        replacement = _functional_rotary()(module, forward)
         setattr(model.get_submodule(parent), attribute, replacement)
         if rope_type == "longrope":
             rebuild = replacement.original
@@ -508,21 +512,24 @@ def _functional_rotary() -> type:
         document's furthest place, or its row's), with transformers' own initializer (`ROPE_INIT_FUNCTIONS`)
         and amplitude, as `dynamic_rope_update` updates them at batch one. LongRoPE's short and long
         tables are the rotary's own at its original context and one past it; dynamic NTK's is its
-        initializer's at the reach, which a traced length broadcasts per token."""
+        initializer's at the reach, which a traced length broadcasts per token. Each angle lands where
+        the replaced class's own forward puts its pair (`layout`: Llama's halves, Cohere's interleave)."""
 
-        def __init__(self, replaced: torch.nn.Module):
+        def __init__(self, replaced: torch.nn.Module, table_forward: FunctionType):
             super().__init__()
             held = vars(replaced)
             self.config: PretrainedConfig = held["config"]
             self.rope_type: str = held["rope_type"]
             self.attention_scaling: float = held["attention_scaling"]
             self.original = 0
+            short = replaced.get_buffer("original_inv_freq").clone()
             if self.rope_type == "longrope":
                 self.original = int(self.config.rope_parameters["original_max_position_embeddings"])
                 long, _ = ROPE_INIT_FUNCTIONS["longrope"](self.config, None, seq_len=self.original + 1)
-                self.register_buffer("short_inv_freq", replaced.get_buffer("original_inv_freq").clone(),
-                                     persistent=False)
+                self.register_buffer("short_inv_freq", short, persistent=False)
                 self.register_buffer("long_inv_freq", long, persistent=False)
+            self.register_buffer("layout", _rotary_layout(replaced, table_forward, short.shape[0]),
+                                 persistent=False)
 
         def forward(self, x, position_ids, layer_type=None):
             reach = _reach_of(position_ids)[..., None]
@@ -530,13 +537,81 @@ def _functional_rotary() -> type:
                 inv_freq = torch.where(reach + 1 > self.original, self.get_buffer("long_inv_freq"),
                                        self.get_buffer("short_inv_freq"))
             else:
-                inv_freq, _ = ROPE_INIT_FUNCTIONS[self.rope_type](self.config, None, seq_len=reach + 1)
+                inv_freq, _ = ROPE_INIT_FUNCTIONS[self.rope_type](self.config, x.device, seq_len=reach + 1)
             freqs = position_ids[..., None].float() * inv_freq.float()
-            emb = torch.cat((freqs, freqs), dim=-1)
+            emb = freqs[..., self.get_buffer("layout")]
             return ((emb.cos() * self.attention_scaling).to(dtype=x.dtype),
                     (emb.sin() * self.attention_scaling).to(dtype=x.dtype))
 
+    def _rotary_layout(replaced: torch.nn.Module, table_forward: FunctionType, pairs: int) -> torch.Tensor:
+        """Which of its `pairs` frequencies each of the replaced rotary's output dimensions carries, read
+        off its own `table_forward` over a table of distinct frequencies in (0, 1) at position 1, where
+        cos is one to one."""
+        probe = copy.deepcopy(replaced)
+        distinct = torch.arange(1, pairs + 1, dtype=torch.float32) / (pairs + 1)
+        probe.register_buffer("inv_freq", distinct, persistent=False)
+        with torch.no_grad():
+            cos, _ = table_forward(probe, torch.zeros(1, dtype=torch.float32),
+                                   torch.ones(1, 1, dtype=torch.long))
+        angles = torch.arccos((cos[0, 0] / vars(replaced)["attention_scaling"]).clamp(-1, 1))
+        return (angles * (pairs + 1)).round().long() - 1
+
     return FunctionalRotary
+
+
+_LOOPED_EXPERTS = frozenset({"transformers.models.longcat_flash.modeling_longcat_flash.LongcatFlashExperts"})
+"""Experts transformers runs as a Python loop over the experts a call routes to (`nonzero`, `item()`:
+shapes the traced values decide) and does not dispatch through its experts interface
+(`use_experts_implementation`): routed experts, a gated product each, beside identity ('zero') experts
+numbered after them, as `_functional_experts` computes them."""
+
+
+def functional_experts(model: torch.nn.Module) -> None:
+    """Replace each of `model`'s `_LOOPED_EXPERTS` modules with `_functional_experts`, which computes every
+    routed slot at static shapes inside the trace, keeping its parameters under their names."""
+    for name, module in list(model.named_modules()):
+        if f"{type(module).__module__}.{type(module).__qualname__}" in _LOOPED_EXPERTS:
+            parent, _, attribute = name.rpartition(".")
+            setattr(model.get_submodule(parent), attribute, _functional_experts()(module))
+
+
+@functools.cache
+def _functional_experts() -> type:
+    """The torch module `functional_experts` substitutes (built on first use)."""
+    import torch
+
+    class FunctionalExperts(torch.nn.Module):
+        """Routed experts beside identity experts at static shapes: each of a token's routed slots
+        gathers its expert's gate-and-up and down projections (an identity expert's, numbered past the
+        routed ones, the token itself), weighted by its routing weight and summed over the slots, as
+        transformers' loop computes them expert by expert. Its parameters are the replaced module's."""
+
+        def __init__(self, replaced: torch.nn.Module):
+            super().__init__()
+            held = vars(replaced)
+            self.routed: int = held["num_routed_experts"]
+            self.act_fn: torch.nn.Module = replaced.get_submodule("act_fn")
+            self.gate_up_proj = replaced.get_parameter("gate_up_proj")
+            self.down_proj = replaced.get_parameter("down_proj")
+
+        def forward(self, hidden_states, top_k_index, top_k_weights):
+            routed = top_k_index < self.routed
+            held = top_k_index.clamp(max=self.routed - 1)
+            gate, up = torch.einsum("th,tkoh->tko", hidden_states,
+                                    self.gate_up_proj[held]).chunk(2, dim=-1)
+            out = torch.einsum("tki,tkhi->tkh", self.act_fn(gate) * up, self.down_proj[held])
+            out = torch.where(routed[..., None], out, hidden_states[:, None, :])
+            return (out * top_k_weights[..., None]).to(hidden_states.dtype).sum(dim=1)
+
+    return FunctionalExperts
+
+
+def functional_parts(model: torch.nn.Module) -> int | None:
+    """Replace `model`'s parts a traced program cannot run as transformers writes them with ones computing
+    the same inside the trace (`functional_rotaries`, `functional_experts`). Returns the cache's rebuild
+    position (`functional_rotaries`)."""
+    functional_experts(model)
+    return functional_rotaries(model)
 
 
 _REACH: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("dew_reach", default=None)
@@ -1276,7 +1351,7 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
             model = AutoModelForCausalLM.from_config(
                 stated, dtype=stated.dtype if storage == "auto" else storage, experts_implementation=EXPERTS)
     model.eval()
-    rebuild = functional_rotaries(model)
+    rebuild = functional_parts(model)
     jittable = JittableModule(model)
     head = model.get_output_embeddings()
     if not isinstance(head, torch.nn.Module):
