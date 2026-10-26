@@ -142,11 +142,13 @@ def test_the_live_run_holds_the_committed_layout_and_samples_an_image():
     import numpy as np
     from flax.core import unfreeze
 
+    import dew
     from dew.inference import TextToImage
     from dew.training import MeshSpec
 
     repo, revision = LIVE_PIN.read_text().strip().split("@")
-    pipe = TextToImage.from_pretrained(repo, revision=revision, mesh=MeshSpec().build(jax.devices()[:1]))
+    pipe = dew.pipeline(repo, revision=revision, mesh=MeshSpec().build(jax.devices()[:1]))
+    assert isinstance(pipe, TextToImage)
     artifact, expected = published_layout()
     held = unfreeze(pipe.variables)
     assert jax.tree.structure(held) == jax.tree.structure(expected)

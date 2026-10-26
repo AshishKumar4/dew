@@ -77,6 +77,7 @@ from dew.sampling.text import Sampling
 if TYPE_CHECKING:
     from jax.sharding import Mesh
 
+    from dew.inference.tasks import SavedRun
     from dew.interop.torchax_fallback import TorchAdmission
     from dew.lora import Adapter, LoRA
     from dew.nn.cross_attention import CrossAttention
@@ -269,13 +270,20 @@ class Pretrained:
     @classmethod
     def from_run(cls, directory: str | Path, *, step: int | str | None = None,
                  ema: bool | None = None, trust: Sequence[str] = ()) -> Self:
-        """Return a trained run's selected checkpoint, rebuilt from the run's own inference record,
-        in the layout of the architecture the record names. `trust` names the packages outside
-        Dew the record may import (`TextGeneration.from_run`)."""
+        """Return a trained run's selected checkpoint, its latest or `step`, rebuilt from the run's
+        own inference record (`from_saved`). `trust` names the packages outside Dew the record may
+        import (`TextGeneration.from_run`)."""
+        from dew.inference.tasks import SavedRun
+
+        return cls.from_saved(SavedRun.pinned(str(directory), step, trust), ema=ema)
+
+    @classmethod
+    def from_saved(cls, run: SavedRun, *, ema: bool | None = None) -> Self:
+        """Return the pinned checkpoint `run` (`SavedRun.pinned`), rebuilt from the run's own inference
+        record, in the layout of the architecture the record names."""
         from dew.inference.tasks import (
             BlockSettings,
             MaskedSettings,
-            SavedRun,
             TaskSettings,
             TextSettings,
             saved_model,
@@ -283,7 +291,6 @@ class Pretrained:
         )
         from dew.registry import models
 
-        run = SavedRun.pinned(str(directory), step, trust)
         model_config = saved_model(run.record, None)
         model = model_config.build()
         variables = run.variables(ema=ema)
@@ -326,7 +333,7 @@ class Pretrained:
             raise TypeError(f"{type(model).__name__} has no maintained exported bundle layout; "
                             "load diffusion runs with TextToImage.from_run")
         if not isinstance(bundle, cls):
-            raise TypeError(f"{directory} is a {type(bundle).__name__} source, not a {cls.__name__}; "
+            raise TypeError(f"{run.directory} is a {type(bundle).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(bundle).__name__}.from_run or Pretrained.from_run")
         return bundle.bound(model, variables)
 

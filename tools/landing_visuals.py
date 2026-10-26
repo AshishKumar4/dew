@@ -225,7 +225,7 @@ def provenance(experiment, pipe, directory):
         "model": experiment.model,
         "revision": experiment.revision,
         "loaded_with": "dew.inference.TextToImage.from_run(huggingface_hub.snapshot_download("
-        f"{experiment.model!r}, revision=...)), the run from_pretrained loads",
+        f"{experiment.model!r}, revision=...)), the run dew.pipeline loads",
         "checkpoint_step": experiment.checkpoint_step,
         "parameters": int(sum(math.prod(leaf.shape) for leaf in jax.tree.leaves(pipe.variables["params"]))),
         "dew_commit": dew_revision(),
