@@ -249,7 +249,9 @@ def as_a_step(trainer, variables, micro, gradient):
     shards = math.prod(mesh.shape[axis] for axis in batch_axes(mesh))
     options = step_compiler_options(trainer.objective, device_tokens(trainer.objective, micro, shards),
                                     FROZEN in variables, mesh.devices.size)
-    return jax.jit(gradient, compiler_options=options)
+    # Compiled here with the step's own options, so the gate runs it as given: a jit nested in another
+    # with compiler options of its own is refused (row 1800).
+    return as_given(jax.jit(gradient, compiler_options=options))
 
 
 def float32_update(gradient):
