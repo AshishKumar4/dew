@@ -46,6 +46,7 @@ from jax.experimental import pallas as pl
 from dew.nn.kernels import tuning
 from dew.nn.kernels.chunked_launch import read_rows, write_rows
 from dew.nn.kernels.fla_gdn import _dot
+from dew.nn.precision import float32_einsum
 
 
 @dataclasses.dataclass(frozen=True)
@@ -117,6 +118,17 @@ def _picks(tiles: Tiles, fp32: Tiles | None = None) -> Mapping[str, Tiles]:
     state, the state passing, both `C B^T` products and the chunk scan ran 4% to 70% slower on the port
     there (2026-10-13)."""
     return {"bfloat16": tiles, "float32": tiles if fp32 is None else fp32}
+
+
+def _row_block(batch: int, length: int, chunk: int, width: int, bm: int, bn: int):
+    """A chunk-scan program's row block (`_chunk_scan_kernel`'s and `_dx_kernel`'s grid): its block of `bm`
+    rows `m` and head `h` (program axes 0 and 2, axis 0 also counting `width // bn` column blocks), its
+    chunk `c` (axis 1, over the batch), the chunk's first token, the tokens it holds (`_limit`) and the
+    block's rows."""
+    m, h = pl.program_id(0) // (width // bn), pl.program_id(2)
+    c = pl.program_id(1) // batch
+    start = c * chunk
+    return m, h, c, start, _limit(c, length, chunk), pl.ds(start + m * bm, bm)
 
 
 def _limit(c, length: int, chunk: int):
@@ -445,12 +457,7 @@ def _chunk_scan_kernel(cb_ref, x_ref, dt_ref, da_ref, c_ref, states_ref, d_ref, 
     causal `sum_k CB_mk exp(min(acs_m - acs_k, 0)) dt_k x_k` over the chunk's rows, each `CB` block
     weighted in fp32 and rounded to `x`'s dtype before its product; then `D x`; stored fp32."""
     *seq, out_ref = refs
-    columns = width // bn
-    m, h = pl.program_id(0) // columns, pl.program_id(2)
-    c = pl.program_id(1) // batch
-    start = c * chunk
-    limit = _limit(c, length, chunk)
-    rows = pl.ds(start + m * bm, bm)
+    m, h, c, start, limit, rows = _row_block(batch, length, chunk, width, bm, bn)
     da_m = da_ref[rows]
     scale = jnp.exp(da_m)
     if seq:
@@ -645,49 +652,16 @@ class StatePassingBwd(_Launch):
         return (dstates, jnp.sum(dtotal, axis=-1), dinit, converted), None
 
 
-def _block_sum(values, exact: bool):
-    """A `[BM, BN]` block summed to one value as Triton's `tl.sum` sums it on a GPU, a tree over each
-    axis in turn; interpreted (`exact`), that same tree, where XLA's CPU reduction of a block to a scalar
-    adds its entries in sequence and rounds several times more (`D`'s gradient over head-width orders:
-    2 to 7 times a tree's error, mamba_ssm's matching the tree)."""
-    if not exact:
-        return jnp.sum(values)
-    for axis in (1, 0):
-        while values.shape[axis] > 1:
-            left, right = jnp.split(values, 2, axis=axis)
-            values = left + right
-    return values[0, 0]
-
-
-def _tree_sum(values, axes: tuple[int, ...]):
-    """`values` summed over `axes` pairwise, as mamba_ssm's torch sum and XLA's GPU reduction add a
-    kernel's per-block partial sums: a tree on every backend, where XLA's CPU reduction of them runs in
-    sequence."""
-    kept = [axis for axis in range(values.ndim) if axis not in axes]
-    flat = jnp.moveaxis(values, axes, tuple(range(len(axes))))
-    flat = flat.reshape(-1, *(values.shape[axis] for axis in kept))
-    while flat.shape[0] > 1:
-        if flat.shape[0] % 2:
-            flat = jnp.concatenate([flat, jnp.zeros_like(flat[:1])])
-        flat = flat[0::2] + flat[1::2]
-    return flat[0]
-
-
 def _dx_kernel(x_ref, cb_ref, dout_ref, dt_ref, da_ref, d_ref, b_ref, dstates_ref, *refs, batch: int,
                length: int, chunk: int, width: int, bm: int, bn: int, bk: int, exact: bool):
     """mamba_ssm's `_chunk_scan_chunk_state_bwd_dx_kernel` (ssd_combined.py:92-254) for one chunk of one
     head and a `[BM, BN]` block of `x`: the gradient through the state the chunk leaves, `B_m dleave^T`
     decayed by `exp(min(acs_last - acs_m, 0))`, plus the causal `sum_k CB_km exp(min(acs_k - acs_m, 0))
     dout_k` over the chunk's later rows (`CB` weighted in fp32, rounded to `dout`'s dtype), times
-    `dt_m`, plus `D dout_m`; `dt`'s gradient `sum_p (...) x_m` and `D`'s `sum dout x` per block for
+    `dt_m`, plus `D dout_m`; `dt`'s gradient `sum_p (...) x_m` and `D`'s `sum_p dout x` per row, for
     XLA to sum."""
     *seq, dx_ref, ddt_ref, dd_ref = refs
-    columns = width // bn
-    m, n, h = pl.program_id(0) // columns, pl.program_id(0) % columns, pl.program_id(2)
-    c = pl.program_id(1) // batch
-    start = c * chunk
-    limit = _limit(c, length, chunk)
-    rows = pl.ds(start + m * bm, bm)
+    m, h, _, start, limit, rows = _row_block(batch, length, chunk, width, bm, bn)
     taken = _from(limit, m * bm)
     da_m = da_ref[rows]
     scale = jnp.exp(jnp.minimum(da_ref[start + chunk - 1] - da_m, 0.0))
@@ -715,7 +689,7 @@ def _dx_kernel(x_ref, cb_ref, dout_ref, dt_ref, da_ref, d_ref, b_ref, dstates_re
     dout = read_rows(dout_ref.at[rows], taken).astype(jnp.float32)
     write_rows(dx_ref.at[rows], taken, dx + dout * d_ref[h])
     x = read_rows(x_ref.at[rows], taken).astype(jnp.float32)
-    dd_ref[m, n] = _block_sum(dout * x, exact)
+    dd_ref[rows] = jnp.sum(dout * x, axis=1)
     ddt_ref[rows] = jnp.sum(acc * x, axis=1)
 
 
@@ -755,15 +729,17 @@ class ChunkScanChunkStateBwdDx(_Launch):
             out_specs=[headed,
                        pl.BlockSpec((None, None, None, padded),
                                     lambda mn, bc, h: (mn % columns, bc % batch, h, 0)),
-                       pl.BlockSpec((None, None, None, chunk // bm, columns),
-                                    lambda mn, bc, h: (bc % batch, bc // batch, h, 0, 0))],
+                       pl.BlockSpec((None, None, None, padded),
+                                    lambda mn, bc, h: (mn % columns, bc % batch, h, 0))],
             out_shape=[jax.ShapeDtypeStruct(x.shape, x.dtype),
                        jax.ShapeDtypeStruct((columns, batch, heads, padded), jnp.float32),
-                       jax.ShapeDtypeStruct((batch, chunks, heads, chunk // bm, columns), jnp.float32)],
+                       jax.ShapeDtypeStruct((columns, batch, heads, padded), jnp.float32)],
             compiler_params=_compiled(config.warps, config.stages), interpret=interpret,
             name="mamba_chunk_scan_chunk_state_bwd_dx",
         )(x, cb, dout, dt, da, d, b, dstates, *([] if seq is None else [seq]))
-        return (dx, jnp.sum(ddt, axis=0), _tree_sum(dd, (0, 1, 3, 4))), None
+        # D's gradient each token's, summed over the tokens and the column blocks as Dew sums a sum
+        # (`float32_einsum`): the CPU's accumulation is the test lane's policy, not this launch's.
+        return (dx, jnp.sum(ddt, axis=0), float32_einsum('cbhl->h', dd)), None
 
 
 def _heads_of(s, g, *, ratio: int, heads: int):
