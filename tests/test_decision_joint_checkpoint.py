@@ -305,6 +305,29 @@ def test_a_joint_release_saves_as_the_release_it_was_read_from(tmp_path):
         bundle, name="release").systemone(request)
 
 
+def test_a_joint_release_exports_its_backbone_alone_and_refuses_a_flat_export(tmp_path):
+    """A release is its backbone and its readout, which no one flat set of tensors holds: `export`
+    refuses it (ValueError), where it once gave the backbone's tensors alone and a weight push
+    (`NCCLPush`) dropped the readout. Its `backbone` exports and saves the backbone alone, the
+    tensors and files the saved release holds beside its head."""
+    release = tmp_path / "release"
+    release.mkdir()
+    for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
+        (release / source.name).symlink_to(source.resolve())
+    bundle = Pretrained.load(release, dtype="float32", attention_impl="xla")
+    with pytest.raises(ValueError):
+        bundle.export()
+    backbone = bundle.backbone()
+    assert not hasattr(backbone, "head_variables")
+    bundle.save(tmp_path / "saved")
+    backbone.save(tmp_path / "backbone")
+    written = load_file(tmp_path / "saved" / "model.safetensors")
+    exported = backbone.export()
+    assert written.keys() == exported.keys() == load_file(tmp_path / "backbone" / "model.safetensors").keys()
+    for name, tensor in exported.items():
+        np.testing.assert_array_equal(written[name], np.asarray(tensor), err_msg=name, strict=True)
+
+
 def test_a_joint_release_fine_tunes_and_reloads_from_the_run(tmp_path):
     """A joint-head release is a whole task to fine-tune: its Qwen 3.5 backbone,
     joint head and layout train together on rows of several questions, and
