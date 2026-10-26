@@ -8,7 +8,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, without_ynn
 
 from dew.inputs import Condition, Field, InputSpec
 from dew.nn.dit import ConditioningEmbed, TextContext, masked_mean
@@ -78,11 +78,12 @@ def test_the_text_conditioning_projects_each_row_once_not_each_token(rng):
         return (params, jax.random.normal(texts, (3, 77, 32)),
                 jax.random.uniform(times, (3,), minval=0.0, maxval=3.0))
 
-    @jax.jit
+    # Both arms are Dew programs, so each compiles without YNNPACK's fusions (testing.md: check 1).
+    @without_ynn
     def pooled(params, hidden, temb):
         return embed.apply(params, temb, TextContext(hidden, mask))
 
-    @jax.jit
+    @without_ynn
     def each_token(params, hidden, temb):
         kernel = params["params"]["text_context_proj"]
         tokens = hidden @ kernel["kernel"] + kernel["bias"]
