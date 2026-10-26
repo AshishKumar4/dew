@@ -82,7 +82,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--head-chunks", type=int, default=4)
     parser.add_argument("--split", type=int, default=None,
                         help="the microbatches a step's batch is read in (Trainer's split); unset plans it")
-    parser.add_argument("--state-dtype", choices=("float32", "bfloat16"), default="float32",
+    parser.add_argument("--state-dtype", choices=("float32", "bfloat16", "int8"), default="float32",
                         help="Adam's moments in memory (OptimConfig.state_dtype)")
     parser.add_argument("--remat", default=None, choices=sorted(REMAT_POLICIES),
                         help="the decoder's starting remat policy; unset, the model's")
@@ -129,6 +129,7 @@ def build(args: argparse.Namespace) -> Run:
     from dew.optim import Cosine, ParamGroup
     from dew.training import MeshSpec, Trainer
     from dew.training.distributed import batch_shardings
+    from dew.training.planning import Timer
 
     data = np.load(args.data)
     windows, order = data["windows"], data["order"]
@@ -190,8 +191,10 @@ def build(args: argparse.Namespace) -> Run:
         return jax.device_put(rows(window_rows(order, step, args.batch)), placement)
 
     compile_start = time.perf_counter()
-    step = trainer.compile(state, batch(0))
-    return Run(trainer, state, step, batch, schedule.schedule(schedule_steps), windows, seq, total,
+    # As `fit` plans: a frontier the plan opens is timed, and the run goes on from the state it timed.
+    timer = Timer(state, batch(0))
+    step = trainer.compile(state, batch(0), timer)
+    return Run(trainer, timer.state, step, batch, schedule.schedule(schedule_steps), windows, seq, total,
                schedule_steps, time.perf_counter() - compile_start, work)
 
 

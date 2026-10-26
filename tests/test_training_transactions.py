@@ -11,6 +11,7 @@ import optax
 import pytest
 from affine_run import raw_leaf
 from flax import struct
+from reference_error import assert_as_exact
 
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition
@@ -171,7 +172,7 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
     from dew.objectives import Step
     from dew.objectives.lm import LMObjective
     from dew.objectives.routing import ExpertBalance
-    from dew.optim import scale_by_qk_clip
+    from dew.optim import scale_by_qk_clip, stepped
 
     # QK-Clip bounds logits only where no QK-norm divides the kernels' scale
     # back out, and refuses a normed layer.
@@ -214,8 +215,9 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
     (expected_loss, aux), gradient = jax.value_and_grad(
         lambda p: objective.scalar_loss({**start, "params": p}, combined, info),
         has_aux=True)(start["params"])
-    updates, _ = optimizer.update(gradient, opt_state, start["params"], qk_stats=aux.qk_stats)
-    expected = optax.apply_updates(start["params"], updates)
+    updates, clipped = optimizer.update(gradient, opt_state, start["params"], qk_stats=aux.qk_stats)
+    # The clip rescales the stepped weights, as the step stores them (`stepped`).
+    expected = stepped(start["params"], updates, opt_state, clipped)
     np.testing.assert_allclose(actual_loss, expected_loss, rtol=1e-6, atol=2e-6)
     for want, got in zip(jax.tree.leaves(expected), jax.tree.leaves(actual.variables["params"]), strict=True):
         np.testing.assert_allclose(got, want, rtol=2e-5, atol=2e-6)
@@ -422,3 +424,77 @@ def test_an_accumulating_step_updates_the_optimizer_in_its_commit_alone():
                         if instruction.op not in moving
                         and any(".mu" in read or ".nu" in read for read in instruction.reads))
     assert not speculated, speculated
+
+
+CLIPPED_STEP_SEEDS = 64
+"""Check 1's declared seeds for a QK-Clip run's stepped kernels against the paper's, sized paired by
+`seeds_for` on armada."""
+
+
+def test_a_clipped_run_stores_its_stepped_kernels_times_the_clip():
+    """A QK-Clip run's step stores each query and key kernel as the paper's `gamma * (W + update)`,
+    its rescale of the stepped kernels by the root of each head's `tau / s_max` (Megatron Core's
+    `clip_qk`): on par with the paper's equations (tools/muonclip_reference.py) over drawn kernels and
+    tokens (check 1), the truth the paper's on the float64 model. The update is a constant, so every
+    arm steps by the same `W + update` and the clip alone sets the kernels apart; the threshold sits
+    below every head's logits, so each head clips. Folding the rescale into an update,
+    `(gamma - 1) W + gamma u`, rounded at `W`'s scale twice (ledger 1659)."""
+    from dew.data.chat import Role
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives import Step
+    from dew.objectives.lm import LMObjective
+    from dew.optim import scale_by_qk_clip
+    from tools.muonclip_reference import clip_qk_kernel, clip_scale
+
+    tau, step, rows = 1e-3, 1e-3, jax.device_count()
+    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=1, num_heads=2, mlp_features=16,
+                              max_seq_len=16, qk_norm=False)
+
+    def objective_of(of):
+        return LMObjective(of, 10, head_chunks=1, loss_role=Role.ASSISTANT)
+
+    constant = optax.stateless(lambda updates, _: jax.tree.map(lambda g: jnp.full_like(g, step), updates))
+    train = Trainer(objective_of(model), optax.chain(constant, scale_by_qk_clip(tau)),
+                    key=jax.random.PRNGKey(7))
+    initial = train.initial_state()
+    # The key as its bits, wrapped again each run: a key array reads back as the device array itself.
+    impl = jax.random.key_impl(initial.key)
+    host = jax.device_get(initial.replace(key=jax.random.key_data(initial.key)))
+    roles = np.full((rows, 11), int(Role.ASSISTANT), np.int32)
+    compiled = {}
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        params = jax.tree.map(lambda leaf: (rng.standard_normal(np.shape(leaf)) * 0.5).astype(leaf.dtype),
+                              host.variables["params"])
+        return params, rng.integers(0, 16, size=roles.shape).astype(np.int32)
+
+    def batch_of(tokens):
+        return {"text": jnp.asarray(tokens), "text_roles": jnp.asarray(roles)}
+
+    def attention(params):
+        return params["layers_0"]["self_attn"]
+
+    def trained(params, tokens):
+        # The step donates its state, so each run places its own copy.
+        key = jax.random.wrap_key_data(host.key, impl=impl)
+        state = jax.device_put(host.replace(variables={**host.variables, "params": params}, key=key))
+        if "step" not in compiled:
+            compiled["step"] = train.compile(state, batch_of(tokens))
+        after, *_ = compiled["step"](state, batch_of(tokens))
+        held = attention(jax.device_get(after.variables["params"]))
+        return {proj: held[proj]["kernel"] for proj in ("q_proj", "k_proj")}
+
+    def paper(of):
+        def clipped(params, tokens):
+            # The logits the step's own loss sows, on the weights before the step.
+            info = Step(jnp.array(0), jax.random.PRNGKey(0), None, qk_stats=True)
+            _, aux = objective_of(of).loss({**host.variables, "params": params}, batch_of(tokens), info)
+            s_max = jnp.max(aux.qk_stats["layers_0"]["self_attn"]["max_logits"][0], axis=0)
+            gamma = clip_scale(s_max, tau)
+            return {proj: clip_qk_kernel(attention(params)[proj]["kernel"] + step, gamma, 2)
+                    for proj in ("q_proj", "k_proj")}
+        return clipped
+
+    assert_as_exact(trained, paper(model), draw, "a clipped run's stepped kernels", seeds=CLIPPED_STEP_SEEDS,
+                    truth_fn=paper(model.clone(dtype=jnp.float64)))

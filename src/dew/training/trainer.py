@@ -87,7 +87,7 @@ from dew.objectives.base import (
     select,
     taken_record,
 )
-from dew.optim import clips_qk, learning_rate, with_rate_scales
+from dew.optim import clips_qk, learning_rate, with_rates
 from dew.records import JSON, boolean, json_value, record
 from dew.telemetry import profile as telemetry_profile
 from dew.telemetry.instrumentation import (
@@ -653,8 +653,7 @@ class Trainer(Generic[Loss, Effects]):
                                               share=DataPartition.of(self.device_mesh))
         if self._config is not None:
             # The rate this run configures, not the one its checkpoint holds.
-            state = dataclasses.replace(state, opt_state=with_rate_scales(state.opt_state,
-                                                                          self._config.rate_scales()))
+            state = dataclasses.replace(state, opt_state=with_rates(state.opt_state, self._config.rates()))
         self._resume_rung(checkpoints.rung(resume))
         from dew.nn.inputs import request_key
         state = dataclasses.replace(state, key=jax.device_put(request_key(state.key), shardings.key))
@@ -996,8 +995,8 @@ class Trainer(Generic[Loss, Effects]):
         transaction, a window pooling `split` x `accumulation`. Every batch of
         a run is split alike, as its first compile planned or its pooling
         state's window holds; later shapes climb the ladder alone. A plan that
-        splits, left open and unrecorded, is timed by `timed` (`fit`) against
-        the batch whole a rung up, and the faster kept.
+        splits or spans devices, left open and unrecorded, is timed by `timed`
+        (`fit`) against the batch whole a rung up, and the faster kept.
         """
         if self.lower_for is not None:
             # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`).
