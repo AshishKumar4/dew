@@ -784,18 +784,22 @@ class Server:
 
     def _blocks_of(self, prompt: np.ndarray) -> np.ndarray | None:
         """The blocks a request's prompt makes under the prefix run (`served_blocks`, which refuses a prompt
-        shorter than an int prefix), None where the server runs causally. A block a layer reads whole is
-        prefilled in one piece, so a server that prefills in pieces of `chunk` tokens refuses a longer
-        block."""
+        shorter than an int prefix), None where the server runs causally."""
         if self.prefix is None:
             return None
-        blocks = served_blocks(np.ones((1, len(prompt)), bool), self.prefix)[0]
-        block = len(prompt) if self.prefix == "prompt" else self.prefix
-        if self.rows.chunk is not None and block > self.rows.chunk:
-            raise ValueError(f"a prefix block of {block} tokens would be prefilled in pieces of at most "
-                             f"{self.rows.chunk} tokens, which split it; serve it without chunk, or with a "
-                             "chunk at least as long as the block")
-        return blocks
+        return served_blocks(np.ones((1, len(prompt)), bool), self.prefix)[0]
+
+    def _piece_end(self, row: _Row) -> int:
+        """Where the row's next prefill piece ends: the prompt's end, or `chunk` tokens on when the rows
+        prefill in pieces, and on past `chunk` to the end of a prefix block the cut would split. A layer
+        reads a block whole, so its tokens' keys and values are computed in one piece: a block longer
+        than `chunk` is one longer piece."""
+        length, chunk = len(row.prompt), self.rows.chunk
+        end = length if chunk is None else min(length, row.prefilled + chunk)
+        groups = row.groups
+        if groups is not None and end < length and groups[end] >= 0 and groups[end] == groups[end - 1]:
+            end = int(np.flatnonzero(groups == groups[end])[-1]) + 1
+        return end
 
     def _request_context(self, embeddings: ArrayLike, lengths: ArrayLike | None) -> np.ndarray:
         """A request's context as its real tokens on the host, `[length, features]`, in the dtype
@@ -872,7 +876,9 @@ class Server:
 
         Rows still prefilling send their next piece, oldest first, each
         group's share of `admission` a step; a piece is the rest of the
-        prompt, or at most `chunk` tokens when the rows prefill in pieces.
+        prompt, or at most `chunk` tokens when the rows prefill in pieces,
+        but for a prefix block the cut would split, which goes whole
+        (`_piece_end`).
         The admission's rows come group by group, as the slots do, and each
         names its slot within its group.
         """
@@ -904,9 +910,11 @@ class Server:
         chosen = [(group * share + index, slot, row) for group, waiting in enumerate(pending)
                   for index, (slot, row) in enumerate(waiting)]
         # The capacity is whole tiles, not a bucket, so a piece's width bucket can pass it.
-        longest = max(len(row.prompt) - row.prefilled for _, _, row in chosen)
+        ends = {slot: self._piece_end(row) for _, slot, row in chosen}
+        longest = max(ends[slot] - row.prefilled for _, slot, row in chosen)
         width = min(shape_bucket(longest, 64), self.capacity)
-        width = width if self.rows.chunk is None else min(width, self.rows.chunk)
+        if self.rows.chunk is not None and longest <= self.rows.chunk:
+            width = min(width, self.rows.chunk)
         count, capacity = share * self.groups, self.capacity
         tokens = np.zeros((count, width), np.int32)
         valid = np.zeros((count, width), bool)
@@ -931,7 +939,7 @@ class Server:
         context_lengths = np.zeros((count,), np.int32)
         blocks = None if self.prefix is None else np.full((count, width), -1, np.int32)
         for index, slot, row in chosen:
-            piece = row.prompt[row.prefilled:row.prefilled + width]
+            piece = row.prompt[row.prefilled:ends[slot]]
             tokens[index, width - len(piece):] = piece
             valid[index, width - len(piece):] = True
             if blocks is not None and row.groups is not None:

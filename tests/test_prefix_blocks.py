@@ -344,17 +344,25 @@ SERVED_PROMPTS = [[3, 1, 4, 1, 5], [2, 7, 1, 8, 2, 8], [9, 9, 9, 9, 9, 9, 9]]
 SERVED_BUDGETS = [4, 3, 5]
 
 
-@pytest.mark.parametrize("prefix", [PREFIX, "prompt"], ids=["first-tokens", "prompt"])
-def test_a_served_prefix_run_draws_what_each_request_draws_alone(prefix):
+PIECES = {"slots": 2, "capacity": 64, "kv_cache": KVCache(page_size=16, pages=8), "chunk": 2}
+"""A paged server prefilling in pieces of 2 tokens, shorter than either prefix's blocks."""
+
+
+@pytest.mark.parametrize("prefix, serving", [(PREFIX, {"slots": 2, "capacity": 64, "admission": 2}),
+                                             (PREFIX, PIECES), ("prompt", PIECES)],
+                         ids=["first-tokens", "first-tokens-in-pieces", "prompt-in-pieces"])
+def test_a_served_prefix_run_draws_what_each_request_draws_alone(prefix, serving):
     """A server prefills each prompt with the blocks the run trained (`prompt_blocks`, through its
     admission), so greedy requests of several lengths, queued past the slots, draw what the lone task
-    draws: the same tokens, lengths and terminations."""
+    draws: the same tokens, lengths and terminations. A server prefilling in pieces shorter than a block
+    prefills that block in one longer piece (`Server._piece_end`), as a layer reads it whole, and the rest
+    of the prompt in pieces."""
     decoder = blocky().clone(max_seq_len=128)
     variables = decoder.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
     task = TextGeneration(decoder, variables, sampling=Sampling(temperature=0, pad_token_id=0), prefix=prefix)
     alone = [task(np.asarray([prompt]), budget, key=index)
              for index, (prompt, budget) in enumerate(zip(SERVED_PROMPTS, SERVED_BUDGETS, strict=True))]
-    server = Server.from_task(task, slots=2, capacity=64, admission=2)
+    server = Server.from_task(task, **serving)
     tickets = [server.submit(prompt, budget, key=index)
                for index, (prompt, budget) in enumerate(zip(SERVED_PROMPTS, SERVED_BUDGETS, strict=True))]
     server.run()
@@ -363,15 +371,6 @@ def test_a_served_prefix_run_draws_what_each_request_draws_alone(prefix):
         np.testing.assert_array_equal(served.tokens, lone.tokens)
         np.testing.assert_array_equal(served.lengths, lone.lengths)
         np.testing.assert_array_equal(served.terminated, lone.terminated)
-
-
-def test_a_prefix_run_served_in_pieces_refuses_a_block_longer_than_a_piece():
-    decoder = blocky().clone(max_seq_len=128)
-    variables = decoder.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
-    task = TextGeneration(decoder, variables, sampling=Sampling(temperature=0, pad_token_id=0), prefix=PREFIX)
-    server = Server.from_task(task, slots=2, capacity=64, kv_cache=KVCache(page_size=16, pages=8), chunk=2)
-    with pytest.raises(ValueError):
-        server.submit(SERVED_PROMPTS[0], SERVED_BUDGETS[0], key=0)
 
 
 def chunked(size: int, *, unchunked: bool = False):
