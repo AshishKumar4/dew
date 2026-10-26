@@ -39,10 +39,11 @@ YARN_SEEDS = {"qwen2-tiny": 8, "qwen2-moe-tiny": 8, "qwen3-moe-tiny": 8, "qwen3-
               "qwen35-tiny": 512, "glm4-moe-tiny": 8, "gpt-neox-tiny": 8, "falcon-tiny": 8,
               "starcoder2-tiny": 8, "mistral-tiny": 8, "mixtral-tiny": 8, "ministral-tiny": 8,
               "gemma-tiny": 8, "gemma2-tiny": 8, "gemma3-tiny": 8, "gemma3n-tiny": 512,
-              "mimo-v2-flash-tiny": 8, "minimax-m2-tiny": 8, "qwen35-moe-text": 512}
+              "mimo-v2-flash-tiny": 8, "minimax-m2-tiny": 8, "qwen35-moe-text": 16}
 """Each fixture's declared check-1 seeds for its YaRN logits, sized by `seeds_for` on armada: Gemma 3n's
-paired with the reference (`seeds_for(dew_fn=...)`), its arms sharing the draw's weights and inputs, where
-the reference alone, heavy-tailed across draws, resolves within no 512."""
+and Qwen 3.5 MoE's text decoder's paired with the reference (`seeds_for(dew_fn=...)`), their arms sharing
+the draw's weights and inputs, where the reference alone, heavy-tailed across draws, resolves within no
+512."""
 
 PAD = 3
 """The pad id each pad-row draw states and fills a quarter of its positions with."""
@@ -294,9 +295,10 @@ def test_each_layer_kind_rotates_by_its_own_record(name, tmp_path):
 
 WRAPPER = "qwen35-native-tiny"
 """A Qwen 3.5 wrapper fixture with its processor's outputs over prompts with images."""
-WRAPPER_SEEDS = 512
-"""The wrapper's YaRN logits' declared check-1 seeds, as many as qwen35-tiny's YaRN logits declare: the
-gated delta net's float32 recurrence is heavy-tailed in both arms."""
+WRAPPER_SEEDS = 8
+"""The wrapper's YaRN logits' declared check-1 seeds, sized by `seeds_for` on armada paired with the
+reference (`seeds_for(dew_fn=...)`): the reference alone, heavy-tailed across draws through the gated
+delta net's float32 recurrence, resolves within no 512."""
 
 
 def test_a_qwen35_wrapper_turns_its_three_axis_rotary_by_a_yarn_record(tmp_path):
