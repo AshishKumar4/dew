@@ -194,8 +194,10 @@ def _llama4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     return _wrapper_fields("llama4", used, text, tower, projector, image, int(tokens))
 
 
-def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) -> AudioFields:
-    """Read the optional audio tower, its embedder and placeholder id for a Gemma wrapper.
+def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int,
+                   audio_token_id: int) -> AudioFields:
+    """Read the optional audio tower and its embedder for a Gemma wrapper, beside the placeholder id
+    the wrapper read for it (`audio_token_id`).
 
     Gemma 4 projects encoded frames through the same norm-and-project
     embedder as its images, at the encoder's output width; the processor
@@ -205,7 +207,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
     vocabulary embedder.
     """
     stated = hf_config.get("audio_config")
-    used.update(("audio_config", "audio_token_id", "audio_soft_tokens_per_image"))
+    used.update(("audio_config", "audio_soft_tokens_per_image"))
     if stated is None:
         return NO_AUDIO.copy()
     audio = _records.record(stated, "audio_config")
@@ -213,8 +215,7 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
         # No encoder: the embedder projects raw frames of audio_embed_dim samples each, one placeholder
         # a frame (Gemma4UnifiedAudioConfig's default 640, configuration_gemma4_unified.py:46 at 5.17.0).
         frame = _records.integer(audio.get("audio_embed_dim", 640), "audio_embed_dim")
-        return {"audio": None, "audio_token_id": _wrapper_token_id(hf_config, used, "audio_token_id"),
-                "audio_soft_tokens": None,
+        return {"audio": None, "audio_token_id": audio_token_id, "audio_soft_tokens": None,
                 "audio_projector": translate_gemma4_projector_config(audio, text_width, frame)}
     encoder = audio_nn.audio_config(audio)
     slots = None
@@ -233,16 +234,15 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
             norm_eps=encoder.rms_norm_eps)}
     return {"audio": {"class": _records.text(audio["model_type"], "audio_config model_type"), "fields": {
                       **asdict(encoder)}},
-            "audio_token_id": _wrapper_token_id(hf_config, used, "audio_token_id"),
-            "audio_soft_tokens": slots, "audio_projector": projector}
+            "audio_token_id": audio_token_id, "audio_soft_tokens": slots, "audio_projector": projector}
 
 
 def _gemma4_placeholders(hf_config: Mapping[str, object], used: set[str]) -> tuple[int, int, int]:
-    """A Gemma 4 wrapper's image, video and audio placeholder ids. The image's is the config's own and
-    refused where it names none, as every wrapper's is; the video's and audio's default to Gemma4Config's
-    and Gemma4UnifiedConfig's, which agree (transformers 5.17.0, configuration_gemma4.py:349,352 and
-    configuration_gemma4_unified.py:309,312), and both stay placeholders to the decoder whether or not
-    a tower reads them."""
+    """A Gemma 4 wrapper's image, video and audio placeholder ids, each read once here. The image's is
+    the config's own and refused where it names none, as every wrapper's is; the video's and audio's
+    default as Gemma4Config's and Gemma4UnifiedConfig's do, which agree (transformers 5.17.0,
+    configuration_gemma4.py:349,352 and configuration_gemma4_unified.py:309,312), and both stay
+    placeholders to the decoder whether or not a tower reads them."""
     image = _wrapper_token_id(hf_config, used, "image_token_id", "image_token_index")
     used.update(("video_token_id", "audio_token_id"))
     video, audio = (_records.integer(hf_config.get(name, default), name)
@@ -262,7 +262,7 @@ def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
     used.update(("vision_soft_tokens_per_image", "boa_token_id", "eoa_token_id", "eoa_token_index"))
     image, video, audio = _gemma4_placeholders(hf_config, used)
     return _wrapper_fields("gemma4", used, text, tower, projector, image, None,
-                           _wrapper_audio(hf_config, used, record_int(text, "emb_features")),
+                           _wrapper_audio(hf_config, used, record_int(text, "emb_features"), audio),
                            video=video, extra=(video, audio))
 
 
@@ -280,7 +280,7 @@ def _gemma4_unified_wrapper(hf_config: Mapping[str, object], used: set[str]) -> 
     used.update(('boa_token_id', 'eoa_token_index'))
     image, video, audio = _gemma4_placeholders(hf_config, used)
     return _wrapper_fields('gemma4_unified', used, text, tower, projector, image, None,
-                           _wrapper_audio(hf_config, used, width), video=video, extra=(video, audio))
+                           _wrapper_audio(hf_config, used, width, audio), video=video, extra=(video, audio))
 
 
 def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
@@ -314,7 +314,8 @@ def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
     image = _wrapper_token_id(hf_config, used, "image_token_id")
     used.update(("vision_soft_tokens_per_image", "boa_token_id", "eoa_token_id"))
     return _wrapper_fields("gemma3n", used, text, tower, projector, image, count,
-                           _wrapper_audio(hf_config, used, record_int(text, "emb_features")))
+                           _wrapper_audio(hf_config, used, record_int(text, "emb_features"),
+                                          _wrapper_token_id(hf_config, used, "audio_token_id")))
 
 
 _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields]] = {

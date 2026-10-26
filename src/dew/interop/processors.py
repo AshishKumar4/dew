@@ -371,7 +371,7 @@ class Processor:
                     raise ValueError(f"{pixels} and {coordinates} arrive together")
             # A Gemma 4 call's vision blocks are its mm_token_type_ids' runs. A call without the field
             # carries none, so its vision tokens read causally, as transformers computes them without it
-            # (5.17.0's modeling_gemma4.py:2395, modeling_gemma4_unified.py:1097-1101).
+            # (5.17.0's modeling_gemma4.py:2395-2405, modeling_gemma4_unified.py:1097-1101).
             if "mm_token_type_ids" in values:
                 types = np.asarray(values["mm_token_type_ids"])
                 if types.shape != tokens.shape or not np.issubdtype(types.dtype, np.integer):
