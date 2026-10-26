@@ -168,6 +168,10 @@ def write_source(directory, name: str, edit=lambda code: code) -> None:
     model = AutoModelForCausalLM.from_config(config, trust_remote_code=True, dtype=torch.float32)
     scatter_weights(model)
     model.save_pretrained(directory)
+    # save_pretrained writes the module of the class the auto class built over the repository's own,
+    # and the auto class builds the class registered for the config's: within one process, that is
+    # an earlier repository's of the same folder name and configuration code, whose `edit` may differ.
+    (directory / f"modeling_{stem}.py").write_text(edit(modeling()))
 
 
 @pytest.mark.parametrize("name", sorted(SOURCES))
