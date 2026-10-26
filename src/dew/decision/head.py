@@ -172,7 +172,10 @@ class DecisionHead(Head):
         # Every token takes its row's question type: a QuestionLayout row asks one question.
         owned = inputs.question_segments[:, None, :] == inputs.segments[:, :, None]
         kinds = jnp.sum(jnp.where(owned, inputs.kinds[:, None, :], 0), axis=-1)
-        x = states + self.type_embedding(kinds).astype(states.dtype)
+        # A padding token's state enters none of the head's blocks, whose attention multiplies its
+        # masked probabilities by every value.
+        x = (jnp.where(inputs.valid[..., None], states, 0)
+             + self.type_embedding(kinds).astype(states.dtype))
         metadata = AttentionMetadata(coordinates=inputs.coordinates())
         for block in self.blocks:
             x = block(x, train=train, attention_metadata=metadata)
@@ -412,11 +415,16 @@ class JointSchemaHead(Head):
         if inputs.spans_in_context != (spanned is not None):
             raise ValueError("a schema read as the row's context comes with the context's states, and "
                              "only then")
-        hidden = self.hidden_norm(states)
+        # A padding token's state, whatever the backbone left there, enters no norm, memory or mean:
+        # the attention over the memory multiplies its masked probabilities by every value.
+        hidden = self.hidden_norm(jnp.where(inputs.valid[..., None], states, 0))
         pooled, pooled_tokens = hidden, inputs.tokens
         if spanned is not None:
-            assert inputs.context is not None, "the context's states come with its tokens"
-            pooled, pooled_tokens = self.hidden_norm(spanned), inputs.context
+            assert inputs.context is not None and inputs.context_lengths is not None, (
+                "the context's states come with its tokens and their count")
+            real = jnp.arange(spanned.shape[1]) < inputs.context_lengths[:, None]
+            pooled = self.hidden_norm(jnp.where(real[..., None], spanned, 0))
+            pooled_tokens = inputs.context
         batch = inputs.tokens.shape[0]
         memory = self.memory_projection(hidden)
         # Each question reads its own row of the window: that row's last token, and its tokens alone.
