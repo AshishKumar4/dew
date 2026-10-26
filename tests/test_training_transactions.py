@@ -372,6 +372,31 @@ def test_local_partial_snapshot_survives_continued_training_and_weight_restore(t
         np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
 
 
+@pytest.mark.parametrize("local", [True, False], ids=["local", "persistent"])
+def test_a_steps_data_position_reads_back_however_the_step_is_restored(tmp_path, local):
+    """The data position a step saved reads back the same however the step is read: alone, as `fit`
+    reads it before it places the state (`Checkpoints.position`), with the whole train state
+    (`Trainer.place`), with the leaves a mapping names, or as host arrays, from the local directory
+    every process holds or from the persistent one."""
+    checkpoints = Checkpoints(str(tmp_path / "persistent"),
+                              local_directory=str(tmp_path / "local"), local_every=1)
+    train = trainer(checkpoints=checkpoints)
+    initial = train.initial_state()
+    data = batches()
+    prefix, *_ = train.compile(initial, data[0])(initial, data[0])
+    share = DataPartition()
+    if local:
+        checkpoints.save_local(1, prefix, b"1", share=share)
+    else:
+        checkpoints.save(1, prefix, b"1", share=share)
+    checkpoints.wait()
+    named = {"variables": jax.tree.map(
+        lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=leaf.sharding), prefix.variables)}
+    _, _, placed = trainer(checkpoints=checkpoints).place()
+    assert [checkpoints.position(1, share), placed, checkpoints.restore(named, 1, share=share)[1],
+            checkpoints.restore(step=1, share=share)[1]] == [b"1"] * 4
+
+
 def test_every_microbatch_of_an_accumulated_update_reads_the_updates_committed_before_it():
     """An update of two microbatches (`accumulation=2`) hands each of them the updates the run
     committed before its own (`Step.updates`), the clock an alternating objective reads its phase
