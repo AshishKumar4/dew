@@ -13,6 +13,19 @@ from dew._records import record
 from dew.batch import Batch
 
 
+def aligned(element: Batch, fields: tuple[str, ...], beside: tuple[str, ...] = ()) -> Batch:
+    """`element`'s `fields`, which hold one entry a token of the record and so one length, as arrays,
+    beside its `beside` fields, on axes of their own and read as they are. A record whose fields
+    differ in length is refused: packed or cut into windows, each field would be cut at other places,
+    one field's tokens standing beside another's from elsewhere, which no reader tells."""
+    lengths = {name: len(element[name]) for name in fields}
+    if len(set(lengths.values())) > 1:
+        raise ValueError(f"a record's token fields {list(fields)} hold one entry a token, so one length; "
+                         f"this record's hold {lengths}")
+    return {**{name: np.asarray(element[name]) for name in fields},
+            **{name: element[name] for name in beside}}
+
+
 @dataclasses.dataclass(frozen=True)
 class Fields(grain.MapTransform):
     """A record's fields `names` (every field where None), renamed by `rename`, without `remove`.
