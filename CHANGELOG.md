@@ -53,6 +53,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   `dew.objectives.lm.objective`); the axis names, `DEFAULT_RULES`, `axis_rules`, `logical_spec`,
   `row_axes`, `batch_axes` and `LayoutRefused` (from `dew.nn.sharding`). Import them from their
   new modules; the old ones no longer hold them.
+- A Hub split's shards are the files `datasets` resolves to it from the repository's listing, by its own
+  default patterns (`dew.data.sources.hub.split_files`): `dev` and `valid` are `validation`'s, a sharded
+  name's split is its own and a lone file is `train`'s, where a name match missed them.
+- An immutable upload's `retries` (`Cache.retry`) re-read only an object it created that reads back
+  otherwise; a failed transfer raises after its transport's own retries, not Dew's on top of them.
 - A decision run's calibration takes its probabilities through SciPy's `softmax` and fits each
   temperature with SciPy's bounded L-BFGS-B on its inverse, at least 1e-3, in place of a hand-written
   softmax and Newton loop; the grouping, ragged rows and soft targets are as before.
