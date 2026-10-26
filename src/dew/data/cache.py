@@ -225,7 +225,7 @@ class Cache:
             return computed
         if published is not None:
             # An optional cache's replay computes a record its generation cannot give (`Cache.read_on`).
-            replay = (_Published(published, transform, self, parent) if self.optional
+            replay = (_Published(published, transform, self, parent).at if self.optional
                       else _Published(published, transform))
             return _Mapped(grain.MapDataset.range(len(parent)).map(replay))
         return _CachedMap(parent, self, key, transform, source, tuple(missing))
@@ -294,14 +294,20 @@ class _Published:
     """The inputs by index a replay by index computes a record from where it reads on."""
 
     def __call__(self, row_id: RowId) -> CachedValue:
+        outputs = self.generation.outputs(row_id)
+        return outputs if self.transform is not None else outputs[0]
+
+    def at(self, index: int) -> CachedValue:
+        """The record at `index` of its inputs, as a replay by index reads it: computed from that
+        input where an optional cache's generation cannot give it (`Cache.read_on`)."""
         try:
-            outputs = self.generation.outputs(row_id)
+            return self(index)
         except (OSError, sqlite3.Error, ValueError) as error:
-            if (self.inputs is None or self.optional is None or not isinstance(row_id, int)
+            if (self.inputs is None or self.optional is None
                     or not self.optional.read_on(error, "replays nothing")):
                 raise
-            outputs = _transformed(row_id, self.inputs[row_id], self.transform)
-        return outputs if self.transform is not None else outputs[0]
+            outputs = _transformed(index, self.inputs[index], self.transform)
+            return outputs if self.transform is not None else outputs[0]
 
     def process(self, row_id: RowId, ordinal: int, value: Record, transform: Transform | None) -> CachedValue:
         try:
