@@ -68,7 +68,14 @@ from dew.nn.mla import IndexerFront
 from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import YarnScaling, rotary_freqs, rotate
 from dew.nn.sharding import RESIDUAL, constrain, down_projection, logical_axes
-from dew.nn.sparse_selection import candidate_pool, index_scores, selection_mask, top_k_keys, top_k_selection
+from dew.nn.sparse_selection import (
+    candidate_pool,
+    index_agreements,
+    index_scores,
+    selection_mask,
+    top_k_keys,
+    top_k_selection,
+)
 from dew.nn.visibility import visible
 
 COMPRESSORS = ('csa', 'hca', 'csa2')
@@ -343,7 +350,8 @@ class IndexScorer(nn.Module):
     def __call__(self, query, keys, x):
         weights = Dense(self.n_heads, use_bias=False, dtype=self.dtype,
                         precision=self.precision, name='weights_proj', dot_general=float32_dot_general)(x)
-        return index_scores(query, keys, weights, self.precision)
+        return index_scores(index_agreements(query, keys, self.precision), weights, query.shape[-1],
+                            self.precision)
 
 
 class LightningIndexer(CompressedEntries):
