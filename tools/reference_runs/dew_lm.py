@@ -82,7 +82,7 @@ def arguments() -> argparse.Namespace:
     parser.add_argument("--head-chunks", type=int, default=4)
     parser.add_argument("--split", type=int, default=None,
                         help="the microbatches a step's batch is read in (Trainer's split); unset plans it")
-    parser.add_argument("--state-dtype", choices=("float32", "bfloat16"), default="float32",
+    parser.add_argument("--state-dtype", choices=("float32", "bfloat16", "int8"), default="float32",
                         help="Adam's moments in memory (OptimConfig.state_dtype)")
     parser.add_argument("--remat", default=None, choices=sorted(REMAT_POLICIES),
                         help="the decoder's starting remat policy; unset, the model's")
