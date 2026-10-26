@@ -34,6 +34,7 @@ from dew.interop.decoder_parts import (
     RopeSpelling,
     base_config,
     dew_path,
+    layer_depth,
     layer_depth_path,
     prediction_path,
     read_partial_rope,
@@ -1000,8 +1001,15 @@ def dspark_path(name: str, config: Mapping[str, object], leaves: Mapping[str, tu
     parts = name.split('.')
     dspark = config.get('dspark')
     stages = dspark['stages'] if isinstance(dspark, Mapping) else 0
-    return prediction_path(name, 'dspark', parts[1] if len(parts) >= 3 else None, stages, '.'.join(parts[2:]),
+    return prediction_path(name, 'dspark', v4_depth(name, config), stages, '.'.join(parts[2:]),
                            leaves, lambda tail: layer_path('layers.0.' + tail, config))
+
+
+def v4_depth(name: str, config: Mapping[str, object]) -> int | None:
+    """The prediction depth or DSpark stage of a V4 tensor, the `{index}` of its `mtp.{index}.*`, or
+    None for the trunk's (`_deepseek_v4_path`, `dspark_path`)."""
+    parts = name.split('.')
+    return int(parts[1]) if parts[0] == 'mtp' and len(parts) >= 3 and parts[1].isdigit() else None
 
 
 def _deepseek_v4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
@@ -1034,7 +1042,7 @@ def _deepseek_v4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...
                 raise ValueError(f"{name} has no prediction-block parameter")
             return path
 
-        return prediction_path(name, 'mtp', parts[1] if len(parts) >= 3 else None,
+        return prediction_path(name, 'mtp', v4_depth(name, config),
                                record_int(config, "num_nextn_predict_layers", 0), '.'.join(parts[2:]),
                                _V4_PREDICTION_LEAVES, block)
     return dew_path(_v4_spelling(name), config)
@@ -1130,7 +1138,7 @@ DEEPSEEK_V4 = DecoderFamily(
     'deepseek_v4',
     'DeepseekV4ForCausalLM',
     lambda model: {},
-    weight_path=_deepseek_v4_path,
+    weight_path=_deepseek_v4_path, prediction_depth=v4_depth,
     prepare=deepseek_v4_prepare,
     preserve_source_layout=True,
     tied_head_names=('head.weight', 'embed.weight'),
@@ -1144,7 +1152,7 @@ DEEPSEEK_V32 = DecoderFamily(
     'deepseek_v32',
     'DeepseekV32ForCausalLM',
     lambda model: {},
-    weight_path=layer_depth_path,
+    weight_path=layer_depth_path, prediction_depth=layer_depth,
     preserve_source_layout=True,
     padding_idx=True,
     defaults={'max_position_embeddings': 163840},
@@ -1161,7 +1169,7 @@ DEEPSEEK_V2 = DecoderFamily(
     'deepseek_v2',
     'DeepseekV2ForCausalLM',
     lambda model: {},
-    weight_path=layer_depth_path,
+    weight_path=layer_depth_path, prediction_depth=layer_depth,
     preserve_source_layout=True,
     aliases={'num_experts': 'n_routed_experts'},
     # DeepseekV2Config's defaults for the fields its decoder and routing read.
@@ -1197,7 +1205,7 @@ DEEPSEEK_V3 = DecoderFamily(
     'deepseek_v3',
     'DeepseekV3ForCausalLM',
     lambda model: {},
-    weight_path=layer_depth_path,
+    weight_path=layer_depth_path, prediction_depth=layer_depth,
     preserve_source_layout=True,
     aliases={'num_local_experts': 'n_routed_experts', 'num_mtp_layers': 'num_nextn_predict_layers'},
     # DeepseekV3Config's defaults for the fields its decoder and routing read: its routed weights
