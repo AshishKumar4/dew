@@ -285,7 +285,9 @@ class InContextMemory(nn.Module):
         real = jnp.ones((batch, length), bool) if tokens.valid is None else jnp.asarray(tokens.valid, bool)
         if tokens.segments is not None:
             real = real & (tokens.segments != 0)
-        places = counted_places(tokens.segments, tokens.valid, tokens.positions)
+        # Each token's rank among its document's real tokens, which the chunks count from whatever
+        # logical positions the call gives, as the chunked path compacts the real tokens from 0.
+        places = counted_places(tokens.segments, tokens.valid)
         places = jnp.broadcast_to(jnp.arange(length)[None], (batch, length)) if places is None else places
         firsts = (real & (jnp.cumsum(real, axis=1) == 1)) | (
             jnp.zeros_like(real) if tokens.starts is None else jnp.asarray(tokens.starts, bool) & real)
