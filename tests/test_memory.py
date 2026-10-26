@@ -542,15 +542,23 @@ ADAPTED = {"titans": ("layers_0", "layers_1"), "gated_linear_attention": ("kerne
 Titans' two MLP layers and a linear memory's one map, at every head of both memory layers."""
 
 
-def factor_draw(model, lora, seed: int):
-    """A seed's base weights for `model`, `lora` attached over them with its factors drawn a tenth of a
-    normal apart from zero, and its token rows."""
-    ids = np.random.default_rng([1649, seed]).integers(0, 37, (ROWS, LENGTH), dtype=np.int32)
-    adapter = lora.apply(model, model.init(jax.random.key(seed), ids), key=seed)
-    rng = np.random.default_rng([1650, seed])
-    factors = jax.tree.map(lambda leaf: (0.1 * rng.standard_normal(leaf.shape)).astype(np.float32),
-                           adapter.variables["params"])
-    return {**adapter.variables, "params": factors}, ids
+def factor_draw(model, lora):
+    """A draw of a seed's base weights for `model` as its init draws them, the factors of `lora`
+    attached over them each drawn a tenth of a normal from zero, and its token rows."""
+    ids = jnp.zeros((ROWS, LENGTH), jnp.int32)
+    initialize = jax.jit(model.init)
+    attached = traverse_util.flatten_dict(lora.apply(model, initialize(jax.random.key(0), ids), key=0)
+                                          .variables["params"])
+
+    def draw(seed: int):
+        ids = np.random.default_rng([1649, seed]).integers(0, 37, (ROWS, LENGTH), dtype=np.int32)
+        base = traverse_util.flatten_dict(initialize(jax.random.key(seed), ids)["params"])
+        rng = np.random.default_rng([1650, seed])
+        factors = {path: (0.1 * rng.standard_normal(leaf.shape)).astype(np.float32)
+                   for path, leaf in attached.items() if path not in base}
+        return {"params": traverse_util.unflatten_dict({**base, **factors})}, ids
+
+    return draw
 
 
 @pytest.mark.parametrize("name", sorted(ADAPTED))
@@ -565,7 +573,8 @@ def test_an_adapter_on_a_memorys_inner_kernels_trains_drops_and_merges(name):
 
     model, wide = decoder(layer(name)), decoder(layer(name), dtype=jnp.float64)
     lora = LoRA(rank=2, modules=ADAPTED[name], dropout=0.5)
-    ids = jnp.asarray(factor_draw(model, lora, 0)[1])
+    draw = factor_draw(model, lora)
+    ids = jnp.asarray(draw(0)[1])
     base = model.init(jax.random.key(0), ids)
     adapter = lora.apply(model, base, key=0)
     adapted = adapter.model
@@ -579,14 +588,14 @@ def test_an_adapter_on_a_memorys_inner_kernels_trains_drops_and_merges(name):
     assert len(inner) == 2 * HEADS * len(ADAPTED[name])
     assert all(np.abs(np.asarray(leaf)).max() > 0 for leaf in inner)
 
-    drawn_factors, ids = factor_draw(model, lora, 0)
+    drawn_factors, ids = draw(0)
     dropped = adapted.apply(drawn_factors, ids, rngs={"dropout": jax.random.key(3)})
     assert not np.array_equal(np.asarray(dropped), np.asarray(adapted.apply(drawn_factors, ids)))
 
     def merged(model):
         return jax.jit(lambda variables, ids: model.apply(adapter.merge(variables), ids))
 
-    assert_as_exact(jax.jit(adapted.apply), merged(model), functools.partial(factor_draw, model, lora),
+    assert_as_exact(jax.jit(adapted.apply), merged(model), draw,
                     f"adapted {name} memory", seeds=SEEDS["adapted memory"], truth_fn=merged(wide))
 
 
