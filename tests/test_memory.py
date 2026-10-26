@@ -110,15 +110,17 @@ def paper_loss(kind: str, objective: Objective):
     return losses[kind]
 
 
-def written(module: InContextMemory, *, dtype, segments=None, gradient=None):
+def written(module: InContextMemory, *, dtype, segments=None, gradient=None, inputs=None):
     """The paper's update as a function of the stream, token by token, in `dtype` (float64 for the
     truth): the views and gates from the layer's projections (or the stream itself), the state in at
     least float32, each gradient at its chunk's start counted from its document's first token
     (`segments` `[S]`, one document where None) of the loss its paper writes for the layer's objective
     (`paper_loss`), the network's `slow` parameters left at W_0, and the readout at `dtype` of the
     state each token updated, or, where a chunk commits its steps at its end, of the state its chunk
-    started from (Nested Learning Eq 71)."""
+    started from (Nested Learning Eq 71). `inputs` maps each vector the network takes (a quantizer's
+    round trip), none where None."""
     wide = jnp.promote_types(dtype, jnp.float32)
+    fed = (lambda view: view) if inputs is None else inputs
     grad_net, read_net = module.network.clone(dtype=wide), module.network.clone(dtype=dtype)
     loss = paper_loss(module.objective.kind, module.objective)
     firsts = np.arange(LENGTH) == 0 if segments is None else np.r_[True, segments[1:] != segments[:-1]]
@@ -146,15 +148,15 @@ def written(module: InContextMemory, *, dtype, segments=None, gradient=None):
                 lambda fresh, kept: jnp.where(first, fresh, kept),
                 (head0, jax.tree.map(jnp.zeros_like, head0), head0, 0), (state, momentum, start, place))
             start = jax.tree.map(lambda w, s: jnp.where(place % module.chunk == 0, w, s), state, start)
-            target = v_t if module.target == "given" else inner(grad_net, start, v_t)
+            target = v_t if module.target == "given" else inner(grad_net, start, fed(v_t))
             apply = functools.partial(inner, grad_net)
-            g = (jax.grad(lambda params: loss(apply(params, k_t), target))(start)
-                 if gradient is None else gradient(loss, apply, start, k_t, target))
+            g = (jax.grad(lambda params: loss(apply(params, fed(k_t)), target))(start)
+                 if gradient is None else gradient(loss, apply, start, fed(k_t), target))
             momentum = jax.tree.map(lambda s, gl: mu_t * s - theta_t * gl, momentum, g)
             state = jax.tree.map(lambda w, s: (1 - alpha_t) * w + s, state, momentum)
             read = start if module.commit == "chunk" else state
             cast = jax.tree.map(lambda leaf: leaf.astype(dtype), {**fixed, **read})
-            return (state, momentum, start, place + 1), read_net.apply({"params": cast}, q_t)
+            return (state, momentum, start, place + 1), read_net.apply({"params": cast}, fed(q_t))
 
         carry = (head0, jax.tree.map(jnp.zeros_like, head0), head0, 0)
         return jax.lax.scan(token, carry, (q, k, v, theta, mu, alpha, jnp.asarray(firsts)))[1]
@@ -586,6 +588,83 @@ def test_an_adapter_on_a_memorys_inner_kernels_trains_drops_and_merges(name):
 
     assert_as_exact(jax.jit(adapted.apply), merged(model), functools.partial(factor_draw, model, lora),
                     f"adapted {name} memory", seeds=SEEDS["adapted memory"], truth_fn=merged(wide))
+
+
+SCALE = 0.125
+"""The FP8 input scale of the quantized checks' inner sites: inputs of a unit's spread take E4M3's
+coarse steps at 8 to 16 times it."""
+
+
+def level() -> InContextMemory:
+    """A continuum-memory level over its block's raw stream, one head of Titans' MLP updated every
+    token: its network's input is the stream itself, the same values in every precision."""
+    return layer("cms").clone(network=MLPMemory(hidden=(2 * WIDTH,)), commit="token")
+
+
+def test_a_memorys_inner_network_rounds_its_inputs_at_their_declared_scale():
+    """A checkpoint's input quantization at an inner site (`dew.quantization.InputQuantization`) rounds
+    that site's input at its scale at every application of the network, the gradient's prediction and
+    the readout: the layer computes its paper's update over the inputs E4M3 rounds at the scale its
+    variables hold, on par against float64 (check 1)."""
+    from dew.quantization import QUANTIZATION, InputQuantization, InputQuantizer
+
+    module = level()
+    quantized = InputQuantization(sites=(("initial/head_0/layers_0", "fp8"),)).apply(module)
+    draw = drawn(module)
+
+    def scaled(seed: int):
+        x, params = draw(seed)
+        scales = {"initial": {"head_0": {"layers_0": {"fp8_input_scale": np.float32(SCALE)}}}}
+        return x, {**params, QUANTIZATION: scales}
+
+    rounded = InputQuantizer.fp8(SCALE).qdq
+    assert_as_exact(jax.jit(quantized.apply), written(module, dtype=jnp.float32, inputs=rounded), scaled,
+                    "quantized memory", seeds=MEMORY_SEEDS,
+                    truth_fn=written(module, dtype=jnp.float64, inputs=rounded))
+
+
+def test_a_quantized_memory_decoder_reloads_from_its_record():
+    """A decoder computing under input quantization at its memories' inner sites reads their scales:
+    its logits move from the plain decoder's at the same weights; and its record rebuilds a decoder that
+    computes them bit for bit."""
+    from dew.config import ModelConfig
+    from dew.quantization import QUANTIZATION, InputQuantization
+    from dew.registry import to_record
+
+    sites = tuple((f"layers_{layer}/self_attn/initial/head_{head}/layers_0", "fp8")
+                  for layer in (0, 1) for head in range(2))
+    plain = decoder()
+    quantized = InputQuantization(sites=sites).apply(plain)
+    ids = jax.random.randint(jax.random.key(1), (ROWS, LENGTH), 0, 37)
+    variables = quantized.init(jax.random.key(0), ids)
+    scales = jax.tree.map(lambda scale: np.float32(SCALE), variables[QUANTIZATION])
+    variables = {**variables, QUANTIZATION: scales}
+    logits = np.asarray(quantized.apply(variables, ids))
+    assert not np.array_equal(logits, np.asarray(plain.apply({"params": variables["params"]}, ids)))
+    record = json.loads(json.dumps(to_record(ModelConfig.from_model(quantized), ModelConfig)))
+    reloaded = ModelConfig.from_dict(record).build()
+    np.testing.assert_array_equal(np.asarray(reloaded.apply(variables, ids)), logits)
+
+
+def test_a_frozen_fp8_inner_kernel_is_w0_as_its_codes_decode():
+    """An inner kernel a frozen FP8 record packs (`InputQuantization.frozen_fp8`, a LoRA run's FP8 base)
+    is the memory's W_0 as its codes decode (`frozen_fp8_kernel`, as a merge decodes it), which the
+    in-context steps move from: the layer computes, bit for bit, the same layer whose kernels are those
+    decoded ones."""
+    from dew.quantization import QUANTIZATION, InputQuantization, frozen_fp8_kernel
+
+    module = layer("titans")
+    sites = tuple(f"initial/head_{head}/layers_0" for head in range(HEADS))
+    record = InputQuantization(frozen_fp8=sites, measured_on="sm90")
+    x, params = drawn(module)(0)
+    codes = record.packed(params["params"])
+    kernels = {("initial", f"head_{head}", "layers_0", "kernel"): frozen_fp8_kernel(
+        codes["initial"][f"head_{head}"]["layers_0"]) for head in range(HEADS)}
+    flat = traverse_util.flatten_dict(params["params"])
+    held = traverse_util.unflatten_dict({path: leaf for path, leaf in flat.items() if path not in kernels})
+    frozen = jax.jit(record.apply(module).apply)({"params": held, QUANTIZATION: codes}, x)
+    decoded = jax.jit(module.apply)({"params": traverse_util.unflatten_dict({**flat, **kernels})}, x)
+    np.testing.assert_array_equal(np.asarray(frozen), np.asarray(decoded))
 
 
 def test_a_memory_refuses_a_bidirectional_decoder():
