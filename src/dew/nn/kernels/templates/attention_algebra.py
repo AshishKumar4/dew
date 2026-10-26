@@ -780,17 +780,16 @@ class Keys(NamedTuple):
     the guarded walk their largest magnitude a key (`magnitudes`, or `largest()` where the mainloop holds the
     values where it cannot read them, a Mosaic slot's shared memory), the
     mainloop's product `dot(a, b)`, `a @ b` in fp32, where the mainloop holds the running sums of the
-    weighted values itself (an MMA's accumulator), `accumulate(acc, scale, parts, value, row)`, which returns
-    the running sums `acc` (the state's, in the mainloop's own form) taken by `scale(acc, row)` with the
-    weights' `parts`' products with the values added (`summed_products`), `row` the old anchor's value row
-    the training step's split sums join (`KeptRows.row`, None on the plain step), and the products the
-    logits are a factor of, where they are (`logits_of`), whose extreme the tile's maximum takes (`peak`)."""
+    weighted values itself (an MMA's accumulator), `accumulate(acc, scale, parts, value)`, which returns
+    the running sums `acc` (the state's, in the mainloop's own form) taken by `scale(acc)` with the weights'
+    `parts`' products with the values added (`summed_products`), and the products the logits are a factor
+    of, where they are (`logits_of`), whose extreme the tile's maximum takes (`peak`)."""
 
     coords: Coords
     logits: jax.Array
     load: Callable[[], jax.Array]
     dot: Callable[[jax.Array, jax.Array], jax.Array]
-    accumulate: Callable[[Any, Callable, Parts, jax.Array, Any], Any] | None = None
+    accumulate: Callable[[Any, Callable, Parts, jax.Array], Any] | None = None
     products: jax.Array | None = None
     largest: Callable[[], jax.Array] | None = None
 
@@ -839,22 +838,19 @@ def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
     form)."""
     m, factor, p, value, held = _softmax(spec, state, keys)
     if held is None and keys.accumulate is not None:
-        acc = keys.accumulate(state.acc, lambda acc, _: carry_factor(acc, factor, None),
-                              ((narrow(p, value.dtype), None),), value, None)
+        acc = keys.accumulate(state.acc, lambda acc: carry_factor(acc, factor, None),
+                              ((narrow(p, value.dtype), None),), value)
         return Partial(acc, m, denominator_after(state.total, factor, p))
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
     times = functools.partial(_times, keys.dot, value, multiplier=multiplier)
     return stepped(state, m, factor, p, times(p), held, times)
 
 
-class KeptRows(NamedTuple):
-    """A training walk that keeps the anchor's value row rather than gather it by key: `row`, the row it
-    keeps (`[bq, Dv]`, or the blocks of it its accumulators hold), and `pick(onehot, value)`, a tile's value
-    rows at a one-hot `[bq, bk]` (each row's anchor key), in the row's structure, its product with the
-    values. The step returns it with the row the anchor moved to (`training_step`)."""
-
-    pick: Callable[[jax.Array, jax.Array], Any]
-    row: Any
+class Anchored(NamedTuple):
+    """A training walk at its anchor known before it (each row's first key at the keys' largest logit, from a
+    walk of `argmax` over its logits alone; the carry's `Argmax` from its start): the anchor's tile gives its
+    own weight and every other key joins the split sums by its product, no old anchor's term ever moving (the
+    anchor's own weight is zero until its tile), so no value row is kept or gathered (`training_step`)."""
 
 
 Gathered = Callable[[jax.Array], jax.Array]
@@ -862,7 +858,7 @@ Gathered = Callable[[jax.Array], jax.Array]
 
 
 @overload
-def training_step(spec: Forward, carry: Carry, keys: Keys, rows: KeptRows) -> tuple[Carry, KeptRows]: ...
+def training_step(spec: Forward, carry: Carry, keys: Keys, rows: Anchored) -> tuple[Carry, Anchored]: ...
 
 
 @overload
@@ -870,22 +866,24 @@ def training_step(spec: Forward, carry: Carry, keys: Keys, rows: Gathered) -> tu
 
 
 def training_step(spec: Forward, carry: Carry, keys: Keys,
-                  rows: Gathered | KeptRows) -> tuple[Carry, Gathered | KeptRows]:
+                  rows: Gathered | Anchored) -> tuple[Carry, Gathered | Anchored]:
     """A training walk's carry after a tile `keys`: its state, whose sums are the weighted values kept apart
     from the anchor key's (`B`, with the initial state's), the anchor key, its own weight, and the other
     keys' weights' sum (keys alone). Where the anchor moved to this tile, the old anchor's term (its weight
-    times its value row, `rows(key)` each row's at its key `[bq]`, or the one the walk keeps, `KeptRows.row`)
-    joins `B` and the sum before the rescale (`split_taken`,
-    `split_rows`), and the new anchor's weight is the tile's; the tile's other keys add their product and
-    their narrowed weights. So neither is summed with a key's weight cancelled out of it. On the guarded walk
-    the tile's product, sum and own weight take the row's shift past its weights' (`beyond_weights`). Where
-    the mainloop holds the sums (`Keys.accumulate`, the plain walk's), they take the tile there. Returns the
-    carry and `rows`, a kept row moved where the anchor moved."""
+    times its value row, `rows(key)` each row's at its key `[bq]`) joins `B` and the sum before the rescale
+    (`split_taken`, `split_rows`), and the new anchor's weight is the tile's; the tile's other keys add their
+    product and their narrowed weights. So neither is summed with a key's weight cancelled out of it. At an
+    anchor known before the walk (`Anchored`, the carry's `Argmax` its own) the anchor's tile alone gives its
+    weight, no other's ever moving. On the guarded walk the tile's product, sum and own weight take the
+    row's shift past its weights' (`beyond_weights`). Where the mainloop holds the sums (`Keys.accumulate`,
+    the plain walk's), they take the tile there. Returns the carry and `rows`."""
     state, arg, own, others_total = carry
     m, factor, p, value, held = _softmax(spec, state, keys)
-    anchor = argmax(arg, keys.logits, keys.coords.k_pos)
-    moved = anchor.peak > arg.peak
+    anchored = isinstance(rows, Anchored)
+    anchor = arg if anchored else argmax(arg, keys.logits, keys.coords.k_pos)
     at_anchor = keys.coords.k_pos == expand(anchor.key, keys.logits)
+    # Known, the anchor arrives at its own tile, its weight zero until then, so no old term joins.
+    moved = jnp.any(at_anchor, axis=-1) if anchored else anchor.peak > arg.peak
     others, own_tile = anchor_split(narrow(p, value.dtype), at_anchor)
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
     parts = ((others, None),)
@@ -895,24 +893,22 @@ def training_step(spec: Forward, carry: Carry, keys: Keys,
         parts = weights_parts(jnp.where(at_anchor, 0.0, p) * multiplier, value.dtype)
         anchor_draw = drawn(keys.coords, keys.coords.q_pos, anchor.key[:, None])
         anchor = anchor._replace(multiplier=None if anchor_draw is None else anchor_draw[:, 0])
-    old = rows.row if isinstance(rows, KeptRows) else rows(arg.key)
-    taken = functools.partial(split_taken, own=own, alpha=factor, moved=moved, held=held,
-                              old_multiplier=arg.multiplier)
+
+    def taken(acc):
+        if isinstance(rows, Anchored):
+            return carry_factor(acc, factor, held)
+        return split_taken(acc, own, factor, moved, rows(arg.key), held, arg.multiplier)
+
     accumulate = keys.accumulate if held is None else None
     if accumulate is None:
         times = functools.partial(_times, keys.dot, value, multiplier=multiplier)
         after = stepped(state, m, factor, p, jnp.zeros_like(state.acc), held, times)
-        acc = taken(state.acc, old_value=old) + beyond_weights(summed_products(parts, value, keys.dot), held)
+        acc = taken(state.acc) + beyond_weights(summed_products(parts, value, keys.dot), held)
     else:
         # The tile's fp32 weights done with before its products, so they hold no registers through them.
         after = Partial(state.acc, m, denominator_after(state.total, factor, p))
-        acc = accumulate(state.acc, lambda acc, row: taken(acc, old_value=row), parts, value, old)
+        acc = accumulate(state.acc, taken, parts, value)
     own, others_total = split_rows(own, others_total, factor, moved, others, own_tile, held)
-    if isinstance(rows, KeptRows):
-        # The anchor's value row where it moved to this tile: the tile's row at its key.
-        picked = rows.pick(at_anchor.astype(value.dtype), value)
-        rows = rows._replace(row=jax.tree.map(
-            lambda new, kept: jnp.where(expand(moved, kept), new.astype(kept.dtype), kept), picked, rows.row))
     return (after._replace(acc=acc), anchor, own, others_total), rows
 
 
@@ -1157,26 +1153,39 @@ def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     return Partial(acc, m, total, Guard(shift, reach, plain, plain_total, live))
 
 
+def output_of(acc: jax.Array, denominator: jax.Array, *, guarded: bool) -> jax.Array:
+    """The weighted values `acc` over their denominator, any leading axes: zero for a query that saw nothing
+    where it may (`guarded`: a guarded walk's or one from a state)."""
+    if not guarded:
+        return acc / expand(denominator, acc)
+    safe = expand(jnp.where(denominator > 0, denominator, 1.0), acc)
+    return jnp.where(expand(denominator > 0, acc), acc / safe, 0.0)
+
+
+def finished_rows(spec: Forward, state: Partial, *, initial: bool) -> tuple[jax.Array, jax.Array]:
+    """The block's residual rows (`finish`'s): the maximum (0 for a query that saw nothing and started from no
+    state, as the reference's) in the units the backward recomputes its logits in, natural, or raw products
+    where the forward's are (`Forward.raw`), and the denominator, unshifted (`room`)."""
+    m = state.m if spec.raw else spec.naturalized(state.m)
+    if spec.guarded or initial:
+        m = jnp.where(m == -jnp.inf, 0.0, m)
+    fields = state.guard
+    if fields is None:
+        return m, state.total
+    # The natural denominator: the unshifted one where finite, else the shifted one taken back.
+    return m, jnp.where(finite(fields.plain_total), fields.plain_total, power2(state.total, fields.shift))
+
+
 def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable | None = None,
            output_params: tuple[jax.Array, ...] = ()) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The block's output `[bq, Dv]` fp32 (its weighted values over its denominator, zero for a query
-    that saw nothing and started from no state, then the output hook) and its residuals: the maximum (0
-    for such a query, as the reference's) in the units the backward recomputes its logits in, natural, or
-    raw products where the forward's are (`Forward.raw`), and the denominator, unshifted (`room`); the
-    output is the shifted sums' ratio, which the shift leaves."""
-    m = state.m if spec.raw else spec.naturalized(state.m)
-    denominator = state.total
-    if spec.guarded or initial:
-        out = jnp.where(expand(denominator > 0, state.acc),
-                        state.acc / expand(jnp.where(denominator > 0, denominator, 1.0), state.acc), 0.0)
-        m = jnp.where(m == -jnp.inf, 0.0, m)
-    else:
-        out = state.acc / expand(denominator, state.acc)
+    that saw nothing and started from no state, then the output hook) and its residual rows
+    (`finished_rows`); the output is the shifted sums' ratio, which the shift leaves."""
+    m, denominator = finished_rows(spec, state, initial=initial)
+    out = output_of(state.acc, state.total, guarded=spec.guarded or initial)
     fields = state.guard
     if fields is not None:
-        # The natural denominator: the unshifted one where finite, else the shifted one taken back.
         bounded = finite(fields.plain_total)
-        denominator = jnp.where(bounded, fields.plain_total, power2(denominator, fields.shift))
         # A live row's elements from the unshifted sums where they and their denominator are finite, as
         # the plain walk's; the shifted sums' ratio where they overflowed (`Guard.plain`). Every other
         # row shifted nothing, so its sums are the plain walk's own (a training walk's joined split sums).

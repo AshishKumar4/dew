@@ -783,16 +783,22 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
                                                                                     jnp.arange(heads))
         normalized = acc0 * (carried * inverse)[..., None] + valued((p * inverse[..., None]) * drawn)
 
-    def one(row, head):
-        o = normalized[row, head]
-        if hooks.output_mod is not None:
-            o = hooks.output_mod(o, *(_per_head(p, row, head) for p in hooks.output_params))
-        return o.astype(query.dtype)
-
-    rows = jnp.arange(batch)
-    out = jax.vmap(jax.vmap(one, in_axes=(None, 0)), in_axes=(0, None))(rows, jnp.arange(heads))
-    out = jnp.swapaxes(out, 1, 2)
+    out = output_hooked(normalized, hooks.output_mod, hooks.output_params)
+    out = jnp.swapaxes(out.astype(query.dtype), 1, 2)
     return (out, safe, total) if residuals else out
+
+
+def output_hooked(out: jax.Array, output_mod: Callable | None, output_params: tuple[Param, ...]) -> jax.Array:
+    """The normalized output `out` `[B, H, Q, Dv]` under `output_mod`, each batch row's and head's `[Q, Dv]`
+    with its parameters as the reference reads them (`_per_head`); `out` itself where there is no hook."""
+    if output_mod is None:
+        return out
+
+    def one(row, head):
+        return output_mod(out[row, head], *(_per_head(param, row, head) for param in output_params))
+
+    batch, heads = out.shape[:2]
+    return jax.vmap(jax.vmap(one, in_axes=(None, 0)), in_axes=(0, None))(jnp.arange(batch), jnp.arange(heads))
 
 
 LOG2E = 1.4426950408889634

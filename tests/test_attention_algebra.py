@@ -437,57 +437,69 @@ def test_the_headroom_guard_leaves_ordinary_inputs_bitwise_unchanged(causal):
     np.testing.assert_array_equal(walked(headroom=True), walked(headroom=False))
 
 
+ANCHORED_SEEDS = 8
+"""The anchored training walk's site's declared draws (check 1)."""
+
+
 @pytest.mark.parametrize("natural", [False, True], ids=["folded", "natural"])
-def test_a_training_step_holding_its_sums_and_anchor_row_is_the_gathering_steps_arithmetic(natural):
-    """`algebra.training_step` as a mainloop that holds its split sums in two blocks of value columns
-    (`Keys.accumulate`) and keeps the anchor's value row (`KeptRows`) runs it, Mosaic's
-    training forward, against the step that sums whole rows and gathers the row by key (`rows`), the plain-JAX
-    and Triton mainloops': the same state, anchor, row sums and split sums, bitwise, over bf16 key tiles whose
-    maximum moves, ties among them. Each product is exact in float64 and rounded once, so a column block's is
-    the whole row's."""
+def test_a_training_walk_at_its_anchor_known_is_on_par_with_the_gathering_walk(natural):
+    """`algebra.training_step` at each row's anchor known before the walk (`Anchored`, from a walk of
+    `argmax` over the logits alone), as Mosaic's training forward runs it, its split sums in the mainloop's
+    accumulator (`Keys.accumulate`), against the step that finds the anchor as it walks and gathers the old
+    anchor's value row where it moves (the plain-JAX and Triton mainloops'): the same maxima and anchor
+    keys, and its split sums, own weight and row sums on par (check 1, the gathering walk in float64 the
+    truth), over bf16 key tiles whose maximum moves, ties among them."""
     queries, width, tile, tiles = 16, 32, 16, 4
-    rng = np.random.default_rng(0)
-    # Each tile's logits a step above the last's in some rows, so anchors move, with ties on a coarse grid.
-    logits = (np.round(rng.normal(size=(tiles, queries, tile)) * 2) / 2
-              + np.arange(tiles)[:, None, None] * rng.integers(0, 2, (1, queries, 1)))
-    values = jnp.asarray(rng.normal(size=(tiles * tile, width)), jnp.bfloat16)
     spec = algebra.Forward("full", tiles * tile, ids=False, scale=1.0, natural=natural)
-    columns = [slice(first, first + width // 2) for first in (0, width // 2)]
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        # Each tile's logits a step above the last's in some rows, so anchors move, ties on a coarse grid.
+        logits = (np.round(rng.normal(size=(tiles, queries, tile)) * 2) / 2
+                  + np.arange(tiles)[:, None, None] * rng.integers(0, 2, (1, queries, 1)))
+        values = rng.normal(size=(tiles * tile, width))
+        return jnp.asarray(logits, jnp.float32), jnp.asarray(values, jnp.bfloat16)
 
     def dot(a, b):
-        return jnp.asarray(np.asarray(a, np.float64) @ np.asarray(b, np.float64), jnp.float32)
+        return jnp.matmul(a, b, preferred_element_type=jnp.promote_types(jnp.result_type(a, b), jnp.float32))
 
-    def keys_at(index, accumulate=None):
+    def keys_at(logits, values, index, accumulate=None):
         positions = algebra.Coords(jnp.arange(queries)[:, None], index * tile + jnp.arange(tile)[None, :])
         value = values[index * tile:(index + 1) * tile]
-        return algebra.Keys(positions, jnp.asarray(logits[index], jnp.float32), lambda: value, dot,
-                            accumulate)
+        return algebra.Keys(positions, logits[index], lambda: value, dot, accumulate)
 
-    nothing = jnp.zeros((queries,), jnp.float32)
-    start = algebra.started(spec, None, queries, width, None)
-    gathered = (start, algebra.no_argmax(queries), nothing, nothing)
-    for index in range(tiles):
-        gathered, _ = algebra.training_step(spec, gathered, keys_at(index), lambda key: values[key])
+    def walk(logits, values, *, anchored: bool):
+        nothing = jnp.zeros((queries,), logits.dtype)
+        start = algebra.started(spec, None, queries, width, None)
+        start = start._replace(acc=start.acc.astype(logits.dtype), m=start.m.astype(logits.dtype),
+                               total=start.total.astype(logits.dtype))
+        arg = algebra.Argmax(nothing - jnp.inf, jnp.zeros((queries,), jnp.int32))
 
-    def accumulate(acc, scale, parts, value, kept):
-        return tuple(scale(block_sums, row) + algebra.summed_products(parts, value[:, block], dot)
-                     for block_sums, row, block in zip(acc, kept, columns, strict=True))
+        def gathered_rows(key):
+            return values[key]
 
-    def picked(onehot, value):
-        return tuple(dot(onehot, value[:, block]) for block in columns)
+        def accumulated(acc, scale, parts, value):
+            return scale(acc) + algebra.summed_products(parts, value, dot)
 
-    row = algebra.KeptRows(picked, tuple(jnp.zeros((queries, width // 2), jnp.bfloat16) for _ in columns))
-    sums = tuple(start.acc[:, block] for block in columns)
-    kept = (algebra.Partial(sums, start.m, start.total), algebra.no_argmax(queries), nothing, nothing)
-    for index in range(tiles):
-        kept, row = algebra.training_step(spec, kept, keys_at(index, accumulate), row)
+        rows: algebra.Gathered | algebra.Anchored = gathered_rows
+        accumulate = None
+        if anchored:
+            for index in range(tiles):
+                arg = algebra.argmax(arg, logits[index], index * tile + jnp.arange(tile)[None, :])
+            rows, accumulate = algebra.Anchored(), accumulated
+        carry = (start, arg, nothing, nothing)
+        for index in range(tiles):
+            carry, _ = algebra.training_step(spec, carry, keys_at(logits, values, index, accumulate), rows)
+        state, arg, own, others_total = carry
+        return state.acc, state.total, own, others_total, state.m, arg.peak, arg.key
 
-    (state, arg, own, others), (kept_state, kept_arg, kept_own, kept_others) = gathered, kept
-    for mine, theirs in ((kept_state.m, state.m), (kept_state.total, state.total), (kept_arg.peak, arg.peak),
-                         (kept_arg.key, arg.key), (kept_own, own), (kept_others, others),
-                         (jnp.concatenate(kept_state.acc, axis=1), state.acc),
-                         (jnp.concatenate(row.row, axis=1), values[arg.key])):
+    anchored, gathered = (jax.jit(functools.partial(walk, anchored=known)) for known in (True, False))
+    logits, values = draw(0)
+    # The maxima and anchor keys are the logits' own, exact in either walk.
+    for mine, theirs in zip(anchored(logits, values)[4:], gathered(logits, values)[4:], strict=True):
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
+    assert_as_exact(lambda *drawn: anchored(*drawn)[:4], lambda *drawn: gathered(*drawn)[:4], draw,
+                    f"anchored training walk {'natural' if natural else 'folded'}", seeds=ANCHORED_SEEDS)
 
 
 @pytest.mark.parametrize("edge", ["small scale", "large scale"])
