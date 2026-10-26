@@ -2269,16 +2269,17 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def marked_residuals(self) -> frozenset[str]:
         """The `RESIDUALS` this decoder's layers can mark: each layer's mixer kind's
-        (`MixerBase.marks`, every name where a kind does not say) and, where a layer, a
-        prediction depth or the drafter has a feed-forward, its (`MLP_RESIDUALS`, the dense
-        MLP's and the experts' alike)."""
+        (`MixerBase.marks`, every name where a kind does not say) and, where a layer, its
+        gated cross-attention, a prediction depth or the drafter has a feed-forward, its
+        (`MLP_RESIDUALS`, the dense MLP's and the experts' alike)."""
         types = self.per_layer_types
         kinds = self.layer_kinds(types)
         mixers = [kind.mixer or self.mixer for kind in kinds.values()]
         if any(mixer is not None and mixer.marks() is None for mixer in mixers):
             return frozenset(RESIDUALS)
         default = AttentionMixer.residuals or ()
-        feeds = (any(spec.routed or spec.width for spec in self._layer_specs(types, kinds, self.layer_mixer))
+        feeds = (any(spec.routed or spec.width or spec.cross
+                     for spec in self._layer_specs(types, kinds, self.layer_mixer))
                  or self.num_nextn_predict_layers or self.dspark is not None)
         marked = (default if mixer is None else mixer.marks() or () for mixer in mixers)
         return frozenset(MLP_RESIDUALS if feeds else ()).union(*marked)
