@@ -104,6 +104,14 @@ DROPPING = ("the Mosaic mainloop takes no probability dropout yet (the route run
 """Why this mainloop refuses a dropping call (`refused`): its ops carry no draw."""
 
 
+def whole_tiles(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> bool:
+    """Whether a program of `family` takes `tiles`: its query and key tiles positive whole multiples of the
+    rows a role's products cover (`Family.rows`), and one to the family's count of consumers
+    (`Family.consumers`), whose turns its walks are written for."""
+    return (0 < tiles.consumers <= family.consumers and tiles.block_q > 0 and tiles.block_k > 0
+            and tiles.block_q % family.rows == 0 and tiles.block_k % family.rows == 0)
+
+
 def refused(dtype, width: int, value_width: int, hooks: Hooks | None, *, backward: bool,
             family: mosaic.Family) -> str | None:
     """Why this mainloop takes no call of `dtype` operands, head widths `width` and `value_width` and `hooks`
@@ -169,7 +177,8 @@ def _hook_jaxprs(hooks: Hooks, tile: tuple[int, int], value_width: int, *,
         return jax.ShapeDtypeStruct(() if kind == Kind.HEAD else (rows, width), kept_dtype(dtype))
 
     traced = []
-    score_mod = hooks.score_mod
+    # A keyed launch's hook is its fingerprint (`tuning.program`), whose lowering its live call established.
+    score_mod = hooks.score_mod if callable(hooks.score_mod) else None
     if score_mod is not None:
         positions = jax.ShapeDtypeStruct(tile, jnp.int32)
         params = [entries(param.kind, param.value.dtype, columns) for param in hooks.score_params]
@@ -184,7 +193,7 @@ def _hook_jaxprs(hooks: Hooks, tile: tuple[int, int], value_width: int, *,
                 return pull(jnp.ones_like(out))
 
             traced.append(jax.make_jaxpr(pulled)(logits, positions, positions, *params).jaxpr)
-    if hooks.output_mod is not None:
+    if callable(hooks.output_mod):
         traced.append(jax.make_jaxpr(hooks.output_mod)(
             jax.ShapeDtypeStruct((rows, value_width), jnp.float32),
             *(entries(param.kind, param.value.dtype, value_width) for param in hooks.output_params)).jaxpr)
@@ -341,9 +350,9 @@ class _Program[T: (Tiles, BackwardTiles)]:
         return count - 1 - index if self.causal else index
 
     def __post_init__(self):
-        unit = self.family.rows
-        if self.tiles.block_q % unit or self.tiles.block_k % unit:
-            raise ValueError(f"{self.tiles}: query and key tiles of whole {unit} rows ({self.family.name})")
+        if not whole_tiles(self.family, self.tiles):
+            raise ValueError(f"{self.tiles}: query and key tiles of whole {self.family.rows} rows and "
+                             f"{self.family.consumers} consumers at most ({self.family.name})")
 
     def walked(self, first):
         """The key tiles a query block from `first` reads: those holding the call's keys (none wholly past

@@ -30,12 +30,13 @@ import functools
 import math
 import operator
 from collections.abc import Callable
-from typing import NamedTuple
+from typing import ClassVar, NamedTuple
 
 import jax
 import jax.numpy as jnp
 
 from dew.hashing import fmix32
+from dew.nn.kernels import tuning
 from dew.nn.precision import at_least_fp32, float32_einsum
 
 
@@ -910,12 +911,89 @@ def differentiable(score_mod: Callable, q_pos, k_pos, params, floating: list[int
 
 
 TRACED_TILE = 16
-"""A launch's `output_width` where it states none (`attention_triton.TritonForward`,
-`attention_mosaic.MosaicForward`)."""
+"""The tile a hook is traced at for its picks' key (`hook_program`)."""
+
+
+def hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], *,
+                 differentiated: bool = False, width: int = TRACED_TILE) -> str | None:
+    """What a score or output hook computes, as its launch's picks key it (`tuning.program`): a score
+    hook traced at a `TRACED_TILE` square fp32 tile, an output hook at `TRACED_TILE` queries of the
+    call's padded value `width`, the entries' indices and each parameter as its kind lays it out there,
+    in its dtype in the kernels (`dtypes`); `differentiated`, its pullback too, so a hook whose
+    derivative is its own rule (`jax.custom_vjp`) keys by that rule. None or an already traced key as
+    it is."""
+    if hook is None or isinstance(hook, str):
+        return hook
+    tile = TRACED_TILE
+    layouts = {Kind.HEAD: (), Kind.QUERY: (tile, 1), Kind.KEY: (1, tile), Kind.TILE: (tile, tile),
+               Kind.OUTPUT: (tile, width)}
+    params = [jax.ShapeDtypeStruct(layouts[kind], dtype) for kind, dtype in zip(kinds, dtypes, strict=True)]
+    square = jax.ShapeDtypeStruct((tile, tile), jnp.float32)
+    if name == "output_mod":
+        return tuning.program(hook, jax.ShapeDtypeStruct((tile, width), jnp.float32), *params)
+    positions = (jax.ShapeDtypeStruct((tile, 1), jnp.int32), jax.ShapeDtypeStruct((1, tile), jnp.int32))
+    if not differentiated:
+        return tuning.program(hook, square, *positions, *params)
+    floating = floating_params(params)
+
+    def pulled(s, q_pos, k_pos, *values):
+        hooked = differentiable(hook, q_pos, k_pos, values, floating)
+        out, pull = jax.vjp(hooked, s, *(values[index] for index in floating))
+        return out, pull(jnp.ones_like(out))
+
+    return tuning.program(pulled, square, *positions, *params)
+
+
+class AttentionLaunch(tuning.KernelOp):
+    """What every launch of the template shares as the tuner sees it (ahead of the op's own bases): its hooks
+    keyed by what each computes (`tuning.KernelOp.traced`, `hook_program`), a score hook at its parameters'
+    kinds and dtypes (`score_kinds`, `score_dtypes`) and with its pullback where the launch differentiates
+    it (`DIFFERENTIATED`, a backward's), a forward's output hook at its parameters' and the padded value
+    width (`output_kinds`, `output_dtypes`, `output_width`); and its timing operands' spans whole
+    (`tuning.KernelOp.operands`, `spanned`), the spans' starts at its arrays' place `SPANS`."""
+
+    DIFFERENTIATED: ClassVar[bool] = False
+    SPANS: ClassVar[int] = 3
+    """The place of the spans' starts among the launch's array arguments, their ends the next, then the
+    queries' and keys' ids where the call has them (a forward's after its queries, keys and values)."""
+    score_kinds: tuple[Kind, ...] = ()
+    score_dtypes: tuple[str, ...] = ()
+    output_kinds: tuple[Kind, ...] = ()
+    output_dtypes: tuple[str, ...] = ()
+    output_width: int = TRACED_TILE
+
+    def traced(self, name: str, value: Callable | str | None) -> str | None:
+        if name == "output_mod":
+            return hook_program(name, value, self.output_kinds, self.output_dtypes, width=self.output_width)
+        return hook_program(name, value, self.score_kinds, self.score_dtypes,
+                            differentiated=self.DIFFERENTIATED)
+
+    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
+        return spanned(specs, super().operands(specs, seed), self.SPANS)
+
+
+def spanned(specs: list[jax.ShapeDtypeStruct], arrays: list[jax.Array], first: int) -> list[jax.Array]:
+    """A launch's timing operands with its spans whole, so a timed launch visits every tile a dense call
+    does: its spans' starts and ends at `specs[first]` and the next (`[B, Q]`, or a call's runs `[B, Q, R]`),
+    each query's interval, or its first run, every key (`specs[1]` being the keys) and its other runs
+    empty past them; and its queries' and keys' ids where the call has them, the two integer arrays after
+    them, one document. Every other operand keeps its draw."""
+    keys = specs[1].shape[1]
+    start, end = specs[first], specs[first + 1]
+    runs = start.shape[2:]
+    opened = (jnp.arange(math.prod(runs)) == 0).reshape(runs)
+    arrays[first] = jnp.broadcast_to(jnp.where(opened, 0, keys), start.shape).astype(start.dtype)
+    arrays[first + 1] = jnp.full(end.shape, keys, end.dtype)
+    ids = [index for index in (first + 2, first + 3)
+           if index < len(specs) and jnp.issubdtype(specs[index].dtype, jnp.integer)]
+    if len(ids) == 2:
+        for index in ids:
+            arrays[index] = jnp.ones(specs[index].shape, specs[index].dtype)
+    return arrays
 
 
 class Split(NamedTuple):
-    """A training forward's split sums (`attention_algebra.split_accumulate`), residuals the backward
+    """A training forward's split sums (`attention_algebra.training_step`), residuals the backward
     reads in place of its first pass: the weighted values of every key but each query's anchor key,
     with the initial state's, `others` `[B, H, Q, Dv]`, the anchor's own weight `own` and the other
     keys' weights' sum `others_total` `[B, H, Q]`, fp32, all at the forward's maximum and at each row's

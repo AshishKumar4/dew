@@ -3098,18 +3098,18 @@ The two L4 step rows are jax 0.11.2 from one Colab session (2026-09-22, 19:55 to
 | device | measurement | fp32 state | bf16 state | int8 state |
 |---|---|---|---|---|
 | A100-40 | lm-dense's moments (359.8M parameters) | 2.88 GB | 1.44 GB | 0.73 GB |
-| A100-40 | one AdamW update over them | 12.35 ms | 10.66 ms | 60.39 ms |
+| A100-40 | one AdamW update over them | 12.35 ms | 10.66 ms | 27.32 ms |
 | A100-40 | lm-dense step, batch 8, full remat: peak | 8.09 GB | 6.64 GB | 5.88 GB |
-| A100-40 | the step | 151.7 ms | 150.3 ms | 196.3 ms |
-| A100-40 | its compile | 28.8 s | 41.9 s | 209.8 s |
-| A100-40 | the loss after its 30 steps on one batch | 0.02833 | 0.02809 | 0.02803 |
+| A100-40 | the step | 151.7 ms | 150.3 ms | 167.9 ms |
+| A100-40 | its compile | 28.8 s | 41.9 s | 82.3 s |
+| A100-40 | the loss after its 30 steps on one batch | 0.02833 | 0.02809 | 0.02818 |
 
 jax 0.12.0.1.post25, each row one process:
 
     PYTHONPATH=src python tools/benchmark_kernels.py adam --state-dtype int8
     PYTHONPATH=src python tools/benchmark_kernels.py step --path lm-dense --batch 8 --remat full --state-dtype int8
 
-with `float32` and `bfloat16` for the other columns. `dew.optim.int8_moments` keeps each moment as torchao's `AdamW8bit` does: codes of Dettmers' dynamic map in blocks of 256 values, each block's largest magnitude in float32, a moment under 4096 values in float32. The update decodes a leaf's moments to fp32, runs optax's update and codes them again, a leaf at a time. Coding each value searches the map for its nearest code (`jnp.searchsorted`, unrolled so it fuses with the rest of the coding; its default loop ran the eight halvings over the whole moment and took a step's peak above fp32 state's). That search is the update's added time and most of the compile's: the step gives back 2.2 GB for 45 ms.
+with `float32` and `bfloat16` for the other columns. `dew.optim.int8_moments` keeps each moment as torchao's `AdamW8bit` does: codes of Dettmers' dynamic map in blocks of 256 values, each block's largest magnitude in float32, a moment under 4096 values in float32. The update decodes a leaf's moments to fp32, runs optax's update and codes them again, a leaf at a time. Coding each value finds its nearest code among the six around an estimate, its decade by its logarithm and its place among the decade's evenly spaced values, each compared apart so the comparisons fuse with the rest of the coding (`dew.optim.quantized`), the code a search of the whole map gives. A search ran its eight halvings one after another: 60.39 ms an update, a 196.3 ms step and a 209.8 s compile, unrolled (`jnp.searchsorted`'s `scan_unrolled`); its default loop ran each halving over the whole moment and took a step's peak above fp32 state's. The coding is the update's added time: the step gives back 2.2 GB for 16 ms.
 
 ### The vocabulary head: the compute dtype's product
 

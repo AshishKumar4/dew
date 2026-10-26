@@ -9,6 +9,7 @@ sums), and the Triton mainloop's, as the route feeds them. Its configs are its T
 the device's, a site pinning one where it names a schedule (`tuning.pinned`)."""
 
 import contextlib
+import dataclasses
 import functools
 
 import jax
@@ -241,15 +242,16 @@ def _check_call_form(case: str, *, interpret: bool, backward: bool = False, form
 
 
 def _check_backward(call: str, shape, *, form: str | None, interpret: bool, keys: int | None = None,
-                    residuals_from=None, target: generation.GpuTarget | None = None):
-    """The backward in the form `form` names (`BACKWARD_FORMS`; None, the default form at the cost model's
-    pick) over the call form `call` of `shape` (its keys `keys`) on `target` (`_device`), from the training
-    forward's residuals at its pick: this mainloop's, or `residuals_from`'s
-    (another mainloop's `forward`, as the route feeds the Triton mainloop's)."""
+                    residuals_from=None, target: generation.GpuTarget | None = None,
+                    config: attention_mosaic.BackwardTiles | None = None):
+    """The backward in the form `form` names (`BACKWARD_FORMS`; None, the default form at `config`, else its
+    derived one) over the call form `call` of `shape` (its keys `keys`) on `target` (`_device`), from the
+    training forward's residuals at its pick: this mainloop's, or `residuals_from`'s (another mainloop's
+    `forward`, as the route feeds the Triton mainloop's)."""
     keys = shape[1] if keys is None else keys
     spans = template.spans(shape[1], keys, shape[0], **CALLS[call])
     draw = _drawn(shape, jnp.bfloat16, keys=keys)
-    accurate, config = (False, None) if form is None else BACKWARD_FORMS[form]
+    accurate, config = (False, config) if form is None else BACKWARD_FORMS[form]
     trained = attention_mosaic.forward if residuals_from is None else residuals_from
 
     def ours(query, key, value, dout):
@@ -444,33 +446,165 @@ def _forward_call(shape, width: int, value_width: int, residuals: bool):
 
 @pytest.mark.parametrize("residuals", [False, True], ids=["forward", "training"])
 @pytest.mark.parametrize(("width", "value_width"), [(128, 64), (128, 128), (128, 256), (256, 256)])
-def test_every_fitting_tile_stages_within_a_hoppers_block(width, value_width, residuals):
-    """On an H100 every forward tile that fits stages within its block (`generation.shared_budget`) and a
-    consumer's registers (`MosaicForward.register_budget`), whatever the widths, and the cost model picks one
-    of them: no table's tile, which at heads 256 wide staged 320 KiB against its 227 (ledger 1582). Where
-    none fits (a training forward's split sums and kept anchor row beside 256-wide values hold more
-    registers than a consumer has), the op is not eligible, so the route takes another mainloop. At D 128
-    the measured spill is out (a consumer of 128 queries: 2.9 to 4.6 ms against 0.49) and
-    FlashAttention-3's 64 queries over 128 keys in."""
+def test_the_derived_tiles_stage_within_a_hoppers_block(width, value_width, residuals):
+    """On an H100 the forward's tiles derived from the facts (`MosaicForward.derived`) stage within its
+    block (`generation.shared_budget`) and a consumer's registers (`register_budget`), whatever the widths:
+    no table's tile, which at heads 256 wide staged 320 KiB against its 227 (ledger 1582). Where none is
+    legal (a training forward's split sums and kept anchor row beside 256-wide values hold more registers
+    than a consumer has), the op is not eligible, so the route takes another mainloop. At D 128 the facts
+    give FlashAttention-3's 64 queries a consumer over 128 keys, two consumers and two stages: a consumer of
+    128 queries spills (2.9 to 4.6 ms against 0.49 measured). The training forward, whose fp32 weights stay
+    beside its logits until its anchor split, walks 64 keys: over 128 its kernel spilled 1.5 KB."""
     with generation.assumed("sm90"):
         target = generation.gpu_target()
         op, ba = _forward_call((2, 4096, 32, 8), width, value_width, residuals)
-        fits = op.fits(ba, target)
-        assert all(op.staged_bytes(ba, tiles, target) <= generation.shared_budget(target) for tiles in fits)
-        assert all(op.registers(ba, tiles) <= op.register_budget(tiles) for tiles in fits)
-        assert op.eligible(ba, target) == bool(fits)
-        assert not fits or op.estimate(ba, target)[1] in fits
-    assert bool(fits) == (value_width < 256 or not residuals)
-    if (width, value_width, residuals) == (128, 128, False):
-        assert not any(tiles.block_q == 128 and tiles.consumers == 2 for tiles in fits)
-        assert attention_mosaic.Tiles(64, 128, 2, 2) in fits
+        derived = op.derived(ba, target)
+        assert op.eligible(ba, target) == (derived is not None)
+        if derived is not None:
+            assert op.legal(ba, derived, target)
+            assert op.staged_bytes(ba, derived, target) <= generation.shared_budget(target)
+            assert op.registers(ba, derived) <= op.register_budget(derived)
+    assert (derived is not None) == (value_width < 256 or not residuals)
+    if (width, value_width) == (128, 128):
+        assert derived == attention_mosaic.Tiles(64, 64 if residuals else 128, 2, 2)
+
+
+def _backward_call(shape, width: int, accurate: bool):
+    """A causal backward's op and bound arguments over `shape`'s operands, its heads `width` wide, with a
+    training forward's residuals."""
+    rows, tokens, heads, kv_heads = shape
+    spans = template.spans(tokens, tokens, rows, causal=True)
+    query = jax.ShapeDtypeStruct((rows, tokens, heads, width), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, tokens, kv_heads, width), jnp.bfloat16)
+    stats = jax.ShapeDtypeStruct((rows, heads, tokens), jnp.float32)
+    residuals = (stats, stats, jax.ShapeDtypeStruct((rows, heads, tokens), jnp.int32),
+                 template.Split(jax.ShapeDtypeStruct((rows, heads, tokens, width), jnp.float32), stats, stats,
+                                stats))
+    op = attention_mosaic.MosaicBackward(form="causal", keys=tokens, scale=width ** -0.5, accurate=accurate)
+    return op, _bound(op, query, key, key, query, spans.start, spans.end, None, None, (), None, residuals)
+
+
+def _softcapped(s, q_pos, k_pos):
+    """A score hook a tuning run keys by what it computes (`AttentionLaunch.HOOKS`)."""
+    del q_pos, k_pos
+    return 30.0 * jnp.tanh(s / 30.0)
+
+
+def _gated(o):
+    """An output hook a tuning run keys by what it computes."""
+    return o * 0.5
+
+
+@pytest.mark.parametrize("launch", ["forward", "backward"])
+def test_a_hooked_launchs_keyed_configs_are_its_derived_ones(launch):
+    """A hooked launch as its picks key it (`tuning.KernelOp.keyed`: each hook its fingerprint, which a
+    stored pick and a tuning run look its configs up by) gives the configs its live call does: its
+    legality reads the fingerprint's lowering as the live call established it, never traces the string."""
+    rows, tokens, heads, kv_heads = SHAPES["interpreted"]
+    spans = template.spans(tokens, tokens, rows, causal=True)
+    query = jax.ShapeDtypeStruct((rows, tokens, heads, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, tokens, kv_heads, 128), jnp.bfloat16)
+    with generation.assumed("sm90"):
+        if launch == "forward":
+            op = attention_mosaic.MosaicForward(score_mod=_softcapped, output_mod=_gated, form="causal",
+                                                keys=tokens, scale=128 ** -0.5)
+            ba = _bound(op, query, key, key, spans.start, spans.end, None, None, (), (), None,
+                        residuals=False)
+        else:
+            stats = jax.ShapeDtypeStruct((rows, heads, tokens), jnp.float32)
+            residuals = (stats, stats, jax.ShapeDtypeStruct((rows, heads, tokens), jnp.int32),
+                         template.Split(jax.ShapeDtypeStruct((rows, heads, tokens, 128), jnp.float32), stats,
+                                        stats, stats))
+            op = attention_mosaic.MosaicBackward(score_mod=_softcapped, form="causal", keys=tokens,
+                                                 scale=128 ** -0.5)
+            ba = _bound(op, query, key, key, query, spans.start, spans.end, None, None, (), None, residuals)
+        keyed = op.keyed(ba)
+        assert isinstance(keyed.op.score_mod, str)
+        assert set(keyed.autotuning_configs) == set(ba.autotuning_configs)
+        assert keyed.heuristics_config == ba.heuristics_config
+
+
+def test_a_pin_the_mosaic_program_cannot_take_is_illegal():
+    """A config a pin or a stored pick names is held to the tiles a program takes (`whole_tiles`) as a
+    derived one is: a 32-query tile under wgmma's 64-row roles, or three consumers where the family's walks
+    take two, is not legal, so a pin of it is refused before any launch."""
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        op, ba = _forward_call(SHAPES["interpreted"], 128, 128, residuals=False)
+        derived = op.derived(ba, target)
+        assert derived is not None and op.legal(ba, derived, target)
+        rows, tokens, _, _ = SHAPES["interpreted"]
+        arrays = [jnp.zeros(ba.arguments[name].shape, ba.arguments[name].dtype)
+                  for name in ("query", "key", "value")]
+        for config in (dataclasses.replace(derived, block_q=32), dataclasses.replace(derived, consumers=3)):
+            assert not op.legal(ba, config, target)
+            with pytest.raises(tuning.Unpinnable), _pinned(config):
+                attention_mosaic.forward(*arrays, template.spans(tokens, tokens, rows, causal=True),
+                                         interpret=True)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("launch", ["forward", "training", "backward"])
+def test_every_tuning_variant_is_on_par_interpreted(launch):
+    """Each config an opt-in tuning run may time on an H100 (`Template.variants`: the derived one and its
+    legal neighbours, `_Mainloop.neighbours`) holds check 1 on the interpreted causal call: a tuner picks
+    among kernels the gate already holds."""
+    shape = SHAPES["interpreted"]
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        if launch == "backward":
+            op, ba = _backward_call(shape, 128, accurate=False)
+        else:
+            op, ba = _forward_call(shape, 128, 128, residuals=launch == "training")
+        variants = op.variants(ba)
+    assert len(variants) > 1
+    for config in variants:
+        if launch == "backward":
+            _check_backward("causal", shape, form=None, interpret=True, config=config, target=target)
+        else:
+            _check_forward("causal", jnp.bfloat16, shape, natural=False, interpret=True, tiles=config,
+                           training=launch == "training", target=target)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("tiles", [attention_mosaic.Tiles(64, 128, 2, 2),
+                                   attention_mosaic.Tiles(64, 192, 2, 1)], ids=["128-keys", "192-keys"])
+def test_a_guarded_launch_walks_its_own_key_tiles(tiles):
+    """A spans call (four documents over 256 keys, their ids from 1: 0 is padding) whose weighted values
+    pass fp32's largest, at forward tiles whose consumers' registers hold the guarded launch's live set
+    over a narrower key tile (`_guarded_tiles`), 128 keys halved, 192 keys cut to a whole tile of the
+    family's rows that divides it: the guarded launch runs on tiles its program takes, reads each block's
+    keys from its own block map, not the plain launch's, and every row's output is on par with jax's own
+    attention, which normalizes its weights before their product (bf16 values near their largest, equal
+    logits)."""
+    rows, queries, heads, kv_heads = 1, 256, 2, 1
+    documents = jnp.repeat(jnp.arange(1, 5, dtype=jnp.int32), queries // 4)[None]
+    spans = template.spans(queries, queries, rows, segment_ids=documents)
+    keep = (documents[:, :, None] == documents[:, None, :])[:, None]
+
+    def draw(seed):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        query = jnp.zeros((rows, queries, heads, 128), jnp.bfloat16)
+        key = jnp.zeros((rows, queries, kv_heads, 128), jnp.bfloat16)
+        value = jax.random.uniform(streams[2], (rows, queries, kv_heads, 128), jnp.float32, 2.9e38,
+                                   3.3e38).astype(jnp.bfloat16)
+        return query, key, value
+
+    def ours(query, key, value):
+        with _device(interpret=True), _pinned(tiles):
+            return attention_mosaic.forward(query, key, value, spans, interpret=True)
+
+    def reference(query, key, value):
+        return jax.nn.dot_product_attention(query, key, value, mask=keep, implementation="xla")
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, "mosaic guarded spans forward", seeds=SEEDS)
 
 
 @pytest.mark.parametrize("unseen", UNSEEN)
 def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give(unseen):
     """On a GPU no row measured the forward's and the backward's tiles come from the family's facts and the
     call's extents and fit the GPU's block, and the forward, the training forward and the backward at the
-    tiles the cost model picks on its facts alone are on par interpreted; on a family without this
+    tiles derived from its facts alone are on par interpreted; on a family without this
     mainloop's bundle neither op is eligible, so the route takes another mainloop
     (`attention_mosaic.backward_takes`)."""
     target = UNSEEN[unseen]
@@ -485,9 +619,9 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give(unseen):
             assert not attention_mosaic.backward_takes(query, key, value, spans, None, dout,
                                                       residuals=residuals)
             return
-        fits = op.fitting(ba, target)
-        assert fits and {tiles.family for tiles in fits} == {"wgmma"}
-        assert all(op.staged_bytes(ba, tiles, target) <= 180 * 1024 for tiles in fits)
+        derived = op.derived(ba, target)
+        assert derived is not None and derived.family == "wgmma"
+        assert op.staged_bytes(ba, derived, target) <= 180 * 1024
     _check_forward("causal", jnp.bfloat16, shape, natural=False, interpret=True, target=target)
     _check_forward("causal", jnp.bfloat16, shape, natural=False, interpret=True, training=True, target=target)
     _check_backward("causal", shape, form=None, interpret=True, target=target)

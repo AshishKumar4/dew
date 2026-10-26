@@ -426,6 +426,67 @@ def test_the_headroom_guard_leaves_ordinary_inputs_bitwise_unchanged(causal):
     np.testing.assert_array_equal(walked(headroom=True), walked(headroom=False))
 
 
+@pytest.mark.parametrize("natural", [False, True], ids=["folded", "natural"])
+def test_a_training_step_holding_its_sums_and_anchor_row_is_the_gathering_steps_arithmetic(natural):
+    """`algebra.training_step` as a mainloop that holds its split sums in two blocks of value columns
+    (`Keys.accumulate`) and keeps the anchor's value row (`KeptRows`, `Argmax.row`) runs it, Mosaic's
+    training forward, against the step that sums whole rows and gathers the row by key (`rows`), the plain-JAX
+    and Triton mainloops': the same state, anchor, row sums and split sums, bitwise, over bf16 key tiles whose
+    maximum moves, ties among them. Each product is exact in float64 and rounded once, so a column block's is
+    the whole row's."""
+    queries, width, tile, tiles = 16, 32, 16, 4
+    rng = np.random.default_rng(0)
+    # Each tile's logits a step above the last's in some rows, so anchors move, with ties on a coarse grid.
+    logits = (np.round(rng.normal(size=(tiles, queries, tile)) * 2) / 2
+              + np.arange(tiles)[:, None, None] * rng.integers(0, 2, (1, queries, 1)))
+    values = jnp.asarray(rng.normal(size=(tiles * tile, width)), jnp.bfloat16)
+    spec = algebra.Forward("full", tiles * tile, ids=False, scale=1.0, natural=natural)
+    columns = [slice(first, first + width // 2) for first in (0, width // 2)]
+
+    def dot(a, b):
+        return jnp.asarray(np.asarray(a, np.float64) @ np.asarray(b, np.float64), jnp.float32)
+
+    def keys_at(index, accumulate=None):
+        positions = algebra.Coords(jnp.arange(queries)[:, None], index * tile + jnp.arange(tile)[None, :])
+        value = values[index * tile:(index + 1) * tile]
+        return algebra.Keys(positions, jnp.asarray(logits[index], jnp.float32), lambda: value, dot,
+                            accumulate)
+
+    nothing = jnp.zeros((queries,), jnp.float32)
+    start = algebra.started(spec, None, queries, width, None)
+    gathered = (start, algebra.no_argmax(queries), nothing, nothing)
+    for index in range(tiles):
+        gathered = algebra.training_step(spec, gathered, keys_at(index), lambda key: values[key])
+
+    held = [start.acc[:, block] for block in columns]
+
+    def accumulate(scale, parts, value, kept):
+        for place, (row, block) in enumerate(zip(kept, columns, strict=True)):
+            held[place] = scale(held[place], row) + algebra.summed_products(parts, value[:, block], dot)
+
+    def picked(onehot, value):
+        return tuple(dot(onehot, value[:, block]) for block in columns)
+
+    anchor = algebra.no_argmax(queries)._replace(row=tuple(jnp.zeros((queries, width // 2), jnp.bfloat16)
+                                                           for _ in columns))
+    kept = (algebra.Partial(jnp.zeros((), jnp.float32), start.m, start.total), anchor, nothing, nothing)
+    for index in range(tiles):
+        kept = algebra.training_step(spec, kept, keys_at(index, accumulate), algebra.KeptRows(picked))
+
+    # A kept row and a gathering walk each need their own carry.
+    with pytest.raises(ValueError):
+        algebra.training_step(spec, gathered, keys_at(0), algebra.KeptRows(picked))
+    with pytest.raises(ValueError):
+        algebra.training_step(spec, kept, keys_at(0), lambda key: values[key])
+
+    (state, arg, own, others), (kept_state, kept_arg, kept_own, kept_others) = gathered, kept
+    for mine, theirs in ((kept_state.m, state.m), (kept_state.total, state.total), (kept_arg.peak, arg.peak),
+                         (kept_arg.key, arg.key), (kept_own, own), (kept_others, others),
+                         (jnp.concatenate(held, axis=1), state.acc),
+                         (jnp.concatenate(kept_arg.row, axis=1), values[arg.key])):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
+
+
 @pytest.mark.parametrize("edge", ["small scale", "large scale"])
 def test_the_accurate_form_is_as_exact_as_the_reference_at_its_raw_domains_edges(edge):
     """The accurate form at scales just outside the raw form's domain (`algebra.RAW_SCALES`), where raw

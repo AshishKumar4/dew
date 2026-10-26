@@ -331,6 +331,10 @@ def test_a_launch_without_a_measurement_fills_six_programs_a_multiprocessor(proc
     space = decode_attention._space(programs, steps, processors)
     assert decode_attention.Split(splits) in space
     assert (space == {decode_attention.Split(1)}) == (not processors or programs >= 0.8 * processors)
+    # An opt-in tuning run times the heuristic's and the counts of its space either side, each of which
+    # the kernel's tests hold to the gate at every config of the space.
+    variants = decode_attention._variants(programs, steps, processors)
+    assert variants[0] == decode_attention.Split(splits) and set(variants) <= space and len(variants) <= 3
 
 
 def decode_step(lengths):
