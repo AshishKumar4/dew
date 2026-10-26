@@ -39,12 +39,17 @@ from test_attention_template import (
 
 from dew.nn import attention
 from dew.nn.attention import scaled_dot_product_attention
-from dew.nn.attention_kernels import ATTENTION, kernel_refusals
+from dew.nn.attention_kernels import ATTENTION, OLD_ROUTES, kernel_refusals
 from dew.nn.inputs import counted_places
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.generation import INHERENT
 from dew.nn.kernels.selection import KernelRefused
-from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_route
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_mosaic,
+    attention_mosaic_program,
+    attention_route,
+)
 from dew.nn.sharding import DEFAULT_RULES
 
 HEADS, KV_HEADS, WIDTH = 4, 2, 32
@@ -383,9 +388,11 @@ def test_the_selector_refuses_a_mask_and_a_bias_by_their_inherent_limits():
         scaled_dot_product_attention(query, key, key, implementation="template", bias=bias)
 
 
-def test_no_target_prefers_the_template_so_only_a_named_call_takes_it():
-    """On every target's row, 'auto' resolves each call to a kernel other than the template. The template runs
-    where a call names it, and where `generation.chosen` names it for the attention choice."""
+def test_a_templated_family_runs_the_template_where_its_declared_route_does_not_take_a_call():
+    """On a family whose Mosaic template has a routed mainloop (`attention_mosaic_program.BUNDLES`), 'auto'
+    resolves each call to its declared old route where that takes it (`OLD_ROUTES`), else the template; on
+    every other family to its row's route, never the template; and a call naming the template, or
+    `generation.chosen` naming it for the attention choice, takes it everywhere (bible §4, owner 10-25)."""
     query = jnp.zeros((ROWS, QUERIES, HEADS, WIDTH), jnp.bfloat16)
     key = jnp.zeros((ROWS, KEYS, KV_HEADS, WIDTH), jnp.bfloat16)
     sinks = jnp.zeros((HEADS,), jnp.bfloat16)
@@ -396,12 +403,19 @@ def test_no_target_prefers_the_template_so_only_a_named_call_takes_it():
         {"causal": True, "key_value_seq_lengths": LENGTHS},
     ]
     for target in generation.TARGETS:
+        family = generation.family(target)
         with generation.assumed(target):
             for call in calls:
                 auto = attention.resolve_implementation("auto", query, key, **call)
-                assert auto != "template", (target, call)
+                if family in attention_mosaic_program.BUNDLES:
+                    old = OLD_ROUTES[family][0]
+                    takes = not kernel_refusals(ATTENTION, old, attention.attention_case(query, key, **call))
+                    assert auto == (old if takes else "template"), (target, call, auto)
+                else:
+                    assert auto != "template", (target, call)
                 named = attention.resolve_implementation("template", query, key, **call)
                 assert named == "template", (target, call)
+    assert generation.family("sm90") in attention_mosaic_program.BUNDLES
     with generation.chosen(attention="template"):
         for call in calls:
             assert attention.resolve_implementation("auto", query, key, **call) == "template", call
@@ -426,10 +440,11 @@ def test_on_an_h100_the_routes_backward_is_the_mosaic_template(case):
 def test_a_gpu_prefers_the_template_for_a_call_with_block_groups(kind):
     """A causal call with block or image groups, or key validity: flash and tokamax's Triton kernel refuse
     it by their inherent limits, and cuDNN takes it only as its mask, by measurement. 'auto' resolves a
-    call with groups to the template exactly where the target's measured row names it (`attention_blocks`:
-    sm80's, where the template was faster and smaller than xla's mask at every length), and a call of key
-    validity alone, which no row measures, to the generic path on every target. Without causality the
-    groups add no key, so the call is an ordinary one, where validity still hides its keys."""
+    call with groups to the template on a family whose Mosaic template has a routed mainloop (wgmma's, its
+    default) and where the target's measured row names it (`attention_blocks`: sm80's, where the template
+    was faster and smaller than xla's mask at every length), and a call of key validity alone to the
+    template on a templated family and to the generic path on every other, no row measuring it. Without
+    causality the groups add no key, so the call is an ordinary one, where validity still hides its keys."""
     query = jnp.zeros((ROWS, QUERIES, HEADS, WIDTH), jnp.bfloat16)
     key = jnp.zeros((ROWS, QUERIES, KV_HEADS, WIDTH), jnp.bfloat16)
     groups = jnp.asarray(block_groups()[0])
@@ -451,7 +466,8 @@ def test_a_gpu_prefers_the_template_for_a_call_with_block_groups(kind):
             auto = attention.resolve_implementation("auto", query, key, causal=True, block_groups=blocks,
                                                     image_groups=images, key_valid=valid)
             measured = generation.TARGETS[target].kernels.get("attention_blocks") == "template"
-            assert (auto == "template") == (measured and kind != "key_valid"), (target, auto)
+            templated = generation.family(target) in attention_mosaic_program.BUNDLES
+            assert (auto == "template") == (templated or (measured and kind != "key_valid")), (target, auto)
     assert generation.TARGETS["sm80"].kernels["attention_blocks"] == "template"
     assert "attention_blocks" not in generation.TARGETS["sm90"].kernels
 
