@@ -771,8 +771,12 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                                            ('epilogue_operands', hooks.epilogue_axes))
                 for _, side_axes in zip(ba.arguments.get(name, ()), axes_of, strict=True)
                 if len(side_axes) == 1 for axis in side_axes}
-        extent = family.copy_extent
-        copied = extent is None or all(self.extents(config)[axis] <= extent for axis in axes)
+        # A vector the family reads from global memory instead (`copies_vectors`) loads in a role's row
+        # tiles: its block along its axis whole roles (ns-regs: a 32-element depth vector on sm86 failed
+        # to cast to the 64-row layout).
+        extent, least = family.copy_extent, 1 if family.copies_vectors else family.role_rows
+        copied = all((extent is None or self.extents(config)[axis] <= extent)
+                     and self.extents(config)[axis] % least == 0 for axis in axes)
         return copied and super().legal(ba, config, target)
 
     @abc.abstractmethod
