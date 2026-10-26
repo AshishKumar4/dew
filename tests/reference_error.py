@@ -1059,28 +1059,15 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
             mine.finite and theirs.finite)
 
 
-def _judged(draws: _Draws, index: int, tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL),
-            conditioned: bool = False) -> tuple[float, float, float]:
-    """A leaf's pooled ratio and its interval over the draws, its `tails` left out. `conditioned`, each
-    draw is weighed by its reference's own error (`_conditioned`)."""
+def _judged(draws: _Draws, index: int, tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)
+            ) -> tuple[float, float, float]:
+    """A leaf's pooled ratio and its interval over the draws, its `tails` left out."""
     a, b = draws.mine[:, index], draws.theirs[:, index]
-    if conditioned:
-        a, b = _conditioned(a, b)
     return (_pooled(a, b), *_interval(a, b, tails=tails))
 
 
-def _conditioned(mine: np.ndarray, theirs: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    """Each draw's errors over its reference's own (the reference's mean squared error 1 on every draw):
-    a draw's conditioning is what both arms' errors scale by, so weighing each by the reference's error
-    pools the arms' ratio draw by draw, where a diverging computation's raw errors span orders of
-    magnitude and the few worst-conditioned draws would decide the pooled ratio alone. A draw the
-    reference holds exactly is left out (the exact-reference rule judges Dew there)."""
-    kept = theirs > 0
-    return mine[kept] / theirs[kept], np.ones(int(kept.sum()))
-
-
 def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL), *,
-               contained: bool = True, conditioned: bool = False) -> tuple[list[Finding], list[Finding]]:
+               contained: bool = True) -> tuple[list[Finding], list[Finding]]:
     """Check 1's findings over `draws` (`assert_as_exact`): each leaf over PARITY (`_status`), a row or
     a value it fails, and each leaf its draws leave inconclusive."""
     over, unresolved = [], []
@@ -1092,12 +1079,6 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
             over.append(Finding(leaf, "not finite", nonfinite,
                                 f"{leaf}: a value is not finite on {nonfinite} of {count} seeds"))
             continue
-        if conditioned and np.any((b == 0) & (a > 0)):
-            # A draw the reference holds exactly, which conditioning-weighted pooling leaves out, Dew
-            # must hold exactly too.
-            drawn = int(np.sum((b == 0) & (a > 0)))
-            over.append(Finding(leaf, "exact reference", root_mean(a[b == 0]),
-                                f"{leaf}: the reference equals float64 on {drawn} draws and dew does not"))
         if np.sum(b) == 0:
             # No ratio to judge, but rows over an orbit's other orders still are; Dew's own RMS error is
             # what a change can make worse.
@@ -1105,7 +1086,7 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
                 over.append(Finding(leaf, "exact reference", root_mean(a),
                                     f"{leaf}: the reference equals float64 on every seed and dew does not"))
         else:
-            ratio, low, high = _judged(draws, index, tails, conditioned)
+            ratio, low, high = _judged(draws, index, tails)
             status = _status(ratio, low, high, contained=contained)
             # The ratio's log from its sums' logs, finite where a sum or the ratio itself would overflow.
             measure = (log_sum(a) - log_sum(b)) / 2
@@ -1169,8 +1150,8 @@ PREVIOUS_TAILS = (5e-4, 5e-4)
 """The interval's tails before check 1's two stages (`_staged`'s `two_stage=False`)."""
 
 
-def _staged(drawn, seeds: int, label: str, *, two_stage: bool = True,
-            conditioned: bool = False) -> tuple[list[Finding], list[Finding], int]:
+def _staged(drawn, seeds: int, label: str, *,
+            two_stage: bool = True) -> tuple[list[Finding], list[Finding], int]:
     """Check 1's two pre-declared stages over `drawn(start, stop)`, the draws of seeds start to stop: at
     `seeds`, a site whose every leaf passes (`_judgement`: its ratio, rows and values) passes; any leaf
     that does not draws the second stage, REDRAW times as many further seeds, and every leaf is judged
@@ -1180,15 +1161,13 @@ def _staged(drawn, seeds: int, label: str, *, two_stage: bool = True,
     tails = (LOWER_TAIL, UPPER_TAIL) if two_stage else PREVIOUS_TAILS
     draws = drawn(0, seeds)
     if two_stage:
-        further = any(_judgement(draws, label, tails, conditioned=conditioned))
+        further = any(_judgement(draws, label, tails))
     else:
-        further = any(np.sum(draws.theirs[:, index]) > 0
-                      and _judged(draws, index, tails, conditioned)[0] > PARITY
+        further = any(np.sum(draws.theirs[:, index]) > 0 and _judged(draws, index, tails)[0] > PARITY
                       for index in range(len(draws.names)))
     if further:
         draws = draws.joined(drawn(seeds, (1 + REDRAW) * seeds))
-    return (*_judgement(draws, label, tails, contained=two_stage, conditioned=conditioned),
-            2 if further else 1)
+    return (*_judgement(draws, label, tails, contained=two_stage), 2 if further else 1)
 
 
 STAGES_LOG = "DEW_CHECK1_STAGES"
@@ -1210,8 +1189,7 @@ def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str]) -> N
 
 
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None,
-                    orders=None, library_fn=None, library_row: int | None = None,
-                    conditioned: bool = False) -> None:
+                    orders=None, library_fn=None, library_row: int | None = None) -> None:
     """Check 1 of the gate: on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst (NARROW_FACTORS' factor at rows of one or
@@ -1259,11 +1237,6 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     reference's error and that arm's, seed by seed (`_Draws.against_larger`). Every other rule is as
     above; a site without it is judged against the reference alone.
 
-    `conditioned` weighs each draw by its reference's own error (`_conditioned`), for a computation
-    whose conditioning spans orders of magnitude over its draws (a diverging inner loop): the pooled
-    ratio is then the mean of the draws' squared ratios, rooted, and its interval theirs; a draw the
-    reference holds exactly, Dew must too. Every other rule is as above.
-
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
     (tests/certified.py)."""
@@ -1289,7 +1262,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                             if width in NARROW_FACTORS]
         return draws
 
-    over, unresolved, stage = _staged(drawn, seeds, label, conditioned=conditioned)
+    over, unresolved, stage = _staged(drawn, seeds, label)
     _logged(label, stage, _verdict(over, unresolved), narrow_leaves)
     if over:
         raise GateFailure(over + unresolved)
@@ -1487,8 +1460,7 @@ def recording(path) -> dict[str, np.ndarray]:
 
 def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: int = 0,
               truth_fn=None, two_stage: bool = True, dew_fn=None, orders=None,
-              paired: bool = False, library_fn=None,
-              conditioned: bool = False) -> list[tuple[str, int, list[str]]]:
+              paired: bool = False, library_fn=None) -> list[tuple[str, int, list[str]]]:
     """Check 1 run `runs` times on an equally exact pair, the reference against itself on disjoint
     draws: each run's verdict, "pass", "over" or "inconclusive", the stage it reached and its findings
     (`_judgement`'s, each naming its leaf and rule), a run judged as `assert_as_exact` judges a site
@@ -1522,7 +1494,7 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
                                                     truth_fn or reference_fn, orders=orders))
             return draws
 
-        over, unresolved, stage = _staged(drawn, seeds, label, two_stage=two_stage, conditioned=conditioned)
+        over, unresolved, stage = _staged(drawn, seeds, label, two_stage=two_stage)
         verdicts.append((_verdict(over, unresolved), stage, [str(finding) for finding in over + unresolved]))
     return verdicts
 
