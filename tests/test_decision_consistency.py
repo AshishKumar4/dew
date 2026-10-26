@@ -152,7 +152,8 @@ def test_examples_grouped_across_rows_train_in_one_window_and_agree_as_one_group
     # Each member's row: the window's row at the start of its instructions.
     rows = {int(np.asarray(inputs.segments)[member[0], np.asarray(inputs.spans)[tuple(member)][0]])
             for member in members}
-    assert len(rows) == (1 if layout.joint else 3)
+    # Each member asks in a row of its own example: three rows under either layout.
+    assert len(rows) == 3
     canonical = np.asarray(batch["canonical"])
     options = np.asarray(inputs.options) | np.asarray(empty)
     apart, _ = categorical.group_divergence(
