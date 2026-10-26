@@ -1124,8 +1124,13 @@ def _assert_kl_outputs(dew, plain, truth, bounds, label):
         # Where the plain arm and Dew both give the float64 value there is no error to compare.
         measured = held & ~rows((value == exact) & (reference == exact))
         if measured.any():
-            assert_as_exact_as_the_reference(value[measured], reference[measured], exact[measured],
-                                             f"{label}: {name}")
+            # Each row over its own truth's largest power of two, exactly: the rows' sizes span
+            # float32's whole range, and a row is judged against its own size, not the leaf's.
+            scale = np.ldexp(1.0, -np.frexp(np.max(np.abs(exact[measured]).reshape(int(measured.sum()), -1),
+                                                   axis=1))[1])
+            scale = scale.reshape((-1,) + (1,) * (exact.ndim - 1))
+            assert_as_exact_as_the_reference(value[measured] * scale, reference[measured] * scale,
+                                             exact[measured] * scale, f"{label}: {name}")
         magnitudes, roundings = bounds[name]
         unheld = ~held & rows((kinds == "normal") | (exact == 0))
         assert np.all(np.isfinite(value[unheld])), name
