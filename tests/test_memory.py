@@ -23,9 +23,11 @@ configuration, its token-by-token path included, at 8 over the drawn weights."""
 
 CONFIGURATIONS = {
     # TTT-Linear (Sec 2.7): f(x) = x + LN(W x), the L2 reconstruction (Eq 4), eta(x) = eta_base sigmoid(.).
-    "ttt_linear": {"network": ResidualMemory(hidden=None, norm=True)},
-    # TTT-MLP: a 4x GELU MLP inside the residual and norm.
-    "ttt_mlp": {"network": ResidualMemory(hidden=4 * FEATURES, activation="gelu")},
+    # Its inner loop updates W and b alone; the layer norm's scale and bias are outer-loop parameters
+    # (the authors' ttt.py, `TTTCache.ttt_param_names`).
+    "ttt_linear": {"network": ResidualMemory(hidden=None, norm=True), "slow": ("norm",)},
+    # TTT-MLP: a 4x GELU MLP inside the residual and norm, the norm outer-loop only.
+    "ttt_mlp": {"network": ResidualMemory(hidden=4 * FEATURES, activation="gelu"), "slow": ("norm",)},
     # Titans' deep memory with momentum and forgetting (Eq 12-14).
     "titans": {"network": MLPMemory(hidden=(2 * FEATURES,)),
                "momentum": Gate(), "retention": Gate(bias=-2.0)},
@@ -85,18 +87,12 @@ def paper_loss(kind: str, objective: Objective):
     return losses[kind]
 
 
-OUTER = {"ttt_linear": ("norm",), "ttt_mlp": ("norm",)}
-"""The network parameters a configuration's paper meta-learns in its outer loop alone, which the inner
-loop reads at W_0: TTT's inner loop updates W1, b1 (and W2, b2) and its layer norm's scale and bias are
-outer-loop parameters (the authors' ttt.py, `TTTCache.ttt_param_names`)."""
-
-
-def written(module: InContextMemory, *, dtype, segments=None, gradient=None, held=()):
+def written(module: InContextMemory, *, dtype, segments=None, gradient=None):
     """The paper's update as a function of the stream, token by token, in `dtype` (float64 for the
     truth): the views and gates from the layer's projections, the state in at least float32, each
     gradient at its chunk's start counted from its document's first token (`segments` `[S]`, one
     document where None) of the loss its paper writes for the layer's objective (`paper_loss`), the
-    network's `held` parameters left at W_0, and the readout at `dtype`."""
+    network's `slow` parameters left at W_0, and the readout at `dtype`."""
     wide = jnp.promote_types(dtype, jnp.float32)
     grad_net, read_net = module.network.clone(dtype=wide), module.network.clone(dtype=dtype)
     loss = paper_loss(module.objective.kind, module.objective)
@@ -111,8 +107,8 @@ def written(module: InContextMemory, *, dtype, segments=None, gradient=None, hel
 
     def one_head(network0, q, k, v, theta, mu, alpha):
         """One row's and head's tokens `[S, F]`, `[S]`, scanned token by token."""
-        fixed = {name: leaf for name, leaf in network0.items() if name in held}
-        head0 = {name: leaf for name, leaf in network0.items() if name not in held}
+        fixed = {name: leaf for name, leaf in network0.items() if name in module.slow}
+        head0 = {name: leaf for name, leaf in network0.items() if name not in module.slow}
 
         def inner(network, params, x):
             """`network` at the updated `params` and the held ones."""
@@ -196,10 +192,9 @@ def applied(module: InContextMemory, call: MixerCall = PLAIN_CALL):
 def test_a_memory_follows_its_papers_update(name):
     """Each configuration computes its paper's update and readout token by token (`written`), on par
     with that written-out update in float32, against float64 (check 1)."""
-    module, held = layer(name), OUTER.get(name, ())
-    assert_as_exact(applied(module), written(module, dtype=jnp.float32, held=held), drawn(module),
-                    f"{name} memory", seeds=MEMORY_SEEDS,
-                    truth_fn=written(module, dtype=jnp.float64, held=held))
+    module = layer(name)
+    assert_as_exact(applied(module), written(module, dtype=jnp.float32), drawn(module), f"{name} memory",
+                    seeds=MEMORY_SEEDS, truth_fn=written(module, dtype=jnp.float64))
 
 
 def test_yaads_objective_switches_by_the_whole_errors_norm():
@@ -381,8 +376,9 @@ def test_a_memory_layer_kind_records_and_rebuilds():
     """A memory layer kind records the memory's whole configuration: a decoder whose two kinds set every
     field a memory computes by away from its default (heads, an existing GatedMLP as a level's network
     over the raw stream with no output projection, an lp and a Huber objective, a self-generated
-    target, constant and scaled gates, momentum, retention, Newton-Schulz steps, the chunk) writes a
-    JSON record that rebuilds the same model, which computes the original's logits bit for bit."""
+    target, constant and scaled gates, momentum, retention, Newton-Schulz steps, the chunk, weights the
+    inner loop holds at W_0) writes a JSON record that rebuilds the same model, which computes the
+    original's logits bit for bit."""
     from model_support import TINY_DECODER
 
     from dew.config import ModelConfig
@@ -398,7 +394,8 @@ def test_a_memory_layer_kind_records_and_rebuilds():
                             retention=Gate(scale=0.5, bias=-1.0), chunk=2, orthogonalize=3, normalize=True)
     level = InContextMemory(network=GatedMLP(hidden_features=48, out_features=32), project_query=False,
                             project_key=False, project_value=False, output=False,
-                            objective=Objective("huber", delta=0.5), learning_rate=Gate(value=0.01), chunk=3)
+                            objective=Objective("huber", delta=0.5), learning_rate=Gate(value=0.01), chunk=3,
+                            slow=("gate_proj",))
     model = CausalTransformer(**{**TINY_DECODER, "vocab_size": 37, "num_layers": 3, "dtype": jnp.float32,
                                  "layer_types": ("heads", "level", "attention"),
                                  "kinds": {"heads": LayerKind(mixer=InContextMemoryMixer(heads)),
