@@ -9,9 +9,10 @@ test_recurrence_stability holds the portable math:
   (`chunk_on('fla', ...)`), whose numbers it runs.
 
 Natively on a GPU of a family the mainloop claims, interpreted off one at the cases `INTERPRETED` names. The
-gradient's arm asserts which backward ran: the fast backward (its reverse launch in the trace) where its
-launches hold (`mainloop.backward_holds`), and on an mma.sync GPU, where they do not, the port's, whose
-gradient its reference arm computes too, so check 1 there holds the forward alone."""
+gradient's arm asserts which backward runs: the fast backward where its launches hold at the call's derived
+tiles (`mainloop.backward_holds`, as `mosaic_rule` reads it; natively, its reverse launch in the trace), and
+on an mma.sync GPU, where they do not, the port's, whose gradient its reference arm computes too, so check 1
+there holds the forward alone."""
 
 import dataclasses
 import functools
@@ -27,6 +28,7 @@ from test_recurrence_stability import SEEDS, SITES, cotangents, restarting, stre
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.kernels.templates.recurrence import mainloop, template
 
 pytestmark = pytest.mark.kernel
 
@@ -54,8 +56,22 @@ def bf16(operands: Chunk) -> Chunk:
                                             for name in ('query', 'key', 'value', 'beta')})
 
 
+def fast_backward(operands: Chunk) -> bool:
+    """Whether the template's rule takes a gradient over `operands` on its fast backward: its launches hold at
+    the call's derived tiles on the device's bundle, or interpreted, the interpreted one's (`mosaic_rule`)."""
+    target = template.Mosaic.launched()
+    bound = template.MOSAIC.bind(operands.query, operands.key, operands.value, operands.log_decay,
+                                 operands.beta, operands.state, operands.starts)
+    tiles = template.MOSAIC.derived(bound, target)
+    return mainloop.backward_holds(operands.query, operands.key, operands.value, operands.log_decay,
+                                   operands.beta, operands.state, tiles=tiles,
+                                   family=mainloop.family_of() or mainloop.INTERPRETED,
+                                   shared=generation.shared_budget(target), starts=operands.starts)
+
+
 def launched(fn, *args) -> set[str]:
-    """The names of the Pallas launches `fn`'s trace over `args` holds."""
+    """The names of the Pallas launches `fn`'s trace over `args` holds: none where the kernels interpret (a
+    CPU's trace inlines their bodies)."""
     graph = jax.make_jaxpr(fn)(*args)
     return {str(equation.params.get('name') or equation.params.get('name_and_src_info'))
             for equation in equations(graph) if equation.primitive.name == 'pallas_call'}
@@ -94,8 +110,11 @@ def test_the_template_stays_finite_and_on_par_with_the_port_where_chunked_forms_
             return bf16(operands), (out.astype(jnp.bfloat16), final)
 
         fast = generation.family(generation.device_generation()) != 'mma.sync'
-        reversed_ = any('recurrence_reverse' in name for name in launched(dew, *draws(0)))
-        assert reversed_ == fast, f'{regime}: the fast backward ran: {reversed_}, expected {fast}'
+        operands, _ = draws(0)
+        assert fast_backward(restarting(lambda given: given, regime)(operands)) == fast, regime
+        names = launched(dew, *draws(0))
+        if names:
+            assert any('recurrence_reverse' in name for name in names) == fast, (regime, sorted(names))
         if not fast:
             # Both arms take the port's gradient: check 1 holds the forward alone (its own case).
             assert_finite(dew, truth, draws(0), regime)
