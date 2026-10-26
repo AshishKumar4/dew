@@ -443,10 +443,9 @@ def test_a_backward_its_forward_does_not_show_is_not_assembled(tmp_path):
         verify_mapping(config, remote=tmp_path / "frozen")
 
 
-def test_a_slot_release_over_a_model_of_parts_loads_its_backbone_by_its_own_code(tmp_path):
-    """A slot release whose backbone is a repository of remote code reads that code where the load opts
-    in, as the backbone alone does: its decoder verifies from parts and holds the backbone's own
-    variables, and it computes the backbone's logits."""
+def _slot_release(tmp_path):
+    """The renamed source's repository alone, and a local slot release over it: the same repository, its
+    remote code included, with a tokenizer and a slot readout beside it."""
     import shutil
 
     from test_slot_sources import BACKBONE
@@ -457,6 +456,14 @@ def test_a_slot_release_over_a_model_of_parts_loads_its_backbone_by_its_own_code
     for name in ("tokenizer.json", "tokenizer_config.json"):
         shutil.copy(BACKBONE / name, release / name)
     (release / "readout.json").write_text(json.dumps({"readout": "slot_lm", "head_dim": 8, "n_slots": 16}))
+    return alone, release
+
+
+def test_a_slot_release_over_a_model_of_parts_loads_its_backbone_by_its_own_code(tmp_path):
+    """A slot release whose backbone is a repository of remote code reads that code where the load opts
+    in, as the backbone alone does: its decoder verifies from parts and holds the backbone's own
+    variables, and it computes the backbone's logits."""
+    alone, release = _slot_release(tmp_path)
     backbone = Pretrained.load(alone, dtype="float32", attention_impl="reference", trust_remote_code=True)
     loaded = Pretrained.load(release, dtype="float32", attention_impl="reference", trust_remote_code=True)
     for ours, theirs in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(backbone.variables),
@@ -465,3 +472,24 @@ def test_a_slot_release_over_a_model_of_parts_loads_its_backbone_by_its_own_code
     ids = np.random.default_rng(1693).integers(0, TINY["vocab_size"], (2, 12)).astype(np.int32)
     np.testing.assert_array_equal(np.asarray(loaded.model.apply(loaded.variables, ids)),
                                   np.asarray(backbone.model.apply(backbone.variables, ids)))
+
+
+@pytest.mark.parametrize("kind", ["alone", "release"])
+def test_one_load_of_local_remote_code_probes_it_once(tmp_path, monkeypatch, kind):
+    """A load verifies the remote code it runs once: a local repository's code, which no commit names,
+    has no recorded verification to read back, so each probe of it runs the source, and a slot release
+    over it routes its backbone before reading its weights and loads it by that one verification, as the
+    backbone alone does."""
+    from dew.interop import verify
+
+    probes = []
+    probe = verify._verified
+
+    def counted(*args, **kwargs):
+        probes.append(args)
+        return probe(*args, **kwargs)
+
+    monkeypatch.setattr(verify, "_verified", counted)
+    source = dict(zip(("alone", "release"), _slot_release(tmp_path), strict=True))[kind]
+    Pretrained.load(source, dtype="float32", attention_impl="reference", trust_remote_code=True)
+    assert len(probes) == 1
