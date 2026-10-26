@@ -1001,8 +1001,9 @@ def test_a_transitions_density_and_kl_hold_at_float32s_largest_variances():
     # A variance near float32's least: the KL, about 2e38, fits, where its twice the quotient would not.
     narrow = np.asarray([2e-38, 3e-38], np.float32)
     near = GaussianTransition(jnp.asarray(mean), jnp.asarray(narrow))
-    kl = np.asarray(near.kl(jnp.full_like(jnp.asarray(mean), np.float32(np.sqrt(8 / 12)))))
-    error = np.float32(12) * np.float32(np.sqrt(8 / 12)) ** 2
+    step = np.float32(np.sqrt(8 / 12))
+    kl = np.asarray(near.kl(jnp.full_like(jnp.asarray(mean), step)))
+    error = np.sum(np.full(12, step) ** 2, dtype=np.float32)
     assert_as_exact_as_the_reference(kl, error / np.float32(2) / narrow,
-                                     float(error) / (2 * narrow.astype(np.float64)),
+                                     12 * float(step) ** 2 / (2 * narrow.astype(np.float64)),
                                      "a narrow transition's KL")
