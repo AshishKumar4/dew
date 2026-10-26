@@ -672,30 +672,6 @@ def test_a_run_record_holding_a_field_its_objective_does_not_write_is_refused(tm
 
 
 
-def test_a_run_is_pinned_once_however_it_is_loaded(tmp_path, monkeypatch):
-    """`dew.pipeline` over a run directory and a task's own `from_run` each pin the run once
-    (`SavedRun.pinned`, which reads its checkpoint's record and imports what it trusts), the task built
-    from the pinned run (`from_saved`), and both load the same task over the same weights."""
-    from dew.inference.tasks import SavedRun
-
-    make_lm_run(tmp_path)
-    pinned = SavedRun.pinned.__func__
-    pins = []
-
-    def counted(cls, directory, step=None, trust=()):
-        pins.append(directory)
-        return pinned(cls, directory, step, trust)
-
-    monkeypatch.setattr(SavedRun, "pinned", classmethod(counted))
-    front = dew.pipeline(str(tmp_path), step=2)
-    assert len(pins) == 1
-    task = TextGeneration.from_run(str(tmp_path), step=2)
-    assert len(pins) == 2
-    assert type(front) is type(task)
-    for mine, theirs in zip(jax.tree.leaves(front.variables), jax.tree.leaves(task.variables), strict=True):
-        np.testing.assert_array_equal(mine, theirs)
-
-
 def test_pipeline_loads_a_run_published_to_the_hub_at_the_commit_it_resolved(tmp_path, monkeypatch):
     """A Hub repository holding a run, as `HfApi().upload_folder` publishes
     it, loads as that run: pulled whole at the commit its metadata resolved

@@ -86,7 +86,7 @@ def test_disk_moe_logits_and_cached_decode_equal_resident(bank_layers, read_ahea
         assert source.stats().cache_bytes == 0
 
 
-def fused(tensors: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+def experts_fused(tensors: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     """`tensors` with each layer's per-expert projections as transformers 5 stores them fused, the
     layout a packed family splits: `experts.gate_up_proj` [E, 2I, H] and `experts.down_proj` [E, H, I]."""
     experts: dict[tuple[str, str], dict[int, np.ndarray]] = {}
@@ -108,12 +108,12 @@ def fused(tensors: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
 @pytest.mark.parametrize("fused_experts", [False, True], ids=["per-expert", "fused-experts"])
 def test_disk_source_reads_shards_and_bounds_cache(fused_experts, tmp_path):
     """A row read from a sharded checkpoint is the resident translation's, under a cache bound: Mixtral's
-    per-expert tensors, and Qwen2-MoE's fused experts (`fused`), which a lazy read splits into views and
-    reads only when the row is placed."""
+    per-expert tensors, and Qwen2-MoE's fused experts (`experts_fused`), which a lazy read splits into
+    views and reads only when the row is placed."""
     from dew.inference.banks import SafetensorsBanks
 
     fixture = FIXTURE.parent / "qwen2-moe-tiny" if fused_experts else FIXTURE
-    tensors = fused(read_weights(fixture)) if fused_experts else read_weights(fixture)
+    tensors = experts_fused(read_weights(fixture)) if fused_experts else read_weights(fixture)
     (tmp_path / "config.json").write_bytes((fixture / "config.json").read_bytes())
     save_sharded(tensors, tmp_path, max_shard_size=12_000)
     with SafetensorsBanks(tmp_path, cache_bytes=1, param_dtype="float32") as source:
