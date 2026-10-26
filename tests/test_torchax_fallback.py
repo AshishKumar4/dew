@@ -16,6 +16,7 @@ lands one fp32 ulp (4.8e-7) from torch's; `LOSS` is two.
 
 import contextlib
 import copy
+import dataclasses
 import math
 
 import jax
@@ -896,3 +897,23 @@ def test_a_tier_3_model_on_transformers_attention_refuses_a_cache(tmp_path):
         loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
     with pytest.raises(Lacks):
         loaded.model.apply(loaded.variables, 2, method="init_cache", mutable=["cache"])
+
+
+def test_a_tier_3_source_generates_and_serves_as_a_native_decoder_does(tmp_path):
+    """A tier-3 source on Dew's attention gives the text generation task a native decoder's does
+    (`text_generation`, which `dew.pipeline` builds), and a server over that task draws the task's
+    own tokens for a request."""
+    from dew.inference import Server
+    from dew.sampling import Sampling
+
+    torch.manual_seed(0)
+    PACKED_MODELS["cohere"]().eval().save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32", max_seq_len=64)
+    task = dataclasses.replace(loaded.text_generation(), sampling=Sampling(temperature=0, eos_token_ids=None))
+    prompt = np.asarray([5, 7, 11], np.int32)
+    direct = task(prompt[None], 6, key=0)
+    server = Server.from_task(task, slots=2, capacity=64)
+    ticket = server.submit(prompt, 6, key=0)
+    server.run()
+    np.testing.assert_array_equal(np.asarray(ticket.result().tokens), np.asarray(direct.tokens))
