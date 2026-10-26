@@ -14,6 +14,15 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   runs timed apart may still keep different plans), and a resumed run continues its checkpoint's plan
   untimed. Dew's tests keep a frontier's first plan (`DEW_UNTIMED_FRONTIER`, a test setting like
   `DEW_WIDE_CPU_ARITHMETIC`).
+- Gemma 4 Unified (`google/gemma-4-12B`, `model_type` `gemma4_unified`) loads as a native media wrapper:
+  its encoder-free vision patches and raw audio frames project into the Gemma 4 decoder, either medium
+  optional, and every attention kind reads each vision block whole. Its model FLOPs count its language
+  model, as a vision projector's work is left out; a wrapper with an audio encoder refuses the count.
+  A Gemma 4 audio clip's placeholders now read their valid frames by index, so a clip with masked frames
+  between valid ones maps each placeholder to its own frame.
+- `WeightLayout.source_array` assembles a source tensor in JAX at its compute dtype, traceable, as
+  `export` lays it out; `export` keeps the host copy and the stored dtype.
+- `record_case` takes no proxy: the recorded reference alone then sizes the count.
 - `SafetensorsBanks` streams a media wrapper's language model and the native backbone of a decision
   release whose readout is stored apart (a slot release), besides a decoder: it reads the source through
   `dew.interop.pretrained.native_backbone`, `Pretrained.load`'s own translation and tree check over the
