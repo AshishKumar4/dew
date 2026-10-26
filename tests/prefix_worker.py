@@ -21,7 +21,7 @@ def mode_prefix_generation(args) -> dict:
     import jax.numpy as jnp
     from block_support import model as block_model
 
-    from dew.coordination import PeerFailure
+    from dew.distributed import PeerFailure
     from dew.inference import TextGeneration
     from dew.nn.inputs import ModelInputs, mesh_of
     from dew.nn.mixers import AttentionMixer
