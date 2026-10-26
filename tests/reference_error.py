@@ -496,7 +496,12 @@ def row_errors(value, truth, terms=None) -> tuple[np.ndarray, np.ndarray]:
         return np.zeros(0), np.zeros(0)
 
     def rms(rows):
-        return np.sqrt(np.mean(np.square(np.asarray(rows, np.float64).reshape(-1, truth.shape[-1])), axis=1))
+        # Each row scaled by its largest first, so a row of finite values near float64's largest squares
+        # in range (row 1628).
+        rows = np.abs(np.asarray(rows, np.float64).reshape(-1, truth.shape[-1]))
+        largest = np.max(rows, axis=1, keepdims=True) if rows.shape[1] else np.zeros((len(rows), 1))
+        scale = np.where(largest > 0, largest, 1.0)
+        return scale[:, 0] * np.sqrt(np.mean(np.square(rows / scale), axis=1))
 
     sizes = rms(truth) if terms is None else np.maximum(rms(truth), rms(terms))
     leaf = max(distance(truth, 0), 0.0 if terms is None else distance(terms, 0))
