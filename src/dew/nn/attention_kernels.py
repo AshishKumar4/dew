@@ -167,15 +167,26 @@ def _flash_installed(case: AttentionCase) -> bool:
 
 
 def _flash_built(case: AttentionCase) -> bool:
+    # A step traced for an assumed GPU takes the wheel its target installs, as `_flash_installed` holds.
     architectures = flash_architectures()
-    return architectures is None or flash_built_for(device_generation(), architectures)
+    return (architectures is None or generation.ASSUMED.get() is not None
+            or flash_built_for(device_generation(), architectures))
+
+
+def _declared(kernel: str) -> bool:
+    """Whether the target's instruction family declares `kernel` its old route (`OLD_ROUTES`), which keeps
+    every call it supports there: its measured qualifications against the other old routes hold."""
+    old = OLD_ROUTES.get(generation.family(device_generation()) or '')
+    return old is not None and old[0] == kernel
 
 
 def _qualified(code: str, has: Callable[[AttentionCase], bool], choice: str, default: str,
                feature: str) -> Requirement[AttentionCase]:
     """FlashAttention's measured requirement that the target row names it for `choice` where a call
-    `has` the feature (`default` the row's answer where it names nothing)."""
-    return _Need(code, lambda case: not has(case) or measured_kernel(choice, default) == 'flash',
+    `has` the feature (`default` the row's answer where it names nothing), which a family declaring it
+    holds (`_declared`)."""
+    return _Need(code, lambda case: not has(case) or _declared('flash')
+                 or measured_kernel(choice, default) == 'flash',
                        lambda case: f"{feature}, for which its target row names it on no "
                                     f"{device_generation()}",
                        row='roadmap: qualify flash attention', kind='measured')
@@ -190,8 +201,10 @@ def _narrow(case: AttentionCase) -> bool:
 
 
 def _row_names_flash(case: AttentionCase) -> bool:
-    """Whether the target's row names FlashAttention for `case`: its narrow heads' row where that
-    speaks for the call (`_narrow`), else its attention row."""
+    """Whether the target's row names FlashAttention for `case`: its family's declared route (`_declared`),
+    else its narrow heads' row where that speaks for the call (`_narrow`), else its attention row."""
+    if _declared('flash'):
+        return True
     if _narrow(case) and measured_kernel('attention_narrow', 'triton') == 'flash':
         return True
     return measured_kernel('attention', 'cudnn') == 'flash'
@@ -216,7 +229,7 @@ FLASH_SUPPORTS = (
                 "the call packs documents with no bound on a row's (`Coordinates.max_segments`), which its "
                 "packed sequences need", row=INHERENT),
     _Need('packed_documents', lambda case: case.documents is None or case.max_segments is None
-                or case.max_segments <= FLASH_PACKED_SEGMENTS,
+                or case.max_segments <= FLASH_PACKED_SEGMENTS or _declared('flash'),
                 lambda case: f"the call packs up to {case.max_segments} documents a row, past the "
                              f"{FLASH_PACKED_SEGMENTS} its empty sequences cost less than the document mask",
                 row='measured: flash packed-document cap (docs/performance.md)', kind='measured'),
@@ -424,8 +437,10 @@ TEMPLATE_SUPPORTS = (
 bf16 and fp16 on the queries and keys alike, no arbitrary mask and no bias, no sharded sequence axis, and the
 call's default arithmetic. It takes every other call form: causality, windows, documents, key lengths and
 starts, block groups, sinks, a softcap, and probability dropout off a GPU (`attention_route.drops`). The
-target's measured row prefers it for block calls (`attention_blocks`, `_attention_preferred`); elsewhere it
-runs where a call names it (`implementation='template'`, or `generation.chosen(attention='template')`)."""
+call runs it by default on a family whose Mosaic template has a routed mainloop, where its declared old
+route does not take the call (`_attention_preferred`), and where a target's measured row prefers it for
+block calls (`attention_blocks`); elsewhere where a call names it (`implementation='template'`, or
+`generation.chosen(attention='template')`)."""
 
 
 OLD_ROUTES: dict[str, tuple[str, str]] = {
@@ -445,8 +460,9 @@ the template wins."""
 
 def _attention_preferred(case: AttentionCase) -> str:
     """The kernel `case` runs: splash on a TPU and xla on a CPU, where its calls take the reference path
-    (`_xla_kernel_on_cpu`); on a GPU xla for a query no fused kernel takes the dtype of; on a family whose
-    Mosaic template has a routed mainloop, its declared old route where that takes the call
+    (`_xla_kernel_on_cpu`); on a GPU xla for a query no fused kernel takes the dtype of (the Mosaic
+    template takes 16-bit operands alone, so no family routes it another); on a family whose Mosaic
+    template has a routed mainloop, its declared old route where that takes the call
     (`OLD_ROUTES`), else the template, which hands a call it does not take to the next kernel by legality;
     elsewhere its row's ('attention', cuDNN by default), and the narrow heads' row's ('attention_narrow')
     for heads at most 64 wide with no window, mask, bias, documents, key lengths or key starts

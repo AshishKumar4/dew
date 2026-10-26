@@ -7,7 +7,8 @@ backward run on the Mosaic template, Mosaic GPU's mainloop, where it runs the ca
 is one it takes and a config fits), else by legality on the frozen Triton mainloop (`attention_triton`, which
 walks no call's runs, `attention_triton.refused`). Everywhere else, or where neither takes the call, both run
 the plain-JAX mainloop (`attention_portable`). Every mainloop's training forward gives the same residuals, so
-the backward runs wherever it is fastest. The route takes score hooks and the initial state. The caller
+the backward runs on whichever takes it by legality (a 16-bit call's fp16 backward on Triton's, which Mosaic's
+bf16 backward does not take). The route takes score hooks and the initial state. The caller
 applies an output hook past the kernel, because the template's backward takes the output before it
 (`templates/attention.py`'s `gradients`).
 """

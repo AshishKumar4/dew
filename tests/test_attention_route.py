@@ -3,8 +3,9 @@
 Its output and its gradients of the query, key, value and sinks are on par with Dew's reference path from
 float64 (check 1), for each call form the route takes, block groups among them, a cache call's included.
 Every case has grouped key heads: four query heads over two. The selector refuses the route a mask and a
-bias by their inherent limits; a target's measured row prefers it for a call with block groups, which no
-other fused kernel reads, and otherwise only a call that names it runs it. On meshes, a named call runs per
+bias by their inherent limits; on a family whose Mosaic template has a routed mainloop (wgmma's) it runs
+every other call its declared old route does not take, a target's measured row prefers it for a call with
+block groups, and otherwise a call that names it runs it. On meshes, a named call runs per
 shard under `sharded.assert_runs_per_shard`: with fewer key heads than the tensor shards, with key heads split
 partly, with key heads split in the other order from the query heads, or with heads that take an axis the
 rows' arguments name.
@@ -39,7 +40,7 @@ from test_attention_template import (
 
 from dew.nn import attention
 from dew.nn.attention import scaled_dot_product_attention
-from dew.nn.attention_kernels import ATTENTION, OLD_ROUTES, kernel_refusals
+from dew.nn.attention_kernels import ATTENTION, FLASH_PACKED_SEGMENTS, kernel_refusals
 from dew.nn.inputs import counted_places
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.generation import INHERENT
@@ -49,6 +50,7 @@ from dew.nn.kernels.templates import (
     attention_mosaic,
     attention_mosaic_program,
     attention_route,
+    attention_triton,
 )
 from dew.nn.sharding import DEFAULT_RULES
 
@@ -389,54 +391,73 @@ def test_the_selector_refuses_a_mask_and_a_bias_by_their_inherent_limits():
 
 
 def test_a_templated_family_runs_the_template_where_its_declared_route_does_not_take_a_call():
-    """On a family whose Mosaic template has a routed mainloop (`attention_mosaic_program.BUNDLES`), 'auto'
-    resolves each call to its declared old route where that takes it (`OLD_ROUTES`), else the template; on
-    every other family to its row's route, never the template; and a call naming the template, or
-    `generation.chosen` naming it for the attention choice, takes it everywhere (bible §4, owner 10-25)."""
-    query = jnp.zeros((ROWS, QUERIES, HEADS, WIDTH), jnp.bfloat16)
-    key = jnp.zeros((ROWS, KEYS, KV_HEADS, WIDTH), jnp.bfloat16)
+    """'auto' on an H100, whose wgmma family has a routed Mosaic template, runs FlashAttention-3 on every
+    16-bit call it supports (a plain call, a window, documents past the old 64-a-row cap) and the template on
+    every other one the template takes (sinks and a softcap, key lengths); an fp32 call stays on xla, the
+    Mosaic template taking 16-bit operands alone. Every other target runs its row's route, never the
+    template on these calls; a call naming the template, or `generation.chosen` naming it for the attention
+    choice, takes it everywhere (bible §4, owner 10-25)."""
     sinks = jnp.zeros((HEADS,), jnp.bfloat16)
-    calls = [
-        {},
-        {"causal": True, "sliding_window": 24},
-        {"sinks": sinks, "softcap": SOFTCAP},
-        {"causal": True, "key_value_seq_lengths": LENGTHS},
-    ]
+    documents = 2 * FLASH_PACKED_SEGMENTS + 2
+    many = jnp.tile(jnp.repeat(jnp.arange(1, documents // 2 + 1), 2)[None], (ROWS, 1))
+    calls = {
+        "plain": (QUERIES, {}, "flash"),
+        "window": (QUERIES, {"causal": True, "sliding_window": 24}, "flash"),
+        "documents past the cap": (documents, {"segment_ids": many, "max_segments": documents // 2}, "flash"),
+        "sinks and a softcap": (QUERIES, {"sinks": sinks, "softcap": SOFTCAP}, "template"),
+        "key lengths": (QUERIES, {"causal": True, "key_value_seq_lengths": LENGTHS}, "template"),
+    }
+
+    def selected(length, call, dtype=jnp.bfloat16):
+        # The kernel selected, not what this host runs of it (`attention_kernels._hosted`).
+        query = jnp.zeros((ROWS, length, HEADS, WIDTH), dtype)
+        key = jnp.zeros((ROWS, length, KV_HEADS, WIDTH), dtype)
+        with generation.routes() as found:
+            attention.resolve_implementation("auto", query, key, **call)
+        (kernel,) = [route.kernel for route in found if route.choice == "attention"]
+        return kernel
+
+    with generation.assumed("sm90"):
+        for name, (length, call, kernel) in calls.items():
+            assert selected(length, call) == kernel, name
+        assert selected(QUERIES, {}, jnp.float32) == "xla"
     for target in generation.TARGETS:
-        family = generation.family(target)
         with generation.assumed(target):
-            for call in calls:
-                # The kernel selected, not what this host runs of it (`attention_kernels._hosted`).
-                with generation.routes() as found:
-                    attention.resolve_implementation("auto", query, key, **call)
-                (auto,) = [route.kernel for route in found if route.choice == "attention"]
-                if family in attention_mosaic_program.BUNDLES:
-                    old = OLD_ROUTES[family][0]
-                    takes = not kernel_refusals(ATTENTION, old, attention.attention_case(query, key, **call))
-                    assert auto == (old if takes else "template"), (target, call, auto)
-                else:
-                    assert auto != "template", (target, call)
-                named = attention.resolve_implementation("template", query, key, **call)
-                assert named == "template", (target, call)
-    assert generation.family("sm90") in attention_mosaic_program.BUNDLES
+            for name, (length, call, _) in calls.items():
+                if target != "sm90":
+                    assert selected(length, call) != "template", (target, name)
+                query = jnp.zeros((ROWS, length, HEADS, WIDTH), jnp.bfloat16)
+                key = jnp.zeros((ROWS, length, KV_HEADS, WIDTH), jnp.bfloat16)
+                assert attention.resolve_implementation("template", query, key, **call) == "template", name
     with generation.chosen(attention="template"):
-        for call in calls:
-            assert attention.resolve_implementation("auto", query, key, **call) == "template", call
+        for name, (length, call, _) in calls.items():
+            assert selected(length, call) == "template", name
 
 
 @pytest.mark.skipif(generation.device_generation() != "sm90", reason="runs the route's backward, on an H100")
 @pytest.mark.gpu(reason="runs the route's backward, on an H100")
 @pytest.mark.parametrize("case", ["causal", "packed-documents", "sinks-softcap"])
 def test_on_an_h100_the_routes_backward_is_the_mosaic_template(case):
-    """On an H100 a bf16 call's backward runs the Mosaic mainloop's Template implementation
-    (`attention_mosaic.MosaicBackward`, traced among the launches, `tuning.seen`) from the Triton forward's
-    residuals, a causal call's, a spans call's and a hooked one's alike (`attention_mosaic.backward_takes`),
-    which the route's parity test holds on par with the reference path."""
+    """On an H100 a bf16 call's training forward and backward run the Mosaic template
+    (`attention_mosaic.MosaicForward`, `MosaicBackward`, traced among the launches, `tuning.seen`), the
+    frozen Triton mainloop not at all, a causal call's, a spans call's and a hooked one's alike
+    (`attention_mosaic.forward_takes`, `backward_takes`), and so does an inference forward; the route's
+    parity test holds them on par with the reference path."""
     queries, keys = geometry(CASES[case])
     operands = drawing(queries, keys, jnp.bfloat16, sinks=bool(CASES[case].get("sinks")))(0)
     with tuning.seen() as launches:
         jax.jit(pulled("template", CASES[case])).trace(*operands)
-    assert any(isinstance(op, attention_mosaic.MosaicBackward) for op, _ in launches)
+    ops = [op for op, _ in launches]
+    assert any(isinstance(op, attention_mosaic.MosaicForward) for op in ops)
+    assert any(isinstance(op, attention_mosaic.MosaicBackward) for op in ops)
+    frozen = (attention_triton.TritonForward, attention_triton.TritonBackward)
+    assert not any(isinstance(op, frozen) for op in ops)
+    with tuning.seen() as launches:
+        jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation="template",
+                                                             **CASES[case])).trace(*operands[:3])
+    ops = [op for op, _ in launches]
+    assert any(isinstance(op, attention_mosaic.MosaicForward) for op in ops)
+    assert not any(isinstance(op, attention_triton.TritonForward) for op in ops)
 
 
 @pytest.mark.parametrize("kind", ["block_groups", "image_groups", "key_valid"])
