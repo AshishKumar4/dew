@@ -20,6 +20,7 @@ from flax import linen as nn
 from jax.experimental import checkify
 from model_support import Digits, decoder, serving_task as task
 from reference_error import assert_as_exact
+from serving_support import Served, assert_served_as_exact
 from sharded import assert_sharded
 from steady_state import guarded, steady_state
 
@@ -708,13 +709,30 @@ def test_a_hybrid_stack_serves_each_rows_own_state_beside_its_pages(options):
         assert_same_generation(ticket.result(), lone)
 
 
-def test_a_shared_prefix_is_refused_where_rows_hold_state_beside_their_pages():
-    """A shared prefix's pages hold its keys and nothing of the recurrent state its prompt left,
-    so a row reusing them would start that state from nothing: the server refuses the prefix
-    cache for such a stack rather than serve it."""
-    with pytest.raises(ValueError):
-        Server.from_task(hybrid_task(), slots=4, capacity=128, kv_cache=KVCache(page_size=4, pages=64),
-                         prefix_cache=True)
+HYBRID_SHARED = {"slots": 2, "capacity": 64, "kv_cache": KVCache(page_size=4, pages=40), "prefix_cache": True}
+"""A paged server sharing full pages of 4 prompt tokens, its rows' recurrent state beside them."""
+
+
+@pytest.mark.parametrize("requests, options, hits", [
+    ((Served(12), Served(12), Served(12, flipped=(9,))), {}, (0, 8, 16)),
+    ((Served(12), Served(12), Served(12, flipped=(9,))), {"chunk": 3}, (0, 8, 16)),
+    ((Served(12), Served(12, flipped=(6,))), {}, (0, 0)),
+    ((Served(12), Served(12, flipped=(6,))), {"prefix_state_every": 1}, (0, 4)),
+    ((Served(12), Served(12, flipped=(1,)), Served(12)), {"prefix_states": 1}, (0, 0, 0)),
+    ((Served(12), Served(12, flipped=(1,)), Served(12)), {"prefix_states": 2}, (0, 0, 8))],
+    ids=["deepest", "deepest-in-pieces", "shallower", "every-page", "evicted", "kept"])
+def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(requests, options, hits):
+    """A shared prefix's pages hold its keys, and a hybrid stack's rows keep their recurrent memory and
+    conv tail beside them: the server keeps the state a prompt leaves at its deepest shareable page
+    boundary (and every `prefix_state_every` pages below it), a piece cut to end there, and a later prompt
+    reuses the pages as deep as a state is kept, starting its row from that state. A prompt agreeing with
+    an earlier one past its deepest boundary reads both its pages; one agreeing only through its first
+    page reads none, unless a state is kept there; a state evicted from a store of one entry takes its
+    reuse with it. Each request draws what it draws alone and scores it as a full forward does (check 1)."""
+    hybrid = hybrid_task()
+    task = TextGeneration(hybrid.model, hybrid.variables, sampling=Sampling(temperature=0, pad_token_id=0))
+    assert_served_as_exact(task, requests, f"hybrid shared prefix {hits}",
+                           serving={**HYBRID_SHARED, **options}, hits=hits)
 
 
 def served_alongside(bound, slots=4, admission=2, **options):

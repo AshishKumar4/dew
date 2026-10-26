@@ -24,6 +24,7 @@ from dew.batch import Variables
 from dew.inference.tasks import cache_sized
 from dew.mesh import logical_spec
 from dew.nn.attention import CROSS_KEY, CROSS_VALUE
+from dew.nn.cross_attention import CROSS_CACHE
 from dew.nn.inputs import Admitted, ModelInputs, default_placement
 from dew.nn.kernels.options import compiler_options
 from dew.nn.kernels.tuning import tune
@@ -543,6 +544,49 @@ def _reusable(compiled: jax.stages.Compiled, formats: Formats) -> Step | None:
              grammar):
         return compiled(params, resident, carried, admission, transforms, stopping, grammar)
     return step
+
+
+def row_state(path) -> bool:
+    """Whether the decoder cache leaf at `path` is a row's own state, which its prompt leaves in the row's
+    slot (a recurrent mixer's memory and conv tail, latent attention's index keys): any leaf but the paged
+    pool's, its table, a row's cursors and a cross-attention layer's context."""
+    return leaf_name(path) not in POOLED | {TABLE} | ROW_CURSORS | CROSS_CACHE
+
+
+def _restored(resident: Slots, carried: Slots, states: Variables, slots: jax.Array,
+              entries: jax.Array) -> tuple[Slots, Slots]:
+    """The state with each row state leaf's `slots` rows set to `states`' `entries` (`row_state`), the rest
+    as it is; a slot past the rows is dropped."""
+    state = joined(resident, carried)
+
+    def restored(held, leaf):
+        return leaf if held is None else leaf.at[slots].set(held[entries].astype(leaf.dtype), mode="drop")
+
+    cache = jax.tree.map(restored, states, state.decoder.cache, is_leaf=lambda x: x is None)
+    return split_donated(state.replace(decoder=state.decoder.replace(cache=cache)))
+
+
+def _captured(states: Variables, resident: Slots, carried: Slots, slots: jax.Array,
+              entries: jax.Array) -> Variables:
+    """`states` with `entries` set to the row state leaves' `slots` rows (`row_state`); an entry past the
+    store is dropped."""
+    def captured(held, leaf):
+        return None if held is None else held.at[entries].set(leaf[slots].astype(held.dtype), mode="drop")
+
+    cache = joined(resident, carried).decoder.cache
+    return jax.tree.map(captured, states, cache, is_leaf=lambda x: x is None)
+
+
+def state_programs(formats: Formats, states: Variables) -> tuple[jax.stages.Wrapped, jax.stages.Wrapped]:
+    """The programs that move row states between the resident state, kept in `formats`, and a store of
+    them placed as `states` is: restoring a store's entries into slots, the resident matrices donated, and
+    capturing slots into a store's entries, the store donated (`dew.inference.pages.States`)."""
+    resident, carried = split_donated(formats)
+    placed = jax.tree.map(lambda leaf: leaf.sharding, states)
+    return (jax.jit(_restored, donate_argnums=(0,), in_shardings=(resident, carried, placed, None, None),
+                    out_shardings=(resident, carried)),
+            jax.jit(_captured, donate_argnums=(0,), in_shardings=(placed, resident, carried, None, None),
+                    out_shardings=placed))
 
 
 def opened_in(formats: Formats) -> jax.stages.Wrapped:

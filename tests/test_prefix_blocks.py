@@ -10,8 +10,6 @@ gets; the counted targets are exact; with no prefix the loss is the
 causal one, bitwise.
 """
 
-import dataclasses
-from collections.abc import Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -20,7 +18,8 @@ import optax
 import pytest
 from block_support import VOCAB, block_causal, model, wrapped
 from model_support import TINY_DECODER, model_draw
-from reference_error import assert_as_exact, seeds_for, widened, without_ynn
+from reference_error import assert_as_exact, seeds_for, without_ynn
+from serving_support import Served, assert_served_as_exact
 
 from dew.batch import BLOCKS_FIELD, coordinates
 from dew.data.chat import Role
@@ -30,7 +29,7 @@ from dew.inference.tasks import TextGeneration
 from dew.nn.inputs import ModelInputs
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixers import AttentionMixer
-from dew.nn.visibility import prefix_blocks, prompt_blocks, served_blocks, with_served_blocks
+from dew.nn.visibility import prefix_blocks, prompt_blocks, served_blocks
 from dew.objectives.lm import TEXT_KEY, LMObjective
 from dew.objectives.lm.objective import batch_text
 from dew.sampling import Sampling
@@ -345,25 +344,12 @@ def test_a_prefix_runs_stage_keeps_the_blocks_a_record_carries(prefix):
     np.testing.assert_array_equal(named["text_block_groups"], BLOCKS[1])
 
 
-SERVED_BUDGET = 3
-"""The tokens each served request draws."""
-
 WHOLE = {"slots": 2, "capacity": 64, "admission": 2}
 """A dense server prefilling each prompt whole, its three requests queued past its two slots."""
 PIECES = {"slots": 2, "capacity": 64, "kv_cache": KVCache(page_size=16, pages=8), "chunk": 2}
 """A paged server prefilling in pieces of 2 tokens, shorter than the prompts' blocks."""
 SHARED = {"slots": 2, "capacity": 64, "kv_cache": KVCache(page_size=4, pages=40), "prefix_cache": True}
 """A paged server sharing its full pages of 4 prompt tokens with a later prompt that agrees with them."""
-
-
-@dataclasses.dataclass(frozen=True)
-class Served:
-    """One served request: its prompt's first `length` tokens of the draw's row, with `flipped` places
-    changed, carrying the groups `groups` names (a field's group of each token, -1 for none)."""
-
-    length: int
-    groups: Mapping[str, tuple[int, ...]] = dataclasses.field(default_factory=dict)
-    flipped: tuple[int, ...] = ()
 
 
 THREE = (Served(5), Served(6), Served(7))
@@ -380,71 +366,11 @@ MEDIA = (Served(7, {BLOCKS_FIELD: (-1, 0, 0, -1, -1, -1, -1), "image_groups": (-
 """Prompts carrying an image beside a block, overlapping it, and an image alone."""
 
 
-def served_inputs(row: np.ndarray, request: Served) -> ModelInputs:
-    """`request`'s prompt of the draw's `row`, carrying its groups."""
-    prompt = row[:request.length].copy()
-    prompt[list(request.flipped)] = (prompt[list(request.flipped)] + 1) % VOCAB
-    return ModelInputs(jnp.asarray(prompt[None], jnp.int32),
-                       {name: jnp.asarray([held], jnp.int32) for name, held in request.groups.items()})
-
-
-def assert_served_as_exact(requests: Sequence[Served], label: str, *, serving: dict, prefix=None,
-                           images: bool = False, hits: Sequence[int] | None = None) -> None:
-    """Check 1 of a server's draws: greedy requests through a server with `serving`, all queued at once, or
-    with `hits` one after another (`prefix_hits` after each, its shared prefix pages), draw what the lone
-    task draws, and score each drawn token's raw log probability on par with a full forward of the decoder
-    over the prompt, its groups and the tokens drawn before it, from the float64 twin's."""
+def served_blocky(prefix=None, images: bool = False) -> TextGeneration:
+    """The lone greedy task over `blocky` a served request is drawn against, under a prefix run if given."""
     decoder = blocky(images).clone(max_seq_len=128)
-    wide = decoder.clone(dtype=jnp.float64, attention_impl="reference")
-    variables = decoder.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
-    task = TextGeneration(decoder, variables, sampling=Sampling(temperature=0, pad_token_id=0), prefix=prefix)
-    width = max(request.length for request in requests)
-
-    def draw(seed):
-        row = np.random.default_rng([0x1536, seed]).integers(1, VOCAB, width).astype(np.int32)
-        drawn = tuple(np.asarray(task(served_inputs(row, request), SERVED_BUDGET, key=index).host().tokens)
-                      [0, -SERVED_BUDGET:] for index, request in enumerate(requests))
-        return row, drawn
-
-    def served(row, drawn):
-        server = Server.from_task(task, **serving)
-        tickets, shared = [], []
-        for index, request in enumerate(requests):
-            tickets.append(server.submit(served_inputs(row, request), SERVED_BUDGET, key=index))
-            if hits is not None:
-                server.run()
-                shared.append(server.prefix_hits)
-        server.run()
-        assert hits is None or shared == list(hits), shared
-        generations = [ticket.result().host() for ticket in tickets]
-        for generation, tokens in zip(generations, drawn, strict=True):
-            np.testing.assert_array_equal(generation.tokens[0, -SERVED_BUDGET:], tokens)
-        return tuple(np.asarray(generation.raw_log_probs[0], np.float32) for generation in generations)
-
-    def explicit(model, wide_weights: bool = False):
-        forward = without_ynn(lambda weights, tokens, groups: jax.nn.log_softmax(
-            model.apply(weights, tokens, **groups)))
-
-        def scored(row, drawn):
-            weights = widened(variables) if wide_weights else variables
-            scores = []
-            for request, tokens in zip(requests, drawn, strict=True):
-                inputs = served_inputs(np.asarray(row), request)
-                prompt, tokens = np.asarray(inputs.tokens), np.asarray(tokens)
-                carried = {name: np.asarray(value) for name, value in inputs.token_fields.items()}
-                held = with_served_blocks(carried, np.ones(prompt.shape, bool), prefix)
-                tail = np.full((1, SERVED_BUDGET - 1), -1, np.int32)
-                logits = forward(weights, jnp.asarray(np.concatenate([prompt, tokens[None, :-1]], 1)),
-                                 {name: jnp.asarray(np.concatenate([value, tail], 1))
-                                  for name, value in held.items()})
-                read = logits[0, prompt.shape[1] - 1:]
-                scores.append(np.asarray(jnp.take_along_axis(read, jnp.asarray(tokens)[:, None], -1)[:, 0]))
-            return tuple(scores)
-        return scored
-
-    seeds = seeds_for(explicit(decoder), draw, label, truth_fn=explicit(wide, wide_weights=True))
-    assert_as_exact(served, explicit(decoder), draw, label, seeds=seeds,
-                    truth_fn=explicit(wide, wide_weights=True))
+    return TextGeneration(decoder, decoder.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32)),
+                          sampling=Sampling(temperature=0, pad_token_id=0), prefix=prefix)
 
 
 @pytest.mark.parametrize("prefix, serving", [(PREFIX, WHOLE), (PREFIX, PIECES), ("prompt", PIECES)],
@@ -455,7 +381,7 @@ def test_a_served_prefix_run_scores_what_each_request_scores_alone(prefix, servi
     over those blocks does (check 1). A server prefilling in pieces shorter than a block prefills that block
     in one longer piece (`Server._piece_end`), as a layer reads it whole, and the rest of the prompt in
     pieces."""
-    assert_served_as_exact(THREE, f"served prefix {prefix} run", serving=serving, prefix=prefix)
+    assert_served_as_exact(served_blocky(prefix), THREE, f"served prefix {prefix} run", serving=serving)
 
 
 @pytest.mark.parametrize("requests, serving, prefix, images", [
@@ -469,8 +395,8 @@ def test_a_served_prompt_carrying_its_groups_scores_what_it_scores_alone(request
     in its row's cache with its keys: requests queued past the slots draw what the lone task draws and score
     it as a full forward over those groups does (check 1). A piece never splits a group, its members
     adjacent or not, and a prompt's own blocks stand over a prefix run's, as `generate` keeps them."""
-    assert_served_as_exact(requests, f"served {request.node.callspec.id}", serving=serving, prefix=prefix,
-                           images=images)
+    assert_served_as_exact(served_blocky(prefix, images), requests, f"served {request.node.callspec.id}",
+                           serving=serving)
 
 
 LONG_BLOCK, SHORT_BLOCK = (-1, 0, 0, 0, 0, 0, -1, -1), (-1, 0, 0, 0, -1, -1, -1, -1)
@@ -493,7 +419,7 @@ def test_a_prefix_page_is_shared_only_between_prompts_whose_groups_agree(request
     a later member reads, while one that agrees through its last grouped token reads the first's full pages,
     a prefix run's prompts of several lengths alike, its resumed piece starting inside a group. Each scores
     what it scores alone (check 1)."""
-    assert_served_as_exact(requests, f"shared pages {hits}", serving=SHARED, prefix=prefix, hits=hits)
+    assert_served_as_exact(served_blocky(prefix), requests, f"shared pages {hits}", serving=SHARED, hits=hits)
 
 
 def chunked(size: int, *, unchunked: bool = False):
