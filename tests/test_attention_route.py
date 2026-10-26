@@ -453,8 +453,7 @@ def test_on_an_h100_the_routes_backward_is_the_mosaic_template(case):
     frozen = (attention_triton.TritonForward, attention_triton.TritonBackward)
     assert not any(isinstance(op, frozen) for op in ops)
     with tuning.seen() as launches:
-        jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, implementation="template",
-                                                             **CASES[case])).trace(*operands[:3])
+        jax.jit(template_call(CASES[case])).trace(*operands[:4])
     ops = [op for op, _ in launches]
     assert any(isinstance(op, attention_mosaic.MosaicForward) for op in ops)
     assert not any(isinstance(op, attention_triton.TritonForward) for op in ops)
