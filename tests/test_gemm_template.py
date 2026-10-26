@@ -15,7 +15,7 @@ import pytest
 from generation_support import INTERPRETS, SUMS_IN_IEEE, generations, lowers, runs
 from jax.experimental.pallas import fuser
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
-from reference_error import assert_as_exact, with_gradients
+from reference_error import as_given, assert_as_exact, with_gradients
 from tuned import each_config
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
@@ -245,7 +245,9 @@ def test_the_templates_gradients_hold_check_1(generation_name, case):
     spec = CASES[case]
     with generation.assumed(generation_name):
         dew = _gradients(_dew(spec, interpret_on_cpu=True))
-        assert_as_exact(dew, jax.jit(_gradients(_plain(spec))), _gradient_draw(spec),
+        # The sm90 interpreter runs eagerly; the gate compiles the other generations' arm itself.
+        dew = as_given(dew) if generation_name == "sm90" else dew
+        assert_as_exact(dew, _gradients(_plain(spec)), _gradient_draw(spec),
                         f"{case} gradients on {generation_name}", seeds=SEEDS,
                         truth_fn=_gradients(_plain(spec, truth=True)))
 
@@ -1139,7 +1141,7 @@ def test_a_cooperative_tiles_gradients_hold_check_1(case):
     pinned = {grouped_matmul.MosaicGmm: COOPERATIVE, grouped_matmul.MosaicTgmm: COOPERATIVE}
     with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"), tuning.pinned(pinned),
           generation.routes() as taken):
-        assert_as_exact(_gradients(_dew(spec, interpret_on_cpu=True)), jax.jit(_gradients(_plain(spec))),
+        assert_as_exact(as_given(_gradients(_dew(spec, interpret_on_cpu=True))), _gradients(_plain(spec)),
                         _gradient_draw(spec), f"{case} cooperative gradients", seeds=SEEDS,
                         truth_fn=_gradients(_plain(spec, truth=True)))
     assert _kernels(taken) == MOSAIC_RAN

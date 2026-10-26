@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import as_given, assert_as_exact_as_the_reference
 from safetensors.numpy import load_file
 
 from dew.interop import diffusion_gemma as adapter
@@ -353,6 +353,7 @@ def test_the_tempered_logits_divide_by_the_reference_temperature_at_every_step()
     def draw(seed):
         return (np.random.default_rng(seed).normal(0, 4, (48, 64)).astype(np.float32), remaining)
 
+    @as_given
     def reference(logits, steps):
         temperature = np.asarray([0.4 + (0.8 - 0.4) * (int(n) / 48) for n in steps])
         return logits / temperature.astype(logits.dtype)[:, None]

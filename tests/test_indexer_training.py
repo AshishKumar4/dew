@@ -22,6 +22,7 @@ import optax
 import pytest
 from recording import RecordingTracker
 from reference_error import (
+    as_given,
     assert_as_exact,
     assert_moves,
     declared_seeds,
@@ -113,9 +114,9 @@ def test_the_loss_its_gradient_and_the_selection_are_maxtexts(name):
         recording(path), name, seeds, truth_fn=lambda inputs: kl(inputs, np.float64(1)),
         inputs_of=published_inputs)
     assert_as_exact(lambda index, inputs, cotangent: kl(inputs, cotangent),
-                    lambda index, inputs, cotangent: reference(index, inputs),
+                    as_given(lambda index, inputs, cotangent: reference(index, inputs)),
                     lambda seed: (*recorded_draw(seed), np.float32(1)), f"{name} indexer loss", seeds=seeds,
-                    truth_fn=lambda index, inputs, cotangent: truth(index, inputs))
+                    truth_fn=as_given(lambda index, inputs, cotangent: truth(index, inputs)))
 
     legacy = fixture()
     legacy_keep = causal(META["length"]) if mask == "causal" else packed_keep(legacy["segments"])
@@ -146,6 +147,7 @@ def test_the_loss_its_gradient_and_the_selection_are_maxtexts(name):
         scores = np.maximum(rng.normal(scale=1.5, size=(transcription.BATCH, length, length)), 0)
         return scores.astype(np.float32), query, key
 
+    @as_given
     def transcribed(scores, query, key):
         dtype = np.asarray(scores).dtype
         indexer_mask, masked_scores = transcription.indexer_call(np.asarray(scores), additive,

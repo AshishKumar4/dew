@@ -13,7 +13,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, with_gradients
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, with_gradients
 
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense, DenseGeneral
@@ -185,6 +185,7 @@ def test_a_bias_sums_its_gradient_over_every_position_at_fp32(layer, shape):
         terms = np.asarray(cotangent, dtype).reshape(8192, -1)
         return terms.sum(0).reshape(variables["params"]["bias"].shape)
 
+    @as_given
     def reference(x, cotangent):
         # torch sums at fp32 and rounds once into the bfloat16 bias.
         return {"bias": np.asarray(jnp.asarray(summed(cotangent, np.float32), jnp.bfloat16), np.float64)}

@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 
 from dew.nn.audio import _position_signal
 from dew.nn.backbones.sd3 import sincos_position
@@ -71,6 +71,7 @@ def test_gemma3n_audio_positions_are_on_par_with_the_reference(width):
         angles = np.asarray(positions, np.float64)[:, None] * inverse[None, :]
         return np.concatenate([np.sin(angles), np.cos(angles)], axis=-1)
 
+    @as_given
     def theirs(positions):
         angles = torch.from_numpy(np.asarray(positions)).float()[:, None] * reference.inv_timescales[0]
         return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1).numpy()

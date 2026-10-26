@@ -12,7 +12,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from reference_error import assert_as_exact, widened
+from reference_error import as_given, assert_as_exact, widened
 
 
 def allocated_bytes(monkeypatch, operation):
@@ -381,7 +381,7 @@ def torch_logits(source, precision=None):
     def run(ids):
         with (precision or contextlib.nullcontext)(), torch.no_grad():
             return source(torch.from_numpy(np.asarray(ids)).long()).logits.double().numpy()
-    return run
+    return as_given(run)
 
 
 def token_table(variables) -> tuple[tuple[str, ...], np.ndarray]:
@@ -428,6 +428,7 @@ def assert_pads_as(model, variables, lookup, wide, pad: int, label: str, *, seed
             return jnp.sum(looked_up * cotangent)
         return flatten_dict(jax.grad(loss)(variables["params"]))[path]
 
+    @as_given
     def ours(ids, cotangent):
         return {"token table": np.asarray(gradient(variables, ids, cotangent), np.float64)}
 
@@ -438,7 +439,7 @@ def assert_pads_as(model, variables, lookup, wide, pad: int, label: str, *, seed
                 rows = torch.nn.Embedding.forward(module, torch.from_numpy(looked_up(ids)).long())
                 (rows * torch.from_numpy(cotangent).to(rows.dtype)).sum().backward()
                 return {"token table": module.weight.grad.double().numpy()}
-        return run
+        return as_given(run)
 
     ids, cotangent = draw(0)
     assert np.any(ours(ids, cotangent)["token table"][pad]) != padded
