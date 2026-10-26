@@ -235,8 +235,6 @@ def _chunk_delta_forward(query, key, value, g, beta, state, chunk_size, starts, 
     # modules; still so on base 8c5b5b16a, test_layer_stack's scanned
     # GLM-5-Next). The barrier materializes the zero. Remove it when XLA:CPU no
     # longer returns an uninitialized scan carry here.
-    if generation.placed_platform() == 'cpu':
-        state = jax.lax.optimization_barrier(state)
     grown, last, kept, last_token = _peeled_chunk_inputs(steps, value, g, beta, starts, chunk_size)
     entered, v_corrected, state = xla_chunk_states(
         steps.key, steps.w, steps.u, grown, last, state, kept, last_token=last_token, delta=delta)
