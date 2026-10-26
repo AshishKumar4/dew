@@ -174,9 +174,10 @@ def test_a_source_binds_a_chain_only_for_controls_its_policy_lacks(task):
     assert bound.logits is None and bound.n == 2
     assert (bound.sampling.repetition_penalty, bound.sampling.typical_p) == (2.0, 0.9)
     rare = replace(altered, generation_config={**altered.generation_config, "epsilon_cutoff": 0.01})
+    # Its unset top_k samples the top 50, as transformers' chain does (`TRANSFORMERS_TOP_K`).
     assert [type(transform) for transform in rare.text_generation().logits] == [
-        decoding.RepetitionPenalty, decoding.Temperature, decoding.TopP, decoding.MinP, decoding.Typical,
-        decoding.EpsilonCutoff]
+        decoding.RepetitionPenalty, decoding.Temperature, decoding.TopK, decoding.TopP, decoding.MinP,
+        decoding.Typical, decoding.EpsilonCutoff]
     override = rare.text_generation(sampling=Sampling(temperature=0))
     assert override.logits is None and override.sampling.repetition_penalty == 1.0 and override.n == 2
     plain = override([[1, 2]], 6, key=jax.random.key(1), n=1)
