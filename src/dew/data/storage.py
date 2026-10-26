@@ -678,6 +678,8 @@ class Store:
             except FileExistsError as error:
                 raise PreconditionFailed(self.url) from error
         if isinstance(fs, S3FileSystem):
+            from botocore.exceptions import ClientError
+
             if fs.loop is None:
                 raise ValueError("Dew storage needs synchronous S3 filesystem options")
             bucket, key, _ = fs.split_path(path)
@@ -687,9 +689,10 @@ class Store:
                 outcome = fs.call_s3("put_object", Bucket=bucket, Key=key, Body=payload,
                                      **({"IfNoneMatch": "*"} if version is None else {"IfMatch": version}))
             except OSError as error:
-                # s3fs translates the refused condition; its response stays the error's cause.
-                answered = getattr(error.__cause__, "response", None) or {}
-                if answered.get("ResponseMetadata", {}).get("HTTPStatusCode") in (409, 412):
+                # s3fs translates the refused condition; botocore's answer stays the error's cause.
+                cause = error.__cause__
+                if isinstance(cause, ClientError) and cause.response.get(
+                        "ResponseMetadata", {}).get("HTTPStatusCode") in (409, 412):
                     raise PreconditionFailed(self.url) from error
                 raise
             fs.invalidate_cache()
