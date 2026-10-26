@@ -67,10 +67,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.gemma3n import AltUp
 from dew.nn.vision.gemma3n import translate_gemma3n_projector_config, translate_gemma3n_vision_config
 from dew.nn.vision.gemma4 import translate_gemma4_projector_config, translate_gemma4_vision_config
-from dew.nn.vision.gemma4_unified import (
-    translate_projector as unified_projector,
-    translate_vision as unified_vision,
-)
+from dew.nn.vision.gemma4_unified import translate_gemma4_unified_vision_config
 from dew.nn.vision.llama4 import translate_llama4_projector_config, translate_llama4_vision_config
 from dew.nn.vision.qwen35 import translate_qwen35_projector_config, translate_qwen35_vision_config
 from dew.nn.vision.siglip import translate_gemma_projector_config, translate_siglip_vision_config
@@ -202,15 +199,23 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
 
     Gemma 4 projects encoded frames through the same norm-and-project
     embedder as its images, at the encoder's output width; the processor
-    inserts exactly one placeholder per valid encoded frame. Gemma 3n keeps
-    a fixed audio_soft_tokens_per_image slots per clip through its vocabulary
-    embedder.
+    inserts exactly one placeholder per valid encoded frame. Gemma 4 Unified
+    has no encoder and projects raw frames through the same embedder. Gemma 3n
+    keeps a fixed audio_soft_tokens_per_image slots per clip through its
+    vocabulary embedder.
     """
     stated = hf_config.get("audio_config")
     used.update(("audio_config", "audio_token_id", "audio_soft_tokens_per_image"))
     if stated is None:
         return NO_AUDIO.copy()
     audio = _records.record(stated, "audio_config")
+    if audio.get("model_type") == "gemma4_unified_audio":
+        # No encoder: the embedder projects raw frames of audio_embed_dim samples each, one placeholder
+        # a frame (Gemma4UnifiedAudioConfig's default 640, configuration_gemma4_unified.py:46 at 5.17.0).
+        frame = _records.integer(audio.get("audio_embed_dim", 640), "audio_embed_dim")
+        return {"audio": None, "audio_token_id": _wrapper_token_id(hf_config, used, "audio_token_id"),
+                "audio_soft_tokens": None,
+                "audio_projector": translate_gemma4_projector_config(audio, text_width, frame)}
     encoder = audio_nn.audio_config(audio)
     slots = None
     projector: Mapping[str, object]
@@ -232,25 +237,33 @@ def _wrapper_audio(hf_config: Mapping[str, object], used: set, text_width: int) 
             "audio_soft_tokens": slots, "audio_projector": projector}
 
 
+def _gemma4_placeholders(hf_config: Mapping[str, object], used: set[str]) -> tuple[int, int, int]:
+    """A Gemma 4 wrapper's image, video and audio placeholder ids. The image's is the config's own and
+    refused where it names none, as every wrapper's is; the video's and audio's default to Gemma4Config's
+    and Gemma4UnifiedConfig's, which agree (transformers 5.17.0, configuration_gemma4.py:349,352 and
+    configuration_gemma4_unified.py:309,312), and both stay placeholders to the decoder whether or not
+    a tower reads them."""
+    image = _wrapper_token_id(hf_config, used, "image_token_id", "image_token_index")
+    used.update(("video_token_id", "audio_token_id"))
+    video, audio = (_records.integer(hf_config.get(name, default), name)
+                    for name, default in (("video_token_id", 258884), ("audio_token_id", 258881)))
+    return image, video, audio
+
+
 def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
     """Read a Gemma 4 wrapper: 2D-table tower, position pooler, embedder, decoder."""
     text = _wrapper_text(hf_config, used, declared_type='gemma4_text')
     tower = translate_gemma4_vision_config(hf_config)
     projector = translate_gemma4_projector_config(
         tower["fields"], _records.integer(text.get("emb_features"), "emb_features"))
-    image = _wrapper_token_id(hf_config, used, "image_token_id", "image_token_index")
     # The soft-token count follows the image resolution, so the record leaves
     # it open and each call reads it off the tower output. The wrapper's
     # vision_soft_tokens_per_image is the processor's budget, not the count.
-    used.update(("vision_soft_tokens_per_image", "video_token_id",
-                 "boa_token_id", "eoa_token_id", "eoa_token_index"))
-    # Gemma4Config's defaults where a config leaves them out: its video and audio placeholders stay
-    # placeholders to the decoder whether or not an audio tower reads the latter.
-    video, audio_id = (_records.integer(hf_config.get(name, default), name)
-                       for name, default in (("video_token_id", 258884), ("audio_token_id", 258881)))
+    used.update(("vision_soft_tokens_per_image", "boa_token_id", "eoa_token_id", "eoa_token_index"))
+    image, video, audio = _gemma4_placeholders(hf_config, used)
     return _wrapper_fields("gemma4", used, text, tower, projector, image, None,
                            _wrapper_audio(hf_config, used, record_int(text, "emb_features")),
-                           video=video, extra=(video, audio_id))
+                           video=video, extra=(video, audio))
 
 
 def _gemma4_unified_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
@@ -261,21 +274,13 @@ def _gemma4_unified_wrapper(hf_config: Mapping[str, object], used: set[str]) -> 
     tower = projector = None
     if vision is not None:
         vision = _records.record(vision, 'vision_config')
-        tower = unified_vision(vision)
-        projector = unified_projector(vision, width, record_int(tower['fields'], 'mm_embed_dim'))
-    audio = hf_config.get('audio_config')
-    audio_fields: AudioFields = NO_AUDIO
-    audio_id = _records.integer(hf_config.get('audio_token_id', 258881), 'audio_token_id')
-    if audio is not None:
-        audio = _records.record(audio, 'audio_config')
-        audio_fields = {'audio': None, 'audio_projector': unified_projector(
-            audio, width, _records.integer(audio.get('audio_embed_dim', 640), 'audio_embed_dim')),
-                        'audio_token_id': audio_id, 'audio_soft_tokens': None}
-    image = _records.integer(hf_config.get('image_token_id', 258880), 'image_token_id')
-    video = _records.integer(hf_config.get('video_token_id', 258884), 'video_token_id')
-    used.update(('audio_config', 'audio_token_id', 'video_token_id', 'boa_token_id', 'eoa_token_index'))
+        tower = translate_gemma4_unified_vision_config(vision)
+        projector = translate_gemma4_projector_config(vision, width,
+                                                      record_int(tower['fields'], 'mm_embed_dim'))
+    used.update(('boa_token_id', 'eoa_token_index'))
+    image, video, audio = _gemma4_placeholders(hf_config, used)
     return _wrapper_fields('gemma4_unified', used, text, tower, projector, image, None,
-                           audio_fields, video=video, extra=(video, audio_id))
+                           _wrapper_audio(hf_config, used, width), video=video, extra=(video, audio))
 
 
 def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
@@ -321,10 +326,11 @@ _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields
 def translate_wrapper_config(hf_config: Mapping[str, object]) -> WrapperFields:
     """Translate a multimodal wrapper into its decoder, tower and projector records.
 
-    gemma3, llama4, gemma4, qwen3_5, qwen3_5_moe, gemma3n and decoder-family
+    gemma3, llama4, gemma4, gemma4_unified, qwen3_5, qwen3_5_moe, gemma3n and decoder-family
     bundles translate. Records retain the decoder, tower, projector, image token ID and token count, and
     for Gemma 3n and Gemma 4 the optional audio tower, its embedder, the
-    audio placeholder ID and Gemma 3n's fixed slots per clip. Gemma 3n's
+    audio placeholder ID and Gemma 3n's fixed slots per clip. Gemma 4 Unified has neither tower: its
+    embedders project vision patches and raw audio frames, either optional. Gemma 3n's
     embedders also embed their hard vocabulary ranges.
     """
     model_type = hf_config.get("model_type")

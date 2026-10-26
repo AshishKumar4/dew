@@ -276,7 +276,8 @@ type DecoderFields = NativeFields[CausalTransformer]
 class AudioFields(TypedDict):
     """Describes the audio half of a wrapper record.
 
-    A family without an audio tower carries all four as None.
+    A family without audio carries all four as None; one whose audio is a projector of raw frames
+    (Gemma 4 Unified) carries no tower (`audio` None) beside its projector and placeholder id.
     """
 
     audio: Mapping[str, object] | None
@@ -976,8 +977,8 @@ def modeling_overrides(source: Mapping[str, object], config: DecoderFields, used
         kinds[name] = kind
 
 
-# Every wrapper record carries the audio fields; families without an audio
-# tower carry them as None.
+# Every wrapper record carries the audio fields; families without audio carry
+# them as None.
 NO_AUDIO: AudioFields = {"audio": None, "audio_projector": None,
                           "audio_token_id": None, "audio_soft_tokens": None}
 

@@ -369,12 +369,15 @@ class Processor:
                                          ("pixel_values_videos", "video_position_ids")):
                 if (pixels in values) != (coordinates in values):
                     raise ValueError(f"{pixels} and {coordinates} arrive together")
+            # A Gemma 4 call's vision blocks are its mm_token_type_ids' runs. A call without the field
+            # carries none, so its vision tokens read causally, as transformers computes them without it
+            # (5.17.0's modeling_gemma4.py:2395, modeling_gemma4_unified.py:1097-1101).
             if "mm_token_type_ids" in values:
                 types = np.asarray(values["mm_token_type_ids"])
                 if types.shape != tokens.shape or not np.issubdtype(types.dtype, np.integer):
                     raise ValueError("mm_token_type_ids must be integer values aligned with input_ids")
                 # Image-to-video adjacency stays one vision run; hard text
-                # breaks it (modeling_gemma4.py:2148-2157).
+                # breaks it (5.17.0's modeling_gemma4.py:2143-2152).
                 vision = (types == 1) | (types == 2)
                 previous = np.concatenate([np.zeros((tokens.shape[0], 1), bool), vision[:, :-1]], axis=1)
                 groups = np.cumsum(vision & ~previous, axis=1, dtype=np.int32) - 1
