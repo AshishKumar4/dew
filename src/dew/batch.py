@@ -433,7 +433,7 @@ def dicts[Tree](tree: Tree) -> Tree:
     at a list. A record that is a mapping of its own kind (an optimizer's `nnx.State`) stays as it is,
     its contents read the same way. The trees an objective holds, the state's and a step's
     written-back collections are dicts, so that a placement writing each placed leaf into the dict
-    that held it (`dew.training.host.stream`) writes into the objective's tree, and every tree of a
+    that held it (`dew.distributed.host.stream`) writes into the objective's tree, and every tree of a
     step has the state's structure."""
     nodes = jax.tree.leaves(
         tree, is_leaf=lambda node: isinstance(node, (dict, FrozenDict)) and type(node) is not dict)

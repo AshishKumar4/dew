@@ -85,10 +85,10 @@ def main() -> None:
 
     from dew.checkpoints import Checkpoints
     from dew.data.dataset import DataPartition, Loader
+    from dew.distributed.batches import shard_batch
     from dew.objectives.lm import LMObjective
     from dew.registry import models
     from dew.training import Layout, MeshSpec, Trainer
-    from dew.training.distributed import shard_batch
 
     def share(partition):
         """A loader's share: the rows of one packed batch this partition's
