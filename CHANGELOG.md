@@ -13,6 +13,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 - `tools/slot_runtime_qualification.py` qualifies a released slot runtime against the authors' engine and
   its float64 truth, the truth's weights streamed from those banks: phases pool, native, environment,
   author, truth (`--partial` resumes a stopped phase) and verdict, one checkout's commit across them.
+- `UNet2DCondition` stores its time embeddings' two maps flat, as `time_linear_1` and `time_linear_2`
+  (and `additional_time_linear_1` and `_2`), where they were `time/in_proj` and `time/out_proj`; a
+  published UNet loads as before. An AutoencoderKL's resnets are `dew.nn.blocks.ResidualBlock` called
+  without a time embedding, and `dew.nn.autoencoders.vae.FlaxResnetBlock2D` is gone. `dew.nn.engram`
+  draws its bucket primes with `sympy.nextprime`, so `sympy` is a dependency.
 - `OptimConfig` and `ScheduleSpec` move from `dew.config` to `dew.optim`, beside the optimizers and
   schedules they build; `Wandb` moves to `dew.training` (`dew.training.tracker`), beside the tracker that
   reads it; and
@@ -56,6 +61,17 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   `dew.objectives.lm.objective`); the axis names, `DEFAULT_RULES`, `axis_rules`, `logical_spec`,
   `row_axes`, `batch_axes` and `LayoutRefused` (from `dew.nn.sharding`). Import them from their
   new modules; the old ones no longer hold them.
+- A Hub split's shards are the files `datasets` resolves to it from the repository's listing, by its own
+  default patterns (`dew.data.sources.hub.split_files`): `dev` and `valid` are `validation`'s, a sharded
+  name's split is its own and a lone file is `train`'s, where a name match missed them.
+- An immutable upload's `retries` (`Cache.retry`) re-read only an object it created that reads back
+  otherwise; a failed transfer raises after its transport's own retries, not Dew's on top of them.
+- A decision run's calibration takes its probabilities through SciPy's `softmax` and fits each
+  temperature with SciPy's bounded L-BFGS-B on its inverse, at least 1e-3, in place of a hand-written
+  softmax and Newton loop; the grouping, ragged rows and soft targets are as before.
+- An S3 store's conditional writes go through s3fs's own call (`call_s3`), as its reads and plain writes
+  do, so a profile's server-side encryption (a KMS key, SSE-C) and its bucket's regional client reach
+  them; a refused condition is still `PreconditionFailed`.
 - 8-bit Adam state codes each moment value among the six codes around its estimate, its decade by its
   logarithm, instead of searching the whole map: on an A100, lm-dense's update takes 27.32 ms against
   60.39, its full-remat step 167.9 against 196.3 ms and compiles in 82.3 against 209.8 s, the codes

@@ -171,10 +171,13 @@ def _unet_path(name: str, rank: int) -> tuple[str, ...]:
     if leaf not in ("weight", "bias"):
         raise ValueError(f"Unknown UNet tensor {name}")
     head = parts.pop(0)
-    roots = {"conv_in": "input", "conv_out": "output", "conv_norm_out": "output_norm",
-             "time_embedding": "time", "add_embedding": "additional_time"}
+    roots = {"conv_in": "input", "conv_out": "output", "conv_norm_out": "output_norm"}
+    # A TimestepEmbedding's two maps lie flat, `{name}_linear_1` and `_2`, as `joint.embedding` stores them.
+    embeddings = {"time_embedding": "time", "add_embedding": "additional_time"}
     if head in roots:
         path = [roots[head]]
+    elif head in embeddings:
+        path = [f"{embeddings[head]}_{parts.pop(0)}"]
     elif head in ("down_blocks", "up_blocks"):
         path = [f"{'down' if head == 'down_blocks' else 'up'}_{parts.pop(0)}"]
         kind, index = parts.pop(0), parts.pop(0)
@@ -228,7 +231,7 @@ def _unet_path(name: str, rank: int) -> tuple[str, ...]:
         else:
             raise ValueError(f"Unknown UNet transformer tensor {name}")
     names = {"time_emb_proj": "temb_projection", "conv_shortcut": "residual_conv",
-             "linear_1": "in_proj", "linear_2": "out_proj", "proj_in": "input", "proj_out": "output"}
+             "proj_in": "input", "proj_out": "output"}
     path.extend(names.get(part, part) for part in parts)
     path.append("bias" if leaf == "bias" else "scale" if rank == 1 else "kernel")
     return tuple(path)

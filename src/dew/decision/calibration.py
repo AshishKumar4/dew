@@ -16,6 +16,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 
 import numpy as np
+from scipy import optimize, special
 
 from dew.decision.questions import Question
 
@@ -57,9 +58,8 @@ class Scored:
 
 
 def softmax(logits: np.ndarray, temperature: float) -> np.ndarray:
-    scaled = np.asarray(logits, np.float64) / temperature
-    shifted = np.exp(scaled - scaled.max())
-    return shifted / shifted.sum()
+    """The options' probabilities at `temperature`, in float64 (SciPy's `softmax`)."""
+    return special.softmax(np.asarray(logits, np.float64) / temperature)
 
 
 TYPE_MINIMUM, BUCKET_MINIMUM = 10, 2000
@@ -124,9 +124,9 @@ class Temperatures:
 
 def _temperature(group: Sequence[Scored]) -> float:
     """The temperature minimizing mean log loss against the gold distributions
-    over `group`, by Newton's method on its inverse, in which the loss is
-    convex: its first derivative is the mean over answers of
-    E_p[z] - E_gold[z] and its second the mean of Var_p[z]. Each gold is
+    over `group`, by SciPy's bounded L-BFGS-B on its inverse, at least 1e-3,
+    in which the loss is convex: its derivative is the mean over answers of
+    E_p[z] - E_gold[z]. Each gold is
     read as a distribution, to unit mass, as `Example.distribution` reads a
     target: a batch packs it in float32, a little short of unit mass, and the
     shortfall would scale with the logits' common offset. Rows of fewer
@@ -141,19 +141,15 @@ def _temperature(group: Sequence[Scored]) -> float:
         gold[row, :len(target)] = target / np.sum(target)
         real[row, :len(held.logits)] = True
     labelled = np.sum(gold * z, axis=1)
-    inverse = 1.0
-    for _ in range(100):
-        scaled = np.where(real, z * inverse, -np.inf)
-        p = np.exp(scaled - scaled.max(axis=1, keepdims=True))
-        p /= p.sum(axis=1, keepdims=True)
-        mean = np.sum(p * z, axis=1)
-        slope = float(np.mean(mean - labelled))
-        curvature = float(np.mean(np.sum(p * (z - mean[:, None]) ** 2, axis=1)))
-        step = slope / max(curvature, 1e-12)
-        inverse = max(inverse - step, 1e-3)
-        if abs(step) < 1e-10 * inverse:
-            break
-    return 1.0 / inverse
+
+    def loss(inverse: np.ndarray) -> tuple[float, np.ndarray]:
+        scaled = np.where(real, z * inverse[0], -np.inf)
+        slope = np.mean(np.sum(special.softmax(scaled, axis=1) * z, axis=1) - labelled)
+        return float(np.mean(special.logsumexp(scaled, axis=1) - inverse[0] * labelled)), np.asarray([slope])
+
+    fitted = optimize.minimize(loss, x0=np.ones(1), jac=True, method="L-BFGS-B", bounds=[(1e-3, None)],
+                               options={"gtol": 1e-12, "ftol": 1e-15})
+    return 1.0 / float(fitted.x[0])
 
 
 @dataclass(frozen=True)
