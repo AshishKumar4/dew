@@ -295,10 +295,11 @@ class InContextMemory(nn.Module):
 
     def _target(self, state: dict, value: jax.Array) -> jax.Array:
         """A token's target: its value view, or the network's image of it at `state` (Nested Learning
-        Eq 84), held fixed in the inner gradient."""
+        Eq 84). The inner gradient holds it fixed (`_gradient` differentiates the prediction alone); the
+        outer one runs through it, to the value projection and the state that made it."""
         if self.target == "given":
             return value
-        return jax.lax.stop_gradient(self._applied(state, value, wide=True))
+        return self._applied(state, value, wide=True)
 
     def _read(self, state: dict, query: jax.Array) -> jax.Array:
         """One head's readout of a token at `state`, at the layer's dtype."""
