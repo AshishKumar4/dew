@@ -872,8 +872,10 @@ def text_to_image(args):
     encoder = CLIPText.from_pretrained(str(FIXTURES / "clip" / "tiny"))
     rows = BATCH // args.processes
     mine = slice(args.process_id * rows, (args.process_id + 1) * rows)
+    # As a run's data holds it (`DiffusionObjective.data`): the prompts' tokens, and the prompts as text.
     batch = {"image": global_images()[mine],
-             "text": {name: value[mine] for name, value in encoder.tokenize(PROMPTS).items()}}
+             "text": {name: value[mine] for name, value in encoder.tokenize(PROMPTS).items()},
+             "captions": np.asarray(PROMPTS)[mine]}
     objective = DiffusionObjective(
         SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1),
         presets.Flow(),
