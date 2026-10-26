@@ -132,7 +132,10 @@ def test_examples_grouped_across_rows_train_in_one_window_and_agree_as_one_group
                                   consistency=0.5)
     reader = decision_rows([PARAPHRASED, NEGATED], None, objective=objective.data(),
                            tokens=layout.max_len)
-    [batch] = list(itertools.islice(reader.train(DataPartition()), 1))
+    # The window that holds the unit, a group of three members: the packer places it whole in one.
+    windows = [batch for batch in itertools.islice(reader.train(DataPartition()), 4)
+               if any(np.sum(np.asarray(batch["groups"]) == group) == 3 for group in range(8))]
+    batch = windows[0]
     groups = np.asarray(batch["groups"])
     inputs = laid_out(batch, objective.bounds.segments)
     variables = objective.init(jax.random.key(0))
