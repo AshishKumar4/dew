@@ -37,7 +37,7 @@ from dew.objectives.diffusion.block import BlockDiffusionObjective, _cache_geome
 from dew.objectives.lm.chunked import chunked_tile, model_logits
 from dew.optim import scale_by_qk_clip, stepped
 from dew.training import MeshSpec
-from dew.training.transaction import example_fields
+from dew.training.transaction import compact_qk, example_fields
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures/hf/diffusion-gemma-sft"
 REFERENCES = FIXTURE / "reference"
@@ -689,33 +689,53 @@ def qk_clip(limit):
     return optax.chain(optax.sgd(0.0), scale_by_qk_clip(limit))
 
 
+def recorded_clip(limit, template):
+    """`qk_clip(limit)` and then a transform that keeps the maxima the step hands its optimizer
+    (`qk_stats`), in a tree shaped as `template`: what the run's own program sowed, which a program
+    of the test's would compute again only to the rounding of its own fusions."""
+    def init(params):
+        del params
+        return jax.tree.map(jnp.zeros_like, template)
+
+    def update(updates, state, params=None, qk_stats=None):
+        del params
+        return updates, state if qk_stats is None else jax.tree.map(
+            lambda sown, kept: jnp.asarray(sown, kept.dtype), qk_stats, state)
+
+    return optax.chain(qk_clip(limit), optax.GradientTransformationExtraArgs(init, update))
+
+
 def clipped_run(obj, batch, limit):
-    """One step of `obj` over `batch` under `qk_clip(limit)`: the starting variables and optimizer state,
-    read before the step consumes them, the passes' `qk` trees at that step's draws, and the stepped
-    variables with the updates committed."""
-    train = Trainer(obj, qk_clip(limit), key=jax.random.PRNGKey(3), split=1)
-    initial = train.initial_state()
-    step = Step(jnp.asarray(0, jnp.int32), jax.random.fold_in(initial.key, 0), None,
-                **example_fields(initial, 0, 1, batch))
-    start = jax.tree.map(np.asarray, initial.variables)
-    opt_state = jax.tree.map(np.asarray, initial.opt_state)
+    """One step of `obj` over `batch` under `recorded_clip(limit)`: the starting variables and optimizer
+    state of `qk_clip(limit)`, read before the step consumes them, the passes' `qk` trees at that step's
+    draws, the stepped variables with the updates committed, and the clip's state and the maxima the
+    run handed it after the step."""
+    initial_key = jax.random.PRNGKey(3)
+    probe = Trainer(obj, qk_clip(limit), key=initial_key, split=1).initial_state()
+    step = Step(jnp.asarray(0, jnp.int32), jax.random.fold_in(probe.key, 0), None,
+                **example_fields(probe, 0, 1, batch))
+    start = jax.tree.map(np.asarray, probe.variables)
     passes = jax.jit(sown_passes, static_argnums=(0,))(obj, jax.tree.map(jnp.asarray, start), batch, step)
+    train = Trainer(obj, recorded_clip(limit, compact_qk(merged(passes))), key=initial_key, split=1)
+    initial = train.initial_state()
+    opt_state = jax.tree.map(np.asarray, initial.opt_state[0])
     final, *_ = train.compile(initial, batch)(initial, batch)
-    return start, opt_state, passes, jax.tree.map(np.asarray, final.variables), int(final.updates)
+    clip_state, handed = jax.tree.map(np.asarray, final.opt_state)
+    return start, opt_state, passes, jax.tree.map(np.asarray, final.variables), clip_state, handed, int(
+        final.updates)
 
 
-def assert_clipped_at_the_maxima(start, opt_state, passes, final, limit):
-    """`final`'s parameters are `qk_clip(limit)`'s update at the passes' merged maxima, applied to `start`
-    with its rescale (`stepped`) bit for bit, and the clip moved some of them. Returns the maxima it
-    clipped at."""
-    maxima = jax.tree.map(np.asarray, merged(passes))
+def assert_clipped_at_the_maxima(start, opt_state, final, clip_state, handed, limit):
+    """The run handed its clip a maximum for every path its passes sowed, and its parameters are
+    `qk_clip(limit)`'s update at those maxima, applied to `start` with its rescale (`stepped`), bit for
+    bit, the rescale the clip's state holds; the clip moved some of them."""
     zero = jax.tree.map(np.zeros_like, start["params"])
-    applied, after = jax.jit(qk_clip(limit).update)(zero, opt_state, start["params"], qk_stats=maxima)
+    applied, after = jax.jit(qk_clip(limit).update)(zero, opt_state, start["params"], qk_stats=handed)
+    jax.tree.map(np.testing.assert_array_equal, clip_state, jax.tree.map(np.asarray, after))
     expected = jax.tree.map(np.asarray, stepped(start["params"], applied, opt_state, after))
     jax.tree.map(np.testing.assert_array_equal, final["params"], expected)
-    assert any(not np.array_equal(after, before) for after, before in
+    assert any(not np.array_equal(moved, before) for moved, before in
                zip(jax.tree.leaves(final["params"]), jax.tree.leaves(start["params"]), strict=True))
-    return maxima
 
 
 def test_a_block_run_clips_its_attention_at_its_passes_maxima():
@@ -727,15 +747,14 @@ def test_a_block_run_clips_its_attention_at_its_passes_maxima():
     obj = unnormed_objective(self_cond_prob=1.0)
     rows = 8 * jax.device_count()
     batch = {"text": jnp.asarray(np.random.default_rng(5).integers(1, 16, size=(rows, 8)), jnp.int32)}
-    start, opt_state, passes, final, updates = clipped_run(obj, batch, threshold)
+    start, opt_state, passes, final, clip_state, handed, updates = clipped_run(obj, batch, threshold)
     assert updates == 1
     encoder, first, second = passes
-    maxima = jax.tree.map(np.asarray, merged(passes))
-    assert max(float(np.max(peak)) for peak in peaks(maxima)) > threshold
+    assert max(float(np.max(peak)) for peak in peaks(handed)) > threshold
     assert any(np.any(own > np.maximum(before, after)) for own, before, after in
                zip(peaks(first), peaks(encoder), peaks(second), strict=True))
-    assert_clipped_at_the_maxima(start, opt_state, passes, final, threshold)
-    _, _, _, unclipped, _ = clipped_run(obj, batch, 1e30)
+    assert_clipped_at_the_maxima(start, opt_state, final, clip_state, handed, threshold)
+    unclipped = clipped_run(obj, batch, 1e30)[3]
     jax.tree.map(np.testing.assert_array_equal, unclipped["params"], start["params"])
 
 
@@ -747,10 +766,10 @@ def test_an_image_conditioned_run_clips_its_text_and_vision_attention_at_their_m
     rows = math.lcm(2, jax.device_count())
     batch = unnormed_image_batch(rows)
     threshold = 0.05
-    start, opt_state, passes, final, updates = clipped_run(obj, batch, threshold)
+    start, opt_state, _, final, clip_state, handed, updates = clipped_run(obj, batch, threshold)
     assert updates == 1
-    maxima = assert_clipped_at_the_maxima(start, opt_state, passes, final, threshold)
-    assert max(float(np.max(peak)) for peak in peaks(maxima)) > threshold
-    assert any(path[0] == "conditioner" for path in flatten_dict(maxima))
-    _, _, _, unclipped, _ = clipped_run(obj, batch, 1e30)
+    assert_clipped_at_the_maxima(start, opt_state, final, clip_state, handed, threshold)
+    assert max(float(np.max(peak)) for peak in peaks(handed)) > threshold
+    assert any(path[0] == "conditioner" for path in flatten_dict(handed))
+    unclipped = clipped_run(obj, batch, 1e30)[3]
     jax.tree.map(np.testing.assert_array_equal, unclipped["params"], start["params"])
