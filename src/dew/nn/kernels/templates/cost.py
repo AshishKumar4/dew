@@ -99,7 +99,7 @@ class Cost:
 
 def seconds(cost: Cost, target: generation.GpuTarget) -> float:
     """The seconds `cost`'s launch is estimated to take on `target` (the module's docstring)."""
-    facts = generation.effective(target)
+    facts = target
     multiprocessors, clock, bandwidth = facts.multiprocessors, facts.clock_hz, facts.memory_bandwidth
     rate = facts.tensor_rate(cost.mode) if cost.program_flops else 1.0
     if multiprocessors is None or clock is None or bandwidth is None or rate is None:
@@ -164,7 +164,7 @@ def resident(target: generation.GpuTarget, staged: int, threads: int, registers:
     """How many programs, each staging `staged` bytes of shared memory and running `threads` threads of
     `registers` registers each, one multiprocessor of `target` holds at once: at least one, the launch
     fitted to a block (`Template.fitting`)."""
-    facts = generation.effective(target)
+    facts = target
     shared = generation.shared_budget(facts) + RESERVED_SHARED
     by_shared = shared // (staged + RESERVED_SHARED)
     by_registers = REGISTERS // (threads * min(registers, THREAD_REGISTERS))

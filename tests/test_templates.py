@@ -67,12 +67,11 @@ def test_a_templates_heuristic_is_its_fastest_fitting_config_the_first_of_equals
 
 
 def test_a_target_that_reports_no_block_takes_the_least_any_gpu_holds():
-    """A GPU generation the table holds no facts for, and that is not this device, budgets 99 KiB; a
-    CPU interprets the kernels as an A100, so budgets an A100's block."""
+    """A GPU generation the table holds no facts for, and that is not this device, budgets 99 KiB, as a
+    CPU does: it has no GPU's facts unless a test states the GPU it emulates (`generation.assumed`)."""
     assert generation.shared_budget(generation.GpuTarget("sm100", "NVIDIA B200")) == generation.SHARED_BUDGET
     assert generation.shared_budget(generation.TARGETS["sm90"]) == generation.TARGETS["sm90"].shared_limit
-    sm80 = generation.TARGETS["sm80"].shared_limit
-    assert generation.shared_budget(generation.GpuTarget("cpu", "cpu")) == sm80
+    assert generation.shared_budget(generation.GpuTarget("cpu", "cpu")) == generation.SHARED_BUDGET
 
 
 def test_a_call_no_config_holds_is_refused_naming_its_bytes_and_the_budget():

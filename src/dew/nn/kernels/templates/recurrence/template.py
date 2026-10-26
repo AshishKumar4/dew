@@ -224,7 +224,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         factored = arguments["g"].ndim == 3 or mainloop.per_key_refusal(dtype, arguments.get("floor")) is None
         family = bundle(target)
         if not (dtype in (jnp.bfloat16, jnp.float16, jnp.float32) and factored and family is not None
-                and generation.effective(target).tensor_rate("16bit") is not None):
+                and target.tensor_rate("16bit") is not None):
             return False
         return bool(self.fits(ba, target))
 
