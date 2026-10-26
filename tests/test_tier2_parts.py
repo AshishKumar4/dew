@@ -475,16 +475,16 @@ def test_a_slot_release_over_a_model_of_parts_loads_its_backbone_by_its_own_code
 
 
 def _counted(path):
-    """An edit of the renamed Llama whose causal LM, once built, appends a line to `path` at each of its
-    forwards: the lines count the times the source's code runs."""
+    """An edit of the renamed Llama whose causal LM, built to run (off torch's meta device, where a probe
+    sizes it and an assembly reads its parts), appends a line to `path`: the lines count the times the
+    source's model is built to run."""
     def edit(code: str) -> str:
         changed = code.replace(
             "        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)\n",
             "        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)\n"
-            "        def counted(module, inputs, output):\n"
+            "        if not self.lm_head.weight.is_meta:\n"
             f"            with open({str(path)!r}, 'a') as file:\n"
-            "                file.write('forward\\n')\n"
-            "        self.register_forward_hook(counted)\n", 1)
+            "                file.write('built\\n')\n", 1)
         assert changed != code
         return changed
     return edit
@@ -493,17 +493,17 @@ def _counted(path):
 @pytest.mark.parametrize("kind", ["alone", "release"])
 def test_one_load_of_local_remote_code_probes_it_once(tmp_path, kind):
     """A load verifies the remote code it runs once: a local repository's code, which no commit names,
-    has no recorded verification to read back, so each probe of it runs the source again. One load of the
-    repository alone, and of a slot release over it, which routes its backbone before reading its
-    weights, runs the source's forwards as often as one probe of it does (`verify_mapping`), and Dew's
-    own load runs none."""
-    forwards = tmp_path / "forwards"
-    sources = dict(zip(("alone", "release"), _slot_release(tmp_path, _counted(forwards)), strict=True))
+    has no recorded verification to read back, so each probe of it builds and runs the source again. One
+    load of the repository alone, and of a slot release over it, which routes its backbone before
+    reading its weights, builds the source's model to run as often as one probe of it does
+    (`verify_mapping`), and Dew's own load builds none."""
+    built = tmp_path / "built"
+    sources = dict(zip(("alone", "release"), _slot_release(tmp_path, _counted(built)), strict=True))
 
     def ran(run) -> int:
-        forwards.unlink(missing_ok=True)
+        built.unlink(missing_ok=True)
         run()
-        return len(forwards.read_text().splitlines()) if forwards.exists() else 0
+        return len(built.read_text().splitlines()) if built.exists() else 0
 
     config = json.loads((sources["alone"] / "config.json").read_text())
     probe = ran(lambda: verify_mapping(config, remote=sources["alone"]))
