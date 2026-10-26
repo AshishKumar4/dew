@@ -42,6 +42,10 @@ type Value = (
 )
 
 
+class Unencodable(TypeError):
+    """A value the artifact codec has no encoding for, as a record a cache keeps meets it."""
+
+
 def _dtype(value: np.ndarray) -> dict[str, str]:
     if value.dtype.fields is None and np.dtype(value.dtype.str) != value.dtype:
         return {"dtype": value.dtype.name}
@@ -227,7 +231,7 @@ def _tree(value: Value, leaves: _Stored | _Hashed, canonical: bool = False) -> J
         if array.ndim or not array.dtype.hasobject:
             return _tree(array, leaves, canonical)
         return {"opaque": f"{type(value).__module__}.{type(value).__qualname__}"}
-    raise TypeError(f"artifact codec cannot encode {type(value).__name__}")
+    raise Unencodable(f"artifact codec cannot encode {type(value).__name__}")
 
 
 def _restore(node: object, leaves: Mapping[str, bytes]) -> Value:

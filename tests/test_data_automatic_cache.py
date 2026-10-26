@@ -329,3 +329,55 @@ def test_each_corpus_of_a_mixture_caches_its_own_leading_maps():
     again = (Counted(), Counted())
     assert read(mixture(again), "indexed") == first
     assert not any(step.calls for step in again)
+
+
+@pytest.mark.parametrize("how", READS)
+def test_an_image_a_record_names_by_path_is_read_past_the_automatic_cache(tmp_path, how):
+    """An image a record names by path is read from storage its content does not key
+    (`dew.data.pipeline.External`): the automatic cache's prefix stops before its decode, so a PNG
+    replaced at the same path reads anew, as with no cache, while the costly map before it is still
+    read back."""
+    import cv2
+
+    from dew.data import images
+
+    paths = [tmp_path / f"{index}.png" for index in range(RECORDS)]
+
+    def drawn(shade: int) -> None:
+        for path in paths:
+            cv2.imwrite(str(path), np.full((4, 4, 3), shade, np.uint8))
+
+    rows = Memory([{"id": np.int32(index), "image": {"bytes": None, "path": str(path)}}
+                   for index, path in enumerate(paths)])
+    step = Counted()
+    chain = Pipeline(rows).map(step, identity="counted@1").map(images.DecodeImage("image", rejects=False))
+
+    def pixels() -> list[int]:
+        loader = compile(chain.batch(2), read=how, loading=Loading(workers=0, threads=1, read_buffer=1))
+        stream = loader.train(DataPartition())
+        try:
+            return sorted(int(image[0, 0, 0]) for batch in stream for image in batch["image"])
+        finally:
+            stream.close()
+
+    drawn(10)
+    assert pixels() == [10] * RECORDS and generations()
+    calls = len(step.calls)
+    drawn(200)
+    assert pixels() == [200] * RECORDS
+    assert len(step.calls) == calls, "the costly map before the decode is read back"
+
+
+@pytest.mark.parametrize("how", READS)
+def test_records_the_codec_cannot_write_are_read_computed_past_the_automatic_cache(how):
+    """A record holding a value the artifact codec has no encoding for (a `pathlib.Path`) stops the
+    automatic cache's fill, as storage that fails does, and the run reads every record computed, the
+    records a run with no cache reads."""
+    step = Counted()
+    # The random map ends the cache's prefix, so what the cache would hold still carries the path.
+    chain = (Pipeline(records()).map(lambda row: {**row, "tag": Path("tag")}, identity="tag@1")
+             .map(step, identity="counted@1")
+             .random_map(lambda row, rng: {key: value for key, value in row.items() if key != "tag"},
+                         identity="untag@1"))
+    assert read(chain, how) == read(chain, how, cache=False)
+    assert not generations()

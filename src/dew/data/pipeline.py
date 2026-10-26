@@ -75,6 +75,16 @@ class Volatile(Protocol):
 
 
 @runtime_checkable
+class External(Protocol):
+    """A step that reads the storage a record names by path, as a media decoder does when its field
+    holds a path rather than bytes: what it makes is keyed by the path, not by what the path holds, so
+    no automatic cache's prefix runs past it (`dew.data.compile._automatic`), a file replaced at the same
+    path reading anew; a chain's own `cache=` keeps what it made, as it is told to."""
+
+    external: bool
+
+
+@runtime_checkable
 class Costly(Protocol):
     """A step that costs more to run on a record than reading what it made back from a cache costs,
     as measured (`tools/benchmark_data.py automatic-cache`), and makes it from the record alone: so a
