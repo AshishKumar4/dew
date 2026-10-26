@@ -1173,7 +1173,9 @@ DEEPSEEK_V2 = DecoderFamily(
 
 
 # Kimi K2.5 wraps that same computation in a vision repo, so it is
-# provenance-only too, and its own tensor names are the wrapper's.
+# provenance-only too, and its own tensor names are the wrapper's. Its pad row
+# is the one its text config states, since the language model is built from
+# text_config (modeling_kimi_k25.py:586), and DeepSeek V3's reader reads it.
 KIMI_K25 = DecoderFamily(
     ('kimi_k25',),
     _kimi_k25_config,
