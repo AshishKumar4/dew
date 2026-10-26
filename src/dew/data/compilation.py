@@ -49,6 +49,13 @@ def compiling[**Arguments, Result](function: Callable[Arguments, Result]) -> Cal
     return compiled
 
 
+def within[Result](function: Callable[[], Result]) -> Callable[[], Result]:
+    """`function`, run in the compilation it was made in, as a thread a compilation starts runs it
+    (`compiling`): a pool's thread holds no compilation of its own."""
+    context = contextvars.copy_context()
+    return lambda: context.copy().run(function)
+
+
 def once(source: Fingerprinted, fingerprinted: Callable[[], Mapping[str, object]]) -> Mapping[str, object]:
     """`source`'s fingerprint, `fingerprinted()`, computed once a compilation (`compiling`): a plan,
     its caches' keys and descriptions each read it, and its records may change between two."""

@@ -190,9 +190,10 @@ def test_records_changed_between_two_compilations_are_read_as_they_are_now():
     """A store's records may change between two compilations: the second fingerprints them again, so it
     reads what its maps make of them now, not what an earlier run cached of the old ones."""
     rows = [{"id": np.int32(index)} for index in range(RECORDS)]
-    first = read(mapped(Counted(), Memory(rows)), "indexed")
+    source = Memory(rows)
+    first = read(mapped(Counted(), source), "indexed")
     rows[0] = {"id": np.int32(50)}
-    second = read(mapped(Counted(), Memory(rows)), "indexed")
+    second = read(mapped(Counted(), source), "indexed")
     assert (50, 60) in second and (50, 60) not in first
 
 
@@ -209,6 +210,28 @@ def test_a_root_this_process_may_not_write_caches_nothing_and_reads_on(monkeypat
         assert not (locked / "cache").exists()
     finally:
         locked.chmod(0o700)
+
+
+@pytest.mark.parametrize("failing", ["lookup", "writer", "admission"])
+def test_an_automatic_cache_whose_storage_fails_reads_on_uncached(monkeypatch, failing):
+    """Storage that fails an automatic cache, where it looks its generation up (a full disk), opens
+    its writer's index or admits a record (its database full), leaves the run reading what its maps
+    make, as with no cache, where a cache the chain names would stop it."""
+    import errno
+    import sqlite3
+
+    from dew.data import cache as caches
+
+    def full(*arguments, **options):
+        if failing == "lookup":
+            raise OSError(errno.ENOSPC, "No space left on device")
+        raise sqlite3.OperationalError("database or disk is full")
+
+    target = {"lookup": (caches.Cache, "generation"), "writer": (caches._Writer, "__init__"),
+              "admission": (caches._Writer, "_admit")}[failing]
+    monkeypatch.setattr(*target, full)
+    assert read(mapped(Counted()), "indexed") == read(mapped(Counted()), "indexed", cache=False)
+    assert not generations()
 
 
 def test_a_run_or_a_process_opts_out_of_its_automatic_cache(monkeypatch, tmp_path):

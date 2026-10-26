@@ -53,7 +53,7 @@ from dew.data.analysis import (
     _written,
     written,
 )
-from dew.data.compilation import compiling
+from dew.data.compilation import compiling, within
 from dew.data.dataset import (
     Closeable,
     DataPartition,
@@ -301,7 +301,9 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
         return _Facts(source, read, source.fingerprint(), metadata, held, label)
 
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as readers:
-        pinned = dict(zip(sources, readers.map(pin, sources.values()), strict=True))
+        # Each read in this compilation, which fingerprints each source once (`compiling`).
+        pinned = dict(zip(sources, readers.map(lambda source: within(lambda: pin(source))(),
+                                               sources.values()), strict=True))
 
     return tuple(with_stores(branch, lambda source: pinned[id(source)]) for branch in pipelines)
 
@@ -1093,6 +1095,7 @@ def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]
                         if not (isinstance(source, _Memory) and not source.held)), measured=measured)
 
 
+@compiling
 def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
     """Inspect through training's lowering, finite unless a repeat asks otherwise.
 
