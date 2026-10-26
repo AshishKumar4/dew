@@ -638,6 +638,10 @@ class Loader:
     """The records the training read is bounded to before they are packed (`compile`'s
     `examples`), whose steps a run's `examples=` budget takes (`example_steps`); None where it is
     not bounded."""
+    token_ends: tuple[int | None, ...] | None = None
+    """The committed tokens each phase of a schedule ends at (`dew.data.pipeline.schedule`), the last
+    where the data ends or None where it runs on, which the trainer reads its commits against and ends
+    the phase at (`PhasedStream.ending`); None for a read on no token clock."""
 
     @property
     def steps_per_epoch(self) -> int | None:
@@ -1253,10 +1257,10 @@ class Ranges:
         return bisect.bisect_right(self.ends, position)
 
 
-def phase_ends(ends: Sequence[int | None], unit: Literal["step", "record"]) -> tuple[int, ...]:
+def phase_ends(ends: Sequence[int | None], unit: Literal["step", "token", "record"]) -> tuple[int, ...]:
     """The ends of every phase but the last, which runs on (`None`), each past the one before it and
-    above zero, counted in `unit`s: steps where a run writes its phases (`Phases`), records where it
-    reads them (`PhasedStream`)."""
+    above zero, counted in `unit`s: steps or committed tokens where a run writes its phases (`Phases`),
+    records where it reads them (`PhasedStream`)."""
     if not ends or ends[-1] is not None:
         raise ValueError(f"phases need one end per phase, in {unit}s, the last None, which runs on")
     bounded = tuple(end for end in ends[:-1] if end is not None)
@@ -1285,14 +1289,35 @@ class PhasedStream:
     trained on one mixture resumes into a phase list that starts with it.
     Changing a phase the run has already read, or ending the current phase
     before the records the run already read in it, is refused.
+
+    A run on the committed-token clock (`tokens`, the committed tokens each
+    phase ends at, the last's where the data ends or None, `dew.data.pipeline.schedule`) knows no phase's
+    end in records ahead: the trainer ends the phase it stands in at the step
+    whose commit reaches the phase's tokens (`ending`), and the saved position
+    carries that end, as the end of a phase the run completed. Each phase opens
+    with the record ends of the phases before it (a corpus they read continues
+    in it from where they left it), so one after an end the run has yet to
+    reach opens once the run reaches it. A phase the run's commits passed
+    within one step ends where it starts, holding no record.
     """
 
     endless = True
 
-    def __init__(self, phases: Sequence[tuple[Callable[[], GlobalReader], int | None]], stop_seconds: float):
-        # The phases that end, the last running on after them.
-        self._phases = Ranges.ending(phase_ends([end for _, end in phases], "record"))
-        self._streams = [open_stream() for open_stream, _ in phases]
+    def __init__(self, phases: Sequence[tuple[Callable[[tuple[int, ...]], GlobalReader], int | None]],
+                 stop_seconds: float, *, tokens: Sequence[int | None] | None = None):
+        ends = [end for _, end in phases]
+        if tokens is None:
+            phase_ends(ends, "record")
+        elif any(end is not None for end in ends) or len(tokens) != len(ends):
+            raise ValueError("a phase on the token clock ends where the run's commits reach its tokens, "
+                             "so it has no end in records until the run reaches it")
+        self._tokens = None if tokens is None else tuple(tokens)
+        # Each ending phase's end in records, None for one on the token clock the run has yet to reach.
+        self._ends: list[int | None] = ends[:-1]
+        self._open = [open_phase for open_phase, _ in phases]
+        self._streams: dict[int, GlobalReader] = {}
+        for index in range(len(phases) if tokens is None else 1):
+            self._stream(index)
         self._records = 0
         self._current: int | None = None
         self.stop_seconds = stop_seconds
@@ -1300,18 +1325,46 @@ class PhasedStream:
     def __iter__(self) -> Iterator[Batch]:
         return self
 
+    def _stream(self, phase: int) -> GlobalReader:
+        """Phase `phase`'s reader, opened with the ends of the phases before it."""
+        if phase not in self._streams:
+            before = self._ends[:phase]
+            if any(end is None for end in before):
+                raise ValueError(f"phase {phase} opens where the phases before it end, which the run has "
+                                 "not reached")
+            self._streams[phase] = self._open[phase](tuple(end for end in before if end is not None))
+        return self._streams[phase]
+
     def _phase(self, records: int) -> int:
-        return self._phases.holding(records)
+        """The phase that reads the record at `records`: the first whose end, known, is past it."""
+        return next((index for index, end in enumerate(self._ends) if end is None or records < end),
+                    len(self._ends))
 
     def _start(self, phase: int) -> int:
-        return self._phases.start(phase)
+        start = self._ends[phase - 1] if phase else 0
+        if start is None:
+            raise ValueError(f"phase {phase} starts where the run has not reached")
+        return start
+
+    def _resolve(self, phase: int, end: int | None) -> None:
+        """Phase `phase` of the token clock ends at `end` records, or at none the run has reached; the
+        phases after it, opened at its old end, open again where they now start."""
+        if self._ends[phase] == end:
+            return
+        if end is not None and end < self._start(phase):
+            raise ValueError(f"phase {phase} cannot end at record {end}, before it starts")
+        self._ends[phase] = end
+        for later in [index for index in self._streams if index > phase]:
+            if later == self._current:
+                self._current = None
+            self._streams.pop(later).close()
 
     def __next__(self) -> Batch:
         phase = self._phase(self._records)
         if phase != self._current:
             if self._current is not None:
                 self._streams[self._current].close()
-            stream = self._streams[phase]
+            stream = self._stream(phase)
             stream.set_state(
                 position.encode(
                     position.Global(records=self._records - self._start(phase), order=stream.order)
@@ -1325,78 +1378,108 @@ class PhasedStream:
         batch = next(stream)
         read = stream.records - before
         self._records += read
-        if phase < len(self._phases.ends) and self._records > self._phases.ends[phase]:
+        end = self._ends[phase] if phase < len(self._ends) else None
+        if end is not None and self._records > end:
             raise ValueError(
                 f"a step of {read} records crossed the phase boundary at record "
-                f"{self._phases.ends[phase]}; phases end on step boundaries"
+                f"{end}; phases end on step boundaries"
             )
         return batch
 
     def get_state(self) -> bytes:
         # The phase of the last record read: at a boundary nothing of the next
         # phase is read yet, so the finished one is still current and a
-        # resume may change what follows it or extend it.
-        phase = self._phases.holding(self._records - 1) if self._records else 0
+        # resume may change what follows it or extend it. A phase the token
+        # clock ended is completed where it ended, as no list of phases
+        # says where that is.
+        if self._tokens is not None:
+            phase = self._phase(self._records)
+        else:
+            phase = self._phase(self._records - 1) if self._records else 0
         plans = [
-            position.read(_global_position(stream.get_state())).plan for stream in self._streams[: phase + 1]
+            position.read(_global_position(self._stream(index).get_state())).plan
+            for index in range(phase + 1)
         ]
-        completed = zip((stream.order for stream in self._streams), self._phases.ends[:phase], strict=False)
+        completed = tuple((self._stream(index).order, self._start(index + 1)) for index in range(phase))
         return position.encode(
             position.Global(
                 records=self._records,
-                order=self._streams[phase].order,
-                completed=tuple(completed),
+                order=self._stream(phase).order,
+                completed=completed,
                 plan={"phases": plans} if any(plan is not None for plan in plans) else None,
             )
         )
 
     def set_state(self, state: bytes) -> None:
         saved = position.read(state)
+        from dew.data.plan import same_order
+
+        if self._tokens is not None:
+            if len(saved.completed) > len(self._ends):
+                raise ValueError(f"the saved run finished {len(saved.completed)} phases, and this run has "
+                                 f"{len(self._ends) + 1}")
+            # The ends the saved run reached, and none past them, which this run reaches as it reads.
+            for index in range(len(self._ends)):
+                self._resolve(index, saved.completed[index][1] if index < len(saved.completed) else None)
         if saved.plan is not None:
             plans = saved.plan.get("phases") if "phases" in saved.plan else [saved.plan]
             if not isinstance(plans, list) or len(plans) != len(saved.completed) + 1:
                 raise ValueError("saved phase plans do not cover the completed and current phases")
             for index, plan in enumerate(plans):
-                if index >= len(self._streams) or (plan is not None and not isinstance(plan, Mapping)):
+                if index >= len(self._open) or (plan is not None and not isinstance(plan, Mapping)):
                     raise ValueError("saved phase plan is not part of this run")
                 end = saved.completed[index][1] if index < len(saved.completed) else saved.records
-                self._streams[index].set_state(
+                stream = self._stream(index)
+                stream.set_state(
                     position.encode(
-                        position.Global(
-                            records=end - self._start(index), order=self._streams[index].order, plan=plan
-                        )
+                        position.Global(records=end - self._start(index), order=stream.order, plan=plan)
                     )
                 )
-        from dew.data.plan import same_order
 
         for index, (order, end) in enumerate(saved.completed):
-            if (index >= len(self._phases.ends) or not same_order(order, self._streams[index].order)
-                    or self._phases.ends[index] != end):
+            if (index >= len(self._ends) or not same_order(order, self._stream(index).order)
+                    or self._ends[index] != end):
                 raise ValueError(
                     f"the saved run finished phase {index} reading {order} to record "
                     f"{end}, and this run's phase {index} is not that; a phase the "
                     f"run has read cannot change under it"
                 )
         phase = len(saved.completed)
-        if phase >= len(self._streams) or not same_order(saved.order, self._streams[phase].order):
+        if phase >= len(self._open) or not same_order(saved.order, self._stream(phase).order):
             raise ValueError(
                 f"the saved position is {saved.records} records into phase {phase}, "
                 f"reading {saved.order}, and this run's phase {phase} reads something "
                 f"else; resume with the order the checkpoint was written in"
             )
-        if phase < len(self._phases.ends) and saved.records > self._phases.ends[phase]:
+        end = self._ends[phase] if phase < len(self._ends) else None
+        if end is not None and saved.records > end:
             raise ValueError(
                 f"the saved run has read {saved.records} records, past this run's end "
-                f"of phase {phase} at {self._phases.ends[phase]}"
+                f"of phase {phase} at {end}"
             )
         self.close()
         self._records = saved.records
 
+    def ending(self, state: bytes) -> bytes:
+        """`state`, a position of this run on the committed-token clock, with the phase it stands in
+        ended where it stands and the next opened there: where the run's commits reached the phase's
+        tokens, which the trainer reads (`dew.training.Trainer.fit`)."""
+        if self._tokens is None:
+            raise ValueError("phases on the step clock end at the steps they were written with")
+        self.set_state(state)
+        phase = self._phase(self._records)
+        if phase >= len(self._ends):
+            raise ValueError("the last phase runs on; it has no end to reach")
+        self._resolve(phase, self._records)
+        return self.get_state()
+
     def identity(self) -> str:
-        return "; ".join(
-            [*(stream.identity() for stream in self._streams),
-             f"phases ending at records {list(self._phases.ends)}"]
-        )
+        # A phase on the token clock opens where the run reaches it: the pool agrees on those open (the
+        # trainer agrees again as it opens a later one) and on where every phase ends.
+        ends = (f"records {list(self._ends)}" if self._tokens is None
+                else f"committed tokens {list(self._tokens)}")
+        return "; ".join([*(self._streams[index].identity() for index in sorted(self._streams)),
+                          f"phases ending at {ends}"])
 
     def close(self) -> None:
         if self._current is not None:

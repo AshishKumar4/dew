@@ -84,9 +84,10 @@ from dew.training.display import TrainingDisplay
 from dew.training.evaluation import EvalSuite, Summary
 from dew.training.profiling import ProfileWindow
 from dew.training.quantization import quantize_trunk
+from dew.training.rollout import Rollout
 from dew.training.selection import Best
 from dew.training.tracker import LocalTracker, Tracker, Trackers, Wandb, WandbTracker
-from dew.training.trainer import Rollout, Trainer
+from dew.training.trainer import Trainer
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance

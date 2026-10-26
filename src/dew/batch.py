@@ -445,6 +445,12 @@ def dicts[Tree](tree: Tree) -> Tree:
         tree, is_leaf=lambda node: isinstance(node, (dict, FrozenDict)) and type(node) is not dict)
 
 
+def owned_dicts[Tree](tree: Tree) -> Tree:
+    """`tree` as a state holds its trees: every mapping a dict (`dicts`), the containers the
+    state's own, so nothing the state does to them reaches the caller's tree."""
+    return jax.tree.map(lambda leaf: leaf, dicts(tree))
+
+
 def part(variables: Variables, name: str) -> Variables:
     """Cut the `name` subtree out of every collection that holds one: one
     module's own tree out of an objective's that nests several under each
@@ -504,6 +510,7 @@ __all__ = [
     "freeze",
     "leaves_by_path",
     "merge",
+    "owned_dicts",
     "padded_rows",
     "part",
     "real_places",

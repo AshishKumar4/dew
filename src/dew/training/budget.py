@@ -18,12 +18,9 @@ from dew.training.evaluation import Summary
 
 
 def run_length(steps: int | None, epochs: int | None, tokens: int | None, examples: int | None = None, *,
-               required: bool = True, counts_tokens: bool = True) -> None:
+               required: bool = True) -> None:
     """Refuse a run whose length is named twice, by two of `steps`, `epochs` and `examples`, or, where
-    `required`, not at all; `tokens` caps any of them or bounds a run alone, for an objective that
-    `counts_tokens`."""
-    if tokens is not None and not counts_tokens:
-        raise ValueError("tokens= needs an objective that counts real tokens")
+    `required`, not at all; `tokens` caps any of them or bounds a run alone."""
     named = [name for name, value in (("steps", steps), ("epochs", epochs), ("examples", examples))
              if value is not None]
     if len(named) > 1:
@@ -45,6 +42,15 @@ def run_steps(loader: Loader, steps: int | None, epochs: int | None, tokens: int
     if epochs is None:
         return steps
     return loader.epoch_steps(epochs, accumulation)
+
+
+def run_tokens(loader: Loader, tokens: int | None, *, counts_tokens: bool) -> int | None:
+    """The run's token budget: `tokens`, or where a schedule's last stage ends the data at its tokens
+    (`dew.data.pipeline.schedule`), the first reached; refused where the objective counts none."""
+    if (tokens is not None or loader.token_ends is not None) and not counts_tokens:
+        raise ValueError("tokens= and a schedule's stages need an objective that counts real tokens")
+    last = None if loader.token_ends is None else loader.token_ends[-1]
+    return last if tokens is None else tokens if last is None else min(tokens, last)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -118,5 +124,5 @@ class Pause:
         return step, real
 
 
-__all__ = ["Pause", "Plateau", "every_step", "recorded", "run_length",
-           "run_steps"]
+__all__ = ["Pause", "Plateau", "every_step", "recorded", "run_length", "run_steps",
+           "run_tokens"]
