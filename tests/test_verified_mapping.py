@@ -171,16 +171,16 @@ def _registered(kind: str, **fields) -> dict:
     return tiny_config(config_class.model_type, **GLM_FLASH, **fields).to_dict()
 
 
-@pytest.mark.parametrize("kind", ["flash", "unpadded"])
-def test_a_convention_pads_the_row_its_source_pads(kind):
+@pytest.mark.parametrize(("kind", "pad"), [("flash", 0), ("flash", -1), ("unpadded", 0)])
+def test_a_convention_pads_the_row_its_source_pads(kind, pad):
     """GLM-4.7-Flash's classes under a type of their own verify as DeepSeek V3's convention, and the same
     classes whose table pads no row, under a config stating a pad id, do not: the probe holds each
     candidate's pad row to the source's own table's, which takes no gradient there (ledger 1593) and
-    which no eval logit shows."""
+    which no eval logit shows. A negative pad id names the row it counts back from the table's end, as
+    torch's lookup and Dew's both read it, so -1 is the last row in each."""
     from dew.interop.verify import Unmapped, VerifiedMapping, verify_mapping
 
-    config = _registered(kind)
-    assert config["pad_token_id"] is not None
+    config = _registered(kind, pad_token_id=pad)
     assert isinstance(verify_mapping(config), Unmapped if kind == "unpadded" else VerifiedMapping)
 
 
