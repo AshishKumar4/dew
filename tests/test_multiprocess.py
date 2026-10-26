@@ -139,7 +139,8 @@ def test_a_schedule_ends_its_stage_at_one_step_on_every_process(tmp_path):
     """The committed tokens a schedule's stage ends on are the pool's, summed over its processes, so
     two processes end the first stage at one step, the one a single process ends it at, and land on
     its parameters."""
-    corpus = token_corpus(tmp_path / "tokens", records=32, seq_len=4)
+    # Fifteen windows of four, whose tokens all stand in the model's vocabulary of 64.
+    corpus = token_corpus(tmp_path / "tokens", records=15, seq_len=4)
     flags = {"tokens": corpus.train, "seq_len": 4, "steps": 6}
     pool = run_pool("schedule_fit", tmp_path / "pool", 2, **flags)
     alone = run_pool("schedule_fit", tmp_path / "alone", 1, **flags)
