@@ -876,7 +876,7 @@ def test_a_tier_3_models_final_states_and_head_are_transformers(case, tmp_path):
 SLOT_TOKENIZER = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
 """The tokenizer and chat template a tier-3 slot release ships: the tiny Qwen's, byte-level."""
 SLOT_HEAD = 8
-SLOT_SEEDS = 8
+SLOT_SEEDS = 128
 """The tier-3 slot release's declared check-1 seeds, sized by `seeds_for` on armada."""
 SLOT_WORDS = ("refund", "late", "order", "broken", "account", "charge", "screen", "login")
 
