@@ -56,19 +56,21 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
 
 
 def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_width: int, dtype,
-                         residuals: bool, stages: int, *, peaks: bool = False) -> tuple[list, dict]:
+                         residuals: bool, stages: int, *, peaks: bool = False, out_dtype=None
+                         ) -> tuple[list, dict]:
     """The forward program's allocations as `Family.scoped` takes them, in `_launch`'s order: its consumers'
     query stages and their rows' status; each one's output stage where the value is not as wide as the query
-    (the output stores through the query's stage where it is), a training forward's its split sums' fp32
-    (`_Residuals`); a training forward's or a peak walk's anchor keys' stage; the query loads' barriers and
+    and as narrow, `out_dtype`, the query's by default (the output stores through the query's stage where it
+    is), a training forward's its split sums' fp32 (`_Residuals`); a training forward's or a peak walk's
+    anchor keys' stage; the query loads' barriers and
     the consumers' turns' barrier; and its key and value streams in `stages` slots (`Family.streams`), a
     peak walk's keys alone."""
     consumers, block_q, block_k = tiles.consumers, tiles.block_q, tiles.block_k
     scoped = [plgpu.SMEM((consumers, block_q, width), dtype), plgpu.SMEM((consumers, block_q), jnp.float32)]
     if residuals:
         scoped.append(plgpu.SMEM((consumers, block_q, value_width), jnp.float32))
-    elif value_width != width and not peaks:
-        scoped.append(plgpu.SMEM((consumers, block_q, value_width), dtype))
+    elif not peaks and (value_width != width or out_dtype not in (None, dtype)):
+        scoped.append(plgpu.SMEM((consumers, block_q, value_width), out_dtype or dtype))
     if residuals or peaks:
         scoped.append(plgpu.SMEM((consumers, block_q), jnp.int32))
     scoped += [plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_arrivals=consumers)]
@@ -78,10 +80,10 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     return scoped, family.streams(blocks, stages, consumers)
 
 
-def guarded_columns(family: mosaic.Family, value_width: int, dtype, *, output_hook: bool) -> int:
+def guarded_columns(family: mosaic.Family, value_width: int, dtype) -> int:
     """The value columns a guarded launch walks at once (`_plain_forward`): a block of the family's swizzled
-    columns (`Family.column_unit`), the whole width where an output hook reads a row's whole output."""
-    return value_width if output_hook else min(value_width, family.column_unit(dtype))
+    columns (`Family.column_unit`)."""
+    return min(value_width, family.column_unit(dtype))
 
 
 def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype) -> Tiles | None:
@@ -110,7 +112,9 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     columns at a time: its walk carries its shifted and unshifted sums and forms both tiles' products a step
     (`algebra.stepped`), four `[block_q, Dv]` fp32 tiles beside its logits, which a block of the columns
     holds within a consumer's registers (ledger 1617). Each block's output is exact on its own (its rows'
-    shifts its own columns' room, `algebra.room`); the rare launch takes its logits once a block."""
+    shifts its own columns' room, `algebra.room`); the rare launch takes its logits once a block. An output
+    hook reads a row's whole output, so where there is one the blocks store theirs in fp32 and the hook runs
+    on the rows they make in XLA (`template.output_hooked`, the reference's own), rounded once after it."""
     family = bundle_of(tiles, query.dtype)
     call, spec, (q, k, v), (spans_of, hooked) = _prepared(query, key, value, spans, hooks, scale=scale,
                                                           natural=natural, tiles=tiles, family=family)
@@ -120,9 +124,9 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
             status, out = _launch(q, k, v, spans_of, hooked, None, spec=form, hooks=hooks, tiles=tiles,
                                   family=family, training=False, interpret=interpret)
             return out, status[0], status[1] > 0
-        # An output hook reads a row's whole output, so its call takes the guarded launch at its full width.
-        unit = guarded_columns(family, v.shape[-1], v.dtype, output_hook=hooks.output_mod is not None)
+        unit = guarded_columns(family, v.shape[-1], v.dtype)
         guarded = guarded_tiles(family, tiles, unit, v.dtype)
+        hooked_blocks = hooks.output_mod is not None
         # The plain launch's legality held a guarded tile at `tiles` (`MosaicForward.legal`).
         assert guarded is not None, tiles
         # A spans call's block map counts blocks of the launch's own key tile.
@@ -134,19 +138,31 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
             columns = v[..., first:first + unit]
             guard = _Guard(live.astype(jnp.int32), jnp.swapaxes(algebra.magnitudes(columns), 1, 2))
             initial = hooked.initial
-            held = hooked if initial is None else hooked._replace(
-                initial=(*initial[:2], initial[2][..., first:first + unit]))
-            blocks.append(_launch(q, k, columns, guarded_spans, held, guard, spec=form, hooks=hooks,
+            held = hooked._replace(output=()) if initial is None else hooked._replace(
+                output=(), initial=(*initial[:2], initial[2][..., first:first + unit]))
+            blocks.append(_launch(q, k, columns, guarded_spans, held, guard, spec=form,
+                                  hooks=dataclasses.replace(hooks, output_mod=None, output_params=()),
                                   tiles=guarded, family=family, training=False, interpret=interpret,
-                                  columns=first)[1])
+                                  columns=first, out_dtype=jnp.float32 if hooked_blocks else None)[1])
+        out = jnp.concatenate(blocks, axis=-1)
+        if hooked_blocks:
+            out = jnp.swapaxes(_output_hooked(jnp.swapaxes(out, 1, 2), hooks, hooked), 1, 2).astype(q.dtype)
         # Its maxima and overflows `walked_launches` reads of the plain launch alone.
-        return jnp.concatenate(blocks, axis=-1), jnp.zeros(live.shape, jnp.float32), jnp.zeros_like(live)
+        return out, jnp.zeros(live.shape, jnp.float32), jnp.zeros_like(live)
 
     def kept(live: jax.Array, guarded: jax.Array, plain: jax.Array) -> jax.Array:
         return jnp.where(jnp.swapaxes(live, 1, 2)[..., None], guarded, plain)
 
     out = algebra.walked_launches(spec, launch, kept)
     return out[:, :call.queries, :, :value.shape[3]]
+
+
+def _output_hooked(out: jax.Array, hooks: Hooks, hooked: _Hooked) -> jax.Array:
+    """The normalized output `out` `[B, H, Qp, Dv]` fp32 under the output hook in XLA, its parameters as the
+    launches read them (`hooked`, padded to the call's blocks; `template.output_hooked`)."""
+    params = tuple(Param(array, param.kind) for array, param in zip(hooked.output, hooks.output_params,
+                                                                     strict=True))
+    return output_hooked(out, hooks.output_mod, params)
 
 
 def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
@@ -184,9 +200,7 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
             value_rows = jnp.take(jnp.swapaxes(v, 1, 2).reshape(-1, v.shape[-1]), places, axis=0)
             acc = algebra.split_output(split.others, split.own, value_rows)
             out = algebra.output_of(acc, rows[1], guarded=form.guarded or hooks.initial is not None)
-            params = tuple(Param(array, param.kind)
-                           for array, param in zip(hooked.output, hooks.output_params, strict=True))
-            out = output_hooked(out, hooks.output_mod, params)
+            out = _output_hooked(out, hooks, hooked)
             overflowed = (status[1] > 0) | algebra.overflowed(acc)
             return ((jnp.swapaxes(out, 1, 2).astype(q.dtype), rows[0], rows[1], anchors, split), status[0],
                     overflowed)
@@ -462,10 +476,11 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
 def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Guard | None, *,
             spec: algebra.Forward, hooks: Hooks, tiles: Tiles, family: mosaic.Family, training: bool,
             interpret: bool, columns: int | None = None, peaks: bool = False,
-            anchors: tuple[jax.Array, jax.Array] | None = None):
+            anchors: tuple[jax.Array, jax.Array] | None = None, out_dtype=None):
     """The forward's launch in `spec`'s form (`guard`'s rows shifting where given): its rows' status `[2, B,
     H, Qp]` fp32, their maxima in the walk's units and 1 where their weighted values overflowed
-    (`algebra.walked_launches`), and its output `[B, Qp, H, Dv]`. In `training`, at the
+    (`algebra.walked_launches`), and its output `[B, Qp, H, Dv]` in `out_dtype` (the query's by default). In
+    `training`, at the
     `anchors` a peak walk found, its status and residuals (`_Residuals`) and no output: the rows
     `[5, B, H, Qp]` fp32 (maxima, denominators, the anchor's own weight, the other keys' weights' sum and
     their shift), the anchor keys `[B, H, Qp]` int32 and the split sums `[B, Qp, H, Dv]` fp32. A peak walk
@@ -482,9 +497,10 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
                        spec.queries)
     # The output stores through the query's stage where the two are as wide (its rows are read before the
     # store); else it takes a stage of its own beside the query's and the rings (`_forward_allocations`).
-    reuse = value.shape[-1] == width
+    out_dtype = query.dtype if out_dtype is None else jnp.dtype(out_dtype)
+    reuse = value.shape[-1] == width and out_dtype == query.dtype
     scoped, rings = _forward_allocations(family, tiles, width, value.shape[-1], query.dtype, training,
-                                         program.stages, peaks=peaks)
+                                         program.stages, peaks=peaks, out_dtype=out_dtype)
     arrays = len(scoped) - 2
 
     def body(q_ref, k_ref, v_ref, *refs, streams):
@@ -552,7 +568,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, guard: _Gu
                     jax.ShapeDtypeStruct((batch, heads, queries), jnp.int32),
                     jax.ShapeDtypeStruct((batch, queries, heads, value.shape[-1]), jnp.float32))
     else:
-        out_type = (status_type, jax.ShapeDtypeStruct((batch, queries, heads, value.shape[-1]), query.dtype))
+        out_type = (status_type, jax.ShapeDtypeStruct((batch, queries, heads, value.shape[-1]), out_dtype))
     approx_math = approximate(hooks, (block_q, block_k), value.shape[-1], differentiated=False)
     # Each launch named apart, so its compile reports and profile rows say which it is.
     kind = "peaks" if peaks else "training" if training else "forward"

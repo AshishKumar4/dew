@@ -237,8 +237,7 @@ class MosaicForward(_Mainloop[Tiles]):
         if ba.arguments["residuals"] or not algebra.headroom(value.dtype):
             return True
         family = bundle_of(config, query.dtype)
-        columns = guarded_columns(family, value.shape[3], value.dtype,
-                                  output_hook=self.output_mod is not None)
+        columns = guarded_columns(family, value.shape[3], value.dtype)
         return guarded_tiles(family, config, columns, value.dtype) is not None
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Tiles | None:
