@@ -10,6 +10,7 @@ that write every tensor back, so `Pretrained.save` restores what it read.
 
 from __future__ import annotations
 
+import copy
 import dataclasses
 import json
 import os
@@ -17,7 +18,7 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from functools import partial
 from pathlib import Path
-from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, Self
+from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple, NoReturn, Self
 
 import jax
 import jax.numpy as jnp
@@ -350,7 +351,8 @@ class Pretrained:
              mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
              fallback: str | None = None, weights: bool = True, on_host: bool = False,
              modeling_overrides: Mapping[str, object] | None = None,
-             trust_remote_code: bool = False, text_only: bool = False) -> Self:
+             trust_remote_code: bool = False, text_only: bool = False,
+             prediction_depths: int | None = None) -> Self:
         """Load a source as a native Flax model with explicit parameter trees, as the kind of source it is.
 
         `name_or_dir` is a local HF directory or a Hub model ID. Decoder, tower and
@@ -406,6 +408,13 @@ class Pretrained:
         built, nor their tensors read, and the source saves as that text checkpoint. A source that is
         a decoder already loads as it is; a pipeline or a fallback has no language model to take.
 
+        `prediction_depths` keeps the first that many of a decoder's multi-token prediction depths
+        (DeepSeek V3's, GLM's and Qwen3.5's `mtp` blocks): None the ones the checkpoint holds, 0
+        none, `n` the first `n`; a DSpark drafter, whose stages draft as one, is kept whole or at 0
+        not at all. The load reads the source as a checkpoint of those
+        alone (`_kept_depths`): the others are neither built nor their tensors read, and it saves as
+        that checkpoint. A source that holds fewer keeps what it holds; one with none holds none.
+
         Without `weights`, the variables are their shapes and dtypes alone
         (`jax.ShapeDtypeStruct`), read from the source's headers through the same
         translation: what a run that resumes from its own checkpoint builds its state
@@ -434,6 +443,9 @@ class Pretrained:
 
         dtype = dtype_name(dtype)
         param_dtype = AUTO if param_dtype == AUTO else dtype_name(param_dtype)
+        if prediction_depths is not None and (isinstance(prediction_depths, bool) or prediction_depths < 0):
+            raise ValueError(f"prediction_depths keeps the first that many depths, 0 or more, not "
+                             f"{prediction_depths!r}")
         # The reference refuses a folder outside the source before anything is fetched.
         directory, reference, composite = _source_metadata(
             sources.SourceReference(str(name_or_dir), revision, subfolder), selected, fallback,
@@ -443,7 +455,7 @@ class Pretrained:
             single_file=single_file, dduf_file=dduf_file, placed=placed, streaming=streaming or not weights,
             weights=weights, dtype=dtype, param_dtype=param_dtype, attention_impl=attention_impl,
             max_seq_len=max_seq_len, overrides=modeling_overrides, trust_remote_code=trust_remote_code,
-            text_only=text_only)
+            text_only=text_only, prediction_depths=prediction_depths)
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
@@ -846,11 +858,17 @@ def _text_generation(loaded: Pretrained, sampling: Sampling | None) -> TextGener
     )
 
 
+def _no_language_model(name: str, kind: str) -> NoReturn:
+    """Refuse `text_only` on a source of `kind`, which has no wrapper's language model to take."""
+    raise ValueError(f"{name} is a {kind}, which has no wrapper's language model for text_only to take")
+
+
 def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dtype: str = "float32",
                           revision: str | None = None, attention_impl: str = "auto",
                           size: tuple[int, ...] | None = None, variables: Variables | None = None,
                           mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
-                          text: bool = True) -> PretrainedPipeline:
+                          text: bool = True, text_only: bool = False,
+                          prediction_depths: int | None = None) -> PretrainedPipeline:
     """A published diffusion pipeline, to train from its own weights.
 
     `size` is the (height, width) in pixels the pipeline runs at instead of
@@ -870,7 +888,13 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     takes the prompts its conditioner encoded alone
     (`TextToImage.prepare(conditions=...)`), and a prompt, training or
     `save`, which read the text encoder, are refused.
+
+    `text_only` and `prediction_depths` read as `Pretrained.load`'s do: a
+    pipeline has no wrapper's language model for `text_only` to take, and
+    its components hold no prediction depths, so any count keeps them all.
     """
+    if text_only:
+        _no_language_model(checkpoint, "diffusion pipeline")
     directory = sources.snapshot(checkpoint, revision, weights=False)
     if variables is not None and not text:
         raise ValueError("supplied variables bind every component; text=False skips reading one")
@@ -1122,19 +1146,19 @@ def _loaded_kind(reference: sources.SourceReference, directory: Path, composite:
                  dduf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
                  weights: bool, dtype: str, param_dtype: str, attention_impl: str,
                  max_seq_len: int | None, overrides: Mapping[str, object] | None,
-                 trust_remote_code: bool, text_only: bool) -> tuple[Pretrained, bool]:
+                 trust_remote_code: bool, text_only: bool,
+                 prediction_depths: int | None = None) -> tuple[Pretrained, bool]:
     """The source `Pretrained.load` resolved, loaded as its kind loads: a composite release, the
     transformers forward it asks for, a diffusion pipeline, or a natively translated decoder or
-    wrapper (a wrapper's language model alone where `text_only` asks); and whether it is that
-    language model, taken out of its wrapper."""
+    wrapper (a wrapper's language model alone where `text_only` asks, the first `prediction_depths`
+    of its prediction depths where that is given); and whether it is that language model, taken out
+    of its wrapper."""
     folder = reference.directory(directory)
     pipeline = (single_file is not None or dduf_file is not None
                 or (gguf_file is None and (folder / "model_index.json").is_file()
                     and not _names_a_model(folder)))
     if text_only and fallback is None and (pipeline or composite is not None):
-        kind = "diffusion pipeline" if pipeline else "composite release"
-        raise ValueError(f"{reference.name} is a {kind}, which has no wrapper's language model for "
-                         "text_only to take")
+        _no_language_model(reference.name, "diffusion pipeline" if pipeline else "composite release")
     def code() -> Path | None:
         """The snapshot holding the source's own modules, which tier 2 reads where the load opted into
         running them, fetched for a loader that reads them alone: a native decoder's at its folder, a
@@ -1147,7 +1171,8 @@ def _loaded_kind(reference: sources.SourceReference, directory: Path, composite:
                                         param_dtype=param_dtype, attention_impl=attention_impl,
                                         max_seq_len=max_seq_len, weights=weights,
                                         overrides=overrides,
-                                        code=None if composite.backbone is None else code())
+                                        code=None if composite.backbone is None else code(),
+                                        prediction_depths=prediction_depths)
     elif fallback is not None:
         from dew.interop import torchax_fallback
 
@@ -1174,7 +1199,7 @@ def _loaded_kind(reference: sources.SourceReference, directory: Path, composite:
                                    attention_impl=attention_impl, max_seq_len=max_seq_len, weights=weights,
                                    overrides=overrides,
                                    remote=None if remote is None else reference.directory(remote),
-                                   pinned=reference, text_only=text_only)
+                                   pinned=reference, text_only=text_only, prediction_depths=prediction_depths)
     return loaded, False
 
 
@@ -1588,7 +1613,7 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
                            streaming: bool, dtype: str, param_dtype: str, attention_impl: str,
                            max_seq_len: int | None, weights: bool,
                            overrides: Mapping[str, object] | None = None,
-                           code: Path | None = None) -> Pretrained:
+                           code: Path | None = None, prediction_depths: int | None = None) -> Pretrained:
     """Materialize the described components through the native backbone and tensor-map owners.
     All Hub paths remain relative to the resolved snapshot root, including a selected subfolder. `code`
     is the snapshot holding the source's own modules where the load runs them (`trust_remote_code`),
@@ -1610,7 +1635,7 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
         pinned = source.component(component.config_folder)
         remote = None if code is None else pinned.directory(code)
         routed = _routed(_native_config(component.config, overrides), remote=remote, pinned=pinned,
-                         text_only=False, overrides=overrides)
+                         text_only=False, overrides=overrides, prediction_depths=prediction_depths)
         forwarded = isinstance(routed.route, TorchRoute)
         reads_shared = not forwarded or bool(head_source.weight_file is None and component.tensor_prefix)
         if weights or reads_shared:
@@ -1627,7 +1652,7 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
             gguf_file=None, component=component, tensors=tensors,
             placed=placed, streaming=streaming, dtype=dtype, param_dtype=param_dtype,
             attention_impl=attention_impl, max_seq_len=max_seq_len, weights=weights, overrides=overrides,
-            remote=remote, routed=routed)
+            remote=remote, routed=routed, prediction_depths=prediction_depths)
     else:
         _unread_overrides(overrides, "a release without a native backbone")
     missing = False
@@ -1693,13 +1718,17 @@ class _Routed(NamedTuple):
 
 
 def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: sources.SourceReference | None,
-            text_only: bool, overrides: Mapping[str, object] | None) -> _Routed:
+            text_only: bool, overrides: Mapping[str, object] | None,
+            prediction_depths: int | None = None) -> _Routed:
     """A native source's config, its route and, where `text_only` takes a wrapper's language model
     alone, that model's wrapper fields, decided before any weight downloads, on the config alone: a
     format the codec cannot read, a family's refusal, an unregistered decoder checked against
     transformers (tiers 2 and 3). The language model reads as its text family's checkpoint
     (`decoders.language_model_config`); a route that reads no `overrides` refuses them. `remote` and
-    `pinned` are `source_route`'s."""
+    `pinned` are `source_route`'s. Where `prediction_depths` is given, the config is the checkpoint's
+    of that many depths (`_kept_depths`), which the load reads and saves."""
+    if prediction_depths is not None:
+        config = _kept_depths(config, prediction_depths)
     route = source_route(config, remote=remote, pinned=pinned)
     language = route.wrapper if text_only and isinstance(route, WrapperRoute) else None
     if language is not None:
@@ -1791,6 +1820,57 @@ def native_backbone(directory: str | Path, *, param_dtype: str) -> tuple[Mapping
     return component.config, translated.built.variables
 
 
+DEPTH_COUNTS = ("num_nextn_predict_layers", "mtp_num_hidden_layers", "num_mtp_layers", "n_mtp_layers")
+"""The fields a source's config counts its multi-token prediction depths by, family by family."""
+
+
+def _scopes(config: dict) -> list[dict]:
+    """The scopes a decoder's fields are stated in: `config`'s top, then its `text_config` if any."""
+    text = config.get("text_config")
+    return [config, *([text] if isinstance(text, dict) else [])]
+
+
+def _kept_depths(config: Mapping[str, object], kept: int) -> dict:
+    """`config` as the config of a checkpoint holding its first `kept` prediction depths alone: each
+    depth count it states (`DEPTH_COUNTS`, at its top or in its `text_config`) at most `kept`. A DSpark
+    drafter's stages, which its `compress_ratios` list past the trunk's layers, draft as one, its heads
+    on its last stage (`dew.interop.families.deepseek`), so it is kept whole or, at 0, not at all;
+    a count between is refused. A load reads, builds and saves the source this config states
+    (`Pretrained.load(prediction_depths=)`)."""
+    written = copy.deepcopy(dict(config))
+    for scope in _scopes(written):
+        for counted in DEPTH_COUNTS:
+            if isinstance(scope.get(counted), int) and scope[counted] > kept:
+                scope[counted] = kept
+        ratios, layers = scope.get("compress_ratios"), scope.get("num_hidden_layers")
+        if scope.get("dspark_block_size") and isinstance(ratios, list) and isinstance(layers, int):
+            stages = len(ratios) - layers
+            if 0 < kept < stages:
+                raise ValueError(f"a DSpark drafter's {stages} stages draft as one, its heads on the last: "
+                                 f"prediction_depths keeps all of them or none (0), not {kept}")
+            if not kept:
+                scope["compress_ratios"], scope["dspark_block_size"] = ratios[:layers], 0
+    return written
+
+
+def _kept_tensors(tensors: Mapping[str, np.ndarray], config: Mapping[str, object], route: SourceRoute,
+                  kept: int) -> Mapping[str, np.ndarray]:
+    """`tensors` without those of the prediction depths past the first `kept`, none read: the depth of
+    each as its family places it (`decoders.source_depth`), a decoder's by its route's record, a
+    wrapper's language model's through the wrapper's names."""
+    match route:
+        case DecoderRoute(record=record):
+            depth = decoders.source_depths(record, _records.text(config.get("model_type"), "model_type"))
+        case WrapperRoute(wrapper=wrapper):
+            depth = decoders.wrapper_source_depths(wrapper)
+        case VerifiedRoute(verified=verified):
+            family = verified.entry(config)
+            depth = decoders.source_depths(verified.translate(config, tuple(tensors), family), family)
+        case _:
+            return tensors
+    return {name: tensor for name, tensor in tensors.items() if (held := depth(name)) is None or held < kept}
+
+
 def _load_native_source(source: sources.SourceReference, root: Path, *,
                         gguf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
                         dtype: str, param_dtype: str, attention_impl: str,
@@ -1800,7 +1880,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
                         overrides: Mapping[str, object] | None = None,
                         remote: Path | None = None, pinned: sources.SourceReference | None = None,
                         routed: _Routed | None = None,
-                        text_only: bool = False) -> tuple[Pretrained, bool]:
+                        text_only: bool = False, prediction_depths: int | None = None
+                        ) -> tuple[Pretrained, bool]:
     """Decode native source weights and bind their processors and export layout, and whether the
     bundle is a wrapper's language model taken alone (`text_only`). `remote` is the source's own code
     where the load runs it, and `pinned` where it was fetched (`source_route`). `routed` is the route a
@@ -1824,7 +1905,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     config = _native_config(config, overrides)
     family = config.get("model_type")
     if routed is None:
-        routed = _routed(config, remote=remote, pinned=pinned, text_only=text_only, overrides=overrides)
+        routed = _routed(config, remote=remote, pinned=pinned, text_only=text_only, overrides=overrides,
+                         prediction_depths=prediction_depths)
     config, route, language = routed
     if isinstance(route, TorchRoute):
         from dew.interop import torchax_fallback
@@ -1841,6 +1923,8 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
     if language is not None:
         tensors = _language_model_tensors(tensors, language)
+    if prediction_depths is not None:
+        tensors = _kept_tensors(tensors, config, route, prediction_depths)
     translated = _translated(config, route, tensors, directory, dtype=dtype, param_dtype=param_dtype,
                              attention_impl=attention_impl, max_seq_len=max_seq_len, streaming=streaming)
     model, variables, record, built, layouts, retained, export_adapter = translated.built
