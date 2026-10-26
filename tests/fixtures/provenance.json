@@ -1103,7 +1103,7 @@
     },
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -3639,7 +3639,7 @@
    "sources": [
     {
      "repo": "huggingface/diffusers",
-     "version": "0.34.0",
+     "version": "0.39.0",
      "runs": "diffusers"
     },
     {
@@ -3681,12 +3681,12 @@
    "sources": [
     {
      "repo": "huggingface/diffusers",
-     "version": "0.34.0",
+     "version": "0.39.0",
      "runs": "diffusers"
     },
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -3697,7 +3697,7 @@
    "sources": [
     {
      "repo": "huggingface/diffusers",
-     "version": "0.34.0",
+     "version": "0.39.0",
      "runs": "diffusers"
     }
    ],
