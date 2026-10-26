@@ -603,13 +603,16 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     Where `planned` collects launches, the launch's record instead (`Launch`, its `work`), and zeros.
 
     A `persistent` launch runs `grid`'s tiles on as many programs as the device's multiprocessors hold at
-    once (`cost.resident`, at their stated registers; `Family.persist`), its streams' rings running on across
-    them, two deep where they do (`mosaic.RingFamily`'s) and a multiprocessor holds as many programs two deep
-    as one, so a tile's loads go out under the last tile's work: a launch of one-step tiles whose program
-    holds a multiprocessor's registers alone (each launch's 255 registers a thread an H100 holds one of,
-    long-scoreboard stalls 51 to 73% of its time, SE-family-h100-80a38c02d). An A100's launches held one
-    program each, a quarter of the warps fla's held, with registers for two (SE-family-a100-8c5b5b16a).
-    Its program gives its tile's walk (`_walk`) for the grid's indices `_axis` reads. A program that
+    once (`cost.resident`, each thread at a thread's registers, `cost.THREAD_REGISTERS`, as the cost model
+    reads a launch: ptxas's count passes the stated, an H100's states launch's 138 registers against 123,
+    which held it to one program a multiprocessor, SE-family-h100-8def67e3e; `Family.persist`), its
+    streams' rings running on across them, two deep where they do (`mosaic.RingFamily`'s) and a
+    multiprocessor holds as many programs two deep as one, so a tile's loads go out under the last tile's
+    work: a launch of one-step tiles whose program holds a multiprocessor's registers alone (each launch's
+    255 registers a thread an H100 holds one of, long-scoreboard stalls 51 to 73% of its time,
+    SE-family-h100-80a38c02d). An A100's launches held one program each, a quarter of the warps fla's held,
+    with registers for two (SE-family-a100-8c5b5b16a). Its program gives its tile's walk (`_walk`) for the
+    grid's indices `_axis` reads. A program that
     `reduces` none takes no reduction scratch (`_allocated`; the compile gate holds its plan's shared memory
     to at least the compiled kernel's)."""
     family = call.family
@@ -622,7 +625,7 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
             return _allocated(family, {"walked": family.streams(blocks, depth, 1)}, staging, reduces=reduces)
 
         def holding(depth: int) -> int:
-            return cost.resident(call.target, shared(depth), threads, held.registers(family))
+            return cost.resident(call.target, shared(depth), threads, cost.THREAD_REGISTERS)
 
         stages = 2 if (isinstance(family, mosaic.RingFamily) and shared(2) <= family.most_shared
                        and holding(2) == holding(1)) else 1
