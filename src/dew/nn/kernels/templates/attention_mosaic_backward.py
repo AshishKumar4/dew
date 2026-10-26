@@ -263,8 +263,8 @@ def _dq_launch(query, key, value, dout, peak, prior, anchor, delta, key_index, s
     out = family.kernel(
         entry, out_type=(sums, sums, stats_shape) if walk.accurate else (sums, stats_shape),
         grid=(heads, queries // pair, batch), grid_names=("heads", "q_tiles", "batch"), consumers=consumers,
-        interpret=walk.interpret, approx_math=walk.approx_math)(query, key, value, dout, peak, prior, anchor,
-                                                                delta, key_index, *leaves)
+        interpret=walk.interpret, approx_math=walk.approx_math, name="attention_dq")(
+            query, key, value, dout, peak, prior, anchor, delta, key_index, *leaves)
     dq, keyed, rows = out if walk.accurate else (out[0], None, out[1])
     return dq, keyed, rows
 
@@ -442,7 +442,8 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     launch = family.kernel(
         entry, out_type=(gradient, gradient, *(grad_shapes[kind] for kind in graded)),
         grid=(heads, keys_padded // pair, batch), grid_names=("heads", "k_tiles", "batch"),
-        consumers=consumers, interpret=walk.interpret, approx_math=walk.approx_math)
+        consumers=consumers, interpret=walk.interpret, approx_math=walk.approx_math,
+        name="attention_dkv_fused" if walk.fused else "attention_dkv")
     operands = (query, key, value, dout, peak, total, anchor, delta, key_index, *leaves)
     if not walk.fused:
         return launch(*operands)
