@@ -236,7 +236,6 @@ def request(seed, *, questions, short_words, long_words):
 
 def make_pool(args):
     from reference_error import REDRAW, SIZING_FROM
-    from reference_source import dew_revision
 
     if args.count < 8 or args.short_words < 1 or args.long_words < args.short_words:
         raise ValueError("the pool needs at least eight verdict draws and positive ordered state lengths")
@@ -244,7 +243,7 @@ def make_pool(args):
         raise ValueError(f"a request asks a positive multiple of {len(OPTIONS)} questions")
     verdict = list(range(args.count * (1 + REDRAW)))
     pilot = list(range(SIZING_FROM, SIZING_FROM + 2 * args.count))
-    pool = {"commit": dew_revision(), "count": args.count,
+    pool = {"commit": recorded_commit(), "count": args.count,
             "questions": args.questions, "short_words": args.short_words, "long_words": args.long_words,
             "verdict": verdict, "pilot": pilot,
             "requests": {str(seed): request(seed, questions=args.questions, short_words=args.short_words,
@@ -593,14 +592,20 @@ def verdict(args, pool):
     source = source_identity(args.source)
     expected = {"commit": pool["commit"], "pool_sha256": file_sha256(args.pool),
                 "source_sha256": manifest_sha256(source), "device": torch.device(args.device).type}
-    metadata = {}
+    metadata, seeds = {}, [*pool["pilot"], *pool["verdict"]]
     for phase in ("native", "author", "truth"):
         record = json.loads((args.records / f"{phase}.json").read_text())
         run = {**expected, "phase": phase, "compute_dtype": "float64" if phase == "truth" else args.dtype}
         admit(record, run, phase)
-        for spent in record.get("requests", ()):
-            admit(spent, run, f"{phase}'s request {spent.get('seed')}")
         metadata[phase] = record
+        if phase == "native":
+            continue
+        # The author's and truth's runs record each request, a resumed one among them, in the pool's order.
+        if "requests" not in record or [spent.get("seed") for spent in record["requests"]] != seeds:
+            raise ValueError(f"{phase} does not hold one request record for each of this pool's pilots and "
+                             f"verdict draws, in order")
+        for spent in record["requests"]:
+            admit(spent, run, f"{phase}'s request {spent['seed']}")
     stored = stored_dtypes(args.source)
     for phase, held in (("native", stored), ("author", sorted({args.dtype, AUTHOR_HEAD_DTYPE})),
                         ("truth", ["float64"])):
@@ -692,12 +697,24 @@ def stored_dtypes(directory):
                    if jnp.issubdtype(tensor.dtype, jnp.floating)})
 
 
-def recorded_run(args):
-    """The provenance a phase records, read before it runs and again after: its phase, the checkout's
-    commit, and the pool's and source's digests."""
+def recorded_commit():
+    """The commit the pool and every phase record name, the checkout's. A checkout that changes a tracked
+    file or adds one to Dew's source (`dew._checkout.clean`) is refused, as its records would name code
+    they did not run."""
     from reference_source import dew_revision
 
-    return {"phase": args.phase, "commit": dew_revision(), "pool_sha256": file_sha256(args.pool),
+    from dew import _checkout
+
+    if not _checkout.clean():
+        raise SystemExit("the checkout has uncommitted changes, so its records cannot name the code they "
+                         "ran; record from a clean checkout")
+    return dew_revision()
+
+
+def recorded_run(args):
+    """The provenance a phase records, read before it runs and again after: its phase, the checkout's
+    commit (`recorded_commit`), and the pool's and source's digests."""
+    return {"phase": args.phase, "commit": recorded_commit(), "pool_sha256": file_sha256(args.pool),
             "source_sha256": manifest_sha256(source_identity(args.source))}
 
 
