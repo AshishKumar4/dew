@@ -2,6 +2,21 @@
 
 The native and author phases run in separate processes. LayerBanks owns weight reads and layouts;
 the author's Transformers model owns all forward arithmetic and Accelerate owns its offload hooks.
+One qualification is one checkout: the pool and every phase record name its commit, and the verdict
+refuses records of different commits. On one GPU, from a checkout:
+
+    PYTHONPATH=src:tests:tools python tools/slot_runtime_qualification.py pool --output run/pool.json
+    PYTHONPATH=src:tests:tools python tools/slot_runtime_qualification.py native --source RELEASE \
+        --pool run/pool.json --output run/native.npz
+    AUTHOR=$(PYTHONPATH=src:tests:tools python tools/slot_runtime_qualification.py environment)
+    PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu $AUTHOR tools/slot_runtime_qualification.py author \
+        --source RELEASE --pool run/pool.json --partial run/partial --output run/author.npz
+    PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu $AUTHOR tools/slot_runtime_qualification.py truth \
+        --source RELEASE --pool run/pool.json --partial run/partial --output run/truth.npz
+    PYTHONPATH=src:tests:tools python tools/slot_runtime_qualification.py verdict --source RELEASE \
+        --pool run/pool.json --records run --output run/verdict.json
+
+RELEASE is the release's local directory: the authors' runtime runs causal for a Hub id.
 """
 
 import argparse
@@ -19,16 +34,25 @@ from dataclasses import asdict, replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
+AUTHOR_OVERRIDES = ROOT / "locks/reference/torch28-cu128-tf519-v1.override.txt"
+"""The author and truth phases' environment over the checkout's CPU lock: the reference transformers and
+the CUDA 12.8 torch (`author_python`)."""
+AUTHOR_HEAD_DTYPE = "float32"
+"""The dtype the author phase builds the authors' engine to hold its readout in, beside a narrow backbone."""
+JAX_PLATFORMS = {"gpu": "cuda"}
+"""JAX's name for a CUDA device's platform, against torch's: the records name every device as torch does."""
 
 
 class TorchBankWeights(Mapping):
-    """A Transformers state dict backed by one native layer bank, never a full resident checkpoint.
+    """A Transformers state dict read from the native layer banks one layer at a time, each recovered
+    tensor then kept on the host at its stored precision, so the whole checkpoint is resident there
+    after the first forward (`offloaded_model` refuses one larger than the host's free memory).
 
     Source names pass through Transformers' published checkpoint conversion mapping. The inverse
     native weight layouts recover the source tensors; non-decoder entries are read one tensor at a time.
     Each tensor, once recovered, is kept on the host at the narrowest float dtype that holds it exactly
     (the release's stored one: bf16 for a bf16 release), so every later forward reads no bank and
-    widens it in NumPy: the release is read and laid out once per run, not once per forward. The
+    widens it in NumPy, and the release is read and laid out once a run. The
     narrow copy is storage outside Torch, so the float64 oracle's audit sees float64 tensors alone.
     """
 
@@ -212,6 +236,7 @@ def request(seed, *, questions, short_words, long_words):
 
 def make_pool(args):
     from reference_error import REDRAW, SIZING_FROM
+    from reference_source import dew_revision
 
     if args.count < 8 or args.short_words < 1 or args.long_words < args.short_words:
         raise ValueError("the pool needs at least eight verdict draws and positive ordered state lengths")
@@ -219,7 +244,7 @@ def make_pool(args):
         raise ValueError(f"a request asks a positive multiple of {len(OPTIONS)} questions")
     verdict = list(range(args.count * (1 + REDRAW)))
     pilot = list(range(SIZING_FROM, SIZING_FROM + 2 * args.count))
-    pool = {"count": args.count, "redraw": REDRAW, "sizing_from": SIZING_FROM,
+    pool = {"commit": dew_revision(), "count": args.count,
             "questions": args.questions, "short_words": args.short_words, "long_words": args.long_words,
             "verdict": verdict, "pilot": pilot,
             "requests": {str(seed): request(seed, questions=args.questions, short_words=args.short_words,
@@ -275,6 +300,7 @@ def native(args, pool):
     from dew.interop import Pretrained
     from dew.registry import dtype_name
 
+    # Each leaf at the dtype the release stores it in, as the verdict reads the release's headers.
     bundle = Pretrained.load(args.source, dtype=args.dtype, param_dtype="auto", attention_impl="xla")
     task = replace(Decide.of(bundle), budget=Budget(tokens=4096, rows=4))
     scoring, variables = task.scoring()
@@ -297,9 +323,10 @@ def native(args, pool):
         part(variables, "backbone"), jnp.zeros((1, 1), jnp.int32), method="hidden_states"))
     return values, {"batch_rows": observed.batch_rows,
                     "compute_dtype": dtype_name(hidden.dtype),
-                    "parameter_dtypes": sorted({str(value.dtype) for value in leaves}),
-                    "storage": "auto",
-                    "platforms": sorted({device.platform for device in devices}),
+                    "parameter_dtypes": sorted({str(value.dtype) for value in leaves
+                                                if jnp.issubdtype(value.dtype, jnp.floating)}),
+                    "device": ",".join(sorted({JAX_PLATFORMS.get(device.platform, device.platform)
+                                               for device in devices})),
                     "devices": sorted(str(device) for device in devices),
                     "device_memory": jax.devices()[0].memory_stats()}
 
@@ -320,7 +347,7 @@ def _floating(value):
 
 @contextlib.contextmanager
 def float64_operations():
-    """Audit actual Torch operation outputs, not just the model's final dtype."""
+    """Audit the dtype of every floating output each Torch operation returns."""
     import torch
     from torch.overrides import TorchFunctionMode
 
@@ -392,7 +419,63 @@ def _across(before, after):
     return after - before
 
 
-def author(args, pool, *, truth, commit):
+PROVENANCE = ("phase", "commit", "pool_sha256", "source_sha256", "compute_dtype", "device")
+"""The run a record was made in, which admits it: a phase's record, and each request record within it."""
+
+IEEE = {"float32_matmul": "highest", "cuda_tf32": False, "cudnn_tf32": False}
+"""The runtime settings under which Torch computes float32 products at IEEE float32 (`precision`)."""
+
+
+def admit(record, run, what):
+    """Refuse `record` unless it was made in `run`: the same phase, commit, pool and source digests,
+    compute dtype and device type (`PROVENANCE`). A field the record lacks differs."""
+    differing = [field for field in PROVENANCE if record.get(field) != run[field]]
+    if differing:
+        raise ValueError(f"{what} was recorded in another run: its {differing} differ from this run's")
+
+
+class Partial:
+    """A phase's request records, each written as its request finishes under `directory/<phase>`, so a
+    stopped phase resumes: a record is read back only where it was made in this run (`admit`)."""
+
+    def __init__(self, directory, run):
+        self.run = run
+        self.directory = directory / run["phase"]
+        self.directory.mkdir(parents=True, exist_ok=True)
+
+    def read(self, seed):
+        """Seed's recorded values and cost, or None where no earlier run recorded it."""
+        import numpy as np
+
+        record = self.directory / f"{seed}.npz"
+        if not record.exists():
+            return None
+        spent = json.loads(record.with_suffix(".json").read_text())
+        admit(spent, self.run, str(record))
+        with np.load(record) as held:
+            return {name: held[name] for name in held.files}, spent
+
+    def write(self, seed, values, spent):
+        import numpy as np
+
+        record = self.directory / f"{seed}.npz"
+        partial = record.with_name(f"{seed}.partial.npz")
+        np.savez(partial, **values)
+        record.with_suffix(".json").write_text(json.dumps(spent) + "\n")
+        partial.replace(record)
+
+
+def precision():
+    """What Torch computes float32 products at, read from the runtime (`IEEE`)."""
+    import torch
+
+    return {"float32_matmul": torch.get_float32_matmul_precision(),
+            "cuda_tf32": torch.backends.cuda.matmul.allow_tf32, "cudnn_tf32": torch.backends.cudnn.allow_tf32}
+
+
+def author(args, pool, run):
+    """The authors' engine over the pool's pilots and verdict draws, at the narrow precision, or as the
+    float64 truth with its weights streamed from the native banks; `run` is the phase's provenance."""
     from unittest.mock import patch
 
     import numpy as np
@@ -400,6 +483,7 @@ def author(args, pool, *, truth, commit):
     import transformers
     from slot_readout_reference import oracle_precision, runtime
 
+    truth = run["phase"] == "truth"
     torch.set_float32_matmul_precision("highest")
     torch.backends.cudnn.allow_tf32 = False
     measured = None
@@ -430,24 +514,19 @@ def author(args, pool, *, truth, commit):
         engine_type = importlib.import_module("slot_reference.engine").DecisionEngine
         engine = engine_type(str(args.source), device=args.device,
                              dtype="float64" if truth else args.dtype,
-                             head_dtype="float64" if truth else "float32", fork_mode="batched")
+                             head_dtype="float64" if truth else AUTHOR_HEAD_DTYPE, fork_mode="batched")
         if truth and engine.model is not model:
             raise RuntimeError("the author runtime did not retain the bank-fed model")
-        if args.partial is not None:
-            args.partial.mkdir(parents=True, exist_ok=True)
-        pool_hash = hashlib.sha256(args.pool.read_bytes()).hexdigest()
+        run = {**run, "compute_dtype": str(engine.torch_dtype).removeprefix("torch."),
+               "device": torch.device(engine.device).type}
+        partial = None if args.partial is None else Partial(args.partial, run)
         values, requests = {}, []
         for index, seed in enumerate((*pool["pilot"], *pool["verdict"])):
             body = pool["requests"][str(seed)]
-            record = None if args.partial is None else args.partial / f"{seed}.npz"
-            if record is not None and record.exists():
-                # A request an earlier run of this phase recorded, over this pool, is read back.
-                spent = json.loads(record.with_suffix(".json").read_text())
-                if spent["pool_sha256"] != pool_hash:
-                    raise ValueError(f"{record} was recorded over another request pool")
-                with np.load(record) as held:
-                    values.update({name: held[name] for name in held.files})
-                requests.append(spent)
+            held = None if partial is None else partial.read(seed)
+            if held is not None:
+                values.update(held[0])
+                requests.append(held[1])
                 continue
             began = time.perf_counter()
             before = {} if measured is None else measured()
@@ -460,23 +539,17 @@ def author(args, pool, *, truth, commit):
                 asked[name] = np.asarray(logits[0], np.float64 if truth else np.float32)
             values.update(asked)
             spent = {"seed": seed, "index": index, "seconds": time.perf_counter() - began,
-                     **({} if measured is None else _across(before, measured())),
-                     "pool_sha256": pool_hash, "commit": commit}
-            if torch.device(args.device).type == "cuda":
+                     **({} if measured is None else _across(before, measured())), **run}
+            if run["device"] == "cuda":
                 spent["peak_device_bytes"] = torch.cuda.max_memory_allocated(args.device)
             requests.append(spent)
             print(json.dumps(spent), flush=True)
-            if record is not None:
-                partial = record.with_name(f"{seed}.partial.npz")
-                np.savez(partial, **asked)
-                record.with_suffix(".json").write_text(json.dumps(spent) + "\n")
-                partial.replace(record)
-        metadata = {"device": str(engine.device),
-                    "compute_dtype": str(engine.torch_dtype).removeprefix("torch."),
+            if partial is not None:
+                partial.write(seed, asked, spent)
+        metadata = {"compute_dtype": run["compute_dtype"], "device": run["device"],
                     "parameter_dtypes": sorted({str(value.dtype).removeprefix("torch.")
                                                 for value in engine.model.parameters()}),
-                    "storage": "float64" if truth else args.dtype,
-                    "precision": "ieee"}
+                    "precision": precision()}
         if truth:
             # Every request's own operations, across the runs that recorded them.
             counts = {key: sum(spent[key] for spent in requests)
@@ -486,7 +559,7 @@ def author(args, pool, *, truth, commit):
             metadata.update(counts)
             metadata.update(bank_reads=weights.reads, peak_bank_bytes=weights.peak_bank_bytes,
                             whole_checkpoint_bytes=weights.whole_bytes, bank_stats=asdict(banks.stats()))
-        if torch.device(args.device).type == "cuda":
+        if run["device"] == "cuda":
             metadata["peak_device_bytes"] = max(
                 [torch.cuda.max_memory_allocated(args.device),
                  *(spent["peak_device_bytes"] for spent in requests if "peak_device_bytes" in spent)])
@@ -496,42 +569,54 @@ def author(args, pool, *, truth, commit):
 
 def verdict(args, pool):
     """Check 1 of native against the author's runtime, each question's option log-probabilities from the
-    float64 truth's. The count is sized paired, native's errors against the author's on the pilots
-    the records hold (`recorded_pilots`), and the verdict judges its own draws at it, never a pilot.
-    Pairing holds because native and the author read the same released weights at their stored
-    precision and the same recorded inputs, so they share their upstream rounding."""
-    import numpy as np
-    from reference_error import Inconclusive, assert_as_exact, leaf_summary, recorded_pilots, seeds_for
+    float64 truth's.
 
-    phases = ("native", "author", "truth")
-    metadata = {phase: json.loads((args.records / f"{phase}.json").read_text()) for phase in phases}
-    pool_hash = hashlib.sha256(args.pool.read_bytes()).hexdigest()
+    The records are admitted first, each phase's and each of its requests' (`admit`), against the run
+    this verdict expects: this pool and source, the pool's commit, the declared compute dtype and device.
+    Each arm's parameters are held at what its storage policy gives the release's stored dtypes: native
+    keeps each stored dtype, the author holds its backbone at the compute dtype and its readout at
+    AUTHOR_HEAD_DTYPE, and the truth holds all of them in float64; the author and truth computed under
+    IEEE float32 products.
+
+    The count is sized paired, native's errors against the author's on the pilots the records hold
+    (`recorded_pilots`), and the verdict judges its own draws at that count, never a pilot. The arms read
+    the same released backbone weights at their stored precision and the same recorded inputs; their
+    readouts differ, native's at the compute dtype and the author's at AUTHOR_HEAD_DTYPE. A count the
+    shared part does not set leaves the verdict's interval unresolved, which is Inconclusive."""
+    import numpy as np
+    import torch
+    from reference_error import Inconclusive, assert_as_exact, leaf_summary, recorded_pilots, seeds_for
+    from reference_source import dew_revision
+
+    if not pool.get("commit"):
+        raise ValueError("the pool names no commit, so its phases cannot be held to one")
     source = source_identity(args.source)
-    for phase, record in metadata.items():
-        if record["phase"] != phase or record["pool_sha256"] != pool_hash:
-            raise ValueError(f"{phase} was not recorded for this phase and request pool")
-        if record["compute_dtype"] != ("float64" if phase == "truth" else args.dtype):
-            raise ValueError(f"{phase} was recorded at a different compute dtype")
-        expected_storage = "auto" if phase == "native" else "float64" if phase == "truth" else args.dtype
-        if record["storage"] != expected_storage or not record["parameter_dtypes"]:
-            raise ValueError(f"{phase} was recorded at a different parameter storage policy")
-        if record["source"] != source:
-            raise ValueError(f"{phase} was recorded from a different source manifest")
-    if not metadata["native"].get("commit"):
-        raise ValueError("native was recorded without its commit")
-    device = args.device.partition(":")[0]
-    if metadata["native"]["platforms"] != ["gpu" if device == "cuda" else device]:
-        raise ValueError("the native computation ran on a different device platform")
+    expected = {"commit": pool["commit"], "pool_sha256": file_sha256(args.pool),
+                "source_sha256": manifest_sha256(source), "device": torch.device(args.device).type}
+    metadata = {}
+    for phase in ("native", "author", "truth"):
+        record = json.loads((args.records / f"{phase}.json").read_text())
+        run = {**expected, "phase": phase, "compute_dtype": "float64" if phase == "truth" else args.dtype}
+        admit(record, run, phase)
+        for spent in record.get("requests", ()):
+            admit(spent, run, f"{phase}'s request {spent.get('seed')}")
+        metadata[phase] = record
+    stored = stored_dtypes(args.source)
+    for phase, held in (("native", stored), ("author", sorted({args.dtype, AUTHOR_HEAD_DTYPE})),
+                        ("truth", ["float64"])):
+        if metadata[phase]["parameter_dtypes"] != held:
+            raise ValueError(f"{phase} held its parameters at {metadata[phase]['parameter_dtypes']}; its "
+                             f"storage policy over the release's {stored} holds them at {held}")
     for phase in ("author", "truth"):
-        record = metadata[phase]
-        if record["device"].partition(":")[0] != device or record["precision"] != "ieee":
-            raise ValueError(f"{phase} was recorded on a different device or precision policy")
+        if metadata[phase]["precision"] != IEEE:
+            raise ValueError(f"{phase} computed float32 products at {metadata[phase]['precision']}, "
+                             f"not {IEEE}")
     truth = metadata["truth"]
-    if truth["parameter_dtypes"] != ["float64"] or truth["floating_operations"] < 1:
-        raise ValueError("the recorded truth did not execute the float64 model")
-    if device == "cuda" and truth["cuda_floating_operations"] < 1:
+    if truth["floating_operations"] < 1:
+        raise ValueError("the recorded truth executed no floating operations")
+    if expected["device"] == "cuda" and truth["cuda_floating_operations"] < 1:
         raise ValueError("the recorded truth executed no floating CUDA operations")
-    loaded = {phase: np.load(args.records / f"{phase}.npz") for phase in phases}
+    loaded = {phase: np.load(args.records / f"{phase}.npz") for phase in metadata}
     # Every phase holds the pilots and the verdict's draws, native's in one record of one commit.
     asked = {name for seed in (*pool["pilot"], *pool["verdict"])
              for name in pool["requests"][str(seed)]["questions"]}
@@ -551,14 +636,8 @@ def verdict(args, pool):
         names = pool["requests"][str(int(index))]["questions"]
         return {"log_probabilities": np.concatenate([normalized(loaded[phase][name]) for name in names])}
 
-    def served(index):
-        return log_probabilities("native", index)
-
-    def original(index):
-        return log_probabilities("author", index)
-
-    def exact(index):
-        return log_probabilities("truth", index)
+    original = functools.partial(log_probabilities, "author")
+    exact = functools.partial(log_probabilities, "truth")
 
     def recorded(index):
         return {"log_probabilities": leaf_summary(original(index)["log_probabilities"],
@@ -568,17 +647,20 @@ def verdict(args, pool):
         return (np.asarray(seed, np.int64),)
 
     original.recorded = recorded.recorded = exact.recorded = True
+    native = functools.partial(log_probabilities, "native")
     count = seeds_for(recorded_pilots(original, draw, len(pool["pilot"])), draw, "released slot runtime",
-                      dew_fn=served, truth_fn=exact)
+                      dew_fn=native, truth_fn=exact)
     if count > pool["count"]:
         raise Inconclusive(f"the reference requires {count} draws; the fixed set has only {pool['count']}")
-    assert_as_exact(served, recorded, draw, "released slot runtime", seeds=count, truth_fn=exact)
-    args.output.write_text(json.dumps({"seeds": count, "verdict": "green", "source": source,
-                                      "pool_sha256": pool_hash, "phases": metadata}, indent=2) + "\n")
+    assert_as_exact(native, recorded, draw, "released slot runtime", seeds=count, truth_fn=exact)
+    args.output.write_text(json.dumps({"commit": dew_revision(), "seeds": count, "verdict": "green",
+                                      "source": source, "pool_sha256": expected["pool_sha256"],
+                                      "phases": metadata}, indent=2) + "\n")
 
 
 def source_identity(directory):
-    """The requested local source, including weights, readout, processor and configuration bytes."""
+    """The source's weight files (safetensors and torch) and every metadata file the loader reads
+    (`METADATA_PATTERNS`), each by its path in the source and its sha256."""
     from dew.interop.sources import METADATA_PATTERNS
 
     root = directory.resolve()
@@ -586,24 +668,64 @@ def source_identity(directory):
     for path in sorted(root.rglob("*")):
         if path.is_file() and (path.suffix in (".safetensors", ".pt")
                                or any(path.match(pattern) for pattern in METADATA_PATTERNS)):
-            with path.open("rb") as stream:
-                files[path.relative_to(root).as_posix()] = hashlib.file_digest(stream, "sha256").hexdigest()
+            files[path.relative_to(root).as_posix()] = file_sha256(path)
     return {"files": files}
+
+
+def manifest_sha256(manifest):
+    """One digest of a source's manifest (`source_identity`), as each record names its source."""
+    return hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+
+
+def file_sha256(path):
+    with path.open("rb") as stream:
+        return hashlib.file_digest(stream, "sha256").hexdigest()
+
+
+def stored_dtypes(directory):
+    """The floating dtypes the source's safetensors store, read from their headers."""
+    import jax.numpy as jnp
+
+    from dew.interop.safetensors_io import read_weights
+
+    return sorted({str(tensor.dtype) for tensor in read_weights(directory).values()
+                   if jnp.issubdtype(tensor.dtype, jnp.floating)})
+
+
+def recorded_run(args):
+    """The provenance a phase records, read before it runs and again after: its phase, the checkout's
+    commit, and the pool's and source's digests."""
+    from reference_source import dew_revision
+
+    return {"phase": args.phase, "commit": dew_revision(), "pool_sha256": file_sha256(args.pool),
+            "source_sha256": manifest_sha256(source_identity(args.source))}
+
+
+def author_python():
+    """The author and truth phases' Python: the checkout's CPU lock under `AUTHOR_OVERRIDES`, built once
+    by tools/environments.py and reused while its installation is unchanged."""
+    from environments import reference
+
+    return reference("slot-author-cu128-tf519", [
+        "-r", str(ROOT / "locks/cpu.txt"), "--override", str(AUTHOR_OVERRIDES),
+        "--extra-index-url", "https://download.pytorch.org/whl/cu128",
+        "--index-strategy", "unsafe-best-match"])
 
 
 def main():
     import numpy as np
 
     sys.path.insert(0, str(ROOT / "tests"))
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("phase", choices=("pool", "native", "author", "truth", "verdict"))
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("phase", choices=("pool", "native", "environment", "author", "truth", "verdict"))
     parser.add_argument("--source", type=Path)
     parser.add_argument("--pool", type=Path)
     parser.add_argument("--records", type=Path)
     parser.add_argument("--partial", type=Path,
-                        help="a directory each request's record is written to as it finishes, and an "
-                             "earlier run's are read back from, so a stopped phase resumes")
-    parser.add_argument("--output", type=Path, required=True)
+                        help="a directory each request's record is written to as it finishes, by phase, and "
+                             "an earlier run's are read back from, so a stopped phase resumes")
+    parser.add_argument("--output", type=Path)
     parser.add_argument("--dtype", choices=("float32", "bfloat16"), default="bfloat16")
     parser.add_argument("--device", default="cuda:0")
     parser.add_argument("--count", type=int, default=16)
@@ -611,6 +733,11 @@ def main():
     parser.add_argument("--short-words", type=int, default=8)
     parser.add_argument("--long-words", type=int, default=256)
     args = parser.parse_args()
+    if args.phase == "environment":
+        print(author_python())
+        return
+    if args.output is None:
+        parser.error(f"the {args.phase} phase writes its --output")
     if args.phase == "pool":
         make_pool(args)
         return
@@ -623,15 +750,11 @@ def main():
             parser.error("a verdict needs its recorded phases")
         verdict(args, pool)
         return
-    from reference_source import git_head
-
-    commit = git_head(ROOT)
-    values, metadata = (native(args, pool) if args.phase == "native"
-                        else author(args, pool, truth=args.phase == "truth", commit=commit))
-    metadata.update(phase=args.phase,
-                    pool_sha256=hashlib.sha256(args.pool.read_bytes()).hexdigest(), commit=commit,
-                    source=source_identity(args.source),
-                    peak_host_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
+    run = recorded_run(args)
+    values, metadata = native(args, pool) if args.phase == "native" else author(args, pool, run)
+    if recorded_run(args) != run:
+        raise RuntimeError("the pool or the source changed while the phase ran, so its record names neither")
+    metadata.update(run, peak_host_rss_bytes=resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024,
                     packages={name: importlib.metadata.version(name)
                               for name in ("jax", "torch", "transformers", "accelerate", "numpy")})
     np.savez(args.output, **values)

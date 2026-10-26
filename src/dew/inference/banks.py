@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-import json
 import math
 import threading
 import time
@@ -39,7 +38,6 @@ from jax.experimental.layout import Format, Layout as DeviceLayout
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
 from jax.typing import DTypeLike
 
-from dew import _records
 from dew.batch import Variables, merge
 from dew.nn.backbones.decoder_stack import DecoderBank, stack_layers
 from dew.nn.backbones.layer_plan import group_layers, layer_index
@@ -265,12 +263,12 @@ class SafetensorsBanks(LayerBanks):
 
     The checkpoint is a decoder, a media wrapper around one, or the native
     backbone a release with a separately stored readout describes (a slot
-    decision release). It translates the weights through `Pretrained.load`'s
-    own native reader, with its `SourceLeaf` recipes over read-only memory
-    maps, including expert stacking, transposition and the cast to
-    `param_dtype` (by default the checkpoint's dtype). Quantized checkpoints
-    are refused, because their codec may dequantize the entire checkpoint
-    before translation, which would break the memory bound below.
+    decision release). It translates the weights as `Pretrained.load` does
+    (`dew.interop.pretrained.native_backbone`), with its `SourceLeaf` recipes
+    over read-only memory maps, including expert stacking, transposition and
+    the cast to `param_dtype` (by default the checkpoint's dtype). Quantized
+    checkpoints are refused, because their codec may dequantize the entire
+    checkpoint before translation, which would break the memory bound below.
 
     The cache keeps complete layers in read order until `cache_bytes` is
     full, and holds them until `close`. A sequential decoder visits every
@@ -279,8 +277,9 @@ class SafetensorsBanks(LayerBanks):
     partial cache useful. One read-ahead slot holds the next layer, even
     with a zero cache, unless `read_ahead` is False. Host memory for weights
     is bounded by `cache_bytes`, two rows and one leaf's conversion scratch.
-    Embeddings, heads and the KV cache stay resident outside that bound, and
-    the bound does not count the kernel's page cache.
+    Embeddings, heads, a media wrapper's towers and projectors (read whole,
+    as the wrapper's reader reads them) and the KV cache stay resident
+    outside that bound, and the bound does not count the kernel's page cache.
 
     Keep the source open and its files unchanged until all executions
     finish, because a compiled callback cannot read a closed source.
@@ -288,60 +287,14 @@ class SafetensorsBanks(LayerBanks):
 
     def __init__(self, directory: str | Path, *, cache_bytes: int = 0,
                  param_dtype: DTypeLike | Literal["auto"] = "auto", read_ahead: bool = True):
-        from dew.interop.composite import NativeComponent
-        from dew.interop.decoder_parts import DecoderFamily
-        from dew.interop.hf_decoders import families
-        from dew.interop.pretrained import (
-            DecoderRoute,
-            WrapperRoute,
-            _composite_description,
-            _load_native_source,
-            source_route,
-        )
-        from dew.interop.safetensors_io import read_weights
-        from dew.interop.sources import SourceReference
+        from dew.interop.pretrained import native_backbone
         from dew.registry import dtype_name
 
         if cache_bytes < 0:
             raise ValueError("cache_bytes must be nonnegative")
-        folder = Path(directory)
-        # A release with a separately stored readout banks the native backbone it describes.
-        description = _composite_description(folder)
-        component = (NativeComponent(_records.record(json.loads((folder / "config.json").read_text()),
-                                                     "config.json"))
-                     if description is None else description.backbone)
-        if component is None:
-            raise ValueError("disk banks require a native backbone, not a standalone readout")
-        config = component.config
+        config, self._variables = native_backbone(
+            directory, param_dtype="auto" if param_dtype == "auto" else dtype_name(param_dtype))
         self.config: Mapping[str, object] = MappingProxyType(config)
-        sections = [config]
-        if "text_config" in config:
-            sections.append(_records.record(config["text_config"], "text_config"))
-        if any(section.get("quantization_config") or section.get("expert_dtype") for section in sections):
-            raise ValueError("disk banks require unquantized safetensors; a whole-model codec is not bounded")
-
-        def unregistered(_config):
-            raise ValueError("disk banks require a registered native decoder family")
-
-        match source_route(config, verified=unregistered):
-            case DecoderRoute():
-                family = _records.text(config.get("model_type"), "model_type")
-            case WrapperRoute(wrapper=wrapper):
-                family = wrapper["text_model_type"]
-            case _:
-                raise ValueError("disk banks require a native decoder or its media wrapper")
-        if families()[family].prepare is not DecoderFamily.prepare or families()[family].packed:
-            raise ValueError("disk banks require a family with lazy tensor translation; "
-                             "this family's preparation can materialize checkpoint weights")
-        # The loader's own translation and tree check, over the safetensors alone: a pickle shard set
-        # would be read whole before the first row.
-        backbone, _ = _load_native_source(
-            SourceReference(str(folder)), folder, gguf_file=None, component=component,
-            tensors=component.own_tensors(read_weights(folder / component.weights_folder)),
-            placed=lambda variables: variables, streaming=True, dtype="float32",
-            param_dtype="auto" if param_dtype == "auto" else dtype_name(param_dtype),
-            attention_impl="reference", max_seq_len=None)
-        self._variables: Variables = backbone.variables
         self._shapes = jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), self._variables
         )

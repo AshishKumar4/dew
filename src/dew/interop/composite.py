@@ -39,6 +39,13 @@ class NativeComponent:
         cut = len(self.tensor_prefix)
         return {name[cut:]: tensor for name, tensor in shared.items() if name.startswith(self.tensor_prefix)}
 
+    def other_tensors[T](self, shared: Mapping[str, T]) -> Mapping[str, T]:
+        """The shared shard set's tensors outside this component's prefix, a readout's stored beside it;
+        none where the component holds the whole set (no prefix)."""
+        if not self.tensor_prefix:
+            return {}
+        return {name: tensor for name, tensor in shared.items() if not name.startswith(self.tensor_prefix)}
+
 
 @dataclass(frozen=True)
 class HeadComponent:
