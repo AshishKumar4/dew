@@ -122,7 +122,7 @@ from dew.telemetry.records import (
     Record,
     StepCompiled,
 )
-from dew.training._fit import FitPlan, FitRun, split_metrics, unrecorded_parts, waited_read
+from dew.training._fit import FitPlan, FitRun, split_metrics, unrecorded_parts, validation_suites, waited_read
 from dew.training._lowering import Lowered
 from dew.training.budget import Pause, Plateau, run_length, run_steps
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -226,26 +226,6 @@ def _reported(rollout: Rollout | None, metrics: Sequence[Metric]) -> dict[str, S
         **getattr(rollout, "shown", {}),
         **{metric.name: shown for metric in metrics if (shown := getattr(metric, "shown", None)) is not None},
     }
-
-
-def _suites(dataset: Loader, validation: Mapping[str, Reader | EvalSuite] | None,
-            metrics: Sequence[Metric], eval_every: int | None) -> dict[str, EvalSuite]:
-    """Every split `fit` validates, by name, with its metrics and cadence
-    resolved: `dataset.val` alone is the one suite `val`."""
-    if validation is None:
-        if metrics and dataset.val is None:
-            # Else the metrics would never be scored, and the run would not say so.
-            raise ValueError("metrics score validation data: give the dataset a val split, or validation=")
-        # `val` is read only when a pass is scheduled; a dataset need not hold one.
-        validation = {"val": dataset.val} if (eval_every or metrics) and dataset.val is not None else {}
-    elif not validation:
-        raise ValueError("validation must contain a split")
-    suites = {}
-    for name, entry in validation.items():
-        suite = entry if isinstance(entry, EvalSuite) else EvalSuite(entry)
-        suites[name] = EvalSuite(suite.data, tuple(suite.metrics) or tuple(metrics),
-                                 eval_every if suite.every is None else suite.every)
-    return suites
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1400,7 +1380,7 @@ class Trainer(Generic[Loss, Effects]):
         steps = run_steps(loader, steps, epochs, tokens, self.accumulation, examples)
         count_compilation_cache()
         self._schedule(None if steps is None else steps // self.accumulation)
-        suites = _suites(loader, validation, metrics, eval_every)
+        suites = validation_suites(loader, validation, metrics, eval_every)
         selection, plateau, pause = self._fit_policies(best, stop, metrics, suites, checkpoint_every,
                                                        steps, tokens)
         self._preflight(loader, plateau, suites, preview=preview, stated=dataset,
