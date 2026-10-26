@@ -162,7 +162,7 @@ Use a fresh output directory: exports commit immutable shards and a manifest, an
 
 ## Mixtures, objectives and order
 
-`mix(datasets, weights=..., by="records" | "tokens")` mixes accepted records before sharding and ends at its first exhausted member, as Grain's mix does; a member that repeats never ends. With `by="tokens"`, token stores' shares count valid targets, not padding. `phases((first, until_step), ..., (last, None))` reads datasets one after another, each until the training step it names and the last until the run ends; each phase is a whole chain of the same batch.
+`mix(datasets, weights=..., by="records" | "tokens")` mixes accepted records before sharding and ends at its first exhausted member, as Grain's mix does; a member that repeats never ends. With `by="tokens"`, token stores' shares count valid targets, not padding. `phases((first, until_step), ..., (last, None))` reads datasets one after another, each until the training step it names and the last until the run ends; each phase is a whole chain of the same batch. `schedule([(first, tokens), ..., (last, None)])` reads them on the run's committed-token clock instead: each stage ends at the step whose commit brings the run's committed tokens, the count `fit(tokens=)` reads, to the stage's own.
 
 ## Token-budget batches
 

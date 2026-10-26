@@ -1093,7 +1093,7 @@ def test_a_schedule_ends_its_stage_at_the_step_whose_commit_reaches_its_tokens(t
     phased = token_trainer(tmp_path / "phased").fit(phases((first, step), (second, None)).batch(8), steps=8)
     assert_same(whole, parameters(phased), "the schedule against phases switching where its commits did")
     assert scheduled.checkpoints is not None
-    _, saved = scheduled.checkpoints.restore()
+    _, saved = scheduled.checkpoints.restore(share=DataPartition())
     assert saved is not None and position.read(saved).completed[0][1] == step * 8
     for stopped in (2, step):
         resumed = token_trainer(tmp_path / f"stopped-{stopped}")

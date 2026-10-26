@@ -213,7 +213,7 @@ trainer.fit(prep(train).shuffle(seed=0, window=200_000).batch(1024),
 
 ### A staged frontier pretraining run
 
-This sketch uses the token-clock schedule described in the [roadmap](../roadmap.md#data). Existing phases switch at step boundaries.
+A schedule's stages switch on the run's committed-token clock; `phases` switch at the training steps they name.
 
 ```python
 pretrain = mix(sources, weights=[.75, .12, .05, .05, .03], by="tokens").map(text.tokenize(tok)).pack(seq_len=8192)
@@ -238,7 +238,7 @@ gantt
   long context, 64k     :13500, 13600
 ```
 
-Each stage runs for its committed valid target tokens, the same clock as `fit(tokens=)`. At a boundary, sources shared between stages continue from their own positions; packer and prefetch buffers are dropped and counted; a new sequence length recompiles the step once.
+Each stage runs for its committed valid target tokens, the same clock as `fit(tokens=)`, and ends at the step whose commit reaches them, on every process alike: the trainer reads the committed tokens before each step while a stage's end lies ahead, and at the end opens the stream again where that step left it, so what the prefetch worker read past the end is dropped untrained. The saved position holds where each finished stage ended, and a resume reads the stages after it from there. A corpus shared between stages continues from where the earlier stage left it. A stage that one step's commit passes reads nothing, and the last stage runs on (`None`) or ends the data at its own tokens. A new sequence length recompiles the step once.
 
 ### Offline preparation, published once
 
