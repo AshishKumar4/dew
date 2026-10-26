@@ -609,6 +609,33 @@ def test_a_hub_tokenizer_lays_rows_out_from_the_revision_its_identity_names(monk
     assert resolved == [("acme/tokenizer", None)]
 
 
+def test_a_joint_head_reads_none_of_its_rows_padding():
+    """A window's rows of unequal length pad the shorter: the joint head's logits are the same whatever
+    states the backbone leaves on that padding, NaN included, as a padded or diverged row's can be."""
+    from dew.decision import DecisionInputs, JointLayout, JointSchemaHead
+    from dew.objectives.base import part
+
+    layout = JointLayout(max_len=96)
+    head = JointSchemaHead(hidden_size=32, width=32, routing_layers=1, layers=1, heads=2, feedforward=64)
+    objective = DecisionObjective(tiny_backbone(), tokenizer=TOKENIZER, specials=SPECIALS, layout=layout,
+                                  head=head)
+    rows = [layout.rows(TOKENIZER, SPECIALS, text, {"team": Choice("Which team?", ["billing", "sales"])})[0]
+            for text in ("short", "a much longer state than the first")]
+    inputs = DecisionInputs.collate(rows, SPECIALS.pad)
+    padding = ~np.asarray(inputs.valid)
+    assert padding.any()
+    variables = objective.init(jax.random.key(0))
+    model = objective.model
+    states = np.asarray(model.states(variables, inputs))
+    diverged = np.where(padding[..., None], np.nan, states).astype(states.dtype)
+    table = model.table(variables)
+
+    def logits(given):
+        return np.asarray(head.apply(part(variables, "head"), jnp.asarray(given), inputs, table))
+
+    np.testing.assert_array_equal(logits(diverged), logits(states))
+
+
 @pytest.mark.parametrize("joint", [False, True])
 def test_the_abstract_state_draws_a_missing_head_at_the_shapes_init_draws(joint):
     """A missing head drawn in a trace of the state (the abstract state a restore builds) has the
