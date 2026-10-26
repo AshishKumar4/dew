@@ -13,7 +13,7 @@ import optax
 import pytest
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
 from steady_state import steady_state
-from test_training_transactions import ShortScaleTrainer, Terms, Tiny, batches
+from test_training_transactions import SHORT_SCALE, Terms, Tiny, batches
 
 from dew.checkpoints import Checkpoints
 from dew.data import Loading, Memory
@@ -139,9 +139,9 @@ def test_host_accumulation_replays_original_rng_and_mutable_snapshots(tmp_path, 
     data = batches()
     states = []
     for layout in (DEVICE, HOST):
-        trainer = ShortScaleTrainer(
+        trainer = Trainer(
             Tiny(composite), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9),
-            accumulation=2, dynamic_scale=True, layout=layout)
+            accumulation=2, dynamic_scale=SHORT_SCALE, layout=layout)
         state, _, _ = trainer.place()
         step = trainer.compile(state, data[0])
         prefix, *_ = step(state, data[0])
@@ -160,9 +160,9 @@ def test_host_accumulation_replays_original_rng_and_mutable_snapshots(tmp_path, 
     platforms_agree(*states, steps=1)
 
     checkpoints = Checkpoints(str(tmp_path / "run"))
-    trainer = ShortScaleTrainer(
+    trainer = Trainer(
         Tiny(composite), optax.adamw(.03, weight_decay=.1), key=jax.random.PRNGKey(9),
-        accumulation=2, dynamic_scale=True, layout=HOST, checkpoints=checkpoints)
+        accumulation=2, dynamic_scale=SHORT_SCALE, layout=HOST, checkpoints=checkpoints)
     start, _, _ = trainer.place()
     step = trainer.compile(start, data[0])
     prefix, *_ = step(start, data[0])
@@ -227,8 +227,8 @@ def test_nonfinite_optimizer_candidate_rolls_back_all_cpu_owned_fields():
     optimizer = optax.GradientTransformation(lambda params: optax.EmptyState(), update)
     results = []
     for layout in (DEVICE, HOST):
-        trainer = ShortScaleTrainer(Tiny(), optimizer, key=jax.random.PRNGKey(9),
-                                    dynamic_scale=True, layout=layout)
+        trainer = Trainer(Tiny(), optimizer, key=jax.random.PRNGKey(9),
+                                    dynamic_scale=SHORT_SCALE, layout=layout)
         initial, _, _ = trainer.place()
         data = batches()[0]
         # the step consumes the state
