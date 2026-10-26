@@ -946,3 +946,137 @@ def test_a_tier_3_models_cache_holds_the_context_its_config_class_reads(tmp_path
     with pytest.warns(TransformersTierWarning):
         loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
     assert loaded.model.max_seq_len == 32
+
+
+def _moving_ropes() -> dict:
+    """Cohere's rotary as LongRoPE and as dynamic NTK, each switching past an original context of 8
+    positions of a 32-position model: the rope_parameters transformers' rotary recomputes from each
+    call's positions (`dynamic_rope_update`)."""
+    pairs = COHERE["hidden_size"] // COHERE["num_attention_heads"] // 2
+    rng = np.random.default_rng(0x1493)
+    return {
+        "longrope": {"rope_type": "longrope", "rope_theta": 10000.0, "original_max_position_embeddings": 8,
+                     "short_factor": (1 + rng.random(pairs)).tolist(),
+                     "long_factor": (2 + 4 * rng.random(pairs)).tolist()},
+        "dynamic": {"rope_type": "dynamic", "rope_theta": 10000.0, "factor": 3.0},
+    }
+
+
+def _moving_model(rope: str):
+    fields = {**COHERE, "max_position_embeddings": 32 if rope == "longrope" else 8,
+              "rope_parameters": _moving_ropes()[rope]}
+    torch.manual_seed(0)
+    return transformers.CohereForCausalLM(transformers.CohereConfig(**fields)).eval()
+
+
+MOVING_SEEDS = {"longrope documents": 8, "dynamic documents": 8, "longrope steps": 8, "dynamic steps": 8}
+"""The functional rotaries' declared check-1 seeds, sized by `seeds_for` on armada."""
+
+
+@pytest.mark.parametrize("rope", ["longrope", "dynamic"])
+def test_a_rotary_that_recomputes_its_tables_runs_each_packed_document_as_transformers_does(rope, tmp_path):
+    """A source whose rotary transformers recomputes from each call's positions (LongRoPE's tables
+    switching, dynamic NTK's base growing, past the original context) runs in tier 3 with those tables
+    computed in the trace from each document's reach (`functional_rotaries`): a packed row of a document
+    within the original context and one past it holds check 1, each document against transformers'
+    forward of it alone."""
+    model = _moving_model(rope)
+    model.save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32")
+    assert loaded.model.cache_rebuild_position == (8 if rope == "longrope" else None)
+    with float64():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager").eval()
+        wide.load_state_dict(model.state_dict())
+    lengths = (5, 13)
+    forward = jax.jit(lambda variables, tokens, segments: loaded.model.apply(variables, tokens,
+                                                                             segment_ids=segments))
+
+    def draw(seed):
+        rng = np.random.default_rng([0x1494, seed])
+        return (rng.integers(0, model.config.vocab_size, (1, sum(lengths))),)
+
+    segments = np.concatenate([np.full(length, index + 1) for index, length in enumerate(lengths)])[None]
+
+    def ours(tokens):
+        return np.asarray(forward(loaded.variables, tokens.astype(np.int32), segments), np.float64)
+
+    def theirs(source, precision=contextlib.nullcontext):
+        def run(tokens):
+            rows, start = [], 0
+            for length in lengths:
+                alone = copy.deepcopy(source)
+                with precision(), torch.no_grad():
+                    rows.append(alone(torch.from_numpy(tokens[:, start:start + length]).long()).logits
+                                .double().numpy())
+                start += length
+            return np.concatenate(rows, axis=1)
+        return run
+
+    reference = copy.deepcopy(model)
+    reference.set_attn_implementation("eager")
+    assert_as_exact(ours, theirs(reference), draw, f"{rope} documents",
+                    seeds=MOVING_SEEDS[f"{rope} documents"], truth_fn=theirs(wide, float64))
+
+
+@pytest.mark.parametrize("rope", ["longrope", "dynamic"])
+def test_a_rotary_that_recomputes_its_tables_decodes_as_transformers_generates(rope, tmp_path):
+    """A recomputing rotary decodes through Dew's cache as transformers' own generation runs it: each
+    call's new tokens rotate by the tables of the row's furthest token, the cached keys keeping theirs
+    (LongRoPE's rebuild past its original context is the sampler's, `cache_rebuild_position`). Two rows
+    of unequal prompts, the first left-padded, decode across the original context, every step's logits
+    holding check 1 against transformers' incremental forward of each row alone."""
+    model = _moving_model(rope)
+    model.save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32", max_seq_len=16)
+    with float64():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager").eval()
+        wide.load_state_dict(model.state_dict())
+    steps, vocab = 6, model.config.vocab_size
+
+    @jax.jit
+    def decoded(variables, prompt, valid, continued):
+        cache = loaded.model.apply(variables, prompt.shape[0], method="init_cache", mutable=["cache"])[1]
+        logits, state = loaded.model.apply({**variables, **cache}, prompt, decode=True, attention_mask=valid,
+                                           mutable=["cache"])
+        stepped = [logits[:, -1]]
+        for step in range(steps):
+            logits, state = loaded.model.apply({**variables, **state}, continued[:, step:step + 1],
+                                               decode=True, mutable=["cache"])
+            stepped.append(logits[:, 0])
+        return jnp.stack(stepped, axis=1)
+
+    def draw(seed):
+        rng = np.random.default_rng([0x1495, seed])
+        prompt = rng.integers(0, vocab, (2, 6)).astype(np.int32)
+        valid = np.ones((2, 6), bool)
+        valid[0, :2] = False
+        return prompt, valid, rng.integers(0, vocab, (2, steps)).astype(np.int32)
+
+    def ours(prompt, valid, continued):
+        return np.asarray(decoded(loaded.variables, prompt, valid, continued), np.float64)
+
+    def theirs(source, precision=contextlib.nullcontext):
+        def run(prompt, valid, continued):
+            rows = []
+            for row in range(2):
+                alone = copy.deepcopy(source)
+                with precision(), torch.no_grad():
+                    first = torch.from_numpy(prompt[row][valid[row]][None]).long()
+                    out = alone(input_ids=first, use_cache=True)
+                    logits = [out.logits[0, -1]]
+                    for step in range(steps):
+                        out = alone(input_ids=torch.from_numpy(continued[row, step:step + 1][None]).long(),
+                                    past_key_values=out.past_key_values, use_cache=True)
+                        logits.append(out.logits[0, -1])
+                rows.append(torch.stack(logits).double().numpy())
+            return np.stack(rows)
+        return run
+
+    reference = copy.deepcopy(model)
+    reference.set_attn_implementation("eager")
+    assert_as_exact(ours, theirs(reference), draw, f"{rope} steps", seeds=MOVING_SEEDS[f"{rope} steps"],
+                    truth_fn=theirs(wide, float64))
