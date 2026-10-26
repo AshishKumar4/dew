@@ -2234,7 +2234,7 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def recompute_more(self) -> Self | None:
         """One rung up `DECODER_REMAT`, past any rung that keeps nothing more of the names
-        these layers mark than the rung above it (`MixerBase.residuals`), whose step would
+        these layers mark than the rung above it (`MixerBase.marks`), whose step would
         compile the same; None at the top or off the ladder."""
         if self.remat not in DECODER_REMAT[:-1]:
             return None
@@ -2266,13 +2266,13 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def marked_residuals(self) -> frozenset[str]:
         """The `RESIDUALS` this decoder's layers can mark: each layer's mixer kind's
-        (`MixerBase.residuals`, every name where a kind does not say) and the MLP's."""
+        (`MixerBase.marks`, every name where a kind does not say) and the MLP's."""
         types = self.per_layer_types
         mixers = [kind.mixer or self.mixer for kind in self.layer_kinds(types).values()]
-        if any(mixer is not None and mixer.residuals is None for mixer in mixers):
+        if any(mixer is not None and mixer.marks() is None for mixer in mixers):
             return frozenset(RESIDUALS)
         default = AttentionMixer.residuals or ()
-        return frozenset(MLP_RESIDUALS).union(*(default if mixer is None else mixer.residuals or ()
+        return frozenset(MLP_RESIDUALS).union(*(default if mixer is None else mixer.marks() or ()
                                                 for mixer in mixers))
 
     @nn.nowrap

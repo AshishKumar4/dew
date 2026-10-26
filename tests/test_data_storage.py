@@ -165,6 +165,57 @@ def test_a_filesystem_of_its_own_supplies_conditional_writes():
     assert store.put_immutable(b"second") == second
 
 
+def test_an_immutable_put_reads_again_only_an_upload_that_reads_back_otherwise():
+    """`put_immutable`'s retries are for an object it created that reads back with other bytes, which no
+    transport checks: it is read again, and returns once a read verifies, or raises an OSError after its
+    retries. A failed transfer raises at once, since the transport has retried it already."""
+    from fsspec.implementations.memory import MemoryFileSystem
+
+    calls = {"writes": 0, "reads": 0}
+
+    class Flaky(MemoryFileSystem):
+        protocol = "flaky"
+        garbled = 1
+        refused = False
+
+        @classmethod
+        def _strip_protocol(cls, path):
+            return super()._strip_protocol(path.replace("flaky://", "memory://", 1))
+
+        def ukey(self, path):
+            return hashlib.sha256(super().cat_file(path)).hexdigest()
+
+        def cat_file(self, path, *args, **kwargs):
+            calls["reads"] += 1
+            payload = super().cat_file(path, *args, **kwargs)
+            # The first `garbled` reads return other bytes, as a store that has yet to settle would.
+            return payload[::-1] if calls["reads"] <= type(self).garbled else payload
+
+        def put_conditional(self, path, payload, version):
+            calls["writes"] += 1
+            if type(self).refused:
+                raise ConnectionError("the transfer failed after the transport's own retries")
+            if (self.ukey(path) if self.exists(path) else None) != version:
+                raise FileExistsError(path)
+            self.pipe_file(path, payload)
+            return self.ukey(path)
+
+    fsspec.register_implementation("flaky", Flaky, clobber=True)
+    store = Store(f"flaky://storage-{uuid4().hex}/value")
+    assert store.put_immutable(b"payload", retries=2) == store.get_versioned().version
+    assert (calls["writes"], calls["reads"]) == (1, 3)
+    calls.update(writes=0, reads=0)
+    Flaky.garbled = 9
+    with pytest.raises(OSError):
+        Store(f"flaky://storage-{uuid4().hex}/value").put_immutable(b"payload", retries=2)
+    assert (calls["writes"], calls["reads"]) == (1, 3)
+    calls.update(writes=0, reads=0)
+    Flaky.refused = True
+    with pytest.raises(ConnectionError):
+        Store(f"flaky://storage-{uuid4().hex}/value").put_immutable(b"payload", retries=5)
+    assert (calls["writes"], calls["reads"]) == (1, 0)
+
+
 def test_two_finalizers_publish_only_one_snapshot(store):
     start = threading.Barrier(2)
 
