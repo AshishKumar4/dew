@@ -98,6 +98,7 @@ from dew.objectives.base import (
     model_rngs,
     thaw,
 )
+from dew.objectives.lm.adaptation import ChunkAdaptation, adapted_scores
 from dew.objectives.lm.chunked import (
     chunked_tile,
     final_read,
@@ -619,6 +620,10 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     """Whether `token_scores` marks each prediction by default (`LMObjective`'s token accuracy).
     A policy or preference loss reports none, and asks for the marks where it scores them."""
 
+    adaptation: ChunkAdaptation | None = None
+    """How the model's continuum level steps in context by the loss it scores (`LMObjective`);
+    None reads the level as it is trained."""
+
     head_fused: bool = True
     """Whether a tiled head scored for its weighted sums takes their gradient in its forward
     (`token_scores`' `z_loss`, `LMObjective`'s training loss): the fit ladder turns it off where the
@@ -664,6 +669,8 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
             return f"{type(model).__name__} does not declare logits_flops for the LM head"
         if self.mtp_weight and not isinstance(model, CountedPredictions):
             return f"{type(model).__name__} does not declare prediction_flops for its MTP depths"
+        if self.adaptation is not None:
+            return "a continuum level stepped in context has no count of its windows' gradients"
         return None
 
     def _token_geometry(self, batch: Batch) -> tuple[np.ndarray, Mapping[str, jax.Array | Coordinates]]:
@@ -817,12 +824,21 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
 
         A rollout uses one snapshot of the policy and draws every completion from it;
         the result records the actual and raw-policy likelihoods that the objective's
-        ratio needs.
+        ratio needs. An objective that steps its level in context (`adaptation`) has no
+        generation that steps it, so it refuses (ValueError) rather than draw from the
+        level it starts with.
         """
+        if self.adaptation is not None:
+            raise ValueError("an objective that steps its continuum level in context scores what no "
+                             "generation draws yet: a generation reads the level it starts with")
         return TextGeneration(self.model, params, sampling=sampling)
 
-    def task_settings(self) -> TextSettings:
-        """The decoder's row length, preview budget, sampling policy, and tokenizer or source processor."""
+    def task_settings(self) -> TextSettings | None:
+        """The decoder's row length, preview budget, sampling policy, and tokenizer or source processor.
+        None for an objective that steps its level in context (`adaptation`), which no generation
+        task serves yet: its saved runs restore their trained state, and build no task."""
+        if self.adaptation is not None:
+            return None
         samples = self.samples
         return TextSettings(seq_len=self.seq_len,
                             max_new_tokens=0 if samples is None else samples.max_new_tokens,
@@ -904,8 +920,14 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         dtype = at_least_fp32(hidden.dtype)
         weights = self._row_weights(prepared, roles, dtype)
         total = None
-        whole = model_logits(self.model, params, hidden) if logits else None
-        if whole is not None:
+        whole = model_logits(self.model, params, hidden) if logits and self.adaptation is None else None
+        if self.adaptation is not None:
+            # The level steps window by window over these targets, weighted as the loss weighs them.
+            adapted = adapted_scores(self.model, params, hidden, targets, weights,
+                                     token_layout(prepared.slice_tokens(stop=-1).token_fields),
+                                     self.adaptation, predict=predict, logits=logits)
+            losses, predicted, log_z, whole = adapted.losses, adapted.predicted, adapted.log_z, adapted.logits
+        elif whole is not None:
             losses, predicted, log_z = logits_cross_entropy(whole, targets, predict=predict)
         elif table is not None:
             total, (losses, predicted, log_z) = fused_head_loss(
@@ -1227,6 +1249,15 @@ class LMObjective(TokenScorer):
 
     `token_accuracy` reports the argmax accuracy; False skips the pass
     over every logit it costs (0.77 ms of the head's 8.0 on a TPU v6e).
+
+    `adaptation` steps the model's continuum level (`CausalTransformer.continuum`) in context by
+    this loss's own next-token targets, Nested Learning's test-time training over the task loss
+    (`dew.objectives.lm.adaptation.ChunkAdaptation`): every `window` tokens of a document, the level
+    steps by `rate` times the summed gradient of their weighted losses, and the next window reads
+    it; training learns the level's start through every step. Evaluation and validation score the
+    same way. A preview, a rollout policy and a saved run's task would draw from the level's start,
+    which no generation steps yet, so an objective with `adaptation` takes no `samples`, refuses
+    `policy` and records no task.
     """
 
     def __init__(
@@ -1251,6 +1282,7 @@ class LMObjective(TokenScorer):
         indexer: IndexerTraining | None = None,
         token_accuracy: bool = True,
         processor: Processor | None | Omitted = OMITTED,
+        adaptation: ChunkAdaptation | None = None,
     ):
         """Build the objective; the class docstring describes each argument."""
         super().__init__(model, seq_len, head_chunks=head_chunks, head_tile=head_tile, samples=samples,
@@ -1259,6 +1291,14 @@ class LMObjective(TokenScorer):
         self.token_accuracy = token_accuracy
         _check_terms(self.model, aux_loss_alpha=aux_loss_alpha, mtp_weight=mtp_weight, z_loss=z_loss,
                      router_z_loss=router_z_loss)
+        if adaptation is not None:
+            if getattr(self.model, "continuum", None) is None:
+                raise ValueError("adaptation steps a continuum level, which this model does not have "
+                                 "(CausalTransformer.continuum)")
+            if samples is not None:
+                raise ValueError("adaptation scores through a level stepped in context, which a preview's "
+                                 "generation does not step; train it without samples")
+        self.adaptation = adaptation
         self.balance_rate = balance_rate
         self.aux_loss_alpha = aux_loss_alpha
         self.seq_aux = seq_aux
