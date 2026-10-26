@@ -36,7 +36,7 @@ import jax
 import jax.numpy as jnp
 
 from dew.hashing import fmix32
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, float32_einsum
 
 
 @jax.tree_util.register_dataclass
@@ -668,10 +668,13 @@ def scores(query: jax.Array, key: jax.Array, spans: KeySpans, hooks: Hooks | Non
     wide = jnp.promote_types(query.dtype, jnp.float32)
     scale = width ** -0.5 if scale is None else scale
     seen = dense(spans)
+    grouped = query.reshape(batch, queries, kv_heads, heads // kv_heads, width)
+    products = float32_einsum("bqhgd,bkhd->bhgqk", grouped, key,
+                              preferred_element_type=wide).reshape(batch, heads, queries, spans.keys)
+    products = products * jnp.asarray(scale, wide)
 
     def one(row, head):
-        q, k = query[row, :, head], key[row, :, head // (heads // kv_heads)]
-        s = jnp.einsum("qd,kd->qk", q, k, preferred_element_type=wide) * jnp.asarray(scale, wide)
+        s = products[row, head]
         if hooks.score_mod is not None:
             q_pos = jnp.arange(queries)[:, None]
             k_pos = jnp.arange(spans.keys)[None, :]
@@ -683,17 +686,18 @@ def scores(query: jax.Array, key: jax.Array, spans: KeySpans, hooks: Hooks | Non
 
 def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
               *, scale: float | None = None, residuals: bool = False):
-    """The template's arithmetic in XLA ops: `query` `[B, Q, H, D]` over `key` and `value` `[B, K, Hk, D]`
-    and `[B, K, Hk, Dv]`, a query head reading the key head it shares with `H // Hk` others, the keys
-    `spans` leaves it. As the kernels compute it: products of the inputs accumulated in fp32 (fp64 for
-    fp64 inputs), the scale and `score_mod` on the fp32 logits, the softmax from `hooks.initial` in fp32
-    (or the wider of the inputs' and the state's dtypes), the probabilities rounded to the values' dtype
-    for their product, the output normalized in fp32 and `output_mod` applied before it rounds to the
-    query's dtype. A query that sees no key and starts from no state gives zeros. With `residuals`, also
-    each query's running maximum `m` and denominator `total` `[B, H, Q]` (natural log, unnormalized), in
-    the softmax's dtype, a query that sees no key and starts from no state holding 0 for both, so every
-    residual is finite; a softmax resumed from them (`Initial`) starts such a query from `m = -inf`. No
-    hooks where `hooks` is None."""
+    """The template's arithmetic in XLA ops: `query` `[B, Q, H, D]` over `key` and `value` `[B, K, Hk, D]` and
+    `[B, K, Hk, Dv]`, a query head reading the key head it shares with `H // Hk` others, the keys `spans`
+    leaves it. As the kernels compute it: products of the inputs accumulated in fp32 (fp64 for fp64
+    inputs) as Dew's every product is (`dew.nn.precision.float32_einsum`, which a CPU under Dew's tests
+    sums in float64 and rounds once, as the reference path's), the scale and `score_mod` on the fp32
+    logits, the softmax from `hooks.initial` in fp32 (or the wider of the inputs' and the state's dtypes),
+    the probabilities rounded to the values' dtype for their product, the output normalized in fp32 and
+    `output_mod` applied before it rounds to the query's dtype. A query that sees no key and starts from
+    no state gives zeros. With `residuals`, also each query's running maximum `m` and denominator `total`
+    `[B, H, Q]` (natural log, unnormalized), in the softmax's dtype, a query that sees no key and starts
+    from no state holding 0 for both, so every residual is finite; a softmax resumed from them (`Initial`)
+    starts such a query from `m = -inf`. No hooks where `hooks` is None."""
     hooks = Hooks() if hooks is None else hooks
     batch, queries, heads, _ = query.shape
     kv_heads = key.shape[2]
@@ -704,46 +708,56 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
             wide = jnp.promote_types(wide, state.dtype)
     logits = scores(query, key, spans, hooks, scale=scale).astype(wide)
 
-    def one(row, head):
-        s, v = logits[row, head], value[row, :, head // (heads // kv_heads)]
-        if hooks.initial is None:
-            m0 = jnp.full((queries,), -jnp.inf, wide)
-            total0 = jnp.zeros((queries,), wide)
-            acc0 = jnp.zeros((queries, value.shape[-1]), wide)
-        else:
-            m0 = hooks.initial.m[row, head].astype(wide)
-            total0 = hooks.initial.total[row, head].astype(wide)
-            acc0 = hooks.initial.acc[row, head].astype(wide)
-        m = jnp.maximum(m0, jnp.max(s, axis=-1, initial=-jnp.inf))
-        safe = jnp.where(jnp.isfinite(m), m, 0)
-        p = jnp.exp(s - safe[:, None])
-        carried = jnp.where(jnp.isfinite(m0), jnp.exp(m0 - safe), 0)
-        total = total0 * carried + jnp.sum(p, axis=-1)
-        if hooks.drop is None:
-            acc = acc0 * carried[:, None] + jnp.einsum("qk,kd->qd", p.astype(value.dtype), v,
-                                                        preferred_element_type=wide)
-            o = jnp.where(total[:, None] > 0, acc / jnp.where(total > 0, total, 1)[:, None], 0)
-        else:
-            # Normalized before the draw's multiplier narrows them, as the kernels take them: a kept weight's
-            # z times its normalized weight stays in the values' range where z times the unnormalized one may
-            # not (fp16 at a rate of 1 - 2^-16). The state's share is normalized the same way.
-            inverse = jnp.where(total > 0, 1 / jnp.where(total > 0, total, 1), 0)
+    if hooks.initial is None:
+        m0 = jnp.full((batch, heads, queries), -jnp.inf, wide)
+        total0 = jnp.zeros((batch, heads, queries), wide)
+        acc0 = jnp.zeros((batch, heads, queries, value.shape[-1]), wide)
+    else:
+        m0 = hooks.initial.m.astype(wide)
+        total0 = hooks.initial.total.astype(wide)
+        acc0 = hooks.initial.acc.astype(wide)
+    m = jnp.maximum(m0, jnp.max(logits, axis=-1, initial=-jnp.inf))
+    safe = jnp.where(jnp.isfinite(m), m, 0)
+    p = jnp.exp(logits - safe[..., None])
+    carried = jnp.where(jnp.isfinite(m0), jnp.exp(m0 - safe), 0)
+    total = total0 * carried + jnp.sum(p, axis=-1)
+
+    def valued(weights: jax.Array) -> jax.Array:
+        # The weights narrowed to the values' dtype times the values, a query group's over its key head.
+        grouped = weights.astype(value.dtype).reshape(batch, kv_heads, heads // kv_heads, queries, spans.keys)
+        return float32_einsum("bhgqk,bkhd->bhgqd", grouped, value,
+                              preferred_element_type=wide).reshape(batch, heads, queries, value.shape[-1])
+
+    drop = hooks.drop
+    if drop is None:
+        acc = acc0 * carried[..., None] + valued(p)
+        normalized = jnp.where(total[..., None] > 0, acc / jnp.where(total > 0, total, 1)[..., None], 0)
+    else:
+        # Normalized before the draw's multiplier narrows them, as the kernels take them: a kept weight's z
+        # times its normalized weight stays in the values' range where z times the unnormalized one may not
+        # (fp16 at a rate of 1 - 2^-16). The state's share is normalized the same way.
+        inverse = jnp.where(total > 0, 1 / jnp.where(total > 0, total, 1), 0)
+
+        def multiplier(row, head):
             # The keep bits are the draw's, shared with the kernels; a kept entry takes its own dtype's
             # 1 / (1 - rate), rounded once from its double, so a float64 reference is exact at its rate.
-            draw = hooks.drop.draw(row, head)
-            scale = jnp.where(draw.keep(*positions), jnp.asarray(draw.bound, p.dtype), 0)
-            kept = (p * inverse[:, None]) * scale
-            acc = acc0 * (carried * inverse)[:, None] + jnp.einsum("qk,kd->qd", kept.astype(value.dtype), v,
-                                                                    preferred_element_type=wide)
-            o = acc
+            draw = drop.draw(row, head)
+            return jnp.where(draw.keep(*positions), jnp.asarray(draw.bound, p.dtype), 0)
+
+        drawn = jax.vmap(jax.vmap(multiplier, in_axes=(None, 0)), in_axes=(0, None))(jnp.arange(batch),
+                                                                                    jnp.arange(heads))
+        normalized = acc0 * (carried * inverse)[..., None] + valued((p * inverse[..., None]) * drawn)
+
+    def one(row, head):
+        o = normalized[row, head]
         if hooks.output_mod is not None:
             o = hooks.output_mod(o, *(_per_head(p, row, head) for p in hooks.output_params))
-        return o.astype(query.dtype), safe, total
+        return o.astype(query.dtype)
 
     rows = jnp.arange(batch)
-    out, m, total = jax.vmap(jax.vmap(one, in_axes=(None, 0)), in_axes=(0, None))(rows, jnp.arange(heads))
+    out = jax.vmap(jax.vmap(one, in_axes=(None, 0)), in_axes=(0, None))(rows, jnp.arange(heads))
     out = jnp.swapaxes(out, 1, 2)
-    return (out, m, total) if residuals else out
+    return (out, safe, total) if residuals else out
 
 
 LOG2E = 1.4426950408889634

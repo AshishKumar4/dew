@@ -362,7 +362,8 @@ def test_a_decode_step_traced_with_x64_on_runs_the_decode_kernel():
         mesh = gpu_mesh(jax.sharding.Mesh(np.array(jax.devices()[:1]), ("data",)), "sm80")
         with assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
             lowered = jax.jit(attended).trace(query, key, key).lower(lowering_platforms=("cuda",))
-    assert triton_kernels(lowered) == {"decode_attention": 1}
+    # The decode kernel, and its guarded launch, which runs only where the plain one overflowed.
+    assert triton_kernels(lowered) == {"decode_attention": 1, "decode_attention_headroom": 1}
 
 
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])

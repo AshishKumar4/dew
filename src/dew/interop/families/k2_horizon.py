@@ -61,8 +61,7 @@ def _k2_horizon_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
     # K2HorizonConfig drops the window unless use_sliding_window is set, and its attention builds
     # biases where attention_bias says (:212-223).
     # The rotary builds transformers' YaRN where rope_parameters names it (:740-748).
-    rope = read_rope(hf, used, PLAIN_SPELLING, yarn_max_pos=records.integer(
-        hf.get('max_position_embeddings', 32768), 'max_position_embeddings'))
+    rope = read_rope(hf, used, PLAIN_SPELLING)
     config = base_config({**hf, 'sliding_window': None}, used, rope=rope, scale_after_cast=False,
                          reads=frozenset({'attention_bias', 'sliding_window'}))
     groups = records.integer(hf.get('layernorm_num_groups', 1), 'layernorm_num_groups')
@@ -92,4 +91,6 @@ def _k2_horizon_export(model: CausalTransformer) -> Mapping[str, object]:
 K2_HORIZON = DecoderFamily(
     ('k2_horizon',), _k2_horizon_config, lambda fields: _groups(fields) != 1,
     'k2_horizon', 'K2HorizonForCausalLM', _k2_horizon_export, preserve_source_layout=False,
+    # The remote K2HorizonConfig's context, which a YaRN record's omitted lengths read.
+    defaults={'max_position_embeddings': 32768},
 )

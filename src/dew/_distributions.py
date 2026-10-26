@@ -40,10 +40,21 @@ def draw(key: jax.Array, scores: jax.Array, where: jax.Array | None = None,
     return jax.random.categorical(key, scores, axis=-1).astype(jnp.int32)
 
 
+def counter_key(key: jax.Array) -> jax.Array:
+    """A counter-based key (threefry2x32) of `key`'s bits, whatever `key`'s implementation: a mapped
+    draw under it is each mapped key's own, where an RBG key maps every draw from its first key
+    (https://docs.jax.dev/en/latest/jax.random.html#advanced-rng-configuration)."""
+    return jax.random.wrap_key_data(jax.random.bits(key, (2,), jnp.uint32), impl="threefry2x32")
+
+
 def row_draw(keys: jax.Array, scores: jax.Array, where: jax.Array | None = None,
              message: str = "a row drawn from holds no distribution") -> jax.Array:
-    """`draw` with row `i` of `scores` `[B, ..., V]` drawn under `keys[i]` alone, as the row
-    drawn by itself would be."""
+    """`draw` with row `i` of `scores` `[B, ..., V]` drawn under `keys[i]` alone, the same whatever
+    rows it is drawn beside. Row keys of another implementation than threefry2x32 are each made
+    counter-based first (`counter_key`), a key at a time, as `vmap` would draw every RBG row from the
+    first key's stream."""
     held = wellformed(scores)
     checkify.debug_check(jnp.all(held if where is None else held | ~where), message)
+    if jax.random.key_impl(keys) != "threefry2x32":
+        keys = jax.lax.map(counter_key, keys)
     return jax.vmap(jax.random.categorical)(keys, scores).astype(jnp.int32)

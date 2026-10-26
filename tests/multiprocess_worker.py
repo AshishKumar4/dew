@@ -673,7 +673,8 @@ def mode_pool_refusals(args) -> dict:
     copies, another length, a first read that fails there, a stream that
     runs out after one batch there, and a batch without a field. A resume
     from a newest checkpoint the processes list differently is refused as
-    well. Each outcome is the error's text, or None for a fit that trained."""
+    well, and streams that run out after one batch on both end the fit
+    there. Each outcome is the error's text, or None for a fit that trained."""
     import jax
     import optax
     import orbax.checkpoint as ocp
@@ -725,7 +726,7 @@ def mode_pool_refusals(args) -> dict:
                           checkpoints=checkpoints)
         try:
             trainer.fit(data, steps=2, log_every=1, **flags)
-        except (ValueError, RuntimeError, StopIteration) as error:
+        except (ValueError, RuntimeError) as error:
             return f"{type(error).__name__}: {error}"
         return None
 
@@ -737,6 +738,7 @@ def mode_pool_refusals(args) -> dict:
         "count": trained(stream(64 + 32 * other, 0)),
         "first_read": trained(reads(fail=other)),
         "eof": trained(reads(ends=1 if other else None)),
+        "ended": trained(reads(ends=1)),
         "layout": trained(reads(fields=("x",) if other else ("x", "y"))),
         "saved": trained(stream(64, 0), Checkpoints(str(Path(args.run_dir) / "saved")), checkpoint_every=1),
     }
@@ -870,8 +872,10 @@ def text_to_image(args):
     encoder = CLIPText.from_pretrained(str(FIXTURES / "clip" / "tiny"))
     rows = BATCH // args.processes
     mine = slice(args.process_id * rows, (args.process_id + 1) * rows)
+    # As a run's data holds it (`DiffusionObjective.data`): the prompts' tokens, and the prompts as text.
     batch = {"image": global_images()[mine],
-             "text": {name: value[mine] for name, value in encoder.tokenize(PROMPTS).items()}}
+             "text": {name: value[mine] for name, value in encoder.tokenize(PROMPTS).items()},
+             "captions": np.asarray(PROMPTS)[mine]}
     objective = DiffusionObjective(
         SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1),
         presets.Flow(),
