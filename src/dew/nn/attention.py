@@ -455,8 +455,8 @@ def _moment_normalized(x, scale, bias, axes: tuple[int, ...], epsilon: float, re
     flax takes E[x^2] - E[x]^2. That difference cancels where a group's mean
     dwarfs its spread, and its gradient carries the loss: FLUX.2's published
     VAE's input gradient sat twice torch's distance from float64, its worst
-    seeds 6 to 10 times. The centered form is never less exact, at one more
-    pass over the group. The weight is folded into the inverse deviation
+    seeds 6 to 10 times. The centered form has no such cancellation, at one
+    more pass over the group. The weight is folded into the inverse deviation
     before it meets the centered activations. `scale` and `bias` (None for
     none) broadcast against `x`'s trailing axes."""
     statistics = at_least_fp32(x.dtype if requested is None else requested)
