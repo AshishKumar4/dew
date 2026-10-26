@@ -88,7 +88,6 @@ The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): 
 
 - Integrate DataTrove once for decontamination and distributed MinHash dedup through publication and snapshots. [201, 203]
 - Add language and scored quality filters with recorded models and thresholds. Existing length, image-size and aspect filters remain the simple predicates. [202]
-- Add a public `schedule([(dataset, tokens), ...])` on the committed-token clock. Step-based phases exist; named mixture draws are already stable. Keep schedule member state keyed by member identity. [216]
 - Translate per-share streamed, filtered and packed positions across host counts without changing their order. Global record-count positions already support host-count changes. [722]
 - Spread a filtered read across worker processes so none starves, and have a read that can never yield a row raise rather than spin. [883]
 - Select holdouts over a generation by input position, or refuse them above the published store. [884]

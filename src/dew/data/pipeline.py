@@ -500,13 +500,20 @@ class Mixture:
 @dataclasses.dataclass(frozen=True)
 class Phases:
     pipelines: tuple[Pipeline, ...]
-    until_steps: tuple[int | None, ...]
+    ends: tuple[int | None, ...]
+    """Where each phase ends, as `clock` counts them: at the training step it names (`phases`), or at
+    the run's committed tokens (`schedule`). The last runs on (None); on the token clock it may end
+    instead, where the data ends."""
+    clock: Literal["steps", "tokens"] = "steps"
 
     def __post_init__(self) -> None:
-        if len(self.pipelines) != len(self.until_steps):
+        if len(self.pipelines) != len(self.ends):
             raise ValueError(f"phases need one end per pipeline: {len(self.pipelines)} pipelines and "
-                             f"{len(self.until_steps)} ends")
-        phase_ends(self.until_steps, "step")
+                             f"{len(self.ends)} ends")
+        if self.clock == "steps":
+            phase_ends(self.ends, "step")
+        else:
+            phase_ends(self.ends if self.ends[-1] is None else (*self.ends, None), "token")
 
 
 def children(pipeline: Pipeline) -> tuple[Pipeline, ...]:
@@ -1051,6 +1058,26 @@ def phases(*entries: tuple[Dataset, int | None]) -> Pipeline:
         raise ValueError("phases need at least one (dataset, until_step)")
     return Pipeline(Phases(tuple(dataset._chain() for dataset, _ in entries),
                            tuple(until for _, until in entries)))
+
+
+def schedule(stages: Sequence[tuple[Dataset, float | None]]) -> Pipeline:
+    """Datasets read one after another on the run's committed-token clock, the clock `fit(tokens=)`
+    counts: each `(dataset, tokens)` for the valid target tokens its steps commit, the last for the
+    rest of the run (`None`), or for its tokens, where the data ends (the run's last step). A stage
+    ends at the step whose commit reaches its tokens, on every process alike, so its last step may
+    commit past them; one that a single step's commit passes reads nothing. A corpus that an earlier
+    stage read continues from where it left it, and what the run had read ahead of the end is not
+    trained on. Each stage is a whole chain, laid out and batched as it reads."""
+    if not stages:
+        raise ValueError("a schedule needs at least one (dataset, tokens)")
+    budgets = [tokens for _, tokens in stages]
+    if any(tokens is None for tokens in budgets[:-1]) or any(
+            tokens is not None and not (math.isfinite(tokens) and tokens >= 1) for tokens in budgets):
+        raise ValueError(f"every stage but the last commits a count of tokens, of at least one; got "
+                         f"{budgets}")
+    ends = list(itertools.accumulate(int(tokens) for tokens in budgets if tokens is not None))
+    return Pipeline(Phases(tuple(dataset._chain() for dataset, _ in stages),
+                           (*ends[:len(stages) - 1], None if budgets[-1] is None else ends[-1]), "tokens"))
 
 
 @dataclasses.dataclass(frozen=True)

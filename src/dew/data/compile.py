@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import itertools
 import os
 import threading
 from collections.abc import Iterator, Mapping, Sequence
@@ -51,6 +52,7 @@ from dew.data.analysis import (
     _until,
     _volatile,
     _written,
+    reach,
     written,
 )
 from dew.data.compilation import compiling, within
@@ -880,19 +882,29 @@ def _compile_phases(
     if not isinstance(source, Phases):
         raise TypeError("phased compilation needs a Phases source")
     _tokenizer_contract((train,) if validation is None else (train, validation))
-    consumed: dict[str, int] = {}
+
+    def staged_at(index: int, consumed: Mapping[str, int]) -> _Staged:
+        """Phase `index`, each corpus it reads continued past what the phases before it read of it."""
+        return _staged(_continued(source.pipelines[index], consumed)._then(*train.stages),
+                       validation if index == 0 else None, objective=objective, read=read,
+                       provision=provision, loading=loading, seed=seed, rejections=rejections)
+
+    def consumed_by(phases: Sequence[_Staged], ends: Sequence[int]) -> dict[str, int]:
+        """What `phases` read of each corpus, each ending at its record end of `ends`: its members a
+        memory read kept, at the shares the lowering mixes."""
+        consumed: dict[str, int] = {}
+        for phase, (start, end) in zip(phases, itertools.pairwise((0, *ends)), strict=True):
+            _delivered(phase.train, end - start, consumed)
+        return consumed
+
+    tokens = source.clock == "tokens"
     staged: list[tuple[_Staged, int | None]] = []
-    previous = 0
-    for index, (pipeline, until) in enumerate(zip(source.pipelines, source.until_steps, strict=True)):
-        phase = _staged(_continued(pipeline, consumed)._then(*train.stages),
-                        validation if index == 0 else None, objective=objective, read=read,
-                        provision=provision, loading=loading, seed=seed, rejections=rejections)
-        end = None if until is None else until * phase.build.batch
-        staged.append((phase, end))
-        if end is not None:
-            # The phase as it reads: its members a memory read kept, at the shares the lowering mixes.
-            _delivered(phase.train, end - previous, consumed)
-            previous = end
+    for index, until in enumerate(source.ends):
+        # A phase on the token clock ends where the run reaches it, so it is staged as it reads first,
+        # and again with the ends of the phases before it once the run reaches them (`opened`).
+        ends = [end for _, end in staged if end is not None]
+        phase = staged_at(index, {} if tokens else consumed_by([phase for phase, _ in staged], ends))
+        staged.append((phase, None if tokens or until is None else until * phase.build.batch))
     # Every phase declares the most documents a window of any phase holds, so the run steps one program.
     packed = _coordinated(*(phase.train for phase, _ in staged))
     built: list[tuple[Loader, int | None]] = []
@@ -910,20 +922,32 @@ def _compile_phases(
                              f"a run runs the same ones, written after the phases")
         built.append((loaded, end))
 
-    def training(partition: DataPartition) -> Iterator[Batch]:
-        def global_reader(reader: Reader) -> GlobalReader:
-            opened = reader(partition)
-            if not isinstance(opened, GlobalReader):
-                if isinstance(opened, Closeable):
-                    opened.close()
-                raise ValueError("a phase must expose a global record-count position")
-            return opened
+    @functools.cache
+    def opened(index: int, ends: tuple[int, ...]) -> Loader:
+        """Phase `index` as it reads where the phases before it ended at `ends`, in records: as staged,
+        unless a corpus it reads continues from theirs."""
+        if not tokens or not index:
+            return built[index][0]
+        consumed = consumed_by([phase for phase, _ in staged[:index]], ends)
+        if not any(consumed.get(_name(chain), 0) for chain, _ in _leaves(source.pipelines[index])):
+            return built[index][0]
+        return _compiled(staged_at(index, consumed), packed, host=host, resume=resume)
 
-        phases = [(functools.partial(global_reader, loaded.train), end) for loaded, end in built]
-        return PhasedStream(phases, loading.stop_seconds)
+    def training(partition: DataPartition) -> Iterator[Batch]:
+        def global_reader(index: int, ends: tuple[int, ...]) -> GlobalReader:
+            opened_reader = opened(index, ends).train(partition)
+            if not isinstance(opened_reader, GlobalReader):
+                if isinstance(opened_reader, Closeable):
+                    opened_reader.close()
+                raise ValueError("a phase must expose a global record-count position")
+            return opened_reader
+
+        phases = [(functools.partial(global_reader, index), end) for index, (_, end) in enumerate(built)]
+        return PhasedStream(phases, loading.stop_seconds, tokens=source.ends if tokens else None)
 
     # Only the last phase's order can end, so its batch decides what an epoch's short batch does.
-    return dataclasses.replace(built[0][0], train=training, tail=built[-1][0].tail, order_records=None)
+    return dataclasses.replace(built[0][0], train=training, tail=built[-1][0].tail, order_records=None,
+                               token_ends=source.ends if tokens else None)
 
 
 def _continued(pipeline: Pipeline, consumed: Mapping[str, int]) -> Pipeline:
@@ -1191,13 +1215,32 @@ def fitted[Entry](
 
 
 def _endless(chain: Pipeline) -> Pipeline:
-    """`chain` read endlessly: a repeat before its batch where it has none."""
-    if any(isinstance(stage, Repeat) for stage in chain.stages):
+    """`chain` read endlessly: a repeat before its batch where it has none and its read can end. A
+    chain of phases reads each phase through the chain's own stages, and where one of them already
+    reads on (`_reads_on`), as Grain refuses to repeat an order without end, each other phase repeats
+    at the place the chain's own repeat takes, its share of the chain's stages before the batch moved
+    into it; a mixture whose members all read on is read as it is."""
+    if any(isinstance(stage, Repeat) for stage in chain.stages) or _reads_on(chain):
         return chain
     batching = [index for index, stage in enumerate(chain.stages)
                 if isinstance(stage, (BatchStage, TokenBudget))]
     at = batching[0] if batching else len(chain.stages)
+    source = chain.source
+    if isinstance(source, Phases):
+        read = [child._then(*chain.stages[:at]) for child in source.pipelines]
+        if any(map(_reads_on, read)):
+            each = tuple(phase if _reads_on(phase) else phase.repeat() for phase in read)
+            return dataclasses.replace(chain, source=dataclasses.replace(source, pipelines=each),
+                                       stages=chain.stages[at:])
     return dataclasses.replace(chain, stages=(*chain.stages[:at], Repeat(None), *chain.stages[at:]))
+
+
+def _reads_on(chain: Pipeline) -> bool:
+    """Whether `chain` reads without end as written (`analysis.reach`): its stages leave it endless, or
+    it mixes members that all read on."""
+    source = chain.source
+    unending = isinstance(source, Mixture) and all(_reads_on(child) for child in source.pipelines)
+    return reach(chain.stages, unending)[0]
 
 
 def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int | None = None,
