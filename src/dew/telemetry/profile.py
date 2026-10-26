@@ -112,6 +112,28 @@ def report_table(path: Path, index: int = 0) -> tuple[list[str], list[dict[str, 
                      for row in tables[index].get("rows", [])]
 
 
+def program_kernels(capture: Path, programs: Sequence[str]) -> dict[str, list[dict[str, JSON]]]:
+    """A capture's kernels (one of `Profiler.captures`; XProf's kernel_stats, `report_table`), each row
+    filed under the first of `programs`, in their order, whose name its op name holds: the jitted program
+    it ran in, which XProf's `op_name` begins with (`jit(<name>)/...`), so callers name each program for
+    what it runs (`fn.__name__`). The order decides between names one holds another of (`step` before
+    `step_eval` files both under `step`). The rest go under `''`; each list by total time, longest first.
+    A capture whose export failed has no kernel_stats: FileNotFoundError naming it."""
+    stats = capture / "reports" / "kernel_stats.json"
+    if not stats.is_file():
+        raise FileNotFoundError(f"capture {capture} has no kernel_stats report (its manifest's "
+                                "capture_errors and export_status say why)")
+    _, rows = report_table(stats)
+    found: dict[str, list[dict[str, JSON]]] = {name: [] for name in (*programs, "")}
+    for row in rows:
+        op = str(row.get("op_name") or "")
+        owner = next((name for name in programs if name in op), "")
+        found[owner].append(row)
+    for kernels in found.values():
+        kernels.sort(key=lambda row: -float(str(row.get("total_duration_us") or 0)))
+    return found
+
+
 def attributed_ops(reports: Path) -> int | None:
     """How many HLO ops XProf's hlo_stats in `reports` attributes device time
     to, not counting whole modules (`XlaModule`), as it reports kernels run as
@@ -242,10 +264,18 @@ class Profiler:
         self._metadata: dict[str, JSON] = {}
         self._temporary = directory is None
         self._phase: Literal["starting", "running", "stopping"] | None = None
+        self._captures: list[Path] = []
 
     @property
     def directory(self) -> Path | None:
         return self._directory
+
+    @property
+    def captures(self) -> tuple[Path, ...]:
+        """The capture directories this profiler's stops exported, in order: each holds its manifest and
+        its `reports/` (`report_table`, `program_kernels`). Where an export failed (the manifest's
+        `capture_errors`, `export_status`) reports/ may lack a report."""
+        return tuple(self._captures)
 
     def region(self, name: str) -> AbstractContextManager[None]:
         """Return a context manager that marks a named span in the trace while
@@ -350,6 +380,7 @@ class Profiler:
                 self._converter = None
                 self._metadata = {}
         assert capture is not None and converter is not None
+        self._captures.append(capture)
         metadata["body_status"] = body
         metadata["capture_status"] = "failed" if failures else "completed"
         metadata["capture_errors"] = [str(error) for error in failures]
