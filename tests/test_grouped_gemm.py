@@ -550,7 +550,7 @@ def ampere(generation_name: str = "sm80"):
 @pytest.mark.parametrize("sizes", [name for name in SIZES if any(SIZES[name])])
 def test_an_ampere_gpu_runs_mosaics_launch_unnamed_and_tritons_by_name(sizes, out_dtype):
     """Without warpgroup MMA, the Mosaic GPU forward's mma.sync tile (`mosaic_gpu.derived`) runs the grouped
-    forward unnamed, a cell no old route measured faster on (`grouped_matmul.OLD_ROUTES`, CONSUMERS3), and
+    forward unnamed, a cell no old route measured faster on (`grouped_matmul.DECLARED`, CONSUMERS3), and
     Triton's launch where the call names it; named, each is as exact as XLA's ragged dot rounded to its
     output dtype from float64, unrouted rows and empty groups included."""
     x, w, dy, group = operands(SIZES[sizes], jnp.bfloat16)

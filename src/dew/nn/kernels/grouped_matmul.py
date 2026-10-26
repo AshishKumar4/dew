@@ -1413,14 +1413,21 @@ class GroupedCase:
     """A grouped product as the grouped selector reads it (`GROUPED`): whether the kernels run where
     the call does (`placed`: a GPU's, or a CPU's interpreting them; the template's dispatch runs in the
     branch its platform places), whether they see its operands whole (`whole`,
-    `dew.nn.sharding.seen_whole`), the `product` it declares, its `rows` and its launches bound to it
-    (`call`)."""
+    `dew.nn.sharding.seen_whole`), the `product` it declares, its `rows`, its launches bound to it
+    (`call`) and the `kind` of call it is ('grouped forward', 'dense input_gradient', 'grouped
+    kernel_gradient exact', as `gmm_call` and `tgmm_call` state it), which with the device's instruction
+    family is its cell (`DECLARED`)."""
 
     placed: bool
     whole: bool
     product: Product
     rows: int
     call: base.Call
+    kind: str
+
+    @property
+    def cell(self) -> tuple[str | None, str]:
+        return generation.family(self.call.target.generation), self.kind
 
 
 _Need = selection.Requirement[GroupedCase]
@@ -1458,94 +1465,72 @@ def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]
                      f"{case.call.target.generation}", row='ledger 1295'), *measured))
 
 
-OLD_ROUTES: dict[tuple[str, str, str], tuple[str, str]] = {
-    ('mma.sync', 'input_gradient', 'grouped'):
+DECLARED: dict[tuple[str | None, str], tuple[str, str]] = {
+    ('mma.sync', 'grouped input_gradient'):
         ('triton', "CONSUMERS3 (b1241ba7b, A100, two programs a multiprocessor): the template's mma.sync "
                    "tile 1.239x Triton's time, geomean of 6 grouped MoE rows (its forward 0.828x)"),
-    ('mma.sync', 'kernel_gradient', 'grouped'):
+    ('mma.sync', 'grouped kernel_gradient'):
         ('triton', "CONSUMERS3: 1.358x Triton's time, geomean of 6 grouped rows"),
-    ('mma.sync', 'forward', 'dense'):
-        ('xla', "DENSE1 (A100, 2d1bbd051): Mosaic 1.923x and Triton 1.947x XLA's dot (cuBLAS), geomean of 10 "
-                "projections at 8192 tokens"),
-    ('mma.sync', 'input_gradient', 'dense'):
-        ('xla', "DENSE1 (A100): Mosaic 2.881x, Triton 1.839x XLA's dot"),
-    ('mma.sync', 'kernel_gradient', 'dense'):
-        ('xla', "DENSE1 (A100): Mosaic 1.964x, Triton 1.735x XLA's dot"),
-    ('wgmma', 'forward', 'dense'):
-        ('xla', "DENSE1 (H100, 2d1bbd051): Mosaic 1.067x and Triton 1.616x XLA's dot (cuBLAS), geomean of 10 "
-                "projections at 8192 tokens"),
-    ('wgmma', 'input_gradient', 'dense'): ('xla', "DENSE1 (H100): Mosaic 1.048x, Triton 1.738x XLA's dot"),
-    ('wgmma', 'kernel_gradient', 'dense'): ('xla', "DENSE1 (H100): Mosaic 1.049x, Triton 1.149x XLA's dot"),
+    ('mma.sync', 'dense forward'):
+        ('xla', "DENSE1 (A100, 2d1bbd051, one program a multiprocessor): Mosaic 1.923x and Triton 1.947x "
+                "XLA's dot (cuBLAS), geomean of 10 projections at 8192 tokens"),
+    ('mma.sync', 'dense input_gradient'):
+        ('xla', "DENSE1 (A100, one program a multiprocessor): Mosaic 2.881x, Triton 1.839x XLA's dot"),
+    ('mma.sync', 'dense kernel_gradient'):
+        ('xla', "DENSE1 (A100, one program a multiprocessor): Mosaic 1.964x, Triton 1.735x XLA's dot"),
+    ('wgmma', 'grouped forward'):
+        ('cutlass', "R7B (0428aad7b, H100 PCIe): the template 1.146x CUTLASS's time, geomean of 7 grouped "
+                    "MoE rows (worst 1.54x, kimi-linear gate_up)"),
+    ('wgmma', 'grouped input_gradient'):
+        ('cutlass', "R7B: 1.237x CUTLASS's time, geomean of 7 grouped rows (worst 1.74x)"),
+    ('wgmma', 'grouped kernel_gradient exact'):
+        ('triton', "R7B: 1.069x Triton's time, geomean of 6 grouped rows (0.948x CUTLASS's)"),
+    ('wgmma', 'dense forward'):
+        ('xla', "DENSE1 (H100, 2d1bbd051): Mosaic 1.067x and Triton 1.616x XLA's dot (cuBLAS), geomean of "
+                "10 projections at 8192 tokens"),
+    ('wgmma', 'dense input_gradient'): ('xla', "DENSE1 (H100): Mosaic 1.048x, Triton 1.738x XLA's dot"),
+    ('wgmma', 'dense kernel_gradient'): ('xla', "DENSE1 (H100): Mosaic 1.049x, Triton 1.149x XLA's dot"),
 }
-"""The cells where an old route measured faster than the template, each with its receipt (owner, bible
-da64ae5): (instruction family, product, grouped or dense) to (the old route, the receipt). A listed cell
-runs its old route: every launch before it in `GROUPED`'s order steps aside (`_measured_slower`). The
-template is the default on every other cell; a cell leaves the list once the template measures at least as
-fast on it (geomean over the receipt's rows). Nothing is ranked at runtime. A call the template cannot run
-(its legality) takes the next route in `GROUPED`'s order, which is no cell of this list."""
+"""The grouped GEMM's declared cells (`selection.Op.declared`), where an old route measured faster than the
+template, each with its receipt (owner, bible da64ae5): (instruction family, kind of call) to (the old
+route, the receipt). The template is the default on every other cell; a cell leaves the list once the
+template measures at least as fast on it (geomean over the receipt's rows). Nothing is ranked at runtime. A
+call the template cannot run (its legality) takes the next route in `GROUPED`'s order, which is no cell of
+this list."""
 
-
-def _cell(case: "GroupedCase") -> tuple[str, str, str] | None:
-    """The `OLD_ROUTES` cell a call is: its GPU's instruction family, its product (a kernel gradient,
-    exactly summed or not, or an input gradient or a forward) and whether it is dense; None off a CUDA
-    GPU."""
-    target = case.call.target
-    family = generation.family(target.generation)
-    if generation.capability(target.generation) is None or family is None:
-        return None
-    arguments = next(iter(case.call.bound.values()))[1].arguments
-    if 'trans_rhs' not in arguments:
-        product = 'kernel_gradient exact' if arguments.get('exact_sums') else 'kernel_gradient'
-    else:
-        product = 'input_gradient' if arguments['trans_rhs'] else 'forward'
-    shape = 'dense' if arguments.get('dense') else 'grouped'
-    return (family, product, shape)
-
-
-def _old_route_reason(case: "GroupedCase") -> str:
-    """Why the template leaves a listed cell to its old route: the cell and its receipt."""
-    cell = _cell(case)
-    route, receipt = OLD_ROUTES[cell] if cell is not None else ('', '')
-    return f"{route} measured faster on this cell ({', '.join(cell or ())}): {receipt}"
-
-
-def _measured_slower(name: str) -> _Need:
-    """What keeps launch `name` off an `OLD_ROUTES` cell whose old route is another, unless named, so the
-    old route runs it."""
-    def holds(case: "GroupedCase") -> bool:
-        cell = _cell(case)
-        return cell not in OLD_ROUTES or OLD_ROUTES[cell][0] == name
-
-    return _Need('old_route', holds, _old_route_reason, row='bible da64ae5', kind='measured')
-
-
-NAMED = _Need('named', lambda case: False,
-              lambda case: "this launch runs only where a call names it (`generation.chosen`)",
-              row="no production route", kind='measured')
-"""What keeps CUTLASS's launches off every call that does not name them: a vendored kernel that was never a
-production route, which no measurement ranks against the template's."""
+DECLARED_ONLY = _Need('declared', lambda case: DECLARED.get(case.cell, ('',))[0] == 'cutlass',
+                      "CUTLASS's launches run on the cells where they measured faster than the template "
+                      "(`DECLARED`), and where a call names them", row='bible da64ae5', kind='measured')
+"""What keeps CUTLASS's launches, a vendored production route where they win (bible §6, as FA3), off every
+other cell: the template, then Triton by legality, run those."""
 
 
 _GMMS = (MosaicGmm(), MosaicTpuGmm(), Gmm(), CutlassGmm())
 _TGMMS = (MosaicTgmm(), MosaicTpuTgmm(), Tgmm(), CutlassTgmm())
 
 GROUPED: selection.Op[GroupedCase] = selection.Op('grouped_matmul', (
-    *(_launch_kernel(launch.name, *((NAMED,) if launch.name == 'cutlass' else
-                                    (_measured_slower(launch.name),)))
+    *(_launch_kernel(launch.name, *((DECLARED_ONLY,) if launch.name == 'cutlass' else ()))
       for launch in _GMMS),
-    selection.Kernel[GroupedCase]('xla', (), generic=True)))
+    selection.Kernel[GroupedCase]('xla', (), generic=True)), declared=DECLARED)
 """The grouped selector, in a fixed order, the template first (owner, bible da64ae5): Mosaic GPU's launch
-where it takes the call, the TPU's launch on a TPU, Triton's where they refuse, else XLA's program, but an
-`OLD_ROUTES` cell runs its old route; CUTLASS's launches only by name (`NAMED`). Every
-implementation shares the template's signature, so each binds the call's own arguments, `_GMMS`' for a
-product, `_TGMMS`' for a kernel gradient."""
+where it takes the call, the TPU's launch on a TPU, Triton's where they refuse, else XLA's program, but a
+declared cell runs its old route (`DECLARED`); CUTLASS's launches on their declared cells and by name
+alone (`DECLARED_ONLY`). Every implementation shares the template's signature, so each binds the call's
+own arguments, `_GMMS`' for a product, `_TGMMS`' for a kernel gradient."""
 
 
 def grouped_case(launches, arguments, options, *, product: Product, whole: bool,
                  placed: bool = True) -> GroupedCase:
-    """The `GroupedCase` of `launches` called with `arguments` and `options` (`gmm_call`, `tgmm_call`)."""
+    """The `GroupedCase` of `launches` called with `arguments` and `options` (`gmm_call`, `tgmm_call`),
+    its kind of call as they state it: a kernel gradient (exactly summed or not) from `tgmm_call`'s
+    launches, an input gradient or a forward from `gmm_call`'s, dense or grouped."""
+    if launches is _TGMMS:
+        made = 'kernel_gradient exact' if options['exact_sums'] else 'kernel_gradient'
+    else:
+        made = 'input_gradient' if options['trans_rhs'] else 'forward'
+    kind = f"{'dense' if options['dense'] else 'grouped'} {made}"
     return GroupedCase(placed, whole, product, arguments[0].shape[0],
-                       base.call(launches, *arguments, **options))
+                       base.call(launches, *arguments, **options), kind)
 
 
 def launched(launches, arguments, options, *, product: Product, whole: bool):

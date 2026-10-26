@@ -453,7 +453,7 @@ def test_a_dense_product_whose_extents_no_tile_divides_holds_check_1(transpose_r
     def forward(run):
         return lambda x, w, ms, nw, b, cotangent: run(x, w, ms, nw, b)
 
-    # Named: a dense cell runs XLA's dot unnamed (`grouped_matmul.OLD_ROUTES`).
+    # Named: a dense cell runs XLA's dot unnamed (`grouped_matmul.DECLARED`).
     with generation.assumed("sm80"), generation.chosen(grouped_matmul="triton"), tuning.seen() as launches:
         truth = functools.partial(plain, wide=jnp.float64, out=jnp.float64)
         assert_as_exact(jax.jit(forward(dew)), jax.jit(forward(plain)), draw, "dense 65x40x100", seeds=SEEDS,
@@ -502,7 +502,7 @@ def test_a_dense_gradient_takes_a_padded_tile_where_no_dividing_one_fits():
 def test_a_dense_products_exact_sums_survive_one_row_tile():
     """At the highest precision, a dense fp32 product of one row tile and many depth steps (its first grid
     axis one program, where a program id is a constant) through Triton's launch, named (a dense cell runs
-    XLA's dot unnamed, `grouped_matmul.OLD_ROUTES`), sums each step's product by an IEEE add: its error
+    XLA's dot unnamed, `grouped_matmul.DECLARED`), sums each step's product by an IEEE add: its error
     holds check 1 against XLA's IEEE sums, which a tensor core's truncating accumulation does not."""
     draw = _dense_draw(64, 4096, 128)
 
@@ -1014,7 +1014,7 @@ def test_the_tpu_launches_gradients_hold_check_1(case):
         x, w, *rest = _draw(seed)
         return (x, w.astype(jnp.bfloat16), *rest)
 
-    # Named: the TPU's launches run by name until measured (`grouped_matmul.NAMED`).
+    # Named, as the TPU's launches are tested here.
     with (generation.assumed("v5e"), jax.default_matmul_precision("default"),
           generation.chosen(grouped_matmul="mosaic_tpu"), generation.routes() as taken):
         assert_as_exact(_gradients(_dew(spec, interpret_on_cpu=True)), jax.jit(_gradients(_plain(spec))),
@@ -1537,8 +1537,9 @@ def test_an_interpreted_fp32_sum_that_cancels_at_mixed_magnitudes_is_its_float64
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
 def test_each_cell_runs_the_template_unless_its_old_route_measured_faster(generation_name):
     """On each GPU family, every product (forward, input gradient, kernel gradient; grouped and dense) runs
-    the template's Mosaic launch, unless `grouped_matmul.OLD_ROUTES` lists its cell, which runs its old
-    route (owner, bible da64ae5): nothing ranks a launch at runtime."""
+    the template's Mosaic launch, unless `grouped_matmul.DECLARED` lists its cell, which runs its old
+    route where that route runs here (CUTLASS's where dew_cutlass is installed for the GPU), else the
+    template (owner, bible da64ae5): nothing ranks a launch at runtime."""
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     rows, depth, width, groups = 4096, 1024, 2048, 8
     sizes = jnp.full((groups,), rows // groups, jnp.int32)
@@ -1558,8 +1559,10 @@ def test_each_cell_runs_the_template_unless_its_old_route_measured_faster(genera
     }
     family = generation.family(generation_name)
     for (made, shape), (call, *operands) in calls.items():
-        cell = (family, made, shape)
-        expected = grouped_matmul.OLD_ROUTES[cell][0] if cell in grouped_matmul.OLD_ROUTES else "mosaic_gpu"
+        cell = (family, f"{shape} {made}")
+        expected = grouped_matmul.DECLARED.get(cell, ("mosaic_gpu",))[0]
+        if expected == "cutlass" and generation_name not in grouped_matmul.cutlass_architectures():
+            expected = "mosaic_gpu"
         with generation.assumed(generation_name), generation.routes() as taken:
             jax.jit(call).trace(*operands)
         assert _kernels(taken) == {expected}, (cell, _kernels(taken))
