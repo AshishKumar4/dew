@@ -3093,6 +3093,17 @@ tokamax's kernel differentiates through XLA, so its backward is XLA's; on an A10
 
 The two L4 step rows are jax 0.11.2 from one Colab session (2026-09-22, 19:55 to 20:13 CDT); the update rows and the v6e rows are jax 0.11.1. The rounding noise is a counter hash of the step, the leaf and the element index. threefry noise (`jax.random.bits`) makes the update slower than fp32 state on both devices. bf16 state saves memory everywhere, but on the v6e lm-dense step it costs 0.9% in time, so the option stays off by default.
 
+### 8-bit Adam state: `OptimConfig(state_dtype='int8')`
+
+| device | measurement | fp32 state | bf16 state | int8 state |
+|---|---|---|---|---|
+| A100 | moments of a 234M-parameter decoder | 1.87 GB | 0.94 GB | 0.48 GB |
+| A100 | peak of its full-remat AdamW step, 8 x 512 tokens | 4.22 GB | 3.68 GB | 3.22 GB |
+| A100 | the step | 52.9 ms | 52.6 ms | 81.2 ms |
+| A100 | the loss after 12 steps on one batch | 0.6259 | 0.6276 | 0.6262 |
+
+`dew.optim.int8_moments` keeps each moment as torchao's `AdamW8bit` does: codes of Dettmers' dynamic map in blocks of 256 values, each block's largest magnitude in float32, a moment under 4096 values in float32. The step decodes a leaf's moments to fp32, runs optax's update and codes them again, a leaf at a time (receipts TL-a100-int8-moments-1663c, jax 0.12, scratch/int8-moments-probe-1663c). Its search for each value's nearest code is `jnp.searchsorted`'s unrolled one: its default loop ran the eight halvings over the whole moment, a 170.7 ms step at a peak of 4.85 GB, above fp32's on both. The 28 ms left over fp32 is the coding of 234M values twice a step; on a 4.66B-parameter model at 24,576 tokens a step it is a few percent of the step.
+
 ### The vocabulary head: the compute dtype's product
 
 The head's product follows the compute dtype, as torch autocast and MaxText (`logits_dot_in_fp32=False`) run it. Under bf16 compute both operands multiply as bf16 with fp32 accumulation, in the model's head and the chunked loss alike, while the softmax and the loss stay fp32; an fp32 model keeps its fp32 head. The table times forward plus backward of the chunked head alone, at 8 x 1024 tokens, 1024 features and vocabulary 50304:

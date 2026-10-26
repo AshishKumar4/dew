@@ -722,7 +722,7 @@ def quantized(moment: jax.Array, values: jax.Array, block: int) -> tuple[jax.Arr
     scales = jnp.maximum(jnp.max(jnp.abs(blocked), axis=-1), 1e-12)
     fractions = (blocked / scales[..., None]).reshape(moment.shape)
     # Unrolled, the search fuses with the rest of the quantization: its default loop ran each of its eight
-    # halvings over the whole moment, 3.3x an A100's fp32 Adam step on a 234M-parameter decoder.
+    # halvings over the whole moment, an A100's step of a 234M-parameter decoder 170.7 ms against 81.2.
     below = jnp.clip(jnp.searchsorted(values, fractions, side="right", method="scan_unrolled") - 1, 0,
                      values.shape[0] - 1)
     above = jnp.minimum(below + 1, values.shape[0] - 1)
