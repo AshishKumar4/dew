@@ -18,7 +18,9 @@ never runs (`hub_modules` a Hugging Face repo's remote code).
 EDM2 networks import. `saved_fixture` writes a generator's arrays with its
 provenance as the suite reads them, `git_head` names the commit of the
 checkout a record came from, and `recipe_images` draws the images a recipe
-names.
+names. `record_padding` records the rows a release's own token lookup leaves
+untrained under a fixture's config with its pad id stated, left out and null
+(`padding_variant`), which the suite reads offline.
 """
 
 from __future__ import annotations
@@ -53,6 +55,87 @@ def stub_torch_utils() -> None:
     package.persistence, package.misc = persistence, misc
     sys.modules.update({"torch_utils": package, "torch_utils.persistence": persistence,
                         "torch_utils.misc": misc})
+
+
+PAD = 3
+"""The pad id the stated case of a padding recording states (`record_padding`)."""
+
+PADDING = "padding.json"
+"""A release's padding recording, beside its fixture's config (`record_padding`)."""
+
+PADDING_CASES = ("stated", "omitted", "null")
+"""A padding recording's cases: the pad id stated as PAD, left out, and stated null."""
+
+
+def _at(config, place: Sequence[str]):
+    """The level of `config` (a dict, or a config object) at `place`."""
+    for key in place:
+        config = config[key] if isinstance(config, Mapping) else getattr(config, key)
+    return config
+
+
+def padding_variant(config: Mapping, case: str, place: Sequence[str], vocab_size: int | None = None) -> dict:
+    """`config` with its pad id as `case` puts it, at `place` (a wrapper's text config, which its
+    language model is built from), and the vocabulary there `vocab_size` where given."""
+    import copy
+
+    variant = copy.deepcopy(dict(config))
+    level = _at(variant, place)
+    level.pop("pad_token_id", None)
+    if case != "omitted":
+        level["pad_token_id"] = PAD if case == "stated" else None
+    if vocab_size is not None:
+        level["vocab_size"] = vocab_size
+    return variant
+
+
+def config_lookups(configured, causal_lm, place: Sequence[str] = ()):
+    """`record_padding`'s readers of a release built of a config: `configured` builds its config of a
+    dict and `causal_lm` its model of that config, whose input embeddings are the token lookup, and the
+    pad id it resolves is the config's at `place`, the class's default where the dict states none."""
+    def lookup_of(variant):
+        return causal_lm(configured(variant)).get_input_embeddings()
+
+    def pad_of(variant):
+        level = _at(configured(variant), place)
+        if isinstance(level, Mapping):
+            return level.get("pad_token_id")
+        return getattr(level, "pad_token_id", None)
+    return lookup_of, pad_of
+
+
+def record_padding(lookup_of, pad_of, config: Mapping, directory: Path, place: Sequence[str] = ()) -> None:
+    """Record at `directory`/PADDING the rows a release's own token lookup leaves untrained (ledger 1593)
+    under the fixture config `config` in each of PADDING_CASES (`padding_variant`): `lookup_of` builds
+    the release's token lookup of a config dict and `pad_of` reads the pad id the release resolves from
+    it (`config_lookups`). The lookup looks every row of its table up once under a cotangent of ones,
+    and a row whose gradient stays zero is one it pads. A pad id the release resolves past the table (a
+    class default, where the dict states none) grows the table to hold it, as torch refuses a pad id
+    outside it. Each case records the vocabulary its config states there (None where it states none),
+    the table's rows and the untrained ones, beside `place` and the transformers and torch releases
+    that ran."""
+    import json
+
+    import torch
+    import transformers
+
+    cases = {}
+    for case in PADDING_CASES:
+        variant = padding_variant(config, case, place)
+        pad = pad_of(variant)
+        if pad is not None and pad >= _at(variant, place)["vocab_size"]:
+            variant = padding_variant(config, case, place, pad + 1)
+        lookup = lookup_of(variant)
+        lookup.zero_grad()
+        rows = lookup.weight.shape[0]
+        lookup(torch.arange(rows)).sum().backward()
+        untrained = (lookup.weight.grad == 0).all(dim=-1).nonzero().flatten().tolist()
+        vocab = _at(variant, place).get("vocab_size")
+        cases[case] = {"vocab_size": vocab, "rows": rows, "untrained": untrained}
+    record = {"place": list(place), "cases": cases, "transformers": transformers.__version__.split("+")[0],
+              "torch": torch.__version__.split("+")[0]}
+    (directory / PADDING).write_text(json.dumps(record, indent=1, sort_keys=True) + "\n")
+    print(directory / PADDING, json.dumps(cases), flush=True)
 
 
 def saved_fixture(path: Path, arrays: dict, meta: dict) -> None:
