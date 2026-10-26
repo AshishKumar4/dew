@@ -436,7 +436,8 @@ def decoder(**fields):
     from dew.nn.mixers.memory import InContextMemoryMixer
 
     memory = InContextMemory(network=MLPMemory(hidden=(16,)), heads=2, head_features=8, chunk=4,
-                             learning_rate=Gate(scale=0.5), momentum=Gate(), retention=Gate(bias=-2.0))
+                             normalize=True, learning_rate=Gate(scale=STEP), momentum=Gate(),
+                             retention=Gate(bias=-2.0))
     return CausalTransformer(**{"vocab_size": 37, **TINY_DECODER, "num_layers": 4, "dtype": jnp.float32,
                                 "layer_types": ("memory", "memory", "attention", "attention"),
                                 "kinds": {"memory": LayerKind(mixer=InContextMemoryMixer(memory))}, **fields})
@@ -455,7 +456,7 @@ def test_a_memory_decoder_trains_scans_remats_and_decodes():
     plain, scanned = decoder(), decoder(scan_layers=True)
     rematted = decoder(scan_layers=True, remat=RematPolicy(save=(CARRY,)))
     wide = decoder(dtype=jnp.float64)
-    draw_model = model_draw(plain, (2, LENGTH), 37)
+    draw_model = model_draw(plain, (ROWS, LENGTH), 37)
 
     def trained(model):
         """The model's logits and its parameters' gradient under a cotangent."""
@@ -466,7 +467,7 @@ def test_a_memory_decoder_trains_scans_remats_and_decodes():
         return run
 
     def draw_with_cotangent(seed: int):
-        cotangent = np.random.default_rng([1648, seed]).standard_normal((2, LENGTH, 37)).astype(np.float32)
+        cotangent = np.random.default_rng([1648, seed]).standard_normal((ROWS, LENGTH, 37)).astype(np.float32)
         return *draw_model(seed), cotangent
 
     for name, model in (("scanned", scanned), ("rematted", rematted)):
