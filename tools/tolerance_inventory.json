@@ -145,10 +145,6 @@
    "comparisons": 16,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_decoder_remat.py": {
-   "comparisons": 19,
-   "lane": "Training"
-  },
   "tests/test_decoding_components.py": {
    "comparisons": 8,
    "lane": "Training"
@@ -377,10 +373,6 @@
    "comparisons": 5,
    "lane": "Training"
   },
-  "tests/test_lm_objective.py": {
-   "comparisons": 38,
-   "lane": "Training"
-  },
   "tests/test_lm_recipe.py": {
    "comparisons": 6,
    "lane": "Models, Serving & RL"
@@ -501,12 +493,8 @@
    "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_optim.py": {
-   "comparisons": 18,
-   "lane": "Training"
-  },
   "tests/test_optim_schedules.py": {
-   "comparisons": 13,
+   "comparisons": 12,
    "lane": "Training"
   },
   "tests/test_optional_ema.py": {

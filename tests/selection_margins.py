@@ -138,6 +138,33 @@ def margin(config, captured, label: str) -> float:
     return smallest
 
 
+def routing_margin(sown, moe, kept: int) -> float:
+    """The smallest margin of the routers' selections a forward sowed in its 'router' collection
+    (`sown`; an objective's training forward returns it, trunk and prediction depths, so the margin
+    is of the routes the step takes, its dropout included): each router's scores with the balancing
+    bias the decoder's 'moe' collection holds for it, where it holds one (`Router.selection` of a text
+    token), by `top_margin` at `kept`. A stacked router's bias stacks its layers as its scores do."""
+    smallest, seen = np.inf, 0
+    for path, scores in jax.tree_util.tree_flatten_with_path(sown)[0]:
+        names = [str(getattr(part, "key", getattr(part, "idx", part))) for part in path]
+        if "scores" not in names:
+            continue
+        seen += 1
+        held = moe
+        for name in names[:names.index("scores")]:
+            held = held.get(name, {}) if isinstance(held, dict) else {}
+        values = np.asarray(scores, np.float64)
+        if isinstance(held, dict) and "e_score_correction_bias" in held:
+            bias = np.asarray(held["e_score_correction_bias"], np.float64)
+            between = (1,) * (values.ndim - bias.ndim)
+            values = values + bias.reshape(bias.shape[:-1] + between + bias.shape[-1:])
+        smallest = min(smallest, float(np.min(top_margin(values, kept))))
+    # A routed forward sows its routers' scores, or the draw would pass unfiltered.
+    if not seen:
+        raise AssertionError("the forward sowed no router scores; open its 'router' collection")
+    return smallest
+
+
 def clearing(draw, clears, tries: int = 64):
     """`draw(key)` at the first key from a seed whose inputs `clears`: the seed itself, then
     `1_000_003 * (attempt + 1) + seed`, apart from every seed of the windows a site draws (a verdict's

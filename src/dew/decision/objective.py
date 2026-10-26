@@ -37,7 +37,7 @@ from dew.decision.model import DecisionModel
 from dew.decision.questions import KINDS, Choice, Question, Score
 from dew.decision.scoring import LogLoss, ScoringRule
 from dew.decision.task import Decide, DecideSettings, Weights, laid_out
-from dew.inference.pipeline import RunProcessor
+from dew.inference.loading import RunProcessor
 from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import Field, InputSpec
 from dew.interop.processors import Processor

@@ -132,8 +132,8 @@ def test_a_run_imported_by_from_flaxdiff_samples_what_flaxdiffs_preview_did(tmp_
 
     from reference_error import assert_as_exact_as_the_reference
 
+    from dew.inference import TextToImage
     from dew.interop.flaxdiff import _towers
-    from dew.sampling import TextToImage
     from tools.flaxdiff_pipeline_reference import KEY, PROMPTS, checkpoint, run_config, towers
 
     with np.load(Path(__file__).parent / "fixtures" / "flaxdiff_pipeline" / "reference.npz") as stored:

@@ -58,18 +58,24 @@ def _brownian_walk(state: _Brownian, point, shape, depth: int) -> jax.Array:
     value_low = jnp.zeros(shape, jnp.float32)
     value_high = jnp.sqrt(span) * jax.random.normal(jax.random.fold_in(state.key, 0), shape,
                                                     dtype=jnp.float32)
-    index = jnp.zeros((), jnp.int32)
-    for level in range(1, depth + 1):
+
+    # One level of the descent: a loop of `depth` iterations, so a step's program holds one level's
+    # draw however deep the construction runs, rather than `depth` of them per query.
+    def level_of(level, carried):
+        value_low, value_high, position, index = carried
         node = jax.random.fold_in(jax.random.fold_in(state.key, level), 2 * index + 1)
-        deviation = 0.5 * jnp.sqrt(span * 2.0 ** (1 - level))
+        # 2**(1 - level) exactly, as the unrolled construction's Python constant is, not a traced power.
+        deviation = 0.5 * jnp.sqrt(span * jnp.ldexp(jnp.float32(1.0), 1 - level))
         value_middle = 0.5 * (value_low + value_high) + deviation * jax.random.normal(
             node, shape, dtype=jnp.float32)
         position = position * 2.0
         right = position >= 1.0
         position = position - right.astype(jnp.float32)
-        value_low = jnp.where(right, value_middle, value_low)
-        value_high = jnp.where(right, value_high, value_middle)
-        index = 2 * index + right.astype(jnp.int32)
+        return (jnp.where(right, value_middle, value_low), jnp.where(right, value_high, value_middle),
+                position, 2 * index + right.astype(jnp.int32))
+
+    value_low, value_high, position, _ = jax.lax.fori_loop(
+        1, depth + 1, level_of, (value_low, value_high, position, jnp.zeros((), jnp.int32)))
     return value_low + position * (value_high - value_low)
 
 

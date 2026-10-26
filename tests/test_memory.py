@@ -451,16 +451,17 @@ def test_a_zero_step_reads_the_initial_network():
 
 def test_an_orthogonalized_step_follows_the_paper_with_muons_iteration():
     """With `orthogonalize`, each matrix of a token's gradient steps as Muon's quintic Newton-Schulz of it
-    (`dew.optim.newton_schulz`, Nested Learning Sec 4.2) and its vectors as they are: the layer is the
-    paper's update with that map applied to its gradients, on par against float64 (check 1)."""
-    from dew.optim import newton_schulz
+    (optax's iteration, `dew.optim._orthogonalized`, Nested Learning Sec 4.2) and its vectors as they are:
+    the layer is the paper's update with that map applied to its gradients, on par against float64
+    (check 1)."""
+    from dew.optim import _orthogonalized
 
     module = layer("titans").clone(orthogonalize=5)
 
     def gradient(loss, apply, start, k, target):
         """The paper's gradient with Muon's map on each matrix, in the reference's own precision."""
         g = jax.grad(lambda held: loss(apply(held, k), target))(start)
-        return jax.tree.map(lambda leaf: newton_schulz(leaf, 5) if leaf.ndim == 2 else leaf, g)
+        return jax.tree.map(lambda leaf: _orthogonalized(leaf, 5, None) if leaf.ndim == 2 else leaf, g)
 
     assert_as_exact(applied(module), written(module, dtype=jnp.float32, gradient=gradient), drawn(module),
                     "orthogonalized memory", seeds=MEMORY_SEEDS,

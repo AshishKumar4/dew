@@ -25,11 +25,11 @@ from jax.typing import DTypeLike
 from dew.cache import persist_compilations
 from dew.checkpoints import PYTHON_RUN, RUN_FILE
 from dew.data.text import Tokenizer
+from dew.inference.images import TextToImage
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
 from dew.objectives.base import SavedTask, Variables
 from dew.registry import dtype_name
-from dew.sampling.pipelines import TextToImage
 
 if TYPE_CHECKING:
     from jax.sharding import Mesh
@@ -132,6 +132,7 @@ def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | 
         Pretrained,
         PretrainedBlockDecoder,
         PretrainedDecoder,
+        PretrainedFallback,
         PretrainedMaskedDecoder,
         PretrainedPipeline,
     )
@@ -151,7 +152,7 @@ def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | 
             return loaded.text_to_image()
         case PretrainedBlockDecoder():
             return loaded.block_generation()
-        case PretrainedDecoder() | PretrainedMaskedDecoder():
+        case PretrainedDecoder() | PretrainedMaskedDecoder() | PretrainedFallback():
             return loaded.text_generation()
     raise TypeError(f"{source} loaded as {type(loaded).__name__}, which has no generation task")
 

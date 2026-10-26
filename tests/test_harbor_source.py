@@ -753,12 +753,13 @@ def test_an_interrupted_trainer_kills_its_trials_and_starts_no_queued_one(tmp_pa
     assert time.monotonic() - began < 30
     (seen,) = (tmp_path / "trials").glob("*/seen.json")
     assert not list((tmp_path / "trials").glob("*/result.json"))
-    # The running trial died with its trainer rather than running on without it.
+    # The running trial died with its trainer rather than running on without it. Orphaned by the
+    # trainer, it is reparented to the namespace's init, which may leave it a zombie for longer.
     pid = json.loads(seen.read_text())["pid"]
     deadline = time.monotonic() + 10
-    while Path(f"/proc/{pid}").exists() and time.monotonic() < deadline:
+    while not ended(pid) and time.monotonic() < deadline:
         time.sleep(0.1)
-    alive = Path(f"/proc/{pid}").exists()
+    alive = not ended(pid)
     if alive:
         os.kill(pid, 9)
     assert not alive, "the interrupted trainer's running trial outlived it"

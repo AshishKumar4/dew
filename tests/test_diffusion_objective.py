@@ -139,7 +139,7 @@ def test_compiled_samples_follow_the_autoencoder_they_decode_with():
 
 
 def test_a_preset_builds_the_same_loss_and_images_as_its_process():
-    from dew.sampling import TextToImage
+    from dew.inference import TextToImage
 
     preset = presets.Flow(shift=2.5, logit_mean=-0.3, min_snr_gamma=4)
     inputs = InputSpec(Field("image", (2, 2, 1)))
@@ -430,7 +430,8 @@ def test_each_example_draws_its_own_times_noise_and_dropout_on_every_layout():
     example the same times, noise and dropped condition, and so the same noised input, target and
     loss weight, bitwise, as the transaction places each microbatch's rows among the update's
     examples (`example_places`). The model's dropout stays the attempt's (`Step.key`)."""
-    from dew.objectives.base import Recorder, example_stream, stream
+    from dew._distributions import counter_key
+    from dew.objectives.base import Recorder, stream
     from dew.training.distributed import microbatch
     from dew.training.transaction import example_places
 
@@ -464,7 +465,7 @@ def test_each_example_draws_its_own_times_noise_and_dropout_on_every_layout():
     assert len({float(np.asarray(whole["times"])[row]) for row in range(8)}) == 8
     # An example's noise is its documented draw: the update's key folded with the draw's name, then the
     # example's place.
-    third = jax.random.fold_in(jax.random.fold_in(example_stream(update), stream("noise")), 3)
+    third = jax.random.fold_in(jax.random.fold_in(counter_key(update), stream("noise")), 3)
     np.testing.assert_array_equal(np.asarray(whole["noise"])[3],
                                   np.asarray(jax.random.normal(third, (RES, RES, 3), jnp.float32)))
 
