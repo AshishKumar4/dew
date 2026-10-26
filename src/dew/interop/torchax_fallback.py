@@ -52,7 +52,9 @@ from dew.interop.generation_config import read_generation_config
 from dew.interop.pickles import host_dtype, host_view
 from dew.interop.pretrained import PretrainedFallback, source_processor
 from dew.interop.weights import AUTO
-from dew.nn.inputs import COORDINATES_FIELD, VALIDITY_FIELD, Coordinates, coordinates
+from dew.nn.attention import cache_positions
+from dew.nn.inputs import COORDINATES_FIELD, VALIDITY_FIELD, Coordinates, coordinates, real_slots
+from dew.nn.kv_cache import filled_slots
 from dew.nn.precision import at_least_fp32, configured_precision, float32_products, scaled
 from dew.nn.protocols import Lacks, OutputTable
 from dew.nn.sharding import LogicalAxes, Suffix, parameter_path
@@ -907,8 +909,9 @@ class TorchCausalLM(nn.Module):
         laid = self._laid(tokens, {**fields, **packing})
         if laid is not None and laid.max_segments > 1:
             raise ValueError("a decoding row continues one document, and these rows hold several")
-        return self._decoded(tokens, None if laid is None else laid.valid,
-                             None if laid is None else laid.positions)
+        # The tokens that write: those the validity marks less the padding a row numbers 0 in its documents.
+        real = real_slots({**fields, **packing}, jnp.shape(tokens)[:2])
+        return self._decoded(tokens, real, None if laid is None else laid.positions)
 
     def init_cache(self, batch_size: int) -> None:
         """Open the decode cache of `batch_size` rows (`Decoding`), every slot unfilled: one decoding
@@ -921,9 +924,10 @@ class TorchCausalLM(nn.Module):
         return self.clone(max_seq_len=capacity)
 
     def _cached(self, rows: int) -> dict[int, Variable]:
-        """Each attention layer's cache variable by its `layer_idx`, opened at `rows` rows of
-        `max_seq_len` slots where it is not yet: its keys' and values' shapes and dtypes are those
-        one decoding token of each row writes (`TorchGraph.step` over no held cache)."""
+        """Each attention layer's keys and values by its `layer_idx`, opened at `rows` rows of
+        `max_seq_len` slots where they are not yet: their shapes and dtypes are those one decoding token
+        of each row writes (`TorchGraph.step` over no held cache). The rows' cursor is the model's own
+        (`cache_positions`), one for every layer."""
         tokens = jnp.zeros((rows, 1), jnp.int32)
         slots = jnp.zeros((rows, 1), jnp.int32)
         filled = jnp.ones((rows, 1), bool)
@@ -932,31 +936,25 @@ class TorchCausalLM(nn.Module):
 
         def opened(written: Mapping[str, jax.ShapeDtypeStruct]) -> Callable[[], dict[str, jax.Array]]:
             def zeros():
-                return {"cache_index": jnp.zeros((rows,), jnp.int32),
-                        **{name: jnp.zeros((rows, self.max_seq_len, *shape.shape[2:]), shape.dtype)
-                           for name, shape in written.items()}}
+                return {name: jnp.zeros((rows, self.max_seq_len, *shape.shape[2:]), shape.dtype)
+                        for name, shape in written.items()}
             return zeros
 
         return {layer: self.variable("cache", f"layer_{layer}", opened(written))
                 for layer, written in sorted(shapes.items())}
 
-    def _decoded(self, tokens, attention_mask, positions) -> jax.Array:
+    def _decoded(self, tokens, real, positions) -> jax.Array:
         tokens = jnp.asarray(tokens)
         rows, width = tokens.shape[:2]
-        valid = (jnp.ones((rows, width), bool) if attention_mask is None
-                 else jnp.asarray(attention_mask, bool))
         cache = self._cached(rows)
-        cursor = next(iter(cache.values())).value["cache_index"]
-        # A valid token fills its row's next slot, an invalid one none (-1), as Dew's caches fill.
-        slots = jnp.where(valid, cursor[:, None] + jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1, -1)
-        after = cursor + jnp.sum(valid, axis=1, dtype=jnp.int32)
-        filled = jnp.arange(self.max_seq_len)[None, :] < after[:, None]
+        # Each real token fills its row's next slot, the rest none (-1), as Dew's caches fill.
+        slots, _ = cache_positions(self, rows, width, real)
+        filled = filled_slots(self.get_variable("cache", "cache_index"), self.max_seq_len)
         places = jnp.maximum(slots, 0) if positions is None else jnp.asarray(positions, jnp.int32)
-        held = {layer: {name: value for name, value in variable.value.items() if name != "cache_index"}
-                for layer, variable in cache.items()}
+        held = {layer: dict(variable.value) for layer, variable in cache.items()}
         logits, written = self._step(self.variables, tokens, held, slots, filled, places)
         for layer, variable in cache.items():
-            variable.value = {"cache_index": after, **written[layer]}
+            variable.value = written[layer]
         return logits.astype(at_least_fp32(logits.dtype))
 
     def _step(self, variables, tokens, held, slots, filled, places):
