@@ -482,19 +482,6 @@ def gpu_target(identifier: str | None = None) -> GpuTarget:
     return GpuTarget(identifier, identifier)
 
 
-@functools.cache
-def _cuda_device() -> type:
-    """jax's abstract device with the compute capability a CUDA device states ('8.0'), one class a process
-    (equal devices, equal meshes)."""
-    from jax.sharding import AbstractDevice
-
-    @dataclasses.dataclass(frozen=True, slots=True, kw_only=True)
-    class CudaDevice(AbstractDevice):
-        compute_capability: str | None = None
-
-    return CudaDevice
-
-
 def gpu_mesh(mesh: Mesh, generation: str) -> AbstractMesh:
     """`mesh`'s axes over abstract devices of the CUDA `generation` ('sm80'), none of which this process
     needs: a program traced on it, under `assumed(generation)`, lowers its Pallas kernels to Triton, and
@@ -503,14 +490,15 @@ def gpu_mesh(mesh: Mesh, generation: str) -> AbstractMesh:
     Mosaic GPU lowers for (its `utils._infer_arch`; a device that states none it takes for sm90's, and an
     sm80 kernel's cp.async waits do not lower), but an sm90's, which Mosaic's default already is: stated,
     its `9.0` sends a warpgroup-MMA kernel's ptxas a lower default SM than the sm_90a its PTX targets
-    ('SM version specified by .target is higher than default SM version assumed', FAM-contract3)."""
-    from jax.sharding import AbstractMesh
+    ('SM version specified by .target is higher than default SM version assumed', FAM-contract3). JAX
+    0.12's abstract device states it (`AbstractDevice.compute_capability`)."""
+    from jax.sharding import AbstractDevice, AbstractMesh
     target = gpu_target(generation)
     version = capability(generation)
     if not target.generation.startswith('sm') or target.shared_limit is None or version is None:
         raise ValueError(f"no CUDA target for {generation!r}")
     stated = None if version == (9, 0) else '.'.join(map(str, version))
-    device = _cuda_device()(device_kind=target.device_kind, num_cores=None, platform='cuda',
+    device = AbstractDevice(device_kind=target.device_kind, num_cores=None, platform='cuda',
                             compute_capability=stated)
     return AbstractMesh(mesh.axis_sizes, mesh.axis_names, axis_types=mesh.axis_types, abstract_device=device)
 
