@@ -410,8 +410,10 @@ class _DecisionSource(View[Source]):
             held = row.get("example")
             held = row if held is None else held
             # Grouped examples train as one unit, whose questions a window holds together.
-            grouped = isinstance(held, GroupedExamples) or (isinstance(held, Mapping) and "examples" in held)
-            examples = GroupedExamples.of(held).examples if grouped else (Example.of(held),)
+            if isinstance(held, GroupedExamples) or (isinstance(held, Mapping) and "examples" in held):
+                examples = GroupedExamples.of(held).examples
+            else:
+                examples = (Example.of(held),)
             asked = [question for example in examples for question in example.questions.values()]
             self._facts["questions"] = max(self._facts.get("questions", 0), len(asked))
             self._facts["options"] = max(self._facts.get("options", 0),
