@@ -532,12 +532,14 @@ _PLANNED: contextvars.ContextVar[list | None] = contextvars.ContextVar("planned"
 """Where `planned` collects its launches; None where they run."""
 
 
-def _allocated(family: mosaic.Family, *allocations) -> int:
+def _allocated(family: mosaic.Family, *allocations, reduces: bool = True) -> int:
     """The bytes of shared memory a program of `allocations` takes, as Mosaic GPU's resource estimate counts
     them (`mosaic.allocated`, `mosaic.BARRIER_BYTES`): each tile's (a ring's stages one tile), a pipelined
     family's streams' stages of each tile (`mosaic_sm80.Pipeline`, which `emit_pipeline` allocates), each
-    barrier's, and the scratch the family's compiler parameters reserve for a reduction across warps
-    (`Family.reduction_scratch`)."""
+    barrier's, and where the program `reduces`, the scratch the family's compiler parameters reserve for a
+    reduction across warps (`Family.reduction_scratch`), which the estimate takes for a kernel with any
+    reduction and none without (an A100's solve launch asked for its tiles' 90112 bytes alone,
+    SE-family-a100-0c8018352)."""
     barrier, tile = (plgpu.Barrier, plgpu.ClusterBarrier), type(plgpu.SMEM((1,), jnp.float32))
 
     def leaf(x) -> bool:
@@ -552,8 +554,8 @@ def _allocated(family: mosaic.Family, *allocations) -> int:
             barriers += math.prod(np.atleast_1d(x.num_barriers))
         elif isinstance(x, tile):
             sizes.append(math.prod(x.shape) * jnp.dtype(x.dtype).itemsize)
-    return (mosaic.allocated(*sizes, *([family.reduction_scratch] if family.reduction_scratch else []))
-            + mosaic.BARRIER_BYTES * barriers)
+    scratch = [family.reduction_scratch] if reduces and family.reduction_scratch else []
+    return mosaic.allocated(*sizes, *scratch) + mosaic.BARRIER_BYTES * barriers
 
 
 def _inverse_flops() -> float:
@@ -592,7 +594,7 @@ def _landed(landing: dict) -> dict:
 
 def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, stages: int, live,
             work: Work, held: _Held, staging: tuple = (), once: dict | None = None,
-            landing: dict | None = None, persistent: bool = False):
+            landing: dict | None = None, persistent: bool = False, reduces: bool = True):
     """`program(*refs, streams, staging, landing)` as a kernel over `grid`, run where `live(refs)` holds (a
     laid call's chunks and sequences are as many as its worst case, most of them empty): its streams'
     allocations (of `blocks`, `stages` deep, and of `once`'s blocks, loaded once, one deep; `Family.opened`
@@ -607,7 +609,9 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     holds a multiprocessor's registers alone (each launch's 255 registers a thread an H100 holds one of,
     long-scoreboard stalls 51 to 73% of its time, SE-family-h100-80a38c02d). An A100's launches held one
     program each, a quarter of the warps fla's held, with registers for two (SE-family-a100-8c5b5b16a).
-    Its program gives its tile's walk (`_walk`) for the grid's indices `_axis` reads."""
+    Its program gives its tile's walk (`_walk`) for the grid's indices `_axis` reads. A program that
+    `reduces` none takes no reduction scratch (`_allocated`; the compile gate holds its plan's shared memory
+    to at least the compiled kernel's)."""
     family = call.family
     landed = _landed(landing or {})
     staging = (*staging, landed)
@@ -615,7 +619,7 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     threads = 128 * family.warpgroups(1)
     if persistent:
         def shared(depth: int) -> int:
-            return _allocated(family, {"walked": family.streams(blocks, depth, 1)}, staging)
+            return _allocated(family, {"walked": family.streams(blocks, depth, 1)}, staging, reduces=reduces)
 
         def holding(depth: int) -> int:
             return cost.resident(call.target, shared(depth), threads, held.registers(family))
@@ -641,7 +645,8 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
             each = -(-tiles // programs)
             flops = work.flops * _products(call.held.parts) * each
             collected.append(Launch(name, programs, threads,
-                                    _allocated(family, streams, staging), held.registers(family),
+                                    _allocated(family, streams, staging, reduces=reduces),
+                                    held.registers(family),
                                     work.steps * each, stages, stepped, flops, work.exponentials * each,
                                     moved))
             return jax.tree.map(lambda x: jnp.zeros(x.shape, x.dtype), out_type)
@@ -833,7 +838,7 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
                                       values=((CHUNK, value_width), call.given))
                      | _vector_blocks(call, "gate", "low", "write", "column_gate", "column_low"),
                      stages=1, live=_taken(7), work=work, held=held_tiles, staging=staging, landing=landing,
-                     persistent=True)(k, v, hi, lo, beta, hi, lo, taken)
+                     persistent=True, reduces=False)(k, v, hi, lo, beta, hi, lo, taken)
     return solved if keeps else (None, *solved)
 
 
