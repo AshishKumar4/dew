@@ -251,7 +251,8 @@ def _gemm_mainloop_cases(generation_name: str, *, every_consumer_count: bool = F
                 family = mosaic_gpu.family_of(config, jnp.bfloat16)
                 configs = {}
                 for consumers in sorted({1, family.consumers}):
-                    rows_ = max(config.block_m, family.role_rows * consumers)
+                    # Each consumer keeps its share of the derived tile's rows.
+                    rows_ = config.block_m // config.warpgroups * consumers
                     tile = dataclasses.replace(config, warpgroups=consumers, block_m=rows_)
                     if launch.legal(ba, tile, target):
                         configs[f"{name} x{consumers} {tile}"] = tile
