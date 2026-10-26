@@ -5,18 +5,15 @@ the project's gate environment. The output belongs under tests/fixtures for fetc
 """
 
 import argparse
-import bisect
 import contextlib
 import copy
 import dataclasses
 import importlib
 import importlib.metadata
 import json
-import math
 import shutil
 import subprocess
 import tempfile
-from collections.abc import Sequence
 from pathlib import Path
 
 import numpy as np
@@ -27,11 +24,10 @@ from block_override_reference import (
     REFERENCE,
     calibrate,
     oracle_precision,
-    release_blocks,
     release_source,
 )
 from fetched_fixtures import save
-from reference_source import defined_in, git_head, package, published_files
+from reference_source import git_head, package, published_files
 
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "tests/fixtures/hf/qwen38-dense-tiny"
@@ -40,6 +36,9 @@ PROMPT_REVISION = "81ce62f1597c91e46767d4d02d6ac2e18534fe94"
 PROMPT_FILES = {
     "qev/prompt.py": "17dfae09e4dff47cb8ce80e172eba116f188b82b70c2777bd14fd9b8a71680de",
     "qev/schema.py": "bce4b7d353ac115a9e50aef284975ddeed9a3bb452e3fd928a556668705bc2f3",
+    "qev/engine.py": "f9665c68714818dbea8edc1e80d0b0d86737537dd606ff53cff37aafb84d6bf4",
+    "qev/answers.py": "09b06dba258c80a6a9afdaa5aacfd0f7523f9d2a087a7b6402ca03553ea6fba6",
+    "qev/calibrate.py": "3fa6013a81c7e79a702afcdcc0ebd089bee7047590c18cc44708850f5aeda1ee",
 }
 SITES = ("causal_slot_lm", "causal_head", "block_slot_lm", "block_head")
 WIDTH = 512
@@ -49,23 +48,20 @@ WIDTH = 512
 def runtime():
     """The pinned author's prompt with the release patch applied, beside its actual readout definitions."""
     held = published_files(PROMPT_REPO, PROMPT_REVISION, PROMPT_FILES)
-    patch, source = release_source()
+    patch, _ = release_source()
     with tempfile.TemporaryDirectory() as temporary:
         root = Path(temporary)
         for name in PROMPT_FILES:
             target = root / name
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(held / name, target)
-        subprocess.run(["git", "apply", "--include=qev/prompt.py", str(patch)], cwd=root, check=True)
+        subprocess.run(["git", "apply", "--include=qev/prompt.py", "--include=qev/engine.py",
+                         "--include=qev/readout.py", str(patch)], cwd=root, check=True)
         package("slot_reference", root / "qev")
         prompt = importlib.import_module("slot_reference.prompt")
         schema = importlib.import_module("slot_reference.schema")
-        readout = release_blocks()
-        readout.update(defined_in(source, ("ReadoutHead", "pool_options", "token_layout", "final_norm",
-                                           "HiddenCapture"),
-                                  {"torch": torch, "math": math, "bisect": bisect,
-                                   "Sequence": Sequence, "MAX_SLOTS": prompt.MAX_SLOTS}, filename=str(patch)))
-        yield prompt, schema, readout
+        readout = importlib.import_module("slot_reference.readout")
+        yield prompt, schema, vars(readout)
 
 
 def draw(seed: int, tokenizer, prompt, schema, readout):

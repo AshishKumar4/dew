@@ -31,6 +31,14 @@ class NativeComponent:
     weights_folder: str = ""
     tensor_prefix: str = ""
 
+    def own_tensors[T](self, shared: Mapping[str, T]) -> Mapping[str, T]:
+        """This component's tensors of the shard set it shares with a readout: those under its tensor
+        prefix, named without it."""
+        if not self.tensor_prefix:
+            return shared
+        cut = len(self.tensor_prefix)
+        return {name[cut:]: tensor for name, tensor in shared.items() if name.startswith(self.tensor_prefix)}
+
 
 @dataclass(frozen=True)
 class HeadComponent:

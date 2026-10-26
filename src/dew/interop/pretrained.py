@@ -1568,9 +1568,7 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
                 source = replace(source, revision=root.name)
             if reads_shared:
                 shared = sources.load_shards(weight_source.directory(root))
-        tensors = None if forwarded else (
-            {name[len(prefix):]: tensor for name, tensor in shared.items() if name.startswith(prefix)}
-            if prefix else shared)
+        tensors = None if forwarded else component.own_tensors(shared)
         backbone, _ = _load_native_source(
             source, root,
             gguf_file=None, component=component, tensors=tensors,
