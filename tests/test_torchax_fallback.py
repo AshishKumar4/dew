@@ -1212,3 +1212,31 @@ def test_identity_experts_alone_run_as_transformers_runs_them(tmp_path):
     assert_as_exact(lambda tokens: np.asarray(forward(loaded.variables, tokens), np.float64),
                     theirs(reference), token_draw(0x1498, LONGCAT["vocab_size"], (2, 12)),
                     "identity-only longcat logits", seeds=IDENTITY_SEEDS, truth_fn=theirs(wide, float64))
+
+
+ERNIE = {**TINY, "num_key_value_heads": 2, "moe_num_experts": 4, "moe_k": 2, "moe_intermediate_size": 32,
+         "moe_layer_start_index": 1}
+"""A tiny Ernie 4.5 MoE, whose rotary keeps its tables in float32 whatever its input's dtype."""
+
+
+@pytest.mark.parametrize("family", ["cohere", "ernie4_5_moe"])
+def test_a_functional_rotary_computes_the_tables_its_source_rotary_computes(family):
+    """A functional rotary (`functional_rotaries`) gives the tables its source rotary gives a call over
+    one row, bit for bit and in the same dtype, a narrow input's included: Cohere's in the input's dtype,
+    interleaved; Ernie 4.5's in float32 whatever the input, as its rotation reads them."""
+    from dew.interop.torchax_fallback import functional_rotaries
+
+    dynamic = {"rope_type": "dynamic", "rope_theta": 10000.0, "factor": 2.0}
+    model = (transformers.CohereForCausalLM(transformers.CohereConfig(**COHERE, rope_parameters=dynamic))
+             if family == "cohere" else transformers.Ernie4_5_MoeForCausalLM(
+                 transformers.Ernie4_5_MoeConfig(**ERNIE, rope_parameters=dynamic))).eval()
+    source = copy.deepcopy(model.model.rotary_emb)
+    functional_rotaries(model)
+    positions = torch.arange(80)[None]
+    for dtype in (torch.float32, torch.bfloat16):
+        x = torch.zeros(1, dtype=dtype)
+        with torch.no_grad():
+            expected, computed = source(x, positions), model.model.rotary_emb(x, positions)
+        for theirs, ours in zip(expected, computed, strict=True):
+            assert ours.dtype == theirs.dtype
+            assert torch.equal(ours, theirs)
