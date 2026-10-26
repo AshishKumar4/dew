@@ -178,8 +178,15 @@ export([{"text": ids[:held]}], "data/corpus-byte/val", format="array_record",
 | `z_loss` | `0.0` | PaLM's squared log-partition auxiliary. |
 | `qk_stats` | `False` | Report per-head attention logit maxima, the key-head count and the head width for `muonclip`, which clips per query group as Megatron Core does and leaves an output gate's weights alone. |
 | `token_accuracy` | `True` | Report argmax accuracy. |
+| `adaptation` | `None` | `ChunkAdaptation(window, rate, select)`: step the model's continuum level in context by this loss (test-time training over the task loss, below). `None` reads the level as trained. |
 
 The step reports `ce`, `perplexity` and `token_accuracy`. `LMObjective` refuses a model built with `causal=False`.
+
+### Test-time training over the task loss
+
+A decoder built with `continuum=ContinuumLevel(hidden)` (`dew.nn.continuum`) reads a small residual level, `x + up(act(down(x)))`, on its final states before its head. `up` starts at zero, so the level starts as the identity and the decoder's logits are its own. `LMObjective(model, seq_len, adaptation=ChunkAdaptation(window=16, rate=0.01))` steps that level in context by the loss it scores, Nested Learning's continuum memory (Behrouz et al., arXiv 2512.24695, section 7.1, equation 71): every `window` tokens of a document the level steps by `rate` times the summed gradient of those tokens' weighted next-token losses, and the next window reads the stepped level. Each document, a packed row's included, starts from the level the run trains, and training learns that start through every step. Evaluation and validation score the same way. `select` names the level's parts that step (`down`, `up`); the others hold their trained values.
+
+No generation steps the level yet, so an adapted objective takes no `samples`, refuses a rollout's `policy` and records no inference task; its runs save and resume their trained state. A continuum level has no transformers counterpart, so a decoder with one does not export.
 
 ### Loss and precision
 
@@ -215,7 +222,7 @@ With gradient accumulation, the cross-entropy and multi-token-prediction (MTP) l
 
 ## Pretrained checkpoints
 
-`Pretrained.load(name_or_dir)` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle that holds the native Flax model, its variables, the checkpoint's processor or tokenizer, the source config and the generation defaults. The bundle's class depends on the kind of source it read, and each class has the methods that work for that kind: `PretrainedDecoder` (text generation), `PretrainedMaskedDecoder` (LLaDA, Dream), `PretrainedBlockDecoder` (DiffusionGemma), `PretrainedPipeline` (latent diffusion, `text_to_image`) and `PretrainedFallback` (tier 3, transformers' own forward, training only). Every kind can take an adapter (`adapt`), and you can pass any of them in place of the model to the objective that trains it. Calling `load` on a specifi…
+`Pretrained.load(name_or_dir)` reads a local Hugging Face directory or a Hub identifier into a `Pretrained` bundle that holds the native Flax model, its variables, the checkpoint's processor or tokenizer, the source config and the generation defaults. The bundle's class depends on the kind of source it read, and each class has the methods that work for that kind: `PretrainedDecoder` (text generation), `PretrainedMaskedDecoder` (LLaDA, Dream), `PretrainedBlockDecoder` (DiffusionGemma), `PretrainedPipeline` (latent diffusion, `text_to_image`) and `PretrainedFallback` (tier 3, transformers' own forward; text generation where its attention is Dew's). Every kind can take an adapter (`adapt`), and you can pass any of them in place of the model to the objective that trains it. Calling `load` on a specifi…
 
 `LMObjective(bundle, seq_len, **options)` trains a decoder bundle from its loaded weights. With token files prepared using the checkpoint's tokenizer (`dew data export ... --tokenizer Qwen/Qwen3-0.6B`), fine-tuning uses the same trainer as training from scratch:
 

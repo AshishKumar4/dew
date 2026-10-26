@@ -50,7 +50,6 @@ and `tiny_inputs`, which that file's registry-wide parametrization needs.
 import dataclasses
 import functools
 import json
-from collections.abc import Callable
 from pathlib import Path
 from typing import NamedTuple
 
@@ -570,12 +569,6 @@ def _rungs(model) -> list:
     return rungs
 
 
-RUNG_SHARES = 3
-"""The parts each ladder's rungs are stepped in, every `RUNG_SHARES`-th rung a case: a ladder steps
-one compiled step a rung, and a checkpoint's whole ladder (kimi-k3-tiny's) took 253 s on an A100,
-past a CI task's 240; at two shares deepseek-v41-tiny's first share took 223 s on armada."""
-
-
 RUNG_SEEDS = 8
 """Check 1's declared seeds for a rung's forward against the model's, sized paired by `seeds_for` on
 an A100, where a rung's checkpoint barriers change the forward program."""
@@ -596,41 +589,23 @@ def _redrawn(inputs, seed: int):
     return jax.tree.map(leaf, inputs)
 
 
-class _Base(NamedTuple):
-    """What every share of one model's ladder compares its rungs with (`_based`)."""
+def _climbs_and_restores(model, variables, inputs, **apply) -> None:
+    """Each rung holds less than the one below it, and its top rung steps the
+    forward the model does: the top rung's checkpoint makes its forward another
+    program, which check 1 holds against the model's from the model's float64
+    twin over drawn inputs. Its backward recomputes, which can round apart
+    (gemma2-tiny's gradients by up to 1.2e-4, kimi-k3-tiny's 8.3e-3 of 10.8;
+    test_decoder_remat.py found the same), so the gradients are the model's
+    bits or as exact as them. A rung's record restores it from any rung below
+    it and moves no rung above it, and the top rung runs over the model's
+    variables, every collection where it was.
 
-    gradient: dict
-    written: frozenset
-    truth: Callable[[], dict]
-
-
-_BASES: dict[str, _Base] = {}
-"""Each ladder's base by its case, computed once for all its shares in a process."""
-
-
-def _based(key: str, model, variables, inputs, **apply) -> _Base:
-    """The model's own gradient, the collections it writes and its float64 twin's gradient (computed
-    where a rung's bits differ), each computed once a ladder (`_BASES`)."""
-    if key not in _BASES:
-        _, gradient_tree = _stepped(model, variables, inputs, **apply)
-        written = frozenset(model.apply(variables, *inputs, mutable=True, **apply)[1].keys())
-        truth = functools.cache(
-            lambda: _stepped(_float64(model), widened(variables), widened(inputs), **apply)[1])
-        _BASES[key] = _Base(gradient_tree, written, truth)
-    return _BASES[key]
-
-
-def _climbs_and_restores(key: str, model, variables, inputs, share: int, **apply) -> None:
-    """Each rung holds less than the one below it and steps the forward the
-    model does: a rung's checkpoint makes its forward another program, which
-    check 1 holds against the model's from the model's float64 twin over drawn
-    inputs. Its backward recomputes, which can round apart (gemma2-tiny's
-    gradients by up to 1.2e-4, kimi-k3-tiny's 8.3e-3 of 10.8; test_decoder_remat.py
-    found the same), so the gradients are the model's bits or as exact as them.
-    A rung's record restores it from any rung below it and moves no rung
-    above it, and the rung runs over the model's variables, every collection
-    where it was. `share` steps every `RUNG_SHARES`-th rung above the model from it, so the
-    shares together step each rung once; every share checks the whole ladder's records."""
+    Of testing.md's memory settings, no remat and a rung of the planner's, a
+    model meets each once here: its top rung, which recomputes every name its
+    layers mark, so every checkpoint site the architecture has runs under
+    remat. Each named policy below it steps on its own in
+    test_decoder_remat.py (`test_named_policies_train_the_same_model_as_full`),
+    which no architecture here repeats."""
     rungs = _rungs(model)
     records = [rung.recompute_record() for rung in rungs]
     assert len(rungs) > 1
@@ -641,30 +616,87 @@ def _climbs_and_restores(key: str, model, variables, inputs, share: int, **apply
             assert restored == records[max(low, high)], (records[low], records[high], restored)
     assert all(rung.restore_recompute("no rung").recompute_record() == record
                for rung, record in zip(rungs, records, strict=True))
-    base = _based(key, model, variables, inputs, **apply)
-    shared = rungs[1 + share::RUNG_SHARES]
-    assert shared or len(rungs) <= 1 + share, records
+    _, gradient_tree = _stepped(model, variables, inputs, **apply)
+    truth = functools.cache(
+        lambda: _stepped(_float64(model), widened(variables), widened(inputs), **apply)[1])
+    written = model.apply(variables, *inputs, mutable=True, **apply)[1].keys()
     # Applied as the step applies them: some models read their ids on the host.
     def forward_truth(*inputs):
         with jax.enable_x64(new_val=True):
             wide = _call(_float64(model), widened(variables), widened(inputs), **apply)
             return np.asarray(wide, np.float64)
 
-    for rung in shared:
-        stepped = _stepped(rung, variables, inputs, **apply)
-        assert_as_exact(lambda *inputs, rung=rung: np.asarray(_call(rung, variables, inputs, **apply)),
-                        lambda *inputs: np.asarray(_call(model, variables, inputs, **apply)),
-                        lambda seed: _redrawn(inputs, seed), f"forward at {rung.recompute_record()}",
-                        seeds=RUNG_SEEDS, truth_fn=forward_truth)
-        as_exact(stepped[1], base.gradient, base.truth, f"gradient at {rung.recompute_record()}")
-        assert rung.apply(variables, *inputs, mutable=True, **apply)[1].keys() == base.written
+    top = rungs[-1]
+    stepped = _stepped(top, variables, inputs, **apply)
+    assert_as_exact(lambda *inputs: np.asarray(_call(top, variables, inputs, **apply)),
+                    lambda *inputs: np.asarray(_call(model, variables, inputs, **apply)),
+                    lambda seed: _redrawn(inputs, seed), f"forward at {top.recompute_record()}",
+                    seeds=RUNG_SEEDS, truth_fn=forward_truth)
+    as_exact(stepped[1], gradient_tree, truth, f"gradient at {top.recompute_record()}")
+    assert top.apply(variables, *inputs, mutable=True, **apply)[1].keys() == written
 
 
-@pytest.mark.parametrize("share", range(RUNG_SHARES))
 @pytest.mark.parametrize("name", PATHS)
-def test_a_checkpoints_remat_rungs_step_as_it_does(name, share):
+def test_a_checkpoints_remat_rungs_step_as_it_does(name):
     source, read = loaded(name), reads(name, "float32")
-    _climbs_and_restores(name, source.model, source.variables, (read.tokens,), share, method="logits")
+    _climbs_and_restores(source.model, source.variables, (read.tokens,), method="logits")
+
+
+CONTINUUM_SEEDS = 8
+"""Check 1's declared seeds for a continuum decoder scanned at its top remat rung, and decoding, against
+its plain forward (`seeds_for`)."""
+
+
+def test_a_continuum_level_composes_with_the_scan_the_ladder_and_the_cache():
+    """A decoder with a continuum level (`dew.nn.continuum`) scanned at its top remat rung computes the
+    logits and gradients the same decoder does unscanned and unrematerialized, and its cached decode
+    the logits its own full forward gives each prefix, both on par (check 1) from its float64 twin over
+    drawn variables and tokens: the level stands after the stack, so a scan, a rung's checkpoints and a
+    cache leave it as the head reads it."""
+    from dew.nn.continuum import ContinuumLevel
+
+    plain = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=3, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=32, attention_impl="xla",
+                              continuum=ContinuumLevel(hidden=4))
+    scanned = _rungs(plain.clone(scan_layers=True))[-1]
+    tokens = jnp.zeros((ROWS, LENGTH), jnp.int32)
+    shapes = jax.eval_shape(lambda: plain.init(jax.random.key(0), tokens))
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        variables = jax.tree.map(lambda leaf: (0.3 * rng.standard_normal(leaf.shape)).astype(np.float32),
+                                 shapes)
+        drawn = rng.integers(0, VOCAB, (ROWS, LENGTH)).astype(np.int32)
+        return variables, drawn, rng.standard_normal((ROWS, LENGTH, VOCAB)).astype(np.float32)
+
+    def stepped(model):
+        def run(variables, drawn, cotangent):
+            output, pull = jax.vjp(lambda params: model.apply({"params": params}, drawn), variables["params"])
+            return output, pull(cotangent)[0]
+        return run
+
+    assert_as_exact(jax.jit(stepped(scanned)), jax.jit(stepped(plain)), draw,
+                    "a scanned, rematerialized continuum decoder", seeds=CONTINUUM_SEEDS,
+                    truth_fn=stepped(_float64(plain)))
+
+    def decoded(model):
+        def run(variables, drawn, _):
+            cache = model.apply(variables, ROWS, method="init_cache", mutable=["cache"])[1]["cache"]
+            steps = []
+            for position in range(LENGTH):
+                logits, held = model.apply({**variables, "cache": cache}, drawn[:, position:position + 1],
+                                           decode=True, mutable=["cache"])
+                cache = held["cache"]
+                steps.append(logits[:, 0])
+            return jnp.stack(steps, axis=1)
+        return run
+
+    def whole(model):
+        return lambda variables, drawn, _: model.apply(variables, drawn)
+
+    assert_as_exact(jax.jit(decoded(plain)), jax.jit(whole(plain)), draw,
+                    "a continuum decoder's cached decode", seeds=CONTINUUM_SEEDS,
+                    truth_fn=whole(_float64(plain)))
 
 
 RECOMPUTED = [case for case in ARCHITECTURES
@@ -680,14 +712,13 @@ def _inputs(case) -> tuple:
     return sample, jnp.asarray([0.3, 0.7]), TextContext(text, jnp.ones((ROWS, TEXT_TOKENS), bool))
 
 
-@pytest.mark.parametrize("share", range(RUNG_SHARES))
 @pytest.mark.parametrize("case", RECOMPUTED, ids=[case.name for case in RECOMPUTED])
-def test_an_architectures_remat_rungs_step_as_it_does(case, share):
+def test_an_architectures_remat_rungs_step_as_it_does(case):
     """Every architecture test_architectures.py trains that climbs a remat
     ladder, decoders and DiT stacks, at its size there."""
     model = models.build(case.architecture, **case.config)
     inputs = _inputs(case)
-    _climbs_and_restores(case.name, model, model.init(jax.random.key(0), *inputs), inputs, share)
+    _climbs_and_restores(model, model.init(jax.random.key(0), *inputs), inputs)
 
 
 def _packed(variables, groups) -> dict:

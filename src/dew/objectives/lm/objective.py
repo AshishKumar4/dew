@@ -72,6 +72,7 @@ from dew.nn.protocols import (
     Lacks,
     LayerStates,
     OutputTable,
+    SteppedInContext,
     TokenModel,
     head_table,
 )
@@ -919,23 +920,8 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         table = self._fused_head(params) if z_loss is not None else None
         dtype = at_least_fp32(hidden.dtype)
         weights = self._row_weights(prepared, roles, dtype)
-        total = None
-        whole = model_logits(self.model, params, hidden) if logits and self.adaptation is None else None
-        if self.adaptation is not None:
-            # The level steps window by window over these targets, weighted as the loss weighs them.
-            adapted = adapted_scores(self.model, params, hidden, targets, weights,
-                                     token_layout(prepared.slice_tokens(stop=-1).token_fields),
-                                     self.adaptation, predict=predict, logits=logits)
-            losses, predicted, log_z, whole = adapted.losses, adapted.predicted, adapted.log_z, adapted.logits
-        elif whole is not None:
-            losses, predicted, log_z = logits_cross_entropy(whole, targets, predict=predict)
-        elif table is not None:
-            total, (losses, predicted, log_z) = fused_head_loss(
-                hidden, table, targets, weights, z_loss=float(z_loss or 0.0), tile=self.head_tile,
-                predict=predict)
-        else:
-            losses, predicted, log_z = head_cross_entropy(
-                self.model, params, hidden, targets, self.head_chunks, tile=self.head_tile, predict=predict)
+        total, (losses, predicted, log_z), whole = self._head_scores(
+            params, hidden, targets, weights, prepared, table, predict=predict, z_loss=z_loss, logits=logits)
         weights = weights.astype(losses.dtype)
         correct = None if predicted is None else (predicted == targets).astype(losses.dtype)
         depth_scores = []
@@ -969,6 +955,28 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
                 depth_scores.append((depth_losses, depth_weights, depth_total))
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls, total,
                       whole)
+
+    def _head_scores(self, params, hidden, targets, weights, prepared, table, *, predict: bool,
+                     z_loss: float | None, logits: bool):
+        """The head's scores of `targets` from final states `hidden`: the weighted sum where a fused
+        head took it (`table`), each target's loss, top-1 column and log partition, and the whole
+        logits where asked; through the continuum level stepped in context (`adaptation`), the
+        whole logits, the fused head or the tiled head."""
+        if self.adaptation is not None:
+            # The level steps window by window over these targets, weighted as the loss weighs them.
+            adapted = adapted_scores(self.model, params, hidden, targets, weights,
+                                     prepared.slice_tokens(stop=-1).token_fields, self.adaptation,
+                                     predict=predict, logits=logits)
+            return None, (adapted.losses, adapted.predicted, adapted.log_z), adapted.logits
+        if logits:
+            whole = model_logits(self.model, params, hidden)
+            return None, logits_cross_entropy(whole, targets, predict=predict), whole
+        if table is not None:
+            total, scores = fused_head_loss(hidden, table, targets, weights, z_loss=float(z_loss or 0.0),
+                                            tile=self.head_tile, predict=predict)
+            return total, scores, None
+        return None, head_cross_entropy(self.model, params, hidden, targets, self.head_chunks,
+                                        tile=self.head_tile, predict=predict), None
 
     def _row_weights(self, prepared, roles, dtype):
         """Weight the targets the row itself scores (`scored_targets`), and
@@ -1156,6 +1164,11 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         return text_preview("LM preview", setup, generate, None if settings is None else settings.decode)
 
 
+def _steps_in_context(model) -> bool:
+    """Whether `model` holds a level an objective steps in context (`SteppedInContext`)."""
+    return isinstance(model, SteppedInContext) and model.in_context
+
+
 class LMObjective(TokenScorer):
     """Trains a next-token model with shifted cross entropy, teacher-forced scoring and optional previews.
 
@@ -1292,9 +1305,9 @@ class LMObjective(TokenScorer):
         _check_terms(self.model, aux_loss_alpha=aux_loss_alpha, mtp_weight=mtp_weight, z_loss=z_loss,
                      router_z_loss=router_z_loss)
         if adaptation is not None:
-            if getattr(self.model, "continuum", None) is None:
+            if not _steps_in_context(self.model):
                 raise ValueError("adaptation steps a continuum level, which this model does not have "
-                                 "(CausalTransformer.continuum)")
+                                 "(CausalTransformer.continuum, `SteppedInContext`)")
             if samples is not None:
                 raise ValueError("adaptation scores through a level stepped in context, which a preview's "
                                  "generation does not step; train it without samples")

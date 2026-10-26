@@ -162,6 +162,22 @@ def test_a_without_ynn_arm_runs_over_windows():
     np.testing.assert_array_equal(over_windows(without_ynn(lambda x: x * 2))(x), x * 2)
 
 
+def test_a_recordings_measured_errors_size_its_site_as_seeds_for_would():
+    """`seeds_resolving` over the reference's errors measured apart (a recording's merged shards) gives
+    `seeds_for`'s count for the reference compared with itself on the same draws, and refuses a
+    recording of too few seeds."""
+    from reference_error import _drawn, seeds_for, seeds_resolving
+
+    count = seeds_for(_product, _draw, "product")
+    draws = _drawn(_product, _product, _draw, range(4 * count))
+    assert seeds_resolving(draws.theirs, draws.names, "product") == count
+    with pytest.raises(AssertionError):
+        seeds_resolving(draws.theirs[:count], draws.names, "product", start=count)
+    # Past its ceiling it refuses, as seeds_for does, however many seeds are recorded.
+    with pytest.raises(AssertionError):
+        seeds_resolving(draws.theirs, draws.names, "product", most=count // 2)
+
+
 def test_a_torch_arm_pulls_back_the_cotangent_it_is_given():
     """`torch_with_gradients` gives, bit for bit, a torch function's output and the gradients torch's
     autograd pulls back from the cotangent passed last, cast to the output's dtype, at float32 and at
@@ -628,6 +644,21 @@ def test_a_small_row_the_reference_measures_is_judged_at_its_own_size():
     assert raised.type is GateFailure
 
 
+def _tiny_row_recording(live):
+    """A recording's draw and evaluation of `live` (`_tiny_row`'s reference): each seed's inputs by name,
+    and the reference's float32 outputs beside their float64 truth."""
+    def draw(seed):
+        x, w = _draw(seed)
+        return {"x": x, "w": w}
+
+    def evaluate(inputs):
+        with jax.enable_x64(new_val=False):
+            reference = jax.tree.map(np.asarray, live(inputs["x"], inputs["w"]))
+        truth = jax.tree.map(np.asarray, live(*(np.asarray(inputs[n], np.float64) for n in ("x", "w"))))
+        return reference, truth
+    return draw, evaluate
+
+
 def test_a_summarized_recording_keeps_the_zero_rows_rule_for_its_small_rows():
     """A recording that keeps its reference's evidence and its truth's sketch alone (`record_case`'s
     summary) keeps no row's own size, and its sketch holds the truth at its leaf's scale, not a tiny
@@ -637,19 +668,10 @@ def test_a_summarized_recording_keeps_the_zero_rows_rule_for_its_small_rows():
 
     recorder = load("recorded_references")
     dew, live = _tiny_row(4)
-
-    def draw(seed):
-        x, w = _draw(seed)
-        return {"x": x, "w": w}
+    draw, evaluate = _tiny_row_recording(live)
 
     def as_inputs(fn):
         return lambda inputs: fn(inputs["x"], inputs["w"])
-
-    def evaluate(inputs):
-        with jax.enable_x64(new_val=False):
-            reference = jax.tree.map(np.asarray, live(inputs["x"], inputs["w"]))
-        truth = jax.tree.map(np.asarray, live(*(np.asarray(inputs[n], np.float64) for n in ("x", "w"))))
-        return reference, truth
 
     with jax.enable_x64(new_val=True):
         recorded = recorder.record_case("site", draw, evaluate, as_inputs(live), summary=True)
@@ -661,6 +683,33 @@ def test_a_summarized_recording_keeps_the_zero_rows_rule_for_its_small_rows():
         assert_as_exact(lambda index, inputs: as_inputs(dew)(inputs), reference, drawn, "summarized",
                         seeds=seeds, truth_fn=truth)
     assert raised.type is GateFailure
+
+
+def test_a_recording_made_in_shards_is_the_recording_one_run_makes():
+    """A summarized recording made in shards of seeds (`record_shard`), each drawn as one run draws it,
+    and joined (`merge_shards`) is the recording `record_case`'s summary makes of the same reference:
+    the same declared count, evidence and sketches, whatever order the shards come in. Shards that
+    leave a seed out are refused."""
+    from tool_support import load
+
+    recorder = load("recorded_references")
+    _, live = _tiny_row(4)
+    draw, evaluate = _tiny_row_recording(live)
+
+    with jax.enable_x64(new_val=True):
+        whole = recorder.record_case("site", draw, evaluate, lambda inputs: live(inputs["x"], inputs["w"]),
+                                     summary=True)
+        kept = len(whole["site.input_digest"])
+        cut = kept // 3
+        shards = [recorder.record_shard("site", draw, evaluate, seeds)
+                  for seeds in (range(cut, 2 * kept), range(cut))]
+        merged = recorder.merge_shards("site", shards)
+        assert merged.keys() == whole.keys()
+        for key, value in whole.items():
+            np.testing.assert_array_equal(merged[key], value, err_msg=key)
+        with pytest.raises(ValueError):
+            recorder.merge_shards("site", [shards[0], recorder.record_shard("site", draw, evaluate,
+                                                                            range(cut - 1))])
 
 
 def test_a_recorded_reference_is_drawn_by_its_index_and_covers_the_redraw(tmp_path):
