@@ -55,8 +55,9 @@ CARRY = "memory_carry"
 """The name of the state a chunk hands the next (`checkpoint_name`), for a remat policy to save."""
 
 STATE, MOMENTUM, START, COUNT = "memory_state", "memory_momentum", "memory_start", "memory_count"
-"""The decode cache's variables: the network's parameters now, the momentum, the parameters at the
-chunk's start, and each row's real tokens seen, rows first."""
+"""The decode cache's variables: the network's fast parameters now, the momentum, the parameters at the
+chunk's start, and the real tokens of each row's current document seen, rows first. A row that has
+seen none starts from W_0."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -289,10 +290,7 @@ class InContextMemory(nn.Module):
         # logical positions the call gives, as the chunked path compacts the real tokens from 0.
         places = counted_places(tokens.segments, tokens.valid)
         places = jnp.broadcast_to(jnp.arange(length)[None], (batch, length)) if places is None else places
-        firsts = (real & (jnp.cumsum(real, axis=1) == 1)) | (
-            jnp.zeros_like(real) if tokens.starts is None else jnp.asarray(tokens.starts, bool) & real)
-        steps = _Steps(query.astype(wide), key.astype(wide), value.astype(wide), theta, mu, a, real,
-                       firsts, places % self.chunk == 0)
+        steps = _Steps(query.astype(wide), key.astype(wide), value.astype(wide), theta, mu, a, real, places)
         if call.decode:
             read = self._decoded(initial, slow, steps)
         elif tokens.max_segments > 1:
@@ -348,7 +346,8 @@ class InContextMemory(nn.Module):
     def _token(self, carry: tuple, step: tuple, initial: dict, slow: dict) -> tuple:
         """One token's update and readout over every row and head: the definition."""
         start, state, momentum = carry
-        query, key, value, theta, mu, a, real, first, boundary = step
+        query, key, value, theta, mu, a, real, place = step
+        first, boundary = real & (place == 0), real & (place % self.chunk == 0)
 
         def reset(fresh: dict, held: dict) -> dict:
             return jax.tree.map(lambda f, h: jnp.where(_lead(first, h), f, h), fresh, held)
@@ -422,7 +421,9 @@ class InContextMemory(nn.Module):
         return last, reads
 
     def _decoded(self, initial: dict, slow: dict, steps: _Steps) -> jax.Array:
-        """A cached call: the cache's state continued token by token, its first call allocating it."""
+        """A cached call: the cache's state continued token by token, its first call allocating it. The
+        call's first document continues the row's, whose real tokens the cache has counted; a document
+        that starts in the call starts from W_0, and the cache then counts that document's."""
         batch = steps.real.shape[0]
         rows = jax.tree.map(lambda leaf: jnp.zeros((batch, *leaf.shape), leaf.dtype), initial)
         allocated = self.has_variable("cache", STATE)
@@ -430,21 +431,24 @@ class InContextMemory(nn.Module):
         state = self.variable("cache", STATE, lambda: rows)
         momentum = self.variable("cache", MOMENTUM, lambda: rows)
         seen = self.variable("cache", COUNT, jnp.zeros, (batch,), jnp.int32)
-        # A row's place continues from the tokens it has seen; a fresh row starts from W_0.
-        places = seen.value[:, None] + jnp.cumsum(steps.real, axis=1) - steps.real
-        first = steps.real & (places == 0)
-        boundary = steps.real & (places % self.chunk == 0)
-        reads, carry = self._stepped(initial, slow, steps._replace(first=first, boundary=boundary),
+        real = steps.real
+        # The first document is every token up to the call's second document start.
+        continued = jnp.cumsum(real & (steps.places == 0), axis=1) <= 1
+        places = steps.places + jnp.where(continued, seen.value[:, None], 0)
+        reads, carry = self._stepped(initial, slow, steps._replace(places=places),
                                      (start.value, state.value, momentum.value))
         if allocated:
             start.value, state.value, momentum.value = carry
-            seen.value = seen.value + jnp.sum(steps.real, axis=1, dtype=jnp.int32)
+            last = jnp.max(jnp.where(real, jnp.arange(real.shape[1]), 0), axis=1, keepdims=True)
+            counted = jnp.take_along_axis(places, last, axis=1)[:, 0] + 1
+            seen.value = jnp.where(jnp.any(real, axis=1), counted, seen.value).astype(jnp.int32)
         return reads
 
 
 class _Steps(NamedTuple):
     """A call's per-token fields, rows then tokens first: the views `[B, S, H, F]`, the gates
-    `[B, S, H]`, and the real, first and chunk-boundary masks `[B, S]`."""
+    `[B, S, H]`, the real tokens `[B, S]` and each one's rank among its document's real tokens
+    `[B, S]`, its first at 0, from which its chunks count."""
 
     query: jax.Array
     key: jax.Array
@@ -453,8 +457,7 @@ class _Steps(NamedTuple):
     mu: jax.Array
     a: jax.Array
     real: jax.Array
-    first: jax.Array
-    boundary: jax.Array
+    places: jax.Array
 
 
 def _lead(scalars: jax.Array, leaf: jax.Array) -> jax.Array:
