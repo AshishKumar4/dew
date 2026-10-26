@@ -571,6 +571,23 @@ def specified_layer_types(hf_config: Mapping[str, object], used: set[str],
     return tuple(cycle[index % len(cycle)] for index in range(count))
 
 
+def native_layer_types(hf_config: Mapping[str, object], used: set[str], convention: str) -> tuple[str, ...]:
+    """The config's `layer_types`, else the ones its own transformers class derives from it
+    (`AutoConfig.for_model`), as transformers builds the model: Qwen2's and Qwen3's window from
+    `max_window_layers` on under `use_sliding_window`, at the class's own default of that bound. A type
+    transformers has no class for is read by the class of the `convention` the family reads it by."""
+    if hf_config.get('layer_types') is not None:
+        return specified_layer_types(hf_config, used)
+    from transformers import AutoConfig
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
+    used.update(('use_sliding_window', 'sliding_window', 'max_window_layers'))
+    model_type = hf_config.get('model_type')
+    owner = model_type if isinstance(model_type, str) and model_type in CONFIG_MAPPING else convention
+    fields = {name: value for name, value in hf_config.items() if name != 'model_type'}
+    return _records.strings(AutoConfig.for_model(owner, **fields).layer_types, 'layer_types')
+
+
 def decoder_kinds(layer_types: tuple[str, ...], window: int | None,
            local_theta: float | None, full_theta: float | None,
            full_head_dim: int | None) -> dict[str, KindFields]:

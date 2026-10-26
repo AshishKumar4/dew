@@ -25,11 +25,11 @@ from dew.interop.decoder_parts import (
     Leaves,
     Renames,
     base_config,
+    native_layer_types,
     refuse,
     renamed_name,
     renamed_path,
 )
-from dew.interop.families.qwen import qwen_layer_types
 from dew.nn.backbones.causal_transformer import CausalTransformer
 
 _NAMES: Renames = (('input_layernorm_2', 'post_attention_layernorm'),
@@ -54,9 +54,10 @@ def _ouro_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         refuse(f'early_exit_step {exit_step!r}', f'the decoder reads the last pass, step {steps - 1}')
     used.update(('total_ut_steps', 'early_exit_threshold', 'early_exit_step'))
     # OuroConfig drops the window unless use_sliding_window is set, and
-    # derives layer_types with Qwen2's rule when none are stated.
+    # derives layer_types with Qwen2Config's rule when none are stated.
     windowed = {**hf, 'sliding_window': hf.get('sliding_window') if hf.get('use_sliding_window') else None}
-    config = base_config(windowed, used, rope=PLAIN_SPELLING, layer_types=qwen_layer_types(windowed, used),
+    config = base_config(windowed, used, rope=PLAIN_SPELLING,
+                         layer_types=native_layer_types(windowed, used, 'qwen2'),
                          reads=frozenset({'layer_types', 'sliding_window'}))
     config.update(sandwich_norms=True, loop={'steps': steps, 'exit_gate': True})
     return config
