@@ -7,6 +7,12 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 - Test-time training over the task loss: a decoder's continuum level (`CausalTransformer(continuum=ContinuumLevel(hidden))`) is stepped in context by the LM loss every `window` tokens of a document (`LMObjective(adaptation=ChunkAdaptation(...))`), Nested Learning's equation 71, each document from the trained start, training through every step.
 - A label's cross-entropy derivative in its own logit is `p - 1` while the label holds at most half its row and minus the rest of the row past it (`dew.nn.categorical.label_entry`), for the whole-logits head and the tiled, fused and vocabulary-split heads alike; the rest alone sat two to three times as far from float64 on unconfident rows.
+- `OptimConfig(state_dtype='int8')` stores adam's and adamw's moments blockwise in 8 bits
+  (`dew.optim.int8_moments`, bitsandbytes' and torchao's 8-bit Adam): a quarter of float32's state, the
+  update computed from the moments dequantized to fp32. On an A100, lm-dense's full-remat step peaks at
+  5.88 GB against fp32 state's 8.09 and takes 196.3 ms against 151.7 (`tools/benchmark_kernels.py
+  step --state-dtype int8`). bf16 and 8-bit Adam share one leafwise transform, and an 8-bit moment's
+  codes and scales are placed by their parameters' axes.
 - `Trainer.fit(examples=N)` and `--trainer.examples N` bound a run to the chain's
   first N records, counted before packing and each read once, its steps (and so
   its schedule) the ones the data plan counts for them. `Pause(fraction)`, as
