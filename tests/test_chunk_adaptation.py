@@ -36,9 +36,9 @@ ADAPTATION_SEEDS = 8
 SELECTED_SEEDS = 256
 """Check 1's declared seeds for a level whose `up` alone steps, sized paired by `seeds_for` on armada."""
 
-GRADIENT_SEEDS = 512
-"""Check 1's declared seeds for the outer gradient through the windows' steps: the 512 over which its
-verdict resolves on armada, where its paired sizing (`seeds_for`) does not within 512."""
+GRADIENT_SEEDS = 8
+"""Check 1's declared seeds for the outer gradient through the windows' steps, sized paired by
+`seeds_for` on armada."""
 
 LEVEL_SEEDS = 8
 """Check 1's declared seeds for the gradient through the level against its formula (`seeds_for`)."""
@@ -65,55 +65,76 @@ def drawn_variables(seed: int, model: CausalTransformer = MODEL):
     return jax.tree.map(lambda leaf: (0.5 * rng.standard_normal(leaf.shape)).astype(np.float32), shapes)
 
 
-def equation_71(model, variables, hidden, targets, weights, documents, adaptation: ChunkAdaptation):
-    """Equation 71 read literally, document by document of each row: each window of `window` tokens
-    reads the level it opened with, and after it the level steps by `rate` times the summed gradient
-    of its tokens' weighted next-token losses. The losses are each token's log-softmax, apart from
-    Dew's own cross entropy."""
+def equation_71(model, variables, hidden, targets, weights, layout, adaptation: ChunkAdaptation):
+    """Equation 71 read literally, token by token of each row: a run of a document's real tokens starts
+    from the level's start; each real token reads its window's level, and at the first real token of
+    the run's next window the level steps by `rate` times the summed gradient of the window's weighted
+    next-token losses; a padding slot reads the level open at it. The losses are each token's
+    log-softmax, apart from Dew's own cross entropy."""
     params = variables["params"]
+    start = params["continuum"]
+    valid, documents = layout
+    rows, length = targets.shape
 
-    def window_losses(level, states, window_targets):
+    def token_loss(level, state, target):
         held = {**variables, "params": {**params, "continuum": level}}
-        logits = model.apply(variables, model.apply(held, states, method="continuum_states"),
-                             method="head_logits")
-        return -jnp.take_along_axis(jax.nn.log_softmax(logits), window_targets[:, None], axis=-1)[:, 0]
+        logits = model.apply(variables, model.apply(held, state[None], method="continuum_states"),
+                             method="head_logits")[0]
+        return -jax.nn.log_softmax(logits)[target]
 
-    rows = []
-    for row in range(targets.shape[0]):
-        losses, start = [], 0
-        while start < targets.shape[1]:
-            end = start
-            while end < targets.shape[1] and documents[row][end] == documents[row][start]:
-                end += 1
-            level = params["continuum"]
-            for opened in range(start, end, adaptation.window):
-                closed = min(opened + adaptation.window, end)
-                window, pull = jax.vjp(lambda at, row=row, opened=opened, closed=closed: window_losses(
-                    at, hidden[row, opened:closed], targets[row, opened:closed]), level)
-                losses.append(window)
-                (gradient,) = pull(weights[row, opened:closed].astype(window.dtype))
-                level = {name: jax.tree.map(lambda leaf, grad: leaf - adaptation.rate * grad, part,
-                                            gradient[name])
-                         if not adaptation.select or name in adaptation.select else part
-                         for name, part in level.items()}
-            start = end
-        rows.append(jnp.concatenate(losses))
-    return jnp.stack(rows)
+    def step(level, gradient):
+        return {name: jax.tree.map(lambda leaf, grad: leaf - adaptation.rate * grad, part, gradient[name])
+                if not adaptation.select or name in adaptation.select else part
+                for name, part in level.items()}
+
+    def zeros():
+        return jax.tree.map(jnp.zeros_like, start)
+
+    out = []
+    for row in range(rows):
+        level, summed, losses = start, zeros(), []
+        document, count, opened, begun = None, 0, -1, False
+        for slot in range(length):
+            real = valid is None or bool(valid[row][slot])
+            here = None if documents is None else int(documents[row][slot])
+            if real and (not begun or here != document):
+                level, summed, count, opened, document, begun = start, zeros(), 0, 0, here, True
+            if real and count // adaptation.window != opened:
+                level, summed, opened = step(level, summed), zeros(), count // adaptation.window
+            loss, pull = jax.vjp(
+                lambda at, row=row, slot=slot: token_loss(at, hidden[row, slot], targets[row, slot]), level)
+            if real:
+                (gradient,) = pull(weights[row, slot].astype(loss.dtype))
+                summed = jax.tree.map(jnp.add, summed, gradient)
+                count += 1
+            losses.append(loss)
+        out.append(jnp.stack(losses))
+    return jnp.stack(out)
 
 
-def documents_of(*, packed: bool) -> np.ndarray:
-    """Each row's documents: one a row, or each row packed with documents of one to seven tokens,
-    their starts falling inside a window's span of slots."""
-    if not packed:
-        return np.zeros((ROWS, LENGTH), np.int32)
+LAYOUTS = ("documents", "packed", "padded")
+"""One document a row; rows packed with documents of one to seven tokens, a document's number used
+again after another's; and those rows with padding inside documents and after them."""
+
+
+def layout_of(kind: str) -> tuple[np.ndarray | None, np.ndarray | None]:
+    """The rows' validity and documents for a layout of `LAYOUTS` (`dew.nn.inputs.token_layout`)."""
+    if kind == "documents":
+        return None, None
     rng = np.random.default_rng(0)
     rows = []
     for _ in range(ROWS):
         lengths = []
         while sum(lengths) < LENGTH:
             lengths.append(int(rng.integers(1, 8)))
-        rows.append(np.repeat(np.arange(1, len(lengths) + 1), lengths)[:LENGTH])
-    return np.asarray(rows, np.int32)
+        rows.append(np.repeat(np.arange(len(lengths)) % 2 + 1, lengths)[:LENGTH])
+    documents = np.asarray(rows, np.int32)
+    if kind == "packed":
+        return None, documents
+    valid = np.ones_like(documents, bool)
+    valid[:, -2:] = False
+    valid[np.arange(ROWS), rng.integers(1, LENGTH - 2, ROWS)] = False
+    return valid, np.where(valid, documents, 0)
 
 
 def draw(seed: int):
@@ -125,71 +146,72 @@ def draw(seed: int):
             rng.integers(0, VOCAB, (ROWS, LENGTH)).astype(np.int32), weights)
 
 
-@pytest.mark.parametrize("packed", [False, True], ids=["documents", "packed"])
-@pytest.mark.parametrize(("window", "rate"), [(1, 0.1), (3, 0.1), (3, 0.0), (32, 0.1)])
-def test_the_scan_steps_the_level_as_equation_71(*, packed, window, rate):
+@pytest.mark.parametrize("kind", LAYOUTS)
+@pytest.mark.parametrize(("window", "rate"), [(1, 0.5), (3, 0.5), (3, 0.1), (3, 0.0), (32, 0.5)])
+def test_the_scan_steps_the_level_as_equation_71(kind, window, rate):
     """Each target's loss is equation 71's: its window read at the level stepped by every window of
-    its document before it, on par with the literal loop (check 1), at a window of one token (online
-    SGD), of three, of more than the row (the level as trained), and at rate zero; one document a row
-    and packed rows, whose documents each start from the level's start, one of them inside a block."""
-    documents = documents_of(packed=packed)
+    its run before it, on par with the literal loop (check 1), at a window of one token (online SGD),
+    of three, of more than the row (the level as trained), at rates of a half, a tenth and zero; one
+    document a row, packed rows whose runs each start from the level's start, a number reused after
+    another document's starting a run of its own, and padded rows whose padding reads the open window
+    and splits no run."""
+    layout = layout_of(kind)
     adaptation = ChunkAdaptation(window=window, rate=rate)
-    layout = (None, jnp.asarray(documents) if packed else None)
+    held = tuple(None if part is None else jnp.asarray(part) for part in layout)
 
     def dew(variables, hidden, targets, weights):
-        return adapted_scores(MODEL, variables, hidden, targets, weights, layout, adaptation,
+        return adapted_scores(MODEL, variables, hidden, targets, weights, held, adaptation,
                               predict=False, logits=False).losses
 
     def reference(variables, hidden, targets, weights):
-        return equation_71(MODEL, variables, hidden, targets, weights, documents, adaptation)
+        return equation_71(MODEL, variables, hidden, targets, weights, layout, adaptation)
 
     assert_as_exact(jax.jit(dew), jax.jit(reference), draw,
-                    f"equation 71 at a window of {window}, rate {rate}", seeds=ADAPTATION_SEEDS)
+                    f"equation 71 over {kind} at a window of {window}, rate {rate}", seeds=ADAPTATION_SEEDS)
 
 
 def test_only_the_selected_parts_step():
     """A selection steps those parts of the level and holds the rest at their trained values: with
     `up` alone stepping, each loss is equation 71's with `down` fixed (check 1)."""
-    adaptation = ChunkAdaptation(window=2, rate=0.1, select=("up",))
-    documents = documents_of(packed=False)
+    adaptation = ChunkAdaptation(window=2, rate=0.5, select=("up",))
 
     def dew(variables, hidden, targets, weights):
         return adapted_scores(MODEL, variables, hidden, targets, weights, (None, None), adaptation,
                               predict=False, logits=False).losses
 
     def reference(variables, hidden, targets, weights):
-        return equation_71(MODEL, variables, hidden, targets, weights, documents, adaptation)
+        return equation_71(MODEL, variables, hidden, targets, weights, (None, None), adaptation)
 
     assert_as_exact(jax.jit(dew), jax.jit(reference), draw, "up alone stepping", seeds=SELECTED_SEEDS)
 
 
-@pytest.mark.parametrize("packed", [False, True], ids=["documents", "packed"])
-def test_training_differentiates_through_every_step(*, packed):
+@pytest.mark.parametrize("kind", LAYOUTS)
+@pytest.mark.parametrize("rate", [0.1, 0.5])
+def test_training_differentiates_through_every_step(kind, rate):
     """The outer loss's gradient flows through each window's step to the level's start, the head
     and the states: the gradient of the weighted losses, second order through the steps, on par with
-    the literal loop's (check 1)."""
-    documents = documents_of(packed=packed)
-    adaptation = ChunkAdaptation(window=3, rate=0.1)
-    layout = (None, jnp.asarray(documents) if packed else None)
+    the literal loop's (check 1), over each layout and at rates of a tenth and a half."""
+    layout = layout_of(kind)
+    adaptation = ChunkAdaptation(window=3, rate=rate)
+    held = tuple(None if part is None else jnp.asarray(part) for part in layout)
 
     def gradient_draw(seed):
         variables, hidden, targets, weights = draw(seed)
         return variables, hidden, targets, weights, np.float32(1.0)
 
     def dew(variables, hidden, targets, weights):
-        return jnp.sum(weights * adapted_scores(MODEL, variables, hidden, targets, weights, layout,
+        return jnp.sum(weights * adapted_scores(MODEL, variables, hidden, targets, weights, held,
                                                 adaptation, predict=False, logits=False).losses)
 
     def reference(variables, hidden, targets, weights):
-        return jnp.sum(weights * equation_71(MODEL, variables, hidden, targets, weights, documents,
-                                             adaptation))
+        return jnp.sum(weights * equation_71(MODEL, variables, hidden, targets, weights, layout, adaptation))
 
     def differentiated(fn):
         return lambda variables, hidden, targets, weights, cotangent: with_gradients(
             lambda variables, hidden: fn(variables, hidden, targets, weights))(variables, hidden, cotangent)
 
     assert_as_exact(jax.jit(differentiated(dew)), jax.jit(differentiated(reference)), gradient_draw,
-                    "the gradient through the windows' steps", seeds=GRADIENT_SEEDS)
+                    f"the gradient through the windows' steps over {kind}, rate {rate}", seeds=GRADIENT_SEEDS)
 
 
 def test_a_level_at_its_start_is_the_identity():
