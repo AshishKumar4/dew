@@ -20,9 +20,12 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   published UNet loads as before. An AutoencoderKL's resnets are `dew.nn.blocks.ResidualBlock` called
   without a time embedding, and `dew.nn.autoencoders.vae.FlaxResnetBlock2D` is gone. `dew.nn.engram`
   draws its bucket primes with `sympy.nextprime`, so `sympy` is a dependency.
-- A flow transition's density and KL hold at a variance near float32's largest: the density is JAX's
-  isotropic `multivariate_normal.logpdf`, and the KL halves after its division, where `2 pi` or 2 times
-  the variance overflowed. Schulman's k3 KL estimate is one helper through `expm1`
+- A flow transition's density and KL hold at float32's edges: the density is JAX's isotropic
+  `multivariate_normal.logpdf`, where `2 pi` times a variance near float32's largest overflowed, and the
+  KL takes the error's half from its quotient, rounded once, where 2 times such a variance or an error
+  over a variance near float32's least overflowed and half an error near its least flushed to zero (a KL
+  of 0 for 0.5).
+  Schulman's k3 KL estimate is one helper through `expm1`
   (`dew.rl.surrogate.sampled_kl`), which a small log ratio's `exp(d) - 1` rounded away.
 - A masked-diffusion row's reveals are its own under RBG keys too (`dew._distributions.counted`, the
   rest of ledger 1669), and TensorBoard histograms are its own `histogram_pb`'s, the plugin's tensor.
