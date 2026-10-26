@@ -11,7 +11,7 @@ import optax
 import pytest
 import torch
 from flax.traverse_util import flatten_dict, unflatten_dict
-from reference_error import assert_as_exact, indexed_recording, over_windows, recording, windows
+from reference_error import assert_as_exact, indexed_recording, over_windows, recording, seeds_for, windows
 from transformers import (
     AutoModelForImageTextToText,
     Gemma4UnifiedConfig,
@@ -417,6 +417,58 @@ def optional_source(source, directory, media):
         return values
 
     return source_pair(directory), draw
+
+
+def assert_live_forward(pair, draw, label):
+    """Check 1 of Dew's forward against transformers' on `draw`'s inputs, the reference compared with
+    itself sizing the site's seeds (`seeds_for`)."""
+    ours, reference, truth = forward_functions(pair)
+    seeds = seeds_for(reference, draw, label, truth_fn=truth)
+    assert_as_exact(ours, reference, draw, label, seeds=seeds, truth_fn=truth)
+
+
+def test_vision_without_its_token_types_runs_causal_as_transformers_does(source):
+    """Pixels whose call carries no mm_token_type_ids carry no vision blocks: every vision token reads
+    causally, as transformers' own forward computes them without the field (its block ids stay -1,
+    modeling_gemma4_unified.py:1097-1101 at 5.17.0). Dew computes what transformers computes on the same
+    untyped inputs."""
+    def draw(seed):
+        values = unified_draw(source[1].config, seed)
+        del values["mm_token_type_ids"]
+        return (values,)
+
+    assert_live_forward(source, draw, "Gemma4 Unified untyped forward")
+
+
+def test_a_softcapped_unified_release_caps_its_logits_as_transformers_does(source, tmp_path):
+    """The released 12B caps its final logits at 30 (final_logit_softcapping); the fixture with that one
+    field set computes transformers' capped logits."""
+    original = source[1]
+    config = copy.deepcopy(original.config)
+    config.text_config.final_logit_softcapping = 30.0
+    reference = Gemma4UnifiedForConditionalGeneration(config).float().eval()
+    reference.load_state_dict(original.state_dict(), strict=True)
+    reference.save_pretrained(tmp_path, safe_serialization=True)
+    reference.config.to_json_file(tmp_path / "config.json", use_diff=False)
+    for name in ("processor_config.json", "tokenizer_config.json", "tokenizer.json"):
+        shutil.copyfile(FIXTURE / name, tmp_path / name)
+    pair = source_pair(tmp_path)
+    assert_live_forward(pair, lambda seed: (unified_draw(original.config, seed),),
+                        "Gemma4 Unified softcapped forward")
+
+
+def test_a_unified_config_without_its_image_placeholder_is_refused():
+    """A wrapper config names the token its images stand in for; one that leaves image_token_id out is
+    refused, as Gemma 4's is, rather than read with a guessed id."""
+    import json
+
+    from dew.interop.hf_decoders import translate_wrapper_config
+
+    config = json.loads((FIXTURE / "config.json").read_text())
+    assert translate_wrapper_config(config)["image_token_id"] == config["image_token_id"]
+    del config["image_token_id"]
+    with pytest.raises(ValueError):
+        translate_wrapper_config(config)
 
 
 @pytest.mark.parametrize("media", ["text", "vision", "audio"])
