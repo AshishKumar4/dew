@@ -5,6 +5,14 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A loaded decoder's pad row takes no gradient wherever its source's table pads it. Kimi Linear, Kimi K3,
+  Ouro, Dream, LLaDA-MoE and LLaDA2 now pad `pad_token_id` as their released code does, at their config
+  class's own default where a config states none; Dew trained that row before. Qwen 3.5's wrappers load
+  a YaRN or Llama 3.1 rope record, their three-axis rotary turning by its ramp. Tier 2's probe runs past
+  a rope ramp's original context and holds a convention's pad row to the source's table, a negative pad
+  id counting back from the table's end. A verification of a repository's own code is recorded under
+  the repository, Hub commit and folder it was fetched at, and a local directory's own code is verified
+  at each load.
 - Test-time training over the task loss: a decoder's continuum level (`CausalTransformer(continuum=ContinuumLevel(hidden))`) is stepped in context by the LM loss every `window` tokens of a document (`LMObjective(adaptation=ChunkAdaptation(...))`), Nested Learning's equation 71, each document from the trained start, training through every step.
 - A label's cross-entropy derivative in its own logit is `p - 1` while the label holds at most half its row and minus the rest of the row past it (`dew.nn.categorical.label_entry`), for the whole-logits head and the tiled, fused and vocabulary-split heads alike; the rest alone sat two to three times as far from float64 on unconfident rows.
 - `UNet2DCondition` stores its time embeddings' two maps flat, as `time_linear_1` and `time_linear_2`
