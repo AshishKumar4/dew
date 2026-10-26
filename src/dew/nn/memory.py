@@ -296,15 +296,19 @@ class InContextMemory(nn.Module):
                 {name: initial[name] for name in self.slow})
 
     def _initial(self, features: int) -> dict:
-        """W_0, a head's network parameters stacked over the heads `[H, ...]`."""
+        """W_0 stacked over the heads `[H, ...]`, held as each head's own network parameters (`initial/
+        head_0`, ...): a head's matrix is a matrix an optimizer steps on its own (Muon orthogonalizes it
+        apart from the other heads') and a vector a vector, as its network declares them."""
         network = self._inner(wide=False)
+        names = [f"head_{head}" for head in range(self.heads)]
 
         def drawn(key: jax.Array) -> dict:
-            keys = jax.random.split(key, self.heads)
             example = jnp.zeros((1, features), jnp.float32)
-            return jax.vmap(lambda one: dict(network.init(one, example)["params"]))(keys)
+            return {name: dict(network.init(one, example)["params"])
+                    for name, one in zip(names, jax.random.split(key, self.heads), strict=True)}
 
-        return self.param("initial", drawn)
+        heads = self.param("initial", drawn)
+        return jax.tree.map(lambda *leaves: jnp.stack(leaves), *(heads[name] for name in names))
 
     @nn.compact
     def __call__(self, x: jax.Array, call: MixerCall = PLAIN_CALL) -> jax.Array:

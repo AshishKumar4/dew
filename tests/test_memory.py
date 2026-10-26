@@ -155,7 +155,8 @@ def written(module: InContextMemory, *, dtype, segments=None, gradient=None):
     def run(x, params):
         # Cast here, under the caller's float64 mode where the truth runs.
         p = jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype), params["params"])
-        initial = jax.tree.map(lambda leaf: jnp.asarray(leaf, wide), params["params"]["initial"])
+        heads = [params["params"]["initial"][f"head_{head}"] for head in range(module.heads)]
+        initial = jax.tree.map(lambda *leaves: jnp.stack(leaves).astype(wide), *heads)
         x = jnp.asarray(x, dtype)
         batch = x.shape[0]
         q, k, v = ((x @ p[f"{name}_proj"]["kernel"]).reshape(batch, LENGTH, module.heads, -1) if projected
@@ -187,10 +188,6 @@ def unit(view):
     and rounded once to its dtype."""
     wide = view.astype(jnp.promote_types(view.dtype, jnp.float32))
     return (wide / jnp.sqrt(jnp.sum(wide * wide, axis=-1, keepdims=True) + L2NORM_EPS)).astype(view.dtype)
-
-
-def _head(index: int, leaf):
-    return leaf[index]
 
 
 def drawn(module: InContextMemory):
@@ -261,7 +258,8 @@ class Product(nn.Module):
 def on_the_general_path(params: dict) -> dict:
     """A linear memory's weights as the same memory over `Product` holds them."""
     initial = params["params"]["initial"]
-    return {"params": {**params["params"], "initial": {"kernel": initial["kernel"]["kernel"]}}}
+    held = {name: {"kernel": head["kernel"]["kernel"]} for name, head in initial.items()}
+    return {"params": {**params["params"], "initial": held}}
 
 
 @pytest.mark.parametrize("name", ["linear_attention", "gated_linear_attention", "delta_rule"])
@@ -403,8 +401,7 @@ def test_a_zero_step_reads_the_initial_network():
         queries = (x @ kernel).reshape(-1, LENGTH, HEADS, FEATURES)
         network = ResidualMemory(hidden=4 * FEATURES, dtype=x.dtype)
         stored = params["params"]["initial"]
-        heads = [network.apply({"params": jax.tree.map(functools.partial(_head, h), stored)},
-                               queries[:, :, h]) for h in range(HEADS)]
+        heads = [network.apply({"params": stored[f"head_{h}"]}, queries[:, :, h]) for h in range(HEADS)]
         return jnp.stack(heads, axis=2).reshape(-1, LENGTH, HEADS * FEATURES)
 
     assert_as_exact(applied(module), jax.jit(initial), drawn(module), "zero-step memory", seeds=MEMORY_SEEDS,
