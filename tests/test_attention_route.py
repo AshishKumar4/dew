@@ -49,7 +49,6 @@ from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import (
     attention as template,
     attention_mosaic,
-    attention_portable,
     attention_route,
     attention_triton,
 )
@@ -529,29 +528,24 @@ def test_a_gpu_prefers_the_template_for_a_call_with_block_groups(kind):
 
 def test_the_accurate_form_is_one_option_away():
     """`generation.chosen(attention_form='accurate')` runs every template call in the accurate form (natural
-    logits and the accurate products, `attention_route.FORMS`), its forward and backward bitwise the
-    mainloop's own at that form, and the default runs the fast one; a form the template does not have is
-    refused."""
+    logits and the accurate products, `attention_route.FORMS`), its forward and gradients bitwise a call's
+    that names that form, and 'fast' runs the default, a call's that names none; the two forms differ; a
+    form the template does not have is refused."""
     spans = template.spans(QUERIES, KEYS, ROWS, causal=True)
     query, key, value, _, dout = drawing(QUERIES, KEYS, jnp.float32, sinks=False)(0)
-    tiles = {"block_q": attention_route.PLAIN_TILE, "block_k": attention_route.PLAIN_TILE,
-             "pad": attention_route.PLAIN_TILE}
 
-    def routed(q, k, v):
-        out, pull = jax.vjp(lambda q, k, v: attention_route.attend(q, k, v, spans), q, k, v)
+    def routed(q, k, v, **form):
+        out, pull = jax.vjp(lambda q, k, v: attention_route.attend(q, k, v, spans, **form), q, k, v)
         return out, pull(dout)
 
-    for form, natural, accurate in (("accurate", True, True), ("fast", False, False)):
+    found = {}
+    for form, named in (("accurate", {"natural": True, "accurate": True}), ("fast", {})):
         with generation.chosen(attention_form=form):
-            out, grads = jax.jit(routed)(query, key, value)
-        want = attention_portable.attend(query, key, value, spans, template.Hooks(), natural=natural, **tiles)
-        residuals = attention_portable.attend(query, key, value, spans, template.Hooks(), natural=natural,
-                                              residuals=True, **tiles)[1:]
-        pulled = attention_portable.backward(query, key, value, spans, template.Hooks(), dout,
-                                             residuals=residuals, natural=natural, accurate=accurate, **tiles)
-        np.testing.assert_array_equal(np.asarray(out), np.asarray(want), err_msg=form)
-        for mine, theirs in zip(grads, (pulled.query, pulled.key, pulled.value), strict=True):
+            found[form] = jax.tree.leaves(jax.jit(routed)(query, key, value))
+        want = jax.tree.leaves(jax.jit(functools.partial(routed, **named))(query, key, value))
+        for mine, theirs in zip(found[form], want, strict=True):
             np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs), err_msg=form)
+    assert any(not np.array_equal(accurate, fast) for accurate, fast in zip(*found.values(), strict=True))
     with generation.chosen(attention_form="exact"), pytest.raises(ValueError):
         attention_route.attend(query, key, value, spans)
 
