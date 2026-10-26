@@ -302,8 +302,8 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
 
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as readers:
         # Each read in this compilation, which fingerprints each source once (`compiling`).
-        pinned = dict(zip(sources, readers.map(lambda source: within(lambda: pin(source))(),
-                                               sources.values()), strict=True))
+        tasks = [within(functools.partial(pin, source)) for source in sources.values()]
+        pinned = dict(zip(sources, readers.map(lambda task: task(), tasks), strict=True))
 
     return tuple(with_stores(branch, lambda source: pinned[id(source)]) for branch in pipelines)
 
