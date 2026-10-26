@@ -15,6 +15,7 @@ from jax.sharding import Mesh
 from dew._coordination import agreed_next
 from dew._records import JSON
 from dew.batch import Batch
+from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader, Reader
 from dew.data.pipeline import Dataset
 from dew.distributed.batches import DevicePrefetchIterator, Signature
@@ -87,7 +88,7 @@ class FitPlan:
     tokens: int | None
     checkpoint_every: Cadence | datetime.timedelta
     checkpoint_final: bool
-    local_every: int | None
+    local_every: Cadence
     metrics: Sequence[Metric]
     preview: bool
     best: tuple[Best, ...] = ()
@@ -162,9 +163,11 @@ class FitPlan:
     @staticmethod
     def cadences(loader: Loader, validation: Mapping[str, Reader | EvalSuite] | None,
                  metrics: Sequence[Metric], steps: int | None, tokens: int | None, accumulation: int,
-                 written: tuple[int | str, int | str | None, int | str | datetime.timedelta | None]
-                 ) -> tuple[int | Tokens, Cadence, Cadence | datetime.timedelta, dict[str, EvalSuite]]:
-        """`fit`'s log, validation and checkpoint cadences and its suites' (`validation_suites`), each
+                 written: tuple[int | str, int | str | None, int | str | datetime.timedelta | None],
+                 checkpoints: Checkpoints | None = None) -> tuple[
+                     int | Tokens, Cadence, Cadence | datetime.timedelta, Cadence, dict[str, EvalSuite]]:
+        """`fit`'s log, validation and checkpoint cadences, its `checkpoints`' local one
+        (`Checkpoints.local_every`), and its suites' (`validation_suites`), each
         written as steps, a duration or a share of the run such as "5%", resolved once against its planned
         length: the whole updates nearest that share of its `steps` microsteps, `accumulation` an update,
         at least one; of a budget of `tokens` alone, each time the committed tokens pass a multiple of that
@@ -182,7 +185,8 @@ class FitPlan:
             checkpoint_every, "checkpoint_every")
         suites = {name: dataclasses.replace(suite, every=cadence(suite.every, f"{name}'s every"))
                   for name, suite in validation_suites(loader, validation, metrics, evaluated).items()}
-        return logged, evaluated, saved, suites
+        local = None if checkpoints is None else cadence(checkpoints.local_every, "local_every")
+        return logged, evaluated, saved, local, suites
 
     def recorded(self, config: OptimConfig | None, accumulation: int) -> dict[str, JSON]:
         """The cadences this plan resolved and the warmups of `config`'s schedules over its updates,
@@ -191,8 +195,9 @@ class FitPlan:
             None if self.steps is None else self.steps // accumulation)
         suites = {f"{name}.every": recorded(suite.every) for name, suite in self.suites.items()
                   if suite.every != self.eval_every}
+        local = {} if self.local_every is None else {"local_every": recorded(self.local_every)}
         return {"log_every": recorded(self.log_every), "eval_every": recorded(self.eval_every),
-                "checkpoint_every": recorded(self.checkpoint_every), **suites,
+                "checkpoint_every": recorded(self.checkpoint_every), **local, **suites,
                 **{f"warmup_steps.{name}": value for name, value in warmups.items()}}
 
     def due(self, step: int, real: int = 0, before: int = 0) -> tuple[str, ...]:
@@ -213,6 +218,8 @@ class FitRun:
     evaluation: Evaluation | None = None
     last_checkpoint: float = 0.0
     checkpoint_due: bool = False
+    local_due: bool = False
+    """Whether the local checkpoint cadence falls on the run's latest step (`FitPlan.local_every`)."""
     committed: int = 0
     """The run's committed tokens after its last step, where a token budget reads them (`FitPlan.real`)."""
     stop_control: dict = dataclasses.field(default_factory=dict)

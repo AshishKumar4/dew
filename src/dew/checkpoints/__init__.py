@@ -72,7 +72,7 @@ from orbax.checkpoint.checkpoint_managers import preservation_policy as preserva
 from dew import _records, position
 from dew._coordination import broadcast_from_process_zero, from_every_process, seen_by_every_process
 from dew._hashing import fmix32
-from dew._records import JSON, duration, json_value
+from dew._records import JSON, duration, json_value, share
 from dew.batch import PARAMETER_ROOTS, Variables
 from dew.cleanup import attempted
 from dew.files import write_atomically
@@ -929,9 +929,11 @@ class Checkpoints:
 
     `local_directory` names a path on every host's own disk where the run
     keeps one more checkpoint, the latest, which `fit` writes every
-    `local_every` steps. Each process writes the shards its devices hold under
-    its own subdirectory, so the same path works for a pod and for one host
-    running several processes. `latest` is the newest step every process can
+    `local_every` steps, or at each share of the run it names, such as `5%`,
+    as `fit` resolves its other cadences (`dew.training.budget.every_step`).
+    Each process writes the shards its devices hold under its own
+    subdirectory, so the same path works for a pod and for one host running
+    several processes. `latest` is the newest step every process can
     read, local or persistent, and `restore` reads it from wherever it is. A
     local checkpoint restores onto the placement it was written with, because
     no process holds another process's shards; the persistent checkpoint
@@ -939,12 +941,14 @@ class Checkpoints:
     """
 
     def __init__(self, directory: str, *, keep: int | Keep = Keep.latest,
-                 local_directory: str | None = None, local_every: int | None = None):
+                 local_directory: str | None = None, local_every: int | str | None = None):
         if (local_directory is None) != (local_every is None):
             raise ValueError(
                 "local checkpoints take both local_directory and local_every: where "
                 "every host writes its copy, and every how many steps")
-        if local_every is not None and local_every < 1:
+        if isinstance(local_every, str):
+            share(local_every)
+        elif local_every is not None and local_every < 1:
             raise ValueError(f"local_every must be at least 1, got {local_every}")
         self.directory = str(location(directory))
         self.keep = Keep(latest=keep) if isinstance(keep, int) else keep

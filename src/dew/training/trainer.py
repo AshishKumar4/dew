@@ -1373,8 +1373,8 @@ class Trainer(Generic[Loss, Effects]):
         count_compilation_cache()
         self._schedule(None if steps is None else steps // self.accumulation)
         written = log_every, eval_every, checkpoint_every
-        logged, evaluated, saved, suites = FitPlan.cadences(loader, validation, metrics, steps, tokens,
-                                                            self.accumulation, written)
+        logged, evaluated, saved, local, suites = FitPlan.cadences(
+            loader, validation, metrics, steps, tokens, self.accumulation, written, self.checkpoints)
         declared = declarations(suites, metrics, summaries, loss=self.objective.defines_validation_loss)
         selection, plateau, pause = self._fit_policies(best, stop, declared, saved, steps, tokens)
         self._preflight(loader, plateau, suites, preview=preview, stated=dataset,
@@ -1392,7 +1392,7 @@ class Trainer(Generic[Loss, Effects]):
             plan = FitPlan(
                 dataset=loader, steps=steps, log_every=logged, eval_every=evaluated, tokens=tokens,
                 checkpoint_every=saved, checkpoint_final=checkpoint_final,
-                local_every=None if checkpoints is None else checkpoints.local_every,
+                local_every=local,
                 metrics=metrics, preview=preview, best=selection, stop=plateau, suites=suites, pause=pause,
                 held_best=restore_best and checkpoints is None, observe=observe, summaries=tuple(summaries),
                 declared=declared,
@@ -1748,6 +1748,7 @@ class Trainer(Generic[Loss, Effects]):
                 run.checkpoint_due = agree_process_phase(None, phase="checkpoint clock", available=due) > 0
         else:
             run.checkpoint_due = plan.falls(plan.checkpoint_every, current, real, before)
+        run.local_due = plan.falls(plan.local_every, current, real, before)
         due = plan.due(current, real, before)
         evaluation_due = bool(due) or plan.falls(plan.eval_every, current, real, before)
         # A run's last step, its budget's or the step after which its stream runs out, is scored and saved
@@ -1857,8 +1858,7 @@ class Trainer(Generic[Loss, Effects]):
                 and not (final and plan.checkpoint_final) and bool(winners)
                 and all(rank.weights_only for rank in winners) and not self._ends_here(run, interval))
             run.last_checkpoint = time.perf_counter()
-        if (plan.local_every and checkpoints is not None and current % plan.local_every == 0
-                and run.last_local_saved != current):
+        if run.local_due and checkpoints is not None and run.last_local_saved != current:
             self._read_taken(run)
             run.other += self._saved_local_checkpoint(
                 checkpoints, current, state, position, interval, control=run.stop_control)
