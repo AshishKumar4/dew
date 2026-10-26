@@ -601,7 +601,8 @@ def test_the_accurate_forms_rescale_is_as_exact_as_its_exponent_rounded_once(raw
 def _accurate_dq(query, key, value, spans, hooks, dout, scale, name):
     """The accurate form's dQ (`natural=True, accurate=True`: the keyed sums, each factor's mantissa and
     exponent apart, `algebra.dq_finish`) on the Triton mainloop interpreted and the plain-JAX one: finite,
-    the two equal to the bit, and on par with the reference's own fp32 dQ against float64's (check 1)."""
+    the two equal to the bit, and on par with the reference's own fp32 dQ against float64's (check 1); where
+    the reference's is float64's exactly, which check 1 cannot weigh, float64's exactly too."""
     tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
     form = {"scale": scale, "natural": True, "accurate": True}
     with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
@@ -622,7 +623,10 @@ def _accurate_dq(query, key, value, spans, hooks, dout, scale, name):
     theirs = reference_dq(jnp.float32)
     with jax.enable_x64(new_val=True):
         want = reference_dq(jnp.float64)
-    assert_as_exact_as_the_reference(found, theirs, want, name)
+    if np.array_equal(theirs, want):
+        np.testing.assert_array_equal(found, want, err_msg=name)
+    else:
+        assert_as_exact_as_the_reference(found, theirs, want, name)
     return found, want
 
 
