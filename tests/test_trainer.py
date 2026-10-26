@@ -1465,6 +1465,29 @@ def test_a_tree_of_any_kind_of_mapping_is_held_as_dicts_where_it_enters(tmp_path
     assert not others and float(counted(state.variables["stats"])) == 3.0
 
 
+def recorded_momentum() -> optax.GradientTransformation:
+    """Momentum whose state is a record that is a mapping of its own kind (`nnx.State`), read by
+    attribute, as an optimizer may keep its state."""
+    from flax import nnx
+
+    def init(params):
+        return nnx.State({"momentum": jax.tree.map(jnp.zeros_like, params)})
+
+    def update(updates, state, params=None):
+        momentum = jax.tree.map(lambda held, gradient: 0.9 * held + gradient, state.momentum, updates)
+        return jax.tree.map(lambda held: -1e-2 * held, momentum), nnx.State({"momentum": momentum})
+
+    return optax.GradientTransformation(init, update)
+
+
+def test_a_supplied_state_keeps_an_optimizer_record_that_is_a_mapping_of_its_own_kind(tmp_path):
+    """Only container mappings become dicts where a state enters: an optimizer's record that is a
+    mapping of its own kind stays one, its fields read as its update reads them."""
+    trainer = make_trainer(tmp_path, objective=Counted(), optimizer=recorded_momentum())
+    state = trainer.fit(dataset(), steps=2, log_every=1, state=trainer.initial_state())
+    assert int(state.step) == 2 and type(state.opt_state).__name__ == "State"
+
+
 def test_a_supplied_state_whose_parameters_and_moments_hold_a_frozen_dict_in_a_list_trains(tmp_path):
     """A state handed to fit is held whole as dicts of its own: its variables under any mapping, and a
     Flax `FrozenDict` in a list both where a parameter sits and where the optimizer's moments of it do,
