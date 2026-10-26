@@ -325,9 +325,7 @@ def test_a_stacked_matrix_is_read_in_place_at_a_layer(generation_name):
         assert_as_exact(with_gradients(dew), jax.jit(with_gradients(plain)), draw,
                         f"stacked layer on {generation_name}", seeds=SEEDS,
                         truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64, out=jnp.float64)))
-        # The forward's Mosaic launch, named: an Ampere GPU's grouped forward is an old-route cell
-        # (`grouped_matmul.OLD_ROUTES`).
-        with generation.chosen(grouped_matmul="mosaic_gpu"), tuning.seen() as launches:
+        with tuning.seen() as launches:
             jax.jit(dew).trace(*draw(0)[:2])
     read = {ba.arguments['kernel'].shape for op, ba in launches if isinstance(op, grouped_matmul.MosaicGmm)}
     assert read == {(layers * groups, depth, width)}

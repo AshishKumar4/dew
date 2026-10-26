@@ -5,6 +5,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- On an Ampere GPU, the grouped GEMM's Mosaic launches run two programs a multiprocessor, eight warps as
+  cuBLAS's kernels run, each in half its shared memory (`mosaic.Family.programs`, `Tiles.programs`): on an
+  A100, 0.73 to 0.89 of one program's time (a product's geomean over 6 MoE and 4 dense rows), and the MoE
+  forward runs the template by default, at 0.83 of Triton's time (CONSUMERS3).
 - Dew's fused kernels, the delta rules' decay and memory products and the frozen FP8 product take
   their reverse mode through one `jax.experimental.hijax` linear map (`generation.linear_map`)
   instead of `linear_call`, which JAX deprecates in favour of hijax (jax-ml/jax#41782): their

@@ -1468,13 +1468,11 @@ def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]
 
 
 OLD_ROUTES: dict[tuple[str, str, str], tuple[str, str]] = {
-    ('mma.sync', 'forward', 'grouped'):
-        ('triton', "R10 (852bb4bd3, A100): the template's mma.sync tile 1.017x Triton's time, geomean of 6 "
-                   "grouped MoE rows"),
     ('mma.sync', 'input_gradient', 'grouped'):
-        ('triton', "R10: 1.263x Triton's time, geomean of 6 grouped rows"),
+        ('triton', "CONSUMERS3 (b1241ba7b, A100, two programs a multiprocessor): the template's mma.sync "
+                   "tile 1.239x Triton's time, geomean of 6 grouped MoE rows (its forward 0.828x)"),
     ('mma.sync', 'kernel_gradient', 'grouped'):
-        ('triton', "R10: 1.093x Triton's time, geomean of 6 grouped rows"),
+        ('triton', "CONSUMERS3: 1.358x Triton's time, geomean of 6 grouped rows"),
     ('mma.sync', 'forward', 'dense'):
         ('xla', "DENSE1 (A100, 2d1bbd051): Mosaic 1.923x and Triton 1.947x XLA's dot (cuBLAS), geomean of 10 "
                 "projections at 8192 tokens"),
