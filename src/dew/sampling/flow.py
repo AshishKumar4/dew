@@ -140,30 +140,31 @@ def _split(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     return _scaled(x, -exponent), exponent
 
 
-def _rows(x: jax.Array, like: jax.Array) -> jax.Array:
-    """A per-row `x` `[B]` shaped to broadcast against `like` `[B, ...]`."""
-    return jnp.reshape(x, x.shape + (1,) * (like.ndim - x.ndim))
+def _apart(left: jax.Array, right: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`left - right` per coordinate as a significand in [1, 2) or zero and an exponent (`_split`): each
+    coordinate's two values over their own larger power of two before the subtraction, and the
+    difference renormalized after it, so a difference past float32's largest (`2**127 - -2**127`), below
+    its least (two neighbouring tiny means), or surviving beside a coordinate that cancels (`2**-26 - 0`
+    beside `2**126 - 2**126`) is formed in range and keeps its own exponent."""
+    power = jnp.maximum(_exponent(left), _exponent(right))
+    part, own = _split(_scaled(left, -power) - _scaled(right, -power))
+    return part, own + power
 
 
-def _subtracted(left: jax.Array, right: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`left - right` per row as a value and a power, `(left - right) = value * 2**power`: both over
-    their rows' largest power of two before the subtraction, so a difference past float32's largest
-    (`2**127 - -2**127`) or below its least (two neighbouring tiny means) is formed in range."""
-    axes = tuple(range(1, left.ndim))
-    power = jnp.maximum(jnp.max(_exponent(left), axis=axes), jnp.max(_exponent(right), axis=axes))
-    return _scaled(left, -_rows(power, left)) - _scaled(right, -_rows(power, right)), power
+Split = tuple[jax.Array, jax.Array]
+"""An array as its significands and exponents (`_split`, `_apart`)."""
 
 
-def _contracted(left: jax.Array, right: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`sum(left * right)` over each row as a value and a power: each product formed from the two
-    significands (`_split`) with its own exponent, the row's terms aligned to its largest before they
-    sum, so a small coordinate's product does not flush beside a large one's and cancelling terms
-    cancel before anything is restored."""
-    axes = tuple(range(1, left.ndim))
-    (left_part, left_power), (right_part, right_power) = _split(left), _split(right)
+def _contracted(left: Split, right: Split) -> Split:
+    """`sum(left * right)` over each row, of two arrays given as significands and exponents (`_split`,
+    `_apart`), as a value and a power: each product of the significands with its own exponent, the
+    row's terms aligned to its largest nonzero one before they sum, so a small coordinate's product
+    does not flush beside a large one's and cancelling terms cancel before anything is restored."""
+    (left_part, left_power), (right_part, right_power) = left, right
+    axes = tuple(range(1, left_part.ndim))
     products, powers = left_part * right_part, left_power + right_power
     top = jnp.max(jnp.where(products != 0, powers, FLOOR), axis=axes)
-    return _scaled(products, powers - _rows(top, powers)).sum(axis=axes), top
+    return _scaled(products, powers - expand(top, powers)).sum(axis=axes), top
 
 
 def _combined(left: jax.Array, left_power: jax.Array, right: jax.Array, right_power: jax.Array) -> jax.Array:
@@ -177,13 +178,13 @@ def _combined(left: jax.Array, left_power: jax.Array, right: jax.Array, right_po
 
 
 def _divergence_parts(mean: jax.Array, reference: jax.Array, variance: jax.Array):
-    """The scaled parts of `|mean - reference|**2 / (2 variance)` (`_divergence`): the difference and
-    its power (`_subtracted`), the variance's significand and exponent (`_split`), and the KL's
-    quotient and power, `KL = quotient * 2**power`, the quotient below `4n`."""
-    difference, shift = _subtracted(mean, reference)
+    """The scaled parts of `|mean - reference|**2 / (2 variance)` (`_divergence`): the difference's
+    significands and exponents (`_apart`), the variance's (`_split`), and the KL's quotient and power,
+    `KL = quotient * 2**power`, the quotient below `4n`."""
+    difference = _apart(mean, reference)
     level, spread = _split(variance)
-    quotient = jnp.square(difference).sum(axis=tuple(range(1, mean.ndim))) / level
-    return difference, shift, level, spread, quotient, 2 * shift - spread - 1
+    total, top = _contracted(difference, difference)
+    return difference, level, spread, total / level, top - spread - 1
 
 
 def _divergence(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> jax.Array:
@@ -200,7 +201,7 @@ def _divergence(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> j
 @jax.custom_jvp
 def _directional(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> jax.Array:
     """`_divergence`, whose forward mode forms `sum(d * (t_mean - t_reference)) / v - KL * t_v / v` as
-    the KL is formed: the tangents' difference in range (`_subtracted`), its contraction against the
+    the KL is formed: the tangents' difference in range (`_apart`), its contraction against the
     difference product by product (`_contracted`), the variance's term from the KL's quotient, and the
     two terms joined before their power is restored (`_combined`). Its tangent reads the tangents'
     exponents, so it is forward mode alone: reverse mode is `_kl_pullback`'s (`linear_tangent`), and a
@@ -212,11 +213,10 @@ def _directional(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> 
 def _directional_jvp(primals, tangents):
     """`_directional`'s tangent, every product and quotient of scaled operands, its power restored once."""
     mean_tangent, reference_tangent, variance_tangent = tangents
-    difference, shift, level, spread, quotient, power = _divergence_parts(*primals)
-    moving, moving_shift = _subtracted(mean_tangent, reference_tangent)
-    along, along_power = _contracted(difference, moving)
+    difference, level, spread, quotient, power = _divergence_parts(*primals)
+    along, along_power = _contracted(difference, _apart(mean_tangent, reference_tangent))
     stretch, stretch_power = _split(variance_tangent)
-    moved = _combined(along / level, along_power + shift + moving_shift - spread,
+    moved = _combined(along / level, along_power - spread,
                       -(quotient * stretch / level), power + stretch_power - spread)
     return _scaled(quotient, power), moved
 
@@ -227,10 +227,9 @@ def _kl_pullback(saved, operands, cotangent):
     reference's its negation, and the variance's `-cotangent * KL / variance` from the KL's quotient,
     each power restored once (`_scaled`)."""
     del saved
-    difference, shift, level, spread, quotient, power = _divergence_parts(*operands)
-    (scale, scale_power), (part, part_power) = _split(cotangent), _split(difference)
-    pulled = _scaled(_rows(scale / level, part) * part,
-                     _rows(scale_power + shift - spread, part) + part_power)
+    (part, part_power), level, spread, quotient, power = _divergence_parts(*operands)
+    scale, scale_power = _split(cotangent)
+    pulled = _scaled(expand(scale / level, part) * part, expand(scale_power - spread, part) + part_power)
     return pulled, -pulled, -_scaled(scale * quotient / level, scale_power + power - spread)
 
 
