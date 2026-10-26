@@ -41,7 +41,7 @@ import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
 from dew.mesh import logical_spec, mesh_axes
-from dew.nn.categorical import label_derivative, rescaled, segment_log_partition, target_loss
+from dew.nn.categorical import label_derivative, label_entry, rescaled, segment_log_partition, target_loss
 from dew.nn.kernels.generation import gpu_target
 from dew.nn.precision import (
     added_to,
@@ -547,26 +547,28 @@ def _softmax_cotangent(logits, first, excluded, peaks, masses, rests, labels, d_
     vocabulary-split head's 8192 gradient elements more than twice as far from
     float64 as that reference's over 52 orders of its columns, against 5.
 
-    The loss's part of the target's entry is the rest of its row's share summed
-    directly, `rests` (the row's exponentials scaled to its maximum, the
-    target's column left out), never its share less one: once the share rounds
-    to 1 that is 0, while the rest of the row, arXiv:2610.31642's eq. 7, is
-    not. The partition's part is the target's own share, never 1 less the
-    rest, which an unlikely target's share would cancel to 0. Without `picked`
-    the entry is `(d_partition * e_t - d_first * rests) / masses`; with it,
-    `d_first + d_partition * p_t` taken as `(d_first * rests + (d_first +
-    d_partition) * e_t) / masses`, where the loss's cotangents `d_first =
-    -d_partition` leave the rest alone. A target outside the tile one-hots to
-    zero rather than to a wrapped column."""
+    The loss's part of the target's entry is the categorical's label entry
+    (`dew.nn.categorical.label_entry`) of the target's share and the rest of its
+    row's, `rests` (the row's exponentials scaled to its maximum, the target's
+    column left out): its share less one while the share is at most a half,
+    else minus the rest, arXiv:2610.31642's eq. 7, which keeps it once the share
+    rounds to 1. The partition's part is the target's own share, never 1 less
+    the rest, which an unlikely target's share would cancel to 0. Without
+    `picked` the entry is `d_partition * p_t + d_first * label_entry`; with it,
+    `d_first + d_partition * p_t` taken as `(d_first + d_partition) * p_t -
+    d_first * label_entry`, where the loss's cotangents `d_first =
+    -d_partition` leave the label entry alone and the partition's alone leaves
+    its share. A target outside the tile one-hots to zero rather than to a
+    wrapped column."""
     exponentials = jnp.exp(_without(logits, first, excluded) - peaks[:, None])
     # A target at the excluded column scores a constant +inf, which no logit moves.
     selected = _without(jax.nn.one_hot(labels - first, logits.shape[-1], dtype=bool), first,
                         excluded, value=False)
     coefficient = d_partition if picked else d_first + d_partition
     share = exponentials * (coefficient / masses)[:, None]
-    rest = (d_first * (rests / masses))[:, None]
-    target = (exponentials * ((d_first + d_partition) / masses)[:, None] + rest if picked
-              else exponentials * (d_partition / masses)[:, None] - rest)
+    entry = label_entry(exponentials / masses[:, None], (rests / masses)[:, None])
+    target = (exponentials * ((d_first + d_partition) / masses)[:, None] - d_first[:, None] * entry if picked
+              else exponentials * (d_partition / masses)[:, None] + d_first[:, None] * entry)
     return jnp.where(selected, target, share)
 
 

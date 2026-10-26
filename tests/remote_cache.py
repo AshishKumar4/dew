@@ -54,6 +54,10 @@ _R2 = importlib.util.spec_from_file_location(
     "armada_r2", Path(__file__).resolve().parents[1] / "tools" / "armada" / "r2.py")
 r2 = importlib.util.module_from_spec(_R2)
 _R2.loader.exec_module(r2)  # the Worker's one client and its contract (tools/armada/r2.py)
+_HOST = importlib.util.spec_from_file_location(
+    "armada_host", Path(__file__).resolve().parents[1] / "tools" / "armada" / "host.py")
+HOST = importlib.util.module_from_spec(_HOST)
+_HOST.loader.exec_module(HOST)  # the host's CPU class, which keys a bundle (tools/armada/host.py)
 MAX_BYTES = r2.MAX_BYTES
 """The largest bundle sent or read: the Worker's bound (tools/armada/r2.json)."""
 SUFFIX = "-cache"
@@ -311,19 +315,17 @@ def prefix() -> str:
     (jax/_src/cache_key.py), so a release of jax alone that lowers a program differently keys it
     anew, and one that does not (a post-release of Dew's patch stack) keeps every file's programs.
     The Python minor is among them because jax 0.11.2 names 3.14's stdlib zstd codec "zlib" in its
-    key (`dew.cache.default_compilation_cache_dir`); and the host's CPU class (`dew._host.cpu_class`),
+    key (`dew.cache.default_compilation_cache_dir`); and the host's CPU class (`HOST.cpu_class`),
     on every backend, as XLA:CPU compiles for the features of the host that compiles and a GPU lane's
     bundles hold CPU executables too (its host-side computations): armada's hosts span classes, and a
     program from another class need not link here, after which the process compiles nothing more."""
     import jax
     import jaxlib
 
-    from dew._host import cpu_class
-
     kind = "".join(character if character.isalnum() else "-" for character in jax.devices()[0].device_kind)
     backend = jax.default_backend()
     minor = f"py{sys.version_info.major}.{sys.version_info.minor}"
-    return f"jaxlib{jaxlib.__version__}/{backend}/{minor}/{kind}/{cpu_class()}"
+    return f"jaxlib{jaxlib.__version__}/{backend}/{minor}/{kind}/{HOST.cpu_class()}"
 
 
 def install(url: str, token: str) -> RemoteCache | None:

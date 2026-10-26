@@ -15,7 +15,7 @@ from dew import _records
 from dew.batch import Variables
 from dew.data.text import HFTokenizer
 from dew.interop.composite import CompositeSource, HeadComponent, NativeComponent, SourceKind
-from dew.interop.pretrained import Pretrained
+from dew.interop.pretrained import Pretrained, with_overrides
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.registry import dtype_name, from_record, import_path
 
@@ -48,6 +48,20 @@ _LABELS = Labels(variants=("{}",), names=SLOT_LABELS)
 
 def _path(name: str) -> tuple[str, ...] | None:
     return _PATHS.get(name)
+
+
+def _attention(overrides: Mapping[str, object]) -> Mapping[str, object]:
+    """The attention modes a `modeling_overrides` record states, by layer kind."""
+    return _records.record(overrides.get("attention", {}), "modeling_overrides.attention")
+
+
+def _full_attention(overrides: Mapping[str, object]) -> str:
+    """The full-attention layers' mode a `modeling_overrides` record states: causal, or the release's
+    block_bidirectional; causal where it states none. The release's `attention` field states it."""
+    mask = _attention(overrides).get("full_attention", "causal")
+    if mask not in ("causal", "block_bidirectional"):
+        raise ValueError(f"unknown full-attention override {mask!r}")
+    return mask
 
 
 def _initialize(head: nn.Module, backbone: Pretrained) -> Variables:
@@ -121,11 +135,15 @@ class SlotSource(SourceKind):
                   else tuple((_records.integer(value, "label_ids"),) for value in ids))
         if labels != canonical or actual != picked:
             raise ValueError("the slot format records its canonical bare labels in tokenizer order")
-        readout = {"readout": mode, "head_dim": fields.get("head_dim", 256), "n_slots": len(ids)}
-        if layout.blocks:
-            readout["attention"] = "noncausal"
         root = Path(directory)
         Pretrained.save(bundle, root, max_shard_size=max_shard_size)
+        readout = {"readout": mode, "head_dim": fields.get("head_dim", 256), "n_slots": len(ids)}
+        # The release's attention field states its full attention as the saved config's overrides do;
+        # the rows' blocks may serve another kind as well.
+        written = _records.record(json.loads((root / "config.json").read_text()), "config.json")
+        if _full_attention(_records.record(written.get("modeling_overrides", {}),
+                                           "modeling_overrides")) == "block_bidirectional":
+            readout["attention"] = "noncausal"
         bundle.decision_tokenizer.save_pretrained(root)
         if mode == "head":
             import torch
@@ -160,16 +178,16 @@ class SlotSource(SourceKind):
                       Text("\n\n"), AnswerCue()))
 
     @staticmethod
-    def describe(directory: Path) -> CompositeSource | None:
+    def describe(directory: Path, overrides: Mapping[str, object] | None = None) -> CompositeSource | None:
         path = directory / "config.json"
         if not path.is_file():
             return None
         config = _records.record(json.loads(path.read_text()), "config.json")
-        overrides = _records.record(config.get("modeling_overrides", {}), "modeling_overrides")
+        released = _records.record(config.get("modeling_overrides", {}), "modeling_overrides")
         path = directory / "readout.json"
-        if not path.is_file() and "readout" not in overrides:
+        if not path.is_file() and "readout" not in released:
             return None
-        fields = ({key: overrides[key] for key in ("readout", "head_dim", "n_slots") if key in overrides}
+        fields = ({key: released[key] for key in ("readout", "head_dim", "n_slots") if key in released}
                   if not path.is_file() else _records.record(json.loads(path.read_text()), "readout.json"))
         unknown = set(fields) - {"readout", "head_dim", "n_slots", "attention"}
         if unknown:
@@ -184,22 +202,23 @@ class SlotSource(SourceKind):
         attention = fields.get("attention", "causal")
         if attention not in ("causal", "noncausal"):
             raise ValueError("a slot readout's attention is causal or noncausal")
-        if "attention" in overrides:
-            masks = _records.record(overrides["attention"], "modeling_overrides.attention")
-            mask = masks.get("full_attention", "causal")
-            if mask not in ("causal", "block_bidirectional"):
-                raise ValueError(f"unknown full-attention override {mask!r}")
-            declared = "noncausal" if mask == "block_bidirectional" else "causal"
+        if "attention" in released:
+            declared = "noncausal" if _full_attention(released) == "block_bidirectional" else "causal"
             if "attention" in fields and attention != declared:
                 raise ValueError("readout.json and config.json declare different attention policies")
             attention = declared
-        native = {key: value for key, value in overrides.items()
+        native = {key: value for key, value in released.items()
                   if key not in ("readout", "head_dim", "n_slots")}
         if attention == "noncausal" and "attention" not in native:
             native["attention"] = {"full_attention": "block_bidirectional"}
         config = {key: value for key, value in config.items() if key != "modeling_overrides"}
         if native:
             config["modeling_overrides"] = native
+        # The load's own overrides over the release's: its rows lie in blocks exactly where a layer of
+        # the backbone the native loader builds under them reads blocks, of whatever kind.
+        built = _records.record(with_overrides(config, overrides).get("modeling_overrides", {}),
+                                "modeling_overrides")
+        blocks = "block_bidirectional" in _attention(built).values()
         tokenizer = HFTokenizer(str(directory), local_files_only=True)
         labels, ids = _labels(tokenizer, count)
         head = (SlotHeadSource({"class": import_path(LabelReadout), "fields": {
@@ -207,7 +226,7 @@ class SlotSource(SourceKind):
                 if mode == "slot_lm" else SlotHeadSource({"class": import_path(SlotReadout), "fields": {
                     "label_ids": [row[0] for row in ids], "head_dim": dimension, "slot_rows": count}},
                     _path, weight_file="readout_head.pt", initialize=_initialize))
-        layout = SlotSource.layout(labels=labels, blocks=attention == "noncausal")
+        layout = SlotSource.layout(labels=labels, blocks=blocks)
         return CompositeSource(NativeComponent(config), head, PretrainedDecision.from_components, "",
                                {"layout": layout, "calibration": Calibration(), "strict_specials": False,
                                 "writer": SlotSource.save})

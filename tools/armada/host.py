@@ -1,4 +1,5 @@
-"""The host a process runs on, as Dew's caches of compiled programs and the CI's records key it."""
+"""The host a process runs on, as the CI's records, the tests' shared compilation cache and its XLA
+bundles key it: a tool, not Dew's library, which keys nothing by its host."""
 
 import platform
 import re
