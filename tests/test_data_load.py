@@ -92,12 +92,15 @@ def test_hub_records_prepare_the_pinned_split_and_hold_out_its_first_256(hub, re
 
 
 RACE = """
-import io, sys, threading
-from datasets.utils.tqdm import tqdm as bars
+import importlib, io, sys, threading
 from tqdm.contrib.concurrent import thread_map
-if sys.argv[1] == "held":
+bars = importlib.import_module(sys.argv[2]).tqdm
+if sys.argv[1] == "read":
     from dew.data.sources.hub import hold_progress_lock
     hold_progress_lock()
+if sys.argv[1] == "listing":
+    from dew.data.sources.hub import split_files
+    split_files(["data/train-00000.parquet"], "train")
 started, opened, failures = threading.Event(), threading.Event(), []
 def other():
     started.wait()
@@ -117,24 +120,29 @@ closer = threading.Thread(target=other)
 closer.start(); mapped.start(); closer.join()
 print(failures)
 """
-"""A `datasets` bar opened while another thread reads shards through tqdm's thread_map, as `datasets` reads
-a split's Arrow shards, and closed once the map has ended, in a fresh interpreter: before any read or after
-the lock a Hub read holds (`hold_progress_lock`)."""
+"""A bar of the class `sys.argv[2]` names, opened while another thread maps shards through tqdm's
+thread_map with that class, as `datasets` reads or prepares a split's shards and resolves a listing's
+files, and closed once the map has ended, in a fresh interpreter: before any Hub call, or after a Hub
+read (`hold_progress_lock`) or a listing's discovery (`split_files`)."""
 
 
-def test_a_bar_alive_across_another_threads_shard_read_closes_once_a_hub_read_holds_the_lock():
-    """`datasets`' thread_map deletes its bar class's lock under a bar of another thread's read that outlives
-    the map, as two splits read at once do; after a Hub read holds the class's lock, the map restores it
-    and the bar closes."""
+@pytest.mark.parametrize("bars", ["datasets.utils.tqdm", "tqdm.auto", "huggingface_hub.utils.tqdm"],
+                         ids=["datasets", "auto", "hub-client"])
+@pytest.mark.parametrize("call", ["read", "listing"])
+def test_a_bar_alive_across_another_threads_shard_read_closes_once_a_hub_call_holds_the_lock(call, bars):
+    """tqdm's thread_map deletes its bar class's lock under a bar of another thread's map that outlives
+    it, as two splits read at once, or two streamed sources discovered at once, do; after a Hub read or
+    a listing's discovery, a lock tqdm's class holds is the one every map's class finds, so the map
+    restores it and the bar closes, whichever class `datasets` or the Hub client lends it."""
     import subprocess
     import sys
 
     def race(mode: str) -> str:
-        return subprocess.run([sys.executable, "-c", RACE, mode], capture_output=True, text=True,
+        return subprocess.run([sys.executable, "-c", RACE, mode, bars], capture_output=True, text=True,
                               check=True).stdout.strip()
 
     assert race("bare") != "[]"
-    assert race("held") == "[]"
+    assert race(call) == "[]"
 
 
 def test_a_refused_read_and_disabled_provisioning_leave_the_hub_cache_unprepared(hub):
