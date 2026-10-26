@@ -66,49 +66,60 @@ def test_a_pickle_checkpoint_converts_once_and_then_loads_without_torch(tmp_path
     assert jax.tree.all(jax.tree.map(np.array_equal, first.variables, second.variables))
 
 
-def _converting(root: str, rounds: int, barrier, failures) -> None:
+def _converting(root: str, worker: int, rounds: int, barrier) -> None:
     """One pool process: each round, once every process is at the barrier, convert and read that round's
-    pickle (`sources.tensor_file`, as a release's readout loads), each failure to find its weights put on
-    `failures`."""
+    pickle (`sources.tensor_file`, as a release's readout loads), each failure to find its weights written
+    to the worker's own report. Any other failure aborts the barrier, so no peer waits on this process."""
     os.environ["XDG_CACHE_HOME"] = str(Path(root) / "cache")
     from dew.interop import sources
 
-    for round_ in range(rounds):
-        barrier.wait()
-        try:
-            sources.tensor_file(Path(root) / f"release-{round_}" / "readout_head.pt")
-        except FileNotFoundError as failure:
-            failures.put(f"{round_}: {failure}")
+    missing = []
+    try:
+        for round_ in range(rounds):
+            barrier.wait()
+            try:
+                sources.tensor_file(Path(root) / f"release-{round_}" / "readout_head.pt")
+            except FileNotFoundError as failure:
+                missing.append(f"{round_}: {failure}")
+    except BaseException:
+        barrier.abort()
+        raise
+    (Path(root) / f"report-{worker}.json").write_text(json.dumps(missing))
 
 
 def test_processes_converting_one_pickle_at_once_each_read_its_weights():
     """A pool's processes loading one release's pickle at once each convert it and read the conversion,
-    round after round, under a cache on the home directory's filesystem, where a pool's ~/.cache lies (an
-    overlay in CI, whose listing of a folder another process was rewriting a file in found no weights).
-    Each conversion is published whole, so every read finds them."""
-    rounds, processes = 16, 8
+    round after round, under a cache on the home directory's filesystem, where a pool's ~/.cache lies: an
+    overlay in CI, where a listing of the folder another process was replacing a file in found no weights
+    (eight processes, forty rounds: some forty misses before the conversion was published whole, none
+    under a tmpfs). Each conversion is published whole, so every read finds its weights."""
+    rounds, workers = 8, 8
     home = Path.home() / ".cache"
     home.mkdir(parents=True, exist_ok=True)
     root = tempfile.mkdtemp(dir=home, prefix="dew-pickle-race-")
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(workers)
+    pool = []
     try:
         for round_ in range(rounds):
             release = Path(root) / f"release-{round_}"
             release.mkdir()
             torch.save({f"w{index}": torch.randn(64, 64) for index in range(8)}, release / "readout_head.pt")
-        context = multiprocessing.get_context("spawn")
-        barrier, failures = context.Barrier(processes), context.Queue()
-        pool = [context.Process(target=_converting, args=(root, rounds, barrier, failures))
-                for _ in range(processes)]
-        for process in pool:
-            process.start()
+        for worker in range(workers):
+            pool.append(context.Process(target=_converting, args=(root, worker, rounds, barrier)))
+            pool[-1].start()
         for process in pool:
             process.join()
-        assert [process.exitcode for process in pool] == [0] * processes
-        found = []
-        while not failures.empty():
-            found.append(failures.get())
-        assert not found, found[:3]
+        assert [process.exitcode for process in pool] == [0] * workers
+        missing = [line for worker in range(workers)
+                   for line in json.loads((Path(root) / f"report-{worker}.json").read_text())]
+        assert not missing, missing[:3]
     finally:
+        barrier.abort()
+        for process in pool:
+            if process.is_alive():
+                process.terminate()
+            process.join()
         shutil.rmtree(root, ignore_errors=True)
 
 
