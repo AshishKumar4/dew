@@ -3325,7 +3325,14 @@ jitted medians of five interleaved groups of thirty calls, 8192 tokens (jax 0.11
 | 12288 x 4096 | 2.639 | 1.820 | 1.45 |
 
 So a Qwen3.5-0.8B's projections (1024 wide) stay in bf16, and a 9B's attention and MLP
-projections gain. Which sites run FP8 is that measurement on the run's own GPU and token count
+projections gain. That FP8 GEMM did not hold the accuracy gate on an H100: Hopper's FP8 tensor cores
+keep a narrower running sum, and at 512 x 4096 x 4096 its product lay 291 times the dequantized fp32
+product's distance from float64 at the highest precision (3011 times at the default), however K was
+split. The product now multiplies the codes widened to bf16 and held apart from the dot, which XLA
+runs as a bf16 GEMM with exact products and fp32 sums (0.53 times that distance), in 1.7 times the
+FP8 GEMM's time, so no site measures faster in FP8 until a kernel whose FP8 sum keeps fp32's
+accuracy returns (ledger 1625). Until then a frozen FP8 base saves neither memory nor time: its codes
+take two bytes a parameter, as bf16's do, and multiply as bf16 values. Which sites run FP8 is that measurement on the run's own GPU and token count
 (`measured_fp8_sites`), recorded with the generation it was taken on; another generation is
 refused rather than reusing it. The function changes by E4M3's rounding of both operands.
 
