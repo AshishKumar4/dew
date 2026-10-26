@@ -29,7 +29,7 @@ from dew.registry import mixers
 from dew.training import Trainer
 from dew.training.distributed import Layout, MeshSpec, microbatch
 from dew.training.memory import climb_to, recompute_more, rung_record
-from dew.training.planning import Timer, planned, splits
+from dew.training.planning import TIMED_REPEATS, UNTIMED_FRONTIER, Timer, planned, splits
 
 ROWS, SEQ = 32, 16
 BATCH = {"text": jnp.asarray((np.arange(ROWS * (SEQ + 1)).reshape(ROWS, SEQ + 1) * 7) % 64, jnp.int32)}
@@ -383,10 +383,12 @@ def test_a_resumed_run_reads_its_batches_in_the_microbatches_its_checkpoint_trai
 
 
 @pytest.mark.mesh(devices=2)
-def test_a_resumed_run_continues_the_plan_its_frontier_chose_untimed(tmp_path):
+def test_a_resumed_run_continues_the_plan_its_frontier_chose_untimed(tmp_path, monkeypatch):
     """A run over two devices times its frontier, the batch whole as it fits and a rung up, and keeps one;
     a run resumed from its checkpoint continues that plan without timing again, as the run it continues
     compiled it, so the two train one program whatever a second timing would say."""
+    # The frontier timed, as the library times it: Dew's tests keep its first plan otherwise.
+    monkeypatch.delenv(UNTIMED_FRONTIER)
     corpus = token_files(tmp_path)
 
     def run(split):
@@ -549,7 +551,8 @@ def test_the_timer_steps_the_state_it_was_given_and_hands_back_a_fresh_copy():
     before = [raw(leaf).copy() for leaf in jax.tree.leaves(state)]
     timer = Timer(state, BATCH)
     seconds = timer([step, step])
-    assert len(seconds) == 2 and all(took > 0 for took in seconds)
+    assert len(seconds) == 2
+    assert all(len(samples) == TIMED_REPEATS and min(samples) > 0 for samples in seconds)
     assert all(leaf.is_deleted() for leaf in jax.tree.leaves(state))
     assert all(np.array_equal(raw(left), right)
                for left, right in zip(jax.tree.leaves(timer.state), before, strict=True))

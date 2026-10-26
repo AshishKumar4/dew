@@ -509,21 +509,11 @@ def orbit(width: int):
     return orders
 
 
-def chosen(fitted: Trainer):
-    """A timer that picks the plan `fitted`'s fit kept from the two it timed (`plan["timed"]`): the
-    kept one timed faster, the other slower, whatever either took then."""
-    timed = fitted.plan["timed"]
-    kept = [(timing["split"], timing["remat"]) == (fitted.plan["split"], fitted.plan["remat"])
-            for timing in timed or ()]
-    return lambda steps: [[0.0] if keep else [1.0] for keep in kept]
-
-
-def drawn_steps(case: Case, tmp_path, fsdp, devices, initial, steps: int, *, exact: bool = False,
-                fitted: Trainer | None = None):
+def drawn_steps(case: Case, tmp_path, fsdp, devices, initial, steps: int, *, exact: bool = False):
     """`steps` steps of a layout over the batch a draw gives, from `initial` in the residual order
     it gives (`reordered`), every step on the same rows, as `run_case`'s `fit` takes them, the step
-    compiled once for every draw at the plan `fitted`'s fit chose where it timed two (`fitted.plan`'s
-    `timed`, a frontier over several devices): a function of the raw batch and the order returning
+    compiled once for every draw at the plan fit takes, a frontier's first, untimed in Dew's tests
+    (`dew.training.planning.UNTIMED_FRONTIER`): a function of the raw batch and the order returning
     the stepped state's variables, optimizer state and EMA taken back to the identity order
     (`in_identity_order`). `exact` runs one device in float64 from the state widened, the batch's
     samples widened (`wide`), built at its first call, so under the caller's float64."""
@@ -541,7 +531,7 @@ def drawn_steps(case: Case, tmp_path, fsdp, devices, initial, steps: int, *, exa
         batch = shard_batch(trainer.device_mesh, prepare_counts(
             trainer.objective, wide(case, raw) if exact else raw, count_model=False))
         if len(built) == 1:
-            built.append(trainer.compile(state, batch, None if fitted is None else chosen(fitted)))
+            built.append(trainer.compile(state, batch))
         for _ in range(steps):
             state, *_ = built[1](state, batch)
         return in_identity_order(
@@ -640,9 +630,9 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layou
     seeds = LAYOUT_SEEDS[case.name]
     fsdp = LAYOUTS[layout]
     _, alone, _ = run_case(case, tmp_path, fsdp=1, devices=1, state=copied(), steps=steps)
-    fitted, state, _ = run_case(case, tmp_path, fsdp=fsdp, state=copied(), steps=steps)
+    _, state, _ = run_case(case, tmp_path, fsdp=fsdp, state=copied(), steps=steps)
     drawn = {"one device": drawn_steps(case, tmp_path, 1, 1, initial, steps),
-             layout: drawn_steps(case, tmp_path, fsdp, None, initial, steps, fitted=fitted)}
+             layout: drawn_steps(case, tmp_path, fsdp, None, initial, steps)}
     # The drawn steps are fit's own on its batch, bit for bit, so what check 1 judges is the run's:
     # the cell's own batch in its own order, whatever selection margin a draw then asks.
     own = (next(batches(case, encoder)()), np.arange(width))

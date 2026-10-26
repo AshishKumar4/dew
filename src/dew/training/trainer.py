@@ -168,7 +168,17 @@ from dew.training.model_flops import (
 )
 from dew.training.narrow import narrowed, narrowed_paths
 from dew.training.observe import Observe
-from dew.training.planning import Candidate, Planned, Timer, faster, plan_step, settled, splits, whole_step
+from dew.training.planning import (
+    Candidate,
+    Planned,
+    Timer,
+    faster,
+    plan_step,
+    settled,
+    splits,
+    untimed_frontier,
+    whole_step,
+)
 from dew.training.profiling import ProfileWindow, owned_capture, start_capture, stop_capture
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
@@ -2110,7 +2120,9 @@ class Trainer(Generic[Loss, Effects]):
             agreed_same("training batch layout", lambda: batch_layout(batch))
             began = time.perf_counter()
             with region("compile"):
-                compiled[signature] = (self.compile(state, batch, timer), self.step_flops)
+                # Dew's tests keep a frontier's first plan (`UNTIMED_FRONTIER`), a test setting.
+                compiled[signature] = (self.compile(state, batch, None if untimed_frontier() else timer),
+                                       self.step_flops)
             seconds = time.perf_counter() - began
             links = {axis: AxisLink(link.bytes_per_second, link.spread)
                      for axis, link in self.links.items()}

@@ -14,6 +14,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 from collections.abc import Callable, Mapping, Sequence
 
 import jax
@@ -241,6 +242,20 @@ def step_seconds(step: Callable, state: TrainState, batch: Batch) -> list[float]
         return held[0]
 
     return samples(stepped, warmup=TIMED_WARMUP, repeats=TIMED_REPEATS, calls=TIMED_STEPS)
+
+
+UNTIMED_FRONTIER = "DEW_UNTIMED_FRONTIER"
+"""The environment variable that, set to 1, has a process keep a frontier's first plan untimed: Dew's
+tests' setting (tests/lane_environment.py), never the library's. A frontier's choice follows its
+clock, so two runs timed apart may train different programs, by design; a test whose property is a
+resume's, two pools a run and its resume, would read that choice as its own, where no record pins a
+pool's plan (`dew.training.rungs.recorded_rung`). The choice itself stays tested through `Trainer.compile`'s
+own timer."""
+
+
+def untimed_frontier() -> bool:
+    """Whether this process keeps a frontier's first plan untimed (`UNTIMED_FRONTIER`)."""
+    return os.environ.get(UNTIMED_FRONTIER) == "1"
 
 
 def faster(timings: Sequence[Sequence[float]]) -> int:

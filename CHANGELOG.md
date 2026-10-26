@@ -11,7 +11,8 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   reduction; a float64 schedule division is the plain division; and a plan over several devices is
   timed against the batch whole a rung up on every backend: it keeps the first plan unless the other's
   every sample beats it (`dew.training.planning.faster`), so two runs of one configuration train one
-  program, and a resumed run continues its checkpoint's plan untimed. The sharded LM head maps over the axes that
+  program, and a resumed run continues its checkpoint's plan untimed. Dew's tests keep a frontier's
+  first plan (`DEW_UNTIMED_FRONTIER`, a test setting like `DEW_WIDE_CPU_ARITHMETIC`). The sharded LM head maps over the axes that
   split its tokens alone, every other axis left automatic, in place of holding every axis manual.
 - 8-bit Adam state codes each moment value among the six codes around its estimate, its decade by its
   logarithm, instead of searching the whole map: on an A100, lm-dense's update takes 27.32 ms against
