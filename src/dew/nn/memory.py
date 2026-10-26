@@ -36,7 +36,10 @@ tokens, so a method interceptor the model computes under finds each head's sites
 An adapter on an inner kernel (`dew.lora`) adds its branch, s drop(x) A B, at every application, as it
 does at any Dense, its dropout drawing from each token's key in a forward that carries the dropout
 stream. Its update is W_0's: the B factor rides the state with no step of its own, so a retention
-forgets it as it forgets W_0, and the memory computes what the adapter's merge computes.
+forgets it as it forgets W_0, and the memory computes what the adapter's merge computes. A checkpoint's
+input quantization at an inner site (`dew.quantization`) rounds that site's input at every application
+alike. A frozen FP8 record's codes at an inner kernel stand for W_0's kernel, as they decode: in a
+memory only W_0 is frozen, and each application multiplies the state the steps move from it.
 
 A linear memory (`LinearMemory`) on its given target, with no momentum, no orthogonalized or slow
 weights and each token reading its own step, is a row of the shared linear recurrence
@@ -206,10 +209,10 @@ class InContextMemory(nn.Module):
     `network` is the inner network, any module that maps one vector of the view's width to one of the
     same width and takes a `dtype` (`LinearMemory`, `ResidualMemory`, `MLPMemory`, an existing block
     such as `GatedMLP`); it runs as each head's scope stores it, at the dtype each use asks, and its
-    parameters, drawn at init, are W_0. `heads` memories run side by side over the views split into heads of
-    `head_features`. A view is projected from the stream, or the stream itself where its `project_*`
-    is off, as a continuum-memory level reads its block's input (one head). `gates` are the step size
-    theta (`learning_rate`), the momentum mu (None: none) and the retention alpha (None: none).
+    parameters, drawn at init, are W_0. `heads` memories run side by side over the views split into
+    heads of `head_features`. A view is projected from the stream, or the stream itself where its
+    `project_*` is off, as a continuum-memory level reads its block's input (one head). `gates` are the
+    step size theta (`learning_rate`), the momentum mu (None: none) and the retention alpha (None: none).
     `output` projects the heads' readouts back to the stream's width.
     """
 
@@ -335,8 +338,8 @@ class InContextMemory(nn.Module):
 
         # A wrapper's packing (a frozen FP8 record's codes in a kernel's place) leaves a stored W_0 another
         # structure than a fresh draw's, which a param's check against its initializer would refuse.
-        stored = (self.get_variable("params", "initial") if self.has_variable("params", "initial")
-                  else self.param("initial", drawn))
+        stored = (nn.meta.unbox(self.get_variable("params", "initial"))
+                  if self.has_variable("params", "initial") else self.param("initial", drawn))
         others = {collection: tree["initial"] for collection, tree in self.variables.items()
                   if collection != "params" and "initial" in tree}
         heads = [_decoded_codes({"params": stored[name], **{collection: tree[name] for collection, tree
