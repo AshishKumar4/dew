@@ -270,7 +270,8 @@ def test_a_library_arm_holds_dew_to_the_larger_of_its_error_and_the_references()
                             library_fn=library, **unnamed)
     with pytest.raises(TypeError):
         assert_as_exact(arm(1.7, "mine"), reference, draw, "a NumPy library arm", seeds=16, truth_fn=truth,
-                        library_fn=lambda x, *_: {"covered": np.asarray(x), "other": np.asarray(x)},
+                        library_fn=lambda x, *_: {"covered": np.full(np.shape(x), 1 / 3),
+                                                  "other": np.full(np.shape(x), 1 / 3)},
                         library_row=1543, library_leaves=both)
     verdicts = null_runs(reference, draw, "library arm", seeds=16, runs=2, truth_fn=truth,
                          dew_fn=arm(1.7, "mine"), paired=True, library_fn=library, library_leaves=both)
