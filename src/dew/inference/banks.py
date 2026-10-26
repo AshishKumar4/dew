@@ -555,7 +555,7 @@ def spread(tree: Mapping, rows=lambda leaf, count: [leaf[offset] for offset in r
     goes and the base is held twice for one leaf at most.
 
     A CPU-owned training run stores its frozen collection banked
-    (`dew.training.execution.banked`); this is the layer view every reader
+    (`banked`, its inverse); this is the layer view every reader
     keyed by `layers_N`, a placement or a model, takes of it.
     """
     spread_tree = {}
