@@ -5,11 +5,16 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
-- Every run names the metrics its validation passes score, `--val-metrics` (`RunConfig.val_metrics`), which
-  only a diffusion run held: where it names none, each kind scores its own (`default_metrics`): a
-  language model its perplexity, a decision run accuracy, calibration error, the risk-coverage area and
-  the log loss, a JEPA run its probes, an image run CLIP; `[]` scores none.
+- Every run names its validation splits' metrics, `--val-metrics` (`RunConfig.val_metrics`), which only a
+  diffusion run held: each metric scores the split it names (`MetricConfig.split`) or every split, so a
+  decision run scores accuracy on `val` and the Brier score on `test`. Where it names none, each split
+  scores the kind's own (`default_metrics`): a language model's perplexity, a decision run's accuracy,
+  calibration error, risk-coverage area and log loss, a JEPA run's probes, an image run's CLIP.
   `DiffusionRunConfig.build_eval_metrics` is `validation_metrics(validates=...)`.
+- A run weighs its splits' scores into named summaries, a board's weighted index (`--val-summaries`,
+  `Trainer.fit(summaries=)`, `dew.training.evaluation.Summary`): each formed once an evaluation, only
+  where it scored every split the summary weighs, logged as `summary/<name>`, and ranked by `Best`
+  (`--trainer.best summary/<name>`) and `Plateau`.
 - A language-model run loops a `--pretrained` decoder as a decision run does: `--loop-steps`,
   `--loop-layers`, `--loop-backprop-steps` and `--loop-remat` are both runs' (`DecoderRunConfig`), and
   `looping` is `dew.config.looping`.

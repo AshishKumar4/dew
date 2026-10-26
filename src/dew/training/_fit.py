@@ -16,7 +16,7 @@ from dew.objectives.base import Batch, Metric
 from dew.telemetry.profile import region
 from dew.training.budget import Plateau
 from dew.training.distributed import DevicePrefetchIterator, Signature
-from dew.training.evaluation import EvalSuite, Evaluation
+from dew.training.evaluation import EvalSuite, Evaluation, Summary
 from dew.training.interval import Interval, Taken
 from dew.training.observe import Observe
 from dew.training.runtime import PreemptionNotice
@@ -50,6 +50,8 @@ class FitPlan:
     suites: Mapping[str, EvalSuite] = dataclasses.field(default_factory=dict)
     held_best: bool = False  # a restore_best without Checkpoints (`HeldBest`)
     """Every validation split by name, its metrics and cadence resolved."""
+    summaries: tuple[Summary, ...] = ()
+    """The scalars each evaluation that scores every split they weigh forms (`Summary`)."""
     observe: Observe | None = None
 
     @property

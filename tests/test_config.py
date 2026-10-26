@@ -557,11 +557,14 @@ def test_param_groups_with_schedules_momentum_and_bounds_round_trip():
     assert loaded.optim.param_groups[0].bounds == (0.0, 24.0)
 
 
-def test_every_kind_of_run_scores_the_metrics_it_names_and_its_own_by_default():
-    """`val_metrics` is every run's (`RunConfig`): where it names none, each kind scores its own where
-    its data validates (`default_metrics`): a language model its perplexity, a decision run its
-    held-out suite, a JEPA run its probes; `()` scores none, and a metric named is what each scores,
-    its record round tripping through the command line and run.json alike."""
+def test_every_kind_of_run_scores_its_own_metrics_unless_it_names_each_splits():
+    """`val_metrics` is every run's (`RunConfig`). Where it names none, each split scores the kind's own
+    (`default_metrics`): a language model its perplexity, a decision run its held-out suite, a JEPA run
+    its probes. Where it names them, each split scores those that name it or no split
+    (`MetricConfig.split`), a split none names scores none, and a metric of a split the run does not
+    validate is refused; the record round trips through the command line and run.json alike."""
+    import types
+
     from dew.config import MetricConfig
     from dew.config.jepa import JepaRunConfig
     from dew.config.lm import LMRunConfig
@@ -571,16 +574,28 @@ def test_every_kind_of_run_scores_the_metrics_it_names_and_its_own_by_default():
     from dew.objectives.jepa.probes import KnnProbe, LinearProbe
     from dew.objectives.lm.objective import Perplexity
 
-    def kinds(run):
-        return [type(metric) for metric in run.validation_metrics(validates=True)]
+    def kinds(metrics):
+        return [type(metric) for metric in metrics]
 
-    assert kinds(LMRunConfig()) == [Perplexity] and LMRunConfig().validation_metrics(validates=False) == ()
-    assert kinds(DecisionRunConfig()) == [Accuracy, ECE, AURC, LogLoss]
-    assert kinds(JepaRunConfig()) == [] and kinds(JepaRunConfig(probe_classes=7)) == [LinearProbe, KnnProbe]
+    assert kinds(LMRunConfig().validation_metrics(validates=True)) == [Perplexity]
+    assert LMRunConfig().validation_metrics(validates=False) == ()
+    assert kinds(DecisionRunConfig().validation_metrics(validates=True)) == [Accuracy, ECE, AURC, LogLoss]
+    assert kinds(JepaRunConfig(probe_classes=7).validation_metrics(validates=True)) == [LinearProbe, KnnProbe]
     linear, knn = JepaRunConfig(probe_classes=7, knn_k=5).validation_metrics(validates=False)
     assert (linear.num_classes, knn.num_classes, knn.k) == (7, 7, 5)
-    named = LMRunConfig.cli(["--val-metrics", '[{"name": "brier"}]'])
-    assert named.val_metrics == (MetricConfig("brier"),) and kinds(named) == [Brier]
-    assert LMRunConfig.from_dict(named.to_dict()) == named
-    for run in (LMRunConfig, DecisionRunConfig, JepaRunConfig):
-        assert run(val_metrics=[]).validation_metrics(validates=True) == ()
+    splits = {"val": object(), "test": object()}
+    stream = types.SimpleNamespace(val=None)
+    assert LMRunConfig().suites(stream, splits) is None
+    flag = '[{"name": "accuracy"}, {"name": "brier", "split": "test"}]'
+    named = DecisionRunConfig.cli(["--val-metrics", flag])
+    assert named.val_metrics == (MetricConfig("accuracy"), MetricConfig("brier", split="test"))
+    suites = named.suites(stream, splits)
+    assert {split: (suite.data, kinds(suite.metrics)) for split, suite in suites.items()} == {
+        "val": (splits["val"], [Accuracy]), "test": (splits["test"], [Accuracy, Brier])}
+    assert DecisionRunConfig.from_dict(named.to_dict()) == named
+    only = LMRunConfig(val_metrics=[MetricConfig("perplexity", split="test")]).suites(stream, splits)
+    assert {split: kinds(suite.metrics) for split, suite in only.items()} == {"val": [], "test": [Perplexity]}
+    assert LMRunConfig(val_metrics=[]).suites(types.SimpleNamespace(val=None), None) == {}
+    for stray in ([MetricConfig("brier", split="holdout")], [MetricConfig("brier")]):
+        with pytest.raises(ValueError):
+            LMRunConfig(val_metrics=stray).suites(stream, splits if stray[0].split else None)

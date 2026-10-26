@@ -143,7 +143,7 @@ from dew.training.distributed import (
     step_reads,
     traced_start,
 )
-from dew.training.evaluation import EvalSuite, Evaluation
+from dew.training.evaluation import EvalSuite, Evaluation, Summary
 from dew.training.interval import Interval, held
 from dew.training.memory import (
     climb_to,
@@ -1300,6 +1300,7 @@ class Trainer(Generic[Loss, Effects]):
         best: str | Metric | TrainingScalar | types.MethodType | Best | Sequence[Best] | None = None,
         stop: Plateau | Pause | None = None,
         validation: Dataset | Mapping[str, Dataset | Reader | EvalSuite] | None = None,
+        summaries: Sequence[Summary] = (),
         restore_best: bool = False,
         state: TrainState | None = None,
         observe: Observe | None = None,
@@ -1312,8 +1313,7 @@ class Trainer(Generic[Loss, Effects]):
         run's initial state, say. It is not a continuation, which is a checkpoint's
         alone: its input reader starts at the position `dataset` supplies.
 
-        Every `log_every` steps, the tracker receives the loss, the objective's
-        metrics and the throughput.
+        Every `log_every` steps, the tracker receives the loss, the objective's metrics and the throughput.
 
         `tokens` stops at the first microbatch that reaches this real-token
         budget, from the same counter as `train/tokens`, persisted in checkpoints.
@@ -1321,11 +1321,12 @@ class Trainer(Generic[Loss, Effects]):
         with `steps=None`, a decaying schedule needs its own step horizon. `examples`
         trains on the chain's first records, each once (`Loader.example_steps`).
 
-        Every `eval_every` steps, and at the end, the validation split is scored. The
-        objective's artifacts go to the tracker and to `metrics`, whose reductions are
-        logged as `val/<name>`. `validation` is that split as a Dataset, or names
-        several, each a Dataset, a reader scored as `dataset.val` would be or an
-        `EvalSuite` with its own metrics and cadence, logged as `<name>/<metric>`.
+        Every `eval_every` steps, and at the end, the validation split is scored. The objective's
+        artifacts go to the tracker and to `metrics`, whose reductions are logged as `val/<name>`.
+        `validation` is that split as a Dataset, or names several, each a Dataset, a reader scored as
+        `dataset.val` would be or an `EvalSuite` with its own metrics and cadence, logged as
+        `<name>/<metric>`. Each of `summaries` weighs those scores into one, `summary/<name>`, formed
+        at an evaluation that scored every split it weighs, which `best` and `Plateau` rank by.
 
         `restore_best=True` returns the model the run ranked best: the final
         state with the counters, variables and EMA of the best step
@@ -1335,12 +1336,10 @@ class Trainer(Generic[Loss, Effects]):
         so it is the best model, not a point to resume training from, which
         the run's checkpoints are.
 
-        Every `checkpoint_every` steps, the state and the data position are
-        written; `checkpoint_final=True` also writes the final state, independently
-        of that cadence. A duration is checked at each `log_every` step, so
-        they are written at the first log step after that much time. Every
-        `checkpoints.local_every` steps they are also written to the local
-        directory.
+        Every `checkpoint_every` steps, the state and the data position are written;
+        `checkpoint_final=True` also writes the final state, independently of that cadence. A
+        duration is checked at each `log_every` step, so they are written at the first log step
+        after that much time, and every `checkpoints.local_every` steps to the local directory.
 
         A preemption notice (a scheduler's SIGTERM; `PreemptionNotice`) stops the run
         at the next step every process agrees on. That step's state and data position
@@ -1367,8 +1366,9 @@ class Trainer(Generic[Loss, Effects]):
         count_compilation_cache()
         self._schedule(None if steps is None else steps // self.accumulation)
         suites = _suites(loader, validation, metrics, eval_every)
-        selection, plateau, pause = self._fit_policies(best, stop, metrics, suites, checkpoint_every,
-                                                       steps, tokens)
+        summaries = self._summaries(summaries, suites)
+        selection, plateau, pause = self._fit_policies(best, stop, metrics, suites, summaries,
+                                                       checkpoint_every, steps, tokens)
         self._preflight(loader, plateau, suites, preview=preview,
                         loss=(self.checkpoints is not None or restore_best) and not selection)
         preview = preview and self.tracker is not None
@@ -1386,7 +1386,7 @@ class Trainer(Generic[Loss, Effects]):
                 checkpoint_every=checkpoint_every, checkpoint_final=checkpoint_final,
                 local_every=None if checkpoints is None else checkpoints.local_every,
                 metrics=metrics, preview=preview, best=selection, stop=plateau, suites=suites, pause=pause,
-                held_best=restore_best and checkpoints is None, observe=observe,
+                held_best=restore_best and checkpoints is None, observe=observe, summaries=summaries,
             )
             trained = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state)
             # The state a checkpoint would hold: the step rebuilds its narrow copies.
@@ -1877,7 +1877,18 @@ class Trainer(Generic[Loss, Effects]):
             run.ahead = (waited_read(run, interval, agree=True),)
         return run.ahead[0] is None
 
-    def _fit_policies(self, best, stop, metrics, suites, checkpoint_every, steps, tokens):
+    def _summaries(self, summaries: Sequence[Summary],
+                   suites: Mapping[str, EvalSuite]) -> tuple[Summary, ...]:
+        """`summaries`, each of whose scores some evaluation records (`Summary.check`), one of each name."""
+        names = [summary.name for summary in summaries]
+        if len(names) != len(set(names)):
+            raise ValueError(f"summaries are named apart, and {names} repeats one")
+        loss = self.objective.defines_validation_loss
+        for summary in summaries:
+            summary.check(suites, loss)
+        return tuple(summaries)
+
+    def _fit_policies(self, best, stop, metrics, suites, summaries, checkpoint_every, steps, tokens):
         """The run's best selection and its stop policy: a `Plateau` with its metric bound to the
         objective, or the step and tokens a `Pause` of a run of `steps` and `tokens` ends it at
         (`Pause.at`), which needs a checkpointer to resume from."""
@@ -1888,7 +1899,8 @@ class Trainer(Generic[Loss, Effects]):
                              "checkpointer; pass Checkpoints(directory)")
         pause = stop.at(steps, tokens, self.accumulation) if isinstance(stop, Pause) else (None, None)
         plateau = stop if isinstance(stop, Plateau) else None
-        scored = split_metrics(suites) or {'val': tuple(metrics)}
+        scored = {**(split_metrics(suites) or {'val': tuple(metrics)}),
+                  **({Summary.SPLIT: summaries} if summaries else {})}
         raw = (
             ()
             if best is None
@@ -1921,9 +1933,9 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError("select each metric once; one Best.top already keeps all its winners")
         if plateau is not None:
             metric = owned(plateau.metric)
-            if not isinstance(metric, (Metric, TrainingScalar)):
+            if not isinstance(metric, (Metric, TrainingScalar, Summary)):
                 raise TypeError(
-                    "Plateau selects a declared metric object, not a Best policy or score function"
+                    "Plateau selects a declared metric object or summary, not a Best policy or score function"
                 )
             stopping = Best(metric, mode=plateau.mode, split=plateau.split).resolved(scored)
             plateau = dataclasses.replace(plateau, metric=metric, mode=stopping.mode, split=stopping.split)
@@ -1934,7 +1946,7 @@ class Trainer(Generic[Loss, Effects]):
         stop = plan.stop
         if stop is None:
             return False
-        assert isinstance(stop.metric, (Metric, TrainingScalar)), (
+        assert isinstance(stop.metric, (Metric, TrainingScalar, Summary)), (
             "fit binds the stopping selector before stepping"
         )
         name = f'{stop.split}/{stop.metric.name}'
@@ -2000,11 +2012,15 @@ class Trainer(Generic[Loss, Effects]):
                     and not any(metric.name == 'loss' for metric in suite.metrics))
             evaluations.append(self._evaluate(state, shardings, suite.data, suite.metrics, plan.preview,
                                               loss=loss, split=split, training=reports, warm=warm))
-        return dataclasses.replace(
-            evaluations[0],
-            scores={name: value for report in evaluations for name, value in report.scores.items()},
-            elapsed_seconds=sum(report.elapsed_seconds for report in evaluations),
-        )
+        scores = {name: value for report in evaluations for name, value in report.scores.items()}
+        # Each summary is formed once, here, and only where this pass scored every split it weighs.
+        formed = {} if warm else {name: value for summary in plan.summaries
+                                  for name, value in summary.formed(scores, chosen).items()}
+        if formed:
+            self._report_evaluation(dataclasses.replace(evaluations[0], scores=formed, previews=(),
+                                                        coordinated_batches=0))
+        return dataclasses.replace(evaluations[0], scores={**scores, **formed},
+                                   elapsed_seconds=sum(report.elapsed_seconds for report in evaluations))
 
     def _preflight(self, dataset: Loader, stop, suites: Mapping[str, EvalSuite], *,
                    preview: bool, loss: bool) -> None:
