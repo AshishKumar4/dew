@@ -9,6 +9,7 @@ sums), and the Triton mainloop's, as the route feeds them. Its configs are its T
 the device's, a site pinning one where it names a schedule (`tuning.pinned`)."""
 
 import contextlib
+import dataclasses
 import functools
 
 import jax
@@ -481,6 +482,64 @@ def _backward_call(shape, width: int, accurate: bool):
                                 stats))
     op = attention_mosaic.MosaicBackward(form="causal", keys=tokens, scale=width ** -0.5, accurate=accurate)
     return op, _bound(op, query, key, key, query, spans.start, spans.end, None, None, (), None, residuals)
+
+
+def _softcapped(s, q_pos, k_pos):
+    """A score hook a tuning run keys by what it computes (`AttentionLaunch.HOOKS`)."""
+    del q_pos, k_pos
+    return 30.0 * jnp.tanh(s / 30.0)
+
+
+def _gated(o):
+    """An output hook a tuning run keys by what it computes."""
+    return o * 0.5
+
+
+@pytest.mark.parametrize("launch", ["forward", "backward"])
+def test_a_hooked_launchs_keyed_configs_are_its_derived_ones(launch):
+    """A hooked launch as its picks key it (`tuning.KernelOp.keyed`: each hook its fingerprint, which a
+    stored pick and a tuning run look its configs up by) gives the configs its live call does: its
+    legality reads the fingerprint's lowering as the live call established it, never traces the string."""
+    rows, tokens, heads, kv_heads = SHAPES["interpreted"]
+    spans = template.spans(tokens, tokens, rows, causal=True)
+    query = jax.ShapeDtypeStruct((rows, tokens, heads, 128), jnp.bfloat16)
+    key = jax.ShapeDtypeStruct((rows, tokens, kv_heads, 128), jnp.bfloat16)
+    with generation.assumed("sm90"):
+        if launch == "forward":
+            op = attention_mosaic.MosaicForward(score_mod=_softcapped, output_mod=_gated, form="causal",
+                                                keys=tokens, scale=128 ** -0.5)
+            ba = _bound(op, query, key, key, spans.start, spans.end, None, None, (), (), None)
+        else:
+            stats = jax.ShapeDtypeStruct((rows, heads, tokens), jnp.float32)
+            residuals = (stats, stats, jax.ShapeDtypeStruct((rows, heads, tokens), jnp.int32),
+                         template.Split(jax.ShapeDtypeStruct((rows, heads, tokens, 128), jnp.float32), stats,
+                                        stats, stats))
+            op = attention_mosaic.MosaicBackward(score_mod=_softcapped, form="causal", keys=tokens,
+                                                 scale=128 ** -0.5)
+            ba = _bound(op, query, key, key, query, spans.start, spans.end, None, None, (), None, residuals)
+        keyed = op.keyed(ba)
+        assert isinstance(keyed.op.score_mod, str)
+        assert set(keyed.autotuning_configs) == set(ba.autotuning_configs)
+        assert keyed.heuristics_config == ba.heuristics_config
+
+
+def test_a_pin_the_mosaic_program_cannot_take_is_illegal():
+    """A config a pin or a stored pick names is held to the tiles a program takes (`whole_tiles`) as a
+    derived one is: a 32-query tile under wgmma's 64-row roles, or three consumers where the family's walks
+    take two, is not legal, so a pin of it is refused before any launch."""
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        op, ba = _forward_call(SHAPES["interpreted"], 128, 128, residuals=False)
+        derived = op.derived(ba, target)
+        assert derived is not None and op.legal(ba, derived, target)
+        rows, tokens, _, _ = SHAPES["interpreted"]
+        arrays = [jnp.zeros(ba.arguments[name].shape, ba.arguments[name].dtype)
+                  for name in ("query", "key", "value")]
+        for config in (dataclasses.replace(derived, block_q=32), dataclasses.replace(derived, consumers=3)):
+            assert not op.legal(ba, config, target)
+            with pytest.raises(tuning.Unpinnable), _pinned(config):
+                attention_mosaic.forward(*arrays, template.spans(tokens, tokens, rows, causal=True),
+                                         interpret=True)
 
 
 @INTERPRETS
