@@ -188,9 +188,10 @@ def test_a_loss_mean_is_as_exact_as_numpys_float32_mean():
     (check 1): one reduction over every element left such a sum a float32 step from the correctly
     rounded one, and the JEPA loss a float32 ulp from float64 on some weights, several times numpy's
     distance."""
-    from reference_error import assert_as_exact
+    from reference_error import as_given, assert_as_exact
 
-    assert_as_exact(jax.jit(row_means), lambda squares: squares.mean(axis=1), squared_rows, "row means",
+    assert_as_exact(jax.jit(row_means), as_given(lambda squares: squares.mean(axis=1)), squared_rows,
+                    "row means",
                     seeds=ROW_MEAN_SEEDS)
     (squares,) = squared_rows(0)
     ratio = Objective.row_mean(jnp.asarray(squares), {}, axis=1)

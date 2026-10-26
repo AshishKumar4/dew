@@ -215,7 +215,9 @@ def test_the_stages_log_names_a_judgements_narrow_leaves(tmp_path, monkeypatch):
     def computed(narrow, wide):
         return {"narrow": narrow * (1 + 2.0 ** -20), "wide": wide * (1 + 2.0 ** -20)}
 
-    assert_as_exact(computed, computed, draw, "narrow and wide", seeds=8,
+    # A NumPy law over float64 draws, as given; one function as both arms.
+    given = as_given(computed)
+    assert_as_exact(given, given, draw, "narrow and wide", seeds=8,
                     truth_fn=lambda narrow, wide: {"narrow": narrow, "wide": wide})
     [entry] = [json.loads(line) for line in log.read_text().splitlines()]
     assert entry["narrow_leaves"] == ["['narrow']"]
