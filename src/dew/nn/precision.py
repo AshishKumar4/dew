@@ -210,9 +210,8 @@ honors on a CPU."""
 WIDE_CPU_ARITHMETIC = "DEW_WIDE_CPU_ARITHMETIC"
 """The environment variable that, set to 1, has a process's CPU programs take the arithmetic Dew's
 tests hold a CPU to: float32 products summed in float64 and rounded once (`accumulated`, `spread`), a
-loop's running sum of them compensated so it rounds once too (`compensates_loops`), a row's logsumexp
-reduced in levels of short blocks (`dew.objectives.lm.chunked`) and a float64 division divided as
-written (`dew.diffusion.schedules.common.divided`). Read as each program is traced; set by the tests'
+loop's running sum of them compensated so it rounds once too (`compensates_loops`). Read as each
+program is traced; set by the tests'
 environment (tests/lane_environment.py), never by the library, which without it takes none of these
 forms on any platform. Each such site chooses the wide form by the platform the
 program is lowered for (`platform_dependent`, or for a loop's carry the platform its code is chosen
