@@ -241,9 +241,10 @@ def test_a_self_generated_target_carries_the_outer_gradient():
     assert np.abs(np.asarray(gradient)).max() > 0
 
 
-def packed(segments: np.ndarray) -> MixerCall:
-    """A call over rows packed with the documents `segments` numbers."""
-    laid = coordinates(segments=jnp.asarray(segments), max_segments=2)
+def packed(segments: np.ndarray, positions: np.ndarray | None = None) -> MixerCall:
+    """A call over rows packed with the documents `segments` numbers, at the logical `positions` given
+    (each document's real tokens counted from 0 where None)."""
+    laid = coordinates(segments=jnp.asarray(segments), positions=positions, max_segments=2)
     return MixerCall(metadata=AttentionMetadata(coordinates=laid))
 
 
@@ -268,6 +269,18 @@ def test_packed_documents_read_as_each_alone():
     first = np.asarray(module.apply(params, x[:, :cut], packed(np.ones((ROWS, cut), np.int32))))
     second = np.asarray(module.apply(params, x[:, cut:], packed(np.ones((ROWS, LENGTH - cut), np.int32))))
     np.testing.assert_array_equal(together, np.concatenate([first, second], axis=1))
+
+
+def test_logical_positions_leave_a_documents_chunks_in_place():
+    """A memory counts its chunks over each document's real tokens from its first, whatever logical
+    positions the call gives (a continuation's or a canvas's origin): a packed row whose positions
+    start at 1 reads, bit for bit, as the same row with positions from 0."""
+    module = layer("titans")
+    x, params = drawn(module)(0)
+    segments = np.ones((ROWS, LENGTH), np.int32)
+    shifted = np.broadcast_to(np.arange(1, LENGTH + 1, dtype=np.int32), (ROWS, LENGTH))
+    np.testing.assert_array_equal(np.asarray(module.apply(params, x, packed(segments, shifted))),
+                                  np.asarray(module.apply(params, x, packed(segments))))
 
 
 @pytest.mark.parametrize("name", ["titans", "cms"])
