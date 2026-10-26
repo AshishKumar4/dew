@@ -59,12 +59,21 @@ def decoder(continuum: ContinuumLevel | None = LEVEL, **options) -> CausalTransf
 MODEL = decoder()
 
 
-def drawn_variables(seed: int, model: CausalTransformer = MODEL):
-    """`model`'s variables drawn at 0.5 N(0, 1), its level's `up` among them, so the level moves the
-    states from its first window."""
+STABLE_SCALE = {0.0: 0.5, 0.1: 0.5, 0.5: 0.25}
+"""The scale each rate's draws take: an inner step is stable while the rate times the loss's curvature
+in the level stays below 2, as gradient descent's is, and past it the level diverges window by window,
+its problem's condition number growing with each, so every finite-precision arm, float64's included,
+loses its digits and no draw resolves a comparison. At 0.5 N(0, 1) a step of a half is past it (no
+site resolved within 512 seeds over 64 rows, the verdicts near parity, 1.15 within [0.93, 2.54]);
+at a quarter it is stable and every site resolves. Every rate and both scales stay in the proof."""
+
+
+def drawn_variables(seed: int, model: CausalTransformer = MODEL, scale: float = 0.5):
+    """`model`'s variables drawn at `scale` N(0, 1), its level's `up` among them, so the level moves
+    the states from its first window."""
     rng = np.random.default_rng(seed)
     shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, LENGTH), jnp.int32)))
-    return jax.tree.map(lambda leaf: (0.5 * rng.standard_normal(leaf.shape)).astype(np.float32), shapes)
+    return jax.tree.map(lambda leaf: (scale * rng.standard_normal(leaf.shape)).astype(np.float32), shapes)
 
 
 def equation_71(model, variables, hidden, targets, weights, fields, adaptation: ChunkAdaptation):
@@ -157,12 +166,14 @@ def fields_of(kind: str) -> dict[str, np.ndarray]:
     return {"segment_ids": padded, "attention_mask": valid}
 
 
-def draw(seed: int, rows: int = ROWS):
-    """A draw's variables, final states, targets and weights over `rows` rows, two weights zero."""
+def draw(seed: int, rows: int = ROWS, scale: float = 0.5):
+    """A draw's variables at `scale`, final states, targets and weights over `rows` rows, two weights
+    zero."""
     rng = np.random.default_rng(seed)
     weights = rng.uniform(0.5, 1.5, (rows, LENGTH)).astype(np.float32)
     weights[0, 3] = weights[5, 0] = 0.0
-    return (drawn_variables(seed), rng.standard_normal((rows, LENGTH, FEATURES)).astype(np.float32),
+    states = rng.standard_normal((rows, LENGTH, FEATURES)).astype(np.float32)
+    return (drawn_variables(seed, scale=scale), states,
             rng.integers(0, VOCAB, (rows, LENGTH)).astype(np.int32), weights)
 
 
@@ -185,7 +196,7 @@ def test_the_scan_steps_the_level_as_equation_71(kind, window, rate):
     def reference(variables, hidden, targets, weights):
         return equation_71(MODEL, variables, hidden, targets, weights, fields, adaptation)
 
-    assert_as_exact(jax.jit(dew), jax.jit(reference), draw,
+    assert_as_exact(jax.jit(dew), jax.jit(reference), lambda seed: draw(seed, scale=STABLE_SCALE[rate]),
                     f"equation 71 over {kind} at a window of {window}, rate {rate}", seeds=ADAPTATION_SEEDS)
 
 
@@ -209,7 +220,8 @@ def test_padding_steps_alike_however_it_is_marked(kind):
     def reference(variables, hidden, targets, weights):
         return equation_71(MODEL, variables, hidden, targets, weights, fields, adaptation)
 
-    assert_as_exact(jax.jit(dew), jax.jit(reference), draw, f"padding marked as {kind}", seeds=PADDING_SEEDS)
+    assert_as_exact(jax.jit(dew), jax.jit(reference), lambda seed: draw(seed, scale=STABLE_SCALE[0.5]),
+                    f"padding marked as {kind}", seeds=PADDING_SEEDS)
 
 
 def test_only_the_selected_parts_step():
@@ -224,7 +236,8 @@ def test_only_the_selected_parts_step():
     def reference(variables, hidden, targets, weights):
         return equation_71(MODEL, variables, hidden, targets, weights, {}, adaptation)
 
-    assert_as_exact(jax.jit(dew), jax.jit(reference), draw, "up alone stepping", seeds=SELECTED_SEEDS)
+    assert_as_exact(jax.jit(dew), jax.jit(reference), lambda seed: draw(seed, scale=STABLE_SCALE[0.5]),
+                    "up alone stepping", seeds=SELECTED_SEEDS)
 
 
 @pytest.mark.parametrize("kind", LAYOUTS)
@@ -237,7 +250,7 @@ def test_training_differentiates_through_every_step(kind, rate):
     adaptation = ChunkAdaptation(window=3, rate=rate)
 
     def gradient_draw(seed):
-        variables, hidden, targets, weights = draw(seed)
+        variables, hidden, targets, weights = draw(seed, scale=STABLE_SCALE[rate])
         return variables, hidden, targets, weights, np.float32(1.0)
 
     def dew(variables, hidden, targets, weights):
