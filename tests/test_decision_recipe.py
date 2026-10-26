@@ -8,7 +8,6 @@ from pathlib import Path
 
 import pytest
 
-from dew.config import RunConfig
 from dew.data import Files, Loading, Memory
 from dew.decision import Choice, Decide, decisions
 from dew.decision.config import DecisionRunConfig
@@ -95,8 +94,9 @@ def test_a_decision_run_scores_each_split_with_its_own_metrics_and_ranks_by_thei
                          "summary/board"}
         assert scores[step]["summary/board"] == (scores[step]["val/accuracy"]
                                                  + 3 * scores[step]["test/accuracy"]) / 4
-    recorded = RunConfig.from_dict(json.loads((run / "run.json").read_text()))
-    assert (recorded.val_metrics, recorded.val_summaries) == (config.val_metrics, config.val_summaries)
+    recorded, stated = json.loads((run / "run.json").read_text()), config.to_dict()
+    assert [recorded[name] for name in ("val_metrics", "val_summaries")] == [
+        stated[name] for name in ("val_metrics", "val_summaries")]
 
 
 QWEN = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
