@@ -68,6 +68,17 @@ def automatic_root(loading: Loading) -> str | None:
     return named or os.path.join(dew_cache_dir(), "data")
 
 
+def _opened_writer(cache: Cache, key: DependencyManifest) -> _Writer | _Computed:
+    """A writer of `key`'s fill, or, where an optional cache's storage cannot hold one, none: its
+    records are computed (`Cache.read_on`)."""
+    try:
+        return _Writer(cache, key)
+    except (OSError, sqlite3.Error) as error:
+        if not cache.read_on(error, "writes nothing"):
+            raise
+        return _Computed()
+
+
 class Abandoned(RuntimeError):
     """An upload or a seal the cache's writer was closed before, which it counts (`abandoned`)."""
 type Transform = Callable[[int, Record], Outputs]
@@ -127,10 +138,18 @@ class Cache:
     shard_bytes: int | str = 16 * 2**20
     storage_options: Mapping[str, object] | None = field(default=None, repr=False)
     optional: bool = False
-    """Whether a run reads on without it where its local storage fails (no room, no permission): a
-    cache the compiler placed (`dew.data.compile._automatic`), which a run never needs, stops
-    admitting there and its records are computed, as they are with no cache. A cache a chain names
-    stops the run."""
+    """Whether a run reads on without it where its storage fails (no room, no permission, its
+    index's database full or read-only): a cache the compiler placed (`dew.data.compile._automatic`),
+    which a run never needs, then looks nothing up, stops admitting and its records are computed,
+    as they are with no cache (`read_on`). A cache a chain names stops the run."""
+
+    def read_on(self, error: OSError | sqlite3.Error, doing: str) -> bool:
+        """Whether this cache reads on uncached after its storage raised `error` while `doing`: it is
+        `optional`, and logs that it does."""
+        if not self.optional:
+            return False
+        _log.warning("cache %s %s: %s; the run reads on uncached", self.url, doing, error)
+        return True
 
     def __post_init__(self) -> None:
         if min(self.spool_limit, _byte_size(self.mirror_bytes), self.local_limit, self.shard_limit) < 1:
@@ -194,10 +213,16 @@ class Cache:
         input publishes the generation of `source`, the source they are. The
         inputs `missing` that a read skips (a store's absent records) are written
         as a fill starts, so it can complete without reading them."""
-        self._root(key)
+        computed = _Mapped(parent if transform is None else parent.map_with_index(_Passthrough(transform)))
         if transform is not None and _volatile(transform):
-            return _Mapped(parent.map_with_index(_Passthrough(transform)))
-        published = self.generation(key)
+            return computed
+        try:
+            self._root(key)
+            published = self.generation(key)
+        except (OSError, sqlite3.Error) as error:
+            if not self.read_on(error, "looks up nothing"):
+                raise
+            return computed
         if published is not None:
             return _Mapped(grain.MapDataset.range(len(parent)).map(_Published(published, transform)))
         return _CachedMap(parent, self, key, transform, source, tuple(missing))
@@ -210,10 +235,17 @@ class Cache:
         transform: Transform | None = None,
         threads: int | None = None,
     ) -> Callable[[Shard], grain.IterDataset]:
-        self._root(key)
+        computed = (reader if transform is None
+                    else _PassthroughReader(reader, _Passthrough(transform), threads))
         if transform is not None and _volatile(transform):
-            return _PassthroughReader(reader, _Passthrough(transform), threads)
-        published = self.generation(key)
+            return computed
+        try:
+            self._root(key)
+            published = self.generation(key)
+        except (OSError, sqlite3.Error) as error:
+            if not self.read_on(error, "looks up nothing"):
+                raise
+            return computed
         return _CachedReader(reader, self, key, transform,
                              None if published is None else _Published(published, transform))
 
@@ -378,16 +410,15 @@ class _Writer:
             if not transient and self.admitting:
                 try:
                     self._admit(row_key, payload)
-                except OSError as error:
-                    # Local storage that fails mid-fill (no room, no permission): an optional cache
-                    # stops admitting, as a full one does with on_full='stop', and reads on.
-                    if not self.cache.optional:
+                except (OSError, sqlite3.Error) as error:
+                    # Storage that fails mid-fill: an optional cache stops admitting, as a full one
+                    # does with on_full='stop', and reads on.
+                    if not self.cache.read_on(error, "stopped admission"):
                         raise
                     # What it held unwritten is dropped, so its fill ends unsealed and publishes nothing.
                     self.admitting = False
                     self.pending.clear()
                     self.pending_bytes = 0
-                    _log.warning("cache %s stopped admission: %s", self.root.url, error)
         return outputs if transform is not None else outputs[0]
 
     def _admit(self, row_key: str, payload: bytes) -> None:
@@ -554,6 +585,9 @@ class _Writer:
             if self.cache.on_full == "block":
                 raise
             _log.warning("cache %s remains filling after upload failure: %s", self.root.url, error)
+        except sqlite3.Error as error:
+            if not self.cache.read_on(error, "remains filling"):
+                raise
 
     def _completed(self) -> None:
         """The outcome of a fill's completion (`complete`) once it ends,
@@ -681,11 +715,10 @@ class _CachedMap(_Mapped):
             if "_writer" not in self.__dict__:
                 try:
                     writer = _Writer(self.cache, self.key, expected=len(self), source=self.filled)
-                except OSError as error:
-                    # Local storage that cannot hold a writer: an optional cache computes its records.
-                    if not self.cache.optional:
+                except (OSError, sqlite3.Error) as error:
+                    # Storage that cannot hold a writer: an optional cache computes its records.
+                    if not self.cache.read_on(error, "writes nothing"):
                         raise
-                    _log.warning("cache %s writes nothing: %s", self.cache.url, error)
                     self.__dict__["_writer"] = _Computed()
                     return self.__dict__["_writer"]
                 finalizer = weakref.finalize(self, writer.close)
@@ -800,7 +833,7 @@ class _CachedIterator(grain.DatasetIterator):
         # A shard the generation holds under another ID (another mount, a stream cut into more shards
         # than it has) runs its steps and writes nothing, so the key holds no rows under its IDs.
         self.writer: _Writer | _Published | _Computed = (
-            _Writer(cache, key) if published is None
+            _opened_writer(cache, key) if published is None
             else published if published.generation.holds((shard.id, 0))
             else _Computed())
         self.ordinal = 0

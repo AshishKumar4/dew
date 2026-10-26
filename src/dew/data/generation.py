@@ -22,7 +22,7 @@ from dew.data.pipeline import Record, Rejected
 from dew.data.plan import array_digest
 from dew.data.retention import LocalRetention
 from dew.data.sources.base import Read, Shard, ShardManifest, Source, _indexed_manifest, _uncounted, url_label
-from dew.data.sources.codec import decode, encode, encoded_fingerprint
+from dew.data.sources.codec import decode, encode, encoded_fingerprint, fingerprint
 from dew.data.sources.index import ArrayIndex
 from dew.data.sources.records import ArrayRecords
 from dew.data.storage import Store, Versioned, local
@@ -448,10 +448,11 @@ class Generation:
         # key's digest, so a read in any order visits each page all the time, which a few pages held
         # would read and check again each time. Publication reads the pages' other facts itself.
         @lru_cache(maxsize=256)
-        def opened(page: str) -> dict[str, tuple[str, int]]:
+        def opened(page: str) -> dict[str, tuple[str, int, str]]:
             entries = json.loads(_checked(Store(self.url, self.storage_options),
                                           self.manifest["pages"][page]))
-            return {key: (entry["shard"], entry["record"]) for key, entry in entries.items()}
+            return {key: (entry["shard"], entry["record"], entry["payload_sha256"])
+                    for key, entry in entries.items()}
 
         return opened
 
@@ -473,12 +474,19 @@ class Generation:
         @lru_cache(maxsize=64)
         def opened(path: str) -> ArrayRecords:
             root = Store(self.manifest["root"], self.storage_options)
-            # A remote shard is checked as its mirror holds it; a local one in place, where a mirror
-            # would copy it beside itself.
-            _checked(root if local(root.resolve()[0]) else root.cached(), self.manifest["shards"][path])
+            if self._local:
+                # Checked in place, the file its reader reads.
+                _checked(root, self.manifest["shards"][path])
             return ArrayRecords((root.child(path).url,), self.storage_options)
 
         return opened
+
+    @cached_property
+    def _local(self) -> bool:
+        """Whether its shards are local files, which a reader reads as they were checked whole as it
+        opened them (`_shard`); a remote shard's reader reads an object the check did not, so each
+        record it reads is checked against its digest (`outputs`)."""
+        return local(Store(self.manifest["root"], self.storage_options).resolve()[0])
 
     def __getstate__(self) -> Mapping[str, object]:
         return {"url": self.url, "storage_options": self.storage_options, "_definition": self._definition,
@@ -531,13 +539,14 @@ class Generation:
 
     def outputs(self, row_id: RowId) -> Outputs:
         row_key = _row_key(row_id)
-        shard, place = self._page(input_page(row_key))[row_key]
-        # The shard it reads from was checked whole as it was opened (`_shard`), so its record is the
-        # one written.
+        shard, place, digest = self._page(input_page(row_key))[row_key]
         payload = self._shard(shard)[place]
         if not isinstance(payload, bytes):
             raise ValueError(f"committed cache record is not bytes: {self.url}")
-        return _decode_outputs(payload)
+        values = _decode_outputs(payload)
+        if not self._local and fingerprint(values) != digest:
+            raise ValueError(f"committed cache completion is corrupt for {row_key}")
+        return values
 
     def __len__(self) -> int:
         return self.manifest["rows"]

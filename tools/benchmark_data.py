@@ -876,12 +876,14 @@ def caching_chain(config: Caching, directory: Path) -> "tuple[list[dict], Callab
             tokenizer.train_from_iterator((row["text"] for row in rows[:200]), trainers.BpeTrainer(
                 vocab_size=4000, special_tokens=["[UNK]", "</s>"]))
             PreTrainedTokenizerFast(tokenizer_object=tokenizer, eos_token="</s>").save_pretrained(directory)
-            steps = (text.tokenize(str(directory)), Fields(("id",)))
+            steps = (text.tokenize(str(directory)),)
     def chain(cache: str | None) -> Pipeline:
+        """The steps over the records, cached after them where `cache` names one: a cache holds what
+        they make whole (a tokenized document's ids), and the batch reads the record's id beside it."""
         mapped = Pipeline(Memory(rows))
         for step in steps:
             mapped = mapped.map(step)
-        return (mapped if cache is None else mapped.cache(cache)).batch(config.batch)
+        return (mapped if cache is None else mapped.cache(cache)).map(Fields(("id",))).batch(config.batch)
 
     return rows, chain
 
