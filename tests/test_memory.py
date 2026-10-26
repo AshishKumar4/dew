@@ -167,7 +167,7 @@ def written(module: InContextMemory, *, dtype, segments=None, gradient=None, inp
     def run(x, params):
         # Cast here, under the caller's float64 mode where the truth runs.
         p = jax.tree.map(lambda leaf: jnp.asarray(leaf, dtype), params["params"])
-        heads = [params["params"]["initial"][f"head_{head}"] for head in range(module.heads)]
+        heads = [params["params"][f"head_{head}"] for head in range(module.heads)]
         initial = jax.tree.map(lambda *leaves: jnp.stack(leaves).astype(wide), *heads)
         x = jnp.asarray(x, dtype)
         batch = x.shape[0]
@@ -312,9 +312,8 @@ class Product(nn.Module):
 
 def on_the_general_path(params: dict) -> dict:
     """A linear memory's weights as the same memory over `Product` holds them."""
-    initial = params["params"]["initial"]
-    held = {name: {"kernel": head["kernel"]["kernel"]} for name, head in initial.items()}
-    return {"params": {**params["params"], "initial": held}}
+    return {"params": {name: {"kernel": tree["kernel"]["kernel"]} if head_of((name,)) is not None else tree
+                       for name, tree in params["params"].items()}}
 
 
 @pytest.mark.parametrize("name", ["linear_attention", "gated_linear_attention", "delta_rule"])
@@ -455,8 +454,8 @@ def test_a_zero_step_reads_the_initial_network():
         kernel = params["params"]["q_proj"]["kernel"].astype(x.dtype)
         queries = (x @ kernel).reshape(-1, LENGTH, HEADS, FEATURES)
         network = ResidualMemory(hidden=4 * FEATURES, dtype=x.dtype)
-        stored = params["params"]["initial"]
-        heads = [network.apply({"params": stored[f"head_{h}"]}, queries[:, :, h]) for h in range(HEADS)]
+        heads = [network.apply({"params": params["params"][f"head_{h}"]}, queries[:, :, h])
+                 for h in range(HEADS)]
         return jnp.stack(heads, axis=2).reshape(-1, LENGTH, HEADS * FEATURES)
 
     assert_as_exact(applied(module), jax.jit(initial), drawn(module), "zero-step memory", seeds=MEMORY_SEEDS,
@@ -533,8 +532,9 @@ def test_a_memory_decoder_trains_scans_remats_and_decodes():
                         truth_fn=trained(wide))
     gradient = trained(rematted)(*draw_with_cotangent(0))[1]
     for index in (0, 1):
-        assert all(np.abs(np.asarray(leaf)).max() > 0
-                   for leaf in jax.tree.leaves(gradient[f"layers_{index}"]["self_attn"]["initial"]))
+        layer = gradient[f"layers_{index}"]["self_attn"]
+        assert all(np.abs(np.asarray(leaf)).max() > 0 for name in layer if head_of((name,)) is not None
+                   for leaf in jax.tree.leaves(layer[name]))
 
     @jax.jit
     def decoded(variables, ids):
@@ -936,10 +936,11 @@ def test_muon_steps_each_memory_heads_matrices_on_their_own():
 
     model = decoder()
     params = model.init(jax.random.key(0), jnp.zeros((2, LENGTH), jnp.int32))["params"]
-    numbers = muon_weight_dimension_numbers(params)["layers_0"]["self_attn"]["initial"]
+    numbers = muon_weight_dimension_numbers(params)["layers_0"]["self_attn"]
     layers = {f"layers_{index}": {"kernel": optax.contrib.MuonDimensionNumbers(), "bias": None}
               for index in (0, 1)}
-    assert numbers == {f"head_{head}": layers for head in range(2)}
+    assert {name: tree for name, tree in numbers.items() if head_of((name,)) is not None} == {
+        f"head_{head}": layers for head in range(2)}
     solver = OptimConfig(optimizer="muon", learning_rate=1e-3).build(10)
     updates, _ = solver.update(jax.tree.map(jnp.ones_like, params), solver.init(params), params)
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(updates))

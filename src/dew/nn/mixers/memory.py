@@ -21,7 +21,9 @@ class InContextMemoryMixer(MixerBase):
     memory: InContextMemory
 
     def marks(self) -> tuple[str, ...]:
-        """The residuals the memory's path marks (`InContextMemory.residuals`)."""
+        """The residuals of every path the memory's configuration can take (`InContextMemory.residuals`):
+        the kind cannot see the wrappers a model computes under, which decide whether a linear memory
+        runs the recurrence or its general path, so it names both paths' residuals."""
         return self.memory.residuals
 
     def build(self, ctx: MixerContext):
