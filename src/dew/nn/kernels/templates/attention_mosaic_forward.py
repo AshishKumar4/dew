@@ -253,6 +253,27 @@ class _Residuals(NamedTuple):
     keys_smem: object
 
 
+def _scored(program: _Program, spec: algebra.Forward, q, index, slots, first, spans: _Spans | None,
+            hooked: _Hooked, place: tuple, whole, turn, *, hooks: Hooks) -> tuple:
+    """A key tile's first key, coordinates and logits under the score hook (batch row and head `place`, its
+    queries from `first`), and their products where the logits are a factor of them (`algebra.logits_of`),
+    every walk's (`_consumer`'s, `_peak_consumer`'s), so a peak walk's logits are the training walk's to the
+    bit. A tile every query sees whole takes no mask: one walk, the choice a tile's (a walk of each, these
+    rings' waits and arrivals in two loops, faulted on an H100 under jax 0.11.2's lowering)."""
+    row, head = place
+    family, tiles = program.family, program.tiles
+    shape = (tiles.block_q, tiles.block_k)
+    s = family.product(q, slots["keys"].transpose((1, 0)), shape, turn)
+    slots.release("keys")
+    k_first = index * tiles.block_k
+    # The tile's places formed a step, not held across the walk beside its sums (`_coords`).
+    coords = _coords(family, spans, row, first, k_first, shape)
+    params = tuple(_param(family, ref, param.kind, row, head, first, s, k_first)
+                   for ref, param in zip(hooked.score, hooks.score_params, strict=True))
+    logits, products = algebra.logits_of(spec, s, coords, params, masked=jnp.logical_not(whole(index)))
+    return k_first, coords, logits, products
+
+
 def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_view, status_views, q_smem,
               q_loaded, out_smem, row_smem, streams, turn, streamed: tuple, first, spans: _Spans | None,
               hooked: _Hooked, guard: _Guard | None, place: tuple, *, hooks: Hooks,
@@ -270,7 +291,6 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     XLA, `_trained_forward`)."""
     row, head, kv_head = place
     family, tiles = program.family, program.tiles
-    shape = (tiles.block_q, tiles.block_k)
     lo, hi, whole = program.reach(first, spans, row)
     family.loaded(((q_view, q_smem, q_loaded),))
     q = family.held(q_smem)
@@ -297,18 +317,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     family.passed(streams, streamed[0], lo, first=streamed[0], between=lambda: (turn(), turn()))
 
     def scored(index, slots):
-        # A key tile's logits under the score hook, and their products where the logits are a factor of
-        # them. A tile every query sees whole takes no mask: one walk, the choice a tile's (a walk of each,
-        # these rings' waits and arrivals in two loops, faulted on an H100 under jax 0.11.2's lowering).
-        s = family.product(q, slots["keys"].transpose((1, 0)), shape, turn)
-        slots.release("keys")
-        k_first = index * tiles.block_k
-        # The tile's places formed a step, not held across the walk beside its sums (`_coords`).
-        coords = _coords(family, spans, row, first, k_first, shape)
-        params = tuple(_param(family, ref, param.kind, row, head, first, s, k_first)
-                       for ref, param in zip(hooked.score, hooks.score_params, strict=True))
-        logits, products = algebra.logits_of(spec, s, coords, params, masked=jnp.logical_not(whole(index)))
-        return k_first, coords, logits, products
+        return _scored(program, spec, q, index, slots, first, spans, hooked, (row, head), whole, turn,
+                       hooks=hooks)
 
     def value_of(slots):
         # The value slot, once the partner's products are issued: its turn on the tensor cores is over when
@@ -412,26 +422,19 @@ def _peak_consumer(program: _Program, spec: algebra.Forward, consumer, q_view, p
     """A peak walk's query block (batch row and head `place`): each row's keys' largest logit, in the walk's
     units, and the first key that holds it (`algebra.argmax`, the training walk's anchor, `algebra.Anchored`),
     over the key tiles it reads through the family's key stream, the logits under the score hook as the
-    training walk forms them to the bit (`_consumer`'s `scored`), stored through the row stages to
+    training walk forms them (`_scored`), stored through the row stages to
     `peak_views`. Its turns on the tensor cores and the slots its partner alone reads are the training walk's
     own (`_consumer`)."""
-    row, head = place
     family, tiles = program.family, program.tiles
-    shape = (tiles.block_q, tiles.block_k)
-    lo, hi, whole = program.reach(first, spans, row)
+    lo, hi, whole = program.reach(first, spans, place[0])
     family.loaded(((q_view, q_smem, q_loaded),))
     q = family.held(q_smem)
     pl.when(consumer == 1)(turn)
     family.passed(streams, streamed[0], lo, first=streamed[0], between=lambda: (turn(), turn()))
 
     def step(index, slots, arg, accumulators):
-        s = family.product(q, slots["keys"].transpose((1, 0)), shape, turn)
-        slots.release("keys")
-        k_first = index * tiles.block_k
-        coords = _coords(family, spans, row, first, k_first, shape)
-        params = tuple(_param(family, ref, param.kind, row, head, first, s, k_first)
-                       for ref, param in zip(hooked.score, hooks.score_params, strict=True))
-        logits, _ = algebra.logits_of(spec, s, coords, params, masked=jnp.logical_not(whole(index)))
+        _, coords, logits, _ = _scored(program, spec, q, index, slots, first, spans, hooked, place, whole,
+                                       turn, hooks=hooks)
         # The partner's turn, as a training step's value product would take it.
         turn(wait=False)
         turn(arrive=False)
