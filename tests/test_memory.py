@@ -2,8 +2,11 @@
 equations, written out token by token below (`written`), at check 1 against float64; the chunk-parallel
 computation against the token-by-token one; the linear memories on the shared recurrence against their
 general path; packed documents as each alone; a decode, and a cached packed prefill, as the full pass;
-the outer gradients through a self-generated target; a zero step size reading the initial network; and
-the memory as a decoder's layer kind, scanned, rematted, decoded, under Muon and recorded."""
+the outer gradients through a self-generated target; a zero step size reading the initial network; the
+memory as a decoder's layer kind, scanned, rematted, decoded, under Muon and recorded; its heads'
+networks under the model's wrappers, an adapter on every head or one, a checkpoint's input
+quantization, a frozen FP8 base, Qwix's quantized training and serving; and its rows split over a
+mesh's data axis."""
 
 import functools
 import json
