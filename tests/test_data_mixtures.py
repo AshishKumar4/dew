@@ -1145,7 +1145,7 @@ def test_a_configured_run_on_a_schedule_ends_where_its_data_does(tmp_path):
     second = Pipeline(Memory(Indexed(2, 64))).shuffle(1).repeat()
     data = schedule([(first, 50), (second, 30)]).batch(8)
     fitted = token_trainer(tmp_path / "fitted").fit(data)
-    config = RunConfig(optim=OptimConfig(optimizer="sgd", learning_rate=0.5), trainer=TrainerConfig(
+    config = RunConfig(optim=OptimConfig(optimizer="adamw", learning_rate=1e-3), trainer=TrainerConfig(
         checkpoint_dir=str(tmp_path / "configured"), steps=None, epochs=None, tokens=None, log_every=1,
         eval_every=None, checkpoint_every=None))
     configured = config.train(TokenCounted(), data, name="scheduled")
