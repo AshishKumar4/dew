@@ -27,20 +27,19 @@ def programs(directory: Path) -> dict[str, bytes]:
 
 
 def test_a_bundle_is_its_host_class_s_alone_on_every_backend():
-    """A bundle is its host class's (`dew._host.cpu_class`) whatever the backend: XLA:CPU compiles for the
-    host that compiles, and a GPU lane's programs hold CPU executables too (its host-side computations), so
-    a program from another class need not link here ("Failed to materialize symbols"), after which the
-    process compiles nothing more. On the CPU, whose device kind is "cpu" on every host, and on a GPU
-    lane's backend alike."""
+    """A bundle is its host class's (`remote_cache.HOST.cpu_class`) whatever the backend: XLA:CPU
+    compiles for the host that compiles, and a GPU lane's programs hold CPU executables too (its
+    host-side computations), so a program from another class need not link here ("Failed to
+    materialize symbols"), after which the process compiles nothing more. On the CPU, whose device kind
+    is "cpu" on every host, and on a GPU lane's backend alike."""
     import os
     import subprocess
     import sys
 
     script = """
-import dew._host
 import remote_cache
 for named in ("AuthenticAMD-25-17", "AuthenticAMD-25-1"):
-    dew._host.cpu_class = lambda named=named: named
+    remote_cache.HOST.cpu_class = lambda named=named: named
     print(remote_cache.prefix())
 """
     path = os.pathsep.join([os.path.dirname(__file__), os.environ.get("PYTHONPATH", "")])
@@ -136,9 +135,7 @@ print(remote.programs_fetched, remote.uploaded, int(counts.get("train/cache_miss
     assert (value, fetched, uploaded) == ("18.0", "0", "1") and int(compiled) >= 1
     [key] = stored
     assert key.startswith(f"/jaxlib{__import__('jaxlib').__version__}/")
-    from dew._host import cpu_class
-
-    assert key.endswith(f"/cpu/{cpu_class()}/bundles/tests/test_step.py")
+    assert key.endswith(f"/cpu/{remote_cache.HOST.cpu_class()}/bundles/tests/test_step.py")
     programs = len(list(remote_cache.unpacked(stored[key])))
     assert programs >= 1
     # Read back, nothing compiles: JAX's persistent cache misses nothing.

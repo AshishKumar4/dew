@@ -5,11 +5,20 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- Test-time training over the task loss: a decoder's continuum level (`CausalTransformer(continuum=ContinuumLevel(hidden))`) is stepped in context by the LM loss every `window` tokens of a document (`LMObjective(adaptation=ChunkAdaptation(...))`), Nested Learning's equation 71, each document from the trained start, training through every step.
+- A label's cross-entropy derivative in its own logit is `p - 1` while the label holds at most half its row and minus the rest of the row past it (`dew.nn.categorical.label_entry`), for the whole-logits head and the tiled, fused and vocabulary-split heads alike; the rest alone sat two to three times as far from float64 on unconfident rows.
 - `UNet2DCondition` stores its time embeddings' two maps flat, as `time_linear_1` and `time_linear_2`
   (and `additional_time_linear_1` and `_2`), where they were `time/in_proj` and `time/out_proj`; a
   published UNet loads as before. An AutoencoderKL's resnets are `dew.nn.blocks.ResidualBlock` called
   without a time embedding, and `dew.nn.autoencoders.vae.FlaxResnetBlock2D` is gone. `dew.nn.engram`
   draws its bucket primes with `sympy.nextprime`, so `sympy` is a dependency.
+- A flow transition's density and KL hold at a variance near float32's largest: the density is JAX's
+  isotropic `multivariate_normal.logpdf`, and the KL halves after its division, where `2 pi` or 2 times
+  the variance overflowed. Schulman's k3 KL estimate is one helper through `expm1`
+  (`dew.rl.surrogate.sampled_kl`), which a small log ratio's `exp(d) - 1` rounded away.
+- A masked-diffusion row's reveals are its own under RBG keys too (`dew._distributions.counted`, the
+  rest of ledger 1669), and TensorBoard histograms are its own `histogram_pb`'s, the plugin's tensor.
+- The host CPU classifier is the CI's (tools/armada/host.py), not the library's: `dew._host` is gone.
 - `OptimConfig` and `ScheduleSpec` move from `dew.config` to `dew.optim`, beside the optimizers and
   schedules they build; `Wandb` moves to `dew.training` (`dew.training.tracker`), beside the tracker that
   reads it; and
