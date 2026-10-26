@@ -1440,6 +1440,7 @@ mixers: Aliases[type[MixerBase], MixerBase] = Aliases("mixer", {
     "kpool_sparse_attention": "dew.nn.dsa_kpool:KPoolSparseAttentionMixer",
     "mamba": "dew.nn.mixers.mamba:MambaMixer",
     "mamba2": "dew.nn.mixers.mamba2:Mamba2Mixer",
+    "memory": "dew.nn.mixers.memory:InContextMemoryMixer",
     "mla": "dew.nn.mla:MLAMixer",
     "mlp": "dew.nn.mixers.mlp:MLPMixer",
 }, base="dew.nn.mixer_base:MixerBase")
