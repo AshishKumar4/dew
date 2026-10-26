@@ -158,14 +158,20 @@ def loaded(copies) -> None:
         plgpu.barrier_wait(barrier)
 
 
-def stored(parts, views, *, smem) -> None:
+def stored(parts, views, *, smem, wait: bool = True) -> None:
     """Each of `parts` written whole to its view of `views` through the shared buffer `smem`, in turn, the
-    buffer reused once its copy is done."""
-    for part, view in zip(parts, views, strict=True):
+    buffer reused once its copy has read it; the last copy waited for unless `wait` is false, when it
+    stays in flight, one store group (`Family.store_wait`)."""
+    last = len(parts) - 1
+    for index, (part, view) in enumerate(zip(parts, views, strict=True)):
         smem[...] = part.astype(smem.dtype)
         plgpu.commit_smem()
         plgpu.copy_smem_to_gmem(smem, view)
-        plgpu.wait_smem_to_gmem(0)
+        if index < last:
+            # The next part writes `smem`: this copy's reads of it done first.
+            plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+        elif wait:
+            plgpu.wait_smem_to_gmem(0)
 
 
 def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int,
@@ -618,8 +624,16 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         plgpu.commit_smem()
 
     @abc.abstractmethod
-    def stored(self, parts, views, *, smem) -> None:
-        """Each of `parts` written whole to its view of `views`, through `smem` where the family stores so."""
+    def stored(self, parts, views, *, smem, wait: bool = True) -> None:
+        """Each of `parts` written whole to its view of `views`, through `smem` where the family stores so.
+        Unless `wait`, the last copy out of `smem` stays in flight as one store group, so the caller's
+        next work overlaps it: it waits (`store_wait`) before writing `smem` again, alternating two
+        landing tiles to keep one store in flight while it fills the other."""
+
+    def store_wait(self, pending: int) -> None:
+        """Waits until at most `pending` of this thread's deferred stores (`stored(wait=False)`) still read
+        their shared tiles: a family that stores through registers has none."""
+        del pending
 
     @abc.abstractmethod
     def added(self, value: jax.Array, view, interpret: bool, *, smem) -> None:
@@ -893,10 +907,13 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     def loaded(self, copies) -> None:
         loaded(copies)
 
-    def stored(self, parts, views, *, smem) -> None:
+    def stored(self, parts, views, *, smem, wait: bool = True) -> None:
         # An add still reading `smem` (`added`) done first.
         plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-        stored(parts, views, smem=smem)
+        stored(parts, views, smem=smem, wait=wait)
+
+    def store_wait(self, pending: int) -> None:
+        plgpu.wait_smem_to_gmem(pending, wait_read_only=True)
 
     def added(self, value: jax.Array, view, interpret: bool, *, smem) -> None:
         if interpret:
