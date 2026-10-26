@@ -567,6 +567,8 @@ class Draw:
     row: jax.Array
     head: jax.Array
     rate: float
+    queries: jax.Array | None = None
+    keys: jax.Array | None = None
 
     @property
     def bound(self) -> float:
@@ -575,7 +577,13 @@ class Draw:
 
     def keep(self, queries: jax.Array, keys: jax.Array) -> jax.Array:
         """Whether the draw keeps the entries at `queries` and `keys` (indices that broadcast): the keep bits
-        every mainloop and the reference share, each taking its own scale for a kept entry."""
+        every mainloop and the reference share, each taking its own scale for a kept entry. Where the draw
+        holds the call's global `queries` and `keys` (a sequence exchange's slice, `DropPlaces`), the indices
+        are local and read their global places there."""
+        if self.queries is not None:
+            queries = jnp.take(self.queries, queries)
+        if self.keys is not None:
+            keys = jnp.take(self.keys, keys)
         word = fmix32(self.seed[0] ^ jnp.uint32(DROP_DOMAIN))
         for part in (self.seed[1], self.row, self.head, queries):
             word = fmix32(word ^ jnp.asarray(part).astype(jnp.uint32))
@@ -593,15 +601,33 @@ def dropout_seed(dropout_rng) -> jax.Array:
     return jax.random.bits(dropout_rng, (2,), jnp.uint32)
 
 
-def dropout_keep(seed: jax.Array, rate: float, shape) -> jax.Array:
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class DropPlaces:
+    """The global places a slice of a call draws its dropout at, where a sequence exchange holds a slice of
+    its rows, heads, queries or keys (`dew.nn.attention.sequence_parallel_attention`): each local batch
+    row's `rows` `[B]`, query head's `heads` `[H]`, query's `queries` `[Q]` and key's `keys` `[K]` global
+    index, so every device drops the weights one device holding the whole call drops."""
+
+    rows: jax.Array
+    heads: jax.Array
+    queries: jax.Array
+    keys: jax.Array
+
+
+def dropout_keep(seed: jax.Array, rate: float, shape, places: DropPlaces | None = None) -> jax.Array:
     """Which weights of `shape` `[..., H, Q, K]` probability dropout keeps, true where the draw keeps one.
     Each weight takes its batch row (the leading dims, flattened), head, query and key, the coordinates the
-    attention templates draw at (`Draw`); a caller scales a kept weight by `1 / (1 - rate)` in its
+    attention templates draw at (`Draw`), their global places where a sequence exchange holds a slice of
+    the call (`places`, its leading dims one); a caller scales a kept weight by `1 / (1 - rate)` in its
     own dtype."""
     *rows, heads, queries, keys = shape
-    draw = Draw((seed[0], seed[1]), jnp.arange(math.prod(rows)).reshape(*rows, 1, 1, 1),
-                jnp.arange(heads).reshape(heads, 1, 1), rate)
-    return draw.keep(jnp.arange(queries)[:, None], jnp.arange(keys)[None, :])
+    if places is None:
+        places = DropPlaces(jnp.arange(math.prod(rows)), jnp.arange(heads), jnp.arange(queries),
+                            jnp.arange(keys))
+    draw = Draw((seed[0], seed[1]), places.rows.reshape(*rows, 1, 1, 1), places.heads.reshape(heads, 1, 1),
+                rate)
+    return draw.keep(places.queries[:, None], places.keys[None, :])
 
 
 @jax.tree_util.register_dataclass
@@ -611,16 +637,22 @@ class Dropout:
     and key is kept where its draw keeps it and multiplied by `1 / (1 - rate)`, while the softmax's
     denominator takes the undropped weights, so the output is the softmax over the values `z v`. `seed`
     holds the call's two uint32 words, `rows` `[B]` and `heads` `[H]` each local batch row's and query
-    head's global index (a shard's own positions are not, `_per_shard`), and `rate` is static."""
+    head's global index (a shard's own positions are not, `_per_shard`), `queries` `[Q]` and `keys` `[K]`
+    each local query's and key's where a sequence exchange holds a slice of them (`DropPlaces`; local are
+    global where None), and `rate` is static."""
 
     seed: jax.Array
     rows: jax.Array
     heads: jax.Array
     rate: float = dataclasses.field(metadata={"static": True})
+    queries: jax.Array | None = None
+    keys: jax.Array | None = None
 
     def draw(self, row, head) -> Draw:
-        """The draw of the local batch row `row` and query head `head`, indices into `rows` and `heads`."""
-        return Draw((self.seed[0], self.seed[1]), self.rows[row], self.heads[head], self.rate)
+        """The draw of the local batch row `row` and query head `head`, indices into `rows` and `heads`, at
+        the call's global `queries` and `keys` where a sequence exchange holds a slice of them."""
+        return Draw((self.seed[0], self.seed[1]), self.rows[row], self.heads[head], self.rate, self.queries,
+                    self.keys)
 
 
 @jax.tree_util.register_dataclass
