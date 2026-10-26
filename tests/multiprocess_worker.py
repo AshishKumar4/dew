@@ -417,8 +417,11 @@ def mode_data(args) -> dict:
 
 
 def mode_online_data(args) -> dict:
-    """One pass over records fetched from the pool's server, each process reading its share of one
-    global order: the records it read, by the image each url's bytes hold, and the plan's lowering."""
+    """The first pass of a training order over records fetched from the pool's server, each process
+    reading its share of one global order: the records it read, by the image each url's bytes hold,
+    and the plan's lowering. A training order reads on past its pass, so the pass is its batches."""
+    import itertools
+
     import jax
 
     from dew.data.compile import compile
@@ -428,15 +431,13 @@ def mode_online_data(args) -> dict:
     data = compile(online_pipeline(args.records, args.online).shuffle(0).batch(BATCH), seed=0,
                    loading=Loading(workers=args.workers, threads=2, read_buffer=8, worker_buffer=2))
     partition = DataPartition.of(MeshSpec().build())
-    records, batches = [], 0
     stream = data.train(partition)
     try:
-        for batch in stream:
-            records.extend(batch_records(batch))
-            batches += 1
+        records = [record for batch in itertools.islice(stream, args.records // BATCH)
+                   for record in batch_records(batch)]
     finally:
         stream.close()
-    return {"process_index": jax.process_index(), "records": records, "batches": batches,
+    return {"process_index": jax.process_index(), "records": records,
             "lowering": None if data.plan is None else data.plan.lowering}
 
 
