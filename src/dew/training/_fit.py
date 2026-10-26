@@ -11,7 +11,7 @@ from collections.abc import Iterator, Mapping, Sequence
 import jax
 
 from dew._coordination import agreed_next
-from dew.data.dataset import Loader
+from dew.data.dataset import DataPartition, Loader
 from dew.objectives.base import Batch, Metric
 from dew.telemetry.profile import region
 from dew.training.budget import Plateau
@@ -125,6 +125,9 @@ class FitRun:
     training: dict[str, jax.Array] = dataclasses.field(default_factory=dict)
     source: Iterator[Batch] | None = None
     train: DevicePrefetchIterator | None = None
+    partition: DataPartition | None = None
+    """The share of the training data this process reads, where the stream opens again at a stage of
+    a schedule (`Trainer._scheduled`)."""
     tracing: bool = False
     traced: int = 0
     other: float = 0.0
