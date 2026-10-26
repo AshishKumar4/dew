@@ -185,7 +185,9 @@ class GatedMLP(nn.Module):
             self.up_proj = dense(projections[up][1], name=up)
         self.down_proj = dense(projections[down][1], name=down, **normal_kernel(
             self.init_std if self.output_init_std is None else self.output_init_std))
-        self.dropout = Dropout(rate=self.dropout_rate)
+        if self.dropout_rate:
+            # Only where it drops: two MLPs sharing one owner's scope (`joint.embedding`) hold one name.
+            self.dropout = Dropout(rate=self.dropout_rate)
         if self.ngpt is not None:
             if not self._gated() or self.swiglu_limit is not None or self.activation_sparsity:
                 raise ValueError("an nGPT feed-forward is a plain gated product: it takes no clamp, "
