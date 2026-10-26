@@ -142,7 +142,9 @@ class Mosaic(base.Template[mainloop.Tiles]):
           launch, a program a value block, sequence and value head walking its sequence's chunks in turn,
           has as many programs as the device has multiprocessors (fla's chunk_fwd_h runs the 27B gated
           delta net's 192 programs a 32-wide block on an A100's 108, where 64 wide its 96 left twelve
-          idle the whole walk, SE-rx-ncu-b106b18d8); the narrowest legal where none fills them;
+          idle the whole walk, SE-rx-ncu-b106b18d8); the narrowest legal where none fills them; of
+          those at which the call's fast backward holds where it holds at any (`_backward_holds`: its
+          launches take the states launch's block, an H100's reverse launch 328 registers 64 wide);
         - output block: the widest legal beside it (`_staged`), the output launch's registers apart from the
           states launch's: on an A100 the output launch holds 264 registers 32 wide, where the states
           launch's 384 programs 16 wide took two waves of 593 us (SE-family-a100-0c8018352);
@@ -157,6 +159,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
                  if tiles is not None]
         if not legal:
             return None
+        legal = [tiles for tiles in legal if self._backward_holds(ba, tiles, target)] or legal
         arguments = ba.arguments
         batch, length, heads, _ = arguments["value"].shape
         sequences = batch * (1 if arguments.get("starts") is None
@@ -164,6 +167,16 @@ class Mosaic(base.Template[mainloop.Tiles]):
         filling = [tiles for tiles in legal if target.multiprocessors is None
                    or columns // tiles.block_v * sequences * heads >= target.multiprocessors]
         return filling[0] if filling else legal[-1]
+
+    def _backward_holds(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles,
+                        target: generation.GpuTarget) -> bool:
+        """Whether the call's fast backward's launches, past the forward's, hold at `tiles` (`mainloop.holds`;
+        a call taking none, `_launches`', holds)."""
+        forward = self._launches(ba, tiles, target, backward=False)
+        both = self._launches(ba, tiles, target, backward=True)
+        family = bundle(target)
+        assert family is not None
+        return mainloop.holds(both[len(forward):], family, generation.shared_budget(target))
 
     def states_held(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
                     ) -> int:
