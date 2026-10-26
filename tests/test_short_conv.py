@@ -6,6 +6,8 @@ tier runs them on the GPU, with the training shapes' tests: there each output's 
 distance is held to XLA's own by tests/reference_error.py's rule.
 """
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -84,6 +86,20 @@ def truth(x, weights, shift, valid, parts, grads, activation=True, segments=None
         wide = jax.tree.map(lambda a: None if a is None else jnp.asarray(a, jnp.float64), (x, weights, shift))
         return run(xla_conv1d, *wide, valid, parts, jnp.float64,
                    tuple(jnp.asarray(grad, jnp.float64) for grad in grads), activation, segments)
+
+
+def row_truth(x, weights, parts, grads, segments):
+    """`truth`'s pieces and gradients of `x` and the taps, on the host, a row at a time: each row's pieces and
+    input gradient its own, the taps' gradient the rows' summed in float64; a row's float64 conv the device
+    holds at once, not the batch's."""
+    rows = [jax.device_get(truth(x[i:i + 1], weights, None, None, parts,
+                                 tuple(grad[i:i + 1] for grad in grads),
+                                 segments=None if segments is None else segments[i:i + 1]))
+            for i in range(x.shape[0])]
+    pieces = tuple(np.concatenate([row[0][k] for row in rows]) for k in range(len(rows[0][0])))
+    dx = np.concatenate([row[1][0] for row in rows])
+    dtaps = functools.reduce(np.add, (np.asarray(row[1][1], np.float64) for row in rows))
+    return pieces, (dx, dtaps, *rows[0][1][2:])
 
 
 def assert_follows_xla(got, want, exact, label):
@@ -353,12 +369,13 @@ def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, pa
     def kernels(x, weights):
         return run(kernel_conv, x, weights, None, None, parts, dtype, grads, segments=segments)
 
-    # The reference's and the truth's leaves on the host as each is computed, so the device holds one run's
-    # arrays at a time: held there beside the kernels' runs, the 9b's packed rows peaked at 9.2 GiB of an
-    # A100, past a packed job's 8.9 GiB share (row 1724, SE-conv1724-a100-fd8508b5a).
+    # The reference's and the truth's leaves on the host as each is computed, and the truth a row at a time
+    # (`row_truth`): the 9b's packed rows peaked at 9.2 GiB of an A100, past a packed job's 8.9 GiB share
+    # where main's GPU tier ran them (row 1724, SE-conv1724-a100-fd8508b5a), 8.85 with the arrays on the
+    # host alone (SE-conv1724-a100-9419b90c1).
     want, want_grads = jax.device_get(run(xla_conv1d, x, weights, None, None, parts, dtype, grads,
                                           segments=segments))
-    exact, exact_grads = jax.device_get(truth(x, weights, None, None, parts, grads, segments=segments))
+    exact, exact_grads = row_truth(x, weights, parts, grads, segments)
     pins = [{}] + [{op: config} for op in (short_conv.ConvForward, short_conv.ConvBackward)
                    for config in each_config(op, kernels, x, weights)]
     for pin in pins:
