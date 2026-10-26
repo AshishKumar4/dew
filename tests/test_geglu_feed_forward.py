@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, with_gradients
+from reference_error import as_given, assert_as_exact, with_gradients
 
 from dew.diffusion.process import DenoisingCondition
 from dew.nn.activations import gated_product
@@ -73,7 +73,7 @@ def test_the_tanh_gelu_and_its_gradient_are_as_exact_as_torchs():
 
     def named(run):
         """`run`'s value and gradient by name."""
-        return lambda *inputs: dict(zip(("value", "gradient"), run(*inputs), strict=True))
+        return as_given(lambda *inputs: dict(zip(("value", "gradient"), run(*inputs), strict=True)))
 
     def theirs(dtype):
         pulled = torch_with_gradients(lambda x: torch.nn.functional.gelu(x, approximate="tanh"))

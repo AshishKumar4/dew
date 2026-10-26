@@ -101,7 +101,9 @@ def check_schedule(ref, case):
         with float64_scheduler(sys.modules[source.__module__]):
             return oracle_walk(source.from_config(drawn(jitter)), initial, torch.float64)
 
-    assert_as_exact(dew, reference, draw, f"{case} walk", seeds=SEEDS[case], truth_fn=truth)
+    # The walk's schedule is built from each draw's jittered table on the host, and the reference is torch's.
+    assert_as_exact(as_given(dew), as_given(reference), draw, f"{case} walk", seeds=SEEDS[case],
+                    truth_fn=truth)
 
 
 def check_unet(directory, case):
@@ -156,6 +158,7 @@ def check(directory, case):
 if __name__ == "__main__":
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
     from reference_error import (
+        as_given,
         assert_as_exact,
         assert_as_exact_as_the_reference,
         torch_with_gradients,
