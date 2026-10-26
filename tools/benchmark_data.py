@@ -529,10 +529,10 @@ def training_measure(factory, objective, config: Worker) -> dict:
     import jax
     import optax
 
+    from dew.distributed.batches import DevicePrefetchIterator
     from dew.telemetry.instrumentation import model_flops_utilization
     from dew.telemetry.profile import capture_options
     from dew.training import Trainer
-    from dew.training.distributed import DevicePrefetchIterator
 
     trainer = Trainer(objective, optax.adam(1e-4), key=0, checkpoints=None, tracker=None)
     state, _, _ = trainer.place()

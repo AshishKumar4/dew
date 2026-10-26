@@ -21,8 +21,8 @@ def main() -> None:
 
     from dew._coordination import collective_host
     from dew.data.dataset import Loader
+    from dew.distributed.batches import shard_batch
     from dew.objectives.rl import EpisodeStatus, Observation
-    from dew.training.distributed import shard_batch
 
     harness = Harness()
     records = []
