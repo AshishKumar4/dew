@@ -21,7 +21,7 @@ from flax import struct
 from jax.typing import ArrayLike
 
 from dew.diffusion.process import Denoiser, Process
-from dew.diffusion.schedules import RectifiedFlow, divided, expand
+from dew.diffusion.schedules import RectifiedFlow, expand
 from dew.nn.kernels.generation import linear_tangent
 from dew.nn.precision import at_least_fp32
 
@@ -99,74 +99,106 @@ class GaussianTransition:
             raise ValueError("reference and policy transition means must share one shape")
         difference = mean - reference_mean
         safe_variance = jnp.where(variance > 0, variance, 1)
-        error = jnp.square(difference).sum(axis=tuple(range(1, mean.ndim)))
-        deterministic = jnp.where(error == 0, 0.0, jnp.inf)
+        apart = jnp.any(difference != 0, axis=tuple(range(1, mean.ndim)))
+        deterministic = jnp.where(apart, jnp.inf, 0.0)
         return jnp.where(variance > 0, _gaussian_kl(difference, safe_variance),
                          jnp.where(variance == 0, deterministic, jnp.nan))
 
 
+def _exponent(x: jax.Array) -> jax.Array:
+    """Each `|x|`'s binary exponent `e`, `2**e <= |x| < 2**(e + 1)` where `x` is a normal number, read
+    from its bits: a zero, or a subnormal, which XLA:CPU reads as zero, gives the least normal's less
+    one, and an infinity or a NaN the largest's plus one."""
+    info = jnp.finfo(x.dtype)
+    unsigned = jnp.uint32 if info.bits == 32 else jnp.uint64
+    field = (jax.lax.bitcast_convert_type(jnp.abs(x), unsigned) >> info.nmant) & ((1 << info.nexp) - 1)
+    return field.astype(jnp.int32) - (info.maxexp - 1)
+
+
+def _scaled(x: jax.Array, power: jax.Array) -> jax.Array:
+    """`x * 2**power`, exact where the result is a normal number: the power in parts each a normal
+    number's, all of its sign, applied in turn, so each partial product lies between `x` and the
+    result and leaves no range the result keeps."""
+    info = jnp.finfo(x.dtype)
+    unsigned = jnp.uint32 if info.bits == 32 else jnp.uint64
+    power = jnp.asarray(power, jnp.int32)
+    for _ in range(4):
+        part = jnp.clip(power, info.minexp, info.maxexp - 1)
+        biased = (part + (info.maxexp - 1)).astype(unsigned) << info.nmant
+        x = x * jax.lax.bitcast_convert_type(biased, x.dtype)
+        power = power - part
+    return x
+
+
+def _unit(x: jax.Array, axes: tuple[int, ...]) -> tuple[jax.Array, jax.Array]:
+    """`x` over a power of two, `2**top` for the largest exponent of its rows over `axes`, so its
+    largest entry lies in [1, 2), and `top`."""
+    top = jnp.max(_exponent(x), axis=axes) if axes else _exponent(x)
+    return _scaled(x, -jnp.reshape(top, top.shape + (1,) * (x.ndim - top.ndim))), top
+
+
+def _divergence_parts(difference: jax.Array, variance: jax.Array):
+    """The scaled parts of `|difference|**2 / (2 variance)` (`_divergence`): the difference over its
+    row's power of two (`_unit`) with that power, the variance's alike, and the KL's own quotient and
+    power, `KL = quotient * 2**power`, the quotient in [1/2, 4n)."""
+    axes = tuple(range(1, difference.ndim))
+    unit, top = _unit(difference, axes)
+    level, spread = _unit(variance, ())
+    quotient = jnp.square(unit).sum(axis=axes) / level
+    return unit, top, level, spread, quotient, 2 * top - spread - 1
+
+
 def _divergence(difference: jax.Array, variance: jax.Array) -> jax.Array:
-    """`|difference|**2 / (2 variance)`, one row a `variance`, as one division of operands in range: the
-    variance doubled where that is finite, else the squared error halved, an error over so wide a
-    variance far above float32's least. Halving the error alone left half an error near its least below
-    the normal range, which XLA:CPU flushes to zero (a KL of 0 where it is 0.5), and halving the
-    quotient after overflowed where half of it fits. Its derivatives are `_gaussian_kl`'s."""
-    error = jnp.square(difference).sum(axis=tuple(range(1, difference.ndim)))
-    doubled = 2 * variance
-    wide = doubled == jnp.inf
-    return jnp.where(wide, error * 0.5, error) / jnp.where(wide, variance, doubled)
+    """`|difference|**2 / (2 variance)`, one row a `variance`, every product and quotient formed from
+    operands scaled to a power of two's range and the power restored once at the end (`_scaled`), so
+    no step leaves float32's range where the KL keeps it: an error near float32's least over a variance
+    as small (a KL of 0.5 where half the error flushed to zero), a squared difference past its largest
+    over a variance as wide. Its derivatives are `_gaussian_kl`'s."""
+    *_, quotient, power = _divergence_parts(difference, variance)
+    return _scaled(quotient, power)
 
 
 @jax.custom_jvp
 def _directional(difference: jax.Array, variance: jax.Array) -> jax.Array:
-    """`_divergence` whose forward mode keeps its steps in float32's range where its result is: the
-    difference's tangent summed against the difference before one division by the variance
-    (`divided`), so a cancelling tangent (`[16, -16]` at a difference of 0.5 over 2**-126) sums to its
-    0 rather than to two overflowing products; the variance's coefficient `-KL / variance` as two
-    factors of about its root each (`_halves`), the tangent meeting one and then the other, so
-    neither a tangent over the variance first (`2**-126 / 2**32`) nor the coefficient alone (`2**249`
-    at the least) leaves the range the term keeps."""
+    """`_divergence`, whose forward mode forms its tangent as it forms the KL: the difference and its
+    tangent each over its row's power of two, contracted so a cancelling tangent sums to its 0 before
+    anything divides, then divided by the variance's scaled value and the powers restored once; the
+    variance's term `-KL * tangent / variance` from the KL's quotient, the tangent's and the variance's
+    scaled values alike. Its tangent reads the tangent's exponents, so it is not transposed: reverse
+    mode is `_kl_pullback`'s (`linear_tangent`)."""
     return _divergence(difference, variance)
 
 
 @_directional.defjvp
 def _directional_jvp(primals, tangents):
-    """`_directional`'s tangent: the difference's summed before its division, the variance's through its
-    coefficient's halves."""
+    """`_directional`'s tangent, each product of scaled operands and each power restored once."""
     (difference, variance), (difference_tangent, variance_tangent) = primals, tangents
-    value = _divergence(difference, variance)
-    held, spread = _halves(value, variance)
-    along = divided((difference * difference_tangent).sum(axis=tuple(range(1, difference.ndim))), variance)
-    return value, along - held * variance_tangent * spread
+    unit, top, level, spread, quotient, power = _divergence_parts(difference, variance)
+    axes = tuple(range(1, difference.ndim))
+    moving, moving_top = _unit(difference_tangent, axes)
+    along = _scaled((unit * moving).sum(axis=axes) / level, top + moving_top - spread)
+    stretch, stretch_top = _unit(variance_tangent, ())
+    return _scaled(quotient, power), along - _scaled(quotient * stretch / level, power + stretch_top - spread)
 
 
 def _kl_pullback(saved, operands, cotangent):
-    """The KL's reverse mode: each element's slope `difference / variance` against the cotangent, so a
-    cotangent over a variance near float32's largest (whose `1 / (2 variance)` is below the normal
-    range) meets the slope, which is not; and the variance's coefficient's halves (`_halves`) one after
-    the other."""
+    """The KL's reverse mode: each element's `cotangent * difference / variance`, and the variance's
+    `-cotangent * KL / variance`, from the cotangent, the difference, the variance and the KL each over
+    its power of two (`_unit`, `_divergence_parts`), the powers restored once (`_scaled`)."""
     del saved
     difference, variance = operands
-    held, spread = _halves(_divergence(difference, variance), variance)
-    slope = divided(difference, expand(variance, difference))
-    return slope * expand(cotangent, difference), -(cotangent * spread) * held
+    unit, top, level, spread, quotient, power = _divergence_parts(difference, variance)
+    scale, scale_top = _unit(cotangent, ())
+    rows = (-1,) + (1,) * (difference.ndim - 1)
+    pulled = _scaled(jnp.reshape(scale / level, rows) * unit, jnp.reshape(scale_top + top - spread, rows))
+    return pulled, -_scaled(scale * quotient / level, scale_top + power - spread)
 
 
 _gaussian_kl = linear_tangent(lambda difference, variance: (_divergence(difference, variance), ()),
                               _kl_pullback, _directional)
 """`_divergence` differentiated through Dew's seam (`dew.nn.kernels.generation.linear_tangent`): its
-forward mode `_directional`'s, its reverse mode `_kl_pullback`'s, each order keeping its steps in
-range."""
-
-
-def _halves(numerator: jax.Array, divisor: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`numerator / divisor` as two factors of about its root each: the numerator over a power of two,
-    and that power over the divisor (`divided`), the power half their exponents' sum, so a number
-    multiplied by one and then the other leaves float32's range only where the whole product does."""
-    _, top = jnp.frexp(numerator)
-    _, bottom = jnp.frexp(divisor)
-    power = (top + bottom) // 2
-    return jnp.ldexp(numerator, -power), divided(jnp.ldexp(jnp.ones_like(divisor), power), divisor)
+forward mode `_directional`'s, its reverse mode `_kl_pullback`'s, each forming every product and
+quotient from operands scaled to range."""
 
 
 def flow_transition(x: ArrayLike, velocity: ArrayLike, sigma: ArrayLike,

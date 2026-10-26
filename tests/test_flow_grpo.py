@@ -1044,9 +1044,107 @@ KL_EDGES = {
     # the variance first, 2**-158, flushed; and an inexact row beside it.
     "wide error": _rows(
         (np.ldexp(1.0, 32), (np.ldexp(1.0, 63), 0), (4, 0), (1, 1), np.ldexp(1.0, -126), 1.0),
+        # A tangent of 2**66 at 2**63 under 2**32: a JVP of 2**97 whose product, 2**129, overflowed.
+        (np.ldexp(1.0, 32), (np.ldexp(1.0, 63), 0), (np.ldexp(1.0, 66), 0), (0, 0), 1.0, 1.0),
+        # A cotangent of 2**127 at [1, 1] under 1: a variance cotangent of -2**127 whose halves overflowed.
+        (1.0, (1.0, 1.0), (1, 0), (0, 1), 1.0, np.ldexp(1.0, 127)),
         (np.ldexp(1.7, 32), (np.ldexp(1.5, 63), np.ldexp(1.0, 62)), (2, -3), (-2, 5),
          np.ldexp(1.3, -126), 0.7)),
 }
+
+
+def _exponents(x):
+    """Each value's binary exponent and its value over that power, `x = unit * 2**top` with the row's
+    largest `|unit|` in [1/2, 1), in NumPy, every value exact (`np.frexp`, `np.ldexp`)."""
+    top = np.frexp(np.max(np.abs(x), axis=-1, keepdims=True) if x.ndim > 1 else np.abs(x))[1]
+    return np.ldexp(x, -top), top
+
+
+def _numpy_kl(difference, variance, mean_tangent, variance_tangent, cotangent):
+    """The KL, its JVPs along the mean and the variance and its VJP to the mean, in NumPy's float32,
+    each product and quotient of operands over their powers of two and the power restored once, the
+    textbook's range-safe evaluation."""
+    unit, top = _exponents(difference)
+    level, spread = np.frexp(variance)
+    quotient = np.sum(unit**2, axis=1) / level
+    power = 2 * top[:, 0] - spread - 1
+    moving, moving_top = _exponents(mean_tangent)
+    stretch, stretch_top = np.frexp(variance_tangent)
+    scale, scale_top = np.frexp(cotangent)
+    return {"KL": np.ldexp(quotient, power),
+            "JVP along the mean": np.ldexp(np.sum(unit * moving, axis=1) / level,
+                                           top[:, 0] + moving_top[:, 0] - spread),
+            "JVP along the variance": -np.ldexp(quotient * stretch / level, power + stretch_top - spread),
+            "VJP to the mean": np.ldexp((scale / level)[:, None] * unit,
+                                        (scale_top + top[:, 0] - spread)[:, None])}
+
+
+def _kl_grid():
+    """Rows over float32's exponent range in the offset, the variance, the mean's tangent, the
+    variance's and the cotangent, each at eight exponents from -126 to 126, an inexact significand
+    each, two elements a row: their offsets and tangents apart, or equal offsets whose tangents
+    cancel."""
+    levels = (-126, -80, -40, -1, 0, 40, 80, 126)
+    grid = np.asarray(list(itertools.product(levels, repeat=5)))
+    significands = (1.3, 1.7, 1.1, 1.9, 1.5)
+    offset, variance, tangent, stretch, cotangent = (np.ldexp(np.float32(significand), grid[:, index])
+                                                    for index, significand in enumerate(significands))
+    apart = (np.stack([offset, np.float32(0.8) * offset], 1),
+             np.stack([tangent, np.float32(0.6) * tangent], 1))
+    cancelling = (np.stack([offset, offset], 1), np.stack([tangent, -tangent], 1))
+    offsets, tangents = (np.concatenate(pair).astype(np.float32)
+                         for pair in zip(apart, cancelling, strict=True))
+    return (offsets, *(np.tile(column, 2).astype(np.float32) for column in (variance,)), tangents,
+            *(np.tile(column, 2).astype(np.float32) for column in (stretch, cotangent)))
+
+
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "jit"])
+def test_a_transitions_kl_and_its_derivatives_hold_over_float32s_exponent_range(compiled):
+    """Over a grid of float32's exponents (`_kl_grid`), cancelling and not, a transition's KL, its JVPs
+    along the mean, the reference and the variance, and its VJP to the mean are on their float64
+    values (check 1) as NumPy's range-safe float32 evaluation is, wherever the float64 value is a
+    normal float32; where it overflows float32 they are its infinity, and where it is below the normal
+    range they are below it too, eagerly and compiled."""
+    from dew.sampling.flow import GaussianTransition
+
+    offsets, variance, tangents, stretch, cotangent = _kl_grid()
+    mean, reference = np.zeros_like(offsets), offsets
+
+    def kl(at, reference, spread):
+        return GaussianTransition(at, spread).kl(reference)
+
+    def derivatives(mean, reference, variance, tangents, stretch, cotangent):
+        primals = (mean, reference, variance)
+        value, along_mean = jax.jvp(kl, primals,
+                                    (tangents, jnp.zeros_like(reference), jnp.zeros_like(variance)))
+        _, along_reference = jax.jvp(kl, primals, (jnp.zeros_like(mean), tangents, jnp.zeros_like(variance)))
+        _, along_variance = jax.jvp(lambda spread: kl(mean, reference, spread), (variance,), (stretch,))
+        _, pullback = jax.vjp(lambda at: kl(at, reference, variance), mean)
+        return value, along_mean, along_reference, along_variance, pullback(cotangent)[0]
+
+    run = jax.jit(derivatives) if compiled else derivatives
+    dew = dict(zip(("KL", "JVP along the mean", "JVP along the reference", "JVP along the variance",
+                    "VJP to the mean"),
+                   (np.asarray(value) for value in run(*(jnp.asarray(value) for value in (
+                       mean, reference, variance, tangents, stretch, cotangent)))), strict=True))
+    difference = mean - reference
+    numpy = _numpy_kl(difference, variance, tangents, stretch, cotangent)
+    numpy["JVP along the reference"] = -numpy["JVP along the mean"]
+    wide = [value.astype(np.float64) for value in (difference, variance, tangents, stretch, cotangent)]
+    divergence = np.sum(wide[0] ** 2, axis=1) / (2 * wide[1])
+    along = np.sum(wide[0] * wide[2], axis=1) / wide[1]
+    truth = {"KL": divergence, "JVP along the mean": along, "JVP along the reference": -along,
+             "JVP along the variance": -divergence * wide[3] / wide[1],
+             "VJP to the mean": wide[4][:, None] * wide[0] / wide[1][:, None]}
+    tiny, largest = np.finfo(np.float32).tiny, np.finfo(np.float32).max
+    for name, exact in truth.items():
+        value, size = dew[name], np.abs(exact)
+        normal = (size >= tiny) & (size <= largest)
+        assert_as_exact_as_the_reference(value[normal], numpy[name][normal], exact[normal],
+                                         f"a KL's {name} over float32's exponents")
+        over = size > largest
+        assert np.all(np.isinf(value[over]) & (np.sign(value[over]) == np.sign(exact[over]))), name
+        assert np.all(np.abs(value[size < tiny]) < tiny), name
 
 
 @pytest.mark.parametrize("edge", list(KL_EDGES))
