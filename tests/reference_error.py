@@ -1284,8 +1284,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     if (library_fn is None) != (library_row is None):
         raise ValueError(f"{label}: a library arm is the owner's exception, named with its ledger row")
     if library_fn is not None and row_conditioned:
-        raise ValueError(f"{label}: a library arm judges against the larger arm's error, which row-conditioned "
-                         f"pooling does not keep")
+        raise ValueError(f"{label}: a library arm judges against the larger arm's error, which "
+                         f"row-conditioned pooling does not keep")
     _refuse_numpy_arms(draw, dew_fn, reference_fn)
     dew_fn, reference_fn = _arms(dew_fn, reference_fn)
     library_fn = None if library_fn is None else _arms(library_fn, library_fn)[1]
