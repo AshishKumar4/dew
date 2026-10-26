@@ -13,6 +13,7 @@ from dew import _records
 from dew.interop.weights import in_params
 from dew.nn.dense import Dense
 from dew.nn.precision import float32_dot_general
+from dew.nn.scan_orders import patchify
 from dew.nn.text_encoders import _encoder_layer_path
 from dew.nn.vision.vit import LearnedPositions, MergeProjector, SpecialTokens, VisionTransformer, ViTLayout
 from dew.registry import Record
@@ -32,22 +33,18 @@ from .common import (
 
 
 def pixel_shuffle(patches: jax.Array, ratio: float) -> jax.Array:
-    """Space to depth: each ratio-by-ratio block becomes one thicker token.
+    """Space to depth: each block of `1 / ratio` patches a side of the square
+    patch grid becomes one thicker token, its patches row by row (`patchify`).
 
     The inverse of a pixel shuffle at the same ratio (modeling_llama4.py,
     pixel_shuffle): tokens shrink by ratio squared and channels grow by it.
     """
     batch, count, channels = patches.shape
     side = round(count ** 0.5)
-    grown = round(channels / ratio ** 2)
-    if abs(grown * ratio ** 2 - channels) > 1e-6:
-        raise ValueError(
-            f"{channels} channels do not split over a shuffle ratio of {ratio}")
-    grid = patches.reshape(batch, side, side, channels)
     block = round(1 / ratio)
-    shuffled = grid.reshape(batch, side // block, block, side // block, block, channels)
-    shuffled = shuffled.transpose(0, 1, 3, 2, 4, 5)
-    return shuffled.reshape(batch, (side // block) ** 2, grown)
+    if block * ratio != 1:
+        raise ValueError(f"a shuffle ratio of {ratio} does not gather whole blocks of patches")
+    return patchify(patches.reshape(batch, side, side, channels), block)
 
 
 class Llama4VisionTransformer(nn.Module):
