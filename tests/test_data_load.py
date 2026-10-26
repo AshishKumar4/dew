@@ -126,14 +126,14 @@ files, and closed once the map has ended, in a fresh interpreter: before any Hub
 read (`hold_progress_lock`) or a listing's discovery (`split_files`)."""
 
 
-@pytest.mark.parametrize("bars", ["datasets.utils.tqdm", "tqdm.auto", "huggingface_hub.utils.tqdm"],
-                         ids=["datasets", "auto", "hub-client"])
+@pytest.mark.parametrize("bars", ["datasets.utils.tqdm", "tqdm.auto"], ids=["datasets", "auto"])
 @pytest.mark.parametrize("call", ["read", "listing"])
 def test_a_bar_alive_across_another_threads_shard_read_closes_once_a_hub_call_holds_the_lock(call, bars):
     """tqdm's thread_map deletes its bar class's lock under a bar of another thread's map that outlives
     it, as two splits read at once, or two streamed sources discovered at once, do; after a Hub read or
     a listing's discovery, a lock tqdm's class holds is the one every map's class finds, so the map
-    restores it and the bar closes, whichever class `datasets` or the Hub client lends it."""
+    restores it and the bar closes, whichever class `datasets` lends it: its own for a listing's files
+    and a split's shards, tqdm's default for a prepared split's."""
     import subprocess
     import sys
 

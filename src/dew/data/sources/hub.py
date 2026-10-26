@@ -26,7 +26,7 @@ def hold_progress_lock() -> None:
     the class nor a class it derives from held one. Two maps at once (compile's readers: a holdout's train
     and held; several streamed sources discovered together) then delete it under each other's bars:
     "type object 'tqdm' has no attribute '_lock'". Held by tqdm's class, which every bar class `datasets`
-    and the Hub client lend a map derive from, each map finds it and restores it instead."""
+    lends a map derives from, each map finds it and restores it instead."""
     from tqdm import tqdm as bars
 
     bars.get_lock()
