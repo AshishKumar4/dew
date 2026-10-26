@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 import tokamax
 from fla_gdn_support import CONV_SHAPES, conv_config_cases, conv_training_cases, kda_training_cases
+from generation_support import COMPILES_FOR_TPU
 from kernel_compile import compile_kernels, failures
 
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurrence, short_conv, tuning
@@ -243,6 +244,7 @@ def test_the_resource_gate_refuses_a_spilling_mosaic_kernel():
         assert len(mosaic_failures([{**record, "kernels": [a, b, c]}])) == 2
 
 
+@COMPILES_FOR_TPU
 def test_splash_compiles_for_a_v5e_with_libtpu():
     """Dew's splash path, forward and backward, compiled by libtpu for a compile-only v5e on this CPU
     (tests/kernel_compile.py): within the v5e's scoped VMEM, as the blocks splash takes are sized
