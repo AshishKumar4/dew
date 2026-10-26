@@ -278,8 +278,7 @@ class _Triton(_GroupedLaunch[Tile]):
         while rows > 16 or columns > 16:
             rows, columns = (rows, columns // 2) if columns > rows else (rows // 2, columns)
             shapes.append((rows, columns))
-        dense = ba.arguments.get('dense')
-        depth, width = self._dense_extents(ba) if dense else (None, None)
+        extents = self._dense_extents(ba) if ba.arguments.get('dense') else None
         found = None
         for output in shapes:
             for floor in (3, 2):
@@ -288,8 +287,8 @@ class _Triton(_GroupedLaunch[Tile]):
                                  if self.legal(ba, tile := self.tile(output, step, stages), target)), None)
                     if tile is None:
                         continue
-                    divides = dense and depth % self.contraction(tile) == 0 and width % output[1] == 0
-                    if not dense or divides:
+                    if extents is None or (extents[0] % self.contraction(tile) == 0
+                                           and extents[1] % output[1] == 0):
                         return tile
                     found = found or tile
         return found
