@@ -353,7 +353,7 @@ def _trained(spec: algebra.Forward, family: mosaic.Family, start: algebra.Partia
     `first`) from `start`: `algebra.training_step`, its split sums in the family's accumulators, taken in
     place a block of the family's swizzled value columns at a time (`Keys.accumulate`), and the anchor's
     value row kept in registers, the same blocks of it, picked from a value tile by its one-hot product where
-    the anchor moved (`Keys.picked`, `Argmax.row`): each block's join and pick take a `[rows, unit]` fp32
+    the anchor moved (`KeptRows`, `Argmax.row`): each block's join and pick take a `[rows, unit]` fp32
     temporary, not the whole width's. `scored(index, slots)` gives a tile's place, coordinates, logits and
     products, and `value_of(slots)` its value slot. Returns the state with the split sums as the state's
     sums, and what the walk leaves beside them: the anchor's own weight, the other keys' weights' sum, the
@@ -379,11 +379,11 @@ def _trained(spec: algebra.Forward, family: mosaic.Family, start: algebra.Partia
         def picked(onehot, value):
             return tuple(dot(onehot, value.at[:, columns]) for columns in blocks)
 
-        keys = algebra.Keys(coords, logits, functools.partial(value_of, slots), dot, accumulate, products,
-                            picked=picked)
+        keys = algebra.Keys(coords, logits, functools.partial(value_of, slots), dot, accumulate, products)
         # The sums are the accumulators', which the step takes in place (`Keys.accumulate`).
         state = algebra.Partial(jnp.zeros((), jnp.float32), m, total)
-        state, arg, own, others_total = algebra.training_step(spec, (state, arg, own, others_total), keys)
+        state, arg, own, others_total = algebra.training_step(spec, (state, arg, own, others_total), keys,
+                                                              algebra.KeptRows(picked))
         return (state.m, state.total, arg, own, others_total), tuple(held)
 
     nothing = family.zeros((rows,))

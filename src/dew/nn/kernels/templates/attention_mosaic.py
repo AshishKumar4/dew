@@ -56,6 +56,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _parts,
     _width,
     refused,
+    whole_tiles,
 )
 from dew.nn.kernels.templates.base import Template, Unfitted
 
@@ -75,28 +76,22 @@ def _extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
 
 def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held: int, walked: int,
                                                 tiles: Callable[[int, int, int], Config],
-                                                fits: Callable[[Config], bool], depth: int,
-                                                steps: Callable[[Config], int]) -> Config | None:
+                                                fits: Callable[[Config], bool]) -> Config | None:
     """A launch's config from its family's facts and the call's extents (design §7), no space ranked: its
     consumers the family's (`Family.consumers`), fewer where the `held` rows a consumer accumulates (a
     forward's queries, a dK/dV launch's keys) fill fewer of the family's units; each consumer's rows the
     family's unit (`_extents`' least: the rows its products cover, `Family.role_rows`, in whole swizzled
     rows), so one consumer's softmax runs under its partner's products as FlashAttention-3's does; the tile
     it walks the largest unit multiple of the `walked` extent whose live set a consumer's registers hold and
-    whose stages the block holds (`fits`); its stages the ring's busy depth (`depth`: two, one more where a
-    walk keeps a slot or a product past its step), at most the walk's `steps` and two at the least; fewer
-    consumers where no tile of the family's count holds the block (a GPU of a smaller one). `tiles(rows,
-    walked, consumers)` builds the config at two stages. None where no tile fits."""
+    whose two stages the block holds (`fits`), two the ring's busy depth, a slot loading while one is read;
+    fewer consumers where no tile of the family's count holds the block (a GPU of a smaller one).
+    `tiles(rows, walked, consumers)` builds the config. None where no tile fits."""
     rows = _extents(family, dtype, held)[-1]
     for consumers in range(max(1, min(family.consumers, -(-held // rows))), 0, -1):
         for extent in _extents(family, dtype, walked):
             config = tiles(rows, extent, consumers)
-            if not fits(config):
-                continue
-            for stages in range(max(2, min(depth, steps(config))), 1, -1):
-                staged = dataclasses.replace(config, stages=stages)
-                if fits(staged):
-                    return staged
+            if fits(config):
+                return config
     return None
 
 
@@ -185,11 +180,13 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         return interpretable and self.derived(ba, target) is not None
 
     def legal(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> bool:
-        """Whether a launch of `ba` runs at `config` on `target`: the target's family's bundle (`BUNDLES`), a
-        call the launch takes (`refusal`), and the block and registers `Template.legal` holds it to."""
+        """Whether a launch of `ba` runs at `config` on `target`: the target's family's bundle (`BUNDLES`),
+        tiles its program takes (`whole_tiles`), a call the launch takes (`refusal`), and the block and
+        registers `Template.legal` holds it to. A pinned or stored config is held to it as a derived one."""
         family = BUNDLES.get(config.family)
         return (family is not None and config.family == generation.family(target.generation)
-                and self.refusal(ba, family) is None and super().legal(ba, config, target))
+                and whole_tiles(family, config) and self.refusal(ba, family) is None
+                and super().legal(ba, config, target))
 
     def _family(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mosaic.Family | None:
         """The target's family's bundle where the launch takes the call there, else None."""
@@ -266,11 +263,8 @@ class MosaicForward(_Mainloop[Tiles]):
         def tiles(rows: int, walked: int, consumers: int) -> Tiles:
             return Tiles(rows, walked, 2, consumers, family.name)
 
-        def steps(config: Tiles) -> int:
-            return _padded(query.shape[1], key.shape[1], config)[1] // config.block_k
-
         return _derived(family, query.dtype, query.shape[1], key.shape[1], tiles,
-                        lambda config: self.legal(ba, config, target), 2, steps)
+                        lambda config: self.legal(ba, config, target))
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         """The program's shared memory (`_forward_allocations`, `_staged`), at the call's widths as the launch
@@ -481,12 +475,8 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         def tiles(rows: int, walked: int, consumers: int) -> BackwardTiles:
             return BackwardTiles(walked, rows, 2, consumers, fused=False, family=family.name)
 
-        def steps(config: BackwardTiles) -> int:
-            padded_q, padded_k = _padded(query.shape[1], key.shape[1], config)
-            return max(padded_q // config.block_q, padded_k // config.block_k)
-
         return _derived(family, query.dtype, key.shape[1], query.shape[1], tiles,
-                        lambda config: self.legal(ba, config, target), 2, steps)
+                        lambda config: self.legal(ba, config, target))
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles,
                      target: generation.GpuTarget) -> int:
