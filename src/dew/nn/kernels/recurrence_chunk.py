@@ -654,7 +654,8 @@ def port_kernel(query, key, value, g=None, beta=None, state=None, starts=None, *
     ('forward', 'training'), which logs a call the row's port turns down the first time: the template's
     implementations bound to it where its decay and write gate are given. Where they are not
     (`on_the_port`, a layer's probe ahead of its gates), a call that names the template falls back to the
-    selector's own pick rather than refusing it, its launches unbound."""
+    selector's own pick rather than refusing it, its launches unbound; one that names another kernel insists
+    on it, as every call does (`selection.KernelRefused`: the port named over varying operands)."""
     from .templates.recurrence import template
 
     call = None if g is None or beta is None else base.call(
@@ -664,8 +665,9 @@ def port_kernel(query, key, value, g=None, beta=None, state=None, starts=None, *
     case = PortCase(reverse=not FORWARD_MODE.get(), varying=bool(jax.typeof(value).mat.varying),
                     dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1], call=call,
                     family=family, product=product)
-    if call is None:
-        return select(GATED_DELTA, case, forced(GATED_DELTA.choice), insist=False).kernel
+    named = forced(GATED_DELTA.choice)
+    if call is None and named == MOSAIC.name:
+        return select(GATED_DELTA, case, named, insist=False).kernel
     return select(GATED_DELTA, case).kernel
 
 
