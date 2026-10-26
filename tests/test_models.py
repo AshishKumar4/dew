@@ -600,6 +600,50 @@ def test_group_norm_is_flax_s(rng, dtype, shape):
                     f"group norm {dtype} {shape}", seeds=GROUP_NORM_SEEDS, truth_fn=truth)
 
 
+OFFSET_GROUP_NORM_SEEDS = 32
+"""The offset group norm's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada."""
+
+
+def test_group_norm_is_as_exact_as_torch_s_where_a_group_s_mean_dwarfs_its_spread():
+    """A group's variance is its centered mean square, as torch's GroupNorm takes it: over activations a
+    hundred from zero at a spread of one, where E[x^2] - E[x]^2 cancels in fp32, the forward and the
+    input's gradient are on par (check 1) with torch's float32 GroupNorm from flax's in float64."""
+    import torch
+
+    shape, groups = (2, 4, 4, 16), 4
+    ours = GroupNorm(groups, epsilon=1e-6)
+    params = ours.init(jax.random.key(0), jnp.zeros(shape))
+    cotangent = np.asarray(jax.random.normal(jax.random.key(1), shape, jnp.float32))
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed), 3)
+        drawn = jax.random.normal(keys[0], shape, jnp.float32) + 100.0
+        moved = jax.tree.map(lambda leaf, key: np.asarray(leaf + 0.1 * jax.random.normal(key, leaf.shape)),
+                             params, {"params": dict(zip(params["params"], jax.random.split(keys[1], 2),
+                                                          strict=True))})
+        return np.asarray(drawn), moved
+
+    def dew(drawn, moved):
+        value, pullback = jax.vjp(lambda x: ours.apply(moved, x), drawn)
+        return {"value": np.asarray(value), "gradient": np.asarray(pullback(cotangent)[0])}
+
+    def torch_s(drawn, moved):
+        x = torch.tensor(np.moveaxis(drawn, -1, 1), requires_grad=True)
+        y = torch.nn.functional.group_norm(x, groups, torch.tensor(moved["params"]["scale"]),
+                                           torch.tensor(moved["params"]["bias"]), eps=1e-6)
+        (y * torch.tensor(np.moveaxis(cotangent, -1, 1))).sum().backward()
+        return {"value": np.moveaxis(y.detach().numpy(), 1, -1),
+                "gradient": np.moveaxis(x.grad.numpy(), 1, -1)}
+
+    def truth(drawn, moved):
+        wide = nn.GroupNorm(groups, epsilon=1e-6, dtype=jnp.float64)
+        value, pullback = jax.vjp(lambda x: wide.apply(moved, x), drawn)
+        return {"value": np.asarray(value), "gradient": np.asarray(pullback(cotangent.astype(np.float64))[0])}
+
+    assert_as_exact(jax.jit(dew), torch_s, draw, "offset group norm", seeds=OFFSET_GROUP_NORM_SEEDS,
+                    truth_fn=truth)
+
+
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 def test_group_norm_activates_its_wide_output_before_its_one_cast(rng, dtype):
     """The activation reads the fp32 affine result, as Diffusers' Flax VAE
