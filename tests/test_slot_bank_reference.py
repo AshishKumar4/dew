@@ -68,14 +68,16 @@ def edited(path, **fields):
 
 @pytest.mark.parametrize("changed", [None, "pool", "source", "tokenizer", "device", "dtype", "phase",
                                      "native commit", "author commit", "truth commit", "pool commit",
-                                     "mixed commits", "request commit", "pilots", "parameters", "precision"])
+                                     "mixed commits", "request commit", "requests", "dropped request",
+                                     "pilots", "parameters", "precision"])
 def test_a_runtime_verdict_refuses_records_from_a_different_experiment(tmp_path, changed):
     """A verdict judges the three phases' records only where each, and each request record within them,
     was made in one run of the commit the pool names: over this pool, from this source's bytes (its
     tokenizer files among them), at the declared device, dtype and phase, native's pilots and verdict
     draws in one record, each arm's parameters at its storage policy over the release's stored dtypes
-    and the author's products at IEEE float32. Any one of them changed refuses the verdict before it
-    writes one; a verdict it writes names its own commit."""
+    and the author's products at IEEE float32, the author's and truth's request records one for each
+    pilot and verdict draw in order. Any one of them changed refuses the verdict before it writes one; a
+    verdict it writes names its own commit."""
     with run_from("slot_runtime_qualification", "tools") as tool:
         from reference_source import dew_revision
 
@@ -97,6 +99,12 @@ def test_a_runtime_verdict_refuses_records_from_a_different_experiment(tmp_path,
             metadata = json.loads((tmp_path / "author.json").read_text())
             metadata["requests"][3]["commit"] = "1" * 40
             (tmp_path / "author.json").write_text(json.dumps(metadata))
+        elif changed == "requests":
+            edited(tmp_path / "author.json", requests=None)
+        elif changed == "dropped request":
+            metadata = json.loads((tmp_path / "truth.json").read_text())
+            del metadata["requests"][5]
+            (tmp_path / "truth.json").write_text(json.dumps(metadata))
         elif changed == "pilots":
             with np.load(tmp_path / "native.npz") as held:
                 verdict = {name for seed in pool["verdict"]
