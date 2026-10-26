@@ -168,6 +168,10 @@ def write_source(directory, name: str, edit=lambda code: code) -> None:
     model = AutoModelForCausalLM.from_config(config, trust_remote_code=True, dtype=torch.float32)
     scatter_weights(model)
     model.save_pretrained(directory)
+    # save_pretrained writes the module of the class the auto class built over the repository's own,
+    # and the auto class builds the class registered for the config's: within one process, that is
+    # an earlier repository's of the same folder name and configuration code, whose `edit` may differ.
+    (directory / f"modeling_{stem}.py").write_text(edit(modeling()))
 
 
 @pytest.mark.parametrize("name", sorted(SOURCES))
@@ -443,20 +447,27 @@ def test_a_backward_its_forward_does_not_show_is_not_assembled(tmp_path):
         verify_mapping(config, remote=tmp_path / "frozen")
 
 
-def test_a_slot_release_over_a_model_of_parts_loads_its_backbone_by_its_own_code(tmp_path):
-    """A slot release whose backbone is a repository of remote code reads that code where the load opts
-    in, as the backbone alone does: its decoder verifies from parts and holds the backbone's own
-    variables, and it computes the backbone's logits."""
+def _slot_release(tmp_path, edit=lambda code: code):
+    """The renamed source's repository alone (`edit` of its modeling code), and a local slot release over
+    it: the same repository, its remote code included, with a tokenizer and a slot readout beside it."""
     import shutil
 
     from test_slot_sources import BACKBONE
 
     alone, release = tmp_path / "renamed", tmp_path / "release"
-    write_source(alone, "renamed")
+    write_source(alone, "renamed", edit)
     shutil.copytree(alone, release)
     for name in ("tokenizer.json", "tokenizer_config.json"):
         shutil.copy(BACKBONE / name, release / name)
     (release / "readout.json").write_text(json.dumps({"readout": "slot_lm", "head_dim": 8, "n_slots": 16}))
+    return alone, release
+
+
+def test_a_slot_release_over_a_model_of_parts_loads_its_backbone_by_its_own_code(tmp_path):
+    """A slot release whose backbone is a repository of remote code reads that code where the load opts
+    in, as the backbone alone does: its decoder verifies from parts and holds the backbone's own
+    variables, and it computes the backbone's logits."""
+    alone, release = _slot_release(tmp_path)
     backbone = Pretrained.load(alone, dtype="float32", attention_impl="reference", trust_remote_code=True)
     loaded = Pretrained.load(release, dtype="float32", attention_impl="reference", trust_remote_code=True)
     for ours, theirs in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(backbone.variables),
@@ -465,3 +476,41 @@ def test_a_slot_release_over_a_model_of_parts_loads_its_backbone_by_its_own_code
     ids = np.random.default_rng(1693).integers(0, TINY["vocab_size"], (2, 12)).astype(np.int32)
     np.testing.assert_array_equal(np.asarray(loaded.model.apply(loaded.variables, ids)),
                                   np.asarray(backbone.model.apply(backbone.variables, ids)))
+
+
+def _counted(path):
+    """An edit of the renamed Llama whose causal LM, built to run (off torch's meta device, where a probe
+    sizes it and an assembly reads its parts), appends a line to `path`: the lines count the times the
+    source's model is built to run."""
+    def edit(code: str) -> str:
+        changed = code.replace(
+            "        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)\n",
+            "        self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)\n"
+            "        if not self.lm_head.weight.is_meta:\n"
+            f"            with open({str(path)!r}, 'a') as file:\n"
+            "                file.write('built\\n')\n", 1)
+        assert changed != code
+        return changed
+    return edit
+
+
+@pytest.mark.parametrize("kind", ["alone", "release"])
+def test_one_load_of_local_remote_code_probes_it_once(tmp_path, kind):
+    """A load verifies the remote code it runs once: a local repository's code, which no commit names,
+    has no recorded verification to read back, so each probe of it builds and runs the source again. One
+    load of the repository alone, and of a slot release over it, which routes its backbone before
+    reading its weights, builds the source's model to run as often as one probe of it does
+    (`verify_mapping`), and Dew's own load builds none."""
+    built = tmp_path / "built"
+    sources = dict(zip(("alone", "release"), _slot_release(tmp_path, _counted(built)), strict=True))
+
+    def ran(run) -> int:
+        built.unlink(missing_ok=True)
+        run()
+        return len(built.read_text().splitlines()) if built.exists() else 0
+
+    config = json.loads((sources["alone"] / "config.json").read_text())
+    probe = ran(lambda: verify_mapping(config, remote=sources["alone"]))
+    assert probe > 0
+    assert ran(lambda: Pretrained.load(sources[kind], dtype="float32", attention_impl="reference",
+                                       trust_remote_code=True)) == probe

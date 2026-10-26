@@ -14,6 +14,7 @@ from dew.decision import Choice, Decide, decisions
 from dew.decision.config import DecisionRunConfig
 from dew.decision.scoring import ScoringRule
 from dew.registry import from_record
+from dew.training.evaluation import Summary
 
 pytestmark = pytest.mark.mesh
 
@@ -59,7 +60,8 @@ def test_a_decision_run_scores_each_split_with_its_own_metrics_and_ranks_by_thei
     """A decision run names its validation splits and each one's metrics (`--val-metrics`): accuracy on
     every split and the Brier score on `test` alone, in place of the task's own suite. A summary weighs
     both splits' accuracy into one (`--val-summaries`), formed at each evaluation, which scores both, and
-    the run ranks its checkpoints by it (`--trainer.best summary/board`)."""
+    the run ranks its checkpoints by it (`--trainer.best evaluation/summary/board`)."""
+    board = f"{Summary.SPLIT}/board"
     table = tmp_path / "tickets.csv"
     tickets = [("charged twice for March", "billing"), ("the site is down", "technical"),
                ("how much is the pro plan", "sales"), ("refund my last invoice", "billing")] * 6
@@ -78,7 +80,7 @@ def test_a_decision_run_scores_each_split_with_its_own_metrics_and_ranks_by_thei
         "--trainer.steps", "2", "--trainer.eval-every", "1", "--trainer.checkpoint-every", "1",
         "--trainer.log-every", "1", "--trainer.multi-host", "False",
         "--trainer.compilation-cache-dir", "None",
-        "--model.dtype", "float32", "--trainer.best", "summary/board",
+        "--model.dtype", "float32", "--trainer.best", board,
         "--val-metrics", '[{"name": "accuracy"}, {"name": "brier", "split": "test"}]',
         "--val-summaries", json.dumps([{"name": "board", "weights": {"val/accuracy": 1, "test/accuracy": 3},
                                         "better": "higher"}])],
@@ -90,11 +92,9 @@ def test_a_decision_run_scores_each_split_with_its_own_metrics_and_ranks_by_thei
     for row in logged:
         scores.setdefault(row["step"], {}).update(row["scalars"])
     for step in (1, 2):
-        names = {name for name in scores[step] if name.split("/")[0] in ("val", "test", "summary")}
-        assert names == {"val/loss", "val/accuracy", "test/loss", "test/accuracy", "test/brier",
-                         "summary/board"}
-        assert scores[step]["summary/board"] == (scores[step]["val/accuracy"]
-                                                 + 3 * scores[step]["test/accuracy"]) / 4
+        names = {name for name in scores[step] if name.rpartition("/")[0] in ("val", "test", Summary.SPLIT)}
+        assert names == {"val/loss", "val/accuracy", "test/loss", "test/accuracy", "test/brier", board}
+        assert scores[step][board] == (scores[step]["val/accuracy"] + 3 * scores[step]["test/accuracy"]) / 4
     recorded = RunConfig.load(str(run))
     assert (recorded.val_metrics, recorded.val_summaries) == (config.val_metrics, config.val_summaries)
 

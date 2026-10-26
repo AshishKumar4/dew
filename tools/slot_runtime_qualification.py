@@ -480,7 +480,7 @@ def author(args, pool, run):
     import numpy as np
     import torch
     import transformers
-    from slot_readout_reference import oracle_precision, runtime
+    from block_override_reference import oracle_precision, release_package
 
     truth = run["phase"] == "truth"
     torch.set_float32_matmul_precision("highest")
@@ -509,7 +509,7 @@ def author(args, pool, run):
             counts = stack.enter_context(float64_operations())
             seconds, forwards = stack.enter_context(layer_seconds(model, torch.device(args.device)))
             measured = functools.partial(_spent, seconds, forwards, weights, counts)
-        _, schema, _ = stack.enter_context(runtime())
+        _, schema, _ = stack.enter_context(release_package())
         engine_type = importlib.import_module("slot_reference.engine").DecisionEngine
         engine = engine_type(str(args.source), device=args.device,
                              dtype="float64" if truth else args.dtype,
@@ -639,14 +639,15 @@ def verdict(args, pool):
             raise ValueError("the recorded truth logits were narrowed after execution")
 
     def log_probabilities(phase, index):
-        """A draw's leaf: each question's log-softmax over its own options, in the phase's precision,
-        its questions in turn. The claim is the options' probabilities, so their shared shift is out."""
-        def normalized(logits):
-            top = logits.max()
-            return logits - (top + np.log(np.sum(np.exp(logits - top))))
+        """A draw's leaf: each question's log-softmax over its own options, its questions in turn. The
+        claim is the options' probabilities, so their shared shift is out: each phase's recorded logits,
+        in the precision that phase computed them, are normalized in float64 (SciPy's `log_softmax`),
+        where a shift as large as a float32 logit's adds no rounding of its own."""
+        from scipy.special import log_softmax
 
         names = pool["requests"][str(int(index))]["questions"]
-        return {"log_probabilities": np.concatenate([normalized(loaded[phase][name]) for name in names])}
+        return {"log_probabilities": np.concatenate([
+            log_softmax(np.asarray(loaded[phase][name], np.float64)) for name in names])}
 
     original = functools.partial(log_probabilities, "author")
     exact = functools.partial(log_probabilities, "truth")
