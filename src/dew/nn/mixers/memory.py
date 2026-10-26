@@ -22,5 +22,7 @@ class InContextMemoryMixer(MixerBase):
     memory: InContextMemory
 
     def build(self, ctx: MixerContext):
+        if not ctx.causal:
+            raise ValueError("memory requires causal=True; its in-context steps read a token's prefix alone")
         return functools.partial(type(self.memory), **{**rebuilt(dict, self.memory), "dtype": ctx.dtype,
                                                        "precision": ctx.precision})
