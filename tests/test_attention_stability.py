@@ -30,7 +30,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_oracle import exact_attention
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, with_gradients
+from reference_error import as_given, assert_as_exact, assert_as_exact_as_the_reference, with_gradients
 
 from dew.nn.documents import CrossDocuments
 from dew.nn.kernels import decode_attention, generation, tuning
@@ -811,7 +811,7 @@ def test_the_accurate_form_is_finite_and_as_exact_as_the_reference_at_fp32s_edge
     (`ACCURATE`), check 1 over the family's draws; a row that sees nothing, zero."""
     seeds, family = SEEDS[family], FAMILIES[family]
     draw = _cast(family, family.draw)
-    reference = jax.jit(with_gradients(_reference(family, anchored=False)))
+    reference = as_given(jax.jit(with_gradients(_reference(family, anchored=False))))
     truth = with_gradients(_reference(family, anchored=True))
     for name, mainloop in _mainloops(family, ACCURATE).items():
         label = f"{name} accurate {family.dtype}"
@@ -826,7 +826,7 @@ def _default_is_finite(family_name: str, mainloop_name: str) -> None:
     here is no claim, and its ties the documented divergence (the module's docstring)."""
     seeds, family = SEEDS[family_name], FAMILIES[family_name]
     draw = _cast(family, family.draw)
-    reference = jax.jit(with_gradients(_reference(family, anchored=False)))
+    reference = as_given(jax.jit(with_gradients(_reference(family, anchored=False))))
     label = f"{mainloop_name} default {family.dtype}"
     differentiated = jax.jit(with_gradients(_mainloops(family, {})[mainloop_name]))
     assert_finite(differentiated, reference, draw, label, seeds=seeds)
@@ -881,7 +881,7 @@ def test_the_frozen_triton_backward_reads_a_guarded_forwards_rows_whatever_its_p
         with tuning.pinned(PINS):
             return attention_triton.backward(*operands, interpret=True, split=False)
 
-    reference = jax.jit(with_gradients(_reference(family_of, anchored=False)))
+    reference = as_given(jax.jit(with_gradients(_reference(family_of, anchored=False))))
     unsplit = jax.jit(with_gradients(_differentiable(family_of, forward, backward)))
     assert_finite(unsplit, reference, _cast(family_of, family_of.draw), f"triton unsplit {family_of.dtype}",
                   seeds=seeds)
@@ -1005,7 +1005,7 @@ def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, f
     the family's draws."""
     seeds, family = SEEDS[family], FAMILIES[family]
     decoded, forward = _decoded(family, FORMS[form])
-    assert_as_exact(jax.jit(decoded), jax.jit(_reference(family, anchored=False)), forward,
+    assert_as_exact(jax.jit(decoded), as_given(jax.jit(_reference(family, anchored=False))), forward,
                     f"decode {form} {family.dtype}", seeds=seeds,
                     truth_fn=_reference(family, anchored=True))
 
@@ -1021,7 +1021,7 @@ def test_decodes_default_is_finite_where_its_sums_pass_fp32s_largest(family):
     either form (`algebra.Forward.headroom`)."""
     seeds, family = SEEDS[family], FAMILIES[family]
     decoded, forward = _decoded(family, None)
-    assert_finite(jax.jit(decoded), jax.jit(_reference(family, anchored=False)), forward,
+    assert_finite(jax.jit(decoded), as_given(jax.jit(_reference(family, anchored=False))), forward,
                   f"decode default {family.dtype}", seeds=seeds)
 
 
