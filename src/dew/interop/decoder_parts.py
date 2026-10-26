@@ -295,8 +295,8 @@ class WrapperFields(AudioFields):
     model_type: str
     text_model_type: str
     text: DecoderFields
-    tower: Mapping[str, object]
-    projector: Mapping[str, object]
+    tower: Mapping[str, object] | None
+    projector: Mapping[str, object] | None
     image_token_id: int
     tokens_per_image: int | None
     video_token_id: int | None

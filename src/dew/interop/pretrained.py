@@ -937,6 +937,11 @@ def _wrapper_attention(config: decoder_parts.DecoderFields, names: Sequence[str]
     config["kinds"] = kinds
 
 
+def _layer_kinds(config: decoder_parts.DecoderFields) -> tuple[str, ...]:
+    """Each layer kind a decoder's `layer_types` names, once, in order."""
+    return tuple(dict.fromkeys(_records.strings(config["layer_types"], "layer_types")))
+
+
 def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.WrapperFields,
                          max_seq_len: int | None) -> decoder_parts.DecoderFields:
     """Read the decoder fields a wrapper's text_config states, with the corrections
@@ -944,7 +949,8 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.Wra
 
     Gemma 3 projects its logits without the causal-LM class's final tanh cap
     and attends its image spans both ways; Gemma 4 does the same on its
-    sliding layers when the config asks for it; Qwen3.5 splits its rotary
+    sliding layers when the config asks for it; Gemma 4 Unified reads each
+    vision block whole on every attention layer; Qwen3.5 splits its rotary
     into the three mrope sections its wrapper positions rows with.
     """
     family = config.get("model_type")
@@ -954,10 +960,13 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.Wra
         text_fields["max_seq_len"] = max_seq_len
     if family == "gemma3":
         text_fields["final_logit_softcap"] = None
-        names = _records.strings(text_fields["layer_types"], "layer_types")
-        _wrapper_attention(text_fields, tuple(dict.fromkeys(names)), {"bidirectional_images": True})
+        _wrapper_attention(text_fields, _layer_kinds(text_fields), {"bidirectional_images": True})
     if family == "gemma4" and text_config.get("use_bidirectional_attention") == "vision":
         _wrapper_attention(text_fields, ("sliding_attention",), {"bidirectional_images": True})
+    # Unified states vision unless its config says otherwise, and reads each vision block whole on
+    # every layer kind, past the sliding window.
+    if family == "gemma4_unified" and text_config.get("use_bidirectional_attention", "vision") == "vision":
+        _wrapper_attention(text_fields, _layer_kinds(text_fields), {"bidirectional_blocks": True})
     if family in QWEN35_TYPES:
         rope = _records.record(text_config.get("rope_parameters") or {}, "rope_parameters")
         sections = rope.get("mrope_section", [11, 11, 10])
@@ -982,8 +991,8 @@ def _wrapper_model(config: Mapping[str, object], record: decoder_parts.WrapperFi
     audio_record = record["audio"]
     audio_projector = record["audio_projector"]
     return MultimodalTransformer(
-        language_model, towers.from_record(record["tower"]),
-        projectors.from_record(record["projector"]), family,
+        language_model, None if record["tower"] is None else towers.from_record(record["tower"]),
+        None if record["projector"] is None else projectors.from_record(record["projector"]), family,
         record["image_token_id"], dtype=resolve_dtype(dtype),
         # A text_config that states a null pad id states none, and the
         # wrapper's own field defaults to 0 for exactly that.
