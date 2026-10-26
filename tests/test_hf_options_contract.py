@@ -231,17 +231,13 @@ def test_an_unprepared_pinned_csv_split_selects_the_read_arrow_provisions(tmp_pa
 
 
 def test_importing_hub_without_datasets_does_not_load_the_optional_package():
+    # An environment without the optional package: Python refuses an import of a module whose
+    # entry in sys.modules is None, as it refuses one that is not installed.
     code = """
-import builtins
-original = builtins.__import__
-def absent(name, *args, **kwargs):
-    if name == 'datasets':
-        raise ModuleNotFoundError('datasets is absent')
-    return original(name, *args, **kwargs)
-builtins.__import__ = absent
+import sys
+sys.modules['datasets'] = None
 from dew.data.sources.hub import Hub
 source = Hub('acme/records', name='named', revision='frozen')
-source.__dict__['commit'] = 'frozen'
 try:
     source.builder
 except ImportError as error:
