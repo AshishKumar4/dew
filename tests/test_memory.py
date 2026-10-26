@@ -34,9 +34,12 @@ CONFIGURATIONS = {
     "moneta": {"network": ResidualMemory(hidden=4 * FEATURES),
                "objective": Objective("lp", p=3.0), "retention": Gate(bias=-2.0),
                "learning_rate": Gate(scale=0.005)},
-    # Yaad: Huber's bias (Miras Eq 13, 26).
+    # Yaad: Miras Eq 16's switch between l2 and l1 by the whole error's norm, as its Eq 26 selects.
     "yaad": {"network": ResidualMemory(hidden=4 * FEATURES),
-             "objective": Objective("huber", delta=0.5), "retention": Gate(bias=-2.0)},
+             "objective": Objective("l2_or_l1", delta=0.5), "retention": Gate(bias=-2.0)},
+    # Miras' first Huber bias, each coordinate's Huber loss (Eq 13-14), on Yaad's memory.
+    "huber": {"network": ResidualMemory(hidden=4 * FEATURES),
+              "objective": Objective("huber", delta=0.5), "retention": Gate(bias=-2.0)},
     # Nested Learning's self-modifying memory: a residual MLP (Eq 89), its own target (Eq 84), retention.
     "self_modifying": {"network": ResidualMemory(hidden=2 * FEATURES, norm=False),
                        "target": "self_generated", "retention": Gate(bias=-2.0)},
@@ -82,20 +85,15 @@ def paper_loss(kind: str, objective: Objective):
     return losses[kind]
 
 
-PAPER_KINDS = {"yaad": "l2_or_l1"}
-"""The loss a configuration's paper takes where its objective is not that kind: Yaad's Eq 26 selects
-Miras Eq 16, the switch between l2 and l1 by the whole error's norm."""
-
-
-def written(module: InContextMemory, *, dtype, segments=None, gradient=None, kind=None):
+def written(module: InContextMemory, *, dtype, segments=None, gradient=None):
     """The paper's update as a function of the stream, token by token, in `dtype` (float64 for the
     truth): the views and gates from the layer's projections, the state in at least float32, each
     gradient at its chunk's start counted from its document's first token (`segments` `[S]`, one
-    document where None) of the loss its paper writes (`paper_loss`, of `kind`, the objective's where
-    None), and the readout at `dtype`."""
+    document where None) of the loss its paper writes for the layer's objective (`paper_loss`), and the
+    readout at `dtype`."""
     wide = jnp.promote_types(dtype, jnp.float32)
     grad_net, read_net = module.network.clone(dtype=wide), module.network.clone(dtype=dtype)
-    loss = paper_loss(kind or module.objective.kind, module.objective)
+    loss = paper_loss(module.objective.kind, module.objective)
     firsts = np.arange(LENGTH) == 0 if segments is None else np.r_[True, segments[1:] != segments[:-1]]
 
     def gate(name, spec, x, p):
@@ -185,10 +183,8 @@ def test_a_memory_follows_its_papers_update(name):
     """Each configuration computes its paper's update and readout token by token (`written`), on par
     with that written-out update in float32, against float64 (check 1)."""
     module = layer(name)
-    kind = PAPER_KINDS.get(name)
-    assert_as_exact(applied(module), written(module, dtype=jnp.float32, kind=kind), drawn(module),
-                    f"{name} memory", seeds=MEMORY_SEEDS,
-                    truth_fn=written(module, dtype=jnp.float64, kind=kind))
+    assert_as_exact(applied(module), written(module, dtype=jnp.float32), drawn(module), f"{name} memory",
+                    seeds=MEMORY_SEEDS, truth_fn=written(module, dtype=jnp.float64))
 
 
 def test_yaads_objective_switches_by_the_whole_errors_norm():
