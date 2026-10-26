@@ -5,10 +5,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import pytest
 from learning_gate import assert_learns
 
 from dew.config import OptimConfig
-from dew.optim import OPTIMIZER_MAP, QUANTIZED_SIZE, QuantizedMoment, dequantized, dynamic_map, quantized
+from dew.optim import OPTIMIZER_MAP, QUANTIZED_SIZE, QuantizedMoments, dequantized, dynamic_map, quantized
 
 LR = 1e-2
 BLOCK = 256
@@ -39,16 +40,16 @@ def test_a_moment_is_coded_by_its_blocks_nearest_value():
     bitsandbytes' and torchao's share)."""
     moment = jnp.asarray(np.random.default_rng(0).standard_normal((4, 2 * BLOCK)), jnp.float32)
     values = jnp.asarray(dynamic_map(signed=True))
-    coded = quantized(moment, values, BLOCK)
-    assert coded.codes.dtype == jnp.uint8 and coded.scales.shape == (4, 2)
+    codes, scales = quantized(moment, values, BLOCK)
+    assert codes.dtype == jnp.uint8 and scales.shape == (4, 2)
     blocked = np.asarray(moment).reshape(4, 2, BLOCK)
-    fractions = (blocked / np.asarray(coded.scales)[..., None]).reshape(4, 2 * BLOCK)
+    fractions = (blocked / np.asarray(scales)[..., None]).reshape(4, 2 * BLOCK)
     nearest = np.argmin(np.abs(np.asarray(values)[None, None, :] - fractions[..., None]), axis=-1)
-    np.testing.assert_array_equal(np.asarray(coded.codes), nearest)
-    back = np.asarray(dequantized(coded, values, BLOCK)).reshape(4, 2, BLOCK)
+    np.testing.assert_array_equal(np.asarray(codes), nearest)
+    back = np.asarray(dequantized(codes, scales, values, BLOCK)).reshape(4, 2, BLOCK)
     peaks = np.abs(blocked).argmax(-1)[..., None]
     peak, decoded = np.take_along_axis(blocked, peaks, -1), np.take_along_axis(back, peaks, -1)
-    least = np.asarray(values)[0] * np.asarray(coded.scales)[..., None]
+    least = np.asarray(values)[0] * np.asarray(scales)[..., None]
     np.testing.assert_array_equal(decoded, np.where(peak > 0, peak, least))
 
 
@@ -66,9 +67,10 @@ def test_int8_state_takes_optax_adamw_steps_from_the_fp32_moments():
     moments = state.inner_state[0]
     assert params["big"].size >= QUANTIZED_SIZE > params["small"].size
     for moment in (moments.mu, moments.nu):
-        assert isinstance(moment["big"], QuantizedMoment) and moment["big"].codes.dtype == jnp.uint8
-        assert moment["big"].scales.shape == (16, 2) and moment["small"].dtype == jnp.float32
-        stored = moment["big"].codes.nbytes + moment["big"].scales.nbytes
+        assert isinstance(moment, QuantizedMoments) and moment.codes["big"].dtype == jnp.uint8
+        assert moment.scales["big"].shape == (16, 2)
+        assert moment.codes["small"].dtype == jnp.float32 and moment.scales["small"] is None
+        stored = moment.codes["big"].nbytes + moment.scales["big"].nbytes
         assert stored * 4 <= params["big"].nbytes * (1 + 4 / BLOCK)
 
 
@@ -117,3 +119,44 @@ def test_int8_state_trains_as_fp32_adam_does():
                 ((2 * improvement - reference_improvement) / reference_improvement)[units]}
 
     assert_learns(contrasts, "8-bit moments", units=UNITS)
+
+
+def split_dims(spec, ndim: int, axis: str) -> list[int]:
+    """The dimensions of a leaf of `ndim` dimensions its sharding `spec` splits over the mesh's `axis`."""
+    names = tuple(spec) + (None,) * (ndim - len(spec))
+    return [dim for dim, name in enumerate(names) if axis in jax.tree.leaves(name)]
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("axis", ["tensor", "expert"])
+def test_int8_moments_are_placed_as_their_parameters_are(axis):
+    """A moment's codes and block scales are trees of the parameters' own paths, so a layout places each as
+    its parameter's declared axes say: over a tensor axis of two devices a projection's codes are split as
+    its kernel is, over an expert axis an expert's are, and the scales too, along each dimension of the
+    parameter's split that their blocks divide by the axis."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.lm import LMObjective
+    from dew.training import MeshSpec, Trainer
+
+    model = CausalTransformer(vocab_size=256, emb_features=512, num_layers=1, num_heads=2, mlp_features=1024,
+                              max_seq_len=16, dtype=jnp.float32,
+                              mixture={"experts": 4, "top_k": 2} if axis == "expert" else None)
+    trainer = Trainer(LMObjective(model, 8), solver(), key=jax.random.key(0), mesh=MeshSpec(**{axis: 2}))
+    state, _, _ = trainer.place()
+    params = state.variables["params"]
+    moments = [node for node in jax.tree.leaves(state.opt_state, is_leaf=lambda node: isinstance(
+        node, QuantizedMoments)) if isinstance(node, QuantizedMoments)]
+    assert len(moments) == 2
+    split = 0
+    for moment in moments:
+        assert jax.tree.structure(moment.codes) == jax.tree.structure(params)
+        scales = jax.tree.leaves(moment.scales, is_leaf=lambda leaf: leaf is None)
+        for param, codes, scale in zip(jax.tree.leaves(params), jax.tree.leaves(moment.codes), scales,
+                                       strict=True):
+            assert codes.sharding.spec == param.sharding.spec
+            dims = split_dims(param.sharding.spec, param.ndim, axis)
+            split += bool(dims)
+            if scale is not None:
+                assert split_dims(scale.sharding.spec, scale.ndim, axis) == [
+                    dim for dim in dims if scale.shape[dim] % 2 == 0]
+    assert split > 0
