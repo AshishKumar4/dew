@@ -712,6 +712,38 @@ def test_a_recording_made_in_shards_is_the_recording_one_run_makes():
                                                                             range(cut - 1))])
 
 
+def test_a_recorded_reference_with_pilots_sizes_paired_on_them_alone():
+    """A recorded reference sizes paired only on pilot draws its recording holds (`recorded_pilots`),
+    from SIZING_FROM on, never past them; one without pilots is refused, and so is a live reference
+    marked with pilots."""
+    from reference_error import SIZING_FROM, recorded_pilots
+
+    pilots = range(SIZING_FROM, SIZING_FROM + 32)
+    theirs = {seed: _product(*_draw(seed)) for seed in pilots}
+    mine = {seed: _reordered(*_draw(seed)) for seed in pilots}
+    truths = {seed: {"y": np.asarray(_draw(seed)[0], np.float64) @ np.asarray(_draw(seed)[1], np.float64)}
+              for seed in pilots}
+
+    def reference(seed):
+        return theirs[int(seed)]
+
+    def dew(seed):
+        return mine[int(seed)]
+
+    def truth(seed):
+        return truths[int(seed)]
+
+    def draw(seed):
+        return (np.int64(seed),)
+
+    reference.recorded = True
+    with pytest.raises(ValueError):
+        seeds_for(reference, draw, "no pilots", dew_fn=dew, truth_fn=truth)
+    assert seeds_for(recorded_pilots(reference, 32), draw, "pilots", dew_fn=dew, truth_fn=truth) <= 32
+    with pytest.raises(ValueError):
+        recorded_pilots(_product, 32)
+
+
 def test_a_recorded_reference_is_drawn_by_its_index_and_covers_the_redraw(tmp_path):
     """A reference recorded over (1 + REDRAW)·K seeds: each draw reads its seed's inputs, the reference
     and truth read their recorded outputs at it, and check 1 judges Dew against them; a recording too
