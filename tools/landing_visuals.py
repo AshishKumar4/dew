@@ -209,12 +209,13 @@ class Scorer:
 
 
 def load_pipe(experiment):
-    from huggingface_hub import snapshot_download
+    """The run loaded as `dew.pipeline` loads a Hub run, at the commit its revision resolves, and that
+    commit's metadata directory, whose run.json the provenance hashes."""
+    import dew
+    from dew.interop import sources
 
-    from dew.inference import TextToImage
-
-    directory = snapshot_download(repo_id=experiment.model, revision=experiment.revision)
-    return TextToImage.from_run(directory), directory
+    metadata = sources.snapshot(experiment.model, experiment.revision, weights=False)
+    return dew.pipeline(experiment.model, revision=metadata.name), metadata
 
 
 def provenance(experiment, pipe, directory):
@@ -224,8 +225,7 @@ def provenance(experiment, pipe, directory):
     return {
         "model": experiment.model,
         "revision": experiment.revision,
-        "loaded_with": "dew.inference.TextToImage.from_run(huggingface_hub.snapshot_download("
-        f"{experiment.model!r}, revision=...)), the run dew.pipeline loads",
+        "loaded_with": f"dew.pipeline({experiment.model!r}, revision=...)",
         "checkpoint_step": experiment.checkpoint_step,
         "parameters": int(sum(math.prod(leaf.shape) for leaf in jax.tree.leaves(pipe.variables["params"]))),
         "dew_commit": dew_revision(),

@@ -2,7 +2,7 @@
   "model": {
     "model": "dewml/hybrid-dit-176m",
     "revision": "90d1717ac262e1b33a65ac602812ef442129c7ea",
-    "loaded_with": "dew.inference.TextToImage.from_run(huggingface_hub.snapshot_download('dewml/hybrid-dit-176m', revision=...)), the run dew.pipeline loads",
+    "loaded_with": "dew.pipeline('dewml/hybrid-dit-176m', revision=...)",
     "checkpoint_step": 1350000,
     "parameters": 175640848,
     "dew_commit": "aaffb62c07ffad78c72b29758673d1c4f5c37f4a",
