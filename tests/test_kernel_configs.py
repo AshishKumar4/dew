@@ -279,8 +279,10 @@ def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(gen
     cases = _gemm_mainloop_cases(generation_name)
     # Every form the generation's family runs derives a tile at these shapes: an eligibility regression
     # fails here rather than leaving the gate fewer cases.
-    forms = {"forward", "input gradient", "kernel gradient", "kernel gradient exact fp32",
-             "normed biased forward", "normed kernel gradient"}
+    forms = {"forward", "input gradient", "kernel gradient"}
+    if generation.gpu_target(generation_name).wgmma:
+        # Hooked and exactly summed calls run on warpgroup MMA alone (`grouped_matmul._Mosaic.eligible`).
+        forms |= {"kernel gradient exact fp32", "normed biased forward", "normed kernel gradient"}
     assert {case.name.split(" Tiles(")[0] for case in cases} == forms
     found = compile_mosaic_kernels(cases, generation_name)
     unreported = [record["name"] for record in found if not record.get("kernels")]
@@ -305,18 +307,18 @@ def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name):
     adopts a Family head: plain and transposed right operands (the forward and the input gradient), fixed
     and streamed side vectors (the normed prologue's row and depth vectors, the epilogue's column vector),
     bf16 and fp32 stores, the running sum (exact sums), and each form at one consumer and at the family's
-    most (`_gemm_mainloop_cases(every_consumer_count=True)`). A form the family refuses by a stated fact
-    (`Family.stores`) is left out; every other form and count must be present and lower, within the block,
-    spilling nothing. No version guard skips it: a JAX that breaks the contract fails here."""
+    most (`_gemm_mainloop_cases(every_consumer_count=True)`); hooked and exactly summed forms on warpgroup
+    MMA alone, where the launches take them. Every form and count must be present and lower, within the
+    block, spilling nothing. No version guard skips it: a JAX that breaks the contract fails here."""
     from kernel_compile import compile_mosaic_kernels
 
     family = (mosaic_sm90.WGMMA if generation.gpu_target(generation_name).wgmma
               else mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16)))
     cases = _gemm_mainloop_cases(generation_name, every_consumer_count=True)
-    forms = {"forward", "input gradient", "kernel gradient", "kernel gradient exact fp32",
-             "normed biased forward", "normed kernel gradient", "forward bf16"}
-    if not family.stores(jnp.bfloat16):
-        forms -= {"kernel gradient", "normed biased forward", "forward bf16"}
+    forms = {"forward", "input gradient", "kernel gradient", "forward bf16"}
+    if family.name == "wgmma":
+        # Hooked and exactly summed calls run on warpgroup MMA alone (`grouped_matmul._Mosaic.eligible`).
+        forms |= {"kernel gradient exact fp32", "normed biased forward", "normed kernel gradient"}
     counts = sorted({1, family.consumers})
     expected = {f"{form} x{count}" for form in forms for count in counts}
     got = {case.name.split(" Tiles(")[0] for case in cases}
