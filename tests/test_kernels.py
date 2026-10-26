@@ -1107,6 +1107,25 @@ def test_narrow_heads_take_the_kernel_their_target_measured_fastest(generation_n
     assert "row" not in refused
 
 
+@pytest.mark.parametrize("dtype, kept", [(jnp.float16, False), (jnp.bfloat16, True)])
+def test_an_fp16_call_leaves_the_triton_route_as_a_declared_gap(dtype, kept):
+    """A causal call of 16-wide heads where an L4's row prefers tokamax's Triton kernel: an fp16 one is
+    refused by its dtype, whose dQ that kernel narrows before the scale the route applies outside it
+    (row 1676, `triton_attention`), and the next kernel takes it; a bf16 one keeps it."""
+    from dew.nn.attention import attention_case, resolve_implementation
+    from dew.nn.attention_kernels import ATTENTION, kernel_refusals
+    from dew.nn.kernels import generation
+
+    query = jnp.zeros((2, 128, 4, 16), dtype)
+    with generation.assumed("sm89"), generation.routes() as found:
+        resolve_implementation("auto", query, query, causal=True)
+        refused = {refusal.code for refusal in kernel_refusals(
+            ATTENTION, "triton", attention_case(query, query, causal=True))}
+    (route,) = [route for route in found if route.choice == "attention"]
+    assert ("fp16" not in refused) == kept
+    assert (route.kernel == "triton") == kept
+
+
 @pytest.mark.parametrize("head_dim, kept", [(8, False), (16, True)])
 def test_heads_narrower_than_the_triton_kernel_computes_take_the_next_kernel(head_dim, kept):
     """A causal bf16 call of narrow heads prefers tokamax's Triton kernel where its GPU's row names it
