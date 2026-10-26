@@ -9,10 +9,16 @@ recording of at most 1 MiB and sends a larger one to the fetched store (tools/fe
 proxy only plans: the declared count is the recorded reference's own. (tools/recorded_draws.py is
 another thing: it records the random draws a reference generator's library makes, so a second
 precision reads the same samples.)
+
+A summarized recording too slow for one process is made in shards: `record_shard` keeps the evidence of
+a run of seeds, each drawn as one run draws it, and `merge_shards` joins the shards in seed order and
+declares the count their joined evidence resolves (`seeds_resolving`), writing what `record_case`'s
+summary writes.
 """
 
 import json
 import sys
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 import jax
@@ -21,9 +27,17 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fetched_fixtures import save
-from reference_error import REDRAW, as_given, input_digest, leaf_summary, seeds_for, truth_sketch
+from reference_error import (
+    REDRAW,
+    as_given,
+    input_digest,
+    leaf_summary,
+    seeds_for,
+    seeds_resolving,
+    truth_sketch,
+)
 
-__all__ = ["provenance", "record_case", "record_reference", "save"]
+__all__ = ["merge_shards", "provenance", "record_case", "record_reference", "record_shard", "save"]
 
 
 def provenance(reference: str, revision: str, device: str, command: str, **details) -> np.ndarray:
@@ -98,28 +112,11 @@ def record_case(label: str, draw, evaluate, proxy, *, truth_proxy=None, store_in
     # than the recorded reference confirms leaves draws the recording does not keep.
     kept = (1 + REDRAW) * confirmed
     ensure(kept)
-    result = {}
     if summary:
-        kept_records = records[:kept]
-        for name in records[0][1]:
-            evidence = [leaf_summary(record[1][name], record[2][name]) for record in records[:kept]]
-            result.update({f"{label}.mse.{name}": np.asarray([leaf.mse for leaf in evidence]),
-                           f"{label}.worst.{name}": np.asarray([leaf.worst for leaf in evidence]),
-                           f"{label}.finite.{name}": np.asarray([leaf.finite for leaf in evidence]),
-                           f"{label}.zero_rows.{name}": np.concatenate(
-                               [np.zeros(0, np.int64), *(leaf.zero_rows for leaf in evidence)]),
-                           f"{label}.zero_errors.{name}": np.concatenate(
-                               [np.zeros(0), *(leaf.zero_errors for leaf in evidence)]),
-                           f"{label}.zero_offsets.{name}": np.cumsum(
-                               [0, *(len(leaf.zero_rows) for leaf in evidence)]),
-                           f"{label}.sketch.{name}": np.stack([truth_sketch(record[2][name], seed)
-                                                               for seed, record in enumerate(kept_records)]),
-                           f"{label}.shape.{name}": np.asarray(np.shape(records[0][2][name]), np.int64),
-                           f"{label}.dtype.{name}": np.asarray(evidence[0].dtype)})
-        result[f"{label}.input_digest"] = np.asarray([input_digest(record[0]) for record in records[:kept]])
-        result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
+        result = _finished(label, _evidence(label, range(kept), records[:kept]), confirmed)
         print(f"{label}: declared {confirmed} seeds; recorded {kept} draws' evidence", flush=True)
         return result
+    result = {}
     for index, kind in enumerate(("input", "reference", "truth")):
         if kind == "input" and not store_inputs:
             continue
@@ -130,3 +127,99 @@ def record_case(label: str, draw, evaluate, proxy, *, truth_proxy=None, store_in
     result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
     print(f"{label}: declared {confirmed} seeds; recorded {kept} draws", flush=True)
     return result
+
+
+def record_shard(label: str, draw, evaluate, seeds: range) -> dict[str, np.ndarray]:
+    """The evidence `record_case`'s summary keeps of `seeds`, a run of a recording's seeds, each drawn as
+    one run draws it (`draw(seed)`) and evaluated (`evaluate(inputs)`, the reference's outputs and their
+    float64 truth): one shard of a recording `merge_shards` joins. Each seed's outputs are summarized
+    as they are evaluated and dropped, so a shard holds its evidence alone."""
+    def records():
+        for seed in seeds:
+            inputs = draw(seed)
+            reference, truth = evaluate(inputs)
+            yield inputs, jax.tree.map(np.asarray, reference), jax.tree.map(np.asarray, truth)
+    return _evidence(label, seeds, records())
+
+
+def merge_shards(label: str, shards: Sequence[Mapping[str, np.ndarray]]) -> dict[str, np.ndarray]:
+    """`label`'s summarized recording from its shards (`record_shard`), as `record_case`'s summary writes
+    it: their seeds joined in order from seed 0, the count the joined evidence resolves
+    (`seeds_resolving`, the reference against itself), and that count's (1 + REDRAW) times kept. Shards
+    that leave a seed out or repeat one are refused, and so are too few seeds for the count's redraw."""
+    ordered = sorted(shards, key=lambda shard: int(shard[f"{label}.drawn"][0]))
+    joined = {key: np.concatenate([shard[key] for shard in ordered])
+              for key in ordered[0] if not _whole(label, key)}
+    joined.update({key: ordered[0][key] for key in ordered[0] if _whole(label, key)})
+    drawn = joined[f"{label}.drawn"]
+    if not np.array_equal(drawn, np.arange(len(drawn))):
+        raise ValueError(f"{label}: the shards hold seeds {_runs(drawn)}, not one run from seed 0")
+    names = [key.removeprefix(f"{label}.mse.") for key in joined if key.startswith(f"{label}.mse.")]
+    confirmed = seeds_resolving(np.stack([joined[f"{label}.mse.{name}"] for name in names], axis=1),
+                                names, label)
+    kept = (1 + REDRAW) * confirmed
+    if len(drawn) < kept:
+        raise ValueError(f"{label}: {confirmed} seeds resolve, and their redraw needs {kept} seeds; the "
+                         f"shards hold {len(drawn)}")
+    result = _finished(label, joined, confirmed)
+    print(f"{label}: declared {confirmed} seeds; merged {kept} draws' evidence", flush=True)
+    return result
+
+
+def _evidence(label: str, seeds: range, records) -> dict[str, np.ndarray]:
+    """`records`' evidence, one row a seed of `seeds`, read one record at a time (an iterable of
+    (inputs, reference, truth)): each leaf's `leaf_summary` (its rows of float64 zero joined, with their
+    count a seed) and its truth's sketch, and each seed's input digest."""
+    digests, leaves, sketches, shapes = [], {}, {}, {}
+    for seed, (inputs, reference, truth) in zip(seeds, records, strict=True):
+        digests.append(input_digest(inputs))
+        for name in reference:
+            leaves.setdefault(name, []).append(leaf_summary(reference[name], truth[name]))
+            sketches.setdefault(name, []).append(truth_sketch(truth[name], seed))
+            shapes.setdefault(name, np.asarray(np.shape(truth[name]), np.int64))
+    evidence = {f"{label}.drawn": np.asarray(seeds, np.int64), f"{label}.input_digest": np.asarray(digests)}
+    for name, summaries in leaves.items():
+        evidence.update({
+            f"{label}.mse.{name}": np.asarray([leaf.mse for leaf in summaries]),
+            f"{label}.worst.{name}": np.asarray([leaf.worst for leaf in summaries]),
+            f"{label}.finite.{name}": np.asarray([leaf.finite for leaf in summaries]),
+            f"{label}.zero_counts.{name}": np.asarray([len(leaf.zero_rows) for leaf in summaries], np.int64),
+            f"{label}.zero_rows.{name}": np.concatenate([np.zeros(0, np.int64),
+                                                         *(leaf.zero_rows for leaf in summaries)]),
+            f"{label}.zero_errors.{name}": np.concatenate(
+                [np.zeros(0), *(leaf.zero_errors for leaf in summaries)]),
+            f"{label}.sketch.{name}": np.stack(sketches[name]),
+            f"{label}.shape.{name}": shapes[name],
+            f"{label}.dtype.{name}": np.asarray(summaries[0].dtype)})
+    return evidence
+
+
+def _finished(label: str, evidence: Mapping[str, np.ndarray], confirmed: int) -> dict[str, np.ndarray]:
+    """The recording `evidence` (`_evidence`) makes at `confirmed` declared seeds: its first (1 + REDRAW)
+    times that many seeds, each leaf's rows of float64 zero by their span a seed (`zero_offsets`)."""
+    kept = (1 + REDRAW) * confirmed
+    result = {f"{label}.input_digest": evidence[f"{label}.input_digest"][:kept]}
+    names = [key.removeprefix(f"{label}.mse.") for key in evidence if key.startswith(f"{label}.mse.")]
+    for name in names:
+        offsets = np.cumsum([0, *evidence[f"{label}.zero_counts.{name}"][:kept]])
+        result.update({f"{label}.{field}.{name}": evidence[f"{label}.{field}.{name}"][:kept]
+                       for field in ("mse", "worst", "finite", "sketch")})
+        result.update({f"{label}.zero_rows.{name}": evidence[f"{label}.zero_rows.{name}"][:offsets[-1]],
+                       f"{label}.zero_errors.{name}": evidence[f"{label}.zero_errors.{name}"][:offsets[-1]],
+                       f"{label}.zero_offsets.{name}": offsets,
+                       f"{label}.shape.{name}": evidence[f"{label}.shape.{name}"],
+                       f"{label}.dtype.{name}": evidence[f"{label}.dtype.{name}"]})
+    result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
+    return result
+
+
+def _whole(label: str, key: str) -> bool:
+    """Whether `key` holds one value for the whole recording (a leaf's shape and dtype), not one a seed."""
+    return key.startswith((f"{label}.shape.", f"{label}.dtype."))
+
+
+def _runs(seeds: np.ndarray) -> str:
+    """`seeds`, sorted, as their runs: 0-15, 32-47."""
+    ordered = np.unique(seeds)
+    breaks = np.flatnonzero(np.diff(ordered) != 1) + 1
+    return ", ".join(f"{run[0]}-{run[-1]}" for run in np.split(ordered, breaks))

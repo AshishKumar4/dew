@@ -5,6 +5,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- 8-bit Adam state codes each moment value among the six codes around its estimate, its decade by its
+  logarithm, instead of searching the whole map: on an A100, lm-dense's update takes 27.32 ms against
+  60.39, its full-remat step 167.9 against 196.3 ms and compiles in 82.3 against 209.8 s, the codes
+  the search's (`dew.optim.quantized`).
 - `OptimConfig(state_dtype='int8')` stores adam's and adamw's moments blockwise in 8 bits
   (`dew.optim.int8_moments`, bitsandbytes' and torchao's 8-bit Adam): a quarter of float32's state, the
   update computed from the moments dequantized to fp32. On an A100, lm-dense's full-remat step peaks at
@@ -34,7 +38,7 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 - Two optimizers from Nested Learning (arXiv 2512.24695) as Optax transforms: `dew.optim.scale_by_m3`, M3's
   Muon over Adam's second moment with a slow momentum gathered once per chunk, and
   `dew.optim.delta_gradient_descent`, the step to eq. 56's minimizer given each kernel's input. M3
-  orthogonalizes through `dew.optim.newton_schulz`, Muon's quintic iteration on each matrix alone.
+  orthogonalizes through optax's own Muon iteration (`optax.contrib.scale_by_muon` with no momentum).
 - A filtered or packed read resumes on any number of readers once it is prepared: publish its rows (and
   a terminal pack's plan) as a generation with `dew data publish` and read it by index, and a new run
   lowers to the global order. A per-share read refused on another topology now says so.

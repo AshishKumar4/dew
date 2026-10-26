@@ -132,6 +132,7 @@ def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | 
         Pretrained,
         PretrainedBlockDecoder,
         PretrainedDecoder,
+        PretrainedFallback,
         PretrainedMaskedDecoder,
         PretrainedPipeline,
     )
@@ -151,7 +152,7 @@ def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | 
             return loaded.text_to_image()
         case PretrainedBlockDecoder():
             return loaded.block_generation()
-        case PretrainedDecoder() | PretrainedMaskedDecoder():
+        case PretrainedDecoder() | PretrainedMaskedDecoder() | PretrainedFallback():
             return loaded.text_generation()
     raise TypeError(f"{source} loaded as {type(loaded).__name__}, which has no generation task")
 
