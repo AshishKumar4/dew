@@ -485,6 +485,26 @@ def test_a_memory_layer_kind_trains_scans_and_decodes_in_a_decoder():
                     truth_fn=truth)
 
 
+def test_muon_steps_each_memory_heads_matrices_on_their_own():
+    """A memory decoder trains under Muon: each head's inner matrices are matrices Muon orthogonalizes on
+    their own, by Linen's kernel convention (inputs into outputs), its biases take AdamW's update, and
+    one step of the optimizer runs over the whole tree."""
+    import optax
+
+    from dew.config import OptimConfig
+    from dew.optim import muon_weight_dimension_numbers
+
+    model = decoder()
+    params = model.init(jax.random.key(0), jnp.zeros((2, LENGTH), jnp.int32))["params"]
+    numbers = muon_weight_dimension_numbers(params)["layers_0"]["self_attn"]["initial"]
+    layers = {f"layers_{index}": {"kernel": optax.contrib.MuonDimensionNumbers(), "bias": None}
+              for index in (0, 1)}
+    assert numbers == {f"head_{head}": layers for head in range(2)}
+    solver = OptimConfig(optimizer="muon", learning_rate=1e-3).build(10)
+    updates, _ = solver.update(jax.tree.map(jnp.ones_like, params), solver.init(params), params)
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(updates))
+
+
 def test_a_memory_layer_kind_records_and_rebuilds():
     """A memory layer kind records the memory's whole configuration: a decoder whose two kinds set every
     field a memory computes by away from its default (heads, an existing GatedMLP as a level's network
