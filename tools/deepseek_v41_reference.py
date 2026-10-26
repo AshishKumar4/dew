@@ -25,7 +25,8 @@ quantizers and the stand-ins to. `--search N` ranks N seeds from `--seed` by
 what fp32 noise can reach in them (`search`); SEED is the first of 119.
 `--vision` writes the vision half beside the fixture (`write_vision`), and
 `--fp64`, run after both, the float64 truth of everything they wrote
-(`write_truth`).
+(`write_truth`). `--padding` records the rows the release's token lookup leaves
+untrained, its pad id stated, left out and null (`write_padding`).
 
 It writes tests/fixtures/hf/deepseek-v41-tiny: the release's config.json
 spelling at toy width, a model.safetensors under the release's tensor names,
@@ -80,7 +81,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from reference_source import loaded, saved_fixture
+from reference_source import loaded, record_padding, saved_fixture
 
 REPO = "deepseek-ai/DeepSeek-V4.1-Flash"
 DEEPSEEK_V41_REVISION = "dba1be0a40aa45a94ad051997016db3960a90277"
@@ -956,6 +957,16 @@ def write(seed: int):
     print(f"{FIXTURE}: {len(tensors)} tensors, loss {outputs['loss']:.6f}")
 
 
+def write_padding() -> None:
+    """padding.json beside the fixture (`reference_source.record_padding`): the release builds its
+    token lookup of ModelArgs alone, `ParallelEmbedding(args.vocab_size, args.dim)` (model.py:1201),
+    which reads no pad id, so each case's config is the fixture's and the lookup the same."""
+    model, _ = import_reference()
+    args = model.ModelArgs(**TINY)
+    record_padding(lambda variant: model.ParallelEmbedding(args.vocab_size, args.dim), lambda variant: None,
+                   json.loads((FIXTURE / "config.json").read_text()), FIXTURE)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("mode", nargs="?", choices=("orders",))
@@ -966,6 +977,7 @@ def main():
                         help="write the tilelang kernels' outputs (kernels.npz) on CUDA")
     parser.add_argument("--fp64", action="store_true", help="write the fixture's float64 truth")
     parser.add_argument("--vision", action="store_true", help="write the vision half beside the fixture")
+    parser.add_argument("--padding", action="store_true", help="record the rows the lookup leaves untrained")
     options = parser.parse_args()
     torch.set_default_dtype(torch.float32)
     # One thread keeps every reduction in one order, so a rerun writes the
@@ -981,6 +993,8 @@ def main():
         write_truth(options.seed)
     elif options.vision:
         write_vision(options.seed)
+    elif options.padding:
+        write_padding()
     elif options.search:
         search(options.seed, options.search)
     else:
