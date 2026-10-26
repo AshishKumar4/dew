@@ -994,8 +994,8 @@ class Trainer(Generic[Loss, Effects]):
         transaction, a window pooling `split` x `accumulation`. Every batch of
         a run is split alike, as its first compile planned or its pooling
         state's window holds; later shapes climb the ladder alone. A plan that
-        splits, left open and unrecorded, is timed by `timed` (`fit`) against
-        the batch whole a rung up, and the faster kept.
+        splits or spans devices, left open and unrecorded, is timed by `timed`
+        (`fit`) against the batch whole a rung up, and the faster kept.
         """
         if self.lower_for is not None:
             # Shapes are all a lowering reads, so the state may be abstract (`jax.eval_shape`).
