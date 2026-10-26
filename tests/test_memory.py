@@ -1,7 +1,9 @@
 """The in-context memory (`dew.nn.memory`, ledger 1645): each configuration against its paper's update
 equations, written out token by token below (`written`), at check 1 against float64; the chunk-parallel
-computation against the token-by-token one; packed documents as each alone; a decode as the full pass;
-and a zero step size reading the initial network."""
+computation against the token-by-token one; the linear memories on the shared recurrence against their
+general path; packed documents as each alone; a decode, and a cached packed prefill, as the full pass;
+the outer gradients through a self-generated target; a zero step size reading the initial network; and
+the memory as a decoder's layer kind, scanned, rematted, decoded, under Muon and recorded."""
 
 import functools
 import json
