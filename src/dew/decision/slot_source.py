@@ -138,10 +138,10 @@ class SlotSource(SourceKind):
         root = Path(directory)
         Pretrained.save(bundle, root, max_shard_size=max_shard_size)
         readout = {"readout": mode, "head_dim": fields.get("head_dim", 256), "n_slots": len(ids)}
-        # The release's attention field states its full attention as the saved config's overrides do;
-        # the rows' blocks may serve another kind as well.
-        written = _records.record(json.loads((root / "config.json").read_text()), "config.json")
-        if _full_attention(_records.record(written.get("modeling_overrides", {}),
+        # The release's attention field states its full attention as the config `Pretrained.save` writes
+        # does: the bundle's own, the load's overrides over the release's. The rows' blocks may serve
+        # another kind as well.
+        if _full_attention(_records.record(bundle.config.get("modeling_overrides", {}),
                                            "modeling_overrides")) == "block_bidirectional":
             readout["attention"] = "noncausal"
         bundle.decision_tokenizer.save_pretrained(root)
