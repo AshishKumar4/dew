@@ -847,8 +847,9 @@ def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_pre
     @jax.jit
     def decoded(variables, prompt, valid, continued):
         cache = loaded.model.apply(variables, prompt.shape[0], method="init_cache", mutable=["cache"])[1]
-        padding = ({"attention_mask": valid} if stated == "mask"
-                   else {"segment_ids": valid.astype(jnp.int32)})
+        # One document a row, its padding the document 0 of the row's segments where so stated.
+        padding = ({"attention_mask": valid} if stated == "mask" else {"coordinates": coordinates(
+            prompt.shape, segments=valid.astype(jnp.int32), max_segments=1)})
         logits, state = loaded.model.apply({**variables, **cache}, prompt, decode=True, mutable=["cache"],
                                            **padding)
         stepped = [logits[:, -1]]
