@@ -1064,6 +1064,34 @@ def _sequence_walk(call: _Call, memory: _Operand, name: str, entering: tuple, wa
     family.roles(1, consumer, producer)
 
 
+def _gated_write(call: _Call, corrected, loaded, prefix: tuple, last, head) -> tuple:
+    """`_states`' step's write gated to its chunk's end and each key slice's decay `[block, 1]` across the
+    chunk: under a decay a key dimension the corrected values as they are and each slice's rows' decays at
+    the chunk's last token (`prefix`, its halves' refs `[R, HV * Dk]`); under one a head the chunk's write
+    gated by `algebra.scalar_write` and its last prefix, a row's vector each slice's rows take, from
+    `loaded` (`_states`' prefetch, a step ahead)."""
+    family, slices = call.family, call.width // call.block
+    if call.per_key:
+        columns = [pl.ds(head * call.width + i * call.block, call.block) for i in range(slices)]
+        return corrected, [algebra.raised(*(family.rows_of(ref.at[last, span]) for ref in prefix))[:, None]
+                           for span in columns]
+    assert loaded is not None, "a decay a head's walk prefetches its prefix"
+    (ending, ending_low), (gate, low), _ = loaded
+    gated, decayed = algebra.scalar_write(corrected, ending, gate, ending_low, low)
+    return gated, [decayed[:, None]] * slices
+
+
+def _states_held(call: _Call, values: _Operand, keys: _Operand, bv: int) -> _Held:
+    """What `_states`' consumer thread holds: the memory carried, its key slices in fp32, and the next
+    chunk's prefix vectors (`prefetch`); a step's corrected and written values beside the values' block and
+    a memory slice as a product's operand (and, where products read registers, a block of the weighted keys
+    and of the keys)."""
+    held = call.held
+    return _Held(carried=[_f32(call.width, bv)] + [_f32(CHUNK, 1)] * 5, phases=(
+        [_f32(CHUNK, bv)] * 2 + _held(values, CHUNK, bv) + _held(held, call.block, bv)
+        + _fragments(call, (held, CHUNK, call.block), (keys, CHUNK, call.block)),))
+
+
 def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
     """`(h [chunks * HV * Dk, Dv], corrected [R, HV * Dv], final [B * HV * Dk, Dv])`: the memory each chunk
     enters and the corrected values as `call.held`, and each row's final memory, fp32, each sequence's chunks
@@ -1134,18 +1162,7 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
             before_store()
             held.store(corrected_ref, corrected, n * CHUNK, CHUNK, h * value_width + j * bv, bv,
                        family=family, smem=landing["corrected"], wait=False)
-            if call.per_key:
-                gated = corrected
-                decay = [algebra.raised(*(family.rows_of(ref.at[last, pl.ds(h * width + i * call.block,
-                                                                            call.block)])
-                                          for ref in (hi_ref, lo_ref)))[:, None] for i in range(slices)]
-            else:
-                # The chunk's last prefix as a row's vector of it, each of whose entries is the decay a key
-                # slice's rows take, prefetched a step ahead (`prefetch`).
-                assert loaded is not None, "a decay a head's walk prefetches its prefix"
-                (ending, ending_low), (gate, low), _ = loaded
-                gated, decayed = algebra.scalar_write(corrected, ending, gate, ending_low, low)
-                decay = [decayed[:, None]] * slices
+            gated, decay = _gated_write(call, corrected, loaded, (hi_ref, lo_ref), last, h)
             separate = None
             if held.parts > 1:
                 # An fp32 call's last write outside the product (`algebra.carried`), held to the fp32
@@ -1176,15 +1193,10 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
     # A sequence's chunks, the mean over the laid sequences; two products a chunk.
     steps = call.chunks / sequences.shape[0]
     work = Work(4 * CHUNK * width * bv * steps, steps)
-    # The memory carried, its key slices in fp32, and the next chunk's prefix vectors (`prefetch`); a step's
-    # corrected and written values beside the values' block and a memory slice as a product's operand (and,
-    # where products read registers, a block of the weighted keys and of the keys).
-    held_tiles = _Held(carried=[_f32(width, bv)] + [_f32(CHUNK, 1)] * 5, phases=(
-        [_f32(CHUNK, bv)] * 2 + _held(values, CHUNK, bv) + _held(held, call.block, bv)
-        + _fragments(call, (held, CHUNK, call.block), (keys, CHUNK, call.block)),))
     return _kernel(program, call, out_type=out_type, grid=(value_width // bv, sequences.shape[0], call.heads),
                    grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
-                   live=lambda refs: refs[7][lax.axis_index("sequences"), 1] > 0, work=work, held=held_tiles,
+                   live=lambda refs: refs[7][lax.axis_index("sequences"), 1] > 0, work=work,
+                   held=_states_held(call, values, keys, bv),
                    staging=(*_staging(held, (call.block, bv)), _column_scratch(call)), once=initials,
                    landing={**_memory_landing(call, bv), "corrected": held.landing(CHUNK, bv),
                             "final": ((call.block, bv), jnp.float32)})(

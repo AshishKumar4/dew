@@ -537,13 +537,13 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
             return chunk_delta_rule(query, key, value, g.reshape(*value.shape[:3], -1), beta, state, size,
                                     starts=starts, delta=hooks.delta, scale=scale, dtype=work)
 
-        operands = (query, key, value, g, beta, state, starts)
+        arrays = (query, key, value, g, beta, state, starts)
         if kernels[0] == kernels[1]:
-            out, final = run(kernels[0], *operands)
+            out, final = run(kernels[0], *arrays)
         else:
             # The cell's forward and its training take different kernels (`PORT_CELLS`).
             out, final = _by_product(functools.partial(run, kernels[0]), functools.partial(run, kernels[1]),
-                                     *operands)
+                                     *arrays)
         out = recurrence.skipped(hooks, out.astype(work), value, given, work)
     # The epilogue in the working precision, and the output rounded once.
     return recurrence.normed(hooks, out, given, work).astype(dtype), final
