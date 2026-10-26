@@ -225,7 +225,9 @@ class Mma(mosaic.Family):
 
             def store(output, value, ref, place):
                 smem = staging[output].at[index]
-                smem[...] = value.astype(smem.dtype)
+                # Unoptimized, as `copied`'s transfers: JAX 0.12 takes an unflagged store as optimized-only,
+                # which its layout inference searched to exhaustion beside the ladder's copies (ns-gate3).
+                plgpu.store(smem, value.astype(smem.dtype), optimized=False)
                 mosaic.store_rows(smem, ref, *place, copy=mosaic.copied)
 
             @plgpu.nd_loop(tiles, collective_axes=axis)
@@ -297,7 +299,7 @@ class Mma(mosaic.Family):
             if smem is None:
                 view[...] = part.astype(view.dtype)
                 continue
-            smem[...] = part.astype(smem.dtype)
+            plgpu.store(smem, part.astype(smem.dtype), optimized=False)
             rows = smem.shape[0]
             mosaic.store_rows(smem, view, 0, 0, jnp.int32(rows), 0, rows, copy=mosaic.copied)
 
