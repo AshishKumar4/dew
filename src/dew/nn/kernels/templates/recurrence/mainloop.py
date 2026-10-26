@@ -1371,14 +1371,10 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
 
         def prologue():
             """A decay a head's prefix as a row's vectors and a column's, from global memory before the walk
-            waits on its tiles, and its rows' decays (`algebra.raised`), a tile's once for every value
-            block's: an A100's output launch, sixteen columns a block, took eight of their floors and clamps
-            a chunk, more of its instructions than its products' (SE-sass2-a100-3f302590b). Not streamed:
-            four more rings' stream bookkeeping spilled a value block 64 wide's output (388 bytes on an
-            H100's, 0a261aae0)."""
-            rows = tuple(family.rows_of(ref.at[h, span]) for ref in (hi_ref, lo_ref))
-            return (rows, tuple(family.columns_of(ref.at[h, span]) for ref in (column_hi_ref, column_lo_ref)),
-                    algebra.raised(*rows))
+            waits on its tiles. Not streamed: four more rings' stream bookkeeping spilled a value block 64
+            wide's output (388 bytes on an H100's, 0a261aae0)."""
+            return (tuple(family.rows_of(ref.at[h, span]) for ref in (hi_ref, lo_ref)),
+                    tuple(family.columns_of(ref.at[h, span]) for ref in (column_hi_ref, column_lo_ref)))
 
         def step(index, slots, carry, accumulators, loaded=None):
             def block(name, operand, c, *, along_rows=False):
@@ -1409,7 +1405,7 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
                                                  _Issuer(call))
             else:
                 assert loaded is not None, "a decay a head's prefix loads in the prologue"
-                (gate, low), laid, grown = loaded
+                (gate, low), laid = loaded
                 # The tiles taken before the first step's branch: a slot is the stream's, every step's.
                 queries, keys = ([block(name, call.given, c) for c in range(width // call.block)]
                                  for name in ("queries", "keys"))
@@ -1423,7 +1419,7 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
                     for piece, buffer in zip(pieces, staged, strict=True):
                         family.staged(piece, buffer)
 
-                out = algebra.chunk_output(queries.__getitem__, entered, width // call.block, grown,
+                out = algebra.chunk_output(queries.__getitem__, entered, width // call.block, gate, low,
                                            _Parts(staged, held.dtype), value, scale, _Issuer(call))
             view = o_ref.at[span, pl.ds(h * value_width + index * bv, bv)]
             family.stored([out.astype(o_ref.dtype)], [view], smem=landing["out"])
