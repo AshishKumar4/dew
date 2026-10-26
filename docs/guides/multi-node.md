@@ -229,7 +229,7 @@ Each fsdp group spans the two hosts of its replica. With `--mesh '{"fsdp": 2}'` 
 - a failing process stops the pool, including a rank whose loader fails in the middle of `fit` and a rank that stalls without failing;
 - a pool refuses a checkpoint directory its processes do not share;
 - two pools started together get a port each;
-- a pool's second run loads, on every process, the step its first run compiled.
+- a pool's second run loads the step its first run compiled, on process 0, and on every process of a GPU pool.
 
 On a GPU run, the tests marked `mesh(devices=2)` take one GPU per process.
 
