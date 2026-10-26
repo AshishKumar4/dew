@@ -5,6 +5,13 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A loaded decoder's pad row takes no gradient wherever its source's table pads it. Kimi Linear, Kimi K3,
+  Ouro, Dream, LLaDA-MoE and LLaDA2 now pad `pad_token_id` as their released code does, at their config
+  class's own default where a config states none; Dew trained that row before. Qwen 3.5's wrappers load
+  a YaRN or Llama 3.1 rope record, their three-axis rotary turning by its ramp. Tier 2's probe runs past
+  a rope ramp's original context and holds a convention's pad row to the source's table. A verification
+  of a repository's own code is recorded under the Hub commit it was fetched at, and a local directory's
+  own code is verified at each load.
 - `OptimConfig` and `ScheduleSpec` move from `dew.config` to `dew.optim`, beside the optimizers and
   schedules they build; `Wandb` moves to `dew.training` (`dew.training.tracker`), beside the tracker that
   reads it; and
