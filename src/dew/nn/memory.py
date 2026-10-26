@@ -6,14 +6,17 @@ of its own, and the token reads the updated network:
     g_t = grad_W objective(f(W_t'; k_t), target_t)      gradients at the chunk's start state W_t'
     S_t = mu_t S_{t-1} - theta_t g_t                     momentum (mu = 0 without it)
     W_t = a_t W_{t-1} + S_t                              retention (a = 1 - alpha; 1 without it)
-    y_t = f(W_t; q_t)
+    y_t = f(W_t; q_t)                                    or f(W_t'; q_t) where a chunk commits at its end
 
 (Titans, arXiv 2501.00663, Eq 8-15; TTT, arXiv 2407.04620, Eq 2-6; Miras, arXiv 2504.13173, Eq 10, 13,
-28; Nested Learning, arXiv 2512.24695, Eq 71, 84-90.) The target is the value view (`Given`) or the
-network's own image of it at the chunk's start, `f(W_t'; v_t)` (`SelfGenerated`, Nested Learning
+28; Nested Learning, arXiv 2512.24695, Eq 71, 84-90.) The target is the value view (`given`) or the
+network's own image of it at the chunk's start, `f(W_t'; v_t)` (`self_generated`, Nested Learning
 Eq 84). A chunk of `chunk` tokens takes every gradient at the state it starts from, counted from its
-document's first real token; `chunk=1` is online gradient descent. A document's first token starts
-from W_0, the network's meta-learned parameters, with no momentum.
+document's first real token; `chunk=1` is online gradient descent. Each token reads the network its
+own step updated, or, where the chunk commits its steps at its end (`commit`), the network its chunk
+started from (a continuum-memory level, Nested Learning Eq 71). A document's first token starts from
+W_0, the network's meta-learned parameters, with no momentum; the parameters the inner loop never
+steps (`slow`) stay at W_0 throughout.
 
 The state (W, S and the chunk's start) is held in at least float32 whatever the compute dtype, and
 the inner gradients and the scans run there: a bfloat16 state drops every step below its ulp. The
@@ -180,6 +183,11 @@ class InContextMemory(nn.Module):
     momentum: Gate | None = None
     retention: Gate | None = None
     chunk: int = 16
+    commit: Literal["token", "chunk"] = "token"
+    """When a step becomes the network a token reads: each token's at once (`token`, TTT and Titans,
+    which read the state their own step updated), or a chunk's at its end (`chunk`): the network stays
+    as it is between those scheduled updates, so every token of a chunk reads the network its chunk
+    started from, a continuum-memory level's (Nested Learning Eq 71)."""
     orthogonalize: int = 0
     """Newton-Schulz steps orthogonalizing each matrix of a token's gradient before its step (`dew.optim.
     newton_schulz`, Nested Learning Sec 4.2's Muon-style inner update); 0 steps the gradient as it is.
@@ -206,6 +214,8 @@ class InContextMemory(nn.Module):
             raise ValueError(f"orthogonalize counts Newton-Schulz steps, got {self.orthogonalize}")
         if self.target not in ("given", "self_generated"):
             raise ValueError(f"a memory's target is given or self_generated, not {self.target!r}")
+        if self.commit not in ("token", "chunk"):
+            raise ValueError(f"a memory commits its steps every token or chunk, not {self.commit!r}")
         if self.heads > 1 and not (self.project_query and self.project_key and self.project_value):
             raise ValueError("a view read as the stream itself is one head's; project it to split heads")
         super().__post_init__()
@@ -351,7 +361,7 @@ class InContextMemory(nn.Module):
         new_momentum = jax.tree.map(lambda s, g: _lead(mu, s) * s - _lead(theta, g) * g, momentum, gradient)
         new_state = jax.tree.map(lambda w, s: _lead(a, w) * w + s, state, new_momentum)
         state, momentum = keep(new_state, state), keep(new_momentum, momentum)
-        read = jax.vmap(jax.vmap(self._read))(state, slow, query)
+        read = jax.vmap(jax.vmap(self._read))(state if self.commit == "token" else start, slow, query)
         return (start, state, momentum), read
 
     def _stepped(self, initial: dict, slow: dict, steps: _Steps, carry: tuple | None = None
@@ -404,7 +414,8 @@ class InContextMemory(nn.Module):
         moment = jax.tree.map(lambda s0, bs: _scaled(composed[..., 0, 0], s0) + bs, momentum, offsets[0])
         states = jax.tree.map(lambda s0, w0, bw: _scaled(composed[..., 1, 0], s0)
                               + _scaled(composed[..., 1, 1], w0) + bw, momentum, state, offsets[1])
-        reads = jax.vmap(jax.vmap(jax.vmap(self._read), in_axes=(0, None, 0)))(states, slow, step.query)
+        read, axis = (states, 0) if self.commit == "token" else (state, None)
+        reads = jax.vmap(jax.vmap(jax.vmap(self._read), in_axes=(axis, None, 0)))(read, slow, step.query)
         last = jax.tree.map(lambda leaf: leaf[:, -1], (states, moment))
         return last, reads
 

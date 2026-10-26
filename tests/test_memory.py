@@ -50,8 +50,8 @@ CONFIGURATIONS = {
     "linear_attention": {"network": LinearMemory(),
                          "objective": Objective("dot"), "chunk": 1},
     # A continuum-memory level (Nested Learning Sec 7.1): an existing gated MLP over its block's input,
-    # reconstructing it, its parameters stepped every chunk's tokens (Eq 71) at a hundredth.
-    "cms": {"network": GatedMLP(hidden_features=2 * WIDTH, out_features=WIDTH), "heads": 1,
+    # reconstructing it, its parameters stepped at the end of every chunk (Eq 71), at a hundredth.
+    "cms": {"network": GatedMLP(hidden_features=2 * WIDTH, out_features=WIDTH), "commit": "chunk", "heads": 1,
             "head_features": None, "project_query": False, "project_key": False, "project_value": False,
             "output": False, "normalize": False, "learning_rate": Gate(scale=0.01)},
 }
@@ -94,19 +94,14 @@ def paper_loss(kind: str, objective: Objective):
     return losses[kind]
 
 
-COMMITTED = {"cms"}
-"""The configurations whose paper commits a chunk's steps at its end: a continuum-memory level's
-parameters stay as they are between its scheduled updates (Nested Learning Eq 71), so each token reads
-the network as its chunk found it."""
-
-
-def written(module: InContextMemory, *, dtype, segments=None, gradient=None, committed=False):
+def written(module: InContextMemory, *, dtype, segments=None, gradient=None):
     """The paper's update as a function of the stream, token by token, in `dtype` (float64 for the
     truth): the views and gates from the layer's projections (or the stream itself), the state in at
     least float32, each gradient at its chunk's start counted from its document's first token
     (`segments` `[S]`, one document where None) of the loss its paper writes for the layer's objective
     (`paper_loss`), the network's `slow` parameters left at W_0, and the readout at `dtype` of the
-    state each token updated, or, where `committed`, of the state its chunk started from."""
+    state each token updated, or, where a chunk commits its steps at its end, of the state its chunk
+    started from (Nested Learning Eq 71)."""
     wide = jnp.promote_types(dtype, jnp.float32)
     grad_net, read_net = module.network.clone(dtype=wide), module.network.clone(dtype=dtype)
     loss = paper_loss(module.objective.kind, module.objective)
@@ -141,7 +136,8 @@ def written(module: InContextMemory, *, dtype, segments=None, gradient=None, com
                  if gradient is None else gradient(loss, apply, start, k_t, target))
             momentum = jax.tree.map(lambda s, gl: mu_t * s - theta_t * gl, momentum, g)
             state = jax.tree.map(lambda w, s: (1 - alpha_t) * w + s, state, momentum)
-            cast = jax.tree.map(lambda leaf: leaf.astype(dtype), {**fixed, **(start if committed else state)})
+            read = start if module.commit == "chunk" else state
+            cast = jax.tree.map(lambda leaf: leaf.astype(dtype), {**fixed, **read})
             return (state, momentum, start, place + 1), read_net.apply({"params": cast}, q_t)
 
         carry = (head0, jax.tree.map(jnp.zeros_like, head0), head0, 0)
@@ -209,10 +205,9 @@ def applied(module: InContextMemory, call: MixerCall = PLAIN_CALL):
 def test_a_memory_follows_its_papers_update(name):
     """Each configuration computes its paper's update and readout token by token (`written`), on par
     with that written-out update in float32, against float64 (check 1)."""
-    module, committed = layer(name), name in COMMITTED
-    assert_as_exact(applied(module), written(module, dtype=jnp.float32, committed=committed), drawn(module),
-                    f"{name} memory", seeds=MEMORY_SEEDS,
-                    truth_fn=written(module, dtype=jnp.float64, committed=committed))
+    module = layer(name)
+    assert_as_exact(applied(module), written(module, dtype=jnp.float32), drawn(module), f"{name} memory",
+                    seeds=MEMORY_SEEDS, truth_fn=written(module, dtype=jnp.float64))
 
 
 def test_yaads_objective_switches_by_the_whole_errors_norm():
@@ -275,10 +270,12 @@ def test_packed_documents_read_as_each_alone():
     np.testing.assert_array_equal(together, np.concatenate([first, second], axis=1))
 
 
-def test_a_decode_continues_the_full_pass():
+@pytest.mark.parametrize("name", ["titans", "cms"])
+def test_a_decode_continues_the_full_pass(name):
     """A prefill and then one token a call, through the cache, reads each token as the full pass does,
-    momentum and chunk boundaries carried across the calls: on par against float64 (check 1)."""
-    module = layer("titans")
+    momentum, chunk boundaries and a level's network as its last scheduled update committed it carried
+    across the calls: on par against float64 (check 1)."""
+    module = layer(name)
     decode = MixerCall(decode=True)
 
     @jax.jit
@@ -292,7 +289,7 @@ def test_a_decode_continues_the_full_pass():
         return jnp.concatenate(reads, axis=1)
 
     full = applied(module, packed(np.ones((ROWS, LENGTH), np.int32)))
-    assert_as_exact(decoded, full, drawn(module), "decoded memory", seeds=MEMORY_SEEDS,
+    assert_as_exact(decoded, full, drawn(module), f"decoded {name} memory", seeds=MEMORY_SEEDS,
                     truth_fn=written(module, dtype=jnp.float64))
 
 
@@ -394,9 +391,9 @@ def test_a_memory_layer_kind_records_and_rebuilds():
     """A memory layer kind records the memory's whole configuration: a decoder whose two kinds set every
     field a memory computes by away from its default (heads, an existing GatedMLP as a level's network
     over the raw stream with no output projection, an lp and a Huber objective, a self-generated
-    target, constant and scaled gates, momentum, retention, Newton-Schulz steps, the chunk, weights the
-    inner loop holds at W_0) writes a JSON record that rebuilds the same model, which computes the
-    original's logits bit for bit."""
+    target, constant and scaled gates, momentum, retention, Newton-Schulz steps, the chunk and its
+    commit, weights the inner loop holds at W_0) writes a JSON record that rebuilds the same model,
+    which computes the original's logits bit for bit."""
     from model_support import TINY_DECODER
 
     from dew.config import ModelConfig
@@ -412,7 +409,7 @@ def test_a_memory_layer_kind_records_and_rebuilds():
     level = InContextMemory(network=GatedMLP(hidden_features=48, out_features=32), project_query=False,
                             project_key=False, project_value=False, output=False,
                             objective=Objective("huber", delta=0.5), learning_rate=Gate(value=0.01), chunk=3,
-                            slow=("gate_proj",))
+                            commit="chunk", slow=("gate_proj",))
     model = CausalTransformer(**{**TINY_DECODER, "vocab_size": 37, "num_layers": 3, "dtype": jnp.float32,
                                  "layer_types": ("heads", "level", "attention"),
                                  "kinds": {"heads": LayerKind(mixer=InContextMemoryMixer(heads)),
