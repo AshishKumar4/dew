@@ -18,7 +18,9 @@ on which tier 3 decides whether transformers' own forward runs it
 not shrink by the standard sizes, or transformers builds or runs no shrunken
 model) is refused as `ProbeUnavailable`, naming the generic route
 (`fallback="torchax"`).
-The probe runs LENGTH tokens, so a field that acts only past that many
+The probe runs LENGTH tokens, past every position-dependent length the config
+states that `shrink` knows to shrink: a window, a chunk and a rope ramp's
+original context. A field of another name that acts only past LENGTH
 positions agrees there and is not caught.
 
 The same probe tools/hf_reference.py writes the committed fixtures with:
@@ -85,6 +87,11 @@ _VOCAB = 256
 # Below LENGTH, so a window the reference applies and the convention does not
 # (or the reverse) shows in the probe's logits.
 _WINDOW = 4
+# A rope ramp's original context, below LENGTH too: a ramp rescales the
+# frequencies whose wavelengths pass the original context, which within it
+# turn too little to show, so a ramp the reference applies and the convention
+# does not (or the reverse) shows only past it.
+_CONTEXT = 8
 # Probe fields Dew never reads that would change what the reference builds or
 # runs, not what it computes: `auto_map` asks transformers to run the
 # checkpoint's own code, and the probe runs in fp32 whatever the checkpoint
@@ -130,6 +137,9 @@ class ModelSource:
     remote: Path | None = None
     references: Mapping[str, str] = field(default_factory=dict)
     """Each auto class's remote class reference, for the classes the `auto_map` names."""
+    revision: str | None = None
+    """The Hub commit the remote code was fetched at, which names that code; None for transformers' own
+    classes and for a local directory's code, which no commit names."""
 
     def config_class(self) -> type[PretrainedConfig]:
         from transformers import AutoConfig
@@ -153,16 +163,10 @@ class ModelSource:
             return AutoModelForCausalLM.from_config(config, trust_remote_code=False)
         return self._remote_class('AutoModelForCausalLM')(config)
 
-    def code(self) -> str | None:
-        """The remote code's identity, which a recorded verification names: the digest of every Python
-        file the repository holds, the modules its `auto_map` names and every one they import from it;
-        None for transformers' own."""
-        if self.remote is None:
-            return None
-        digest = hashlib.sha256()
-        for path in sorted(self.remote.rglob('*.py')):
-            digest.update(path.relative_to(self.remote).as_posix().encode() + b'\0' + path.read_bytes())
-        return digest.hexdigest()
+    def recordable(self) -> bool:
+        """Whether a verification of these classes may be recorded for a later load (`_record_key`):
+        transformers' own, which its release names, or remote code at the commit that names it."""
+        return self.remote is None or self.revision is not None
 
     def _remote_class(self, auto: str):
         from transformers.dynamic_module_utils import get_class_from_dynamic_module
@@ -170,12 +174,13 @@ class ModelSource:
         return get_class_from_dynamic_module(self.references[auto], str(self.remote))
 
     @classmethod
-    def of(cls, model_type: str, hf_config: Mapping[str, object], remote: Path | None) -> ModelSource:
-        """The classes `hf_config` names: with `remote` (the opted-in repository), each of
-        `_REMOTE_CLASSES` its `auto_map` names is the repository's own, the others transformers'. A
-        class in another repository (transformers' `repo--module.Class`) is refused: its code is
-        neither the repository's, which the load pinned, nor in the digest a verification is recorded
-        under (`code`)."""
+    def of(cls, model_type: str, hf_config: Mapping[str, object], remote: Path | None,
+           revision: str | None = None) -> ModelSource:
+        """The classes `hf_config` names: with `remote` (the opted-in repository, fetched at `revision`
+        where it is the Hub's), each of `_REMOTE_CLASSES` its `auto_map` names is the repository's own,
+        the others transformers'. A class in another repository (transformers' `repo--module.Class`) is
+        refused: its code is neither the repository's, which the load pinned, nor named by the commit a
+        verification is recorded under (`revision`)."""
         held = _records.record(hf_config.get('auto_map') or {}, 'auto_map')
         if remote is None or not any(auto in held for auto in _REMOTE_CLASSES):
             return cls(model_type)
@@ -185,7 +190,7 @@ class ModelSource:
         if elsewhere:
             raise _refuse(model_type, f"its auto_map names {elsewhere} in another repository, whose code the "
                           "load neither pinned nor verifies; load a repository that holds its own code")
-        return cls(model_type, Path(remote), references)
+        return cls(model_type, Path(remote), references, revision)
 
 
 class VerifiedMappingWarning(UserWarning):
@@ -302,11 +307,12 @@ def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -
     (SmolLM3's `no_rope_layers`, one entry per layer with every fourth
     layer off) would read as all-on over two layers and hide the difference.
     The query-to-key-head ratio stays, and so does whether the hidden width
-    is the heads' total width; a stated window shrinks below the probe's
-    length so it acts, and a token id past the probe's vocabulary moves
-    inside it. Each standard size is read and written under the source's own key for it (`_Sizes`),
-    a size the network needs (the heads, the width, the depth) the config leaves unstated at its
-    class's default, and a size neither states is a KeyError.
+    is the heads' total width; a stated window or chunk, and a rope ramp's
+    stated original context, shrink below the probe's length so each acts,
+    and a token id past the probe's vocabulary moves inside it. Each standard
+    size is read and written under the source's own key for it (`_Sizes`), a
+    size the network needs (the heads, the width, the depth) the config leaves
+    unstated at its class's default, and a size neither states is a KeyError.
     """
     sizes = _Sizes.of(hf_config, source)
     key = sizes.key
@@ -349,10 +355,16 @@ def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -
         stated = hf_config[key('head_dim')]
         rotary = 'qk_rope_head_dim' in hf_config and stated == hf_config['qk_rope_head_dim']
         fields[key('head_dim')] = _HEAD_DIM // 2 if rotary else _HEAD_DIM
-    # A window or a chunk shrinks below the probe's length, so the probe runs past it.
+    # A window, a chunk and a ramp's original context shrink below the probe's length, so the probe runs
+    # past each.
     for positional in ('sliding_window', 'attention_chunk_size'):
         if isinstance(hf_config.get(positional), int):
             fields[positional] = _WINDOW
+    for record in ('rope_parameters', 'rope_scaling'):
+        if isinstance(rope := hf_config.get(record), Mapping):
+            fields[record] = _within_probe(rope)
+    if isinstance(hf_config.get('original_max_position_embeddings'), int):
+        fields['original_max_position_embeddings'] = _CONTEXT
     for key in ('pad_token_id', 'bos_token_id', 'eos_token_id'):
         value = hf_config.get(key)
         if isinstance(value, int):
@@ -360,6 +372,15 @@ def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -
         elif isinstance(value, list):
             fields[key] = [min(token, _VOCAB - 1) for token in _records.integers(value, key)]
     return fields
+
+
+def _within_probe(record: Mapping[str, object]) -> Mapping[str, object]:
+    """A rope record with the original context it states at `_CONTEXT`: a record's own, or each layer
+    type's of a record nested by layer type."""
+    if 'original_max_position_embeddings' in record:
+        return {**record, 'original_max_position_embeddings': _CONTEXT}
+    return {key: _within_probe(value) if isinstance(value, Mapping) else value
+            for key, value in record.items()}
 
 
 def _unmapped(names: Collection[str], record: decoder_parts.DecoderFields,
@@ -449,8 +470,8 @@ class VerifiedMapping:
     """What fp32 rounding alone reaches on the probe (`_ROUNDING`)."""
     inert: tuple[str, ...]
     """The config fields the convention does not read, which changed nothing on the probe's shrunken
-    instance: a field whose effect starts past the probe's sizes (a context it never reaches) is not
-    shown inert by it."""
+    instance: a field whose effect starts past a context the probe never reaches (one `shrink` does not
+    know to shrink below it) is not shown inert by it."""
     source: ModelSource | None = None
     """Where the type's classes came from, where not transformers' own (remote code, opted into)."""
 
@@ -663,17 +684,18 @@ def _trained(reference: PreTrainedModel, assembly: parts.Assembly, family: decod
                         f"past the {_GRADIENT_PARITY:.0f} that tells rounding from another backward")
 
 
-def verify_mapping(hf_config: Mapping[str, object], *,
-                   remote: Path | None = None) -> VerifiedMapping | Unmapped:
+def verify_mapping(hf_config: Mapping[str, object], *, remote: Path | None = None,
+                   revision: str | None = None) -> VerifiedMapping | Unmapped:
     """Check an unregistered model_type against transformers before its weights download.
 
     The first candidate is the decoder assembled from the registered families' parts (`PARTS`,
     `dew.interop.parts`), each read from the source's own code; the whole-family `CONVENTIONS`
     follow. `remote` is the repository whose remote code the user opted into running
     (`Pretrained.load(..., trust_remote_code=True)`): the type's config and model classes are then
-    its own, by its config's `auto_map`. A verification passed before, under the same config,
-    transformers release, Dew implementation and remote code, is read back without the probe
-    (`_recorded`).
+    its own, by its config's `auto_map`, and `revision` the Hub commit that code was fetched at. A
+    verification passed before, under the same config, transformers release, Dew implementation and
+    remote code commit, is read back without the probe (`_recorded`); a local directory's code, which
+    no commit names, is verified at each load.
 
     transformers builds its class for the type from `shrink(hf_config)` with
     random weights (`scatter_weights`) and saves it as safetensors; each
@@ -694,19 +716,20 @@ def verify_mapping(hf_config: Mapping[str, object], *,
     from transformers import __version__
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-    source = ModelSource.of(model_type, hf_config, remote)
+    source = ModelSource.of(model_type, hf_config, remote, revision)
     if model_type not in CONFIG_MAPPING and len(source.references) < len(_REMOTE_CLASSES):
         raise _refuse(model_type, f"transformers {__version__} has no class for it, and its repo's own "
                       "code is run only where the load opts in (trust_remote_code=True) and its config's "
                       f"auto_map names both {list(_REMOTE_CLASSES)}")
     held = None if source.remote is None else source
-    key = _record_key(hf_config, source)
-    recorded = _recorded(key)
+    key = _record_key(hf_config, source) if source.recordable() else None
+    recorded = None if key is None else _recorded(key)
     if recorded is not None:
         return replace(recorded, source=held)
     verdict = _verified(hf_config, source)
     if isinstance(verdict, VerifiedMapping):
-        _record(key, verdict)
+        if key is not None:
+            _record(key, verdict)
         return replace(verdict, source=held)
     if source.remote is not None:
         # Tier 3 runs transformers' own classes, which a remote type has none of.
@@ -722,7 +745,8 @@ _VERIFIED = 'verified'
 def _record_key(hf_config: Mapping[str, object], source: ModelSource) -> str:
     """What a verification holds for: the config, the transformers and torch releases, Dew's own
     implementation (every source file of `dew`, so any change of a reader, the shrink or a model
-    verifies again) and the remote code, as one digest."""
+    verifies again) and the commit the remote code was fetched at (`ModelSource.revision`), as one
+    digest."""
     from transformers import __version__
 
     import dew
@@ -730,7 +754,7 @@ def _record_key(hf_config: Mapping[str, object], source: ModelSource) -> str:
     digest = hashlib.sha256()
     import importlib.metadata
 
-    digest.update(json.dumps({'config': hf_config, 'transformers': __version__, 'remote': source.code(),
+    digest.update(json.dumps({'config': hf_config, 'transformers': __version__, 'remote': source.revision,
                               'torch': importlib.metadata.version('torch')},
                              sort_keys=True, default=str).encode())
     package = Path(dew.__file__).parent
