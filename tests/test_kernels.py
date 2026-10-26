@@ -858,6 +858,24 @@ def test_cpu_fp32_attention_rounds_closer_to_float64_than_jax_nn():
     assert mine <= 0.75 * theirs, (mine, theirs)
 
 
+@pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the setting is a CPU's")
+@pytest.mark.parametrize("wide", [True, False], ids=["test setting", "library"])
+def test_a_cpu_takes_the_reference_attention_under_the_test_setting_alone(wide, monkeypatch):
+    """'auto' and 'xla' on a CPU take the reference path in a process running Dew's test setting
+    (`WIDE_CPU_ARITHMETIC`), whose fp32 sums jax.nn's xla kernel would run below, and jax.nn's xla
+    kernel in a library process, which sets nothing, as on any platform: no CPU veto of its own."""
+    from dew.nn.attention import resolve_implementation
+    from dew.nn.precision import WIDE_CPU_ARITHMETIC
+
+    if wide:
+        monkeypatch.setenv(WIDE_CPU_ARITHMETIC, "1")
+    else:
+        monkeypatch.delenv(WIDE_CPU_ARITHMETIC, raising=False)
+    query = jnp.zeros((2, 16, 4, 8), jnp.float32)
+    for implementation in ("auto", "xla"):
+        assert resolve_implementation(implementation, query, query) == ("reference" if wide else "xla")
+
+
 @pytest.mark.skipif(jax.default_backend() != 'cpu', reason="the float64 sum is a CPU's")
 def test_cpu_fp32_attention_summed_in_float64_takes_forward_mode():
     """fp32 reference attention over 300 keys, whose products a CPU sums in float64
