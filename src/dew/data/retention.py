@@ -14,6 +14,8 @@ from typing import BinaryIO
 
 from filelock import FileLock
 
+from dew.files import write_atomically
+
 
 def read_pin(path: Path) -> BinaryIO:
     """A reader's pin at `path`, shared with every other process's, held until the returned file is
@@ -62,6 +64,20 @@ class LocalRetention:
     def _size(self) -> int:
         return sum(path.stat().st_size for key in self._keys() for path in key.rglob("*") if path.is_file())
 
+    @property
+    def _ledger(self) -> Path:
+        return self.directory / ".retention.bytes"
+
+    def _held(self) -> int:
+        """The bytes the root holds, as the last reservation recorded them (`reserve`), else counted.
+        Every write into the root reserves first and an eviction recounts, so the record is never
+        less than the root holds; a write that failed or a file removed outside a reservation leaves
+        it more, which the next reservation over the limit counts again."""
+        try:
+            return int(self._ledger.read_text())
+        except (FileNotFoundError, ValueError):
+            return self._size()
+
     @staticmethod
     def _reclaim(key: Path) -> None:
         referenced = set()
@@ -101,9 +117,17 @@ class LocalRetention:
         with FileLock(str(self.directory / ".retention.lock")):
             replaced = target.stat().st_size if target.is_file() else 0
             needed = max(0, byte_count - replaced)
-            if self._size() + needed > self.max_bytes:
-                for key in self._keys():
-                    self._abandoned(key)
+            # The root is walked only where the recorded bytes would pass the limit: once to count what
+            # it holds, then as it evicts. Under the limit a write reads one small record.
+            held = self._held()
+            if held + needed > self.max_bytes:
+                held = self._size()
+            if held + needed <= self.max_bytes:
+                write_atomically(self._ledger, str(held + needed))
+                yield
+                return
+            for key in self._keys():
+                self._abandoned(key)
             candidates = sorted(
                 (manifest.stat().st_atime_ns, manifest.parent)
                 for key in self._keys()
@@ -130,11 +154,13 @@ class LocalRetention:
                             current.unlink()
                     shutil.rmtree(generation)
                     self._reclaim(key)
-            if self._size() + needed > self.max_bytes:
+            held = self._size()
+            if held + needed > self.max_bytes:
                 raise OSError(
                     f"local cache {self.directory} cannot admit {needed} bytes within "
                     f"keep_local_bytes={self.max_bytes}; its remaining generations or writers are pinned"
                 )
+            write_atomically(self._ledger, str(held + needed))
             yield
 
     @staticmethod

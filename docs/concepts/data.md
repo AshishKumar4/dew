@@ -181,7 +181,7 @@ A chain's stages run where written. Use `map`, `random_map`, `filter`, `filter_m
 
 ## Cache and storage publication
 
-`pipeline.cache(Cache(url, ...))` is a bounded write-through artifact stage. It identifies the source snapshot, transform code, dependencies and tokenizer. A filling run keeps its own plan even if another process publishes a complete generation.
+With no `cache=`, a memory or indexed read caches the records its leading maps make where one of them costs more to run than to read back, a learned tokenizer's encoding (`dew.data.pipeline.Costly`), in a local directory of bounded size, and a later run reads them back; `Loading(cache=False)` or `DEW_DATA_CACHE=off` turns it off. `pipeline.cache(Cache(url, ...))` is a bounded write-through artifact stage. It identifies the source snapshot, transform code, dependencies and tokenizer. A filling run keeps its own plan even if another process publishes a complete generation.
 
 `publish(prefix, Cache(url), read=...)` drains a deterministic prefix, certifies source coverage and publishes one generation transactionally. A future run names `Generation(url)` explicitly to read it. Random steps belong after the cache; a plain function before it needs a stable identity. Cache writes require a clean checkout.
 
