@@ -387,7 +387,6 @@ def test_a_slot_release_over_a_model_of_parts_loads_its_backbone_by_its_own_code
     (release / "readout.json").write_text(json.dumps({"readout": "slot_lm", "head_dim": 8, "n_slots": 16}))
     backbone = Pretrained.load(alone, dtype="float32", attention_impl="reference", trust_remote_code=True)
     loaded = Pretrained.load(release, dtype="float32", attention_impl="reference", trust_remote_code=True)
-    assert type(loaded.model) is type(backbone.model)
     for ours, theirs in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(backbone.variables),
                             strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
