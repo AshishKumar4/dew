@@ -287,9 +287,10 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
     launched = {"MosaicGmm", "MosaicTgmm"} if target.wgmma else {"MosaicGmm"}
 
     def products(rows, depth, width, groups):
-        # The forward, and its input and kernel gradients as the reverse pass launches them, each alone.
+        # The forward, and its input and kernel gradients as the reverse pass launches them, each alone,
+        # their outputs fp32, which every family stores (`mosaic.Family.stores`).
         sizes = jnp.full((groups,), rows // groups, jnp.int32)
-        forward = functools.partial(template.gemm, group_sizes=sizes, out_dtype=jnp.bfloat16,
+        forward = functools.partial(template.gemm, group_sizes=sizes, out_dtype=jnp.float32,
                                     precision="default", interpret_on_cpu=True)
         bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
         x, w, dy = bf16((rows, depth)), bf16((groups, depth, width)), bf16((rows, width))
@@ -325,12 +326,12 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
         # of it (a frozen operand's cotangent is never formed).
         return w if target.wgmma else jax.lax.stop_gradient(w)
 
-    def projection(dtype=jnp.bfloat16):
+    def projection(dtype=jnp.float32):
         return lambda x, w: expert_projection(x, held(w), group_sizes, dtype, "xla", None)
 
     def through_mosaic(x, w, dy):
         with generation.assumed(target), generation.chosen(grouped_matmul="mosaic_gpu"):
-            return with_gradients(lambda x, w: template.gemm(x, held(w), group_sizes, out_dtype=jnp.bfloat16,
+            return with_gradients(lambda x, w: template.gemm(x, held(w), group_sizes, out_dtype=jnp.float32,
                                                              precision="default",
                                                              interpret_on_cpu=True))(x, w, dy)
 
