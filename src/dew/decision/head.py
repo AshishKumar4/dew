@@ -172,7 +172,10 @@ class DecisionHead(Head):
         # Every token takes its row's question type: a QuestionLayout row asks one question.
         owned = inputs.question_segments[:, None, :] == inputs.segments[:, :, None]
         kinds = jnp.sum(jnp.where(owned, inputs.kinds[:, None, :], 0), axis=-1)
-        x = states + self.type_embedding(kinds).astype(states.dtype)
+        # A padding token's state enters none of the head's blocks, whose attention multiplies its
+        # masked probabilities by every value.
+        x = (jnp.where(inputs.valid[..., None], states, 0)
+             + self.type_embedding(kinds).astype(states.dtype))
         metadata = AttentionMetadata(coordinates=inputs.coordinates())
         for block in self.blocks:
             x = block(x, train=train, attention_metadata=metadata)
