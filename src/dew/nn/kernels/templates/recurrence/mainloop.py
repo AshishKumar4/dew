@@ -1308,12 +1308,15 @@ def _output_streams(call: _Call, bv: int) -> tuple[dict, tuple]:
     """`_output`'s streamed blocks and its staging tiles at value blocks `bv` wide: the queries, a value
     block's memory entered and values; under a decay a head the keys, the scores staged once for every
     value block's product; under one a key dimension the prefix tiles and the intra launch's scores, a key
-    block's product staged."""
+    block's gated queries and the causal scores staged once a tile for every value block's (an H100's output
+    launch 16 columns a block took 1.02 ms gating and staging them each block, fla's 0.156, the template's
+    64 wide 0.341, SE-kda-h100-0428aad7b)."""
     width, held, memories, gates = call.width, call.held, call.memories, call.gates
     if call.per_key:
         given = {"gates": ((CHUNK, width), gates), "lows": ((CHUNK, width), gates),
                  "scores": ((CHUNK, CHUNK), held)}
-        staging = _staging(held, (CHUNK, call.block))
+        staging = (*_staging(call.given, *[(CHUNK, call.block)] * (width // call.block)),
+                   *_staging(held, (CHUNK, CHUNK)))
     else:
         given = {"keys": ((CHUNK, width), call.given)}
         staging = _staging(held, (CHUNK, CHUNK))
@@ -1352,7 +1355,7 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
                 streams, staging, landing):
         n, h = _axis("chunks"), _axis("heads")
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
-        (staged,) = staging
+        staged = staging[0]
         if call.per_key:
             given = {"gates": gates.views(hi_ref, row, CHUNK, h * width, width),
                      "lows": gates.views(lo_ref, row, CHUNK, h * width, width),
@@ -1385,13 +1388,25 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
             entered = functools.partial(block, "entered", memories, along_rows=True)
             value = _tile(slots, "values", held)
             if call.per_key:
+                *gated, local = staging
+
                 def decays(c):
                     return tuple(block(name, gates, c).value() for name in ("gates", "lows"))
 
-                out = algebra.key_decayed_output(
-                    lambda c: block("queries", call.given, c).value(), decays, entered, width // call.block,
-                    _tile(slots, "scores", held).value().astype(jnp.float32), value, scale,
-                    _Issuer(call, {"memory": staged, "local": staged}))
+                # The gated queries and the causal scores once a tile, at its first step, staged for every
+                # value block's products.
+                @pl.when(index == 0)
+                def _():
+                    queries = algebra.key_gated_queries(lambda c: block("queries", call.given, c).value(),
+                                                        decays, width // call.block)
+                    scored = _tile(slots, "scores", held).value().astype(jnp.float32)
+                    for tile, (buffer,) in zip((*queries, algebra.causal_scores(scored, held.dtype)),
+                                               (*gated, local), strict=True):
+                        family.staged(tile, buffer)
+
+                out = algebra.key_decayed_output(lambda c: _Parts(gated[c], call.given.dtype), entered,
+                                                 width // call.block, _Parts(local, held.dtype), value, scale,
+                                                 _Issuer(call))
             else:
                 assert loaded is not None, "a decay a head's prefix loads in the prologue"
                 (gate, low), laid, grown = loaded
