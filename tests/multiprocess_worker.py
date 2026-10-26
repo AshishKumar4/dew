@@ -2219,7 +2219,8 @@ def mode_decision_publish(args) -> dict:
     mesh = MeshSpec(fsdp=jax.device_count()).build()
     placed = Pretrained.load(args.release, dtype="float32", attention_impl="xla", mesh=mesh,
                              layout=Layout(min_shard=1, tolerance=1.0))
-    rollouts.SafetensorsReload(placed, Path(args.run_dir), (), "vllm", dtype="float32").write(placed.variables)
+    written = rollouts.SafetensorsReload(placed, Path(args.run_dir), (), "vllm", dtype="float32")
+    written.write(placed.variables)
     published = rollouts._published(placed, placed.variables, jnp.dtype("float32"), phase="push gather")
     if published is not None:
         np.savez(args.out.with_suffix(".npz"), **published.export())
