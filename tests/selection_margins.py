@@ -35,20 +35,21 @@ def selects(config) -> bool:
 
 def capture(model):
     """`model`'s forward capturing its discontinuous selections, compiled once: the lightning indexer's
-    scores from its `scores` method and its heads' agreements before their relu from its `agreements`,
-    Gemma 3n's gate from its gated MLP's Dense, a Router's selection
-    scores, group scores and group mask from its own methods, and gpt-oss's and Gemma 4's router logits
-    from their Dense. One compiled forward rather than an op at a time: XLA:CPU's JIT failed to
-    materialize a gather fusion among the many small programs an unjitted capture compiles."""
+    scores from its `scores` method and its heads' agreements before their relu, which it sows under
+    `SELECTIONS` for a caller that opens that collection, Gemma 3n's gate from its gated MLP's Dense, a
+    Router's selection scores, group scores and group mask from its own methods, and gpt-oss's and
+    Gemma 4's router logits from their Dense. One compiled forward rather than an op at a time:
+    XLA:CPU's JIT failed to materialize a gather fusion among the many small programs an unjitted
+    capture compiles."""
     from dew.nn.gemma4_moe import Gemma4TextRouter
     from dew.nn.gpt_oss import GptOssMLP
-    from dew.nn.mla import SparseIndexer
+    from dew.nn.mla import SELECTIONS, SparseIndexer
     from dew.nn.mlp import GatedMLP
     from dew.nn.moe import Router
 
     def selecting(module, method):
         if isinstance(module, SparseIndexer):
-            return method in ("scores", "agreements")
+            return method == "scores"
         if isinstance(module, Router):
             return method in ("selection", "group_scores", "group_mask")
         if isinstance(module, nn.Dense) and method == "__call__" and (
@@ -60,7 +61,7 @@ def capture(model):
         return method == "__call__" and isinstance(module, nn.Dense) and module.name == "gate_proj" and gated
 
     return jax.jit(lambda variables, tokens: model.apply(
-        variables, tokens, capture_intermediates=selecting, mutable=["intermediates"])[1])
+        variables, tokens, capture_intermediates=selecting, mutable=["intermediates", SELECTIONS])[1])
 
 
 def gate_margin(values: np.ndarray, sparsity: float) -> float:
@@ -136,15 +137,17 @@ def margin(config, captured, label: str) -> float:
     mixture = config.get("mixture") or {}
     routers: dict[tuple[str, ...], dict[str, np.ndarray]] = {}
     indexers: dict[tuple[str, ...], dict[str, np.ndarray]] = {}
-    for path, values in jax.tree_util.tree_flatten_with_path(captured.get("intermediates", {}))[0]:
+    held = {"intermediates": captured.get("intermediates", {}), "selections": captured.get("selections", {})}
+    for path, values in jax.tree_util.tree_flatten_with_path(held)[0]:
         seen += 1
         names = [str(getattr(part, "key", part)) for part in path]
         if names[-2] in ("selection", "group_scores", "group_mask"):
             routers.setdefault(tuple(names[:-2]), {})[names[-2]] = np.asarray(values)
             continue
         if names[-2] in ("scores", "agreements"):
-            # A call's scores and its heads' agreements, keyed by the indexer and the call.
-            indexers.setdefault((*names[:-2], names[-1]), {})[names[-2]] = np.asarray(values, np.float64)
+            # A call's scores and its heads' agreements, keyed by the indexer and the call, whichever
+            # collection holds them.
+            indexers.setdefault((*names[1:-2], names[-1]), {})[names[-2]] = np.asarray(values, np.float64)
             continue
         values = np.asarray(values, np.float64)
         if "gate_proj" in names:
