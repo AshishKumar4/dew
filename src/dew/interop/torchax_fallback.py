@@ -545,16 +545,29 @@ def _functional_rotary() -> type:
 
     def _rotary_layout(replaced: torch.nn.Module, table_forward: FunctionType, pairs: int) -> torch.Tensor:
         """Which of its `pairs` frequencies each of the replaced rotary's output dimensions carries, read
-        off its own `table_forward` over a table of distinct frequencies in (0, 1) at position 1, where
-        cos is one to one."""
+        off its own `table_forward` at amplitude one over a table of distinct frequencies in (0, 1) at
+        position 1, where cos is one to one. A rotary whose table forward is not that, its cos and sin
+        over the table it holds laid out by frequency (a complex `freqs_cis`, a table recomputed from
+        its own initializer, another amplitude), is refused by name."""
         probe = copy.deepcopy(replaced)
         distinct = torch.arange(1, pairs + 1, dtype=torch.float32) / (pairs + 1)
         probe.register_buffer("inv_freq", distinct, persistent=False)
+        vars(probe)["attention_scaling"] = 1.0
         with torch.no_grad():
-            cos, _ = table_forward(probe, torch.zeros(1, dtype=torch.float32),
-                                   torch.ones(1, 1, dtype=torch.long))
-        angles = torch.arccos((cos[0, 0] / vars(replaced)["attention_scaling"]).clamp(-1, 1))
-        return (angles * (pairs + 1)).round().long() - 1
+            computed = table_forward(probe, torch.zeros(1, dtype=torch.float32),
+                                     torch.ones(1, 1, dtype=torch.long))
+        refused = ValueError(f"{type(replaced).__name__}'s table forward does not lay its cos and sin out by "
+                             "frequency from the table it holds, which tier 3 computes in the trace")
+        if not (isinstance(computed, tuple) and len(computed) == 2 and all(
+                isinstance(table, torch.Tensor) and not table.is_complex() for table in computed)):
+            raise refused
+        cos, sin = computed
+        layout = (torch.arccos(cos[0, 0].float().clamp(-1, 1)) * (pairs + 1)).round().long() - 1
+        if not (bool(((layout >= 0) & (layout < pairs)).all())
+                and torch.equal(torch.cos(distinct[layout]).to(cos.dtype), cos[0, 0])
+                and torch.equal(torch.sin(distinct[layout]).to(sin.dtype), sin[0, 0])):
+            raise refused
+        return layout
 
     return FunctionalRotary
 
@@ -580,28 +593,53 @@ def _functional_experts() -> type:
     """The torch module `functional_experts` substitutes (built on first use)."""
     import torch
 
+    from dew.interop.parts import gated_activation
+    from dew.nn.activations import gated_product
+    from dew.nn.moe import EXPERT_AXES, expert_compute_dtype, expert_dispatch, expert_projection
+
     class FunctionalExperts(torch.nn.Module):
-        """Routed experts beside identity experts at static shapes: each of a token's routed slots
-        gathers its expert's gate-and-up and down projections (an identity expert's, numbered past the
-        routed ones, the token itself), weighted by its routing weight and summed over the slots, as
-        transformers' loop computes them expert by expert. Its parameters are the replaced module's."""
+        """Routed experts beside identity experts at static shapes, through Dew's grouped expert
+        dispatch (`dew.nn.moe.expert_dispatch`): each routed slot runs its expert's gated product
+        (`expert_projection` over the rows sorted by expert), an identity slot (numbered past the
+        routed experts, which the dispatch's sentinel holds at zero) passes its token, and the slots sum
+        weighted by their routing weights in at least fp32, as transformers' loop computes them expert by
+        expert. Its parameters are the replaced module's; one of identity experts alone holds none."""
 
         def __init__(self, replaced: torch.nn.Module):
             super().__init__()
-            held = vars(replaced)
-            self.routed: int = held["num_routed_experts"]
-            self.act_fn: torch.nn.Module = replaced.get_submodule("act_fn")
-            self.gate_up_proj = replaced.get_parameter("gate_up_proj")
-            self.down_proj = replaced.get_parameter("down_proj")
+            self.routed: int = vars(replaced)["num_routed_experts"]
+            self.activation = gated_activation(replaced.get_submodule("act_fn"))
+            if self.routed:
+                self.gate_up_proj = replaced.get_parameter("gate_up_proj")
+                self.down_proj = replaced.get_parameter("down_proj")
 
         def forward(self, hidden_states, top_k_index, top_k_weights):
-            routed = top_k_index < self.routed
-            held = top_k_index.clamp(max=self.routed - 1)
-            gate, up = torch.einsum("th,tkoh->tko", hidden_states,
-                                    self.gate_up_proj[held]).chunk(2, dim=-1)
-            out = torch.einsum("tki,tkhi->tkh", self.act_fn(gate) * up, self.down_proj[held])
-            out = torch.where(routed[..., None], out, hidden_states[:, None, :])
-            return (out * top_k_weights[..., None]).to(hidden_states.dtype).sum(dim=1)
+            from torchax.interop import jax_view, torch_view
+
+            x, index, weights = (jax_view(tensor) for tensor in (hidden_states, top_k_index, top_k_weights))
+            identity = index >= self.routed
+            slots = jnp.zeros((*index.shape, x.shape[-1]), x.dtype)
+            if self.routed:
+                gate_up = jax_view(self.get_parameter("gate_up_proj"))[:self.routed]
+                width = gate_up.shape[1] // 2
+                kernels = (jnp.swapaxes(gate_up[:, :width], 1, 2), jnp.swapaxes(gate_up[:, width:], 1, 2),
+                           jnp.swapaxes(jax_view(self.get_parameter("down_proj")), 1, 2))
+                compute = expert_compute_dtype(x, *kernels, dtype=None)
+
+                def project(tokens, sizes, _ids, held):
+                    def linear(rows, kernel):
+                        return jnp.asarray(expert_projection(rows, kernel, sizes, compute, "xla", None))
+                    gated = gated_product(self.activation)(linear(tokens, held[0]), linear(tokens, held[1]))
+                    return linear(gated, held[2])
+
+                slots = expert_dispatch(project, x, jnp.where(identity, self.routed, index), kernels,
+                                        tuple(EXPERT_AXES[name] for name in ("gate_proj", "up_proj",
+                                                                             "down_proj")),
+                                        num_experts=self.routed, dispatch="global", output_dtype=compute)
+            held = jnp.where(identity[..., None], x[:, None, :], slots)
+            wide = at_least_fp32(x.dtype)
+            out = jnp.sum(held.astype(wide) * weights[..., None].astype(wide), axis=1)
+            return torch_view(out.astype(x.dtype))
 
     return FunctionalExperts
 
