@@ -170,7 +170,7 @@ def test_the_gate_compiles_two_dew_arms_without_ynnpack_and_one_beside_a_given_a
     from reference_error import _arms, _Windowed, as_given, assert_as_exact, over_windows, without_ynn
 
     def dew(x):
-        return x * 2
+        return jnp.asarray(x) * 2
 
     def written(x):
         return x + x
@@ -203,7 +203,7 @@ def test_a_numpy_arm_is_refused_unless_it_is_given_and_windows_keep_their_arms_p
     from reference_error import SIZING_FROM, _arms, as_given, assert_as_exact, over_windows, seeds_for
 
     def dew(x):
-        return x * 2
+        return jnp.asarray(x) * 2
 
     def numpy(x):
         return np.asarray(x) * 2

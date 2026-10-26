@@ -1399,14 +1399,10 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
     reference (a dropped term, a wrong scale), the runs measure the procedure's power on that class,
     both procedures on the same draws. `paired` runs both arms on the same draws, as a site does, `dew_fn`
     then the other implementation (an equally exact one, or a fault); `orders` judges rows over each
-    draw's orbit, as a site that declares one."""
+    draw's orbit, as a site that declares one. The runs evaluate their arms as given: a class's
+    arms compile themselves where they are programs, and a fault injects itself on the host."""
     if paired and dew_fn is None:
         raise ValueError("a paired null run takes its other implementation, `dew_fn`")
-    # The runs compile their arms as check 1 does (`_arms`).
-    if dew_fn is not None:
-        dew_fn, reference_fn = _arms(dew_fn, reference_fn)
-    else:
-        reference_fn = _arms(reference_fn, reference_fn)[1]
     verdicts = []
     span = (1 + REDRAW) * seeds
     for run in range(first, first + runs):
