@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, widened
+from reference_error import as_given, assert_as_exact, widened
 
 from dew.diffusion import presets
 from dew.inputs import CharTable, Condition, Field, InputSpec
@@ -66,6 +66,7 @@ def test_the_objective_trains_the_duration_and_one_step_samples_the_interval():
         start, end = (schedule.model_time(jnp.full((4,), time, x_T.dtype)) for time in (1, 0))
         return x_T - model.apply(held, x_T, start, **conditions, duration=start - end)
 
+    @as_given
     def truth(x_T):
         with jax.enable_x64(new_val=True):
             return interval(task.model.clone(dtype=jnp.float64), *widened((variables, x_T, given)))

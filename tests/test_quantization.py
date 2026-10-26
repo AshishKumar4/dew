@@ -23,6 +23,7 @@ import pytest
 from flax import linen as nn
 from flax.core import FrozenDict
 from reference_error import (
+    as_given,
     assert_as_exact,
     assert_as_exact_as_the_reference,
     assert_fp32_reduction_bound,
@@ -824,11 +825,13 @@ def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_mode
     def raw(generation):
         return generation.raw_log_probs[0, :generation.lengths[0]]
 
+    @as_given
     def packed_side(seed):
         _, actual, from_server = drawn(int(seed))
         return {"logits": np.asarray(served.model.apply(served.variables, prompt_of(seed))),
                 "task": raw(actual), "server": raw(from_server)}
 
+    @as_given
     def canonical_side(seed):
         expected, _, _ = drawn(int(seed))
         return {"logits": np.asarray(reference.model.apply(reference.variables, prompt_of(seed))),
@@ -1140,6 +1143,7 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
         mesh = spec.build()
         program = gradient(LMObjective(qmodel, SEQ_LEN))
 
+        @as_given
         def run(variables, rows, cotangent):
             placed = jax.device_put(variables, Layout(min_shard=256).shardings(mesh, variables))
             with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
@@ -1151,7 +1155,8 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
     loop, piped = runner(MeshSpec(fsdp=8)), runner(MeshSpec(fsdp=4, stage=2), 2)
     loss, grads = piped(*draw(0))
     assert np.isfinite(loss) and all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(grads))
-    assert_as_exact(lambda *inputs: {"loss": piped(*inputs)[0]}, lambda *inputs: {"loss": loop(*inputs)[0]},
+    assert_as_exact(as_given(lambda *inputs: {"loss": piped(*inputs)[0]}),
+                    as_given(lambda *inputs: {"loss": loop(*inputs)[0]}),
                     draw, "quantized pipeline loss", seeds=PIPELINE_SEEDS,
                     truth_fn=lambda variables, rows, cotangent: {"loss": np.asarray(unquantized(
                         variables["params"], variables, {"text": rows}, cotangent)[0])})

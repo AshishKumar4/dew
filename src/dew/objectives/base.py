@@ -46,7 +46,7 @@ from dew._records import JSON
 from dew.artifacts import Artifact, Artifacts, TokenScores
 from dew.batch import EXAMPLE_ROWS, FROZEN, VALID_ROWS, Batch, PathFilter, Variables, dicts, everything, part
 from dew.nn import categorical
-from dew.nn.kernels.options import Held, compiler_options
+from dew.nn.kernels.options import Held, Option, compiler_options
 from dew.nn.precision import accumulated, at_least_fp32, compensated_sum, weighted_total
 from dew.nn.protocols import HiddenStates, ProjectsParameters
 from dew.nn.sharding import rows_taken
@@ -919,7 +919,7 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     def program(self, name: Hashable, function: Callable, *, static_argnames: tuple[str, ...] = (),
                 holds: tuple[DeviceStep | AutoEncoder | Guidance, ...] = (),
-                modules: tuple[nn.Module, ...] = (), step: Mapping[str, bool | int] | None = None):
+                modules: tuple[nn.Module, ...] = (), step: Mapping[str, Option] | None = None):
         """`function` jitted as this objective's program `name`, reused only while its modules and head
         tiles stay fixed (`program_key`), and under the context it traced in (`trace_context`).
 

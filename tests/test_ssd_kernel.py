@@ -29,7 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, assert_computes_the_oracle, with_gradients, without_ynn
+from reference_error import as_given, assert_as_exact, assert_computes_the_oracle, with_gradients, without_ynn
 from ssd_support import ssd_orbit
 
 from dew.nn.kernels.recurrence_chunk import RESET_DECAY
@@ -178,6 +178,7 @@ def parity_functions(chunk_size: int, roundings: int, platform: str = "tpu"):
         lambda *o: xla_chunk_scan(*o, chunk_size), operands, seeded))
     recurrence = jax.jit(lambda operands, seeded: evaluated(stepwise_scan, operands, seeded))
 
+    @as_given
     def truth(operands, seeded):
         with jax.default_device(jax.devices("cpu")[0]):
             exact, twin = recurrence(operands, seeded), xla(operands, seeded)

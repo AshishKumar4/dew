@@ -20,7 +20,7 @@ import jax
 import numpy as np
 import pytest
 import torch
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 
 from dew.interop import Pretrained, gguf as dew_gguf
 
@@ -563,6 +563,6 @@ def test_a_gemma_or_moe_file_loads_the_model_it_was_converted_from(tmp_path, cas
 
     draw = clearing_selections(loaded, token_draw(0x1607, VOCAB, (2, 12)), case)
     # The twin runs inside `float64`, which widens its code's casts to float32 (Gemma's norms).
-    assert_as_exact(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64),
+    assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, ids), np.float64)),
                     torch_logits(reference), draw, f"{case} file logits", seeds=SOURCE_SEEDS[case],
                     truth_fn=torch_logits(wide, float64))

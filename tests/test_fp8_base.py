@@ -26,7 +26,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import NamedSharding, PartitionSpec
 from model_support import TINY_DECODER
 from process_support import READ_ONLY, fresh, keeping_picks
-from reference_error import assert_as_exact, widened, with_gradients, without_ynn
+from reference_error import as_given, assert_as_exact, widened, with_gradients, without_ynn
 
 from dew.batch import FROZEN
 from dew.data.dataset import Loader
@@ -220,6 +220,7 @@ def tangents(x, forward, forward_scale, dgrad, dgrad_scale, direction):
 fp8_tangents = without_ynn(tangents)
 
 
+@as_given
 def default_precision_tangents(*inputs):
     """`fp8_tangents` compiled under JAX's default matmul precision, not the suite's highest
     (`lane_environment`): the products state their own."""
@@ -334,6 +335,7 @@ def test_split_over_fsdp_the_frozen_product_is_one_devices():
     split = NamedSharding(mesh, PartitionSpec("fsdp", None))
     products = jax.jit(fp8_products)
 
+    @as_given
     def placed(*arrays):
         # Placed before the jit, as a run's arrays arrive: a device_put inside one constrains nothing.
         arrays = jax.device_put(arrays, split)

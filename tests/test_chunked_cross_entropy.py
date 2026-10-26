@@ -26,7 +26,7 @@ import numpy as np
 import optax
 import pytest
 from confident_support import confident, label_derivative, log_partition, log_softmax
-from reference_error import assert_as_exact, seeds_for, with_gradients
+from reference_error import as_given, assert_as_exact, seeds_for, with_gradients
 from residual_orders import order
 from sharded import collectives
 
@@ -146,6 +146,7 @@ def test_vocabulary_bias_is_fp32_after_tied_or_untied_head_products(dtype, tied)
             losses = optax.softmax_cross_entropy_with_integer_labels(head(bias).logits(states), targets)
         return {f'{tile}': losses for tile in (None, (2, 11))}
 
+    @as_given
     def truth(states, bias, targets):
         losses = true_losses(head(bias), states, targets, dtype)
         return {f'{tile}': losses for tile in (None, (2, 11))}
@@ -239,6 +240,7 @@ def test_a_checkpoints_head_input_quantization_reaches_every_head_that_scores_it
             return optax.softmax_cross_entropy_with_integer_labels(
                 chunked.model_logits(model, variables, states), targets)
 
+    @as_given
     def truth(states, targets):
         return true_losses(table, states, targets, dtype)
 
@@ -315,7 +317,7 @@ def test_the_scale_and_bias_gradients_match_full_logits_under_the_float64_rule(d
 
     assert_as_exact(jax.jit(under('default', pulled(bounded))), jax.jit(under('default', pulled(full))),
                     with_cotangent(draw, full), f'{dtype} vocabulary gradient', seeds=SEEDS['scale and bias'],
-                    truth_fn=pulled(truth))
+                    truth_fn=as_given(pulled(truth)))
 
 
 @pytest.mark.mesh(devices=2)
@@ -380,6 +382,7 @@ def test_a_vocabulary_split_head_takes_every_gradient_under_the_float64_rule(til
     specs = (P('fsdp'), P(None, 'fsdp'), P('fsdp'), P('fsdp'), P(), P())
     drawn = with_cotangent(draw, whole)
 
+    @as_given
     def split(*terms):
         with jax.set_mesh(mesh), jax.default_matmul_precision('highest'):
             placed = [jax.device_put(term, NamedSharding(mesh, spec)) for term, spec in
@@ -460,6 +463,7 @@ def split_scores(model, wide_model, shape, vocab: int, objective_of, adjusted, l
     def placed(variables, tokens):
         return jax.device_put(variables, shardings), shard_batch(mesh, {'text': np.asarray(tokens)})['text']
 
+    @as_given
     def split(variables, tokens):
         with jax.set_mesh(mesh):
             return scored(*placed(variables, tokens))
@@ -468,7 +472,7 @@ def split_scores(model, wide_model, shape, vocab: int, objective_of, adjusted, l
         wider = jax.tree.leaves(variables)[0].dtype == np.float64
         return (wide if wider else objective).token_scores(variables, tokens)
 
-    assert_as_exact(lambda *drawn: split(*drawn).losses, jax.jit(lambda *drawn: alone(*drawn).losses), draw,
+    assert_as_exact(as_given(lambda *drawn: split(*drawn).losses), lambda *drawn: alone(*drawn).losses, draw,
                     label, seeds=seeds)
     np.testing.assert_array_equal(split(*draw(0)).correct, alone(*draw(0)).correct)
     return mesh, *placed(*draw(0))
@@ -628,7 +632,7 @@ def test_bf16_states_from_the_backbone_score_as_the_logits_did(chunks, tie_embed
 
     assert_as_exact(jax.jit(tiled), jax.jit(whole), draw,
                     f'{dtype} {tie_embeddings} {chunks} backbone states', seeds=SEEDS['backbone states'],
-                    truth_fn=lambda hidden, targets: true_losses(table, hidden, targets, dtype))
+                    truth_fn=as_given(lambda hidden, targets: true_losses(table, hidden, targets, dtype)))
     hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
     matrix = OutputTable(head_matrix(model, variables), vocab_major=False)
     _, predicted, _ = chunked_cross_entropy(hidden, matrix, ids, chunks)
@@ -754,6 +758,7 @@ def test_lm_training_with_small_vocabularies_matches_the_unchunked_head(chunks):
     compiled = trainer.compile(initial, {"text": draw(0)[0]})
     scores = jax.jit(lambda ids: objective.token_scores(initial.variables, ids).losses)
 
+    @as_given
     def trained(ids, cotangent):
         del cotangent  # One, the trainer's own.
         state, _, _, _, accepted, _ = compiled(jax.tree.map(jnp.copy, initial), {"text": ids})
@@ -1243,7 +1248,7 @@ def test_a_confident_targets_logit_gradient_is_the_rest_of_the_rows_eq_7(path, m
     negative."""
     targets = np.full((3,), label, np.int32)
     gradient = jax.jit(jax.grad(functools.partial(path_loss, path, targets)))
-    assert_as_exact(gradient, lambda logits: label_derivative(logits, label),
+    assert_as_exact(gradient, as_given(lambda logits: label_derivative(logits, label)),
                     lambda seed: confident(margin, seed, label),
                     f"{path} at margin {margin}, column {label}", seeds=CONFIDENT_SEEDS)
     (rows,) = confident(margin, 0, label)
@@ -1274,6 +1279,7 @@ def test_a_confident_targets_rest_of_the_row_leaves_an_excluded_column_out(path,
         tile = (3, 3) if path == "tiled" else None
         return chunked_cross_entropy(logits, head, targets, 1, tile=tile, excluded=excluded)[0].sum()
 
+    @as_given
     def reference(logits):
         kept = label_derivative(np.delete(logits, excluded, axis=-1), label)
         return np.concatenate([kept[:, :excluded], np.zeros((len(kept), 1), kept.dtype), kept[:, excluded:]],
@@ -1295,6 +1301,7 @@ def vocabulary_split(gradient):
 
     mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
 
+    @as_given
     def split(logits):
         with jax.set_mesh(mesh), jax.default_matmul_precision("highest"):
             placed = (jax.device_put(logits, NamedSharding(mesh, P("fsdp"))),
@@ -1327,6 +1334,7 @@ def test_a_vocabulary_split_heads_confident_target_gradient_is_eq_7(tile, margin
 
     gradient = jax.jit(jax.grad(loss))
 
+    @as_given
     def reference(logits):
         if excluded is None:
             return label_derivative(logits, label)
@@ -1342,6 +1350,7 @@ def test_a_vocabulary_split_heads_confident_target_gradient_is_eq_7(tile, margin
         assert np.all(split(rows)[:, excluded] == 0)
 
 
+@as_given
 def softmax(rows: np.ndarray) -> np.ndarray:
     """NumPy's softmax over the last axis, in the rows' own dtype (`log_softmax`)."""
     return np.exp(log_softmax(rows))
@@ -1392,6 +1401,7 @@ def test_a_dominant_z_loss_keeps_an_unlikely_targets_share(path, margin):
                                                      tile=(3, 3) if path == "tiled" else None)
         return (losses + weight * jnp.square(log_z)).sum()
 
+    @as_given
     def reference(rows):
         return (label_derivative(rows, target) + 2 * weight * log_partition(rows) * softmax(rows))[:, target]
 

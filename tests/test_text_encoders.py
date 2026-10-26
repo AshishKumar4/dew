@@ -25,7 +25,7 @@ from types import SimpleNamespace
 import jax
 import numpy as np
 import pytest
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 
 from dew.inputs import CLIPText, Condition, Field, InputSpec, T5Text
 from dew.nn.text_encoders import CLIPModel, translate_config
@@ -155,9 +155,10 @@ def assert_as_exact_as_transformers(ours, names, source, draw, label: str) -> No
     import torch
 
     def theirs(dtype):
-        return lambda inputs: transformers_clip(source, inputs, dtype, names)
+        return as_given(lambda inputs: transformers_clip(source, inputs, dtype, names))
 
-    assert_as_exact(lambda inputs: {name: np.asarray(value) for name, value in ours(inputs).items()},
+    assert_as_exact(as_given(lambda inputs: {name: np.asarray(value)
+                                             for name, value in ours(inputs).items()}),
                     theirs(torch.float32), draw, label, seeds=SEEDS[label], truth_fn=theirs(torch.float64))
 
 
@@ -411,8 +412,9 @@ def test_clip_image_transform_matches_the_reference_processor(config, height, wi
                                                                                 processor.image_std))
         return (crop * processor.rescale_factor - mean) / std
 
-    assert_as_exact(lambda pixels: np.asarray(transform(pixels)),
-                    lambda pixels: processor(list(pixels), return_tensors="np")["pixel_values"], draw,
+    assert_as_exact(as_given(lambda pixels: np.asarray(transform(pixels))),
+                    as_given(lambda pixels: processor(list(pixels), return_tensors="np")["pixel_values"]),
+                    draw,
                     f"image transform {height}x{width}", seeds=SEEDS['image transform'], truth_fn=normalized)
 
 
@@ -496,6 +498,7 @@ def test_a_t5_tower_computes_in_its_compute_dtype_as_the_reference_does():
         with precision(dtype):
             model = T5EncoderModel.from_pretrained(directory, dtype=dtype).eval()
 
+        @as_given
         def run(inputs):
             ids, mask = (torch.from_numpy(np.asarray(inputs[name], np.int64))
                          for name in ("input_ids", "attention_mask"))
@@ -506,6 +509,7 @@ def test_a_t5_tower_computes_in_its_compute_dtype_as_the_reference_does():
             return {"last_hidden_state": (states.float() if dtype == torch.bfloat16 else states).numpy()}
         return run
 
+    @as_given
     def ours(inputs):
         return {"last_hidden_state": hidden(encoder, inputs["input_ids"], inputs["attention_mask"])}
 

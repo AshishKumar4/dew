@@ -51,7 +51,7 @@ from dew.inference.banks import (
 )
 from dew.mesh import batch_axes
 from dew.nn.backbones.layer_plan import layer_index
-from dew.nn.kernels.options import program
+from dew.nn.kernels.options import Option, program
 from dew.training.memory import device_tokens, step_compiler_options
 from dew.training.transaction import Realization, placed_as_rows
 
@@ -198,7 +198,7 @@ class HostExecution:
         self.device = device
         self.unstack = functools.partial(program(logical, static_argnames="sites"), sites=self.sites)
 
-    def forward(self, step: Mapping[str, bool | int]):
+    def forward(self, step: Mapping[str, Option]):
         """The loss and its pullback, compiled for the objective's modules as they are now, under the
         `step`'s XLA options (`step_options`): the objective owns the program, which its fit ladder
         replaces with its model. The dataset's device steps run in it, on the accelerator, before the
@@ -208,7 +208,7 @@ class HostExecution:
             functools.partial(_forward, functools.partial(_after, self.device, self.objective._loss)),
             static_argnames=("layout",), holds=self.device, step=step)
 
-    def step_options(self, variables, batch) -> dict[str, bool | int]:
+    def step_options(self, variables, batch) -> dict[str, Option]:
         """The XLA options the resident step compiles under (`step_compiler_options`), which the host
         step's forward and pullback take too, so the two differ by the host boundary alone: the
         tokens each accelerator device steps of `batch`, whether the step trains next to frozen

@@ -37,7 +37,7 @@ import torch
 from interop_support import fixture_arrays
 from jax.sharding import PartitionSpec as P
 from recording import RecordingTracker
-from reference_error import assert_as_exact, torch_with_gradients, with_gradients
+from reference_error import as_given, assert_as_exact, torch_with_gradients, with_gradients
 from selection_margins import indexer_margins
 from tool_support import load
 
@@ -248,6 +248,7 @@ def test_yarn_matches_the_reference_derivation():
     assert yarn_query_scale(yarn) == (0.1 * math.log(40.0) + 1.0) ** 2
     _, wide = reference_block("mla_v3", wide=True)
 
+    @as_given
     def reference(positions, wide_run=False):
         with float64() if wide_run else contextlib.nullcontext():
             rows = torch.from_numpy(np.asarray(positions)).long()[None]
