@@ -136,15 +136,24 @@ def head_tensors(params: Mapping[str, object]) -> dict[str, np.ndarray]:
     return joined_packed({layout.name: layout.export(variables) for layout in layouts}, IN_PROJ)
 
 
+def export(bundle: "PretrainedDecision", variables: Mapping[str, object] | None = None
+           ) -> dict[str, np.ndarray]:
+    """Every tensor of the joint-head release `save` writes: the backbone's under their checkpoint names
+    and the head's under the release's (`joint_head.safetensors`), with `variables` in place of the
+    backbone's."""
+    from dew.decision.sources import joined_release
+
+    return joined_release(bundle.backbone().export(variables), head_tensors(bundle.head_variables["params"]),
+                          "model.safetensors and joint_head.safetensors")
+
+
 def save(bundle: "PretrainedDecision", directory: str | Path, *,
          max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
     """Write a joint-head release, which `Pretrained.load` reads back: the held native backbone
     as a standard checkpoint with its tokenizer, and beside it the head's sizes
     (`joint_head_config.json`) and tensors under the release's names (`joint_head.safetensors`)."""
-    from dew.interop.pretrained import Pretrained
-
     root = Path(directory)
-    Pretrained.save(bundle, root, max_shard_size=max_shard_size)
+    bundle.backbone().save(root, max_shard_size=max_shard_size)
     bundle.decision_tokenizer.save_pretrained(root)
     sizes = {name: getattr(bundle.head, name) for name in SIZES}
     (root / HEAD_CONFIG).write_text(json.dumps(sizes, indent=1) + "\n")
