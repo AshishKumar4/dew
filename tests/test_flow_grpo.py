@@ -1044,9 +1044,176 @@ KL_EDGES = {
     # the variance first, 2**-158, flushed; and an inexact row beside it.
     "wide error": _rows(
         (np.ldexp(1.0, 32), (np.ldexp(1.0, 63), 0), (4, 0), (1, 1), np.ldexp(1.0, -126), 1.0),
+        # A tangent of 2**66 at 2**63 under 2**32: a JVP of 2**97 whose product, 2**129, overflowed.
+        (np.ldexp(1.0, 32), (np.ldexp(1.0, 63), 0), (np.ldexp(1.0, 66), 0), (0, 0), 1.0, 1.0),
+        # A cotangent of 2**127 at [1, 1] under 1: a variance cotangent of -2**127 whose halves overflowed.
+        (1.0, (1.0, 1.0), (1, 0), (0, 1), 1.0, np.ldexp(1.0, 127)),
         (np.ldexp(1.7, 32), (np.ldexp(1.5, 63), np.ldexp(1.0, 62)), (2, -3), (-2, 5),
          np.ldexp(1.3, -126), 0.7)),
 }
+
+
+def _numpy_kl(mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent):
+    """The KL, its JVP along every tangent at once and its VJPs, in NumPy's float32, every
+    difference, product and quotient of operands over their powers of two (`np.frexp`) and the power
+    restored once (`np.ldexp`), the textbook's range-safe evaluation, independent of Dew's."""
+    def apart(left, right):
+        power = np.maximum(np.frexp(np.max(np.abs(left), 1))[1], np.frexp(np.max(np.abs(right), 1))[1])
+        return np.ldexp(left, -power[:, None]) - np.ldexp(right, -power[:, None]), power
+
+    def joined(left, left_power, right, right_power):
+        left_power = np.where(left != 0, left_power, -4096)
+        right_power = np.where(right != 0, right_power, -4096)
+        power = np.maximum(left_power, right_power)
+        return np.ldexp(np.ldexp(left, left_power - power) + np.ldexp(right, right_power - power), power)
+
+    difference, shift = apart(mean, reference)
+    level, spread = np.frexp(variance)
+    quotient, power = np.sum(difference**2, axis=1) / level, 2 * shift - spread - 1
+    moving, moving_shift = apart(mean_tangent, reference_tangent)
+    (part, part_power), (step, step_power) = np.frexp(difference), np.frexp(moving)
+    products, powers = part * step, part_power + step_power
+    top = np.max(np.where(products != 0, powers, -4096), axis=1)
+    along = np.sum(np.ldexp(products, powers - top[:, None]), axis=1)
+    stretch, stretch_power = np.frexp(variance_tangent)
+    scale, scale_power = np.frexp(cotangent)
+    return {"KL": np.ldexp(quotient, power),
+            "JVP": joined(along / level, top + shift + moving_shift - spread,
+                          -(quotient * stretch / level), power + stretch_power - spread),
+            "VJP to the mean": np.ldexp((scale / level)[:, None] * part,
+                                        (scale_power + shift - spread)[:, None] + part_power),
+            "VJP to the variance": -np.ldexp(scale * quotient / level, scale_power + power - spread)}
+
+
+def _kl_truth(mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent):
+    """The KL, its JVP and its VJP to the mean and the variance in float64, on the float32 inputs."""
+    wide = [value.astype(np.float64) for value in
+            (mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent)]
+    difference, moving = wide[0] - wide[1], wide[3] - wide[4]
+    divergence = np.sum(difference**2, axis=1) / (2 * wide[2])
+    return {"KL": divergence,
+            "JVP": np.sum(difference * moving, axis=1) / wide[2] - divergence * wide[5] / wide[2],
+            "VJP to the mean": wide[6][:, None] * difference / wide[2][:, None],
+            "VJP to the variance": -wide[6] * divergence / wide[2]}
+
+
+def _kl_derivatives(mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent):
+    """A transition's KL, its JVP along every tangent at once, and its VJP to the mean and the variance."""
+    from dew.sampling.flow import GaussianTransition
+
+    def kl(at, reference, spread):
+        return GaussianTransition(at, spread).kl(reference)
+
+    value, moved = jax.jvp(kl, (mean, reference, variance),
+                           (mean_tangent, reference_tangent, variance_tangent))
+    _, pullback = jax.vjp(lambda at, spread: kl(at, reference, spread), mean, variance)
+    to_mean, to_variance = pullback(cotangent)
+    return {"KL": value, "JVP": moved, "VJP to the mean": to_mean, "VJP to the variance": to_variance}
+
+
+def _kinds(exact):
+    """Each float64 value's place in float32's range by its binary exponent (`np.frexp`, `x = m *
+    2**e` with `m` in [1/2, 1)): "normal" a binade clear of the least normal (e from -124 to 128),
+    "over" past the largest (e from 129), "below" under half the least normal or zero (e to -126),
+    and "edge" the binade where one rounding may cross the least normal."""
+    exponent = np.frexp(exact)[1]
+    return np.where(exact == 0, "below", np.where(exponent >= 129, "over", np.where(
+        exponent >= -124, "normal", np.where(exponent <= -126, "below", "edge"))))
+
+
+def _below_normal(values):
+    """Whether each float32 is zero or subnormal: its exponent field is zero."""
+    return (values.astype(np.float32).view(np.uint32) >> 23 & 0xFF) == 0
+
+
+def _assert_kl_outputs(dew, numpy, truth, label):
+    """Each output of `_kl_derivatives` against float64 by its place in float32's range (`_kinds`): a
+    normal value exactly where its float64 value is a float32, else on par with NumPy's range-safe
+    evaluation (check 1); an overflowing one infinite of its sign; one below the normal range zero or
+    subnormal."""
+    for name, exact in truth.items():
+        value, kinds = np.asarray(dew[name]), _kinds(exact)
+        normal, representable = kinds == "normal", np.asarray(exact, np.float32).astype(np.float64) == exact
+        np.testing.assert_array_equal(value[normal & representable],
+                                      np.asarray(exact, np.float32)[normal & representable], err_msg=name)
+        inexact = normal & ~representable
+        if inexact.any():
+            assert_as_exact_as_the_reference(value[inexact], numpy[name][inexact], exact[inexact],
+                                             f"{label}: {name}")
+        over = kinds == "over"
+        assert np.all(np.isinf(value[over]) & (np.sign(value[over]) == np.sign(exact[over]))), name
+        assert np.all(_below_normal(value[kinds == "below"])), name
+
+
+def _kl_grid():
+    """Rows over float32's exponent range in the mean, the reference, the variance, the mean's tangent,
+    the variance's and the cotangent, each at six exponents from -124 to 125, an inexact significand
+    each, two elements a row: means apart and tangents apart, or equal elements whose tangents cancel;
+    the reference's tangent 0.7 of the mean's. From -124, so a row's smaller element is still normal:
+    XLA:CPU reads a subnormal input as zero, which no float64 truth of the input's own value does."""
+    levels = (-124, -60, -1, 0, 60, 125)
+    grid = np.asarray(list(itertools.product(levels, repeat=6)))
+    significands = (1.3, 1.7, 1.1, 1.9, 1.5, 1.2)
+    mean, reference, variance, tangent, stretch, cotangent = (
+        np.ldexp(np.float32(significand), grid[:, index]) for index, significand in enumerate(significands))
+
+    def pairs(first, second):
+        return np.stack([first, second], 1)
+
+    apart = (pairs(mean, np.float32(0.8) * mean), pairs(reference, np.float32(0.6) * reference),
+             pairs(tangent, np.float32(0.6) * tangent))
+    cancelling = (pairs(mean, mean), pairs(reference, reference), pairs(tangent, -tangent))
+    means, references, tangents = (np.concatenate(pair).astype(np.float32)
+                                   for pair in zip(apart, cancelling, strict=True))
+    rows = [np.tile(column, 2).astype(np.float32) for column in (variance, stretch, cotangent)]
+    return means, references, rows[0], tangents, np.float32(0.7) * tangents, rows[1], rows[2]
+
+
+@pytest.mark.parametrize("compiled", [False, True], ids=["eager", "jit"])
+def test_a_transitions_kl_and_its_derivatives_hold_over_float32s_exponent_range(compiled):
+    """Over a grid of float32's exponents in every input (`_kl_grid`), cancelling and not, a transition's
+    KL, its JVP along the mean's, the reference's and the variance's tangents at once, and its VJPs to
+    the mean and the variance hold their float64 values by their place in float32's range
+    (`_assert_kl_outputs`), eagerly and compiled."""
+    inputs = _kl_grid()
+    run = jax.jit(_kl_derivatives) if compiled else _kl_derivatives
+    _assert_kl_outputs(run(*(jnp.asarray(value) for value in inputs)), _numpy_kl(*inputs), _kl_truth(*inputs),
+                       "a KL over float32's exponents")
+
+
+REVIEWED = {
+    # (mean, reference, variance, mean tangent, reference tangent, variance tangent, cotangent), each
+    # input one row, the KL's JVP and VJP each exact in float32.
+    "train 192's cancelling tangent": (
+        [[0.5, 0.5]], [[0, 0]], [2.0**-126], [[16, -16]], [[0, 0]], [0], [1]),
+    "train 195's overflowing contraction": (
+        [[2.0**63, 0]], [[0, 0]], [2.0**32], [[2.0**66, 0]], [[0, 0]], [0], [1]),
+    "train 195's overflowing variance pullback": (
+        [[1, 1]], [[0, 0]], [1], [[0, 0]], [[0, 0]], [1], [2.0**127]),
+    "a variance tangent over the variance first": (
+        [[2.0**63, 0]], [[0, 0]], [2.0**32], [[0, 0]], [[0, 0]], [2.0**-126], [1]),
+    "a small coordinate's product beside a large one": (
+        [[1, 2.0**-80, 0]], [[0, 0, 0]], [2.0**-100], [[0, 2.0**-80, 1]], [[0, 0, 0]], [0], [1]),
+    "two terms past the range whose sum is in it": (
+        [[1]], [[0]], [2.0**-126], [[4 + 2.0**-21]], [[0]], [2.0**-123], [1]),
+    "two terms below the range whose sum is in it": (
+        [[2.0**-63]], [[0]], [1], [[2.0**-64]], [[0]], [-1], [1]),
+    "a difference past the largest": (
+        [[2.0**127]], [[-2.0**127]], [np.finfo(np.float32).max], [[1]], [[0]], [0], [1]),
+    "a difference below the least": (
+        [[(1 + 2.0**-23) * 2.0**-126]], [[2.0**-126]], [2.0**-126], [[2.0**127]], [[0]], [0], [2.0**127]),
+}
+
+
+@pytest.mark.parametrize("case", list(REVIEWED))
+def test_a_transitions_kl_and_its_derivatives_are_exact_at_each_reviewed_input(case):
+    """Each input a review found leaving float32's range (`REVIEWED`): the KL, its JVP along every
+    tangent at once and its VJPs to the mean and the variance, eagerly and compiled, are their float64
+    values where those are float32s, and otherwise as `_assert_kl_outputs` holds them."""
+    inputs = tuple(np.asarray(value, np.float32) for value in REVIEWED[case])
+    for run in (_kl_derivatives, jax.jit(_kl_derivatives)):
+        _assert_kl_outputs(run(*(jnp.asarray(value) for value in inputs)), _numpy_kl(*inputs),
+                           _kl_truth(*inputs), case)
 
 
 @pytest.mark.parametrize("edge", list(KL_EDGES))
@@ -1074,23 +1241,25 @@ def test_a_transitions_kl_and_its_derivatives_hold_at_float32s_edges(edge):
                                 (jnp.asarray(variance_tangent),))
     _, pullback = jax.vjp(lambda at: kl(at, *primals[1:]), primals[0])
     pulled_back = np.asarray(pullback(jnp.asarray(cotangent))[0])[:, 0, :2]
-    difference = -offsets
-    divergence = np.sum(difference**2, axis=1) / np.float32(2) / variance
-    wide = [value.astype(np.float64) for value in
-            (difference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent)]
-    wide_divergence = np.sum(wide[0] ** 2, axis=1) / (2 * wide[1])
-    outputs = {
-        "KL": (value, divergence, wide_divergence),
-        "JVP along the mean": (moved_mean, np.sum(np.float32(2) * difference * mean_tangent, axis=1)
-                               / np.float32(2) / variance, np.sum(wide[0] * wide[2], axis=1) / wide[1]),
-        "JVP along the reference": (moved_reference,
-                                    -np.sum(np.float32(2) * difference * reference_tangent, axis=1)
-                                    / np.float32(2) / variance, -np.sum(wide[0] * wide[3], axis=1) / wide[1]),
-        "JVP along the variance": (moved_variance, -(divergence * variance_tangent) / variance,
-                                   -wide_divergence * wide[4] / wide[1]),
-        "VJP to the mean": (pulled_back, cotangent[:, None] * difference / variance[:, None],
-                            wide[5][:, None] * wide[0] / wide[1][:, None]),
-    }
+    flat, nothing, still = np.zeros_like(offsets), np.zeros_like(offsets), np.zeros_like(variance)
+
+    def numpy(mean_tangent, reference_tangent, variance_tangent):
+        return _numpy_kl(flat, offsets, variance, mean_tangent, reference_tangent, variance_tangent,
+                         cotangent)
+
+    def truth(mean_tangent, reference_tangent, variance_tangent):
+        return _kl_truth(flat, offsets, variance, mean_tangent, reference_tangent, variance_tangent,
+                         cotangent)
+
+    along = {"mean": (mean_tangent, nothing, still), "reference": (nothing, reference_tangent, still),
+             "variance": (nothing, nothing, variance_tangent)}
+    outputs = {"KL": (value, numpy(*along["mean"])["KL"], truth(*along["mean"])["KL"]),
+               "VJP to the mean": (pulled_back, numpy(*along["mean"])["VJP to the mean"],
+                                   truth(*along["mean"])["VJP to the mean"])}
+    moves = (("mean", moved_mean), ("reference", moved_reference), ("variance", moved_variance))
+    for direction, moved in moves:
+        outputs[f"JVP along the {direction}"] = (moved, numpy(*along[direction])["JVP"],
+                                                 truth(*along[direction])["JVP"])
     for name, (dew, reference, truth) in outputs.items():
         assert np.all(np.isfinite(np.asarray(dew))), name
         assert_as_exact_as_the_reference(np.asarray(dew), reference, truth,
