@@ -290,6 +290,7 @@ def test_right_padding_and_logical_positions_survive_cached_generation(kind):
     def full(dtype=None):
         at, weights = (model, params) if dtype is None else (model.clone(dtype=dtype), widened(params))
 
+        @as_given
         def run(tokens, positions, drawn):
             with jax.enable_x64(new_val=True) if dtype is not None else nullcontext():
                 return policy_scores(at, weights, tokens[:, :2], np.full(ROWS, 2), drawn, greedy,
