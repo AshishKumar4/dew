@@ -471,6 +471,23 @@ def test_a_unified_config_without_its_image_placeholder_is_refused():
         translate_wrapper_config(config)
 
 
+def test_a_unified_config_without_its_audio_placeholder_takes_the_config_class_default():
+    """Gemma4UnifiedConfig defaults audio_token_id (258881, configuration_gemma4_unified.py:312 at
+    5.17.0), so a config that leaves it out names that placeholder: its audio reads it and the decoder
+    keeps it a placeholder, as transformers' config class would."""
+    import json
+
+    from dew.interop.hf_decoders import translate_wrapper_config
+
+    config = json.loads((FIXTURE / "config.json").read_text())
+    stated = translate_wrapper_config(config)
+    assert stated["audio_token_id"] == config["audio_token_id"] in stated["extra_placeholder_ids"]
+    del config["audio_token_id"]
+    defaulted = translate_wrapper_config(config)
+    assert defaulted["audio_token_id"] == 258881 in defaulted["extra_placeholder_ids"]
+    assert defaulted["audio_projector"] == stated["audio_projector"]
+
+
 @pytest.mark.parametrize("media", ["text", "vision", "audio"])
 def test_a_unified_source_can_omit_either_media_component(source, tmp_path, media):
     pair, draw = optional_source(source, tmp_path, media)
