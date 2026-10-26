@@ -253,9 +253,23 @@ def test_a_part_whose_code_differs_is_not_assembled(tmp_path):
 _LOADED = """
 import sys
 from dew.interop import Pretrained
-Pretrained.load(sys.argv[1], dtype="float32", attention_impl="reference", trust_remote_code=True)
+Pretrained.load(sys.argv[1], subfolder=sys.argv[2] or None, dtype="float32", attention_impl="reference",
+                trust_remote_code=True)
 """
-"""A load of the source `argv[1]` names, running its own code, in a process of its own."""
+"""A load of the source `argv[1]` names, at the folder `argv[2]` selects, running its own code."""
+
+
+def _offline_load(root, source, subfolder: str = ""):
+    """A load of `source` (at `subfolder`) in a process of its own, offline over the Hub cache at
+    `root`/hub with Dew's cache at `root`/cache."""
+    import os
+    import subprocess
+    import sys
+
+    env = {**os.environ, "HF_HUB_CACHE": str(root / "hub"), "HF_HUB_OFFLINE": "1",
+           "XDG_CACHE_HOME": str(root / "cache"), "JAX_PLATFORMS": "cpu"}
+    return subprocess.run([sys.executable, "-c", _LOADED, str(source), subfolder], capture_output=True,
+                          text=True, env=env)
 
 
 def test_a_verification_of_remote_code_is_recorded_under_its_commit(tmp_path):
@@ -264,10 +278,6 @@ def test_a_verification_of_remote_code_is_recorded_under_its_commit(tmp_path):
     at another commit is verified and recorded again; a local directory's code, which no commit names,
     is verified at each load and recorded under none. Each load runs offline over a Hub cache holding
     the repository at a commit, in a process of its own."""
-    import os
-    import subprocess
-    import sys
-
     from interop_support import hub_cache
 
     write_source(tmp_path / "repo", "renamed")
@@ -275,13 +285,10 @@ def test_a_verification_of_remote_code_is_recorded_under_its_commit(tmp_path):
     repos = [f"dew/renamed-{index}" for index in range(2)]
     for index, repo in enumerate(repos):
         hub_cache(tmp_path / "hub", repo, tmp_path / "repo", commit=f"{index}" * 40)
-    env = {**os.environ, "HF_HUB_CACHE": str(tmp_path / "hub"), "HF_HUB_OFFLINE": "1",
-           "XDG_CACHE_HOME": str(tmp_path / "cache"), "JAX_PLATFORMS": "cpu"}
     verified = tmp_path / "cache" / "dew" / "verified"
 
     def load(source) -> None:
-        run = subprocess.run([sys.executable, "-c", _LOADED, str(source)], capture_output=True, text=True,
-                             env=env)
+        run = _offline_load(tmp_path, source)
         assert run.returncode == 0, run.stderr[-2000:]
 
     load(tmp_path / "repo")
@@ -289,6 +296,25 @@ def test_a_verification_of_remote_code_is_recorded_under_its_commit(tmp_path):
     for count, repo in enumerate(repos, 1):
         load(repo)
         assert len(list(verified.glob("*/mapping.json"))) == count
+
+
+def test_each_code_folder_at_one_commit_is_verified_on_its_own(tmp_path):
+    """A commit names a whole repository, whose folders (`subfolder`) may each hold code of their own:
+    two folders at one commit, each beside the same config, one the renamed Llama and the other the same
+    code that trains otherwise than it evaluates (`_hooked`), are verified each, so the second is refused
+    after the first's verification is recorded, as it is refused alone."""
+    from interop_support import hub_cache
+
+    (tmp_path / "repo").mkdir()
+    write_source(tmp_path / "repo" / "plain", "renamed")
+    write_source(tmp_path / "repo" / "hooked", "renamed", _hooked)
+    configs = [json.loads((tmp_path / "repo" / folder / "config.json").read_text())
+               for folder in ("plain", "hooked")]
+    assert configs[0] == configs[1]
+    hub_cache(tmp_path / "hub", "dew/renamed", tmp_path / "repo")
+    plain = _offline_load(tmp_path, "dew/renamed", "plain")
+    assert plain.returncode == 0, plain.stderr[-2000:]
+    assert _offline_load(tmp_path, "dew/renamed", "hooked").returncode != 0
 
 
 @pytest.mark.parametrize("name", sorted(SOURCES))
