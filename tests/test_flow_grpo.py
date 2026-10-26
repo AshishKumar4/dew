@@ -1165,6 +1165,9 @@ FIXED_ROWS = (
     ([1e18, 0, 0], [0, 0, 0], 2.5e38, [4, 0, 0], [4, 0, 0], 1e30, 0.7),
     ([0.5, 0, 0], [0, 0, 0], 2.0**-126, [4, 0, 0], [-4, 0, 0], 2.0**-126, 2.0**-126),
     ([2.0**127, 0, 0], [-2.0**127, 0, 0], float(np.finfo(np.float32).max), [1, 0, 0], [0, 0, 0], 0, 1),
+    # A product the plain sum flushes beside largest ones that cancel (train 208, 1806): Dew may lose
+    # it as plain does, and no more.
+    ([2.0**45, 2.0**45, 2.0**-73], [0, 0, 0], 2.0**-21, [2.0**81, -2.0**81, 2.0**-73], [0, 0, 0], 0, 1),
     # A KL just under float32's largest (train 208), and two rows of far different sizes, the second's
     # VJP not hiding the first's.
     ([2.0**64, 0, 0], [0, 0, 0], 0.5 + 2.0**-24, [1, 0, 0], [0, 0, 0], 0, 1),
