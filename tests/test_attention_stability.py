@@ -21,6 +21,7 @@ ulps); dQ's, by FlashAttention's one bf16 product at the first D, at keys an ulp
 groups, 379 ulps); dK's at a small weight on a large value in bf16 (12, 8 ulps); and dV's, by the fold's
 recomputed weights, at keys an ulp apart in fp32 (100, 16 ulps)."""
 
+import contextlib
 import dataclasses
 import functools
 from collections.abc import Callable
@@ -984,19 +985,22 @@ def _cache(array: jax.Array) -> jax.Array:
 
 
 def _decoded(family: Family, natural: bool | None) -> tuple[Callable, Callable]:
-    """The decode kernel over `family`'s step, interpreted, each row's keys the first `K` of its cache, in
-    the form `natural` names (None, the default), and the family's draw without its cotangent (a decode step
-    has no backward)."""
+    """The decode kernel over `family`'s step, interpreted on a CPU (as an A100's launch) and compiled on a
+    GPU, each row's keys the first `K` of its cache, in the form `natural` names (None, the default), the
+    family's slice count pinned, and the family's draw without its cotangent (a decode step has no
+    backward)."""
     lengths = family.spans.get("lengths")
     form = {} if natural is None else {"natural": natural}
 
     def decoded(query, key, value, sinks):
         count = np.full(query.shape[0], key.shape[1]) if lengths is None else lengths
-        # An A100's slice counts, which a launch on a CPU, of no multiprocessors, does not offer.
+        # The family's slice count, which a launch on a CPU, of no multiprocessors, does not offer: there
+        # as an A100's launch.
         pin = {decode_attention.DecodeAttention: decode_attention.Split(family.splits)}
-        with generation.assumed("sm80"), tuning.pinned(pin):
+        target = generation.assumed("sm80") if INTERPRETED else contextlib.nullcontext()
+        with target, tuning.pinned(pin):
             return decode_attention.attend(query, _cache(key), _cache(value), jnp.asarray(count, jnp.int32),
-                                           sinks=sinks, interpret=True, **form)
+                                           sinks=sinks, interpret=INTERPRETED, **form)
 
     def forward(seed):
         return _cast(family, family.draw)(seed)[:4]
@@ -1006,8 +1010,8 @@ def _decoded(family: Family, natural: bool | None) -> tuple[Callable, Callable]:
 
 @pytest.mark.parametrize("family, form", DECODED, ids=[f"{family}-{form}" for family, form in DECODED])
 def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, form):
-    """The decode kernel's output, interpreted, each row's keys the first `K` of its cache, check 1 over
-    the family's draws."""
+    """The decode kernel's output, interpreted on a CPU and compiled on a GPU (its guarded launch and merge),
+    each row's keys the first `K` of its cache, check 1 over the family's draws."""
     seeds, family = SEEDS[family], FAMILIES[family]
     decoded, forward = _decoded(family, FORMS[form])
     assert_as_exact(jax.jit(decoded), jax.jit(_reference(family, anchored=False)), forward,
@@ -1021,9 +1025,9 @@ largest."""
 
 @pytest.mark.parametrize("family", DECODED_OVERFLOWS)
 def test_decodes_default_is_finite_where_its_sums_pass_fp32s_largest(family):
-    """The decode kernel's default form, interpreted, finite wherever the reference is (`assert_finite`)
-    over the families whose weighted values' sums pass fp32's largest: it guards its sums' headroom in
-    either form (`algebra.Forward.headroom`)."""
+    """The decode kernel's default form, interpreted on a CPU and compiled on a GPU, finite wherever the
+    reference is (`assert_finite`) over the families whose weighted values' sums pass fp32's largest: it
+    guards its sums' headroom in either form (`algebra.Forward.headroom`)."""
     seeds, family = SEEDS[family], FAMILIES[family]
     decoded, forward = _decoded(family, None)
     assert_finite(jax.jit(decoded), jax.jit(_reference(family, anchored=False)), forward,
