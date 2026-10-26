@@ -1148,8 +1148,9 @@ backend and `kernels.get_kernel("kernels-community/flash-attn3").flash_attn_func
 (`triton_runs`), measured faster than cuDNN on an RTX 4080 and as fast as FlashAttention-2 on an
 A100. On an H100 SXM at Llama-3.2-1B's attention (4 x 4096 tokens, 32 query heads over 8 of 64,
 causal, bf16, jax 0.11.2, tokamax 0.0.15) forward and backward took 4.44 ms on it, 2.78 on cuDNN and
-2.17 on FlashAttention-3, which a 1B FSDP step on two H100s spent 82 of 301 ms on. So sm90's row
-names flash for those heads (`attention_narrow`). The rows reproduce with `PYTHONPATH=src python
+2.17 on FlashAttention-3, which a 1B FSDP step on two H100s spent 82 of 301 ms on. So Hopper takes
+flash for those heads (attention's declared cell, `attention_kernels.DECLARED`), and a GPU of no routed
+Mosaic mainloop takes it first by legality. The rows reproduce with `PYTHONPATH=src python
 tools/benchmark_attention.py --implementations triton flash cudnn --sequence-lengths 4096
 --head-dims 64 --batch-size 4 --heads 32 --kv-groups 4 --causal True`.
 
@@ -1233,9 +1234,9 @@ SXM at batch 2 (Mistral 1), the RTX 4080 at batch 1, jax 0.11.2, median of 20:
 
 The 4080's backward takes no head over 192, so Gemma 3 stays off flash there. Flash's output and
 its query, key, value and sink gradients lie within tests/reference_error.py's rule of the xla
-kernel's from float64, batched and packed (tests/test_kernels.py), on all three GPUs. So the
-target rows of sm80, sm89 and sm90 name flash for `attention_window` and `attention_sinks`; sm120
-keeps its windows on cuDNN and its sinks on XLA until a G4 measures them. A packed or key-masked
+kernel's from float64, batched and packed (tests/test_kernels.py), on all three GPUs. So flash takes
+windows and sinks wherever it takes the call (`FLASH_SUPPORTS`), Hopper's by its declared cell and
+other GPUs' by legality, the template elsewhere on a family with a routed Mosaic mainloop. A packed or key-masked
 windowed call keeps its band on cuDNN, which takes the band's mask as a bias. Each row reproduces
 with `tools/benchmark_attention.py`, for example the MiMo row with `PYTHONPATH=src python
 tools/benchmark_attention.py --implementations xla flash --sequence-lengths 4096 --head-dims 192
@@ -1261,8 +1262,8 @@ and backward in ms, median of 20, jax 0.11.2:
 | A100 40GB, 16 | 24.65 | 3.94 | 6.69 | 157.13 |
 
 An empty sequence costs about 3.2 us on the H100 and 6.3 on the A100, so a cap of the row length
-loses to the mask, and 64 wins at every document count. The target rows of sm80 and sm90 name
-flash for `attention_packed`, and `flash_refusal` takes a packed call there when its
+loses to the mask, and 64 wins at every document count. So flash takes packed calls wherever it
+takes the call, and `flash_refusal` takes a packed call there when its
 `Coordinates.max_segments` is at most 64 (`FLASH_PACKED_SEGMENTS`). A packed read declares the most
 documents its windows hold: what its plan or memory read placed in one, or a streamed pack's
 `segments`; a streamed pack without one declares the row length, which stays on the mask. Decision

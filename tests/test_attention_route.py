@@ -4,8 +4,8 @@ Its output and its gradients of the query, key, value and sinks are on par with 
 float64 (check 1), for each call form the route takes, block groups among them, a cache call's included.
 Every case has grouped key heads: four query heads over two. The selector refuses the route a mask and a
 bias by their inherent limits; on a family whose Mosaic template has a routed mainloop (wgmma's) it runs
-every other call its declared old route does not take, a target's measured row prefers it for a call with
-block groups, and otherwise a call that names it runs it. On meshes, a named call runs per
+every other call its declared cell's old route does not take (`attention_kernels.DECLARED`), and otherwise a
+call that names it runs it. On meshes, a named call runs per
 shard under `sharded.assert_runs_per_shard`: with fewer key heads than the tensor shards, with key heads split
 partly, with key heads split in the other order from the query heads, or with heads that take an axis the
 rows' arguments name.
@@ -429,9 +429,9 @@ def test_a_templated_family_runs_the_template_where_its_declared_route_does_not_
     16-bit call it supports (a plain call, a window) and the template on every other one the template takes
     (sinks and a softcap, key lengths, documents past FlashAttention's measured 64-a-row cap, which stays
     its own requirement); an fp32 call stays on xla, the
-    Mosaic template taking 16-bit operands alone. Every other target runs its row's route, never the
-    template on these calls; a call naming the template, or `generation.chosen` naming it for the attention
-    choice, takes it everywhere (bible §4, owner 10-25)."""
+    Mosaic template taking 16-bit operands alone. Every other target, of no routed Mosaic mainloop, runs the
+    op's order by legality, never the template on these calls; a call naming the template, or
+    `generation.chosen` naming it for the attention choice, takes it everywhere (bible §4, owner 10-25)."""
     sinks = jnp.zeros((HEADS,), jnp.bfloat16)
     documents = 2 * FLASH_PACKED_SEGMENTS + 2
     many = jnp.tile(jnp.repeat(jnp.arange(1, documents // 2 + 1), 2)[None], (ROWS, 1))

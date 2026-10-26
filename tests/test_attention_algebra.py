@@ -639,8 +639,12 @@ def test_the_accurate_forms_rescale_is_as_exact_as_its_exponent_rounded_once(raw
     def rounded(m, safe):
         return spec.carry(m - safe)
 
+    def exact(m, safe):
+        # In float64 the exponent's difference and its product with the scale are exact.
+        return jnp.exp((m - safe) * (spec.scale if raw else 1.0))
+
     assert_as_exact(jax.jit(functools.partial(algebra.carried, spec)), jax.jit(rounded), draw,
-                    f"the accurate form's rescale, {'raw' if raw else 'scaled'}", seeds=8)
+                    f"the accurate form's rescale, {'raw' if raw else 'scaled'}", seeds=8, truth_fn=exact)
 
 
 def _accurate_dq(query, key, value, spans, hooks, dout, scale, name):

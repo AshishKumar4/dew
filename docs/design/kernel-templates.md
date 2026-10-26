@@ -621,7 +621,7 @@ The template enters each Op as one `Kernel('template', TEMPLATE_SUPPORTS)`. Its 
 | Kernel today | Replaced by | Deletion it enables (when its scoreboard row is met) |
 |---|---|---|
 | `flash` (FA2/FA3 wheel) | template | `flash_attention`, `FLASH_SUPPORTS`, `flash_architectures`/`flash_built_for`, `FLASH_PACKED_SEGMENTS`, the dew_flash_attn wheel and its build. Per §1 and §13 Q1, these go once the template's default beats them at the gate, in time and in memory. |
-| `triton` (tokamax Triton) | template | `triton_attention`, `TRITON_SUPPORTS`, the `attention_narrow` rows in TARGETS. |
+| `triton` (tokamax Triton) | template | `triton_attention`, `TRITON_SUPPORTS`. |
 | `cudnn` | template | `cudnn_attention`, `CUDNN_SUPPORTS`, `cudnn_takes_mask`, `kernel_for_materialized_mask`, `widen_value_heads`, `cudnn_max_head_dim`. |
 | `tpu` (Splash, Pallas flash interpreted) | template's TPU mainloop (Splash's MaskInfo adopted) | `splash_attention`, `splash_mask_descriptor`, `splash_dense_mask`, `splash.block_sizes`, `pallas_flash_attention`, `TPU_SUPPORTS`. |
 | `xla` (jax.nn) | template's plain-JAX mainloop on CPU | `_xla_kernel_narrows`, `_xla_kernel_chains`, `XLA_SUPPORTS`' handoffs. |

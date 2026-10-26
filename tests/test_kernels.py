@@ -1112,64 +1112,61 @@ def test_a_kernels_requirements_are_what_the_kernel_takes_on_this_gpu(kernel, ca
         assert np.all(np.isfinite(run()))
 
 
-@pytest.mark.parametrize("generation_name, narrow", [("sm80", "flash"), ("sm86", "flash"),
-                                                     ("sm90", "flash"), ("sm89", "triton")])
-def test_narrow_heads_take_the_kernel_their_target_measured_fastest(generation_name, narrow):
-    """A causal bf16 call of 64-wide heads prefers its GPU row's narrow-heads kernel
-    ('attention_narrow'): the FA wheel where it was measured fastest, an A10, an A100 and an H100
-    (`generation.TARGETS`), tokamax's Triton kernel where the row names none. FlashAttention's own row
-    requirement reads the same row, so where the wheel holds code for the GPU the preference is the
-    route, an A10's narrow heads included where its attention row names none."""
-    from dew.nn.attention import attention_case, resolve_implementation
-    from dew.nn.attention_kernels import ATTENTION, kernel_refusals
+@pytest.mark.parametrize("generation_name", ["sm80", "sm86", "sm89", "sm90"])
+@pytest.mark.parametrize("head_dim", [64, 128])
+def test_a_bf16_call_takes_flash_on_its_cell_or_by_legality(generation_name, head_dim):
+    """A causal bf16 call takes FlashAttention on every GPU it measured fastest on: Hopper's by its declared
+    cell (`attention_kernels.DECLARED`), its refusal naming the template it sets aside and the receipt; a GPU
+    of no routed Mosaic mainloop (mma.sync's) as the op's first kernel by legality, no table row
+    preferring another (bible §4)."""
+    from dew.nn.attention import resolve_implementation
     from dew.nn.kernels import generation
 
-    query = jnp.zeros((2, 128, 4, 64), jnp.bfloat16)
+    query = jnp.zeros((2, 128, 4, head_dim), jnp.bfloat16)
     with generation.assumed(generation_name), generation.routes() as found:
         resolve_implementation("auto", query, query, causal=True)
-        refused = {refusal.code for refusal in kernel_refusals(
-            ATTENTION, narrow, attention_case(query, query, causal=True))}
     (route,) = [route for route in found if route.choice == "attention"]
-    assert route.preferred == narrow
-    # The row qualifies the preferred kernel: only host facts (backend, wheel) may turn it down here.
-    assert "row" not in refused
+    assert route.kernel == "flash"
+    if generation_name == "sm90":
+        assert route.preferred == "template" and route.refusal.code == "old_route"
+    else:
+        assert route.preferred == "flash" and route.refusal is None
 
 
 @pytest.mark.parametrize("dtype, kept", [(jnp.float16, False), (jnp.bfloat16, True)])
 def test_an_fp16_call_leaves_the_triton_route_as_a_declared_gap(dtype, kept):
-    """A causal call of 16-wide heads where an L4's row prefers tokamax's Triton kernel: an fp16 one is
-    refused by its dtype, whose dQ that kernel narrows before the scale the route applies outside it
-    (row 1676, `triton_attention`), and the next kernel takes it; a bf16 one keeps it."""
-    from dew.nn.attention import attention_case, resolve_implementation
+    """A causal call of 16-wide heads that prefers tokamax's Triton kernel: an fp16 one is refused by its
+    dtype, whose dQ that kernel narrows before the scale the route applies outside it (row 1676,
+    `triton_attention`), and the next kernel takes it; a bf16 one keeps it."""
+    from dew.nn.attention import attention_case
     from dew.nn.attention_kernels import ATTENTION, kernel_refusals
     from dew.nn.kernels import generation
+    from dew.nn.kernels.selection import select
 
     query = jnp.zeros((2, 128, 4, 16), dtype)
-    with generation.assumed("sm89"), generation.routes() as found:
-        resolve_implementation("auto", query, query, causal=True)
-        refused = {refusal.code for refusal in kernel_refusals(
-            ATTENTION, "triton", attention_case(query, query, causal=True))}
-    (route,) = [route for route in found if route.choice == "attention"]
+    with generation.assumed("sm89"), generation.routes():
+        case = attention_case(query, query, causal=True)
+        refused = {refusal.code for refusal in kernel_refusals(ATTENTION, "triton", case)}
+        route = select(ATTENTION, case, "triton", insist=False)
     assert ("fp16" not in refused) == kept
     assert (route.kernel == "triton") == kept
 
 
 @pytest.mark.parametrize("head_dim, kept", [(8, False), (16, True)])
 def test_heads_narrower_than_the_triton_kernel_computes_take_the_next_kernel(head_dim, kept):
-    """A causal bf16 call of narrow heads prefers tokamax's Triton kernel where its GPU's row names it
-    for them, an L4's: 8-wide heads, which that kernel computes wrong (`TRITON_NARROWEST`), are refused
-    by their width and the next kernel takes the call; 16-wide heads keep it."""
-    from dew.nn.attention import attention_case, resolve_implementation
+    """A causal bf16 call of narrow heads that prefers tokamax's Triton kernel: 8-wide heads, which that
+    kernel computes wrong (`TRITON_NARROWEST`), are refused by their width and the next kernel takes the
+    call; 16-wide heads keep it."""
+    from dew.nn.attention import attention_case
     from dew.nn.attention_kernels import ATTENTION, kernel_refusals
     from dew.nn.kernels import generation
+    from dew.nn.kernels.selection import select
 
     query = jnp.zeros((2, 128, 4, head_dim), jnp.bfloat16)
-    with generation.assumed("sm89"), generation.routes() as found:
-        resolve_implementation("auto", query, query, causal=True)
-        refused = {refusal.code for refusal in kernel_refusals(
-            ATTENTION, "triton", attention_case(query, query, causal=True))}
-    (route,) = [route for route in found if route.choice == "attention"]
-    assert route.preferred == "triton"
+    with generation.assumed("sm89"), generation.routes():
+        case = attention_case(query, query, causal=True)
+        refused = {refusal.code for refusal in kernel_refusals(ATTENTION, "triton", case)}
+        route = select(ATTENTION, case, "triton", insist=False)
     assert ("head_dim" not in refused) == kept
     assert (route.kernel == "triton") == kept
 

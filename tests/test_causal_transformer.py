@@ -338,13 +338,14 @@ def test_decode_cache_matches_the_full_sequence(rng, attention_impl):
 
 
 @pytest.mark.gpu(reason="FlashAttention runs on CUDA")
-def test_a_cached_prompt_reads_its_cache_through_flash_where_its_row_names_it(rng, without_deterministic_ops):
+def test_a_cached_prompt_reads_its_cache_through_flash_where_its_wheel_runs(rng, without_deterministic_ops):
     """A bf16 prompt prefilled into the cache under 'auto' reads it as the documents its tokens end, no
-    mask, which FlashAttention takes where the GPU's row names it for packed documents: the compiled
-    prefill holds its kernel there, and its logits are on par with the xla
-    kernel's uncached forward from the float64 forward over drawn weights and
-    prompts (check 1)."""
-    from dew.nn.kernels.generation import measured_kernel
+    mask, which FlashAttention takes wherever its wheel holds code for the GPU (Hopper's declared cell, other
+    GPUs' first kernel by legality): the compiled prefill holds its kernel there, and its logits are on par
+    with the xla kernel's uncached forward from the float64 forward over drawn weights and prompts
+    (check 1)."""
+    from dew.nn.attention import attention_case
+    from dew.nn.attention_kernels import ATTENTION
 
     model = tiny(dtype=jnp.bfloat16)
     ids = tokens(rng)
@@ -352,8 +353,9 @@ def test_a_cached_prompt_reads_its_cache_through_flash_where_its_row_names_it(rn
     prompt = ids[:, :6]
     made, step = decode_steps(model)
     compiled = step.lower(params, made(params, prompt.shape[0]), prompt).compile().as_text()
-    flash = (measured_kernel('attention_packed', 'xla') == 'flash'
-             and measured_kernel('attention', 'cudnn') == 'flash')
+    probe = jnp.zeros((1, 8, 1, 64), jnp.bfloat16)
+    failed = ATTENTION.kernel('flash').failed(attention_case(probe, probe))
+    flash = not {requirement.code for requirement in failed} & {'not_installed', 'binary_arch'}
     # FlashAttention-2's and -3's packed calls (dew_flash_attn's custom-call targets).
     assert bool(re.search(r'dew_flash3?_mha_varlen_fwd', compiled)) == flash
     assert_as_exact(lambda params, prompt: step(params, made(params, prompt.shape[0]), prompt)[0],

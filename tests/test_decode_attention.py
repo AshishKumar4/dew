@@ -962,7 +962,7 @@ def test_flash_reads_a_cache_calls_documents_as_exactly_as_jax_nn_reads_its_mask
     def truth(query, key, value):
         return exact_attention(query, key, value, keep=np.asarray(mask))
 
-    with chosen(attention="flash", attention_packed="flash", attention_window="flash"):
+    with chosen(attention="flash"):
         case = attention_case(query, key, causal=True, sliding_window=window, segment_ids=documents,
                               max_segments=1)
         assert kernel_refusals(ATTENTION, "flash", case) == []
@@ -983,12 +983,12 @@ def test_flash_reads_a_cache_calls_documents_as_exactly_as_jax_nn_reads_its_mask
 
 @pytest.mark.parametrize("width", [128, 96])
 @pytest.mark.parametrize("generation", ["sm80", "sm90"])
-def test_a_bf16_decode_step_routes_to_the_kernel_its_generation_measured_fastest(generation, width,
-                                                                                without_deterministic_ops):
+def test_a_bf16_decode_step_routes_to_the_decode_kernel_first(generation, width, without_deterministic_ops):
     """A bf16 decode step of 16 query heads over 8 key heads, traced through the public attention for a
-    GPU: an A100 runs the decode kernel its row prefers (`generation.TARGETS`' sm80 'decode', from the DCU
-    receipt), and hands a width it does not take (96) on to cuDNN; an H100 runs cuDNN, its default. Out
-    of the cuda lane's deterministic ops, which refuse cuDNN (`without_deterministic_ops`)."""
+    GPU: an A100 and an H100 run the decode kernel, the template's decode mainloop and its default (no cell
+    declares cuDNN: on an A100 it measured 1.57 times as fast in geometric mean, `generation.TARGETS`'
+    note), and hand a width it does not take (96) on to cuDNN by legality. Out of the cuda lane's
+    deterministic ops, which refuse cuDNN (`without_deterministic_ops`)."""
     from dew.nn.kernels.generation import assumed
 
     query = jnp.zeros((2, 1, 16, width), jnp.bfloat16)
@@ -998,6 +998,5 @@ def test_a_bf16_decode_step_routes_to_the_kernel_its_generation_measured_fastest
         jax.make_jaxpr(lambda q, k, v: scaled_dot_product_attention(q, k, v, key_value_seq_lengths=lengths))(
             query, key, key)
     [route] = [route for route in found if route.choice == "decode"]
-    preferred = "decode" if generation == "sm80" else "cudnn"
-    assert (route.preferred, route.kernel) == (preferred, preferred if width == 128 else "cudnn")
-    assert (route.refusal is None) == (route.kernel == preferred)
+    assert (route.preferred, route.kernel) == ("decode", "decode" if width == 128 else "cudnn")
+    assert (route.refusal is None) == (route.kernel == "decode")
