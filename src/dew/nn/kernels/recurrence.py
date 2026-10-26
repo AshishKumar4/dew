@@ -35,7 +35,7 @@ from dew.nn.precision import (
 )
 
 from . import chunked_launch, norm_swiglu, short_conv, tuning
-from .generation import triton_runs
+from .generation import INHERENT, Refusal, triton_runs
 
 
 @dataclasses.dataclass(frozen=True)
@@ -621,12 +621,23 @@ def _whole(hooks: Hooks) -> bool:
     return hooks.conv is not None or hooks.output is not None
 
 
-def fits(hooks: Hooks, state) -> bool:
-    """Whether the launch takes this `[rows, heads, Dk, Dv]` state: a GPU Dew's Triton kernels run on
-    (`triton_runs`), held in fp32 or bf16, its widths powers of two (Triton's blocks)."""
+def refusal(state, *, tangent: bool = False) -> Refusal | None:
+    """Why the launch turns down a `[rows, heads, Dk, Dv]` `state`, or None where it takes it: it runs
+    on a GPU Dew's Triton kernels run on (`triton_runs`), holds the state in fp32 or bf16 and computes
+    in fp32 (a float64 state keeps its own precision in `step_reference`), takes widths that are powers
+    of two (Triton's blocks), and updates the state in place, which JAX's Pallas gives no tangent, so a
+    token traced for forward-mode derivatives (`tangent`) is no launch's."""
     dk, dv = state.shape[-2:]
-    return (triton_runs() and state.dtype in (jnp.float32, jnp.bfloat16)
-            and all(width > 0 and width & (width - 1) == 0 for width in (dk, dv)))
+    return next((Refusal(code, detail, row) for holds, code, detail, row in (
+        (not tangent, 'forward_mode', "a JVP trace needs forward-mode derivatives; the launch updates its "
+         "state in place, which JAX's Pallas gives no tangent", INHERENT),
+        (triton_runs(), 'capability', "the launch needs a GPU of sm80 or later", INHERENT),
+        (state.dtype in (jnp.float32, jnp.bfloat16), 'precision',
+         f"the launch holds a state in fp32 or bf16 and computes in fp32, not {state.dtype}", INHERENT),
+        (all(width > 0 and width & (width - 1) == 0 for width in (dk, dv)), 'widths',
+         f"the launch's blocks take power-of-two widths, not {dk} by {dv}",
+         'roadmap: recurrence step widths'),
+    ) if not holds), None)
 
 
 def _one_tap(hooks: Hooks, conv: Conv, operands: Step, given: dict, dtype):

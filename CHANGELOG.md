@@ -5,6 +5,31 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A loaded decoder's pad row takes no gradient wherever its source's table pads it. Kimi Linear, Kimi K3,
+  Ouro, Dream, LLaDA-MoE and LLaDA2 now pad `pad_token_id` as their released code does, at their config
+  class's own default where a config states none; Dew trained that row before. Qwen 3.5's wrappers load
+  a YaRN or Llama 3.1 rope record, their three-axis rotary turning by its ramp. Tier 2's probe runs past
+  a rope ramp's original context and holds a convention's pad row to the source's table, a negative pad
+  id counting back from the table's end. A verification of a repository's own code is recorded under
+  the repository, Hub commit and folder it was fetched at, and a local directory's own code is verified
+  at each load.
+- Test-time training over the task loss: a decoder's continuum level (`CausalTransformer(continuum=ContinuumLevel(hidden))`) is stepped in context by the LM loss every `window` tokens of a document (`LMObjective(adaptation=ChunkAdaptation(...))`), Nested Learning's equation 71, each document from the trained start, training through every step.
+- A label's cross-entropy derivative in its own logit is `p - 1` while the label holds at most half its row and minus the rest of the row past it (`dew.nn.categorical.label_entry`), for the whole-logits head and the tiled, fused and vocabulary-split heads alike; the rest alone sat two to three times as far from float64 on unconfident rows.
+- `UNet2DCondition` stores its time embeddings' two maps flat, as `time_linear_1` and `time_linear_2`
+  (and `additional_time_linear_1` and `_2`), where they were `time/in_proj` and `time/out_proj`; a
+  published UNet loads as before. An AutoencoderKL's resnets are `dew.nn.blocks.ResidualBlock` called
+  without a time embedding, and `dew.nn.autoencoders.vae.FlaxResnetBlock2D` is gone. `dew.nn.engram`
+  draws its bucket primes with `sympy.nextprime`, so `sympy` is a dependency.
+- A flow transition's density and KL hold at float32's edges: the density is JAX's isotropic
+  `multivariate_normal.logpdf`, where `2 pi` times a variance near float32's largest overflowed, and the
+  KL takes the error's half from its quotient, rounded once, where 2 times such a variance or an error
+  over a variance near float32's least overflowed and half an error near its least flushed to zero (a KL
+  of 0 for 0.5).
+  Schulman's k3 KL estimate is one helper through `expm1`
+  (`dew.rl.surrogate.sampled_kl`), which a small log ratio's `exp(d) - 1` rounded away.
+- A masked-diffusion row's reveals are its own under RBG keys too (`dew._distributions.counted`, the
+  rest of ledger 1669), and TensorBoard histograms are its own `histogram_pb`'s, the plugin's tensor.
+- The host CPU classifier is the CI's (tools/armada/host.py), not the library's: `dew._host` is gone.
 - `OptimConfig` and `ScheduleSpec` move from `dew.config` to `dew.optim`, beside the optimizers and
   schedules they build; `Wandb` moves to `dew.training` (`dew.training.tracker`), beside the tracker that
   reads it; and
@@ -48,6 +73,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   `dew.objectives.lm.objective`); the axis names, `DEFAULT_RULES`, `axis_rules`, `logical_spec`,
   `row_axes`, `batch_axes` and `LayoutRefused` (from `dew.nn.sharding`). Import them from their
   new modules; the old ones no longer hold them.
+- A Hub split's shards are the files `datasets` resolves to it from the repository's listing, by its own
+  default patterns (`dew.data.sources.hub.split_files`): `dev` and `valid` are `validation`'s, a sharded
+  name's split is its own and a lone file is `train`'s, where a name match missed them.
+- An immutable upload's `retries` (`Cache.retry`) re-read only an object it created that reads back
+  otherwise; a failed transfer raises after its transport's own retries, not Dew's on top of them.
 - A decision run's calibration takes its probabilities through SciPy's `softmax` and fits each
   temperature with SciPy's bounded L-BFGS-B on its inverse, at least 1e-3, in place of a hand-written
   softmax and Newton loop; the grouping, ragged rows and soft targets are as before.

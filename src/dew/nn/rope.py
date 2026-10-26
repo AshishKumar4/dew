@@ -203,12 +203,21 @@ class YarnScaling:
 def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = None,
                  partial_rotary_type: str = 'proportional',
                  rope_scaling: RopeScaling | LongRopeScaling | YarnScaling | None = None, *,
-                 dtype: DTypeLike, reach=None):
+                 dtype: DTypeLike, reach=None, section: Sequence[int] | None = None):
     """Return cos and sin of the rotary angles at absolute `positions`: [P, pairs].
 
     `positions` is [P], or [B, P] for a packed batch whose documents restart at
     0. The angles are computed in `dtype` (at least fp32), so a token rotates
     the same in prefill and decode.
+
+    With `section`, Qwen's interleaved M-RoPE, `positions` is [B, S, 3]: each
+    token's temporal, height and width ids. Pair i turns by the height id
+    when `i % 3 == 1` and `i < 3 * section[1]`, by the width id when
+    `i % 3 == 2` and `i < 3 * section[2]`, and by the temporal id otherwise
+    (Qwen3-VL's `apply_interleaved_mrope`), each at the frequency and
+    amplitude the rope and its ramp give that pair (Llama 3.1's or YaRN's,
+    the same at every position), as Qwen3_5TextRotaryEmbedding builds them
+    through `ROPE_INIT_FUNCTIONS` (modeling_qwen3_5.py:143-213).
 
     LongRoPE picks its short or long factors by how far a sequence reaches: a
     row's furthest position, or `reach` `[B, P]`, each token's document's
@@ -265,7 +274,17 @@ def rotary_freqs(positions, head_dim: int, theta: float, rot_dim: int | None = N
             inv_freq = jnp.pad(inv_freq, (*((0, 0),) * (inv_freq.ndim - 1), (0, padding)))
         else:
             inv_freq = np.concatenate([inv_freq, np.zeros((padding,), inv_freq.dtype)])
-    angles = jnp.asarray(positions, inv_freq.dtype)[..., None] * inv_freq
+    if section is None:
+        angles = jnp.asarray(positions, inv_freq.dtype)[..., None] * inv_freq
+    else:
+        if positions.shape[-1] != 3:
+            raise ValueError(f"M-RoPE reads three coordinates per position, got {positions.shape[-1]}")
+        indices = jnp.arange(inv_freq.shape[-1])
+        axes = jnp.zeros(indices.shape, jnp.int32)
+        for axis in (1, 2):
+            axes = jnp.where((indices % 3 == axis) & (indices < section[axis] * 3), axis, axes)
+        selected = jnp.take_along_axis(positions, axes[None, None, :], axis=-1)
+        angles = selected.astype(inv_freq.dtype) * inv_freq
     cos, sin = jnp.cos(angles), jnp.sin(angles)
     if isinstance(rope_scaling, LongRopeScaling):
         cos, sin = cos * rope_scaling.amplitude, sin * rope_scaling.amplitude
@@ -302,28 +321,6 @@ def axis_tables[P: (np.ndarray, jax.Array)](positions: P, axes: Sequence[int], t
         return np.cos(joined).astype(table), np.sin(joined).astype(table)
     joined = jnp.concatenate(angles, axis=-1)
     return jnp.cos(joined).astype(table), jnp.sin(joined).astype(table)
-
-
-def mrope_tables(positions: jax.Array, section: Sequence[int], width: int, theta: float, *,
-                 dtype: DTypeLike) -> tuple[jax.Array, jax.Array]:
-    """cos and sin of Qwen's interleaved M-RoPE over a `width`-wide rope:
-    `[B, S, width // 2]` from temporal, height and width ids `[B, S, 3]`.
-
-    Pair i turns at `inverse_frequencies(theta, width)[i]` by the height id
-    when `i % 3 == 1` and `i < 3 * section[1]`, by the width id when
-    `i % 3 == 2` and `i < 3 * section[2]`, and by the temporal id otherwise
-    (Qwen3-VL's `apply_interleaved_mrope`). The angles are computed in
-    `dtype`.
-    """
-    if positions.shape[-1] != 3:
-        raise ValueError(f"M-RoPE reads three coordinates per position, got {positions.shape[-1]}")
-    indices = jnp.arange(width // 2)
-    axes = jnp.zeros((width // 2,), jnp.int32)
-    for axis in (1, 2):
-        axes = jnp.where((indices % 3 == axis) & (indices < section[axis] * 3), axis, axes)
-    selected = jnp.take_along_axis(positions, axes[None, None, :], axis=-1)
-    angles = selected.astype(dtype) * inverse_frequencies(theta, width, dtype=dtype)
-    return jnp.cos(angles), jnp.sin(angles)
 
 
 def rotate(x, cos, sin, *, pairs: Literal['half', 'adjacent'] = 'half',

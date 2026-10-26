@@ -33,6 +33,7 @@ from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.inputs import TOKENWISE, AttentionMetadata, MixerCall
 from dew.nn.kernels.generation import chosen
+from dew.nn.memory import Gate, InContextMemory, MLPMemory
 from dew.nn.mixer_base import MixerRefused
 from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
@@ -233,7 +234,10 @@ KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm"
                "mamba2": ({"num_heads": 8, "head_dim": 32, "state_size": 32, "n_groups": 4,
                            "chunk_size": 64}, {}),
                "gated_delta_net": ({"linear_num_key_heads": 2, "linear_num_value_heads": 4,
-                                    "linear_key_head_dim": 16, "linear_value_head_dim": 16}, {})}
+                                    "linear_key_head_dim": 16, "linear_value_head_dim": 16}, {}),
+               "memory": ({"memory": InContextMemory(
+                   network=MLPMemory(hidden=(16,)), heads=2, head_features=8, chunk=4, normalize=True,
+                   learning_rate=Gate(scale=0.1), momentum=Gate(), retention=Gate(bias=-2.0))}, {})}
 """The fields a kind needs beyond its defaults to build in `tiny`: its own, then the model's. The
 recurrent kinds default to their models' heads (Kimi Linear's 64 of 128, Qwen3.5's 32 of 128), whose
 per-key pairwise decays alone take 134 MB a chunk in KDA's portable math."""
@@ -242,7 +246,7 @@ REFUSED = {"kpool_sparse_attention"}
 """Kinds that refuse packed rows."""
 
 SEEDS = {"attention": 64, "deepseek_v4": 256, "gated_delta_net": 512, "kimi_delta_attention": 512,
-         "llama4": 128, "mamba": 32, "mamba2": 256, "mla": 64, "mlp": 64}
+         "llama4": 128, "mamba": 32, "mamba2": 256, "memory": 256, "mla": 64, "mlp": 64}
 """Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for which
 documents run alone compared with themselves resolve PARITY in every logit and parameter gradient (on
 armada). Mamba2's 8 heads of 32 over a state of 32 in 64-token chunks (`KIND_FIELDS`) take 256 at 0.04 s a
@@ -360,7 +364,7 @@ POLICY_VALUES = {"force_fp32_for_softmax": False, "attn_logit_softcap": 30.0, "a
 KIND_CONTEXT = {"llama4": {"qk_norm": False}, "deepseek_v4": {"sliding_window": 8}}
 """Layer fields a kind needs to build at all, beyond the test's context."""
 
-ATTENDS_NOTHING = {"mlp", "gated_delta_net", "kimi_delta_attention", "mamba", "mamba2"}
+ATTENDS_NOTHING = {"mlp", "gated_delta_net", "kimi_delta_attention", "mamba", "mamba2", "memory"}
 """The registry's kinds that mix tokens without attention, whose layers' attention policies are not theirs."""
 
 
@@ -422,7 +426,7 @@ def test_a_decoder_climbs_only_the_remat_rungs_its_layers_mark(kind, rungs):
 @pytest.mark.parametrize("kind", ["kimi_delta_attention", "mamba", "mamba2", "gated_delta_net"])
 @chosen(gated_delta_rule="fla")
 def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, capsys):
-    """A decoder skips the remat rungs that keep none of its mixers' names (`MixerBase.residuals`), so
+    """A decoder skips the remat rungs that keep none of its mixers' names (`MixerBase.marks`), so
     a kind may name only what its layer marks: under `jax.checkpoint` with a policy saving each one
     alone, a tiny decoder of that kind saves it for its backward. A recurrence's output is both its
     'context' and its 'scan', either of which keeps it. A delta rule's decay and inverse are its
@@ -432,7 +436,7 @@ def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, capsy
     from dew.nn.backbones.decoder_block import RematPolicy
 
     value = mixers.build(kind, **KIND_FIELDS.get(kind, ({}, {}))[0])
-    assert value.residuals is not None
+    assert value.marks() is not None
     model = tiny(mixer=value, max_seq_len=64, **KIND_FIELDS.get(kind, ({}, {}))[1])
     tokens = jax.random.randint(jax.random.key(3), (1, 64), 0, VOCAB)
     variables = model.init(jax.random.key(4), tokens)
@@ -446,7 +450,7 @@ def test_a_remat_policy_keeps_every_residual_a_recurrent_mixer_names(kind, capsy
         print_saved_residuals(jax.checkpoint(loss, policy=policy), variables)
         return f"named '{name}'" in capsys.readouterr().out
 
-    assert [name for name in value.residuals if not saves(name)] == []
+    assert [name for name in value.marks() or () if not saves(name)] == []
 
 
 def one_tap(kind):

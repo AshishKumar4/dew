@@ -129,6 +129,16 @@ class Modulation(nn.Module):
         return jnp.split(projected, self.pieces, axis=-1)
 
 
+def padded_row(padding_idx: int | None, rows: int) -> int | None:
+    """The row of a table of `rows` that `padding_idx` names, as torch's `nn.Embedding` reads it: a
+    negative id counts from the table's end, one outside the table is refused, and None names none."""
+    if padding_idx is None:
+        return None
+    if not -rows <= padding_idx < rows:
+        raise ValueError(f"padding_idx {padding_idx} is outside the table of {rows} rows")
+    return padding_idx % rows
+
+
 class TokenEmbedding(nn.Embed):
     """Token lookup with cotangent accumulation in the parameter dtype."""
 
@@ -148,12 +158,9 @@ class TokenEmbedding(nn.Embed):
                 raise ValueError("Embedding dtype promotion must return an array")
         else:
             rows = table_rows(self.embedding, inputs, self.dtype or self.embedding.dtype)
-        if self.padding_idx is None:
+        padding = padded_row(self.padding_idx, self.num_embeddings)
+        if padding is None:
             return rows
-        if not -self.num_embeddings <= self.padding_idx < self.num_embeddings:
-            raise ValueError(f"padding_idx {self.padding_idx} is outside the table of "
-                             f"{self.num_embeddings} rows")
-        padding = self.padding_idx % self.num_embeddings
         return jnp.where((inputs == padding)[..., None], jax.lax.stop_gradient(rows), rows)
 
 
@@ -290,8 +297,10 @@ def _torch_bicubic_weights(size_in: int, size_out: int, antialias: bool) -> np.n
 IMAGENET_MEAN = (0.485, 0.456, 0.406)
 IMAGENET_STD = (0.229, 0.224, 0.225)
 """The ImageNet pixel statistics, per RGB channel, that encoders trained on ImageNet read their
-inputs under: transformers' `IMAGENET_DEFAULT_MEAN` and `IMAGENET_DEFAULT_STD`, which a test holds
-these equal to (Dew imports no transformers at module level)."""
+inputs under: transformers' `IMAGENET_DEFAULT_MEAN` and `IMAGENET_DEFAULT_STD`, written out since
+importing those runs `transformers.utils`, which imports torch where it is installed (transformers
+5.16.1, utils/generic.py), and image sampling imports this module with neither
+(tests/test_imports.py)."""
 
 
 def torch_bicubic_resize(x, height: int, width: int, *, antialias: bool = False):
@@ -359,10 +368,11 @@ class Downsample(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    """Norm, activation, convolution, the projected time embedding added,
-    norm, activation, convolution, plus the input (through a 1x1 convolution
-    when the width changes). `norm_groups` of 0 swaps the group norms for
-    RMS norms."""
+    """Norm, activation, convolution, the projected time embedding added
+    where the call gives one (an AutoencoderKL's blocks take none), norm,
+    activation, convolution, plus the input (through a 1x1 convolution when
+    the width changes). `norm_groups` of 0 swaps the group norms for RMS
+    norms."""
     features: int
     kernel_size: tuple = (3, 3)
     activation: Callable = jax.nn.swish
@@ -371,6 +381,9 @@ class ResidualBlock(nn.Module):
     precision: PrecisionLike = None
     norm_epsilon: float = 1e-4
     dropout: float = 0.0
+    shortcut: str = "residual_conv"
+    """The 1x1 convolution's name: Dew's UNets' `residual_conv`, or an AutoencoderKL's
+    `conv_shortcut`, under which diffusers' Flax checkpoints load and are written as they are."""
 
     @nn.nowrap
     def spatial_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
@@ -396,15 +409,16 @@ class ResidualBlock(nn.Module):
         self.norm2 = norm()
 
     @nn.compact
-    def __call__(self, x: jax.Array, temb: jax.Array, *, train: bool = False):
+    def __call__(self, x: jax.Array, temb: jax.Array | None = None, *, train: bool = False):
         conv = partial(Conv, features=self.features, kernel_size=self.kernel_size,
                        strides=(1, 1), dtype=self.dtype, precision=self.precision)
         out = conv(name="conv1")(self.norm1(x))
 
-        temb = DenseGeneral(features=self.features, name="temb_projection",
-                            dtype=self.dtype, precision=self.precision,
-                            dot_general=float32_dot_general)(temb)
-        out = out + temb[:, None, None, :]
+        if temb is not None:
+            temb = DenseGeneral(features=self.features, name="temb_projection",
+                                dtype=self.dtype, precision=self.precision,
+                                dot_general=float32_dot_general)(temb)
+            out = out + temb[:, None, None, :]
 
         out = self.norm2(out)
         if self.dropout:
@@ -413,5 +427,5 @@ class ResidualBlock(nn.Module):
 
         residual = x
         if residual.shape != out.shape:
-            residual = conv(kernel_size=(1, 1), name="residual_conv")(residual)
+            residual = conv(kernel_size=(1, 1), name=self.shortcut)(residual)
         return out + residual

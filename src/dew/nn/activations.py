@@ -36,12 +36,11 @@ from .precision import at_least_fp32, capped_logits, rounded_to
 
 
 def gelu_exact(x: jax.Array) -> jax.Array:
-    """`0.5 * x * erfc(-x / sqrt(2))`, `jax.nn.gelu(approximate=False)`'s arithmetic, in at
-    least fp32, in `x`'s dtype. Over 2^20 normal fp32 inputs at scale 3 it lies 5.6e-8 RMS
-    from float64 where the `1 + erf` form and torch's gelu lie 1.0e-7, and 4.5e-10 against
-    1.3e-7 below x = -3. In bf16 both forms lie 1.76e-3 RMS from float64."""
-    work = x.astype(at_least_fp32(x.dtype))
-    return (.5 * work * jax.lax.erfc(-work * math.sqrt(.5))).astype(x.dtype)
+    """`jax.nn.gelu(approximate=False)`, `0.5 * x * erfc(-x / sqrt(2))`, in at least fp32, in
+    `x`'s dtype. Over 2^20 normal fp32 inputs at scale 3 it lies 5.6e-8 RMS from float64 where
+    the `1 + erf` form and torch's gelu lie 1.0e-7, and 4.5e-10 against 1.3e-7 below x = -3.
+    In bf16 both forms lie 1.76e-3 RMS from float64."""
+    return jax.nn.gelu(x.astype(at_least_fp32(x.dtype)), approximate=False).astype(x.dtype)
 
 
 def gelu_exact_torch(x: jax.Array) -> jax.Array:

@@ -17,6 +17,14 @@
    "tool": "tools/joint_checkpoint_reference.py",
    "sources": [{"repo": "Cloudflare/clef", "version": "2f3de3dd85f379784083b0814d997ab627200f0c", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
+  "hf/k2-horizon-tiny/padding.json": {
+   "tool": "tools/k2_horizon_reference.py",
+   "sources": [{"repo": "IFM/K2-Horizon-0.9B", "version": "383cb66347be", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}]
+  },
+  "hf/mimo-v2-tiny/padding.json": {
+   "tool": "tools/remote_code_reference.py",
+   "sources": [{"repo": "XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "version": "6a7f202e8dbd0e57b3fe1da03917d08d75abc4b8", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.17.0", "runs": "transformers"}]
+  },
   "hf/phi3-tiny/logits.npy": {
    "tool": "tools/hf_reference.py",
    "sources": [{"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
@@ -1250,6 +1258,10 @@
     }
    ]
   },
+  "hf/dream-tiny/padding.json": {
+   "tool": "tools/remote_code_reference.py",
+   "sources": [{"repo": "Dream-org/Dream-v0-Base-7B", "version": "6572adb5535263e4d1a337b56942ba48b6dee2a9", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.46.3", "runs": "transformers"}]
+  },
   "hf/gemma-3n-audio-tiny/reference.npz": {
    "tool": "tools/audio_wrapper_reference.py",
    "sources": [
@@ -1903,6 +1915,10 @@
    ],
    "note": "Dynamic remote import; fla kernels forced IEEE; compressed-tensors 0.17.1 supplies packed/decompressed weight inputs."
   },
+  "hf/kimi-k3-tiny/padding.json": {
+   "tool": "tools/kimi_k3_reference.py",
+   "sources": [{"repo": "moonshotai/Kimi-K3", "version": "f831ab66814297da540d832a5235f8e904f29d06", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.56.2", "runs": "transformers"}]
+  },
   "hf/kimi-linear-tiny/numerics.npz": {
    "tool": "tools/kimi_float64_reference.py",
    "sources": [
@@ -1950,6 +1966,10 @@
     }
    ],
    "note": "Dynamic remote import; routing weights use unshifted scores (tools/kimi_linear_reference.py:33); fla kernels forced IEEE."
+  },
+  "hf/kimi-linear-tiny/padding.json": {
+   "tool": "tools/kimi_linear_reference.py",
+   "sources": [{"repo": "moonshotai/Kimi-Linear-48B-A3B-Instruct", "version": "e1df551a447157d4658b573f9a695d57658590e9", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.57.1", "runs": "transformers"}]
   },
   "hf/llada-moe-tiny": {
    "tool": "tools/llada_moe_reference.py",
@@ -2000,6 +2020,10 @@
      "runs": "transformers"
     }
    ]
+  },
+  "hf/llada-tiny/padding.json": {
+   "tool": "tools/remote_code_reference.py",
+   "sources": [{"repo": "GSAI-ML/LLaDA-8B-Base", "version": "0f2787f2d87eac5eed8a087d5ecd24277e6255b2", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.46.3", "runs": "transformers"}]
   },
   "hf/llama-tiny/beam.npz": {
    "tool": "tools/beam_reference.py",
@@ -3862,6 +3886,10 @@
    "sources": [{"repo": "ByteDance/Ouro-1.4B", "version": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.56.2", "runs": "transformers"}]
   },
   "hf/ouro-tiny/padded_logits_f64.npy": {
+   "tool": "tools/ouro_reference.py",
+   "sources": [{"repo": "ByteDance/Ouro-1.4B", "version": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.56.2", "runs": "transformers"}]
+  },
+  "hf/ouro-tiny/padding.json": {
    "tool": "tools/ouro_reference.py",
    "sources": [{"repo": "ByteDance/Ouro-1.4B", "version": "574fa66cb8bf5abdc979642d01cf2b79b16bfab1", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.56.2", "runs": "transformers"}]
   },
