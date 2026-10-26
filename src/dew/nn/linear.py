@@ -512,7 +512,8 @@ def _decode_preferred(case: DecodeCase) -> str:
 DELTA_DECODE: Op[DecodeCase] = Op('delta_decode', (
     Kernel('fused', (*_LAUNCH, Requirement('unfused', lambda case: case.fuses,
                                            "the caller has no conv, gates or gated norm for the fused step "
-                                           "to take; its token runs the step alone", row=INHERENT))),
+                                           "to take; its token runs the step alone", row=INHERENT,
+                                           kind='handoff'))),
     Kernel('step', _LAUNCH),
     Kernel('xla', (), generic=True)), _decode_preferred)
 """The decode selector of both recurrence callers (a gated delta net's layer, `decode_step`'s): the fused

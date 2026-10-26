@@ -1100,7 +1100,7 @@ def test_a_decode_token_reports_the_fused_step_as_its_route_where_its_target_tak
                 for found_route in found if found_route.choice == "delta_decode"]
 
     assert decode_routes(32)[-1] == ("step", "step", None)
-    assert decode_routes(24)[-1] == ("xla", "step", "step_widths")
+    assert decode_routes(24)[-1] == ("xla", "step", "widths")
     with chosen(gated_delta_rule="xla"):
         assert decode_routes(32)[-1] == ("xla", "xla", None)
     with chosen(delta_decode="fused"):

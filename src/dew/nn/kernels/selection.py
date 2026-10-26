@@ -34,7 +34,8 @@ class Requirement[C]:
     `kind` is 'capability', what the kernel cannot compute; 'measured', where the target measured
     another kernel faster or never qualified this one, which a forced choice overrides; or
     'handoff', a call structurally outside what the kernel applies to, which it hands to the op's next
-    generic kernel even when forced (a generic kernel's handoff, a join's projections run apart)."""
+    kernel even when forced (a generic kernel's to the next generic one, a join's projections run apart, a
+    decode token with nothing to fuse runs the step alone)."""
 
     code: str
     holds: Callable[[C], bool]
@@ -111,11 +112,11 @@ def select[C](op: Op[C], case: C, named: str | None = None, *, insist: bool = Tr
     """The kernel `op` runs for `case` on the target, reported as its route: `named` (or the kernel
     `chosen` names) where it takes the case, else the op's preference (`preferred`, or the first of its
     kernels that takes the case), else the first of the op's kernels that does. A named kernel that does
-    not take the case raises with every requirement it fails, its measured ones aside, and hands a case only
-    its handoff requirements turn down to the op's next generic kernel. Without `insist`,
-    `named` is the call's own preference, before `chosen`'s, and one that does not take the case hands
-    it to the op's other kernels, its refusal reported (a norm's or a SiLU product's per-call
-    implementation)."""
+    not take the case raises with every requirement it fails, its measured ones aside, and hands a case
+    only its handoff requirements turn down to the op's next kernels (a generic one to the next generic
+    ones). Without `insist`, `named` is the call's own preference, before `chosen`'s, and one that does not
+    take the case hands it to the op's other kernels, its refusal reported (a norm's or a SiLU product's
+    per-call implementation)."""
     kernel, preferred, refusal = _decided(op, case, named, insist)
     return generation.route(op.choice, kernel=kernel.name, preferred=preferred, refusal=refusal,
                             ran=op.hosted(kernel.name))
@@ -137,9 +138,12 @@ def _decided[C](op: Op[C], case: C, named: str | None,
         insisted = named or forced(op.choice)
         preferred = insisted or _preferred(op, case)
     first = op.kernel(preferred)
-    # An insisted kernel hands a call only its handoffs turn down, and only to the generic kernels.
-    candidates = [first, *(kernel for kernel in op.kernels if kernel is not first
-                           and (insisted is None or kernel.generic))]
+    # An insisted kernel hands a call only its handoffs turn down, to the op's next kernels in turn; a
+    # generic one to the next generic ones.
+    handing = insisted is not None and not first.generic
+    rest = op.kernels[op.kernels.index(first) + 1:] if handing else op.kernels
+    candidates = [first, *(kernel for kernel in rest if kernel is not first
+                           and (insisted is None or not first.generic or kernel.generic))]
     refusal = None
     for kernel in candidates:
         # A kernel a call names passes what the targets measured of it, whether or not the call insists.
