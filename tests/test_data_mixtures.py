@@ -29,6 +29,7 @@ import pytest
 from affine_run import FEATURES, Affine
 from token_support import write_token_corpus
 
+from dew.batch import VALID_ROWS, freeze, thaw
 from dew.data import Files, Loading, Memory, phases, presets
 from dew.data.compile import compile, held, publish, validation
 from dew.data.dataset import CAPTION, DataPartition, GlobalStream, Loader, Ramp, Stage, ramped
@@ -36,7 +37,7 @@ from dew.data.images import EncodeCaptions
 from dew.data.pipeline import DeviceStep, Pipeline, mix
 from dew.data.plan import Manifest, Plan
 from dew.data.sources import TokenFiles
-from dew.objectives.base import VALID_ROWS, Aux, Objective, Ratio, freeze, thaw
+from dew.objectives.base import Aux, Objective, Ratio
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
 READ = Loading(workers=0, threads=1, read_buffer=8, worker_buffer=1)
@@ -1221,7 +1222,7 @@ def test_a_batch_the_pipeline_cannot_cut_into_microbatches_is_refused_before_it_
     rows would compute another's again. The run is refused as it starts,
     before anything compiles, naming a batch and a microbatch count that
     fit."""
-    from dew.nn.sharding import LayoutRefused
+    from dew.mesh import LayoutRefused
 
     trainer = Trainer(Regression(), optax.sgd(0.5), key=jax.random.key(0),
                       mesh=MeshSpec(fsdp=2, stage=2), microbatches=4,

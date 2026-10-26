@@ -38,26 +38,31 @@ from flax import linen as nn, struct
 from flax.traverse_util import unflatten_dict
 from jax.typing import ArrayLike
 
+from dew._coordination import agreed, collective_host
 from dew.artifacts import Artifact, TextSamples, TokenScores
-from dew.coordination import agreed, collective_host
+from dew.batch import (
+    COORDINATES_FIELD,
+    FROZEN,
+    VALID_ROWS,
+    Batch,
+    Coordinates,
+    PathFilter,
+    Variables,
+    freeze,
+    merge,
+    real_slots,
+    scored_targets,
+    shifted_span,
+    thaw,
+    token_layout,
+)
 from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
 from dew.inference.tasks import Processor, TextSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
-from dew.nn.inputs import (
-    CONTEXT,
-    CONTEXT_LENGTHS,
-    COORDINATES_FIELD,
-    Coordinates,
-    ModelInputs,
-    pad_token_rows,
-    real_slots,
-    rotate_rows,
-    shifted_span,
-    token_layout,
-)
+from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs, pad_token_rows, rotate_rows
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_moments
 from dew.nn.precision import at_least_fp32
@@ -78,26 +83,19 @@ from dew.nn.protocols import (
 )
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
-    FROZEN,
     OMITTED,
-    VALID_ROWS,
     Aux,
-    Batch,
     EMASpec,
     Objective,
     Omitted,
-    PathFilter,
     Prediction,
     ProgramModule,
     Ratio,
     Shown,
     Step,
-    Variables,
-    freeze,
-    merge,
+    ended,
     merge_totals,
     model_rngs,
-    thaw,
 )
 from dew.objectives.lm.adaptation import ChunkAdaptation, adapted_scores
 from dew.objectives.lm.chunked import (
@@ -290,10 +288,10 @@ def _prepared(tokens: ModelInputs | jax.Array, segment_ids: jax.Array | None = N
     """The rows as `ModelInputs`, bare ids cast to int32, their packing among the token fields.
 
     A packed batch from a data pipeline carries its windows' `coordinates`
-    (`dew.nn.inputs.Coordinates`, the packer's); a rollout's names each row's
+    (`dew.batch.Coordinates`, the packer's); a rollout's names each row's
     `segment_ids` and `positions`. Either comes beside the ids or in the
     `ModelInputs`; a field named both ways is refused. Everything after reads
-    the packing off what this returns (`dew.nn.inputs.token_layout`).
+    the packing off what this returns (`dew.batch.token_layout`).
     """
     prepared = tokens if isinstance(tokens, ModelInputs) else ModelInputs(jnp.asarray(tokens, jnp.int32))
     columns = {name: column for name, column in (("positions", positions), ("segment_ids", segment_ids),
@@ -353,7 +351,7 @@ def batch_text(batch) -> ModelInputs:
     stale = sorted({"text_segment_ids", "text_positions"} & set(batch))
     if stale:
         raise ValueError(f"a packed batch lays its documents out in text_coordinates "
-                         f"(dew.nn.inputs.coordinates), not {', '.join(stale)}")
+                         f"(dew.batch.coordinates), not {', '.join(stale)}")
     laid = batch.get("text_coordinates")
     return _prepared(batch[TEXT_KEY], coordinates=None if laid is None else jax.tree.map(jnp.asarray, laid))
 
@@ -556,27 +554,6 @@ def _phase_filter(model: nn.Module, indexer: IndexerTraining | None,
 _DEFAULT_SAMPLING = Sampling()
 
 
-
-def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, depth: int = 0,
-                   roles=None, role: int | None = None):
-    """Whether each target the loss scores at prediction `depth` counts, as
-    `[B, S - 1 - depth]` booleans, in `xp` (numpy for the host's FLOP
-    geometry and the data's target counts, jax.numpy for the loss): the
-    state at p scores the token `depth + 1` later, which counts when it is
-    not padding, when the attention mask keeps every position from the state
-    to it, in a packed batch when the state and it share a document (segment
-    0 is padding), and with a `role` (`loss_role`) when `roles`, one per
-    token, give the target that role."""
-    span = depth + 1
-    counted = shifted_span(tokens.shape, span, valid=attention_mask, segments=segment_ids, xp=xp)
-    if pad_id is not None:
-        counted = counted & (tokens[:, span:] != pad_id)
-    if segment_ids is not None:
-        counted = counted & (segment_ids[:, span:] != 0)
-    if role is not None and roles is not None:
-        counted = counted & (roles[:, span:] == role)
-    return counted
-
 class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     """Scores a causal decoder's tokens: the machinery the LM, preference and
     policy losses share, without a loss of its own.
@@ -645,6 +622,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
                  samples: Samples | None = None, variables: Variables | None | Omitted = OMITTED,
                  qk_stats: bool = False, processor: Processor | None | Omitted = OMITTED):
         """Bind the decoder and set how its tokens are scored; the class docstring describes each argument."""
+        self.eos_token_ids = ended(model, OMITTED)
         model = self.bind_model(model, variables=variables, processor=processor)
         _check_reads(model)
         self.model = model
@@ -820,8 +798,16 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
 
+    def sampled(self, sampling: Sampling) -> Sampling:
+        """`sampling` with the end-of-sequence ids of the source this objective was built over where it
+        names none (`ended`), so a policy drawn from a loaded source stops where the source's own task
+        does; a bare model's objective names none to add."""
+        if sampling.eos_token_ids is not None or not self.eos_token_ids:
+            return sampling
+        return dataclasses.replace(sampling, eos_token_ids=self.eos_token_ids)
+
     def policy(self, params: Variables, sampling: Sampling = _DEFAULT_SAMPLING) -> TextGeneration:
-        """Return the model over this training tree as a generation task.
+        """Return the model over this training tree as a generation task, under `sampling` (`sampled`).
 
         A rollout uses one snapshot of the policy and draws every completion from it;
         the result records the actual and raw-policy likelihoods that the objective's
@@ -832,18 +818,18 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         if self.adaptation is not None:
             raise ValueError("an objective that steps its continuum level in context scores what no "
                              "generation draws yet: a generation reads the level it starts with")
-        return TextGeneration(self.model, params, sampling=sampling)
+        return TextGeneration(self.model, params, sampling=self.sampled(sampling))
 
     def task_settings(self) -> TextSettings | None:
-        """The decoder's row length, preview budget, sampling policy, and tokenizer or source processor.
-        None for an objective that steps its level in context (`adaptation`), which no generation
-        task serves yet: its saved runs restore their trained state, and build no task."""
+        """The decoder's row length, preview budget, sampling policy (`sampled`), and tokenizer or
+        source processor. None for an objective that steps its level in context (`adaptation`), which
+        no generation task serves yet: its saved runs restore their trained state, and build no task."""
         if self.adaptation is not None:
             return None
         samples = self.samples
         return TextSettings(seq_len=self.seq_len,
                             max_new_tokens=0 if samples is None else samples.max_new_tokens,
-                            sampling=Sampling() if samples is None else samples.sampling,
+                            sampling=self.sampled(Sampling() if samples is None else samples.sampling),
                             tokenizer=recorded_tokenizer(self.processor),
                             processor=recorded_processor(self.processor))
 
@@ -1140,7 +1126,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         """Sample the configured prompt once, then decode only on process zero.
 
         An objective whose EMA holds a frozen reference draws from the live
-        policy instead, which is what `_ema_is_reference` says.
+        policy instead, which is what `ema_is_reference` says.
         """
         settings = self.samples
 
@@ -1154,9 +1140,8 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
                      ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             policy, prompt, max_new_tokens = prepared
             tokens = np.asarray(policy(prompt, max_new_tokens, key=step.key).host().tokens)
-            given = prompt.token_fields.get("attention_mask")
             ids = np.asarray(prompt.tokens)
-            asked = np.ones(ids.shape, bool) if given is None else np.asarray(given, bool)
+            asked = real_slots(prompt.token_fields, ids.shape, xp=np)
             # The prompt's padding is no text; every drawn column is shown, as it was drawn.
             drawn = np.ones((ids.shape[0], tokens.shape[1] - ids.shape[1]), bool)
             return tokens, np.concatenate([asked, drawn], axis=1), ids[0][asked[0]]

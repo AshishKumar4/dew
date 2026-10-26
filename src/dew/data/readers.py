@@ -11,8 +11,9 @@ from typing import Literal
 import grain.python as pygrain
 import numpy as np
 
+from dew._records import record
+from dew.batch import Batch
 from dew.data.dataset import (
-    Batch,
     Closeable,
     DataPartition,
     FilledBatch,
@@ -27,7 +28,6 @@ from dew.data.dataset import (
 from dew.data.mixing import CorpusCounts, data_metrics, state_counts
 from dew.data.pipeline import HostStep, Map
 from dew.data.plan import Plan
-from dew.records import record
 
 
 @dataclasses.dataclass(frozen=True)
@@ -90,7 +90,7 @@ class _CanonicalPass:
         import jax
         from jax.experimental import multihost_utils
 
-        from dew.coordination import agreed, broadcast_from_process_zero
+        from dew._coordination import agreed, broadcast_from_process_zero
         from dew.data.sources.codec import decode, encode
 
         root = jax.process_index() == 0

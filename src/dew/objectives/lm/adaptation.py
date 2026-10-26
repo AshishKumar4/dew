@@ -35,7 +35,8 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from dew.nn.inputs import real_slots, sequence_blocks, token_layout
+from dew.batch import real_slots, token_layout
+from dew.nn.inputs import sequence_blocks
 from dew.nn.protocols import SteppedInContext
 
 

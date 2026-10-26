@@ -17,9 +17,10 @@ import grain.experimental as gx
 import grain.python as pygrain
 import numpy as np
 
-from dew.data.dataset import LONG_RUN, Batch, logged_run
+from dew._records import boolean, integer, record, text
+from dew.batch import Batch
+from dew.data.dataset import LONG_RUN, logged_run
 from dew.data.pipeline import Record, Rejected
-from dew.records import boolean, integer, record, text
 
 _log = logging.getLogger(__name__)
 

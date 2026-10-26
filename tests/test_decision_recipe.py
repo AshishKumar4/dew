@@ -54,7 +54,61 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(tmp_path):
     assert decide.name == "tickets" and set(decide.calibration.temperatures.types) == {"choice"}
 
 
+def test_a_lora_run_over_a_decision_release_trains_its_factors_and_reloads(tmp_path):
+    """A decision release takes the backbone's transformations as a fresh backbone does: a LoRA
+    run over a slot release starts from the release's own readout and its question layout, trains
+    the adapter's factors and the readout over a frozen base, and its saved run loads back as a
+    task answering with the trained probabilities."""
+    import jax
+    import numpy as np
+    import optax
+    from test_slot_sources import slot_release
+
+    from dew.batch import FROZEN
+    from dew.checkpoints import Checkpoints
+    from dew.decision.layout import QuestionLayout
+    from dew.lora import LoRA
+    from dew.training import Trainer
+
+    release, stored = slot_release(tmp_path, "head")
+    rows = Memory([{"text": text, "label": label} for text, label in
+                   [("charged twice", "billing"), ("site down", "technical"), ("pro price", "sales")] * 4])
+    asked = rows.pipe(decisions, question="team").read("memory").batch(8).loading(Loading(workers=0))
+    default = Fitted(data=asked)
+    # The release serves long rows; training pads each to the layout's length, so the run budgets it.
+    config = dataclasses.replace(default, pretrained=str(release), lora=LoRA(rank=2, modules=("q_proj",)),
+                                 max_len=512, trainer=dataclasses.replace(default.trainer, multi_host=False,
+                                                                          compilation_cache_dir=None))
+    objective, dataset = config.prepare().train("adapted")
+    assert objective.layout.max_len == 512
+    assert isinstance(objective.layout, QuestionLayout)
+    head = objective.held_variables()["params"]["head"]
+    for native, name in (("slots", "slot"), ("q", "q.weight"), ("k", "k.weight")):
+        np.testing.assert_array_equal(np.asarray(head[native]), stored[name])
+    start = objective.init(jax.random.key(0))
+    run = tmp_path / "run"
+    checkpoints = Checkpoints(str(run), keep=1)
+    state = Trainer(objective, optax.adam(1e-2), key=0, checkpoints=checkpoints).fit(
+        dataset, steps=2, log_every=100, checkpoint_every=2)
+    checkpoints.wait()
+
+    def moved(before, after):
+        return [not np.array_equal(np.asarray(a), np.asarray(b))
+                for a, b in zip(jax.tree.leaves(before), jax.tree.leaves(after), strict=True)]
+
+    assert all(not change for change in moved(start[FROZEN], state.variables[FROZEN]))
+    assert any(moved(start["params"]["head"], state.variables["params"]["head"]))
+    assert any(moved(start["params"]["backbone"], state.variables["params"]["backbone"]))
+    live, reloaded = objective.pipeline(state), Decide.from_run(str(run))
+    question = {"team": Choice("Which team?", ["billing", "technical", "sales"])}
+    first, again = live("charged twice", question), reloaded("charged twice", question)
+    np.testing.assert_array_equal(first["team"].probabilities, again["team"].probabilities)
+
+
 QWEN = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
+TICKETS = Memory([{"text": text, "label": label} for text, label in
+                  [("charged twice", "billing"), ("site down", "technical"), ("pro price", "sales")] * 4]
+                 ).pipe(decisions, question="team").read("memory").batch(8).loading(Loading(workers=0))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -194,14 +248,32 @@ def test_a_checkpoint_loops_at_the_passes_and_over_the_block_asked():
 @pytest.mark.parametrize("fields,checkpoint,message", [
     ({"loop_backprop_steps": 1}, QWEN, "has no loop"),
     ({"loop_remat": True}, QWEN, "has no loop"),
-    ({"loop_backprop_steps": 1}, TINY, "Laya checkpoint"),
-    ({"loop_remat": True}, TINY, "Laya checkpoint"),
-    ({"remat": "full"}, TINY, "Laya checkpoint"),
+    ({"loop_backprop_steps": 1}, TINY, "has no loop"),
+    ({"loop_remat": True}, TINY, "has no loop"),
     ({"remat": "unknown"}, QWEN, "remat names one of"),
 ])
 def test_a_decision_run_refuses_memory_options_without_their_backbone(fields, checkpoint, message):
     with pytest.raises(ValueError):
-        DecisionRunConfig(pretrained=str(checkpoint), **fields).prepare()
+        DecisionRunConfig(pretrained=str(checkpoint), data=TICKETS, **fields).prepare()
+
+
+def test_a_decision_release_takes_its_backbones_layer_recomputation():
+    """`--remat` chooses a decision release's backbone layer policy as a fresh backbone's: the
+    prepared objective's backbone recomputes its layers under that policy, under the release's own
+    head and layout."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.decoder_block import remat_policy
+
+    default = Fitted(data=TICKETS)
+    objective, _ = dataclasses.replace(default, pretrained=str(TINY), remat="full",
+                                       trainer=dataclasses.replace(default.trainer, multi_host=False,
+                                                                   compilation_cache_dir=None)).prepare().train("x")
+    released = Decide.from_pretrained(TINY, attention_impl="xla")
+    backbone = objective.model.backbone
+    assert isinstance(backbone, CausalTransformer) and backbone.remat == remat_policy("full")
+    assert released.model.backbone.remat != backbone.remat
+    assert type(objective.model.head) is type(released.model.head)
+    assert type(objective.layout) is type(released.layout)
 
 
 class Started(DecisionRunConfig):
@@ -211,6 +283,13 @@ class Started(DecisionRunConfig):
         return objective
 
 
+class Fitted(DecisionRunConfig):
+    """A decision run that hands back the objective it would train and the data it would train on."""
+
+    def train(self, objective, dataset, **settings):
+        return objective, dataset
+
+
 def test_a_lora_decision_runs_source_loads_onto_its_trainers_mesh():
     """A decision run that trains an adapter over a source reads the source onto its trainer's mesh
     (`TrainerConfig.source_placement`), as an LM run does: its objective's frozen base is device
@@ -218,9 +297,9 @@ def test_a_lora_decision_runs_source_loads_onto_its_trainers_mesh():
     import jax
     import optax
 
+    from dew.batch import FROZEN
     from dew.decision import DecisionObjective
     from dew.lora import LoRA
-    from dew.objectives.base import FROZEN
     from dew.training import Trainer
 
     rows = Memory([{"text": text, "label": label} for text, label in

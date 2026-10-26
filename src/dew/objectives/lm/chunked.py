@@ -40,6 +40,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import PartitionSpec as P
 
+from dew.mesh import logical_spec, mesh_axes
 from dew.nn.categorical import label_derivative, label_entry, rescaled, segment_log_partition, target_loss
 from dew.nn.kernels.generation import gpu_target
 from dew.nn.precision import (
@@ -67,7 +68,6 @@ from dew.nn.protocols import (
     OutputTable,
     head_table,
 )
-from dew.nn.sharding import logical_spec, mesh_axes
 
 
 def tile_columns(vocab_size: int, chunks: int, columns: int) -> int:

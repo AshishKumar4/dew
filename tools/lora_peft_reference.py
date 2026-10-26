@@ -203,8 +203,8 @@ def adapter_orders(adapter) -> tuple[dict, set[str]]:
     those whose `lora_A`'s first declared axis is 'embed'."""
     import jax
 
+    from dew.batch import thaw
     from dew.nn.sharding import declarations, declared_axes, parameter_path
-    from dew.objectives.base import thaw
 
     whole = thaw(adapter.variables)
     declared = declarations(whole["params"])
@@ -223,8 +223,8 @@ def in_order(adapter, whole: dict, residual_inputs: set[str], order: np.ndarray,
     sys.path.insert(0, str(ROOT / "tests"))
     from residual_orders import permuted
 
+    from dew.batch import freeze
     from dew.lora import FACTORS
-    from dew.objectives.base import freeze
 
     variables = freeze(permuted(whole, order), lambda path: path[-1] in FACTORS)
     if masks is None:
