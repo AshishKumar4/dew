@@ -41,6 +41,7 @@ from dew.lora import unadapted
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.autoencoders.kl import posterior_latent
 from dew.nn.flops import MissingFlopsCount
+from dew.nn.kernels.options import Held
 from dew.nn.mp import Uncertainty
 from dew.nn.protocols import (
     CountedCondition,
@@ -532,6 +533,15 @@ class DiffusionObjective(Objective[Ratio]):
         """
         shape = self.inputs.sample.shape
         return shape if self.autoencoder is None else self.autoencoder.latent_shape(shape)
+
+    def towers(self) -> tuple[Held, ...]:
+        """The modules `program_key` names, the conditions' encoders a step encodes its captions with,
+        the autoencoder it encodes its images with and an alignment's frozen representation encoder."""
+        autoencoder = () if self.autoencoder is None else self.autoencoder.towers()
+        representation = None if self.alignment is None else self.alignment.encoder
+        alignment = () if representation is None else (representation,)
+        encoders = (encoder for _, encoder in self.inputs.encoders)
+        return (*super().towers(), *encoders, *autoencoder, *alignment)
 
     def encoder_params(self) -> dict:
         if self.variables is not None and "encoders" in self.variables:

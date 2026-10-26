@@ -600,3 +600,43 @@ def test_every_kind_of_run_scores_its_own_metrics_unless_it_names_each_splits():
     for stray in ([MetricConfig("brier", split="holdout")], [MetricConfig("brier")]):
         with pytest.raises(ValueError):
             LMRunConfig(val_metrics=stray).suites(stream, splits if stray[0].split else None)
+
+
+@pytest.mark.parametrize("kind", ["lm", "decision", "diffusion"])
+def test_every_run_kind_reads_its_source_options_from_the_command_line(kind):
+    """`--source.text-only` and `--source.prediction-depths` are every run kind's, and its source's
+    load reads them beside where it reads the source (`RunConfig.source_keywords`)."""
+    from dew.config import SourceOptions
+    from dew.config.diffusion import DiffusionRunConfig
+    from dew.config.lm import LMRunConfig
+    from dew.decision.config import DecisionRunConfig
+
+    kinds = {"lm": LMRunConfig, "decision": DecisionRunConfig, "diffusion": DiffusionRunConfig}
+    run = kinds[kind].cli(["--source.text-only", "--source.prediction-depths", "0",
+                           "--trainer.multi-host", "False"])
+    assert run.source == SourceOptions(text_only=True, prediction_depths=0)
+    keywords = run.source_keywords(frozen=False)
+    assert keywords["text_only"] is True and keywords["prediction_depths"] == 0 and keywords["on_host"]
+
+
+def test_a_diffusion_source_has_no_language_model_for_text_only_to_take():
+    from dew.interop.pretrained import load_diffusion_source
+
+    with pytest.raises(ValueError):
+        load_diffusion_source("unused/pipeline", text_only=True)
+
+
+def test_a_trainers_cadences_may_be_shares_of_the_run_on_the_command_line():
+    """`--trainer.log-every`, `--trainer.eval-every` and `--trainer.checkpoint-every` each take a share
+    of the run such as 5%, which reaches fit as written for it to resolve against the run's length;
+    a value that is neither steps, a share, epoch nor a duration is refused."""
+    from dew.config.lm import LMRunConfig
+
+    run = LMRunConfig.cli(["--trainer.log-every", "1%", "--trainer.eval-every", "5%",
+                           "--trainer.checkpoint-every", "10%", "--trainer.multi-host", "False"])
+    trainer = run.trainer
+    assert (trainer.log_every, trainer.eval_every, trainer.checkpoint_every) == ("1%", "5%", "10%")
+    for flags in (["--trainer.eval-every", "5x"], ["--trainer.log-every", "epoch"]):
+        with pytest.raises((ValueError, SystemExit)):
+            LMRunConfig.cli([*flags, "--trainer.multi-host", "False"])
+
