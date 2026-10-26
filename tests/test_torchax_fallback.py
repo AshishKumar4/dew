@@ -887,9 +887,8 @@ def tier3_slot_release(directory):
     is sized to that vocabulary and its special ids. Its torch model and its stored head."""
     text = json.loads((SLOT_TOKENIZER / "config.json").read_text())["text_config"]
     torch.manual_seed(0)
-    model = transformers.CohereForCausalLM(transformers.CohereConfig(
-        **COHERE, vocab_size=text["vocab_size"], pad_token_id=text["pad_token_id"],
-        bos_token_id=text["bos_token_id"], eos_token_id=text["eos_token_id"])).eval()
+    sized = {name: text[name] for name in ("vocab_size", "pad_token_id", "bos_token_id", "eos_token_id")}
+    model = transformers.CohereForCausalLM(transformers.CohereConfig(**{**COHERE, **sized})).eval()
     model.save_pretrained(directory)
     for name in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
         shutil.copy(SLOT_TOKENIZER / name, directory / name)
