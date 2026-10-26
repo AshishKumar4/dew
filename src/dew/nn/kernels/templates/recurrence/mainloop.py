@@ -731,19 +731,22 @@ def _walk(streams, views, step, call: _Call, *, steps: int = 1, prologue: Callab
     family.roles(1, consumer, lambda: family.stream(streams, views, 0, steps))
 
 
-def _solved(k, v, hi, lo, beta, taken, call: _Call):
+def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
     """`(a [R, HV * C], w [R, HV * Dk], u [R, HV * Dv])` as `call.held` of each chunk and value head under a
     decay a head, fla's kkt_solve and recompute_w_u in one program (FlashQLA's first kernel): the keys'
     products (`algebra.keyed`) inverted by doubling on the chunk's tile (`algebra.doubled`, its merges in
     fp16 in a 16-bit call, `_merges`), stored less its unit diagonal (`a`, the backward's), and applied in
     registers to the decayed write-gated keys and the write-gated values (`algebra.weighted`), the inverse
     staged once for every block's product: one launch's tiles and one load of the keys, where two launches
-    stored and loaded the inverse between them."""
+    stored and loaded the inverse between them. Where it `keeps` no inverse (a forward no backward reads,
+    `a` None), its store's landing tile goes: an A100's launch then holds two programs a multiprocessor
+    (an inverse's 8 KB past half its shared memory kept it at one, SE-family-a100-0c8018352)."""
     width, value_width, family = call.width, call.value_width, call.family
     held = dataclasses.replace(call.held, rows=call.rows)
 
-    def program(k_ref, v_ref, hi_ref, lo_ref, beta_ref, column_hi_ref, column_lo_ref, taken_ref, a_ref, w_ref,
-                u_ref, *, streams, staging, landing):
+    def program(k_ref, v_ref, hi_ref, lo_ref, beta_ref, column_hi_ref, column_lo_ref, taken_ref, *outputs,
+                streams, staging, landing):
+        a_ref, w_ref, u_ref = outputs if keeps else (None, *outputs)
         n, h = _axis("chunks"), _axis("heads")
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
         views = _views(keys=call.given.views(k_ref, row, CHUNK, h // call.group * width, width),
@@ -779,7 +782,8 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call):
             # The inverse less its unit diagonal, which `algebra.weighted` adds outside its product.
             lower = (algebra.doubled(-system, _merging(merges, call))
                      - jnp.where(_diagonal(CHUNK, family), 1.0, 0.0))
-            held.store(a_ref, lower, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
+            if keeps:
+                held.store(a_ref, lower, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
             # The inverse staged once (the first set) for every block's product, a block staged in the
             # second: `_Issuer` keeps a staged value for the products after it that take it.
             sets = [lower_tile, scaled_tile]
@@ -811,8 +815,9 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call):
         + (_held(held, CHUNK, CHUNK) * 2 if held.parts > 1 else []),
         [_f32(CHUNK, CHUNK)] + [_f32(CHUNK, call.block)] * 2 + _held(call.given, CHUNK, call.block)
         + _fragments(call, (held, CHUNK, CHUNK), (call.given, CHUNK, call.block))))
-    out_type = (held.shape(call.heads * CHUNK), held.shape(call.heads * width),
-                held.shape(call.heads * value_width))
+    out_type = (held.shape(call.heads * width), held.shape(call.heads * value_width))
+    if keeps:
+        out_type = (held.shape(call.heads * CHUNK), *out_type)
     # The inverse's application stages in the doubling's merge tiles where they are its form (an fp32 call's
     # bf16 parts, a block a chunk wide), done by then: apart, an fp32 call's launch took 242864 bytes of
     # shared memory, past an H100's block (SE-family-h100-e0de17766).
@@ -820,14 +825,16 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call):
     reused = (held.parts > 1 and merging[0][0].dtype == held.stored and call.block == CHUNK)
     staging = merging if reused else (*merging, _staging(held, (CHUNK, CHUNK))[0],
                                       _staging(held, (CHUNK, call.block))[0])
-    return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
-                   grid_names=("chunks", "heads"),
-                   blocks=_streamed(keys=((CHUNK, width), call.given),
-                                    values=((CHUNK, value_width), call.given))
-                   | _vector_blocks(call, "gate", "low", "write", "column_gate", "column_low"),
-                   stages=1, live=_taken(7), work=work, held=held_tiles, staging=staging,
-                   landing={"square": held.landing(CHUNK, CHUNK), "block": held.landing(CHUNK, call.block)},
-                   persistent=True)(k, v, hi, lo, beta, hi, lo, taken)
+    landing = {"square": held.landing(CHUNK, CHUNK)} if keeps else {}
+    landing["block"] = held.landing(CHUNK, call.block)
+    solved = _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
+                     grid_names=("chunks", "heads"),
+                     blocks=_streamed(keys=((CHUNK, width), call.given),
+                                      values=((CHUNK, value_width), call.given))
+                     | _vector_blocks(call, "gate", "low", "write", "column_gate", "column_low"),
+                     stages=1, live=_taken(7), work=work, held=held_tiles, staging=staging, landing=landing,
+                     persistent=True)(k, v, hi, lo, beta, hi, lo, taken)
+    return solved if keeps else (None, *solved)
 
 
 def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
@@ -1417,21 +1424,21 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, max_segment
     (`per_key_refusal`)."""
     out, final, _ = kept_forward(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale,
                                  delta=delta, tiles=tiles, wide=wide, family=family, interpret=interpret,
-                                 floor=floor)
+                                 floor=floor, keeps=False)
     return out, final
 
 
 def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, max_segments: int | None = None,
                  scale: float | None = None, delta: bool = True, wide: bool = False,
                  family: mosaic.Family | None = None, interpret: bool = False,
-                 floor: float | None = None) -> tuple[jax.Array, jax.Array, tuple]:
+                 floor: float | None = None, keeps: bool = True) -> tuple[jax.Array, jax.Array, tuple]:
     """`forward`'s `(o, final)` and what the fast backward takes rather than compute again (`gradients`'
-    `inverse` and `kept`): each chunk's inverse under a decay a head (`_solved`'s, None otherwise), as fla's
-    backward keeps its `A`, and the launches' weighted keys, memories and corrected values, `(w, h,
-    corrected)`, which the port keeps unless a remat rung recomputes them (`recurrence_chunk.RECOMPUTED`),
-    the caller's choice."""
+    `inverse` and `kept`): each chunk's inverse under a decay a head (`_solved`'s, None otherwise or where
+    the call `keeps` none, `forward`'s), as fla's backward keeps its `A`, and the launches' weighted keys,
+    memories and corrected values, `(w, h, corrected)`, which the port keeps unless a remat rung recomputes
+    them (`recurrence_chunk.RECOMPUTED`), the caller's choice."""
     run = _prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
-                    tiles=tiles, family=family, interpret=interpret, floor=floor)
+                    tiles=tiles, family=family, interpret=interpret, floor=floor, keeps=keeps)
     call, tiles = run.call, run.tiles
     o = _output(run.q, run.k, run.h, run.corrected, run.hi, run.lo, run.taken, call, tiles, scale=run.scale,
                 out_dtype=jnp.float32 if wide else run.dtype, scores=run.scores)
@@ -1471,10 +1478,11 @@ class _Run:
 
 
 def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
-              inverse=None, kept=None, floor: float | None = None) -> _Run:
+              inverse=None, kept=None, floor: float | None = None, keeps: bool = True) -> _Run:
     """`forward`'s operands checked, padded and laid, and its launches before the output run: under a decay a
     head the solve's but where its `inverse` is given, and the weighted and states launches' but where their
-    `kept` values, `(w, h, corrected)`, are (`kept_forward`'s; its final memory then None)."""
+    `kept` values, `(w, h, corrected)`, are (`kept_forward`'s; its final memory then None). The solve stores
+    its inverse where the call `keeps` it (`_solved`)."""
     family = family_of() if family is None else family
     if family is None:
         raise NotImplementedError(f"the mainloop has no bundle for the "
@@ -1519,7 +1527,7 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     elif delta and inverse is None:
         # The forward's residuals come in pairs: a recomputed forward has neither.
         assert kept is None, "a kept forward keeps its inverse"
-        a, w, u = _solved(k, v, hi, lo, beta, taken, call)
+        a, w, u = _solved(k, v, hi, lo, beta, taken, call, keeps=keeps)
     elif delta:
         a = inverse
         if kept is None:
