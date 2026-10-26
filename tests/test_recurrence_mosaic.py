@@ -64,6 +64,39 @@ chunks, the last ragged, the packed documents' starts still on and off the chunk
 in Mosaic GPU's interpreter within a test's ten minutes, which the full geometry is not."""
 
 
+NATIVE = pytest.mark.gpu(reason="checked natively: interpreted, its draws take a CPU task's share alone, "
+                                "and each mainloop it runs is checked interpreted at a case beside it")
+"""A case the GPU tier checks alone: the CPU's interpreted check 1 of every mainloop takes the cases
+`INTERPRETED_FORWARD` and `INTERPRETED_GRADIENT` name."""
+
+DTYPES = {'bf16': jnp.bfloat16, 'fp32': jnp.float32}
+
+INTERPRETED_FORWARD = {('one sequence', 'fp32'), ('a ragged length', 'bf16'), ('packed documents', 'bf16'),
+                       ('a decay a key dimension', 'bf16'), ('a decay a key dimension', 'fp32'),
+                       ('a decay a key dimension, packed', 'bf16'),
+                       ('a decay a key dimension, packed', 'fp32')}
+"""The forward's cases the CPU interprets: each launch in each arithmetic (an fp32 call's three parts, a
+16-bit call's), over key blocks and key heads' groups, a ragged chunk, packed documents, a decay a key
+dimension's launches packed and not, and an fp32 call's refusal under one. Interpreted, the whole grid took
+3.5 times these (2838 against 805 seconds)."""
+
+INTERPRETED_GRADIENT = {('a ragged length', 'bf16', 'kept'), ('a ragged length', 'bf16', 'recomputed'),
+                        ('a ragged length', 'fp32', 'kept'), ('one sequence', 'bf16', 'kept'),
+                        ('packed documents', 'bf16', 'kept')}
+"""The gradient's cases the CPU interprets: the fast backward's launches over a ragged chunk, two key blocks
+and two key heads' groups, packed documents, its forward's memories kept and recomputed, and an fp32
+call's adjoint (the portable math's). Interpreted, the whole grid took 5.4 times these (7828 against 1452
+seconds)."""
+
+
+def interpreted(grid: list[tuple], chosen: set[tuple]) -> list:
+    """`grid`'s parameters, each id its values joined by '-', those not in `chosen` the GPU tier's alone
+    (`NATIVE`); a test's dtype taken by its id."""
+    return [pytest.param(*(DTYPES.get(value, value) for value in values), id='-'.join(values),
+                         marks=() if values in chosen else NATIVE)
+            for values in grid]
+
+
 def geometry(case: str) -> dict:
     """Case `case`'s operands as `SHAPES` gives them, shortened off a GPU of a family a bundle claims
     (`INTERPRETED_LENGTH`)."""
@@ -153,8 +186,8 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype):
     return rule
 
 
-@pytest.mark.parametrize('dtype', [jnp.bfloat16, jnp.float32], ids=['bf16', 'fp32'])
-@pytest.mark.parametrize('case', SHAPES)
+@pytest.mark.parametrize(('case', 'dtype'), interpreted(
+    [(case, dtype) for dtype in DTYPES for case in SHAPES], INTERPRETED_FORWARD))
 def test_the_mosaic_forward_is_as_exact_as_its_reference(case, dtype):
     """The mainloop's output and final memory on par from float64 with its reference's over the case's draws
     (check 1, truth the recurrence a token at a time in float64): the gated delta rule with a decay a head or
@@ -268,6 +301,9 @@ def test_an_fp32_operand_splits_into_finite_parts_summing_to_it():
 GRADIENT_CASES = [case for case, shape in SHAPES.items() if not shape.get('per_key')]
 """The cases whose gradient the mainloop takes: a decay a head's (the gated delta rule's)."""
 
+REMATS = {'kept': (), 'recomputed': ('delta_memory',)}
+"""The remat rungs a gradient case runs under: the forward's memories kept, or recomputed in the backward."""
+
 
 def drawn(dtype, seed: int, **shape) -> tuple[Chunk, tuple[jax.Array, jax.Array]]:
     """A draw's operands (`draw`), its documents' starts taken out (`restarted` puts them back: they are not
@@ -286,10 +322,10 @@ def restarted(fn, case: str):
     return lambda drawn: fn(dataclasses.replace(drawn, starts=operands.starts))
 
 
-@pytest.mark.parametrize('recomputed', [(), ('delta_memory',)], ids=['kept', 'recomputed'])
-@pytest.mark.parametrize('dtype', [jnp.bfloat16, jnp.float32], ids=['bf16', 'fp32'])
-@pytest.mark.parametrize('case', GRADIENT_CASES)
-def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, recomputed):
+@pytest.mark.parametrize(('case', 'dtype', 'remat'), interpreted(
+    [(case, dtype, remat) for remat in ('kept', 'recomputed') for dtype in DTYPES for case in GRADIENT_CASES],
+    INTERPRETED_GRADIENT))
+def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, remat):
     """The gradient of the mainloop's rule on par from float64 with its reference's over the case's draws
     (check 1, truth the recurrence a token at a time's in float64): in a 16-bit call the mainloop's fast
     backward (`mainloop.gradients`, fla's DAG) against the fla port's, whose numbers it runs, from the
@@ -300,7 +336,7 @@ def test_the_mosaic_gradient_is_as_exact_as_its_reference(case, dtype, recompute
 
     def compiled(fn):
         def traced(*arguments):
-            with recomputing(recomputed):
+            with recomputing(REMATS[remat]):
                 return with_gradients(restarted(fn, case))(*arguments)
 
         return jax.jit(traced)
