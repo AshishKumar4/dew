@@ -22,7 +22,7 @@ from jax.typing import ArrayLike
 
 from dew.diffusion.process import Denoiser, Process
 from dew.diffusion.schedules import RectifiedFlow, expand
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, correctly_rounded_divide
 
 from .guidance import Guidance, Walk
 from .sample import sample
@@ -77,9 +77,10 @@ class GaussianTransition:
         dimensions = math.prod(value.shape[1:])
         # The form of JAX's isotropic `multivariate_normal.logpdf` (a scalar covariance): log(2 pi) and
         # the log variance summed apart, so a variance near float32's largest does not overflow 2 pi
-        # times it. Each row has its own variance, which that function would take one row at a time.
-        log_prob = -0.5 * (error / safe_variance
-                           + dimensions * (jnp.log(2 * math.pi) + jnp.log(safe_variance)))
+        # times it, and the error's half taken in its quotient's exponent (`_halved_quotient`). Each row
+        # has its own variance, which that function would take one row at a time.
+        log_prob = (-_halved_quotient(error, safe_variance)
+                    - dimensions / 2 * (jnp.log(2 * math.pi) + jnp.log(safe_variance)))
         return jnp.where(variance > 0, log_prob, jnp.nan)
 
     def kl(self, reference_mean: ArrayLike) -> jax.Array:
@@ -97,10 +98,17 @@ class GaussianTransition:
         error = jnp.square(mean - reference_mean).sum(axis=tuple(range(1, mean.ndim)))
         safe_variance = jnp.where(variance > 0, variance, 1)
         deterministic = jnp.where(error == 0, 0.0, jnp.inf)
-        # Halved before the division, an exact power of two: twice a variance near float32's largest
-        # overflows, as does an error over a variance near its least, where half the quotient fits.
-        return jnp.where(variance > 0, error / 2 / safe_variance,
+        return jnp.where(variance > 0, _halved_quotient(error, safe_variance),
                          jnp.where(variance == 0, deterministic, jnp.nan))
+
+
+def _halved_quotient(error: jax.Array, variance: jax.Array) -> jax.Array:
+    """`error / (2 variance)`, a Gaussian's squared error over twice its variance, rounded once, the half
+    taken in the quotient's exponent (`dew.nn.precision.correctly_rounded_divide`'s `power`): twice a
+    variance near float32's largest overflows, as does an error over a variance near its least where
+    half the quotient fits, and half an error near float32's least is below the normal range, which
+    XLA:CPU flushes to zero (a KL of 0 where it is 0.5)."""
+    return correctly_rounded_divide(error, variance, -1)
 
 
 def flow_transition(x: ArrayLike, velocity: ArrayLike, sigma: ArrayLike,

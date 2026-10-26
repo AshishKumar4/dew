@@ -510,9 +510,10 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
     return product, rounded(tail - lost if subtract else lost + tail)
 
 
-@jax.custom_jvp
-def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike) -> jax.Array:
-    """The correctly rounded fp32 quotient, IEEE division's, on XLA's approximate
+@functools.partial(jax.custom_jvp, nondiff_argnums=(2,))
+def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.typing.ArrayLike,
+                             power: int = 0) -> jax.Array:
+    """The correctly rounded fp32 quotient, times `2**power`, IEEE division's, on XLA's approximate
     dividers too: XLA:CPU rewrites a division by a broadcast into a multiplication
     by its reciprocal (openxla/xla#51148), and XLA:GPU's fp32 a / b is off IEEE on
     30 to 50% of quotients (DIVIDE-a100, DIVIDE-h100 receipts), where a quantizer's
@@ -528,13 +529,25 @@ def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.t
     scaled onto that grid rounds to its nearest integer, ties to even, the exact
     residual settling a scaled significand that lands on a half, and the
     integer is the result's bits, which no flush to zero reaches. Past the
-    largest float the quotient is infinite. A zero, infinite or NaN operand,
-    or a subnormal one, which XLA:CPU reads as zero, is the division's. Its
-    derivative is the division's, as JAX differentiates `a / b`.
+    largest float the quotient is infinite. `power` joins the exponents'
+    difference, so a scaled quotient rounds once too, where scaling the
+    quotient after would overflow it first or scaling an operand before would
+    take it below the normal range, which XLA:CPU flushes to zero (a Gaussian
+    KL's `error / (2 variance)`). A zero, infinite or NaN operand, or a
+    subnormal one, which XLA:CPU reads as zero, is the division's, scaled.
+    Float64 operands take float64 division, which no XLA backend approximates,
+    scaled where the quotient fits and through the numerator, then far from
+    the floor, where it overflowed. Its derivative is the division's, scaled,
+    as JAX differentiates `a / b * 2**power`.
     """
+    if not -126 <= power <= 127:
+        raise ValueError(f"a quotient scales by a power of two float32 holds, -126 to 127, not {power}")
+    if jnp.result_type(numerator, denominator) == jnp.float64:
+        wide = jnp.asarray(numerator, jnp.float64), jnp.asarray(denominator, jnp.float64)
+        return _wide_quotient(*wide, power)
     numerator, denominator = jnp.broadcast_arrays(jnp.asarray(numerator, jnp.float32),
                                                   jnp.asarray(denominator, jnp.float32))
-    plain = numerator / denominator
+    plain = numerator / denominator * jnp.float32(2.0**power)
     tiny = jnp.finfo(jnp.float32).tiny
     special = ((jnp.abs(numerator) < tiny) | (jnp.abs(denominator) < tiny)
                | ~jnp.isfinite(numerator) | ~jnp.isfinite(denominator))
@@ -543,7 +556,7 @@ def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.t
     held = jnp.where(special, 1.0, numerator), jnp.where(special, 1.0, denominator)
     (top, top_exponent), (bottom, bottom_exponent) = (jnp.frexp(jnp.abs(value)) for value in held)
     significand, residual = _rounded_significand(top, bottom)
-    exponent = top_exponent - bottom_exponent
+    exponent = top_exponent - bottom_exponent + power
     bits = jax.lax.bitcast_convert_type(significand, jnp.int32)
     # The rounded significand's biased exponent once scaled: 1 to 254 is a normal float.
     field = ((bits >> 23) & 0xFF) + exponent
@@ -562,6 +575,16 @@ def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.t
     magnitude = jnp.where(field >= 255, jnp.inf, jnp.where(field >= 1, normal, subnormal))
     signed = jnp.where(negative, -magnitude, magnitude)
     return jnp.where(special, plain, signed)
+
+
+def _wide_quotient(numerator: jax.Array, denominator: jax.Array, power: int) -> jax.Array:
+    """A float64 quotient times `2**power` (`correctly_rounded_divide`): scaled after the division where
+    the quotient fits, an exact power of two; where it overflowed, before it, through a finite numerator
+    that large, which the scale keeps normal."""
+    quotient = numerator / denominator
+    factor = 2.0**power
+    overflowed = jnp.isinf(quotient) & jnp.isfinite(numerator) & (denominator != 0)
+    return jnp.where(overflowed, numerator * factor / denominator, quotient * factor)
 
 
 def _rounded_significand(numerator: jax.Array, denominator: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -597,9 +620,9 @@ def _rounded_significand(numerator: jax.Array, denominator: jax.Array) -> tuple[
 
 
 @correctly_rounded_divide.defjvp
-def _divide_jvp(primals, tangents):
-    """The rounding is a selection among neighbours, so the quotient's tangent is the division's."""
-    return correctly_rounded_divide(*primals), jax.jvp(jnp.divide, primals, tangents)[1]
+def _divide_jvp(power, primals, tangents):
+    """The rounding is a selection among neighbours, so the quotient's tangent is the division's, scaled."""
+    return correctly_rounded_divide(*primals, power), jax.jvp(jnp.divide, primals, tangents)[1] * 2.0**power
 
 
 def compensated_add(left, right):
