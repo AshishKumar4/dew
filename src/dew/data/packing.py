@@ -211,7 +211,8 @@ class _PackedRows:
         chunks = []
         for position in range(start, stop):
             chunk = self._at("order", position)
-            document = record(self._documents[self._at("documents", chunk)], "packed document")
+            document = self._pack.document(record(self._documents[self._at("documents", chunk)],
+                                                  "packed document"))
             offset, size = self._at("offsets", chunk), self._at("sizes", chunk)
             chunks.append(
                 {name: np.asarray(document[name])[offset : offset + size] for name in self._pack.fields}
