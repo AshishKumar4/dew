@@ -5,6 +5,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- `UNet2DCondition` stores its time embeddings' two maps flat, as `time_linear_1` and `time_linear_2`
+  (and `additional_time_linear_1` and `_2`), where they were `time/in_proj` and `time/out_proj`; a
+  published UNet loads as before. An AutoencoderKL's resnets are `dew.nn.blocks.ResidualBlock` called
+  without a time embedding, and `dew.nn.autoencoders.vae.FlaxResnetBlock2D` is gone. `dew.nn.engram`
+  draws its bucket primes with `sympy.nextprime`, so `sympy` is a dependency.
 - `OptimConfig` and `ScheduleSpec` move from `dew.config` to `dew.optim`, beside the optimizers and
   schedules they build; `Wandb` moves to `dew.training` (`dew.training.tracker`), beside the tracker that
   reads it; and
