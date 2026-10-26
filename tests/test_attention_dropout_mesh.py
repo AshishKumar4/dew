@@ -12,9 +12,9 @@ from flax import linen as nn
 from jax.sharding import Mesh, NamedSharding, PartitionSpec
 from test_attention_dropout import RATE
 
+from dew.mesh import DEFAULT_RULES
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels.templates.attention import dropout_keep, dropout_seed
-from dew.mesh import DEFAULT_RULES
 
 
 @pytest.mark.mesh(devices=8)

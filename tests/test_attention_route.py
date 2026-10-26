@@ -37,6 +37,7 @@ from test_attention_template import (
     own_documents,
 )
 
+from dew.mesh import DEFAULT_RULES
 from dew.nn import attention
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.attention_kernels import ATTENTION, kernel_refusals
@@ -45,7 +46,6 @@ from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.generation import INHERENT
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_route
-from dew.mesh import DEFAULT_RULES
 
 HEADS, KV_HEADS, WIDTH = 4, 2, 32
 MESH_TENSOR, MESH_HEADS = 4, 8
