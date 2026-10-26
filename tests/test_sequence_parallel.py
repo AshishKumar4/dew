@@ -36,6 +36,7 @@ from dew.nn.attention import (
     scaled_dot_product_attention,
 )
 from dew.nn.inputs import MixerCall
+from dew.nn.kernels.templates import attention as template
 from dew.nn.rope import rotary_freqs
 from dew.training import MeshSpec
 
@@ -107,13 +108,18 @@ CALLS = {
 
 def through(exchange, query, key, value, *, implementation="reference", **call):
     """One attention call through the named exchange, over the mesh's
-    sequence axis, whichever the per-call choice would have taken."""
+    sequence axis, whichever the per-call choice would have taken; a dropping
+    call (`dropout_rate`, `dropout_rng`) draws from its rng's words as
+    `scaled_dot_product_attention` does."""
     kernel = functools.partial(attention_kernel, implementation=implementation)
+    rng = call.get("dropout_rng")
     return EXCHANGES[exchange](
         kernel, query, key, value, jax.sharding.get_abstract_mesh().shape["sequence"],
         causal=call.get("causal", False), sliding_window=call.get("sliding_window"),
         mask=call.get("mask"), bias=call.get("bias"), sinks=call.get("sinks"),
-        key_value_seq_lengths=call.get("key_value_seq_lengths"))
+        key_value_seq_lengths=call.get("key_value_seq_lengths"),
+        dropout_rate=call.get("dropout_rate", 0.0),
+        dropout_seed=None if rng is None else template.dropout_seed(rng))
 
 
 @pytest.mark.mesh
@@ -203,6 +209,47 @@ def test_the_exchange_agrees_forward_and_backward_where_heads_split_further(spec
                                  argnums=(0, 1, 2)))(query, key, value)
     for got, want in zip(split, whole, strict=True):
         np.testing.assert_allclose(np.asarray(got), np.asarray(want), atol=2e-5, rtol=1e-6)
+
+
+@pytest.mark.mesh
+@pytest.mark.parametrize("exchange", sorted(EXCHANGES))
+@pytest.mark.parametrize("name", ["causal", "full", "packed", "sinks"])
+def test_a_dropping_call_drops_what_one_device_drops(name, exchange):
+    """Probability dropout over a sequence the mesh splits draws each weight at
+    its global row, head, query and key (`template.DropPlaces`), so either
+    exchange drops the weights one device drops, the gather's striped queries
+    too: its output and its query, key and value gradients are the whole
+    sequence's, as the seam's are (row 1709: a split sequence refused dropout)."""
+    query, key, value = heads(jax.random.key(0), kv_heads=2)
+    call = dict(CALLS[name], dropout_rate=0.3, dropout_rng=jax.random.key(7))
+
+    def loss(attend):
+        return lambda q, k, v: jnp.sum(attend(q, k, v) ** 2)
+
+    def whole_call(q, k, v):
+        return scaled_dot_product_attention(q, k, v, deterministic=False, **call)
+
+    whole = whole_call(query, key, value)
+    whole_grads = jax.grad(loss(whole_call), argnums=(0, 1, 2))(query, key, value)
+    with jax.set_mesh(SPLIT.build()):
+        split = jax.jit(lambda q, k, v: through(exchange, q, k, v, **call))(query, key, value)
+        split_grads = jax.jit(jax.grad(loss(lambda q, k, v: through(exchange, q, k, v, **call)),
+                                       argnums=(0, 1, 2)))(query, key, value)
+    np.testing.assert_allclose(np.asarray(split), np.asarray(whole), atol=TOLERANCE, rtol=0)
+    for got, want in zip(split_grads, whole_grads, strict=True):
+        np.testing.assert_allclose(np.asarray(got), np.asarray(want), atol=2e-5, rtol=1e-6)
+
+
+@pytest.mark.mesh
+def test_the_entry_drops_over_a_split_sequence():
+    """`scaled_dot_product_attention` under a split sequence takes a dropping
+    call (it refused one) and drops what the whole sequence does."""
+    query, key, value = heads(jax.random.key(0), kv_heads=2)
+    call = {"causal": True, "dropout_rate": 0.3, "dropout_rng": jax.random.key(7), "deterministic": False}
+    whole = scaled_dot_product_attention(query, key, value, **call)
+    with jax.set_mesh(SPLIT.build()):
+        split = jax.jit(lambda q, k, v: scaled_dot_product_attention(q, k, v, **call))(query, key, value)
+    np.testing.assert_allclose(np.asarray(split), np.asarray(whole), atol=TOLERANCE, rtol=0)
 
 
 @pytest.mark.mesh
