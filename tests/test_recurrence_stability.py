@@ -338,7 +338,18 @@ def test_the_chunked_op_stays_finite_and_exact_where_chunked_forms_break(name, r
                     seeds=SEEDS[name, regime])
 
 
-@pytest.mark.parametrize('name, regime', CASES)
+ACCELERATED = [pytest.param(name, regime, id=f'{name}-{regime}-{backend}',
+                           marks=getattr(pytest.mark, backend)(reason=f"the portable backward as {backend} "
+                                                                      f"compiles it"))
+               for backend in ('gpu', 'tpu') for name in ('scalar delta', 'vector delta')
+               for regime in ('decays near zero', 'aligned keys', 'resets on chunk edges')]
+"""The gradient sites an accelerator holds too: the portable backward is a TPU's default and any GPU's past
+its kernels, whose compilers fuse and round its arithmetic as the CPU's do not (template numerics review
+2026-10-26 follow-up: its float64 evidence was the CPU's alone); the delta rule a decay a head and a key
+dimension under the regimes its chunked forms break hardest."""
+
+
+@pytest.mark.parametrize('name, regime', CASES + ACCELERATED)
 def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime):
     """The portable math's gradient finite wherever the reference's in float64 is, and on par with the
     token-by-token recurrence's from float64 (check 1) over the site's declared seeds."""

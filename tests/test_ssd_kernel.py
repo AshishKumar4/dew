@@ -34,6 +34,7 @@ from ssd_support import ssd_orbit
 
 from dew.nn.kernels.recurrence_chunk import RESET_DECAY
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_runs
+from dew.nn.precision import float32_products, products_dtype
 
 pytestmark = pytest.mark.kernel
 
@@ -118,7 +119,7 @@ def _chunk_writes(x_c, B_c, a_c):
     its magnitude."""
     suffix = jax.lax.cumsum(a_c, axis=a_c.ndim - 1, reverse=True)
     to_end = jnp.exp(jnp.pad(suffix[..., 1:], [(0, 0)] * (a_c.ndim - 1) + [(0, 1)]))
-    return jnp.einsum('nbjhs,nbhj,nbjhp->nbhps', B_c, to_end, x_c)
+    return exact_einsum('nbjhs,nbhj,nbjhp->nbhps', B_c, to_end, x_c)
 
 
 def _carry(previous, step):
@@ -126,6 +127,13 @@ def _carry(previous, step):
     span's total log decay and add the span's own write."""
     writes, log_decay = step
     return jnp.exp(log_decay)[..., None, None] * previous + writes, previous
+
+
+def exact_einsum(spec: str, *operands):
+    """`jnp.einsum` at its operands' precision (`precision.float32_products`): fp32 products in fp32, where
+    a TPU's default takes one bf16 pass, which hid the kernel's own default-precision matmuls from check 1
+    (template numerics review 2026-10-26 follow-up, P1-1)."""
+    return jnp.einsum(spec, *operands, precision=float32_products(products_dtype(*operands)))
 
 
 def xla_chunk_scan(x, B, C, a, carried, chunk_size: int):
@@ -147,8 +155,8 @@ def xla_chunk_scan(x, B, C, a, carried, chunk_size: int):
     a_cumsum = jnp.cumsum(a_c, axis=-1)
     # 1. The intra-chunk output: L[i, j] = exp(segsum) masks C_i . B_j.
     L = jnp.exp(segment_sum(a_c))                           # [NC, B, H, C, C]
-    G = jnp.einsum('nbihs,nbjhs->nbhij', C_c, B_c)
-    y_diag = jnp.einsum('nbhij,nbjhp->nbihp', G * L, x_c)
+    G = exact_einsum('nbihs,nbjhs->nbhij', C_c, B_c)
+    y_diag = exact_einsum('nbhij,nbjhp->nbihp', G * L, x_c)
     # 2. Each chunk's own write into the state, decayed to the chunk's end.
     states = _chunk_writes(x_c, B_c, a_c)
     # 3. The state crossing the chunks: the reference's `decay_chunk @ states`
@@ -156,7 +164,7 @@ def xla_chunk_scan(x, B, C, a, carried, chunk_size: int):
     # chunk by chunk.
     final, previous = jax.lax.scan(_carry, carried, (states, a_cumsum[..., -1]))
     # 4. The state each chunk reads, decayed to every position of it.
-    y_off = jnp.einsum('nbihs,nbhps,nbhi->nbihp', C_c, previous, jnp.exp(a_cumsum))
+    y_off = exact_einsum('nbihs,nbhps,nbhi->nbihp', C_c, previous, jnp.exp(a_cumsum))
     return jnp.moveaxis(y_diag + y_off, 0, 1).reshape(batch, total, heads, head_dim), final
 
 
