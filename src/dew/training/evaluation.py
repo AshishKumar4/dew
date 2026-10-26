@@ -2,10 +2,8 @@
 
 from __future__ import annotations
 
-import base64
 import contextlib
 import dataclasses
-import pickle
 import sys
 import time
 import types
@@ -30,7 +28,14 @@ from dew.batch import VALID_ROWS, Batch, Variables
 from dew.data.dataset import Closeable, DataPartition, Reader, rows_of, take_rows
 from dew.data.pipeline import Dataset
 from dew.objectives.base import Effects, Loss, Metric, Objective, Step, TrainingScalar, recorded_name
-from dew.training.distributed import MeshSpec, shard_batch, split_fields, with_host
+from dew.training.distributed import (
+    MeshSpec,
+    row_origins,
+    shard_batch,
+    shared_host_fields,
+    split_fields,
+    with_host,
+)
 
 
 @dataclass(frozen=True)
@@ -481,8 +486,8 @@ def _merged(produced, batch: Batch, held: Batch, index: int, *, mesh: Mesh, metr
         if host:
             rows = rows_of(held)
             produced, home, origins = collective_host(
-                (produced, device, _origins(mesh, rows)), phase=f"scoring batch {index}")
-            home = with_host(home, _shares_host(mesh, host, np.asarray(origins), rows))
+                (produced, device, row_origins(mesh, rows)), phase=f"scoring batch {index}")
+            home = with_host(home, shared_host_fields(mesh, host, np.asarray(origins), rows))
         else:
             produced, home = collective_host((produced, device), phase=f"scoring batch {index}")
 
@@ -499,42 +504,6 @@ def _merged(produced, batch: Batch, held: Batch, index: int, *, mesh: Mesh, metr
 
     agreed(f"metrics batch {index}", merge)
     return produced
-
-
-def _origins(mesh: Mesh, rows: int) -> jax.Array:
-    """Each row of the batch placed on `mesh`, numbered by where it came from, `share * rows + row`:
-    this process's `rows` rows of its share (`DataPartition.of`), placed as the batch's are
-    (`shard_batch`), so the gathered numbers say which share's row each row of the batch is."""
-    share = DataPartition.of(mesh).index
-    return shard_batch(mesh, {"origin": share * rows + np.arange(rows, dtype=np.int32)})["origin"]
-
-
-def _shares_host(mesh: Mesh, host: Batch, origins: np.ndarray, rows: int) -> Batch:
-    """The host fields of a batch spread over processes, each row where `origins` places it: every
-    share's own rows, from its first reader, which no device carries, so they meet on the host
-    (`from_every_process`). Every process takes part; the fields are whole on each."""
-    partition = DataPartition.of(mesh)
-    # Agreed, so a record no reader can serialize fails every process rather than leaving its peers
-    # waiting for its fields.
-    told = agreed("host fields serialization", lambda: base64.b64encode(pickle.dumps(host)).decode()
-                  if partition.reader == 0 else "")
-    shares = {index: pickle.loads(base64.b64decode(word))
-              for index, word in from_every_process([partition.index, told]) if word}
-    ordered = [shares[index] for index in range(len(shares))]
-    share, row = np.divmod(origins, rows)
-
-    def gathered(*columns):
-        first = columns[0]
-        # A field of one value for the whole batch, not one a row (`rows_of`), is every share's alike.
-        rowed = len(first) == rows if isinstance(first, list | tuple) else np.shape(first)[:1] == (rows,)
-        if not rowed:
-            return first
-        values = [columns[position][place] for position, place in zip(share, row, strict=True)]
-        if not isinstance(first, np.ndarray):
-            return values
-        return np.asarray(values, dtype=object) if first.dtype == object else np.asarray(values)
-
-    return jax.tree.map(gathered, *ordered, is_leaf=lambda column: not isinstance(column, Mapping))
 
 
 def _previewed(objective: Objective[Loss, Effects], variables: Variables, batch: Batch,

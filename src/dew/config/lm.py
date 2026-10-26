@@ -25,7 +25,6 @@ import jax.numpy as jnp
 
 from dew._records import integer, text
 from dew.config import ObjectiveConfig, Prepared, RunConfig
-from dew.data.compile import fitted
 from dew.data.text import HFTokenizer, tokenizer_for
 from dew.objectives.lm.objective import Perplexity, Samples
 from dew.optim import OptimConfig
@@ -143,8 +142,7 @@ class LMRunConfig(RunConfig):
                 model=model if source is None else source, seq_len=tokens.seq_len, variables=variables,
                 samples=samples, processor=self.processor(), qk_stats=self.optim.optimizer == "muonclip")
         # Compiled once: the run's length and its cadences are read off this loader, which `train` trains on.
-        loaded, held = fitted(self.chain(), self.validation, objective=objective.data(),
-                              seed=self.data_seed)
+        loaded, held = self.compiled(objective.data(), self.chain(), self.validation)
         # The run's own default metric, asked for where it holds a validation split to score.
         scored = self.trainer.eval_interval(loaded) is not None and bool(held)
         validation = (Perplexity(),) if scored else ()

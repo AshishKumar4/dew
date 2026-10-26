@@ -13,6 +13,26 @@ import numpy as np
 from dew.telemetry.records import RECORD_TYPES
 
 
+def reward_service():
+    """The test's reward, which rank zero alone serves, and the first values and captions it saw,
+    kept outside the code under test."""
+    import jax
+
+    callback_rewards, callback_captions = [], []
+
+    def reward(images, context):
+        if jax.process_index() != 0:
+            raise RuntimeError("the test's reward service is only available on rank zero")
+        value = 1_000_000 - 0.01 * np.square(
+            images.mean(axis=(1, 2, 3), dtype=np.float64) - np.asarray(context["target"], np.float64))
+        if not callback_rewards:
+            callback_rewards.append(value.copy())
+            callback_captions.append([str(caption) for caption in context["caption"]])
+        return value
+
+    return reward, callback_rewards, callback_captions
+
+
 def main() -> None:
     rank, processes = int(sys.argv[1]), int(sys.argv[2])
     coordinator, output = sys.argv[3], Path(sys.argv[4])
@@ -29,7 +49,7 @@ def main() -> None:
     from dew.nn.backbones.dit import SimpleDiT
     from dew.objectives.rl import FlowGRPOObjective, FlowRollout
     from dew.training import MeshSpec, Trainer
-    from dew.training.distributed import shard_batch
+    from dew.training.distributed import shard_batch, split_fields, with_host
 
     inputs = InputSpec(Field("image", (4, 4, 1)), {
         "textcontext": Condition(CharTable.from_pretrained(tokens=3, features=4))})
@@ -37,17 +57,7 @@ def main() -> None:
                       num_layers=1, num_heads=2, mlp_ratio=2)
     process = Process(FlowMatchingScheduler(shift=2), FlowMatchPredictionTransform())
     objective = FlowGRPOObjective(model, process, inputs, guidance=None, beta=0.1, steps=3)
-    callback_rewards = []
-
-    def reward(images, context):
-        if jax.process_index() != 0:
-            raise RuntimeError("the test's reward service is only available on rank zero")
-        value = 1_000_000 - 0.01 * np.square(
-            images.mean(axis=(1, 2, 3), dtype=np.float64) - np.asarray(context["target"], np.float64))
-        if not callback_rewards:
-            # Keep the service's original values outside the code under test.
-            callback_rewards.append(value.copy())
-        return value
+    reward, callback_rewards, callback_captions = reward_service()
 
     class PixelMean:
         name = "pixel_mean"
@@ -84,8 +94,10 @@ def main() -> None:
     rollout = FlowRollout(objective, reward, groups=3, steps=3)
     trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(70),
                       rollout=rollout, mesh=MeshSpec(), tracker=tracker)
-    global_batch = {**inputs.tokenize(["red", "blue", "green", "gold"]),
-                    "target": np.asarray([-0.5, -0.1, 0.1, 0.5], np.float32)}
+    captions = ["red", "blue", "green", "gold"]
+    # The captions stay on each process's host beside the placed rows, as a run's data keeps them.
+    global_batch = {**inputs.tokenize(captions), "target": np.asarray([-0.5, -0.1, 0.1, 0.5], np.float32),
+                    "caption": np.asarray(captions)}
     width = 4 // processes
     local = jax.tree.map(lambda value: value[rank * width:(rank + 1) * width], global_batch)
     initial = trainer.place()[0]
@@ -95,7 +107,8 @@ def main() -> None:
             rollout(initial, local, jax.random.key(71))
         except ValueError as error:
             refusal = str(error)
-    rolled = rollout(initial, shard_batch(trainer.device_mesh, local), jax.random.key(71))
+    device, host = split_fields(local)
+    rolled = rollout(initial, with_host(shard_batch(trainer.device_mesh, device), host), jax.random.key(71))
     reassembled = shard_batch(trainer.device_mesh, rolled)
     scores = objective.log_probs(initial.variables, reassembled)
     compared = collective_host((scores, reassembled["old_log_probs"], reassembled["rewards"],
@@ -118,6 +131,7 @@ def main() -> None:
     output.write_text(json.dumps({
         "local_rewards": np.asarray(rolled["rewards"]).tolist(),
         "callback_rewards": callback_rewards[0].tolist() if callback_rewards else None,
+        "callback_captions": callback_captions[0] if callback_captions else None,
         "global_rewards": np.asarray(compared[2]).tolist(),
         "global_advantages": np.asarray(compared[3]).tolist(),
         "global_scores": np.asarray(compared[0]).tolist(),

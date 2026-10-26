@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import collections
 import dataclasses
 import fnmatch
@@ -10,6 +11,7 @@ import hashlib
 import json
 import logging
 import math
+import pickle
 import statistics
 import threading
 from collections.abc import Callable, Iterator, Mapping
@@ -1092,6 +1094,44 @@ def split_fields(batch: Batch | np.ndarray | jax.Array) -> tuple[Batch | np.ndar
         else:
             host[name] = value
     return (device if host else batch), host
+
+
+def row_origins(mesh: Mesh, rows: int) -> jax.Array:
+    """Each row of the batch placed on `mesh`, numbered by where it came from, `share * rows + row`:
+    this process's `rows` rows of its share (`DataPartition.of`), placed as the batch's are
+    (`shard_batch`), so the gathered numbers say which share's row each row of the batch is."""
+    share = DataPartition.of(mesh).index
+    return shard_batch(mesh, {"origin": share * rows + np.arange(rows, dtype=np.int32)})["origin"]
+
+
+def shared_host_fields(mesh: Mesh, host: Batch, origins: np.ndarray, rows: int) -> Batch:
+    """The host fields of a batch spread over processes, each row where `origins` places it: every
+    share's own rows, from its first reader, which no device carries, so they meet on the host
+    (`from_every_process`), numbered as `row_origins` numbers them. Every process takes part; the
+    fields are whole on each, a list or array column a leaf, as a validation pass and a rollout's
+    reward read them."""
+    partition = DataPartition.of(mesh)
+    # Agreed, so a record no reader can serialize fails every process rather than leaving its peers
+    # waiting for its fields.
+    told = agreed("host fields serialization", lambda: base64.b64encode(pickle.dumps(host)).decode()
+                  if partition.reader == 0 else "")
+    shares = {index: pickle.loads(base64.b64decode(word))
+              for index, word in from_every_process([partition.index, told]) if word}
+    ordered = [shares[index] for index in range(len(shares))]
+    share, row = np.divmod(origins, rows)
+
+    def gathered(*columns):
+        first = columns[0]
+        # A field of one value for the whole batch, not one a row (`rows_of`), is every share's alike.
+        rowed = len(first) == rows if isinstance(first, list | tuple) else np.shape(first)[:1] == (rows,)
+        if not rowed:
+            return first
+        values = [columns[position][place] for position, place in zip(share, row, strict=True)]
+        if not isinstance(first, np.ndarray):
+            return values
+        return np.asarray(values, dtype=object) if first.dtype == object else np.asarray(values)
+
+    return jax.tree.map(gathered, *ordered, is_leaf=lambda column: not isinstance(column, Mapping))
 
 
 def with_host(placed: Batch, host: Batch) -> Batch:

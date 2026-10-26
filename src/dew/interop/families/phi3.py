@@ -109,7 +109,6 @@ def _phi3_export(model: CausalTransformer) -> Mapping[str, object]:
                              'partial_rotary_factor': model.partial_rotary_factor or 1.}),
         'rope_scaling': None,
         'layer_types': None,
-        'pad_token_id': None,
         'eos_token_id': None,
     }
 
@@ -121,5 +120,6 @@ PHI3 = DecoderFamily(
     packed=_PHI3_PACKED,
     export_weights=decoder_tensors, preserve_source_layout=True,
     # Phi3Config's norm epsilon and context.
-    defaults={'rms_norm_eps': 1e-5, 'max_position_embeddings': 4096},
+    defaults={'rms_norm_eps': 1e-5, 'max_position_embeddings': 4096, 'pad_token_id': 32000},
+    padding_idx=True,
 )

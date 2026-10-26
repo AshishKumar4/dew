@@ -25,8 +25,9 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from dew._coordination import agreed, broadcast_from_process_zero, collective_host
+from dew._coordination import agreed, agreed_same, broadcast_from_process_zero, collective_host
 from dew.batch import Batch, Variables
+from dew.data.dataset import rows_of
 from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceGrid
@@ -40,6 +41,7 @@ from dew.rl.surrogate import clipped_surrogate_terms
 from dew.sampling.flow import FlowSDE, FlowTrajectory, GaussianTransition
 from dew.sampling.guidance import CFG, Walk
 from dew.sampling.solvers import Euler, Solver
+from dew.training.distributed import row_origins, shared_host_fields, split_fields, with_host
 
 from .sessions import ADVANTAGES_KEY, OLD_LOG_PROBS_KEY
 
@@ -339,6 +341,10 @@ class FlowRollout:
         rows = np.asarray(sorted(owned), np.int64)
         return (rows[:, None] * self.groups + np.arange(self.groups)).reshape(-1)
 
+    def _grouped(self, value, xp=jnp):
+        """`value`'s rows each repeated into its group of samples, in the array namespace `xp`."""
+        return xp.repeat(value, self.groups, axis=0)
+
     def _expanded(self, batch: Batch) -> tuple[Batch, slice | np.ndarray, int]:
         """Repeat every source row into its group of samples.
 
@@ -362,7 +368,7 @@ class FlowRollout:
                     f"a flow rollout over a pool of {jax.process_count()} processes reads a batch placed "
                     f"across them (shard_batch), and a {value.shape} leaf of this one is held by this "
                     f"process alone")
-            return jnp.repeat(value, self.groups, axis=0)
+            return self._grouped(value)
 
         return jax.tree.map(repeat, batch), owned, count
 
@@ -411,17 +417,40 @@ class FlowRollout:
         `train_steps` transitions. The processes agree that each phase
         succeeded before the next collective runs.
         """
+        # The text a reward reads stays on each host (`split_fields`); the rest is placed. Every process
+        # agrees which host fields there are before any of them gathers them.
+        batch, host = split_fields(batch)
+        fields = agreed_same("flow rollout host fields", lambda: sorted(
+            jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(
+                host, is_leaf=lambda column: not isinstance(column, Mapping))))
         expanded, owned, count = agreed("flow rollout setup", lambda: self._expanded(batch))
         # The objective owns the program; the rollout fixes only its count of time points.
         generate = self.objective.program(f"flow rollout over {self.steps} time points", self._generate_impl)
         generated = agreed("flow rollout generation", lambda: generate(state.variables, expanded, key))
-        (trajectory, images, spatial), context = collective_host(
-            (generated, expanded), phase="flow rollout")
+        source = _source(self.objective.inputs, batch)
+        # In a pool the source is placed across processes (`_expanded`), and each source row's origin rides
+        # the rollout's own collective (`row_origins`), so its host fields meet in that order.
+        placed = source.sharding
+        mesh = (placed.mesh if isinstance(placed, jax.sharding.NamedSharding)
+                and isinstance(placed.mesh, jax.sharding.Mesh) and not source.is_fully_addressable else None)
+        rows = rows_of(host) if fields else 0
+        origins = row_origins(mesh, rows) if fields and mesh is not None else None
+        (trajectory, images, spatial), context, origins = collective_host(
+            (generated, expanded, origins), phase="flow rollout")
+        # The reward reads the host fields beside the samples' context, each source row's repeated into its
+        # group as the context's are; the training rows read neither.
+        scored = context
+        if fields:
+            held = (host if origins is None or mesh is None
+                    else shared_host_fields(mesh, host, np.asarray(origins), rows))
+            grouped = jax.tree.map(lambda column: self._grouped(np.asarray(column), np), held,
+                                   is_leaf=lambda column: not isinstance(column, Mapping))
+            scored = with_host(context, grouped)
 
         def score() -> np.ndarray | None:
             if jax.process_index() != 0:
                 return None
-            rewards = np.asarray(self.reward(np.asarray(images), context), np.float64)
+            rewards = np.asarray(self.reward(np.asarray(images), scored), np.float64)
             if rewards.shape != (count * self.groups,) or not np.isfinite(rewards).all():
                 raise ValueError("a flow reward must return one finite scalar per generated sample")
             return rewards

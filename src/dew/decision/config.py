@@ -26,7 +26,6 @@ import jax
 
 from dew._records import number, record
 from dew.config import ObjectiveConfig, Prepared, RunConfig
-from dew.data.compile import fitted
 from dew.decision.head import DecisionHead, JointSchemaHead
 from dew.decision.laya import LAYA
 from dew.decision.layout import Framing, Layout, Schema, Segment, default_layout
@@ -216,8 +215,7 @@ class DecisionRunConfig(RunConfig):
                                   if number(value, f"mixture_weights.{name}") > 0}
             summary["made"] = record(facts.get("mixture_made", {}), "mixture_made")
         # Compiled once: `train` reads the run's length and cadences off this loader and trains on it.
-        dataset, held = fitted(self.chain(), self.validation, objective=objective.data(),
-                                seed=self.data_seed)
+        dataset, held = self.compiled(objective.data(), self.chain(), self.validation)
         summary["records"] = dataset.records
         unfit = {name: counter.rejected.get("unfit", 0) for name, counter in dataset.counts.items()}
         unfit["held out"] = sum(counter.rejected.get("unfit",

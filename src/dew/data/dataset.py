@@ -634,6 +634,10 @@ class Loader:
     """The records a training read of a global order that ends hands out over all its passes, the
     same on every share, by which a batch ramp ends its last step (`RampedStream`); None where the
     order never ends or its read counts none ahead."""
+    examples: int | None = None
+    """The records the training read is bounded to before they are packed (`compile`'s
+    `examples`), whose steps a run's `examples=` budget takes (`example_steps`); None where it is
+    not bounded."""
 
     @property
     def steps_per_epoch(self) -> int | None:
@@ -656,8 +660,10 @@ class Loader:
         """
         if self.records is None:
             raise ValueError(
-                "epochs need a dataset with a record count; this one streams "
-                "without one, so give the run length in steps"
+                "epochs need a dataset with a record count, and this one streams without one: online "
+                "packing or a filter over an indexed or streamed read cuts its order per share. Read it "
+                "whole first (.read('memory')), read a published packing generation by index, or give "
+                "the run length in steps or tokens"
             )
         records = epochs * self.records
         steps = self._steps(records, window)
@@ -665,6 +671,38 @@ class Loader:
             raise ValueError(f"{records} records do not fill one batch of {self.batch}, so {epochs} epochs "
                              "are no steps at all: read more data, lower the batch, or count the run in "
                              "steps")
+        return steps
+
+    def example_steps(self, examples: int, window: int = 1) -> int:
+        """The steps that read the `examples` records this loader's training read is bounded to
+        (`examples`), its last batch short where they end inside one, in whole updates of `window`
+        steps. A global order's plan counts them ahead (`order_records`); one read in its own
+        order, as a pack that runs as rows arrive makes, is counted by reading it once to its end, on
+        the host. Refused where the read is bounded to another count, in a pool, whose processes
+        split the short batch the examples end in unevenly, so each would end at a step of its own,
+        and where the last steps would make no whole update, so some examples would train nothing."""
+        if self.examples != examples:
+            held = "not bounded" if self.examples is None else f"bounded to {self.examples}"
+            raise ValueError(f"examples={examples} reads a training chain bounded to that many records "
+                             f"before packing, and this loader's is {held}; give fit the Dataset chain, "
+                             "which it bounds and compiles")
+        if jax.process_count() > 1:
+            raise ValueError("examples end in a short batch, which a pool's processes would split unevenly "
+                             "and end at steps of their own; train them on one process or count the run "
+                             "in steps")
+        if self.order_records is not None:
+            steps = self._steps(self.order_records, window)
+        else:
+            stream = self.train(DataPartition())
+            try:
+                steps = sum(1 for _ in stream)
+            finally:
+                if isinstance(stream, Closeable):
+                    stream.close()
+        if steps % window:
+            raise ValueError(f"{examples} examples fill {steps} batches, which are not whole updates of "
+                             f"{window} steps: the last {steps % window} would update nothing; change the "
+                             "examples, the batch or the accumulation")
         return steps
 
 

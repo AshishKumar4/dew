@@ -28,18 +28,14 @@ def _phi_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     # half, YaRN among them (modeling_phi.py:42-45, `_compute_yarn_parameters`).
     theta, partial, rope = partial_rope(hf, PLAIN_SPELLING, default_factor=.5)
     flat = {**hf, 'rope_theta': theta, 'rope_parameters': rope or None}
-    ropes = read_rope(flat, used, PLAIN_SPELLING, yarn_max_pos=_records.integer(
-        hf.get('max_position_embeddings', 2048), 'max_position_embeddings'))
+    ropes = read_rope(flat, used, PLAIN_SPELLING)
     activation = _records.text(hf.get('hidden_act', 'gelu_new'), 'hidden_act')
     mlp = ungated_mlp(activation, ('gelu_new', 'gelu_pytorch_tanh', 'gelu', 'relu'), 'hidden_act', 'Phi')
     if hf.get('qk_layernorm', False):
         refuse('qk_layernorm', 'Phi q/k LayerNorm has no RMSNorm counterpart')
     config = base_config({**flat, 'hidden_act': 'silu'}, used, rope=ropes, reads=frozenset())
     used.update(('partial_rotary_factor', 'qk_layernorm', 'layer_norm_eps', 'resid_pdrop',
-                 'embd_pdrop', 'attention_dropout', 'pad_token_id'))
-    # PhiModel's embedding is nn.Embedding(padding_idx=pad_token_id), None by default
-    # (modeling_phi.py:328, configuration_phi.py:82).
-    pad = hf.get('pad_token_id')
+                 'embd_pdrop', 'attention_dropout'))
     config.update({
         'mlp': mlp, 'mlp_bias': True,
         'norm_type': 'layer', 'norm_bias': True, 'scale_after_cast': False,
@@ -49,7 +45,6 @@ def _phi_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
         'dropout_rate': _records.number(hf.get('resid_pdrop', 0.), 'resid_pdrop'),
         'embedding_dropout_rate': _records.number(hf.get('embd_pdrop', 0.), 'embd_pdrop'),
         'attention_dropout_rate': _records.number(hf.get('attention_dropout', 0.) or 0., 'attention_dropout'),
-        'padding_idx': None if pad is None else _records.integer(pad, 'pad_token_id'),
     })
     return config
 
@@ -72,7 +67,6 @@ def _phi_export(model: CausalTransformer) -> Mapping[str, object]:
                             'partial_rotary_factor': model.partial_rotary_factor or 1.},
         **({} if model.yarn is None else {'rope_scaling': None}),
         'attention_bias': None, 'rms_norm_eps': None, 'head_dim': None,
-        'pad_token_id': model.padding_idx,
     }
 
 
@@ -82,4 +76,7 @@ PHI = DecoderFamily(
     'phi', 'PhiForCausalLM', _phi_export,
     weight_path=partial(renamed_path, _PHI_NAMES), export_path=partial(renamed_name, _PHI_NAMES),
     export_weights=decoder_tensors, preserve_source_layout=False,
+    # PhiConfig's context (configuration_phi.py:73), which a YaRN record's omitted lengths read.
+    defaults={'max_position_embeddings': 2048},
+    padding_idx=True,
 )

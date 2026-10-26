@@ -266,7 +266,11 @@ class _Attending:
     """What Dew's attention reads of the call it runs in (`TorchGraph.traced`): the kernel it names,
     each token's document (`[B, S]`, 0 for padding, None for one document a row), the real tokens
     (`[B, S]`, None for all) and the most documents a row holds, whether the call trains, and its
-    dropout key (None for none)."""
+    dropout key (None for none). `visible` `[B, S, S]` is the call's own visibility where it states
+    one (a decision row's options, `attention_pairwise_mask`), which then replaces the documents and
+    causality; a window then keeps each query to the keys within it of its position (`places`, each
+    token's index where None) only where the call states its keys' positions (`key_places`), as Dew's
+    own attention reads a stated visibility (`AttentionMetadata.key_positions`)."""
 
     implementation: str
     documents: jax.Array | None
@@ -274,6 +278,9 @@ class _Attending:
     max_segments: int
     train: bool
     key: jax.Array | None
+    visible: jax.Array | None = None
+    places: jax.Array | None = None
+    key_places: jax.Array | None = None
 
 
 _ATTENDING: contextvars.ContextVar[_Attending | None] = contextvars.ContextVar("dew_attending", default=None)
@@ -318,6 +325,7 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
 
     from dew.nn.attention import scaled_dot_product_attention
     from dew.nn.local_attention import compacted
+    from dew.nn.visibility import windowed
 
     call = _ATTENDING.get()
     if call is None:
@@ -338,16 +346,28 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
         raise ValueError("this model's training forward drops attention probabilities (dropout) and was "
                          "given no 'dropout' rng")
 
+    rng = jax.random.fold_in(call.key, module.layer_idx) if drawn and call.key is not None else None
+    dropping = {"dropout_rate": float(dropout) if drawn else 0.0, "deterministic": not drawn,
+                "dropout_rng": rng}
+
     def attend(q, k, v, *, places, segment_ids, valid):
         del places, valid  # the documents hold the padding apart, as 0
         return scaled_dot_product_attention(
             q, k, v, implementation=call.implementation, causal=True, sliding_window=window,
-            softcap=softcap, sinks=sinks, segment_ids=segment_ids, max_segments=max_segments,
-            dropout_rate=float(dropout) if drawn else 0.0,
-            dropout_rng=jax.random.fold_in(call.key, module.layer_idx) if drawn and call.key is not None
-            else None, deterministic=not drawn)
+            softcap=softcap, sinks=sinks, segment_ids=segment_ids, max_segments=max_segments, **dropping)
 
-    if call.valid is None:
+    if call.visible is not None:
+        # The call's own visibility is the whole of it; a window counts the stated keys' positions.
+        visible = jnp.asarray(call.visible, bool)
+        if window is not None and call.key_places is not None:
+            batch, length = visible.shape[:2]
+            places = (jnp.broadcast_to(jnp.arange(length), (batch, length)) if call.places is None
+                      else call.places)
+            reach = windowed(places[:, :, None], call.key_places[:, None, :], window, causal=False)
+            visible = visible & reach
+        out = scaled_dot_product_attention(q, k, v, implementation=call.implementation,
+                                           mask=visible[:, None], softcap=softcap, sinks=sinks, **dropping)
+    elif call.valid is None:
         out = attend(q, k, v, places=None, segment_ids=call.documents, valid=None)
     else:
         out = compacted(attend, q, k, v, None, call.documents, call.valid)
@@ -469,21 +489,30 @@ class TorchGraph:
     module: JittableModule
     persistent: tuple[str, ...]
     attention_impl: str | None = None
+    shapes: Mapping[str, Mapping[str, jax.ShapeDtypeStruct]] = field(default_factory=dict)
+    """The source's variables, `params` and `buffers`, as shapes and dtypes: what an initialization,
+    which holds none of them, traces the forward over (`TorchCausalLM._run`)."""
 
     def __call__(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array],
                  tokens: jax.Array, *, train: bool, key: jax.Array | None = None,
-                 precision: jax.lax.PrecisionLike = None,
-                 laid: Coordinates | None = None) -> tuple[jax.Array, jax.Array]:
+                 precision: jax.lax.PrecisionLike = None, laid: Coordinates | None = None,
+                 visible: jax.Array | None = None, key_places: jax.Array | None = None,
+                 head_input: jax.Array | None = None) -> tuple[jax.Array, jax.Array]:
         """The logits and the output head's input states for `tokens`, in Dew's torchax
         environment (`_environment`), every product at `precision` (`configured_precision`):
         torch's operators state none. Each broadcast of a value narrower than fp32 sums
         its gradient in fp32 (`_accumulating`), as torch's reduction of a broadcast's
         gradient does. `laid` places the tokens in their documents, which Dew's attention
-        keeps apart and whose positions transformers' rotary reads."""
+        keeps apart and whose positions transformers' rotary reads; `visible` `[B, S, S]`, where
+        given, is what each token sees in their place, and `key_places` `[B, S]` the keys' positions a
+        window counts (`_Attending`). `head_input`, where
+        given, is the output head's input in place of the states the forward computes, so the
+        logits are the head's over it, every step the forward takes after the head included."""
         documents, max_segments = _documents(laid)
         positions = None if laid is None else laid.places()
         valid = None if laid is None or laid.valid is None else jnp.asarray(laid.valid, bool)
-        arguments = (dict(params), dict(buffers), tokens, key, positions, documents, valid)
+        arguments = (dict(params), dict(buffers), tokens, key, positions, documents, valid, visible,
+                     key_places, head_input)
         traced, shapes, draws = self.traced(*arguments, train=train, precision=precision,
                                             max_segments=max_segments)
         logits, hidden = jax.tree.unflatten(jax.tree.structure(shapes),
@@ -500,17 +529,21 @@ class TorchGraph:
     def traced(self, params: Mapping[str, jax.typing.ArrayLike], buffers: Mapping[str, jax.typing.ArrayLike],
                tokens: jax.typing.ArrayLike, key: jax.Array | None,
                positions: jax.typing.ArrayLike | None = None, documents: jax.typing.ArrayLike | None = None,
-               valid: jax.typing.ArrayLike | None = None, *, train: bool,
+               valid: jax.typing.ArrayLike | None = None, visible: jax.typing.ArrayLike | None = None,
+               key_places: jax.typing.ArrayLike | None = None, head_input: jax.typing.ArrayLike | None = None,
+               *, train: bool,
                precision: jax.lax.PrecisionLike = None, max_segments: int = 1):
         """The forward over these arguments traced once (`jax.make_jaxpr`), its output shapes, and the
         draws it made (`_Draws`): on torchax's device, a key's, or on the host, fixed by the trace."""
         env = _environment()
         draws = _Draws()
 
-        def forward(params, buffers, tokens, key, positions, documents, valid):
-            arguments = env.j2t_iso((dict(params), dict(buffers), tokens, positions))
+        def forward(params, buffers, tokens, key, positions, documents, valid, visible, key_places,
+                    head_input):
+            arguments = env.j2t_iso((dict(params), dict(buffers), tokens, positions, head_input))
             attending = (contextlib.nullcontext() if self.attention_impl is None else _attending(
-                _Attending(self.attention_impl, documents, valid, max_segments, train, key)))
+                _Attending(self.attention_impl, documents, valid, max_segments, train, key, visible,
+                           positions, key_places)))
             self.module.train(train)
             try:
                 with (env, env.override_property(prng=key) if key is not None else contextlib.nullcontext(),
@@ -521,7 +554,8 @@ class TorchGraph:
 
         with configured_precision(precision):
             closed, shapes = jax.make_jaxpr(forward, return_shape=True)(
-                dict(params), dict(buffers), tokens, key, positions, documents, valid)
+                dict(params), dict(buffers), tokens, key, positions, documents, valid, visible, key_places,
+                head_input)
         return closed, shapes, draws
 
     def export(self, model: nn.Module, variables: Mapping[str, object],
@@ -704,17 +738,22 @@ def _accumulated_backward(shape, dimensions, value, cotangent):
 _accumulated.defvjp(_accumulated_forward, _accumulated_backward)
 
 
-def _forward(model: PreTrainedModel, tokens: torch.Tensor,
-             positions: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+def _forward(model: PreTrainedModel, tokens: torch.Tensor, positions: torch.Tensor | None = None,
+             head_input: torch.Tensor | None = None) -> tuple[torch.Tensor, torch.Tensor]:
     """Run `model` over `tokens` at `positions` (each token's index where None), keeping what its
-    output head reads."""
+    output head reads, or, given `head_input`, reading that into its head in place of its states."""
     import torch
 
     states: list[torch.Tensor] = []
     head = model.get_output_embeddings()
     if not isinstance(head, torch.nn.Module):
         raise ValueError(f"{type(model).__name__} has no output embeddings for a causal LM's logits")
-    hook = head.register_forward_pre_hook(lambda _, inputs: states.append(inputs[0]))
+
+    def read(_, inputs):
+        states.append(inputs[0])
+        return None if head_input is None else (head_input, *inputs[1:])
+
+    hook = head.register_forward_pre_hook(read)
     try:
         logits = model(input_ids=tokens, position_ids=positions, use_cache=False).logits
     finally:
@@ -743,6 +782,13 @@ class TorchCausalLM(nn.Module):
     transformers' rotary each token's place in its document (`_laid`); one on
     transformers' own attention reads plain token rows, refusing a packing
     field by name. Neither has a cached decode.
+
+    `hidden_states` are the states the output head reads, the final norm's
+    output, which a reader of a backbone's states takes (a decision readout,
+    a probe), and `logits_from_hidden` the head over given states. Its
+    initialization declares no variables, the source's being its own, and
+    returns the forward's shape and dtype over them (`TorchGraph.shapes`) as
+    zeros: what a reader sizing itself to the states traces (`DecisionModel.head_size`).
     """
 
     graph: TorchGraph
@@ -776,6 +822,34 @@ class TorchCausalLM(nn.Module):
         logits, _ = self._run(tokens, train, self._laid(tokens, packing))
         return logits.astype(at_least_fp32(logits.dtype))
 
+    def hidden_states(self, tokens, train: bool = False, *, conditioning: Mapping[str, object] | None = None,
+                      attention_pairwise_mask=None, attention_key_positions=None, **packing) -> jax.Array:
+        """The states the output head reads, `[B, S, features]`, for rows laid as `logits` lays them
+        (`_laid`). `attention_pairwise_mask` `[B, S, S]` states what each token sees, which then
+        replaces documents and causality, and `attention_key_positions` `[B, S]` the keys' positions a
+        window counts (on Dew's attention only), as Dew's own decoders read them; the tokens' rotary
+        positions are the packing's (`positions`, `coordinates`).
+        A tier-3 model reads no context: `conditioning` stays empty."""
+        if conditioning:
+            raise TypeError("a tier-3 model has no cross-attention to read a context with")
+        laid = self._laid(tokens, packing)
+        if attention_pairwise_mask is None:
+            return self._run(tokens, train, laid)[1]
+        if self.graph.attention_impl is None:
+            # Transformers' own attention reads its own causal mask; Dew's reads the stated one.
+            raise ValueError("a stated visibility (attention_pairwise_mask) runs on Dew's attention, and "
+                             "this model runs transformers' own")
+        keys = None if attention_key_positions is None else jnp.asarray(attention_key_positions)
+        return self._run(tokens, train, laid, visible=jnp.asarray(attention_pairwise_mask, bool),
+                         key_places=keys)[1]
+
+    def logits_from_hidden(self, hidden: jax.Array) -> jax.Array:
+        """The output head over `hidden` `[B, S, features]`, every step the forward takes after the
+        head included (a logit scale, a softcap), in at least float32 as `logits` returns them."""
+        tokens = jnp.zeros(jnp.shape(hidden)[:2], jnp.int32)
+        logits, _ = self._run(tokens, train=False, head_input=hidden)
+        return logits.astype(at_least_fp32(logits.dtype))
+
     def _laid(self, tokens, packing: Mapping[str, object]) -> Coordinates | None:
         """The rows' `Coordinates` from their packing fields, None for none: a model on Dew's attention
         reads `coordinates`, else `segment_ids`, `positions` and the validity field; one on
@@ -796,12 +870,19 @@ class TorchCausalLM(nn.Module):
         return coordinates((batch, length), segments=packing.get("segment_ids"),
                            valid=packing.get(VALIDITY_FIELD), positions=packing.get("positions"))
 
-    def _run(self, tokens, train: bool, laid: Coordinates | None = None) -> tuple[jax.Array, jax.Array]:
+    def _run(self, tokens, train: bool, laid: Coordinates | None = None, *, visible=None, key_places=None,
+             head_input=None) -> tuple[jax.Array, jax.Array]:
         if self.is_initializing():
-            raise ValueError(
-                "a torchax model has no initializer; apply it to the variables "
-                "Pretrained.load returned, or pass them to LMObjective as variables=")
-        held = self.variables
+            # The source's variables are its own: the forward's shapes over them, as zeros.
+            def over(held):
+                return self._over(held, tokens, laid, visible, key_places, head_input, train=False)
+
+            shapes = jax.eval_shape(over, self.graph.shapes)
+            return jax.tree.map(lambda shape: jnp.zeros(shape.shape, shape.dtype), shapes)
+        return self._over(self.variables, tokens, laid, visible, key_places, head_input, train=train)
+
+    def _over(self, held, tokens, laid, visible, key_places, head_input, *,
+              train: bool) -> tuple[jax.Array, jax.Array]:
         params = {name: self._compute(leaf) for name, leaf in held["params"].items()}
         buffers = {name: jnp.asarray(leaf) for name, leaf in held.get("buffers", {}).items()}
         key = self.make_rng("dropout") if train and self.has_rng("dropout") else None
@@ -810,7 +891,8 @@ class TorchCausalLM(nn.Module):
         compute = self.dtype or jnp.result_type(*[leaf for leaf in params.values()
                                                   if jnp.issubdtype(leaf.dtype, jnp.floating)])
         return self.graph(params, buffers, jnp.asarray(tokens), train=train, key=key,
-                          precision=float32_products(compute, self.precision), laid=laid)
+                          precision=float32_products(compute, self.precision), laid=laid, visible=visible,
+                          key_places=key_places, head_input=head_input)
 
     def _compute(self, leaf) -> jax.Array:
         value = jnp.asarray(leaf)
@@ -826,11 +908,6 @@ class TorchTableLM(TorchCausalLM):
     so the vocabulary-sized logits are never built whole."""
 
     head: str = field(kw_only=True)
-
-    def hidden_states(self, tokens, train: bool = False, **packing) -> jax.Array:
-        """The states the output head reads, `[B, S, features]`."""
-        _, hidden = self._run(tokens, train, self._laid(tokens, packing))
-        return hidden
 
     def output_table(self) -> OutputTable:
         """The output head's `[vocab, features]` torch weight as the bound params
@@ -940,7 +1017,8 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
     vocab = int(head_weight.shape[0])
     # Torch's copies are no longer read: the forward runs on the arrays above.
     torch.nn.Module.to(model, "meta")
-    graph = TorchGraph(jittable, persistent, attention_impl=attention_impl if attends else None)
+    graph = TorchGraph(jittable, persistent, attention_impl=attention_impl if attends else None,
+                       shapes={"params": _shapes(params), "buffers": _shapes(buffers)})
     module = (TorchCausalLM(graph, vocab, dtype=resolve_dtype(dtype)) if head_name is None
               else TorchTableLM(graph, vocab, dtype=resolve_dtype(dtype), head=head_name))
     processor = source_processor(directory, config, config, module, source=source)
@@ -959,6 +1037,11 @@ def load(source: sources.SourceReference, root: Path, *, dtype: str,
     built = {**config, "dtype": dtype, "fallback": "torchax", **versions}
     return PretrainedFallback(module, {"params": params, "buffers": buffers}, processor, config, directory,
                               built, generation_config, export_adapter=graph.export, revision=revision)
+
+
+def _shapes(leaves: Mapping[str, np.ndarray | jax.ShapeDtypeStruct]) -> dict[str, jax.ShapeDtypeStruct]:
+    """Each leaf's shape and dtype."""
+    return {name: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype) for name, leaf in leaves.items()}
 
 
 def _shrunk_plain_head(config: Mapping[str, object]) -> bool:
