@@ -1712,7 +1712,8 @@ class RunConfig:
                 checkpoint_final=trainer.checkpoint_final,
                 metrics=metrics if suites is None else (), preview=trainer.wandb is not None,
                 best=trainer.best_policies(), stop=trainer.stop,
-                validation=validation if suites is None else suites, summaries=self.val_summaries,
+                # A run that names no metrics and validates no split has no suite to score.
+                validation=validation if suites is None else suites or None, summaries=self.val_summaries,
             )
             if after is not None:
                 after(state, checkpoints.directory)

@@ -106,7 +106,7 @@ from dew.telemetry.records import (
     Record,
     StepCompiled,
 )
-from dew.training._fit import FitPlan, FitRun, split_metrics, waited_read
+from dew.training._fit import FitPlan, FitRun, declarations, waited_read
 from dew.training._lowering import Lowered
 from dew.training.budget import Pause, Plateau, run_length, run_steps
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
@@ -1367,8 +1367,9 @@ class Trainer(Generic[Loss, Effects]):
         self._schedule(None if steps is None else steps // self.accumulation)
         suites = _suites(loader, validation, metrics, eval_every)
         summaries = self._summaries(summaries, suites)
-        selection, plateau, pause = self._fit_policies(best, stop, metrics, suites, summaries,
-                                                       checkpoint_every, steps, tokens)
+        declared = declarations(suites, metrics, summaries)
+        selection, plateau, pause = self._fit_policies(best, stop, declared, checkpoint_every, steps,
+                                                       tokens)
         self._preflight(loader, plateau, suites, preview=preview,
                         loss=(self.checkpoints is not None or restore_best) and not selection)
         preview = preview and self.tracker is not None
@@ -1387,6 +1388,7 @@ class Trainer(Generic[Loss, Effects]):
                 local_every=None if checkpoints is None else checkpoints.local_every,
                 metrics=metrics, preview=preview, best=selection, stop=plateau, suites=suites, pause=pause,
                 held_best=restore_best and checkpoints is None, observe=observe, summaries=summaries,
+                declared=declared,
             )
             trained = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state)
             # The state a checkpoint would hold: the step rebuilds its narrow copies.
@@ -1888,7 +1890,7 @@ class Trainer(Generic[Loss, Effects]):
             summary.check(suites, loss)
         return tuple(summaries)
 
-    def _fit_policies(self, best, stop, metrics, suites, summaries, checkpoint_every, steps, tokens):
+    def _fit_policies(self, best, stop, scored, checkpoint_every, steps, tokens):
         """The run's best selection and its stop policy: a `Plateau` with its metric bound to the
         objective, or the step and tokens a `Pause` of a run of `steps` and `tokens` ends it at
         (`Pause.at`), which needs a checkpointer to resume from."""
@@ -1899,8 +1901,6 @@ class Trainer(Generic[Loss, Effects]):
                              "checkpointer; pass Checkpoints(directory)")
         pause = stop.at(steps, tokens, self.accumulation) if isinstance(stop, Pause) else (None, None)
         plateau = stop if isinstance(stop, Plateau) else None
-        scored = {**(split_metrics(suites) or {'val': tuple(metrics)}),
-                  **({Summary.SPLIT: summaries} if summaries else {})}
         raw = (
             ()
             if best is None
