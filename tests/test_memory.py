@@ -7,6 +7,7 @@ the memory as a decoder's layer kind, scanned, rematted, decoded, under Muon and
 
 import functools
 import json
+import re
 
 import jax
 import jax.numpy as jnp
@@ -215,6 +216,19 @@ def drawn(module: InContextMemory):
 def applied(module: InContextMemory, call: MixerCall = PLAIN_CALL):
     """`module` over a draw's stream under the draw's weights."""
     return jax.jit(lambda x, params: module.apply(params, x, call))
+
+
+def head_of(path: tuple[str, ...]) -> int | None:
+    """The memory head whose network the scope `path` lies in (a scope `head_<h>`), or None."""
+    return next((int(name[5:]) for name in path if re.fullmatch(r"head_\d+", name)), None)
+
+
+def inner_sites(params: dict, heads: tuple[int, ...] | None = None) -> list[str]:
+    """The `/`-joined scopes in `params` of every inner Dense (a module holding a kernel) of a memory
+    head's network, of the `heads` given, or every head where None."""
+    return sorted({"/".join(path[:-1]) for path in traverse_util.flatten_dict(params)
+                   if path[-1] == "kernel" and head_of(path) is not None
+                   and (heads is None or head_of(path) in heads)})
 
 
 @pytest.mark.parametrize("name", sorted(CONFIGURATIONS))
@@ -538,10 +552,14 @@ def test_a_memory_decoder_trains_scans_remats_and_decodes():
                     seeds=SEEDS["memory decoder decode"], truth_fn=last(wide))
 
 
-ADAPTED = {"titans": ("layers_0", "layers_1"), "gated_linear_attention": ("kernel",),
-           "delta_rule": ("kernel",)}
-"""Each configuration's inner kernels by the module names an adapter targets (`dew.lora.LoRA.modules`):
-Titans' two MLP layers and a linear memory's one map, at every head of both memory layers."""
+ADAPTED = {"titans": ("titans", ("layers_0", "layers_1"), 2 * HEADS * 2),
+           "titans head_0": ("titans", ("head_0.layers_0",), 2),
+           "gated_linear_attention": ("gated_linear_attention", ("kernel",), 2 * HEADS),
+           "delta_rule": ("delta_rule", ("kernel",), 2 * HEADS)}
+"""Each case's configuration, the inner kernels an adapter targets by their module names
+(`dew.lora.LoRA.modules`) and how many it targets over both memory layers: Titans' two MLP layers and a
+linear memory's one map at every head, and the first layer of the first head alone, the other heads'
+networks as they were."""
 
 
 def factor_draw(model, lora):
@@ -565,16 +583,17 @@ def factor_draw(model, lora):
 
 @pytest.mark.parametrize("name", sorted(ADAPTED))
 def test_an_adapter_on_a_memorys_inner_kernels_trains_drops_and_merges(name):
-    """LoRA on every head's inner kernels of two memory layers (`dew.lora`): fresh, the decoder's logits
-    are the base's bit for bit; its loss's gradient reaches every inner B factor; a forward that carries
-    the dropout stream drops the branches' inputs, so its logits move; and with drawn factors the
-    adapted decoder computes its merge, on par against the merge in float64 (check 1): a retention
-    forgets the adapter's update as it forgets W_0's, and a linear memory's recurrence reads the adapted
-    map."""
+    """LoRA on inner kernels of two memory layers (`dew.lora`), every head's or one head's alone: fresh,
+    the decoder's logits are the base's bit for bit; its loss's gradient reaches every targeted B
+    factor; a forward that carries the dropout stream drops the branches' inputs, so its logits move;
+    and with drawn factors the adapted decoder computes its merge, on par against the merge in float64
+    (check 1): a retention forgets the adapter's update as it forgets W_0's, and a linear memory's
+    recurrence reads the adapted map."""
     from dew.lora import LoRA
 
-    model, wide = decoder(layer(name)), decoder(layer(name), dtype=jnp.float64)
-    lora = LoRA(rank=2, modules=ADAPTED[name], dropout=0.5)
+    configuration, modules, targets = ADAPTED[name]
+    model, wide = decoder(layer(configuration)), decoder(layer(configuration), dtype=jnp.float64)
+    lora = LoRA(rank=2, modules=modules, dropout=0.5)
     draw = factor_draw(model, lora)
     ids = jnp.asarray(draw(0)[1])
     base = model.init(jax.random.key(0), ids)
@@ -586,8 +605,8 @@ def test_an_adapter_on_a_memorys_inner_kernels_trains_drops_and_merges(name):
     gradient = jax.grad(lambda factors: jnp.sum(adapted.apply({**adapter.variables, "params": factors}, ids)
                                                 ** 2))(adapter.variables["params"])
     inner = [leaf for path, leaf in traverse_util.flatten_dict(gradient).items()
-             if path[-1] == "lora_B" and "initial" in path]
-    assert len(inner) == 2 * HEADS * len(ADAPTED[name])
+             if path[-1] == "lora_B" and head_of(path) is not None]
+    assert len(inner) == targets
     assert all(np.abs(np.asarray(leaf)).max() > 0 for leaf in inner)
 
     drawn_factors, ids = draw(0)
@@ -620,12 +639,14 @@ def test_a_memorys_inner_network_rounds_its_inputs_at_their_declared_scale():
     from dew.quantization import QUANTIZATION, InputQuantization, InputQuantizer
 
     module = level()
-    quantized = InputQuantization(sites=(("initial/head_0/layers_0", "fp8"),)).apply(module)
     draw = drawn(module)
+    site = next(site for site in inner_sites(draw(0)[1]["params"]) if site.endswith("layers_0"))
+    record = InputQuantization(sites=((site, "fp8"),))
+    quantized = record.apply(module)
+    scales = jax.tree.map(lambda _: np.float32(SCALE), record.declared())
 
     def scaled(seed: int):
         x, params = draw(seed)
-        scales = {"initial": {"head_0": {"layers_0": {"fp8_input_scale": np.float32(SCALE)}}}}
         return x, {**params, QUANTIZATION: scales}
 
     rounded = InputQuantizer.fp8(SCALE).qdq
@@ -635,18 +656,18 @@ def test_a_memorys_inner_network_rounds_its_inputs_at_their_declared_scale():
 
 
 def test_a_quantized_memory_decoder_reloads_from_its_record():
-    """A decoder computing under input quantization at its memories' inner sites reads their scales:
-    its logits move from the plain decoder's at the same weights; and its record rebuilds a decoder that
-    computes them bit for bit."""
+    """A decoder computing under input quantization at its memories' first heads' first inner sites, the
+    other heads' networks as they were, reads their scales: its logits move from the plain decoder's at
+    the same weights; and its record rebuilds a decoder that computes them bit for bit."""
     from dew.config import ModelConfig
     from dew.quantization import QUANTIZATION, InputQuantization
     from dew.registry import to_record
 
-    sites = tuple((f"layers_{layer}/self_attn/initial/head_{head}/layers_0", "fp8")
-                  for layer in (0, 1) for head in range(2))
     plain = decoder()
-    quantized = InputQuantization(sites=sites).apply(plain)
     ids = jax.random.randint(jax.random.key(1), (ROWS, LENGTH), 0, 37)
+    first = inner_sites(plain.init(jax.random.key(0), ids)["params"], heads=(0,))
+    sites = tuple((site, "fp8") for site in first if site.endswith("layers_0"))
+    quantized = InputQuantization(sites=sites).apply(plain)
     variables = quantized.init(jax.random.key(0), ids)
     scales = jax.tree.map(lambda scale: np.float32(SCALE), variables[QUANTIZATION])
     variables = {**variables, QUANTIZATION: scales}
@@ -657,20 +678,33 @@ def test_a_quantized_memory_decoder_reloads_from_its_record():
     np.testing.assert_array_equal(np.asarray(reloaded.apply(variables, ids)), logits)
 
 
-def test_a_frozen_fp8_inner_kernel_is_w0_as_its_codes_decode():
+FROZEN = {"titans": layer("titans"), "linear": layer("delta_rule").clone(momentum=Gate(value=0.0))}
+"""The frozen FP8 check's memories: Titans' biased MLP, whose first layer's kernel alone each head's
+packing takes, and a linear memory with a momentum of zero (off the recurrence, a general path as the
+decoded layer's), whose one kernel is all a head holds, so the packing takes every one of its
+parameters."""
+
+
+@pytest.mark.parametrize("name", sorted(FROZEN))
+def test_a_frozen_fp8_inner_kernel_is_w0_as_its_codes_decode(name):
     """An inner kernel a frozen FP8 record packs (`InputQuantization.frozen_fp8`, a LoRA run's FP8 base)
     is the memory's W_0 as its codes decode (`frozen_fp8_kernel`, as a merge decodes it), which the
-    in-context steps move from: the layer computes, bit for bit, the same layer whose kernels are those
-    decoded ones."""
+    in-context steps move from, a head packed whole holding no parameter of its own: the layer computes,
+    bit for bit, the same layer whose kernels are those decoded ones."""
     from dew.quantization import QUANTIZATION, InputQuantization, frozen_fp8_kernel
 
-    module = layer("titans")
-    sites = tuple(f"initial/head_{head}/layers_0" for head in range(HEADS))
-    record = InputQuantization(frozen_fp8=sites, measured_on="sm90")
+    module = FROZEN[name]
     x, params = drawn(module)(0)
+    sites = tuple(site for site in inner_sites(params["params"])
+                  if name != "titans" or site.endswith("layers_0"))
+    record = InputQuantization(frozen_fp8=sites, measured_on="sm90")
     codes = record.packed(params["params"])
-    kernels = {("initial", f"head_{head}", "layers_0", "kernel"): frozen_fp8_kernel(
-        codes["initial"][f"head_{head}"]["layers_0"]) for head in range(HEADS)}
+    kernels = {}
+    for site in sites:
+        leaves = codes
+        for scope in site.split("/"):
+            leaves = leaves[scope]
+        kernels[(*site.split("/"), "kernel")] = frozen_fp8_kernel(leaves)
     flat = traverse_util.flatten_dict(params["params"])
     held = traverse_util.unflatten_dict({path: leaf for path, leaf in flat.items() if path not in kernels})
     frozen = jax.jit(record.apply(module).apply)({"params": held, QUANTIZATION: codes}, x)
@@ -700,19 +734,30 @@ def explicit_rows_run(module: InContextMemory):
     return run
 
 
+MESHED = {"titans": layer("titans"), "titans committed": layer("titans").clone(commit="chunk"),
+          "gated_linear_attention": layer("gated_linear_attention"),
+          "cms": layer("cms").clone(learning_rate=Gate(scale=STEP))}
+"""The memories the mesh check splits: Titans' each token reading its own step or its chunk's start,
+a linear memory on the recurrence, and a continuum-memory level, an existing gated MLP over the raw
+stream committing per chunk, at the papers' step (its own hundredth's step-size gradient does not
+resolve within 512 seeds)."""
+
+
 @pytest.mark.mesh(devices=2)
-@pytest.mark.parametrize(("name", "commit"), [("titans", "token"), ("titans", "chunk"),
-                                              ("gated_linear_attention", "token")])
-def test_a_memory_runs_its_rows_split_over_an_explicit_axis(name, commit):
-    """Rows split over an Explicit data axis, as a run's batch is: a memory's forward, the gradients of
-    its weights and stream, its forward over packed documents and a prefill continued token by token
-    through its cache, each on the general chunk scan (each token reading its own step, or its chunk's
-    start), the token scan or a linear memory's recurrence, are what one device computes, on par
-    against float64 (check 1)."""
+@pytest.mark.parametrize(("name", "axis"), [("titans", "Explicit"), ("titans committed", "Explicit"),
+                                            ("gated_linear_attention", "Explicit"), ("cms", "Explicit"),
+                                            ("cms", "Auto")])
+def test_a_memory_runs_its_rows_split_over_a_data_axis(name, axis):
+    """Rows split over a data axis, Explicit or Auto, as a run's batch is: a memory's forward, the
+    gradients of its weights and stream, its forward over packed documents and a prefill continued token
+    by token through its cache, each on the general chunk scan (each token reading its own step, or its
+    chunk's start), the token scan or a linear memory's recurrence, are what one device computes, on
+    par against float64 (check 1). On an Auto mesh a gated MLP's activations are placed per token as its
+    rank names them."""
     from jax.sharding import AxisType, NamedSharding, PartitionSpec
 
-    module = layer(name).clone(commit=commit)
-    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    module = MESHED[name]
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(getattr(AxisType, axis),), devices=jax.devices()[:2])
     run, draw = explicit_rows_run(module), drawn(module)
     segments = np.broadcast_to(np.where(np.arange(LENGTH) < 5, 1, 2), (ROWS, LENGTH)).astype(np.int32)
 
@@ -727,8 +772,92 @@ def test_a_memory_runs_its_rows_split_over_an_explicit_axis(name, commit):
             return jax.device_get(run(jax.device_put(x, rows), jax.device_put(params, whole),
                                       jax.device_put(cotangent, rows), jax.device_put(segments, rows)))
 
-    assert_as_exact(split, run, placed, f"{name} memory rows split", seeds=SEEDS["rows split"],
+    assert_as_exact(split, run, placed, f"{name} memory rows split over {axis}", seeds=SEEDS["rows split"],
                     truth_fn=explicit_rows_run(module.clone(dtype=jnp.float64)))
+
+
+INNER = r"(.*/)?head_\d+/.*"
+"""A Qwix pattern selecting every inner Dense of a memory's heads' networks."""
+
+
+def test_a_quantized_memorys_update_rounds_from_its_own_stream():
+    """Qwix's fake-quantized training (`dew.quantization.Quantization`) of every inner Dense of two
+    memory layers, its gradients int8 and rounded stochastically: each application of a head's network,
+    the memory's inner gradients among them, draws from its token's key of the call's own
+    `stochastic_rounding` stream (`training_rngs`), so the same key repeats the logits and their outer
+    gradients bit for bit, another moves them, and both are finite."""
+    pytest.importorskip("qwix")
+    from dew.objectives.base import training_rngs
+    from dew.quantization import Quantization
+
+    model = Quantization(patterns=(INNER,), bwd_qtype="int8", bwd_stochastic_rounding="uniform").apply(
+        decoder())
+    ids = jax.random.randint(jax.random.key(1), (ROWS, LENGTH), 0, 37)
+    params = model.init(jax.random.key(0), ids)["params"]
+
+    @jax.jit
+    def trained(params, key):
+        rngs = training_rngs(key)
+        logits, pull = jax.vjp(lambda held: model.apply({"params": held}, ids, rngs=rngs), params)
+        return logits, pull(jnp.ones_like(logits))[0]
+
+    drawn = trained(params, jax.random.key(0))
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves(drawn))
+    jax.tree.map(np.testing.assert_array_equal, drawn, trained(params, jax.random.key(0)))
+    other = trained(params, jax.random.key(1))
+    assert not np.array_equal(np.asarray(drawn[0]), np.asarray(other[0]))
+
+
+def test_serving_quantization_refuses_a_memorys_moving_inner_weights():
+    """Serving quantization (`quantize_for_serving`) stores each weight a rule selects quantized, and the
+    products read the stored values; a memory's inner weights move with every token, so there is no
+    stored value to serve, which a pattern selecting them is refused for at init
+    (`QuantizedServingRefused`). One selecting the memory's projections alone serves them, the served
+    decoder computing what quantized training computed, bit for bit."""
+    pytest.importorskip("qwix")
+    from dew.nn.memory import QuantizedServingRefused
+    from dew.quantization import Quantization, quantize_for_serving
+
+    model = decoder()
+    ids = jax.random.randint(jax.random.key(1), (ROWS, LENGTH), 0, 37)
+    variables = model.init(jax.random.key(0), ids)
+    with pytest.raises(QuantizedServingRefused):
+        quantize_for_serving(model, variables, Quantization(patterns=(INNER,)), ids)
+    spec = Quantization(patterns=(r".*self_attn/[qkvo]_proj",))
+    served, held = quantize_for_serving(model, variables, spec, ids)
+    np.testing.assert_array_equal(np.asarray(served.apply(held, ids)),
+                                  np.asarray(spec.apply(model).apply(variables, ids)))
+
+
+def test_a_qwix_quantized_linear_memory_leaves_the_recurrence():
+    """A linear memory whose inner kernel Qwix fake-quantizes (`dew.quantization.Quantization`) computes
+    its network as the quantized product, no linear map of its input by its kernel, which the shared
+    recurrence's rows are, so it runs its general path: the delta rule computes, bit for bit, the same
+    quantized network with a momentum of zero, which no recurrence row takes."""
+    pytest.importorskip("qwix")
+    from dew.quantization import Quantization
+
+    spec = Quantization(patterns=(INNER,))
+    x, params = drawn(layer("delta_rule"))(0)
+    routed = spec.apply(layer("delta_rule")).apply(params, x)
+    general = spec.apply(layer("delta_rule").clone(momentum=Gate(value=0.0))).apply(params, x)
+    np.testing.assert_array_equal(np.asarray(routed), np.asarray(general))
+
+
+def test_a_memory_composes_under_a_field_named_network():
+    """A memory held in a module's field named `network`, as a public wrapper holds the module it runs,
+    initializes and computes as the memory alone over the same weights."""
+    class Holder(nn.Module):
+        network: InContextMemory
+
+        def __call__(self, x):
+            return self.network(x)
+
+    module = layer("titans")
+    x = drawn(module)(0)[0]
+    variables = Holder(module).init(jax.random.key(0), x)
+    np.testing.assert_array_equal(np.asarray(Holder(module).apply(variables, x)),
+                                  np.asarray(module.apply({"params": variables["params"]["network"]}, x)))
 
 
 def test_a_memory_refuses_a_bidirectional_decoder():
@@ -740,27 +869,37 @@ def test_a_memory_refuses_a_bidirectional_decoder():
         decoder(causal=False).init(jax.random.key(0), ids)
 
 
-def test_a_memory_decoder_names_and_climbs_to_the_residuals_its_path_marks(capsys):
-    """A memory kind marks the residuals its configured path marks (`MixerBase.marks`), each of which a
-    policy saving it alone keeps for the backward beyond what a policy saving nothing keeps, and its
-    decoder's remat ladder skips by them: a linear memory on the delta rule, which runs the rule's
-    port, its decay, inverse and memory, so its ladder takes the rung recomputing the rule's memory
-    alone; Titans' memory its chunk scan's carry, which its scan keeps chunk by chunk, and a ladder
-    without that rung."""
+def test_a_memory_decoder_marks_and_climbs_by_the_paths_it_can_take(capsys):
+    """A memory kind marks (`MixerBase.marks`) the residuals of every path its configuration can take,
+    since a wrapper the kind cannot see takes a linear memory off the recurrence: each name a decoder of
+    the kind marks, as a policy saving that name alone keeps for the backward more than a policy saving
+    nothing, is among them, wrapped or not, and the decoder's remat ladder skips by them. A linear
+    memory on the delta rule marks the rule's port's decay, inverse and memory on the recurrence, and
+    its chunk scan's carry under an input quantization of its first head, which takes it off the
+    recurrence; its ladder takes the rung recomputing the rule's memory alone. Titans' memory marks its
+    carry, and its ladder has no such rung."""
     from jax.ad_checkpoint import print_saved_residuals
     from model_support import TINY_DECODER
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.decoder_block import RematPolicy
     from dew.nn.kernels.generation import chosen
-    from dew.nn.mixer_base import DELTA_RESIDUALS
+    from dew.nn.mixer_base import DELTA_RESIDUALS, MEMORY_RESIDUALS
     from dew.nn.mixers.memory import InContextMemoryMixer
+    from dew.quantization import QUANTIZATION, InputQuantization
 
-    def kept(memory: InContextMemory) -> tuple[tuple[str, ...], list]:
+    ids = jax.random.randint(jax.random.key(3), (2, LENGTH), 0, 37)
+
+    def kept(memory: InContextMemory, *, quantized: bool = False) -> tuple[set[str], list]:
         kind = InContextMemoryMixer(memory)
         model = CausalTransformer(**{"vocab_size": 37, **TINY_DECODER, "dtype": jnp.float32, "mixer": kind})
-        ids = jax.random.randint(jax.random.key(3), (2, LENGTH), 0, 37)
         variables = model.init(jax.random.key(4), ids)
+        if quantized:
+            sites = tuple((site, "fp8") for site in inner_sites(variables["params"], heads=(0,)))
+            record = InputQuantization(sites=sites)
+            model = record.apply(model)
+            scales = jax.tree.map(lambda _: np.float32(SCALE), record.declared())
+            variables = {**variables, QUANTIZATION: scales}
 
         def saved(names: tuple[str, ...]) -> str:
             capsys.readouterr()
@@ -770,8 +909,8 @@ def test_a_memory_decoder_names_and_climbs_to_the_residuals_its_path_marks(capsy
             return capsys.readouterr().out
 
         nothing = saved(())
-        marked = kind.marks()
-        assert marked and all(saved((name,)) != nothing for name in marked)
+        marked = {name for name in (*DELTA_RESIDUALS, *MEMORY_RESIDUALS) if saved((name,)) != nothing}
+        assert marked and marked <= set(kind.marks())
         climbed = [model]
         while (stronger := climbed[-1].recompute_more()) is not None:
             climbed.append(stronger)
@@ -779,8 +918,10 @@ def test_a_memory_decoder_names_and_climbs_to_the_residuals_its_path_marks(capsy
 
     with chosen(gated_delta_rule="fla"):
         delta, delta_rungs = kept(layer("delta_rule"))
+        quantized, _ = kept(layer("delta_rule"), quantized=True)
     titans, titans_rungs = kept(layer("titans"))
-    assert set(DELTA_RESIDUALS) <= set(delta) and "all_but_delta_memory" in delta_rungs
+    assert set(DELTA_RESIDUALS) <= delta and "all_but_delta_memory" in delta_rungs
+    assert CARRY in quantized
     assert CARRY in titans and "all_but_delta_memory" not in titans_rungs
 
 
