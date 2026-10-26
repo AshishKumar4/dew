@@ -14,6 +14,14 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   runs timed apart may still keep different plans), and a resumed run continues its checkpoint's plan
   untimed. Dew's tests keep a frontier's first plan (`DEW_UNTIMED_FRONTIER`, a test setting like
   `DEW_WIDE_CPU_ARITHMETIC`).
+- `SafetensorsBanks` streams a media wrapper's language model and the native backbone of a decision
+  release whose readout is stored apart (a slot release), besides a decoder: it reads the source through
+  `dew.interop.pretrained.native_backbone`, `Pretrained.load`'s own translation and tree check over the
+  safetensors alone. A wrapper's towers and projectors are read whole and stay resident. A config that
+  states `expert_dtype` without a quantization config is no longer refused.
+- `tools/slot_runtime_qualification.py` qualifies a released slot runtime against the authors' engine and
+  its float64 truth, the truth's weights streamed from those banks: phases pool, native, environment,
+  author, truth (`--partial` resumes a stopped phase) and verdict, one checkout's commit across them.
 - A loaded decoder's pad row takes no gradient wherever its source's table pads it. Kimi Linear, Kimi K3,
   Ouro, Dream, LLaDA-MoE and LLaDA2 now pad `pad_token_id` as their released code does, at their config
   class's own default where a config states none; Dew trained that row before. Qwen 3.5's wrappers load
