@@ -21,6 +21,7 @@ from flax.typing import Dtype
 from dew.interop.weights import ParamTree, indexed_path, translate_parameters
 from dew.nn.attention import GroupNorm, NormalAttention
 from dew.nn.autoencoders.api import check_class
+from dew.nn.blocks import ResidualBlock
 from dew.nn.conv import Conv
 
 
@@ -59,28 +60,12 @@ class FlaxDownsample2D(nn.Module):
                     name="conv")(jnp.pad(hidden_states, pad_width=pad))
 
 
-class FlaxResnetBlock2D(nn.Module):
-    """Run two group-normed 3x3 convolutions and add the input back, through
-    a 1x1 convolution when the block changes the channel count."""
-
-    in_channels: int
-    out_channels: int
-    groups: int = 32
-    dtype: Dtype = jnp.float32
-
-    @nn.compact
-    def __call__(self, hidden_states):
-        residual = hidden_states
-        hidden_states = GroupNorm(self.groups, activation=nn.swish, dtype=self.dtype,
-                                  name="norm1")(hidden_states)
-        hidden_states = _conv(self.out_channels, self.dtype, "conv1")(hidden_states)
-        hidden_states = GroupNorm(self.groups, activation=nn.swish, dtype=self.dtype,
-                                  name="norm2")(hidden_states)
-        hidden_states = _conv(self.out_channels, self.dtype, "conv2")(hidden_states)
-        if self.in_channels != self.out_channels:
-            residual = Conv(self.out_channels, kernel_size=(1, 1), strides=(1, 1), padding="VALID",
-                            dtype=self.dtype, name="conv_shortcut")(residual)
-        return hidden_states + residual
+def _resnet(features: int, groups: int, dtype, name: str | None = None) -> ResidualBlock:
+    """An AutoencoderKL resnet: the shared residual block called without a time
+    embedding, with diffusers' norms (1e-6, then SiLU) and its 1x1 shortcut
+    under the checkpoint's `conv_shortcut`."""
+    return ResidualBlock(features, norm_groups=groups, norm_epsilon=1e-6, dtype=dtype,
+                         shortcut="conv_shortcut", name=name)
 
 
 class FlaxAttentionBlock(nn.Module):
@@ -113,7 +98,6 @@ class _Level(nn.Module):
     only the first changing the channel count, then the level's resampling,
     `downsamplers_0` or `upsamplers_0`, which the last level does without."""
 
-    in_channels: int
     out_channels: int
     num_layers: int
     groups: int
@@ -123,9 +107,8 @@ class _Level(nn.Module):
     @nn.compact
     def __call__(self, hidden_states):
         for index in range(self.num_layers):
-            hidden_states = FlaxResnetBlock2D(self.in_channels if index == 0 else self.out_channels,
-                                              self.out_channels, self.groups, self.dtype,
-                                              name=f"resnets_{index}")(hidden_states)
+            hidden_states = _resnet(self.out_channels, self.groups, self.dtype,
+                                    f"resnets_{index}")(hidden_states)
         if self.resample == "down":
             return FlaxDownsample2D(self.out_channels, dtype=self.dtype, name="downsamplers_0")(hidden_states)
         if self.resample == "up":
@@ -143,12 +126,11 @@ class FlaxUNetMidBlock2D(nn.Module):
 
     @nn.compact
     def __call__(self, hidden_states):
-        resnet = partial(FlaxResnetBlock2D, self.in_channels, self.in_channels, self.resnet_groups,
-                         self.dtype)
-        hidden_states = resnet(name="resnets_0")(hidden_states)
+        resnet = partial(_resnet, self.in_channels, self.resnet_groups, self.dtype)
+        hidden_states = resnet("resnets_0")(hidden_states)
         hidden_states = FlaxAttentionBlock(self.in_channels, self.resnet_groups, self.dtype,
                                            name="attentions_0")(hidden_states)
-        return resnet(name="resnets_1")(hidden_states)
+        return resnet("resnets_1")(hidden_states)
 
 
 class FlaxEncoder(nn.Module):
@@ -170,7 +152,7 @@ class FlaxEncoder(nn.Module):
         channels = self.block_out_channels
         sample = _conv(channels[0], self.dtype, "conv_in")(sample)
         for index, width in enumerate(channels):
-            sample = _Level(channels[max(index - 1, 0)], width, self.layers_per_block, self.norm_num_groups,
+            sample = _Level(width, self.layers_per_block, self.norm_num_groups,
                             "down" if index != len(channels) - 1 else None, self.dtype,
                             name=f"down_blocks_{index}")(sample)
         sample = FlaxUNetMidBlock2D(channels[-1], self.norm_num_groups, self.dtype, name="mid_block")(sample)
@@ -198,8 +180,8 @@ class FlaxDecoder(nn.Module):
         sample = _conv(channels[0], self.dtype, "conv_in")(sample)
         sample = FlaxUNetMidBlock2D(channels[0], self.norm_num_groups, self.dtype, name="mid_block")(sample)
         for index, width in enumerate(channels):
-            sample = _Level(channels[max(index - 1, 0)], width, self.layers_per_block + 1,
-                            self.norm_num_groups, "up" if index != len(channels) - 1 else None, self.dtype,
+            sample = _Level(width, self.layers_per_block + 1, self.norm_num_groups,
+                            "up" if index != len(channels) - 1 else None, self.dtype,
                             name=f"up_blocks_{index}")(sample)
         sample = GroupNorm(self.norm_num_groups, activation=nn.swish, dtype=self.dtype,
                            name="conv_norm_out")(sample)

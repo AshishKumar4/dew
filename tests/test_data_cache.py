@@ -1397,9 +1397,10 @@ def test_a_local_cache_fails_a_shard_its_disk_refuses_at_once(tmp_path, monkeypa
 
 
 def test_a_remote_upload_that_fails_ends_the_fill_waiting_for_its_room():
-    """A fill that waits for spool room as a shard uploads is woken when the upload fails, after
-    the cache's retries, and ends with the upload's error rather than waiting on bytes that will
-    never free. The service fails only once the fill is waiting."""
+    """A fill that waits for spool room as a shard uploads is woken when the upload fails, at once:
+    the transport has retried a failed transfer already, so the cache's retries, which re-read an
+    upload that reads back otherwise, try it no more. It ends with the upload's error rather than
+    waiting on bytes that will never free. The service fails only once the fill is waiting."""
     import numpy as np
     from fsspec.implementations.memory import MemoryFileSystem
 
@@ -1446,7 +1447,7 @@ def test_a_remote_upload_that_fails_ends_the_fill_waiting_for_its_room():
     reader.join(20)
     try:
         assert not reader.is_alive()
-        assert [type(error) for error in raised] == [OSError] and len(attempts) == 2
+        assert [type(error) for error in raised] == [OSError] and len(attempts) == 1
     finally:
         waiting.set()
         rows.close()
