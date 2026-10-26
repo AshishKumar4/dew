@@ -14,6 +14,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import Counting, dataset, val_batches
+from recording import RecordingTracker
 
 from dew.artifacts import TokenScores
 from dew.checkpoints import Checkpoints, Keep, Metrics, Ranking
@@ -699,24 +700,9 @@ def test_a_refused_save_leaves_the_step_the_retention_policy_reads(tmp_path):
     assert [kept.step for kept in checkpoints.kept()] == [1, 2]
 
 
-class Stepped:
-    """A tracker that keeps each logged row with its step."""
-
-    def __init__(self):
-        self.rows = []
-
-    def log(self, scalars, step):
-        self.rows.append((int(step), dict(scalars)))
-
-    def artifact(self, value, step):
-        pass
-
-    def close(self):
-        pass
-
-    def at(self, name: str) -> dict[int, float]:
-        """Each step's logged value of `name`."""
-        return {step: row[name] for step, row in self.rows if name in row}
+def logged(tracker: RecordingTracker, name: str) -> dict[int, float]:
+    """Each step's logged value of `name`."""
+    return {step: row[name] for step, row in tracker.scalars if name in row}
 
 
 def summarized(path, rare: list[float], steps: int, **fit):
@@ -730,7 +716,7 @@ def summarized(path, rare: list[float], steps: int, **fit):
     often = Scripted('often', itertools.count(10.0, -1.0))
     seldom = Scripted('rare', iter(rare))
     board = Summary('board', {'often/often': 1.0, 'rare/rare': 3.0}, better='lower')
-    tracker = Stepped()
+    tracker = RecordingTracker()
     run = Trainer(Overfit(), optax.sgd(0.1), key=jax.random.key(0), tracker=tracker,
                   checkpoints=Checkpoints(str(path), keep=1))
     suites = {'often': EvalSuite(data().val, (often,)), 'rare': EvalSuite(data().val, (seldom,), 3)}
@@ -747,7 +733,7 @@ def test_a_summary_is_formed_only_where_every_split_it_weighs_was_scored(tmp_pat
     Its value is the weighted mean of that step's own scores, it is logged, and best-K ranks by it."""
     _, checkpoints, tracker = summarized(tmp_path / 'run', [4.0, 1.0, 2.0], 7,
                                          best=lambda board: Best('summary/board'))
-    often, rare, board = tracker.at('often/often'), tracker.at('rare/rare'), tracker.at('summary/board')
+    often, rare, board = (logged(tracker, name) for name in ('often/often', 'rare/rare', 'summary/board'))
     assert sorted(often) == list(range(1, 8)) and sorted(rare) == sorted(board) == [3, 6, 7]
     for step, value in board.items():
         assert value == (often[step] + 3 * rare[step]) / 4
@@ -760,4 +746,13 @@ def test_a_plateau_counts_only_the_evaluations_that_form_its_summary(tmp_path):
     of patience the run stops at step 9, the first summary no better than step 6's."""
     state, _, tracker = summarized(tmp_path / 'run', [4.0, 1.0, 9.0, 0.0], 12,
                                    stop=lambda board: Plateau(board, evals=1))
-    assert int(state.step) == 9 and sorted(tracker.at('summary/board')) == [3, 6, 9]
+    assert int(state.step) == 9 and sorted(logged(tracker, 'summary/board')) == [3, 6, 9]
+
+
+def test_an_aggregate_reads_a_summary_where_it_is_formed(tmp_path):
+    """An aggregate reads a summary by its recorded name as it reads a split's metric: at a step that
+    formed it, its value, and at one whose rarer suite did not run, NaN, which ranks nothing, the fit
+    declaring it to its rankings as to its selections (`declarations`)."""
+    _, checkpoints, _ = summarized(tmp_path / 'run', [4.0, 1.0, 2.0], 7,
+                                   best=lambda board: Best(lambda scores: scores['summary/board']))
+    assert checkpoints.resolve('best:aggregate:0') == 6

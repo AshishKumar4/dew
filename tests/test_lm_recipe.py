@@ -798,3 +798,13 @@ def test_a_pretrained_run_loops_its_decoder_as_a_decision_run_does(tmp_path):
     assert (recorded.loop_steps, recorded.loop_layers) == (2, (0, 1))
     with pytest.raises(ValueError):
         LMRunConfig(loop_steps=2)
+
+
+def test_a_run_that_names_no_metrics_and_validates_nothing_trains(tmp_path):
+    """`--val-metrics '[]'` scores no metric: a run whose data holds no validation split trains with no
+    suite at all, as one that names none does, rather than an empty set of splits."""
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
+    config = dataclasses.replace(run_config(tokens, "--trainer.steps", "2", "--val-metrics", "[]"),
+                                 validation=None)
+    assert config.val_metrics == ()
+    assert int(config.run().step) == 2
