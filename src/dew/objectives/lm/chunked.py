@@ -495,7 +495,7 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, gro
             # head's products sum them (`running_sum`; the forms' axis comes first).
             prior = jax.lax.dynamic_slice_in_dim(d_states, start, size, axis=1)
             d_states = jax.lax.dynamic_update_slice_in_dim(
-                d_states, added_to(prior, states_tile), start, axis=1)
+                d_states, added_to(prior, _apart(states_tile)), start, axis=1)
             if d_cap is not None:
                 d_cap = added_to(d_cap, cap_tile)
             return d_states, added_to(d_matrix, matrix_tile), d_cap, d_tile
@@ -644,13 +644,25 @@ def _state_product(d_raw, table, precision, work, width: int | None) -> jax.Arra
         return float32_einsum('tv,vd->td', d_raw, table, precision=precision, preferred_element_type=work)
 
     def columns(first, running, size):
-        return added_to(running, float32_einsum(
+        return added_to(running, _apart(float32_einsum(
             'tv,vd->td', jax.lax.dynamic_slice_in_dim(d_raw, first, size, axis=1),
             jax.lax.dynamic_slice_in_dim(table, first, size), precision=precision,
-            preferred_element_type=work))
+            preferred_element_type=work)))
 
     return running_total(_over_tiles(running_sum((d_raw.shape[0], table.shape[1]), work), table.shape[0],
                                      width, columns))
+
+
+def _apart(product: jax.Array) -> jax.Array:
+    """A state product of one vocabulary tile, which joins the state gradient's running sum apart from
+    its GEMM (an optimization barrier). XLA otherwise takes the addition into the GEMM, cuBLASLt's
+    beta=1 epilogue with no workspace, whose sum over the tile's columns then cannot split: on an H100
+    a tiled head's state gradient sat 1.8 to 2.1 times as far from float64 as the whole head's one
+    product, and apart 0.86 to 0.92 times (receipt TL-h100-apart-1725, row 1725). The head gradient's
+    sum over token tiles keeps the fusion: there the epilogue adds each tile's product to the sum
+    before rounding it, and apart it sat 1.7 times as far as the whole head's over three tiles
+    (TL-h100-tiles-fix-1725)."""
+    return jax.lax.optimization_barrier(product)
 
 
 _whole_head = jax.custom_vjp(_whole_head_impl, nondiff_argnums=(5, 6, 7, 8, 10, 11))
