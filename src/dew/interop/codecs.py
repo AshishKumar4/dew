@@ -354,7 +354,7 @@ MXFP4 = SourceQuantization(
     # Kept in the bf16 the blocks decode to where `param_dtype` keeps a weight's own (`AUTO`), as
     # transformers holds it.
     decode_kept=lambda tensors, name, param_dtype: dequantize_mxfp4(
-        *(tensors[name + suffix] for suffix in MXFP4_SUFFIXES),
+        tensors[name + MXFP4_SUFFIXES[0]], tensors[name + MXFP4_SUFFIXES[1]],
         checkpoint_dtype(np.dtype(ml_dtypes.bfloat16), param_dtype)))
 """GPT OSS's MXFP4 (`quant_method: mxfp4`), [E, in, out] weights under their stems."""
 
