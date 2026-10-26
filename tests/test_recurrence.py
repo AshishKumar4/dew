@@ -1,5 +1,6 @@
 """The linear recurrence's decode step (`dew.nn.kernels.recurrence.step`): every combination of its
-hooks against its XLA form in float64, at every config of its launch, and the continuation contract a
+hooks against its XLA form in float64, at its launch's config (`recurrence.COLUMNS`' column blocks, or a
+whole head where a hook reads one), and the continuation contract a
 decode token keeps (an idle row untouched, a bf16 state rounded as it is held)."""
 
 import dataclasses
@@ -16,7 +17,10 @@ from tuned import each_config, taken
 from dew.nn.kernels import recurrence, tuning
 from dew.nn.precision import FP32_SUMS
 
-ROWS, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH, TAPS = 16, 2, 4, 16, 32, 4
+ROWS, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH, TAPS = 16, 2, 4, 16, 64, 4
+"""The draws' shape: values two of the step launch's column blocks wide (`recurrence.COLUMNS`), so check 1
+reaches a head's later blocks' programs, as a gated delta net's 128-wide values take four (template numerics
+review 2026-10-26, P3-6)."""
 """A decode token with grouped heads, idle rows and a four-tap history."""
 
 NORMS = (None, recurrence.OutputNorm(1e-6, 'silu'), recurrence.OutputNorm(1e-6, 'sigmoid'))
@@ -188,7 +192,10 @@ def test_every_hook_combination_steps_as_its_float64_form(hooks):
     reference_fn = jax.jit(functools.partial(recurrence.step_reference, hooks))
     reference = reference_fn(given)
 
-    for config in each_config(recurrence.StepLaunch, functools.partial(recurrence.step, hooks), given):
+    configs = each_config(recurrence.StepLaunch, functools.partial(recurrence.step, hooks), given)
+    # A column-split launch runs more than one block a head, its later programs' columns among them.
+    assert all(config.block == 0 or VALUE_WIDTH // config.block > 1 for config in configs), configs
+    for config in configs:
         with tuning.pinned({recurrence.StepLaunch: config}):
             step = jax.jit(functools.partial(recurrence.step, hooks))
             assert_as_exact(step, summed(hooks), functools.partial(draw, hooks), f'{hooks} {config}',
