@@ -21,7 +21,6 @@ from reference_error import assert_as_exact, seeds_for, without_ynn
 
 from dew.data.chat import Role
 from dew.data.steps.blocks import Blocks
-from dew.data.steps.text import CountTargets
 from dew.inference.serving import Server
 from dew.inference.tasks import TextGeneration
 from dew.nn.inputs import BLOCKS_FIELD, ModelInputs, coordinates
@@ -303,19 +302,14 @@ def test_a_count_the_record_carries_is_counted_again_over_its_blocks():
     assert Blocks(prefix=PREFIX).map(record)["_dew_valid_targets"] == 3
 
 
-def test_the_prefix_option_puts_the_block_stage_before_the_counts():
-    data = LMObjective(blocky(), SEQ, prefix="prompt").data()
-    assert data.train[0] == Blocks(prompt=True, fills=True)
-    assert isinstance(data.train[1], CountTargets)
-
-
 @pytest.mark.parametrize("prefix", [PREFIX, "prompt"])
 def test_a_prefix_runs_stage_keeps_the_blocks_a_record_carries(prefix):
     """The rows a prefix run's compiled chain delivers (`fitted` with its objective's stages), to training
     and to evaluation alike: a record that carries its own blocks keeps them, as the loss keeps a batch's
     (`prefixed_fields`), and one without takes the prefix's, each document's first tokens or its prompt;
-    a prompt run's record that carries blocks needs no roles of its own. A stage a pipeline names itself
-    replaces them."""
+    a prompt run's record that carries blocks needs no roles of its own. The rows' target counts are
+    counted over those blocks, each target inside a block or past its document dropped. A stage a
+    pipeline names itself replaces them."""
     from dew.data import Memory
     from dew.data.compile import fitted
     from dew.data.dataset import DataPartition
@@ -327,13 +321,16 @@ def test_a_prefix_runs_stage_keeps_the_blocks_a_record_carries(prefix):
     records = [{**bare, "text_block_groups": own}, bare]
     filled = BLOCKS[1] if prefix == PREFIX else np.asarray([1, 1, 1, -1, -1, -1, 2, -1, -1], np.int32)
     chain = Memory(records).batch(2).read("memory").workers(0)
-    loader, readers = fitted(chain, chain, objective=LMObjective(blocky(), SEQ, prefix=prefix).data())
+    objective = LMObjective(blocky(), SEQ, prefix=prefix)
+    loader, readers = fitted(chain, chain, objective=objective.data())
     for stream in (loader.train(DataPartition()), readers["val"](DataPartition())):
         try:
-            delivered = next(stream)["text_block_groups"]
+            delivered = next(stream)
         finally:
             stream.close()
-        np.testing.assert_array_equal(delivered, np.stack([own, filled]))
+        np.testing.assert_array_equal(delivered["text_block_groups"], np.stack([own, filled]))
+        # Each row's count is the targets its loss scores over those blocks (`scored_tokens`).
+        np.testing.assert_array_equal(delivered["_dew_valid_targets"], objective.scored_tokens(delivered))
     named = Blocks(prefix=PREFIX).map({**records[0], "text_positions": POSITIONS[1]})
     np.testing.assert_array_equal(named["text_block_groups"], BLOCKS[1])
 
