@@ -8,6 +8,7 @@ the scan, on par with it by check 1 against its own float64 run."""
 from pathlib import Path
 
 import jax
+import jax.flatten_util
 import jax.numpy as jnp
 import numpy as np
 import optax
@@ -65,7 +66,43 @@ in the level stays below 2, as gradient descent's is, and past it the level dive
 its problem's condition number growing with each, so every finite-precision arm, float64's included,
 loses its digits and no draw resolves a comparison. At 0.5 N(0, 1) a step of a half is past it (no
 site resolved within 512 seeds over 64 rows, the verdicts near parity, 1.15 within [0.93, 2.54]);
-at a quarter it is stable and every site resolves. Every rate and both scales stay in the proof."""
+at a quarter it is stable and every site resolves. Every rate and both scales stay in the proof, and
+every draw that steps is held below `STEP_MARGIN` (`stable`). ChunkAdaptation's own rate, 0.01, over
+a decoder's own initialization is far inside it."""
+
+STEP_MARGIN = 1.5
+"""The most a draw's rate times its measured curvature may be (`stable`): inside gradient descent's
+bound of 2 with room, so a change to the draws neither re-enters the divergent corner nor goes far."""
+
+
+def curvature(variables, hidden, targets, weights, window: int, select: tuple[str, ...] = ()) -> float:
+    """The largest curvature over rows of the weighted next-token loss of a row's first `window` slots
+    in the level's stepped parts at its start: the largest eigenvalue of that loss's exact Hessian,
+    which an inner step of rate `eta` takes stably while `eta` times it stays below 2."""
+    params = variables["params"]
+    start = params["continuum"]
+    moving = {name: part for name, part in start.items() if not select or name in select}
+    flat, unravel = jax.flatten_util.ravel_pytree(moving)
+
+    def window_loss(vector, row_hidden, row_targets, row_weights):
+        held = {**variables, "params": {**params, "continuum": {**start, **unravel(vector)}}}
+        logits = MODEL.apply(variables, MODEL.apply(held, row_hidden[:window], method="continuum_states"),
+                             method="head_logits")
+        losses = -jnp.take_along_axis(jax.nn.log_softmax(logits), row_targets[:window, None], axis=-1)[:, 0]
+        return jnp.sum(row_weights[:window] * losses)
+
+    hessians = jax.vmap(jax.hessian(window_loss), in_axes=(None, 0, 0, 0))(flat, hidden, targets, weights)
+    return float(jnp.max(jnp.linalg.eigvalsh(hessians)[..., -1]))
+
+
+def stable(drawn, rate: float, window: int, select: tuple[str, ...] = ()):
+    """`drawn`, a draw's variables, states, targets and weights, once its step is held stable: a rate
+    of zero, or a window past the row, takes no step; any other's rate times its measured curvature
+    (`curvature`) is at most `STEP_MARGIN`."""
+    if rate and window < LENGTH:
+        measured = rate * curvature(*drawn, window, select)
+        assert measured <= STEP_MARGIN, f"the draw's step is {measured:.3f} past its stable range"
+    return drawn
 
 
 def drawn_variables(seed: int, model: CausalTransformer = MODEL, scale: float = 0.5):
@@ -196,7 +233,8 @@ def test_the_scan_steps_the_level_as_equation_71(kind, window, rate):
     def reference(variables, hidden, targets, weights):
         return equation_71(MODEL, variables, hidden, targets, weights, fields, adaptation)
 
-    assert_as_exact(jax.jit(dew), jax.jit(reference), lambda seed: draw(seed, scale=STABLE_SCALE[rate]),
+    assert_as_exact(jax.jit(dew), jax.jit(reference),
+                    lambda seed: stable(draw(seed, scale=STABLE_SCALE[rate]), rate, window),
                     f"equation 71 over {kind} at a window of {window}, rate {rate}", seeds=ADAPTATION_SEEDS)
 
 
@@ -220,7 +258,8 @@ def test_padding_steps_alike_however_it_is_marked(kind):
     def reference(variables, hidden, targets, weights):
         return equation_71(MODEL, variables, hidden, targets, weights, fields, adaptation)
 
-    assert_as_exact(jax.jit(dew), jax.jit(reference), lambda seed: draw(seed, scale=STABLE_SCALE[0.5]),
+    assert_as_exact(jax.jit(dew), jax.jit(reference),
+                    lambda seed: stable(draw(seed, scale=STABLE_SCALE[0.5]), 0.5, 3),
                     f"padding marked as {kind}", seeds=PADDING_SEEDS)
 
 
@@ -236,7 +275,8 @@ def test_only_the_selected_parts_step():
     def reference(variables, hidden, targets, weights):
         return equation_71(MODEL, variables, hidden, targets, weights, {}, adaptation)
 
-    assert_as_exact(jax.jit(dew), jax.jit(reference), lambda seed: draw(seed, scale=STABLE_SCALE[0.5]),
+    assert_as_exact(jax.jit(dew), jax.jit(reference),
+                    lambda seed: stable(draw(seed, scale=STABLE_SCALE[0.5]), 0.5, 2, ("up",)),
                     "up alone stepping", seeds=SELECTED_SEEDS)
 
 
@@ -250,7 +290,7 @@ def test_training_differentiates_through_every_step(kind, rate):
     adaptation = ChunkAdaptation(window=3, rate=rate)
 
     def gradient_draw(seed):
-        variables, hidden, targets, weights = draw(seed, scale=STABLE_SCALE[rate])
+        variables, hidden, targets, weights = stable(draw(seed, scale=STABLE_SCALE[rate]), rate, 3)
         return variables, hidden, targets, weights, np.float32(1.0)
 
     def dew(variables, hidden, targets, weights):
