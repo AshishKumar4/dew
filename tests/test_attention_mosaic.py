@@ -574,7 +574,7 @@ def test_every_tuning_variant_is_on_par_interpreted(launch):
 def test_a_guarded_launch_walks_its_own_key_tiles(tiles):
     """A spans call (four documents over 256 keys, their ids from 1: 0 is padding) whose weighted values
     pass fp32's largest, at forward tiles whose consumers' registers hold the guarded launch's live set
-    over a narrower key tile (`_guarded_tiles`), 128 keys halved, 192 keys cut to a whole tile of the
+    over a narrower key tile (`guarded_tiles`), 128 keys halved, 192 keys cut to a whole tile of the
     family's rows that divides it: the guarded launch runs on tiles its program takes, reads each block's
     keys from its own block map, not the plain launch's, and every row's output is on par with jax's own
     attention, which normalizes its weights before their product (bf16 values near their largest, equal

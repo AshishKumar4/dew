@@ -44,6 +44,8 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     _forward_allocations,
     _plain_forward,
     _trained_forward,
+    guarded_columns,
+    guarded_tiles,
 )
 from dew.nn.kernels.templates.attention_mosaic_program import (
     BackwardTiles,
@@ -54,23 +56,11 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _width,
     bundle,
     bundle_of,
+    extents,
     refused,
     whole_tiles,
 )
 from dew.nn.kernels.templates.base import Template, Unfitted
-
-
-def _extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
-    """A tile axis's extents on `family`, largest first: whole multiples of the rows a consumer's products
-    cover (`Family.role_rows`) and of its swizzled rows (`Family.column_unit`; a tile's keys are its weights'
-    product's depth, its queries the dK/dV launch's), at most what one copy moves (`Family.copy_extent`,
-    where the family's copies bound it; else registers bound them, `fits`) and the call's `extent` in whole
-    multiples (a longer tile holds padding alone)."""
-    unit = math.lcm(family.role_rows, family.column_unit(dtype))
-    top = -(-max(extent, 1) // unit)
-    if family.copy_extent is not None:
-        top = min(top, family.copy_extent // unit)
-    return tuple(range(top * unit, 0, -unit))
 
 
 def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held: int, walked: int,
@@ -88,10 +78,10 @@ def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held:
     whose two stages the block holds (`fits`), two the ring's busy depth, a slot loading while one is read;
     fewer consumers where no tile of the family's count holds the block (a GPU of a smaller one).
     `tiles(rows, walked, consumers)` builds the config. None where no tile fits."""
-    rows = _extents(family, dtype, held)[-1]
+    rows = extents(family, dtype, held)[-1]
     most = family.consumers if overlapped else 1
     for consumers in range(max(1, min(most, -(-held // rows))), 0, -1):
-        for extent in _extents(family, dtype, walked):
+        for extent in extents(family, dtype, walked):
             config = tiles(rows, extent, consumers)
             if fits(config):
                 return config
@@ -180,13 +170,13 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
 
     def neighbours(self, ba: tokamax.BoundArguments, config: Config) -> Sequence[Config]:
         """The configs next to the derived `config` an opt-in tuning run times beside it (`variants`): the
-        walked tile one unit size either side (`_extents`), a stage fewer and more, a consumer fewer and
+        walked tile one unit size either side (`extents`), a stage fewer and more, a consumer fewer and
         more, each alone; `variants` keeps the legal ones."""
         query = ba.arguments["query"]
         family = bundle_of(config, query.dtype)
         walked = getattr(config, self.WALKED)
-        extents = _extents(family, query.dtype, max(walked * 2, query.shape[1], ba.arguments["key"].shape[1]))
-        sizes = [size for size in extents if size in (walked // 2, walked * 2)]
+        reach = max(walked * 2, query.shape[1], ba.arguments["key"].shape[1])
+        sizes = [size for size in extents(family, query.dtype, reach) if size in (walked // 2, walked * 2)]
         changes = [*({self.WALKED: size} for size in sizes),
                    {"stages": config.stages - 1}, {"stages": config.stages + 1},
                    {"consumers": config.consumers - 1}, {"consumers": config.consumers + 1}]
@@ -236,6 +226,20 @@ class MosaicForward(_Mainloop[Tiles]):
         run = _trained_forward if residuals else _plain_forward
         return run(query, key, value, self.spans(start, end, query_ids, key_ids), hooks, scale=self.scale,
                    natural=self.natural, tiles=config, interpret=interpret), None
+
+    def legal(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> bool:
+        """`_Mainloop.legal`'s, and on a plain launch whose sums can pass fp32's largest (`algebra.headroom`),
+        a guarded key tile its consumers' registers hold beside it (`guarded_tiles`), which the launch walks
+        where the plain one overflowed."""
+        if not super().legal(ba, config, target):
+            return False
+        query, value = ba.arguments["query"], ba.arguments["value"]
+        if ba.arguments["residuals"] or not algebra.headroom(value.dtype):
+            return True
+        family = bundle_of(config, query.dtype)
+        columns = guarded_columns(family, value.shape[3], value.dtype,
+                                  output_hook=self.output_mod is not None)
+        return guarded_tiles(family, config, columns, value.dtype) is not None
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Tiles | None:
         """Its tiles from the facts (`_derived`): each consumer a unit of queries, the key tile the largest

@@ -23,7 +23,6 @@ fold's reach, and its overflowed rows again shifting under headroom). Its legali
 
 import dataclasses
 import functools
-import math
 from typing import NamedTuple
 
 import jax
@@ -50,6 +49,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _views_of,
     approximate,
     bundle_of,
+    extents,
     refused,
 )
 
@@ -73,26 +73,29 @@ def _forward_allocations(family: mosaic.Family, tiles: Tiles, width: int, value_
     return scoped, family.streams(blocks, stages, consumers)
 
 
-def _guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype) -> Tiles:
+def guarded_columns(family: mosaic.Family, value_width: int, dtype, *, output_hook: bool) -> int:
+    """The value columns a guarded launch walks at once (`_plain_forward`): a block of the family's swizzled
+    columns (`Family.column_unit`), the whole width where an output hook reads a row's whole output."""
+    return value_width if output_hook else min(value_width, family.column_unit(dtype))
+
+
+def guarded_tiles(family: mosaic.Family, tiles: Tiles, columns: int, dtype) -> Tiles | None:
     """The guarded launch's tiles beside the plain launch's `tiles` (`_plain_forward`): its consumers and
-    query blocks, and the widest key tile that divides the plain one in whole rows of the family's roles
-    (`Family.rows`) and of a swizzled row of keys (`mosaic.SWIZZLE_BYTES`), so the plain launch's padded keys
-    are whole tiles of it, whose live set a consumer's registers hold (`mosaic.live_registers`): its shifted
-    and unshifted sums of `columns` value columns fp32 carried, beside a step's logits and weights fp32 and
-    the two products the step forms (`algebra.stepped`); the least such tile where none fits."""
+    query blocks, and the widest of the family's key extents (`extents`) that divides the plain key tile, so
+    the plain launch's padded keys are whole tiles of it, whose live set a consumer's registers hold
+    (`mosaic.live_registers`): its shifted and unshifted sums of `columns` value columns fp32 carried, beside
+    a step's logits and weights fp32 and the two products the step forms (`algebra.stepped`). None where
+    none fits: the plain launch is then illegal at `tiles` (`MosaicForward.legal`)."""
     budget = family.registers(tiles.consumers)
     rows = tiles.block_q
-    unit = math.lcm(family.rows, mosaic.SWIZZLE_BYTES // jnp.dtype(dtype).itemsize)
     carried = [(rows, columns, jnp.float32)] * 2
 
     def held(block: int) -> bool:
         stepped = [(rows, block, jnp.float32)] * 2 + [(rows, columns, jnp.float32)] * 2
         return mosaic.live_registers(family, carried, stepped) <= budget
 
-    blocks = [block for block in range(unit, tiles.block_k + 1, unit) if tiles.block_k % block == 0][::-1]
-    if not blocks:
-        return tiles
-    return dataclasses.replace(tiles, block_k=next((block for block in blocks if held(block)), blocks[-1]))
+    blocks = [block for block in extents(family, dtype, tiles.block_k) if tiles.block_k % block == 0]
+    return next((dataclasses.replace(tiles, block_k=block) for block in blocks if held(block)), None)
 
 
 def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks, *,
@@ -113,8 +116,10 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
                                   family=family, training=False, interpret=interpret)
             return out, status[0], status[1] > 0
         # An output hook reads a row's whole output, so its call takes the guarded launch at its full width.
-        unit = v.shape[-1] if hooks.output_mod is not None else min(v.shape[-1], family.column_unit(v.dtype))
-        guarded = _guarded_tiles(family, tiles, unit, v.dtype)
+        unit = guarded_columns(family, v.shape[-1], v.dtype, output_hook=hooks.output_mod is not None)
+        guarded = guarded_tiles(family, tiles, unit, v.dtype)
+        # The plain launch's legality held a guarded tile at `tiles` (`MosaicForward.legal`).
+        assert guarded is not None, tiles
         # A spans call's block map counts blocks of the launch's own key tile.
         guarded_spans = _spans_of(spec, call, guarded.block_q, guarded.block_k)
         blocks = []

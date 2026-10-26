@@ -125,6 +125,19 @@ DROPPING = ("the Mosaic mainloop takes no probability dropout yet (the route run
 """Why this mainloop refuses a dropping call (`refused`): its ops carry no draw."""
 
 
+def extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
+    """A tile axis's extents on `family`, largest first: whole multiples of the rows a consumer's products
+    cover (`Family.role_rows`) and of its swizzled rows (`Family.column_unit`; a tile's keys are its weights'
+    product's depth, its queries the dK/dV launch's), at most what one copy moves (`Family.copy_extent`,
+    where the family's copies bound it; else registers bound them, `fits`) and the call's `extent` in whole
+    multiples (a longer tile holds padding alone)."""
+    unit = math.lcm(family.role_rows, family.column_unit(dtype))
+    top = -(-max(extent, 1) // unit)
+    if family.copy_extent is not None:
+        top = min(top, family.copy_extent // unit)
+    return tuple(range(top * unit, 0, -unit))
+
+
 def whole_tiles(family: mosaic.Family, tiles: "Tiles | BackwardTiles") -> bool:
     """Whether a program of `family` takes `tiles`: its query and key tiles positive whole multiples of the
     rows a role's products cover (`Family.rows`), and one to the family's count of consumers
