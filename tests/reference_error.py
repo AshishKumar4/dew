@@ -1347,11 +1347,12 @@ def _step_errors(value, truth) -> np.ndarray:
 def _grown(dew_fn, reference_fn, draw, seeds, truth_fn=None
            ) -> tuple[list[str], np.ndarray, np.ndarray, np.ndarray]:
     """Each leaf's growth evidence over `seeds` (`assert_grows_no_faster`), seed by leaf: the log of
-    Dew's RMS error at its last step over its first that both arms round, less the reference's, which
+    Dew's RMS error at the last step both arms round over the first, less the reference's, which
     cancels the conditioning the draw gives both arms alike; whether Dew is finite on every value; and
-    Dew's RMS error where the reference holds every step exactly, which Dew must too. A step both hold
-    exactly (a gradient no earlier step's loss reaches) is no start of growth, and a draw on which an
-    arm holds every step so (a parameter the loss never reads), or Dew is not finite, has none (NaN)."""
+    Dew's RMS error over the steps the reference holds exactly, which Dew must hold too. A step an arm
+    holds exactly (a gradient no earlier window's loss reaches, a padded token's loss) bounds no
+    growth, and a draw with fewer than two steps both round, or on which Dew is not finite, has none
+    (NaN)."""
     names, growths, finite, exact = None, [], [], []
     for seed in seeds:
         inputs = draw(seed)
@@ -1376,15 +1377,14 @@ def _grown(dew_fn, reference_fn, draw, seeds, truth_fn=None
                                  f"draw within the reference's range")
             finite[-1].append(bool(np.isfinite(leaf).all()))
             mine, theirs = _step_errors(leaf, true), _step_errors(their_leaf, true)
-            exact[-1].append(0.0 if theirs.any() or not finite[-1][-1] else root_mean(np.square(mine)))
-            if not (finite[-1][-1] and mine.any() and theirs.any()):
+            held = theirs == 0
+            exact[-1].append(root_mean(np.square(mine[held])) if finite[-1][-1] and held.any() else 0.0)
+            rounded = np.flatnonzero((mine > 0) & (theirs > 0))
+            if not finite[-1][-1] or rounded.size < 2:
                 growths[-1].append(math.nan)
                 continue
-            rounded = np.flatnonzero((mine[:-1] > 0) & (theirs[:-1] > 0))
-            if not rounded.size:
-                raise ValueError(f"{name}: on seed {seed} no step before the last rounds in both arms, so "
-                                 f"nothing grows from one; draw steps that round")
-            logs = _logs([mine[-1], mine[rounded[0]], theirs[-1], theirs[rounded[0]]])
+            first, last = rounded[0], rounded[-1]
+            logs = _logs([mine[last], mine[first], theirs[last], theirs[first]])
             growths[-1].append(float(logs[0] - logs[1] - logs[2] + logs[3]))
     return names, np.asarray(growths), np.asarray(finite), np.asarray(exact)
 
@@ -1407,12 +1407,12 @@ def _growth_judgement(names, growths: np.ndarray, finite: np.ndarray, exact: np.
         if exact[:, index].any():
             missed = int(np.sum(exact[:, index] > 0))
             over.append(Finding(leaf, "exact reference", float(np.max(exact[:, index])),
-                                f"{leaf}: the reference equals float64 at every step on {missed} of {seeds} "
-                                f"seeds and dew does not"))
+                                f"{leaf}: dew is not float64's at steps the reference holds exactly, on "
+                                f"{missed} of {seeds} seeds"))
         values = growths[:, index][~np.isnan(growths[:, index])]
         count = len(values)
         if not count:
-            # Both arms hold every step exactly on every seed: nothing grows.
+            # No seed rounds two steps in both arms: nothing grows.
             continue
         if count < FEWEST_SEEDS:
             unresolved.append(Finding(leaf, "inconclusive", FEWEST_SEEDS / count,
@@ -1447,13 +1447,14 @@ def assert_grows_no_faster(dew_fn, reference_fn, draw, label: str, *, seeds: int
     Every leaf's leading axis is the computation's steps, in order, the same in both arms and the
     truth (`reference_fn` on the inputs widened to float64, or `truth_fn`), each finite on every seed,
     as the reference must be. On each draw each arm's growth is the log of its RMS error from float64
-    at the last step over the first that both arms round (`_step_errors`, `_grown`). Dew's less the
-    reference's cancels the draw's conditioning, which amplifies both arms' rounding alike, and as a
-    difference of logs its spread over draws is finite where a ratio of two errors is heavy-tailed. A
-    leaf passes when the mean of it over the seeds is at most log PARITY, by check 1's bootstrap
-    interval and tails (`_status`'s reading, in logs), and fails above; two pre-declared stages, as
-    check 1's: any leaf not passing at `seeds` draws REDRAW times as many further seeds and is judged
-    again over all of them, then fails or is Inconclusive. The gate compiles the arms as check 1 does
+    at the last step both arms round over the first (`_step_errors`, `_grown`), and Dew holds every
+    step the reference holds exactly. Dew's growth less the reference's cancels the draw's
+    conditioning, which amplifies both arms' rounding alike, and as a difference of logs its spread
+    over draws is finite where a ratio of two errors is heavy-tailed. A leaf passes when the mean of it
+    over the seeds is at most log PARITY, by check 1's bootstrap interval and tails (`_status`'s
+    reading, in logs), and fails above; two pre-declared stages, as check 1's: any leaf not passing at
+    `seeds` draws REDRAW times as many further seeds and is judged again over all of them, then fails
+    or is Inconclusive. The gate compiles the arms as check 1 does
     (`_arms`)."""
     if seeds < FEWEST_SEEDS:
         raise Inconclusive([Finding(label, "inconclusive", FEWEST_SEEDS / max(seeds, 1), f"{label}: {seeds} "
