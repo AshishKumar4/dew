@@ -28,8 +28,9 @@ from jax.custom_derivatives import SymbolicZero
 
 from dew.nn.precision import at_least_fp32
 
-__all__ = ["cross_entropy", "entropy", "group_divergence", "kl_divergence", "label_derivative", "log_probs",
-           "probabilities", "rescaled", "segment_log_partition", "soft_cross_entropy", "target_loss"]
+__all__ = ["cross_entropy", "entropy", "group_divergence", "kl_divergence", "label_derivative", "label_entry",
+           "log_probs", "probabilities", "rescaled", "segment_log_partition", "soft_cross_entropy",
+           "target_loss"]
 
 
 def widened(logits: jax.Array, where: jax.Array | None = None) -> jax.Array:
@@ -90,20 +91,26 @@ def _label_loss_tangent(primals, tangents):
     return _label_loss(logits, labels), jnp.sum(derivative * tangents[0], axis=-1)
 
 
+def label_entry(share: jax.Array, others: jax.Array) -> jax.Array:
+    """The derivative of `-log p` in the label's own logit, from the label's `share` of its row and
+    the `others`' share summed: `share - 1` while the label holds at most half the row, else minus
+    the others' sum (arXiv:2610.31642, eq. 7). Past a half `share - 1` cancels, and rounds to 0 once
+    the share rounds to 1, where the others' sum keeps it and the row's derivative sums to zero in
+    any rounding; below a half `1 - share` is at least a half and `share - 1` rounds once, where the
+    others' sum carries each class's share of the partition's rounding, which left an unconfident
+    label's entry two to three times as far from float64. Every head's label entry is this one rule
+    (`label_derivative`, `dew.objectives.lm.chunked`)."""
+    return jnp.where(share > 0.5, -others, share - 1)
+
+
 def label_derivative(probability: jax.Array, labels: jax.Array) -> jax.Array:
     """The derivative of `-log p[labels]` in its row's logits, from the row's `probability` over the
-    last axis: each other class's probability, and at the label `p - 1` or, once the label holds more
-    than half the row, minus the other classes' sum (arXiv:2610.31642, eq. 7). Past a half `p - 1`
-    cancels, and rounds to 0 once the label's share rounds to 1, where the others' sum keeps it and
-    the row's derivative sums to zero in any rounding; below a half `1 - p` is at least a half and
-    `p - 1` rounds once, where the others' sum carries each class's share of the partition's rounding,
-    which left an unconfident label's entry two to three times as far from float64. A label outside
-    the row one-hots to nothing, and its row's derivative is the probabilities."""
+    last axis: each other class's probability, and at the label `label_entry`'s. A label outside the
+    row one-hots to nothing, and its row's derivative is the probabilities."""
     label = jax.nn.one_hot(labels, probability.shape[-1], dtype=bool)
     others = jnp.where(label, 0.0, probability)
     share = jnp.sum(jnp.where(label, probability, 0.0), axis=-1, keepdims=True)
-    entry = jnp.where(share > 0.5, -jnp.sum(others, axis=-1, keepdims=True), share - 1)
-    return jnp.where(label, entry, others)
+    return jnp.where(label, label_entry(share, jnp.sum(others, axis=-1, keepdims=True)), others)
 
 
 def soft_cross_entropy(logits: jax.Array, targets: jax.Array, where: jax.Array | None = None) -> jax.Array:
