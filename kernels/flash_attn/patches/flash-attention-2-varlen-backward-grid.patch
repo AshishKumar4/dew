@@ -59,7 +59,7 @@ index 9c8baff..b89044a 100644
 +}
 +
 +// The `block_idx`-th block of the padded block space (varlen_num_blocks) as (bidb, block within the
-+// sequence), or (-1, 0) in a gap or past the batch: a binary search over cu_seqlens for the last
++// sequence), or (-1, 0) before the first sequence, in a gap or past the batch: a binary search over cu_seqlens for the last
 +// sequence starting at or before it.
 +template <int kBlock>
 +__forceinline__ __device__ cute::tuple<int, int> varlen_block_coord(const int block_idx, const int num_batch,
@@ -71,7 +71,7 @@ index 9c8baff..b89044a 100644
 +    }
 +    const int block = block_idx - (cu_seqlens[bidb] / kBlock + bidb);
 +    const int seqlen = seqused ? seqused[bidb] : cu_seqlens[bidb + 1] - cu_seqlens[bidb];
-+    return block < (seqlen + kBlock - 1) / kBlock ? cute::make_tuple(bidb, block) : cute::make_tuple(-1, 0);
++    return 0 <= block && block < (seqlen + kBlock - 1) / kBlock ? cute::make_tuple(bidb, block) : cute::make_tuple(-1, 0);
 +}
 +
  template<bool Varlen=true>
