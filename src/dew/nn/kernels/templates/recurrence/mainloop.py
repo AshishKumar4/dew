@@ -91,12 +91,17 @@ PARTS = 3
 @dataclasses.dataclass(frozen=True)
 class Tiles:
     """A forward's tiles, the recurrence template's config, derived from the call's shape and the device's
-    and its bundle's facts (`templates.recurrence.template.Mosaic.derived`): the value block the states and
-    output launches split the values into (`block_v`), and the chunks the states launch has in flight
-    (`stages`)."""
+    and its bundle's facts (`templates.recurrence.template.Mosaic.derived`): the value block the states
+    launch splits the values into (`block_v`), the chunks it has in flight (`stages`), and the output
+    launch's value block (`block_o`), the states launch's where None."""
 
     block_v: int
     stages: int
+    block_o: int | None = None
+
+    @property
+    def output_block(self) -> int:
+        return self.block_v if self.block_o is None else self.block_o
 
 
 BF16_LARGEST = float(jnp.finfo(jnp.bfloat16).max)
@@ -1250,7 +1255,7 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
     value block: under a decay a head its own pairs' scores taken once, at the first step, and staged for
     every block's (`algebra.chunk_scores`, `chunk_output`), under one a key dimension the intra launch's
     (`scores`, `_intra`; `algebra.key_decayed_output`)."""
-    width, value_width, bv, gates = call.width, call.value_width, tiles.block_v, call.gates
+    width, value_width, bv, gates = call.width, call.value_width, tiles.output_block, call.gates
     held, memories, family = dataclasses.replace(call.held, rows=call.rows), call.memories, call.family
     steps = value_width // bv
 
