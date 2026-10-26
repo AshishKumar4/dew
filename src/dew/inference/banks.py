@@ -42,6 +42,7 @@ from dew.batch import Variables, merge, without
 from dew.nn.backbones.decoder_stack import DecoderBank, stack_layers
 from dew.nn.backbones.layer_plan import group_layers, layer_index
 from dew.nn.hyper_connections import Carried
+from dew.nn.kernels.options import program
 
 if TYPE_CHECKING:
     from dew.training.distributed import Layout, MeshSpec, Placement
@@ -221,7 +222,7 @@ class CheckpointBanks(LayerBanks):
                              layers[0], namespace=namespace)
         rows = [one_layer(self._restored(at_layer(_row_placement(placement), index, namespace=namespace)),
                           index, namespace=namespace) for index in layers]
-        return jax.jit(stack_layers, out_shardings=placement)(*rows)
+        return program(stack_layers, out_shardings=placement)(*rows)
 
     def _restored(self, placement: Placement) -> Variables:
         """Restore the variables `placement` names onto its shardings, as every load of a run's
@@ -685,7 +686,7 @@ def placed_rows(bank: jax.Array, count: int) -> tuple[jax.Array, ...]:
     sharding places it, in the bank's memory, and the bank deleted after."""
     sharding = bank.sharding
     assert isinstance(sharding, NamedSharding), "a restored bank is placed by a layout's NamedSharding"
-    cut = jax.jit(_cut, static_argnames="count",
+    cut = program(_cut, static_argnames="count",
                   out_shardings=(row_sharding(sharding),) * count)(bank, count=count)
     bank.delete()
     return cut

@@ -5,6 +5,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- Every outer program Dew compiles goes through one seam (`dew.nn.kernels.options.program`): an image
+  task's encode, noise and solver start, a bank's stacking, an autoencoder's encode and decode, LPIPS's
+  and FID's networks and a host step's unstack, so two loads of one module share its programs. The seam
+  holds placement trees by their structure and leaves. An objective's own programs and the serving
+  kernel's donated step programs stay apart, as their docstrings say.
 - The library holds no CPU-only algorithm (bible §5): a vocabulary row's fused logsumexp is one
   plain pass on every platform, which Dew's CPU test setting takes in float64 and rounds once
   (`dew.nn.precision.widened_reduction`, beside `accumulated`), in place of a CPU-only blocked
