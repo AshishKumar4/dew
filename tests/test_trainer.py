@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 
 import jax
@@ -1405,6 +1406,63 @@ class ListedParameters(Objective):
 
     def loss(self, variables, batch, step):
         return jnp.sum(variables["params"]["layers"][0]["w"] ** 2), Aux({})
+
+
+MAPPINGS = {"dict": dict, "frozen": frozen_dict, "ordered": collections.OrderedDict}
+"""The kinds of mapping a caller's tree may hold its collections in."""
+
+
+def held_count(kind: str, container: str, count) -> dict:
+    """A `stats` collection of `count`, `{"count": count}` in a mapping of `kind`, as `container` holds
+    it: the mapping itself, or in a list or a tuple."""
+    node = MAPPINGS[kind]({"count": count})
+    return {"seen": node if container == "mapping" else [node] if container == "list" else (node,)}
+
+
+def counted(stats):
+    """The count `held_count` holds."""
+    seen = stats["seen"]
+    return (seen if isinstance(seen, Mapping) else seen[0])["count"]
+
+
+class Kinded(Counted):
+    """`Counted`, its count starting in mappings of `started`'s kind and written back in `written`'s,
+    each held as `container` holds it (`held_count`)."""
+
+    def __init__(self, started: str, written: str, container: str):
+        self.started, self.written, self.container = started, written, container
+
+    def fresh_variables(self, key, held):
+        stats = held_count(self.started, self.container, jnp.zeros(()))
+        return {"params": {"w": jnp.ones((2,))}, "stats": stats}
+
+    def loss(self, variables, batch, step):
+        loss = jnp.sum(variables["params"]["w"] ** 2)
+        stats = held_count(self.written, self.container, counted(variables["stats"]) + 1)
+        return loss, Aux({}, variables={"stats": stats})
+
+
+@pytest.mark.parametrize("container", ["mapping", "list", "tuple"])
+@pytest.mark.parametrize("kind", list(MAPPINGS))
+@pytest.mark.parametrize("entry", ["init", "supplied", "write-back"])
+def test_a_tree_of_any_kind_of_mapping_is_held_as_dicts_where_it_enters(tmp_path, entry, kind, container):
+    """A tree a run is handed holds its collections in any kind of mapping (a dict, a Flax
+    `FrozenDict`, an `OrderedDict`), under a list or a tuple too: where the objective's init returns
+    it, where a supplied state holds it and where the loss writes it back, the state holds it as
+    dicts, so every step's tree has one structure and the run counts every step."""
+    objective = Kinded(kind if entry == "init" else "dict", kind if entry == "write-back" else "dict",
+                       container)
+    trainer = make_trainer(tmp_path, objective=objective, optimizer=optax.sgd(1e-2))
+    supplied = None
+    if entry == "supplied":
+        initial = trainer.initial_state()
+        stats = held_count(kind, container, counted(initial.variables["stats"]))
+        supplied = dataclasses.replace(initial, variables={**initial.variables, "stats": stats})
+    state = trainer.fit(dataset(), steps=3, log_every=1, state=supplied)
+    others = [node for node in jax.tree.leaves(
+        state, is_leaf=lambda node: isinstance(node, Mapping) and type(node) is not dict)
+        if isinstance(node, Mapping)]
+    assert not others and float(counted(state.variables["stats"])) == 3.0
 
 
 def test_a_supplied_state_whose_parameters_and_moments_hold_a_frozen_dict_in_a_list_trains(tmp_path):

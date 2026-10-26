@@ -17,7 +17,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import struct
-from flax.core import FrozenDict
 
 type Variables = Mapping[str, Any]
 """A Flax variables dict: the `params` collection plus any other collection
@@ -416,16 +415,20 @@ def thaw(variables: Variables) -> Variables:
 
 def dicts[Tree](tree: Tree) -> Tree:
     """`tree` (a variables tree, or a state holding several) with every mapping a dict: a tree that
-    holds a Flax `FrozenDict` anywhere, under a mapping, a sequence or any other node, rebuilt over the
-    same leaves with each one a dict, any other the caller's own tree. The trees an objective holds are
-    dicts, so that a placement writing each placed leaf into the dict that held it
-    (`dew.training.host.stream`) writes into the objective's tree, and a step's collections keep the
-    state's containers."""
-    nodes = jax.tree.leaves(tree, is_leaf=lambda node: isinstance(node, FrozenDict))
-    if not any(isinstance(node, FrozenDict) for node in nodes):
+    holds a mapping of any other kind anywhere (a Flax `FrozenDict`, an `OrderedDict`), under a
+    mapping, a sequence or any other node, rebuilt over the same leaves with each one a dict, any other
+    the caller's own tree. Flax's `unfreeze` stops at a list, and no JAX tree utility makes one kind of
+    mapping of every kind. The trees an objective holds, the state's and a step's written-back
+    collections are dicts, so that a placement writing each placed leaf into the dict that held it
+    (`dew.training.host.stream`) writes into the objective's tree, and every tree of a step has the
+    state's structure."""
+    nodes = jax.tree.leaves(tree, is_leaf=lambda node: isinstance(node, Mapping) and type(node) is not dict)
+    if not any(isinstance(node, Mapping) and type(node) is not dict for node in nodes):
         return tree
-    return jax.tree.map(lambda node: dicts(dict(node)) if isinstance(node, FrozenDict) else node, tree,
-                        is_leaf=lambda node: isinstance(node, FrozenDict))
+    return jax.tree.map(
+        lambda node: ({key: dicts(value) for key, value in node.items()}
+                      if isinstance(node, Mapping) and type(node) is not dict else node),
+        tree, is_leaf=lambda node: isinstance(node, Mapping) and type(node) is not dict)
 
 
 def part(variables: Variables, name: str) -> Variables:
