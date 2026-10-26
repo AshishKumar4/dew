@@ -297,8 +297,10 @@ loads the wrapper. A decoder or a fallback source is text already and loads as i
 pipeline, a family that reads its media bundle as one decoder (DeepSeek-V4.1), and a quantized wrapper
 are refused. A checkpoint that holds none of the prediction depths its config names loads as its trunk;
 one holding some of them must hold all. `prediction_depths` chooses how many the load builds: None
-the ones the checkpoint holds, 0 none, `n` the first `n`, the others neither built nor their tensors
-read, with or without `text_only`. A run passes both through `--source.text-only` and
+the ones the checkpoint holds, 0 none, `n` the first `n` (a DSpark drafter's stages count as its
+depths). The load reads the source as the checkpoint of those depths alone, its config's counts cut
+before routing and the others' tensors dropped before any is read, and saves as that checkpoint,
+with or without `text_only`. A run passes both through `--source.text-only` and
 `--source.prediction-depths` (`RunConfig.source`), whatever kind of run it is.
 
 Serving is one engine of kinds (`dew.inference.Engine`). A kind (`Kind`) admits waiting requests

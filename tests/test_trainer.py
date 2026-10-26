@@ -1255,6 +1255,24 @@ def test_the_run_start_records_the_cadences_and_warmups_it_resolved(tmp_path):
                                             "warmup_steps.learning_rate": 4}
 
 
+def test_a_local_checkpoint_cadence_may_be_a_share_of_the_run(tmp_path):
+    """`Checkpoints.local_every` may be a share of the run, resolved as `fit`'s other cadences are: 25%
+    of 8 steps writes the local checkpoint every 2, and the run's start records it."""
+    from dew.telemetry.records import CheckpointRequested, FitStarted
+
+    tracker = RecordingTracker()
+    checkpoints = Checkpoints(str(tmp_path / "run"), local_directory=str(tmp_path / "local"),
+                              local_every="25%")
+    make_trainer(tracker=tracker, checkpoints=checkpoints).fit(dataset(), steps=8, log_every=4)
+    local = [step for step, value in tracker.artifacts
+             if isinstance(value, CheckpointRequested) and value.local]
+    assert local == [2, 4, 6, 8]
+    started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
+    assert started.cadences["local_every"] == 2
+    with pytest.raises(ValueError):
+        Checkpoints(str(tmp_path / "other"), local_directory=str(tmp_path / "local"), local_every="25")
+
+
 def test_a_share_of_a_token_budget_falls_where_the_committed_tokens_pass_its_multiples():
     """A cadence written as a share of a token budget alone falls at each step whose commit passes a
     multiple of that share of the budget's tokens: 25% of 96 logs at the steps that bring the

@@ -1168,6 +1168,11 @@ class ParamGroup:
         return rates_of(learning_rate if self.schedule is None else self.schedule,
                       self.learning_rate_multiplier)
 
+    def rate[R](self, learning_rate: R) -> R | ScheduleBase:
+        """The rate its solver runs at: its own schedule, or the config's `learning_rate` where it
+        names none."""
+        return learning_rate if self.schedule is None else self.schedule
+
     def solver(self, make: Callable[..., optax.GradientTransformation],
                learning_rate: float | ScheduleBase, steps: int | None,
                opts: Mapping[str, object]) -> optax.GradientTransformation:
@@ -1181,8 +1186,8 @@ class ParamGroup:
         if self.b1 is not None and 'b1' not in inspect.signature(make).parameters:
             raise ValueError(f"param group {self.name!r} schedules b1, and its optimizer "
                              f"takes no b1 (adam, adamw and lamb do)")
-        solver = scheduled_solver(make, learning_rate if self.schedule is None else self.schedule, steps,
-                                  opts, self.b1, self.learning_rate_multiplier)
+        solver = scheduled_solver(make, self.rate(learning_rate), steps, opts, self.b1,
+                                  self.learning_rate_multiplier)
         if self.bounds is not None:
             solver = optax.chain(solver, _keep_within(*self.bounds))
         return solver
@@ -1500,7 +1505,8 @@ class OneCycle(ScheduleBase):
     peak_value: float = dataclasses.field(metadata={'rate': True})
     init_value: float | None = dataclasses.field(default=None, metadata={'rate': True})
     end_value: float | None = dataclasses.field(default=None, metadata={'rate': True})
-    warmup_fraction: float = 0.3
+    warmup_fraction: float | str = 0.3
+    """The share of the run its rise lasts, torch's `pct_start`: a fraction, or a share such as `30%`."""
 
     def rates(self) -> dict[str, float]:
         """The peak, and the init and end values with torch's derived defaults resolved."""
@@ -1508,12 +1514,21 @@ class OneCycle(ScheduleBase):
         return {'peak_value': self.peak_value, 'init_value': init,
                 'end_value': init / 1e4 if self.end_value is None else self.end_value}
 
+    def _rise(self, steps: int) -> float:
+        """The step its rate peaks at over a run of `steps`, torch's phase end, kept a float as torch
+        keeps it."""
+        fraction = self.warmup_fraction
+        return (share(fraction) if isinstance(fraction, str) else fraction) * steps - 1
+
+    def warmup(self, steps: int | None) -> int:
+        """The steps of its rise, to the whole step its rate peaks at (`_rise`)."""
+        return round(self._rise(self._horizon(steps, "trainer.steps")))
+
     def values(self, steps: int | None, rates: Rates | None = None
                ) -> optax.Schedule:
         rates = self.rates() if rates is None else rates
         steps = self._horizon(steps, "trainer.steps")
-        # torch's phase ends, kept as floats as torch keeps them.
-        rise, last = self.warmup_fraction * steps - 1, steps - 1
+        rise, last = self._rise(steps), steps - 1
         if not 0 < rise < last:
             raise ValueError(f"a one-cycle schedule over {steps} steps with warmup fraction "
                              f"{self.warmup_fraction} has no rise or no fall; give it more steps")
@@ -1667,10 +1682,12 @@ class OptimConfig:
         """Each of its schedules' warmup in that schedule's own steps over a run of `steps` updates,
         its share of the run resolved (`ScheduleBase.warmup`), by where the config holds it, as a
         run's plan records it; a schedule with no warmup of steps is not among them."""
-        held: list[tuple[str, object]] = [("learning_rate", self.learning_rate)]
+        held: list[tuple[str, object]] = [] if self.param_groups else [("learning_rate", self.learning_rate)]
         for group in self.param_groups:
-            held += [(f"param_groups.{group.name}.schedule", group.schedule),
-                     (f"param_groups.{group.name}.b1", group.b1)]
+            # The schedules the group's solver runs (`ParamGroup.rate`): the config's own where the
+            # group names none.
+            rate = "learning_rate" if group.schedule is None else f"param_groups.{group.name}.schedule"
+            held += [(rate, group.rate(self.learning_rate)), (f"param_groups.{group.name}.b1", group.b1)]
         warmups = {}
         for name, schedule in held:
             if isinstance(schedule, ScheduleBase):
