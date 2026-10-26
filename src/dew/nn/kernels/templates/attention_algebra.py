@@ -882,9 +882,11 @@ def training_step(spec: Forward, carry: Carry, keys: Keys,
     anchored = isinstance(rows, Anchored)
     anchor = arg if anchored else argmax(arg, keys.logits, keys.coords.k_pos)
     at_anchor = keys.coords.k_pos == expand(anchor.key, keys.logits)
-    # Known, the anchor arrives at its own tile, its weight zero until then, so no old term joins.
-    moved = jnp.any(at_anchor, axis=-1) if anchored else anchor.peak > arg.peak
     others, own_tile = anchor_split(narrow(p, value.dtype), at_anchor)
+    # Known, the anchor's weight arrives in its own tile, zero before it (its logit the keys' largest, 1
+    # there unless an initial state's maximum passes it), so no old term joins: a row moves where its
+    # weight arrives, which no reduction of the tile's keys need find.
+    moved = own_tile > 0 if anchored else anchor.peak > arg.peak
     multiplier = drawn(keys.coords, keys.coords.q_pos, keys.coords.k_pos)
     parts = ((others, None),)
     if multiplier is not None:
