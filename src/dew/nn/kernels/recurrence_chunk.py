@@ -514,25 +514,36 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                                  kernels=ported is not False)
     else:
         port = hooks.delta and hooks.decay != 'none' and ported is not False
-        kernel = port_kernel(query, key, value, g, beta, state, starts, max_segments=max_segments,
-                             scale=scale, wide=epilogue, floor=hooks.floor) if port else 'xla'
-        if kernel == 'mosaic_gpu':
-            from .templates.recurrence import template
+        # A caller asking the port (`ported`) takes it where the selector would take the portable math.
+        kernels = [(port_kernel(query, key, value, g, beta, state, starts, max_segments=max_segments,
+                                scale=scale, wide=epilogue, floor=hooks.floor, product=product)
+                    if port else 'xla') for product in ('forward', 'training')]
+        kernels = ['fla' if ported and kernel == 'xla' else kernel for kernel in kernels]
 
-            out, final = template.MOSAIC(query, key, value, g, beta, state, starts, max_segments=max_segments,
-                                         scale=scale, wide=epilogue, floor=hooks.floor)
-        elif port and (ported or kernel != 'xla'):
-            # Unrounded where an epilogue follows, as on the portable math.
-            out, final = fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
-                                  scale=scale, wide=epilogue)
-        else:
+        def run(kernel, query, key, value, g, beta, state, starts):
+            if kernel == 'mosaic_gpu':
+                from .templates.recurrence import template
+
+                return template.MOSAIC(query, key, value, g, beta, state, starts, max_segments=max_segments,
+                                       scale=scale, wide=epilogue, floor=hooks.floor)
+            if kernel == 'fla':
+                # Unrounded where an epilogue follows, as on the portable math.
+                return fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
+                                scale=scale, wide=epilogue)
             group = value.shape[2] // key.shape[2]
             if group > 1:
                 query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
             size = held_chunk(chunk_size, key.shape[-1]) if hooks.delta else chunk_size
-            out, final = chunk_delta_rule(query, key, value, g.reshape(*value.shape[:3], -1), beta, state,
-                                          size, starts=starts, delta=hooks.delta, scale=scale,
-                                          dtype=work)
+            return chunk_delta_rule(query, key, value, g.reshape(*value.shape[:3], -1), beta, state, size,
+                                    starts=starts, delta=hooks.delta, scale=scale, dtype=work)
+
+        operands = (query, key, value, g, beta, state, starts)
+        if kernels[0] == kernels[1]:
+            out, final = run(kernels[0], *operands)
+        else:
+            # The cell's forward and its training take different kernels (`PORT_CELLS`).
+            out, final = _by_product(functools.partial(run, kernels[0]), functools.partial(run, kernels[1]),
+                                     *operands)
         out = recurrence.skipped(hooks, out.astype(work), value, given, work)
     # The epilogue in the working precision, and the output rounded once.
     return recurrence.normed(hooks, out, given, work).astype(dtype), final
@@ -543,14 +554,19 @@ class PortCase:
     """A delta rule's call as the port's selector reads it (`GATED_DELTA`): whether it is traced for
     reverse mode alone (`reverse`; `FORWARD_MODE` marks `jax.jvp`'s traces), whether a caller's
     `shard_map` that checks varying axes holds operands that vary (`varying`), the operands' common
-    `dtype`, the keys' width (`key_width`), and the recurrence template's implementations bound to the call
-    (`call`, `templates.base.Call`; None where the caller asks of the port alone, `on_the_port`)."""
+    `dtype`, the keys' width (`key_width`), the recurrence template's implementations bound to the call
+    (`call`, `templates.base.Call`; None where the caller asks of the port alone, `on_the_port`), the
+    instruction family of the device it runs on (`family`, `generation.family`; None off a GPU), and the
+    product it is selected for (`product`: 'forward' where no gradient is taken, 'training' where one is,
+    `_by_product`)."""
 
     reverse: bool
     varying: bool
     dtype: np.dtype
     key_width: int
     call: base.Call | None = None
+    family: str | None = None
+    product: str = 'forward'
 
     @property
     def widest(self) -> int:
@@ -580,48 +596,90 @@ the port takes in their dtype. Packed documents take the port at any bound: it s
 where they pass, as many as the tokens' chunks, a row's and one, whatever the bound
 (`chunked_launch.Sequences`)."""
 
+PORT_CELLS: dict[tuple[str, str], str] = {
+    ('wgmma', 'forward'): "on an H100 PCIe, 16-bit, the port's forward 0.602 ms against the template's "
+                          "0.776 on Qwen3.5-27B's gated delta net and 0.484 against 0.634 on Qwen3-Next's "
+                          "(SE-family-h100-e0de17766)",
+}
+"""The cells, each an instruction family and a product (`PortCase.product`), where a receipt shows the fla
+port faster than the recurrence template, the port running them (owner, bible da64ae5): the list shrinks as
+the template wins its cells, and no cell is picked or ranked at run time. Training on an H100 is the
+template's: its fast backward took 2.56 ms against the port's 3.14 (the same receipt)."""
+
 MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (
     *PORT_SUPPORTS[:2],
     Requirement('launch', lambda case: case.call is not None and case.call.eligible('mosaic_gpu'),
                 "the recurrence template's launches take no call of these dtypes or widths, or no config "
                 "fits this device, or no Mosaic bundle claims its instruction family", row='ledger 1294'),
-    Requirement('measured', lambda case: False,
-                "an A100 ran the template's forward at 1.43 times the port's time on the 27B gated delta net "
-                "(SE-rx-a100-e54e87486), so it runs where a call names it", row='ledger 1294',
-                kind='measured'),
+    Requirement('device', lambda case: case.family is not None,
+                "no GPU runs the call: off one, the mainloop runs interpreted where a call names it",
+                row=INHERENT, kind='measured'),
+    Requirement('declared', lambda case: (case.family, case.product) not in PORT_CELLS,
+                lambda case: f"a declared port cell: {PORT_CELLS[case.family, case.product]}",
+                row='bible da64ae5', kind='measured'),
 )
 """What the recurrence template's Mosaic GPU mainloop (`templates.recurrence.template.Mosaic`) needs of a
 call: the port's trace and placement (its custom VJP, a Pallas call's results), its own launches' call
-(`Template.eligible`: dtypes, widths, a bundle for the device's family, a config that fits); and, until it
-holds the port's time per row, a named call."""
+(`Template.eligible`: dtypes, widths, a bundle for the device's family, a config that fits), a GPU, and a
+cell the port is not declared faster on (`PORT_CELLS`)."""
+
+MOSAIC = Kernel('mosaic_gpu', MOSAIC_SUPPORTS)
+
+
+def _preferred_kernel(case: PortCase) -> str:
+    """The delta rule's kernel for `case`: the recurrence template wherever it takes the call (the default
+    on every cell, owner); else the current route, the port where the target's row names it
+    (`measured_kernel`, the table qualification reads) and the call meets its requirements, else the
+    portable math."""
+    return MOSAIC.name if not MOSAIC.failed(case) else measured_kernel('gated_delta_rule', 'xla')
+
 
 GATED_DELTA: Op[PortCase] = Op('gated_delta_rule',
-                               (Kernel('mosaic_gpu', MOSAIC_SUPPORTS),
-                                Kernel('fla', PORT_SUPPORTS), Kernel('xla', (), generic=True)),
-                               lambda case: measured_kernel('gated_delta_rule', 'xla'))
-"""The delta rule's selector: the port where the target's row names it (`measured_kernel`, the table
-qualification reads) and the call meets its requirements, else the portable math; the recurrence template
-where named, at its derived tiles."""
+                               (MOSAIC, Kernel('fla', PORT_SUPPORTS), Kernel('xla', (), generic=True)),
+                               _preferred_kernel)
+"""The delta rule's selector (`_preferred_kernel`): the recurrence template at its derived tiles on every
+cell it takes but the declared port cells (`PORT_CELLS`), else the current route."""
 
 
 def port_kernel(query, key, value, g=None, beta=None, state=None, starts=None, *,
                 max_segments: int | None = None, scale: float | None = None, wide: bool = False,
-                floor: float | None = None) -> str:
-    """The kernel the delta rule's selector (`GATED_DELTA`) gives a call over these operands, which logs a
-    call the row's port turns down the first time: the template's implementations bound to it where its
-    decay and write gate are given. Where they are not (`on_the_port`, a layer's probe ahead of its gates),
-    a call that names the template falls back to the selector's own pick rather than refusing it, its
-    launches unbound."""
+                floor: float | None = None, product: str = 'forward') -> str:
+    """The kernel the delta rule's selector (`GATED_DELTA`) gives a call over these operands for `product`
+    ('forward', 'training'), which logs a call the row's port turns down the first time: the template's
+    implementations bound to it where its decay and write gate are given. Where they are not
+    (`on_the_port`, a layer's probe ahead of its gates), a call that names the template falls back to the
+    selector's own pick rather than refusing it, its launches unbound."""
     from .templates.recurrence import template
 
     call = None if g is None or beta is None else base.call(
         (template.MOSAIC,), query, key, value, g, beta, state, starts, max_segments=max_segments, scale=scale,
         delta=True, wide=wide, floor=floor)
+    family = generation.family(generation.device_generation()) if jax.default_backend() == 'gpu' else None
     case = PortCase(reverse=not FORWARD_MODE.get(), varying=bool(jax.typeof(value).mat.varying),
-                    dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1], call=call)
+                    dtype=jnp.dtype(jnp.result_type(query, key, value)), key_width=key.shape[-1], call=call,
+                    family=family, product=product)
     if call is None:
         return select(GATED_DELTA, case, forced(GATED_DELTA.choice), insist=False).kernel
     return select(GATED_DELTA, case).kernel
+
+
+def _by_product(forward, training, *operands):
+    """`forward(*operands)` where no gradient is taken, and `training(*operands)`'s forward and pullback
+    where one is (each kernel's own VJP): the delta rule's cells per product (`PORT_CELLS`), which a trace
+    cannot tell apart before its gradient is asked."""
+
+    @jax.custom_vjp
+    def rule(*operands):
+        return forward(*operands)
+
+    def ahead(*operands):
+        return jax.vjp(training, *operands)
+
+    def back(pullback, cotangent):
+        return pullback(cotangent)
+
+    rule.defvjp(ahead, back)
+    return rule(*operands)
 
 
 def on_the_port(query, key, value) -> bool:
