@@ -1469,6 +1469,15 @@ def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]
                      f"{case.call.target.generation}", row='ledger 1295'), *measured))
 
 
+MMA_SYNC_MEASURED = _Need(
+    'mma_sync', lambda case: case.call.target.wgmma,
+    "an A100 ran the Mosaic GPU launches' mma.sync tiles slower than Triton's on the forward (1.08x) and "
+    "the input gradient (1.26x) (R10, 852bb4bd3), so they run where the call names them", row='R10',
+    kind='measured')
+"""What keeps the Mosaic GPU launches off a GPU without warpgroup MMA unless named: main's route there is
+Triton's, which mma.sync has not measured at least as fast as (BIBLE §4)."""
+
+
 NAMED = _Need('named', lambda case: False,
               lambda case: "this launch runs only where a call names it (`generation.chosen`)",
               row="owner, bible 67b4f84: a template replaces a production route once measured at least as "
@@ -1492,12 +1501,13 @@ _GMMS = (MosaicGmm(), MosaicTpuGmm(), Gmm(), CutlassGmm())
 _TGMMS = (MosaicTgmm(), MosaicTpuTgmm(), Tgmm(), CutlassTgmm())
 
 GROUPED: selection.Op[GroupedCase] = selection.Op('grouped_matmul', (
-    *(_launch_kernel(launch.name, *((NAMED,) if launch.name in ('mosaic_tpu', 'cutlass') else ()))
+    *(_launch_kernel(launch.name, *((NAMED,) if launch.name in ('mosaic_tpu', 'cutlass') else
+                                    (MMA_SYNC_MEASURED,) if launch.name == 'mosaic_gpu' else ()))
       for launch in _GMMS),
     selection.Kernel[GroupedCase]('xla', (), generic=True)))
 """The grouped selector, in a fixed order, main's route: Mosaic GPU's launch where it takes the call (an
-H100's, where it measured faster than Triton's; mma.sync's where this JAX lowers it), Triton's where it
-refuses, else XLA's program; the TPU's and CUTLASS's launches only by name (`NAMED`). Every
+H100's, where it measured faster than Triton's; mma.sync's only by name, `MMA_SYNC_MEASURED`), Triton's
+where it refuses, else XLA's program; the TPU's and CUTLASS's launches only by name (`NAMED`). Every
 implementation shares the template's signature, so each binds the call's own arguments, `_GMMS`' for a
 product, `_TGMMS`' for a kernel gradient."""
 
