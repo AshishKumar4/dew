@@ -130,10 +130,18 @@ def test_a_chain_reads_the_same_records_and_plan_with_or_without_its_automatic_c
     assert plan(cache=True) == plan(cache=False)
 
 
+@dataclass(frozen=True)
+class Kept:
+    """The records whose id is no multiple of three."""
+
+    def __call__(self, row) -> bool:
+        return int(row["id"]) % 3 != 0
+
+
 LAYOUTS = {
-    "windows": lambda: Pipeline(records()).map(Tokens(), identity="tokens@1").windows(4).shuffle(0),
+    "windows": lambda: Pipeline(records()).map(Tokens(), identity="tokens@1").windows(4),
     "mixture": lambda: mix([Pipeline(records(offset)).map(Counted(), identity=f"counted-{offset}@1")
-                            .filter(lambda row: int(row["id"]) % 3 != 0) for offset in (0, 100)]),
+                            .filter(Kept(), identity="kept@1") for offset in (0, 100)]),
 }
 
 
@@ -147,6 +155,12 @@ def test_a_laid_out_chain_keeps_its_plan_and_resumes_across_its_automatic_cache(
         return compile(LAYOUTS[layout]().repeat(2).batch(2, drop_remainder=False), read=how,
                        loading=Loading(workers=0, threads=1, read_buffer=1, cache=cache))
 
+    # A first run reads the whole chain, which fills its caches; the next reads them back.
+    filling = loader(cache=True).train(DataPartition())
+    try:
+        list(filling)
+    finally:
+        filling.close()
     cached = loader(cache=True)
     stream = cached.train(DataPartition())
     try:
