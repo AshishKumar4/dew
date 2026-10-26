@@ -96,7 +96,7 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
             and modules and not any(isinstance(module, TritonGemm) and module.keeps_triton_gemm
                                     for module in modules)):
         options['xla_gpu_enable_triton_gemm'] = False
-    options.update(compiler_options(*modules))
+    options.update(compiler_options(*objective.towers()))
     return options or None
 
 

@@ -417,7 +417,7 @@ def plan_step[LossT, EffectsT](
     fitted: tuple[Candidate, jax.stages.Compiled] | None = None
     dropped: str | None = None  # the rung (`rung`) the narrow copies were dropped at
     # Every rung keeps, XLA's defaults' included, the options the modules need to compute right.
-    required = compiler_options(*(entry.module for entry in objective.program_key())) or None
+    required = compiler_options(*objective.towers()) or None
 
     def current() -> dict[str, JSON]:
         return rung_record(objective, xla_defaults, narrow=narrow)
