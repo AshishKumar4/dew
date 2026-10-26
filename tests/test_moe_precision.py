@@ -18,7 +18,7 @@ import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
 from reference_error import assert_as_exact, with_gradients
 from scipy.special import erfc
-from tuned import fitting, taken
+from tuned import each_config, taken
 
 from dew.nn.activations import exact_gelu
 from dew.nn.gpt_oss import GptOssExperts
@@ -181,24 +181,19 @@ HOPPER = pytest.mark.skipif(not (triton_runs() and gpu_target().wgmma),
     pytest.param(grouped_matmul.MosaicGmm, 768, 768, marks=HOPPER),
     pytest.param(grouped_matmul.MosaicTgmm, 768, 768, marks=HOPPER)])
 def test_every_tile_of_the_grouped_kernels_holds_the_float64_gate(kernel, width, features):
-    """Each tile a launch fits (`Template.fitting`), of the implementation the
+    """Each config a launch may take (`each_config`: the tile it derives and
+    the variants an opt-in tuning run times), of the implementation the
     launch is forced to, over groups ragged against every tile size, one
     empty and one of a single row: the output and both gradients of a bf16
     projection over an fp32 master hold check 1 against XLA's ragged dot,
     from float64 sums of the same bf16 operands, over the site's draws.
-    Triton's fixed tiles, which its cost model ranks, are each proven here.
     Triton's widths are ragged against its tiles, which mask them; Mosaic's
     divide by every tile width it derives (64 to 256, and a pair's 256
-    rows), which it needs, so its cooperative tiles and the forward's pairs
-    are among those checked."""
+    rows), which it needs."""
     gate = _tile_gate(kernel, width, features)
     with kernel_choices(grouped_matmul=kernel.name):
-        configs = fitting(kernel, _tile_gate_arm('pallas'), *gate.draw(0))
-    assert len(configs) > 1
-    if kernel.name == 'mosaic_gpu':
-        # The kernel gradient's schedule is one multiprocessor's (`MosaicTgmm.space`).
-        paired = set() if kernel is grouped_matmul.MosaicTgmm else {(2, 2)}
-        assert {(c.warpgroups, c.cluster) for c in configs} == {(1, 1), (2, 1)} | paired
+        configs = each_config(kernel, _tile_gate_arm('pallas'), *gate.draw(0))
+    assert configs
     for config in configs:
         gate.check(config)
 

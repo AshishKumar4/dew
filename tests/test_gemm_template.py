@@ -196,9 +196,9 @@ COOPERATIVE = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2)
 """A tile two consumer warpgroups compute, on one multiprocessor (the interpreter models no cluster)."""
 
 
-MOSAIC_RAN = {'mosaic_gpu'} if jax.default_backend() == 'cpu' else {'mosaic_gpu', 'triton'}
-"""The grouped matmul's kernels a call pinned to Mosaic reports: a GPU process also traces the CPU branch
-of its platform choice, which interprets Triton's and never runs there (`grouped_matmul.launched`)."""
+MOSAIC_RAN = {'mosaic_gpu'}
+"""The grouped matmul's kernels a call pinned to Mosaic reports, in a CPU's process or a GPU's: a GPU
+process builds no CPU branch of its platform choice (`grouped_matmul._on_platform`)."""
 
 
 def _kernels(taken) -> set:
