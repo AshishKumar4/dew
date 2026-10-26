@@ -39,13 +39,15 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.interpreters.ad import JVPTracer
 
+from dew.batch import Coordinates, valid_order
+from dew.mesh import MeshAxes, logical_spec, mesh_axes
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, short_conv
 
 from .attention import FORWARD_MODE, gated_rms_normalized, repeat_kv_heads
 from .blocks import normal_kernel
 from .flops import conv_flops, delta_flops, projection_flops
-from .inputs import PLAIN_CALL, Coordinates, MixerCall, coordinates_of, valid_order
+from .inputs import PLAIN_CALL, MixerCall, coordinates_of
 from .joined import joined_dense, joins
 from .kernels import generation
 from .kernels.generation import INHERENT, Refusal, first_refusal, measured_kernel, route, triton_runs
@@ -55,13 +57,10 @@ from .sharding import (
     HEADS,
     MLP_HIDDEN,
     RESIDUAL,
-    MeshAxes,
     constrain,
     grouped_heads,
     logical_axes,
-    logical_spec,
     manual_map,
-    mesh_axes,
     rows_like,
     seen_whole,
 )

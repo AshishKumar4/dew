@@ -72,47 +72,80 @@ import json
 import os
 from pathlib import Path
 from typing import Any, Dict
-from huggingface_hub import get_safetensors_metadata, hf_hub_download
 
 import numpy as np
 import torch
+from huggingface_hub import get_safetensors_metadata, hf_hub_download
 from transformers import (
-    AutoModelForCausalLM, AutoTokenizer, BloomConfig, BloomForCausalLM, DeepseekV3Config, DeepseekV3ForCausalLM,
-    Gemma2Config, Gemma2ForCausalLM, Gemma3Config, Gemma3ForCausalLM, Gemma3TextConfig,
-    GemmaConfig, GemmaForCausalLM, GPTNeoConfig, GPTNeoForCausalLM, LlamaConfig, LlamaForCausalLM,
-    PhiConfig, PhiForCausalLM, Phi3Config, Phi3ForCausalLM,
-    FalconConfig, FalconForCausalLM,
-    GPTJConfig, GPTJForCausalLM, GPTBigCodeConfig, GPTBigCodeForCausalLM, Starcoder2Config,
-    Starcoder2ForCausalLM, MiMoV2FlashConfig, MiMoV2FlashForCausalLM,
-    Qwen3Config, Qwen3ForCausalLM, MistralConfig, MistralForCausalLM, PreTrainedModel,
-    MixtralConfig, MixtralForCausalLM, Qwen2Config, Qwen2ForCausalLM,
-    Qwen3MoeConfig, Qwen3MoeForCausalLM, Olmo3Config, Olmo3ForCausalLM,
-    SiglipVisionConfig, SiglipVisionModel,
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    BloomConfig,
+    BloomForCausalLM,
+    DeepseekV3Config,
+    DeepseekV3ForCausalLM,
+    FalconConfig,
+    FalconForCausalLM,
+    Gemma2Config,
+    Gemma2ForCausalLM,
+    Gemma3Config,
+    Gemma3ForCausalLM,
+    Gemma3TextConfig,
+    GemmaConfig,
+    GemmaForCausalLM,
+    GPTBigCodeConfig,
+    GPTBigCodeForCausalLM,
+    GPTJConfig,
+    GPTJForCausalLM,
+    GPTNeoConfig,
+    GPTNeoForCausalLM,
+    LlamaConfig,
+    LlamaForCausalLM,
+    MiMoV2FlashConfig,
+    MiMoV2FlashForCausalLM,
+    MistralConfig,
+    MistralForCausalLM,
+    MixtralConfig,
+    MixtralForCausalLM,
+    Olmo3Config,
+    Olmo3ForCausalLM,
+    Phi3Config,
+    Phi3ForCausalLM,
+    PhiConfig,
+    PhiForCausalLM,
+    PreTrainedModel,
+    Qwen2Config,
+    Qwen2ForCausalLM,
+    Qwen3Config,
+    Qwen3ForCausalLM,
+    Qwen3MoeConfig,
+    Qwen3MoeForCausalLM,
+    SiglipVisionConfig,
+    SiglipVisionModel,
+    Starcoder2Config,
+    Starcoder2ForCausalLM,
 )
-from transformers.models.deepseek_v32.configuration_deepseek_v32 import (
-    DeepseekV32Config,
-)
-from transformers.models.deepseek_v32.modeling_deepseek_v32 import (
-    DeepseekV32ForCausalLM,
-)
+from transformers.models.deepseek_v32.configuration_deepseek_v32 import DeepseekV32Config
+from transformers.models.deepseek_v32.modeling_deepseek_v32 import DeepseekV32ForCausalLM
 from transformers.models.gemma3.modeling_gemma3 import Gemma3MultiModalProjector
-from transformers.models.gemma4.configuration_gemma4 import (
-    Gemma4Config, Gemma4TextConfig, Gemma4VisionConfig,
-)
+from transformers.models.gemma4.configuration_gemma4 import Gemma4Config, Gemma4TextConfig, Gemma4VisionConfig
 from transformers.models.gemma4.modeling_gemma4 import (
-    Gemma4ForConditionalGeneration, Gemma4MultimodalEmbedder, Gemma4VisionModel,
+    Gemma4ForConditionalGeneration,
+    Gemma4MultimodalEmbedder,
+    Gemma4VisionModel,
 )
 from transformers.models.llama4.configuration_llama4 import Llama4VisionConfig
-from transformers.models.llama4.modeling_llama4 import (
-    Llama4MultiModalProjector, Llama4VisionModel,
-)
+from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector, Llama4VisionModel
 from transformers.models.nemotron_h.configuration_nemotron_h import NemotronHConfig
 from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHForCausalLM
 from transformers.models.qwen3_5.configuration_qwen3_5 import (
-    Qwen3_5Config, Qwen3_5TextConfig, Qwen3_5VisionConfig,
+    Qwen3_5Config,
+    Qwen3_5TextConfig,
+    Qwen3_5VisionConfig,
 )
 from transformers.models.qwen3_5.modeling_qwen3_5 import (
-    Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration, Qwen3_5VisionModel,
+    Qwen3_5ForCausalLM,
+    Qwen3_5ForConditionalGeneration,
+    Qwen3_5VisionModel,
 )
 
 from dew.interop.verify import BATCH, probe_ids, reference_logits, scatter_weights
@@ -371,11 +404,9 @@ MINIMAX_M2_CONFIGS = (
 
 def write_minimax_m2() -> None:
     """The fixed MiniMax rotary port, saved under the released per-expert names."""
-    from safetensors.torch import save_file
-    import transformers
-    from transformers import MiniMaxM2Config, MiniMaxM2ForCausalLM
-
     from reference_releases import require
+    from safetensors.torch import save_file
+    from transformers import MiniMaxM2Config, MiniMaxM2ForCausalLM
 
     require("minimax-m2")
     torch.manual_seed(0)
@@ -409,9 +440,9 @@ def write_minimax_m2() -> None:
 
 def write_minimax_m2_fp8(config: dict, weights: dict, ids: torch.Tensor) -> None:
     """Run Transformers' CPU dequantization on the released FP8 storage layout."""
-    from torch_precision import float64, float64_twin
     from safetensors.torch import save_file
-    from transformers import MiniMaxM2ForCausalLM, FineGrainedFP8Config
+    from torch_precision import float64, float64_twin
+    from transformers import FineGrainedFP8Config, MiniMaxM2ForCausalLM
 
     directory = FIXTURES / 'minimax-m2-fp8-tiny'
     directory.mkdir(parents=True, exist_ok=True)
@@ -955,9 +986,7 @@ def write_gemma3_mm_tiny() -> None:
     np.save(directory / "projector_ref.npy", system["soft"])
     ids = np.array([[2, 5, 202, 7, 9], [202, 3, 4, 5, 6]], np.int32)
     with torch.no_grad():
-        from transformers.models.gemma3.modeling_gemma3 import (
-            Gemma3ForConditionalGeneration,
-        )
+        from transformers.models.gemma3.modeling_gemma3 import Gemma3ForConditionalGeneration
         wrapper = Gemma3ForConditionalGeneration(Gemma3Config(
             text_config={k: v for k, v in text_config.items()
                          if k not in ("architectures", "model_type")},
@@ -1006,9 +1035,7 @@ def write_llama4_mm_tiny() -> None:
     ids = np.array([[2, 5, 92, 7, 9], [92, 3, 4, 5, 6]], np.int32)
     with torch.no_grad():
         from transformers.models.llama4.configuration_llama4 import Llama4Config
-        from transformers.models.llama4.modeling_llama4 import (
-            Llama4ForConditionalGeneration,
-        )
+        from transformers.models.llama4.modeling_llama4 import Llama4ForConditionalGeneration
         wrapper = Llama4ForConditionalGeneration(Llama4Config(
             text_config={k: v for k, v in text_config.items()
                          if k not in ("architectures", "model_type")},
@@ -1336,12 +1363,8 @@ def write_diffusion_sc_tiny() -> None:
     """The self-conditioning MLP alone: its weights, narrow config, fixed
     inputs and the fp32 reference output."""
     from safetensors.torch import save_file
-    from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
-        DiffusionGemmaTextConfig,
-    )
-    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
-        DiffusionGemmaSelfConditioning,
-    )
+    from transformers.models.diffusion_gemma.configuration_diffusion_gemma import DiffusionGemmaTextConfig
+    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaSelfConditioning
 
     config = DiffusionGemmaTextConfig(
         hidden_size=32, intermediate_size=64, hidden_activation="gelu_pytorch_tanh",
@@ -1394,11 +1417,10 @@ def diffusion_gemma_tiny(fields: dict, canvas_length: int):
     dew tree holds them once, and the loader's tied check refuses a
     checkpoint that disagrees there."""
     from transformers.models.diffusion_gemma.configuration_diffusion_gemma import (
-        DiffusionGemmaConfig, DiffusionGemmaTextConfig,
+        DiffusionGemmaConfig,
+        DiffusionGemmaTextConfig,
     )
-    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import (
-        DiffusionGemmaForBlockDiffusion,
-    )
+    from transformers.models.diffusion_gemma.modeling_diffusion_gemma import DiffusionGemmaForBlockDiffusion
     from transformers.models.gemma4.configuration_gemma4 import Gemma4VisionConfig
 
     text = DiffusionGemmaTextConfig(**{key: value for key, value in fields.items() if key != "model_type"})
@@ -1550,9 +1572,9 @@ def write_logits_recording(name: str, model: PreTrainedModel, command: str) -> N
     import sys
 
     import jax
-    from torch_precision import float64, float64_twin
     from fetched_fixtures import save
     from recorded_references import provenance, record_case
+    from torch_precision import float64, float64_twin
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
     from interop_support import drawn_ids, float64_logits

@@ -53,11 +53,30 @@ def variant(request, source):
     return directory, load_rae(directory), fixture_arrays(directory / "reference.npz")
 
 
-def test_every_computed_tensor_is_mapped_and_exports_bit_identical(variant):
-    directory, (_, params, layouts, _), _ = variant
+def test_every_computed_tensor_exports_and_reloads_after_an_encoder_update(variant, tmp_path):
+    import shutil
+
+    from dew.interop.decoder_parts import layout_tensors
+    from dew.interop.safetensors_io import save_sharded
+
+    directory, (autoencoder, params, layouts, _), reference = variant
     tensors = component_tensors(directory, "")
     read = {name: tensor for name, tensor in tensors.items() if not name.startswith(UNREAD)}
     assert_layout_tensors(layouts, {"autoencoder": params}, read, "vae/")
+    image = 2 * channels_last(reference["image"]) - 1
+    probe = channels_last(reference["probe_latent"])
+    gradient = jax.grad(lambda values: jnp.sum(autoencoder.encode(values, image) * probe))(params)
+    trained = jax.tree.map(lambda value, grad: value - 0.01 * grad, params, gradient)
+    expected = autoencoder.encode(trained, image)
+    assert not np.array_equal(expected, autoencoder.encode(params, image))
+    exported = layout_tensors({layout.name.removeprefix("vae/"): layout for layout in layouts},
+                              {"autoencoder": trained},
+                              retained={name: tensor for name, tensor in tensors.items()
+                                        if name.startswith(UNREAD)})
+    shutil.copyfile(directory / "config.json", tmp_path / "config.json")
+    save_sharded(exported, tmp_path, max_shard_size=20_000, stem="diffusion_pytorch_model")
+    restored, variables, _, _ = load_rae(tmp_path)
+    np.testing.assert_array_equal(restored.encode(variables, image), expected)
 
 
 def test_the_latent_matches_the_source(variant):
@@ -74,6 +93,8 @@ def test_the_latent_matches_the_source(variant):
     gap = scaled_gap(latent, expected)
     print(f"{config['encoder_type']} latent gap {gap:.3g}")
     assert gap < FORWARD
+    empty = autoencoder.encode(params, 2 * image[:0] - 1)
+    assert empty.shape == expected[:0].shape
 
 
 def test_the_decode_matches_the_source(variant):

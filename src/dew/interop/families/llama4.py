@@ -11,7 +11,7 @@ import dataclasses
 from collections.abc import Mapping
 from functools import partial
 
-from dew import records
+from dew import _records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
     MOE_SHARED,
@@ -44,18 +44,18 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     interleaved layer is routed and carries a shared expert. The remaining
     layers take the wider dense MLP.
     """
-    layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    layers = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     no_rope = hf_config.get('no_rope_layers') or None
     if no_rope is None:
         no_rope = _default_no_rope_layers(
-            layers, records.integer(hf_config.get('no_rope_layer_interval', 4), 'no_rope_layer_interval'))
-    no_rope = records.integers(no_rope, 'no_rope_layers')
+            layers, _records.integer(hf_config.get('no_rope_layer_interval', 4), 'no_rope_layer_interval'))
+    no_rope = _records.integers(no_rope, 'no_rope_layers')
     if len(no_rope) != layers or set(no_rope) - {0, 1}:
         refuse(f"no_rope_layers {list(no_rope)!r}", f"it names a flag per layer of {layers}")
     layer_types = _rope_layer_types(no_rope)
     stated = hf_config.get('layer_types')
-    if stated is not None and records.strings(stated, 'layer_types') != layer_types:
-        refuse(f"layer_types {list(records.strings(stated, 'layer_types'))!r}",
+    if stated is not None and _records.strings(stated, 'layer_types') != layer_types:
+        refuse(f"layer_types {list(_records.strings(stated, 'layer_types'))!r}",
                 "it disagrees with no_rope_layers, which is what the reference reads")
     # The released Scout spells its llama3 ramp flat (rope_theta beside
     # rope_scaling); a config transformers wrote nests both. Either way the
@@ -77,38 +77,38 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     # Llama4TextAttention's two layers as ordinary kinds: the rotated, chunked one turns adjacent
     # pairs under a weightless L2 norm (`use_qk_norm`); the global one carries no positions and scales
     # each query by its position (`attn_temperature_tuning`).
-    tuning = ((records.number(hf_config['floor_scale'], 'floor_scale'),
-               records.number(hf_config['attn_scale'], 'attn_scale'))
+    tuning = ((_records.number(hf_config['floor_scale'], 'floor_scale'),
+               _records.number(hf_config['attn_scale'], 'attn_scale'))
               if hf_config['attn_temperature_tuning'] else None)
     chunk = hf_config.get('attention_chunk_size')
     full = native_fields(LayerKind)(qk_norm=False, mixer=None)
     full['mixer'] = {'class': 'attention', 'fields': {'nope': True, 'temperature_tuning': tuning}}
     chunked = native_fields(LayerKind)(
-        chunk=None if chunk is None else records.integer(chunk, 'attention_chunk_size'),
+        chunk=None if chunk is None else _records.integer(chunk, 'attention_chunk_size'),
         qk_norm=bool(hf_config['use_qk_norm']), mixer=None)
     chunked['mixer'] = {'class': 'attention', 'fields': {'rotary_pairs': 'adjacent', 'qk_norm_weight': False}}
     kinds: dict[str, KindFields] = {'full_attention': full, 'chunked_attention': chunked}
     moe_layers = hf_config.get('moe_layers')
-    step = records.integer(hf_config.get('interleave_moe_layer_step', 1), 'interleave_moe_layer_step')
+    step = _records.integer(hf_config.get('interleave_moe_layer_step', 1), 'interleave_moe_layer_step')
     mixture: MixtureFields = native_fields(Mixture)(
-        experts=records.integer(hf_config['num_local_experts'], 'num_local_experts'),
-        top_k=records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok'),
+        experts=_records.integer(hf_config['num_local_experts'], 'num_local_experts'),
+        top_k=_records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok'),
         score_function='sigmoid',
         norm_topk_prob=False,
         scale_inputs=True,
-        expert_features=records.integer(hf_config['intermediate_size'], 'intermediate_size'),
-        shared_features=records.integer(hf_config['intermediate_size'], 'intermediate_size'),
+        expert_features=_records.integer(hf_config['intermediate_size'], 'intermediate_size'),
+        shared_features=_records.integer(hf_config['intermediate_size'], 'intermediate_size'),
     )
     if moe_layers is None:
         if step < 1:
             refuse(f"interleave_moe_layer_step {step}", "the routed layers are every step-th one")
         # Llama4TextConfig's default (configuration_llama4.py:186-194).
         moe_layers = list(range(step - 1, layers, step))
-    mixture['layers'] = records.integers(moe_layers, 'moe_layers')
+    mixture['layers'] = _records.integers(moe_layers, 'moe_layers')
     config.update(
         # The dense layers take intermediate_size_mlp; the experts and the
         # shared expert take intermediate_size.
-        mlp_features=records.integer(hf_config['intermediate_size_mlp'], 'intermediate_size_mlp'),
+        mlp_features=_records.integer(hf_config['intermediate_size_mlp'], 'intermediate_size_mlp'),
         qk_norm=False,
         kinds={name: kinds[name] for name in kinds if name in layer_types},
         mixture=mixture,

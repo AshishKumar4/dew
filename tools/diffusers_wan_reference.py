@@ -45,8 +45,8 @@ import numpy as np
 import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from torch_precision import default_dtype, float64, widened
 from reference_releases import RELEASES, require
+from torch_precision import default_dtype, float64, widened
 
 DIFFUSERS = RELEASES["diffusers"]["diffusers"]
 SOURCE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/wan-source"
@@ -161,7 +161,6 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
 
 
 def output_root(destination: str) -> Path:
-    import diffusers
 
     require("diffusers")
     torch.set_num_threads(2)

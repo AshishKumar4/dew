@@ -15,10 +15,12 @@ import optax
 from affine_run import Affine, dataset
 from flax import linen as nn
 
-from dew.config import ModelConfig, ObjectiveConfig, RunConfig, TrainerConfig
+from dew.batch import VALID_ROWS
+from dew.config import ObjectiveConfig, RunConfig, TrainerConfig
 from dew.inputs import Field, InputSpec
-from dew.objectives.base import VALID_ROWS, Step
+from dew.objectives.base import Step
 from dew.objectives.supervised import Accuracy, CrossEntropy, Supervised
+from dew.registry import ModelConfig
 from dew.training import Trainer
 
 INPUTS = InputSpec(Field("x", (3,)))

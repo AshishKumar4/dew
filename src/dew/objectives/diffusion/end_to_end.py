@@ -31,11 +31,12 @@ import numpy as np
 from flax import linen as nn
 from jax.typing import ArrayLike
 
+from dew.batch import Batch, Variables
 from dew.nn.autoencoders import AutoEncoder, LatentAffine
 from dew.nn.autoencoders.kl import posterior_moments
 from dew.nn.conv import Conv
 from dew.nn.precision import at_least_fp32
-from dew.objectives.base import Batch, Objective, Variables
+from dew.objectives.base import Objective
 
 AUTOENCODER = "autoencoder"
 """Where the trained autoencoder's parameters sit in `params`."""

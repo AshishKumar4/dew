@@ -24,10 +24,11 @@ from token_support import repeated_token_batch, write_token_corpus
 
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
+from dew.mesh import mesh_axes
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.blocks import Upsample
 from dew.nn.conv import Conv
-from dew.nn.sharding import declarations, declared_axes, mesh_axes
+from dew.nn.sharding import declarations, declared_axes
 from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -347,8 +348,9 @@ def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(
     one head cannot split, and its smaller projection needs 92.6 GB/s.
     A one-position context saves no work even on a CPU link.
     """
+    from dew.mesh import SEQUENCE_AXIS
     from dew.nn.attention import NormalAttention
-    from dew.nn.sharding import SEQUENCE_AXIS, Link, measured_links
+    from dew.nn.sharding import Link, measured_links
     from dew.telemetry.instrumentation import compiled_flops
 
     model = NormalAttention(64, heads=heads, dim_head=16, attention_impl="reference")
@@ -400,8 +402,8 @@ def test_a_frozen_collection_kept_whole_is_never_gathered_over_fsdp(mesh, device
     (tensor): the step gathers none of what they split, the optimizer state
     and the trained parameters lie as the split layout lays them, and one
     step trains what it trains."""
+    from dew.batch import FROZEN
     from dew.lora import LoRA
-    from dew.objectives.base import FROZEN
     from dew.training.distributed import placed_bytes
 
     model = tiny()
@@ -446,8 +448,8 @@ class Named(nn.Module):
 
     @nn.compact
     def __call__(self, x):
+        from dew.batch import FROZEN
         from dew.nn.dense import Dense
-        from dew.objectives.base import FROZEN
 
         return Dense(16, name=FROZEN)(jax.nn.relu(Dense(64, name="hidden")(x)))
 
@@ -459,8 +461,8 @@ def test_a_module_or_optimizer_group_named_frozen_keeps_its_split_under_frozen_w
     module or an optimizer group that is only named `frozen` keeps its fsdp split, in its
     parameters and its Adam moments: with no frozen collection the layout places every train-state
     leaf and trains one step exactly as the split layout does."""
+    from dew.batch import FROZEN
     from dew.inputs import Field, InputSpec
-    from dew.objectives.base import FROZEN
     from dew.objectives.supervised import Supervised
 
     rng = np.random.default_rng(0)

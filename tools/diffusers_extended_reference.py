@@ -13,25 +13,36 @@ so the draws are the reference's own, and adds them as `{task}/{name}` to the np
 """
 import argparse
 import json
-from pathlib import Path
 import tempfile
+from pathlib import Path
 
 import jax
 import numpy as np
 import torch
+from diffusers import (
+    AutoencoderKL,
+    DDIMScheduler,
+    FlaxStableDiffusionPipeline,
+    FlaxStableDiffusionXLPipeline,
+    FlaxUNet2DConditionModel,
+    StableDiffusionPipeline,
+    StableDiffusionXLImg2ImgPipeline,
+    StableDiffusionXLInpaintPipeline,
+    UNet2DConditionModel,
+)
+from diffusers.models.modeling_pytorch_flax_utils import load_flax_checkpoint_in_pytorch_model
+from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
 from flax import serialization
 from flax.traverse_util import flatten_dict, unflatten_dict
 from PIL import Image
-from diffusers import (FlaxStableDiffusionPipeline, FlaxStableDiffusionXLPipeline,
-                       FlaxUNet2DConditionModel, UNet2DConditionModel, AutoencoderKL,
-                       DDIMScheduler, StableDiffusionXLImg2ImgPipeline, StableDiffusionXLInpaintPipeline)
-from diffusers.models.modeling_pytorch_flax_utils import load_flax_checkpoint_in_pytorch_model
-from transformers import (CLIPConfig, CLIPVisionConfig, CLIPImageProcessor,
-                          CLIPTextModel, CLIPTextModelWithProjection)
-from diffusers import StableDiffusionPipeline
-from diffusers.pipelines.stable_diffusion.safety_checker import StableDiffusionSafetyChecker
-
 from reference_releases import require
+from transformers import (
+    CLIPConfig,
+    CLIPImageProcessor,
+    CLIPTextModel,
+    CLIPTextModelWithProjection,
+    CLIPVisionConfig,
+)
 
 
 def convert(model_class, config, parameters, *, vae=False):

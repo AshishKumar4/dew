@@ -29,15 +29,15 @@ import jax
 import numpy as np
 from jax.sharding import Mesh
 
+from dew._records import JSON, json_value, record
 from dew.files import write_atomically
 from dew.nn.kernels.generation import gpu_target
 from dew.nn.sharding import trace_context
-from dew.records import JSON, json_value, record
 from dew.telemetry.instrumentation import StepFlops, step_flops
 
 if TYPE_CHECKING:
-    from dew.objectives.base import Batch
-    from dew.training.state import TrainState
+    from dew.batch import Batch
+    from dew.state import TrainState
     from dew.training.trainer import StepFn
 
 
