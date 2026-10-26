@@ -584,7 +584,14 @@ def verdict(args, pool):
     shared part does not set leaves the verdict's interval unresolved, which is Inconclusive."""
     import numpy as np
     import torch
-    from reference_error import Inconclusive, assert_as_exact, leaf_summary, recorded_pilots, seeds_for
+    from reference_error import (
+        Inconclusive,
+        as_given,
+        assert_as_exact,
+        leaf_summary,
+        recorded_pilots,
+        seeds_for,
+    )
     from reference_source import dew_revision
 
     if not pool.get("commit"):
@@ -653,7 +660,8 @@ def verdict(args, pool):
         return (np.asarray(seed, np.int64),)
 
     original.recorded = recorded.recorded = exact.recorded = True
-    native = functools.partial(log_probabilities, "native")
+    # Every phase is read from the recordings and normalized on the host, as given.
+    native = as_given(functools.partial(log_probabilities, "native"))
     count = seeds_for(recorded_pilots(original, draw, len(pool["pilot"])), draw, "released slot runtime",
                       dew_fn=native, truth_fn=exact)
     if count > pool["count"]:

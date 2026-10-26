@@ -26,7 +26,7 @@ from memory_support import (
     layer,
     written,
 )
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 
 from dew.batch import coordinates
 from dew.nn.inputs import AttentionMetadata, MixerCall
@@ -380,6 +380,7 @@ def test_a_memory_runs_its_rows_split_over_a_data_axis(name, axis):
         cotangent = np.random.default_rng([1651, seed]).standard_normal((*x.shape[:2], WIDTH))
         return x, params, cotangent.astype(np.float32), segments
 
+    @as_given
     def split(x, params, cotangent, segments):
         with jax.set_mesh(mesh):
             rows, whole = NamedSharding(mesh, PartitionSpec("data")), NamedSharding(mesh, PartitionSpec())
