@@ -226,6 +226,20 @@ def test_a_call_policy_takes_the_tasks_eos_and_pad_ids(task):
     assert named.lengths.tolist() == [4] and not named.terminated.any()
 
 
+@pytest.mark.parametrize(("stated", "cut"), [({}, 50), ({"top_k": None}, 50), ({"top_k": 0}, None),
+                                             ({"top_k": 7}, 7)], ids=["absent", "null", "zero", "seven"])
+def test_a_sampled_source_cuts_to_the_top_k_transformers_generate_samples_from(task, stated, cut):
+    """A sampled source that leaves top_k unset samples from transformers' top 50, as its `generate`
+    does; a stated 0 asks for no cut, and any other count is its cut."""
+    from pathlib import Path
+
+    from dew.interop.pretrained import PretrainedDecoder
+
+    source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {},
+                               generation_config={"do_sample": True, **stated})
+    assert source.text_generation().sampling.top_k == cut
+
+
 @pytest.mark.parametrize("changed", [{"temperature": True}, {"top_p": np.True_}, {"top_k": True},
                                      {"repetition_penalty": "1.1"}, {"eos_token_ids": True}])
 def test_a_policy_refuses_as_it_is_built_a_flag_or_a_non_number_where_a_setting_goes(changed):
