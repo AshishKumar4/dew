@@ -1487,6 +1487,37 @@ def image_flow():
     assert_computed_as_on_the_host(run, "an int8 image task's latents")
 
 
+def test_an_objective_encodes_through_an_int8_text_tower_as_the_host_does():
+    """A program an objective compiles (`Objective.program`) compiles for every tower it runs
+    (`Objective.towers`), so a prompt encoded there by an int8 CLIP tower, the denoiser beside it in float,
+    is as exact as the host's encoding. With Triton's GEMMs open to XLA (`with_triton_gemms`)."""
+    with_triton_gemms(int8_tower_flow)
+
+
+def int8_tower_flow():
+    from dew.diffusion import presets
+    from dew.inputs import Condition, Field, InputSpec
+    from dew.inputs.encoders import CLIPText
+    from dew.nn.backbones.dit import SimpleDiT
+    from dew.objectives.diffusion import DiffusionObjective
+
+    encoder = CLIPText.from_pretrained(str(Path(__file__).parent / "fixtures" / "clip" / "tiny"))
+    tower = Quantization(dtype="int8").apply(encoder.transformer)
+    tokens = encoder.tokenize(["a red bird", "a blue fish"])
+    held = jax.device_get(encoder.params)
+
+    def run(dtype):
+        encoding = dataclasses.replace(encoder, transformer=tower.clone(dtype=dtype))
+        objective = DiffusionObjective(
+            SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2, mlp_ratio=1, dtype=dtype),
+            presets.Flow(), InputSpec(Field("image", (8, 8, 3)), {"textcontext": Condition(encoding)}),
+            guidance=None, steps=2)
+        encode = objective.program("prompt encoding", objective.encode)
+        return encode({"textcontext": placed(held, dtype)}, {"textcontext": tokens})["textcontext"].hidden
+
+    assert_computed_as_on_the_host(run, "an int8 text tower's encoding")
+
+
 def test_an_int8_guide_walks_as_the_host_does():
     """A float image task autoguided by its own denoiser quantized to int8 (`Autoguidance`) walks a
     prompt's latents as the same task does on the host: the walk compiles for the guide it runs as
