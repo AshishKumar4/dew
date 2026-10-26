@@ -141,6 +141,8 @@ environment, so one scope at a time sets and restores them."""
 REGISTERS = re.compile(r"Used (\d+) registers")
 SPILLS = re.compile(r"(\d+) bytes spill stores, (\d+) bytes spill loads")
 SMEM = re.compile(r"smem_scratch_bytes=(\d+)")
+KERNEL_COUNTER = re.compile(r"_\d+$")
+"""The counter Mosaic GPU appends to a kernel's name in its reports' file names."""
 TMEM_USED = re.compile(r"tmem_scratch_cols=(\d+), tmem_collective_scratch_cols=(\d+)")
 
 
@@ -165,15 +167,21 @@ def mosaic_kernels(directory: str) -> list[dict]:
     """Each Mosaic GPU kernel's report in `directory`: its shared bytes and tensor memory columns (Mosaic's
     resource estimate), its registers a thread and its spilled bytes (ptxas's), or `unread`, what a
     report lacks: either report without the other, or a field neither states, is no evidence the kernel
-    is within its resources."""
+    is within its resources. A case's reports are paired by the kernel's name less the counter Mosaic
+    appends (`KERNEL_COUNTER`), which JAX 0.12 numbers apart for the two reports; a case names each kernel
+    once."""
     kernels = []
     reports = Path(directory)
-    names = {path.name.removesuffix(".resources.txt") for path in reports.glob("*.resources.txt")}
-    names |= {path.name.removesuffix(".ptxas") for path in reports.glob("*.ptxas")}
-    for name in sorted(names):
-        resources, ptxas = reports / f"{name}.resources.txt", reports / f"{name}.ptxas"
-        text = resources.read_text() if resources.exists() else ""
-        log = ptxas.read_text() if ptxas.exists() else ""
+    named: dict[str, dict[str, Path]] = {}
+    for kind, suffix in (("resources", ".resources.txt"), ("ptxas", ".ptxas")):
+        for path in reports.glob(f"*{suffix}"):
+            found = named.setdefault(KERNEL_COUNTER.sub("", path.name.removesuffix(suffix)), {})
+            # Paired by name: a case that compiles a name twice would pair the wrong reports.
+            assert kind not in found, f"a case compiled {path.name} and {found[kind].name}: name them apart"
+            found[kind] = path
+    for name, found in sorted(named.items()):
+        text = found["resources"].read_text() if "resources" in found else ""
+        log = found["ptxas"].read_text() if "ptxas" in found else ""
         shared, tmem = SMEM.search(text), TMEM_USED.search(text)
         registers, spills = REGISTERS.findall(log), SPILLS.findall(log)
         unread = [field for field, found in (("shared bytes", shared), ("tensor memory columns", tmem),

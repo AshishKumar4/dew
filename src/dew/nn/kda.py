@@ -184,7 +184,8 @@ class KimiDeltaAttention(nn.Module):
             # route is asked again of them.
             return chunk_gated_delta_rule(query, key, value, g, beta, held, self.chunk_size,
                                           ported=ported and on_the_port(query, key, value),
-                                          starts=starts, max_segments=tokens.max_segments)
+                                          starts=starts, max_segments=tokens.max_segments,
+                                          floor=self.lower_bound)
 
         # The decode state is GatedDeltaNet's pair, here in fp32; the
         # allocation-only call returns before any state is written. The conv

@@ -25,7 +25,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from dew.nn.precision import L2NORM_EPS, compensated_add, float32_einsum, l2norm
+from dew.nn.precision import L2NORM_EPS, at_least_fp32, compensated_add, float32_einsum, l2norm
 
 from . import chunked_launch, norm_swiglu, short_conv, tuning
 from .generation import triton_runs
@@ -72,8 +72,10 @@ class Hooks:
     `rated`: the write gate times the head's `rate` (Mamba's discretization, `A dt` with `dt` the
     write gate), a value kind defined on a contraction, `rate <= 0` and the write gate `>= 0`, which
     its callers hold and a port may take as given (mamba_ssm's kernels clamp each decay to at most
-    one); a skip `D v`, and the epilogue. The chunked op (`recurrence_chunk.chunk`) takes the same
-    form."""
+    one); a skip `D v`, and the epilogue; and `floor`, the least log decay a token a layer declares
+    (Kimi delta attention's `lower_bound`, -5), which a decay a key dimension's factored chunk form reads
+    as its range's bound (`recurrence_algebra.factored_range`). The chunked op (`recurrence_chunk.chunk`)
+    takes the same form."""
     conv: Conv | None = None
     l2norm: bool = False
     scale: float | None = None
@@ -84,6 +86,7 @@ class Hooks:
     rated: bool = False
     skip: bool = False
     output: OutputNorm | None = None
+    floor: float | None = None
 
     @property
     def gated_write(self) -> bool:
@@ -327,7 +330,7 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
     given = read(hooks, operands)
     state = given['state']
     operand = given['token' if hooks.conv is not None else 'value'].dtype
-    work = jnp.promote_types(jnp.promote_types(operand, state.dtype), jnp.float32)
+    work = at_least_fp32(jnp.promote_types(operand, state.dtype))
     key_width = state.shape[2]
     query, key, value, history = _prologue(hooks, given, work)
     decay, write = _gates(hooks, given, work, key_width)
@@ -629,7 +632,7 @@ def _one_tap(hooks: Hooks, conv: Conv, operands: Step, given: dict, dtype):
     token = given['token']
     rows, (value_heads, key_width, value_width) = token.shape[0], given['state'].shape[1:]
     key_heads = _pieces(hooks, value_heads, key_width, value_width, token.shape[-1])
-    work = jnp.promote_types(token.dtype, jnp.float32)
+    work = at_least_fp32(token.dtype)
     pre = token.astype(work) * given['taps'][:, 0].astype(work)
     convolved = pre if conv.activation is None else pre * jax.nn.sigmoid(pre)
     query, key, value = jnp.split(convolved, [key_heads * key_width, 2 * key_heads * key_width], axis=-1)
