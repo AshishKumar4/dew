@@ -295,12 +295,12 @@ class _Decoder(nn.Module):
         return _causal(self, 3, 3, 3, "conv_out", x)
 
 
-def _posterior(model: nn.Module, params, video, key=None, noise=None):
+def _posterior(model: WanVAE, params, video, key=None, noise=None):
     """A video's posterior draw: the whole video's moments, its chunks assembled, and its noise whole."""
     return posterior_latent(chunked_moments(model, {"params": params}, video), key, noise)
 
 
-def _chunk_decoded(model: nn.Module, params, latents):
+def _chunk_decoded(model: WanVAE, params, latents):
     """A video's latents decoded chunk by chunk (`chunked_decode`)."""
     return chunked_decode(model, {"params": params}, latents)
 
