@@ -46,7 +46,6 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     _trained_forward,
 )
 from dew.nn.kernels.templates.attention_mosaic_program import (
-    DROPPING,
     BackwardTiles,
     Tiles,
     _block,
@@ -227,10 +226,13 @@ class MosaicForward(_Mainloop[Tiles]):
     output_dtypes: tuple[str, ...] = ()
     output_width: int = TRACED_TILE
 
-    def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial, *,
-             residuals: bool, interpret: bool, config: Tiles, return_residuals: bool = False):
+    def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, initial,
+             drop=None, *, residuals: bool, interpret: bool, config: Tiles, return_residuals: bool = False):
         hooks = Hooks(self.score_mod, tuple(map(Param, score_params, self.score_kinds)), initial,
-                      self.output_mod, tuple(map(Param, output_params, self.output_kinds)))
+                      self.output_mod, tuple(map(Param, output_params, self.output_kinds)), drop)
+        if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False,
+                             family=bundle_of(config, query.dtype)):
+            raise NotImplementedError(reason)
         run = _trained_forward if residuals else _plain_forward
         return run(query, key, value, self.spans(start, end, query_ids, key_ids), hooks, scale=self.scale,
                    natural=self.natural, tiles=config, interpret=interpret), None
@@ -274,7 +276,8 @@ class MosaicForward(_Mainloop[Tiles]):
         query, value = ba.arguments["query"], ba.arguments["value"]
         hooks = Hooks(self.score_mod, tuple(map(Param, ba.arguments["score_params"], self.score_kinds)),
                       ba.arguments["initial"], self.output_mod,
-                      tuple(map(Param, ba.arguments["output_params"], self.output_kinds)))
+                      tuple(map(Param, ba.arguments["output_params"], self.output_kinds)),
+                      ba.arguments["drop"])
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=False, family=family)
 
 
@@ -346,11 +349,9 @@ def forward_takes(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
 
 def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None, *,
                   scale: float | None, natural: bool) -> tuple[MosaicForward, tuple]:
-    """`forward`'s op and its arguments; a dropping call refused before one is built, as its op carries no
-    draw (`refused`)."""
+    """`forward`'s op and its arguments, a dropping call's draw among them, which its legality rule refuses
+    (`refused`)."""
     hooks = Hooks() if hooks is None else hooks
-    if hooks.drop is not None:
-        raise NotImplementedError(DROPPING)
     op = MosaicForward(score_mod=hooks.score_mod, output_mod=hooks.output_mod,
                        score_kinds=tuple(param.kind for param in hooks.score_params),
                        output_kinds=tuple(param.kind for param in hooks.output_params),
@@ -360,7 +361,7 @@ def _forward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Key
                        scale=query.shape[3] ** -0.5 if scale is None else scale, natural=natural)
     return op, (query, key, value, spans.start, spans.end, spans.query_ids, spans.key_ids,
                 tuple(param.value for param in hooks.score_params),
-                tuple(param.value for param in hooks.output_params), hooks.initial)
+                tuple(param.value for param in hooks.output_params), hooks.initial, hooks.drop)
 
 
 def _backward_registers(family: mosaic.Family, config: BackwardTiles, width: int, value_width: int, dtype, *,
@@ -399,10 +400,10 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     rounded: bool = True
 
     def _fwd(self, query, key, value, dout, start, end, query_ids, key_ids, score_params, initial, residuals,
-             *, interpret: bool, config: BackwardTiles, return_residuals: bool = False):
+             drop=None, *, interpret: bool, config: BackwardTiles, return_residuals: bool = False):
         family = bundle_of(config, query.dtype)
         spans = self.spans(start, end, query_ids, key_ids)
-        hooks = Hooks(self.score_mod, tuple(map(Param, score_params, self.score_kinds)), initial)
+        hooks = Hooks(self.score_mod, tuple(map(Param, score_params, self.score_kinds)), initial, drop=drop)
         if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=True,
                              family=family):
             raise NotImplementedError(reason)
@@ -469,7 +470,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
     def refusal(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> str | None:
         query, value = ba.arguments["query"], ba.arguments["value"]
         hooks = Hooks(self.score_mod, tuple(map(Param, ba.arguments["score_params"], self.score_kinds)),
-                      ba.arguments["initial"])
+                      ba.arguments["initial"], drop=ba.arguments["drop"])
         return refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=True, family=family)
 
 
@@ -513,10 +514,8 @@ def backward_takes(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
 def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
                    dout: jax.Array, residuals: tuple, *, scale: float | None, natural: bool,
                    accurate: bool, rounded: bool = True) -> tuple[MosaicBackward, tuple]:
-    """`backward`'s op and its arguments; a dropping call refused before one is built (`_forward_call`)."""
+    """`backward`'s op and its arguments, a dropping call's draw among them (`_forward_call`)."""
     hooks = Hooks() if hooks is None else hooks
-    if hooks.drop is not None:
-        raise NotImplementedError(DROPPING)
     op = MosaicBackward(score_mod=hooks.score_mod,
                         score_kinds=tuple(param.kind for param in hooks.score_params),
                         score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),
@@ -524,4 +523,4 @@ def _backward_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
                         scale=query.shape[3] ** -0.5 if scale is None else scale, natural=natural,
                         accurate=accurate, rounded=rounded)
     return op, (query, key, value, dout, spans.start, spans.end, spans.query_ids, spans.key_ids,
-                tuple(param.value for param in hooks.score_params), hooks.initial, residuals)
+                tuple(param.value for param in hooks.score_params), hooks.initial, residuals, hooks.drop)

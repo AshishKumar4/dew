@@ -61,8 +61,6 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     if hooks.output_mod is not None:
         raise ValueError("the attention route takes score hooks and the initial state; its backward takes "
                          "the output before an output hook, so the caller applies `output_mod` to the result")
-    if hooks.drop is not None and not drops():
-        raise NotImplementedError(DROPS_NOT)
     form = generation.measured_kernel('attention_form', 'fast')
     if form not in FORMS:
         raise ValueError(f"attention_form {form!r}: the template's forms are {', '.join(FORMS)}")
@@ -96,15 +94,18 @@ def _on_gpu() -> bool:
     return generation.gpu_placed() and generation.bf16_dot_runs()
 
 
-DROPS_NOT = ("the template's GPU mainloops take no probability dropout yet: the Triton mainloop is frozen, "
-             "and Mosaic's takes the weights hook next (ledger row 1521)")
-"""Why the route refuses a dropping call on a GPU (`drops`)."""
+DROPS_NOT = ("the template's GPU mainloops draw no probability dropout yet (the Triton mainloop is frozen, "
+             "and Mosaic's takes the weights hook next, ledger row 1521): a dropping call there runs the "
+             "plain-JAX mainloop, so the selector leaves it to the reference path")
+"""Why 'auto' leaves a dropping call on a GPU to the reference path (`drops`)."""
 
 
 def drops() -> bool:
-    """Whether the route's mainloops here take probability dropout: the plain-JAX mainloop's, where it runs
-    every call (off a GPU, or on one before sm80, where the GPU mainloops do not run, `_on_gpu`). On an sm80
-    or later GPU the route's mainloops are Triton's and Mosaic's, which take none yet (`DROPS_NOT`)."""
+    """Whether the route's own mainloop here draws probability dropout: the plain-JAX mainloop's, where it
+    runs every call (off a GPU, or on one before sm80, where the GPU mainloops do not run, `_on_gpu`). On an
+    sm80 or later GPU the route's mainloops are Triton's and Mosaic's, whose legality rules refuse a dropping
+    call (`attention_triton.refused`, `attention_mosaic.refused`), so it runs the plain-JAX one there
+    (`DROPS_NOT`)."""
     return not _on_gpu()
 
 

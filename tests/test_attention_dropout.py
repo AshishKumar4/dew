@@ -473,10 +473,11 @@ def test_a_dropping_call_under_x64_on_fp32_inputs_keeps_fp32_gradients():
 
 @pytest.mark.gpu(reason="the route's GPU mainloops refuse dropout where calls run on an sm80 GPU or later")
 def test_a_dropping_call_on_a_gpu_takes_the_template_only_where_its_mainloop_draws():
-    """On a GPU the route's mainloops of sm80 and later, Triton's and Mosaic's, take no dropout yet, and
+    """On a GPU the route's mainloops of sm80 and later, Triton's and Mosaic's, draw no dropout yet, and
     before sm80 the plain-JAX mainloop runs every call and draws it (`attention_route.drops`). The selector
-    refuses the template for a dropping call, naming row 1521, and a direct route call refuses rather than
-    drop nothing, exactly where the route's mainloops take none; elsewhere the route drops."""
+    refuses the template for a dropping call, naming row 1521, exactly where the GPU mainloops draw none; a
+    direct route call drops either way, there on the plain-JAX mainloop, which their legality rules leave it
+    (`attention_mosaic.refused`, `attention_triton.refused`)."""
     from dew.nn.attention_kernels import ATTENTION, kernel_refusals
     from dew.nn.kernels.templates import attention_route
 
@@ -488,11 +489,10 @@ def test_a_dropping_call_on_a_gpu_takes_the_template_only_where_its_mainloop_dra
     assert refused == (not drops)
     call = functools.partial(attention_route.attend, query, key, value, template.spans(8, 8, ROWS),
                              template.Hooks(drop=dropout_of(seed_words(0), ROWS, HEADS)))
-    if drops:
+    with generation.routes() as found:
         assert bool(jnp.all(jnp.isfinite(call())))
-    else:
-        with pytest.raises(NotImplementedError):
-            call()
+    mainloops = [route.kernel for route in found if route.choice == "attention_mainloop"]
+    assert mainloops and set(mainloops) == {"portable"}
 
 
 def test_the_gpu_mainloops_refuse_a_dropping_call_at_every_entry():
