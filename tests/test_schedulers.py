@@ -17,7 +17,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
+from reference_error import as_given, assert_as_exact, declared_seeds, indexed_recording, recording
 from scipy import stats
 
 import dew.diffusion.schedules as schedulers
@@ -115,7 +115,7 @@ def test_forward_diffusion_invertible(cls, make, steps, family, sample_shape):
     def written(x0, noise, alpha, sigma):
         return (alpha * x0 + sigma * noise - noise * sigma) / alpha
 
-    assert_as_exact(jax.jit(round_trip), written, draw, "invertible", seeds=SEEDS['invertible'],
+    assert_as_exact(jax.jit(round_trip), as_given(written), draw, "invertible", seeds=SEEDS['invertible'],
                     truth_fn=lambda x0, noise, alpha, sigma: x0)
 
 
@@ -173,6 +173,7 @@ def test_sqrt_schedule_is_diffusion_lms_table(steps):
         # Step k's time (k + 1) / T, rounded once to the arms' float32.
         return ((step + 1) / steps).astype(np.float32)
 
+    @as_given
     def theirs(step):
         def alpha_bar(t):
             return 1 - np.sqrt(t + 0.0001)
@@ -220,6 +221,7 @@ def assert_weights_are_the_authors(name, mean, options, table, process_of):
         recording(RECORDED), label, seeds, inputs_of=partial(table_inputs, table),
         truth_fn=jax.jit(partial(closed_form, name, mean, options, dtype=jnp.float64)))
 
+    @as_given
     def weighted(index, inputs):
         process = process_of(np.asarray(inputs["betas"]))
         return {"weight": process.weight(jnp.arange(process.schedule.T))}
@@ -306,6 +308,7 @@ def test_min_snr_weights_the_same_clean_image_prediction_the_same_whatever_the_p
         weight = process.weight(t)
         return {"weight": weight, "loss": weight * error}
 
+    @as_given
     def clean(t, x_0, epsilon, raw):
         sigma = karras_sigma(t)[:, None, None, None]
         x_t = x_0 + sigma * epsilon
@@ -352,6 +355,7 @@ def test_min_snr_weights_a_flow_velocity_as_the_clean_image_it_reads_out():
             losses[type(transform).__name__] = weight * jnp.mean(jnp.square(read - target), axis=(1, 2, 3))
         return losses
 
+    @as_given
     def clean(t, x_0, epsilon, velocity, estimate):
         path = t[:, None, None, None]
         weight = np.minimum(((1 - t) / t) ** 2, 5.0)
@@ -410,12 +414,14 @@ def test_edm_preset_samples_on_the_karras_grid():
     def karras(t):
         return (40 ** 0.2 + (1 - t) * (0.01 ** 0.2 - 40 ** 0.2)) ** 5
 
-    assert_as_exact(process.sampler_schedule.sigmas, karras, times, "karras grid", seeds=SEEDS['karras grid'])
+    assert_as_exact(process.sampler_schedule.sigmas, as_given(karras), times, "karras grid",
+                    seeds=SEEDS['karras grid'])
 
     def weighted(t):
         return {"weight": process.weight(t),
                 "scale": process.prediction.get_input_scale(process.schedule.rates(t))}
 
+    @as_given
     def edm(t):
         sigma = np.exp(t * 1.2 + -1.2)
         return {"weight": 1 / 0.7**2 + 1 / sigma**2, "scale": 1 / np.sqrt(0.7**2 + sigma**2)}
@@ -431,7 +437,7 @@ def test_edm_preset_samples_on_the_karras_grid():
     def sigmas(seed):
         return (np.exp(drawn(seed, 6).uniform(np.log(0.01), np.log(40.0), ROWS)).astype(np.float32),)
 
-    assert_as_exact(process.schedule.t_of_sigma, lambda sigma: (np.log(sigma) + 1.2) / 1.2, sigmas,
+    assert_as_exact(process.schedule.t_of_sigma, as_given(lambda sigma: (np.log(sigma) + 1.2) / 1.2), sigmas,
                     "edm time", seeds=SEEDS['edm time'])
 
 
@@ -482,7 +488,8 @@ def test_presets_rebuild_from_their_fields(rng):
         sigma = 3 * t / (1 + 2 * t)
         return {"alpha": 1 - sigma, "sigma": sigma}
 
-    assert_as_exact(lambda t: dict(zip(("alpha", "sigma"), process.schedule.rates(t), strict=True)), shifted,
+    assert_as_exact(lambda t: dict(zip(("alpha", "sigma"), process.schedule.rates(t), strict=True)),
+                    as_given(shifted),
                     lambda seed: (drawn(seed, 7).uniform(0, 1, ROWS).astype(np.float32),), "flow rates",
                     seeds=SEEDS['flow rates'])
     draws = process.schedule.sample_t(rng, 1 << 18)
@@ -524,6 +531,7 @@ def test_the_edm_schedules_time_of_a_sigma_is_on_par_with_its_correctly_rounded_
     def draw(seed):
         return (np.exp(np.random.default_rng(seed).normal(-1.2, 1.2, 4096)).astype(np.float32),)
 
+    @as_given
     def reference(sigma):
         centred = np.log(sigma.astype(np.float64)).astype(sigma.dtype) - sigma.dtype.type(-1.2)
         return centred / sigma.dtype.type(1.2)

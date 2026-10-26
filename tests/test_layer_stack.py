@@ -19,7 +19,7 @@ import numpy as np
 import pytest
 import selection_margins
 from model_support import largest_difference
-from reference_error import FEWEST_SEEDS, GateFailure, assert_as_exact, widened, without_ynn
+from reference_error import FEWEST_SEEDS, GateFailure, as_given, assert_as_exact, widened, without_ynn
 from sharded import assert_sharded
 from token_support import token_rows
 
@@ -270,7 +270,8 @@ class ScanCase:
                 return jax.device_get(self.runs["truth"](*widened((ids, cotangent))))
 
         def arm(name):
-            return lambda ids, cotangent: jax.device_get(self.runs[name](ids, cotangent))
+            # Each arm runs its program, compiled as two Dew arms are (`measured`), and fetches its outputs.
+            return as_given(lambda ids, cotangent: jax.device_get(self.runs[name](ids, cotangent)))
         return arm("scanned"), arm("plain"), truth
 
 
@@ -484,6 +485,7 @@ def layer_states_on(spec, model, variables, microbatches=None):
     placed = jax.device_put(variables, Layout(min_shard=TINY_SHARD).shardings(mesh, variables))
     compiled = without_ynn(lambda tree, rows: layer_states(model, tree, rows))
 
+    @as_given
     def states(ids):
         rows = shard_batch(mesh, {"ids": ids})["ids"]
         with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
@@ -672,8 +674,9 @@ def fetched_layer_states():
               if name.startswith("layers_")}
     on_host = {**variables, "params": {**variables["params"], **layers}}
     compiled = without_ynn(lambda tree, ids: layer_states(model, tree, ids))
-    return (lambda ids: compiled(on_host, ids)), (lambda ids: compiled(variables, ids)), float64_layer_states(
-        model, variables)
+    # Each arm runs the compiled program on its own weights, the host-resident ones kept in host memory.
+    return (as_given(lambda ids: compiled(on_host, ids)), as_given(lambda ids: compiled(variables, ids)),
+            float64_layer_states(model, variables))
 
 
 def test_a_host_resident_stacks_layer_states_are_a_resident_ones():

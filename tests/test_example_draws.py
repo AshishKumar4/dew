@@ -9,7 +9,7 @@ import numpy as np
 import optax
 import pytest
 import scipy.special
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 
 from dew._distributions import counter_key
 from dew.batch import EXAMPLE_ROWS
@@ -263,6 +263,7 @@ def test_a_meanflow_update_read_as_halves_is_on_par_with_its_whole_batch():
 
     first, second = summed(objective, slice(0, rows // 2)), summed(objective, slice(rows // 2, rows))
 
+    @as_given
     def halves(variables):
         return np.asarray(first(variables)) + np.asarray(second(variables))
 
@@ -280,6 +281,7 @@ def test_a_shortcut_update_read_as_halves_targets_each_example_as_its_whole_batc
     rows = HALVES_ROWS
 
     def targets(objective, *parts: slice):
+        @as_given
         def read(variables):
             recorder = Recorder()
             for part in parts:

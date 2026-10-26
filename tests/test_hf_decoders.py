@@ -113,7 +113,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import flat_tree, llada_draw, llada_fields
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, declared_seeds, recording
+from reference_error import (
+    as_given,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    declared_seeds,
+    recording,
+)
 
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.hf_decoders import translate_config, translate_weights
@@ -1230,7 +1236,8 @@ def test_llada_moe_trained_exports_reload_and_run(llada_moe_source, tmp_path, de
     actual = jax.jit(lambda tokens: reloaded.model.apply(reloaded.variables, tokens, **fields))
     expected = jax.jit(lambda tokens: model.apply(trained, tokens, **fields))
     # Saving and loading is an identity, so the reference is exact at every draw.
-    assert_as_exact(lambda seed: actual(draws[int(seed)]), lambda seed: expected(draws[int(seed)]),
+    assert_as_exact(as_given(lambda seed: actual(draws[int(seed)])),
+                    as_given(lambda seed: expected(draws[int(seed)])),
                     lambda seed: (np.asarray(seed, np.int32),), name + ' trained export', seeds=8,
                     truth_fn=lambda seed: np.asarray(expected(draws[int(seed)]), np.float64))
     prompt = ids[:1, :4]
