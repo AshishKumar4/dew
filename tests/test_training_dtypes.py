@@ -288,7 +288,7 @@ def test_scaled_native_gradients_preserve_update_and_restart(tmp_path, parameter
 @pytest.mark.parametrize("seq_aux", [False, True])
 def test_router_reductions_preserve_float64_scores(seq_aux):
     from dew.nn.moe import global_router_loss, sequence_router_losses
-    from dew.objectives.lm.objective import router_moments
+    from dew.objectives.routing import router_moments
 
     def balance_loss(scores, indices):
         if seq_aux:
@@ -399,6 +399,7 @@ def test_x64_router_bias_storage_survives_updates_and_restart(tmp_path, bias_dty
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives import Step
     from dew.objectives.lm import LMObjective
+    from dew.objectives.routing import ExpertBalance
     with jax.enable_x64():
         model = CausalTransformer(vocab_size=8, emb_features=8, num_layers=1,
                                   num_heads=2, mlp_features=16, max_seq_len=8,
@@ -406,7 +407,7 @@ def test_x64_router_bias_storage_survives_updates_and_restart(tmp_path, bias_dty
         initial = model.init(jax.random.PRNGKey(1), jnp.ones((1, 4), jnp.int32))
         initial["moe"] = jax.tree.map(lambda x: x.astype(bias_dtype), initial["moe"])
         objective = LMObjective(model, 4, variables=initial, head_chunks=1,
-                                balance_rate=.02, aux_loss_alpha=.1, seq_aux=False)
+                                balance=ExpertBalance(balance_rate=.02, aux_loss_alpha=.1, seq_aux=False))
         checkpoints = Checkpoints(str(tmp_path / "router"))
         def build():
             return Trainer(objective, optax.sgd(.01), key=jax.random.PRNGKey(2),
