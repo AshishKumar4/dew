@@ -903,13 +903,14 @@ def test_the_readers_of_one_share_train_on_the_rows_its_first_reader_sampled(tmp
 
 @pytest.mark.mesh(devices=2)
 def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
-    """A pool runs twice over one persistent compilation cache, and the second
-    run loads its step on every process: only process 0 writes entries, so each
-    process keys the step as process 0 did. JAX keys an executable by its
-    process's topology fingerprint, which on a GPU counts its NVLink links, and
-    jaxlib 0.12 starts no GPU pool whose processes' fingerprints differ
-    (openxla/xla#49677; docs/guides/multi-node.md), so a pool that starts keys
-    alike."""
+    """A pool runs twice over one persistent compilation cache: process 0 writes
+    the entries, and its second run loads its step. Another process loads it
+    where its key is process 0's. JAX keys an executable by its process's
+    topology fingerprint: on a GPU, whose pool shares one topology (jaxlib 0.12
+    starts none whose fingerprints differ, openxla/xla#49677;
+    docs/guides/multi-node.md), every process does; on the CPU, where a
+    process's topology is its own devices, the others compile the step again,
+    as upstream JAX does (Main, 2026-10-26: no fork code for the CPU alone)."""
     cache, records = tmp_path / "cache", tmp_path / "records"
     program = (
         "import json, sys\n"
@@ -940,7 +941,7 @@ def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
         "step = events[before:]\n"
         "Path(sys.argv[2], f'{jax.process_index()}.json').write_text(json.dumps(\n"
         "    [step.count('/jax/compilation_cache/compile_requests_use_cache'),\n"
-        "     step.count('/jax/compilation_cache/cache_hits')]))\n"
+        "     step.count('/jax/compilation_cache/cache_hits'), jax.default_backend()]))\n"
     )
     runs, logged = [], []
     for run in range(2):
@@ -954,7 +955,11 @@ def test_a_pools_second_run_loads_what_its_first_compiled(tmp_path):
         # it wrote or could not, which says why a second run loads nothing.
         logged += [f"run {run}: {line}" for line in (done.stdout + done.stderr).splitlines()
                    if "cache" in line.lower()]
-    # [lookups, hits] a process: the first run compiles every lookup, the second loads it.
-    compiled = runs[0][0][0]
-    assert compiled > 0 and runs == [[[compiled, 0]] * 2, [[compiled, compiled]] * 2], (
+    # [lookups, hits, backend] a process: the first run compiles every lookup; the
+    # second loads them on process 0, and on process 1 where it keys as process 0.
+    compiled, backend = runs[0][0][0], runs[0][0][2]
+    keyed_alike = backend != "cpu"
+    assert compiled > 0 and runs == [
+        [[compiled, 0, backend]] * 2,
+        [[compiled, compiled, backend], [compiled, compiled if keyed_alike else 0, backend]]], (
         runs, "\n".join(logged))
