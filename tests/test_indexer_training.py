@@ -30,12 +30,13 @@ from reference_error import (
     with_gradients,
 )
 
+from dew.batch import FROZEN, coordinates
 from dew.data.dataset import Loader
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.inputs import ModelInputs, coordinates
+from dew.nn.inputs import ModelInputs
 from dew.nn.mla import INDEXER, indexer_kl
 from dew.nn.sparse_selection import top_k_keys
-from dew.objectives.base import FROZEN, Step
+from dew.objectives.base import Step
 from dew.objectives.lm import IndexerTraining, LMObjective
 from dew.training import Layout, MeshSpec, Trainer
 from tools import indexer_reference as transcription

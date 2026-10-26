@@ -7,10 +7,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from dew.batch import coordinates
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.inputs import coordinates
 from dew.sampling import Sampling, generate
 
 FIXTURES = Path(__file__).parent / 'fixtures' / 'hf'

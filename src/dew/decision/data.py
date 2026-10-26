@@ -10,12 +10,12 @@ from typing import ClassVar, Literal
 
 import numpy as np
 
-from dew import records
+from dew import _records
+from dew._records import JSON, json_value, record
 from dew.data.lowering import prepared_rows
 from dew.data.pipeline import Configured, Dataset, Pipeline, Stage, mix
 from dew.data.sources.base import Read, Rows, Source, View, _consumed, stated as store_facts
 from dew.decision.questions import Choice, Question
-from dew.records import JSON, json_value, record
 
 
 @dataclass(frozen=True)
@@ -229,7 +229,7 @@ def groups_of(value: JSON) -> tuple[Group, ...]:
     for name, members in record(value, "groups").items():
         mapped = {}
         for question, options in record(members, f"groups.{name}").items():
-            mapped[question] = {key: records.text(canonical, f"groups.{name}.{question}.{key}")
+            mapped[question] = {key: _records.text(canonical, f"groups.{name}.{question}.{key}")
                                 for key, canonical in record(options, f"groups.{name}.{question}").items()}
         groups.append(Group(name, mapped))
     return tuple(groups)
@@ -246,11 +246,11 @@ def _distribution(question: Question, target: JSON, name: str) -> tuple[float, .
     """A target distribution from a row: probabilities in the question's option order, or keyed by option."""
     match target:
         case list():
-            return tuple(records.number(value, name) for value in target)
+            return tuple(_records.number(value, name) for value in target)
         case dict():
             if set(target) != set(question.options):
                 raise ValueError(f"{name} keys {sorted(target)}, not the options {list(question.options)}")
-            return tuple(records.number(target[option], f"{name}.{option}") for option in question.options)
+            return tuple(_records.number(target[option], f"{name}.{option}") for option in question.options)
         case _:
             raise ValueError(f"{name} is a list of probabilities or a mapping of options to them")
 
@@ -267,7 +267,7 @@ def _label(value: str | int | float | bool) -> str | int:
 
 def _slots(stated: Mapping[str, object]) -> dict[str, int]:
     """The question and option slots a mixture's manifest states its rows need."""
-    return {name: records.integer(value, f"slots.{name}")
+    return {name: _records.integer(value, f"slots.{name}")
             for name, value in record(stated.get("slots", {}), "slots").items()}
 
 @dataclass(frozen=True)
@@ -421,7 +421,7 @@ class _DecisionSource(View[Source]):
             names = (
                 self.table.options
                 or tuple(self._classes)
-                or records.strings(
+                or _records.strings(
                     record(stated.get("class_names", {}), "class names").get(self.table.label, ()),
                     "class names",
                 )
@@ -467,7 +467,7 @@ def mixture(root_url: str, *, weights: Mapping[str, float] | None = None,
 
     stated, pinned = _stated(root_url, descriptor)
     shares = {
-        name: records.number(value, f"weights.{name}")
+        name: _records.number(value, f"weights.{name}")
         for name, value in record(stated.get("weights", {}), "weights").items()
     } | dict(weights or {})
     training, held, kept = [], [], []
@@ -527,7 +527,7 @@ def _corpus(root_url: str, stated: Mapping[str, object], pinned: Mapping[str, ob
     if isinstance(shards, list):
         listed = [record(shard, "shard") for shard in shards]
         declared: dict[str, Mapping[str, object]] | None = {
-            root + "/" + records.text(shard["path"], "shard.path"): shard for shard in listed
+            root + "/" + _records.text(shard["path"], "shard.path"): shard for shard in listed
         }
         paths = tuple(declared)
     else:
@@ -538,7 +538,7 @@ def _corpus(root_url: str, stated: Mapping[str, object], pinned: Mapping[str, ob
     if not paths:
         return None
     index = record(entry.get("index", {}), "index").get("path")
-    source_index = None if index is None else root + "/" + records.text(index, "index.path")
+    source_index = None if index is None else root + "/" + _records.text(index, "index.path")
     if declared is not None and source_index is not None:
         declared[source_index] = record(entry["index"], "index")
     dataset = _DecisionSource(Files(paths, format="jsonl", index=source_index, file_info=declared),
@@ -582,5 +582,5 @@ class _ParseConfigured:
             if "slots" in metadata:
                 return ParseExample()
             raise ValueError("decision flat table needs options, ClassLabel metadata or read='memory'")
-        return dataclasses.replace(self.table, options=records.strings(names, "decision_options"),
+        return dataclasses.replace(self.table, options=_records.strings(names, "decision_options"),
                                    by_value=metadata.get("decision_options_by_value") is True)

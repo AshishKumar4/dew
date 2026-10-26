@@ -23,7 +23,6 @@ import logging
 import math
 import os
 import threading
-import typing
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
@@ -31,15 +30,11 @@ from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 import grain.python as pygrain
 import jax
 import numpy as np
-import tyro
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 
 from dew import position
-from dew.nn.sharding import LayoutRefused, batch_axes
-
-# `Batch` lives in dew.objectives.base. The data layer imports it from here
-# so a dataset module needs one import for the value and its shape.
-from dew.objectives.base import VALID_ROWS, Batch
+from dew.batch import VALID_ROWS, Batch, padded_rows
+from dew.mesh import LayoutRefused, batch_axes
 
 _log = logging.getLogger(__name__)
 
@@ -47,8 +42,6 @@ if TYPE_CHECKING:
     from dew.data.mixing import CorpusCounts
     from dew.data.pipeline import DeviceStep
     from dew.data.plan import Plan
-
-
 
 
 @dataclasses.dataclass(frozen=True)
@@ -211,32 +204,6 @@ type Indexed = Records | Sequence[Batch]
 """Records read by index: a source that answers grain's two methods, or a
 plain sequence of them. A spec that lists its records in memory hands over
 the sequence, the way the video specs list their clips."""
-
-
-def record_argument[Value](annotation: type[Value]) -> tyro.constructors.PrimitiveConstructorSpec[Value]:
-    """A field typed `annotation` written as one JSON value on the command
-    line, the record a run holds: a tuple of records as a list,
-    `[{"field": ...}, ...]`, and a mapping of class records as an
-    object, `{"sigma": {"class": "linear", "fields": {...}}}`, since a flag per
-    field cannot spell a collection whose length or keys the command line
-    decides.
-
-    The value is read with `from_record` and written with `to_record`, so a
-    flag, a default and `run.json` hold the same record. Use it as the
-    field's metadata: `Annotated[Mapping[str, ScheduleSpec],
-    record_argument(Mapping[str, ScheduleSpec])]`."""
-    from dew.registry import from_record, to_record
-
-    container = typing.get_origin(annotation) or annotation
-    if container is Mapping:
-        container = dict
-    return tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1,
-        metavar="JSON",
-        instance_from_str=lambda given: from_record(annotation, json.loads(given[0]), dtypes=False),
-        is_instance=lambda given: isinstance(given, container),
-        str_from_instance=lambda given: [json.dumps(to_record(given, annotation))],
-    )
 
 
 @runtime_checkable
@@ -985,7 +952,7 @@ def describe(source: Indexed | pygrain.MapDataset[Batch]) -> str:
 
 class FilledBatch(pygrain.MapTransform):
     """A batch of fewer than `rows` records filled out with repeats of its
-    own rows (`RowPlan.pad`), and `VALID_ROWS` marking the real ones: those of
+    own rows (`dew.batch.padded_rows`), and `VALID_ROWS` marking the real ones: those of
     its own a batch that marks them already marks real. Without `real` every
     row is a repeat."""
 
@@ -993,14 +960,11 @@ class FilledBatch(pygrain.MapTransform):
         self._rows, self._real = rows, real
 
     def map(self, element: Batch) -> Batch:
-        from dew.nn.inputs import RowPlan
-
         held = rows_of(element)
         if held == self._rows and self._real:
             return element
-        plan = RowPlan(None, held, self._rows, 0, 1)
-        indices = plan.pad(np.arange(held))
-        valid = ~plan.padding & self._real
+        indices, repeats = padded_rows(held, self._rows)
+        valid = ~repeats & self._real
         if VALID_ROWS in element:
             valid = valid & np.asarray(element[VALID_ROWS], bool)[indices]
         return {**take_batch(element, indices), VALID_ROWS: valid}
@@ -1633,5 +1597,4 @@ __all__ = [
     "Stage",
     "Stoppable",
     "mapped",
-    "record_argument",
 ]

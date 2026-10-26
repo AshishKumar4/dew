@@ -28,8 +28,8 @@ from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step, model_rngs
 from dew.objectives.lm import LMObjective
+from dew.state import TrainState
 from dew.training.distributed import Layout, MeshSpec, shard_batch
-from dew.training.state import TrainState
 from dew.training.transaction import write_back
 
 SHAPES = {

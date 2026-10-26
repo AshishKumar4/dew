@@ -24,11 +24,11 @@ import jax
 import jax.numpy as jnp
 from flax.typing import Dtype
 
-from dew import records
+from dew import _records
+from dew.batch import Variables
 from dew.interop.components import bind_component
 from dew.interop.weights import indexed_path
 from dew.nn.dense import Dense
-from dew.objectives.base import Variables
 
 from ..activations import gated_product, silu
 from ..attention import rms_normalized
@@ -428,15 +428,15 @@ def _per_level(config: Mapping[str, object], name: str, levels: int) -> tuple:
 def dc_ae_fields(config: Mapping[str, object]) -> DCAEFields:
     """Read an `AutoencoderDC` config into the fields `DCAE` takes, refusing
     what the port does not compute."""
-    encoder_channels = records.integers(config["encoder_block_out_channels"], "encoder_block_out_channels")
-    decoder_channels = records.integers(config["decoder_block_out_channels"], "decoder_block_out_channels")
+    encoder_channels = _records.integers(config["encoder_block_out_channels"], "encoder_block_out_channels")
+    decoder_channels = _records.integers(config["decoder_block_out_channels"], "decoder_block_out_channels")
     levels = len(encoder_channels)
     if len(decoder_channels) != levels:
         raise ValueError("the encoder and decoder have different numbers of levels")
     fields = DCAEFields(
-        image_channels=records.integer(config["in_channels"], "in_channels"),
-        latent_channels=records.integer(config["latent_channels"], "latent_channels"),
-        head_dim=records.integer(config["attention_head_dim"], "attention_head_dim"),
+        image_channels=_records.integer(config["in_channels"], "in_channels"),
+        latent_channels=_records.integer(config["latent_channels"], "latent_channels"),
+        head_dim=_records.integer(config["attention_head_dim"], "attention_head_dim"),
         encoder_blocks=_per_level(config, "encoder_block_types", levels),
         decoder_blocks=_per_level(config, "decoder_block_types", levels),
         encoder_channels=encoder_channels, decoder_channels=decoder_channels,

@@ -26,8 +26,9 @@ from flax import linen as nn
 from flax.traverse_util import unflatten_dict
 from jax.typing import DTypeLike
 
-from dew import records
+from dew import _records
 from dew._model_types import QWEN35_TYPES
+from dew.batch import Variables
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
@@ -37,6 +38,7 @@ from dew.inference.tasks import Processor as TaskProcessor
 from dew.inputs import InputSpec
 from dew.interop import decoder_parts, gguf, hf_decoders as decoders, mamba2, sources, verify
 from dew.interop.codecs import SourceQuantization, source_quantization
+from dew.interop.composite import CompositeSource, NativeComponent
 from dew.interop.config_records import NativeFields
 from dew.interop.decoder_bindings import decoder_layouts, reading_layout
 from dew.interop.generation_config import (
@@ -61,14 +63,14 @@ from dew.interop.pipeline_assembly import (
 from dew.interop.processors import Processor, hosts
 from dew.interop.safetensors_io import MAX_SHARD_SIZE, LazyTensors, tensor_specs
 from dew.interop.streaming import WeightLayout
-from dew.interop.weights import AUTO, declared_dtype
+from dew.interop.weights import AUTO, checkpoint_dtype, declared_dtype
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import layer_scalar_mode
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer
-from dew.objectives.base import Variables
+from dew.objectives.base import SavedTask
 from dew.registry import dtype_name, from_record, projectors, record_fields, resolve_dtype, towers
 from dew.sampling.text import Sampling
 
@@ -230,6 +232,27 @@ class Pretrained:
     fields.
     """
 
+
+    @property
+    def eos_token_ids(self) -> tuple[int, ...]:
+        """The end-of-sequence ids the source's generation stops at, from its generation config or
+        its config (`eos_token_id`), none where neither names one."""
+        return eos_ids(self.config, self.generation_config)
+    def map_variables(self, transform: Callable[[Variables], Variables]) -> Self:
+        """This bundle with its variable tree transformed, for placement or a shape-only load.
+        Composite bundles apply the same transformation to each component."""
+        return replace(self, variables=transform(self.variables))
+
+    def pipeline(self) -> SavedTask:
+        """The native task declared by this source kind."""
+        raise TypeError(f"{type(self).__name__} has no native task")
+
+    def packed(self) -> Self:
+        """A serving view with packed projections, preserving this bundle's arrays for reuse."""
+        from dew.inference.projections import inference_projections
+
+        return replace(self, variables=inference_projections(self.model, self.variables))
+
     @property
     def text_processor(self) -> TaskProcessor | None:
         """Return what the bundle's tasks encode and decode text with.
@@ -249,48 +272,53 @@ class Pretrained:
         """Return a trained run's selected checkpoint, rebuilt from the run's own inference record,
         in the layout of the architecture the record names. `trust` names the packages outside
         Dew the record may import (`TextGeneration.from_run`)."""
-        from dew.config import ModelConfig
-        from dew.inference.tasks import run_record
-        from dew.records import record, text
-        from dew.registry import models, objectives
-        declaration, step = run_record(str(directory), step, trust)
-        model_config = ModelConfig.from_dict(record(declaration['model'], 'model'))
+        from dew.inference.tasks import (
+            BlockSettings,
+            MaskedSettings,
+            SavedRun,
+            TaskSettings,
+            TextSettings,
+            saved_model,
+            saved_settings,
+        )
+        from dew.registry import models
+
+        run = SavedRun.pinned(str(directory), step, trust)
+        model_config = saved_model(run.record, None)
         model = model_config.build()
-        kind = text(declaration['objective'], 'objective')
-        variables = objectives[kind]._saved_variables(str(directory), step=step, ema=ema)
-        # The run's task (its policy, budget, pad id and process), in the format the export's readers read.
-        sampling = declaration.get('sampling')
-        budget = declaration.get('max_new_tokens')
-        budget = budget if isinstance(budget, int) else None
-        pad = declaration.get('pad_token_id')
-        pad = pad if isinstance(pad, int) else None
-        tokenizer = declaration.get('tokenizer')
-        tokenizer = None if tokenizer is None else text(tokenizer, 'tokenizer')
+        variables = run.variables(ema=ema)
+        # The run's task as its loader reads it (`saved_settings`): its policy, budget, pad and
+        # end-of-sequence ids and process, which the export writes in the format its readers read.
+        held = None if run.objective.settings is None else saved_settings(run.record, run.objective.settings)
+        task = held if isinstance(held, TaskSettings) else None
+        budget = None if task is None else task.max_new_tokens
+        tokenizer = None if task is None else task.tokenizer
         # A run over a source's own processor records its source, and the bundle writes its files.
-        source = declaration.get('processor')
-        processor = None if source is None else load_processor(text(source, 'processor'), model)
+        processor = None if task is None or task.processor is None else load_processor(task.processor, model)
         trained = models[model_config.name]
         if trained is CausalTransformer:
             decoder = from_record(CausalTransformer, model)
-            masked = objectives[kind] is objectives['masked_diffusion']
-            generation = (masked_generation_config(budget, pad) if masked else
-                          None if not isinstance(sampling, dict) else
-                          generation_config_of(Sampling(**sampling), budget))
+            generation = (masked_generation_config(budget, None, held.eos_token_ids)
+                          if isinstance(held, MaskedSettings) else
+                          generation_config_of(held.sampling, budget) if isinstance(held, TextSettings)
+                          else None)
             bundle = replace(PretrainedDecoder.from_model(decoder, variables, tokenizer=tokenizer,
                                                           generation_config=generation), processor=processor)
-            if masked:
+            if isinstance(held, MaskedSettings):
                 bundle = PretrainedMaskedDecoder(
                     decoder, bundle.variables, bundle.processor, bundle.config, bundle.source,
                     bundle.model_config, bundle.generation_config,
                     export_adapter=bundle.export_adapter, tokenizer=bundle.tokenizer)
         elif trained is models["diffusion_gemma"]:
-            from dew.diffusion.block import BlockProcess
             from dew.interop import diffusion_gemma
+            if not isinstance(held, BlockSettings):
+                raise TypeError(f"a {model_config.name} run of {run.objective.__name__} records no block "
+                                "process to export")
             block = from_record(DiffusionGemma, model)
             published = diffusion_gemma.published_config(block)
-            process = from_record(BlockProcess, record(declaration['process'], 'process'), dtypes=False)
-            generation = diffusion_gemma.generation_config_of(process, max_new_tokens=budget,
-                                                              pad_token_id=pad)
+            generation = diffusion_gemma.generation_config_of(held.process, max_new_tokens=budget,
+                                                              pad_token_id=held.pad_token_id,
+                                                              eos_token_ids=held.eos_token_ids)
             bundle = PretrainedBlockDecoder(
                 block, variables, processor, published, None, model_config.fields, generation,
                 export_adapter=diffusion_gemma.export_weights, tokenizer=tokenizer)
@@ -307,20 +335,21 @@ class Pretrained:
         `Adapter.from_run` rebuilds it, so `export` and `save` merge its factors into
         their kernels and `adapter.save` writes them alone; the bundle itself where
         `model` carries none."""
-        from dew.config import ModelConfig
-        from dew.lora import Adapter
+        from dew.lora import Adapter, recorded_adapter
+        from dew.registry import ModelConfig
 
-        record = ModelConfig.from_model(model).adapter
+        record = recorded_adapter(ModelConfig.from_model(model).wrappers)
         return self if record is None else replace(self, adapter=Adapter.recorded(model, variables, record))
 
     @classmethod
     def load(cls, name_or_dir: str | Path, *, dtype: DTypeLike = jnp.bfloat16,
              param_dtype: DTypeLike | Literal["auto"] = jnp.float32,
              attention_impl: str = "auto", max_seq_len: int | None = None,
-             revision: str | None = None, gguf_file: str | None = None,
+             revision: str | None = None, subfolder: str | None = None, gguf_file: str | None = None,
              single_file: str | None = None, dduf_file: str | None = None,
              mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
              fallback: str | None = None, weights: bool = True, on_host: bool = False,
+             modeling_overrides: Mapping[str, object] | None = None,
              trust_remote_code: bool = False, text_only: bool = False) -> Self:
         """Load a source as a native Flax model with explicit parameter trees, as the kind of source it is.
 
@@ -357,24 +386,13 @@ class Pretrained:
         (`dew.interop.gguf`), and its tokenizer is the processor when the repo ships
         no tokenizer.
 
-        `single_file` names an original-format diffusion checkpoint in the repo or
-        directory. Diffusers' own key maps convert it once into Dew's cache as the
-        diffusers pipeline it describes (`dew.interop.single_file`), which then loads;
-        the cache entry is published only after that load succeeds. The configs come
-        from the repo or directory when it has a model_index.json, and otherwise from
-        the diffusers repo that diffusers infers from the checkpoint, at the commit
-        fetched. A component the file lacks gets its weights from the same place, or
-        is refused by name.
-
-        `dduf_file` names a DDUF file in the repo or directory, which is a diffusers
-        pipeline packed into one archive. It is unpacked once into Dew's cache
-        (`dew.interop.dduf`) and loads as the directory it packs, the same way
-        diffusers' own `from_pretrained(..., dduf_file=)` reads it.
-
-        `fallback="torchax"` opts into tier 3 for any causal LM that transformers can
-        build, registered or not: transformers' PyTorch forward lowered to JAX by
-        torchax (`dew.interop.torchax_fallback`), with no Dew kernels, sharding rules
-        or cached generation.
+        `single_file` selects an original diffusion checkpoint, converted through
+        Diffusers' key maps (`dew.interop.single_file`); `dduf_file` selects a packed
+        diffusion pipeline (`dew.interop.dduf`). Both load through the ordinary
+        directory pipeline after conversion. `fallback="torchax"` selects the
+        explicit transformers-forward route (`dew.interop.torchax_fallback`).
+        `subfolder` selects a folder within the resolved snapshot; decision releases
+        are assembled from their declared backbone and head components.
 
         `trust_remote_code=True` lets tier 2 run the repository's own modeling code (its
         `auto_map`) for a model_type transformers has no class for (`dew.interop.verify`), and `save`
@@ -393,6 +411,13 @@ class Pretrained:
         translation: what a run that resumes from its own checkpoint builds its state
         around (`TrainerConfig.resumes`), as MaxText loads its base parameters only
         for a run with no checkpoint.
+
+        `modeling_overrides` is a record of the form a release's config states under
+        that key, read through the same reader over the release's own, kind by kind:
+        `{"attention": {"full_attention": "block_bidirectional"}}` lets that layer kind's
+        tokens read their whole block (`AttentionMixer.bidirectional_blocks`, a call's
+        `block_groups`) on any decoder or wrapper this loads natively, and "causal"
+        turns a release's back off. A saved model states it in its own config.
         """
         selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
                                      dduf_file=dduf_file)
@@ -409,19 +434,21 @@ class Pretrained:
 
         dtype = dtype_name(dtype)
         param_dtype = AUTO if param_dtype == AUTO else dtype_name(param_dtype)
-        directory = sources.snapshot(str(name_or_dir), revision, weights=False)
-        # A Hub snapshot directory is named by its commit.
-        commit = None if os.path.isdir(name_or_dir) else directory.name
-        loaded, extracted = _loaded_source(name_or_dir, directory, commit, placed, fallback=fallback,
-                                gguf_file=gguf_file, single_file=single_file, dduf_file=dduf_file,
-                                streaming=streaming, weights=weights, dtype=dtype, param_dtype=param_dtype,
-                                attention_impl=attention_impl, max_seq_len=max_seq_len,
-                                trust_remote_code=trust_remote_code, text_only=text_only)
+        # The reference refuses a folder outside the source before anything is fetched.
+        directory, reference, composite = _source_metadata(
+            sources.SourceReference(str(name_or_dir), revision, subfolder), selected, fallback)
+        loaded, extracted = _loaded_kind(
+            reference, directory, composite, fallback=fallback, gguf_file=gguf_file,
+            single_file=single_file, dduf_file=dduf_file, placed=placed, streaming=streaming or not weights,
+            weights=weights, dtype=dtype, param_dtype=param_dtype, attention_impl=attention_impl,
+            max_seq_len=max_seq_len, overrides=modeling_overrides, trust_remote_code=trust_remote_code,
+            text_only=text_only)
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
-        published = _published(loaded, name_or_dir, selected=bool(selected) or extracted)
-        return _resident(published, weights=weights, placed=streaming or on_host)
+        published = _published(loaded, name_or_dir,
+                               selected=bool(selected) or reference.subfolder is not None or extracted)
+        return _resident(published, weights=weights, streaming=streaming, on_host=on_host)
 
     @property
     def layouts(self) -> Mapping[str, WeightLayout]:
@@ -472,10 +499,10 @@ class Pretrained:
         cross-attention, so `save` and `export` refuse the result; a run's
         checkpoint keeps it.
         """
+        from dew.batch import freeze, merge, select, thaw
         from dew.nn.cross_attention import crossing
         from dew.nn.inputs import request_key
         from dew.nn.protocols import CrossAttending, Predicting
-        from dew.objectives.base import freeze, merge, select, thaw
 
         if not isinstance(self.model, CrossAttending):
             raise TypeError(f"a {type(self.model).__name__} takes no cross-attention layers")
@@ -595,6 +622,9 @@ class PretrainedDecoder(Pretrained):
 
     model: CausalTransformer | MultimodalTransformer
 
+    def pipeline(self):
+        return self.packed().text_generation()
+
     @classmethod
     def from_model(cls, model: nn.Module, variables: Variables, *,
                    tokenizer: str | decoders.ExportTokenizer | None = None,
@@ -658,6 +688,9 @@ class PretrainedMaskedDecoder(Pretrained):
 
     model: CausalTransformer
 
+    def pipeline(self):
+        return self.packed().text_generation()
+
     def text_generation(self) -> MaskedGeneration:
         """Build the masked generation task this source describes.
 
@@ -673,7 +706,7 @@ class PretrainedMaskedDecoder(Pretrained):
         audit_masked(config, generation)
         return MaskedGeneration(self.model, self.variables, MDLM(mask_id=mask_id)(),
                                 self.text_processor,
-                                eos_token_ids=eos_ids(config, generation),
+                                eos_token_ids=self.eos_token_ids,
                                 pad_token_id=pad_id(config, generation),
                                 max_new_tokens=generation_limit(config, generation, "max_new_tokens"),
                                 max_length=generation_limit(config, generation, "max_length"),
@@ -690,6 +723,9 @@ class PretrainedBlockDecoder(Pretrained):
     # declare (generation_diffusion_gemma.py, 5.16.1).
     names_tokenizer: ClassVar[bool] = False
 
+    def pipeline(self):
+        return self.packed().block_generation()
+
     def block_generation(self) -> BlockGeneration:
         """Build the DiffusionGemma canvas task, with the source's sampler config as its default."""
         from dew.interop import diffusion_gemma
@@ -699,7 +735,7 @@ class PretrainedBlockDecoder(Pretrained):
             self.variables,
             diffusion_gemma.generation_process(self.config, self.generation_config),
             self.text_processor,
-            eos_ids(self.config, self.generation_config),
+            self.eos_token_ids,
             pad_id(self.config, self.generation_config),
             max_new_tokens=generation_limit(self.config, self.generation_config, "max_new_tokens"),
             max_length=generation_limit(self.config, self.generation_config, "max_length"),
@@ -723,6 +759,9 @@ class PretrainedPipeline(Pretrained):
     schedule: SourceSchedule
     task: SourceTask
     finish: Callable[[Mapping[str, object], jax.Array], jax.Array] | None = field(default=None, repr=False)
+
+    def pipeline(self):
+        return self.text_to_image()
 
     def text_to_image(self) -> TextToImage:
         """Build the pipeline as a sampling task with its published policy.
@@ -778,6 +817,9 @@ class PretrainedFallback(Pretrained):
     Dew's decode cache (`text_generation`, as a native decoder's, which `dew.pipeline` and the
     server run); one on transformers' own refuses a cache (`TorchCausalLM`).
     """
+
+    def pipeline(self):
+        return self.text_generation()
 
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
         """The text generation task this source describes, as a native decoder's
@@ -835,7 +877,8 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
         raise ValueError(f"size is (height, width) or (frames, height, width), not {size}")
     streaming = variables is None and (mesh is not None or layout is not None)
     loaded = _pipeline_source(
-        checkpoint, directory, None if os.path.isdir(checkpoint) else directory.name, None, None,
+        sources.SourceReference(checkpoint, None if os.path.isdir(checkpoint) else directory.name),
+        directory, None, None,
         lambda values: place(values, mesh, layout) if streaming else values, dtype=dtype,
         attention_impl=attention_impl, param_dtype=param_dtype, streaming=streaming, size=size,
         variables=variables, text=text)
@@ -854,14 +897,14 @@ def _published[K: Pretrained](loaded: K, name_or_dir: str | Path, *, selected: b
     return loaded if loaded.revision is None or selected else replace(loaded, origin=str(name_or_dir))
 
 
-def _pipeline_weights(name_or_dir: str | Path, directory: Path, index: Mapping[str, object],
+def _pipeline_weights(source: sources.SourceReference, root: Path, index: Mapping[str, object],
                       skipped: tuple[str, ...] = ()) -> Path:
     """The snapshot with the weights of every component `index` declares but
     `skipped`, fetched at the commit the metadata fetch returned as
     `directory`, so the weights come from that commit even if the requested
     branch moves."""
-    return sources.snapshot(str(name_or_dir), directory.name, weights=tuple(
-        name for name in index if component_present(index, name) and name not in skipped))
+    return source.directory(source.weights(root, tuple(
+        name for name in index if component_present(index, name) and name not in skipped)))
 
 
 def _assembled_pipeline(directory: Path, index: Mapping[str, object], commit: str | None,
@@ -886,9 +929,9 @@ def _wrapper_attention(config: decoder_parts.DecoderFields, names: Sequence[str]
     kinds = decoder_parts.kinds_of(config).copy()
     for name in names:
         kind = kinds.get(name, {})
-        mixer = records.record(kind.get("mixer") or config.get("mixer")
+        mixer = _records.record(kind.get("mixer") or config.get("mixer")
                                or {"class": "attention", "fields": {}}, "mixer")
-        held = records.record(mixer.get("fields", {}), "mixer.fields")
+        held = _records.record(mixer.get("fields", {}), "mixer.fields")
         kinds[name] = NativeFields(LayerKind, {
             **kind, "mixer": {**mixer, "fields": {**held, **fields}}})
     config["kinds"] = kinds
@@ -905,18 +948,18 @@ def _wrapper_text_fields(config: Mapping[str, object], record: decoder_parts.Wra
     into the three mrope sections its wrapper positions rows with.
     """
     family = config.get("model_type")
-    text_config = records.record(config["text_config"], "text_config")
+    text_config = _records.record(config["text_config"], "text_config")
     text_fields = record["text"].copy()
     if max_seq_len is not None:
         text_fields["max_seq_len"] = max_seq_len
     if family == "gemma3":
         text_fields["final_logit_softcap"] = None
-        names = records.strings(text_fields["layer_types"], "layer_types")
+        names = _records.strings(text_fields["layer_types"], "layer_types")
         _wrapper_attention(text_fields, tuple(dict.fromkeys(names)), {"bidirectional_images": True})
     if family == "gemma4" and text_config.get("use_bidirectional_attention") == "vision":
         _wrapper_attention(text_fields, ("sliding_attention",), {"bidirectional_images": True})
     if family in QWEN35_TYPES:
-        rope = records.record(text_config.get("rope_parameters") or {}, "rope_parameters")
+        rope = _records.record(text_config.get("rope_parameters") or {}, "rope_parameters")
         sections = rope.get("mrope_section", [11, 11, 10])
         if (not isinstance(sections, (list, tuple)) or len(sections) != 3
                 or any(type(value) is not int or value < 0 for value in sections)):
@@ -934,8 +977,8 @@ def _wrapper_model(config: Mapping[str, object], record: decoder_parts.WrapperFi
                    language_model: CausalTransformer, *, dtype: str) -> MultimodalTransformer:
     """Build the wrapper its record describes: the decoder above, the towers and
     projectors it names, and the placeholder ids its prompts carry."""
-    family = records.text(config["model_type"], "model_type")
-    text_config = records.record(config["text_config"], "text_config")
+    family = _records.text(config["model_type"], "model_type")
+    text_config = _records.record(config["text_config"], "text_config")
     audio_record = record["audio"]
     audio_projector = record["audio_projector"]
     return MultimodalTransformer(
@@ -944,7 +987,7 @@ def _wrapper_model(config: Mapping[str, object], record: decoder_parts.WrapperFi
         record["image_token_id"], dtype=resolve_dtype(dtype),
         # A text_config that states a null pad id states none, and the
         # wrapper's own field defaults to 0 for exactly that.
-        pad_token_id=records.integer(text_config.get("pad_token_id") or 0, "pad_token_id"),
+        pad_token_id=_records.integer(text_config.get("pad_token_id") or 0, "pad_token_id"),
         extra_placeholder_ids=record["extra_placeholder_ids"],
         audio=None if audio_record is None else towers.from_record(audio_record),
         audio_projection=(None if audio_projector is None
@@ -953,7 +996,7 @@ def _wrapper_model(config: Mapping[str, object], record: decoder_parts.WrapperFi
 
 
 def source_processor(directory: Path, config: Mapping[str, object], record: Mapping[str, object],
-                      model: nn.Module, gguf_path: Path | None = None, *, source: str
+                      model: nn.Module, gguf_path: Path | None = None, *, source: sources.SourceReference
                       ) -> Processor | None:
     """Build the host preprocessing a source ships, or None where it ships none.
 
@@ -964,8 +1007,8 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
     processor config beside a text-only model), and a tiny multimodal
     fixture without processor files tokenizes text only.
 
-    `source` names the local directory or the Hub repo at the commit the
-    loader resolved, the identity a run records to reload the processor
+    `source` records the directory or Hub repository, commit and selected folder
+    the loader resolved, the identity a run records to reload the processor
     (`load_processor`). A GGUF file's text processor keeps none, since the
     source alone does not name the file it read. Only the media branch reads media
     files from its directory and keeps the wrapper's translated `record`.
@@ -987,37 +1030,28 @@ def source_processor(directory: Path, config: Mapping[str, object], record: Mapp
     return None
 
 
-def load_processor(source: str, model: nn.Module) -> Processor | None:
+def load_processor(source: sources.SourceReference, model: nn.Module) -> Processor | None:
     """Reload the recorded processor from its source, beside `model`.
 
-    A saved task keeps the local directory or `repo@commit` the processor's
-    files came from, not its translated fields. Reading that source's config
+    A saved task keeps the source's directory/repository, commit and subfolder
+    as a typed record, not its translated fields. Reading that source's config
     and translating its wrapper derives a media processor's geometry again
-    without loading the model's weights.
+    without loading the model's weights. A composite's metadata codec selects
+    the native component's config, as it does for the initial load.
     """
-    name, revision = split_revision(source)
-    directory = sources.snapshot(name, revision, weights=False)
-    config, _ = _source_config(name, directory, revision, None)
+    directory = source.metadata()
+    description = _composite_description(directory)
+    component = None if description is None else description.backbone
+    if component is None:
+        config, _ = _source_config(source.name, directory, source.revision, None)
+    else:
+        config = component.config
+        directory = directory / component.config_folder
     record = decoders.translate_wrapper_config(config) if _media_wrapper(config) else {}
     return source_processor(directory, config, record, model, source=source)
 
 
-def split_revision(source: str) -> tuple[str, str | None]:
-    """Split a `repo@revision` reference into the repo and the revision.
-
-    This is Levanter's `RepoRef` spelling: a branch, tag or commit after the last
-    '@'. A local directory, or a reference without '@', names no revision. Hub
-    repo IDs cannot contain '@'.
-    """
-    if os.path.isdir(source) or "@" not in source:
-        return source, None
-    name, revision = source.rsplit("@", 1)
-    if not name or not revision:
-        raise ValueError(f"{source!r} is not a repo@revision reference")
-    return name, revision
-
-
-def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | None, single_file: str | None,
+def _pipeline_source(source: sources.SourceReference, root: Path, single_file: str | None,
                      dduf_file: str | None, placed: Callable[[Variables], Variables], *, dtype: str,
                      attention_impl: str, param_dtype: str, streaming: bool,
                      size: tuple[int, ...] | None = None, variables: Variables | None = None,
@@ -1037,6 +1071,8 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
     is read.
     """
 
+    directory, commit = source.directory(root), source.revision
+
     def pipeline(directory: Path, stored: sources.StoredWeights | None = None) -> PretrainedPipeline:
         index = json.loads((directory / "model_index.json").read_text())
         if size is not None:
@@ -1048,7 +1084,7 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
 
     if dduf_file is not None:
         from dew.interop import dduf
-        return pipeline(dduf.unpacked(sources.repo_file(name_or_dir, directory, dduf_file)))
+        return pipeline(dduf.unpacked(source.file(root, dduf_file)))
     if single_file is not None:
         from dew.interop import single_file as original
         # A repo or directory that describes the pipeline (model_index.json
@@ -1056,24 +1092,98 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
         # takes; a Hub repo's are its metadata snapshot, so the weights of a
         # component the file lacks come from the repo at that commit.
         configs = directory if (directory / "model_index.json").is_file() else None
-        hub = None if configs is None or commit is None else (str(name_or_dir), commit)
-        with original.unpacked(sources.repo_file(name_or_dir, directory, single_file), configs, hub) as (
+        hub = None if configs is None or commit is None else source
+        with original.unpacked(source.file(root, single_file), configs, hub) as (
                 converted, published):
             return replace(pipeline(converted), source=published)
     if (directory / "model_index.json").is_file() and not _names_a_model(directory):
         if variables is not None:
-            return pipeline(directory, sources.StoredWeights(str(name_or_dir), directory))
+            return pipeline(directory, sources.StoredWeights(source.name, root, source.subfolder or ""))
         index = json.loads((directory / "model_index.json").read_text())
         skipped = () if text else text_components(
             pipeline_denoiser(directory, dtype=dtype, attention_impl=attention_impl).text, index)
-        return pipeline(_pipeline_weights(name_or_dir, directory, index, skipped))
+        return pipeline(_pipeline_weights(source, root, index, skipped))
     return None
 
 
 def _names_a_model(directory: Path) -> bool:
     """Whether `directory`'s own config.json names a model by its `model_type`."""
     path = directory / "config.json"
-    return path.is_file() and "model_type" in records.record(json.loads(path.read_text()), "config.json")
+    return path.is_file() and "model_type" in _records.record(json.loads(path.read_text()), "config.json")
+
+
+def _loaded_kind(reference: sources.SourceReference, directory: Path, composite: CompositeSource | None, *,
+                 fallback: str | None, gguf_file: str | None, single_file: str | None,
+                 dduf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
+                 weights: bool, dtype: str, param_dtype: str, attention_impl: str,
+                 max_seq_len: int | None, overrides: Mapping[str, object] | None,
+                 trust_remote_code: bool, text_only: bool) -> tuple[Pretrained, bool]:
+    """The source `Pretrained.load` resolved, loaded as its kind loads: a composite release, the
+    transformers forward it asks for, a diffusion pipeline, or a natively translated decoder or
+    wrapper (a wrapper's language model alone where `text_only` asks); and whether it is that
+    language model, taken out of its wrapper."""
+    folder = reference.directory(directory)
+    pipeline = (single_file is not None or dduf_file is not None
+                or (gguf_file is None and (folder / "model_index.json").is_file()
+                    and not _names_a_model(folder)))
+    if text_only and fallback is None and (pipeline or composite is not None):
+        kind = "diffusion pipeline" if pipeline else "composite release"
+        raise ValueError(f"{reference.name} is a {kind}, which has no wrapper's language model for "
+                         "text_only to take")
+    if composite is not None:
+        loaded = _load_composite_source(reference, directory, composite,
+                                        placed=placed, streaming=streaming, dtype=dtype,
+                                        param_dtype=param_dtype, attention_impl=attention_impl,
+                                        max_seq_len=max_seq_len, weights=weights,
+                                        overrides=overrides)
+    elif fallback is not None:
+        from dew.interop import torchax_fallback
+
+        _unread_overrides(overrides, "the transformers forward")
+        loaded = torchax_fallback.load(reference, directory, dtype=dtype, param_dtype=param_dtype,
+                                       attention_impl=attention_impl, max_seq_len=max_seq_len,
+                                       weights=weights)
+        loaded = replace(loaded, variables=placed(loaded.variables))
+    elif gguf_file is None:
+        # A selected GGUF file is a decoder, whatever pipeline index the repo also ships.
+        loaded = _pipeline_source(reference, directory, single_file, dduf_file, placed,
+                                  dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
+                                  streaming=streaming)
+        if loaded is not None:
+            _unread_overrides(overrides, "a diffusion pipeline")
+    else:
+        loaded = None
+    if loaded is None:
+        # Without its weights, a decoder's leaves are translated as streaming translates them, each
+        # a view of its stored tensor that nothing reads.
+        remote = (reference.directory(sources.remote_code(reference.name, directory)) if trust_remote_code
+                  else None)
+        return _load_native_source(reference, directory, gguf_file=gguf_file, placed=placed,
+                                   streaming=streaming, dtype=dtype, param_dtype=param_dtype,
+                                   attention_impl=attention_impl, max_seq_len=max_seq_len, weights=weights,
+                                   overrides=overrides, remote=remote, text_only=text_only)
+    return loaded, False
+
+
+def _overridden(config: Mapping[str, object], overrides: Mapping[str, object] | None) -> Mapping[str, object]:
+    """`config` with `overrides`, a `modeling_overrides` record, over the source's own: each attention
+    kind it names takes its mode, the others keep the source's. The decoder translation reads and
+    checks the result (`decoder_parts.modeling_overrides`)."""
+    if overrides is None:
+        return config
+    own = _records.record(config.get("modeling_overrides", {}), "modeling_overrides")
+    given = _records.record(overrides, "modeling_overrides")
+    merged = {**own, **given}
+    if "attention" in own and "attention" in given:
+        merged["attention"] = {**_records.record(own["attention"], "modeling_overrides.attention"),
+                               **_records.record(given["attention"], "modeling_overrides.attention")}
+    return {**config, "modeling_overrides": merged}
+
+
+def _unread_overrides(overrides: Mapping[str, object] | None, route: str) -> None:
+    """Refuse `overrides` on a route whose model no override reaches, rather than load without them."""
+    if overrides is not None:
+        raise ValueError(f"modeling_overrides reach a model Dew translates; {route} reads none")
 
 
 def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
@@ -1091,7 +1201,7 @@ def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
         raise FileNotFoundError(f"{name_or_dir} has no config.json, which says what model its weights "
                                 f"are; {shipped}")
     with open(directory / "config.json") as handle:
-        config = records.record(json.load(handle), "config.json")
+        config = _records.record(json.load(handle), "config.json")
     return config, None
 
 
@@ -1219,6 +1329,9 @@ def _wrapper_source(config: Mapping[str, object], record: decoder_parts.WrapperF
     model = _wrapper_model(config, record, language_model, dtype=dtype)
     variables = native_variables({**parts, "language_model": decoders.with_constants(
         parts["language_model"], record["text"], directory)})
+    # Every component the record builds holds every leaf it computes with: a tower, projector or
+    # prediction-depth tensor the checkpoint lacks is refused here, as a decoder's is.
+    decoder_parts.check_decoder_tree(variables, model)
     layouts, retained = _wrapper_layouts(tensors, record, variables, language, media)
     return _Built(model, variables, record, wrapper, layouts, retained)
 
@@ -1329,7 +1442,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
             # The route's record is its own; this load edits a copy of it.
             record = NativeFields(CausalTransformer, translated)
             # translate_config refused every model_type but a registered family's name.
-            family = records.text(config.get("model_type"), "model_type")
+            family = _records.text(config.get("model_type"), "model_type")
         case VerifiedRoute(verified=verified):
             family = verified.entry(config)
             record = verified.translate(config, tensors, family)
@@ -1368,13 +1481,16 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     return _Built(model, variables, record, built, layouts, retained, export_adapter)
 
 
-def _resident[Loaded: Pretrained](loaded: Loaded, *, weights: bool, placed: bool) -> Loaded:
+def _resident[Loaded: Pretrained](loaded: Loaded, *, weights: bool, streaming: bool, on_host: bool) -> Loaded:
     """`loaded`'s variables as the load asked for them: their shapes and dtypes alone without its
-    weights, else on JAX's default device, unless the load placed them or keeps them on the host."""
+    weights, host arrays where it keeps them on the host, else on JAX's default device unless the
+    load placed them as it streamed them. A composite applies each to every component."""
     if not weights:
-        return replace(loaded, variables=jax.tree.map(
-            lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), loaded.variables))
-    return loaded if placed else replace(loaded, variables=on_default_device(loaded.variables))
+        return loaded.map_variables(lambda tree: jax.tree.map(
+            lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), tree))
+    if on_host:
+        return loaded.map_variables(lambda tree: jax.tree.map(np.asarray, tree))
+    return loaded if streaming else loaded.map_variables(on_default_device)
 
 
 def _selected_payload(fallback: str | None, **files: str | None) -> list[str]:
@@ -1393,72 +1509,134 @@ def _selected_payload(fallback: str | None, **files: str | None) -> list[str]:
     return selected
 
 
-def _loaded_source(name_or_dir: str | Path, directory: Path, commit: str | None,
-                   placed: Callable[[Variables], Variables], *, fallback: str | None, gguf_file: str | None,
-                   single_file: str | None, dduf_file: str | None, streaming: bool, weights: bool, dtype: str,
-                   param_dtype: str, attention_impl: str, max_seq_len: int | None, trust_remote_code: bool,
-                   text_only: bool) -> tuple[Pretrained, bool]:
-    """The source `Pretrained.load` resolved, read by its kind: tier 3 where `fallback` asks, a
-    pipeline, or a natively translated decoder or wrapper (a wrapper's language model alone where
-    `text_only` asks); and whether it is that language model, taken out of its wrapper."""
-    pipeline = (single_file is not None or dduf_file is not None
-                or (gguf_file is None and (directory / "model_index.json").is_file()
-                    and not _names_a_model(directory)))
-    if text_only and fallback is None and pipeline:
-        raise ValueError(f"{name_or_dir} is a diffusion pipeline, which has no language model for "
-                         "text_only to take")
-    if fallback is not None:
-        from dew.interop import torchax_fallback
-        loaded = torchax_fallback.load(name_or_dir, directory, commit, dtype=dtype,
-                                       param_dtype=param_dtype, attention_impl=attention_impl,
-                                       max_seq_len=max_seq_len, weights=weights)
-        loaded = replace(loaded, variables=placed(loaded.variables))
-    elif gguf_file is None:
-        # A selected GGUF file is a decoder, whatever pipeline index the repo also ships.
-        loaded = _pipeline_source(name_or_dir, directory, commit, single_file, dduf_file, placed,
-                                  dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype,
-                                  streaming=streaming or not weights)
+
+def _source_metadata(requested: sources.SourceReference, selected: list, fallback: str | None
+                     ) -> tuple[Path, sources.SourceReference, CompositeSource | None]:
+    """Resolve one metadata snapshot of `requested` before any component's weights are read: the
+    snapshot, the reference pinned to its commit (none for a local directory), and the composite
+    release its selected folder describes. Explicit payload/fallback selections take precedence over
+    composite metadata."""
+    directory = sources.snapshot(requested.name, requested.revision, weights=False)
+    commit = None if os.path.isdir(requested.name) else directory.name
+    reference = replace(requested, revision=commit, subfolder=requested.subfolder or None)
+    composite = (None if selected or fallback is not None
+                 else _composite_description(reference.directory(directory)))
+    return directory, reference, composite
+
+
+def _composite_description(directory: Path) -> CompositeSource | None:
+    """A registered composite's metadata, without reading or placing its weights."""
+    from dew.registry import source_kinds
+
+    for provider in source_kinds.values():
+        description = provider.describe(directory)
+        if description is not None:
+            return description
+    return None
+
+
+def _load_composite_source(source: sources.SourceReference, root: Path,
+                           description: CompositeSource, *, placed: Callable[[Variables], Variables],
+                           streaming: bool, dtype: str, param_dtype: str, attention_impl: str,
+                           max_seq_len: int | None, weights: bool,
+                           overrides: Mapping[str, object] | None = None) -> Pretrained:
+    """Materialize the described components through the native backbone and tensor-map owners.
+    All Hub paths remain relative to the resolved snapshot root, including a selected subfolder."""
+    from dew.interop.streaming import materialize
+    from dew.interop.weights import record_layouts
+
+    component = description.backbone
+    head_source = description.head
+    directory = source.directory(root)
+    backbone, prefix = None, ""
+    shared: Mapping[str, np.ndarray] = {}
+    if component is not None:
+        prefix = component.tensor_prefix
+        # The route of the config the backbone translates, a mamba_ssm one's normalized as
+        # `_load_native_source` normalizes it. The transformers forward reads its backbone's weights
+        # itself, and none without them; the shared file is read for it only where the head is stored
+        # in it, but its weights' snapshot is resolved and pinned here whenever it reads weights.
+        routed = (mamba2.config_from_mamba_ssm(component.config) if mamba2.is_mamba_ssm(component.config)
+                  else component.config)
+        forwarded = isinstance(source_route(routed), TorchRoute)
+        reads_shared = not forwarded or bool(head_source.weight_file is None and prefix)
+        if weights or reads_shared:
+            weight_source = source.component(component.weights_folder)
+            root = weight_source.weights(root)
+            directory = source.directory(root)
+            if source.revision is not None:
+                source = replace(source, revision=root.name)
+            if reads_shared:
+                shared = sources.load_shards(weight_source.directory(root))
+        tensors = None if forwarded else (
+            {name[len(prefix):]: tensor for name, tensor in shared.items() if name.startswith(prefix)}
+            if prefix else shared)
+        backbone, _ = _load_native_source(
+            source, root,
+            gguf_file=None, component=component, tensors=tensors,
+            placed=placed, streaming=streaming, dtype=dtype, param_dtype=param_dtype,
+            attention_impl=attention_impl, max_seq_len=max_seq_len, weights=weights, overrides=overrides)
     else:
-        loaded = None
-    if loaded is None:
-        # Without its weights, a decoder's leaves are translated as streaming translates them, each
-        # a view of its stored tensor that nothing reads.
-        remote = sources.remote_code(name_or_dir, directory) if trust_remote_code else None
-        return _load_native_source(name_or_dir, directory, commit, gguf_file=gguf_file, placed=placed,
-                                   streaming=streaming or not weights, dtype=dtype,
-                                   param_dtype=param_dtype, attention_impl=attention_impl,
-                                   max_seq_len=max_seq_len, weights=weights, remote=remote,
-                                   text_only=text_only)
-    return loaded, False
+        _unread_overrides(overrides, "a release without a native backbone")
+    missing = False
+    if head_source.weight_file is None:
+        head_tensors = {name: tensor for name, tensor in shared.items() if not name.startswith(prefix)}
+    else:
+        path = (source.file(root, head_source.weight_file) if head_source.initialize is None
+                else source.optional_file(root, head_source.weight_file))
+        missing = path is None
+        head_tensors = {} if path is None else sources.tensor_file(path)
+    head = head_source.build(backbone, dtype, attention_impl,
+                             shapes=None if missing else {name: tensor.shape
+                                                          for name, tensor in head_tensors.items()})
+    if missing:
+        if backbone is None or head_source.initialize is None:
+            raise ValueError("initializing a missing readout requires its backbone and initializer")
+        initialize = head_source.initialize
+
+        def drawn(variables):
+            initialized = initialize(head, replace(backbone, variables=variables))
+            return jax.tree_util.tree_map_with_path(
+                lambda path, leaf: leaf.astype(checkpoint_dtype(
+                    np.dtype(leaf.dtype), param_dtype,
+                    path=tuple(jax.tree_util.keystr((key,), simple=True) for key in path))), initialized)
+
+        if weights:
+            variables = drawn(backbone.variables)
+        else:
+            shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype),
+                                   backbone.variables)
+            variables = jax.eval_shape(drawn, shapes)
+    else:
+        params, _ = record_layouts("", decoder_parts.split_packed(head_tensors, head_source.packed),
+                                   head_source.path, (), param_dtype=param_dtype, lazy=True)
+        if head_source.reshape is not None:
+            params = head_source.reshape(head, params)
+        if not streaming:
+            params = materialize(params)
+        variables = {"params": params}
+    if backbone is None:
+        return Pretrained(head, placed(variables), None, {}, directory,
+                          record_fields(head, type(head)), revision=source.revision)
+    return description.bundle(backbone, head, placed(variables), directory,
+                              description.tokenizer_folder, **description.fields)
 
 
-def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | None, *,
-                        gguf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
-                        dtype: str, param_dtype: str, attention_impl: str,
-                        max_seq_len: int | None, weights: bool = True,
-                        remote: Path | None = None, text_only: bool = False) -> tuple[Pretrained, bool]:
-    """Decode native source weights and bind their processors and export layout, and whether the
-    bundle is a wrapper's language model taken alone (`text_only`).
-
-    Diffusers pipelines and the explicit torchax fallback have already taken
-    their own routes; this boundary handles native decoders and media wrappers,
-    and hands an unregistered causal LM tier 3 runs (`TorchRoute`) to it.
-    """
-    gguf_path = None if gguf_file is None else sources.repo_file(name_or_dir, directory, gguf_file)
-    config, tensors = _source_config(name_or_dir, directory, commit, gguf_path)
-    mamba_ssm = mamba2.is_mamba_ssm(config)
-    if mamba_ssm:
-        config = mamba2.config_from_mamba_ssm(config)
-    family = config.get("model_type")
-    # Before any weight downloads, on the config alone: a format the codec cannot read, a family's
-    # refusal, an unregistered decoder checked against transformers (tiers 2 and 3).
+def _routed(config: Mapping[str, object], *, remote: Path | None, text_only: bool,
+            overrides: Mapping[str, object] | None
+            ) -> tuple[Mapping[str, object], SourceRoute, decoder_parts.WrapperFields | None]:
+    """A native source's config, its route and, where `text_only` takes a wrapper's language model
+    alone, that model's wrapper fields, decided before any weight downloads, on the config alone: a
+    format the codec cannot read, a family's refusal, an unregistered decoder checked against
+    transformers (tiers 2 and 3). The language model reads as its text family's checkpoint
+    (`decoders.language_model_config`); a route that reads no `overrides` refuses them."""
     route = source_route(config, remote=remote)
-    # A wrapper's language model alone reads as its text family's checkpoint.
     language = route.wrapper if text_only and isinstance(route, WrapperRoute) else None
     if language is not None:
         if decoders.bundles(config):
-            raise ValueError(f"{family} reads its media bundle whole as one decoder family; text_only "
-                             "takes a wrapper whose language model is its own text family's checkpoint")
+            raise ValueError(f"{config.get('model_type')} reads its media bundle whole as one decoder "
+                             "family; text_only takes a wrapper whose language model is its own text "
+                             "family's checkpoint")
         if source_quantization(config) is not None:
             raise ValueError("text_only takes an unquantized wrapper: a quantized one's module selection "
                              "names the wrapper's modules, which its text checkpoint renames")
@@ -1467,14 +1645,52 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
     elif text_only and isinstance(route, DiffusionGemmaRoute):
         raise ValueError("text_only takes a media wrapper's language model; DiffusionGemma's decoder is "
                          "its whole model")
+    if isinstance(route, TorchRoute | DiffusionGemmaRoute):
+        _unread_overrides(overrides, "the transformers forward" if isinstance(route, TorchRoute)
+                          else "a diffusion Gemma's text tower")
+    return config, route, language
+
+
+def _load_native_source(source: sources.SourceReference, root: Path, *,
+                        gguf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
+                        dtype: str, param_dtype: str, attention_impl: str,
+                        max_seq_len: int | None, weights: bool = True,
+                        component: NativeComponent | None = None,
+                        tensors: Mapping[str, np.ndarray] | None = None,
+                        overrides: Mapping[str, object] | None = None,
+                        remote: Path | None = None, text_only: bool = False) -> tuple[Pretrained, bool]:
+    """Decode native source weights and bind their processors and export layout, and whether the
+    bundle is a wrapper's language model taken alone (`text_only`).
+
+    Diffusers pipelines and the explicit torchax fallback have already taken
+    their own routes; this boundary handles native decoders and media wrappers,
+    and hands an unregistered causal LM tier 3 runs (`TorchRoute`) to it.
+    `overrides` (`Pretrained.load`'s `modeling_overrides`) join the source's own.
+    """
+    name_or_dir, commit = source.name, source.revision
+    directory = source.directory(root)
+    gguf_path = None if gguf_file is None else source.file(root, gguf_file)
+    if component is None:
+        config, tensors = _source_config(name_or_dir, directory, commit, gguf_path)
+    else:
+        config = component.config
+        directory = source.component(component.config_folder).directory(root)
+    mamba_ssm = mamba2.is_mamba_ssm(config)
+    if mamba_ssm:
+        config = mamba2.config_from_mamba_ssm(config)
+    config = _overridden(config, overrides)
+    family = config.get("model_type")
+    config, route, language = _routed(config, remote=remote, text_only=text_only, overrides=overrides)
     if isinstance(route, TorchRoute):
         from dew.interop import torchax_fallback
-        loaded = torchax_fallback.load(name_or_dir, directory, commit, dtype=dtype, param_dtype=param_dtype,
+        selected = source if component is None else source.component(component.config_folder)
+        loaded = torchax_fallback.load(selected, root, dtype=dtype, param_dtype=param_dtype,
                                        attention_impl=attention_impl, max_seq_len=max_seq_len,
                                        admission=route.admitted, weights=weights)
         return replace(loaded, variables=placed(loaded.variables)), False
     if tensors is None:
-        directory = sources.snapshot(str(name_or_dir), directory.name)
+        root = source.weights(root)
+        directory = source.directory(root)
         tensors = sources.load_shards(directory)
     if mamba_ssm:
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
@@ -1509,7 +1725,10 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
                 max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming,
                 quantized=source_quantization(config) is not None, checked=checked)
     model, variables = _input_quantization(model, variables, layouts, config, grid)
-    source = str(name_or_dir) if commit is None else f"{name_or_dir}@{directory.name}"
+    resolved_commit = commit
+    if component is None and commit is not None:
+        resolved_commit = root.name
+    source = replace(source, revision=resolved_commit)
     processor = source_processor(directory, config, record, model, gguf_path, source=source)
     generation_config = read_generation_config(directory)
 
@@ -1522,7 +1741,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
                     layouts, retained, export_adapter, quantized_tensors=quantized_tensors,
                     quantized_scale_dtype=scale_dtype, quantization_grid=grid,
                     # The weights' commit: a pickle repo's may be its conversion's.
-                    revision=None if commit is None else directory.name,
+                    revision=resolved_commit,
                     tokenizer="byte" if named == "byte" else None,
                     # The modules a verification from parts ran, from the source's own snapshot.
                     code=remote if isinstance(route, VerifiedRoute) and route.verified.source is not None

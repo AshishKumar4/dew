@@ -1,7 +1,7 @@
 """Save and restore a run's training state and data position with Orbax.
 
 A checkpoint holds every train-state field `TrainState` marks checkpointed
-(`dew.training.state.CHECKPOINTED`): the clocks, the variables, the optimizer
+(`dew.state.CHECKPOINTED`): the clocks, the variables, the optimizer
 state, the EMA, the key, the loss scaler and a partial accumulation window,
 and, when the data iterator can report one, `position`. The narrow compute
 copies derive from the variables and are rebuilt on resume. A position
@@ -69,25 +69,25 @@ from etils import epath
 from orbax.checkpoint.checkpoint_manager import AsyncOptions, MultiprocessingOptions
 from orbax.checkpoint.checkpoint_managers import preservation_policy as preservation
 
-from dew import position, records
+from dew import _records, position
+from dew._coordination import broadcast_from_process_zero, from_every_process, seen_by_every_process
+from dew._hashing import fmix32
+from dew._records import JSON, duration, json_value
+from dew.batch import PARAMETER_ROOTS, Variables
 from dew.cleanup import attempted
-from dew.coordination import broadcast_from_process_zero, from_every_process, seen_by_every_process
 from dew.files import write_atomically
-from dew.hashing import fmix32
+from dew.mesh import LogicalAxes
 from dew.nn import sharding
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import LogicalAxes
-from dew.objectives.base import PARAMETER_ROOTS, Variables
-from dew.records import JSON, duration, json_value
 from dew.telemetry.profile import region
 
 if TYPE_CHECKING:
     import optax
     from flax.training.dynamic_scale import DynamicScale
 
-    from dew.config import ModelConfig
     from dew.data.dataset import DataPartition
-    from dew.training.state import Accumulation, TrainState
+    from dew.registry import ModelConfig
+    from dew.state import Accumulation, TrainState
 
 # One field of the train state as a checkpoint holds it: a scalar array, a
 # tree of arrays, or one of the records the state carries beside them. The
@@ -779,7 +779,7 @@ def _check_template(template, metadata, stored, *, mapping: bool) -> None:
             f"({' and '.join(RETIRED_RATE)}), which Dew's optimizer no longer forms: it holds the "
             "schedule's own rate fields (dew.optim.RateState), so a run cannot resume it. Resume it "
             "with the Dew that wrote it, or start a fresh run from its weights in a directory of its own.")
-    from dew.training.state import CHECKPOINTED
+    from dew.state import CHECKPOINTED
     missing = set(CHECKPOINTED).difference(stored)
     if missing:
         raise ValueError(f"training checkpoint lacks required state fields {sorted(missing)}")
@@ -845,7 +845,7 @@ def _filled(template, restored: dict, step: int):
     if (not isinstance(template.window_size, jax.ShapeDtypeStruct)
             and int(restored["window_size"]) != int(template.window_size)):
         raise ValueError("checkpoint accumulation window_size differs from this run")
-    from dew.training.state import CHECKPOINTED
+    from dew.state import CHECKPOINTED
     # A field no checkpoint holds (the narrow copies) starts over: the
     # template's are of its own parameters, not the restored ones.
     return template.replace(**restored, **{field.name: field.default for field in dataclasses.fields(template)
@@ -1287,7 +1287,7 @@ class Checkpoints:
             state_tree, frozen = self._frozen(self._item(state, saved, share))
             state_tree, deltas = _with_ema_deltas(state_tree)
             if weights_only:
-                from dew.training.state import MODEL_STATE
+                from dew.state import MODEL_STATE
                 state_tree = {name: state_tree[name] for name in MODEL_STATE}
         profile_metadata = None if profiles is None else {
             'updates': int(profiles.updates), 'stds': [float(std) for std in np.asarray(profiles.stds)]}
@@ -1559,7 +1559,7 @@ class Checkpoints:
     @staticmethod
     def _item(state: TrainState, saved: bytes | None,
               share: DataPartition | None) -> dict[str, StateLeaf]:
-        from dew.training.state import CHECKPOINTED
+        from dew.state import CHECKPOINTED
         state_tree = {name: getattr(state, name) for name in CHECKPOINTED}
         if saved is not None:
             if share is None:
@@ -1590,12 +1590,12 @@ class Checkpoints:
                              f"got {recorded!r}")
         table = {}
         for entry in recorded:
-            entry = records.record(entry, 'boxed')
+            entry = _records.record(entry, 'boxed')
             names = entry['names']
             if not isinstance(names, list):
                 raise ValueError(f"step {resolved}'s boxed names are a list, got {names!r}")
-            table[records.strings(entry['path'], 'boxed path')] = tuple(
-                None if name is None else records.text(name, 'boxed name') for name in names)
+            table[_records.strings(entry['path'], 'boxed path')] = tuple(
+                None if name is None else _records.text(name, 'boxed name') for name in names)
         return table
 
     def variables(self, *, step: int | str | None = None, ema: bool | None = None,
@@ -1609,8 +1609,8 @@ class Checkpoints:
         The subtrees at `unread`'s paths are neither placed nor read
         (`dew.objectives.base.UNREAD`).
         """
+        from dew.batch import FROZEN, without
         from dew.inference.banks import banked_placement, placed_rows, shape_rows, spread
-        from dew.objectives.base import FROZEN, without
         from dew.training.distributed import (
             Layout as DefaultLayout,
             MeshSpec as DefaultMesh,
@@ -1653,7 +1653,7 @@ class Checkpoints:
         given, the rest in their stored dtypes. Every load of a run's variables restores through it: a
         whole run's onto its layout (`variables`) and a bank's rows onto theirs
         (`dew.inference.banks.CheckpointBanks`)."""
-        from dew.objectives.base import merge
+        from dew.batch import merge
         from dew.registry import resolve_dtype
 
         target = resolve_dtype(param_dtype)
@@ -1700,7 +1700,7 @@ class Checkpoints:
 
     def accumulation_template(self, step: int):
         """Return the persisted pending-array shapes, without reading their values."""
-        from dew.training.state import CHECKPOINTED, Accumulation
+        from dew.state import CHECKPOINTED, Accumulation
         metadata = _item_metadata(self._step_metadata(step, local=step == self._local_latest()))
         missing = set(CHECKPOINTED).difference(metadata.keys())
         if missing:
@@ -1778,7 +1778,7 @@ class Checkpoints:
                     lambda path, leaf: _from_delta_planes(leaf, weights[path])
                     if path in deltas else leaf, restored['ema'])
         else:
-            from dew.training.state import CHECKPOINTED
+            from dew.state import CHECKPOINTED
             state_tree = {name: getattr(template, name) for name in CHECKPOINTED} \
                 if not isinstance(template, Mapping) else dict(template)
             held = _held_apart(state_tree, frozen)
@@ -1947,7 +1947,7 @@ def averaged(runs: Sequence[str | os.PathLike[str]], *, step: int | str | None =
     `ema` as its loaders read them (its average where None and it keeps one): a model soup of runs
     trained apart from one start, any objective's.
 
-    A run's weights are its model's tree (`Objective._saved_variables`, read onto `mesh` as `layout`
+    A run's weights are its model's tree (`SavedRun.variables`, read onto `mesh` as `layout`
     places it, as a run's loaders take them) in fp32 with its frozen leaves back in `params`, a LoRA
     run's factors merged into their kernels first (`Adapter.merge`), as the mean of two runs' factors
     is not the mean of the weights they make: a LoRA run, a partly frozen one and a whole fine-tune of
@@ -1958,10 +1958,10 @@ def averaged(runs: Sequence[str | os.PathLike[str]], *, step: int | str | None =
     the host in fp32 (`_taken`), one run's shards beside it at a time, a subnormal kept as float64's
     mean rounds it where a device may flush it, and assembles its leaves as the first run's are
     placed: a pool averages runs no one process holds whole. An integer or boolean leaf must agree
-    across the runs. `trust` is as `run_record` takes it."""
+    across the runs. `trust` is as `SavedRun.pinned` takes it."""
     if len(runs) < 2:
         raise ValueError(f"an average is of two or more runs, got {len(runs)}")
-    from dew.coordination import agreed
+    from dew._coordination import agreed
     from dew.training.host import place_leaf
 
     means: list = []
@@ -2036,21 +2036,19 @@ def _effective_weights(directory: str, step: int | str | None, ema: bool | None,
     merged away, and its directory, step and average read: the adapter's factors merged where the
     recorded model's tree is (`Objective._recorded_part`), beside any part its record leaves out, and
     the frozen leaves back in `params` (`thaw`). What the merge holds goes as this returns."""
-    from dew.config import ModelConfig
-    from dew.inference.tasks import run_record
-    from dew.lora import Adapter, AdapterRecord
-    from dew.objectives.base import joined, part, thaw
-    from dew.registry import objectives
+    from dew.batch import part, thaw
+    from dew.inference.tasks import SavedRun, saved_model
+    from dew.lora import Adapter, AdapterRecord, recorded_adapter
+    from dew.objectives.base import joined
 
-    declaration, pinned = run_record(directory, step, trust)
-    objective = objectives[records.text(declaration["objective"], "objective")]
-    config = ModelConfig.from_dict(records.record(declaration["model"], "model"))
-    tree = objective._saved_variables(directory, step=pinned, ema=ema, mesh=mesh, layout=layout,
-                                      param_dtype=jnp.float32)
-    if config.adapter is not None:
+    run = SavedRun.pinned(directory, step, trust)
+    pinned, objective, config = run.step, run.objective, saved_model(run.record, None)
+    tree = run.variables(ema=ema, mesh=mesh, layout=layout, param_dtype=jnp.float32)
+    adapter = recorded_adapter(config.wrappers)
+    if adapter is not None:
         name = objective._recorded_part
         own = tree if name is None else part(tree, name)
-        merged = Adapter.recorded(config.build(), own, config.adapter).merge(own)
+        merged = Adapter.recorded(config.build(), own, adapter).merge(own)
         if name is None:
             tree = merged
         else:
@@ -2060,7 +2058,7 @@ def _effective_weights(directory: str, step: int | str | None, ema: bool | None,
         kept = checkpoints.stored(pinned).get("ema") is not None
     base = dataclasses.replace(config, wrappers=tuple(
         wrapper for wrapper in config.wrappers if not isinstance(wrapper, AdapterRecord)))
-    return thaw(tree), base, (directory, pinned, not objective._ema_is_reference and (
+    return thaw(tree), base, (directory, pinned, not objective.ema_is_reference and (
         kept if ema is None else bool(ema)))
 
 
