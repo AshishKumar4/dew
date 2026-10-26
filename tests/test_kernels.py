@@ -227,21 +227,22 @@ LARGE_LOGIT_SEEDS = 16
 
 @on_gpu
 def test_triton_trains_at_large_logits_on_par_with_xla():
-    """tokamax's kernel, as 'triton' runs it, at logits near 1e4 (a channel of each query and key drawn
-    near 256, as a small DiT's trained projections give them, the rest small): its output and its query,
-    key and value gradients on par with the xla kernel's from float64 (check 1). Its dK/dV sweep scales
-    the keys where its forward and dQ scale the queries, so its scores there round apart from the
-    forward's residuals by tens of units, and the weights it rebuilds from them were off by e^76 (row
-    1676: a MeanFlow step's key and value gradients 1e35 to 1e62 times xla's error); the route hands it
-    the queries scaled once (`triton_attention`)."""
+    """tokamax's kernel, as 'triton' runs it, at logits near 1e4 that its softmax spreads over every key:
+    a channel of each query drawn near 256 and the keys' all 256, as a small DiT's trained projections
+    give them, the other channels standard normal, so the logits differ by a few units a key. Its output
+    and its query, key and value gradients on par with the xla kernel's from float64 (check 1). Its dK/dV
+    sweep scaled the keys where its forward and dQ scale the queries, so its scores there rounded apart
+    from the forward's residuals by units, and the weights it rebuilt from them were off by their
+    exponential (row 1676: a MeanFlow step's key and value gradients 1e35 to 1e62 times xla's error); the
+    route hands it the queries scaled once (`triton_attention`)."""
     pytest.importorskip("tokamax")
     shape = (2, 64, 2, 32)
 
     def draw(seed):
-        streams = jax.random.split(jax.random.PRNGKey(seed), 5)
+        streams = jax.random.split(jax.random.PRNGKey(seed), 4)
         query, key, value = (jax.random.normal(stream, shape, jnp.float32) for stream in streams[:3])
         query = query.at[..., 0].set(jax.random.uniform(streams[3], shape[:3], minval=200, maxval=300))
-        key = key.at[..., 0].set(jax.random.uniform(streams[4], shape[:3], minval=200, maxval=300))
+        key = key.at[..., 0].set(256.0)
         return tuple(x.astype(jnp.bfloat16) for x in (query, key, value))
 
     def pulled(implementation):
