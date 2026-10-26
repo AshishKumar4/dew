@@ -81,7 +81,7 @@ DEW_GROUPS: list[tuple[str, list[str]]] = [
     ("Inference and interop", ["dew.inference", "dew.inference.banks", "dew.inference.tasks",
                               "dew.interop", "dew.interop.diffusion_gemma"]),
     ("Decision models", ["dew.decision", "dew.decision.config", "dew.decision.data", "dew.decision.objective",
-                         "dew.decision.layout", "dew.decision.task"]),
+                         "dew.decision.rows", "dew.decision.layout", "dew.decision.task"]),
     ("Conditions and evaluation", ["dew.inputs", "dew.inputs.encoders", "dew.eval", "dew.eval.harness"]),
     ("Configuration", ["dew.config", "dew.config.lm", "dew.config.jepa", "dew.config.diffusion",
                        "dew.config.sweep"]),
