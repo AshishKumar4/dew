@@ -5,6 +5,14 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- `SafetensorsBanks` streams a media wrapper's language model and the native backbone of a decision
+  release whose readout is stored apart (a slot release), besides a decoder: it reads the source through
+  `dew.interop.pretrained.native_backbone`, `Pretrained.load`'s own translation and tree check over the
+  safetensors alone. A wrapper's towers and projectors are read whole and stay resident. A config that
+  states `expert_dtype` without a quantization config is no longer refused.
+- `tools/slot_runtime_qualification.py` qualifies a released slot runtime against the authors' engine and
+  its float64 truth, the truth's weights streamed from those banks: phases pool, native, environment,
+  author, truth (`--partial` resumes a stopped phase) and verdict, one checkout's commit across them.
 - `OptimConfig` and `ScheduleSpec` move from `dew.config` to `dew.optim`, beside the optimizers and
   schedules they build; `Wandb` moves to `dew.training` (`dew.training.tracker`), beside the tracker that
   reads it; and
