@@ -59,7 +59,7 @@ SEEDS = {'attention cache capacity': 32, 'attention cached scores raw': 8,
          'llama4 registered scores policy': 16, 'mamba registered scores raw': 8,
          'mamba registered scores policy': 16, 'mamba2 registered scores raw': 8,
          'mamba2 registered scores policy': 8, 'memory registered scores raw': 8,
-         'memory registered scores policy': 16, 'mla registered scores raw': 16,
+         'memory registered scores policy': 32, 'mla registered scores raw': 16,
          'mla registered scores policy': 16, 'mlp registered scores raw': 8,
          'mlp registered scores policy': 16}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
