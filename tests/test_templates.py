@@ -159,7 +159,8 @@ def test_a_call_runs_the_first_implementation_that_runs_it_on_the_device_or_the_
 def _selected(kernels: dict, generic: tuple = (), named: str | None = None) -> str:
     """The kernel a selector over `kernels` (name to whether it takes the call), the `generic` ones
     (taking every call) after them, runs, `named` as `generation.chosen` names it; a kernel `None`
-    names takes no call but by name, as CUTLASS's grouped GEMM (`grouped_matmul.NAMED`)."""
+    names takes no call but by name, as CUTLASS's grouped GEMM off its declared cells
+    (`grouped_matmul.DECLARED_ONLY`)."""
     def requirement(takes):
         if takes is None:
             return Requirement[None]("named", lambda case: False, "", row=generation.INHERENT,

@@ -214,7 +214,7 @@ def _experts_lowered(generation: str, implementation: str):
 def test_an_expert_layer_lowers_for_the_gpu_with_the_grouped_matmul_its_generation_chooses(generation):
     """'auto' runs the grouped matmul's kernels on every GPU generation, each forward and backward
     launch of each projection the route its cell takes there (its route says which): the template's
-    Mosaic GPU launch, or the old route `grouped_matmul.OLD_ROUTES` lists. On an Ampere-class GPU the
+    Mosaic GPU launch, or the old route `grouped_matmul.DECLARED` lists. On an Ampere-class GPU the
     forward runs Mosaic GPU's and the gradients Triton's, whose two kernels lower; on one whose family has
     no bundle (`bundles.of`: consumer Blackwell's) Triton's runs all three; on Hopper Triton's runs only
     where a launch runs it, Mosaic GPU's lowering as no Triton kernel. The experts'
