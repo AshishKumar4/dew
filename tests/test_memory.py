@@ -344,7 +344,7 @@ def test_a_memory_layer_kind_records_and_rebuilds():
     level = InContextMemory(network=GatedMLP(hidden_features=48, out_features=32), project_query=False,
                             project_key=False, project_value=False, output=False,
                             objective=Objective("huber", delta=0.5), learning_rate=Gate(value=0.01), chunk=3)
-    model = CausalTransformer(**{**TINY_DECODER, "vocab_size": 37, "num_layers": 3, "dtype": "float32",
+    model = CausalTransformer(**{**TINY_DECODER, "vocab_size": 37, "num_layers": 3, "dtype": jnp.float32,
                                  "layer_types": ("heads", "level", "attention"),
                                  "kinds": {"heads": LayerKind(mixer=InContextMemoryMixer(heads)),
                                            "level": LayerKind(mixer=InContextMemoryMixer(level)),
