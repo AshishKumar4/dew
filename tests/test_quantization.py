@@ -889,6 +889,35 @@ def test_a_program_finds_every_quantized_tower_its_models_hold():
     assert [found.dtype for found in quantizations(nested)] == ["int8"]
 
 
+def test_a_diffusion_step_compiles_for_the_quantized_text_tower_it_encodes_with():
+    """A text-to-image objective's programs run its conditions' encoders and its autoencoder beside its
+    denoiser (`Objective.towers`), so the options its step and its samples compile with read a quantized
+    text tower (`compiler_options`) as they read a quantized denoiser."""
+    from pathlib import Path
+
+    from dew.diffusion import presets
+    from dew.inputs import Condition, Field, InputSpec
+    from dew.inputs.encoders import CLIPText
+    from dew.nn.backbones.dit import SimpleDiT
+    from dew.nn.kernels.options import quantizations
+    from dew.objectives.diffusion import DiffusionObjective
+
+    pytest.importorskip("qwix")
+    encoder = CLIPText.from_pretrained(str(Path(__file__).parent / "fixtures" / "clip" / "tiny"))
+
+    def objective(tower):
+        return DiffusionObjective(SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
+                                            mlp_ratio=1),
+                                  presets.Flow(), InputSpec(Field("image", (8, 8, 3)),
+                                                            {"textcontext": Condition(tower)}),
+                                  guidance=None, steps=2)
+
+    assert quantizations(*objective(encoder).towers()) == []
+    tower = Quantization(dtype="int8").apply(encoder.transformer)
+    quantized = dataclasses.replace(encoder, transformer=tower)
+    assert [found.dtype for found in quantizations(*objective(quantized).towers())] == ["int8"]
+
+
 SPLIT_SEEDS = 16
 """The split quantized tree's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on
 armada."""

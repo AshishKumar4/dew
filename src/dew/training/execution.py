@@ -343,8 +343,7 @@ class HostExecution:
             with jax.set_mesh(self.accelerator):
                 # The pullback runs its int8 dots here, apart from the forward's program, with an
                 # int8 backward (`Quantization.bwd_qtype`) on the options that ask for it.
-                pulled = program(_trainable_cotangent,
-                                 *(entry.module for entry in self.objective.program_key()), step=options,
+                pulled = program(_trainable_cotangent, *self.objective.towers(), step=options,
                                  static_argnames=("sites", "paths", "layout"))
                 gradient = pulled(back, self.on_accelerator(cotangent), sites=self.sites, paths=moving,
                                   layout=layout)
