@@ -1566,7 +1566,7 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
         routed = (mamba2.config_from_mamba_ssm(component.config) if mamba2.is_mamba_ssm(component.config)
                   else component.config)
         remote = None if code is None else source.component(component.config_folder).directory(code)
-        forwarded = isinstance(source_route(routed, remote=remote), TorchRoute)
+        forwarded = isinstance(source_route(routed, remote=remote, revision=source.revision), TorchRoute)
         reads_shared = not forwarded or bool(head_source.weight_file is None and prefix)
         if weights or reads_shared:
             weight_source = source.component(component.weights_folder)
