@@ -114,8 +114,9 @@ from flax import struct
 
 from dew.config import Prepared, RunConfig, TrainerConfig
 from dew.data import Loading, Memory
+from dew.mesh import DEFAULT_RULES
 from dew.objectives.base import Objective, mean_of_totals, merge_totals
-from dew.training import DEFAULT_RULES, Layout, MeshSpec
+from dew.training import Layout, MeshSpec
 
 
 @struct.dataclass
@@ -186,7 +187,8 @@ class ActivityRun(RunConfig):
 
 TRAIN_RUN = '''
 import dataclasses, sys
-from dew.config import ModelConfig, TrainerConfig
+from dew.config import TrainerConfig
+from dew.registry import ModelConfig
 from toypackage.models import ActivityRun
 default = ActivityRun().trainer
 run = ActivityRun(model=ModelConfig("toypackage.models:Population", {"neurons": 64}),

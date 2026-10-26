@@ -17,13 +17,14 @@ from typing import ClassVar
 
 import numpy as np
 
-from dew.data.dataset import Batch, Records
+from dew._records import record
+from dew.batch import Batch
+from dew.data.dataset import Records
 from dew.data.generation import Generation
 from dew.data.pipeline import ExpandStep, Pack
 from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _consumed, _indexed_manifest
 from dew.data.tokens import chunk_lengths, chunk_table, first_fit, packed_window
-from dew.records import record
 
 
 def plan_name(pack: Pack, field: str) -> str:
@@ -286,4 +287,4 @@ class PackedSource(View[Source]):
         return None
 
     def manifest(self) -> ShardManifest:
-        return _indexed_manifest(self, self.plan.location, self.plan.location, 1024)
+        return _indexed_manifest(self, self.plan.location, 1024)

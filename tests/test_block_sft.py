@@ -20,12 +20,13 @@ from reference_error import assert_as_exact
 from safetensors.numpy import load_file
 
 from dew import Trainer
+from dew.batch import FROZEN, freeze, select
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
 from dew.interop import Pretrained
 from dew.interop.diffusion_gemma import translate_weights
 from dew.nn.inputs import ModelInputs
-from dew.objectives.base import FROZEN, Step, freeze, select
+from dew.objectives.base import Step
 from dew.objectives.diffusion.block import BlockDiffusionObjective
 from dew.training import MeshSpec
 from dew.training.transaction import example_fields
@@ -365,7 +366,9 @@ def loaded_image_source():
                                  "image_groups": jnp.where(indices >= 0, indices // 2, -1),
                                  "positions": positions},
                          {"pixel_values": pixels, "image_lengths": jnp.asarray([1, 2])})
-    obj = BlockDiffusionObjective(loaded.model, prompt_length=8, variables=loaded.variables)
+    # The loaded source itself, whose weights and end-of-sequence ids the objective takes, its text
+    # processor left out as the objective's tests read token ids.
+    obj = BlockDiffusionObjective(loaded, prompt_length=8, processor=None)
     variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
     step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.key(3), ema=None)
     return loaded, inputs, obj, variables, step
@@ -480,9 +483,8 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     key = jax.random.key(11)
     published_task = readback.block_generation()
     # The run's task stops where the published one does: at the checkpoint's end-of-sequence ids, which
-    # the run's own settings do not carry yet (ledger 895).
-    run_task = replace(obj.pipeline(resumed, ema=False, processor=loaded.processor),
-                       eos_token_ids=published_task.eos_token_ids)
+    # the objective took from the source.
+    run_task = obj.pipeline(resumed, ema=False, processor=loaded.processor)
     generated = run_task(prompt, 4, key=key, process=published_task.process)
     published = published_task(prompt, 4, key=key)
     np.testing.assert_array_equal(generated.tokens, published.tokens)

@@ -53,10 +53,13 @@ from flax.linen.dtypes import promote_dtype
 from flax.linen.module import Interceptor
 from flax.nnx import bridge
 
+from dew._records import finite
+from dew.batch import FROZEN, Path, Variables, freeze, merge as overlay, part, select, thaw
+from dew.cache import INTERCEPTED
 from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
-from dew.nn.dense import Dense, DenseGeneral
+from dew.nn.dense import _contractions, _linear_site
 from dew.nn.dropout import Dropout
 from dew.nn.flops import (
     MissingFlopsCount,
@@ -84,7 +87,6 @@ from dew.nn.protocols import (
     CountedVideo,
 )
 from dew.nn.sharding import LOW_RANK_FACTORS
-from dew.objectives.base import FROZEN, Path, Variables, freeze, merge as overlay, part, select, thaw
 from dew.quantization import (
     FROZEN_FP8,
     QUANTIZATION,
@@ -92,8 +94,7 @@ from dew.quantization import (
     frozen_fp8_kernel,
     measured_fp8_sites,
 )
-from dew.records import finite
-from dew.registry import rebuilt, wrapper_layers
+from dew.registry import Wrapper, rebuilt, wrapper_layers
 
 PEFT_CONFIG = "adapter_config.json"
 PEFT_WEIGHTS = "adapter_model.safetensors"
@@ -347,21 +348,18 @@ class Adapter:
         binding whose shapes do not fit the restored factors is refused by name.
         `trust` is as `TextGeneration.from_run` takes it.
         """
-        from dew.config import ModelConfig
-        from dew.inference.tasks import run_record
-        from dew.records import record, text
-        from dew.registry import objectives
+        from dew.inference.tasks import SavedRun, saved_model
 
-        declaration, step = run_record(str(directory), step, trust)
-        config = ModelConfig.from_dict(record(declaration['model'], 'model'))
-        if config.adapter is None:
+        run = SavedRun.pinned(str(directory), step, trust)
+        config = saved_model(run.record, None)
+        adapter = recorded_adapter(config.wrappers)
+        if adapter is None:
             raise ValueError(f"{directory} trained no adapter")
-        objective = objectives[text(declaration['objective'], 'objective')]
-        variables = objective._saved_variables(str(directory), step=step, ema=ema)
+        variables = run.variables(ema=ema)
         # The recorded model's own tree, where the objective's nests it beside parts the record leaves out.
-        if objective._recorded_part is not None:
-            variables = part(variables, objective._recorded_part)
-        return cls.recorded(config.build(), variables, config.adapter)
+        if run.objective._recorded_part is not None:
+            variables = part(variables, run.objective._recorded_part)
+        return cls.recorded(config.build(), variables, adapter)
 
     @classmethod
     def recorded(cls, model: nn.Module, variables: Variables, adapter: AdapterRecord) -> Adapter:
@@ -566,23 +564,17 @@ class _Branch:
             child = getattr(module, name)
             a, b = child.get_variable("params", "lora_A"), child.get_variable("params", "lora_B")
             return _updated(kernel, a, b, _scale(target, self.rslora))
-        target = _target_at(self.targets, root + module.path) if context.method_name == "__call__" else None
+        target = (_target_at(self.targets, root + module.path)
+                  if context.method_name in ("__call__", "_linear") else None)
         if target is None:
             return next_fun(*args, **kwargs)
-        # Dew's layers are flax's with the bias summed at fp32; a model built on flax's own adapts alike.
-        if type(module) not in (Dense, DenseGeneral, nn.Dense, nn.DenseGeneral):
-            raise TypeError(
-                f"{'/'.join(root + module.path)} is a {type(module).__name__}; an adapter "
-                "targets Dense and DenseGeneral kernels")
+        if not _linear_site(context, "/".join(root + module.path)):
+            return next_fun(*args, **kwargs)
         x = args[0] if args else kwargs["inputs"]
         output = next_fun(*args, **kwargs)
-        if isinstance(module, nn.DenseGeneral):
-            if module.batch_dims:
-                raise TypeError(f"{'/'.join(root + module.path)} contracts with batch dims")
-            axes = (module.axis,) if isinstance(module.axis, int) else tuple(module.axis)
-        else:
-            axes = (-1,)
-        axes = tuple(sorted(axis % x.ndim for axis in axes))
+        axes, batch_dims = _contractions(module, x.ndim)
+        if batch_dims:
+            raise TypeError(f"{'/'.join(root + module.path)} contracts with batch dims")
         if module.has_variable("params", "lora_A"):
             # A frozen FP8 site holds no kernel past init (`_fp8_packed`); its factors hold their shapes.
             a, b = module.get_variable("params", "lora_A"), module.get_variable("params", "lora_B")
@@ -763,11 +755,11 @@ def _adapted(model: nn.Module, bound: _Bound) -> nn.Module:
             return _record(bound)
 
         def apply(self, variables, *args, **kwargs):
-            with nn.intercept_methods(branch):
+            with INTERCEPTED(new_value=True), nn.intercept_methods(branch):
                 return super().apply(thaw(variables), *args, **kwargs)
 
         def init_with_output(self, *args, **kwargs):
-            with nn.intercept_methods(branch):
+            with INTERCEPTED(new_value=True), nn.intercept_methods(branch):
                 output, variables = super().init_with_output(*args, **kwargs)
             return output, _fp8_packed(model, dict(freeze(variables, lambda path: path in factors)))
 
@@ -823,6 +815,11 @@ class AdapterRecord:
                        binding.name, ((*module.split('/'), 'kernel'),), binding.shape, binding.transpose)
                    for module, binding in self.layouts.items()}
         return targets, layouts
+
+
+def recorded_adapter(wrappers: Sequence[Wrapper]) -> AdapterRecord | None:
+    """The LoRA bound among a model record's `wrappers` (`ModelConfig.wrappers`), or None."""
+    return next((wrapper for wrapper in wrappers if isinstance(wrapper, AdapterRecord)), None)
 
 
 def _record(bound: _Bound) -> AdapterRecord:

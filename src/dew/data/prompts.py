@@ -24,8 +24,8 @@ from typing import TYPE_CHECKING, Literal
 
 import numpy as np
 
-from dew.nn.inputs import token_ids
-from dew.records import JSON, json_value
+from dew._records import JSON, json_value
+from dew.batch import token_ids
 
 from .chat import Conversation, render_prompt
 from .text import ByteTokenizer, HFTokenizer
@@ -126,7 +126,7 @@ keeps `tools_kwargs` inside `extra_info`."""
 
 def _text(value: JSON) -> str:
     """One reward column as a string: missing is empty, a string is itself, and any other value
-    travels as its JSON (a row's value narrowed by `dew.records.json_value` first)."""
+    travels as its JSON (a row's value narrowed by `dew._records.json_value` first)."""
     match value:
         case None:
             return ""

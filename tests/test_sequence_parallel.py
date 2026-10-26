@@ -332,7 +332,8 @@ def test_equal_multimodal_coordinates_rotate_the_shared_keys_like_plain_position
     """Equal temporal and spatial coordinates reduce M-RoPE to plain RoPE,
     including the keys a later layer shares. Both must read the same table.
     """
-    from dew.nn.inputs import AttentionMetadata, coordinates as token_coordinates
+    from dew.batch import coordinates as token_coordinates
+    from dew.nn.inputs import AttentionMetadata
     from dew.nn.mixer_base import MixerContext
     from dew.nn.mixers.attention import CausalSelfAttention
 

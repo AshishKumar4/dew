@@ -106,13 +106,15 @@ class DewLM(TemplateLM):
 
     @classmethod
     def from_run(cls, run: str, *, batch_size: int = 1, ema: bool | None = None,
-                 step: int | str | None = None, dtype: str | None = None) -> DewLM:
+                 step: int | str | None = None, dtype: str | None = None,
+                 trust: Sequence[str] = ()) -> DewLM:
         """Load the run directory `run` as a harness model, the way `dew.pipeline` builds it.
 
         With `ema=None`, it uses the run's averaged weights when the run kept
-        them, and its live weights otherwise.
+        them, and its live weights otherwise. `trust` is as `TextGeneration.from_run`
+        takes it.
         """
-        return cls(TextGeneration.from_run(run, ema=ema, step=step, dtype=dtype),
+        return cls(TextGeneration.from_run(run, ema=ema, step=step, dtype=dtype, trust=trust),
                    batch_size=batch_size)
 
     @classmethod

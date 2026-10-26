@@ -15,7 +15,7 @@ from collections.abc import Mapping
 
 from flax.traverse_util import flatten_dict
 
-from dew import records
+from dew import _records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
     PLAIN_SPELLING,
@@ -283,7 +283,7 @@ def _glm5_next_names(path: tuple[str, ...], config: Mapping[str, object],
     if head.startswith('layers_'):
         prefix = f"model.layers.{int(head.removeprefix('layers_'))}."
     elif head.startswith('mtp_'):
-        layer = records.integer(fields['num_layers'], 'num_layers') + int(head.removeprefix('mtp_'))
+        layer = _records.integer(fields['num_layers'], 'num_layers') + int(head.removeprefix('mtp_'))
         prefix = f'model.layers.{layer}.'
         tail = tail[1:] if tail[0] == 'block' else tail
         if tail == ['final_norm', 'scale']:
@@ -293,7 +293,7 @@ def _glm5_next_names(path: tuple[str, ...], config: Mapping[str, object],
     if len(tail) == 4 and tail[:2] == ['mlp', 'experts'] and tail[3] == 'kernel':
         return tuple(checked(f'{prefix}mlp.experts.{expert}.{tail[2]}.weight',
                              (*path[:-2], str(expert), *path[-2:]))
-                     for expert in range(records.integer(config['n_routed_experts'], 'n_routed_experts')))
+                     for expert in range(_records.integer(config['n_routed_experts'], 'n_routed_experts')))
     if len(tail) == 2 and tail[0] in ('attn_hc', 'ffn_hc'):
         return checked(f"{prefix}hc_{tail[0].removesuffix('_hc')}_{tail[1]}", path)
     ending = 'weight' if tail[-1] in ('kernel', 'scale') else tail[-1]
@@ -336,13 +336,13 @@ def _glm4_moe_config(hf_config: Mapping[str, object], used: set[str]) -> Decoder
     used.update(('use_qk_norm', 'num_nextn_predict_layers'))
     config = base_config(hf_config, used, rope=ropes,
                           qk_norm=bool(hf_config.get('use_qk_norm', False)))
-    layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    layers = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     config.update(
         o_proj_bias=False,
         partial_rotary_factor=None if factor == 1.0 else factor,
         partial_rotary_type="default",
         mixture=deepseek_mixture(hf_config, layers, used),
-        num_nextn_predict_layers=records.integer(
+        num_nextn_predict_layers=_records.integer(
             hf_config.get("num_nextn_predict_layers", 0), "num_nextn_predict_layers"
         ),
     )
@@ -363,17 +363,17 @@ def _glm_indexer_types(hf_config: Mapping[str, object], layers: int, used: set[s
     used.update(('indexer_types', 'index_topk_pattern', 'index_topk_freq',
                  'index_skip_topk_offset'))
     stated_types = hf_config.get('indexer_types')
-    types = None if stated_types is None else list(records.strings(stated_types, 'indexer_types'))
+    types = None if stated_types is None else list(_records.strings(stated_types, 'indexer_types'))
     if types is None:
         pattern = hf_config.get('index_topk_pattern')
         if pattern is not None:
             letters = {'F': 'full', 'S': 'shared'}
             types = ([letters.get(letter, letter) for letter in pattern]
                      if isinstance(pattern, str)
-                     else list(records.strings(pattern, 'index_topk_pattern')))
+                     else list(_records.strings(pattern, 'index_topk_pattern')))
         else:
-            freq = max(records.integer(hf_config.get('index_topk_freq', 1), 'index_topk_freq'), 1)
-            offset = records.integer(hf_config.get('index_skip_topk_offset', 2), 'index_skip_topk_offset')
+            freq = max(_records.integer(hf_config.get('index_topk_freq', 1), 'index_topk_freq'), 1)
+            offset = _records.integer(hf_config.get('index_skip_topk_offset', 2), 'index_skip_topk_offset')
             types = ['full' if max(index - offset + 1, 0) % freq == 0 else 'shared'
                      for index in range(layers)]
     if len(types) != layers:
@@ -400,7 +400,7 @@ def _glm_moe_dsa_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
     attend the previous full layer's top-k (:313-318, :739-748). The MTP depth
     ships past num_hidden_layers as GLM 4.5's does.
     """
-    layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    layers = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     # GlmMoeDsaConfig.__post_init__:152 points head_dim at the rope slice
     # whatever the config says (GLM-5.2 ships 192 over a rope width of 64),
     # so the field describes nothing the reference computes.
@@ -421,12 +421,12 @@ def _glm_moe_dsa_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
     shared = tuple(index for index, kind in
                    enumerate(_glm_indexer_types(hf_config, layers, used))
                    if kind == 'shared')
-    mixer = records.record(config.get('mixer'), 'mixer')
-    config['mixer'] = {'class': mixer['class'], 'fields': {**records.record(mixer['fields'], 'mixer fields'),
+    mixer = _records.record(config.get('mixer'), 'mixer')
+    config['mixer'] = {'class': mixer['class'], 'fields': {**_records.record(mixer['fields'], 'mixer fields'),
                                                          'index_rope_interleave': True}}
     if shared:
         config['kv_shared_layers'] = shared
-    config["num_nextn_predict_layers"] = records.integer(
+    config["num_nextn_predict_layers"] = _records.integer(
         hf_config.get("num_nextn_predict_layers", 0), "num_nextn_predict_layers"
     )
     return config

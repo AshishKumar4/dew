@@ -169,7 +169,8 @@ def test_a_packed_delta_net_lowers_onto_the_port_whatever_documents_its_rows_dec
     (so the row's length, 128, far more than its two chunks) or declared at 64, lowered for an A100 on
     this CPU: its forward and backward run on the port's kernels, which keep only the memories passing
     between a document's chunks, whatever the bound."""
-    from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
+    from dew.batch import coordinates
+    from dew.nn.inputs import AttentionMetadata, MixerCall
     from dew.nn.linear import GatedDeltaNet
 
     layer = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=2, head_k_dim=32, head_v_dim=32,
