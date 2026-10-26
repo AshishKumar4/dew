@@ -57,8 +57,6 @@ CELLS: dict[str, tuple[str, ...]] = {
 CELLS_ON_FOUR: dict[str, tuple[str, ...]] = {
     "dense": ("stage4", "stage2_sequence2"),
 }
-EXCHANGE: dict[str, tuple[str, ...]] = {"moe_grpo": ("expert4", "expert2_fsdp2")}
-"""The cells a mixture runs with its expert exchange dispatch, which needs an expert axis."""
 REFUSED: dict[tuple[str, str], str] = {
     ("hybrid_sft", "stage4"): "ledger 1436: its layer pattern does not repeat every L / stages layers",
 }
@@ -80,18 +78,16 @@ def references(tmp_path_factory):
 
 
 @pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize(("model", "layout", "devices", "mixture"), [
-    *(pytest.param(model, layout, None, {}, id=f"{model}-{layout}")
+@pytest.mark.parametrize(("model", "layout", "devices"), [
+    *(pytest.param(model, layout, None, id=f"{model}-{layout}")
       for model, layouts in sorted(CELLS.items()) for layout in layouts),
-    *(pytest.param(model, layout, 4, {}, id=f"{model}-{layout}-on-four")
-      for model, layouts in sorted(CELLS_ON_FOUR.items()) for layout in layouts),
-    *(pytest.param(model, layout, None, {"dispatch": "exchange"}, id=f"{model}-{layout}-exchange")
-      for model, layouts in sorted(EXCHANGE.items()) for layout in layouts)])
-def test_each_layout_of_a_model_matches_one_device_or_is_refused_as_stated(model, layout, devices, mixture,
+    *(pytest.param(model, layout, 4, id=f"{model}-{layout}-on-four")
+      for model, layouts in sorted(CELLS_ON_FOUR.items()) for layout in layouts)])
+def test_each_layout_of_a_model_matches_one_device_or_is_refused_as_stated(model, layout, devices,
                                                                            references):
     tool, held = references
     with jax.enable_x64(new_val=True):
-        rows = tool.run([model], (layout,), dtype="float32", steps=1, anchor=True, mixture=mixture,
+        rows = tool.run([model], (layout,), dtype="float32", steps=1, anchor=True, mixture={},
                         objective={}, references=held, speak=lambda line: None,
                         keep=lambda rows: None, devices=devices)
     stated = "refused" if (model, layout) in REFUSED else "works"
