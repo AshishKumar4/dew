@@ -1103,7 +1103,7 @@
     },
     {
      "repo": "huggingface/transformers",
-     "version": "5.17.0",
+     "version": "5.16.1",
      "runs": "transformers"
     }
    ],
