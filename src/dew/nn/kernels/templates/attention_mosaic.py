@@ -75,18 +75,22 @@ def _extents(family: mosaic.Family, dtype, extent: int) -> tuple[int, ...]:
 
 def _derived[Config: (Tiles, BackwardTiles)](family: mosaic.Family, dtype, held: int, walked: int,
                                                 tiles: Callable[[int, int, int], Config],
-                                                fits: Callable[[Config], bool]) -> Config | None:
+                                                fits: Callable[[Config], bool], *,
+                                                overlapped: bool) -> Config | None:
     """A launch's config from its family's facts and the call's extents (design §7), no space ranked: its
-    consumers the family's (`Family.consumers`), fewer where the `held` rows a consumer accumulates (a
-    forward's queries, a dK/dV launch's keys) fill fewer of the family's units; each consumer's rows the
-    family's unit (`_extents`' least: the rows its products cover, `Family.role_rows`, in whole swizzled
-    rows), so one consumer's softmax runs under its partner's products as FlashAttention-3's does; the tile
+    consumers the family's (`Family.consumers`) where its step `overlapped` (a softmax between its products,
+    which runs under its partner's products as the consumers take turns, FlashAttention-3's), else one (a
+    step issuing its products back to back, which turns only make wait); fewer where the `held` rows a
+    consumer accumulates (a forward's queries, a dK/dV launch's keys) fill fewer of the family's units; each
+    consumer's rows the family's unit (`_extents`' least: the rows its products cover, `Family.role_rows`, in
+    whole swizzled rows); the tile
     it walks the largest unit multiple of the `walked` extent whose live set a consumer's registers hold and
     whose two stages the block holds (`fits`), two the ring's busy depth, a slot loading while one is read;
     fewer consumers where no tile of the family's count holds the block (a GPU of a smaller one).
     `tiles(rows, walked, consumers)` builds the config. None where no tile fits."""
     rows = _extents(family, dtype, held)[-1]
-    for consumers in range(max(1, min(family.consumers, -(-held // rows))), 0, -1):
+    most = family.consumers if overlapped else 1
+    for consumers in range(max(1, min(most, -(-held // rows))), 0, -1):
         for extent in _extents(family, dtype, walked):
             config = tiles(rows, extent, consumers)
             if fits(config):
@@ -216,7 +220,10 @@ class MosaicForward(_Mainloop[Tiles]):
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> Tiles | None:
         """Its tiles from the facts (`_derived`): each consumer a unit of queries, the key tile the largest
-        its registers and the block hold, two stages."""
+        its registers and the block hold, two stages; the family's consumers taking turns on the plain
+        forward, whose softmax runs under the other's products, and one on the training forward, whose
+        split sums and kept anchor row issue its products back to back (TRAINC-h100: 4.13 against 2.39 ms
+        causal, 6.90 against 4.30 full, at 64 x 64 with two consumers and one)."""
         family = self._family(ba, target)
         if family is None:
             return None
@@ -226,7 +233,8 @@ class MosaicForward(_Mainloop[Tiles]):
             return Tiles(rows, walked, 2, consumers, family.name)
 
         return _derived(family, query.dtype, query.shape[1], key.shape[1], tiles,
-                        lambda config: self.legal(ba, config, target))
+                        lambda config: self.legal(ba, config, target),
+                        overlapped=not ba.arguments.get("residuals"))
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         """The program's shared memory (`_forward_allocations`, `_staged`), at the call's widths as the launch
@@ -390,9 +398,11 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
 
     def derived(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> BackwardTiles | None:
         """Its tiles from the facts (`_derived`): each dK/dV consumer a unit of keys, the query tile both
-        launches walk the largest their registers and the block hold, two stages, and two launches (the
-        dQ launch, then the dK/dV one): deterministic, and of the least memory; the one-launch schedule, which
-        adds dQ in shared order, runs where a test names it until FlashAttention-3's structure replaces it."""
+        launches walk the largest their registers and the block hold, two stages, one consumer, whose step
+        issues its products back to back (TRAINC-h100: 6.88 against 3.72 ms causal, 9.68 against 7.56 full,
+        at 64 x 64 with two consumers and one), and two launches (the dQ launch, then the dK/dV one):
+        deterministic, and of the least memory; the one-launch schedule, which adds dQ in shared order, runs
+        where a test names it until FlashAttention-3's structure replaces it."""
         family = self._family(ba, target)
         if family is None:
             return None
@@ -402,7 +412,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
             return BackwardTiles(walked, rows, 2, consumers, fused=False, family=family.name)
 
         return _derived(family, query.dtype, key.shape[1], query.shape[1], tiles,
-                        lambda config: self.legal(ba, config, target))
+                        lambda config: self.legal(ba, config, target), overlapped=False)
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles,
                      target: generation.GpuTarget) -> int:

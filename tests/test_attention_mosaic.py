@@ -454,7 +454,9 @@ def test_the_derived_tiles_stage_within_a_hoppers_block(width, value_width, resi
     than a consumer has), the op is not eligible, so the route takes another mainloop. At D 128 the facts
     give FlashAttention-3's 64 queries a consumer over 128 keys, two consumers and two stages: a consumer of
     128 queries spills (2.9 to 4.6 ms against 0.49 measured). The training forward, whose fp32 weights stay
-    beside its logits until its anchor split, walks 64 keys: over 128 its kernel spilled 1.5 KB."""
+    beside its logits until its anchor split, walks 64 keys (over 128 its kernel spilled 1.5 KB) on one
+    consumer, its step's products issued back to back, which two consumers' turns only made wait (4.13
+    against 2.39 ms, TRAINC-h100)."""
     with generation.assumed("sm90"):
         target = generation.gpu_target()
         op, ba = _forward_call((2, 4096, 32, 8), width, value_width, residuals)
@@ -466,7 +468,7 @@ def test_the_derived_tiles_stage_within_a_hoppers_block(width, value_width, resi
             assert op.registers(ba, derived) <= op.register_budget(derived)
     assert (derived is not None) == (value_width < 256 or not residuals)
     if (width, value_width) == (128, 128):
-        assert derived == attention_mosaic.Tiles(64, 64 if residuals else 128, 2, 2)
+        assert derived == attention_mosaic.Tiles(64, 64 if residuals else 128, 2, 1 if residuals else 2)
 
 
 def _backward_call(shape, width: int, accurate: bool):
