@@ -277,10 +277,10 @@ def loss_scale(dynamic_scale: bool | dynamic_scale_lib.DynamicScale) -> dynamic_
     return dynamic_scale_lib.DynamicScale() if dynamic_scale else None
 
 
-def held_dicts(variables: Variables) -> Variables:
-    """`variables` as a state holds its trees: every mapping a dict (`dew.batch.dicts`), the containers
-    the state's own, so nothing the state does to them reaches the caller's tree."""
-    return jax.tree.map(lambda leaf: leaf, dicts(variables))
+def held_dicts[Tree](tree: Tree) -> Tree:
+    """`tree` as a state holds its trees: every mapping a dict (`dew.batch.dicts`), the containers the
+    state's own, so nothing the state does to them reaches the caller's tree."""
+    return jax.tree.map(lambda leaf: leaf, dicts(tree))
 
 
 class Trainer(Generic[Loss, Effects]):
@@ -1435,8 +1435,9 @@ class Trainer(Generic[Loss, Effects]):
             if checkpoints is not None and checkpoints.latest is not None:
                 run.stop_control = checkpoints.control(checkpoints.latest)
         else:
-            # A supplied state's trees are held as dicts too (`initial_state`).
-            initial = dataclasses.replace(initial, variables=held_dicts(initial.variables))
+            # A supplied state's trees are held as dicts too (`initial_state`), its optimizer's and
+            # accumulation's mirrors of the parameters with them.
+            initial = held_dicts(dataclasses.replace(initial, variables=dict(initial.variables)))
             shardings, _ = self._validated(initial)
             state = jax.device_put(initial, shardings)
             position = None
