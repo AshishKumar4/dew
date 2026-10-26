@@ -11,6 +11,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.mesh import LogicalAxes
 from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, projection_flops
 from dew.nn.moe import (
@@ -23,7 +24,7 @@ from dew.nn.moe import (
     renormalized_softmax,
 )
 from dew.nn.precision import float32_dot_general
-from dew.nn.sharding import LogicalAxes, logical_axes
+from dew.nn.sharding import logical_axes
 
 FUSED_EXPERT_AXES: Mapping[str, LogicalAxes] = {
     "gate_up_proj": ("exp", "embed", "mlp"),

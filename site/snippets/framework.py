@@ -23,10 +23,10 @@ ROOT = Path(__file__).resolve().parents[2]
 def lm():
     # Begin snippet: lm
     from dew import Trainer
-    from dew.config import OptimConfig
     from dew.data import Hub, presets
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
+    from dew.optim import OptimConfig
 
     data = Hub("winglian/tiny-shakespeare").shuffle(0).repeat().pipe(presets.lm, "byte", seq_len=64, batch=8)
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
@@ -41,11 +41,11 @@ def lm():
 def diffusion():
     # Begin snippet: diffusion
     from dew import Field, InputSpec, Trainer
-    from dew.config import OptimConfig
     from dew.data import Hub, presets
     from dew.diffusion.presets import Flow
     from dew.nn.backbones import SimpleDiT
     from dew.objectives.diffusion import DiffusionObjective
+    from dew.optim import OptimConfig
     from dew.sampling import Euler
 
     data = Hub("uoft-cs/cifar10").shuffle(0).repeat().pipe(presets.images, 32, batch=64, field="img")
@@ -61,9 +61,9 @@ def diffusion():
 def jepa():
     # Begin snippet: jepa
     from dew import Field, Trainer
-    from dew.config import OptimConfig
     from dew.data import Hub, presets
     from dew.objectives.jepa import JepaEncoder, JepaObjective, JepaPredictor, MultiBlockMask
+    from dew.optim import OptimConfig
 
     data = Hub("uoft-cs/cifar10").shuffle(0).repeat().pipe(presets.images, 32, batch=64, field="img")
     encoder = JepaEncoder(patch_size=4, emb_features=32, num_layers=1, num_heads=2)
@@ -84,10 +84,10 @@ def grpo():
     import numpy as np
 
     from dew import LocalTracker, Trainer
-    from dew.config import OptimConfig
     from dew.data import Memory, presets
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.rl import GRPOObjective, RolloutScheduler
+    from dew.optim import OptimConfig
     from dew.sampling import Sampling
 
     def reward(completion, record):
@@ -122,10 +122,10 @@ def finetune():
     from dataclasses import replace
 
     from dew import Trainer
-    from dew.config import OptimConfig
     from dew.data import Hub, presets
     from dew.interop import PretrainedDecoder
     from dew.objectives.lm import LMObjective
+    from dew.optim import OptimConfig
     from dew.sampling import Sampling
 
     name = "HuggingFaceTB/SmolLM2-135M-Instruct"
@@ -147,10 +147,10 @@ def pretrained():
     import jax.numpy as jnp
 
     from dew import Trainer
-    from dew.config import OptimConfig
     from dew.data import Hub, presets
     from dew.interop import PretrainedDecoder
     from dew.objectives.lm import LMObjective
+    from dew.optim import OptimConfig
     from dew.sampling import Sampling
 
     bundle = PretrainedDecoder.load("Qwen/Qwen3-0.6B", dtype=jnp.bfloat16, param_dtype=jnp.bfloat16,
@@ -237,10 +237,10 @@ def mesh():
     jax.config.update("jax_num_cpu_devices", 4)
 
     from dew import MeshSpec, Trainer
-    from dew.config import OptimConfig
     from dew.data import Hub, presets
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
+    from dew.optim import OptimConfig
 
     data = Hub("winglian/tiny-shakespeare").shuffle(0).repeat().pipe(presets.lm, "byte", seq_len=64, batch=8)
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
@@ -257,10 +257,10 @@ def mesh():
 def reliability():
     # Begin snippet: reliability
     from dew import Checkpoints, Trainer
-    from dew.config import OptimConfig
     from dew.data import Hub, presets
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
+    from dew.optim import OptimConfig
     from dew.training import prepare_process
 
     prepare_process(multi_host=False, xla_flags="--xla_gpu_deterministic_ops=true")
@@ -296,10 +296,10 @@ def reliability():
 def profile():
     # Begin snippet: profile
     from dew import ProfileWindow, Trainer
-    from dew.config import OptimConfig
     from dew.data import Hub, presets
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
+    from dew.optim import OptimConfig
 
     data = Hub("winglian/tiny-shakespeare").shuffle(0).repeat().pipe(presets.lm, "byte", seq_len=64, batch=8)
     model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,

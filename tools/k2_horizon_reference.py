@@ -18,9 +18,9 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch_precision import float64, float64_twin
 from huggingface_hub import hf_hub_download
 from reference_source import hub_modules
+from torch_precision import float64, float64_twin
 
 from dew.interop.verify import probe_ids, scatter_weights
 

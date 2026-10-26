@@ -21,18 +21,22 @@ from __future__ import annotations
 import dataclasses
 import fnmatch
 import inspect
+import json
 import math
 from collections.abc import Callable, Mapping, Sequence
-from typing import Literal, NamedTuple
+from typing import TYPE_CHECKING, Annotated, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import tyro
 
-from dew.hashing import fmix32
+from dew._hashing import fmix32
+from dew.mesh import LogicalAxes
 from dew.nn.precision import at_least_fp32
-from dew.nn.sharding import LogicalAxes, declarations, declared_axes
+from dew.nn.sharding import declarations, declared_axes
+from dew.registry import JsonDict, from_record, record_argument, schedules, to_record
 
 # Attention stores its projections either as one matrix over the flattened
 # head space or as a dimension per head. The head dimensions count as one
@@ -1530,6 +1534,161 @@ class Exponential(ScheduleBase):
         return lambda count: rates['offset'] + decay(count)
 
 
+if TYPE_CHECKING:
+    # tyro reads the runtime annotation, a Union of the aliased schedules, and a type checker cannot
+    # read a variable in a type expression. Both get what they need: the base class statically, the
+    # union at runtime, once every schedule above is defined (`dew.registry.schedules`).
+    type ScheduleSpec = ScheduleBase
+else:
+    ScheduleSpec = schedules.union
+
+def _rate_argument() -> tyro.constructors.PrimitiveConstructorSpec:
+    """The learning rate as one command-line value, the record a run holds: a number, the constant
+    rate, or a schedule's record as JSON (`dew.registry.from_record`)."""
+    annotation = float | ScheduleSpec
+
+    def number(value) -> bool:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+    def read(given: list[str]) -> float | ScheduleBase:
+        value = json.loads(given[0])
+        if number(value):
+            return float(value)
+        built = from_record(annotation, value, dtypes=False)
+        if not isinstance(built, ScheduleBase):
+            raise TypeError(f"--optim.learning-rate is a number or a schedule's record, not {given[0]}")
+        return built
+
+    return tyro.constructors.PrimitiveConstructorSpec(
+        nargs=1, metavar="RATE|JSON", instance_from_str=read,
+        is_instance=lambda given: number(given) or isinstance(given, ScheduleBase),
+        str_from_instance=lambda given: [json.dumps(to_record(given, annotation))])
+
+
+@dataclasses.dataclass(frozen=True)
+class OptimConfig:
+    """Holds the optimizer, learning-rate schedule and gradient clipping."""
+
+    optimizer: Optimizer = "adamw"
+    optimizer_opts: JsonDict = dataclasses.field(default_factory=dict)
+    learning_rate: Annotated[float | ScheduleSpec, _rate_argument()] = 2.7e-4
+    """The learning rate: a constant, or a schedule as one typed record per kind (`dew.optim`).
+
+    The kinds are cosine, power (lm-engine's power law with an optional linear
+    tail), linear, one_cycle (torch's `OneCycleLR`) and exponential; each record
+    holds only its own fields, and `every` steps any of them once per that many
+    updates. On the command line it is one value: `--optim.learning-rate 3e-4`, or a
+    schedule's record, `--optim.learning-rate '{"class": "cosine", "fields": {...}}'`.
+    """
+    weight_decay: float | None = None
+    """The weight decay passed to the optimizer, None keeping its own (adamw's 1e-4, the others'
+    0); for 'adam' it is torch's coupled L2 penalty, added to the gradient before the moments
+    read it, for 'adamw' the decoupled decay. Either decay, the default included, spares biases
+    and vectors such as a norm's scale, timm's split for every optimizer
+    (`dew.optim.weight_decay_mask`); Muon decays them as Moonlight does, and
+    `param_groups` replace the split. Records written before this change decayed every
+    parameter; ParamGroup('all', ('*',)) restores that."""
+    b1: float | None = None
+    """Adam's first-moment decay, for adam, adamw and lamb; None keeps the optimizer's."""
+    b2: float | None = None
+    """Adam's second-moment decay, for adam, adamw and lamb; None keeps the optimizer's."""
+    param_groups: Annotated[tuple[ParamGroup, ...], record_argument(tuple[ParamGroup, ...])] = ()
+    """Per-group learning rates, momentum schedules, weight decay and bounds; the first
+    matching group wins.
+
+    Empty runs one optimizer over every parameter. `ParamGroup.mup` is lm-engine's muP split.
+    """
+    clip_grads: float = 0.0
+    state_dtype: Literal["float32", "bfloat16", "int8"] = "float32"
+    """The dtype of Adam's moments in memory.
+
+    float32 stores adam's and adamw's two moments, and Muon's momentum, in
+    float32 whatever the parameters' dtype, so bfloat16 or float16 weights
+    train on full-precision moments. bfloat16 stores both with stochastic
+    rounding (`dew.optim.bf16_moments`), for adam and adamw only. That halves
+    the optimizer state and reduces the update's memory traffic. int8 stores
+    both blockwise in 8 bits (`dew.optim.int8_moments`, bitsandbytes' and
+    torchao's 8-bit Adam), for adam and adamw only: a quarter of float32's,
+    about 2 bytes a parameter for the two.
+    """
+    forced_weight_normalization: bool = False
+    """Whether to renormalize every magnitude-preserving weight (`dew.nn.mp.MPConv`) after each update.
+
+    This is EDM2's forced weight normalization, which its `edm2_unet` trains with
+    (`dew.nn.mp.forced_weight_normalization`).
+    """
+    ema_profiles: tuple[float, ...] = ()
+    """Relative standard deviations of the power-function EMAs a run keeps for post-hoc EMA.
+
+    See `dew.optim.power_profiles`; Karras et al. use (0.05, 0.10). Every
+    checkpoint save snapshots these averages, and `Checkpoints.posthoc_ema` builds
+    an average with any other relative standard deviation from the snapshots.
+    Empty keeps none.
+    """
+
+    def build(self, steps: int | None) -> optax.GradientTransformation:
+        """Build the optimizer this config describes, with its schedule, parameter groups and clipping.
+
+        `steps` is the run's length in updates, which the schedule decays over unless the
+        config names its own end. With `param_groups`, one optimizer runs per group under
+        `optax.multi_transform`, each on its own schedule (the config's when it names
+        none) times its multiplier, with its own weight decay, `b1` schedule and bounds
+        (`ParamGroup.solver`); the global-norm clip still reads every gradient
+        together, before the groups split them. Each solver holds its rate's
+        fields in its state (`dew.optim.scheduled_solver`), so runs at
+        rates of one schedule's timings compile one step.
+        """
+        opts = dict(self.optimizer_opts)
+        if {'b1', 'b2'} & opts.keys():
+            raise ValueError("b1 and b2 are fields of OptimConfig, not optimizer_opts")
+        given = {'b1': self.b1, 'b2': self.b2, 'weight_decay': self.weight_decay}
+        opts.update({name: value for name, value in given.items() if value is not None})
+        make: Callable[..., optax.GradientTransformation] = OPTIMIZER_MAP[self.optimizer]
+        if self.state_dtype != 'float32':
+            if self.optimizer not in STATE_OPTIMIZERS[self.state_dtype]:
+                raise ValueError(
+                    f"state_dtype={self.state_dtype!r} stores Adam's moments, which "
+                    f"{sorted(STATE_OPTIMIZERS[self.state_dtype])} have; {self.optimizer!r} does not")
+            make = STATE_OPTIMIZERS[self.state_dtype][self.optimizer]
+        elif self.optimizer in ('adam', 'adamw'):
+            opts = {'mu_dtype': 'float32', 'nu_dtype': 'float32', **opts}
+        elif self.optimizer in ('muon', 'muonclip'):
+            opts = {'mu_dtype': 'float32', **opts}
+        if self.param_groups:
+            names = [group.name for group in self.param_groups]
+            if len(set(names)) != len(names):
+                raise ValueError(f"param group names repeat: {names}")
+            solvers = {}
+            for group in self.param_groups:
+                decay = {} if group.weight_decay is None else {'weight_decay': group.weight_decay}
+                solvers[group.name] = group.solver(make, self.learning_rate, steps, {**opts, **decay})
+            solver = optax.multi_transform(solvers, param_labels(self.param_groups))
+        else:
+            if self.optimizer not in ('muon', 'muonclip'):
+                opts['mask'] = weight_decay_mask
+            solver = scheduled_solver(make, self.learning_rate, steps, opts)
+
+        if self.clip_grads > 0:
+            solver = optax.chain(optax.clip_by_global_norm(self.clip_grads), solver)
+        if self.forced_weight_normalization:
+            from dew.nn.mp import forced_weight_normalization
+
+            solver = optax.chain(solver, forced_weight_normalization())
+        if self.ema_profiles:
+            solver = power_profiles(solver, self.ema_profiles)
+        return solver
+
+    def rates(self) -> dict[str | None, dict[str, float]]:
+        """The rate fields each of `build`'s solvers holds in its state
+        (`dew.optim.scheduled_solver`), by param group, or under None
+        for the one solver of a config without groups. A resumed run sets
+        them over its checkpoint's (`with_rates`), so the configured
+        rate is the one it steps at."""
+        if not self.param_groups:
+            return {None: rates_of(self.learning_rate)}
+        return {group.name: group.rates(self.learning_rate) for group in self.param_groups}
+
+
 __all__ = ["NEWTON_SCHULZ", "BoundsState", "Cosine", "DeltaState", "Exponential", "Linear", "M3State",
-           "OneCycle", "ParamGroup", "Power", "PowerProfilesState", "PowerTail", "QKClipState",
-           "ScheduleBase", "delta_gradient_descent", "scale_by_m3", "stepped"]
+           "OneCycle", "OptimConfig", "ParamGroup", "Power", "PowerProfilesState", "PowerTail",
+           "QKClipState", "ScheduleBase", "ScheduleSpec", "delta_gradient_descent", "scale_by_m3", "stepped"]

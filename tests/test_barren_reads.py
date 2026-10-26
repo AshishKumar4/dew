@@ -10,12 +10,12 @@ import numpy as np
 import pytest
 from reader_support import assert_resumes_where_it_stopped
 
+from dew._records import record
 from dew.data import Loading, Memory, Rejected, mix
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import Pipeline
 from dew.data.sources.grain import from_grain
-from dew.records import record
 
 WORKERS = Loading(workers=3, threads=1, read_buffer=1, worker_buffer=1)
 

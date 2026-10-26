@@ -19,10 +19,12 @@ from reference_error import assert_as_exact_as_the_reference
 
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
-from dew.nn.autoencoders import AutoEncoder, AutoencoderKL, StableDiffusionVAE
+from dew.nn.autoencoders import AutoEncoder, AutoencoderKL, LatentNormalization, StableDiffusionVAE
+from dew.nn.autoencoders.api import ModuleAutoEncoder
 from dew.nn.autoencoders.pretrained import REGISTRATIONS
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import Recorder, Step
+from dew.registry import to_record
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "vae"
 
@@ -146,17 +148,17 @@ def _published(kind: str, directory: Path):
     return autoencoder, autoencoder.params
 
 
-RECORDS = tuple(entry.record for entry in REGISTRATIONS)
-"""Every built-in autoencoder's record name, one per registration."""
+RECORDS = ("sd_vae", *ARCHIVES)
+"""Every built-in autoencoder, by the fixture it is built from: the SD VAE's `tiny_vae` and the others'
+archives (`_published`)."""
 
 
 def test_every_registration_is_one_autoencoder_with_a_fixture():
-    """No record name, wrapper or published class registers twice, and every registered autoencoder has
-    its fixture here (`_published`; the SD VAE's is `tiny_vae`)."""
+    """No wrapper or published class registers twice, and every registered autoencoder has its fixture
+    here."""
     published = [name for entry in REGISTRATIONS for name in entry.published]
-    assert len(set(RECORDS)) == len(RECORDS) and len(set(published)) == len(published)
-    assert len({entry.wrapper for entry in REGISTRATIONS}) == len(REGISTRATIONS)
-    assert set(ARCHIVES) | {"sd_vae"} == set(RECORDS)
+    assert len(set(published)) == len(published)
+    assert len({entry.wrapper for entry in REGISTRATIONS}) == len(REGISTRATIONS) == len(RECORDS)
 
 
 @pytest.mark.parametrize("kind", RECORDS)
@@ -226,20 +228,75 @@ def test_a_stochastic_encoder_samples_at_its_given_noise_and_a_deterministic_one
     assert not np.array_equal(sampled, mean)
 
 
+class Plain(ModuleAutoEncoder[AutoencoderKL]):
+    """A user's autoencoder with nothing of its own to record: it inherits the generic constructor."""
+
+    def record_arguments(self) -> dict:
+        return {}
+
+
+class Halved(ModuleAutoEncoder[AutoencoderKL]):
+    """A user's autoencoder, no built-in: a native AutoencoderKL whose latents it scales by `factor`,
+    recorded with that factor (`record_arguments`)."""
+
+    def __init__(self, model: AutoencoderKL, params, factor: float):
+        super().__init__(model, params)
+        self.factor = factor
+        self.normalization = LatentNormalization({"factor": factor}, 0.0, factor)
+
+    def record_arguments(self) -> dict:
+        return {"factor": self.factor}
+
+
+@pytest.mark.parametrize("own", ["inherited constructor", "own constructor"])
+def test_a_users_autoencoder_rebuilds_from_its_record_as_a_built_in_does(own):
+    """An autoencoder of the user's own records itself as the registry records any component, its class
+    by import path (`registry.to_record`), and rebuilds from that record around the run's parameters
+    (`AutoEncoder.bound`), no registration needed: the rebuilt one encodes and decodes bitwise as the one it
+    recorded, its normalization included. Its class and its module's survive JSON as import paths."""
+    vae = tiny_vae()
+    original = (Plain(vae.model, vae.params) if own == "inherited constructor"
+                else Halved(vae.model, vae.params, factor=0.5))
+    record = json.loads(json.dumps(to_record(original, AutoEncoder)))
+    assert record["class"].endswith(f":{type(original).__name__}")
+    assert record["fields"]["model"]["class"].endswith(":AutoencoderKL")
+    rebuilt = AutoEncoder.bound(record, params=original.params)
+    assert type(rebuilt) is type(original)
+    assert dict(rebuilt.normalization.record) == dict(original.normalization.record)
+    assert (rebuilt.latent_shift, rebuilt.latent_scale) == (original.latent_shift, original.latent_scale)
+    image = jax.random.uniform(jax.random.key(0), (2, IMAGE_SIZE, IMAGE_SIZE, 3), minval=-1.0, maxval=1.0)
+    latent = original.encode(original.params, image)
+    np.testing.assert_array_equal(rebuilt.encode(rebuilt.params, image), latent)
+    np.testing.assert_array_equal(rebuilt.decode(rebuilt.params, latent),
+                                  original.decode(original.params, latent))
+
+
+def test_an_earlier_runs_autoencoder_record_reads_as_its_class_record():
+    """An earlier run recorded a built-in autoencoder by its registration's name with its module's bare
+    fields; the run's loader (`SavedRun.pinned`, `earlier_shapes`) reads it as the class record Dew
+    writes now, which rebuilds the same autoencoder."""
+    from dew.inference.tasks import earlier_shapes
+
+    original = tiny_vae(latent_shift=0.25, latent_scale=0.5)
+    record = to_record(original, AutoEncoder)
+    earlier = {"name": "sd_vae", "fields": {**record["fields"], "model": record["fields"]["model"]["fields"]}}
+    assert earlier_shapes({"autoencoder": earlier})["autoencoder"] == record
+
+
 @pytest.mark.parametrize("kind", RECORDS)
 def test_every_built_in_autoencoder_rebuilds_from_its_saved_record_alone(kind, tmp_path):
-    """A saved diffusion task records its autoencoder (`to_json`) and a run rebuilds it from that
-    record around the checkpoint's parameters (`from_json`), the source it was loaded from gone: the
-    record survives JSON, and the rebuilt autoencoder declares the same latent shape and encodes and
-    decodes bitwise as the one it recorded, its normalization included."""
+    """A saved diffusion task records its autoencoder (`registry.to_record`) and a run rebuilds it from
+    that record around the checkpoint's parameters (`AutoEncoder.bound`), the source it was loaded from
+    gone: the record survives JSON, and the rebuilt autoencoder declares the same latent shape and
+    encodes and decodes bitwise as the one it recorded, its normalization included."""
     if kind == "sd_vae":
         original = tiny_vae(latent_shift=0.25, latent_scale=0.5)
         params = original.params
     else:
         original, params = _published(kind, tmp_path / "source")
         shutil.rmtree(tmp_path / "source")
-    record = json.loads(json.dumps(original.to_json()))
-    rebuilt = AutoEncoder.from_json(record, params=params)
+    record = json.loads(json.dumps(to_record(original, AutoEncoder)))
+    rebuilt = AutoEncoder.bound(record, params=params)
     assert type(rebuilt) is type(original)
     side = 2 * original.downscale_factor
     frames = (5,) if kind == "wan" else ()

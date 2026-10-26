@@ -35,8 +35,8 @@ from typing import TypedDict
 
 import numpy as np
 
+from dew._records import JSON, finite, integer, integers, listed, record as section, text
 from dew.data.prompts import PromptRecord
-from dew.records import JSON, finite, integer, integers, listed, record as section, text
 
 from .records import messages, reals
 from .rollout import Reward

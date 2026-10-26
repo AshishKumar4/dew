@@ -4,7 +4,7 @@ A tutorial that shows what a model learns at stages, a sample from each fifth of
 next-token probabilities after each, called `fit` once a stage, each stage resuming the last one's
 checkpoint. An observer takes those values inside one fit instead: at every `every`-th step, and at
 the run's last, the trainer hands `call` the state the step just produced and keeps what it returns,
-copied home (`dew.coordination.collective_host`) before the next step donates the state's buffers.
+copied home (`dew._coordination.collective_host`) before the next step donates the state's buffers.
 
 Every process of a pool calls `fit` with an observer of the same cadence, runs `call` and keeps the
 values, as every process takes part in an evaluation: a call may run the model on the mesh, and a
@@ -18,10 +18,10 @@ import dataclasses
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
-from dew.coordination import agree_process_phase, agreed, agreed_same, collective_host
+from dew._coordination import agree_process_phase, agreed, agreed_same, collective_host
 
 if TYPE_CHECKING:
-    from dew.training.state import TrainState
+    from dew.state import TrainState
 
 
 @dataclasses.dataclass

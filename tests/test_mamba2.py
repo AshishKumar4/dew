@@ -34,8 +34,9 @@ from reference_error import (
 from ssd_support import mamba2_draw, mamba2_run
 
 from dew.accuracy import distance
+from dew.batch import coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.inputs import AttentionMetadata, MixerCall, ModelInputs, coordinates
+from dew.nn.inputs import AttentionMetadata, MixerCall, ModelInputs
 from dew.nn.mixers.mamba2 import Mamba2, chunk_ssd, recurrent_ssd
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec

@@ -847,6 +847,114 @@ def test_a_recording_made_in_shards_is_the_recording_one_run_makes():
                                                                             range(cut - 1))])
 
 
+def test_a_recorded_truth_over_windows_counts_one_window_and_checks_every_one():
+    """A summarized recording of windows read back through `indexed_recording` with a truth over windows
+    (`over_windows`): its rounding count traces one window, as one draw's program, so the truth is read
+    where a loop that stacks its windows on the host cannot be traced whole, and every window's truth is
+    checked against the recording, a change confined to the last window refused."""
+    from reference_error import _one_draws_program, chain_roundings, over_windows, windows
+    from tool_support import load
+
+    recorder = load("recorded_references")
+
+    def product(inputs):
+        return {"y": jnp.dot(inputs["x"], inputs["w"], precision="highest")}
+
+    draw = windows(lambda seed: dict(zip(("x", "w"), _draw(seed), strict=True)), 4)
+
+    def evaluate(inputs):
+        with jax.enable_x64(new_val=False):
+            reference = over_windows(product)(inputs)
+        return reference, over_windows(product)(widened(inputs))
+
+    one = dict(zip(("x", "w"), _draw(0), strict=True))
+    program, arguments = _one_draws_program(over_windows(product), (draw(0),))
+    assert program is product
+    counted = chain_roundings(jax.make_jaxpr(program)(*arguments))
+    assert counted == chain_roundings(jax.make_jaxpr(product)(one))
+    last = draw(0)["x"][3, 0, 0]
+
+    def moved_last(inputs):
+        # The last window's truth moved by a millionth, every other window's as it is.
+        return {"y": product(inputs)["y"] * jnp.where(inputs["x"][0, 0] == last, 1 + 1e-6, 1.0)}
+
+    with jax.enable_x64(new_val=True):
+        recorded = recorder.record_case("site", draw, evaluate, jax.vmap(product), summary=True)
+        seeds = int(recorded["site.seeds"])
+        for truth_fn, holds in ((product, True), (moved_last, False)):
+            _, _, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw,
+                                            truth_fn=over_windows(truth_fn))
+            if holds:
+                truth(0, widened(draw(0)))
+            else:
+                with pytest.raises(AssertionError):
+                    truth(0, widened(draw(0)))
+
+
+def _recorded_pairs(dew, reference, count: int, missing=()):
+    """`dew` and `reference` recorded at `count` pilot seeds from SIZING_FROM on but the `missing` ones,
+    each looked up by its seed, with a truth of zero, and the seeds the reference was asked for."""
+    from reference_error import SIZING_FROM
+
+    pilots = range(SIZING_FROM, SIZING_FROM + count)
+    mine = {seed: dew(seed) for seed in pilots}
+    theirs = {seed: reference(seed) for seed in pilots if seed not in missing}
+    asked = []
+
+    def recorded(seed):
+        asked.append(int(seed))
+        return theirs[int(seed)]
+
+    def recorded_dew(seed):
+        return mine[int(seed)]
+
+    def truth(seed):
+        return {"y": np.zeros(64, np.float64)}
+
+    recorded.recorded = True
+    return recorded, recorded_dew, truth, asked
+
+
+def test_a_recorded_reference_with_pilots_sizes_paired_on_them_alone():
+    """A recorded reference sizes paired only on pilot draws it holds (`recorded_pilots`, a view of its
+    own), from SIZING_FROM on, never past them: an error law that never resolves exhausts the 24 pilots
+    held at its last doubling (16), and no lookup reaches past them. One without pilots is refused, a
+    view leaves its reference as it was, a live reference cannot hold pilots, a declaration of pilots
+    the recording lacks is refused at once, and a start past the pilots is refused, not unbound."""
+    from reference_error import SIZING_FROM, recorded_pilots
+
+    def draw(seed):
+        return (np.int64(seed),)
+
+    def straddling(seed):
+        return {"y": np.full(64, 2.0 if seed % 2 == 0 else 0.1, np.float32)}
+
+    def unit(seed):
+        return {"y": np.ones(64, np.float32)}
+
+    reference, dew, truth, asked = _recorded_pairs(straddling, unit, 24)
+    with pytest.raises(ValueError):
+        seeds_for(reference, draw, "no pilots", dew_fn=dew, truth_fn=truth)
+    held = recorded_pilots(reference, draw, 24)
+    assert not hasattr(reference, "pilots") and held.pilots == range(SIZING_FROM, SIZING_FROM + 24)
+    with pytest.raises(AssertionError):
+        seeds_for(held, draw, "never resolving", dew_fn=dew, truth_fn=truth)
+    assert max(asked) < SIZING_FROM + 24
+    with pytest.raises(KeyError):
+        recorded_pilots(reference, draw, 25)
+    holed, _, _, _ = _recorded_pairs(unit, unit, 24, missing={SIZING_FROM + 5})
+    with pytest.raises(KeyError):
+        recorded_pilots(holed, draw, 24)
+    # Arms that agree exactly resolve at once, at the ceiling itself.
+    same, same_dew, zero, _ = _recorded_pairs(unit, unit, 24)
+    assert seeds_for(recorded_pilots(same, draw, 24), draw, "at the ceiling", start=24, dew_fn=same_dew,
+                     truth_fn=zero) == 24
+    with pytest.raises(AssertionError):
+        seeds_for(held, draw, "start past the pilots", start=32, dew_fn=dew, truth_fn=truth)
+    with pytest.raises(ValueError):
+        recorded_pilots(_product, draw, 8)
+
+
 def test_a_recorded_reference_is_drawn_by_its_index_and_covers_the_redraw(tmp_path):
     """A reference recorded over (1 + REDRAW)·K seeds: each draw reads its seed's inputs, the reference
     and truth read their recorded outputs at it, and check 1 judges Dew against them; a recording too

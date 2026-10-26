@@ -21,12 +21,12 @@ from PIL import Image
 
 from dew import Checkpoints, Field, InputSpec, Trainer, sample
 from dew.artifacts import uint8_pixels
-from dew.config import OptimConfig
 from dew.data import TFDS, Dataset, presets
 from dew.data.dataset import Loader
 from dew.diffusion.presets import EDM
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.diffusion import DiffusionObjective
+from dew.optim import OptimConfig
 from dew.sampling import Heun
 from dew.training import ProfileWindow
 

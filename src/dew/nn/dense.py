@@ -17,13 +17,15 @@ then sums, and offer no step to widen it.
 """
 
 import functools
-from collections.abc import Iterable
+import inspect
+from collections.abc import Callable, Iterable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 from flax.core import meta
+from flax.linen.module import InterceptorContext
 from flax.typing import Array
 
 from .precision import accumulated, biased
@@ -84,11 +86,25 @@ def _axes(axes: Iterable[int] | int, ndim: int | None = None) -> tuple[int, ...]
     return axes if ndim is None else tuple(sorted(axis if axis >= 0 else ndim + axis for axis in axes))
 
 
-class Dense(nn.Dense):
-    """Flax's Dense, its bias added by `biased` (the module docstring)."""
+class _LinearEnvelope(nn.Module):
+    """A managed arithmetic call inside an owner's input/output policy, at the same parameter scope."""
 
     @nn.compact
     def __call__(self, inputs: Array) -> jax.Array:
+        return self._envelope(self._linear, inputs)
+
+    @nn.nowrap
+    def _envelope(self, linear: Callable[[Array], jax.Array], inputs: Array) -> jax.Array:
+        return linear(inputs)
+
+    def _linear(self, inputs: Array) -> jax.Array:
+        raise NotImplementedError
+
+
+class Dense(_LinearEnvelope, nn.Dense):
+    """Flax's Dense, its bias added by `biased` (the module docstring)."""
+
+    def _linear(self, inputs: Array) -> jax.Array:
         width = jnp.shape(inputs)[-1]
         kernel = self.param('kernel', self.kernel_init, (width, self.features), self.param_dtype)
         bias = (self.param('bias', self.bias_init, (self.features,), self.param_dtype)
@@ -112,17 +128,16 @@ def _members(init, batched: int, flat_shape):
     return drawn
 
 
-class DenseGeneral(nn.DenseGeneral):
+class DenseGeneral(_LinearEnvelope, nn.DenseGeneral):
     """Flax's DenseGeneral, its bias added by `biased` (the module docstring), and a batched kernel
     drawn a batch member at a time (`_members`)."""
 
-    @nn.compact
-    def __call__(self, inputs: Array) -> jax.Array:
+    def _linear(self, inputs: Array) -> jax.Array:
         features, batch_dims = _axes(self.features), _axes(self.batch_dims)
         if batch_dims and set(batch_dims) != set(range(max(batch_dims) + 1)):
             raise ValueError(f'batch_dims {batch_dims} must be consecutive leading dimensions '
                              'starting from 0.')
-        axis, batch_dims = _axes(self.axis, inputs.ndim), _axes(batch_dims, inputs.ndim)
+        axis, batch_dims = _contractions(self, inputs.ndim)
         batched = len(batch_dims)
         batch_shape = tuple(inputs.shape[dim] for dim in batch_dims)
 
@@ -144,3 +159,42 @@ class DenseGeneral(nn.DenseGeneral):
                      for dim in range(inputs.ndim) if dim not in axis)
         return _biased(self, inputs, kernel, ((axis, contracted), (batch_dims, tuple(range(batched)))), bias,
                        lambda bias: jnp.reshape(bias, kept + features))
+
+
+def _contractions(module: nn.Dense | nn.DenseGeneral, ndim: int
+                   ) -> tuple[tuple[int, ...], tuple[int, ...]]:
+    """Normalized input contraction and batch axes, shared with adapters and input quantization."""
+    if isinstance(module, nn.DenseGeneral):
+        return _axes(module.axis, ndim), _axes(module.batch_dims, ndim)
+    return (ndim - 1,), ()
+
+
+def _plain_dense(module: nn.Module) -> bool:
+    """A bare Dense call, with no subclass envelope for a joined projection to bypass."""
+    return type(module) is Dense
+
+
+def _linear_site(context: InterceptorContext, target: str) -> bool:
+    """Whether this targeted call is the managed linear arithmetic, rather than its envelope.
+
+    Flax exposes the original method publicly. Its partial binding and decorators are inspected,
+    never called here: execution through next_fun must retain every other interceptor.
+    """
+    module = context.module
+    original = context.orig_method
+    while isinstance(original, functools.partial):
+        original = original.func
+    original = inspect.unwrap(original)
+    if isinstance(module, (Dense, DenseGeneral)):
+        owner = DenseGeneral if isinstance(module, DenseGeneral) else Dense
+        arithmetic = context.method_name == "_linear"
+        expected = owner._linear if arithmetic else owner.__call__
+        if original is not inspect.unwrap(expected):
+            raise TypeError(f"{target} overrides its linear {context.method_name}; put input/output policy "
+                            "in _envelope so adapters and quantizers can reach its arithmetic")
+        return arithmetic
+    if isinstance(module, (nn.Dense, nn.DenseGeneral)):
+        owner = nn.DenseGeneral if isinstance(module, nn.DenseGeneral) else nn.Dense
+        if context.method_name == "__call__" and original is inspect.unwrap(owner.__call__):
+            return True
+    raise TypeError(f"{target} does not execute a supported Dense or DenseGeneral arithmetic call")

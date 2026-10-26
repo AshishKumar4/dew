@@ -257,7 +257,7 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
 
     from dew.objectives.base import Aux
     from dew.objectives.lm import LMObjective
-    from dew.training.state import TrainState
+    from dew.state import TrainState
     from dew.training.transaction import Transaction
     from tools.torch_precision import float64
 

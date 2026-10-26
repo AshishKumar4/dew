@@ -8,6 +8,9 @@ import jax
 import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 
+from dew.batch import valid_order
+from dew.mesh import SEQUENCE_AXIS, logical_spec
+
 from .attention import (
     SPLASH_LANES,
     attention_kernel,
@@ -21,19 +24,9 @@ from .attention import (
     tensor_shards,
 )
 from .documents import with_documents
-from .inputs import sequence_blocks, valid_order
+from .inputs import sequence_blocks
 from .kernels.selection import forced
-from .sharding import (
-    HEADS,
-    KV_HEADS,
-    SEQUENCE_AXIS,
-    explicit_spec,
-    logical_spec,
-    manual_map,
-    rows_like,
-    rows_spec,
-    sequence_shards,
-)
+from .sharding import HEADS, KV_HEADS, explicit_spec, manual_map, rows_like, rows_spec, sequence_shards
 from .visibility import same_chunk, visible
 
 

@@ -14,6 +14,25 @@ import jax.numpy as jnp
 import numpy as np
 from reference_error import as_given, widened
 
+
+def allocated_bytes(monkeypatch, operation):
+    """An operation's result and bytes allocated through NumPy.empty while it runs.
+    The recorder delegates every allocation; it changes neither the buffers nor the operation."""
+    total = 0
+    allocate = np.empty
+
+    def recording(*args, **kwargs):
+        nonlocal total
+        array = allocate(*args, **kwargs)
+        total += array.nbytes
+        return array
+
+    with monkeypatch.context() as patch:
+        patch.setattr(np, "empty", recording)
+        value = operation()
+    return value, total
+
+
 TINY_DECODER_FIELDS = {"hidden_size": 64, "num_hidden_layers": 4, "num_attention_heads": 4,
                        "num_key_value_heads": 2, "head_dim": 16, "intermediate_size": 128, "vocab_size": 256,
                        "max_position_embeddings": 64, "tie_word_embeddings": False, "pad_token_id": 0,

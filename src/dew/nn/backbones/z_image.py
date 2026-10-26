@@ -221,10 +221,11 @@ class ZImageTransformer(nn.Module):
         source_time = (1000.0 - jnp.asarray(time, width)) * jnp.asarray(self.t_scale / 1000.0, width)
         features = sinusoidal_time(source_time, FREQUENCIES, dtype=width).astype(dtype)
         maps = self.projections(0, 0)
-        hidden = Dense(maps['t_embedder_1'][1], dtype=self.dtype, precision=self.precision,
-                       name="t_embedder_1", dot_general=float32_dot_general)(features)
-        return Dense(maps['t_embedder_2'][1], dtype=self.dtype, precision=self.precision,
-                     name="t_embedder_2", dot_general=float32_dot_general)(nn.silu(hidden))
+        mlp = GatedMLP(maps['t_embedder_1'][1], maps['t_embedder_2'][1], in_features=features.shape[-1],
+                        activation=nn.silu, use_bias=True, names=("t_embedder_1", "t_embedder_2"),
+                        dtype=self.dtype, precision=self.precision)
+        nn.share_scope(self, mlp)
+        return mlp(features)
 
     @nn.compact
     def __call__(self, x, time, conditioning: DenoisingCondition, train: bool = False):

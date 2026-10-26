@@ -10,7 +10,8 @@ import numpy as np
 from jax.typing import ArrayLike
 
 from dew.artifacts import Artifact, ImageGrid, VideoGrid
-from dew.objectives.base import Batch, Shown, mean_of_totals, merge_totals
+from dew.batch import Batch
+from dew.objectives.base import Shown, mean_of_totals, merge_totals
 
 
 @dataclass(frozen=True, eq=False)
@@ -58,10 +59,7 @@ class Mean[Scored: Artifact]:
             raise ValueError(f"{self.name}: expected per-example values, not an already averaged scalar")
         return float(values.sum()), float(values.size)
 
-    def merge(
-        self, accumulated: tuple[float, float], contribution: tuple[float, float]
-    ) -> tuple[float, float]:
-        return merge_totals(accumulated, contribution)
+    merge = staticmethod(merge_totals)
 
     def finalize(self, accumulated: tuple[float, float]) -> float:
         if accumulated[1] <= 0:

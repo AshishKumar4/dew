@@ -39,11 +39,11 @@ from jax.experimental.layout import Format, Layout as DeviceLayout
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
 from jax.typing import DTypeLike
 
-from dew import records
+from dew import _records
+from dew.batch import Variables, merge
 from dew.nn.backbones.decoder_stack import DecoderBank, stack_layers
 from dew.nn.backbones.layer_plan import group_layers, layer_index
 from dew.nn.hyper_connections import Carried
-from dew.objectives.base import Variables, merge
 
 if TYPE_CHECKING:
     from dew.training.distributed import Layout, MeshSpec, Placement
@@ -294,12 +294,12 @@ class SafetensorsBanks(LayerBanks):
         if cache_bytes < 0:
             raise ValueError("cache_bytes must be nonnegative")
         folder = Path(directory)
-        config = records.record(json.loads((folder / "config.json").read_text()), "config.json")
+        config = _records.record(json.loads((folder / "config.json").read_text()), "config.json")
         self.config: Mapping[str, object] = MappingProxyType(config)
         if self.config.get("quantization_config") or self.config.get("expert_dtype"):
             raise ValueError("disk banks require unquantized safetensors; a whole-model codec is not bounded")
         record = translate_config(self.config)
-        family = records.text(self.config.get("model_type"), "model_type")
+        family = _records.text(self.config.get("model_type"), "model_type")
         if families()[family].prepare is not DecoderFamily.prepare or families()[family].packed:
             raise ValueError("disk banks require a family with lazy tensor translation; "
                              "this family's preparation can materialize checkpoint weights")

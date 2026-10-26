@@ -13,11 +13,11 @@ from typing import ClassVar, Protocol
 import grain.python as grain
 import numpy as np
 
-from dew.data.dataset import Batch
+from dew._records import integers, record
+from dew.batch import Batch
 from dew.data.pipeline import Windows
 from dew.data.sources.base import Read, Rows, ShardManifest, View, _indexed_manifest
 from dew.data.sources.tokens import TokenFiles
-from dew.records import integers, record
 
 
 def _aligned(row: Batch, fields: tuple[str, ...]) -> Batch:
@@ -104,7 +104,7 @@ class WindowSource(View[TokenFiles]):
         return None
 
     def manifest(self) -> ShardManifest:
-        return _indexed_manifest(self, self.describe(), self.describe(), 1024)
+        return _indexed_manifest(self, self.describe(), 1024)
 
 
 class _WindowIterator(grain.DatasetIterator[Batch]):

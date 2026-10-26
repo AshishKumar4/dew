@@ -37,13 +37,14 @@ from safetensors.numpy import load_file
 from test_joined import row_joins
 
 from dew import lora
+from dew.batch import FROZEN, merge, thaw
 from dew.data.dataset import Loader
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.pretrained import Pretrained
 from dew.interop.safetensors_io import read_file, write_file
 from dew.lora import Adapter, AdapterBase, LoRA, Target
 from dew.nn.sharding import ADAPTER_RANK, declarations, declared_axes, parameter_path
-from dew.objectives.base import FROZEN, Step, merge, thaw
+from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.optim import OPTIMIZER_MAP, muon_weight_dimension_numbers
@@ -571,6 +572,156 @@ def _adapted(model, tree, *, contracted=1, rank=2, alpha=4.0, seed=0):
     return adapter, adapter.model, adapted_tree, adapter.merge(adapted_tree)
 
 
+CLIPPED_SEEDS = 64
+"""The clipped adapter site's reference-only sizing, including its input and factor gradients."""
+
+
+def clipped_adapter_case():
+    """A bounded Gemma linear with nonzero LoRA factors, against the clipped linear equation."""
+    import torch
+    import torch.nn.functional as functional
+
+    from dew.nn.vision.gemma4 import Gemma4ClippableLinear
+
+    model = _BranchHost(Gemma4ClippableLinear(12, use_clipped_linears=True))
+    variables = model.init(jax.random.key(7), jnp.zeros((8, 16), jnp.float32))
+    limits = variables["constants"]["proj"]
+    limits.update(input_min=jnp.float32(-0.7), input_max=jnp.float32(0.7),
+                  output_min=jnp.float32(-1), output_max=jnp.float32(1))
+    rank, alpha = 2, 4.0
+    adapter = LoRA(rank=rank, modules=("proj",), alpha=alpha).apply(model, variables, key=9)
+    kernel, bias = (np.asarray(variables["params"]["proj"][name]) for name in ("kernel", "bias"))
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        factors = {"proj": {"lora_A": rng.standard_normal((16, rank), np.float32) * np.float32(0.25),
+                            "lora_B": rng.standard_normal((rank, 12), np.float32) * np.float32(0.1)}}
+        return factors, rng.standard_normal((8, 16), np.float32), rng.standard_normal((8, 12), np.float32)
+
+    @jax.jit
+    def forward(factors, inputs, cotangent):
+        output, pullback = jax.vjp(
+            lambda params, values: adapter.model.apply({**adapter.variables, "params": params}, values),
+            factors, inputs)
+        parameters, values = pullback(cotangent)
+        return {"output": output, "parameters": parameters, "inputs": values}
+
+    def reference(dtype, factors, inputs, cotangent):
+        x = torch.tensor(np.asarray(inputs), dtype=dtype, requires_grad=True)
+        a, b = (torch.tensor(np.asarray(factors["proj"][name]), dtype=dtype, requires_grad=True)
+                for name in lora.FACTORS)
+        low, high = (torch.tensor(np.asarray(limits[name]), dtype=dtype)
+                     for name in ("input_min", "input_max"))
+        clipped = x.clamp(low, high)
+        base = functional.linear(clipped, torch.tensor(kernel.T, dtype=dtype),
+                                 torch.tensor(bias, dtype=dtype))
+        delta = functional.linear(functional.linear(clipped, a.T), b.T)
+        low, high = (torch.tensor(np.asarray(limits[name]), dtype=dtype)
+                     for name in ("output_min", "output_max"))
+        output = (base + (alpha / rank) * delta).clamp(low, high)
+        dx, da, db = torch.autograd.grad(output, (x, a, b), torch.tensor(np.asarray(cotangent), dtype=dtype))
+        return {"output": output.detach().numpy(), "inputs": dx.numpy(),
+                "parameters": {"proj": {"lora_A": da.numpy(), "lora_B": db.numpy()}}}
+
+    return model, variables, adapter, draw, forward, reference
+
+
+def test_a_clipped_linear_adapts_once_inside_its_bounds_and_reloads(tmp_path):
+    import torch
+
+    model, variables, adapter, draw, forward, reference = clipped_adapter_case()
+    assert_as_exact(forward, lambda *args: reference(torch.float32, *args), draw,
+                    "clipped linear adapter", seeds=CLIPPED_SEEDS,
+                    truth_fn=lambda *args: reference(torch.float64, *args))
+    factors, inputs, _ = draw(3)
+    def loss(params):
+        return jnp.mean(jnp.square(adapter.model.apply({**adapter.variables, "params": params}, inputs)))
+
+    optimizer = optax.sgd(0.01)
+    updates, _ = optimizer.update(jax.grad(loss)(factors), optimizer.init(factors), factors)
+    moving = optax.apply_updates(factors, updates)
+    assert any(not np.array_equal(before, after)
+               for before, after in zip(jax.tree.leaves(factors), jax.tree.leaves(moving), strict=True))
+    trained = {**adapter.variables, "params": moving}
+    adapter.save(trained, tmp_path)
+    restored = LoRA.load(model, variables, tmp_path)
+    np.testing.assert_array_equal(restored.model.apply(restored.variables, inputs),
+                                  adapter.model.apply(trained, inputs))
+    merged = model.apply(adapter.merge(trained), inputs)
+    assert np.all(np.isfinite(merged)) and np.all(np.abs(merged) <= 1)
+
+
+def test_field_only_linear_subclasses_train_their_adapter():
+    from dew.nn.dense import Dense
+
+    class FieldDense(Dense):
+        use_bias: bool = False
+
+    class FieldFlaxDense(nn.Dense):
+        use_bias: bool = False
+
+    inputs = jnp.asarray(np.random.default_rng(9).standard_normal((4, 6)), jnp.float32)
+    for projection in (FieldDense(5), FieldFlaxDense(5)):
+        model = _BranchHost(projection)
+        variables = model.init(jax.random.key(3), inputs)
+        adapter = LoRA(rank=2, modules=("proj",)).apply(model, variables, key=4)
+        gradient = jax.grad(lambda params, bound=adapter: jnp.sum(jnp.square(bound.model.apply(
+            {**bound.variables, "params": params}, inputs))))(adapter.variables["params"])
+        assert np.any(np.asarray(gradient["proj"]["lora_B"]))
+
+
+@pytest.mark.parametrize("arithmetic", [False, True])
+def test_an_opaque_linear_override_is_refused_instead_of_training_unused_factors(arithmetic):
+    from dew.nn.dense import Dense
+
+    class OpaqueCall(Dense):
+        @nn.compact
+        def __call__(self, inputs):
+            return jnp.tanh(super().__call__(inputs))
+
+    class OpaqueArithmetic(Dense):
+        def _linear(self, inputs):
+            return jnp.tanh(super()._linear(inputs))
+
+    model = _BranchHost(OpaqueArithmetic(5) if arithmetic else OpaqueCall(5))
+    inputs = jnp.ones((4, 6), jnp.float32)
+    variables = model.init(jax.random.key(3), inputs)
+    adapter = LoRA(rank=2, modules=("proj",)).apply(model, variables, key=4)
+    with pytest.raises(TypeError):
+        adapter.model.apply(adapter.variables, inputs)
+
+
+@pytest.mark.parametrize("frozen", [False, True])
+@pytest.mark.parametrize("boundary", ["input", "output"])
+def test_quantized_clipped_adapters_keep_both_clamp_boundaries(frozen, boundary):
+    """Clamped inputs have zero derivatives while interior inputs still train. A saturated
+    output is exactly its stored bound, including when a packed base replaces the linear call."""
+    from dew.nn.kernels.generation import device_generation
+    from dew.quantization import QUANTIZATION, InputQuantization
+
+    model, variables, _, _, _, _ = clipped_adapter_case()
+    kernel = variables["params"]["proj"]["kernel"]
+    variables["params"]["proj"]["kernel"] = jnp.full_like(kernel, 1 / 256 if boundary == "input" else 1)
+    checkpoint = InputQuantization(sites=(("proj", "nvfp4"),))
+    quantized = checkpoint.apply(model)
+    variables = {**variables, QUANTIZATION: jax.tree.map(
+        lambda scale: jnp.full_like(scale, 0.1), checkpoint.declared())}
+    packed = (InputQuantization(frozen_fp8=("proj",), measured_on=device_generation()) if frozen else None)
+    adapter = LoRA(rank=2, modules=("proj",)).apply(quantized, variables, key=4, fp8_base=packed)
+    inputs = (jnp.stack([jnp.full((16,), 2.0), jnp.full((16,), 0.1)]) if boundary == "input"
+              else jnp.full((2, 16), 0.5)).astype(jnp.float32)
+    output = adapter.model.apply(adapter.variables, inputs)
+    gradient = jax.grad(lambda values: jnp.sum(adapter.model.apply(adapter.variables, values)))(inputs)
+    if boundary == "input":
+        assert np.all(np.asarray(output) > 0)
+        np.testing.assert_array_equal(gradient[0], jnp.zeros_like(gradient[0]))
+        assert np.all(np.asarray(gradient[1]) != 0)
+    else:
+        upper = variables["constants"]["proj"]["output_max"]
+        np.testing.assert_array_equal(output, jnp.broadcast_to(upper, output.shape))
+        np.testing.assert_array_equal(gradient, jnp.zeros_like(gradient))
+
+
 def test_the_branch_reads_a_keyword_input():
     """Flax calls Dense's inputs by keyword as well as positionally; the
     branch has to read `inputs` from kwargs where the call passes it there."""
@@ -753,7 +904,7 @@ def squared_output(model, variables, inputs):
 def _registry_decoder():
     """A tiny causal transformer and its variables, built from the registry:
     no published checkpoint, so no weight layouts to resolve names through."""
-    from dew.config import ModelConfig
+    from dew.registry import ModelConfig
 
     config = ModelConfig("causal_transformer", {**REGISTRY_FIELDS,
                                               "dtype": "float32", "attention_impl": "reference"})
@@ -822,9 +973,9 @@ def test_trained_factors_over_a_bf16_base_resume_on_the_rebuilt_model_as_an_unin
     run's step-2 state bit for bit, and its next two steps reach every leaf and the outputs an
     uninterrupted four-step run reaches, bit for bit. A template whose factors took the base's
     bfloat16 would round the restored factors; a resume that drew afresh would start elsewhere."""
-    from dew.config import ModelConfig
     from dew.inputs import Field, InputSpec
     from dew.objectives.base import Objective
+    from dew.registry import ModelConfig
 
     model = nn.Sequential([nn.Dense(8, param_dtype=jnp.bfloat16), nn.Dense(4, param_dtype=jnp.bfloat16)])
     rows = 2 * jax.device_count()
