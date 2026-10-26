@@ -818,6 +818,9 @@ class PretrainedFallback(Pretrained):
     server run); one on transformers' own refuses a cache (`TorchCausalLM`).
     """
 
+    def pipeline(self):
+        return self.text_generation()
+
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
         """The text generation task this source describes, as a native decoder's
         (`PretrainedDecoder.text_generation`)."""
