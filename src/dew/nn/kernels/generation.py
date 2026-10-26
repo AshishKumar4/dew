@@ -356,9 +356,12 @@ class GpuTarget:
 # 0.17/0.60 against Triton's 0.22/1.88. A10 (sm86), causal 2x2048: width 64, the FA wheel
 # 0.46/1.32, Triton 0.51/1.51, cuDNN 0.58/1.97; width 32, 0.23/0.82, 0.28/0.99, 0.47/1.67. Grouped
 # products, 8192 tokens x 2048 -> 768 over 64 experts: Dew's Pallas grouped matmul 0.60/2.41 on an
-# A100 and 0.27/0.86 on an H100, XLA's ragged dot 7.54/33.99 and 2.62/14.51; tokamax's ragged_dot
-# has no Triton kernel in 0.0.15 and its Mosaic one's backward takes no mixed dtypes. No tokamax
-# implementation is a row's kernel; Dew calls its own through tokamax's Op. Decode (bf16, one query,
+# A100 and 0.27/0.86 on an H100, XLA's ragged dot 7.54/33.99 and 2.62/14.51. tokamax 0.0.15's
+# ragged_dot ships a Triton backend (TritonRaggedDot: plain, transposed and ragged-contracting products,
+# its VJP through them) that needs the triton and jax-triton packages, which Dew's locks do not carry
+# (locks/cuda12.txt, cuda13.txt), so it was not measured here; its Mosaic one's backward takes no mixed
+# dtypes. Requalifying that Triton backend as a comparator is ledger 153. No tokamax implementation is
+# a row's kernel; Dew calls its own through tokamax's Op. Decode (bf16, one query,
 # A100-SXM4-40GB, 2026-10-21, ced5d3ad9, synchronized ms by dew.telemetry.benchmark.samples): Qwen3-0.6B's
 # 16/8 heads of 128 at 1 to 128 rows over 2048 to 131072 keys, the decode kernel 1.57x faster than
 # cuDNN in geometric mean over the 28 shapes, faster in 21, at most 1.19x the fastest arm (cuDNN
