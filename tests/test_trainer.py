@@ -404,9 +404,11 @@ def test_a_resumed_run_continues_the_key_stream(tmp_path):
     resumed = make_trainer(tmp_path, objective=Keyed()).fit(dataset(), steps=4, log_every=1)
     whole = make_trainer(objective=Keyed()).fit(dataset(), steps=4, log_every=1)
 
+    # The restore is exact and the resumed steps are the uninterrupted run's program on the same
+    # values, so a resume that kept its key stream lands on the same bits.
     for expected, actual in zip(jax.tree.leaves(whole.variables),
                                 jax.tree.leaves(resumed.variables), strict=True):
-        np.testing.assert_allclose(np.asarray(expected), np.asarray(actual), rtol=1e-6)
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
 def drawn(seed=0, opened=None, diverge=None):
@@ -1292,8 +1294,23 @@ def host(state):
     return np.array(state.variables["params"]["w"]), np.array(state.ema["params"]["w"])
 
 
+def unscaled(accum: int, microsteps: int):
+    """The weights and their average after `microsteps` good microbatches of the same trainer with no
+    dynamic scale: what a scaled run's accepted steps must equal bit for bit, its scale a power of two
+    that multiplies the loss and divides the gradients exactly."""
+    trainer = Trainer(ScaledObjective(), optax.sgd(.1), key=jax.random.key(0), accumulation=accum)
+    state = trainer.initial_state()
+    good = {"scale": jnp.ones((jax.device_count(),), jnp.float32)}
+    step = trainer.compile(state, good)
+    for _ in range(microsteps):
+        state, *_ = step(state, good)
+    return host(state)
+
+
 @pytest.mark.parametrize("accum", [1, 2])
 def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
+    """A dynamic scale's accepted steps are the unscaled run's, bit for bit, and a rejected one leaves
+    no trace: after it, the run steps on as the unscaled run of its accepted microbatches alone."""
     trainer = Trainer(ScaledObjective(), optax.sgd(.1), key=jax.random.key(0),
                       accumulation=accum, dynamic_scale=True)
     state = trainer.initial_state()
@@ -1303,8 +1320,9 @@ def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
     for _ in range(2 * accum - 1):
         state, *_ = step(state, good)
     w, ema = host(state)
-    np.testing.assert_allclose(w, .8, rtol=1e-6)
-    np.testing.assert_allclose(ema, .9, rtol=1e-6)
+    assert np.all(w != 1.0)
+    for got, want in zip((w, ema), unscaled(accum, 2 * accum - 1), strict=True):
+        np.testing.assert_array_equal(got, want)
     # the step consumes the state
     counted, advanced, scaled = int(state.step), int(state.microstep), float(state.scale.scale)
     state, _, _, finite, accepted, _ = step(state, bad)
@@ -1318,8 +1336,9 @@ def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
     for _ in range(accum):
         state, *_ = step(state, good)
     w, ema = host(state)
-    np.testing.assert_allclose(w, .64, rtol=1e-6)
-    np.testing.assert_allclose(ema, .77, rtol=1e-6)
+    # Two accepted updates: the rejection dropped its window, the pending microbatch with it.
+    for got, want in zip((w, ema), unscaled(accum, 2 * accum), strict=True):
+        np.testing.assert_array_equal(got, want)
     assert int(state.microstep) == 2 * accum
 
 
@@ -1563,7 +1582,7 @@ def test_the_ema_stores_only_the_selected_subtree_and_merges_over_the_rest():
 
     assert set(state.ema["params"]) == {"tracked"}
     live = state.variables["params"]
-    assert not np.allclose(state.ema["params"]["tracked"]["w"], live["tracked"]["w"])
+    assert np.any(np.asarray(state.ema["params"]["tracked"]["w"]) != np.asarray(live["tracked"]["w"]))
     merged = merge(state.variables, state.ema)
     assert merged["params"]["untracked"] is live["untracked"]
     np.testing.assert_array_equal(merged["params"]["tracked"]["w"], state.ema["params"]["tracked"]["w"])
@@ -1650,14 +1669,15 @@ def test_a_custom_step_alternates_two_optimizers_on_the_same_checkpoints_and_tra
 
     state = trainer().fit(dataset(), steps=2, log_every=1)
     # Step 0 moved the generator half way to 1 (lr 0.25 on a gradient of 2(g - 1));
-    # step 1 moved the discriminator half way to the generator.
-    assert float(state.variables["params"]["gen"]["g"]) == pytest.approx(0.5)
-    assert float(state.variables["params"]["disc"]["d"]) == pytest.approx(0.25)
+    # step 1 moved the discriminator half way to the generator. Every value is a few bits' dyadic
+    # fraction, so each product and sum is exact.
+    assert float(state.variables["params"]["gen"]["g"]) == 0.5
+    assert float(state.variables["params"]["disc"]["d"]) == 0.25
     assert [s["train/player"] for _, s in tracker.scalars if "train/player" in s] == [0.0, 1.0]
 
     resumed = trainer().fit(dataset(), steps=4, log_every=1)
-    assert float(resumed.variables["params"]["gen"]["g"]) == pytest.approx(0.75)
-    assert float(resumed.variables["params"]["disc"]["d"]) == pytest.approx(0.5)
+    assert float(resumed.variables["params"]["gen"]["g"]) == 0.75
+    assert float(resumed.variables["params"]["disc"]["d"]) == 0.5
     assert Checkpoints(str(tmp_path / "gan")).latest == 4
 
 
