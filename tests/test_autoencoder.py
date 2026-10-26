@@ -347,7 +347,6 @@ def test_a_local_pipelines_autoencoder_loads_from_its_vae_folder(tmp_path):
     assert isinstance(load_autoencoder(str(pipeline), dtype=jnp.float32), StableDiffusionVAE)
 
 
-
 def test_autoencoders_of_one_module_share_its_programs():
     """An autoencoder's encode and decode are the process's programs over its module
     (`dew.nn.kernels.options.program`): a second load of one module encodes and decodes with no compile
@@ -356,11 +355,13 @@ def test_autoencoders_of_one_module_share_its_programs():
 
     first, second = tiny_vae(), tiny_vae()
     frames = jax.random.uniform(jax.random.key(1), (2, IMAGE_SIZE, IMAGE_SIZE, 3), minval=-1.0)
-    latents = first.encode_batch(first.params, frames, jax.random.key(2))
+    key = jax.random.key(2)
+    latents = first.encode_batch(first.params, frames, key)
     decoded = first.decode_batch(first.params, latents)
-    with Compiles("_encoded") as encodes, Compiles("_decoded") as decodes:
-        again = second.encode_batch(second.params, frames, jax.random.key(2))
+    # Every program, by any name: a load's own jit of its module compiles one.
+    with Compiles(None) as compiles:
+        again = second.encode_batch(second.params, frames, key)
         redecoded = second.decode_batch(second.params, again)
-    assert (encodes.count, decodes.count) == (0, 0)
+    assert compiles.count == 0, [program.name for program in compiles.programs]
     np.testing.assert_array_equal(np.asarray(again), np.asarray(latents))
     np.testing.assert_array_equal(np.asarray(redecoded), np.asarray(decoded))
