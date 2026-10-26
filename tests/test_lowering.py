@@ -36,6 +36,7 @@ from dew.nn.kernels.generation import (
     runtime_facts,
     triton_runs,
 )
+from dew.nn.kernels.templates import bundles
 from dew.training._lowering import triton_kernels
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -213,9 +214,10 @@ def _experts_lowered(generation: str, implementation: str):
 def test_an_expert_layer_lowers_for_the_gpu_with_the_grouped_matmul_its_generation_chooses(generation):
     """'auto' runs the grouped matmul's kernels on every GPU generation, each forward and backward
     launch of each projection the route its cell takes there (its route says which): the template's
-    Mosaic GPU launch, or the old route `grouped_matmul.OLD_ROUTES` lists. On a GPU without warpgroup
-    MMA the forward runs Mosaic GPU's and the gradients Triton's, whose two kernels lower; on Hopper
-    Triton's runs only where a launch runs it, Mosaic GPU's lowering as no Triton kernel. The experts'
+    Mosaic GPU launch, or the old route `grouped_matmul.OLD_ROUTES` lists. On an Ampere-class GPU the
+    forward runs Mosaic GPU's and the gradients Triton's, whose two kernels lower; on one whose family has
+    no bundle (`bundles.of`: consumer Blackwell's) Triton's runs all three; on Hopper Triton's runs only
+    where a launch runs it, Mosaic GPU's lowering as no Triton kernel. The experts'
     SiLU product takes the fused SwiGLU where the row names it, forward and backward, as every fused
     kernel is differentiated through its portable arithmetic (`generation.linear_tangent`)."""
     with routes() as taken:
@@ -227,7 +229,8 @@ def test_an_expert_layer_lowers_for_the_gpu_with_the_grouped_matmul_its_generati
     assert kernels and kernels <= {'triton', 'mosaic_gpu'}
     lowered_grouped = set(triton_kernels(lowered)) & grouped
     if not gpu_target(generation).wgmma:
-        assert kernels == {'mosaic_gpu', 'triton'} and lowered_grouped == grouped
+        bundled = bundles.of(generation, jnp.bfloat16) is not None
+        assert kernels == ({'mosaic_gpu', 'triton'} if bundled else {'triton'}) and lowered_grouped == grouped
     assert bool(lowered_grouped) == ('triton' in kernels)
     swiglu = set().union(*(FAMILIES[key][1] for key in chosen(generation, "step") if key[0] == 'swiglu'))
     assert set(triton_kernels(lowered)) - grouped == swiglu
@@ -302,13 +305,14 @@ def test_fp8_tensor_cores_are_a_fact_of_the_compute_capability(generation, cores
 
 
 @pytest.mark.parametrize("generation, claimed", [
-    ("sm75", "mma.sync"), ("sm80", "mma.sync"), ("sm86", "mma.sync"), ("sm87", "mma.sync"),
+    ("sm75", None), ("sm80", "mma.sync"), ("sm86", "mma.sync"), ("sm87", "mma.sync"),
     ("sm89", "mma.sync"), ("sm90", "wgmma"), ("sm100", "tcgen05"), ("sm103", "tcgen05"),
     ("sm110", "tcgen05"), ("sm120", "mma.sync"), ("sm121", "mma.sync"), ("sm70", None), ("sm60", None),
     ("v5e", "tpu"), ("cpu", None)])
 def test_a_generations_instruction_family_is_its_compute_capabilitys(generation, claimed):
     """The family a template's mainloop claims comes from the compute capability alone, a GPU the table
-    names or not (sm87, sm110 and sm121 it does not); a GPU before Turing or a CPU is in none."""
+    names or not (sm87, sm110 and sm121 it does not); a Turing GPU (no bf16 MMA), one before it or a CPU
+    is in none."""
     assert family(generation) == claimed
 
 
