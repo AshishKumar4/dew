@@ -302,6 +302,7 @@ def test_row_fields_split_as_the_query_rows_do_where_the_heads_contend_for_the_a
              ("activation_batch", "expert"), *DEFAULT_RULES)
     mesh, banded = MeshSpec(tensor=2, expert=2, sequence=2).build(), jax.jit(attend)
 
+    @as_given
     def split(query, key, value):
         # The band under the mesh and the contending rules; the whole sequence outside them.
         with jax.set_mesh(mesh), nn.logical_axis_rules(rules):
