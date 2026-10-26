@@ -57,8 +57,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from flax import linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
+from model_support import float64_twin
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened
 from test_architectures import CASES as ARCHITECTURES, MASK, TEXT_FEATURES, TEXT_TOKENS, VOCAB
 from tiny_models import build_model, tiny_inputs
@@ -326,7 +326,7 @@ def test_trainable_layer_scalars_read_the_frozen_tree_moved_without_a_copy(name)
     assert all(after[path] is leaf for path, leaf in expected.items())
     same(trainable.apply(moved, read.tokens, method="logits"), read.logits)
     with jax.enable_x64(new_val=True):
-        learned = gradient(_float64(trainable), widened(moved), read.tokens,
+        learned = gradient(float64_twin(trainable), widened(moved), read.tokens,
                            np.asarray(_cotangent(read.logits), np.float64), method="logits")
     assert all(np.any(np.asarray(learned[path[1:]])) for path in scalars)
     assert trainable.trainable_variables(moved) is moved
@@ -511,17 +511,8 @@ def test_a_model_at_a_cache_capacity_decodes_what_the_model_does_within_it(name)
     assert (any(CAPACITY in leaf.shape for leaf in jax.tree.leaves(sized_cache))
             == any(model.max_seq_len in leaf.shape for leaf in jax.tree.leaves(cache)))
     np.testing.assert_array_equal(np.asarray(sized_drawn), np.asarray(drawn))
-    as_exact(sized_scores, scores, lambda: _greedy(_float64(model), widened(variables), read.tokens,
+    as_exact(sized_scores, scores, lambda: _greedy(float64_twin(model), widened(variables), read.tokens,
                                                    forced=drawn, **_decoding(name))[2], "cached logits")
-
-
-def _float64(model):
-    """`model` computing in float64, its own `dtype` and every module it
-    holds: the truth a float32 run's rounding is measured from."""
-    fields = [field.name for field in dataclasses.fields(model) if field.name not in ("parent", "name")]
-    held = {name: _float64(getattr(model, name)) for name in fields
-            if isinstance(getattr(model, name), nn.Module)}
-    return model.clone(**held, **({"dtype": jnp.float64} if "dtype" in fields else {}))
 
 
 def _flat(tree) -> np.ndarray:
@@ -618,12 +609,12 @@ def _climbs_and_restores(model, variables, inputs, **apply) -> None:
                for rung, record in zip(rungs, records, strict=True))
     _, gradient_tree = _stepped(model, variables, inputs, **apply)
     truth = functools.cache(
-        lambda: _stepped(_float64(model), widened(variables), widened(inputs), **apply)[1])
+        lambda: _stepped(float64_twin(model), widened(variables), widened(inputs), **apply)[1])
     written = model.apply(variables, *inputs, mutable=True, **apply)[1].keys()
     # Applied as the step applies them: some models read their ids on the host.
     def forward_truth(*inputs):
         with jax.enable_x64(new_val=True):
-            wide = _call(_float64(model), widened(variables), widened(inputs), **apply)
+            wide = _call(float64_twin(model), widened(variables), widened(inputs), **apply)
             return np.asarray(wide, np.float64)
 
     top = rungs[-1]
@@ -677,7 +668,7 @@ def test_a_continuum_level_composes_with_the_scan_the_ladder_and_the_cache():
 
     assert_as_exact(jax.jit(stepped(scanned)), jax.jit(stepped(plain)), draw,
                     "a scanned, rematerialized continuum decoder", seeds=CONTINUUM_SEEDS,
-                    truth_fn=stepped(_float64(plain)))
+                    truth_fn=stepped(float64_twin(plain)))
 
     def decoded(model):
         def run(variables, drawn, _):
@@ -696,7 +687,7 @@ def test_a_continuum_level_composes_with_the_scan_the_ladder_and_the_cache():
 
     assert_as_exact(jax.jit(decoded(plain)), jax.jit(whole(plain)), draw,
                     "a continuum decoder's cached decode", seeds=CONTINUUM_SEEDS,
-                    truth_fn=whole(_float64(plain)))
+                    truth_fn=whole(float64_twin(plain)))
 
 
 RECOMPUTED = [case for case in ARCHITECTURES
@@ -754,7 +745,7 @@ def test_packed_projections_serve_the_models_numbers(name):
     assert model.inference_projection_groups(packed) == groups
     if not model.causal:
         def logits_truth():
-            return [_float64(model).apply(widened(variables), read.tokens, method="logits")]
+            return [float64_twin(model).apply(widened(variables), read.tokens, method="logits")]
 
         as_exact([model.apply(packed, read.tokens, method="logits")], [read.logits], logits_truth,
                  f"{name} packed")
@@ -764,7 +755,7 @@ def test_packed_projections_serve_the_models_numbers(name):
     same(packed_drawn, drawn)
 
     def truth():
-        wide, wide_variables = _float64(model), widened(variables)
+        wide, wide_variables = float64_twin(model), widened(variables)
         return [wide.apply(wide_variables, read.tokens, method="logits"),
                 *_greedy(wide, wide_variables, read.tokens, forced=drawn, decode=True)[2]]
 
