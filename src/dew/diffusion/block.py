@@ -22,6 +22,7 @@ from flax import linen as nn, struct
 from typing_extensions import TypeVar, get_protocol_members
 
 from dew._distributions import draw, wellformed
+from dew.batch import Variables, real_slots, token_id, token_ids
 from dew.interop.weights import decoding_storage
 from dew.nn import categorical
 from dew.nn.inputs import (
@@ -33,13 +34,9 @@ from dew.nn.inputs import (
     mesh_of,
     next_position,
     prompt_major,
-    real_slots,
-    token_id,
-    token_ids,
 )
 from dew.nn.kernels.options import program
 from dew.nn.protocols import BlockDenoiser
-from dew.objectives.base import Variables
 
 ArrayT = TypeVar("ArrayT", bound=jax.Array | np.ndarray, default=jax.Array, covariant=True)
 

@@ -4,18 +4,18 @@ import dataclasses
 import functools
 import hashlib
 import json
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import ClassVar, Literal
 
 import numpy as np
 
-from dew import records
+from dew import _records
+from dew._records import JSON, json_value, record
 from dew.data.lowering import prepared_rows
 from dew.data.pipeline import Configured, Dataset, Pipeline, Stage, mix
 from dew.data.sources.base import Read, Rows, Source, View, _consumed, stated as store_facts
 from dew.decision.questions import Choice, Question
-from dew.records import JSON, json_value, record
 
 
 @dataclass(frozen=True)
@@ -68,25 +68,11 @@ class Example:
                     f"targets.{name} is a distribution over the question's {count} options, "
                     f"got {list(target)}"
                 )
-        grouped: set[str] = set()
         for group in self.groups:
             _asked(self.questions, list(group.members))
-            if len(group.members) < 2:
-                raise ValueError(f"group {group.name!r} holds {len(group.members)} question; a group "
-                                 "holds two or more")
-            if grouped & set(group.members):
-                raise ValueError(f"questions {sorted(grouped & set(group.members))} stand in two groups")
-            grouped |= set(group.members)
-            canonical = None
-            for name, mapped in group.members.items():
-                if set(mapped) != set(self.questions[name].options):
-                    raise ValueError(f"group {group.name!r} maps question {name!r}'s options "
-                                     f"{sorted(mapped)}, not its {list(self.questions[name].options)}")
-                keys = set(mapped.values())
-                if canonical is not None and keys != canonical:
-                    raise ValueError(f"group {group.name!r}'s members map onto other canonical keys: "
-                                     f"{sorted(canonical)} and {sorted(keys)}")
-                canonical = keys
+        def question(name: str) -> Question:
+            return self.questions[name]
+        _checked_groups([(group.name, group.members) for group in self.groups], question)
 
     @classmethod
     def of(cls, row: "Example | Mapping[str, object]") -> "Example":
@@ -140,6 +126,101 @@ class Example:
         return np.eye(len(self.questions[name].options))[self.labels()[name]]
 
 
+def _checked_groups(groups: Sequence[tuple[str, Mapping[str, Mapping[str, str]]]],
+                    question: Callable[[str], Question]) -> None:
+    """Refuse groups that do not ask one thing: each `(name, members)` two members or more, no member
+    in two groups, and each member mapping every option of its question (`question(member)`) onto
+    canonical keys its group's members share."""
+    grouped: set[str] = set()
+    for name, members in groups:
+        if len(members) < 2:
+            raise ValueError(f"group {name!r} holds {len(members)} question; a group holds two or more")
+        if grouped & set(members):
+            raise ValueError(f"questions {sorted(grouped & set(members))} stand in two groups")
+        grouped |= set(members)
+        canonical = None
+        for member, mapped in members.items():
+            options = question(member).options
+            if set(mapped) != set(options):
+                raise ValueError(f"group {name!r} maps question {member!r}'s options {sorted(mapped)}, "
+                                 f"not its {list(options)}")
+            keys = set(mapped.values())
+            if canonical is not None and keys != canonical:
+                raise ValueError(f"group {name!r}'s members map onto other canonical keys: "
+                                 f"{sorted(canonical)} and {sorted(keys)}")
+            canonical = keys
+
+
+def _member(key: str) -> tuple[int, str]:
+    """A grouped examples' member key, `"<example index>.<question>"`, as its example and question."""
+    index, _, question = key.partition(".")
+    if not index.isdigit() or index != str(int(index)) or not question:
+        raise ValueError(f"a member of grouped examples is named '<example index>.<question>', its index "
+                         f"written once (0, not 00), got {key!r}")
+    return int(index), question
+
+
+@dataclass(frozen=True)
+class GroupedExamples:
+    """Examples whose rows train together, so a consistency term (`DecisionObjective.consistency`)
+    holds questions asked across them to one answer: the same question negated, paraphrased or its
+    options re-ordered in rows of their own, under any layout.
+
+    `groups` names each set of such questions (`Group`), its members keyed `"<example index>.<question>"`
+    by the example's index in `examples` and the question's name there, each mapping its question's
+    every option key onto canonical keys the members share, as an example's own groups do. An example's
+    own groups hold too, numbered after these. The examples' rows train in one packed window, as a unit
+    the packer does not split (`DecisionObjective.data`): a unit too long for a window is refused."""
+
+    examples: tuple[Example, ...]
+    groups: tuple[Group, ...] = ()
+
+    def __post_init__(self):
+        object.__setattr__(self, "examples", tuple(Example.of(example) for example in self.examples))
+        if not self.examples:
+            raise ValueError("grouped examples hold one example or more")
+        own = {f"{index}.{member}" for index, example in enumerate(self.examples)
+               for group in example.groups for member in group.members}
+        for group in self.groups:
+            for key in group.members:
+                index, asked = _member(key)
+                if index >= len(self.examples) or asked not in self.examples[index].questions:
+                    raise ValueError(f"group {group.name!r} names question {asked!r} of example {index}, "
+                                     f"which the {len(self.examples)} examples do not ask")
+            if own & set(group.members):
+                raise ValueError(f"group {group.name!r} holds questions {sorted(own & set(group.members))} "
+                                 "an example already groups")
+
+        def question(key: str) -> Question:
+            index, asked = _member(key)
+            return self.examples[index].questions[asked]
+        _checked_groups([(group.name, group.members) for group in self.groups], question)
+
+    def group_of(self, index: int, name: str) -> tuple[int, Mapping[str, str]] | None:
+        """The unit-wide index of the group example `index`'s question `name` stands in, counting each
+        example's own groups after these, and the member's map onto its canonical keys, or None."""
+        key = f"{index}.{name}"
+        for number, group in enumerate(self.groups):
+            if key in group.members:
+                return number, group.members[key]
+        number = len(self.groups) + sum(len(example.groups) for example in self.examples[:index])
+        found = self.examples[index].group_of(name)
+        return None if found is None else (number + found[0], found[1].members[name])
+
+    @classmethod
+    def of(cls, row: "GroupedExamples | Mapping[str, object]") -> "GroupedExamples":
+        """Return grouped examples as they are, or build them from a row with `examples` (each as
+        `Example.of` reads one) and `groups` (`groups_of`), its members named
+        `"<example index>.<question>"`."""
+        if isinstance(row, GroupedExamples):
+            return row
+        held = json_value(row.get("examples"), "examples")
+        if not isinstance(held, list):
+            raise ValueError(f"examples is a list of examples, got {type(held).__name__}")
+        examples = [Example.of(record(example, f"examples.{index}")) for index, example in enumerate(held)]
+        return cls(tuple(examples), groups_of(json_value(row.get("groups"), "groups")))
+
+
 def groups_of(value: JSON) -> tuple[Group, ...]:
     """A row's `groups`, as `Example.groups` holds them: a mapping of each group's name to its members,
     each member's option keys mapped to canonical keys, or None for none."""
@@ -149,10 +230,11 @@ def groups_of(value: JSON) -> tuple[Group, ...]:
     for name, members in record(value, "groups").items():
         mapped = {}
         for question, options in record(members, f"groups.{name}").items():
-            mapped[question] = {key: records.text(canonical, f"groups.{name}.{question}.{key}")
+            mapped[question] = {key: _records.text(canonical, f"groups.{name}.{question}.{key}")
                                 for key, canonical in record(options, f"groups.{name}.{question}").items()}
         groups.append(Group(name, mapped))
     return tuple(groups)
+
 
 def _asked(questions: Mapping[str, Question], named: Iterable[str]) -> None:
     """Refuse an answer or a target to a question the example does not ask."""
@@ -165,11 +247,11 @@ def _distribution(question: Question, target: JSON, name: str) -> tuple[float, .
     """A target distribution from a row: probabilities in the question's option order, or keyed by option."""
     match target:
         case list():
-            return tuple(records.number(value, name) for value in target)
+            return tuple(_records.number(value, name) for value in target)
         case dict():
             if set(target) != set(question.options):
                 raise ValueError(f"{name} keys {sorted(target)}, not the options {list(question.options)}")
-            return tuple(records.number(target[option], f"{name}.{option}") for option in question.options)
+            return tuple(_records.number(target[option], f"{name}.{option}") for option in question.options)
         case _:
             raise ValueError(f"{name} is a list of probabilities or a mapping of options to them")
 
@@ -186,16 +268,19 @@ def _label(value: str | int | float | bool) -> str | int:
 
 def _slots(stated: Mapping[str, object]) -> dict[str, int]:
     """The question and option slots a mixture's manifest states its rows need."""
-    return {name: records.integer(value, f"slots.{name}")
+    return {name: _records.integer(value, f"slots.{name}")
             for name, value in record(stated.get("slots", {}), "slots").items()}
 
 @dataclass(frozen=True)
 class ParseExample:
-    """A row of an example's fields as its `Example`, or a row that holds its `Example` already as it is."""
+    """A row of an example's fields as its `Example`, a row of grouped examples' fields (`examples`) as
+    its `GroupedExamples`, or a row that holds either already as it is."""
 
     def __call__(self, row: Mapping[str, object]) -> Mapping[str, object]:
         held = row.get("example")
-        return {"example": held if isinstance(held, Example) else Example.of(row)}
+        if isinstance(held, (Example, GroupedExamples)):
+            return {"example": held}
+        return {"example": GroupedExamples.of(row) if "examples" in row else Example.of(row)}
 
 
 @dataclass(frozen=True)
@@ -217,7 +302,7 @@ class ParseTable:
     context: str | None = None
 
     def __call__(self, row: Mapping[str, object]) -> Mapping[str, object]:
-        if "state" in row and "questions" in row:
+        if ("state" in row and "questions" in row) or "examples" in row:
             return ParseExample()(row)
         label = row[self.label]
         if not isinstance(label, (str, int, float, bool)):
@@ -290,7 +375,7 @@ class _DecisionSource(View[Source]):
                 if isinstance(names, (list, tuple)) and (not self.before or _named_by(rows, self.table.label,
                                                                                         names)):
                     self._classes[:] = [str(name) for name in names]
-                elif isinstance(first, Mapping) and "questions" not in first and "example" not in first:
+                elif isinstance(first, Mapping) and not {"questions", "example", "examples"} & set(first):
                     if self.table.label not in first:
                         raise ValueError(f"decision table needs column {self.table.label!r}")
                     self._classes[:] = sorted({
@@ -320,16 +405,20 @@ class _DecisionSource(View[Source]):
             row = rows[index]
             if row is None:
                 continue
-            if self.table is not None and "questions" not in row and "example" not in row:
+            if self.table is not None and not {"questions", "example", "examples"} & set(row):
                 self._facts.update(questions=1, options=len(self.table.options or self._classes))
                 continue
-            example = row.get("example")
-            example = Example.of(row) if example is None else Example.of(example)
-            self._facts["questions"] = max(self._facts.get("questions", 0), len(example.questions))
-            self._facts["options"] = max(
-                self._facts.get("options", 0),
-                max((len(question.options) for question in example.questions.values()), default=0),
-            )
+            held = row.get("example")
+            held = row if held is None else held
+            # Grouped examples train as one unit, whose questions a window holds together.
+            if isinstance(held, GroupedExamples) or (isinstance(held, Mapping) and "examples" in held):
+                examples = GroupedExamples.of(held).examples
+            else:
+                examples = (Example.of(held),)
+            asked = [question for example in examples for question in example.questions.values()]
+            self._facts["questions"] = max(self._facts.get("questions", 0), len(asked))
+            self._facts["options"] = max(self._facts.get("options", 0),
+                                         max((len(question.options) for question in asked), default=0))
 
     def metadata(self) -> Mapping[str, object]:
         stated = self.source.metadata()
@@ -337,7 +426,7 @@ class _DecisionSource(View[Source]):
             names = (
                 self.table.options
                 or tuple(self._classes)
-                or records.strings(
+                or _records.strings(
                     record(stated.get("class_names", {}), "class names").get(self.table.label, ()),
                     "class names",
                 )
@@ -383,7 +472,7 @@ def mixture(root_url: str, *, weights: Mapping[str, float] | None = None,
 
     stated, pinned = _stated(root_url, descriptor)
     shares = {
-        name: records.number(value, f"weights.{name}")
+        name: _records.number(value, f"weights.{name}")
         for name, value in record(stated.get("weights", {}), "weights").items()
     } | dict(weights or {})
     training, held, kept = [], [], []
@@ -443,7 +532,7 @@ def _corpus(root_url: str, stated: Mapping[str, object], pinned: Mapping[str, ob
     if isinstance(shards, list):
         listed = [record(shard, "shard") for shard in shards]
         declared: dict[str, Mapping[str, object]] | None = {
-            root + "/" + records.text(shard["path"], "shard.path"): shard for shard in listed
+            root + "/" + _records.text(shard["path"], "shard.path"): shard for shard in listed
         }
         paths = tuple(declared)
     else:
@@ -454,7 +543,7 @@ def _corpus(root_url: str, stated: Mapping[str, object], pinned: Mapping[str, ob
     if not paths:
         return None
     index = record(entry.get("index", {}), "index").get("path")
-    source_index = None if index is None else root + "/" + records.text(index, "index.path")
+    source_index = None if index is None else root + "/" + _records.text(index, "index.path")
     if declared is not None and source_index is not None:
         declared[source_index] = record(entry["index"], "index")
     dataset = _DecisionSource(Files(paths, format="jsonl", index=source_index, file_info=declared),
@@ -498,5 +587,5 @@ class _ParseConfigured:
             if "slots" in metadata:
                 return ParseExample()
             raise ValueError("decision flat table needs options, ClassLabel metadata or read='memory'")
-        return dataclasses.replace(self.table, options=records.strings(names, "decision_options"),
+        return dataclasses.replace(self.table, options=_records.strings(names, "decision_options"),
                                    by_value=metadata.get("decision_options_by_value") is True)

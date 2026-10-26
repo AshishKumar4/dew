@@ -25,6 +25,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
+from dew.mesh import LogicalAxes
 from dew.nn.attention import (
     LayerNorm,
     RMSNorm,
@@ -51,8 +52,9 @@ from dew.nn.precision import (
     float32_einsum,
 )
 from dew.nn.rope import YarnScaling, deinterleaved, rotary_freqs, rotate, yarn_query_scale
-from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
+from dew.nn.sharding import RESIDUAL, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import index_scores, selection_mask, sparse_latent_attention, top_k_selection
+from dew.quantization import quantized_products
 
 
 def open_latent_cache(module: nn.Module, key, value_dim: int, index_keys, max_seq_len: int, *, valid=None):
@@ -715,13 +717,15 @@ class MultiHeadLatentAttention(nn.Module):
                 and not self.nonlinear_input("kv_b_proj"))
 
     def nonlinear_input(self, name: str) -> bool:
-        """Whether this call computes the submodule `name` other than as a
-        linear map of its input. The layer's own Dense is linear; a method
-        interceptor that changes that answers for itself: `dew.lora`'s dropout
-        draws on its targets' inputs, and a checkpoint's input quantization
-        (`dew.quantization`) rounds them."""
-        del name
-        return False
+        """Whether this call computes the submodule `name`, or a module under
+        it, other than as a linear map of its input. The layer's own Dense is
+        one unless the Qwix quantization the call runs under quantizes its
+        activations or gradients (`dew.quantization.quantized_products`); a
+        weight-only rule leaves it linear, by its quantized matrix, which the
+        absorbed path reads. A method interceptor that changes it answers for
+        itself: `dew.lora`'s dropout draws on its targets' inputs, and a
+        checkpoint's input quantization (`dew.quantization`) rounds them."""
+        return quantized_products(self, name).inputs
 
     def _scaled_query(self, q_pass, q_rot):
         """The whole query with YaRN's mscale on it, as every kernel reads it."""

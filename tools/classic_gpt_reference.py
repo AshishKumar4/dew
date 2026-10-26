@@ -39,22 +39,20 @@ def write_fixture(family):
                       f'PYTHONPATH=src python tools/classic_gpt_reference.py --fixture --family {family}')
 
 
-def check_checkpoint(checkpoint, output, revision=None):
-    torch.backends.cuda.matmul.allow_tf32 = False
-    torch.backends.cudnn.allow_tf32 = False
+def check_checkpoint(checkpoint, output, revision):
+    """`checkpoint`'s fp32 logits and greedy continuation at its pinned `revision` through the loader
+    against transformers'. The reference runs on the CPU whatever JAX's platform, so a CPU-only Torch
+    build supplies it beside a GPU and no TF32 enters it."""
     config = AutoConfig.from_pretrained(checkpoint, revision=revision)
-    device = 'cuda' if jax.default_backend() == 'gpu' else 'cpu'
     reference = AutoModelForCausalLM.from_pretrained(checkpoint, dtype=torch.float32,
-                                                    attn_implementation='eager', revision=revision).eval().to(device)
+                                                    attn_implementation='eager', revision=revision).eval()
     tokenizer = AutoTokenizer.from_pretrained(checkpoint, revision=revision)
     ids = tokenizer('The capital of France is', return_tensors='np')['input_ids'].astype(np.int32)
     with torch.no_grad():
-        expected = reference(torch.tensor(ids, device=device), use_cache=False).logits.cpu().numpy()
-        generated = reference.generate(torch.tensor(ids, device=device), do_sample=False,
-                                       max_new_tokens=6, eos_token_id=None,
-                                       pad_token_id=0).cpu().numpy()
+        expected = reference(torch.from_numpy(ids).long(), use_cache=False).logits.numpy()
+        generated = reference.generate(torch.from_numpy(ids).long(), do_sample=False, max_new_tokens=6,
+                                       eos_token_id=None, pad_token_id=0).numpy()
     del reference
-    torch.cuda.empty_cache()
     loaded = Pretrained.load(checkpoint, dtype='float32', attention_impl='reference', max_seq_len=64,
                              revision=revision)
     loaded = dataclasses.replace(loaded, model=loaded.model.clone(precision=jax.lax.Precision.HIGHEST))
@@ -67,8 +65,6 @@ def check_checkpoint(checkpoint, output, revision=None):
     agreement = bool(np.array_equal(actual.argmax(-1), expected.argmax(-1)))
     ours = np.asarray(generate(loaded.model, loaded.variables, ids, 6, key=0,
                                sampling=Sampling(temperature=0)).tokens)
-    metadata = Path(checkpoint) / '.cache' / 'huggingface' / 'download' / 'config.json.metadata'
-    revision = config._commit_hash or revision or (metadata.read_text().splitlines()[0] if metadata.is_file() else None)
     result = {'checkpoint': checkpoint, 'revision': revision,
               'dtype': 'float32', 'precision': 'highest',
               'transformers': transformers.__version__, 'jax': jax.__version__,
@@ -87,12 +83,14 @@ def main():
     parser.add_argument('--fixture', action='store_true')
     parser.add_argument('--family', choices=('gpt2', 'opt'), default='gpt2')
     parser.add_argument('--checkpoint')
-    parser.add_argument('--revision')
+    parser.add_argument('--revision', help='the commit --checkpoint is pinned at')
     parser.add_argument('--output')
     args = parser.parse_args()
     if args.fixture:
         write_fixture(args.family)
     if args.checkpoint:
+        if args.revision is None:
+            parser.error('--checkpoint is checked at a pinned --revision')
         check_checkpoint(args.checkpoint, args.output, args.revision)
 
 

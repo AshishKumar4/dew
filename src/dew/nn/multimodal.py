@@ -12,9 +12,10 @@ import numpy as np
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
+from dew.batch import Coordinates, coordinates as build_coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
-from dew.nn.inputs import Coordinates, CrossContext, coordinates as build_coordinates, next_position
+from dew.nn.inputs import CrossContext, next_position
 from dew.nn.kv_cache import POSITION
 from dew.nn.protocols import OutputTable, ProjectionGroup, held_groups
 from dew.nn.sharding import explicit_spec
@@ -49,6 +50,12 @@ class Fusion:
     media: jax.Array | None
 
 
+def _conditioner_modules(tower: TowerBase, projector: ProjectorBase, dtype, precision):
+    """A media tower and native projector in the conditioner's compute policy."""
+    return (tower.build().clone(dtype=dtype, precision=precision),
+            projector.clone(dtype=dtype, precision=precision))
+
+
 class VisionConditioner(nn.Module):
     """An image encoder and projector with row-aligned media inputs.
 
@@ -65,8 +72,8 @@ class VisionConditioner(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        self.tower = self.vision.build().clone(dtype=self.dtype, precision=self.precision)
-        self.projector = self.projection.build().clone(dtype=self.dtype, precision=self.precision)
+        self.tower, self.projector = _conditioner_modules(self.vision, self.projection,
+                                                         self.dtype, self.precision)
 
     def __call__(self, conditioning: Mapping[str, jax.Array], train: bool = False) -> jax.Array:
         pixels = conditioning["pixel_values"]
@@ -133,9 +140,8 @@ class AudioConditioner(nn.Module):
     precision: PrecisionLike = None
 
     def setup(self):
-        # Named for the shared root scope beside the vision tower and projector.
-        self.audio_tower = self.audio.build().clone(dtype=self.dtype, precision=self.precision)
-        self.audio_projector = self.projection.build().clone(dtype=self.dtype, precision=self.precision)
+        self.audio_tower, self.audio_projector = _conditioner_modules(
+            self.audio, self.projection, self.dtype, self.precision)
 
     def __call__(self, conditioning: Mapping[str, jax.Array]) -> jax.Array:
         features = conditioning["input_features"]
@@ -166,8 +172,10 @@ class AudioConditioner(nn.Module):
 
     def initialize_parameters(self) -> None:
         """Create the audio leaves during a token-only model init."""
-        mel = self.audio.geometry().mel_features or 128
-        frames = 16 if self.soft_tokens is None else 16 * self.soft_tokens
+        geometry = self.audio.geometry()
+        mel = geometry.mel_features or 128
+        # Fixed slots take no more encoded frames than they hold: one token's frames a slot.
+        frames = 16 if self.soft_tokens is None else (geometry.frames_per_token or 16) * self.soft_tokens
         self({"input_features": jnp.zeros((1, 1, frames, mel), self.dtype or jnp.float32),
               "input_features_mask": jnp.ones((1, 1, frames), bool)})
 
@@ -456,6 +464,31 @@ class MultimodalTransformer(DecoderWrapper):
     def logits_from_hidden(self, hidden):
         """Return the decoder's logits of final states `hidden`."""
         return self.language_model.logits_from_hidden(hidden)
+
+    @property
+    def in_context(self) -> bool:
+        """Whether the decoder holds a continuum level (`SteppedInContext`)."""
+        return self.language_model.in_context
+
+    @nn.nowrap
+    def in_context_level(self, variables):
+        """The decoder's continuum level's parameters in `variables` (`SteppedInContext`)."""
+        held = {**variables, "params": variables["params"][self.wraps]}
+        return self.language_model.in_context_level(held)
+
+    @nn.nowrap
+    def with_in_context_level(self, variables, level):
+        """`variables` holding `level` as the decoder's continuum level (`SteppedInContext`)."""
+        held = self.language_model.with_in_context_level({"params": variables["params"][self.wraps]}, level)
+        return {**variables, "params": {**variables["params"], self.wraps: held["params"]}}
+
+    def continuum_states(self, hidden):
+        """The decoder's final states `hidden` past its continuum level (`SteppedInContext`)."""
+        return self.language_model.continuum_states(hidden)
+
+    def head_logits(self, states):
+        """The decoder's head over states its continuum level already read (`SteppedInContext`)."""
+        return self.language_model.head_logits(states)
 
     def states_and_logits(self, tokens, **kwargs):
         """Return the final hidden states and their logits from one media-aware forward pass."""

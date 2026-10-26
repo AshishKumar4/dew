@@ -30,6 +30,8 @@ import grain.experimental as gx
 import grain.python as pygrain
 import numpy as np
 
+from dew._records import boolean, integer, integers, record, strings
+from dew.batch import Batch
 from dew.data.analysis import (
     _LOCAL,
     _VIEWS,
@@ -52,7 +54,6 @@ from dew.data.cache import _Mapped
 from dew.data.concurrent import Concurrently
 from dew.data.dataset import (
     SHARED_BYTES,
-    Batch,
     DataPartition,
     FilledBatch,
     Loading,
@@ -114,11 +115,9 @@ from dew.data.plan import Manifest
 from dew.data.readers import _FillShare
 from dew.data.sources.base import Read, Shard, ShardManifest, Source, materialized
 from dew.data.sources.urls import Fetch
-from dew.data.steps.generic import Fields
 from dew.data.steps.text import LayoutRule, ValidTargets, counted_window, recounted
 from dew.data.text import Chunks
 from dew.data.tokens import _WrappingDataset
-from dew.records import boolean, integer, integers, record, strings
 
 if TYPE_CHECKING:
     from dew.data.cache import Cache
@@ -772,7 +771,7 @@ class _Ruled(pygrain.IterDataset):
 
         seen = LayoutRule()
         documents = self._documents.map(seen)
-        windows = (_packed(documents.map(Fields(self._stage.packed)), self._stage)
+        windows = (_packed(documents.map(self._stage.document), self._stage)
                    if isinstance(self._stage, Pack) else CausalWindows(documents, self._stage))
         return _RuledIterator(iter(windows), seen, self._stage.fields[0])
 

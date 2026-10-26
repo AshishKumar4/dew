@@ -39,6 +39,7 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.mesh import LayoutRefused
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
@@ -46,7 +47,7 @@ from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
 from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import accumulated, at_least_fp32, float32_dot_general, float32_einsum, float32_products
-from dew.nn.sharding import LayoutRefused, logical_axes, rows_like, sequence_shards
+from dew.nn.sharding import logical_axes, rows_like, sequence_shards
 from dew.nn.ssm import affine_spans
 
 CHUNK_SIZE = 64

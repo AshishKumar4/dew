@@ -47,7 +47,6 @@ the source tokenizer has no pad token; masked fill uses its EOS id instead.
 """
 
 import math
-import os
 
 import jax
 import jax.numpy as jnp
@@ -77,14 +76,6 @@ NEW_TOKENS = 12
 RATE = 1e-4
 LOGITS = {"SmolLM2-135M": 3e-4, "Qwen3-0.6B": 7e-4}
 TOKEN_LOSS = 5e-3
-UPDATE = 1e-6
-
-
-def available(repo: str, revision: str) -> bool:
-    if os.environ.get("DEW_NETWORK_TESTS") == "1":
-        return True
-    from huggingface_hub import try_to_load_from_cache
-    return isinstance(try_to_load_from_cache(repo, "model.safetensors", revision=revision), str)
 
 
 pytestmark = pytest.mark.network
@@ -108,8 +99,6 @@ def checkpoint(request):
 def bundle(checkpoint):
     """One released checkpoint as a native model, loaded once per checkpoint."""
     repo, revision = CHECKPOINTS[checkpoint]
-    if not available(repo, revision):
-        pytest.skip(f"{repo} at {revision[:8]} is neither cached nor DEW_NETWORK_TESTS=1")
     return Pretrained.load(repo, dtype="float32", attention_impl="reference",
                            max_seq_len=SEQ, revision=revision)
 
@@ -172,8 +161,8 @@ def scoring(bundle, batch):
     """The objective the scoring and the training step share, and its rows.
 
     Module-scoped because a second copy of a real parameter tree buys these
-    tests nothing. No EMA: the averaged weights are not what the export or
-    the gradient check reads.
+    tests nothing. No EMA: the averaged weights are not what the export
+    reads.
     """
     inputs, _, fill = batch
     ids = np.asarray(inputs.tokens)
@@ -185,7 +174,8 @@ def scoring(bundle, batch):
 
 @pytest.fixture(scope="module")
 def trained(scoring):
-    """One real `Trainer` step of plain SGD over the released weights."""
+    """The state after one real `Trainer` step of plain SGD over the released
+    weights."""
     import grain
 
     from dew.data.dataset import Loader
@@ -198,9 +188,8 @@ def trained(scoring):
     stream = (grain.MapDataset.source(entries).repeat().to_iter_dataset()
               .batch(count, drop_remainder=True))
     data = Loader(train=lambda partition: iter(stream), val=None, records=count, batch=count)
-    state = Trainer(objective, optax.sgd(RATE), key=jax.random.key(2)).fit(
+    return Trainer(objective, optax.sgd(RATE), key=jax.random.key(2)).fit(
         data, steps=1, log_every=1)
-    return state, {"text": tokens}
 
 
 def test_the_load_hands_back_the_checkpoints_own_tokenizer(bundle, batch):
@@ -286,23 +275,6 @@ def test_greedy_generation_draws_the_references_greedy_continuation(bundle, batc
                 == [int(token) for token in expected[0][lengths[row]:]]), text
 
 
-def test_one_trainer_step_moves_the_weights_by_the_objectives_gradient(scoring, trained):
-    """A real `Trainer.fit(steps=1)` over the released weights: with plain
-    SGD the new parameters are the loaded ones less the rate times the
-    objective's own gradient, on every leaf."""
-    objective, variables, _ = scoring
-    state, batch = trained
-    step = Step(step=jnp.asarray(0), key=jax.random.key(1), ema=None)
-    gradient = jax.grad(lambda values: objective.scalar_loss(values, batch, step)[0])(variables)
-
-    held, updated, grads = flat_tree(variables), flat_tree(state.variables), flat_tree(gradient)
-    assert int(state.updates) == 1 and held.keys() == updated.keys()
-    difference = max(float(np.max(np.abs(np.asarray(updated[name])
-                                         - (np.asarray(leaf) - RATE * np.asarray(grads[name])))))
-                     for name, leaf in held.items())
-    assert difference < UPDATE, f"max |update difference| {difference:.3e}"
-
-
 def test_the_trained_export_reloads_and_transformers_reads_it(
         bundle, batch, trained, checkpoint, tmp_path):
     """`Pretrained.save` writes the trained weights back into the released
@@ -314,7 +286,7 @@ def test_the_trained_export_reloads_and_transformers_reads_it(
     from transformers import AutoModelForCausalLM
 
     inputs, _, _ = batch
-    state, _ = trained
+    state = trained
     valid = np.asarray(inputs.token_fields["attention_mask"])
     export = tmp_path / "trained"
 

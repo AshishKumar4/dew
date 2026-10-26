@@ -30,7 +30,7 @@ from reference_error import assert_as_exact, assert_computes_the_oracle, chain_r
 from residual_orders import permuted, residual_width
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
-from dew.config import MetricConfig, ModelConfig, ObjectiveConfig
+from dew.config import MetricConfig, ObjectiveConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader
 from dew.data.images import CAPTIONS
@@ -41,7 +41,7 @@ from dew.nn.text_encoders import DEFAULT_MODEL as CLIP_CHECKPOINT
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.jepa import JepaObjective, MultiBlockMask
 from dew.objectives.lm import LMObjective
-from dew.registry import from_record, metrics, models, to_record
+from dew.registry import ModelConfig, from_record, metrics, models, to_record
 from dew.sampling import CFG, Euler
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 from dew.training.distributed import shard_batch
@@ -512,8 +512,9 @@ def orbit(width: int):
 def drawn_steps(case: Case, tmp_path, fsdp, devices, initial, steps: int, *, exact: bool = False):
     """`steps` steps of a layout over the batch a draw gives, from `initial` in the residual order
     it gives (`reordered`), every step on the same rows, as `run_case`'s `fit` takes them, the step
-    compiled once for every draw: a function of the raw batch and the order returning the stepped
-    state's variables, optimizer state and EMA taken back to the identity order
+    compiled once for every draw at the plan fit takes, a frontier's first, untimed in Dew's tests
+    (`dew.training.planning.UNTIMED_FRONTIER`): a function of the raw batch and the order returning
+    the stepped state's variables, optimizer state and EMA taken back to the identity order
     (`in_identity_order`). `exact` runs one device in float64 from the state widened, the batch's
     samples widened (`wide`), built at its first call, so under the caller's float64."""
     built = []

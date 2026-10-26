@@ -24,7 +24,7 @@ import logging
 from collections.abc import Callable, Collection, Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, Self, TypeGuard, runtime_checkable
 
-from dew.records import JSON, json_value
+from dew._records import JSON, json_value
 
 if TYPE_CHECKING:
     import grain.python as pygrain
@@ -284,16 +284,17 @@ def materialized(source: Source) -> TypeGuard[Materialized]:
     return isinstance(source, View) and source.rows == "materialized"
 
 
-def _indexed_manifest(source: Source, prefix: str, uri: str, rows: int,
+def _indexed_manifest(source: Source, uri: str, rows: int,
                       reader: Callable[[Shard], pygrain.IterDataset] | None = None) -> ShardManifest:
     """The records `source` reads by index as a stream: consecutive ranges of
-    at most `rows` records, each `Shard` named `<prefix>:<start>` at `uri`,
-    read as that slice of its indexed records (`_IndexedSlice`), or by
+    at most `rows` records, each `Shard` named by the record it starts at,
+    which no copy of the source names otherwise, wherever it is, and read at
+    `uri` as that slice of its indexed records (`_IndexedSlice`), or by
     `reader`, which reads the same slice with less than `source` to pickle."""
     count = len(source.records("indexed"))
     return ShardManifest(
         tuple(
-            Shard(f"{prefix}:{start}", uri, start, min(start + rows, count), min(rows, count - start))
+            Shard(f"records:{start}", uri, start, min(start + rows, count), min(rows, count - start))
             for start in range(0, count, rows)
         ),
         _IndexedSlice(source) if reader is None else reader,

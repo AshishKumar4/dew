@@ -5,33 +5,28 @@ checkpoint and its joint schema head beside it, as `joint_head_config.json`
 (the head's sizes) and `joint_head.safetensors`, with the head's tensors
 named by its own modules (the release and the commit the parity fixtures
 reproduce are in tests/fixtures/joint_checkpoint/tiny/source.json).
-`StoredJointHead` reads those two files and `JointCheckpoint` the whole
-release.
+The metadata codec in `decision.sources` describes those files to
+`Pretrained.load`; this module owns their tensor names and native shapes,
+read and written.
 """
 
 import json
 import re
-from dataclasses import dataclass
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Self
+from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax.typing import Dtype
+from flax import linen as nn
 
-from dew import records
-from dew.data.text import HFTokenizer
-from dew.decision.head import JointSchemaHead
 from dew.decision.laya import IN_PROJ
-from dew.decision.layout import DecisionInputs, Specials
-from dew.decision.model import DecisionModel
-from dew.interop import sources
-from dew.interop.decoder_parts import split_packed
-from dew.interop.processors import Processor
-from dew.interop.safetensors_io import read_file
-from dew.interop.weights import translate_parameters
-from dew.objectives.base import Variables, joined
+from dew.decision.layout import DecisionInputs
+from dew.interop.safetensors_io import MAX_SHARD_SIZE, write_file
+
+if TYPE_CHECKING:
+    from dew.decision.sources import PretrainedDecision
 
 HEAD_CONFIG = "joint_head_config.json"
 HEAD_WEIGHTS = "joint_head.safetensors"
@@ -75,37 +70,12 @@ def _path(name: str) -> tuple[str, ...]:
     return (*module, "scale" if norm and leaf == "weight" else {"weight": "kernel", "bias": "bias"}[leaf])
 
 
-@dataclass(frozen=True)
-class StoredJointHead:
-    """A joint schema head and its parameters, as a release stores them."""
-
-    head: JointSchemaHead
-    params: dict
-
-    @classmethod
-    def load(cls, directory: str | Path, *, dtype: Dtype | None = None, param_dtype: str = "float32",
-             attention_impl: str = "auto") -> Self:
-        """Read `joint_head_config.json` and `joint_head.safetensors` from `directory`."""
-        root = Path(directory)
-        config = records.record(json.loads((root / HEAD_CONFIG).read_text()), HEAD_CONFIG)
-        if records.number(config.get("dropout", 0.0), "dropout"):
-            raise ValueError("the stored head drops out at a rate Dew's head does not train with")
-        def size(name: str) -> int:
-            return records.integer(config[name], name)
-
-        head = JointSchemaHead(hidden_size=size("hidden_size"), width=size("width"),
-                               routing_layers=size("routing_layers"), layers=size("layers"),
-                               heads=size("heads"), feedforward=size("feedforward"), dtype=dtype,
-                               attention_impl=attention_impl)
-        tensors = split_packed(read_file(root / HEAD_WEIGHTS)[0], IN_PROJ)
-        flat = translate_parameters(tensors, _path, param_dtype)
-        return cls(head, _shaped(head, flat))
 
 
-def _shaped(head: JointSchemaHead, params: dict) -> dict:
+
+def _shaped(width: int, head: nn.Module, params: dict) -> dict:
     """`params` reshaped to the head's own shapes: its attention projections
     hold their heads apart, `[in, heads, head_width]` and `[heads, head_width, out]`."""
-    width = head.hidden_size
     one = jnp.ones((1, 1), bool)
     inputs = DecisionInputs(tokens=jnp.zeros((1, 2), jnp.int32), segments=jnp.ones((1, 2), jnp.int32),
                             kinds=jnp.zeros((1, 1), jnp.int32), questions=one, spans=jnp.asarray([[[0, 1]]]),
@@ -113,7 +83,7 @@ def _shaped(head: JointSchemaHead, params: dict) -> dict:
     shapes = jax.eval_shape(head.init, jax.random.key(0), jnp.zeros((1, 2, width)), inputs,
                             jnp.zeros((3, width)))["params"]
     flat_shapes = dict(jax.tree_util.tree_leaves_with_path(shapes))
-    reshaped = {path: np.reshape(leaf, flat_shapes[path].shape)
+    reshaped = {path: leaf.reshape(flat_shapes[path].shape)
                 for path, leaf in jax.tree_util.tree_leaves_with_path(params)}
     missing = set(flat_shapes) - set(reshaped)
     if missing:
@@ -122,50 +92,69 @@ def _shaped(head: JointSchemaHead, params: dict) -> dict:
     return jax.tree_util.tree_unflatten(jax.tree.structure(shapes), [reshaped[path] for path in flat_shapes])
 
 
-@dataclass(frozen=True)
-class JointCheckpoint:
-    """One released joint-head checkpoint: its backbone and head, their variables, and its tokenizer."""
+_STEMS = {module: stem for stem, module in _NAMED.items() if not stem.endswith(".weight")}
+_MODULES = {module: part for part, module in _PARTS.items()}
+SIZES = ("hidden_size", "width", "routing_layers", "layers", "heads", "feedforward")
+"""The head's sizes `joint_head_config.json` states, which `decision.sources` reads back."""
 
-    model: DecisionModel
-    variables: Variables
-    tokenizer: HFTokenizer
-    specials: Specials
-    processor: Processor | None
-    """The backbone's processor, which prepares a request's images."""
 
-    @staticmethod
-    def exists(name_or_dir: str | Path, *, revision: str | None = None) -> bool:
-        """Return whether `name_or_dir` holds a joint-head checkpoint.
+def _name(path: tuple[str, ...]) -> str:
+    """The release's name for `JointSchemaHead`'s parameter at `path`: `_path`'s inverse."""
+    if len(path) == 1:
+        return path[0]
+    if path == _NAMED["type_embedding.weight"]:
+        return "type_embedding.weight"
+    *module, leaf = path
+    torch_leaf = "bias" if leaf == "bias" else "weight"
+    layer = re.fullmatch(r"(evidence_layers|layers)_(\d+)", module[0])
+    if layer is not None:
+        return f"{layer[1]}.{layer[2]}.{_MODULES[tuple(module[1:])]}.{torch_leaf}"
+    return f"{_STEMS.get(tuple(module), module[0])}.{torch_leaf}"
 
-        A joint-head checkpoint is a backbone with a `joint_head_config.json` beside it.
-        For a Hub repo id, it asks the Hub without downloading anything (`sources.has_file`).
-        """
-        if Path(name_or_dir).is_dir():
-            return (Path(name_or_dir) / HEAD_CONFIG).is_file()
-        return sources.has_file(str(name_or_dir), HEAD_CONFIG, revision=revision)
 
-    @classmethod
-    def load(cls, name_or_dir: str | Path, *, revision: str | None = None,
-             dtype: str = "float32", param_dtype: str = "float32", attention_impl: str = "auto") -> Self:
-        """Read the checkpoint at `name_or_dir`, a Hub repo or a directory.
+def _stored(path: tuple[str, ...], leaf: np.ndarray) -> np.ndarray:
+    """`leaf` with the attention heads `_shaped` holds apart joined again, as the release stores it."""
+    *module, name = path
+    if module and module[-1] in ("to_q", "to_k", "to_v"):
+        return leaf.reshape(leaf.shape[0], -1) if name == "kernel" else leaf.reshape(-1)
+    if module and module[-1] == "to_out_0" and name == "kernel":
+        return leaf.reshape(-1, leaf.shape[-1])
+    return leaf
 
-        The backbone loads as `Pretrained.load` loads a Qwen 3.5 checkpoint, and the
-        head computes in the backbone's dtype where that is reduced.
-        """
-        from dew.interop.pretrained import Pretrained
 
-        root = sources.snapshot(str(name_or_dir), revision)
-        if not (root / HEAD_WEIGHTS).is_file():
-            from huggingface_hub import hf_hub_download
+def head_tensors(params: Mapping[str, object]) -> dict[str, np.ndarray]:
+    """`JointSchemaHead`'s parameters under the release's tensor names and shapes."""
+    from flax.traverse_util import flatten_dict, unflatten_dict
 
-            # The snapshot holds the backbone's weights alone; the head comes from the same commit.
-            hf_hub_download(str(name_or_dir), HEAD_WEIGHTS, revision=root.name)
-        bundle = Pretrained.load(root, dtype=dtype, param_dtype=param_dtype, attention_impl=attention_impl,
-                                 on_host=True)
-        _, head_dtype = DecisionModel.head_size(bundle.model)
-        head = StoredJointHead.load(root, dtype=head_dtype, param_dtype=param_dtype,
-                                    attention_impl=attention_impl)
-        tokenizer = HFTokenizer(str(root), local_files_only=True)
-        return cls(DecisionModel(bundle.model, head.head),
-                   joined({"backbone": bundle.variables, "head": {"params": head.params}}),
-                   tokenizer, Specials.of(tokenizer), bundle.processor)
+    from dew.interop.decoder_parts import joined_packed
+    from dew.interop.weights import in_params, native_layouts
+
+    stored = unflatten_dict({path: _stored(path, np.asarray(jax.device_get(leaf)))
+                             for path, leaf in flatten_dict(dict(params)).items()})
+    variables = {"params": stored}
+    layouts = native_layouts(variables, lambda path: _name(path[1:]), in_params(_path))
+    return joined_packed({layout.name: layout.export(variables) for layout in layouts}, IN_PROJ)
+
+
+def export(bundle: "PretrainedDecision", variables: Mapping[str, object] | None = None
+           ) -> dict[str, np.ndarray]:
+    """Every tensor of the joint-head release `save` writes: the backbone's under their checkpoint names
+    and the head's under the release's (`joint_head.safetensors`), with `variables` in place of the
+    backbone's."""
+    from dew.decision.sources import joined_release
+
+    return joined_release(bundle.backbone().export(variables), head_tensors(bundle.head_variables["params"]),
+                          "model.safetensors and joint_head.safetensors")
+
+
+def save(bundle: "PretrainedDecision", directory: str | Path, *,
+         max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
+    """Write a joint-head release, which `Pretrained.load` reads back: the held native backbone
+    as a standard checkpoint with its tokenizer, and beside it the head's sizes
+    (`joint_head_config.json`) and tensors under the release's names (`joint_head.safetensors`)."""
+    root = Path(directory)
+    bundle.backbone().save(root, max_shard_size=max_shard_size)
+    bundle.decision_tokenizer.save_pretrained(root)
+    sizes = {name: getattr(bundle.head, name) for name in SIZES}
+    (root / HEAD_CONFIG).write_text(json.dumps(sizes, indent=1) + "\n")
+    write_file(head_tensors(bundle.head_variables["params"]), root / HEAD_WEIGHTS, {"format": "pt"})

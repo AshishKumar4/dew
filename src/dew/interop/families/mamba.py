@@ -15,7 +15,7 @@ import math
 from collections.abc import Mapping
 from functools import partial
 
-from dew import records
+from dew import _records
 from dew.interop import mamba2
 from dew.interop.decoder_parts import (
     DecoderFamily,
@@ -53,7 +53,7 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     hidden, expand = integer("hidden_size", 768), integer("expand", 2)
     stated = hf_config.get("intermediate_size")
     used.add("intermediate_size")
-    if stated is not None and records.integer(stated, "intermediate_size") != expand * hidden:
+    if stated is not None and _records.integer(stated, "intermediate_size") != expand * hidden:
         refuse(f"intermediate_size {stated}",
                f"MambaConfig sets the inner width to expand * hidden_size, {expand * hidden}")
     rank = hf_config.get("time_step_rank", "auto")
@@ -70,7 +70,7 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     mixer = MambaMixer(
         intermediate_size=expand * hidden,
         state_size=integer("state_size", 16),
-        time_step_rank=math.ceil(hidden / 16) if rank == "auto" else records.integer(rank, "time_step_rank"),
+        time_step_rank=math.ceil(hidden / 16) if rank == "auto" else _records.integer(rank, "time_step_rank"),
         conv_kernel=integer("conv_kernel", 4),
         use_bias=boolean("use_bias", default=False),
         use_conv_bias=boolean("use_conv_bias", default=True))

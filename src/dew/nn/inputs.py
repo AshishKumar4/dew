@@ -15,8 +15,23 @@ import numpy as np
 from flax import struct
 from jax.core import Tracer
 
-from dew.coordination import agreed
-from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS, rows_like
+from dew._coordination import agreed
+from dew.batch import (
+    COORDINATES_FIELD,
+    VALIDITY_FIELD,
+    Coordinates,
+    coordinates,
+    document_ranks,
+    document_starts,
+    padded_rows,
+    real_slots,
+    token_ids,
+    token_positions,
+    token_validity,
+    with_validity,
+)
+from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS
+from dew.nn.sharding import rows_like
 
 if TYPE_CHECKING:
     from PIL.Image import Image
@@ -45,34 +60,14 @@ type FieldExtension = Callable[[jax.Array, jax.Array, int], jax.Array]
 PredictionPhase = Literal["ordinary", "extend", "draft"]
 
 
-def token_id(value: object, *, where: str) -> int:
-    """`value` read as one token id: a Python or NumPy integer, not a bool,
-    from 0 through int32's largest. Every parser of ids, a dataset's or a
-    request's, reads them by this law; `where` names what held the value."""
-    if (not isinstance(value, (int, np.integer)) or isinstance(value, (bool, np.bool_))
-            or not 0 <= int(value) <= np.iinfo(np.int32).max):
-        raise ValueError(f"{where} holds token ids, nonnegative int32 integers, got {value!r}")
-    return int(value)
-
-
-def token_ids(values: object, *, where: str) -> list[int]:
-    """`values` read as a nonempty row of token ids by `token_id`'s law: a list, a tuple or a
-    one-dimensional NumPy array, as a tokenizer, a dataset's column or a step of Dew's own
-    (`dew.data.text.Tokenize`) holds them."""
-    if isinstance(values, np.ndarray) and values.ndim == 1:
-        values = values.tolist()
-    if not isinstance(values, (list, tuple)) or not values:
-        raise ValueError(f"{where} holds a nonempty row of token ids, got {values!r}")
-    return [token_id(token, where=where) for token in values]
-
-
 def sequence_blocks(x: jax.Array, block: int, blocks: int | None = None, *,
-                    leading: bool = False) -> jax.Array:
-    """`x` `[B, S, ...]` padded with zeros at the end to `blocks` blocks of `block` positions (as
+                    leading: bool = False, fill=0) -> jax.Array:
+    """`x` `[B, S, ...]` padded with `fill` at the end to `blocks` blocks of `block` positions (as
     many as `S` needs when None) and cut into them, `[B, blocks, block, ...]`, or with the blocks
     leading, `[blocks, B, block, ...]`, for a scan or map over them (`leading`)."""
     blocks = -(-x.shape[1] // block) if blocks is None else blocks
-    x = jnp.pad(x, [(0, 0), (0, blocks * block - x.shape[1])] + [(0, 0)] * (x.ndim - 2))
+    x = jnp.pad(x, [(0, 0), (0, blocks * block - x.shape[1])] + [(0, 0)] * (x.ndim - 2),
+                constant_values=fill)
     x = x.reshape(x.shape[0], blocks, block, *x.shape[2:])
     return jnp.moveaxis(x, 1, 0) if leading else x
 
@@ -312,68 +307,6 @@ def rotate_rows(values: jax.Array, shifts: jax.Array) -> jax.Array:
     return jnp.take_along_axis(values, slots.reshape(slots.shape + (1,) * (values.ndim - 2)), axis=1)
 
 
-def shifted_span(shape: tuple[int, ...], shift: int, *, valid=None, segments=None, xp=jnp):
-    """Which `[B, S - shift]` source positions can reach the token `shift` places later: every
-    intervening token is valid, including both endpoints, and their document IDs match. Padding
-    IDs and target roles belong to the caller; `segments` describes identity, not validity.
-    `xp` is NumPy for host geometry and JAX NumPy for model/loss execution."""
-    batch, length = shape
-    width = length - shift
-    admitted = xp.ones((batch, width), bool)
-    if valid is not None:
-        for offset in range(shift + 1):
-            admitted = admitted & xp.asarray(valid[:, offset:offset + width], bool)
-    if segments is not None:
-        admitted = admitted & (segments[:, :width] == segments[:, shift:shift + width])
-    return admitted
-
-
-@struct.dataclass
-class Coordinates:
-    """Where each token of a batch sits, built once (`coordinates`) and read by every token mixer.
-
-    `positions` `[B, S]` is each real token's logical place in its document,
-    counted over real tokens: a packed batch's or the caller's own, None
-    where none is given, each token's place then its rank among its row's
-    real tokens (`places`) or, in a cached call, the slot its cache writes it
-    at. Rotation and NoPE's temperature read the logical places; windows,
-    chunks and ALiBi count each document's real tokens from its first place
-    (`counted_places`), the logical places wherever
-    those count real tokens; a cache addresses keys by slot. `segments` numbers each
-    row's packed documents from 1, 0 on the padding slots after them, which
-    run as a document of their own, so no layer carries a real document's
-    state or history into them or back; `valid` is the caller's mask of real
-    tokens; `starts` marks each document's first real token but a row's
-    first, which continues whatever state the row holds. Each is None where
-    it holds nothing (one document a row, every token real, no start), which
-    a layer's fast path reads as a static fact. `max_segments` bounds the
-    documents a row holds (the packer's static plan, else the row length) and
-    `right_padded` says every row's real tokens come first.
-    """
-
-    positions: jax.Array | None = None
-    segments: jax.Array | None = None
-    valid: jax.Array | None = None
-    starts: jax.Array | None = None
-    max_segments: int = struct.field(pytree_node=False, default=1)
-    right_padded: bool = struct.field(pytree_node=False, default=False)
-
-    def places(self) -> jax.Array | None:
-        """Each token's logical place in an uncached call: the given `positions`, else its rank among
-        its row's real tokens `[B, S]` (a padding slot's the rank before it, 0 before any); None
-        where every token is real and none is given, each token's place its index. A cached call's
-        places are the slots its cache writes them at where none are given."""
-        if self.positions is not None or self.valid is None:
-            return self.positions
-        return real_places(self.valid)
-
-
-def real_places(valid: jax.Array) -> jax.Array:
-    """Each slot's rank among its row's real tokens under `valid` `[B, S]`: a real token's place, a
-    padding slot's the rank before it, 0 before any (`Coordinates.places` where no positions are given)."""
-    return jnp.maximum(jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1, 0)
-
-
 def cu_seqlens(begins: jax.Array, sequences: int) -> jax.Array:
     """The cumulative offsets of the varlen sequences over the `[B * S]`
     tokens of `begins` `[B, S]`, which marks each sequence's first token: a
@@ -385,55 +318,11 @@ def cu_seqlens(begins: jax.Array, sequences: int) -> jax.Array:
     return jnp.concatenate([starts, jnp.full((1,), rows * length, starts.dtype)]).astype(jnp.int32)
 
 
-def coordinates(shape: tuple[int, int] | None = None, *, segments=None, valid=None, positions=None,
-                max_segments: int | None = None, right_padded: bool = False, xp=jnp) -> Coordinates:
-    """The `Coordinates` of `[batch, length]` tokens from what the batch carries: packed `segments`
-    (one document a row where None), a `valid` mask (every token real where None), explicit
-    `positions` (with `segments`, each document's real tokens counted from 0 where None; without,
-    None, each token's place its row index or cache slot) and the packer's `max_segments` (the row
-    length where None). `shape` is the first given field's where None. `xp` is the array module the
-    fields are built with: jax.numpy in a traced call, numpy where a data reader builds a batch's on
-    the host."""
-    if shape is None:
-        given = [x for x in (segments, valid, positions) if x is not None]
-        if not given:
-            raise ValueError("token coordinates take their shape from a field, or `shape`")
-        batch, length = jnp.shape(given[0])[:2]
-        shape = (batch, length)
-    length = shape[1]
-    segments = None if segments is None else xp.asarray(segments, np.int32)
-    valid = None if valid is None else xp.asarray(valid, bool)
-    for name, field in (("segments", segments), ("valid", valid)):
-        if field is not None and field.shape != shape:
-            raise ValueError(f"token coordinates are {shape}, got {name} {field.shape}")
-    starts = None if segments is None else document_starts(
-        segments, xp.ones(shape, bool) if valid is None else valid, xp=xp)
-    if positions is None and segments is not None:
-        real = xp.ones(shape, bool) if valid is None else valid
-        real = real & (segments != 0)
-        positions = xp.where(real, _ranks(real, starts, xp=xp), 0)
-    positions = None if positions is None else xp.asarray(positions, np.int32)
-    return Coordinates(positions, segments, valid, starts,
-                       max_segments=(1 if segments is None else length) if max_segments is None
-                       else max_segments,
-                       right_padded=right_padded)
-
-
 def coordinates_of(metadata: AttentionMetadata | None, batch: int, length: int) -> Coordinates:
     """The call's `Coordinates`: its metadata's, else those of whole rows of real tokens."""
     if metadata is not None and metadata.coordinates is not None:
         return metadata.coordinates
     return coordinates((batch, length))
-
-
-def _ranks(real, starts, *, xp=jnp):
-    """Each slot's count of the real tokens before it in its document `[B, S]`, `starts` marking each
-    document's first real token but a row's first, a padding slot taking the count before it (0
-    before any)."""
-    rank = xp.cumsum(real, axis=1, dtype=np.int32) - 1
-    begun = xp.where(starts, rank, 0)
-    first = np.maximum.accumulate(begun, axis=1) if xp is np else jax.lax.cummax(begun, axis=1)
-    return xp.maximum(rank - first, 0)
 
 
 def counted_places(segments=None, valid=None, positions=None) -> jax.Array | None:
@@ -457,7 +346,7 @@ def counted_places(segments=None, valid=None, positions=None) -> jax.Array | Non
     if segments is not None:
         real = real & (segments != 0)
     starts = jnp.zeros(shape, bool) if segments is None else document_starts(segments, real)
-    count = _ranks(real, starts)
+    count = document_ranks(real, starts)
     if given is None:
         return count
     firsts = starts | (real & (jnp.cumsum(real, axis=1) == 1))
@@ -516,17 +405,6 @@ def _last_marked(marked: jax.Array) -> jax.Array:
     slot where `marked` holds its starts (`counted_places`), its last real one where it holds the
     real tokens (`document_reach`)."""
     return jax.lax.cummax(jnp.where(marked, jnp.arange(marked.shape[1]), 0), axis=1)
-
-
-def document_starts(segments, valid, *, xp=jnp):
-    """`[B, S]`: each real token whose segment differs from the previous real token's in its row, a
-    row's first real token continuing what precedes the row and a padding slot starting nothing."""
-    order, _ = valid_order(valid, xp=xp)
-    rank = xp.cumsum(valid, axis=1, dtype=np.int32) - 1
-    compact = xp.take_along_axis(segments, order, axis=1)
-    changed = xp.concatenate([xp.zeros_like(compact[:, :1], bool), compact[:, 1:] != compact[:, :-1]],
-                             axis=1)
-    return valid & xp.take_along_axis(changed, xp.maximum(rank, 0), axis=1)
 
 
 CONTEXT = "context"
@@ -752,76 +630,6 @@ def generation_signature(inputs: InputTree, controls: tuple) -> np.ndarray:
     schema = (str(jax.tree.structure(inputs)),
               [(leaf.shape, str(leaf.dtype)) for leaf in jax.tree.leaves(inputs)], controls)
     return np.frombuffer(hashlib.sha256(repr(schema).encode()).digest(), np.uint8)
-
-
-VALIDITY_FIELD = "attention_mask"
-"""The token field that marks real slots. Absent means every slot is real."""
-
-COORDINATES_FIELD = "coordinates"
-"""The token field that holds the tokens' `Coordinates`, which a decoder reads in place of the
-validity field, `segment_ids` and `positions`."""
-
-
-def token_validity(fields: Mapping[str, jax.Array | np.ndarray | Coordinates]):
-    """The validity `[B, S]` a row's token fields hold, as given: their `Coordinates`' where the fields
-    carry them, else the validity field; None where neither holds one."""
-    laid = fields.get(COORDINATES_FIELD)
-    return laid.valid if isinstance(laid, Coordinates) else fields.get(VALIDITY_FIELD)
-
-
-def token_layout(fields: Mapping[str, jax.Array | np.ndarray | Coordinates], *, xp=jnp):
-    """The validity `[B, S]` and documents `[B, S]` of a row's token fields as the decoder reads them:
-    their `Coordinates`' where the fields carry them, else the validity field (`token_validity`) and
-    `segment_ids`. Each is None where nothing gives it (every slot real, one document a row). `xp` is
-    the array module."""
-    laid = fields.get(COORDINATES_FIELD)
-    valid = token_validity(fields)
-    segments = laid.segments if isinstance(laid, Coordinates) else fields.get("segment_ids")
-    return (None if valid is None else xp.asarray(valid, bool),
-            None if segments is None else xp.asarray(segments))
-
-
-def with_validity(fields: Mapping[str, jax.Array | np.ndarray | Coordinates],
-                  valid: jax.Array | np.ndarray | None) -> dict:
-    """`fields` holding `valid` as their validity where `token_validity` reads it, None removing it:
-    in their `Coordinates` where the fields carry them, which the decoder reads in place of the
-    validity field, else in the validity field."""
-    laid = fields.get(COORDINATES_FIELD)
-    if isinstance(laid, Coordinates):
-        return {**fields, COORDINATES_FIELD: replace(laid, valid=valid)}
-    rest = {name: value for name, value in fields.items() if name != VALIDITY_FIELD}
-    return rest if valid is None else {**rest, VALIDITY_FIELD: valid}
-
-
-def token_positions(fields: Mapping[str, jax.Array | np.ndarray | Coordinates], *, xp=jnp):
-    """The logical positions `[B, S]` of a row's token fields as the decoder reads them: their
-    `Coordinates`' where the fields carry them, else the `positions` field; None where neither gives
-    any. `xp` is the array module."""
-    laid = fields.get(COORDINATES_FIELD)
-    positions = laid.positions if isinstance(laid, Coordinates) else fields.get("positions")
-    return None if positions is None else xp.asarray(positions)
-
-
-def real_slots(fields: Mapping[str, jax.Array | np.ndarray | Coordinates], shape: tuple[int, ...], *, xp=jnp):
-    """Which of a request's `shape` `[B, S]` slots hold a real token: those its
-    validity marks, every one where it has none, less the padding a packed
-    row numbers 0 in its documents (`token_layout`). Samplers select, place
-    and continue a row by these, and losses score and count them, so a row
-    padded either way reads as the row alone; a caller's mask is narrowed,
-    never replaced. `xp` is the array module."""
-    valid, segments = token_layout(fields, xp=xp)
-    real = xp.ones(shape, bool) if valid is None else valid
-    return real if segments is None else real & (segments != 0)
-
-
-def valid_order(valid: jax.Array, *, xp=jnp) -> tuple[jax.Array, jax.Array]:
-    """Each row's real slots first, in order, then its padding slots: the
-    physical slot behind each compact column `[rows, slots]`, and how many
-    slots of each row are real `[rows]`. A stable sort of the validity, so a
-    row's tokens keep their order; a caller says what its columns past the
-    count hold (decoding's -1 history tokens, a convolution's zero column). `xp` is the array module."""
-    valid = xp.asarray(valid, bool)
-    return xp.argsort(~valid, axis=-1, stable=True), xp.sum(valid, axis=-1, dtype=np.int32)
 
 
 def _last_real(value: jax.Array, valid: jax.Array) -> jax.Array:
@@ -1106,7 +914,7 @@ def request_axes(mesh: jax.sharding.Mesh) -> tuple[str, ...]:
     """The mesh axes a request's rows split over: every axis but sequence and
     stage, so each process places rows of its own requests on its own
     devices. A training batch's rows split over the data axes alone
-    (`dew.nn.sharding.batch_axes`): every process of a share reads the same
+    (`dew.mesh.batch_axes`): every process of a share reads the same
     rows there, where each process here brings its own."""
     return tuple(axis for axis in mesh.axis_names if axis not in (SEQUENCE_AXIS, STAGE_AXIS))
 
@@ -1153,14 +961,16 @@ class RowPlan:
 
     @property
     def padding(self) -> np.ndarray:
-        """A mask over the ``count`` placed rows, True for the repeats and False for real rows."""
-        return np.arange(self.count) >= self.rows
+        """A mask over the ``count`` placed rows, True for the repeats and False for real rows
+        (`padded_rows`)."""
+        return padded_rows(self.rows, self.count)[1]
 
     def pad(self, tree):
-        """Repeat rows up to ``count``, cycling through the real ones; device arrays stay on device."""
+        """Repeat rows up to ``count``, cycling through the real ones (`padded_rows`); device arrays
+        stay on device."""
         if self.count == self.rows:
             return tree
-        indices = np.arange(self.count) % self.rows
+        indices, _ = padded_rows(self.rows, self.count)
         return jax.tree.map(lambda leaf: leaf[indices] if isinstance(leaf, jax.Array)
                             else np.asarray(leaf)[indices], tree)
 

@@ -35,10 +35,12 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew._records import JSON
+from dew.batch import Coordinates, coordinates as build_coordinates, merge, shifted_span
+from dew.mesh import LayoutRefused, row_axes
+from dew.nn.continuum import Continuum, ContinuumLevel
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
-from dew.objectives.base import merge
-from dew.records import JSON
 from dew.registry import from_record, read_arguments
 
 from ..activations import GatedActivation, Situ, ungated_activation
@@ -63,14 +65,11 @@ from ..hyper_connections import (
 )
 from ..inputs import (
     AttentionMetadata,
-    Coordinates,
     CrossContext,
     LayerInputs,
     PredictionPhase,
-    coordinates as build_coordinates,
     coordinates_of,
     numbered_blocks,
-    shifted_span,
 )
 from ..kv_cache import KVCache
 from ..mixer_base import MLP_RESIDUALS, RESIDUALS
@@ -91,15 +90,7 @@ from ..precision import (
 )
 from ..protocols import OutputTable, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
-from ..sharding import (
-    RESIDUAL,
-    LayoutRefused,
-    constrain,
-    logical_axes,
-    microbatches,
-    pipeline_stages,
-    row_axes,
-)
+from ..sharding import RESIDUAL, constrain, logical_axes, microbatches, pipeline_stages
 from .decoder_block import (
     DECODER_REMAT,
     NORM_SITES,
@@ -335,6 +326,11 @@ class CausalTransformer(nn.Module):
     """How attention layers store the decode cache: dense or paged, full or
     quantized (`dew.nn.kv_cache`). The parameters do not depend on it."""
     mixture: Mixture | None = None        # some layers' feed-forward as `moe.SparseMLP`; None: dense
+    continuum: ContinuumLevel | None = None
+    """A continuum level on the final states before the head (`dew.nn.continuum`): parameters an
+    objective steps in context by its own loss (`LMObjective(adaptation=...)`), every head that
+    reads the states, `__call__`'s and each prediction depth's, reading the level first. It starts
+    as the identity. None gives the plain head."""
     use_double_wide_mlp: bool = False        # Gemma 4 doubles sharing layers' MLP width; needs sharing
     causal: bool = True
     """Whether attention is causal. False gives full attention, the encoder that
@@ -460,6 +456,9 @@ class CausalTransformer(nn.Module):
         if self.mixer is not None and not isinstance(self.mixer, MixerBase):
             raise ValueError(
                 f"mixer is a mixer value, its record, or None, not {self.mixer!r}")
+        if self.continuum is not None and self.ngpt is not None:
+            raise ValueError("a continuum level reads the final norm's states, which a normalized "
+                             "transformer (ngpt) does not have")
         object.__setattr__(self, "remat", remat_policy(self.remat))
         # The wiring checks its own combinations (`BlockWiring.__post_init__`) as the model is made.
         _ = self.wiring
@@ -742,6 +741,9 @@ class CausalTransformer(nn.Module):
             sites['lm_head'] = (self.emb_features, self.vocab_size)
         if self.head_transform is not None:
             sites['head_dense'] = (self.emb_features, self.emb_features)
+        if self.continuum is not None:
+            sites['continuum_down'] = (self.emb_features, self.continuum.hidden)
+            sites['continuum_up'] = (self.continuum.hidden, self.emb_features)
         return sites
 
     @nn.nowrap
@@ -775,8 +777,9 @@ class CausalTransformer(nn.Module):
         reads the embedding table, `vocab_size` rows of `emb_features`."""
         projections = self.projections()
         count = projection_flops(lengths, *projections.get('lm_head', (self.emb_features, self.vocab_size)))
-        if 'head_dense' in projections:
-            count += projection_flops(lengths, *projections['head_dense'])
+        for site in ('head_dense', 'continuum_down', 'continuum_up'):
+            if site in projections:
+                count += projection_flops(lengths, *projections[site])
         return count
 
     @nn.nowrap
@@ -821,7 +824,7 @@ class CausalTransformer(nn.Module):
             copies = (self.mtp_hyper_connections.hc_mult
                       if relative[1] == 'h_proj' and self.mtp_hyper_connections is not None else 1)
             return rows[depth][0] * copies
-        if relative[0] in ('lm_head', 'head_dense'):
+        if relative[0] in ('lm_head', 'head_dense', 'continuum'):
             return np.concatenate([np.empty((0,), np.int64), *(outputs for _, outputs in rows)])
         return np.zeros_like(lengths)
 
@@ -831,7 +834,8 @@ class CausalTransformer(nn.Module):
         relative = path[1:] if path and path[0] == 'params' else path
         if not relative:
             raise MissingFlopsCount("CausalTransformer adapter matrix has no native scope")
-        head = relative[0] in ('lm_head', 'head_dense')
+        # The continuum level stands before the head, which every head read takes it through.
+        head = relative[0] in ('lm_head', 'head_dense', 'continuum')
         if head != logits or relative[0].startswith(('mtp_', 'dspark_')):
             return np.zeros(np.shape(lengths), np.int64)
         passes = 1
@@ -948,6 +952,9 @@ class CausalTransformer(nn.Module):
                 precision=self.precision,
                 dot_general=head_dot_general(self.dtype, self.precision),
                 name='lm_head', **normal_kernel(self.initializer_range))
+        if self.continuum is not None:
+            self.continuum_level = Continuum(self.continuum, dtype=self.dtype, precision=self.precision,
+                                             name='continuum')
         if self.head_transform is not None:
             self.head_dense = Dense(
                 projections['head_dense'][1], use_bias=False, dtype=self.dtype, precision=self.precision,
@@ -1267,7 +1274,35 @@ class CausalTransformer(nn.Module):
         return prediction, self._logits(x[rows, slots])
 
     def _logits(self, x):
-        """The shared fp32 head over `x`: what `__call__` and every MTP depth score with."""
+        """The shared fp32 head over `x`: what `__call__` and every MTP depth score with, the continuum
+        level first where the model has one."""
+        return self.head_logits(x if self.continuum is None else self.continuum_level(x))
+
+    @property
+    def in_context(self) -> bool:
+        """Whether the model holds a continuum level an objective steps in context (`SteppedInContext`)."""
+        return self.continuum is not None
+
+    @nn.nowrap
+    def in_context_level(self, variables):
+        """The continuum level's parameters in `variables`, None without a level (`SteppedInContext`)."""
+        return None if self.continuum is None else variables["params"]["continuum"]
+
+    @nn.nowrap
+    def with_in_context_level(self, variables, level):
+        """`variables` holding `level` as the continuum level's parameters (`SteppedInContext`)."""
+        return {**variables, "params": {**variables["params"], "continuum": level}}
+
+    def continuum_states(self, hidden):
+        """Final states `hidden` past the continuum level, the states its head reads (`head_logits`):
+        an objective that steps the level in context reads it with its own parameters here."""
+        if self.continuum is None:
+            raise ValueError("this model has no continuum level")
+        return self.continuum_level(hidden)
+
+    def head_logits(self, x):
+        """The fp32 head over states the continuum level already read (`continuum_states`), or a
+        model without one's final states: `_logits` past the level."""
         if self.head_transform is not None:
             x = self.head_norm(ungated_activation(self.head_transform, self.head_dense(x)))
         # fp32 logits whose product follows the compute dtype
@@ -1568,7 +1603,7 @@ class CausalTransformer(nn.Module):
           states are the masked call's, the padding's are unspecified, and a
           causal layer runs as an unpadded call does.
         - `coordinates` are the tokens' documents, validity and positions as
-          the batch's builder made them (`dew.nn.inputs.coordinates`, with the
+          the batch's builder made them (`dew.batch.coordinates`, with the
           packer's `max_segments`); where None they are built here from
           `segment_ids`, `attention_mask`, `positions` and `right_padded`.
         - `conditioning` carries the sequence the `cross_attention` layers read
@@ -2073,11 +2108,13 @@ class CausalTransformer(nn.Module):
         """Return the head as the matrix `logits_from_hidden` contracts, read from the bound variables:
         the parameter itself, with `_logits`'s scale, bias, softcap and precision, the compute dtype
         its product follows and a checkpoint's quantizer of its input.
-        None where no matrix alone is the head: past a `head_transform`, or where `lm_head`'s
-        parameters are not its kernel alone: `dew.lora`'s factors beside it, which its interceptor
-        adds, or no kernel at all, a frozen FP8 head's, whose codes its FP8 product reads instead."""
+        None where no matrix alone is the head: past a `head_transform` or a continuum level, or
+        where `lm_head`'s parameters are not its kernel alone: `dew.lora`'s factors beside it, which
+        its interceptor adds, or no kernel at all, a frozen FP8 head's, whose codes its FP8 product
+        reads instead."""
         head = None if self.tie_embeddings else self.lm_head.variables.get("params", {})
-        if self.head_transform is not None or (head is not None and set(head) != {"kernel"}):
+        if (self.head_transform is not None or self.continuum is not None
+                or (head is not None and set(head) != {"kernel"})):
             return None
         return self._head_table()
 
@@ -2209,7 +2246,7 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def recompute_more(self) -> Self | None:
         """One rung up `DECODER_REMAT`, past any rung that keeps nothing more of the names
-        these layers mark than the rung above it (`MixerBase.residuals`), whose step would
+        these layers mark than the rung above it (`MixerBase.marks`), whose step would
         compile the same; None at the top or off the ladder."""
         if self.remat not in DECODER_REMAT[:-1]:
             return None
@@ -2241,13 +2278,13 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def marked_residuals(self) -> frozenset[str]:
         """The `RESIDUALS` this decoder's layers can mark: each layer's mixer kind's
-        (`MixerBase.residuals`, every name where a kind does not say) and the MLP's."""
+        (`MixerBase.marks`, every name where a kind does not say) and the MLP's."""
         types = self.per_layer_types
         mixers = [kind.mixer or self.mixer for kind in self.layer_kinds(types).values()]
-        if any(mixer is not None and mixer.residuals is None for mixer in mixers):
+        if any(mixer is not None and mixer.marks() is None for mixer in mixers):
             return frozenset(RESIDUALS)
         default = AttentionMixer.residuals or ()
-        return frozenset(MLP_RESIDUALS).union(*(default if mixer is None else mixer.residuals or ()
+        return frozenset(MLP_RESIDUALS).union(*(default if mixer is None else mixer.marks() or ()
                                                 for mixer in mixers))
 
     @nn.nowrap
@@ -2261,13 +2298,12 @@ class CausalTransformer(nn.Module):
     @nn.nowrap
     def inference_projection_groups(self, variables: Mapping[str, Mapping]) -> tuple[ProjectionGroup, ...]:
         """Its layers', depths' and drafter's groups, bound without tracing a
-        forward; an encoder serves no decode step and names none. The groups
-        read which parameters the layers hold, never their values, so the
-        layers are bound over the variables' shapes: flax's bound tree is
-        cyclic, and bound over the weights themselves it would keep them alive
-        after the caller drops them until a full collection."""
-        if not self.causal:
-            return ()
+        forward, causal or not: a bidirectional model's masked denoising reads
+        its projections packed as a decoder's steps do. The groups read which
+        parameters the layers hold, never their values, so the layers are
+        bound over the variables' shapes: flax's bound tree is cyclic, and
+        bound over the weights themselves it would keep them alive after the
+        caller drops them until a full collection."""
         bound = self.bind(jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), jnp.result_type(leaf)), variables))
         return declared_groups(*bound.layers, *bound.mtp,

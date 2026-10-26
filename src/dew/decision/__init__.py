@@ -11,16 +11,13 @@ which decides a row's questions together, or a readout of options written under
 `SlotReadout`), and answers with a distribution
 over exactly the options each question names. `Decide` is the task that
 answers requests, and `DecisionObjective` trains one on proper scoring
-rules. `LayaCheckpoint` reads convaiinnovations/laya's released
-checkpoints, and `JointCheckpoint` a released joint-head checkpoint, a
-backbone with its joint schema head beside it, whose head `StoredJointHead`
-reads.
+rules. `Pretrained.load` reads released Laya and joint-head sources, and
+`Decide.of` turns their declared settings into a decision task.
 """
 
 from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures, bucket
-from dew.decision.data import Example, Group, corpus, decisions, mixture
+from dew.decision.data import Example, Group, GroupedExamples, corpus, decisions, mixture
 from dew.decision.head import DecisionHead, Head, JointSchemaHead, LabelReadout, SlotReadout
-from dew.decision.joint_checkpoint import JointCheckpoint, StoredJointHead
 from dew.decision.laya import LayaCheckpoint
 from dew.decision.layout import (
     AnswerCue,
@@ -97,10 +94,10 @@ __all__ = [
     "Example",
     "Framing",
     "Group",
+    "GroupedExamples",
     "Head",
     "Instructions",
     "JevConfidence",
-    "JointCheckpoint",
     "JointLayout",
     "JointSchemaHead",
     "LabelReadout",
@@ -129,7 +126,6 @@ __all__ = [
     "Spherical",
     "State",
     "StateFirstLayout",
-    "StoredJointHead",
     "Temperatures",
     "Text",
     "TopProbability",

@@ -32,8 +32,8 @@ import optax
 from benchmark_cases import LM_DENSE, LM_MOE, Case
 from benchmark_models import build_trainer, compiled_step, timed_steps
 
-from dew.config import OptimConfig
 from dew.nn.moe import expert_projection
+from dew.optim import OptimConfig
 from dew.telemetry.benchmark import samples
 from dew.telemetry.profile import capture_options
 

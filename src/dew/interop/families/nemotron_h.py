@@ -18,7 +18,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
-from dew import records
+from dew import _records
 from dew.interop import mamba2
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
@@ -89,9 +89,9 @@ def _layer_types(hf_config: Mapping[str, object], used: set[str]) -> tuple[str, 
     used.update(("layers_block_type", "layer_types", "hybrid_override_pattern"))
     stated = hf_config.get("layers_block_type", hf_config.get("layer_types"))
     if stated is not None:
-        layers = tuple(_LEGACY.get(kind, kind) for kind in records.strings(stated, "layers_block_type"))
+        layers = tuple(_LEGACY.get(kind, kind) for kind in _records.strings(stated, "layers_block_type"))
     else:
-        pattern = records.text(hf_config.get("hybrid_override_pattern", "ME*-"), "hybrid_override_pattern")
+        pattern = _records.text(hf_config.get("hybrid_override_pattern", "ME*-"), "hybrid_override_pattern")
         unknown = set(pattern) - _PATTERN.keys()
         if unknown:
             raise ValueError(f"hybrid_override_pattern has unknown block kinds {sorted(unknown)}")
@@ -130,7 +130,7 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     # transformers fills the step's kinds in every config; they describe nothing without a depth.
     used.update(("mtp_layers_block_type", "mtp_hybrid_override_pattern"))
     step = _prediction_step(hf_config) if depths else ()
-    activation = records.text(hf_config.get(field("mlp_hidden_act"), "relu2"), "mlp_hidden_act")
+    activation = _records.text(hf_config.get(field("mlp_hidden_act"), "relu2"), "mlp_hidden_act")
     if activation != "relu2":
         raise ValueError(f"nemotron_h mlp_hidden_act {activation!r} is not the supported ReLU² MLP")
     if hf_config.get(field("mamba_hidden_act"), "silu") != "silu":
@@ -141,7 +141,7 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
         state_size=integer("ssm_state_size", 128), n_groups=groups, norm_groups=groups,
         conv_kernel=integer("conv_kernel", 4), chunk_size=integer("chunk_size", 128),
         use_bias=flag("use_bias", default=False), use_conv_bias=flag("use_conv_bias", default=True),
-        time_step_limit=(records.number(hf_config.get(field("time_step_min"), 0.001),
+        time_step_limit=(_records.number(hf_config.get(field("time_step_min"), 0.001),
                                         "time_step_min"), float("inf")))
     mlp = MLPMixer(intermediate_size=integer("intermediate_size", 21504),
                    activation=activation, use_bias=flag("mlp_bias", default=False))
@@ -154,12 +154,12 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
         mixture = Mixture(
             experts=integer("n_routed_experts", 8), top_k=integer("num_experts_per_tok", 2),
             score_function="sigmoid", norm_topk_prob=flag("norm_topk_prob", default=True),
-            scaling=records.number(hf_config.get(field("routed_scaling_factor"), 1.0),
+            scaling=_records.number(hf_config.get(field("routed_scaling_factor"), 1.0),
                                    "routed_scaling_factor"),
             groups=integer("n_group", 1), groups_per_token=integer("topk_group", 1), bias=True,
             expert_features=integer("moe_intermediate_size", 7688),
             shared_features=integer("moe_shared_expert_intermediate_size", 7688) or mlp.intermediate_size,
-            latent_features=None if latent is None else records.integer(latent, "moe_latent_size"))
+            latent_features=None if latent is None else _records.integer(latent, "moe_latent_size"))
         kinds["moe"] = LayerKind(mixer=MLPMixer(
             intermediate_size=mixture.expert_features or mlp.intermediate_size,
             activation=activation, mixture=mixture))
@@ -177,10 +177,10 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     return native_fields(CausalTransformer)(
         vocab_size=integer("vocab_size", 131072), emb_features=integer("hidden_size", 4096),
         num_layers=len(layers), num_heads=heads,
-        num_kv_heads=heads if kv_heads is None else records.integer(kv_heads, "num_key_value_heads"),
+        num_kv_heads=heads if kv_heads is None else _records.integer(kv_heads, "num_key_value_heads"),
         head_dim=integer("head_dim", 128), mlp_features=0, qk_norm=False, scale_after_cast=False,
         max_seq_len=integer("max_position_embeddings", 4096),
-        norm_eps=records.number(hf_config.get(field("layer_norm_epsilon"), 1e-5), "layer_norm_epsilon"),
+        norm_eps=_records.number(hf_config.get(field("layer_norm_epsilon"), 1e-5), "layer_norm_epsilon"),
         tie_embeddings=flag("tie_word_embeddings", default=False), layer_types=layers, kinds=kinds,
         num_nextn_predict_layers=depths, mtp_layer_type=step[0] if step else None,
         mtp_feedforward_type=step[1] if len(step) == 2 else None)
@@ -194,9 +194,9 @@ def _prediction_step(hf_config: Mapping[str, object]) -> tuple[str, ...]:
     (NemotronHConfig.__post_init__)."""
     stated = hf_config.get("mtp_layers_block_type")
     step = (("full_attention", "moe") if stated is None else
-            tuple(_LEGACY.get(kind, kind) for kind in records.strings(stated, "mtp_layers_block_type")))
+            tuple(_LEGACY.get(kind, kind) for kind in _records.strings(stated, "mtp_layers_block_type")))
     if step == ("full_attention", "moe") and hf_config.get("mtp_hybrid_override_pattern") is not None:
-        pattern = records.text(hf_config["mtp_hybrid_override_pattern"], "mtp_hybrid_override_pattern")
+        pattern = _records.text(hf_config["mtp_hybrid_override_pattern"], "mtp_hybrid_override_pattern")
         if unknown := sorted(set(pattern) - _PATTERN.keys()):
             raise ValueError(f"mtp_hybrid_override_pattern has unknown block kinds {unknown}")
         step = tuple(_PATTERN[kind] for kind in pattern)
@@ -241,7 +241,7 @@ def _prediction_path(name: str, config: Mapping[str, object]) -> tuple[str, ...]
 
     leaves = {**(_STEP_START if index % blocks == 0 else {}),
               **(_STEP_END if index % blocks == blocks - 1 else {})}
-    return prediction_path(name, "mtp", index // blocks, records.integer(
+    return prediction_path(name, "mtp", index // blocks, _records.integer(
         config.get("num_nextn_predict_layers", 0), "num_nextn_predict_layers"), ".".join(parts[3:]),
         leaves, block)
 

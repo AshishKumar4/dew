@@ -26,27 +26,24 @@ from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
+from dew.batch import EXAMPLE_ROWS, Batch, Variables, dicts, merge
 from dew.data.dataset import rows_of
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import rows_spec
 from dew.objectives.base import (
-    EXAMPLE_ROWS,
     EXAMPLE_STREAM,
     Aux,
-    Batch,
     Evaluated,
     Ratio,
     Recorded,
     Step,
-    Variables,
-    merge,
     recorded_metrics,
     with_projected,
 )
 from dew.optim import stepped
+from dew.state import Accumulation, TrainState, apart, together
 from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
-from dew.training.state import Accumulation, TrainState, apart, together
 
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)
@@ -197,9 +194,11 @@ def ema_update(ema, params, decay):
 
 
 def write_back(params: Variables, variables: Variables | None) -> Variables:
-    """Replace nonparameter collections whole; the optimizer owns params."""
+    """Replace nonparameter collections whole; the optimizer owns params. A collection comes back in
+    the state's dicts whichever Flax container the objective's `apply` wrote it in (`dew.batch.dicts`)."""
     if variables is None:
         return params
+    variables = dicts(variables)
     if "params" in variables:
         raise ValueError("Aux.variables cannot carry the params collection; the optimizer owns it")
     for name, collection in variables.items():

@@ -32,6 +32,8 @@ dependencies = [
     # dew.data.images decodes, resizes and jitters every image record with it.
     "opencv-python-headless",
     "einops",
+    # dew.nn.engram draws its bucket primes with sympy.nextprime.
+    "sympy",
     # dew.data.dataset's close budget holds grain's worker kill timeout
     # (GRAIN_KILL_SECONDS); 0.2.18 is the release that was tested.
     "grain>=0.2.18,<0.3",

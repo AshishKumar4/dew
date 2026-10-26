@@ -57,7 +57,9 @@ def test_a_media_source_trains_and_saves_text_without_loading_media(monkeypatch,
     monkeypatch.setattr(AutoProcessor, "from_pretrained", load_media)
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="xla")
     processor = loaded.processor
-    assert processor is not None and processor.source == str(directory)
+    from dew.interop.sources import SourceReference
+
+    assert processor is not None and processor.source == SourceReference(str(directory))
     texts = ["token4 token5", "token4 token5 token6"]
     expected = tokenizer(text=texts, padding=True, truncation=False, return_tensors="np")
     inputs = processor(texts)

@@ -34,19 +34,22 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
+from dew.batch import FROZEN, merge, select, thaw
 from dew.inference.banks import (
     assembled,
     bank_sharding,
     bank_sites,
+    banked,
     entry_tree,
     in_namespace,
+    logical,
     narrowed,
     one_layer,
+    without_banks,
 )
-from dew.nn.backbones.layer_plan import group_name, layer_index
+from dew.mesh import batch_axes
+from dew.nn.backbones.layer_plan import layer_index
 from dew.nn.kernels.options import program
-from dew.nn.sharding import batch_axes
-from dew.objectives.base import FROZEN, merge, select, thaw, without
 from dew.training.distributed import batch_shardings
 from dew.training.host import transfer
 from dew.training.memory import device_tokens, step_compiler_options
@@ -132,94 +135,6 @@ def resident(placement, sites, accelerator):
     return banked(placed, sites, lambda rows, path: bank_sharding(rows[0], memory_kind=BANK_MEMORY))
 
 
-def banked(tree, sites, stack, release=None):
-    """Replace a scanned run's per-layer rows with one stacked bank.
-
-    `tree` is a frozen collection keyed per layer. Every leaf that all rows
-    of a run hold moves under the run's bank name, stacked by
-    `stack(rows, path)`. Arrays stack into one bank, shapes into one shape,
-    shardings into the bank's. A leaf only some rows hold stays per layer, as
-    does every run of one, and `run_stack` stacks those with the moving rows
-    at each snapshot.
-
-    `stack` is called with the rows and `path`, the bank leaf's keys from the
-    root, so a caller can place each bank as it makes it. A frozen bank then
-    exists once, from the moment it is placed, rather than as its rows in
-    pinned memory and a stacked copy beside them, which for a stack that
-    fills the host is the second copy that does not fit.
-
-    `release(namespace, index, keys, bank)` is told each row leaf the bank
-    replaced, and the bank itself. The tree the rows came from can then hold
-    the bank where the row was and let the row go.
-    """
-    tree = dict(tree)
-    for site in sites:
-        local = tree
-        for component in site.namespace:
-            if not isinstance(local.get(component), Mapping):
-                local = None
-                break
-            local[component] = dict(local[component])
-            local = local[component]
-        if local is None:
-            continue
-        for first, count in site.view.groups:
-            if count == 1:
-                continue
-            held = [local.get(f"layers_{first + offset}") for offset in range(count)]
-            if not all(isinstance(row, Mapping) for row in held):
-                continue
-            rows = [dict(row) for row in held if isinstance(row, Mapping)]
-            leaves = [{tuple(entry.key for entry in path): leaf
-                       for path, leaf in jax.tree_util.tree_leaves_with_path(row)} for row in rows]
-            shared = set(leaves[0]).intersection(*leaves[1:])
-            if not shared:
-                continue
-            name = group_name(first, count)
-            bank = local.setdefault(name, {})
-            for keys in sorted(shared):
-                node = bank
-                for key in keys[:-1]:
-                    node = node.setdefault(key, {})
-                node[keys[-1]] = stack([held[keys] for held in leaves], (*site.namespace, name, *keys))
-                for offset, row in enumerate(rows):
-                    _drop(row, keys)
-                    if release is not None:
-                        release(site.namespace, first + offset, keys, node[keys[-1]])
-            for offset, row in enumerate(rows):
-                name = f"layers_{first + offset}"
-                if row:
-                    local[name] = row
-                else:
-                    del local[name]
-    return tree
-
-
-def _without_banks(variables, sites):
-    """Return `variables` without the banks a scanned run stores under its name."""
-    banks = [(*site.namespace, name) for site in sites
-             for (first, count), name in zip(site.view.groups, site.view.bank_names(), strict=True)
-             if count > 1]
-    return {collection: without(tree, banks) for collection, tree in variables.items()}
-
-
-def _drop(tree, keys):
-    """Delete the leaf at `keys` from `tree`, and any node that emptied with it."""
-    node, parents = tree, []
-    for key in keys[:-1]:
-        parents.append((node, key))
-        # The copy is written into the parent before the walk moves on; a
-        # chained assignment would bind `node` first and write into the copy.
-        child = dict(node[key])
-        node[key] = child
-        node = child
-    del node[keys[-1]]
-    for parent, key in reversed(parents):
-        if parent[key]:
-            break
-        del parent[key]
-
-
 def _bank_shardings(placed, accelerator, count):
     """Place one bank in bank memory, layer axis in front when it stacks rows."""
     def place(sharding):
@@ -227,32 +142,6 @@ def _bank_shardings(placed, accelerator, count):
         return bank_sharding(row, memory_kind=BANK_MEMORY) if count > 1 else row
 
     return jax.tree.map(place, placed)
-
-
-def _replaced(tree, namespace, subtrees):
-    """`tree` with each collection's namespace subtree replaced, spines copied."""
-    replaced = dict(tree)
-    for collection, subtree in subtrees.items():
-        if not namespace:
-            replaced[collection] = subtree
-            continue
-        spine = dict(replaced[collection])
-        replaced[collection] = spine
-        node = spine
-        for name in namespace[:-1]:
-            node[name] = dict(node[name])
-            node = node[name]
-        node[namespace[-1]] = subtree
-    return replaced
-
-
-def _logical(tree, sites):
-    """Put every declared stack's banks back under their stored `layers_N` paths."""
-    for site in sites:
-        local = in_namespace(tree, site.namespace)
-        if local:
-            tree = _replaced(tree, site.namespace, site.view.unstack(local))
-    return tree
 
 
 def _after(device: tuple[DeviceStep, ...], loss, variables, batch, execution):
@@ -290,7 +179,7 @@ def _trainable_cotangent(back, cotangent, *, sites, paths, layout):
     treedef, held = layout
     cotangents = iter(back(cotangent)[0])
     placed = treedef.unflatten([None if known else next(cotangents) for known in held])
-    gradient = _logical({"params": placed}, sites)["params"]
+    gradient = logical({"params": placed}, sites)["params"]
     trainable = frozenset(paths)
     return select(gradient, lambda path: path in trainable)
 
@@ -307,7 +196,7 @@ class HostExecution:
         self.accelerator, self.cpu = accelerator, cpu
         self.sites = bank_sites(objective) if objective.bank_sites else ()
         self.device = device
-        self.unstack = jax.jit(functools.partial(_logical, sites=self.sites))
+        self.unstack = jax.jit(functools.partial(logical, sites=self.sites))
 
     def forward(self, step: Mapping[str, bool | int]):
         """The loss and its pullback, compiled for the objective's modules as they are now, under the
@@ -349,7 +238,7 @@ class HostExecution:
         # The layout names a leaf's axes as its module declares them, which a
         # bank's leading layer axis is not; a bank is already placed, so the
         # placement is asked about everything but the banks.
-        placement = self.layout.shardings(self.accelerator, _without_banks(variables, self.sites))
+        placement = self.layout.shardings(self.accelerator, without_banks(variables, self.sites))
         whole, placement = thaw(variables), thaw(placement)
         weights = {"params": whole["params"]}
         places = {"params": placement["params"]}

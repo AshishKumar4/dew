@@ -395,7 +395,7 @@ def test_a_masked_walk_whose_model_scores_nothing_refuses_rather_than_reveal_a_t
 
 
 def test_masked_generation_reads_its_ids_as_every_parser_of_ids_does(rng):
-    """NumPy integers are token ids as Python's are (`dew.nn.inputs.token_id`), so a request built
+    """NumPy integers are token ids as Python's are (`dew.batch.token_id`), so a request built
     from a tokenizer's arrays generates as one built from Python ints; a flag or a fraction where
     an id goes is refused."""
     model = transformer(causal=False)
@@ -457,7 +457,7 @@ def test_a_masked_response_continues_the_prompts_fields_and_keeps_its_media():
 
 def test_a_packed_prompt_continues_its_last_document_as_if_alone():
     """A packed prompt numbers its documents from 1 and its padding 0
-    (`dew.nn.inputs.real_slots`), and its tokens sit at their places in their
+    (`dew.batch.real_slots`), and its tokens sit at their places in their
     documents (`Coordinates.places`): a row of two documents and a row padded
     by segment 0 each continue their last document's positions, reading back
     what that document alone does."""
@@ -586,3 +586,23 @@ def test_masked_diffusion_lm_memorises_the_toy_corpus():
     assert generated.shape == (16, ROW) and not np.any(generated == BYTE_MASK)
     match = (generated[:, None, :] == ROWS[None, :, :]).mean(-1).max(-1)
     assert float(match.mean()) > 0.3, match
+
+
+@pytest.mark.parametrize("impl", ["rbg", "unsafe_rbg", "threefry2x32"])
+def test_a_rows_reveals_are_its_own_under_any_key_implementation(impl):
+    """`Unmask.step_rows` draws each row's reveals and tokens under its own key, the same whatever rows it
+    steps beside: `vmap` would draw every row of an RBG key implementation from the first key's stream,
+    so each row key is made counter-based first (`dew._distributions.counted`)."""
+    process, model, rows = DiscreteProcess(LogLinear(), mask_id=MASK), Peaked(), 6
+    denoise = process.denoiser(model, model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)))
+    x = jnp.full((rows, 8), MASK, jnp.int32)
+    t, s = jnp.full((rows,), 0.9), jnp.full((rows,), 0.4)
+    filled, log_probs = (jnp.broadcast_to(value, (rows, *value.shape[1:])) for value in denoise(x, t))
+    keys = jax.random.split(jax.random.key(3, impl=impl), rows)
+
+    def stepped(part):
+        return np.asarray(Unmask().step_rows(x[part], t[part], s[part], filled[part], log_probs[part], (),
+                                             keys[part], process, denoise)[0])
+
+    alone = np.concatenate([stepped(slice(row, row + 1)) for row in range(rows)])
+    np.testing.assert_array_equal(stepped(slice(None)), alone)

@@ -10,8 +10,8 @@ import jax
 import numpy as np
 from flax import linen as nn
 
+from dew.batch import Variables
 from dew.interop.weights import record_layouts
-from dew.objectives.base import Variables
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
@@ -48,8 +48,7 @@ def bind_component[ComponentT, ConfigT: Mapping[str, object]](
     FP32 whatever `param_dtype` says.
     """
     from dew.interop.safetensors_io import read_weights
-    from dew.interop.weights import source_layouts
-    from dew.nn.text_encoders import check_tree
+    from dew.interop.weights import check_tree, source_layouts
 
     layouts: tuple[WeightLayout, ...] = ()
     if params is not None and shapes is not None:

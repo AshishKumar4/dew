@@ -23,9 +23,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.artifacts import Artifact, Decisions
+from dew.batch import Batch
 from dew.decision.metrics import Answered
 from dew.nn import categorical
-from dew.objectives.base import Batch, Metric, Shown, mean_of_totals, merge_totals
+from dew.objectives.base import Metric, Shown, mean_of_totals, merge_totals
 
 
 class ScoringRule(ABC):
@@ -61,12 +62,8 @@ class ScoringRule(ABC):
                              np.float64)
         return float(charged.sum()), float(charged.size)
 
-    def merge(self, accumulated: tuple[float, float],
-              contribution: tuple[float, float]) -> tuple[float, float]:
-        return merge_totals(accumulated, contribution)
-
-    def finalize(self, accumulated: tuple[float, float]) -> float:
-        return mean_of_totals(accumulated)
+    merge = staticmethod(merge_totals)
+    finalize = staticmethod(mean_of_totals)
 
 
 @dataclass(frozen=True)

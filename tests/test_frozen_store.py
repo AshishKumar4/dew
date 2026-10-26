@@ -12,12 +12,13 @@ import orbax.checkpoint as ocp
 import pytest
 from etils import epath
 
+from dew.batch import FROZEN
 from dew.checkpoints import FROZEN_STORE, Checkpoints
 from dew.data import Loading, Memory
 from dew.data.compile import compile
 from dew.lora import Adapter, LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import FROZEN, Aux, Objective, Ratio
+from dew.objectives.base import Aux, Objective, Ratio
 from dew.objectives.lm import LMObjective
 from dew.training import Trainer
 
@@ -209,7 +210,7 @@ import json, sys
 import jax, jax.numpy as jnp, numpy as np
 from jax.sharding import NamedSharding, PartitionSpec as P
 from dew.checkpoints import Checkpoints
-from dew.objectives.base import FROZEN
+from dew.batch import FROZEN
 from dew.training import MeshSpec
 
 mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])

@@ -51,6 +51,7 @@ from dew.nn.inputs import ModelKwarg
 from dew.nn.precision import capped_logits, head_product, scaled_logits
 
 if TYPE_CHECKING:
+    from dew._records import JSON
     from dew.diffusion.process import DenoisingCondition
     from dew.inputs.encoders import ConditionWork
     from dew.nn.backbones.decoder_block import RematPolicy
@@ -61,7 +62,6 @@ if TYPE_CHECKING:
     from dew.nn.kv_cache import KVCache
     from dew.nn.mla import MLAMixer
     from dew.quantization import InputQuantizer
-    from dew.records import JSON
 
 __all__ = [
     "AffineHead",
@@ -222,6 +222,27 @@ class OutputTable:
         of tokens' vectors (a decision head's lexical prior) takes these."""
         rows = self.matrix if self.vocab_major else self.matrix.T
         return rows if self.scale is None else rows * self.scale[:, None]
+
+
+@runtime_checkable
+class SteppedInContext(Protocol):
+    """A model whose head reads parameters an objective steps in context, a window at a time
+    (`dew.nn.continuum`, `LMObjective(adaptation=...)`): the level's parameters within a tree of its
+    variables, None without a level; the tree with others in their place; and the two halves of the
+    head the steps run between, the level on final states (`continuum_states`) and the head past it
+    (`head_logits`). Its owner keeps the level's place in its tree, so an objective never reads it.
+    `in_context` says whether the model holds a level."""
+
+    @property
+    def in_context(self) -> bool: ...
+
+    def in_context_level(self, variables: VariableDict) -> VariableDict | None: ...
+
+    def with_in_context_level(self, variables: VariableDict, level: VariableDict) -> VariableDict: ...
+
+    def continuum_states(self, hidden: jax.Array) -> jax.Array: ...
+
+    def head_logits(self, states: jax.Array) -> jax.Array: ...
 
 
 @runtime_checkable

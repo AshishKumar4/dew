@@ -7,11 +7,12 @@ import numpy as np
 import optax
 import pytest
 
+from dew.batch import everything, merge, select, under
 from dew.data import Memory
 from dew.data.compile import validation
 from dew.data.pipeline import Pipeline
 from dew.data.steps.generic import Formatting
-from dew.objectives.base import Objective, Ratio, Step, everything, merge, select, under
+from dew.objectives.base import Objective, Ratio, Step
 
 
 def tree():

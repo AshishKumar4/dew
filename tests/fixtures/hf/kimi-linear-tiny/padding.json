@@ -1,0 +1,26 @@
+{
+ "cases": {
+  "null": {
+   "rows": 512,
+   "untrained": [],
+   "vocab_size": 512
+  },
+  "omitted": {
+   "rows": 512,
+   "untrained": [
+    0
+   ],
+   "vocab_size": 512
+  },
+  "stated": {
+   "rows": 512,
+   "untrained": [
+    3
+   ],
+   "vocab_size": 512
+  }
+ },
+ "place": [],
+ "torch": "2.14.1",
+ "transformers": "4.57.1"
+}

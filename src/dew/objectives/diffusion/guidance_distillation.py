@@ -18,6 +18,7 @@ import jax.numpy as jnp
 import optax
 from flax import linen as nn
 
+from dew.batch import Variables, dicts
 from dew.diffusion.presets import Preset
 from dew.diffusion.process import DenoisingCondition, Process
 from dew.diffusion.schedules import NoiseScheduler, expand
@@ -25,7 +26,7 @@ from dew.diffusion.transforms import PredictionTransform, broadcast_rates
 from dew.inputs import InputSpec
 from dew.lora import unadapted
 from dew.nn.protocols import Lacks
-from dew.objectives.base import TEACHER, Aux, ProgramModule, Step, Variables, model_rngs
+from dew.objectives.base import TEACHER, Aux, ProgramModule, Step, model_rngs
 from dew.registry import to_record
 from dew.sampling.guidance import guide
 
@@ -77,7 +78,7 @@ class GuidanceDistillationObjective(DiffusionObjective):
             raise ValueError(f"the teacher denoises {built.latent_shape} and the student "
                              f"{self.latent_shape}; they share one latent geometry")
         self.teacher = built
-        self.teacher_variables = held
+        self.teacher_variables = dicts(held)
         self.scales = scales
 
     def program_key(self) -> tuple[ProgramModule, ...]:

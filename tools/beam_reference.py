@@ -36,7 +36,6 @@ import types
 
 import numpy as np
 import torch
-import transformers
 import transformers.generation.utils as generation
 from numerics_reference import FIXTURES, decoder, prompts
 from torch_precision import float64, float64_twin

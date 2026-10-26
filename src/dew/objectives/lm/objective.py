@@ -38,26 +38,31 @@ from flax import linen as nn, struct
 from flax.traverse_util import unflatten_dict
 from jax.typing import ArrayLike
 
+from dew._coordination import agreed, collective_host
 from dew.artifacts import Artifact, TextSamples, TokenScores
-from dew.coordination import agreed, collective_host
+from dew.batch import (
+    COORDINATES_FIELD,
+    FROZEN,
+    VALID_ROWS,
+    Batch,
+    Coordinates,
+    PathFilter,
+    Variables,
+    freeze,
+    merge,
+    real_slots,
+    scored_targets,
+    shifted_span,
+    thaw,
+    token_layout,
+)
 from dew.data.chat import ROLES_KEY, Role
 from dew.inference import TextGeneration
 from dew.inference.tasks import Processor, TextSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
-from dew.nn.inputs import (
-    CONTEXT,
-    CONTEXT_LENGTHS,
-    COORDINATES_FIELD,
-    Coordinates,
-    ModelInputs,
-    pad_token_rows,
-    real_slots,
-    rotate_rows,
-    shifted_span,
-    token_layout,
-)
+from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs, pad_token_rows, rotate_rows
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_moments
 from dew.nn.precision import at_least_fp32
@@ -72,32 +77,27 @@ from dew.nn.protocols import (
     Lacks,
     LayerStates,
     OutputTable,
+    SteppedInContext,
     TokenModel,
     head_table,
 )
 from dew.nn.sharding import LOGITS, constrain
 from dew.objectives.base import (
-    FROZEN,
     OMITTED,
-    VALID_ROWS,
     Aux,
-    Batch,
     EMASpec,
     Objective,
     Omitted,
-    PathFilter,
     Prediction,
     ProgramModule,
     Ratio,
     Shown,
     Step,
-    Variables,
-    freeze,
-    merge,
+    ended,
     merge_totals,
     model_rngs,
-    thaw,
 )
+from dew.objectives.lm.adaptation import ChunkAdaptation, adapted_scores
 from dew.objectives.lm.chunked import (
     chunked_tile,
     final_read,
@@ -288,10 +288,10 @@ def _prepared(tokens: ModelInputs | jax.Array, segment_ids: jax.Array | None = N
     """The rows as `ModelInputs`, bare ids cast to int32, their packing among the token fields.
 
     A packed batch from a data pipeline carries its windows' `coordinates`
-    (`dew.nn.inputs.Coordinates`, the packer's); a rollout's names each row's
+    (`dew.batch.Coordinates`, the packer's); a rollout's names each row's
     `segment_ids` and `positions`. Either comes beside the ids or in the
     `ModelInputs`; a field named both ways is refused. Everything after reads
-    the packing off what this returns (`dew.nn.inputs.token_layout`).
+    the packing off what this returns (`dew.batch.token_layout`).
     """
     prepared = tokens if isinstance(tokens, ModelInputs) else ModelInputs(jnp.asarray(tokens, jnp.int32))
     columns = {name: column for name, column in (("positions", positions), ("segment_ids", segment_ids),
@@ -351,7 +351,7 @@ def batch_text(batch) -> ModelInputs:
     stale = sorted({"text_segment_ids", "text_positions"} & set(batch))
     if stale:
         raise ValueError(f"a packed batch lays its documents out in text_coordinates "
-                         f"(dew.nn.inputs.coordinates), not {', '.join(stale)}")
+                         f"(dew.batch.coordinates), not {', '.join(stale)}")
     laid = batch.get("text_coordinates")
     return _prepared(batch[TEXT_KEY], coordinates=None if laid is None else jax.tree.map(jnp.asarray, laid))
 
@@ -554,27 +554,6 @@ def _phase_filter(model: nn.Module, indexer: IndexerTraining | None,
 _DEFAULT_SAMPLING = Sampling()
 
 
-
-def scored_targets(xp, tokens, pad_id: int | None, attention_mask, segment_ids, depth: int = 0,
-                   roles=None, role: int | None = None):
-    """Whether each target the loss scores at prediction `depth` counts, as
-    `[B, S - 1 - depth]` booleans, in `xp` (numpy for the host's FLOP
-    geometry and the data's target counts, jax.numpy for the loss): the
-    state at p scores the token `depth + 1` later, which counts when it is
-    not padding, when the attention mask keeps every position from the state
-    to it, in a packed batch when the state and it share a document (segment
-    0 is padding), and with a `role` (`loss_role`) when `roles`, one per
-    token, give the target that role."""
-    span = depth + 1
-    counted = shifted_span(tokens.shape, span, valid=attention_mask, segments=segment_ids, xp=xp)
-    if pad_id is not None:
-        counted = counted & (tokens[:, span:] != pad_id)
-    if segment_ids is not None:
-        counted = counted & (segment_ids[:, span:] != 0)
-    if role is not None and roles is not None:
-        counted = counted & (roles[:, span:] == role)
-    return counted
-
 class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     """Scores a causal decoder's tokens: the machinery the LM, preference and
     policy losses share, without a loss of its own.
@@ -619,6 +598,10 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     """Whether `token_scores` marks each prediction by default (`LMObjective`'s token accuracy).
     A policy or preference loss reports none, and asks for the marks where it scores them."""
 
+    adaptation: ChunkAdaptation | None = None
+    """How the model's continuum level steps in context by the loss it scores (`LMObjective`);
+    None reads the level as it is trained."""
+
     head_fused: bool = True
     """Whether a tiled head scored for its weighted sums takes their gradient in its forward
     (`token_scores`' `z_loss`, `LMObjective`'s training loss): the fit ladder turns it off where the
@@ -639,6 +622,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
                  samples: Samples | None = None, variables: Variables | None | Omitted = OMITTED,
                  qk_stats: bool = False, processor: Processor | None | Omitted = OMITTED):
         """Bind the decoder and set how its tokens are scored; the class docstring describes each argument."""
+        self.eos_token_ids = ended(model, OMITTED)
         model = self.bind_model(model, variables=variables, processor=processor)
         _check_reads(model)
         self.model = model
@@ -664,6 +648,8 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
             return f"{type(model).__name__} does not declare logits_flops for the LM head"
         if self.mtp_weight and not isinstance(model, CountedPredictions):
             return f"{type(model).__name__} does not declare prediction_flops for its MTP depths"
+        if self.adaptation is not None:
+            return "a continuum level stepped in context has no count of its windows' gradients"
         return None
 
     def _token_geometry(self, batch: Batch) -> tuple[np.ndarray, Mapping[str, jax.Array | Coordinates]]:
@@ -812,21 +798,38 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
 
+    def sampled(self, sampling: Sampling) -> Sampling:
+        """`sampling` with the end-of-sequence ids of the source this objective was built over where it
+        names none (`ended`), so a policy drawn from a loaded source stops where the source's own task
+        does; a bare model's objective names none to add."""
+        if sampling.eos_token_ids is not None or not self.eos_token_ids:
+            return sampling
+        return dataclasses.replace(sampling, eos_token_ids=self.eos_token_ids)
+
     def policy(self, params: Variables, sampling: Sampling = _DEFAULT_SAMPLING) -> TextGeneration:
-        """Return the model over this training tree as a generation task.
+        """Return the model over this training tree as a generation task, under `sampling` (`sampled`).
 
         A rollout uses one snapshot of the policy and draws every completion from it;
         the result records the actual and raw-policy likelihoods that the objective's
-        ratio needs.
+        ratio needs. An objective that steps its level in context (`adaptation`) has no
+        generation that steps it, so it refuses (ValueError) rather than draw from the
+        level it starts with.
         """
-        return TextGeneration(self.model, params, sampling=sampling)
+        if self.adaptation is not None:
+            raise ValueError("an objective that steps its continuum level in context scores what no "
+                             "generation draws yet: a generation reads the level it starts with")
+        return TextGeneration(self.model, params, sampling=self.sampled(sampling))
 
-    def task_settings(self) -> TextSettings:
-        """The decoder's row length, preview budget, sampling policy, and tokenizer or source processor."""
+    def task_settings(self) -> TextSettings | None:
+        """The decoder's row length, preview budget, sampling policy (`sampled`), and tokenizer or
+        source processor. None for an objective that steps its level in context (`adaptation`), which
+        no generation task serves yet: its saved runs restore their trained state, and build no task."""
+        if self.adaptation is not None:
+            return None
         samples = self.samples
         return TextSettings(seq_len=self.seq_len,
                             max_new_tokens=0 if samples is None else samples.max_new_tokens,
-                            sampling=Sampling() if samples is None else samples.sampling,
+                            sampling=self.sampled(Sampling() if samples is None else samples.sampling),
                             tokenizer=recorded_tokenizer(self.processor),
                             processor=recorded_processor(self.processor))
 
@@ -903,17 +906,8 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         table = self._fused_head(params) if z_loss is not None else None
         dtype = at_least_fp32(hidden.dtype)
         weights = self._row_weights(prepared, roles, dtype)
-        total = None
-        whole = model_logits(self.model, params, hidden) if logits else None
-        if whole is not None:
-            losses, predicted, log_z = logits_cross_entropy(whole, targets, predict=predict)
-        elif table is not None:
-            total, (losses, predicted, log_z) = fused_head_loss(
-                hidden, table, targets, weights, z_loss=float(z_loss or 0.0), tile=self.head_tile,
-                predict=predict)
-        else:
-            losses, predicted, log_z = head_cross_entropy(
-                self.model, params, hidden, targets, self.head_chunks, tile=self.head_tile, predict=predict)
+        total, (losses, predicted, log_z), whole = self._head_scores(
+            params, hidden, targets, weights, prepared, table, predict=predict, z_loss=z_loss, logits=logits)
         weights = weights.astype(losses.dtype)
         correct = None if predicted is None else (predicted == targets).astype(losses.dtype)
         depth_scores = []
@@ -947,6 +941,28 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
                 depth_scores.append((depth_losses, depth_weights, depth_total))
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls, total,
                       whole)
+
+    def _head_scores(self, params, hidden, targets, weights, prepared, table, *, predict: bool,
+                     z_loss: float | None, logits: bool):
+        """The head's scores of `targets` from final states `hidden`: the weighted sum where a fused
+        head took it (`table`), each target's loss, top-1 column and log partition, and the whole
+        logits where asked; through the continuum level stepped in context (`adaptation`), the
+        whole logits, the fused head or the tiled head."""
+        if self.adaptation is not None:
+            # The level steps window by window over these targets, weighted as the loss weighs them.
+            adapted = adapted_scores(self.model, params, hidden, targets, weights,
+                                     prepared.slice_tokens(stop=-1).token_fields, self.adaptation,
+                                     predict=predict, logits=logits)
+            return None, (adapted.losses, adapted.predicted, adapted.log_z), adapted.logits
+        if logits:
+            whole = model_logits(self.model, params, hidden)
+            return None, logits_cross_entropy(whole, targets, predict=predict), whole
+        if table is not None:
+            total, scores = fused_head_loss(hidden, table, targets, weights, z_loss=float(z_loss or 0.0),
+                                            tile=self.head_tile, predict=predict)
+            return total, scores, None
+        return None, head_cross_entropy(self.model, params, hidden, targets, self.head_chunks,
+                                        tile=self.head_tile, predict=predict), None
 
     def _row_weights(self, prepared, roles, dtype):
         """Weight the targets the row itself scores (`scored_targets`), and
@@ -1110,7 +1126,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         """Sample the configured prompt once, then decode only on process zero.
 
         An objective whose EMA holds a frozen reference draws from the live
-        policy instead, which is what `_ema_is_reference` says.
+        policy instead, which is what `ema_is_reference` says.
         """
         settings = self.samples
 
@@ -1124,14 +1140,18 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
                      ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
             policy, prompt, max_new_tokens = prepared
             tokens = np.asarray(policy(prompt, max_new_tokens, key=step.key).host().tokens)
-            given = prompt.token_fields.get("attention_mask")
             ids = np.asarray(prompt.tokens)
-            asked = np.ones(ids.shape, bool) if given is None else np.asarray(given, bool)
+            asked = real_slots(prompt.token_fields, ids.shape, xp=np)
             # The prompt's padding is no text; every drawn column is shown, as it was drawn.
             drawn = np.ones((ids.shape[0], tokens.shape[1] - ids.shape[1]), bool)
             return tokens, np.concatenate([asked, drawn], axis=1), ids[0][asked[0]]
 
         return text_preview("LM preview", setup, generate, None if settings is None else settings.decode)
+
+
+def _steps_in_context(model) -> bool:
+    """Whether `model` holds a level an objective steps in context (`SteppedInContext`)."""
+    return isinstance(model, SteppedInContext) and model.in_context
 
 
 class LMObjective(TokenScorer):
@@ -1227,6 +1247,15 @@ class LMObjective(TokenScorer):
 
     `token_accuracy` reports the argmax accuracy; False skips the pass
     over every logit it costs (0.77 ms of the head's 8.0 on a TPU v6e).
+
+    `adaptation` steps the model's continuum level (`CausalTransformer.continuum`) in context by
+    this loss's own next-token targets, Nested Learning's test-time training over the task loss
+    (`dew.objectives.lm.adaptation.ChunkAdaptation`): every `window` tokens of a document, the level
+    steps by `rate` times the summed gradient of their weighted losses, and the next window reads
+    it; training learns the level's start through every step. Evaluation and validation score the
+    same way. A preview, a rollout policy and a saved run's task would draw from the level's start,
+    which no generation steps yet, so an objective with `adaptation` takes no `samples`, refuses
+    `policy` and records no task.
     """
 
     def __init__(
@@ -1251,6 +1280,7 @@ class LMObjective(TokenScorer):
         indexer: IndexerTraining | None = None,
         token_accuracy: bool = True,
         processor: Processor | None | Omitted = OMITTED,
+        adaptation: ChunkAdaptation | None = None,
     ):
         """Build the objective; the class docstring describes each argument."""
         super().__init__(model, seq_len, head_chunks=head_chunks, head_tile=head_tile, samples=samples,
@@ -1259,6 +1289,14 @@ class LMObjective(TokenScorer):
         self.token_accuracy = token_accuracy
         _check_terms(self.model, aux_loss_alpha=aux_loss_alpha, mtp_weight=mtp_weight, z_loss=z_loss,
                      router_z_loss=router_z_loss)
+        if adaptation is not None:
+            if not _steps_in_context(self.model):
+                raise ValueError("adaptation steps a continuum level, which this model does not have "
+                                 "(CausalTransformer.continuum, `SteppedInContext`)")
+            if samples is not None:
+                raise ValueError("adaptation scores through a level stepped in context, which a preview's "
+                                 "generation does not step; train it without samples")
+        self.adaptation = adaptation
         self.balance_rate = balance_rate
         self.aux_loss_alpha = aux_loss_alpha
         self.seq_aux = seq_aux

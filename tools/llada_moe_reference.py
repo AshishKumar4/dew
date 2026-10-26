@@ -15,10 +15,16 @@ weights; --draw replaces the committed synthetic weights first.
   python tools/llada_moe_reference.py llada-moe-tiny llada-moe-v2-tiny llada2-tiny \\
       --release-python <a Python with transformers 4.57.1>
   python tools/llada_moe_reference.py llada21-tiny llada22-tiny --release-python <transformers 5.16.1>
+
+`--padding` records instead the rows each release's own token lookup leaves untrained under the
+fixture's config with its pad id stated, left out and null (`reference_source.record_padding`), as
+padding.json beside it; it runs the release's code alone, so the Python running it is the release's:
+  <a Python with transformers 4.57.1> tools/llada_moe_reference.py --padding llada-moe-tiny ...
 """
 
 import argparse
 import io
+import json
 import struct
 import subprocess
 import sys
@@ -27,9 +33,10 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from torch_precision import float64, float64_twin
-from remote_code_reference import FIXTURES, RELEASES as REGISTERED, released_model
+from reference_source import config_lookups, record_padding
+from remote_code_reference import FIXTURES, RELEASES as REGISTERED, released_classes, released_model
 from safetensors.torch import save_file
+from torch_precision import float64, float64_twin
 
 RELEASES = {
     "llada-moe-tiny": ("inclusionAI/LLaDA-MoE-7B-A1B-Base", "daccaf1ccbf263a427bc9ac2a23b0b004fb275bf",
@@ -154,6 +161,7 @@ def main():
     parser.add_argument('names', nargs='+', choices=RELEASES)
     parser.add_argument('--draw', action='store_true', help='redraw the committed synthetic checkpoint')
     parser.add_argument('--serve', action='store_true', help="the release's side of the pipe")
+    parser.add_argument('--padding', action='store_true', help='record the rows each lookup leaves untrained')
     parser.add_argument('--release-python', default=sys.executable,
                         help="the Python that runs the release's code, with its transformers")
     args = parser.parse_args()
@@ -161,6 +169,12 @@ def main():
         serve(args.names[0])
         return
     REGISTERED.update(RELEASES)
+    if args.padding:
+        with tempfile.TemporaryDirectory() as workspace:
+            for name in args.names:
+                record_padding(*config_lookups(*released_classes(name, Path(workspace))),
+                               json.loads((FIXTURES / name / 'config.json').read_text()), FIXTURES / name)
+        return
     for name in args.names:
         if args.draw:
             with tempfile.TemporaryDirectory() as workspace, torch.no_grad():

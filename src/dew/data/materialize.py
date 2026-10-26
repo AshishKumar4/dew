@@ -24,8 +24,10 @@ from typing import ClassVar
 import grain.python as pygrain
 import numpy as np
 
+from dew._records import JSON, integer, json_value, record
+from dew.batch import Batch
 from dew.data.analysis import _analyzed, _identity, _label, _name
-from dew.data.dataset import Batch, Ranges, Records
+from dew.data.dataset import Ranges, Records
 from dew.data.lowering import (
     _cache_inputs,
     _CachedOutputs,
@@ -52,9 +54,7 @@ from dew.data.pipeline import (
 )
 from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _uncounted
-from dew.data.steps.generic import Fields
 from dew.data.steps.text import CountRule, CountTargets, LayoutRule, ValidTargets, counted_window
-from dew.records import JSON, integer, json_value, record
 
 _log = logging.getLogger(__name__)
 
@@ -237,8 +237,7 @@ def _memory_stages(
                 [list(identifier) for identifier, _ in rows]
             )
             rule = LayoutRule.of(record(value, "layout document") for _, value in rows)
-            kept = Fields(stage.packed)
-            documents = tuple(kept.map(record(value, "packing document")) for _, value in rows)
+            documents = tuple(stage.document(record(value, "packing document")) for _, value in rows)
             sizes = np.asarray([len(value[stage.fields[0]]) for value in documents], np.int64)
             refuse_overlong(sizes, stage, source.describe())
             if stage.policy == "first-fit" and not stage.along:

@@ -24,7 +24,7 @@ import tyro
 
 from dew import Trainer
 from dew.checkpoints import Checkpoints
-from dew.config import OptimConfig, TrainerConfig
+from dew.config import TrainerConfig
 from dew.decision import (
     AURC,
     ECE,
@@ -39,6 +39,7 @@ from dew.decision import (
 )
 from dew.interop import Pretrained
 from dew.lora import LoRA
+from dew.optim import OptimConfig
 
 LAYA = ("convaiinnovations/laya", "7b928d828b7b0e022f929d9bd2e44165aa270148")
 QWEN = ("Qwen/Qwen3-0.6B", "c1899de289a04d12100db370d81485cdf75e47ca")

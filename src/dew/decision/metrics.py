@@ -12,9 +12,10 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.artifacts import Artifact, Decisions
+from dew.batch import Batch
 from dew.decision.calibration import tied_prefixes
 from dew.eval.common import metric_device
-from dew.objectives.base import Batch, Objective, Shown, mean_of_totals, merge_totals
+from dew.objectives.base import Objective, Shown, mean_of_totals, merge_totals
 
 
 @dataclass(frozen=True)
@@ -62,12 +63,8 @@ class Accuracy:
             share = Objective.accuracy(jnp.asarray(correct, jnp.float32), {})
         return float(share.total), float(share.mass)
 
-    def merge(self, accumulated: tuple[float, float],
-              contribution: tuple[float, float]) -> tuple[float, float]:
-        return merge_totals(accumulated, contribution)
-
-    def finalize(self, accumulated: tuple[float, float]) -> float:
-        return mean_of_totals(accumulated)
+    merge = staticmethod(merge_totals)
+    finalize = staticmethod(mean_of_totals)
 
 
 @dataclass(frozen=True)
