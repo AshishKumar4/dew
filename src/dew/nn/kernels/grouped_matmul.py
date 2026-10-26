@@ -689,9 +689,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # compile gate's H100 run).
         dtype = ba.arguments['tokens'].dtype
         family, block = _bundle(config, dtype), (config.block_m, config.block_n, config.block_k)
-        # A transposed matrix (the input gradient's) is loaded a step deep (`mosaic_sm80.Mma.products`):
-        # its fragment a step's (sm86 and sm89 spilled 8 bytes at an input gradient's 128 x 128 x 32 the
-        # sub-step estimate held, FAMBASE-3).
+        # A transposed matrix (the input gradient's) is loaded a step deep and sliced in registers
+        # (`mosaic_sm80.Mma.products`, `mosaic.tile_registers`).
         transposed = bool(ba.arguments.get('trans_rhs', False))
         plain = mosaic.tile_registers(family, config.warpgroups, block, dtype, transposed=transposed)
         if ba.arguments['hooks'].prologue is None:
