@@ -5,6 +5,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A decision run's calibration takes its probabilities through SciPy's `softmax` and fits each
+  temperature with SciPy's bounded L-BFGS-B on its inverse, at least 1e-3, in place of a hand-written
+  softmax and Newton loop; the grouping, ragged rows and soft targets are as before.
 - An S3 store's conditional writes go through s3fs's own call (`call_s3`), as its reads and plain writes
   do, so a profile's server-side encryption (a KMS key, SSE-C) and its bucket's regional client reach
   them; a refused condition is still `PreconditionFailed`.
