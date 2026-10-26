@@ -30,6 +30,47 @@ def fixture_config(name):
     return json.loads((FIXTURES / name / "config.json").read_text())
 
 
+def test_an_explicit_readout_tensor_file_uses_the_native_safe_weight_reader(tmp_path):
+    """A named .pt head is converted by the same safe tensor reader as native checkpoints,
+    without requiring the backbone's conventional weight filename."""
+    import torch
+
+    from dew.interop.sources import tensor_file
+
+    tensors = {"slot": torch.arange(24, dtype=torch.float32).reshape(3, 8),
+               "q.weight": torch.arange(16, dtype=torch.float32).reshape(2, 8) / 16,
+               "k.weight": torch.zeros((2, 8))}
+    path = tmp_path / "readout_head.pt"
+    torch.save(tensors, path)
+    restored = tensor_file(path)
+    assert set(restored) == set(tensors)
+    for name, value in tensors.items():
+        np.testing.assert_array_equal(restored[name], value.numpy())
+
+
+def test_a_saved_processor_record_reloads_its_selected_folder(tmp_path):
+    """A processor selected below a repository root survives the task-settings JSON round trip;
+    the unrelated root config cannot replace its vocabulary and preprocessing."""
+    from token_support import byte_level_tokenizer
+
+    from dew.inference.tasks import TextSettings
+    from dew.interop import Pretrained
+    from dew.interop.pretrained import load_processor
+    from dew.registry import from_record, to_record
+    from dew.sampling import Sampling
+
+    shutil.copytree(FIXTURES / "qwen3-tiny", tmp_path / "release")
+    byte_level_tokenizer(tmp_path / "release")
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "not_the_selected_release"}))
+    bundle = Pretrained.load(tmp_path, subfolder="release", dtype="float32")
+    settings = TextSettings(seq_len=8, max_new_tokens=2, tokenizer=None,
+                            processor=bundle.processor.source, sampling=Sampling())
+    restored = from_record(TextSettings, json.loads(json.dumps(to_record(settings, TextSettings))))
+    processor = load_processor(restored.processor, bundle.model)
+    for text in ("hello", "hello world"):
+        np.testing.assert_array_equal(processor(text).tokens, bundle.processor(text).tokens)
+
+
 """The commit of SFconvertbot's refs/pr/1 on state-spaces/mamba2-130m."""
 
 

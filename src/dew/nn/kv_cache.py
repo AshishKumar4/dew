@@ -43,12 +43,13 @@ import jax.numpy as jnp
 from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 
+from dew.mesh import logical_spec, mesh_axes
 from dew.nn.kernels import decode_attention, generation
 from dew.nn.kernels.generation import INHERENT, backend
 from dew.nn.kernels.selection import Kernel, KernelRefused, Op, Requirement
 from dew.nn.precision import float32_einsum
 from dew.nn.scatter import DROPPED
-from dew.nn.sharding import logical_spec, manual_map, mesh_axes
+from dew.nn.sharding import manual_map
 
 KVDtype = Literal["int8", "float8_e4m3fn"]
 """The storage formats a quantized cache takes."""

@@ -44,7 +44,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import traverse_util as flax_traverse
 
-from dew import records
+from dew import _records
 from dew.interop import decoder_parts, hf_decoders as decoders, parts, sources
 from dew.interop.decoder_families import ENTRIES
 from dew.objectives.base import Variables
@@ -176,10 +176,10 @@ class ModelSource:
         class in another repository (transformers' `repo--module.Class`) is refused: its code is
         neither the repository's, which the load pinned, nor in the digest a verification is recorded
         under (`code`)."""
-        held = records.record(hf_config.get('auto_map') or {}, 'auto_map')
+        held = _records.record(hf_config.get('auto_map') or {}, 'auto_map')
         if remote is None or not any(auto in held for auto in _REMOTE_CLASSES):
             return cls(model_type)
-        references = {auto: records.text(held[auto], f'auto_map {auto}') for auto in _REMOTE_CLASSES
+        references = {auto: _records.text(held[auto], f'auto_map {auto}') for auto in _REMOTE_CLASSES
                       if auto in held}
         elsewhere = sorted(auto for auto, reference in references.items() if '--' in reference)
         if elsewhere:
@@ -281,7 +281,7 @@ class _Sizes:
         and the heads); a stated size that is no whole number is a ValueError."""
         for spelled in (self.key(name), name):
             if self.config.get(spelled) is not None:
-                return records.integer(self.config[spelled], spelled)
+                return _records.integer(self.config[spelled], spelled)
         return None
 
     def stated(self, name: str) -> int:
@@ -289,7 +289,7 @@ class _Sizes:
         where neither gives it."""
         size = self.given(name)
         if size is None and name in _SPELLED and getattr(self.defaults, name, None) is not None:
-            size = records.integer(getattr(self.defaults, name), name)
+            size = _records.integer(getattr(self.defaults, name), name)
         if size is None:
             raise KeyError(name)
         return size
@@ -339,7 +339,7 @@ def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -
     fields.update({sizes.aliased(name): value for name, value in small.items()
                    if sizes.aliased(name) in hf_config})
     if 'first_k_dense_replace' in hf_config:
-        fields['first_k_dense_replace'] = min(records.integer(hf_config['first_k_dense_replace'],
+        fields['first_k_dense_replace'] = min(_records.integer(hf_config['first_k_dense_replace'],
                                                               'first_k_dense_replace'), 1)
     if key('num_key_value_heads') in hf_config:
         fields[key('num_key_value_heads')] = small_kv
@@ -358,7 +358,7 @@ def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -
         if isinstance(value, int):
             fields[key] = min(value, _VOCAB - 1)
         elif isinstance(value, list):
-            fields[key] = [min(token, _VOCAB - 1) for token in records.integers(value, key)]
+            fields[key] = [min(token, _VOCAB - 1) for token in _records.integers(value, key)]
     return fields
 
 
@@ -739,11 +739,11 @@ def _recorded(key: str) -> VerifiedMapping | None:
     path = Path(dew_cache_dir()) / _VERIFIED / key / 'mapping.json'
     if not path.is_file():
         return None
-    record = records.record(json.loads(path.read_text()), 'verified mapping')
+    record = _records.record(json.loads(path.read_text()), 'verified mapping')
     return VerifiedMapping(
-        records.text(record['model_type'], 'model_type'), records.text(record['family'], 'family'),
-        records.text(record['reference'], 'reference'), records.number(record['error'], 'error'),
-        records.number(record['bound'], 'bound'), tuple(records.strings(record['inert'], 'inert')))
+        _records.text(record['model_type'], 'model_type'), _records.text(record['family'], 'family'),
+        _records.text(record['reference'], 'reference'), _records.number(record['error'], 'error'),
+        _records.number(record['bound'], 'bound'), tuple(_records.strings(record['inert'], 'inert')))
 
 
 def _record(key: str, verified: VerifiedMapping) -> None:

@@ -20,9 +20,9 @@ import numpy as np
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
+from dew._records import JSON
 from dew.nn.dense import Dense
 from dew.nn.dropout import Dropout
-from dew.records import JSON
 
 from .activations import gelu_exact_torch, gelu_tanh
 from .attention import LayerNorm, NormalAttention, QKNorm

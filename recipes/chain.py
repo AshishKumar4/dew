@@ -19,18 +19,19 @@ the reward lives.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from typing import Literal
 
 import jax
 import optax
 from flax import linen as nn
 
+from dew.batch import Variables
 from dew.data.chat import Role
 from dew.data.pipeline import Dataset
 from dew.data.text import tokenizer_for
 from dew.objectives import DistillationObjective
-from dew.objectives.base import OMITTED, Objective, Omitted, Source, Variables
+from dew.objectives.base import OMITTED, Objective, Omitted, Source
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import (
     DPOObjective,
@@ -43,9 +44,9 @@ from dew.objectives.rl import (
     Verifier,
 )
 from dew.objectives.rl.rollout import Reward
-from dew.records import integer, record, text
 from dew.sampling import Sampling, with_ids_of
-from dew.training import Checkpoints, Layout, Rollout, Trainer, TrainState
+from dew.state import TrainState
+from dew.training import Checkpoints, Layout, Rollout, Trainer
 
 
 @dataclasses.dataclass(frozen=True)
@@ -183,7 +184,7 @@ class Recipe:
         # which refuses a missing field by name; one that states them is checked here.
         facts = stage.data.facts()
         stated = facts.get("fields")
-        fields = None if stated is None else record(stated, "the chain's fields")
+        fields = None if stated is None else _stated(facts, "fields", Mapping)
         # A conversation's rows carry their roles, whose assistant turns alone SFT scores; a preference
         # pair's are as `preferences.PreferencePair` lays them out.
         needed = {"pretrain": ("text",), "sft": ("text", "text_roles"),
@@ -208,17 +209,17 @@ class Recipe:
                                          temperature=teacher.temperature), None, student
         if stage.loss == "dpo":
             beta = 0.1 if stage.beta is None else stage.beta
-            objective = DPOObjective(self.model, integer(facts["seq_len"], "seq_len") - 1, beta=beta,
+            objective = DPOObjective(self.model, _stated(facts, "seq_len", int) - 1, beta=beta,
                                      variables=None)
             return objective, None, objective
         beta = 0.0 if stage.beta is None else stage.beta
         if stage.loss == "grpo":
             if stage.reward is None:
                 raise ValueError(f"stage {stage.name!r} samples without a reward; name one")
-            prompt = integer(list(fields["prompt"])[-1], "the prompt's length")
+            prompt = _last_dimension(_stated(_stated(facts, "fields", Mapping), "prompt", Sequence))
             objective = GRPOObjective(self.model, prompt + stage.max_new_tokens - 1, beta=beta,
                                       variables=None)
-            tokenizer = tokenizer_for(text(facts["tokenizer"], "tokenizer"))
+            tokenizer = tokenizer_for(_stated(facts, "tokenizer", str))
             sampling = with_ids_of(stage.sampling, Sampling(eos_token_ids=tokenizer.eos_id))
             return objective, RolloutScheduler.sampled(
                 objective, stage.reward, decode=tokenizer.decode, groups=stage.groups,
@@ -236,8 +237,24 @@ class Recipe:
         return objective, rollout, objective.actor
 
 
+def _stated[Value](facts: Mapping[str, object], name: str, kind: type[Value]) -> Value:
+    """The fact `name` the chain states (`Dataset.facts`), refused where it is not a `kind`."""
+    value = facts.get(name)
+    if not isinstance(value, kind):
+        raise ValueError(f"the chain states its {name} as {value!r}, not a {kind.__name__}")
+    return value
+
+
+def _last_dimension(shape: Sequence[object]) -> int:
+    """The last dimension of a stated field shape (a list or a tuple), refused unless it is a whole number."""
+    length = shape[-1] if shape else None
+    if not isinstance(length, int) or isinstance(length, bool):
+        raise ValueError(f"the chain states the prompt's shape as {shape!r}, which ends in no length")
+    return length
+
+
 def _scored(model: nn.Module | Source, stage: Stage, facts: Mapping[str, object],
             variables: Variables | None | Omitted = OMITTED) -> LMObjective:
     """The next-token objective over the stage's token windows, counting only assistant tokens of SFT."""
-    return LMObjective(model, integer(facts["seq_len"], "seq_len"),
+    return LMObjective(model, _stated(facts, "seq_len", int),
                        loss_role=Role.ASSISTANT if stage.loss == "sft" else None, variables=variables)

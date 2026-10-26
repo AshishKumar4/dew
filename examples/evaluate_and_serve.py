@@ -41,7 +41,7 @@ import tyro
 
 import dew
 from dew.artifacts import uint8_pixels
-from dew.config import ModelConfig, OptimConfig, TrainerConfig
+from dew.config import TrainerConfig
 from dew.config.lm import LMRunConfig
 from dew.data import ByteTokenizer, Loading, Memory, presets, text
 from dew.data.sources import TokenFiles
@@ -49,6 +49,8 @@ from dew.eval import FID, CLIPScore
 from dew.inference import RunProcessor, TextGeneration, TextToImage
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Perplexity
+from dew.optim import OptimConfig
+from dew.registry import ModelConfig
 from dew.sampling import Sampling
 from dew.training import Evaluation
 

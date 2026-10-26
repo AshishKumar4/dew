@@ -253,8 +253,8 @@ def consume(directory: Path, converter_python: str) -> None:
     import transformers
     from transformers import AutoModelForCausalLM
 
-    from tools.torch_precision import float64
     from tools.reference_source import saved_fixture
+    from tools.torch_precision import float64
 
     source = fetch()
     program = build(source)

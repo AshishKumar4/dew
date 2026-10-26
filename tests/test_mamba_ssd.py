@@ -28,7 +28,8 @@ from ssd_support import mamba_ssd_draw, mamba_ssd_operands, mamba_ssd_xla, ssd_v
 from tool_support import load
 from tuned import each_config
 
-from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
+from dew.batch import coordinates
+from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.kernels import generation, mamba_ssd, tuning
 from dew.nn.mixers.mamba2 import Mamba2, chunk_ssd
 

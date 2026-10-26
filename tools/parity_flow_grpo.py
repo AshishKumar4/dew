@@ -122,9 +122,9 @@ def write_recording(command: str) -> None:
     its float32 run's evidence from its float64 run, the count planned on Dew's (`dew_transition`)."""
     import jax
     import torch
-    from torch_precision import float64
     from fetched_fixtures import save
     from recorded_references import provenance, record_case
+    from torch_precision import float64
 
     reference = fetched_reference()
 

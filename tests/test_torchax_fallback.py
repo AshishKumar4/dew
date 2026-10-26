@@ -36,10 +36,10 @@ from reference_error import (
     with_gradients,
 )
 
+from dew.batch import coordinates
 from dew.data.dataset import Loader
 from dew.interop import Pretrained
 from dew.interop.torchax_fallback import TorchLayout, TransformersTierWarning
-from dew.nn.inputs import coordinates
 from dew.nn.protocols import Lacks
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
@@ -194,8 +194,8 @@ def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placemen
     tensor's axes, and the one placement keeps the frozen tensors whole over fsdp, split over the
     tensor axis as the table splits them, while the trained ones, their moments and one step's
     update lie as the split layout lays them."""
-    from dew.nn.sharding import mesh_axes
-    from dew.objectives.base import FROZEN, freeze
+    from dew.batch import FROZEN, freeze
+    from dew.mesh import mesh_axes
     from dew.training.distributed import shard_batch
 
     variables = freeze(loaded.variables, lambda path: ".layers.1." in path[1])
@@ -574,6 +574,61 @@ def test_a_load_without_weights_reads_none_and_states_their_shapes(route, tmp_pa
     assert all(isinstance(leaf, jax.ShapeDtypeStruct) for leaf in jax.tree.leaves(shapes.variables))
 
 
+_SHAPES = """
+import json
+import sys
+import warnings
+import jax
+from dew.interop import Pretrained
+warnings.simplefilter("ignore")
+loaded = Pretrained.load("dew/tiny-cohere", dtype="float32", fallback="torchax", weights=False)
+print(json.dumps(jax.tree.map(lambda leaf: [list(leaf.shape), str(leaf.dtype)], loaded.variables)))
+"""
+
+
+def test_a_shapes_only_fallback_load_reads_no_weights_from_the_hub(tmp_path):
+    """`fallback='torchax'` without weights reads metadata alone: from a Hub cache holding the
+    commit's metadata and not its weight files, offline, it states every leaf's shape and dtype
+    as the load with weights holds it, as a run resuming from its own checkpoint needs."""
+    import json
+    import os
+    import subprocess
+    import sys
+
+    from interop_support import hub_cache
+
+    torch.manual_seed(0)
+    transformers.CohereForCausalLM(transformers.CohereConfig(**COHERE)).save_pretrained(tmp_path / "whole")
+    with pytest.warns(TransformersTierWarning):
+        whole = Pretrained.load(tmp_path / "whole", dtype="float32", fallback="torchax")
+    hub_cache(tmp_path / "hub", "dew/tiny-cohere", tmp_path / "whole")
+    for weights in (tmp_path / "hub").rglob("*.safetensors"):
+        weights.unlink()
+    env = {**os.environ, "HF_HUB_CACHE": str(tmp_path / "hub"), "HF_HUB_OFFLINE": "1", "JAX_PLATFORMS": "cpu"}
+    run = subprocess.run([sys.executable, "-c", _SHAPES], capture_output=True, text=True, env=env)
+    assert run.returncode == 0, run.stderr[-2000:]
+    assert json.loads(run.stdout.splitlines()[-1]) == jax.tree.map(
+        lambda leaf: [list(leaf.shape), str(jnp.dtype(leaf.dtype))], whole.variables)
+
+
+@pytest.mark.parametrize("route", ["tier 3", "fallback"])
+def test_a_selected_folder_loads_its_own_model_through_tier_3(route, tmp_path):
+    """A causal LM stored in a folder below the source's root, selected by `subfolder`, loads the
+    folder's own weights through tier 3, whichever route takes it: the logits are the folder
+    model's as loaded from the folder itself."""
+    torch.manual_seed(0)
+    model = transformers.CohereForCausalLM(transformers.CohereConfig(**COHERE))
+    model.save_pretrained(tmp_path / "root" / "lm")
+    options = {"fallback": "torchax"} if route == "fallback" else {}
+    with pytest.warns(TransformersTierWarning):
+        selected = Pretrained.load(tmp_path / "root", subfolder="lm", dtype="float32", **options)
+    with pytest.warns(TransformersTierWarning):
+        direct = Pretrained.load(tmp_path / "root" / "lm", dtype="float32", **options)
+    ids = jnp.asarray(np.random.default_rng(0).integers(0, COHERE["vocab_size"], (2, 8)), jnp.int32)
+    np.testing.assert_array_equal(selected.model.apply(selected.variables, ids),
+                                  direct.model.apply(direct.variables, ids))
+
+
 @pytest.mark.parametrize("family", ["llama", "neox"])
 def test_bf16_compute_gradients_are_as_exact_as_torchs_bf16(family, tokens, tmp_path):
     """A bf16 checkpoint computing in bf16: LMObjective's loss and its gradient of every parameter
@@ -817,6 +872,28 @@ def test_a_tier_3_models_final_states_and_head_are_transformers(case, tmp_path):
 
 DECODE_SEEDS = {"cohere": 8, "cohere2": 8}
 """Each family's declared check-1 seeds for its cached logits, sized by `seeds_for` on armada."""
+
+
+def test_a_tier_3_source_generates_through_the_pipeline_loader_as_its_bundle_does(tmp_path):
+    """`dew.pipeline` of a tier-3 source on Dew's attention gives the text generation its loaded bundle
+    describes: one greedy sample a prompt, the same tokens from the same prompts."""
+    from dew.inference import pipeline
+    from dew.sampling import Sampling
+
+    torch.manual_seed(0)
+    model = PACKED_MODELS["cohere"]().eval()
+    # Cohere's class defaults name its full vocabulary's special tokens; this one's are inside its 256.
+    for config in (model.config, model.generation_config):
+        config.bos_token_id, config.eos_token_id, config.pad_token_id = 1, 2, 0
+    model.save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        task = pipeline(str(tmp_path), dtype="float32")
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32")
+    prompts, greedy = [[3, 5, 7, 2], [9, 4, 6, 8]], Sampling(temperature=0.0)
+    np.testing.assert_array_equal(
+        task(prompts, 3, key=0, n=1, sampling=greedy).host().tokens,
+        loaded.text_generation()(prompts, 3, key=0, n=1, sampling=greedy).host().tokens)
 
 
 @pytest.mark.parametrize("stated", ["mask", "segments"])
