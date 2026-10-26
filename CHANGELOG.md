@@ -47,6 +47,19 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   run does, and the run refuses a step whose objective returns none, where a decision run trained unclipped
   with no sign of it. `LMObjective`'s, `TokenScorer`'s and the RL objectives' `qk_stats`
   argument is removed: the run asks for them.
+- Every run names its validation splits' metrics, `--val-metrics` (`RunConfig.val_metrics`), which only a
+  diffusion run held: each metric scores the split it names (`MetricConfig.split`) or every split, so a
+  decision run scores accuracy on `val` and the Brier score on `test`. Where it names none, each split
+  scores the kind's own (`default_metrics`): a language model's perplexity, a decision run's accuracy,
+  calibration error, risk-coverage area and log loss, a JEPA run's probes, an image run's CLIP.
+  `DiffusionRunConfig.build_eval_metrics` is `validation_metrics(validates=...)`.
+- A run weighs its splits' scores into named summaries, a board's weighted index (`--val-summaries`,
+  `Trainer.fit(summaries=)`, `dew.training.evaluation.Summary`): each formed once an evaluation, only
+  where it scored every split the summary weighs, logged as `summary/<name>`, and ranked by `Best`
+  (`--trainer.best summary/<name>`) and `Plateau`.
+- A language-model run loops a `--pretrained` decoder as a decision run does: `--loop-steps`,
+  `--loop-layers`, `--loop-backprop-steps` and `--loop-remat` are both runs' (`DecoderRunConfig`), and
+  `looping` is `dew.config.looping`.
 - Test-time training over the task loss: a decoder's continuum level (`CausalTransformer(continuum=ContinuumLevel(hidden))`) is stepped in context by the LM loss every `window` tokens of a document (`LMObjective(adaptation=ChunkAdaptation(...))`), Nested Learning's equation 71, each document from the trained start, training through every step.
 - A label's cross-entropy derivative in its own logit is `p - 1` while the label holds at most half its row and minus the rest of the row past it (`dew.nn.categorical.label_entry`), for the whole-logits head and the tiled, fused and vocabulary-split heads alike; the rest alone sat two to three times as far from float64 on unconfident rows.
 - `UNet2DCondition` stores its time embeddings' two maps flat, as `time_linear_1` and `time_linear_2`

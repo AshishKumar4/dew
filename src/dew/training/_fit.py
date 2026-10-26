@@ -16,7 +16,7 @@ from dew.objectives.base import Batch, Metric
 from dew.telemetry.profile import region
 from dew.training.budget import Plateau
 from dew.training.distributed import DevicePrefetchIterator, Signature
-from dew.training.evaluation import EvalSuite, Evaluation
+from dew.training.evaluation import EvalSuite, Evaluation, Summary
 from dew.training.interval import Interval, Taken
 from dew.training.observe import Observe
 from dew.training.runtime import PreemptionNotice
@@ -27,6 +27,17 @@ def split_metrics(suites: Mapping[str, EvalSuite]) -> dict[str, tuple[Metric, ..
     """Each split's own metrics, by its name: two suites may each hold their own instance of one
     metric."""
     return {name: tuple(suite.metrics) for name, suite in suites.items()}
+
+
+def declarations(suites: Mapping[str, EvalSuite], metrics: Sequence[Metric],
+                 summaries: Sequence[Summary]) -> dict[str, tuple[Metric | Summary, ...]]:
+    """Every score a fit declares, by split: each suite's metrics (fit's own `metrics` as `val` where it
+    validates no suite) and the summaries under theirs (`Summary.SPLIT`). Its selections resolve against
+    this and its rankings read their aggregates' scores off it, one declaration for both."""
+    declared: dict[str, tuple[Metric | Summary, ...]] = {**(split_metrics(suites) or {'val': tuple(metrics)})}
+    if summaries:
+        declared[Summary.SPLIT] = tuple(summaries)
+    return declared
 
 
 @dataclasses.dataclass(frozen=True)
@@ -50,6 +61,10 @@ class FitPlan:
     suites: Mapping[str, EvalSuite] = dataclasses.field(default_factory=dict)
     held_best: bool = False  # a restore_best without Checkpoints (`HeldBest`)
     """Every validation split by name, its metrics and cadence resolved."""
+    summaries: tuple[Summary, ...] = ()
+    """The scalars each evaluation that scores every split they weigh forms (`Summary`)."""
+    declared: Mapping[str, tuple[Metric | Summary, ...]] = dataclasses.field(default_factory=dict)
+    """Every score the fit declares, by split (`declarations`)."""
     observe: Observe | None = None
 
     @property
@@ -74,11 +89,6 @@ class FitPlan:
         """The run's real tokens where a token budget reads them, else 0: the count is read from the
         devices, which a run without one need not wait on."""
         return interval.real_tokens if self.tokens is not None else 0
-
-    @property
-    def declared(self) -> dict[str, tuple[Metric, ...]]:
-        """Each validation split's metrics, by the split's name (`split_metrics`)."""
-        return split_metrics(self.suites)
 
     @property
     def scored(self) -> tuple[Metric, ...]:

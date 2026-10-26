@@ -10,6 +10,7 @@ from typing import Literal
 
 from dew.data.dataset import Loader
 from dew.objectives.base import Metric, TrainingScalar
+from dew.training.evaluation import Summary
 
 
 def run_length(steps: int | None, epochs: int | None, tokens: int | None, examples: int | None = None, *,
@@ -41,8 +42,9 @@ def run_steps(loader: Loader, steps: int | None, epochs: int | None, tokens: int
 
 @dataclasses.dataclass(frozen=True)
 class Plateau:
-    """Stops training after `evals` eligible evaluations without an improvement larger than `min_delta`."""
-    metric: Metric | TrainingScalar | types.MethodType
+    """Stops training after `evals` eligible evaluations without an improvement larger than `min_delta`. A
+    `Summary` is eligible at the evaluations that form it, those that scored every split it weighs."""
+    metric: Metric | TrainingScalar | Summary | types.MethodType
     evals: int = 5
     min_delta: float = 0.0
     mode: Literal['min', 'max'] | None = None

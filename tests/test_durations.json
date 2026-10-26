@@ -4778,6 +4778,7 @@
 "tests/test_inference.py::test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weights[None-bfloat16]": 3.301,
 "tests/test_inference.py::test_saved_decoder_compute_and_storage_overrides_generate_from_the_same_weights[bfloat16-None]": 5.677,
 "tests/test_inference.py::test_saved_sampling_policy_survives_a_disabled_preview_budget": 3.665,
+"tests/test_inference.py::test_validation_metrics_follow_the_sample_field": 0.108,
 "tests/test_inference_clients.py::test_a_policys_pad_id_is_local_and_sends_the_same_request[ollama]": 0.022,
 "tests/test_inference_clients.py::test_a_policys_pad_id_is_local_and_sends_the_same_request[openai]": 0.008,
 "tests/test_inference_clients.py::test_a_policys_penalties_reach_the_wire_where_they_mean_the_same_and_refuse_elsewhere": 0.01,
