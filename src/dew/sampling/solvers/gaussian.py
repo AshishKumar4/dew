@@ -9,8 +9,7 @@ import jax.numpy as jnp
 from flax import struct
 from jax import lax
 
-from dew.diffusion.schedules import divided
-from dew.nn.precision import scaled
+from dew.nn.precision import divided, scaled
 
 from .common import _check_endpoint_domain, _push
 

@@ -52,6 +52,7 @@ from dew.nn.precision import (
     float32_einsum,
     float32_products,
     head_product,
+    paired_sum,
     rounded_operand,
     rounds_to_bf16,
     running_sum,
@@ -190,7 +191,7 @@ def _token_sum(shape: tuple[int, ...], dtype, count: int, tile: int) -> jax.Arra
     1024-token tiles, a bf16 Qwen3-0.6B head at 4096 tokens took 51.0 ms against 27.9 unpaired (node
     receipts SF-time-fix@h100, SF-time2-bf16@h100)."""
     tiles = -(-count // tile)
-    return jnp.zeros((3, *shape), dtype) if tiles > tile else running_sum(shape, dtype)
+    return paired_sum(shape, dtype) if tiles > tile else running_sum(shape, dtype)
 
 
 def _tile_logits(states, matrix, precision: jax.lax.PrecisionLike):
@@ -514,7 +515,8 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, gro
         return d_states, d_table, d_cap, d_columns
 
     d_states, d_table, d_cap, d_columns = _over_tiles(
-        (running_sum(flat.shape, work),
+        # The state gradient over the vocabulary tiles, paired on every backend (`paired_sum`).
+        (paired_sum(flat.shape, work),
          jnp.zeros(table.shape, table.dtype),
          None if softcap is None else running_sum(jnp.shape(softcap), work),
          jax.tree.map(lambda terms: jnp.zeros(terms.shape, work), columns)),
@@ -649,7 +651,7 @@ def _state_product(d_raw, table, precision, work, width: int | None) -> jax.Arra
             jax.lax.dynamic_slice_in_dim(table, first, size), precision=precision,
             preferred_element_type=work))
 
-    return running_total(_over_tiles(running_sum((d_raw.shape[0], table.shape[1]), work), table.shape[0],
+    return running_total(_over_tiles(paired_sum((d_raw.shape[0], table.shape[1]), work), table.shape[0],
                                      width, columns))
 
 
