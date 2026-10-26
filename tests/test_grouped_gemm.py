@@ -587,3 +587,16 @@ def test_a_cooperative_tile_stores_each_of_several_outputs():
     first, second = run(doubled_halves, (jnp.bfloat16, jnp.bfloat16))
     np.testing.assert_array_equal(np.asarray(first, np.float32), np.asarray(run(twice), np.float32))
     np.testing.assert_array_equal(np.asarray(second, np.float32), np.asarray(run(halved), np.float32))
+
+
+def test_each_groups_row_tiles_start_at_its_first_row():
+    """A group's row tiles start at its first row, rounded down to the 8 a TMA descriptor tiles rows by,
+    whole tiles after it, as CUTLASS's grouped GEMM tiles each group: a group within a tile's rows from
+    there takes one tile, reading its matrix once, an empty group none, and the tiles fit the launch's
+    bound (`mosaic_gpu.tile_groups`)."""
+    lengths = jnp.asarray([100, 0, 128, 129, 3, 40], jnp.int32)
+    bound = -(-int(lengths.sum()) // 128) + len(lengths) - 1
+    table = np.asarray(mosaic_gpu.tile_groups(lengths, 128, bound))
+    assert table.tolist() == [[0, 0, 0, 100], [2, 96, 100, 228], [2, 224, 100, 228], [3, 224, 228, 357],
+                              [3, 352, 228, 357], [4, 352, 357, 360], [5, 360, 360, 400], [0, 0, 0, 0],
+                              [0, 0, 0, 0]]

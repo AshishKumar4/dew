@@ -181,7 +181,6 @@ class GroupInfo:
     """Information regarding the group being processed in a block."""
 
     group_id: jax.Array
-    block: jax.Array
     block_start: jax.Array
     actual_start: jax.Array
     actual_end: jax.Array
@@ -190,41 +189,49 @@ class GroupInfo:
 
     @classmethod
     def create(cls, table, tile, tid):
-        """Dew: the group info of row tile `tid`, read from `tile_groups`' table (its group, its block, its
-        group's first and past-last row) rather than walked over every group's length in each tile."""
+        """Dew: the group info of row tile `tid`, read from `tile_groups`' table (its group, its first row,
+        its group's first and past-last row) rather than walked over every group's length in each tile."""
         tile = jnp.int32(tile)
-        group, block, group_start, group_end = (table[tid, column] for column in range(4))
-        block_start = block * tile
+        group, block_start, group_start, group_end = (table[tid, column] for column in range(4))
         actual_start = jnp.maximum(group_start, block_start)
         actual_end = jnp.minimum(group_end, block_start + tile)
         start_within_block = actual_start - block_start
         actual_size = actual_end - actual_start
-        return cls(group_id=group, block=block, block_start=block_start, actual_start=actual_start,
+        return cls(group_id=group, block_start=block_start, actual_start=actual_start,
                    actual_end=actual_end, start_within_block=start_within_block, actual_size=actual_size)
 
 
 def tile_groups(lengths: jax.Array, tile: int, tiles: int) -> jax.Array:
     """Dew: each row tile's group info for `GroupInfo.create`, in XLA before the launch: of tiles `0` to
-    `tiles`, the group (`lengths`' index), its block of `tile` rows, and its group's first and past-last
-    row, int32 `[tiles, 4]`; a tile no group reaches, zeros. Upstream's `GroupInfo.create` walked every
-    group's length in every tile, unrolled: at 129 groups (Qwen3's 128 experts and the unrouted rows) two
-    thirds of a down projection's instructions, and its global loads a third of its stalls (NCU-full)."""
+    `tiles`, the group (`lengths`' index), the tile's first row, and its group's first and past-last row,
+    int32 `[tiles, 4]`; a tile no group reaches, zeros. A group's tiles start at its first row (rounded
+    down to the 8 rows a TMA descriptor tiles by, `TMA_ROWS`), whole tiles after it, as CUTLASS's grouped
+    GEMM tiles each group: a group of up to a tile's rows reads its matrix once, where tiles on the
+    product's own row grid read it once a tile the group touches (two for most of Kimi Linear's
+    128-row experts at 128-row tiles). The tiles number at most `cdiv(rows, tile)` plus the groups less
+    one (a ceiling's sum exceeds the sum's ceiling by at most one a part). Upstream's
+    `GroupInfo.create` walked every group's length in every tile, unrolled: at 129 groups (Qwen3's 128
+    experts and the unrouted rows) two thirds of a down projection's instructions, and its global loads a
+    third of its stalls (NCU-full)."""
     lengths = lengths.astype(jnp.int32)
     ends = jnp.cumsum(lengths)
     starts = ends - lengths
-    index = jnp.arange(lengths.shape[0], dtype=jnp.int32)
     rows = jnp.int32(tile)
-    # A group's tiles are its blocks shifted by its index (one tile per group boundary a block shares),
-    # as upstream counted them, its divisions truncating as `lax.div` does.
-    begin = lax.div(starts, rows) + index
-    end = lax.div(ends - 1, rows) + 1 + index
+    first_rows = starts // TMA_ROWS * TMA_ROWS
+    counts = lax.div(ends - first_rows + rows - 1, rows) * (lengths > 0)
+    firsts = jnp.cumsum(counts) - counts
     tids = jnp.arange(tiles, dtype=jnp.int32)[:, None]
-    ours = (begin[None] <= tids) & (tids < end[None])
-    # The last group whose range holds the tile, as upstream's selects let the last match win.
-    group = (lengths.shape[0] - 1 - jnp.argmax(ours[:, ::-1], axis=1)).astype(jnp.int32)
+    ours = (firsts[None] <= tids) & (tids < (firsts + counts)[None])
+    group = jnp.argmax(ours, axis=1).astype(jnp.int32)
     found = jnp.any(ours, axis=1)
-    columns = (group, tids[:, 0] - group, starts[group], ends[group])
+    block_start = first_rows[group] + (tids[:, 0] - firsts[group]) * rows
+    columns = (group, block_start, starts[group], ends[group])
     return jnp.stack([jnp.where(found, column, 0) for column in columns], axis=1)
+
+
+TMA_ROWS = 8
+"""The rows a TMA descriptor tiles by, to which `gmm` pads its rows and a group's first tile starts."""
+
 
 def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles, transpose_rhs: bool,
         out_dtype, multiprocessors: int, interpret: bool | plgpu.InterpretGPUParams = False,
@@ -260,7 +267,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
         return outs if out_dtypes else outs[0]
     # Dew: a TMA descriptor tiles the rows by 8, so they are padded to a multiple of 8, and the rows past
     # the routed ones, the padding among them, are a last group, whose tiles store zeros.
-    lhs = rows_padded(lhs, 0, 8)  # the rows a TMA descriptor tiles by
+    lhs = rows_padded(lhs, 0, TMA_ROWS)
     m = lhs.shape[0]
     lengths = jnp.concatenate([group_sizes.astype(jnp.int32),
                                jnp.maximum(m - jnp.sum(group_sizes, dtype=jnp.int32), 0)[None]])
@@ -336,7 +343,7 @@ def _gmm_mainloop(lhs, rhs, table, shape: tuple, *, tiles: Tiles, transpose_rhs:
         def scope(side_smems, side_barriers, fixed_smems, fixed_barriers, *, streams):
             def consumer(wg, tile, walk, store, *, active):
                 group, ni = tile
-                row_start = group.block * block_m
+                row_start = group.block_start
                 fixed_refs = [smem.at[wg] for smem in fixed_smems]
                 if active:
                     family.loaded([(prologue_gmems[i].at[pl.ds(row_start, block_m)], ref, barrier.at[wg])
@@ -385,7 +392,7 @@ def _gmm_views(lhs_gmem, rhs_gmem, prologue_gmems, group, column_tile, *, tiles:
     """Dew: `gmm`'s streams' views at a tile (`group`'s rows, `column_tile`; `mosaic.viewed`): its rows',
     its group's matrix's, and each prologue side operand's that follows the depth (`axes_of`, by
     operand), step `j` each one's `j`-th depth block."""
-    rows = pl.ds(group.block * tiles.block_m, tiles.block_m)
+    rows = pl.ds(group.block_start, tiles.block_m)
     matrix = _matrix_columns(rhs_gmem.at[jnp.minimum(group.group_id, groups - 1)], column_tile,
                              block_n=tiles.block_n, transpose_rhs=transpose_rhs)
     return {'rows': (lhs_gmem.at[rows], lambda j: (0, j)), 'matrix': (matrix, _rhs_index(transpose_rhs)),
