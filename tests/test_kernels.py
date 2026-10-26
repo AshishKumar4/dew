@@ -18,9 +18,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from attention_oracle import attention_terms, exact_attention, kept, qkv, value_and_grads
+from attention_oracle import attention_and_grads, attention_terms, exact_attention, kept, qkv, value_and_grads
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference, distance, with_gradients
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, distance, with_gradients
 
 from dew.nn import kernels
 from dew.nn.attention import NormalAttention, scaled_dot_product_attention, weighted_values
@@ -219,6 +219,71 @@ def test_triton_trains_and_agrees_with_xla(q_len, kv_len, heads, kv_heads, head_
     for got, want in zip(fused, reference, strict=True):
         assert got.shape == want.shape
         assert np.abs(got - want).max() <= 2 ** -6 * np.abs(want).max()
+
+
+LARGE_LOGIT_SEEDS = 16
+"""The seeds of the triton route's large-logit site, sized by `seeds_for` (paired) on an A100."""
+
+
+def _large_logits(spread: bool):
+    """Draws of bf16 queries, keys and values `[2, 64, 2, 32]` at logits near 1e4, as a small DiT's
+    trained projections give them: one channel of each query drawn in [200, 300], the same channel of the
+    keys all 256 where the softmax spreads over every key (`spread`), else drawn in [200, 300] too, which
+    saturates most rows on one key; the other channels standard normal."""
+    shape = (2, 64, 2, 32)
+
+    def draw(seed):
+        streams = jax.random.split(jax.random.PRNGKey(seed), 5)
+        query, key, value = (jax.random.normal(stream, shape, jnp.float32) for stream in streams[:3])
+        query = query.at[..., 0].set(jax.random.uniform(streams[3], shape[:3], minval=200, maxval=300))
+        channel = (jnp.full(shape[:3], 256.0) if spread
+                   else jax.random.uniform(streams[4], shape[:3], minval=200, maxval=300))
+        key = key.at[..., 0].set(channel)
+        return tuple(x.astype(jnp.bfloat16) for x in (query, key, value))
+
+    return draw
+
+
+def _pulled(implementation):
+    """`implementation`'s output and its query, key and value gradients under a squared-output loss."""
+    step = attention_and_grads(implementation)
+
+    def run(query, key, value):
+        (_, out), grads = step(query, key, value, None)
+        return (out, *grads)
+
+    return run
+
+
+@on_gpu
+def test_triton_trains_at_large_logits_on_par_with_xla():
+    """tokamax's kernel, as 'triton' runs it, at logits near 1e4 that its softmax spreads over every key
+    (`_large_logits`): its output and its query, key and value gradients on par with the xla kernel's from
+    float64 (check 1). Its dK/dV sweep scaled the keys where its forward and dQ scale the queries, so its
+    scores there rounded apart from the forward's residuals by units, and the weights it rebuilt from them
+    were off by their exponential (row 1676: a MeanFlow step's key and value gradients 1e35 to 1e62 times
+    xla's error); the route hands it the queries scaled once (`triton_attention`)."""
+    pytest.importorskip("tokamax")
+    assert_as_exact(_pulled("triton"), _pulled("xla"), _large_logits(spread=True), "triton at large logits",
+                    seeds=LARGE_LOGIT_SEEDS)
+
+
+@on_gpu
+def test_triton_at_saturated_large_logits_is_finite_where_xla_is():
+    """tokamax's kernel at logits near 1e4 whose rows mostly saturate on one key (`_large_logits`): the
+    route is the default form, FlashAttention's math, whose D (rowsum(dO * O), the output rounded to bf16)
+    cancels against the saturated key's product where the reference's softmax derivative does not, so it
+    holds testing.md's default-form rule there, not check 1: every output and gradient finite wherever
+    xla's is (row 1676; measured 3.6 times xla's dQ error and rows of float64 zero it misses, on an A100 and
+    an H100). The Mosaic template, which replaces this route, takes D about each query's anchor."""
+    pytest.importorskip("tokamax")
+    draw, ours, xla = _large_logits(spread=False), jax.jit(_pulled("triton")), jax.jit(_pulled("xla"))
+    for seed in range(LARGE_LOGIT_SEEDS):
+        inputs = draw(seed)
+        for name, mine, theirs in zip(("out", "dq", "dk", "dv"), ours(*inputs), xla(*inputs), strict=True):
+            mine, theirs = np.asarray(mine, np.float32), np.asarray(theirs, np.float32)
+            lost = np.isfinite(theirs) & ~np.isfinite(mine)
+            assert not lost.any(), f"{name} seed {seed}: {int(lost.sum())} values not finite where xla's are"
 
 
 @on_gpu
@@ -1040,6 +1105,25 @@ def test_narrow_heads_take_the_kernel_their_target_measured_fastest(generation_n
     assert route.preferred == narrow
     # The row qualifies the preferred kernel: only host facts (backend, wheel) may turn it down here.
     assert "row" not in refused
+
+
+@pytest.mark.parametrize("dtype, kept", [(jnp.float16, False), (jnp.bfloat16, True)])
+def test_an_fp16_call_leaves_the_triton_route_as_a_declared_gap(dtype, kept):
+    """A causal call of 16-wide heads where an L4's row prefers tokamax's Triton kernel: an fp16 one is
+    refused by its dtype, whose dQ that kernel narrows before the scale the route applies outside it
+    (row 1676, `triton_attention`), and the next kernel takes it; a bf16 one keeps it."""
+    from dew.nn.attention import attention_case, resolve_implementation
+    from dew.nn.attention_kernels import ATTENTION, kernel_refusals
+    from dew.nn.kernels import generation
+
+    query = jnp.zeros((2, 128, 4, 16), dtype)
+    with generation.assumed("sm89"), generation.routes() as found:
+        resolve_implementation("auto", query, query, causal=True)
+        refused = {refusal.code for refusal in kernel_refusals(
+            ATTENTION, "triton", attention_case(query, query, causal=True))}
+    (route,) = [route for route in found if route.choice == "attention"]
+    assert ("fp16" not in refused) == kept
+    assert (route.kernel == "triton") == kept
 
 
 @pytest.mark.parametrize("head_dim, kept", [(8, False), (16, True)])
