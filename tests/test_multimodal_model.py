@@ -585,6 +585,21 @@ def test_source_backward_trained_export_and_frozen_buffers_match_reference(famil
                 np.testing.assert_array_equal(actual, original)
 
 
+@pytest.mark.parametrize("fixture", ["gemma4-unified-native-tiny", "gemma-4-audio-tiny",
+                                     "gemma-3n-audio-tiny", "gemma3n-vision-tiny", "gemma4-native-tiny"])
+def test_a_wrappers_nested_configs_without_their_types_read_as_the_wrapper_declares_them(fixture):
+    """A wrapper config class builds each nested config from a raw dict as the class it declares
+    (its sub_configs), so a checkpoint whose text, vision and audio configs leave their model_type out
+    translates as the one that states them."""
+    from dew.interop.hf_decoders import translate_wrapper_config
+
+    config = json.loads((FIXTURE.parent / fixture / "config.json").read_text())
+    untyped = {**config, **{part: {key: value for key, value in config[part].items() if key != "model_type"}
+                            for part in ("text_config", "vision_config", "audio_config")
+                            if isinstance(config.get(part), dict)}}
+    assert translate_wrapper_config(untyped) == translate_wrapper_config(config)
+
+
 @pytest.mark.parametrize("fixture", ["gemma3n-vision-tiny", "gemma-3n-audio-tiny"])
 def test_a_gemma3n_config_without_its_audio_placeholder_takes_the_config_class_default(fixture):
     """Gemma3nConfig defaults audio_token_id (262273, configuration_gemma3n.py:460 at transformers
