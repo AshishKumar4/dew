@@ -31,7 +31,6 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 from flax import linen as nn
-from flax.core import unfreeze
 from flax.training import dynamic_scale as dynamic_scale_lib
 from flax.training.early_stopping import EarlyStopping
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
@@ -39,7 +38,7 @@ from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON, boolean, json_value, record
-from dew.batch import FROZEN, Batch, Variables, select
+from dew.batch import FROZEN, Batch, Variables, dicts, select
 from dew.checkpoints import Checkpoints, Ranking
 from dew.cleanup import attempted
 from dew.data.compile import fitted
@@ -278,6 +277,12 @@ def loss_scale(dynamic_scale: bool | dynamic_scale_lib.DynamicScale) -> dynamic_
     return dynamic_scale_lib.DynamicScale() if dynamic_scale else None
 
 
+def held_dicts(variables: Variables) -> Variables:
+    """`variables` as a state holds its trees: every mapping a dict (`dew.batch.dicts`), the containers
+    the state's own, so nothing the state does to them reaches the caller's tree."""
+    return jax.tree.map(lambda leaf: leaf, dicts(variables))
+
+
 class Trainer(Generic[Loss, Effects]):
     """Runs an `Objective`: gradients, sharding, EMA, checkpoints and logging."""
 
@@ -433,9 +438,10 @@ class Trainer(Generic[Loss, Effects]):
         # Static metadata, the same on every trace of the state: the
         # placement reads it from here rather than tracing init again.
         self._boxed = boxed_axes(initialized)
-        # The state holds its trees as dicts, whichever Flax container (a FrozenDict) the objective's
-        # tree came in, so its placement, its updates and its restores share one structure.
-        params = unfreeze(nn.unbox(initialized))
+        # The state holds its trees as dicts of its own, whichever Flax container (a FrozenDict, under a
+        # mapping or a list) the objective's tree came in, so its placement, its updates, the
+        # collections a step writes back (`write_back`) and its restores share one structure.
+        params = held_dicts(nn.unbox(initialized))
         # A held tree's initializer returns the objective's own arrays (`Objective.held_variables`),
         # which the step's donation would free: the moving state takes buffers of its own, as a
         # placed one does (`distributed.placed_held`). The frozen tree no step donates (`apart`), so
@@ -1430,7 +1436,7 @@ class Trainer(Generic[Loss, Effects]):
                 run.stop_control = checkpoints.control(checkpoints.latest)
         else:
             # A supplied state's trees are held as dicts too (`initial_state`).
-            initial = dataclasses.replace(initial, variables=unfreeze(dict(initial.variables)))
+            initial = dataclasses.replace(initial, variables=held_dicts(initial.variables))
             shardings, _ = self._validated(initial)
             state = jax.device_put(initial, shardings)
             position = None
