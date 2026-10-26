@@ -25,6 +25,7 @@ from flax import linen as nn
 from recording import RecordingTracker
 from reference_error import (
     assert_as_exact,
+    assert_as_exact_as_the_reference,
     declared_seeds,
     indexed_recording,
     recording,
@@ -988,8 +989,11 @@ def test_a_transitions_density_and_kl_hold_at_float32s_largest_variances():
     mean = np.zeros((2, 3, 4), np.float32)
     transition = GaussianTransition(jnp.asarray(mean), jnp.asarray(variance))
     density = np.asarray(transition.log_prob(jnp.asarray(mean)))
-    expected = [reference.logpdf(np.zeros(12), np.zeros(12), float(value)) for value in variance]
-    np.testing.assert_allclose(density, expected, rtol=1e-6)
+    half_log = np.float32(6) * (np.log(np.float32(2 * math.pi)) + np.log(variance))
+    truth = [reference.logpdf(np.zeros(12), np.zeros(12), float(value)) for value in variance]
+    assert_as_exact_as_the_reference(density, -half_log, np.asarray(truth), "a wide transition's density")
     away = np.full_like(mean, 1e18)
     kl = np.asarray(transition.kl(jnp.asarray(away)))
-    np.testing.assert_allclose(kl, 12 * 1e36 / (2 * variance.astype(np.float64)), rtol=1e-6)
+    error = np.float32(12) * np.float32(1e18) ** 2
+    assert_as_exact_as_the_reference(kl, error / variance / np.float32(2),
+                                     12 * 1e36 / (2 * variance.astype(np.float64)), "a wide transition's KL")
