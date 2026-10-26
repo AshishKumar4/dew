@@ -54,7 +54,6 @@ from dew.data.pipeline import (
 )
 from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _uncounted
-from dew.data.steps.generic import Fields
 from dew.data.steps.text import CountRule, CountTargets, LayoutRule, ValidTargets, counted_window
 
 _log = logging.getLogger(__name__)
@@ -238,8 +237,7 @@ def _memory_stages(
                 [list(identifier) for identifier, _ in rows]
             )
             rule = LayoutRule.of(record(value, "layout document") for _, value in rows)
-            kept = Fields(stage.packed)
-            documents = tuple(kept.map(record(value, "packing document")) for _, value in rows)
+            documents = tuple(stage.document(record(value, "packing document")) for _, value in rows)
             sizes = np.asarray([len(value[stage.fields[0]]) for value in documents], np.int64)
             refuse_overlong(sizes, stage, source.describe())
             if stage.policy == "first-fit" and not stage.along:
