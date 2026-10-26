@@ -5,6 +5,18 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- `dew.pipeline` is the one loader of a run published to the Hub: `TextToImage.from_pretrained` and the
+  text tasks' `from_pretrained`, which pulled a run and loaded it with `from_run`, are gone; call
+  `dew.pipeline(repo, revision=...)`, which pulls the run at the commit its metadata resolves and picks
+  its task from the run's record. A saved run is pinned once: each task builds from the pinned run with
+  `from_saved`, which `dew.pipeline`, `dew export` and a model soup (`dew.checkpoints.averaged_pinned`)
+  call on the run they pinned, and `from_run` pins a directory and calls it. A plugin's saved task
+  (`Objective.saved_task`) supplies `from_saved`, or derives from `dew.inference.tasks.SavedRunTask`.
+- A server prefilling in pieces prefills a prefix block, or any group a layer reads whole, in one piece
+  where the cut would split it, where it refused a block longer than `chunk`. A served prompt carries its
+  own image and block groups (`block_groups`, `image_groups`), slotted beside its tokens and kept in its
+  row's cache; a prefix page is shared only between prompts whose groups lie alike. Disk banks read a
+  family whose packed tensors split into views of themselves, fused experts among them.
 - The library holds no CPU-only algorithm (bible §5): a vocabulary row's fused logsumexp is one
   plain pass on every platform, which Dew's CPU test setting takes in float64 and rounds once
   (`dew.nn.precision.widened_reduction`, beside `accumulated`), in place of a CPU-only blocked
