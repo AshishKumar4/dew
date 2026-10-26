@@ -159,7 +159,7 @@ def test_row_arguments_split_as_the_query_rows_do_where_the_heads_contend_for_th
     own rows'. The same output as whole sequences."""
     from flax import linen as nn
 
-    from dew.nn.sharding import DEFAULT_RULES
+    from dew.mesh import DEFAULT_RULES
 
     call = dict(CALLS[name])
     if name == "bias":

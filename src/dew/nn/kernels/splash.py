@@ -38,6 +38,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import json
+import math
 from collections.abc import Callable
 from typing import NamedTuple
 
@@ -51,6 +52,9 @@ from jax.experimental.pallas.ops.tpu.splash_attention import (
     splash_attention_mask as mask_lib,
     splash_attention_mask_info as mask_info_lib,
 )
+
+from dew.nn.attention_kernels import SPLASH_BLOCK, SPLASH_LANES
+from dew.nn.kernels import generation
 
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
 NUM_LANES = 128
@@ -1269,3 +1273,52 @@ def make_splash_mha(
     return SplashAttentionKernel(
         *infos, blocks=block_sizes, call=_Call(mask_value, attn_logits_soft_cap, mask_function_fwd, interpret)
     )
+
+
+def backward_vmem(block_q: int, block_kv: int, width: int, itemsize: int, softcap: bool) -> int:
+    """A bound on the scoped VMEM splash's backward kernels plan at XLA's default limit, in bytes, the fused
+    kernel's, which its separate dq and dkv kernels each stay within:
+    its fp32 logits blocks (two, three with a softcap's derivative), each `block_q` by `block_kv`; its
+    query, output-gradient, key and value blocks, each double-buffered in the operands' dtype; and its
+    key and value gradients' fp32 scratch. On a v5e at the 16 MiB default (2026-10-21, 96 configs of
+    widths 64 to 256, both dtypes, a softcap and batches 1 to 8, Dew's own path, and the TPU tier's
+    refused test) it lies past the limit on every config Mosaic refused (16.2 to 22.3 MiB), and within it
+    on all it compiled but eight, which take the next smaller block: a bf16 softcap at width 256 at
+    batches 1 and 2, an f32 softcap at width 128 (which the tier's test run refused at 18.6 MiB), and
+    f32 at width 256 at batch 1. Those calls were causal; a segment ids' or dense mask's blocks are not
+    in the bound."""
+    logits = 4 * block_q * block_kv * (3 if softcap else 2)
+    blocks = 2 * itemsize * width * 2 * (block_q + block_kv)
+    return logits + blocks + 2 * 4 * width * block_kv
+
+
+def block_sizes(q_len: int, kv_len: int, *, width: int, itemsize: int, softcap: bool):
+    """Narrow `SPLASH_BLOCK` to a divisor of each sequence, forward and backward.
+
+    The greatest common divisor divides its sequence, as the mask blocking
+    requires, and stays a multiple of `SPLASH_LANES`, as the key compute block
+    requires. The backward forms each query's delta from its weights, sum_k p
+    * dp, in a pass of the dq kernel's own before its dq and dkv kernels
+    (this module's `_dq`): the flash form, rowsum(o * do), leaves
+    the output's rounding where a query reads one key, whose dq is exactly
+    zero (1.2e-6 from a causal first query on a v5e, where the reference's is
+    0); the sum of its weights cancels there, as the softmax's derivative
+    does. It reads each logits block three times where a fused kernel would
+    read it once. Every block is set: the kernel takes no default. On a TPU whose scoped
+    VMEM limit is measured (`GpuTarget.scoped_vmem`), past which a kernel fails
+    to compile, they halve together, as measured (half of `SPLASH_BLOCK`
+    compiled on every config), while they stay whole lanes, until its plan fits
+    it (`backward_vmem`). Splash takes no VMEM limit of its own (its
+    kernels set none), so the limit is the target's default, which a TPU does
+    not report: where it is unmeasured the blocks stay whole.
+    """
+    block_q, block_kv = math.gcd(SPLASH_BLOCK, q_len), math.gcd(SPLASH_BLOCK, kv_len)
+    budget = generation.gpu_target().scoped_vmem
+    back_q, back_kv = block_q, block_kv
+    while (budget is not None and backward_vmem(back_q, back_kv, width, itemsize, softcap) > budget
+           and min(back_q, back_kv) > SPLASH_LANES):
+        back_q, back_kv = back_q // 2, back_kv // 2
+    return BlockSizes(
+        block_q=block_q, block_kv=block_kv, block_kv_compute=block_kv,
+        block_q_dkv=back_q, block_kv_dkv=back_kv, block_kv_dkv_compute=back_kv,
+        block_q_dq=back_q, block_kv_dq=back_kv)

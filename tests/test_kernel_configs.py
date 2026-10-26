@@ -404,7 +404,7 @@ def test_the_resource_gate_refuses_a_spilling_mosaic_kernel():
 def test_splash_compiles_for_a_v5e_with_libtpu():
     """Dew's splash path, forward and backward, compiled by libtpu for a compile-only v5e on this CPU
     (tests/kernel_compile.py): within the v5e's scoped VMEM, as the blocks splash takes are sized
-    (`dew.nn.attention.splash_block_sizes`)."""
+    (`dew.nn.kernels.splash.block_sizes`)."""
     from kernel_compile import compile_tpu_kernels
 
     from dew.nn.attention import scaled_dot_product_attention
