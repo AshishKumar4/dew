@@ -22,7 +22,7 @@ from jax.typing import ArrayLike
 
 from dew.diffusion.process import Denoiser, Process
 from dew.diffusion.schedules import RectifiedFlow, expand
-from dew.nn.precision import at_least_fp32, correctly_rounded_divide
+from dew.nn.precision import at_least_fp32
 
 from .guidance import Guidance, Walk
 from .sample import sample
@@ -99,12 +99,14 @@ class GaussianTransition:
         error = jnp.square(mean - reference_mean).sum(axis=tuple(range(1, mean.ndim)))
         safe_variance = jnp.where(variance > 0, variance, 1)
         deterministic = jnp.where(error == 0, 0.0, jnp.inf)
-        # `error / (2 variance)` rounded once, the half taken in the quotient's exponent (`power`): twice
-        # a variance near float32's largest overflows, as does an error over a variance near its least
-        # where half the quotient fits, and half an error near its least is below the normal range,
-        # which XLA:CPU flushes to zero (a KL of 0 where it is 0.5).
-        return jnp.where(variance > 0, correctly_rounded_divide(error, safe_variance, -1),
-                         jnp.where(variance == 0, deterministic, jnp.nan))
+        # `error / (2 variance)` rounded once, by the division: the half is a step of the quotient's
+        # exponent, exact where the quotient fits, and of the error's where the quotient alone
+        # overflows, an error that large far above float32's least. Twice a variance near its largest
+        # overflows; half an error near its least is below the normal range, which XLA:CPU flushes to
+        # zero (a KL of 0 where it is 0.5).
+        quotient = error / safe_variance
+        halved = jnp.where(quotient == jnp.inf, error * 0.5 / safe_variance, quotient * 0.5)
+        return jnp.where(variance > 0, halved, jnp.where(variance == 0, deterministic, jnp.nan))
 
 
 def flow_transition(x: ArrayLike, velocity: ArrayLike, sigma: ArrayLike,

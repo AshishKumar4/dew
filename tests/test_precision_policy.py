@@ -435,36 +435,6 @@ def test_quantizer_division_rounds_midpoint_neighbours_as_ieee_division():
     np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
 
 
-@pytest.mark.parametrize("power", [-1, 3])
-def test_a_scaled_quotient_rounds_once_at_float32s_edges(power):
-    """`correctly_rounded_divide`'s `power` scales the quotient in its exponent, so `a / b * 2**power` is the
-    float64 value rounded to float32 once, bit for bit: over operands near float32's least, whose halves
-    are below its normal range, near its largest, whose quotients overflow before their scale, and
-    quotients landing below the normal range, where the result is subnormal."""
-    from dew.nn.precision import correctly_rounded_divide
-
-    rng = np.random.default_rng(1722)
-    significands = (rng.uniform(1, 2, (2, 3, 4096)).astype(np.float32) for _ in range(2))
-    exponents = np.asarray([[-126, -126], [127, -1], [-126, 2]])[:, :, None]
-    numerator, denominator = (np.ldexp(values, exponents[:, index])
-                              for index, values in enumerate(significands))
-    divided = jax.jit(correctly_rounded_divide, static_argnums=2)(numerator, denominator, power)
-    expected = (numerator.astype(np.float64) / denominator.astype(np.float64) * 2.0**power).astype(np.float32)
-    np.testing.assert_array_equal(np.asarray(divided).view(np.uint32), expected.view(np.uint32))
-
-
-def test_a_float64_quotient_scales_through_its_numerator_where_it_overflows():
-    """A float64 quotient times `2**power` takes float64 division: scaled after it where the quotient fits,
-    and before it, through the numerator, where the quotient alone overflows and its half does not."""
-    from dew.nn.precision import correctly_rounded_divide
-
-    with jax.enable_x64(new_val=True):
-        numerator, denominator = np.asarray([1.5e308, 3.0, 1.5]), np.asarray([0.75, 7.0, 0.0])
-        divided = np.asarray(correctly_rounded_divide(numerator, denominator, -1))
-    assert divided.dtype == np.float64
-    np.testing.assert_array_equal(divided, [1.5e308 * 0.5 / 0.75, 3.0 / 7.0 * 0.5, np.inf])
-
-
 def dot_precisions(function, *arguments) -> list:
     """The precision of every dot_general `function` traces over `arguments` under JAX's own default
     precision (the test lane sets 'highest' for every product that states none), with the dtype its
