@@ -82,7 +82,7 @@ def step_compiler_options(objective, tokens: float, frozen: bool,
     (`compiler_options`).
     """
     generation = device_generation()
-    options: dict[str, bool | int] = {}
+    options: dict[str, bool | int | str] = {}
     if backend() == 'gpu' and devices > 1:
         options.update({name: value for name, value in COLLECTIVES.items() if xla_flag(name) is None})
     small = tokens <= 128

@@ -220,6 +220,21 @@ def as_given(fn):
     return given
 
 
+def dew_programs(fn):
+    """`fn`, a Dew arm that runs Dew's own compiled programs (a trainer's step, a task's forward, a
+    server's decode), which the gate cannot compile but which take their XLA options from Dew's one
+    seam (`dew.nn.kernels.options.compiler_options`). Beside another Dew arm, the gate runs it with
+    that seam holding WITHOUT_YNN open (`compiled_with`), so the programs it compiles go without
+    YNNPACK's fusions as the gate's own compile of its other arm does; beside an arm `as_given`, as it
+    is, with the fusions. A program it compiled before its check, or compiles by a bare `jax.jit`
+    outside the seam, keeps its own options."""
+    @functools.wraps(fn)
+    def programs(*inputs, **options):
+        return fn(*inputs, **options)
+    programs.dew_programs = True
+    return programs
+
+
 def _given(fn) -> bool:
     """Whether the gate runs `fn` as it is given (`as_given`, a recorded reference)."""
     return bool(getattr(fn, "as_given", False) or getattr(fn, "recorded", False))
@@ -231,19 +246,33 @@ def _compiled(fn, compile):
     window loop's arm within it (`over_windows`)."""
     if _given(fn) or getattr(fn, "without_ynn", False):
         return fn
+    if getattr(fn, "dew_programs", False):
+        return fn if compile is jax.jit else _with_ynn_off(fn)
     if isinstance(fn, _Windowed):
         return _Windowed(_compiled(fn.fn, compile))
     return compile(fn)
 
 
+def _with_ynn_off(fn):
+    """`fn` run with Dew's compile seam holding WITHOUT_YNN open on the CPU lane (`dew_programs`)."""
+    from dew.nn.kernels.options import compiled_with
+
+    @functools.wraps(fn)
+    def run(*inputs, **options):
+        with compiled_with(WITHOUT_YNN if jax.default_backend() == "cpu" else {}):
+            return fn(*inputs, **options)
+    return run
+
+
 def _arms(dew_fn, reference_fn):
     """The two arms of a check as the gate runs them (docs/design/testing.md, "the numerical contract"):
-    where the gate compiles both, two Dew paths, each without YNNPACK's fusions (`without_ynn`), whose
-    microkernels the host's instruction set picks at run time, so the two run the same kind of code on
-    any host; where one runs as it is given (`as_given`: torch, NumPy, a recording, a Dew program that
-    compiles itself), the other as Dew's users run it, with the fusions (`jax.jit`). A site passes
-    plain functions; the gate compiles them, so no site can compile one arm otherwise than its
-    other. One function as both arms compiles once."""
+    where both are Dew paths, each without YNNPACK's fusions (`without_ynn`), whose microkernels the
+    host's instruction set picks at run time, so the two run the same kind of code on any host: a
+    plain function the gate compiles so, an arm that runs Dew's own programs (`dew_programs`) with
+    them compiled so through Dew's seam; where one runs as it is given (`as_given`: torch, NumPy, a
+    recording, a host loop over programs of its own), the other as Dew's users run it, with the
+    fusions (`jax.jit`). A site passes plain functions; the gate compiles them, so no site can compile
+    one arm otherwise than its other. One function as both arms compiles once."""
     compile = jax.jit if _given(dew_fn) or _given(reference_fn) else without_ynn
     reference = _compiled(reference_fn, compile)
     return (reference if dew_fn is reference_fn else _compiled(dew_fn, compile)), reference
