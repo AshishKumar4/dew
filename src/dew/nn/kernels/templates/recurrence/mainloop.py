@@ -91,12 +91,17 @@ PARTS = 3
 @dataclasses.dataclass(frozen=True)
 class Tiles:
     """A forward's tiles, the recurrence template's config, derived from the call's shape and the device's
-    and its bundle's facts (`templates.recurrence.template.Mosaic.derived`): the value block the states and
-    output launches split the values into (`block_v`), and the chunks the states launch has in flight
-    (`stages`)."""
+    and its bundle's facts (`templates.recurrence.template.Mosaic.derived`): the value block the states
+    launch splits the values into (`block_v`), the chunks it has in flight (`stages`), and the output
+    launch's value block (`block_o`), the states launch's where None."""
 
     block_v: int
     stages: int
+    block_o: int | None = None
+
+    @property
+    def output_block(self) -> int:
+        return self.block_v if self.block_o is None else self.block_o
 
 
 BF16_LARGEST = float(jnp.finfo(jnp.bfloat16).max)
@@ -287,7 +292,7 @@ class _Call:
     delta: bool
     family: mosaic.Family
     interpret: bool
-    multiprocessors: int
+    target: generation.GpuTarget
 
     @property
     def gates(self) -> _Operand:
@@ -527,28 +532,31 @@ _PLANNED: contextvars.ContextVar[list | None] = contextvars.ContextVar("planned"
 """Where `planned` collects its launches; None where they run."""
 
 
-def _allocated(family: mosaic.Family, *allocations) -> int:
+def _allocated(family: mosaic.Family, *allocations, reduces: bool = True) -> int:
     """The bytes of shared memory a program of `allocations` takes, as Mosaic GPU's resource estimate counts
     them (`mosaic.allocated`, `mosaic.BARRIER_BYTES`): each tile's (a ring's stages one tile), a pipelined
-    family's streams' stages of each tile (`mosaic_sm80.Pipeline`, which `emit_pipeline` allocates), each
-    barrier's, and the scratch the family's compiler parameters reserve for a reduction across warps
-    (`Family.reduction_scratch`)."""
+    family's streams' stages of each tile (`mosaic_sm80.Pipeline`, which `emit_pipeline` allocates in its
+    walk's own scope: a program's walks one after another, the largest of them; an A100's states launch
+    asked for 16 KiB less than their sum, its memory entered beside its chunks), each barrier's, and where
+    the program `reduces`, the scratch the family's compiler parameters reserve for a reduction across warps
+    (`Family.reduction_scratch`), which the estimate takes for a kernel with any reduction and none without
+    (an A100's solve launch asked for its tiles' 90112 bytes alone, SE-family-a100-0c8018352)."""
     barrier, tile = (plgpu.Barrier, plgpu.ClusterBarrier), type(plgpu.SMEM((1,), jnp.float32))
 
     def leaf(x) -> bool:
         return isinstance(x, (*barrier, tile, mosaic_sm80.Pipeline))
 
-    sizes, barriers = [], 0
+    sizes, pipelines, barriers = [], [0], 0
     for x in jax.tree.leaves(allocations, is_leaf=leaf):
         if isinstance(x, mosaic_sm80.Pipeline):
-            sizes += [x.stages * math.prod(shape) * jnp.dtype(dtype).itemsize
-                      for shape, dtype in x.blocks.values()]
+            pipelines.append(mosaic.allocated(*(x.stages * math.prod(shape) * jnp.dtype(dtype).itemsize
+                                                for shape, dtype in x.blocks.values())))
         elif isinstance(x, barrier):
             barriers += math.prod(np.atleast_1d(x.num_barriers))
         elif isinstance(x, tile):
             sizes.append(math.prod(x.shape) * jnp.dtype(x.dtype).itemsize)
-    return (mosaic.allocated(*sizes, *([family.reduction_scratch] if family.reduction_scratch else []))
-            + mosaic.BARRIER_BYTES * barriers)
+    scratch = [family.reduction_scratch] if reduces and family.reduction_scratch else []
+    return mosaic.allocated(*sizes, *scratch) + max(pipelines) + mosaic.BARRIER_BYTES * barriers
 
 
 def _inverse_flops() -> float:
@@ -585,9 +593,42 @@ def _landed(landing: dict) -> dict:
     return {name: plgpu.SMEM(shape, dtype) for name, (shape, dtype) in landing.items()}
 
 
+def held_programs(family: mosaic.Family, target: generation.GpuTarget, shared: int) -> int:
+    """The programs of a launch staging `shared` bytes a multiprocessor of `target` holds at once: the most
+    its registers hold (`Family.programs`, at a thread's whole registers: ptxas's count passes the stated,
+    an H100's states launch's 138 registers against 123, which held it to one program a multiprocessor,
+    SE-family-h100-8def67e3e) whose shares of its shared memory each hold one (`mosaic.program_shared`),
+    at least one."""
+    budget = generation.shared_budget(target)
+    return next((programs for programs in range(family.programs(1), 1, -1)
+                 if shared <= mosaic.program_shared(budget, programs)), 1)
+
+
+def _persisted(call: _Call, blocks: dict, staging: tuple, tiles: int, *, reduces: bool) -> tuple[int, int]:
+    """A persistent launch's `(stages, programs)`: as many programs as the device's multiprocessors hold at
+    once (`held_programs`; `Family.persist`), at most its
+    `tiles`, and its streams' rings two deep where they run on (`mosaic.RingFamily`'s) and a multiprocessor
+    holds as many programs two deep as one, so a tile's loads go out under the last tile's work: a launch of
+    one-step tiles whose program holds a multiprocessor's registers alone (each launch's 255 registers a
+    thread an H100 holds one of, long-scoreboard stalls 51 to 73% of its time, SE-family-h100-80a38c02d). An
+    A100's launches held one program each, a quarter of the warps fla's held, with registers for two
+    (SE-family-a100-8c5b5b16a)."""
+    family = call.family
+
+    def shared(depth: int) -> int:
+        return _allocated(family, {"walked": family.streams(blocks, depth, 1)}, staging, reduces=reduces)
+
+    def holding(depth: int) -> int:
+        return held_programs(family, call.target, shared(depth))
+
+    stages = 2 if (isinstance(family, mosaic.RingFamily) and shared(2) <= family.most_shared
+                   and holding(2) == holding(1)) else 1
+    return stages, min(tiles, (call.target.multiprocessors or 1) * holding(stages))
+
+
 def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, stages: int, live,
             work: Work, held: _Held, staging: tuple = (), once: dict | None = None,
-            landing: dict | None = None, persistent: bool = False):
+            landing: dict | None = None, persistent: bool = False, reduces: bool = True):
     """`program(*refs, streams, staging, landing)` as a kernel over `grid`, run where `live(refs)` holds (a
     laid call's chunks and sequences are as many as its worst case, most of them empty): its streams'
     allocations (of `blocks`, `stages` deep, and of `once`'s blocks, loaded once, one deep; `Family.opened`
@@ -595,22 +636,17 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     its launch (`recurrence_solved`, ...). `held` is what a consumer thread holds in registers (`_Held`).
     Where `planned` collects launches, the launch's record instead (`Launch`, its `work`), and zeros.
 
-    A `persistent` launch runs `grid`'s tiles on as many programs as the device has multiprocessors
-    (`Family.persist`), its streams' rings running on across them, two deep where they do
-    (`mosaic.RingFamily`'s) and a block's shared memory holds two (`Family.most_shared`), so a tile's loads
-    go out under the last tile's work: a launch of one-step tiles
-    whose program holds a multiprocessor's registers alone (each launch's 255 registers a thread an H100
-    holds one of, long-scoreboard stalls 51 to 73% of its time, SE-family-h100-80a38c02d). Its program
-    gives its tile's walk (`_walk`) for the grid's indices `_axis` reads."""
+    A `persistent` launch runs `grid`'s tiles on as many programs as the device's multiprocessors hold at
+    once, its streams' rings running on across them (`_persisted`); its program gives its tile's walk
+    (`_walk`) for the grid's indices `_axis` reads. A program that `reduces` none takes no reduction scratch
+    (`_allocated`; the compile gate holds its plan's shared memory to at least the compiled kernel's)."""
     family = call.family
     landed = _landed(landing or {})
     staging = (*staging, landed)
     tiles = math.prod(grid)
+    threads = 128 * family.warpgroups(1)
     if persistent:
-        deep = {"walked": family.streams(blocks, 2, 1)}
-        stages = 2 if (isinstance(family, mosaic.RingFamily)
-                       and _allocated(family, deep, staging) <= family.most_shared) else 1
-        programs = min(tiles, call.multiprocessors)
+        stages, programs = _persisted(call, blocks, staging, tiles, reduces=reduces)
     else:
         programs = tiles
     # The walked streams and those loaded once, each its own allocation (a pipelined family's stages are
@@ -628,8 +664,9 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
             # A persistent program's work is its tiles' (`work` is a tile's), the most any program takes.
             each = -(-tiles // programs)
             flops = work.flops * _products(call.held.parts) * each
-            collected.append(Launch(name, programs, 128 * family.warpgroups(1),
-                                    _allocated(family, streams, staging), held.registers(family),
+            collected.append(Launch(name, programs, threads,
+                                    _allocated(family, streams, staging, reduces=reduces),
+                                    held.registers(family),
                                     work.steps * each, stages, stepped, flops, work.exponentials * each,
                                     moved))
             return jax.tree.map(lambda x: jnp.zeros(x.shape, x.dtype), out_type)
@@ -719,19 +756,22 @@ def _walk(streams, views, step, call: _Call, *, steps: int = 1, prologue: Callab
     family.roles(1, consumer, lambda: family.stream(streams, views, 0, steps))
 
 
-def _solved(k, v, hi, lo, beta, taken, call: _Call):
+def _solved(k, v, hi, lo, beta, taken, call: _Call, *, keeps: bool = True):
     """`(a [R, HV * C], w [R, HV * Dk], u [R, HV * Dv])` as `call.held` of each chunk and value head under a
     decay a head, fla's kkt_solve and recompute_w_u in one program (FlashQLA's first kernel): the keys'
     products (`algebra.keyed`) inverted by doubling on the chunk's tile (`algebra.doubled`, its merges in
     fp16 in a 16-bit call, `_merges`), stored less its unit diagonal (`a`, the backward's), and applied in
     registers to the decayed write-gated keys and the write-gated values (`algebra.weighted`), the inverse
     staged once for every block's product: one launch's tiles and one load of the keys, where two launches
-    stored and loaded the inverse between them."""
+    stored and loaded the inverse between them. Where it `keeps` no inverse (a forward no backward reads,
+    `a` None), its store's landing tile goes: an A100's launch then holds two programs a multiprocessor
+    (an inverse's 8 KB past half its shared memory kept it at one, SE-family-a100-0c8018352)."""
     width, value_width, family = call.width, call.value_width, call.family
     held = dataclasses.replace(call.held, rows=call.rows)
 
-    def program(k_ref, v_ref, hi_ref, lo_ref, beta_ref, column_hi_ref, column_lo_ref, taken_ref, a_ref, w_ref,
-                u_ref, *, streams, staging, landing):
+    def program(k_ref, v_ref, hi_ref, lo_ref, beta_ref, column_hi_ref, column_lo_ref, taken_ref, *outputs,
+                streams, staging, landing):
+        a_ref, w_ref, u_ref = outputs if keeps else (None, *outputs)
         n, h = _axis("chunks"), _axis("heads")
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
         views = _views(keys=call.given.views(k_ref, row, CHUNK, h // call.group * width, width),
@@ -767,7 +807,8 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call):
             # The inverse less its unit diagonal, which `algebra.weighted` adds outside its product.
             lower = (algebra.doubled(-system, _merging(merges, call))
                      - jnp.where(_diagonal(CHUNK, family), 1.0, 0.0))
-            held.store(a_ref, lower, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
+            if keeps:
+                held.store(a_ref, lower, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
             # The inverse staged once (the first set) for every block's product, a block staged in the
             # second: `_Issuer` keeps a staged value for the products after it that take it.
             sets = [lower_tile, scaled_tile]
@@ -799,8 +840,9 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call):
         + (_held(held, CHUNK, CHUNK) * 2 if held.parts > 1 else []),
         [_f32(CHUNK, CHUNK)] + [_f32(CHUNK, call.block)] * 2 + _held(call.given, CHUNK, call.block)
         + _fragments(call, (held, CHUNK, CHUNK), (call.given, CHUNK, call.block))))
-    out_type = (held.shape(call.heads * CHUNK), held.shape(call.heads * width),
-                held.shape(call.heads * value_width))
+    out_type = (held.shape(call.heads * width), held.shape(call.heads * value_width))
+    if keeps:
+        out_type = (held.shape(call.heads * CHUNK), *out_type)
     # The inverse's application stages in the doubling's merge tiles where they are its form (an fp32 call's
     # bf16 parts, a block a chunk wide), done by then: apart, an fp32 call's launch took 242864 bytes of
     # shared memory, past an H100's block (SE-family-h100-e0de17766).
@@ -808,14 +850,16 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call):
     reused = (held.parts > 1 and merging[0][0].dtype == held.stored and call.block == CHUNK)
     staging = merging if reused else (*merging, _staging(held, (CHUNK, CHUNK))[0],
                                       _staging(held, (CHUNK, call.block))[0])
-    return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
-                   grid_names=("chunks", "heads"),
-                   blocks=_streamed(keys=((CHUNK, width), call.given),
-                                    values=((CHUNK, value_width), call.given))
-                   | _vector_blocks(call, "gate", "low", "write", "column_gate", "column_low"),
-                   stages=1, live=_taken(7), work=work, held=held_tiles, staging=staging,
-                   landing={"square": held.landing(CHUNK, CHUNK), "block": held.landing(CHUNK, call.block)},
-                   persistent=True)(k, v, hi, lo, beta, hi, lo, taken)
+    landing = {"square": held.landing(CHUNK, CHUNK)} if keeps else {}
+    landing["block"] = held.landing(CHUNK, call.block)
+    solved = _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
+                     grid_names=("chunks", "heads"),
+                     blocks=_streamed(keys=((CHUNK, width), call.given),
+                                      values=((CHUNK, value_width), call.given))
+                     | _vector_blocks(call, "gate", "low", "write", "column_gate", "column_low"),
+                     stages=1, live=_taken(7), work=work, held=held_tiles, staging=staging, landing=landing,
+                     persistent=True, reduces=False)(k, v, hi, lo, beta, hi, lo, taken)
+    return solved if keeps else (None, *solved)
 
 
 def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
@@ -1199,7 +1243,9 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
                    held=_states_held(call, values, keys, bv),
                    staging=(*_staging(held, (call.block, bv)), _column_scratch(call)), once=initials,
                    landing={**_memory_landing(call, bv), "corrected": held.landing(CHUNK, bv),
-                            "final": ((call.block, bv), jnp.float32)})(
+                            "final": ((call.block, bv), jnp.float32)},
+                   # Its last write's column sums an fp32 call's alone (`_columns`).
+                   reduces=held.parts > 1)(
         k, k if w is None else w, u, hi, lo, beta, h0, sequences)
 
 
@@ -1243,7 +1289,7 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
     value block: under a decay a head its own pairs' scores taken once, at the first step, and staged for
     every block's (`algebra.chunk_scores`, `chunk_output`), under one a key dimension the intra launch's
     (`scores`, `_intra`; `algebra.key_decayed_output`)."""
-    width, value_width, bv, gates = call.width, call.value_width, tiles.block_v, call.gates
+    width, value_width, bv, gates = call.width, call.value_width, tiles.output_block, call.gates
     held, memories, family = dataclasses.replace(call.held, rows=call.rows), call.memories, call.family
     steps = value_width // bv
 
@@ -1321,7 +1367,8 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=blocks, stages=1, live=_taken(8), work=work,
                    held=_output_held(call, bv), staging=staging, landing={"out": ((CHUNK, bv), out_dtype)},
-                   persistent=True)(
+                   # A 16-bit call's takes no reduction (an A100's asked for its tiles' 49152 bytes alone).
+                   persistent=True, reduces=held.parts > 1)(
         q, k if scores is None else scores, h, corrected, hi, lo, hi, lo, taken)
 
 
@@ -1405,21 +1452,21 @@ def forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, max_segment
     (`per_key_refusal`)."""
     out, final, _ = kept_forward(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale,
                                  delta=delta, tiles=tiles, wide=wide, family=family, interpret=interpret,
-                                 floor=floor)
+                                 floor=floor, keeps=False)
     return out, final
 
 
 def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, max_segments: int | None = None,
                  scale: float | None = None, delta: bool = True, wide: bool = False,
                  family: mosaic.Family | None = None, interpret: bool = False,
-                 floor: float | None = None) -> tuple[jax.Array, jax.Array, tuple]:
+                 floor: float | None = None, keeps: bool = True) -> tuple[jax.Array, jax.Array, tuple]:
     """`forward`'s `(o, final)` and what the fast backward takes rather than compute again (`gradients`'
-    `inverse` and `kept`): each chunk's inverse under a decay a head (`_solved`'s, None otherwise), as fla's
-    backward keeps its `A`, and the launches' weighted keys, memories and corrected values, `(w, h,
-    corrected)`, which the port keeps unless a remat rung recomputes them (`recurrence_chunk.RECOMPUTED`),
-    the caller's choice."""
+    `inverse` and `kept`): each chunk's inverse under a decay a head (`_solved`'s, None otherwise or where
+    the call `keeps` none, `forward`'s), as fla's backward keeps its `A`, and the launches' weighted keys,
+    memories and corrected values, `(w, h, corrected)`, which the port keeps unless a remat rung recomputes
+    them (`recurrence_chunk.RECOMPUTED`), the caller's choice."""
     run = _prepared(q, k, v, g, beta, h0, starts=starts, max_segments=max_segments, scale=scale, delta=delta,
-                    tiles=tiles, family=family, interpret=interpret, floor=floor)
+                    tiles=tiles, family=family, interpret=interpret, floor=floor, keeps=keeps)
     call, tiles = run.call, run.tiles
     o = _output(run.q, run.k, run.h, run.corrected, run.hi, run.lo, run.taken, call, tiles, scale=run.scale,
                 out_dtype=jnp.float32 if wide else run.dtype, scores=run.scores)
@@ -1459,10 +1506,11 @@ class _Run:
 
 
 def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles, family, interpret,
-              inverse=None, kept=None, floor: float | None = None) -> _Run:
+              inverse=None, kept=None, floor: float | None = None, keeps: bool = True) -> _Run:
     """`forward`'s operands checked, padded and laid, and its launches before the output run: under a decay a
     head the solve's but where its `inverse` is given, and the weighted and states launches' but where their
-    `kept` values, `(w, h, corrected)`, are (`kept_forward`'s; its final memory then None)."""
+    `kept` values, `(w, h, corrected)`, are (`kept_forward`'s; its final memory then None). The solve stores
+    its inverse where the call `keeps` it (`_solved`)."""
     family = family_of() if family is None else family
     if family is None:
         raise NotImplementedError(f"the mainloop has no bundle for the "
@@ -1491,7 +1539,7 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     rows = chunks * CHUNK
     given = held = _Operand(rows, _parts(dtype), dtype)
     call = _Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
-                 interpret, generation.gpu_target().multiprocessors or 1)
+                 interpret, generation.gpu_target())
     hi, lo = prefix(laid(g).reshape(chunks, CHUNK, -1))
     # A decay a head's prefix a head's row of vectors `[HV, R]`, one a key dimension's tiles `[R, HV * Dk]`.
     hi, lo = (x.reshape(rows, -1) if per_key else x.reshape(rows, heads).T for x in (hi, lo))
@@ -1507,7 +1555,7 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     elif delta and inverse is None:
         # The forward's residuals come in pairs: a recomputed forward has neither.
         assert kept is None, "a kept forward keeps its inverse"
-        a, w, u = _solved(k, v, hi, lo, beta, taken, call)
+        a, w, u = _solved(k, v, hi, lo, beta, taken, call, keeps=keeps)
     elif delta:
         a = inverse
         if kept is None:

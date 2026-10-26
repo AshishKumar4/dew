@@ -334,6 +334,7 @@ def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name):
     assert len(found) == len(cases) and not failed, "\n".join(failed)
 
 
+@COMPILES_FOR_TPU
 @pytest.mark.parametrize("tpu", ["v5e", "v6e"])
 def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
     """The GEMM template's TPU mainloops (`MosaicTpuGmm` forward and input gradient, `MosaicTpuTgmm`),
