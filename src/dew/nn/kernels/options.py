@@ -11,7 +11,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 from collections.abc import Callable, Mapping
-from typing import ClassVar, NamedTuple, Protocol, TypedDict, Unpack, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, TypedDict, Unpack, runtime_checkable
 
 import jax
 import numpy as np
@@ -19,6 +19,10 @@ from jax.sharding import Sharding
 
 from dew.devices import xla_flag
 from dew.nn.kernels.generation import backend, gpu_target
+
+if TYPE_CHECKING:
+    from _typeshed import DataclassInstance
+    from flax import linen as nn
 
 
 class QuantizedDtypes(Protocol):
@@ -40,7 +44,12 @@ class Quantized(Protocol):
     _dew_quantization: ClassVar[QuantizedDtypes]
 
 
-def quantizations(*models: object) -> list[QuantizedDtypes]:
+type Held = nn.Module | DataclassInstance | Mapping[str, Held] | tuple[Held, ...] | list[Held] | None
+"""What a program runs that may hold a quantized tower (`quantizations`): a model, a record of one (a
+condition's encoder), or a mapping or sequence of them; anything else a record holds is passed over."""
+
+
+def quantizations(*models: Held) -> list[QuantizedDtypes]:
     """The quantization every model class among `models` carries (`Quantized`), and every tower they
     hold: each module a model, a task's encoder or any record it is handed holds in its fields,
     a tuple's or a mapping's entries, at any depth, so a quantized text encoder inside a condition's
@@ -48,7 +57,7 @@ def quantizations(*models: object) -> list[QuantizedDtypes]:
     found: list[QuantizedDtypes] = []
     seen: set[int] = set()
 
-    def walk(value: object) -> None:
+    def walk(value: Held) -> None:
         if id(value) in seen or isinstance(value, (jax.Array, np.ndarray, str, bytes, int, float, type)):
             return
         seen.add(id(value))
@@ -70,7 +79,7 @@ def quantizations(*models: object) -> list[QuantizedDtypes]:
     return found
 
 
-def compiler_options(*models: object) -> dict[str, bool]:
+def compiler_options(*models: Held) -> dict[str, bool]:
     """The XLA options a program that runs `models` compiles with on the default device, for its
     `jax.jit(..., compiler_options=)`. Every program Dew compiles over a task's model,
     autoencoder or encoders, or over an objective's modules, takes them, for every tower they hold
@@ -106,7 +115,7 @@ class JitArguments(TypedDict, total=False):
     out_shardings: Placements
 
 
-def program[**P, R](function: Callable[P, R], *models: object,
+def program[**P, R](function: Callable[P, R], *models: Held,
                     step: Mapping[str, bool | int] | None = None,
                     **arguments: Unpack[JitArguments]) -> jax.stages.Wrapped:
     """`function` jitted with the XLA options a program over `models` compiles with
