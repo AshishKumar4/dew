@@ -571,17 +571,25 @@ def test_a_residual_order_is_the_same_decoder(case):
 LAYOUTS = {"8x1 data": 1, "2x4 fsdp": 4}
 """Each layout a cell trains on, by its fsdp width over every device."""
 
+LAYOUT_STEPS = (((1, "8x1 data"), (2, "2x4 fsdp")), ((1, "2x4 fsdp"), (2, "8x1 data")))
+"""The pairs of step count and layout a case trains, alternating by case: each case meets each step
+count and each layout, and each step count meets each layout over the cases, as testing.md's
+settings pairwise asks."""
 
-@pytest.mark.parametrize("layout", tuple(LAYOUTS), ids=("data", "fsdp"))
-@pytest.mark.parametrize("steps", (1, 2), ids=("1-step", "2-steps"))
-@pytest.mark.parametrize("case", CASES, ids=IDS)
+LAYOUT_CELLS = [(case, steps, layout) for index, case in enumerate(CASES)
+                for steps, layout in LAYOUT_STEPS[index % 2]]
+
+
+@pytest.mark.parametrize(("case", "steps", "layout"), LAYOUT_CELLS,
+                         ids=[f"{case.name}-{steps}-step{'s' * (steps > 1)}-{layout.split()[1]}"
+                              for case, steps, layout in LAYOUT_CELLS])
 def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
     """One device and a layout, 8x1 data parallelism (every parameter
     replicated, the batch split across every device) or 2x4 fsdp (the
     parameter tree split four ways, the optimizer's state and the EMA with
     it), train the same steps from the same state: after `steps` steps (one,
-    and two, each layout and step count its own test, so none runs another's
-    fits and draws), the layout's variables, momentum and EMA are as near a
+    or two, each case training each layout once and each step count once,
+    `LAYOUT_STEPS`), the layout's variables, momentum and EMA are as near a
     float64 run as one device's are, over the cell's declared batches (check
     1, `assert_as_exact`), so
     their summing a batch's rows and positions in other orders is the only
