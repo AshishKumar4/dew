@@ -108,9 +108,12 @@ class Mma(mosaic.Family):
 
     name = "mma.sync"
     rows = 16
-    # Two consumer warpgroups where JAX's pipeline runs over them, each its share of a tile's rows and of
-    # every step's copies (CUTLASS's and cuBLASLt's A100 kernels' eight warps).
-    consumers = 2 if collective_pipelines() else 1
+    # One consumer warpgroup. Two run where JAX's pipeline runs over them (`collective_pipelines`), each
+    # its share of a tile's rows and of every step's copies, CUTLASS's and cuBLASLt's eight warps; but the
+    # collective copy's per-share addressing costs each thread 30 to 60 registers the register model does
+    # not count (ns-regs: sm86 forward 190 against 222 registers, sm80's spilling 240 bytes at two), so the
+    # bundle keeps to one until that copy is leaner and a GPU round shows two pay.
+    consumers = 1
     bounded_loads = False
     role_rows = 4 * 16
     operands_in_registers = True
