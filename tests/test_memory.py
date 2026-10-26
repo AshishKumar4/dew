@@ -4,6 +4,7 @@ computation against the token-by-token one; packed documents as each alone; a de
 and a zero step size reading the initial network."""
 
 import functools
+import json
 
 import jax
 import jax.numpy as jnp
@@ -300,8 +301,36 @@ def test_a_memory_layer_kind_trains_scans_and_decodes_in_a_decoder():
 
 
 def test_a_memory_layer_kind_records_and_rebuilds():
-    """The kind is a record: a decoder's config holding it rebuilds the same model."""
-    from dew.config import ModelConfig
+    """A memory layer kind records the memory's whole configuration: a decoder whose two kinds set every
+    field a memory computes by away from its default (heads, an existing GatedMLP as a level's network
+    over the raw stream with no output projection, an lp and a Huber objective, a self-generated
+    target, constant and scaled gates, momentum, retention, Newton-Schulz steps, the chunk) writes a
+    JSON record that rebuilds the same model, which computes the original's logits bit for bit."""
+    from model_support import TINY_DECODER
 
-    model = ModelConfig.from_model(decoder()).build()
-    assert ModelConfig.from_model(model).build() == model
+    from dew.config import ModelConfig
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.layer_plan import LayerKind
+    from dew.nn.mixers.memory import InContextMemoryMixer
+    from dew.nn.mlp import GatedMLP
+    from dew.registry import to_record
+
+    heads = InContextMemory(network=MLPMemory(hidden=(24,), activation="gelu"), heads=4, head_features=8,
+                            objective=Objective("lp", p=3.0), target="self_generated",
+                            learning_rate=Gate(scale=0.05, bias=0.5), momentum=Gate(value=0.5),
+                            retention=Gate(scale=0.5, bias=-1.0), chunk=2, orthogonalize=3, normalize=True)
+    level = InContextMemory(network=GatedMLP(hidden_features=48, out_features=32), project_query=False,
+                            project_key=False, project_value=False, output=False,
+                            objective=Objective("huber", delta=0.5), learning_rate=Gate(value=0.01), chunk=3)
+    model = CausalTransformer(**{**TINY_DECODER, "vocab_size": 37, "num_layers": 3, "dtype": "float32",
+                                 "layer_types": ("heads", "level", "attention"),
+                                 "kinds": {"heads": LayerKind(mixer=InContextMemoryMixer(heads)),
+                                           "level": LayerKind(mixer=InContextMemoryMixer(level)),
+                                           "attention": LayerKind()}})
+    record = json.loads(json.dumps(to_record(ModelConfig.from_model(model), ModelConfig)))
+    rebuilt = ModelConfig.from_dict(record).build()
+    assert rebuilt == model
+    ids = jax.random.randint(jax.random.key(1), (2, LENGTH), 0, 37)
+    variables = model.init(jax.random.key(0), ids)
+    np.testing.assert_array_equal(np.asarray(rebuilt.apply(variables, ids)),
+                                  np.asarray(model.apply(variables, ids)))
