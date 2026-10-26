@@ -25,7 +25,7 @@ from __future__ import annotations
 
 import functools
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, Literal
 
 import jax
 import jax.numpy as jnp
@@ -36,10 +36,12 @@ from lm_eval.api.model import TemplateLM
 from lm_eval.api.registry import register_model
 from lm_eval.models.utils import handle_stop_sequences, normalize_gen_kwargs, postprocess_generated_text
 
+from dew.batch import BLOCKS_FIELD
 from dew.inference.tasks import TextGeneration, cache_ceiling
 from dew.interop.generation_config import source_decoding
-from dew.nn.inputs import pad_token_rows
+from dew.nn.inputs import ModelInputs, pad_token_rows
 from dew.nn.kernels.options import program
+from dew.nn.visibility import served_blocks
 from dew.objectives.lm.objective import LMObjective, TokenScorer
 
 DEFAULT_CONTEXT = 2048
@@ -52,19 +54,33 @@ TokenRequest = tuple[tuple[str, str] | None, list[int], list[int]]
 """One `_loglikelihood_tokens` request: the strings, context ids, continuation ids."""
 
 
-def _scored(scorer: TokenScorer, variables, rows: jax.Array) -> tuple[jax.Array, jax.Array]:
+def _scored(scorer: TokenScorer, variables, rows: ModelInputs) -> tuple[jax.Array, jax.Array]:
     """Return the per-target log-probability and whether the target was the argmax, as the scorer
     the language-model losses share scores them (`TokenScorer.token_scores`), through its tiled
     head, which holds a tile of the vocabulary at a time rather than every row's whole logits;
     compiled with the model's XLA options (`program`).
 
-    `rows` is `[B, T]` of token ids; both results are `[B, T - 1]`, entry `i`
-    belonging to `rows[:, i + 1]`. Rows are right-padded by the caller, which
-    a causal model cannot read backwards, so a short row's own slots hold
-    what they would hold alone.
+    `rows` is `[B, T]` of token ids, with their fields (`_scoring_inputs`); both results are
+    `[B, T - 1]`, entry `i` belonging to `rows[:, i + 1]`. Rows are right-padded by the caller, which
+    a causal model cannot read backwards, so a short row's own slots hold what they would hold alone.
     """
     scores = scorer.token_scores(variables, rows, predict=True)
     return -scores.losses, scores.correct == 1
+
+
+def _scoring_inputs(rows: list[list[int]], contexts: list[int],
+                    prefix: int | Literal["prompt"] | None) -> ModelInputs:
+    """`rows`, each its context's first `contexts` ids and its continuation after, right-padded, as the
+    scorer reads them: under a prefix run, each context's blocks a server makes of a prompt
+    (`served_blocks`, the context whole under "prompt"), each continuation token and padding slot in
+    no block (-1), and the padding marked, so a continuation is scored as its generation reads it."""
+    tokens, fields = pad_token_rows(rows, padding_side="right")
+    token_fields = {name: jnp.asarray(value) for name, value in fields.items()}
+    if prefix is not None:
+        context = np.arange(tokens.shape[1])[None, :] < np.asarray(contexts)[:, None]
+        blocks = np.where(context, served_blocks(context, prefix), -1).astype(np.int32)
+        token_fields[BLOCKS_FIELD] = jnp.asarray(blocks)
+    return ModelInputs(jnp.asarray(tokens), token_fields=token_fields)
 
 
 def _batches(count: int, size: int) -> list[range]:
@@ -264,10 +280,11 @@ class DewLM(TemplateLM):
             rows.append([*context, *continuation][-(self.max_length + 1):])
         answers: list[tuple[float, bool]] = []
         for batch in _batches(len(rows), self.batch_size):
-            tokens, _ = pad_token_rows([rows[index] for index in batch], padding_side="right")
+            inputs = _scoring_inputs([rows[index] for index in batch],
+                                     [len(rows[index]) - len(requests[index][2]) for index in batch],
+                                     self.task.prefix)
             scoring = program(_scored, self.task.model, static_argnums=(0,))
-            probabilities, argmax = scoring(self._scorer(tokens.shape[1]), self.task.variables,
-                                            jnp.asarray(tokens))
+            probabilities, argmax = scoring(self._scorer(inputs.tokens.shape[1]), self.task.variables, inputs)
             values, matched = np.asarray(probabilities), np.asarray(argmax)
             for offset, index in enumerate(batch):
                 end = len(rows[index]) - 1

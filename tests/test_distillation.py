@@ -32,6 +32,7 @@ from dew.objectives import DistillationObjective
 from dew.objectives.base import Step
 from dew.objectives.distillation import PROJECTIONS, TEACHER
 from dew.objectives.lm import TEXT_KEY, LMObjective
+from dew.objectives.routing import ExpertBalance
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "distillation"
@@ -365,10 +366,11 @@ def test_a_vocabulary_mismatch_is_refused_with_the_reason(student_vocab, teacher
 
 
 def test_a_student_with_the_router_balance_loss_is_refused():
-    """`aux_loss_alpha`'s router terms normalise per router, not per token,
+    """The balance loss's router terms normalize per router, not per token,
     so the seam refuses them at the first trace and names the way out."""
     arrays = fixture()
-    student = LMObjective(CausalTransformer(**META["student"]), SEQ, ema_decay=None, aux_loss_alpha=0.01)
+    student = LMObjective(CausalTransformer(**META["student"]), SEQ, ema_decay=None,
+                          balance=ExpertBalance(aux_loss_alpha=0.01))
     teacher = LMObjective(CausalTransformer(**META["teacher"]), SEQ, ema_decay=None)
     objective = DistillationObjective(student, teacher)
     with pytest.raises(ValueError):

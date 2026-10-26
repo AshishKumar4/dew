@@ -22,7 +22,6 @@ from __future__ import annotations
 
 import dataclasses
 import itertools
-import json
 import math
 import threading
 import time
@@ -39,7 +38,6 @@ from jax.experimental.layout import Format, Layout as DeviceLayout
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
 from jax.typing import DTypeLike
 
-from dew import _records
 from dew.batch import Variables, merge, without
 from dew.nn.backbones.decoder_stack import DecoderBank, stack_layers
 from dew.nn.backbones.layer_plan import group_layers, layer_index
@@ -263,12 +261,14 @@ class DiskBankStats:
 class SafetensorsBanks(LayerBanks):
     """Reads a local HF decoder checkpoint without materializing its layer stack.
 
-    It translates the weights with the ordinary decoder's `SourceLeaf`
-    recipes over read-only memory maps, including expert stacking,
-    transposition and the cast to `param_dtype` (by default the
-    checkpoint's dtype). Quantized checkpoints are refused, because their
-    codec may dequantize the entire checkpoint before translation, which
-    would break the memory bound below.
+    The checkpoint is a decoder, a media wrapper around one, or the native
+    backbone a release with a separately stored readout describes (a slot
+    decision release). It translates the weights as `Pretrained.load` does
+    (`dew.interop.pretrained.native_backbone`), with its `SourceLeaf` recipes
+    over read-only memory maps, including expert stacking, transposition and
+    the cast to `param_dtype` (by default the checkpoint's dtype). Quantized
+    checkpoints are refused, because their codec may dequantize the entire
+    checkpoint before translation, which would break the memory bound below.
 
     The cache keeps complete layers in read order until `cache_bytes` is
     full, and holds them until `close`. A sequential decoder visits every
@@ -277,8 +277,9 @@ class SafetensorsBanks(LayerBanks):
     partial cache useful. One read-ahead slot holds the next layer, even
     with a zero cache, unless `read_ahead` is False. Host memory for weights
     is bounded by `cache_bytes`, two rows and one leaf's conversion scratch.
-    Embeddings, heads and the KV cache stay resident outside that bound, and
-    the bound does not count the kernel's page cache.
+    Embeddings, heads, a media wrapper's towers and projectors (read whole,
+    as the wrapper's reader reads them) and the KV cache stay resident
+    outside that bound, and the bound does not count the kernel's page cache.
 
     Keep the source open and its files unchanged until all executions
     finish, because a compiled callback cannot read a closed source.
@@ -286,32 +287,17 @@ class SafetensorsBanks(LayerBanks):
 
     def __init__(self, directory: str | Path, *, cache_bytes: int = 0,
                  param_dtype: DTypeLike | Literal["auto"] = "auto", read_ahead: bool = True):
-        from dew.interop.decoder_parts import DecoderFamily, check_decoder_tree
-        from dew.interop.hf_decoders import families, translate_config, translate_weights
-        from dew.interop.safetensors_io import read_weights
-        from dew.registry import dtype_name, models
+        from dew.interop.pretrained import native_backbone
+        from dew.registry import dtype_name
 
         if cache_bytes < 0:
             raise ValueError("cache_bytes must be nonnegative")
-        folder = Path(directory)
-        config = _records.record(json.loads((folder / "config.json").read_text()), "config.json")
+        config, self._variables = native_backbone(
+            directory, param_dtype="auto" if param_dtype == "auto" else dtype_name(param_dtype))
         self.config: Mapping[str, object] = MappingProxyType(config)
-        if self.config.get("quantization_config") or self.config.get("expert_dtype"):
-            raise ValueError("disk banks require unquantized safetensors; a whole-model codec is not bounded")
-        record = translate_config(self.config)
-        family = _records.text(self.config.get("model_type"), "model_type")
-        if families()[family].prepare is not DecoderFamily.prepare or families()[family].packed:
-            raise ValueError("disk banks require a family with lazy tensor translation; "
-                             "this family's preparation can materialize checkpoint weights")
-        tensors = read_weights(folder)
-        self._variables: Variables = translate_weights(
-            tensors, record, family, param_dtype="auto" if param_dtype == "auto" else dtype_name(param_dtype),
-            lazy=True)
         self._shapes = jax.tree.map(
             lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype), self._variables
         )
-        check_decoder_tree(self._shapes, models.build(
-            "causal_transformer", {**record, "dtype": "float32", "attention_impl": "reference"}))
         self.cache_limit = cache_bytes
         self.read_ahead = read_ahead
         self._cache: dict[tuple[tuple[str, ...], int], Variables] = {}
