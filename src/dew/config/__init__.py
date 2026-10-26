@@ -54,7 +54,7 @@ from dew.coordination import agree_process_phase, agreed
 from dew.data import records
 from dew.data.compile import fitted
 from dew.data.dataset import Loader, Ramp, Reader, ramped, record_argument
-from dew.data.pipeline import Dataset
+from dew.data.pipeline import Dataset, ObjectiveData
 from dew.files import write_atomically
 from dew.inputs import Field
 from dew.lora import AdapterRecord, LoRA
@@ -88,6 +88,7 @@ from dew.registry import (
     wants_tuple,
 )
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
+from dew.training.budget import Pause, run_length, run_steps
 from dew.training.display import TrainingDisplay
 from dew.training.distributed import Layout, MeshSpec
 from dew.training.profiling import ProfileWindow
@@ -95,7 +96,7 @@ from dew.training.quantization import quantize_trunk
 from dew.training.selection import Best
 from dew.training.state import TrainState
 from dew.training.tracker import LocalTracker, Tracker, Trackers, WandbTracker
-from dew.training.trainer import Rollout, Trainer, run_length, run_steps
+from dew.training.trainer import Rollout, Trainer
 
 JsonDict = Annotated[
     Mapping[str, object],
@@ -708,10 +709,16 @@ class TrainerConfig:
     resume.
 
     Uses the counter reported as `train/tokens`, without padding. The final
-    microbatch may cross the budget. With `steps` or `epochs`, the first cap
-    reached ends the run. A token-only run needs a constant learning rate or
-    a schedule with its own explicit step horizon.
+    microbatch may cross the budget. With `steps`, `epochs` or `examples`, the
+    first cap reached ends the run. A token-only run needs a constant learning
+    rate or a schedule with its own explicit step horizon.
     """
+    examples: int | None = None
+    """The run length as the first this many records of the data, each read once, counted before
+    they are packed (`Trainer.fit`'s `examples`); `steps` or `epochs` set it instead."""
+    stop: Annotated[Pause, tyro.conf.subcommand("pause")] | None = None
+    """End the run at a fraction of its length, to resume it later as if it had never stopped
+    (`Pause`): `--trainer.stop.fraction 0.5`."""
     log_every: int = 100
     eval_every: int | Literal["epoch"] | None = "epoch"
     """The steps between validation passes.
@@ -837,7 +844,7 @@ class TrainerConfig:
             raise ValueError("--trainer.split reads each step's batch in that many microbatches, at least 1")
         if self.publish and (self.wandb is None or not self.checkpoint_final):
             raise ValueError("trainer.publish requires trainer.wandb and trainer.checkpoint_final")
-        run_length(self.steps, self.epochs, self.tokens, required=False)
+        run_length(self.steps, self.epochs, self.tokens, self.examples, required=False)
         if isinstance(self.checkpoint_every, str) and self.checkpoint_every != 'epoch':
             object.__setattr__(self, 'checkpoint_every', duration(self.checkpoint_every))
         if isinstance(self.keep, Mapping):
@@ -889,18 +896,26 @@ class TrainerConfig:
             return {"on_host": True}
         return {"mesh": self.mesh, "layout": self.layout}
 
+    def resolved(self, dataset: Loader) -> tuple[Self, Loader, int | None]:
+        """This config and `dataset` as a run trains on them, and the run's steps: the accumulation
+        its token budget sets (`accumulating`), the dataset its batch ramp reads, and the step cap over
+        that (`total_steps`), before which the ramp goes, since it reads fewer records a step early
+        and a pass over the data is that many steps longer. Its updates are the steps over the
+        accumulation."""
+        trainer = self.accumulating(dataset)
+        dataset = dataset if trainer.batch_ramp is None else ramped(dataset, trainer.batch_ramp)
+        return trainer, dataset, trainer.total_steps(dataset)
+
     def total_steps(self, dataset: Loader) -> int | None:
-        """Return the step cap from `steps` or `epochs`, None for a token-only run (`run_steps`, the
-        one policy a direct fit applies too)."""
-        return run_steps(dataset, self.steps, self.epochs, self.tokens, self.accumulation)
+        """Return the step cap from `steps`, `epochs` or `examples`, None for a token-only run
+        (`run_steps`, the one policy a direct fit applies too)."""
+        return run_steps(dataset, self.steps, self.epochs, self.tokens, self.accumulation, self.examples)
 
     def total_updates(self, dataset: Loader) -> int | None:
         """Return the optimizer updates the run takes over `dataset` as `RunConfig.train` finalizes it,
         its token budget's accumulation and its batch ramp applied: what an average that moves once an
         update ramps over. None for a token-only run."""
-        trainer = self.accumulating(dataset)
-        ramp = trainer.batch_ramp
-        steps = trainer.total_steps(dataset if ramp is None else ramped(dataset, ramp))
+        trainer, _, steps = self.resolved(dataset)
         # A window the run ends inside is never committed, as the trainer counts its updates.
         return None if steps is None else steps // trainer.accumulation
 
@@ -1208,7 +1223,7 @@ class RunConfig:
     settings and builds what it trains from them (`prepare`); `run` trains it.
     """
 
-    _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora"}
+    _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora", "trainer.stop": "pause"}
     """The optional settings `cli` turns on by their own flags, each with the
     subcommand its flags imply."""
     RESUMABLE: ClassVar[tuple[str, ...]] = ("trainer", "optim", "data", "validation", "data_seed")
@@ -1479,6 +1494,15 @@ class RunConfig:
                              "preset (dew.data.presets), in Python or in run.json")
         return self.data
 
+    def compiled(self, objective: ObjectiveData, dataset: Dataset | Loader,
+                 validation: Dataset | Mapping[str, Dataset | Reader] | None,
+                 ) -> tuple[Loader, Mapping[str, Reader] | None]:
+        """`dataset` and `validation` as the run trains on them (`fitted`): compiled with `objective`'s
+        stages and `data_seed`, the training read bounded to `trainer.examples` where the run counts
+        them, so its length is read off the loader this returns."""
+        return fitted(dataset, validation, objective=objective, seed=self.data_seed,
+                      examples=self.trainer.examples)
+
     def run(self) -> TrainState:
         """Prepare the process, build what this run trains (`prepare`) and train it.
 
@@ -1486,8 +1510,7 @@ class RunConfig:
         from dew.training import prepare_process, run_timestamp
 
         trainer = self.trainer
-        prepare_process(trainer.wandb, trainer.multi_host, trainer.xla_flags, trainer.compilation_cache_dir,
-                        layout=trainer.layout)
+        prepare_process(trainer.wandb, trainer.multi_host, trainer.xla_flags, trainer.compilation_cache_dir)
         prepared = self.prepare()
         stated = prepared.run.objective
         name = trainer.name or (f"{'run' if stated is None else objectives.label(stated.name)}-"
@@ -1554,20 +1577,17 @@ class RunConfig:
         on and the run's directory before the checkpoint is published, as a
         decision run fits its calibration there, so what it writes is published.
         """
-        dataset, validation = fitted(dataset, validation, objective=objective.data(), seed=self.data_seed)
-        self = dataclasses.replace(self, trainer=self.trainer.accumulating(dataset))
+        dataset, validation = self.compiled(objective.data(), dataset, validation)
+        sized, dataset, steps = self.trainer.resolved(dataset)
+        self = dataclasses.replace(self, trainer=sized)
         if self.trainer.quantization is not None:
             quantize_trunk(objective, self.trainer.quantization)
         # The record names the run's directory, so its run.json trains the same run again.
         self = dataclasses.replace(self.recorded(objective),
                                    trainer=dataclasses.replace(self.trainer, name=name))
         trainer = self.trainer
-        # Before the run length, since a ramp reads fewer records a step early
-        # and a pass over the data is that many steps longer.
-        dataset = dataset if trainer.batch_ramp is None else ramped(dataset, trainer.batch_ramp)
         if dataset.plan is not None:
             summary = {**(summary or {}), "data_plan": dataset.plan.record()}
-        steps = trainer.total_steps(dataset)
         tracker = checkpoints = None
         try:
             wandb_tracker = None
@@ -1617,7 +1637,7 @@ class RunConfig:
                 checkpoint_every=trainer.checkpoint_interval(dataset),
                 checkpoint_final=trainer.checkpoint_final,
                 metrics=metrics, preview=trainer.wandb is not None,
-                best=trainer.best_policies(), validation=validation,
+                best=trainer.best_policies(), stop=trainer.stop, validation=validation,
             )
             if after is not None:
                 after(state, checkpoints.directory)

@@ -226,6 +226,31 @@ def test_a_slot_heads_scores_are_the_releases_law_with_its_query_and_key_trained
     assert_as_exact(dew, law, draw, "slot head law", seeds=READOUT_SEEDS)
 
 
+def test_a_slot_head_reads_none_of_the_tokens_its_options_lines_leave_out():
+    """A slot head pools each option's line alone: states that are NaN at every token no line holds
+    and no answer cue reads, as a padded or diverged row's can be, give the logits the finite states
+    give."""
+    head = SlotReadout(32, tuple(label for (label,) in ids()), head_dim=8)
+    decision = model(head)
+    batch = DecisionInputs.collate(rows_of(0), SPECIALS.pad)
+    params = decision.backbone.init(jax.random.key(0), batch.tokens)["params"]
+    rng = np.random.default_rng([0x1481, 0])
+    trained = {"slots": rng.standard_normal((3, 32)).astype(np.float32),
+               "q": rng.standard_normal((8, 32)).astype(np.float32) * 0.2,
+               "k": rng.standard_normal((8, 32)).astype(np.float32) * 0.2}
+    states = np.asarray(decision.states({"params": {"backbone": params, "head": {}}}, batch))
+    positions = np.arange(states.shape[1])
+    spans = np.asarray(batch.option_spans).reshape(states.shape[0], -1, 2)
+    lines = ((positions >= spans[..., :1]) & (positions < spans[..., 1:])).any(axis=1)
+    cues = (positions == np.asarray(batch.readout)[..., None]).any(axis=1)
+    unread = ~(lines | cues)
+    assert unread.any()
+    diverged = np.where(unread[..., None], np.nan, states).astype(states.dtype)
+    finite = head.apply({"params": trained}, jnp.asarray(states), batch)
+    np.testing.assert_array_equal(np.asarray(head.apply({"params": trained}, jnp.asarray(diverged), batch)),
+                                  np.asarray(finite))
+
+
 def padded(batch: DecisionInputs, width: int) -> DecisionInputs:
     """`batch` with its option slots padded to `width`, as a pass rounds them (`shape_bucket`)."""
     more = width - batch.options.shape[-1]

@@ -489,8 +489,11 @@ PLACED = ("src/", "tests/", "tools/", "examples/", "recipes/", "docs/", "tutoria
 """Where a changed file is placed by the records (executed.py): a Python file a test ran, a page or a
 notebook it read, a fixture every key covers (`shared`). A change elsewhere is placed by none, and runs
 the whole suite (`policy`)."""
-PLACED_FILES = ("README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE")
-"""The checkout's own files at its root that tests read as a page is read."""
+PLACED_FILES = ("README.md", "CONTRIBUTING.md", "AGENTS.md", "LICENSE", "CHANGELOG.md")
+"""The checkout's own files at its root that tests read as a page is read, and the changelog, which
+no test reads (test_changelog_merge writes its own) and most heads add an entry to: placed by none,
+it turned the cache off for every train holding such a head, which then ran its whole suite on every
+round (train 149: 30 task-hours, twice)."""
 
 
 def policy(base: str) -> str:

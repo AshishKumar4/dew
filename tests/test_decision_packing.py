@@ -211,7 +211,10 @@ def decided(objective, variables, batch, segments: int):
     return objective.model.logits(variables, laid_out(batch, segments)), gradient(objective, variables, batch)
 
 
-@pytest.mark.parametrize("arm", ["joint", "marker", "parallel"])
+# The joint arm's float64 truth over the seeds its gradients need is numeric work at model size, a GPU's
+# (BIBLE §8): on armada it took 705 s of CPU, the suite's whole critical path; the others take 187 s and 36 s.
+@pytest.mark.parametrize("arm", [pytest.param("joint", marks=pytest.mark.gpu(
+    reason="the joint arm's float64 truth at the seeds it needs")), "marker", "parallel"])
 def test_a_packed_window_decides_each_row_as_the_row_alone(arm):
     """Rows packed into windows (segments, positions restarting per row, spans moved) give each
     question's logits and the parameters' gradients each row gives alone where its window packed it,
@@ -257,15 +260,8 @@ def test_a_bf16_joint_head_on_flash_reads_each_packed_row_alone(without_determin
                              dtype=jnp.bfloat16, attention_impl="flash"),
         loss=LogLoss(), shuffle_options=False)
     head = objective.model.head.clone(dtype=jnp.float64, attention_impl="xla")
-    # A bf16 scalar's gradient is one rounding draw, the extreme-value statistic the RMS rule does
-    # not hold (tests/reference_error.py): the residual gate's ran from 1.2e-4 to 1.1e-3 from
-    # float64 over packed and alone, flash and xla, on an A100. The head's attention projections
-    # carry flash's forward and backward into many entries each.
-    def attending_in_the_head(path: str) -> bool:
-        return "['head']" in path and ("attn" in path or "['attention']" in path)
-
     assert_rows_decided_alone(objective, (objective.model.backbone.clone(dtype=jnp.float64), head),
-                              PACKING_SEEDS["flash"], held=attending_in_the_head)
+                              PACKING_SEEDS["flash"])
 
 
 def asked(batch, logits) -> np.ndarray:
@@ -308,11 +304,11 @@ scorer_out bias, shared by a question's options, and the joint arm's attention k
 each draw twice the work."""
 
 
-def assert_rows_decided_alone(objective, wide_modules, seeds: int, held=lambda path: True) -> None:
+def assert_rows_decided_alone(objective, wide_modules, seeds: int) -> None:
     """Two packed windows of the examples decide each row's questions as the row does alone where its
-    window packed it (`rows_alone`), logits and the gradients of the leaves `held` names (by
-    `jax.tree_util.keystr`) on par with it (check 1) over drawn parameters, the truth `wide_modules`,
-    the backbone and head in float64, over the rows in windows of their own."""
+    window packed it (`rows_alone`), logits and every parameter's gradient on par with it (check 1)
+    over drawn parameters, the truth `wide_modules`, the backbone and head in float64, over the rows
+    in windows of their own."""
     batch = windows(objective, 2)
     assert max(int(segments.max()) for segments in batch["segments"]) > 1, "no window packed two rows"
     # A sequence kernel runs as many documents as the coordinates bound, and a window's padding as one
@@ -325,31 +321,23 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, held=lambda p
     wide.substitute(wide_modules)
     decide = jax.jit(lambda variables, batch: decided(objective, variables, batch, segments))
 
-    def kept(tree):
-        return {name: leaf for name, leaf in ((jax.tree_util.keystr(path), leaf)
-                                              for path, leaf in jax.tree_util.tree_leaves_with_path(tree))
-                if held(name)}
-
     @as_given
     def packed(variables):
         logits, grads = decide(variables, batch)
-        return asked(batch, logits), kept(grads)
+        return asked(batch, logits), grads
 
     @as_given
     def alone(variables):
-        logits, grads = rows_alone(lambda one: decide(variables, one), batch)
-        return logits, kept(grads)
+        return rows_alone(lambda one: decide(variables, one), batch)
 
     @jax.jit
     def apart_in_float64(variables):
-        return (wide.model.logits(variables, laid_out(rows, segments)),
-                kept(gradient(wide, variables, rows)))
+        return wide.model.logits(variables, laid_out(rows, segments)), gradient(wide, variables, rows)
 
     def truth(variables):
         logits, grads = apart_in_float64(variables)
         return np.asarray(logits)[rows["options"]], grads
 
-    assert kept(objective.init(jax.random.key(0))), "no gradient leaf held"
     # A logit sums within its row's window; a parameter's gradient over every window's tokens, in
     # another order than the rows alone.
     initialized = jax.jit(objective.init)

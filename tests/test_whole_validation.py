@@ -83,9 +83,9 @@ def stacked(records: list) -> dict:
 
 
 def wide(tree):
-    """`tree` with every floating leaf in float64."""
+    """`tree` with every floating leaf in float64; a host field, a record's captions, as it is."""
     return jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64)
-                        if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf, tree)
+                        if jnp.issubdtype(np.asarray(leaf).dtype, jnp.floating) else leaf, tree)
 
 
 def moved(tree, seed: int):

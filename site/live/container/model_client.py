@@ -2,7 +2,7 @@
 
 A live cell runs in a small sandboxed process that holds no model weights.
 `install` puts stand-ins for `dew.interop.PretrainedDecoder`,
-`dew.sampling.TextToImage` and the sampling settings the page's cells use in
+`dew.inference.TextToImage` and the sampling settings the page's cells use in
 place of Dew's own modules. Each call goes to the process on the same host that
 loaded the pinned models with those same calls at startup (model_service.py),
 so a cell reads and prints as it would with Dew installed. Any other Dew module
@@ -208,9 +208,12 @@ def install():
     dew.__path__, dew.__getattr__ = [], absent
     interop = types.ModuleType("dew.interop", __doc__)
     interop.PretrainedDecoder = PretrainedDecoder
+    inference = types.ModuleType("dew.inference", __doc__)
+    inference.TextToImage = TextToImage
     sampling = types.ModuleType("dew.sampling", __doc__)
-    for value in (CFG, DPMSolverMultistep, EulerAncestral, Heun, Sampling, TextToImage):
+    for value in (CFG, DPMSolverMultistep, EulerAncestral, Heun, Sampling):
         setattr(sampling, value.__name__, value)
-    dew.interop, dew.sampling = interop, sampling
-    sys.modules.update({"dew": dew, "dew.interop": interop, "dew.sampling": sampling})
+    dew.inference, dew.interop, dew.sampling = inference, interop, sampling
+    sys.modules.update({"dew": dew, "dew.inference": inference, "dew.interop": interop,
+                        "dew.sampling": sampling})
     sys.meta_path.insert(0, Elsewhere())
