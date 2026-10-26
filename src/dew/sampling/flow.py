@@ -140,69 +140,91 @@ def _split(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     return _scaled(x, -exponent), exponent
 
 
-def _rows(x: jax.Array, like: jax.Array) -> jax.Array:
-    """A per-row `x` `[B]` shaped to broadcast against `like` `[B, ...]`."""
-    return jnp.reshape(x, x.shape + (1,) * (like.ndim - x.ndim))
+Split = tuple[jax.Array, jax.Array]
+"""A value as a quotient and the power of two it is restored by (`_quotient`)."""
 
 
-def _subtracted(left: jax.Array, right: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`left - right` per row as a value and a power, `(left - right) = value * 2**power`: both over
-    their rows' largest power of two before the subtraction, so a difference past float32's largest
-    (`2**127 - -2**127`) or below its least (two neighbouring tiny means) is formed in range."""
-    axes = tuple(range(1, left.ndim))
-    power = jnp.maximum(jnp.max(_exponent(left), axis=axes), jnp.max(_exponent(right), axis=axes))
-    return _scaled(left, -_rows(power, left)) - _scaled(right, -_rows(power, right)), power
+def _shift(top: jax.Array, headroom: int = 0) -> jax.Array:
+    """The power of two values whose largest exponent is `top` are taken down by so their arithmetic
+    stays in float32's normal range, `headroom` exponents above it kept for growth: down only by what
+    overflow requires where they reach float32's largest, so every value a plain computation keeps is
+    kept; up to their largest's own exponent where they lie below 2**-63, so what a plain computation
+    would flush is kept, and nothing it keeps is lost; and none in between, where the computation is
+    the plain one."""
+    return jnp.where(top + headroom > 126, top + headroom - 126, jnp.where(top < -63, top, 0))
 
 
-def _contracted(left: jax.Array, right: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`sum(left * right)` over each row as a value and a power: each product formed from the two
-    significands (`_split`) with its own exponent, the row's terms aligned to its largest before they
-    sum, so a small coordinate's product does not flush beside a large one's and cancelling terms
-    cancel before anything is restored."""
-    axes = tuple(range(1, left.ndim))
+def _differences(left: jax.Array, right: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`left - right` per coordinate as values and shifts, `(left - right) = values * 2**shifts`: the
+    plain subtraction, a coordinate's two operands shifted first as `_shift` asks (`2**127 - -2**127`,
+    two neighbouring tiny values), so every coordinate a plain subtraction holds is that subtraction
+    and no other coordinate moves."""
+    shift = _shift(jnp.maximum(_exponent(left), _exponent(right)))
+    return _scaled(left, -shift) - _scaled(right, -shift), shift
+
+
+def _summed_products(left: jax.Array, left_shift: jax.Array, right: jax.Array,
+                     right_shift: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`sum(left * 2**left_shift * right * 2**right_shift)` over each row as a value and a power: each
+    product the plain product of the two values (their significands', `_split`, which rounds as it
+    does), the row's products shifted together as `_shift` asks for its largest and their sum,
+    summed plainly: every term a plain float32 sum keeps, it keeps
+    (`[2**120, -2**120, 2**-100]` sums to `2**-100`), and a row no product of which overflows is the
+    plain sum."""
     (left_part, left_power), (right_part, right_power) = _split(left), _split(right)
-    products, powers = left_part * right_part, left_power + right_power
-    top = jnp.max(jnp.where(products != 0, powers, FLOOR), axis=axes)
-    return _scaled(products, powers - _rows(top, powers)).sum(axis=axes), top
+    products = left_part * right_part
+    powers = jnp.where(products != 0, left_power + right_power + left_shift + right_shift, FLOOR)
+    count = math.prod(left.shape[1:])
+    top = jnp.max(powers, axis=tuple(range(1, left.ndim)))
+    excess = _shift(top, 2 + math.ceil(math.log2(max(count, 1))))
+    return _scaled(products, powers - expand(excess, powers)).sum(axis=tuple(range(1, left.ndim))), excess
 
 
-def _combined(left: jax.Array, left_power: jax.Array, right: jax.Array, right_power: jax.Array) -> jax.Array:
-    """`left * 2**left_power + right * 2**right_power`, aligned to the larger power before the sum and
-    restored once, so two terms past float32's range whose sum is in it (`inf - inf`), or two below
-    its least whose sum is not, give their sum."""
-    left_power = jnp.where(left != 0, left_power, FLOOR)
-    right_power = jnp.where(right != 0, right_power, FLOOR)
-    power = jnp.maximum(left_power, right_power)
-    return _scaled(_scaled(left, left_power - power) + _scaled(right, right_power - power), power)
+def _quotient(numerator: jax.Array, power: jax.Array, divisor: jax.Array) -> Split:
+    """`numerator * 2**power / divisor`, per row, as a quotient and its power: the significands'
+    quotient (`_split`), in (1/2, 2), which rounds as the plain division does wherever that is a
+    normal number, and the exponents' difference, restored once by whoever reads it (`_scaled`)."""
+    (top, top_power), (bottom, bottom_power) = _split(numerator), _split(divisor)
+    return top / bottom, top_power + power - bottom_power
+
+
+def _sum(left: Split, right: Split) -> jax.Array:
+    """`left + right`, two values given as quotients and powers (`_quotient`), the plain sum of the two
+    restored values, both shifted first as `_shift` asks for the larger and their sum, and restored
+    once."""
+    (left_value, left_power), (right_value, right_power) = left, right
+    top = jnp.maximum(jnp.where(left_value != 0, left_power + _exponent(left_value), FLOOR),
+                      jnp.where(right_value != 0, right_power + _exponent(right_value), FLOOR))
+    shift = _shift(top, 1)
+    return _scaled(_scaled(left_value, left_power - shift) + _scaled(right_value, right_power - shift), shift)
 
 
 def _divergence_parts(mean: jax.Array, reference: jax.Array, variance: jax.Array):
-    """The scaled parts of `|mean - reference|**2 / (2 variance)` (`_divergence`): the difference and
-    its power (`_subtracted`), the variance's significand and exponent (`_split`), and the KL's
-    quotient and power, `KL = quotient * 2**power`, the quotient below `4n`."""
-    difference, shift = _subtracted(mean, reference)
-    level, spread = _split(variance)
-    quotient = jnp.square(difference).sum(axis=tuple(range(1, mean.ndim))) / level
-    return difference, shift, level, spread, quotient, 2 * shift - spread - 1
+    """The parts of `|mean - reference|**2 / (2 variance)` (`_divergence`): the differences and their
+    shifts (`_differences`), and the KL as a quotient and its power (`_quotient`), the half in its power."""
+    difference, shift = _differences(mean, reference)
+    error, excess = _summed_products(difference, shift, difference, shift)
+    return difference, shift, _quotient(error, excess - 1, variance)
 
 
 def _divergence(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> jax.Array:
-    """`|mean - reference|**2 / (2 variance)`, one row a `variance`, every difference, product and
-    quotient formed from operands over powers of two and the power restored once at the end
-    (`_scaled`), so no step leaves float32's range where the KL keeps it: an error near float32's least
-    over a variance as small (a KL of 0.5 where half the error flushed to zero), a squared difference
-    past its largest over a variance as wide. A KL within a rounding of float32's least normal may round
-    below it, which XLA:CPU flushes. Its derivatives are `_gaussian_kl`'s."""
-    *_, quotient, power = _divergence_parts(mean, reference, variance)
+    """`|mean - reference|**2 / (2 variance)`, one row a `variance`: the plain float32 formula wherever it
+    stays below float32's largest, bit for bit in a normal result, and elsewhere the same arithmetic
+    with its operands taken down by only what keeps it in range and the power restored once at the
+    end (`_scaled`): a squared difference past float32's largest over a variance as wide, or a
+    variance whose double overflows; and taken up where every value lies below 2**-63, so it keeps
+    what the plain formula would flush (`_shift`). It keeps every term the plain formula keeps. Its
+    derivatives are `_gaussian_kl`'s."""
+    *_, (quotient, power) = _divergence_parts(mean, reference, variance)
     return _scaled(quotient, power)
 
 
 @jax.custom_jvp
 def _directional(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> jax.Array:
-    """`_divergence`, whose forward mode forms `sum(d * (t_mean - t_reference)) / v - KL * t_v / v` as
-    the KL is formed: the tangents' difference in range (`_subtracted`), its contraction against the
-    difference product by product (`_contracted`), the variance's term from the KL's quotient, and the
-    two terms joined before their power is restored (`_combined`). Its tangent reads the tangents'
+    """`_divergence`, whose forward mode is the plain `sum(d * (t_mean - t_reference)) / v - KL * t_v /
+    v` formed as the KL is: the tangents' difference (`_differences`), its sum of products against the
+    difference (`_summed_products`), each quotient as its significands' (`_quotient`), and the two terms
+    joined (`_sum`), each taken down only by what keeps it in range. Its tangent reads the tangents'
     exponents, so it is forward mode alone: reverse mode is `_kl_pullback`'s (`linear_tangent`), and a
     derivative of the reverse mode in forward mode is not defined."""
     return _divergence(mean, reference, variance)
@@ -210,28 +232,30 @@ def _directional(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> 
 
 @_directional.defjvp
 def _directional_jvp(primals, tangents):
-    """`_directional`'s tangent, every product and quotient of scaled operands, its power restored once."""
+    """`_directional`'s tangent, the plain formula's, each step taken down only where it would overflow."""
     mean_tangent, reference_tangent, variance_tangent = tangents
-    difference, shift, level, spread, quotient, power = _divergence_parts(*primals)
-    moving, moving_shift = _subtracted(mean_tangent, reference_tangent)
-    along, along_power = _contracted(difference, moving)
+    difference, shift, (quotient, power) = _divergence_parts(*primals)
+    along, excess = _summed_products(difference, shift, *_differences(mean_tangent, reference_tangent))
     stretch, stretch_power = _split(variance_tangent)
-    moved = _combined(along / level, along_power + shift + moving_shift - spread,
-                      -(quotient * stretch / level), power + stretch_power - spread)
+    variance_term = _quotient(-(quotient * stretch), power + stretch_power, primals[2])
+    moved = _sum(_quotient(along, excess, primals[2]), variance_term)
     return _scaled(quotient, power), moved
 
 
 def _kl_pullback(saved, operands, cotangent):
-    """The KL's reverse mode: each element's `cotangent * (mean - reference) / variance` from the
-    cotangent's, that element's and the variance's significands with their exponents added, the
-    reference's its negation, and the variance's `-cotangent * KL / variance` from the KL's quotient,
-    each power restored once (`_scaled`)."""
+    """The KL's reverse mode, the plain formula's: each element's `cotangent * (mean - reference) /
+    variance`, the reference's its negation, and the variance's `-cotangent * KL / variance`, each product
+    of significands (`_split`) with its exponents added, each quotient as its significands' (`_quotient`),
+    and each power restored once (`_scaled`)."""
     del saved
-    difference, shift, level, spread, quotient, power = _divergence_parts(*operands)
+    difference, shift, (quotient, power) = _divergence_parts(*operands)
+    variance = operands[2]
     (scale, scale_power), (part, part_power) = _split(cotangent), _split(difference)
-    pulled = _scaled(_rows(scale / level, part) * part,
-                     _rows(scale_power + shift - spread, part) + part_power)
-    return pulled, -pulled, -_scaled(scale * quotient / level, scale_power + power - spread)
+    level, spread = _split(variance)
+    pulled = _scaled(expand(scale / level, part) * part,
+                     expand(scale_power - spread, part) + part_power + shift)
+    to_variance = _quotient(-(scale * quotient), scale_power + power, variance)
+    return pulled, -pulled, _scaled(*to_variance)
 
 
 def _measured(mean: jax.Array, reference: jax.Array, variance: jax.Array) -> tuple[jax.Array, tuple]:
