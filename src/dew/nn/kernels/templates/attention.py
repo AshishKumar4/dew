@@ -580,9 +580,11 @@ class Draw:
         every mainloop and the reference share, each taking its own scale for a kept entry. Where the draw
         holds the call's global `queries` and `keys` (a sequence exchange's slice, `DropPlaces`), the indices
         are local and read their global places there."""
-        if self.queries is not None:
+        # A padded tile's places past a table read its fill, and an empty table (a slice of no queries or
+        # keys) is read at no place: no real entry draws there.
+        if self.queries is not None and self.queries.shape[0]:
             queries = jnp.take(self.queries, queries)
-        if self.keys is not None:
+        if self.keys is not None and self.keys.shape[0]:
             keys = jnp.take(self.keys, keys)
         word = fmix32(self.seed[0] ^ jnp.uint32(DROP_DOMAIN))
         for part in (self.seed[1], self.row, self.head, queries):
