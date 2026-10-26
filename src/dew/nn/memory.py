@@ -345,22 +345,22 @@ class InContextMemory(nn.Module):
         wide = at_least_fp32(self.dtype)
         heads = []
         for network in networks:
-            variables = decoded_frozen_fp8(dict(nn.meta.unbox(network.variables)))
+            variables = dict(decoded_frozen_fp8(dict(nn.meta.unbox(network.variables))))
             flat = traverse_util.flatten_dict(dict(variables.pop("params", {})))
-            served = sorted("/".join(path) for path, leaf in flat.items()
-                            if not isinstance(leaf, jax.Array | np.ndarray))
-            if served:
-                raise QuantizedServingRefused("/".join(network.path), served)
-            unknown = sorted(set(self.slow) - {path[0] for path in flat})
+            weights = {path: leaf for path, leaf in flat.items() if isinstance(leaf, jax.Array | np.ndarray)}
+            if len(weights) < len(flat):
+                raise QuantizedServingRefused("/".join(network.path),
+                                              sorted("/".join(path) for path in flat.keys() - weights.keys()))
+            unknown = sorted(set(self.slow) - {path[0] for path in weights})
             if unknown:
                 raise ValueError(f"slow names {unknown}, which are none of the network's parameters "
-                                 f"{sorted({path[0] for path in flat})}")
-            held = {path for path in flat if path[0] in self.slow or path[-1] == ADAPTER_A}
+                                 f"{sorted({path[0] for path in weights})}")
+            held = {path for path in weights if path[0] in self.slow or path[-1] == ADAPTER_A}
             heads.append(_Head(
                 network,
-                traverse_util.unflatten_dict({path: flat[path].astype(wide) for path in held}),
+                traverse_util.unflatten_dict({path: weights[path].astype(wide) for path in held}),
                 variables,
-                traverse_util.unflatten_dict({path: leaf.astype(wide) for path, leaf in flat.items()
+                traverse_util.unflatten_dict({path: leaf.astype(wide) for path, leaf in weights.items()
                                               if path not in held})))
         return tuple(heads)
 
@@ -539,8 +539,8 @@ class InContextMemory(nn.Module):
             dtype = self.dtype or x.dtype
             params = jax.tree.map(lambda leaf: leaf.astype(dtype) if self.dtype is not None else leaf, params)
             x = x.astype(dtype)
-        rngs = {} if keys is None else {name: jax.random.fold_in(jax.random.wrap_key_data(data), use)
-                                        for name, data in keys.items()}
+        rngs = {} if keys is None else {name: jax.random.fold_in(jax.random.wrap_key_data(key), use)
+                                        for name, key in keys.items()}
         out = _substituted(head.network, {**head.collections, "params": params}, rngs, x)
         if not isinstance(out, jax.Array):
             raise TypeError(f"an in-context memory's network maps a vector to one, got {type(out).__name__}")
@@ -794,7 +794,7 @@ def _within(values: jax.Array, begins: jax.Array) -> jax.Array:
 
 def _at(keys: dict[str, jax.Array] | None, head: int, axis: int) -> dict[str, jax.Array] | None:
     """Each stream's key data in `keys` at head `head` of its `axis`; None stays None."""
-    return None if keys is None else {name: jnp.take(data, head, axis=axis) for name, data in keys.items()}
+    return None if keys is None else {name: jnp.take(key, head, axis=axis) for name, key in keys.items()}
 
 
 def _joined(held: dict, moving: dict) -> dict:
