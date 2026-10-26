@@ -295,14 +295,15 @@ def live_registers(family: "Family", carried, *phases) -> int:
     return int(-(-(words(carried) + phase) // THREADS)) + family.held_registers
 
 
-def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int], dtype) -> int:
+def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int], dtype, *,
+                   transposed: bool = False) -> int:
     """The registers a consumer thread holds at a `(rows, columns, depth)` GEMM tile of `consumers` roles
     of `family` (`live_registers`): its share of the fp32 accumulator carried, and a step's operand
     fragments where its products read registers (`Family.operands_in_registers`; the right operand's in
     each of its replicating warps: `lhs_copies`, `rhs_copies`), the right one's a sub-step deep where
-    it loads it so (`Family.fragment_depth`)."""
+    it loads it so (`Family.fragment_depth`) but a `transposed` one, which it loads a step deep."""
     rows, columns, depth = block
-    share, sub = rows // consumers, family.fragment_depth(depth)
+    share, sub = rows // consumers, depth if transposed else family.fragment_depth(depth)
     fragments = ([(share * family.lhs_copies, depth, dtype), (sub, columns * family.rhs_copies, dtype)]
                  if family.operands_in_registers else [])
     return live_registers(family, [(share, columns, jnp.float32)], fragments)
