@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER, decode_steps, model_draw, with_logit_cotangent
-from reference_error import assert_as_exact, torch_with_gradients, with_gradients
+from reference_error import assert_as_exact, torch_with_gradients, widened, with_gradients, without_ynn
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -49,7 +49,7 @@ SEEDS = {'decode': 16, 'kernels': 16, 'window kernels': 8, 'softcap': 32, 'route
          'grouped': 32, 'sliding decode': 16, 'hybrid decode': 512, 'sandwich': 8, 'packed alone': 16,
          'metadata': 128, 'packed kernels': 16, 'bf16 head': 8, 'strict head': 8, 'norm gradient': 8,
          'xsa': 32, 'xsa decode': 8, 'grouped decode': 32, 'cached prefill': 8, 'packed cudnn': 8,
-         'cudnn decode': 16, 'padded prefill': 8, 'right padded': 16, 'rotary': 8}
+         'cudnn decode': 16, 'padded prefill': 8, 'right padded': 16, 'rotary': 8, 'old record': 64}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, and the GPU
 sites on an A100): the most any of a site's cases took."""
 
@@ -147,7 +147,12 @@ def test_attention_dropout_reaches_local_and_grouped_heads(rng, geometry):
     assert np.asarray(evaluated).tobytes() == np.asarray(baseline).tobytes()
 
 
-def test_old_decoder_record_keeps_zero_dropout_and_bitwise_outputs():
+def test_old_decoder_record_keeps_zero_dropout_and_computes_its_export():
+    """A decoder record from before dropout builds with every rate zero and computes what its
+    serialized pre-dropout forward and gradient compute: the export run as serialized is check 1's
+    reference, and the same pre-dropout program exported in float64 from the same source its truth,
+    over the export's own weights and drawn ids (the two are different programs, which no bits
+    bind)."""
     from flax.traverse_util import unflatten_dict
     from jax import export
 
@@ -161,23 +166,35 @@ def test_old_decoder_record_keeps_zero_dropout_and_bitwise_outputs():
     assert model.embedding_dropout_rate == model.attention_dropout_rate == 0
     directory = Path(__file__).with_name("fixtures")
     held = np.load(directory / "decoder-default-dropout.npz")
-    try:
-        before = export.deserialize((directory / "decoder-default-dropout.jaxexport").read_bytes())
-    except Exception as error:
-        pytest.fail(f"cannot deserialize the pre-dropout forward/gradient export: {error}")
-    with jax.default_device(jax.devices("cpu")[0]):
-        ids = jnp.asarray(held["ids"])
-        params = unflatten_dict({tuple(name.split("/")[1:]): jnp.asarray(leaf)
-                                 for name, leaf in held.items() if name.startswith("params/")})
+    before, wide = (export.deserialize((directory / f"decoder-default-dropout{suffix}.jaxexport")
+                                       .read_bytes()) for suffix in ("", "-float64"))
+    cpu = jax.devices("cpu")[0]
+    params = unflatten_dict({tuple(name.split("/")[1:]): np.asarray(leaf)
+                             for name, leaf in held.items() if name.startswith("params/")})
+    with jax.default_device(cpu):
+        assert jax.tree.structure(jax.jit(forward_and_gradient(model))(params, held["ids"])) == \
+            jax.tree.structure(before.call(params, held["ids"]))
+    # The two arms are two Dew programs, compiled alike (testing.md: both without YNNPACK's fusions).
+    current, exported = without_ynn(forward_and_gradient(model)), without_ynn(before.call)
 
-        expected = before.call(params, ids)
-        # The export's bits are XLA's fp32 sums, which `before.call` runs as serialized; the model
-        # states those sums (`FP32_SUMS`) to be held to them bit for bit.
-        with jax.default_matmul_precision(FP32_SUMS):
-            actual = jax.jit(forward_and_gradient(model))(params, ids)
-        assert jax.tree.structure(actual) == jax.tree.structure(expected)
-        for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
-            assert np.asarray(left).tobytes() == np.asarray(right).tobytes()
+    def draw(seed):
+        ids = np.random.default_rng([0x0D, seed]).integers(0, 17, held["ids"].shape)
+        return (ids.astype(held["ids"].dtype),)
+
+    def ours(ids):
+        with jax.default_device(cpu), jax.default_matmul_precision(FP32_SUMS):
+            return jax.device_get(current(params, ids))
+
+    def theirs(ids):
+        with jax.default_device(cpu):
+            return jax.device_get(exported(params, ids))
+
+    def truth(ids):
+        with jax.enable_x64(new_val=True), jax.default_device(cpu):
+            return jax.device_get(wide.call(widened(params), ids))
+
+    assert_as_exact(ours, theirs, draw, "an old record against its export", seeds=SEEDS["old record"],
+                    truth_fn=truth)
 
 
 def flax_with_keep(query, value, mask, rng, rate: float) -> jax.Array:
