@@ -720,7 +720,8 @@ def test_a_continuum_level_composes_with_the_scan_the_ladder_and_the_cache():
         return lambda variables, drawn, _: model.apply(variables, drawn)
 
     assert_as_exact(jax.jit(decoded(plain)), jax.jit(whole(plain)), draw,
-                    "a continuum decoder's cached decode", seeds=CONTINUUM_SEEDS, truth_fn=whole(_float64(plain)))
+                    "a continuum decoder's cached decode", seeds=CONTINUUM_SEEDS,
+                    truth_fn=whole(_float64(plain)))
 
 
 RECOMPUTED = [case for case in ARCHITECTURES

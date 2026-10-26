@@ -19,6 +19,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.activations import activation
 from dew.nn.dense import Dense
+from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import logical_axes
 
 
@@ -54,4 +55,6 @@ class Continuum(nn.Module):
                      name="down")
         up = Dense(x.shape[-1], use_bias=False, dtype=self.dtype, precision=self.precision, name="up",
                    kernel_init=nn.initializers.zeros_init())
-        return x + up(activation(self.level.activation)(down(x))).astype(x.dtype)
+        # The residual sums in at least fp32 and rounds once to the states' dtype, the head's input.
+        wide = at_least_fp32(x.dtype)
+        return (x.astype(wide) + up(activation(self.level.activation)(down(x))).astype(wide)).astype(x.dtype)
