@@ -554,8 +554,7 @@ class InContextMemory(nn.Module):
         begins, continued = _documents(steps)
         share = (_within(jnp.where(real[..., None], log_kept, 0.0), begins)
                  + jnp.where(continued[..., None], kept[:, None], 0.0))
-        rows = tuple(_with_kernel(jax.tree.map(functools.partial(_scaled_rows, jnp.exp(kept[:, index])),
-                                               _rows(head.initial, real)), held[:, index])
+        rows = tuple(_weights_from(head.initial, held[:, index], jnp.exp(kept[:, index]), real)
                      for index, head in enumerate(heads))
         reads, (_, state, _) = self._stepped(heads, steps._replace(places=steps.places + continued),
                                              (rows, rows, jax.tree.map(jnp.zeros_like, rows)))
@@ -853,18 +852,15 @@ LINEAR_KERNEL = ("kernel", "kernel")
 
 def _kernel(weights: dict) -> jax.Array:
     """A linear memory head's matrix in its `weights`."""
-    return traverse_util.flatten_dict(weights)[LINEAR_KERNEL]
+    return jnp.asarray(traverse_util.flatten_dict(weights)[LINEAR_KERNEL])
 
 
-def _with_kernel(weights: dict, offset: jax.Array) -> dict:
-    """A linear memory head's `weights` with `offset` added to its matrix."""
-    flat = traverse_util.flatten_dict(weights)
-    return traverse_util.unflatten_dict({**flat, LINEAR_KERNEL: flat[LINEAR_KERNEL] + offset})
-
-
-def _scaled_rows(scale: jax.Array, leaf: jax.Array) -> jax.Array:
-    """A head's leaf `[B, ...]` times its rows' scalars `[B]`."""
-    return _lead(scale, leaf) * leaf
+def _weights_from(initial: dict, state: jax.Array, share: jax.Array, real: jax.Array) -> dict:
+    """A linear memory head's weights `[B, ...]` from the recurrence's state `[B, F, F]` and W_0's kept
+    share `[B]`: W_0's every leaf times the share, the state added to its matrix (`LINEAR_KERNEL`)."""
+    rows = _rows(initial, real)
+    kept = traverse_util.flatten_dict(jax.tree.map(lambda leaf: _lead(share, leaf) * leaf, rows))
+    return traverse_util.unflatten_dict({**kept, LINEAR_KERNEL: jnp.asarray(kept[LINEAR_KERNEL]) + state})
 
 
 def _momentum_step(mu: jax.Array, theta: jax.Array, momentum: jax.Array, gradient: jax.Array) -> jax.Array:
