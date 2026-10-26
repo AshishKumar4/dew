@@ -1,4 +1,5 @@
-from dew.sampling import CFG, DPMSolverMultistep, TextToImage
+from dew.inference import TextToImage
+from dew.sampling import CFG, DPMSolverMultistep
 
 pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", revision="8d891d967319e51cd0e73d3e5b7c29d68a238b52")
 prompt = "the northern lights over a frozen lake at night, vivid colors, dramatic lighting, highly detailed"
