@@ -33,6 +33,7 @@ from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.config import MetricConfig, ModelConfig, ObjectiveConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader
+from dew.data.images import CAPTIONS
 from dew.diffusion import presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention import Stage
@@ -201,15 +202,16 @@ CASES = [
                     "bias": True, "expert_features": 16, "shared_features": 16},
         "num_nextn_predict_layers": 1,
     }, seq_len=SEQ_LEN, label="glm4_moe"),
-    # Llama 4's stack at toy width: chunked rotated layers around a global
-    # layer under the llama4 kind, the routed layers scaling their inputs.
+    # Llama 4's stack at toy width: chunked rotated layers, adjacent pairs under the weightless L2
+    # norm, around a global layer without positions tuning its temperature; the routed layers scale
+    # their inputs.
     Case("causal_transformer", {
         **LM, "head_dim": 8, "qk_norm": False,
         "layer_types": ("chunked_attention", "full_attention"),
-        "kinds": {"chunked_attention": {"chunk": 4, "mixer": {
-                      "class": "llama4", "fields": {"use_rope": True, "floor_scale": 4.0}}},
-                  "full_attention": {"mixer": {"class": "llama4", "fields": {"use_rope": False,
-                                               "floor_scale": 4.0}}}},
+        "kinds": {"chunked_attention": {"chunk": 4, "qk_norm": True, "mixer": {
+                      "class": "attention", "fields": {"rotary_pairs": "adjacent", "qk_norm_weight": False}}},
+                  "full_attention": {"mixer": {"class": "attention", "fields": {
+                      "nope": True, "temperature_tuning": (4.0, 0.1)}}}},
         "mixture": {"experts": 8, "top_k": 1, "layers": (1,), "score_function": "sigmoid",
                     "norm_topk_prob": False, "scale_inputs": True, "expert_features": 16,
                     "shared_features": 16},
@@ -569,17 +571,25 @@ def test_a_residual_order_is_the_same_decoder(case):
 LAYOUTS = {"8x1 data": 1, "2x4 fsdp": 4}
 """Each layout a cell trains on, by its fsdp width over every device."""
 
+LAYOUT_STEPS = (((1, "8x1 data"), (2, "2x4 fsdp")), ((1, "2x4 fsdp"), (2, "8x1 data")))
+"""The pairs of step count and layout a case trains, alternating by case: each case meets each step
+count and each layout, and each step count meets each layout over the cases, as testing.md's
+settings pairwise asks."""
 
-@pytest.mark.parametrize("layout", tuple(LAYOUTS), ids=("data", "fsdp"))
-@pytest.mark.parametrize("steps", (1, 2), ids=("1-step", "2-steps"))
-@pytest.mark.parametrize("case", CASES, ids=IDS)
+LAYOUT_CELLS = [(case, steps, layout) for index, case in enumerate(CASES)
+                for steps, layout in LAYOUT_STEPS[index % 2]]
+
+
+@pytest.mark.parametrize(("case", "steps", "layout"), LAYOUT_CELLS,
+                         ids=[f"{case.name}-{steps}-step{'s' * (steps > 1)}-{layout.split()[1]}"
+                              for case, steps, layout in LAYOUT_CELLS])
 def test_architecture_trains_on_every_layout_as_on_one_device(case, steps, layout, tmp_path):
     """One device and a layout, 8x1 data parallelism (every parameter
     replicated, the batch split across every device) or 2x4 fsdp (the
     parameter tree split four ways, the optimizer's state and the EMA with
     it), train the same steps from the same state: after `steps` steps (one,
-    and two, each layout and step count its own test, so none runs another's
-    fits and draws), the layout's variables, momentum and EMA are as near a
+    or two, each case training each layout once and each step count once,
+    `LAYOUT_STEPS`), the layout's variables, momentum and EMA are as near a
     float64 run as one device's are, over the cell's declared batches (check
     1, `assert_as_exact`), so
     their summing a batch's rows and positions in other orders is the only
@@ -713,7 +723,7 @@ def test_a_val_metric_records_its_own_constructors_defaults():
     back. A run's metrics are such records, so a bare alias in their place is refused where the
     run is written: in its record, on its command line and in its fields."""
     clip = MetricConfig("clip")
-    assert clip.defaults == {"modelname": CLIP_CHECKPOINT, "field": "text"}
+    assert clip.defaults == {"modelname": CLIP_CHECKPOINT, "field": CAPTIONS}
     assert from_record(MetricConfig, to_record(clip, MetricConfig)) == clip
     run = unet_run(JSON_UNET)
     with pytest.raises(TypeError):

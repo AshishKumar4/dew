@@ -14,7 +14,7 @@ import numpy as np
 import optax
 
 from dew.config import OptimConfig
-from dew.optim import Cosine, Exponential, OneCycle, ParamGroup
+from dew.optim import Cosine, Exponential, OneCycle, ParamGroup, stepped
 
 TORCH = np.load(Path(__file__).resolve().parent / "fixtures" / "torch_optim" / "reference.npz")
 EPOCHS, PER_EPOCH = 6, 2
@@ -67,15 +67,15 @@ def test_cosine_without_warmup_is_torchs_cosine_annealing():
 
 def test_every_holds_each_value_for_an_epoch_as_a_torch_scheduler_stepped_per_epoch():
     """A run of 40 epochs of 3 updates reads epoch e's value at each of its updates."""
-    stepped = values(OneCycle(peak_value=5e-3, every=3), 40 * 3)
-    np.testing.assert_allclose(stepped, np.repeat(TORCH["one_cycle/lr"], 3), rtol=SCHEDULE_RTOL,
+    held = values(OneCycle(peak_value=5e-3, every=3), 40 * 3)
+    np.testing.assert_allclose(held, np.repeat(TORCH["one_cycle/lr"], 3), rtol=SCHEDULE_RTOL,
                                atol=ULPS * 5e-3)
 
 
 def test_every_counts_the_schedules_fields_in_its_own_steps():
     """`decay_steps` counts epochs: the decay ends after 10 epochs of 4 updates."""
-    stepped = values(Exponential(init_value=12.0, end_value=0.23, decay_steps=10, every=4), 16 * 4)
-    np.testing.assert_allclose(stepped, np.repeat(TORCH["exponential/lr"], 4), rtol=SCHEDULE_RTOL)
+    held = values(Exponential(init_value=12.0, end_value=0.23, decay_steps=10, every=4), 16 * 4)
+    np.testing.assert_allclose(held, np.repeat(TORCH["exponential/lr"], 4), rtol=SCHEDULE_RTOL)
 
 
 def snn_delays_config() -> OptimConfig:
@@ -97,8 +97,9 @@ def run(solver: optax.GradientTransformation, initial, grads) -> dict[str, list[
     update = jax.jit(solver.update)
     trace: dict[str, list[jax.Array]] = {name: [] for name in params}
     for step in range(len(grads["kernel"])):
-        updates, state = update({name: grads[name][step] for name in params}, state, params)
-        params = optax.apply_updates(params, updates)
+        updates, after = update({name: grads[name][step] for name in params}, state, params)
+        # A bounded group's clamp acts on the stepped weights (`stepped`).
+        params, state = stepped(params, updates, state, after), after
         for name, value in params.items():
             trace[name].append(value)
     return trace
@@ -139,7 +140,9 @@ def test_a_bounded_group_clamps_its_parameters_and_no_others():
         ParamGroup("delays", ("delay",), bounds=(0.0, 3.0)), ParamGroup("rest", ("*",))))
     solver = config.build(1)
     grads = {"delay": jnp.asarray([1.0, -1.0]), "kernel": jnp.asarray([1.0, -1.0])}
-    updates, _ = solver.update(grads, solver.init(params), params)
-    stepped = optax.apply_updates(params, updates)
-    np.testing.assert_allclose(stepped["delay"], [0.0, 3.0], atol=1e-7)
-    np.testing.assert_allclose(stepped["kernel"], [-0.45, 3.45], rtol=1e-5)
+    initial = solver.init(params)
+    updates, state = solver.update(grads, initial, params)
+    moved = stepped(params, updates, initial, state)
+    # The clamp is exact: the bounds themselves, where the step overshot them.
+    np.testing.assert_array_equal(moved["delay"], [0.0, 3.0])
+    np.testing.assert_allclose(moved["kernel"], [-0.45, 3.45], rtol=1e-5)

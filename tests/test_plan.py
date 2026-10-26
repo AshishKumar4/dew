@@ -122,19 +122,20 @@ def test_the_fit_ladder_tiles_the_head_fused_then_unfused_before_it_recomputes_m
         return LMObjective(model, seq_len=SEQ)
 
     climbing = objective()
-    rungs = [rung_record(climbing, xla_defaults=False)]
+    rungs = [rung_record(climbing, xla_defaults=False, narrow=True)]
     while len(rungs) < 5 and recompute_more(climbing):
-        rungs.append(rung_record(climbing, xla_defaults=False))
+        rungs.append(rung_record(climbing, xla_defaults=False, narrow=True))
     tile = list(chunked_tile())
     assert [(rung["head_tile"], rung["head_fused"], rung["remat"]) for rung in rungs] == [
         (None, False, None), (tile, True, None), (tile, False, None), (None, False, "minimal"),
         (tile, True, "minimal")]
     resumed = objective()
     climb_to(resumed, rungs[2])
-    assert rung_record(resumed, xla_defaults=False) == rungs[2]
+    assert rung_record(resumed, xla_defaults=False, narrow=True) == rungs[2]
     # A head put back whole, as a new shape starts from the run's own rung, tiles fused again.
     resumed.restore_head(None, fused=False)
-    assert resumed.tile_head() is not None and rung_record(resumed, xla_defaults=False)["head_fused"]
+    assert resumed.tile_head() is not None
+    assert rung_record(resumed, xla_defaults=False, narrow=True)["head_fused"]
 
 
 def test_a_microbatch_is_every_splitth_row():
@@ -400,6 +401,33 @@ def test_a_split_plan_is_timed_against_its_batch_whole_a_rung_up_and_the_faster_
         (2, None, seconds[0]), (1, "minimal", seconds[1])]
     state, loss, *_ = step(state, BATCH)
     assert np.isfinite(float(loss))
+
+
+@pytest.mark.mesh(devices=2)
+def test_a_plan_over_two_accelerators_that_fits_whole_is_timed_against_its_batch_whole_a_rung_up(monkeypatch):
+    """Over two accelerators a plan that fits the batch whole without recomputing is timed against the
+    batch whole one rung up too, whose freed memory lets the scheduler overlap the collectives, and the
+    faster is kept. A CPU's collectives are its host's copies, nothing to overlap: over two CPU devices
+    the plan is not timed, so a run over several compiles one device's steps (test_architectures' layout
+    cells, whose drawn steps are fit's own, bit for bit). On one device the plan is never timed."""
+    free(monkeypatch, LIMIT)
+    trainer = lm()
+    trainer.device_mesh = MeshSpec().build(jax.devices()[:2])
+    state, _, _ = trainer.place()
+    timed = []
+    trainer.compile(state, BATCH, lambda steps: (timed.append(len(steps)), [2.0, 1.0])[1])
+    if jax.default_backend() == "cpu":
+        assert timed == [] and trainer.plan["timed"] is None
+        assert (trainer.plan["split"], trainer.plan["remat"]) == (1, None)
+    else:
+        assert timed == [2]
+        timings = [(plan["split"], plan["remat"]) for plan in trainer.plan["timed"]]
+        assert timings == [(1, None), (1, "minimal")]
+        assert (trainer.plan["split"], trainer.plan["remat"]) == (1, "minimal")
+    alone = lm()
+    state, _, _ = alone.place()
+    alone.compile(state, BATCH, lambda steps: pytest.fail("a single device's whole plan was timed"))
+    assert alone.plan["timed"] is None
 
 
 @pytest.mark.parametrize("split", [1, 2])

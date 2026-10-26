@@ -646,6 +646,38 @@ def test_transition_matches_released_sampler_and_torch_distribution():
 
 
 @pytest.mark.mesh
+def test_a_clip_reward_scores_each_sample_against_its_prompts_caption():
+    """A rollout's reward reads the batch's captions as host text beside its placed conditions
+    (`split_fields`), each repeated into its prompt's group as the conditions are: a CLIP reward
+    (`CLIPScore`) scores each sample against its own prompt's caption through CLIP's own tokenizer,
+    exactly as the metric scores those images and captions, whatever tokenizer the conditions read."""
+    from dew.artifacts import ImageGrid
+    from dew.eval import CLIPScore
+    from dew.inputs import CharTable, Condition
+    from dew.nn.backbones.dit import SimpleDiT
+
+    process = Process(FlowMatchingScheduler(shift=2), FlowMatchPredictionTransform())
+    inputs = InputSpec(Field("image", (8, 8, 3)), {
+        "textcontext": Condition(CharTable.from_pretrained(tokens=3, features=4))})
+    model = SimpleDiT(output_channels=3, patch_size=2, emb_features=8, num_layers=1, num_heads=2, mlp_ratio=2)
+    objective = FlowGRPOObjective(model, process, inputs, steps=3)
+    state = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(21)).initial_state()
+    clip = CLIPScore(str(Path(__file__).resolve().parent / "fixtures" / "clip" / "tiny"))
+    seen = {}
+
+    def reward(images, context):
+        seen["images"] = np.asarray(images)
+        seen["captions"] = [str(caption) for caption in context["captions"]]
+        return np.asarray(clip.fn(ImageGrid(images), context), np.float64)
+
+    captions = ["red", "blue"]
+    prompts = {**inputs.tokenize(captions), "captions": np.asarray(captions)}
+    batch = FlowRollout(objective, reward, groups=2, steps=3)(state, prompts, jax.random.key(3))
+    assert seen["captions"] == ["red", "red", "blue", "blue"]
+    scored = np.asarray(clip.fn(ImageGrid(seen["images"]), {"captions": np.asarray(seen["captions"])}))
+    np.testing.assert_array_equal(np.asarray(batch["rewards"]), scored.astype(np.float32))
+
+
 def test_multihost_flow_rollout_reassembles_owned_groups(tmp_path):
     import subprocess
     import sys
@@ -688,6 +720,10 @@ def test_multihost_flow_rollout_reassembles_owned_groups(tmp_path):
                            / (raw_groups.std(axis=1, keepdims=True) + 1e-4)).reshape(-1)
     # A row's arithmetic is its own on one process or two: the two runs agree bit for bit.
     np.testing.assert_array_equal(raw_callback, baseline["callback_rewards"])
+    # Rank zero's reward reads every sample's caption, each prompt's group in order, gathered from the
+    # host that holds it, as the one process reads its own.
+    grouped = [caption for caption in ("red", "blue", "green", "gold") for _ in range(3)]
+    assert reports[0]["callback_captions"] == baseline["callback_captions"] == grouped
     assert reports[0]["metric_rows"] == 4 and reports[0]["preview_rows"] == 4
     assert reports[1]["metric_rows"] == 0 and reports[1]["preview_rows"] == 0
     assert reports[0]["validation_mean"] == baseline["validation_mean"]

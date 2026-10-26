@@ -73,7 +73,7 @@ from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, recurrence_chunk
 from dew.nn.mixer_base import DELTA_RESIDUALS, MEMORY_RESIDUALS
 from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
-from dew.optim import newton_schulz
+from dew.optim import _orthogonalized
 from dew.quantization import FROZEN_FP8, QUANTIZATION, frozen_fp8_kernel
 
 from .attention import FORWARD_MODE, LayerNorm
@@ -231,9 +231,9 @@ class InContextMemory(nn.Module):
     as it is between those scheduled updates, so every token of a chunk reads the network its chunk
     started from, a continuum-memory level's (Nested Learning Eq 71)."""
     orthogonalize: int = 0
-    """Newton-Schulz steps orthogonalizing each matrix of a token's gradient before its step (`dew.optim.
-    newton_schulz`, Nested Learning Sec 4.2's Muon-style inner update); 0 steps the gradient as it is.
-    Vectors (biases, norm scales) step as they are."""
+    """Newton-Schulz steps orthogonalizing each matrix of a token's gradient before its step, Muon's own
+    iteration (`dew.optim._orthogonalized`, Nested Learning Sec 4.2's Muon-style inner update); 0 steps
+    the gradient as it is. Vectors (biases, norm scales) step as they are."""
     slow: tuple[str, ...] = ()
     """The network's parameters, by their top-level names (a submodule's or a parameter's), that the
     inner loop reads at W_0 and never steps: meta-learned by the outer loop alone, as TTT's layer norm
@@ -529,7 +529,8 @@ class InContextMemory(nn.Module):
         def stepped(path: tuple, leaf: jax.Array) -> jax.Array:
             if path[-1].key == ADAPTER_B:
                 return jnp.zeros_like(leaf)
-            return newton_schulz(leaf, self.orthogonalize) if self.orthogonalize and leaf.ndim == 2 else leaf
+            return (_orthogonalized(leaf, self.orthogonalize, None) if self.orthogonalize and leaf.ndim == 2
+                    else leaf)
 
         return jax.tree_util.tree_map_with_path(stepped, gradient)
 
