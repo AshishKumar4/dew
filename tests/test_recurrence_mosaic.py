@@ -164,7 +164,9 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype):
     takes them (`chunk(..., mainloop='mosaic')`, at its derived tiles); else, the route refusing them (a
     launch's registers past a thread's), the mainloop's rule at its narrowest value block, one chunk in
     flight (`mosaic_rule`), whose arithmetic is the same at any tiles. None where the mainloop's rule refuses
-    the call too (checked): an fp32 call's decay a key dimension (`mainloop.per_key_refusal`)."""
+    the call too (checked): an fp32 call's decay a key dimension (`mainloop.per_key_refusal`); and on a GPU
+    where its launches at those tiles pass the device's shared memory (an fp32 call's solve on an A100's
+    block), whose arithmetic the CPU interprets."""
     (operands,) = draw(dtype, 0, **geometry(case))
     if taken(operands, hooks):
         return functools.partial(chunk, hooks, mainloop='mosaic')
@@ -178,6 +180,14 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype):
                            operands.query, operands.key, operands.value, operands.log_decay, operands.beta)
         return None
     narrowest = mainloop.Tiles(family.narrowest_columns(jnp.bfloat16), 1)
+    if mainloop.family_of() is not None:
+        shapes = [None if x is None else jax.ShapeDtypeStruct(x.shape, x.dtype)
+                  for x in (operands.query, operands.key, operands.value, operands.log_decay, operands.beta,
+                            operands.state, operands.starts)]
+        *given, starts = shapes
+        launches = mainloop.planned(*given, tiles=narrowest, family=family, starts=starts, floor=hooks.floor)
+        if max(launch.shared for launch in launches) > generation.shared_budget(template.Mosaic.launched()):
+            return None
 
     def rule(given: Chunk):
         return mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta, given.state,
