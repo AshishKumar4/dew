@@ -391,6 +391,20 @@ Lineup, all ungated: `google/gemma-4-E2B`, `-E4B`, `-12B`, `-31B`,
 `-12B-it-assistant` and QAT copies. `gemma-4-12B` reports
 `model_type=gemma4_unified`; E2B, E4B, 31B and 26B-A4B report `gemma4`.
 
+For Unified, Dew follows the ordinary forward's vision-block mask in both training and serving:
+vision tokens in the same contiguous block attend bidirectionally in full and sliding layers.
+The block overlay is applied after the sliding window, so the full block stays visible even when
+it is longer than that window.
+Transformers 5.17.0's `Gemma4UnifiedModel.forward` passes block IDs to the generic mask builder
+(`modeling_gemma4_unified.py:1095-1107`, `masking_utils.py:1520-1598`), whose causal and sliding
+builders OR the block overlay in (`masking_utils.py:975-977,1215-1217`). Its stock generation method
+instead calls the vision-specific builder, which adds that overlay only to sliding layers and
+then intersects it with the window
+(`modeling_gemma4_unified.py:1186-1247,1355-1383`). This is an upstream forward/generation difference;
+Dew keeps one mask policy and compares against the ordinary forward. A call without
+`mm_token_type_ids` has no blocks in either (its block IDs stay -1), so its vision tokens read
+causally, in Dew as in transformers.
+
 `Gemma4TextConfig` (`TF/models/gemma4/configuration_gemma4.py:152-183`) plus
 `__post_init__` (`:185-225`):
 

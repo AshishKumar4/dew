@@ -444,7 +444,7 @@ def _gemma4_export(model: CausalTransformer) -> Mapping[str, object]:
         if mixer is not None and not isinstance(mixer, AttentionMixer):
             refuse(f'kinds.{name}.mixer', 'Gemma4 uses ordinary attention')
         if isinstance(mixer, AttentionMixer) and (
-            mixer.bidirectional_images or mixer.mrope_section is not None
+            mixer.bidirectional_images or mixer.bidirectional_blocks or mixer.mrope_section is not None
         ):
             refuse(f'kinds.{name}.mixer', 'multimodal attention metadata needs its source wrapper')
         if kind.rope_scaling is not None or kind.yarn is not None:
@@ -605,6 +605,24 @@ GEMMA4_TEXT = DecoderFamily(
               'vocab_size_per_layer_input': 262144},
     padding_idx=True,
 )
+
+def gemma4_unified_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
+    used.add('is_causal')
+    if hf_config.get('is_causal', True) is not True:
+        refuse('Gemma4Unified text configuration',
+               'only its causal text path with optional vision blocks is mapped')
+    if hf_config.get('enable_moe_block') or hf_config.get('hidden_size_per_layer_input'):
+        refuse('Gemma4Unified text configuration', 'the unified decoder has no MoE or per-layer input branch')
+    return gemma4_config(hf_config, used)
+
+
+GEMMA4_UNIFIED_TEXT = dataclasses.replace(
+    GEMMA4_TEXT, model_types=('gemma4_unified_text',), export_model_type='gemma4_unified_text',
+    translate_config=gemma4_unified_config,
+    architecture='Gemma4UnifiedForCausalLM',
+    defaults={**GEMMA4_DEFAULTS, 'sliding_window': 1024, 'max_position_embeddings': 262144,
+              'use_bidirectional_attention': 'vision'})
+
 
 GEMMA3_TEXT = DecoderFamily(
     (GEMMA3_MODEL_TYPE,),
