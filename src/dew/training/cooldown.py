@@ -147,4 +147,4 @@ def _injected(node: optax.OptState) -> bool:
     return isinstance(node, optax.InjectStatefulHyperparamsState)
 
 
-__all__ = ["Branch", "Cooldowns", "check_branches", "holds_rate", "scaled_rates"]
+__all__ = ["Branch", "Cooldowns"]
