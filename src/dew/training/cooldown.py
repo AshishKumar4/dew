@@ -126,7 +126,7 @@ def check_branches(branches: tuple[Branch, ...], suites: Mapping[str, object], o
         return
     if not suites:
         raise ValueError("a cooldown branch is scored by the run's validation suites, and this run "
-                         "validates none: pass validation=, or a dataset with a held-out split")
+                         "scores none: pass validation=, or eval_every= or metrics= over its val split")
     if not holds_rate(opt_state):
         raise ValueError("a cooldown decays the learning rate the optimizer's state holds, an OptimConfig's "
                          "or optax.inject_hyperparams' constant one; this optimizer's state holds none "

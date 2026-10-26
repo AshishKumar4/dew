@@ -1245,7 +1245,8 @@ def cooldown_run(schedule, steps: int, accumulation: int, tracker=None, cooldown
     """Regression on AdamW at `schedule` for `steps`, scored once at its end, with any `cooldowns`."""
     trainer = make_trainer(tracker=tracker, accumulation=accumulation,
                            optimizer=OptimConfig(optimizer="adamw", learning_rate=schedule))
-    return trainer.fit(dataset(val=val_batches(2)), steps=steps, log_every=steps, cooldowns=cooldowns)
+    return trainer.fit(dataset(val=val_batches(2)), steps=steps, log_every=steps, eval_every=steps,
+                       cooldowns=cooldowns)
 
 
 @pytest.mark.parametrize("accumulation", [1, 2])
@@ -1303,7 +1304,7 @@ def test_a_cooldown_a_run_could_not_score_decay_or_begin_on_an_update_is_refused
     trainer = make_trainer(optimizer=optax.sgd(0.1) if refused == "unscaled" else OptimConfig(),
                            accumulation=2 if refused == "inside" else 1)
     with pytest.raises(ValueError):
-        trainer.fit(dataset(val=None if refused == "unscored" else val_batches(2)), steps=8,
+        trainer.fit(dataset(val=val_batches(2)), steps=8, eval_every=None if refused == "unscored" else 8,
                     cooldowns=Cooldowns(at=(3 if refused == "inside" else 4,)))
 
 
