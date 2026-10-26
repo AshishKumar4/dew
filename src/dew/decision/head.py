@@ -259,13 +259,16 @@ class _FieldLayer(nn.Module):
 def _span_means(values: jax.Array, spans: jax.Array) -> jax.Array:
     """The mean of `values` `[B, L, D]` over each `[..., 2]` (start, end) span of its row.
 
-    `spans` is `[B, ...]`; an empty span, a padding slot's, gives zeros.
+    `spans` is `[B, ...]`; an empty span, a padding slot's, gives zeros. A token no span of its row
+    reads is selected away before the product, so padding's NaN or infinity never reaches a mean (the
+    rule of `dew.nn.precision.weighted_total`).
     """
     positions = jnp.arange(values.shape[1])
     inside = (positions >= spans[..., :1]) & (positions < spans[..., 1:])
     counts = jnp.maximum(jnp.sum(inside, axis=-1, keepdims=True), 1)
-    flat = inside.reshape(inside.shape[0], -1, inside.shape[-1]).astype(values.dtype)
-    summed = accumulated(functools.partial(jnp.einsum, "bnl,bld->bnd"), flat, values)
+    flat = inside.reshape(inside.shape[0], -1, inside.shape[-1])
+    read = jnp.where(jnp.any(flat, axis=1)[..., None], values, 0)
+    summed = accumulated(functools.partial(jnp.einsum, "bnl,bld->bnd"), flat.astype(values.dtype), read)
     summed = summed.reshape(*inside.shape[:-1], values.shape[-1])
     return summed / counts.astype(values.dtype)
 

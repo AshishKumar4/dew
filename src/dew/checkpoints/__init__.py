@@ -842,17 +842,18 @@ class _RankedSteps(preservation.PreservationPolicy):
             held.update(checkpoint.step for checkpoint, kept in zip(
                 ordered, preservation.EveryNSteps(interval_steps=keep.every).should_preserve(
                     ordered, context=context), strict=True) if kept)
-        groups: dict[str, list[tuple[float, int]]] = {}
         limits = self.checkpoints._rank_limits
-        for checkpoint in checkpoints:
-            scores = checkpoint.metrics or {}
-            for key, value in scores.items():
-                if key.startswith('checkpoint/rank/'):
-                    groups.setdefault(key.removeprefix("checkpoint/rank/"), []).append(
-                        (value, checkpoint.step)
-                    )
-        for name, scores in groups.items():
-            held.update(step for _, step in sorted(scores)[:limits.get(name, 1)])
+        ranks = {key for checkpoint in checkpoints for key in checkpoint.metrics or {}
+                 if key.startswith('checkpoint/rank/')}
+        for rank in ranks:
+            # Orbax's BestN over the steps a ranking scored, its scores lower-is-better (`reverse`) and the
+            # newest first, so that of two tied steps its stable sort keeps the older.
+            scored = sorted((checkpoint for checkpoint in checkpoints if rank in (checkpoint.metrics or {})),
+                            key=lambda checkpoint: -checkpoint.step)
+            best = preservation.BestN(get_metric_fn=lambda metrics, rank=rank: metrics[rank], reverse=True,
+                                      n=limits.get(rank.removeprefix('checkpoint/rank/'), 1))
+            held.update(checkpoint.step for checkpoint, kept in zip(
+                scored, best.should_preserve(scored, context=context), strict=True) if kept)
         previous = None
         interval = duration(keep.interval) if isinstance(keep.interval, str) else keep.interval
         # Orbax's EveryNSeconds takes whole seconds; Keep.interval is a timedelta, kept exact here.

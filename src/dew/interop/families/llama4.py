@@ -24,16 +24,14 @@ from dew.interop.decoder_parts import (
     Renames,
     RopeSpelling,
     base_config,
-    kind_mixers,
     read_rope,
     refuse,
     renamed_path,
 )
-from dew.nn import llama4 as llama4_nn
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
-from dew.nn.llama4 import Llama4Mixer
+from dew.nn.mixers.attention import AttentionMixer
 
 # Llama4TextConfig's default_theta (configuration_llama4.py:111), the base an omitted rope_theta means.
 _LLAMA4_SPELLING = RopeSpelling(theta=500000.0)
@@ -49,12 +47,12 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     no_rope = hf_config.get('no_rope_layers') or None
     if no_rope is None:
-        no_rope = llama4_nn.default_no_rope_layers(
+        no_rope = _default_no_rope_layers(
             layers, records.integer(hf_config.get('no_rope_layer_interval', 4), 'no_rope_layer_interval'))
     no_rope = records.integers(no_rope, 'no_rope_layers')
     if len(no_rope) != layers or set(no_rope) - {0, 1}:
         refuse(f"no_rope_layers {list(no_rope)!r}", f"it names a flag per layer of {layers}")
-    layer_types = llama4_nn.rope_layer_types(no_rope)
+    layer_types = _rope_layer_types(no_rope)
     stated = hf_config.get('layer_types')
     if stated is not None and records.strings(stated, 'layer_types') != layer_types:
         refuse(f"layer_types {list(records.strings(stated, 'layer_types'))!r}",
@@ -63,9 +61,11 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     # rope_scaling); a config transformers wrote nests both. Either way the
     # ramp is the model's, and every rotated layer applies it.
     used.update(('no_rope_layers', 'no_rope_layer_interval', 'layer_types'))
+    # Llama4TextRotaryEmbedding builds any rope_type; the family reads Llama 3.1's ramp alone, the
+    # one its releases state, so a YaRN record is refused here.
+    rope = read_rope(hf_config, used, _LLAMA4_SPELLING, ramps=('llama3',))
     config = base_config(hf_config, used, layer_types=layer_types,
-                          rope=dataclasses.replace(read_rope(hf_config, used, _LLAMA4_SPELLING),
-                                                   local_theta=None))
+                          rope=dataclasses.replace(rope, local_theta=None))
     if hf_config.get('router_jitter_noise', 0.0):
         refuse("router_jitter_noise", "the router selects on the logits alone")
     if hf_config.get('output_router_logits', False):
@@ -74,19 +74,19 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
                  'intermediate_size_mlp', 'num_local_experts', 'num_experts_per_tok',
                  'moe_layers', 'interleave_moe_layer_step', 'attention_chunk_size',
                  'use_qk_norm', 'attn_temperature_tuning', 'floor_scale', 'attn_scale'))
-    rule = {
-        'use_qk_norm': bool(hf_config['use_qk_norm']),
-        'attn_temperature_tuning': bool(hf_config['attn_temperature_tuning']),
-        'floor_scale': records.number(hf_config['floor_scale'], 'floor_scale'),
-        'attn_scale': records.number(hf_config['attn_scale'], 'attn_scale'),
-    }
+    # Llama4TextAttention's two layers as ordinary kinds: the rotated, chunked one turns adjacent
+    # pairs under a weightless L2 norm (`use_qk_norm`); the global one carries no positions and scales
+    # each query by its position (`attn_temperature_tuning`).
+    tuning = ((records.number(hf_config['floor_scale'], 'floor_scale'),
+               records.number(hf_config['attn_scale'], 'attn_scale'))
+              if hf_config['attn_temperature_tuning'] else None)
     chunk = hf_config.get('attention_chunk_size')
-    full = native_fields(LayerKind)(mixer=None)
-    full['mixer'] = {'class': 'llama4', 'fields': {**rule, 'use_rope': False}}
-    chunked = native_fields(LayerKind)(chunk=None if chunk is None else records.integer(chunk,
-                                                                                    'attention_chunk_size'),
-                                      mixer=None)
-    chunked['mixer'] = {'class': 'llama4', 'fields': {**rule, 'use_rope': True}}
+    full = native_fields(LayerKind)(qk_norm=False, mixer=None)
+    full['mixer'] = {'class': 'attention', 'fields': {'nope': True, 'temperature_tuning': tuning}}
+    chunked = native_fields(LayerKind)(
+        chunk=None if chunk is None else records.integer(chunk, 'attention_chunk_size'),
+        qk_norm=bool(hf_config['use_qk_norm']), mixer=None)
+    chunked['mixer'] = {'class': 'attention', 'fields': {'rotary_pairs': 'adjacent', 'qk_norm_weight': False}}
     kinds: dict[str, KindFields] = {'full_attention': full, 'chunked_attention': chunked}
     moe_layers = hf_config.get('moe_layers')
     step = records.integer(hf_config.get('interleave_moe_layer_step', 1), 'interleave_moe_layer_step')
@@ -117,14 +117,41 @@ def _llama4_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
 
 
 def _llama4_export(model: CausalTransformer) -> Mapping[str, object]:
-    """The config field the rotated layers' chunk goes back out under: every
-    chunked kind shares Llama 4's one `attention_chunk_size`."""
+    """The config fields Llama 4's kinds go back out under: the rotated layers' one
+    `attention_chunk_size` and their norm (`use_qk_norm`), each layer's `no_rope_layers` entry, and
+    the global layers' temperature tuning. A kind these fields cannot state (per-kind norms or
+    tunings, half-pair rotation) is refused by the export's round trip (`refuse_lossy_export`)."""
     chunks = {kind.chunk for kind in (model.kinds or {}).values() if kind.chunk is not None}
     if len(chunks) > 1:
         raise ValueError(
             f"the kinds chunk at {sorted(chunks)}, and Llama 4's config carries one "
             "attention_chunk_size")
-    return {'attention_chunk_size': chunks.pop() if chunks else None}
+    types = model.per_layer_types
+    rotated = [name for name in types if not _mixer(model, name).nope]
+    unrotated = [name for name in types if _mixer(model, name).nope]
+    tuning = _mixer(model, unrotated[0]).temperature_tuning if unrotated else None
+    return {'attention_chunk_size': chunks.pop() if chunks else None,
+            'no_rope_layers': [int(not _mixer(model, name).nope) for name in types],
+            'use_qk_norm': bool(rotated) and model.kind_of(rotated[0]).qk_norm,
+            'attn_temperature_tuning': tuning is not None,
+            **({} if tuning is None else {'floor_scale': tuning[0], 'attn_scale': tuning[1]})}
+
+
+def _mixer(model: CausalTransformer, layer_type: str) -> AttentionMixer:
+    mixer = model.kind_of(layer_type).mixer or model.mixer or AttentionMixer()
+    if not isinstance(mixer, AttentionMixer):
+        raise ValueError(f"Llama 4's layers attend; the {layer_type} kind mixes by {type(mixer).__name__}")
+    return mixer
+
+
+def _default_no_rope_layers(num_layers: int, interval: int) -> tuple[int, ...]:
+    """`Llama4TextConfig`'s pattern: every `interval`th layer carries no rope."""
+    return tuple(int((index + 1) % interval != 0) for index in range(num_layers))
+
+
+def _rope_layer_types(no_rope_layers) -> tuple[str, ...]:
+    """The config's layer pattern: rotated layers chunk, the rest attend whole."""
+    return tuple('chunked_attention' if rope else 'full_attention' for rope in no_rope_layers)
 
 
 # `Llama4TextExperts` holds `[E, hidden, 2 * expert]` with the gate in the
@@ -144,7 +171,9 @@ _LLAMA4_EXPERTS: Leaves = {f'mlp.experts.{projection}': ('mlp', 'experts', proje
 LLAMA4_TEXT = DecoderFamily(
     ('llama4_text',),
     _llama4_config,
-    lambda fields: any(isinstance(mixer, Llama4Mixer) for mixer in kind_mixers(fields)),
+    # Llama 4 alone scales its routed experts' inputs by their routing weight, whatever its layers'
+    # positions: a model of only NoPE layers is as much Llama 4 as one with rotated ones.
+    lambda fields: bool(fields.mixture is not None and fields.mixture.scale_inputs),
     'llama4_text',
     'Llama4ForCausalLM',
     _llama4_export,
@@ -158,4 +187,5 @@ LLAMA4_TEXT = DecoderFamily(
               'max_position_embeddings': 131072},
     # A model whose rotated layers attend every key says so, against the class's 8192.
     export_nulls=('attention_chunk_size',),
+    padding_idx=True,
 )
