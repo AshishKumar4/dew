@@ -37,6 +37,7 @@ from flax.training.early_stopping import EarlyStopping
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
+from dew import position as positions
 from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew._records import JSON, boolean, json_value, record
 from dew.batch import FROZEN, Batch, Variables, select
@@ -47,6 +48,7 @@ from dew.data.dataset import (
     Closeable,
     DataPartition,
     Loader,
+    PhasedStream,
     RampedStream,
     Reader,
     Stage,
@@ -1360,10 +1362,10 @@ class Trainer(Generic[Loss, Effects]):
         log handler, and one whose JAX opened on the CPU beside an NVIDIA GPU stops.
         """
         run_length(steps, epochs, tokens, examples)
-        if tokens is not None and not self.objective.counts_tokens:
-            raise ValueError("tokens= needs an objective that counts real tokens")
         ready_process()
         loader, validation = fitted(dataset, validation, objective=self.objective.data(), examples=examples)
+        if (tokens is not None or loader.token_ends is not None) and not self.objective.counts_tokens:
+            raise ValueError("tokens= and a schedule's stages need an objective that counts real tokens")
         self._device, self._prefetch = loader.device, device_prefetch
         steps = run_steps(loader, steps, epochs, tokens, self.accumulation, examples)
         count_compilation_cache()
@@ -1443,7 +1445,8 @@ class Trainer(Generic[Loss, Effects]):
         compiled: dict[Signature, tuple[CompiledStep, StepFlops | None]] = {}
         seen = 0
         run.notice = PreemptionNotice()
-        while not plan.ended(run.current, plan.real(interval)):
+        # A schedule's stages end where the commits reach their tokens, its last where its data does.
+        while not plan.ended(run.current, plan.real(interval)) and not self._scheduled(plan, run, interval):
             # The window's capture opens before this iteration's first read, so the step row records
             # the read it waits on rather than a compile that ran before capture began.
             if (profiler is not None and profile is not None
@@ -1611,16 +1614,8 @@ class Trainer(Generic[Loss, Effects]):
                 # Each stage's batch is read whole: no plan splits a ramp's.
                 self._split = 1
             self._rows = (plan.dataset.batch,)
-            if jax.process_count() > 1:
-                # Each process opened its own stream over its own copy of the
-                # corpus, and none reads a record before all agree it is one.
-                agreed_same("training data", lambda: (
-                    f"{plan.dataset.batch} records a step of {stream_identity(run.source)}"))
-            run.endless = stream_endless(run.source)
-            self._marked = marked(partition, self._counted_batch)
-            prepare = self._marked if self.rollout is None else None
-            run.train = DevicePrefetchIterator(run.source, mesh, self._prefetch, source_state=position,
-                                               reads=run.reads, prepare=prepare)
+            run.partition = partition
+            run.train = self._prefetched(plan, run, run.source, position)
             run.source = None  # Lifetime transferred to the prefetch worker.
 
         trained = [entry.module for entry in self.objective.program_key() if entry.trained]
@@ -1635,6 +1630,62 @@ class Trainer(Generic[Loss, Effects]):
             batch=plan.dataset.batch, precision=precision, shown=shown,
             averaged=self.objective.ema is not None and not self.objective.ema_is_reference))
         return False
+
+    def _prefetched(self, plan: FitPlan, run: FitRun, source: Iterator[Batch],
+                    position: bytes | None) -> DevicePrefetchIterator:
+        """`source`'s batches placed ahead of the step by the prefetch worker, which restores it to
+        `position` first, once a pool's processes agree their streams read the same records."""
+        assert run.partition is not None
+        if jax.process_count() > 1:
+            # Each process opened its own stream over its own copy of the
+            # corpus, and none reads a record before all agree it is one.
+            agreed_same("training data", lambda: (
+                f"{plan.dataset.batch} records a step of {stream_identity(source)}"))
+        run.endless = stream_endless(source)
+        self._marked = marked(run.partition, self._counted_batch)
+        prepare = self._marked if self.rollout is None else None
+        return DevicePrefetchIterator(source, self.device_mesh, self._prefetch, source_state=position,
+                                      reads=run.reads, prepare=prepare)
+
+    def _scheduled(self, plan: FitPlan, run: FitRun, interval: Interval) -> bool:
+        """End the stage of a schedule the run stands in (`dew.data.pipeline.schedule`) at the step
+        whose commit reached its tokens, on every process alike, as the committed tokens are the
+        pool's: the stream opens again where that step left it, in the next stage, and what the
+        prefetch worker read ahead of the end is dropped untrained. Returns whether the data ends
+        here, the last stage having reached its tokens. The devices' count is read before each step
+        only while a stage's end lies ahead."""
+        ends = plan.dataset.token_ends
+        state = None if run.train is None else run.train.source_state
+        if ends is None or state is None:
+            return False
+        stage = len(positions.read(state).completed)
+        end = ends[stage] if stage < len(ends) else None
+        if end is None:
+            return False
+        committed = interval.real_tokens
+        if committed < end:
+            return False
+        if stage == len(ends) - 1:
+            self._display.note(f"The schedule's data ended at step {run.current}")
+            return True
+        assert run.train is not None and run.partition is not None
+        run.train.close()
+        run.train = None
+        run.source = source = plan.dataset.train(run.partition)
+        if not isinstance(source, PhasedStream):
+            raise TypeError("a schedule reads its stages as phases")
+        # A stage a single step's commit passed ends where it starts, reading nothing.
+        while stage < len(ends) - 1 and committed >= (ends[stage] or 0):
+            state, stage = source.ending(state), stage + 1
+        self._display.note(f"Stage {stage} of the schedule begins at step {run.current}, after "
+                           f"{committed} committed tokens")
+        run.train = self._prefetched(plan, run, source, state)
+        run.source = None  # Lifetime transferred to the prefetch worker.
+        last = ends[-1]
+        ended = stage == len(ends) - 1 and last is not None and committed >= last
+        if ended:
+            self._display.note(f"The schedule's data ended at step {run.current}")
+        return ended
 
     def _local_devices(self) -> list:
         """This process's devices of the mesh, whose memory the fit check reads."""
