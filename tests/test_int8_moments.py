@@ -136,12 +136,14 @@ def test_int8_moments_are_placed_as_their_parameters_are(axis):
     parameter's split that their blocks divide by the axis."""
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
-    from dew.training import MeshSpec, Trainer
+    from dew.training import Layout, MeshSpec, Trainer
 
     model = CausalTransformer(vocab_size=256, emb_features=512, num_layers=1, num_heads=2, mlp_features=1024,
                               max_seq_len=16, dtype=jnp.float32,
                               mixture={"experts": 4, "top_k": 2} if axis == "expert" else None)
-    trainer = Trainer(LMObjective(model, 8), solver(), key=jax.random.key(0), mesh=MeshSpec(**{axis: 2}))
+    # Every leaf splits where it divides, the scales' few bytes too (`min_shard`).
+    trainer = Trainer(LMObjective(model, 8), solver(), key=jax.random.key(0), mesh=MeshSpec(**{axis: 2}),
+                      layout=Layout(min_shard=1, tolerance=1.0))
     state, _, _ = trainer.place()
     params = state.variables["params"]
     moments = [node for node in jax.tree.leaves(state.opt_state, is_leaf=lambda node: isinstance(

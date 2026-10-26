@@ -696,7 +696,7 @@ def int8_moments(b1: float, b2: float, eps: float, eps_root: float, nesterov: bo
         parts=lambda structure, moment: list(zip(structure.flatten_up_to(moment.codes),
                                                  structure.flatten_up_to(moment.scales), strict=True)),
         decoded=lambda part, signed: (part[0] if part[1] is None
-                                      else dequantized(*part, maps[signed], block)),
+                                      else dequantized(part[0], part[1], maps[signed], block)),
         encoded=encoded,
         whole=lambda structure, parts: QuantizedMoments(structure.unflatten([part[0] for part in parts]),
                                                         structure.unflatten([part[1] for part in parts]))))
