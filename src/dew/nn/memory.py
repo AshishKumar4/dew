@@ -393,10 +393,9 @@ class InContextMemory(nn.Module):
         if held is not None and real.shape[1] == 1:
             # The shared decode dispatch: its step kernel where it takes the state, else the portable
             # step in the memory's own precision.
-            out, state = linear.decode_step(hooks, recurrence.Step(
-                held, query=steps.query[:, 0], key=steps.key[:, 0], value=value[:, 0],
-                log_decay=log_decay[:, 0], beta=beta[:, 0], active=real[:, 0]),
-                tangent=FORWARD_MODE.get() or isinstance(steps.query, JVPTracer))
+            out, state = linear.decode_step(
+                hooks, held, steps.query[:, 0], steps.key[:, 0], value[:, 0], log_decay[:, 0], beta[:, 0],
+                real[:, 0], tangent=FORWARD_MODE.get() or isinstance(steps.query, JVPTracer))
             out = out[:, None]
         else:
             out, state = recurrence_chunk.chunk(hooks, recurrence_chunk.Chunk(

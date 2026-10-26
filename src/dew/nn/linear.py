@@ -435,21 +435,21 @@ def decode_gated_delta_rule(query, key, value, g, beta, state, active=None):
     the state is most of a decode step's bytes."""
     work = jnp.float32
     query, key, value = (x[:, 0].astype(work) for x in (query, key, value))
-    out, final = stepped_per_shard(STEP, recurrence.Step(
-        state, query=query * key.shape[-1] ** -0.5, key=key, value=value, log_decay=g[:, 0].astype(work),
-        beta=beta[:, 0].astype(work), active=active))
+    out, final = stepped_per_shard(STEP, state, query * key.shape[-1] ** -0.5, key, value,
+                                   g[:, 0].astype(work), beta[:, 0].astype(work), active)
     return out[:, None], final
 
 
-def stepped_per_shard(hooks: recurrence.Hooks, operands: recurrence.Step) -> tuple[jax.Array, jax.Array]:
+def stepped_per_shard(hooks: recurrence.Hooks, state: jax.Array, query: jax.Array, key: jax.Array,
+                      value: jax.Array, log_decay: jax.Array, beta: jax.Array, active: jax.Array | None
+                      ) -> tuple[jax.Array, jax.Array]:
     """`recurrence.step`'s `(output [B, Hv, Dv], state')` of a decode token of `query`, `key`,
     `value` `[B, H, D]`, `log_decay` and `beta` `[B, Hv]` over its `state` `[B, Hv, Dk, Dv]`, run per
     shard (`manual_map`), each shard's rows and heads with their state: the launch has no partitioning
-    rule, and the state is most of a decode step's bytes."""
-    state = operands.state
-    active = (jnp.ones(state.shape[:1], bool) if operands.active is None
-              else jnp.asarray(operands.active, bool))
-    rows, heads = grouped_heads((state.shape[0], 1, *operands.value.shape[1:]), operands.key.shape[1])
+    rule, and the state is most of a decode step's bytes. A row `active` `[B]` marks False keeps its
+    state."""
+    active = jnp.ones(state.shape[:1], bool) if active is None else jnp.asarray(active, bool)
+    rows, heads = grouped_heads((state.shape[0], 1, *value.shape[1:]), key.shape[1])
     P = jax.sharding.PartitionSpec
     three, two, memory = P(rows, heads, None), P(rows, heads), P(rows, heads, None, None)
 
@@ -459,7 +459,7 @@ def stepped_per_shard(hooks: recurrence.Hooks, operands: recurrence.Step) -> tup
         return out, final
 
     return manual_map(local, (three, three, three, two, two, memory, P(rows)), (three, memory))(
-        operands.query, operands.key, operands.value, operands.log_decay, operands.beta, state, active)
+        query, key, value, log_decay, beta, state, active)
 
 
 def decode_kernel(state: jax.Array | jax.ShapeDtypeStruct, *, tangent: bool, fuses: bool) -> str:
@@ -483,15 +483,18 @@ def decode_kernel(state: jax.Array | jax.ShapeDtypeStruct, *, tangent: bool, fus
     return route('delta_decode', kernel=preferred, preferred=preferred).kernel
 
 
-def decode_step(hooks: recurrence.Hooks, operands: recurrence.Step, *, tangent: bool
-                ) -> tuple[jax.Array, jax.Array]:
-    """A decode token's `(output, state')` through the shared recurrence: the step kernel per shard
-    (`stepped_per_shard`) where `decode_kernel` picks it, else the portable step
-    (`recurrence.step_reference`) in the operands' own precision, which the compiler partitions."""
-    if decode_kernel(operands.state, tangent=tangent, fuses=False) == 'step':
-        return stepped_per_shard(hooks, operands)
-    out, _, state = recurrence.step_reference(hooks, operands)
-    return out, state
+def decode_step(hooks: recurrence.Hooks, state: jax.Array, query: jax.Array, key: jax.Array,
+                value: jax.Array, log_decay: jax.Array, beta: jax.Array, active: jax.Array | None, *,
+                tangent: bool) -> tuple[jax.Array, jax.Array]:
+    """A decode token's `(output, state')` through the shared recurrence, its operands as
+    `stepped_per_shard` takes them: the step kernel per shard where `decode_kernel` picks it, else the
+    portable step (`recurrence.step_reference`) in the operands' own precision, which the compiler
+    partitions."""
+    if decode_kernel(state, tangent=tangent, fuses=False) == 'step':
+        return stepped_per_shard(hooks, state, query, key, value, log_decay, beta, active)
+    out, _, final = recurrence.step_reference(hooks, recurrence.Step(
+        state, query=query, key=key, value=value, log_decay=log_decay, beta=beta, active=active))
+    return out, final
 
 
 STEP = recurrence.Hooks(decay='scalar')
