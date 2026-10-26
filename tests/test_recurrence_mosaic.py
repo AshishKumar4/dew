@@ -309,7 +309,12 @@ def test_an_fp32_operand_splits_into_finite_parts_summing_to_it():
 
 
 TAKEN = HOOKS + FORMED
-"""The chunked op's hook combinations, every one of which the mainloop takes."""
+"""The chunked op's hook combinations, each run where the mainloop takes it and checked refused where not.
+Their draws are fp32, whose delta-rule and per-key calls the template refuses (an fp32 solve's registers, a
+per-key decay's factoring): the cases that run check 1 are the fp32 calls without the delta rule, a decay a
+head or none, natively (template numerics review 2026-10-26, P2-3: the other forms, the delta rule without
+a decay, the gated linear attentions, the rated scan in bf16 and the formed hooks, hold no float64
+evidence on the template; their reference arm in a 16-bit call is open)."""
 
 
 @ON_ITS_FAMILY
