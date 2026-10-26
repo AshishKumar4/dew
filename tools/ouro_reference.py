@@ -32,8 +32,6 @@ from huggingface_hub import hf_hub_download
 from reference_source import config_lookups, hub_modules, record_padding
 from torch_precision import float64, float64_twin
 
-from dew.interop.verify import probe_ids, scatter_weights
-
 REPO, REVISION = 'ByteDance/Ouro-1.4B', '574fa66cb8bf5abdc979642d01cf2b79b16bfab1'
 FIXTURES = Path(__file__).resolve().parents[1] / 'tests' / 'fixtures' / 'hf'
 COLUMNS = np.random.RandomState(11).choice(49152, 64, replace=False)
@@ -63,6 +61,8 @@ def outputs(model, ids, mask=None, positions=None):
 
 
 def write_tiny(modeling) -> None:
+    from dew.interop.verify import probe_ids, scatter_weights
+
     directory = FIXTURES / 'ouro-tiny'
     directory.mkdir(parents=True, exist_ok=True)
     config = modeling.OuroConfig(
@@ -98,6 +98,8 @@ def write_tiny(modeling) -> None:
 
 
 def write_released(modeling, full: bool) -> None:
+    from dew.interop.verify import probe_ids
+
     directory = FIXTURES / 'ouro-1.4b'
     directory.mkdir(parents=True, exist_ok=True)
     shutil.copy(hf_hub_download(REPO, 'config.json', revision=REVISION), directory / 'config.json')
