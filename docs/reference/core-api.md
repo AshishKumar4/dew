@@ -176,9 +176,9 @@ Import `Checkpoints` from `dew`.
 
 This object does not write `run.json`; run configuration saving is separate. Use the [complete resume example](../guides/checkpoints.md) before adapting these lower-level calls.
 
-<!-- api: dew.checkpoints.averaged dew.checkpoints.Averaged -->
+<!-- api: dew.checkpoints.averaged dew.checkpoints.averaged_pinned dew.checkpoints.Averaged -->
 
-`dew.checkpoints.averaged(runs, step=None, ema=None, mesh=None, layout=None)` averages runs trained apart from one model, of any objective, in fp32, each read onto `mesh` as `layout` places it; a pool's processes each take the mean of the shards they hold. A LoRA run's factors are merged into its kernels first. It returns an `Averaged`: the mean `variables`, the `model` record they apply to (its adapter merged away), and each run's directory, step and whether its EMA was read. Runs of another model are refused.
+`dew.checkpoints.averaged(runs, step=None, ema=None, mesh=None, layout=None)` averages runs trained apart from one model, of any objective, in fp32, each read onto `mesh` as `layout` places it; a pool's processes each take the mean of the shards they hold. A LoRA run's factors are merged into its kernels first. It returns an `Averaged`: the mean `variables`, the `model` record they apply to (its adapter merged away), and each run's directory, step and whether its EMA was read. Runs of another model are refused. `averaged_pinned(runs, ema=None, mesh=None, layout=None)` averages runs pinned already (`SavedRun.pinned`), as `Decide.averaged` does with the runs whose records it compared.
 
 ## Language modeling and generation
 
