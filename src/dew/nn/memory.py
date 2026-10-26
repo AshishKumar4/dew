@@ -55,13 +55,15 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
+from jax.interpreters.ad import JVPTracer
 
+from dew.nn import linear
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, recurrence_chunk
 from dew.nn.mixer_base import MEMORY_RESIDUALS
 from dew.optim import newton_schulz
 
-from .attention import LayerNorm
+from .attention import FORWARD_MODE, LayerNorm
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places, valid_order
 from .precision import at_least_fp32, l2norm
 
@@ -389,9 +391,12 @@ class InContextMemory(nn.Module):
         value = steps.value - read_w0(steps.key) if hooks.delta else steps.value
         begins, continued = _documents(steps)
         if held is not None and real.shape[1] == 1:
-            out, _, state = recurrence.step(hooks, recurrence.Step(
+            # The shared decode dispatch: its step kernel where it takes the state, else the portable
+            # step in the memory's own precision.
+            out, state = linear.decode_step(hooks, recurrence.Step(
                 held, query=steps.query[:, 0], key=steps.key[:, 0], value=value[:, 0],
-                log_decay=log_decay[:, 0], beta=beta[:, 0], active=real[:, 0]))
+                log_decay=log_decay[:, 0], beta=beta[:, 0], active=real[:, 0]),
+                tangent=FORWARD_MODE.get() or isinstance(steps.query, JVPTracer))
             out = out[:, None]
         else:
             out, state = recurrence_chunk.chunk(hooks, recurrence_chunk.Chunk(

@@ -48,7 +48,7 @@ from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, Coordinates, MixerCall, coordinates_of, valid_order
 from .joined import joined_dense, joins
 from .kernels import generation
-from .kernels.generation import first_refusal, measured_kernel, refused, route, triton_runs
+from .kernels.generation import Refusal, first_refusal, measured_kernel, refused, route, triton_runs
 from .kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule, on_the_port, recurrent_delta_rule
 from .precision import L2NORM_EPS, asks_default_precision, at_least_fp32, float32_dot_general, l2norm
 from .sharding import (
@@ -433,22 +433,63 @@ def decode_gated_delta_rule(query, key, value, g, beta, state, active=None):
     the step runs per shard (`manual_map`), each shard's rows and heads with
     their state, as `fla_rule` runs: the kernel has no partitioning rule, and
     the state is most of a decode step's bytes."""
-    active = jnp.ones(state.shape[:1], bool) if active is None else jnp.asarray(active, bool)
-    rows, heads = grouped_heads(value.shape, key.shape[2])
-    P = jax.sharding.PartitionSpec
-    four, three, memory = P(rows, None, heads, None), P(rows, None, heads), P(rows, heads, None, None)
-    return manual_map(_decoded, (four, four, four, three, three, memory, P(rows)),
-                      (four, memory))(query, key, value, g, beta, state, active)
-
-
-def _decoded(query, key, value, g, beta, state, active):
-    """`decode_gated_delta_rule` on arrays a shard holds."""
     work = jnp.float32
     query, key, value = (x[:, 0].astype(work) for x in (query, key, value))
-    out, _, final = recurrence.step(
-        STEP, recurrence.Step(state, query=query * key.shape[-1] ** -0.5, key=key, value=value,
-                              log_decay=g[:, 0].astype(work), beta=beta[:, 0].astype(work), active=active))
+    out, final = stepped_per_shard(STEP, recurrence.Step(
+        state, query=query * key.shape[-1] ** -0.5, key=key, value=value, log_decay=g[:, 0].astype(work),
+        beta=beta[:, 0].astype(work), active=active))
     return out[:, None], final
+
+
+def stepped_per_shard(hooks: recurrence.Hooks, operands: recurrence.Step) -> tuple[jax.Array, jax.Array]:
+    """`recurrence.step`'s `(output [B, Hv, Dv], state')` of a decode token of `query`, `key`,
+    `value` `[B, H, D]`, `log_decay` and `beta` `[B, Hv]` over its `state` `[B, Hv, Dk, Dv]`, run per
+    shard (`manual_map`), each shard's rows and heads with their state: the launch has no partitioning
+    rule, and the state is most of a decode step's bytes."""
+    state = operands.state
+    active = (jnp.ones(state.shape[:1], bool) if operands.active is None
+              else jnp.asarray(operands.active, bool))
+    rows, heads = grouped_heads((state.shape[0], 1, *operands.value.shape[1:]), operands.key.shape[1])
+    P = jax.sharding.PartitionSpec
+    three, two, memory = P(rows, heads, None), P(rows, heads), P(rows, heads, None, None)
+
+    def local(query, key, value, log_decay, beta, held, active):
+        out, _, final = recurrence.step(hooks, recurrence.Step(
+            held, query=query, key=key, value=value, log_decay=log_decay, beta=beta, active=active))
+        return out, final
+
+    return manual_map(local, (three, three, three, two, two, memory, P(rows)), (three, memory))(
+        operands.query, operands.key, operands.value, operands.log_decay, operands.beta, state, active)
+
+
+def step_refusal(hooks: recurrence.Hooks, state: jax.Array | jax.ShapeDtypeStruct) -> Refusal | None:
+    """Why the recurrence's step kernel turns a decode token's `state` down (`recurrence.fits`), or
+    None where it takes it."""
+    return refused((recurrence.fits(hooks, state), 'step_widths',
+                    "the step kernel takes a state of power-of-two widths in fp32 or bf16 on a GPU of sm80 "
+                    "or later"))
+
+
+def decode_step(hooks: recurrence.Hooks, operands: recurrence.Step, *, tangent: bool
+                ) -> tuple[jax.Array, jax.Array]:
+    """A decode token's `(output, state')` through the shared recurrence, reported as `delta_decode`'s
+    route: the step kernel per shard (`stepped_per_shard`) where the target prefers it and it takes the
+    state (`step_refusal`), else the portable step (`recurrence.step_reference`), in the operands'
+    own precision, which the compiler partitions. A token traced for forward-mode derivatives
+    (`tangent`) takes the portable step, as the kernel updates its state in place, which takes none."""
+    preferred = measured_kernel(
+        'delta_decode', 'step' if measured_kernel('gated_delta_rule', 'xla') == 'fla' else 'xla')
+    refusal = None
+    if preferred in ('fused', 'step'):
+        refusal = (refused((not tangent, 'forward_mode', "a JVP trace needs forward-mode derivatives; the "
+                            "step kernel updates its state in place, which takes none"))
+                   or step_refusal(hooks, operands.state))
+        if refusal is None:
+            route('delta_decode', kernel='step', preferred=preferred)
+            return stepped_per_shard(hooks, operands)
+    route('delta_decode', kernel='xla', preferred=preferred, refusal=refusal)
+    out, _, state = recurrence.step_reference(hooks, operands)
+    return out, state
 
 
 STEP = recurrence.Hooks(decay='scalar')
@@ -666,11 +707,7 @@ class GatedDeltaNet(nn.Module):
             if refusal is None:
                 return route('delta_decode', kernel='fused', preferred=preferred).kernel
         if preferred in ('fused', 'step'):
-            stepping = refused(
-                (recurrence.fits(STEP, state), 'step_widths',
-                 "the step kernel takes a state of power-of-two widths in fp32 or bf16 on a GPU of sm80 "
-                 "or later"),
-            )
+            stepping = step_refusal(STEP, state)
             if stepping is None:
                 return route('delta_decode', kernel='step', preferred=preferred, refusal=refusal).kernel
             refusal = refusal or stepping
