@@ -397,16 +397,13 @@ def test_logical_positions_leave_a_documents_chunks_in_place():
                                   np.asarray(module.apply(params, x, packed(segments))))
 
 
-@pytest.mark.parametrize("name", ["titans", "cms", "gated_linear_attention", "delta_rule"])
-def test_a_decode_continues_the_full_pass(name):
-    """A prefill and then one token a call, through the cache, reads each token as the full pass does,
-    momentum, chunk boundaries and a level's network as its last scheduled update committed it carried
-    across the calls: on par against float64 (check 1)."""
-    module = layer(name)
+def decoded(module: nn.Module):
+    """`module` over a draw's stream through its decode cache: a first call allocating it, a prefill of
+    six tokens, then one token a call."""
     decode = MixerCall(decode=True)
 
     @jax.jit
-    def decoded(x, params):
+    def run(x, params):
         _, cache = module.apply(params, x[:, :1], decode, mutable=["cache"])
         prefill, cache = module.apply({**params, **cache}, x[:, :6], decode, mutable=["cache"])
         reads = [prefill]
@@ -415,8 +412,17 @@ def test_a_decode_continues_the_full_pass(name):
             reads.append(token)
         return jnp.concatenate(reads, axis=1)
 
+    return run
+
+
+@pytest.mark.parametrize("name", ["titans", "cms", "gated_linear_attention", "delta_rule"])
+def test_a_decode_continues_the_full_pass(name):
+    """A prefill and then one token a call, through the cache, reads each token as the full pass does,
+    momentum, chunk boundaries and a level's network as its last scheduled update committed it carried
+    across the calls: on par against float64 (check 1)."""
+    module = layer(name)
     full = applied(module, packed(np.ones((ROWS, LENGTH), np.int32)))
-    assert_as_exact(decoded, full, drawn(module), f"decoded {name} memory",
+    assert_as_exact(decoded(module), full, drawn(module), f"decoded {name} memory",
                     seeds=SEEDS.get(f"decoded {name}", MEMORY_SEEDS),
                     truth_fn=written(module, dtype=jnp.float64))
 
@@ -677,24 +683,14 @@ def test_a_cached_linear_memory_off_the_recurrence_continues_its_full_pass():
     record = InputQuantization(sites=tuple((site, "fp8") for site in inner_sites(draw(0)[1]["params"])))
     quantized = record.apply(module)
     scales = jax.tree.map(lambda _: np.float32(SCALE), record.declared())
-    decode = MixerCall(decode=True)
 
     def scaled(seed: int):
         x, params = draw(seed)
         return x, {**params, QUANTIZATION: scales}
 
-    @jax.jit
-    def decoded(x, params):
-        _, cache = quantized.apply(params, x[:, :1], decode, mutable=["cache"])
-        read, cache = quantized.apply({**params, **cache}, x[:, :6], decode, mutable=["cache"])
-        reads = [read]
-        for t in range(6, LENGTH):
-            token, cache = quantized.apply({**params, **cache}, x[:, t:t + 1], decode, mutable=["cache"])
-            reads.append(token)
-        return jnp.concatenate(reads, axis=1)
-
     rounded = InputQuantizer.fp8(SCALE).qdq
-    assert_as_exact(decoded, applied(quantized), scaled, "decoded quantized gated_linear_attention memory",
+    assert_as_exact(decoded(quantized), applied(quantized), scaled,
+                    "decoded quantized gated_linear_attention memory",
                     seeds=MEMORY_SEEDS,
                     truth_fn=written(module, dtype=jnp.float64, inputs=rounded))
 
@@ -789,21 +785,15 @@ def test_a_frozen_fp8_inner_kernel_is_w0_as_its_codes_decode(name):
 def explicit_rows_run(module: InContextMemory):
     """`module`'s forward over whole rows, the gradients of its weights and stream under a cotangent,
     its forward over rows packing two documents (`segments`), and a prefill of six tokens continued one
-    a cached call."""
-    decode = MixerCall(decode=True)
+    a cached call (`decoded`)."""
+    cached = decoded(module)
 
     @jax.jit
     def run(x, params, cotangent, segments):
         full, pull = jax.vjp(lambda held, x: module.apply(held, x), params, x)
         laid = coordinates(segments=segments, max_segments=2)
         call = MixerCall(metadata=AttentionMetadata(coordinates=laid))
-        _, cache = module.apply(params, x[:, :1], decode, mutable=["cache"])
-        prefill, cache = module.apply({**params, **cache}, x[:, :6], decode, mutable=["cache"])
-        reads = [prefill]
-        for t in range(6, LENGTH):
-            token, cache = module.apply({**params, **cache}, x[:, t:t + 1], decode, mutable=["cache"])
-            reads.append(token)
-        return full, pull(cotangent), module.apply(params, x, call), jnp.concatenate(reads, axis=1)
+        return full, pull(cotangent), module.apply(params, x, call), cached(x, params)
 
     return run
 
