@@ -40,7 +40,7 @@ def test_a_moment_is_coded_by_its_blocks_nearest_value():
     bitsandbytes' and torchao's share)."""
     moment = jnp.asarray(np.random.default_rng(0).standard_normal((4, 2 * BLOCK)), jnp.float32)
     values = jnp.asarray(dynamic_map(signed=True))
-    codes, scales = quantized(moment, values, BLOCK)
+    codes, scales = quantized(moment, BLOCK, signed=True)
     assert codes.dtype == jnp.uint8 and scales.shape == (4, 2)
     blocked = np.asarray(moment).reshape(4, 2, BLOCK)
     fractions = (blocked / np.asarray(scales)[..., None]).reshape(4, 2 * BLOCK)
@@ -51,6 +51,41 @@ def test_a_moment_is_coded_by_its_blocks_nearest_value():
     peak, decoded = np.take_along_axis(blocked, peaks, -1), np.take_along_axis(back, peaks, -1)
     least = np.asarray(values)[0] * np.asarray(scales)[..., None]
     np.testing.assert_array_equal(decoded, np.where(peak > 0, peak, least))
+
+
+def searched(values: np.ndarray, fractions: np.ndarray) -> np.ndarray:
+    """The code a search of the whole sorted map gives each of `fractions`, in NumPy: the value below it,
+    or the one above where it is halfway there or past, torchao's `quantize_8bit_with_qmap` rule."""
+    below = np.clip(np.searchsorted(values, fractions, side="right") - 1, 0, len(values) - 1)
+    above = np.minimum(below + 1, len(values) - 1)
+    halfway = (values[above] - values[below]) * np.float32(0.5)
+    return np.where(fractions - values[below] >= halfway, above, below)
+
+
+@pytest.mark.parametrize("signed", [True, False], ids=["signed", "unsigned"])
+def test_a_values_code_is_the_one_a_search_of_the_whole_map_gives(signed):
+    """`quantized` looks for each value's code among the few around its estimate (`_estimated_codes`), and
+    finds the one a search of the whole map does, on every value where the search turns: each map value,
+    the halfway points between neighbours, the float32 numbers either side of both, and 0, together with
+    a quarter million values spread evenly over each decade's logarithm from 1e-9 to 1, of either sign
+    where the map is signed. Each block's peak is 1, so a value is its own fraction."""
+    values = dynamic_map(signed=signed)
+    halves = values[:-1] + (values[1:] - values[:-1]) * np.float32(0.5)
+    turns = np.concatenate([values, halves])
+    rng = np.random.default_rng(0)
+    spread = np.float32(10) ** rng.uniform(-9, 0, 1 << 18).astype(np.float32)
+    if signed:
+        spread *= rng.choice(np.asarray([-1, 1], np.float32), spread.shape)
+    either = [np.nextafter(turns, np.float32(side)) for side in (-2, 2)]
+    fractions = np.concatenate([turns, *either, np.zeros(1, np.float32), spread])
+    fractions = np.clip(fractions, -1 if signed else 0, 1).astype(np.float32)
+    rows = -(-fractions.size // (BLOCK - 1))
+    laid = np.zeros((rows, BLOCK - 1), np.float32).reshape(-1)
+    laid[:fractions.size] = fractions
+    moment = np.concatenate([np.ones((rows, 1), np.float32), laid.reshape(rows, BLOCK - 1)], axis=1)
+    codes, scales = quantized(jnp.asarray(moment), BLOCK, signed=signed)
+    np.testing.assert_array_equal(np.asarray(scales), np.ones((rows, 1), np.float32))
+    np.testing.assert_array_equal(np.asarray(codes), searched(values, moment).astype(np.uint8))
 
 
 def test_int8_state_takes_optax_adamw_steps_from_the_fp32_moments():
