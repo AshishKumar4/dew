@@ -84,14 +84,20 @@ def test_disk_moe_logits_and_cached_decode_equal_resident(bank_layers, read_ahea
         assert source.stats().cache_bytes == 0
 
 
-def test_disk_source_reads_shards_and_bounds_cache(tmp_path):
+@pytest.mark.parametrize("fixture", [FIXTURE, FIXTURE.parent / "qwen2-moe-tiny"],
+                         ids=["mixtral", "fused-experts"])
+def test_disk_source_reads_shards_and_bounds_cache(fixture, tmp_path):
+    """A row read from a sharded checkpoint is the resident translation's, under a cache bound: Mixtral's
+    per-expert tensors, and Qwen2-MoE's fused experts, which a lazy read splits into views and reads
+    only when the row is placed."""
     from dew.inference.banks import SafetensorsBanks
 
-    (tmp_path / "config.json").write_bytes((FIXTURE / "config.json").read_bytes())
-    save_sharded(read_weights(FIXTURE), tmp_path, max_shard_size=12_000)
+    (tmp_path / "config.json").write_bytes((fixture / "config.json").read_bytes())
+    save_sharded(read_weights(fixture), tmp_path, max_shard_size=12_000)
     with SafetensorsBanks(tmp_path, cache_bytes=1, param_dtype="float32") as source:
         row = source.read(0)
-        expected = translate_weights(read_weights(FIXTURE), translate_config(source.config), "mixtral")
+        expected = translate_weights(read_weights(fixture), translate_config(source.config),
+                                     str(source.config["model_type"]))
         for actual, reference in zip(
             jax.tree.leaves(row),
             jax.tree.leaves(

@@ -300,9 +300,12 @@ class SafetensorsBanks(LayerBanks):
             raise ValueError("disk banks require unquantized safetensors; a whole-model codec is not bounded")
         record = translate_config(self.config)
         family = _records.text(self.config.get("model_type"), "model_type")
-        if families()[family].prepare is not DecoderFamily.prepare or families()[family].packed:
-            raise ValueError("disk banks require a family with lazy tensor translation; "
-                             "this family's preparation can materialize checkpoint weights")
+        entry = families()[family]
+        # A packed tensor split into views of itself stays unread until a row is placed; a preparation,
+        # or parts interleaved in runs, copies it at translation.
+        if entry.prepare is not DecoderFamily.prepare or not all(packing.viewed for packing in entry.packed):
+            raise ValueError("disk banks require a family with lazy tensor translation; this family's "
+                             "preparation or interleaved packing copies checkpoint weights")
         tensors = read_weights(folder)
         self._variables: Variables = translate_weights(
             tensors, record, family, param_dtype="auto" if param_dtype == "auto" else dtype_name(param_dtype),
