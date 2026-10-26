@@ -712,6 +712,22 @@ def test_a_recording_made_in_shards_is_the_recording_one_run_makes():
                                                                             range(cut - 1))])
 
 
+def test_a_window_loops_roundings_are_one_windows():
+    """A recorded truth's rounding count (`indexed_recording`) traces a window loop (`over_windows`) on
+    its first window, as one draw's program: each window is a draw of its own, and a loop that stacks
+    its windows on the host cannot be traced whole."""
+    from reference_error import _one_draws_program, chain_roundings, over_windows, windows
+
+    def product(x, w):
+        return {"y": jnp.dot(x, w, precision="highest")}
+
+    program, arguments = _one_draws_program(over_windows(product), windows(_draw, 4)(0))
+    assert program is product
+    assert chain_roundings(jax.make_jaxpr(program)(*arguments)) == chain_roundings(
+        jax.make_jaxpr(product)(*_draw(0)))
+    assert _one_draws_program(product, _draw(0))[0] is product
+
+
 def test_a_recorded_reference_with_pilots_sizes_paired_on_them_alone():
     """A recorded reference sizes paired only on pilot draws its recording holds (`recorded_pilots`),
     from SIZING_FROM on, never past them; one without pilots is refused, and so is a live reference
