@@ -26,27 +26,24 @@ from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
+from dew.batch import EXAMPLE_ROWS, Batch, Variables, merge
 from dew.data.dataset import rows_of
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import rows_spec
 from dew.objectives.base import (
-    EXAMPLE_ROWS,
     EXAMPLE_STREAM,
     Aux,
-    Batch,
     Evaluated,
     Ratio,
     Recorded,
     Step,
-    Variables,
-    merge,
     recorded_metrics,
     with_projected,
 )
 from dew.optim import clips_qk, stepped
+from dew.state import Accumulation, TrainState, apart, together
 from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
-from dew.training.state import Accumulation, TrainState, apart, together
 
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)

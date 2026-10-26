@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.inputs import coordinates, document_starts
+from dew.batch import coordinates, document_starts
 
 
 def windowed(query, key, window: int, *, causal: bool):
@@ -55,7 +55,7 @@ def role_blocks(segments, roles, assistant: int, *, starts=None, xp=jnp):
     """Each document's tokens before its first `assistant` token as one block, numbered by the document's
     segment id, -1 for the rest and for padding (segment 0): a chat row's prompt, which a prefix run of
     "prompt" reads whole. `segments` and `roles` are `[B, S]`. A document opens at each of `starts`, where a
-    caller's documents run on across holes (`dew.nn.inputs.document_starts`), else wherever `segments`
+    caller's documents run on across holes (`dew.batch.document_starts`), else wherever `segments`
     changes. The data stage `Blocks` and the loss of a batch without blocks (`LMObjective`) read this rule."""
     places = xp.broadcast_to(xp.arange(segments.shape[-1], dtype=xp.int32), segments.shape)
     opens = starts if starts is not None else xp.concatenate(

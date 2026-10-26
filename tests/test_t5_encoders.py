@@ -122,7 +122,7 @@ def test_the_json_fields_rebuild_an_encoder_that_agrees():
     """A run's record stores the encoder as its fields; rebuilding from them
     gives the same embeddings."""
     encoder = T5Text.from_pretrained(str(TINY))
-    fields = encoder.to_json()
+    fields = encoder.recorded_fields()
 
 
     rebuilt = T5Text.from_pretrained(**fields)

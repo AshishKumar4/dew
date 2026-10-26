@@ -6,13 +6,14 @@ import numpy as np
 import pytest
 from flax import linen as nn
 
+from dew.batch import coordinates
 from dew.nn.attention import (
     cached_validity,
     causal_attention_mask,
     open_kv_cache,
     scaled_dot_product_attention,
 )
-from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
+from dew.nn.inputs import AttentionMetadata, MixerCall
 from dew.nn.linear import GatedDeltaNet
 from dew.nn.mla import MultiHeadLatentAttention
 

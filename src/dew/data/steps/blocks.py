@@ -7,7 +7,7 @@ import dataclasses
 import grain.python as grain
 import numpy as np
 
-from dew.data.dataset import Batch
+from dew.batch import Batch
 from dew.data.steps.text import recounted
 
 

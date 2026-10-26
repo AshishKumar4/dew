@@ -14,8 +14,9 @@ import optax
 import pytest
 from moe_support import BALANCED_EXPERTS, BALANCED_VOCAB, balanced_decoder, favour_expert_zero, uniform_gates
 
+from dew.batch import coordinates
 from dew.diffusion.discrete import MDLM
-from dew.nn.inputs import ModelInputs, coordinates
+from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.routing import ExpertBalance

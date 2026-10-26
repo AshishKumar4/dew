@@ -10,13 +10,13 @@ import numpy as np
 import pytest
 from grain.experimental import FirstFitPackIterDataset
 
+from dew.batch import VALID_ROWS
 from dew.data import Loading, Memory
 from dew.data.compile import compile, validation
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import Pipeline
 from dew.data.plan import fingerprint
 from dew.data.text import Chunks
-from dew.objectives.base import VALID_ROWS
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
 

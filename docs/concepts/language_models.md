@@ -40,7 +40,7 @@ print(len(ids) - held_out, "training tokens,", held_out, "validation tokens")
 import jax
 
 from dew import Trainer
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.data import presets
 from dew.data.sources import TokenFiles
 from dew.nn.backbones import CausalTransformer
@@ -269,7 +269,7 @@ print(objective.pipeline(state)("The capital of France is", 8, key=0).text[0])
 
 `adapt` leaves `bundle` itself unchanged and returns a new value; adapting an already adapted bundle is refused. `LoRA(...).apply(model, variables, key=)` attaches the same adapter to any model and variables, including a model built from its class, and `LoRA.load(model, variables, path, layouts=)` reads an adapter that PEFT or Diffusers wrote. Both return the bound `Adapter`, whose `model` and `variables` you pass to an objective.
 
-On the command line, a run takes the same spec as `--lora.rank 8 --lora.modules q_proj v_proj`. With `--pretrained`, the adapter goes on the loaded weights; without it, on a fresh draw of the model from the run's key. `Pretrained.from_run(run).adapter.save(...)` writes the run's factors under the source's names from the run alone. To train part of a model without an adapter, split its starting variables with `dew.objectives.base.freeze(variables, filter)`. The leaves the filter keeps are trained and the rest stay frozen.
+On the command line, a run takes the same spec as `--lora.rank 8 --lora.modules q_proj v_proj`. With `--pretrained`, the adapter goes on the loaded weights; without it, on a fresh draw of the model from the run's key. `Pretrained.from_run(run).adapter.save(...)` writes the run's factors under the source's names from the run alone. To train part of a model without an adapter, split its starting variables with `dew.batch.freeze(variables, filter)`. The leaves the filter keeps are trained and the rest stay frozen.
 
 `PretrainedDecoder.from_model` wraps a trained `CausalTransformer` as a source bundle so you can export it, and the bundle's `save` writes the Hugging Face layout. This exports the decoder from the example and loads it back:
 
@@ -407,7 +407,7 @@ Audio clips have a mask that is True for valid frames. Gemma 4 inserts one place
 
 The Gemma 3n and Gemma 4 audio encoders are `dew.nn.audio.Gemma3nAudio` and `Gemma4Audio`, with the tower aliases `gemma3n_audio` and `gemma4_audio`. `audio_config` reads the checkpoint's `audio_config` record and rejects unknown computational fields. `audio_weights` converts the tower's own tensors and keeps Gemma 4's checkpointed clipping bounds in a frozen `constants` collection.
 
-An encoder takes `input_features` shaped `[B, T, F]` and a boolean `input_features_mask` that is True for valid frames, and returns `AudioEncoding(features, mask)`, with the mask subsampled to the encoder's frame rate. A loaded source's processor (`Pretrained.load(...).processor`) runs the checkpoint's own Transformers feature extractor, which turns 16 kHz mono waveforms into those two arrays. Nothing resamples the audio. Gemma 3n projects audio through `Gemma3nProjectorModule.soft_embeddings`, without the scaling used for vision. Gemma 4 reuses `Gemma4ProjectorModule`, with its input width taken from `output_proj_dims`.
+An encoder takes `input_features` shaped `[B, T, F]` and a boolean `input_features_mask` that is True for valid frames, and returns `AudioEncoding(features, mask)`, with the mask subsampled to the encoder's frame rate. A loaded source's processor (`Pretrained.load(...).processor`) runs the checkpoint's own Transformers feature extractor, which turns 16 kHz mono waveforms into those two arrays. Nothing resamples the audio. Gemma 3n projects audio through `Gemma3nProjector.soft_embeddings`, without the scaling used for vision. Gemma 4 reuses `Gemma4Projector`, with its input width taken from `output_proj_dims`.
 
 ## Masked diffusion language models
 
@@ -468,7 +468,7 @@ The default is 64 model evaluations, including the final clean prediction; a cal
 
 A source generation control that native MDLM cannot follow is rejected by name. Neutral values are accepted, as are the shared budget, continuation count, EOS and padding metadata. MDLM does not use a KV cache, so `use_cache=False` is accepted and asking for a cache is not.
 
-Saved masked-diffusion recipe runs keep their compute and storage precision, and `dew.pipeline`'s `ema` option picks the live or EMA weights. The run record rebuilds native MDLM with its default `Unmask` solver and 128 steps, MDLM's own, so custom objective steps or solver choices set in code are not saved. Plain `Checkpoints` saves weights and training state but not these task settings, so you have to apply a custom task configuration again. The recipe does not save an EOS policy either. Source checkpoints follow their own EOS metadata, and for a task built from an objective in code, set EOS with `dataclasses.replace(task, eos_token_ids=(...))`.
+Saved masked-diffusion recipe runs keep their compute and storage precision, and `dew.pipeline`'s `ema` option picks the live or EMA weights. The run record rebuilds native MDLM with its default `Unmask` solver and 128 steps, MDLM's own, so custom objective steps or solver choices set in code are not saved. Plain `Checkpoints` saves weights and training state but not these task settings, so you have to apply a custom task configuration again. The run saves its end-of-sequence ids: an objective over a loaded source takes the source's (`Pretrained.eos_token_ids`), and `eos_token_ids=` sets them otherwise, so the run's task and the task its record rebuilds stop a response there, as the source's own task does.
 
 ## DiffusionGemma
 
@@ -519,8 +519,7 @@ with np.load(sft_source / "reference.npz") as reference:
     train_tokens = np.tile(reference["tokens"], (jax.device_count(), 1))
 block_data = Loader(train=lambda partition: iter([{"text": train_tokens}]), val=None,
                      records=len(train_tokens), batch=len(train_tokens))
-block_objective = BlockDiffusionObjective(sft_bundle.model, prompt_length=4,
-                                          num_canvases=2, variables=sft_bundle.variables)
+block_objective = BlockDiffusionObjective(sft_bundle, prompt_length=4, num_canvases=2)
 block_state = Trainer(block_objective, optax.sgd(0.001), key=jax.random.key(2)).fit(
     block_data, steps=1, log_every=1)
 print("Optimizer updates:", int(block_state.updates))

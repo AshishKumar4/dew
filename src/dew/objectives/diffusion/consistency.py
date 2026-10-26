@@ -30,13 +30,14 @@ import jax.numpy as jnp
 import optax
 from flax import linen as nn
 
+from dew.batch import Variables, part
 from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.schedules.flow import static_shift
 from dew.inputs import InputSpec
 from dew.nn.attention import forward_mode_attention
-from dew.objectives.base import TEACHER, Aux, EMASpec, ProgramModule, Step, Variables, part
+from dew.objectives.base import TEACHER, Aux, EMASpec, ProgramModule, Step
 from dew.sampling.guidance import guide
 
 from .objective import FAKE_SCORE, FlowDistillationObjective

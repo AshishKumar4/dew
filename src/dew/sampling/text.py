@@ -32,22 +32,11 @@ from jax.experimental import checkify
 from jax.typing import ArrayLike
 from typing_extensions import TypeVar
 
-from dew.hashing import array_fingerprint
+from dew._hashing import array_fingerprint
+from dew._records import finite
+from dew.batch import BLOCKS_FIELD, Variables, real_slots, token_positions, valid_order, with_validity
 from dew.interop.weights import decoding_storage
-from dew.nn.inputs import (
-    BLOCKS_FIELD,
-    ModelInputs,
-    PredictionPhase,
-    Request,
-    host_rows,
-    local_rows,
-    mesh_of,
-    next_position,
-    real_slots,
-    token_positions,
-    valid_order,
-    with_validity,
-)
+from dew.nn.inputs import ModelInputs, PredictionPhase, Request, host_rows, local_rows, mesh_of, next_position
 from dew.nn.kernels.options import program
 from dew.nn.kv_cache import gather_cache_rows, refuse_unassigned, write_cache
 from dew.nn.protocols import (
@@ -66,8 +55,6 @@ from dew.nn.protocols import (
     refuse_prefix,
 )
 from dew.nn.visibility import served_blocks
-from dew.objectives.base import Variables
-from dew.records import finite
 from dew.sampling import decoding, strategies
 from dew.sampling.decoding import (
     EndOfSequence,
@@ -794,7 +781,7 @@ def _stable(value: object, seen: frozenset[int] = frozenset()) -> Identity:
 
 
 def _hashed(value: np.ndarray | np.generic | jax.Array) -> str:
-    """An array's dtype, shape and contents, fingerprinted (`dew.hashing.array_fingerprint`)."""
+    """An array's dtype, shape and contents, fingerprinted (`dew._hashing.array_fingerprint`)."""
     digest = hashlib.sha256()
     array_fingerprint(digest, np.asarray(value))
     return digest.hexdigest()

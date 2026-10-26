@@ -62,15 +62,16 @@ import numpy as np
 from flax import core, linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 
-from dew.cache import QUANTIZED_TRACE
+from dew.cache import INTERCEPTED, QUANTIZED_TRACE
+from dew.nn.dense import _contractions, _linear_site
 from dew.nn.kernels.generation import backend
 from dew.nn.precision import accumulated, bf16_dot_general, correctly_rounded_divide
 
 if TYPE_CHECKING:
     from qwix import QArray, QuantizationProvider
 
+    from dew.batch import Variables
     from dew.diffusion.process import Conditioning
-    from dew.objectives.base import Variables
 
 QuantizedDtype = Literal["int8", "fp8"]
 """The gemm dtypes a run trains with: int8 on any backend, fp8 where the
@@ -231,37 +232,84 @@ def _qwix_wrapped(model: nn.Module, provider: QuantizationProvider, wrapper: Qua
 def _quantized(model: nn.Module, provider: QuantizationProvider, spec: Quantization) -> nn.Module:
     """`model` with the matmuls of its `entry_methods` under Qwix's `provider`, in the class Qwix
     makes for the call, a `QuantizedClass` of `spec`,
-    each method tracing what it calls under the key `QUANTIZED_TRACE` gives the provider."""
+    each method tracing what it calls under the provider's kind and `spec` in `QUANTIZED_TRACE`, which
+    names `spec` as its policy for the layers that read its rules (`quantized_products`)."""
     quantized = quantize_with(model, provider, methods=entry_methods(model),
-                              key=(type(provider).__name__, spec))
+                              key=(type(provider).__name__, spec), policy=spec)
     layer: Any = type(quantized)
     layer._dew_quantization = spec
     return quantized
 
 
 def quantize_with(model: nn.Module, provider: QuantizationProvider, *,
-                  methods: Sequence[str] = ("__call__",), key: Hashable | None = None) -> nn.Module:
+                  methods: Sequence[str] = ("__call__",), key: Hashable | None = None,
+                  policy: Quantization | None = None) -> nn.Module:
     """Qwix's `quantize_model(model, provider, methods=methods)`, each of `methods` tracing what it
     calls under `key` in `QUANTIZED_TRACE` (by default the provider's kind and the provider): the
     way Dew runs a model Qwix quantizes with a provider of its own, so Qwix owns the products the
     thread tracing it forms (`dew.nn.precision.accumulated`) and no other thread's, and its traces
-    stay apart from the plain model's."""
+    stay apart from the plain model's. `key` is the caller's, opaque; `policy` is the `Quantization`
+    the provider follows, whose rules a layer reads (`quantized_products`), or None for a provider whose
+    rules Dew does not know."""
     quantized = _qwix().quantize_model(model, provider, methods=methods)
     layer = type(quantized)
-    key = (type(provider).__name__, provider) if key is None else key
+    trace = QuantizedTrace((type(provider).__name__, provider) if key is None else key, policy)
     for name in methods:
-        setattr(layer, name, _keyed(getattr(layer, name), key))
+        setattr(layer, name, _keyed(getattr(layer, name), trace))
     return quantized
 
 
+@dataclasses.dataclass(frozen=True)
+class QuantizedTrace:
+    """What a quantized model's methods trace under (`QUANTIZED_TRACE`, which jit's cache keys on): the
+    caller's opaque cache `key`, and the `Quantization` its provider follows (`policy`), or None for a
+    provider whose rules Dew does not know."""
+
+    key: Hashable
+    policy: Quantization | None
+
+
 def _keyed[**Arguments, Result](method: Callable[Arguments, Result],
-                                 key: Hashable) -> Callable[Arguments, Result]:
-    """`method` run under `key` in `QUANTIZED_TRACE`."""
+                                 trace: QuantizedTrace) -> Callable[Arguments, Result]:
+    """`method` run under `trace` in `QUANTIZED_TRACE`."""
     @functools.wraps(method)
     def keyed(*args: Arguments.args, **kwargs: Arguments.kwargs) -> Result:
-        with QUANTIZED_TRACE(key):
+        with QUANTIZED_TRACE(trace), INTERCEPTED(new_value=True):
             return method(*args, **kwargs)
     return keyed
+
+
+@dataclasses.dataclass(frozen=True)
+class QuantizedProducts:
+    """How the Qwix quantization a call runs under changes the products of a submodule and of the
+    modules under it (`quantized_products`). `inputs`: their activations quantize, or their gradients
+    do, so the submodule is no linear map of its input, which a layer that applies it to another
+    operand (MLA's absorbed kv_b_proj) needs it to be; a weight-only rule with float gradients leaves it
+    linear, by its quantized matrix. `weights`: their weights quantize, so the submodule multiplies by
+    no weight it holds, which a layer that moves its weights (an in-context memory's recurrence) needs
+    it to."""
+
+    inputs: bool
+    weights: bool
+
+
+def quantized_products(module: nn.Module, name: str) -> QuantizedProducts:
+    """How the Qwix quantization the call runs under (`QUANTIZED_TRACE`) changes the products of the
+    bound `module`'s submodule `name` and the modules under it (`QuantizedProducts`), as its policy's
+    rules select their paths: the submodule's own, and the scope of each parameter it holds."""
+    trace: QuantizedTrace | None = QUANTIZED_TRACE.value
+    if trace is None:
+        return QuantizedProducts(inputs=False, weights=False)
+    policy = trace.policy
+    if policy is None:
+        # A trace that names no policy (a provider of the caller's own) may quantize anything.
+        return QuantizedProducts(inputs=True, weights=True)
+    scope = (*module.path, name)
+    params = flatten_dict(dict(module.variables.get("params", {}).get(name, {})))
+    scopes = {scope, *((*scope, *leaf[:-1]) for leaf in params)}
+    if all(policy.rule_for(path) is None for path in scopes):
+        return QuantizedProducts(inputs=False, weights=False)
+    return QuantizedProducts(inputs=not policy.weight_only or policy.bwd_qtype is not None, weights=True)
 
 
 def _qwix(module: str = "qwix") -> ModuleType:
@@ -331,6 +379,24 @@ def frozen_fp8_kernel(leaves: Mapping[str, jax.typing.ArrayLike]) -> jax.Array:
     vocabulary rows (`CausalTransformer.applied_kernel`), traced or not."""
     forward = jnp.asarray(leaves[FROZEN_FP8[0]])
     return (forward.astype(jnp.float32) * jnp.asarray(leaves[FROZEN_FP8[1]], jnp.float32)).T
+
+
+def decoded_frozen_fp8(variables: Variables) -> Variables:
+    """`variables` with each frozen FP8 site's kernel decoded from its packed codes into `params`
+    (`frozen_fp8_kernel`) and its codes gone: the float tree the record packed, which a merge sums an
+    adapter into (`dew.lora.Adapter.merge`) and an in-context memory starts from as its W_0
+    (`dew.nn.memory`). Every other `QUANTIZATION` leaf, an input's scale, stays; the collection goes
+    when the codes were all it held."""
+    held = flatten_dict(dict(variables.get(QUANTIZATION, {})))
+    sites = {path[:-1] for path in held if path[-1] == FROZEN_FP8[0]}
+    if not sites:
+        return variables
+    kernels = {(*site, "kernel"): frozen_fp8_kernel({leaf: jnp.asarray(held[(*site, leaf)])
+                                                     for leaf in FROZEN_FP8}) for site in sites}
+    rest = {path: leaf for path, leaf in held.items() if not (path[:-1] in sites and path[-1] in FROZEN_FP8)}
+    decoded = {name: tree for name, tree in variables.items() if name != QUANTIZATION}
+    decoded["params"] = unflatten_dict({**flatten_dict(dict(variables.get("params", {}))), **kernels})
+    return {**decoded, QUANTIZATION: unflatten_dict(rest)} if rest else decoded
 
 
 def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.Array:
@@ -692,19 +758,23 @@ class InputQuantization:
             if context.method_name == "nonlinear_input":
                 # A layer asks whether its submodule is linear in its input
                 # (`MultiHeadLatentAttention.nonlinear_input`): one that
-                # rounds its input or multiplies in FP8 is not.
+                # rounds its input or multiplies in FP8, or holds a module
+                # that does, is not.
                 name = args[0] if args else kwargs["name"]
-                child = getattr(module, name)
-                return next_fun(*args, **kwargs) or (record.quantizer(child) is not None
-                                                     or child.has_variable(QUANTIZATION, FROZEN_FP8[0]))
-            calls = context.method_name == "__call__"
+                held = flatten_dict(dict(getattr(module, name).variables.get(QUANTIZATION, {})))
+                return next_fun(*args, **kwargs) or any(
+                    path[-1] in (*INPUT_SCALES.values(), FROZEN_FP8[0]) for path in held)
+            calls = context.method_name in ("__call__", "_linear")
             quantizer = record.quantizer(module) if calls else None
             frozen = calls and module.has_variable(QUANTIZATION, FROZEN_FP8[0])
             if quantizer is None and not frozen:
                 return next_fun(*args, **kwargs)
+            if not _linear_site(context, "/".join(module.path)):
+                return next_fun(*args, **kwargs)
             # A Linear's input arrives first or by its parameter's name.
             inputs = args[0] if args else kwargs["inputs"]
-            if not _trailing_contraction(module, inputs.ndim):
+            contracted, batch_dims = _contractions(module, inputs.ndim)
+            if batch_dims or contracted != (inputs.ndim - 1,):
                 raise ValueError(f"{'/'.join(module.path)} holds an input scale or a frozen FP8 kernel, "
                                  "which a Linear contracting its input's trailing axis alone reads")
             if quantizer is not None:
@@ -729,7 +799,7 @@ class InputQuantization:
                 return record.quantizer(module)
 
             def apply(self, variables, *args, **kwargs):
-                with nn.intercept_methods(quantize_inputs):
+                with INTERCEPTED(new_value=True), nn.intercept_methods(quantize_inputs):
                     return super().apply(variables, *args, **kwargs)
 
             def init_with_output(self, *args, **kwargs):
@@ -776,14 +846,14 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
     so a rank whose tree lacks one is refused with its peers rather than
     leaving them at the measurement's agreement.
     """
-    from dew import cache, coordination
+    from dew import _coordination, cache
     from dew.nn.kernels.generation import device_generation, fp8_tensor_cores
 
     def planned() -> dict:
         return {"tokens": tokens,
                 "shapes": {site: list(np.shape(_site_kernel(variables["params"], site))) for site in sites}}
 
-    plan = coordination.agreed_same("frozen FP8 sites to measure", planned)
+    plan = _coordination.agreed_same("frozen FP8 sites to measure", planned)
     shapes = {site: tuple(shape) for site, shape in plan["shapes"].items()}
 
     def decided() -> dict | None:
@@ -799,8 +869,8 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
         faster = {shape: _fp8_faster(shape, tokens) for shape in sorted(set(shapes.values()))}
         return {"sites": [site for site in sites if faster[shapes[site]]], "generation": generation}
 
-    record = coordination.broadcast_from_process_zero(
-        coordination.agreed("measuring frozen FP8 sites", decided))
+    record = _coordination.broadcast_from_process_zero(
+        _coordination.agreed("measuring frozen FP8 sites", decided))
     return InputQuantization(frozen_fp8=tuple(record["sites"]), measured_on=record["generation"])
 
 
@@ -833,17 +903,6 @@ def _fp8_faster(shape: tuple[int, ...], tokens: int) -> bool:
                for fn, args in ((bf16, (x, kernel.astype(jnp.bfloat16), cotangent)),
                                 (fp8, (x, cotangent, leaves)))]
     return timings[1] < timings[0]
-
-
-def _trailing_contraction(module: nn.Module, ndim: int) -> bool:
-    """Whether `module` is a Linear that contracts its rank-`ndim` input's trailing axis alone."""
-    match module:
-        case nn.Dense():
-            return True
-        case nn.DenseGeneral(axis=axis, batch_dims=batch_dims):
-            axes = (axis,) if isinstance(axis, int) else tuple(axis)
-            return not batch_dims and sorted(a % ndim for a in axes) == [ndim - 1]
-    return False
 
 
 def _qtype(dtype: QuantizedDtype) -> jax.typing.DTypeLike:
@@ -1429,4 +1488,5 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     return served, {**variables, "params": parameters}
 
 
-__all__ = ["InputQuantization", "Quantization", "quantize_with", "split_columns"]
+__all__ = ["InputQuantization", "Quantization", "QuantizedProducts", "QuantizedTrace", "quantize_with",
+           "split_columns"]

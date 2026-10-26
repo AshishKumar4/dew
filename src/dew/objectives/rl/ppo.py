@@ -10,7 +10,8 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn, struct
 
-from dew.coordination import agreed, from_every_process
+from dew._coordination import agreed, from_every_process
+from dew.batch import Variables, part
 from dew.inference.tasks import Processor, TextGeneration, TextSettings
 from dew.nn.dense import Dense
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
@@ -25,9 +26,7 @@ from dew.objectives.base import (
     Ratio,
     Shown,
     Step,
-    Variables,
     joined,
-    part,
     projected_draw,
     projected_parts,
 )
@@ -35,8 +34,8 @@ from dew.objectives.routing import ExpertBalance, RoutedStatistics
 from dew.rl.advantage import gae_advantages, masked_whiten
 from dew.rl.surrogate import clipped_value_loss_terms
 from dew.sampling.text import Generation, Sampling
+from dew.state import TrainState
 from dew.training.distributed import shard_batch
-from dew.training.state import TrainState
 
 from .episodes import EpisodeCollector, EpisodeInference
 from .grpo import GRPOObjective, onto_ids
@@ -131,7 +130,7 @@ class PPOObjective(Objective[PPOStatistics | Ratio, Variables]):
 
     saved_task = TextGeneration
     settings = TextSettings
-    _ema_is_reference = True
+    ema_is_reference = True
     _model_part = "policy"
 
     def __init__(self, model, seq_len: int, *, critic: nn.Module,

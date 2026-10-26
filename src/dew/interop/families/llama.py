@@ -12,7 +12,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from functools import partial
 
-from dew import records
+from dew import _records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
     FUSED_EXPERTS,
@@ -63,7 +63,7 @@ def _mixtral_config(hf_config, used):
     used.update(('num_local_experts', 'router_jitter_noise'))
     if hf_config.get('router_jitter_noise', 0.0):
         refuse('router_jitter_noise', 'training-time input jitter has no counterpart')
-    experts = records.integer(hf_config['num_local_experts'], 'num_local_experts')
+    experts = _records.integer(hf_config['num_local_experts'], 'num_local_experts')
     config['mixture'] = native_fields(Mixture)(
         top_k=softmax_top_k(hf_config, used), experts=experts)
     return config
@@ -94,10 +94,10 @@ def _granitemoe_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
                            ('residual_multiplier', 'residual_multiplier'),
                            ('logits_scaling', 'logits_scaling'), ('attention_multiplier', 'attention_scale')):
         used.add(source)
-        config[target] = records.number(hf_config.get(source, 1.0), source)
+        config[target] = _records.number(hf_config.get(source, 1.0), source)
 
     config['mixture'] = native_fields(Mixture)(
-        experts=records.integer(hf_config.get('num_local_experts', 8), 'num_local_experts'),
+        experts=_records.integer(hf_config.get('num_local_experts', 8), 'num_local_experts'),
         top_k=softmax_top_k(hf_config, used))
     used.add('num_local_experts')
     return config

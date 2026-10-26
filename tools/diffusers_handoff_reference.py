@@ -31,8 +31,8 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from tools.diffusers_reference_helpers import restore_transformers_names
-from tools.torch_precision import float64
 from tools.diffusers_wan_reference import float64_scheduler
+from tools.torch_precision import float64
 
 restore_transformers_names()
 

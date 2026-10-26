@@ -2,7 +2,7 @@
 
 A window is owned before the dataset or the mesh do any work (`owned_capture`), started on every rank
 together once its warmup steps have run (`start_capture`), and stopped once its steps have (`stop_capture`).
-Each phase runs under `dew.coordination.agreed`, so a rank that fails raises on all of them, and none
+Each phase runs under `dew._coordination.agreed`, so a rank that fails raises on all of them, and none
 proceeds alone to deadlock its peers at the next collective. The trainer reports what the window wrote.
 """
 
@@ -10,7 +10,7 @@ import dataclasses
 import sys
 from typing import TYPE_CHECKING
 
-from dew.coordination import agreed
+from dew._coordination import agreed
 from dew.telemetry import profile as telemetry_profile
 
 if TYPE_CHECKING:

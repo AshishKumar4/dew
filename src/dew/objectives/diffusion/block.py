@@ -24,18 +24,17 @@ from flax import linen as nn, struct
 from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.artifacts import TokenScores
+from dew.batch import FROZEN, Batch, Variables, real_places, shifted_span, thaw, token_layout
 from dew.inference.tasks import BlockGeneration, BlockSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
-from dew.nn.inputs import ModelInputs, real_places, shifted_span, token_layout
+from dew.nn.inputs import ModelInputs
 from dew.nn.precision import at_least_fp32, weighted_total
 from dew.nn.protocols import BlockDenoiser, CacheCapacity, Lacks, LayerScalars
 from dew.nn.sharding import LOGITS, constrain
 from dew.nn.visibility import same_group
 from dew.objectives.base import (
-    FROZEN,
     OMITTED,
     Aux,
-    Batch,
     EMASpec,
     Objective,
     Omitted,
@@ -43,9 +42,8 @@ from dew.objectives.base import (
     Ratio,
     Source,
     Step,
-    Variables,
+    ended,
     model_rngs,
-    thaw,
 )
 from dew.objectives.lm.chunked import model_logits
 from dew.objectives.lm.head import HeadedObjective
@@ -151,7 +149,8 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
     diffusion cross entropy.
 
     `model` may be the loaded SFT source, and `variables` and `processor`
-    override its own (`Objective.bind_model`).
+    override its own (`Objective.bind_model`), as `eos_token_ids`, the ids its
+    task's responses stop at, overrides the source's (`ended`).
 
     Both cross entropies score the final states through the head by the one
     policy every token objective takes (`dew.objectives.lm.head`, `head_chunks`
@@ -179,7 +178,9 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
                  encoder_loss_weight: float = 1.0, decoder_loss_weight: float = 1.0,
                  ema_decay: float | None = None, head_chunks: int = 4,
                  head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
-                 processor: Processor | None | Omitted = OMITTED):
+                 processor: Processor | None | Omitted = OMITTED,
+                 eos_token_ids: Sequence[int] | Omitted = OMITTED):
+        self.eos_token_ids = ended(model, eos_token_ids)
         model = self.bind_model(model, variables=variables, processor=processor)
         if not (isinstance(model, BlockDenoiser) and isinstance(model, LayerScalars)):
             raise Lacks("canvas",
@@ -238,10 +239,11 @@ class BlockDiffusionObjective(HeadedObjective[BlockSFTStatistics]):
         return BlockProcess(canvas_length=self.model.canvas_length, vocab_size=self.model.vocab_size)
 
     def task_settings(self) -> BlockSettings:
-        """The sequence length, canvas budget, block process, pad id, and tokenizer or source
-        processor: the task's own."""
+        """The sequence length, canvas budget, block process, pad id, end-of-sequence ids, and
+        tokenizer or source processor: the task's own."""
         return BlockSettings(seq_len=self.sequence_length, max_new_tokens=self.canvas_size,
                              process=self._process(), pad_token_id=self.pad_token_id,
+                             eos_token_ids=self.eos_token_ids,
                              tokenizer=recorded_tokenizer(self.processor),
                              processor=recorded_processor(self.processor))
 

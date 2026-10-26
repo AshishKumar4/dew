@@ -39,7 +39,7 @@ import jax.numpy as jnp
 from jax.core import ShapedArray
 from jax.extend import core
 
-from dew.objectives.base import Variables, merge, select
+from dew.batch import Variables, merge, select
 
 _PASSED_THROUGH = ("jit", "pjit", "closed_call", "core_call", "remat2", "checkpoint")
 

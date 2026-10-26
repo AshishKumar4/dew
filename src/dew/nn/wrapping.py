@@ -12,10 +12,10 @@ from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.protocols import block_chunks_of
 
 if TYPE_CHECKING:
+    from dew._records import JSON
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.decoder_block import RematPolicy
     from dew.nn.kv_cache import KVCache
-    from dew.records import JSON
 
 
 class DecoderWrapper(nn.Module):

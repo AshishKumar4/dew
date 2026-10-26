@@ -13,10 +13,10 @@ from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from reference_error import assert_as_exact
 
+from dew.batch import under
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import DataPartition
 from dew.objectives import Aux, EMASpec, Objective, Ratio
-from dew.objectives.base import under
 from dew.training import Trainer
 
 
@@ -405,9 +405,9 @@ def test_an_accumulating_step_updates_the_optimizer_in_its_commit_alone():
     simplifier runs a branch of elementwise ops and reductions, as a clipped
     AdamW's update is (`OptimConfig`'s), on every call and selects its
     result; on Qwen3.5-0.8B that was the whole update every microbatch."""
-    from dew.config import OptimConfig
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
+    from dew.optim import OptimConfig
     from dew.telemetry.instrumentation import hlo_instructions
 
     model = CausalTransformer(vocab_size=64, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,

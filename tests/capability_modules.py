@@ -124,7 +124,7 @@ class FamilyText(ConditionEncoder[str, DenoisingCondition]):
     def captions(self, tokens) -> tuple[str, ...]:
         return self.table.captions(tokens)
 
-    def to_json(self) -> dict:
+    def recorded_fields(self) -> dict:
         return {"checkpoint": "char_table", "width": self.width, "pooled": self.pooled,
                 "guidance": self.guidance, "masked": self.masked}
 

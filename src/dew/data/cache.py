@@ -24,6 +24,7 @@ import numpy as np
 from dew.data.concurrent import Concurrently
 from dew.data.dataset import _QUIET_STOP_SECONDS
 from dew.data.generation import (
+    GENERATION_SCHEMA,
     DependencyManifest,
     Generation,
     Outputs,
@@ -91,8 +92,10 @@ class Cache:
     own writes; it never discovers another filling writer's rows, and a
     writer that completes every input of the source it is given publishes
     that source's generation. Volatile prefixes run on every read and produce
-    no completions. A shard upload to a remote store is tried `retry` more
-    times; one to this host's disk or memory fails at once.
+    no completions. A shard a remote store took but reads back otherwise is
+    read again up to `retry` more times (`Store.put_immutable`); a failed
+    transfer raises after its transport's own retries, and a write to this
+    host's disk or memory fails at once.
     """
 
     url: str
@@ -445,15 +448,16 @@ class _Writer:
         payload = path.read_bytes()
         shard = f"shards/{self.writer}/{number:06d}.array_record"
         segment = f"segments/{self.writer}/{number:06d}.json"
-        # A remote store's write is retried, by the store (`Store.put_immutable`); a local disk's failure,
-        # or its retention refusing room (`LocalRetention`), is the cache's error at once.
+        # A remote store's write that reads back otherwise is read again, by the store
+        # (`Store.put_immutable`); a local disk's failure, or its retention refusing room
+        # (`LocalRetention`), is the cache's error at once.
         retries = self.cache.retry if self.root.remote else 0
         if self.closed:
             raise Abandoned("cache upload was cancelled")
         self.root.child(shard).put_immutable(payload, retries=retries)
         encoded = _json(
             {
-                "schema": 1,
+                "schema": GENERATION_SCHEMA,
                 "shard": {"path": shard, "bytes": len(payload), "sha256": _hash(payload)},
                 "completions": entries,
             }

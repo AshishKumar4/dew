@@ -15,9 +15,10 @@ import jax
 import jax.numpy as jnp
 
 from dew.artifacts import TokenScores
+from dew.batch import VALID_ROWS, Variables
 from dew.data.preferences import IDS_KEY, MASK_KEY
 from dew.inputs import Field, InputSpec
-from dew.objectives.base import VALID_ROWS, Aux, EMASpec, Variables
+from dew.objectives.base import Aux, EMASpec
 from dew.objectives.routing import ExpertBalance
 from dew.rl.surrogate import preference_logsigmoid_terms
 
@@ -39,7 +40,7 @@ class DPOObjective(TokenScorer):
     reads: both halves of every pair route, and the counts sum over them.
     """
 
-    _ema_is_reference = True
+    ema_is_reference = True
     counts_tokens = False
     """Preference pairs need their two-sequence geometry, not LM's text rows."""
 

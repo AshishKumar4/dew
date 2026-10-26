@@ -34,12 +34,12 @@ import optax
 import torch
 from torch.overrides import TorchFunctionMode
 
+from dew.batch import Variables
 from dew.interop.pretrained import Pretrained
 from dew.interop.sources import load_shards
-from dew.objectives.base import Variables
 from dew.objectives.lm import LMObjective
 from dew.objectives.routing import ExpertBalance
-from dew.training import TrainState
+from dew.state import TrainState
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 RATE = 5e-2

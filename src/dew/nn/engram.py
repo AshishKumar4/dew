@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import dataclasses
 import functools
-import math
 
 import jax
 import jax.numpy as jnp
@@ -36,8 +35,8 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
+from dew.batch import real_places, valid_order
 from dew.nn.dense import Dense
-from dew.nn.inputs import real_places, valid_order
 
 from .precision import at_least_fp32, float32_dot_general, rms_statistics
 from .sharding import logical_axes
@@ -46,10 +45,6 @@ _DEAD = -1
 """A compressed id no n-gram reaches across (engram.py:130)."""
 _LIMB = 8
 _LIMBS = 8
-
-
-def _is_prime(n: int) -> bool:
-    return n > 1 and all(n % d for d in range(2, math.isqrt(n) + 1))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -98,18 +93,19 @@ class Engram:
     @functools.cached_property
     def primes(self) -> tuple[tuple[tuple[int, ...], ...], ...]:
         """`[layer][n-gram size][head]` bucket moduli: the next unused prime
-        above `vocab_size - 1`, drawn in order (engram.py:9-14, :107-118)."""
-        seen: set[int] = set()
+        above `vocab_size - 1`, drawn in order (engram.py:9-14, :107-118).
+        Each search restarts there and skips the primes drawn before it, so
+        the draws are the successive primes from `vocab_size` on."""
+        from sympy import nextprime
+
+        current = self.vocab_size - 1
         layers = []
         for _ in self.layer_ids:
             per_ngram = []
             for _ in range(self.max_ngram_size - 1):
-                sizes, current = [], self.vocab_size - 1
+                sizes = []
                 for _ in range(self.n_heads):
-                    current += 1
-                    while not _is_prime(current) or current in seen:
-                        current += 1
-                    seen.add(current)
+                    current = nextprime(current)
                     sizes.append(current)
                 per_ngram.append(tuple(sizes))
             layers.append(tuple(per_ngram))

@@ -19,11 +19,12 @@ from block_support import VOCAB, block_causal, model, wrapped
 from model_support import TINY_DECODER, model_draw
 from reference_error import assert_as_exact, seeds_for, without_ynn
 
+from dew.batch import BLOCKS_FIELD, coordinates
 from dew.data.chat import Role
 from dew.data.steps.blocks import Blocks
 from dew.inference.serving import Server
 from dew.inference.tasks import TextGeneration
-from dew.nn.inputs import BLOCKS_FIELD, ModelInputs, coordinates
+from dew.nn.inputs import ModelInputs
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixers import AttentionMixer
 from dew.nn.visibility import prefix_blocks, prompt_blocks, served_blocks

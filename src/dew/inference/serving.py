@@ -50,7 +50,7 @@ feeds live in `dew.inference.serving_kernel`, and the packing of the weights
 a decode step reads in `dew.inference.projections`.
 
 On a mesh the server runs one program over every device, its state placed
-by the weights' rule table (`dew.nn.sharding.DEFAULT_RULES`). The slots split
+by the weights' rule table (`dew.mesh.DEFAULT_RULES`). The slots split
 as a batch's rows do (`activation_batch`), so each group of devices holds its
 own rows and their cache or page share, draws for them, and seats requests
 it has room for. Tensor parallelism splits the heads, mlp and vocabulary
@@ -81,7 +81,8 @@ from jax.experimental import checkify
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
-from dew.hashing import array_fingerprint
+from dew._hashing import array_fingerprint
+from dew.batch import BLOCKS_FIELD, Variables
 from dew.inference.engine import Timed, normalized, reloaded, settled
 from dew.inference.pages import Pages
 from dew.inference.projections import pack_projections, packed_layout
@@ -110,9 +111,9 @@ from dew.inference.tasks import (
     resident,
     shape_bucket,
 )
+from dew.mesh import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
 from dew.nn.cross_attention import CROSS_CACHE, CrossAttention
 from dew.nn.inputs import (
-    BLOCKS_FIELD,
     CONTEXT,
     CONTEXT_LENGTHS,
     CrossContext,
@@ -124,9 +125,7 @@ from dew.nn.inputs import (
 from dew.nn.kernels.options import compiler_options
 from dew.nn.kv_cache import POOLED, ROW_CURSORS, TABLE, KVCache, is_paged, leaf_name
 from dew.nn.protocols import CrossAttending, Layered, ProjectionGroup, Serving
-from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
 from dew.nn.visibility import served_blocks
-from dew.objectives.base import Variables
 from dew.sampling.decoding import Finishing, LogitsTransform, StopStrings
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import Sample

@@ -33,6 +33,7 @@ import optax
 from flax import linen as nn
 
 from dew.artifacts import Representations
+from dew.batch import Variables, part, thaw, under
 from dew.inputs import Field, InputSpec, unit_range
 from dew.nn.precision import accumulated, at_least_fp32
 from dew.nn.sharding import explicit_spec, whole_spec
@@ -44,14 +45,10 @@ from dew.objectives.base import (
     Ratio,
     Shown,
     Step,
-    Variables,
     joined,
     model_rngs,
-    part,
     projected_draw,
     projected_parts,
-    thaw,
-    under,
 )
 
 from .masking import MultiBlockMask
