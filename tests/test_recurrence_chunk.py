@@ -3,6 +3,7 @@ every hook combination it takes, a sequence over several chunks and a ragged las
 too, held to the same recurrence run a token at a time (the decode step's reference,
 `recurrence.step_reference`) under the accuracy gate (tests/reference_error.py), both from float64."""
 
+import dataclasses
 import functools
 import itertools
 
@@ -358,3 +359,37 @@ def test_composed_chunks_leave_the_memory_the_recurrence_leaves(hooks, packed):
 
     assert_as_exact(jax.jit(composed), jax.jit(recurrent), functools.partial(draw, hooks, packed),
                     f'{hooks} composed', seeds=COMPOSED_SEEDS[hooks, packed])
+
+
+def test_the_delta_rules_selector_keeps_the_port_only_on_its_declared_cells():
+    """The recurrence template is the delta rule's kernel on every cell but the declared ones
+    (`PORT_CELLS`, each a family and a product a receipt shows the port faster on), where its 'declared'
+    requirement turns it down; off a GPU its 'device' requirement does. Both are measured requirements, so
+    a call that names the template still takes it."""
+    case = recurrence_chunk.PortCase(reverse=True, varying=False, dtype=np.dtype(jnp.bfloat16), key_width=128)
+    codes = {(family, product): [r.code for r in recurrence_chunk.MOSAIC.failed(
+        dataclasses.replace(case, family=family, product=product))]
+        for family in ('wgmma', 'mma.sync', None) for product in ('forward', 'training')}
+    for cell, reason in recurrence_chunk.PORT_CELLS.items():
+        assert 'declared' in codes[cell] and 'SE-' in reason, (cell, codes[cell])
+    assert 'declared' not in codes['wgmma', 'training'] and 'declared' not in codes['mma.sync', 'forward']
+    assert all('device' in codes[None, product] for product in ('forward', 'training'))
+    forced = recurrence_chunk.MOSAIC.failed(dataclasses.replace(case, family='wgmma', product='forward'),
+                                            forced=True)
+    assert 'declared' not in [r.code for r in forced]
+
+
+def test_a_call_runs_its_products_kernels_apart():
+    """`_by_product`: a call's value is its forward kernel's, and its gradient its training kernel's own,
+    the two kernels' forward and pullback where a gradient is taken."""
+    def forward(x):
+        return 2.0 * x
+
+    def training(x):
+        return 3.0 * x
+
+    x = jnp.arange(3.0)
+    np.testing.assert_array_equal(recurrence_chunk._by_product(forward, training, x), 2.0 * x)
+    value, grad = jax.value_and_grad(lambda x: recurrence_chunk._by_product(forward, training, x).sum())(x)
+    assert value == 3.0 * x.sum()
+    np.testing.assert_array_equal(grad, jnp.full(3, 3.0))
