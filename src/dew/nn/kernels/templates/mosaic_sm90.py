@@ -23,6 +23,9 @@ class Wgmma(mosaic.RingFamily):
     name = "wgmma"
     rows = 64
     consumers = 2
+    role_rows = 64
+    widest_product = 256
+    most_shared = 227 * 1024  # sm90's (and sm100's) opt-in block
 
     @property
     def layout(self):
@@ -35,6 +38,9 @@ class Wgmma(mosaic.RingFamily):
     @property
     def column(self):
         return plgpu.Layout.WGMMA.reduce(0)
+
+    column_scratch = 4 * 32 * 2
+    """A WGMMA tile's columns sum across its four warps, each lane's two entries a register."""
 
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
         def scores(acc_ref):
@@ -64,6 +70,18 @@ class Wgmma(mosaic.RingFamily):
             else:
                 plgpu.wgmma(acc, part, rhs)
         return acc
+
+    def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
+        """`Family.summed` into a scoped warpgroup accumulator: reading it (`acc_ref[...]`) waits on the
+        products `issue` issued into it, so the value is theirs once they are done."""
+        if interpret:
+            return issue(self.zeros(shape))
+
+        def run(acc_ref):
+            issue(acc_ref)
+            return acc_ref[...]
+
+        return pl.run_scoped(run, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
     def staged_products(self, acc, parts, rhs, buffers, interpret: bool, *, transposed: bool = False):
         mosaic.unscaled(parts)

@@ -28,6 +28,19 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas.ops.tpu.megablox.gmm import make_group_metadata
 
+from dew.nn.kernels.templates.gemm import rows_padded
+
+LANES = 128
+"""A vreg's lanes: Mosaic TPU tiles a block's minor dimensions by them (a block of two dimensions or more
+is of whole multiples), and a v5e MXU's side."""
+
+
+def _exact(dtype) -> lax.Precision:
+    """The precision whose MXU product of `dtype` operands sums them exactly into fp32: a 16-bit operand's
+    one pass (Mosaic TPU refuses an fp32 contraction of bf16 operands, which a process's default precision
+    of 'highest' would ask), a wider one's six."""
+    return lax.Precision.DEFAULT if jnp.dtype(dtype).itemsize == 2 else lax.Precision.HIGHEST
+
 
 @dataclasses.dataclass(frozen=True)
 class Blocks:
@@ -60,7 +73,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
     rhs_depth, width = (rhs.shape[2], rhs.shape[1]) if transpose_rhs else rhs.shape[1:]
     if depth != rhs_depth or depth % block_k or width % block_n:
         raise ValueError(f"a [{rows}, {depth}] x {list(rhs.shape)} product does not take {blocks}")
-    lhs = _rows_padded(lhs, 0, block_m)
+    lhs = rows_padded(lhs, 0, block_m)
     m = lhs.shape[0]
     sizes = group_sizes.astype(jnp.int32)
     lengths = jnp.concatenate([sizes, jnp.maximum(m - jnp.sum(sizes), 0)[None]])
@@ -91,7 +104,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
             if prologue is not None:
                 tile = prologue(tile, *(side[...] for side in prologue_refs)).astype(lhs_ref.dtype)
             acc_ref[...] += lax.dot_general(tile, rhs_ref[...], (((1,), (int(transpose_rhs),)), ((), ())),
-                                            preferred_element_type=jnp.float32)
+                                            precision=_exact(tile.dtype), preferred_element_type=jnp.float32)
 
         @pl.when(step == steps - 1)
         def _():
@@ -156,7 +169,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Bloc
     groups = group_sizes.shape[0]
     if rhs.shape[0] != rows or depth % block_m or width % block_n:
         raise ValueError(f"a [{rows}, {depth}] by {list(rhs.shape)} kernel gradient does not take {blocks}")
-    lhs, rhs = _rows_padded(lhs, 0, block_k), _rows_padded(rhs, 0, block_k)
+    lhs, rhs = rows_padded(lhs, 0, block_k), rows_padded(rhs, 0, block_k)
     m = lhs.shape[0]
     metadata, active = make_group_metadata(group_sizes=group_sizes.astype(jnp.int32), m=m, tm=block_k,
                                            start_group=jnp.int32(0), num_nonzero_groups=groups,
@@ -187,7 +200,8 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Bloc
             # Upstream's selection, in fp32: a neighbour's rows, a NaN or an infinity among them, are zeros.
             tile = jnp.where(mine, tile.astype(jnp.float32), 0.0).astype(lhs_ref.dtype)
             cotangent = jnp.where(mine, rhs_ref[...].astype(jnp.float32), 0.0).astype(rhs_ref.dtype)
-            acc_ref[...] += lax.dot(tile.swapaxes(0, 1), cotangent, preferred_element_type=jnp.float32)
+            acc_ref[...] += lax.dot(tile.swapaxes(0, 1), cotangent, precision=_exact(tile.dtype),
+                                    preferred_element_type=jnp.float32)
 
         @pl.when(last)
         def _():
@@ -231,14 +245,6 @@ def _as_tuple(outs) -> tuple:
     return outs if isinstance(outs, tuple) else (outs,)
 
 
-def _rows_padded(array: jax.Array, axis: int, block: int) -> jax.Array:
-    """`array` with zeros after its own along `axis` up to a multiple of `block`, the row blocks the
-    group metadata tiles by."""
-    pad = -array.shape[axis] % block
-    widths = tuple((0, pad if dim == axis else 0) for dim in range(array.ndim))
-    return jnp.pad(array, widths) if pad else array
-
-
 def _side_padded(side: jax.Array, axes: tuple, block: int) -> jax.Array:
     """A side operand padded as the rows are along the dimension that follows them, wherever it is."""
-    return _rows_padded(side, axes.index('rows'), block) if 'rows' in axes else side
+    return rows_padded(side, axes.index('rows'), block) if 'rows' in axes else side

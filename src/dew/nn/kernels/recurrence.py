@@ -494,10 +494,9 @@ class Launch:
 
 
 WARPS = Launch(0, 8)
-"""The launch without a measurement over a whole head."""
+"""The launch over a whole head."""
 COLUMNS = Launch(32, 8)
-"""The launch without a measurement over value columns: 32 a program, 16 to 64 measured within 3% on
-an RTX 4080."""
+"""The launch over value columns: 32 a program, 16 to 64 measured within 3% on an RTX 4080."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -506,8 +505,14 @@ class StepLaunch(tuning.KernelOp):
     it interprets."""
 
     config_cls: ClassVar[type[Launch]] = Launch
+
     ROWS: ClassVar[tuple[str, ...]] = ('active', 'query', 'key', 'value', 'token', 'held', 'log_decay',
                                        'gate', 'beta', 'z', 'state')
+
+    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
+        """Normal floats and every row active, so a timed launch steps each row's state and history."""
+        return [jnp.ones(spec.shape, spec.dtype) if jnp.issubdtype(spec.dtype, jnp.integer) else array
+                for spec, array in zip(specs, super().operands(specs, seed), strict=True)]
 
     def _fwd(self, active: jax.Array, state: jax.Array, query: jax.Array | None, key: jax.Array | None,
              value: jax.Array | None, token: jax.Array | None, held: jax.Array | None, taps: jax.Array | None,
@@ -526,7 +531,7 @@ class StepLaunch(tuning.KernelOp):
         key_heads = (_pieces(hooks, value_heads, key_width, value_width, given['token'].shape[-1])
                      if hooks.conv is not None else given['query'].shape[1])
 
-        # A hook that reads a whole head has only whole-head configs in its space (`_whole`).
+        # A hook that reads a whole head takes a whole-head config (`_whole`).
         block = config.block or value_width
 
         def whole(array):
@@ -587,18 +592,19 @@ class StepLaunch(tuning.KernelOp):
             return WARPS
         return dataclasses.replace(COLUMNS, block=min(COLUMNS.block, ba.arguments['state'].shape[-1]))
 
-    def _get_autotuning_configs(self, ba) -> set[Launch]:
-        whole = {Launch(0, warps) for warps in (4, 8, 16)}
-        if _whole(ba.kwargs['hooks']):
-            return whole
+    def pinnable(self, ba, config) -> bool:
+        # A program's block of value columns: a whole head where a hook reads one (`_whole`), else a whole
+        # head or a block dividing the state's width.
         width = ba.arguments['state'].shape[-1]
-        return whole | {Launch(block, warps) for block in (16, 32, 64) for warps in (4, 8)
-                        if width % block == 0}
+        return isinstance(config, Launch) and (
+            config.block == 0 or (not _whole(ba.kwargs['hooks']) and 0 < config.block <= width
+                                  and width % config.block == 0))
 
-    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
-        """Normal floats and every row active, so a timed launch steps each row's state and history."""
-        return [jnp.ones(spec.shape, spec.dtype) if jnp.issubdtype(spec.dtype, jnp.integer) else array
-                for spec, array in zip(specs, super().operands(specs, seed), strict=True)]
+    def unpinnable(self, ba, config) -> str:
+        if not isinstance(config, Launch):
+            return super().unpinnable(ba, config)
+        return ("its block of value columns is neither the whole head a hook here reads whole nor a block "
+                "dividing the state's width")
 
 
 def _whole(hooks: Hooks) -> bool:
@@ -654,7 +660,7 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
     if 'log_decay' in given and hooks.decay == 'scalar':
         given['log_decay'] = given['log_decay'].reshape(rows, -1)
     named = jnp.dtype(operand if dtype is None else dtype).name
-    # Positional, None where a hook is off: the tuner keys a launch by its positional arrays.
+    # Positional, None where a hook is off.
     state, *history, out = StepLaunch()(flags, *(given.get(name) for name in OPERANDS), hooks=hooks,
                                         dtype=named, interpret=not triton_runs())
     return out, history[0] if history else None, state
@@ -697,10 +703,10 @@ def _cumsum_kernel(chunk_ref, s_ref, o_ref, *, chunk: int, aligned: bool, scale:
 class ChunkLocalCumsum(chunked_launch._Launch):
     """`cumulated`'s launch (tuning.KernelOp), fla's `chunk_local_cumsum`."""
 
+    revision: int = 2
+
     NAME = "cumulated"
     KEYS, VALUES = None, None
-    revision: int = 2
-    SPACES = chunked_launch._spaces(chunked_launch._tiles([(0, 0)], (1, 2, 4, 8), (1,)))
     PICKS = chunked_launch._picks(chunked_launch.Tiles(0, 0, 2, 1))
 
     def _fwd(self, g: jax.Array, chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int,

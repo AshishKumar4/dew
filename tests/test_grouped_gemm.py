@@ -16,7 +16,7 @@ from jax.sharding import Mesh
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations, with_gradients
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
-from dew.nn.kernels.templates import cost
+from dew.nn.kernels.templates import cost, mosaic_sm80
 from dew.nn.kernels.templates.gemm import mosaic_gpu, template
 from dew.nn.moe import expert_projection
 from tools import grouped_oracle as oracle
@@ -127,11 +127,11 @@ def test_the_kernel_gradient_keeps_a_neighbours_non_finite_rows_out(tiles):
                                               (grouped_matmul.MosaicGmm(), True),
                                               (grouped_matmul.MosaicTgmm(), None)],
                          ids=["MosaicGmm", "MosaicGmm-transposed", "MosaicTgmm"])
-def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch, trans_rhs):
-    """The tiles the Mosaic GPU launches may pick at an expert layer's shapes lower for an H100 on the
-    CPU, as a GPU session's compile would, over rows no multiple of 8: every block shape and every
-    schedule among those that fit an H100's block (`Template.fitting`). The interpreter takes kernels
-    Mosaic GPU's layout inference and TMA descriptors refuse; the GPU's tile gate runs each one
+def test_the_hopper_grouped_matmuls_lower_for_an_h100_at_their_tile_and_a_narrow_pin(launch, trans_rhs):
+    """The tile each Mosaic GPU launch derives at an expert layer's shapes (`Template.derived`), and the
+    narrowest cooperative tile a pin may name there, of another block shape and schedule, lower for an
+    H100 on the CPU, as a GPU session's compile would, over rows no multiple of 8. The interpreter takes
+    kernels Mosaic GPU's layout inference and TMA descriptors refuse; the GPU's tile gate runs each one
     (test_moe_precision)."""
     # Rows not a multiple of 8, which a TMA descriptor tiles by.
     rows, depth, width, groups = 2044, 768, 1536, 8
@@ -146,16 +146,10 @@ def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch, tra
     options = {"out_dtype": "bfloat16", **options, "interpret": False}
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        fits = launch.fitting(launch.bind(*args, **options), generation.gpu_target())
-        # A fitting tile of every block shape and of every schedule: what the lowering depends on
-        # (shared memory, the snake's index arithmetic), each value once.
-        covering = set({(c.block_m, c.block_n): c for c in reversed(fits)}.values())
-        covering |= set({(c.stages, c.grid_block_n): c for c in reversed(fits)}.values())
-        covering |= set({(c.warpgroups, c.cluster, c.block_n): c for c in reversed(fits)}.values())
-        assert {(c.block_m, c.block_n) for c in covering} == {(c.block_m, c.block_n) for c in fits}
-        assert {(c.stages, c.grid_block_n) for c in covering} == {(c.stages, c.grid_block_n) for c in fits}
-        assert {(c.warpgroups, c.cluster) for c in covering} == {(c.warpgroups, c.cluster) for c in fits}
-        for config in sorted(covering, key=repr):
+        ba, target = launch.bind(*args, **options), generation.gpu_target()
+        derived, narrow = launch.derived(ba, target), mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2)
+        assert launch.legal(ba, narrow, target) and derived != narrow
+        for config in (derived, narrow):
             jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
                 lowering_platforms=("cuda",))
 
@@ -240,6 +234,147 @@ def test_cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
     assert ran == {"CutlassGmm", "CutlassTgmm"}
 
 
+def ragged_draw(seed):
+    """The ragged sizes' rows, matrices and cotangent in bf16, at a seed (`operands`)."""
+    x, w, dy, _ = operands(SIZES["ragged"], jnp.bfloat16, seed)
+    return tuple(jnp.asarray(value, jnp.bfloat16) for value in (x, w, dy))
+
+
+UNSEEN = {
+    "ampere-class": generation.GpuTarget("sm80", "Unmeasured Ampere-class GPU", shared_limit=99 * 1024,
+                                         multiprocessors=46, clock_hz=1.4e9, memory_bandwidth=0.45e12),
+    "hopper-class": generation.GpuTarget("sm90", "Unmeasured Hopper-class GPU", shared_limit=180 * 1024,
+                                         multiprocessors=78, clock_hz=1.6e9, memory_bandwidth=2.4e12),
+}
+"""GPUs no row measured, one of each family: an Ampere-class part with fewer multiprocessors and the
+smaller block of an sm86 than an A100's, and a Hopper-class one with fewer multiprocessors, a smaller
+block and another L2 bandwidth than an H100's."""
+
+
+def test_a_program_traced_for_one_gpu_traces_again_for_another_of_its_family():
+    """Two GPUs of one family whose facts differ key a jitted program's traces apart
+    (`generation.assumed`), so neither's launches are sized and picked by the other's facts; the same
+    facts, stated again, share one trace."""
+    traced = []
+
+    @jax.jit
+    def program(x):
+        traced.append(generation.gpu_target())
+        return x + 1
+
+    measured = dataclasses.replace(UNSEEN["hopper-class"], memory_bandwidth=3.0e12)
+    restated = dataclasses.replace(measured)
+    targets = (UNSEEN["hopper-class"], generation.TARGETS["sm90"], measured, restated)
+    for target in targets:
+        with generation.assumed(target):
+            program(jnp.zeros(2))
+    assert traced == list(targets[:3])
+
+
+@INTERPRETS
+@pytest.mark.parametrize("unseen", UNSEEN)
+def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
+    """On a GPU no row measured, each Mosaic GPU launch's tiles are its family's, generated from the
+    family's facts and the call's extents, and fit the GPU's block; the cost model picks among them on
+    the GPU's own facts (at a Qwen3 MoE projection's extents, not every pick the same GPU family's
+    canonical device picks), and the call takes those picks. Named there, the projection's forward and
+    its gradients through them (the matrix frozen where the family runs no kernel gradient) are as exact
+    as XLA's ragged dot from float64."""
+    target = UNSEEN[unseen]
+    canonical = generation.TARGETS[target.generation]
+    family = "wgmma" if target.wgmma else "mma.sync"
+    if not target.wgmma and not mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16)).stores(jnp.bfloat16):
+        pytest.skip("mma.sync stores no bf16 tile on this JAX (Family.stores): these calls run Triton")
+    # mma.sync's tiles run the product and the input gradient; the kernel gradient is warpgroup MMA's.
+    launched = {"MosaicGmm", "MosaicTgmm"} if target.wgmma else {"MosaicGmm"}
+
+    def products(rows, depth, width, groups):
+        # The forward, and its input and kernel gradients as the reverse pass launches them, each alone.
+        sizes = jnp.full((groups,), rows // groups, jnp.int32)
+        forward = functools.partial(template.gemm, group_sizes=sizes, out_dtype=jnp.bfloat16,
+                                    precision="default", interpret_on_cpu=True)
+        bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+        x, w, dy = bf16((rows, depth)), bf16((groups, depth, width)), bf16((rows, width))
+        named = [(forward, (x, w)), (functools.partial(forward, transpose_rhs=True), (dy, w))]
+        if target.wgmma:
+            named.append((functools.partial(template.gemm_t, group_sizes=sizes, out_dtype=jnp.bfloat16,
+                                            interpret_on_cpu=True), (x, dy)))
+        return named
+
+    # At a Qwen3 MoE projection's extents, traced (never run): each launch takes the tile the cost model
+    # picks on the GPU's facts among its family's fitting ones, not every one the canonical device's.
+    budget = generation.shared_budget(target)
+    differs = []
+    with (generation.assumed(target), generation.chosen(grouped_matmul="mosaic_gpu"),
+          tuning.seen() as launches):
+        for product, shapes in products(65536, 2048, 1536, 128):
+            jax.jit(product).trace(*shapes)
+        for (launch, _), (tile, ba) in zip(launches, launches.taken, strict=True):
+            if not isinstance(launch, grouped_matmul._Mosaic):
+                continue
+            assert tile.family == family and tile in launch.fitting(ba, target)
+            assert launch.staged_bytes(ba, tile, target) <= budget
+            assert tile == launch.estimate(ba, target)[1]
+            differs.append(tile != launch.estimate(ba, canonical)[1])
+    assert any(differs)
+
+    sizes = SIZES["ragged"]
+    group_sizes = jnp.asarray(sizes, jnp.int32)
+
+
+    def held(w):
+        # Where the family runs no kernel gradient, the matrix is frozen: the template forms no gradient
+        # of it (a frozen operand's cotangent is never formed).
+        return w if target.wgmma else jax.lax.stop_gradient(w)
+
+    def projection(dtype=jnp.bfloat16):
+        return lambda x, w: expert_projection(x, held(w), group_sizes, dtype, "xla", None)
+
+    def through_mosaic(x, w, dy):
+        with generation.assumed(target), generation.chosen(grouped_matmul="mosaic_gpu"):
+            return with_gradients(lambda x, w: template.gemm(x, held(w), group_sizes, out_dtype=jnp.bfloat16,
+                                                             precision="default",
+                                                             interpret_on_cpu=True))(x, w, dy)
+
+    # Eagerly: the Mosaic interpreter's ordered callbacks are not a jitted `linear_call`'s to carry.
+    with tuning.seen() as launches:
+        assert_as_exact(through_mosaic, jax.jit(with_gradients(projection())), ragged_draw,
+                        f"unseen {unseen}", seeds=SEEDS, truth_fn=with_gradients(projection(jnp.float64)))
+    mosaic = [(launch, ba, tile) for (launch, _), (tile, ba) in zip(launches, launches.taken, strict=True)
+              if isinstance(launch, grouped_matmul._Mosaic)]
+    assert {type(launch).__name__ for launch, _, _ in mosaic} == launched
+    with generation.assumed(target):
+        assert all(tile == launch.estimate(ba, target)[1] for launch, ba, tile in mosaic)
+
+
+@INTERPRETS
+def test_a_frozen_matrix_forms_no_kernel_gradient():
+    """A projection whose matrix is frozen (no reverse pass reaches it) forms no kernel gradient: no
+    launch computes one, and its input gradient through the Mosaic launches is as exact as XLA's from
+    float64."""
+    sizes = SIZES["ragged"]
+    group_sizes = jnp.asarray(sizes, jnp.int32)
+
+
+    def frozen(product):
+        return lambda x, w: product(x, jax.lax.stop_gradient(w))
+
+    def projection(dtype=jnp.bfloat16):
+        return frozen(lambda x, w: expert_projection(x, w, group_sizes, dtype, "xla", None))
+
+    def through_mosaic(x, w, dy):
+        with generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"):
+            return with_gradients(frozen(lambda x, w: template.gemm(x, w, group_sizes, out_dtype=jnp.bfloat16,
+                                                                    interpret_on_cpu=True)))(x, w, dy)
+
+    # Eagerly: the Mosaic interpreter's ordered callbacks are not a jitted `linear_call`'s to carry.
+    with tuning.seen() as launches:
+        assert_as_exact(through_mosaic, jax.jit(with_gradients(projection())), ragged_draw, "frozen matrix",
+                        seeds=SEEDS, truth_fn=with_gradients(projection(jnp.float64)))
+    assert {type(launch).__name__ for launch, _ in launches} == {"MosaicGmm"}
+
+
+@runs("sm80")
 def test_the_kernels_forward_mode_keeps_the_projections_law():
     """An expert projection's tangent through the template (its launches interpreted, as an A100 runs
     them) is the XLA projection's, bit for bit: `dx @ Q(kernel) + Q(x) @ dkernel` with the tangents
@@ -268,6 +403,7 @@ def test_a_named_kernel_refuses_where_the_kernels_do_not_run():
         expert_projection(x, w, sizes, jnp.bfloat16, "auto", None)
 
 
+@runs("sm80")
 def test_a_call_of_no_rows_runs_xla_or_refuses_a_named_kernel():
     """A projection of no rows launches nothing: XLA gives its empty value, the route saying why, and a
     kernel `generation.chosen` names for it raises rather than running XLA."""
@@ -398,18 +534,30 @@ def test_a_tile_of_192_columns_stages_every_column_it_writes():
         check(got, reference[0], truth[0], group, f"forward {tiles}")
 
 
-@runs("sm80")
-@pytest.mark.skipif(jax.default_backend() == "gpu" and generation.device_generation() != "sm80",
-                    reason="Mosaic GPU lowers a kernel for the process's own device, and mma.sync's tile "
-                           "stages its output in an A100's shared memory, which another GPU's block does "
-                           "not hold (99 KiB on sm86, sm89 and sm120; an H100's pipelines past its own, "
-                           "SM80-h100)")
+AMPERE_CLASS = jax.default_backend() == "cpu" or (
+    jax.default_backend() == "gpu" and not generation.gpu_target().wgmma and mosaic_sm80.staging_solved())
+"""Whether this process runs mma.sync's kernels: a CPU interprets them as an A100's; a GPU without warpgroup
+MMA (an A100, an A10, an L4) runs them on its own facts where its JAX's layout inference places them
+(`mosaic_sm80.staging_solved`), where one with warpgroup MMA lowers them for its own device, whose pipelines
+its Mosaic sizes past its block (SM80-h100)."""
+
+
+def ampere(generation_name: str = "sm80"):
+    """The assumed device an mma.sync test runs on: the process's own Ampere-class GPU, else
+    `generation_name`'s, which a CPU interprets."""
+    return generation.assumed(None if jax.default_backend() == "gpu" else generation_name)
+
+
+@pytest.mark.skipif(not AMPERE_CLASS, reason="no mma.sync kernel this GPU and JAX lower")
 @pytest.mark.parametrize("out_dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("sizes", [name for name in SIZES if any(SIZES[name])])
-def test_an_ampere_gpu_runs_the_mosaic_forward_only_by_name(sizes, out_dtype):
-    """Without warpgroup MMA the Mosaic GPU forward runs mma.sync's tiles (`AMPERE_TILES`) only where the
-    call names it: chosen, it is as exact as XLA's ragged dot rounded to its output dtype from float64,
-    unrouted rows and empty groups included; unchosen, Triton's launch runs it."""
+def test_an_ampere_gpu_runs_mosaics_launch_first(sizes, out_dtype):
+    """Without warpgroup MMA, the Mosaic GPU forward's mma.sync tile (`mosaic_gpu.derived`) comes before
+    Triton's launch in the grouped selector's order where mma.sync stores the output dtype
+    (`mosaic.Family.stores`: fp32, not a 16-bit tile, which JAX 0.12's global transfers refuse from its
+    layout): unnamed, the call runs Mosaic's, or Triton's at bf16; named, each launch that takes it is as
+    exact as XLA's ragged dot rounded to its output dtype from float64, unrouted rows and empty groups
+    included."""
     x, w, dy, group = operands(SIZES[sizes], jnp.bfloat16)
     truth = oracle.products(x, w, dy, SIZES[sizes])
     group_sizes = jnp.asarray(SIZES[sizes], jnp.int32)
@@ -423,25 +571,48 @@ def test_an_ampere_gpu_runs_the_mosaic_forward_only_by_name(sizes, out_dtype):
         return template.gemm(x, w, group_sizes, out_dtype=out_dtype, precision="default",
                              interpret_on_cpu=True)
 
-    for named, kernel in ((None, "Gmm"), ("mosaic_gpu", "MosaicGmm")):
-        with (generation.assumed("sm80"), generation.chosen(grouped_matmul=named),
-              tuning.seen() as launches):
+    def running(**chosen):
+        # The launches of the branch the call runs; a GPU process's CPU branch beside it interprets Triton's.
+        with ampere(), generation.chosen(**chosen), tuning.seen() as launches:
             got = jax.jit(forward)(lhs, rhs)
-        # The branch the call runs; a GPU process's CPU branch beside it interprets Triton's.
-        ran = {type(launch).__name__ for launch, ba in launches
-               if ba.arguments["interpret"] == (jax.default_backend() == "cpu")}
-        assert ran == {kernel} and got.dtype == out_dtype
+        ran = [(launch, ba) for (launch, _), (_, ba) in zip(launches, launches.taken, strict=True)
+               if ba.arguments["interpret"] == (jax.default_backend() == "cpu")]
+        return got, ran
+
+    stored = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16)).stores(out_dtype)
+    named_launches = (("triton", "Gmm"), *((("mosaic_gpu", "MosaicGmm"),) if stored else ()))
+    for named, kernel in named_launches:
+        got, ran = running(grouped_matmul=named)
+        assert {type(launch).__name__ for launch, _ in ran} == {kernel} and got.dtype == out_dtype
         check(got, reference, truth[0], group, f"sm80 forward through {kernel} to {jnp.dtype(out_dtype)}")
+    _, ran = running()
+    assert {type(launch).__name__ for launch, _ in ran} == {"MosaicGmm" if stored else "Gmm"}
 
 
+@pytest.mark.skipif(not AMPERE_CLASS, reason="no mma.sync kernel this GPU and JAX lower")
 def test_an_mma_sync_forward_of_no_depth_is_zero():
     """A product of no depth through mma.sync's tile, named on an Ampere GPU, is zero: it sums nothing,
     and no launch runs."""
     lhs, rhs = jnp.zeros((128, 0), jnp.bfloat16), jnp.zeros((1, 0, 256), jnp.bfloat16)
-    with generation.assumed("sm80"), generation.chosen(grouped_matmul="mosaic_gpu"):
+    with ampere(), generation.chosen(grouped_matmul="mosaic_gpu"):
         got = jax.jit(lambda x, w: template.gemm(x, w, jnp.asarray([128], jnp.int32), out_dtype=jnp.float32,
                                                  precision="default", interpret_on_cpu=True))(lhs, rhs)
     assert not np.any(np.asarray(got))
+
+
+def test_a_launch_of_fewer_programs_than_its_slots_costs_one_programs_service():
+    """A lone program costs its own service, however many a multiprocessor could hold, and its pipeline
+    hides no more steps' latency than it takes: the estimate is the same at any residency, and at any
+    stage count past its steps."""
+    with generation.assumed("sm80"):
+        target = generation.gpu_target()
+
+    def seconds(**fields):
+        return cost.seconds(cost.Cost(**{"programs": 1, "device_bytes": 1.0, "program_flops": 1e6, "steps": 2,
+                                         "stages": 3, "resident": 1} | fields), target)
+
+    assert seconds(resident=12) == seconds(resident=1)
+    assert seconds(stages=9) == seconds(stages=3) < seconds(stages=2)
 
 
 def test_the_cost_model_names_a_fact_its_target_lacks():

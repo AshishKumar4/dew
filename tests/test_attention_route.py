@@ -33,16 +33,18 @@ from test_attention_template import (
     cross_documents,
     dews_mask,
     geometry,
+    key_validity,
     own_documents,
 )
 
 from dew.nn import attention
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.attention_kernels import ATTENTION, kernel_refusals
-from dew.nn.kernels import generation
+from dew.nn.inputs import counted_places
+from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.generation import INHERENT
 from dew.nn.kernels.selection import KernelRefused
-from dew.nn.kernels.templates import attention as template, attention_route
+from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_route
 from dew.nn.sharding import DEFAULT_RULES
 
 HEADS, KV_HEADS, WIDTH = 4, 2, 32
@@ -66,6 +68,9 @@ CASES = {
                                       "block_groups": True},
     "cache-call-blocks-starts": {"causal": True, "segment_ids": "cross", "block_groups": True, "starts": True,
                                  "sinks": True},
+    "valid-documents-window-places": {"causal": True, "sliding_window": 24, "segment_ids": "own",
+                                      "valid": True, "positions": True},
+    "cache-call-valid": {"causal": True, "segment_ids": "cross", "valid": True, "sinks": True},
 }
 
 
@@ -84,6 +89,10 @@ def keywords(case: dict) -> dict:
     if case.get("block_groups"):
         keywords["block_groups"], keywords["image_groups"] = (jnp.asarray(groups)
                                                               for groups in block_groups(geometry(case)[1]))
+    if case.get("valid"):
+        keywords["key_valid"] = key_validity(geometry(case)[1])
+    if case.get("positions"):
+        keywords["places"] = counted_places(keywords["segment_ids"], keywords["key_valid"])
     return keywords
 
 
@@ -156,9 +165,11 @@ MESH_CASES = {
     "cross-documents": {"causal": True, "segment_ids": "cross"},
     "lengths-and-starts": {"lengths": True, "starts": True},
     "own-documents-blocks": {"causal": True, "segment_ids": "own", "block_groups": True},
+    "own-documents-valid-places": {"causal": True, "sliding_window": 24, "segment_ids": "own", "valid": True,
+                                   "positions": True},
 }
-"""The calls the per-shard test takes, each with sinks: its ids, lengths, starts and block groups split with
-their rows."""
+"""The calls the per-shard test takes, each with sinks: its ids, lengths, starts, block groups, key validity
+and places split with their rows."""
 WIDE_HEADS = 24
 """The query heads of the partly split mesh tests: eight ways over the tensor and expert axes, three on each
 shard."""
@@ -313,7 +324,8 @@ def test_a_calls_row_arguments_split_as_its_query_rows_do_where_the_heads_conten
                               truth_fn=call("reference"))
 
 
-@pytest.mark.parametrize("name", ["causal-window", "block-causal-documents-window"])
+@pytest.mark.parametrize("name", ["causal-window", "block-causal-documents-window",
+                                  "valid-documents-window-places"])
 def test_a_route_call_under_forward_mode_keeps_the_template_value_and_the_reference_derivative(name):
     """Under `forward_mode_attention` a fused call keeps its kernel's value and takes its tangent from the
     reference path's JVP over the same keys, block groups among them, so the route's primal and tangent are
@@ -336,11 +348,12 @@ def test_a_route_call_under_forward_mode_keeps_the_template_value_and_the_refere
                     seeds=SEEDS)
 
 
-def test_a_dropped_out_call_draws_over_the_keys_its_block_groups_mean():
+@pytest.mark.parametrize("name", ["block-causal-documents-window", "valid-documents-window-places"])
+def test_a_dropped_out_call_draws_over_the_keys_its_block_groups_mean(name):
     """Under active dropout a call runs the reference path's one draw (`_dropout_attention`): with block
-    groups, documents and a window it draws over the mask its spans mean, so it is the same call as one
-    given that mask (`dews_mask`) under the same key, bitwise."""
-    case = CASES["block-causal-documents-window"]
+    groups, or key validity and counted places, documents and a window it draws over the mask its spans
+    mean, so it is the same call as one given that mask (`dews_mask`) under the same key, bitwise."""
+    case = CASES[name]
     query, key, value, _, _ = drawing(*geometry(case), jnp.float32, sinks=False)(0)
     dropped = functools.partial(scaled_dot_product_attention, dropout_rate=0.25,
                                 dropout_rng=jax.random.key(3), deterministic=False)
@@ -394,32 +407,51 @@ def test_no_target_prefers_the_template_so_only_a_named_call_takes_it():
             assert attention.resolve_implementation("auto", query, key, **call) == "template", call
 
 
-@pytest.mark.parametrize("kind", ["block_groups", "image_groups"])
+@pytest.mark.skipif(generation.device_generation() != "sm90", reason="runs the route's backward, on an H100")
+@pytest.mark.gpu(reason="runs the route's backward, on an H100")
+@pytest.mark.parametrize("case", ["causal", "packed-documents", "sinks-softcap"])
+def test_on_an_h100_the_routes_backward_is_the_mosaic_template(case):
+    """On an H100 a bf16 call's backward runs the Mosaic mainloop's Template implementation
+    (`attention_mosaic.MosaicBackward`, traced among the launches, `tuning.seen`) from the Triton forward's
+    residuals, a causal call's, a spans call's and a hooked one's alike (`attention_mosaic.backward_takes`),
+    which the route's parity test holds on par with the reference path."""
+    queries, keys = geometry(CASES[case])
+    operands = drawing(queries, keys, jnp.bfloat16, sinks=bool(CASES[case].get("sinks")))(0)
+    with tuning.seen() as launches:
+        jax.jit(pulled("template", CASES[case])).trace(*operands)
+    assert any(isinstance(op, attention_mosaic.MosaicBackward) for op, _ in launches)
+
+
+@pytest.mark.parametrize("kind", ["block_groups", "image_groups", "key_valid"])
 def test_a_gpu_prefers_the_template_for_a_call_with_block_groups(kind):
-    """A causal call with block or image groups: flash and tokamax's Triton kernel refuse it by their
-    inherent limits, and cuDNN takes it only as its mask, by measurement. 'auto' resolves it to the
-    template exactly where the target's measured row names it (`attention_blocks`: sm80's, where the
-    template was faster and smaller than xla's mask at every length), and elsewhere to a path that reads
-    the mask its spans mean. Without causality the groups add no key, so the call is an ordinary one."""
+    """A causal call with block or image groups, or key validity: flash and tokamax's Triton kernel refuse
+    it by their inherent limits, and cuDNN takes it only as its mask, by measurement. 'auto' resolves a
+    call with groups to the template exactly where the target's measured row names it (`attention_blocks`:
+    sm80's, where the template was faster and smaller than xla's mask at every length), and a call of key
+    validity alone, which no row measures, to the generic path on every target. Without causality the
+    groups add no key, so the call is an ordinary one, where validity still hides its keys."""
     query = jnp.zeros((ROWS, QUERIES, HEADS, WIDTH), jnp.bfloat16)
     key = jnp.zeros((ROWS, QUERIES, KV_HEADS, WIDTH), jnp.bfloat16)
     groups = jnp.asarray(block_groups()[0])
-    blocks, images = (groups, None) if kind == "block_groups" else (None, groups)
+    blocks = groups if kind == "block_groups" else None
+    images = groups if kind == "image_groups" else None
+    valid = key_validity(QUERIES) if kind == "key_valid" else None
     case = attention.attention_case(query, key, causal=True, block_groups=blocks, image_groups=images,
-                                    named="template")
-    assert case.blocks and kernel_refusals(ATTENTION, "template", case) == []
+                                    key_valid=valid, named="template")
+    assert case.spans_only and kernel_refusals(ATTENTION, "template", case) == []
     for kernel in ("flash", "triton"):
-        assert ("blocks", INHERENT) in [(refusal.code, refusal.row)
-                                        for refusal in kernel_refusals(ATTENTION, kernel, case)]
-    assert ("blocks", "measured") in [(requirement.code, requirement.kind) for requirement
-                                      in ATTENTION.kernel("cudnn").failed(case)]
-    assert not attention.attention_case(query, key, block_groups=blocks, image_groups=images).blocks
+        assert ("spans_only", INHERENT) in [(refusal.code, refusal.row)
+                                            for refusal in kernel_refusals(ATTENTION, kernel, case)]
+    assert ("spans_only", "measured") in [(requirement.code, requirement.kind) for requirement
+                                          in ATTENTION.kernel("cudnn").failed(case)]
+    plain = attention.attention_case(query, key, block_groups=blocks, image_groups=images, key_valid=valid)
+    assert plain.spans_only == (kind == "key_valid")
     for target in generation.TARGETS:
         with generation.assumed(target):
             auto = attention.resolve_implementation("auto", query, key, causal=True, block_groups=blocks,
-                                                    image_groups=images)
+                                                    image_groups=images, key_valid=valid)
             measured = generation.TARGETS[target].kernels.get("attention_blocks") == "template"
-            assert (auto == "template") == measured, (target, auto)
+            assert (auto == "template") == (measured and kind != "key_valid"), (target, auto)
     assert generation.TARGETS["sm80"].kernels["attention_blocks"] == "template"
     assert "attention_blocks" not in generation.TARGETS["sm90"].kernels
 

@@ -21,11 +21,13 @@ from dew.nn.kernels.templates.attention import (
     Hooks,
     KeySpans,
     Kind,
+    PaddedCall,
     Split,
     block_map,
     gradients,
     interpreted_dot,
     padded_call,
+    ranges_walk,
     within,
 )
 
@@ -58,6 +60,16 @@ def _output_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array):
             return value[row, rows, head]
         case Kind.KEY | Kind.TILE:
             raise ValueError("an output hook's parameter has no key axis")
+
+
+def _identity(step: jax.Array) -> jax.Array:
+    """A walk's step as its key tile: a range's walk, one step a tile."""
+    return step
+
+
+def _composed(keys_at, tile_of):
+    """`keys_at` of each step's key tile (`stepped`)."""
+    return lambda step: keys_at(tile_of(step))
 
 
 def _weighted(carry: algebra.Carry, *, rows) -> jax.Array:
@@ -99,7 +111,8 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
         def keys_at(form: algebra.Forward, j) -> algebra.Keys:
             # A key tile's logits in `form` (the call's, or the fold's rewalk's, `algebra.walked`).
             columns = j * block_k + jnp.arange(block_k)
-            coords = algebra.Coords(q_pos, columns[None, :], spans,
+            coords = algebra.Coords(q_pos, columns[None, :],
+                                    None if spans is None else algebra.intervals(*spans),
                                     None if row_ids is None else (row_ids[0], row_ids[1][columns]), draw)
             params = tuple(_tile_param(param, kind, row, head, rows, columns)
                            for param, kind in zip(score_params, score_kinds, strict=True))
@@ -115,7 +128,12 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
         resumed = None if initial is None else (initial[0][row, head, rows], initial[1][row, head, rows],
                                                 initial[2][row, head, rows])
 
-        if spec.form == "spans":
+        tile_of = _identity
+        if spec.form == "spans" and blocks_map.ranges is not None:
+            # Runs walk their ranges' tiles in turn.
+            hi, tile_of = ranges_walk(blocks_map.ranges[row, i])
+            lo = 0
+        elif spec.form == "spans":
             lo, hi = blocks_map.lo[row, i], blocks_map.hi[row, i]
         elif spec.form == "causal":
             lo, hi = 0, jnp.minimum(-(-(first_query + block_q) // block_k), tiles)
@@ -128,7 +146,7 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             # The walk in `form`: the plain one where `live` is None, else the guarded one, those rows
             # shifting (`algebra.walked`).
             start_state = algebra.started(form, resumed, block_q, value_width, live)
-            tiles_of = functools.partial(keys_at, form)
+            tiles_of = _composed(functools.partial(keys_at, form), tile_of)
             if residuals:
                 return algebra.training_walk(form, lo, hi, tiles_of, anchor_rows, start_state,
                                              dropping=drop is not None)
@@ -141,7 +159,8 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             state = carry
             if residuals:
                 normalized = functools.partial(algebra.normalized_pass, form, carry,
-                                               functools.partial(keys_at, form), anchor_rows, (lo, hi),
+                                               _composed(functools.partial(keys_at, form), tile_of),
+                                               anchor_rows, (lo, hi),
                                                None if resumed is None else (resumed[0], resumed[2]))
                 state, anchors, sums = algebra.split_written(carry, anchor_rows, normalized)
                 kept = (anchors, *sums)
@@ -204,29 +223,50 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     hooks = Hooks() if hooks is None else hooks
     call = padded_call(query, key, value, spans, hooks, pad)
     queries, value_width = call.queries, value.shape[-1]
-    initial = None
-    if hooks.initial is not None:
-        state = hooks.initial
-        initial = (call.rows(state.m, -jnp.inf), call.rows(state.total),
-                   jnp.pad(call.rows(state.acc), ((0, 0),) * 3 + ((0, call.value.shape[-1] - value_width),)))
     # Every form guards its sums where its values can overflow them (`algebra.Forward.headroom`), and the
     # fold its logits' reach (`algebra.walked`).
-    resumes = initial is not None
     spec = algebra.Forward(spans.form, spans.keys, call.query_ids is not None,
                            query.shape[3] ** -0.5 if scale is None else scale, hooks.score_mod, natural,
-                           algebra.headroom(value.dtype), resumes)
-    out, kept = forward(
-        spec, call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
-        call.score_params, tuple(param.kind for param in hooks.score_params), call.output_params,
-        tuple(param.kind for param in hooks.output_params), initial, block_q=block_q, block_k=block_k,
-        output_mod=hooks.output_mod, residuals=residuals, drop=hooks.drop)
-    if kept is None:
+                           algebra.headroom(value.dtype), hooks.initial is not None)
+    if not residuals:
+        out, _ = padded_walk(spec, call, hooks, block_q=block_q, block_k=block_k, residuals=False)
         return out[:, :queries, :, :value_width]
-    m, denominator, anchors, split = kept
+    out, (m, denominator, anchors, split) = padded_walk(spec, call, hooks, block_q=block_q, block_k=block_k,
+                                                        residuals=True)
     sums = Split(split.others[:, :, :queries, :value_width], split.own[:, :, :queries],
                  split.others_total[:, :, :queries], split.shift[:, :, :queries])
     return (out[:, :queries, :, :value_width], m[:, :, :queries], denominator[:, :, :queries],
             anchors[:, :, :queries], sums)
+
+
+@overload
+def padded_walk(spec: algebra.Forward, call: PaddedCall, hooks: Hooks, *, block_q: int, block_k: int,
+                residuals: Literal[False]) -> tuple[jax.Array, None]:
+    ...
+
+
+@overload
+def padded_walk(spec: algebra.Forward, call: PaddedCall, hooks: Hooks, *, block_q: int, block_k: int,
+                residuals: Literal[True]) -> tuple[jax.Array, tuple[jax.Array, jax.Array, jax.Array, Split]]:
+    ...
+
+
+def padded_walk(spec: algebra.Forward, call: PaddedCall, hooks: Hooks, *, block_q: int, block_k: int,
+                residuals: bool):
+    """`attend`'s walk of a padded call (`padded_call`) in `spec`'s form, which a caller holding a form of its
+    own walks too (another mainloop's guarded rows, `attention_mosaic`): the output `[B, Qp, H, Dvp]` and,
+    with `residuals`, the maxima, denominators, anchor keys and split sums at the padded shapes (else
+    None)."""
+    initial = None
+    if hooks.initial is not None:
+        state = hooks.initial
+        widened = ((0, 0),) * 3 + ((0, call.value.shape[-1] - state.acc.shape[-1]),)
+        initial = call.rows(state.m, -jnp.inf), call.rows(state.total), jnp.pad(call.rows(state.acc), widened)
+    return forward(
+        spec, call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
+        call.score_params, tuple(param.kind for param in hooks.score_params), call.output_params,
+        tuple(param.kind for param in hooks.output_params), initial, block_q=block_q, block_k=block_k,
+        output_mod=hooks.output_mod, residuals=residuals, drop=hooks.drop)
 
 
 def _seen(spans: tuple[jax.Array, jax.Array, jax.Array | None, jax.Array | None], row, rows: jax.Array,
@@ -271,9 +311,14 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
         maxima, chosen = maximum[row, head, rows], key_index[row, head, rows]
         shifts = shift[row, head, rows]
         anchor_rows = jax.lax.dynamic_slice_in_dim(anchor_value[row, :, head], i * block_q, block_q)
-        lo, hi = bounds.lo[row, i], bounds.hi[row, i]
+        lo, hi, tile_of = bounds.lo[row, i], bounds.hi[row, i], _identity
+        if bounds.ranges is not None:
+            # Runs walk their ranges' tiles in turn, as the forward does.
+            hi, tile_of = ranges_walk(bounds.ranges[row, i])
+            lo = 0
 
-        def tile(j):
+        def tile(step):
+            j = tile_of(step)
             columns = j * block_k + jnp.arange(block_k)
             params = tuple(_tile_param(param, kind, row, head, rows, columns)
                            for param, kind in zip(score_params, score_kinds, strict=True))

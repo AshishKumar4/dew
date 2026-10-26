@@ -15,7 +15,7 @@ writes the output itself; more write each slice's fp32 sums, its running
 maximum and its softmax's total, which XLA combines (`_combined`). A decode
 step of a few rows over a long context launches rows x heads programs, two
 for one row of Qwen3.5's attention on a GPU of 108 or 132 multiprocessors;
-slices fill the GPU, and the tuner picks how many (`DecodeAttention`). Six
+slices fill the GPU, as many as its multiprocessors hold (`_heuristic`). Six
 of Qwen3.5-0.8B's 256-wide layers at a 384-slot capacity, 128 rows with 16
 drawing, took 0.28 ms against the folded form's 1.12 and jax.nn's 2.40 on an
 RTX 4080, and 0.20 against 0.33 and 0.41 at 32 rows (docs/performance.md).
@@ -137,7 +137,7 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forwa
     its first term."""
     first_key, length = span
     rows = jnp.arange(QUERIES)
-    spans = jnp.full((QUERIES,), first_key), jnp.full((QUERIES,), length)
+    spans = ((jnp.full((QUERIES,), first_key), jnp.full((QUERIES,), length)),)
 
     def body(step, state):
         key, value = read(step)
@@ -267,19 +267,18 @@ def _space(programs: int, steps: int, processors: int | None) -> set[Split]:
     """The slices a launch of `programs` programs a slice over `steps` steps of the loop may take on a
     GPU of `processors` multiprocessors (`GpuTarget.multiprocessors`): one where the programs already
     fill most of them or none are known, as FlashAttention 2 rules (csrc/flash_attn/flash_api.cpp,
-    `num_splits_heuristic`), else any of `SPLITS` up to one a step. A pick measured where few programs
-    ran is never reused where many do (`KernelOp._stored_nearest`)."""
+    `num_splits_heuristic`), else any of `SPLITS` up to one a step."""
     if not processors or programs >= 0.8 * processors:
         return {Split(1)}
     return {Split(splits) for splits in SPLITS if splits <= min(steps, processors)}
 
 
 RESIDENT = 6
-"""Programs a multiprocessor runs at once that a launch without a pick fills (`_heuristic`)."""
+"""Programs a multiprocessor runs at once that a launch fills (`_heuristic`)."""
 
 
 def _heuristic(programs: int, steps: int, processors: int | None) -> Split:
-    """The most slices of the launch's space (`_space`) whose programs fill at most `RESIDENT` a
+    """The most slices a launch may take (`_space`) whose programs fill at most `RESIDENT` a
     multiprocessor. A program of `WARPS` warps over `BLOCK` keys a step leaves a multiprocessor room
     for several, which hide each other's reads. Over 60 shapes of Qwen3-0.6B's and Qwen3.5-0.8B's dense
     and paged decode (1 to 32 rows, 8K to 128K keys) timed at every count of `SPLITS`, this rule's pick
@@ -294,13 +293,23 @@ def _heuristic(programs: int, steps: int, processors: int | None) -> Split:
                      default=counts[0]))
 
 
+def _whole(rows: int, keys: int) -> jax.Array:
+    """`rows` spans of every one of `keys` keys."""
+    return jnp.stack([jnp.zeros(rows, jnp.int32), jnp.full(rows, keys, jnp.int32)], axis=1)
+
+
 @dataclasses.dataclass(frozen=True)
 class DecodeAttention(tuning.KernelOp):
-    """`attend`'s launch over a contiguous cache: programs a row, a head and a slice, timed with every
-    row reading its whole capacity (`operands`), where slices matter most."""
+    """`attend`'s launch over a contiguous cache: programs a row, a head and a slice."""
 
     config_cls: ClassVar[type[Split]] = Split
+
     ROWS: ClassVar[tuple[str, ...]] = ('query', 'key', 'value', 'spans')
+
+    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
+        """Normal floats, each row's span its whole capacity."""
+        arrays = super().operands(specs, seed)
+        return [*arrays[:3], _whole(specs[3].shape[0], specs[1].shape[1]), *arrays[4:]]
 
     def _fwd(self, query: jax.Array, key: jax.Array, value: jax.Array, spans: jax.Array,
              sinks: jax.Array | None = None, *, interpret: bool, softcap: float | None = None,
@@ -335,33 +344,33 @@ class DecodeAttention(tuning.KernelOp):
         spec = _spec(1 / math.sqrt(width), softcap, natural, value.dtype, sinks is not None)
         return _guarded(launch, spec), None
 
-    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
-        """Normal floats, each row's span its whole capacity."""
-        arrays = super().operands(specs, seed)
-        return [*arrays[:3], _whole(specs[3].shape[0], specs[1].shape[1]), *arrays[4:]]
-
     def _get_heuristics_config(self, ba) -> Split:
-        # At its key's shapes, as its space is (`KernelOp.keyed`), so the pick lies in that space.
-        return _heuristic(*self._launch(self.keyed(ba)))
-
-    def _get_autotuning_configs(self, ba) -> set[Split]:
-        return _space(*self._launch(ba))
+        return _heuristic(*self._launch(ba))
 
     @staticmethod
     def _launch(ba) -> tuple[int, int, int | None]:
-        """Its programs a slice, a row's steps of the loop, and the GPU's multiprocessors."""
+        """Its programs a slice at its rows' next power of two (`_rows`), a row's steps of the loop, and
+        the GPU's multiprocessors."""
         query = ba.arguments['query']
-        return (query.shape[0] * query.shape[2], pl.cdiv(ba.arguments['key'].shape[1], BLOCK),
+        return (_rows(query) * query.shape[2], pl.cdiv(ba.arguments['key'].shape[1], BLOCK),
                 gpu_target().multiprocessors)
 
 
 @dataclasses.dataclass(frozen=True)
 class PagedDecodeAttention(tuning.KernelOp):
-    """`attend_paged`'s launch: programs a row, a key head and a slice, timed with every row reading
-    its whole table (`operands`)."""
+    """`attend_paged`'s launch: programs a row, a key head and a slice."""
 
     config_cls: ClassVar[type[Split]] = Split
+
     ROWS: ClassVar[tuple[str, ...]] = ('query', 'table', 'spans')
+
+    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
+        """Normal floats, each row's table naming pages of the pool in turn and its span the whole
+        table."""
+        arrays = super().operands(specs, seed)
+        (rows, per_row), count, page_size = specs[3].shape, specs[1].shape[1], specs[1].shape[2]
+        table = (jnp.arange(rows * per_row, dtype=jnp.int32) % count).reshape(rows, per_row)
+        return [*arrays[:3], table, _whole(rows, per_row * page_size), *arrays[5:]]
 
     def _fwd(self, query: jax.Array, key_pages: jax.Array, value_pages: jax.Array, table: jax.Array,
              spans: jax.Array, sinks: jax.Array | None = None, *, interpret: bool,
@@ -400,37 +409,26 @@ class PagedDecodeAttention(tuning.KernelOp):
         spec = _spec(1 / math.sqrt(width), softcap, natural, value_pages.dtype, sinks is not None)
         return _guarded(launch, spec), None
 
-    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
-        """Normal floats, each row's table naming pages of the pool in turn and its span the whole
-        table."""
-        arrays = super().operands(specs, seed)
-        (rows, per_row), count, page_size = specs[3].shape, specs[1].shape[1], specs[1].shape[2]
-        table = (jnp.arange(rows * per_row, dtype=jnp.int32) % count).reshape(rows, per_row)
-        return [*arrays[:3], table, _whole(rows, per_row * page_size), *arrays[5:]]
-
     def _get_heuristics_config(self, ba) -> Split:
-        # At its key's shapes, as its space is (`KernelOp.keyed`), so the pick lies in that space.
-        return _heuristic(*self._launch(self.keyed(ba)))
-
-    def _get_autotuning_configs(self, ba) -> set[Split]:
-        return _space(*self._launch(ba))
+        return _heuristic(*self._launch(ba))
 
     @staticmethod
     def _launch(ba) -> tuple[int, int, int | None]:
-        """Its programs a slice, a row's steps of the loop over its table, `BLOCK` keys a step, and the
-        GPU's multiprocessors."""
+        """Its programs a slice at its rows' next power of two (`_rows`), a row's steps of the loop over
+        its table, `BLOCK` keys a step, and the GPU's multiprocessors."""
         query = ba.arguments['query']
         steps = pl.cdiv(ba.arguments['table'].shape[1], BLOCK // ba.arguments['key_pages'].shape[2])
-        return query.shape[0] * query.shape[1], steps, gpu_target().multiprocessors
+        return _rows(query) * query.shape[1], steps, gpu_target().multiprocessors
 
 
 _DECODE = DecodeAttention()
 _PAGED_DECODE = PagedDecodeAttention()
 
 
-def _whole(rows: int, keys: int) -> jax.Array:
-    """`rows` spans of every one of `keys` keys."""
-    return jnp.stack([jnp.zeros(rows, jnp.int32), jnp.full(rows, keys, jnp.int32)], axis=1)
+def _rows(query: jax.Array) -> int:
+    """The query's rows at the next power of two, where a launch's slices are read (`_heuristic`), so one
+    count of slices serves every batch up to it."""
+    return pl.next_power_of_2(query.shape[0])
 
 
 def _spans(lengths: jax.Array, starts: jax.Array | None) -> jax.Array:

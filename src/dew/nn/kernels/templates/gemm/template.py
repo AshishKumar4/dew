@@ -15,16 +15,14 @@ axis it follows ('rows', 'depth' for the prologue's; 'rows', 'columns' for the e
 a dimension of one the hook broadcasts; the kernels load each side tile at their own origins and the
 hook broadcasts a vector itself (`ms[:, None]`). The epilogue applies to every row: a row past the
 routed ones sums nothing, so `gemm(..., epilogue=e)` is `e` of the plain product, and a function
-`jax.experimental.pallas.fuser` hands over keeps its value (`fused`). A measured pick for a launch
-with a hook needs a module-level hook (`tuning.encoded`).
+`jax.experimental.pallas.fuser` hands over keeps its value (`fused`).
 
-Each call runs the launch the cost model picks among the implementations that take it
-(`grouped_matmul.GROUPED`: its Triton, Mosaic GPU and CUTLASS launches) where it lowers for CUDA,
-interpreted on the CPU where `interpret_on_cpu` asks (an assumed TPU's, the TPU launches on Megablox's
-schedule), and XLA's ragged dot with the hooks applied around it everywhere else, a TPU's own lowering
-included until a scoreboard row measures its launches, and for a product no launch takes (the route
-says why), or where `generation.chosen` names XLA; a launch it names that does not take the call
-raises (`selection.KernelRefused`).
+Each call runs the first of the implementations that takes it, in a fixed order
+(`grouped_matmul.GROUPED`: its Mosaic GPU launches, the TPU's on Megablox's schedule, then Triton's;
+CUTLASS's only by name) where it lowers for its target's platform, interpreted on the CPU where
+`interpret_on_cpu` asks, and XLA's ragged dot with the hooks applied around it everywhere else, for a
+product no launch takes (the route says why), or where `generation.chosen` names XLA; a launch it
+names that does not take the call raises (`selection.KernelRefused`).
 `gemm` is differentiable at every order (`generation.linear_tangent`): its reverse mode runs the
 template's own launches with the arithmetic of the portable program's derivative, the products'
 cotangents through `gemm` and `gemm_t` and the hooks' through their VJPs in XLA, recomputing the
@@ -41,6 +39,7 @@ from jax.extend import core as jax_core
 
 from dew.nn.kernels import generation, grouped_matmul
 from dew.nn.kernels.templates.product import declared
+from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import seen_whole
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
@@ -50,7 +49,7 @@ LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
 def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *, transpose_rhs: bool = False,
          prologue=None, prologue_operands: tuple = (), epilogue=None, epilogue_operands: tuple = (),
          out_dtype, out_dtypes: tuple | None = None, precision: PrecisionLike = None,
-         interpret_on_cpu: bool = False, prologue_jvp=None, compute=None):
+         interpret_on_cpu: bool = False, prologue_jvp=None, compute=None, layer: jax.Array | None = None):
     """Each group's rows of `lhs` times its matrix of `rhs`, through the hooks (the module's docstring):
     `[rows, width]` in `out_dtype`, or a tuple in `out_dtypes`. A `precision` above the default
     (explicitly or through `jax_default_matmul_precision`) sums an fp32 output in IEEE fp32, in XLA as in
@@ -62,14 +61,18 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
     dtype the products take, `lhs` rounded to it as `rhs` is, where `lhs`'s own dtype is what its
     cotangent takes, summed in fp32 and rounded once to it (an fp32 input's of a bf16 product); the
     rounding passes tangents through unrounded, the MoE projection's law
-    (`grouped_matmul.portable_projection`), and there is no prologue."""
+    (`grouped_matmul.portable_projection`), and there is no prologue. `layer`, where given (a traced
+    index), picks one layer of a stacked `rhs` (`[layers, *matrices]`: a layer's groups, or its one
+    matrix for a dense product), read in place: the stack's matrices are the call's groups, every other
+    layer's empty, so every launch reads the layer's matrices where they lie and no slice of the stack
+    is made (`_grouped`). Its gradient is the stack's, every other layer's zero."""
     if compute is not None and prologue is not None:
         raise ValueError("a prologue's operand is multiplied in its own dtype, not a named `compute`")
     straight = compute is not None
     compute = jnp.dtype(lhs.dtype if compute is None else compute)
-    dense = group_sizes is None
+    dense = group_sizes is None and layer is None
     prologue = _prologued(prologue, prologue_jvp)
-    rhs, group_sizes = _grouped(lhs, rhs, group_sizes)
+    rhs, group_sizes = _grouped(lhs, rhs, group_sizes, layer)
     prologue_arrays, prologue_axes = _split(prologue_operands, 'prologue')
     epilogue_arrays, epilogue_axes = _split(epilogue_operands, 'epilogue')
     dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
@@ -89,9 +92,13 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
     def forward(*operands):
         return value(*operands), ()
 
-    def backward(saved, operands, cotangent):
+    def backward(saved, operands, cotangent, live):
         del saved
         lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays = operands
+        # The operands a reverse pass differentiates, by their place among the operands' leaves: a frozen
+        # matrix's kernel gradient, or an operand no reverse pass reaches, is never formed.
+        wanted = set(live)
+        prologue_places = set(range(3, 3 + len(prologue_arrays)))
         cotangents = cotangent if several else (cotangent,)
         acc_shape = (lhs.shape[0], rhs.shape[1] if transpose_rhs else rhs.shape[2])
         if epilogue is None:
@@ -111,32 +118,41 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
         # The accumulator's cotangent meets the forward's rounded operands as the portable program's
         # derivative has it: in `lhs`'s dtype where that holds it exactly (a cotangent no wider, passed
         # through), wide otherwise, each product rounding once.
-        work = compute if narrow else jnp.promote_types(d_acc.dtype, jnp.float32)
+        work = compute if narrow else at_least_fp32(d_acc.dtype)
         d_product = d_acc.astype(work)
-        matrix = rhs.astype(compute)
-        # The cotangent of the operand the forward multiplied, `prologue(lhs)` rounded to `lhs`'s dtype.
-        d_operand = jnp.asarray(_gemm(d_product, matrix, group_sizes, None, (), (), None, (), (),
-                                      (jnp.dtype(lhs.dtype),), several=False, transpose_rhs=not transpose_rhs,
-                                      interpret_on_cpu=interpret_on_cpu, precision=precision, dense=dense))
-        if narrow:
-            d_rhs = gemm_t(lhs.astype(compute), d_product, None if dense else group_sizes, prologue=prologue,
-                           prologue_operands=tuple(zip(prologue_arrays, prologue_axes, strict=True)),
-                           out_dtype=rhs.dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
-        else:
-            operand = (lhs.astype(compute) if prologue is None
-                       else prologue(lhs, *prologue_arrays).astype(lhs.dtype))
-            d_rhs = gemm_t(operand.astype(work), d_product, None if dense else group_sizes,
-                           out_dtype=rhs.dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
-        d_rhs = jnp.swapaxes(d_rhs, 1, 2) if transpose_rhs else d_rhs
-        d_lhs, d_prologue = d_operand, ()
-        if prologue is not None:
-            d_lhs, d_prologue = _prologue_cotangents(prologue, lhs, prologue_arrays, prologue_axes,
-                                                     group_sizes, d_operand)
-        return (d_lhs.astype(lhs.dtype), d_rhs, np.zeros(group_sizes.shape, jax.dtypes.float0),
-                tuple(_as_cotangent(d, a) for d, a in zip(d_prologue, prologue_arrays, strict=True)),
-                tuple(_as_cotangent(d, a) for d, a in zip(d_epilogue, epilogue_arrays, strict=True)))
+        d_lhs = d_rhs = None
+        d_prologue = ()
+        if wanted & ({0} | prologue_places):
+            matrix = rhs.astype(compute)
+            # The cotangent of the operand the forward multiplied, `prologue(lhs)` rounded to `lhs`'s dtype.
+            d_operand = jnp.asarray(_gemm(d_product, matrix, group_sizes, None, (), (), None, (), (),
+                                          (jnp.dtype(lhs.dtype),), several=False,
+                                          transpose_rhs=not transpose_rhs, interpret_on_cpu=interpret_on_cpu,
+                                          precision=precision, dense=dense))
+            d_lhs = d_operand
+            if prologue is not None:
+                d_lhs, d_prologue = _prologue_cotangents(prologue, lhs, prologue_arrays, prologue_axes,
+                                                         group_sizes, d_operand)
+            d_lhs = d_lhs.astype(lhs.dtype)
+            d_prologue = tuple(_as_cotangent(d, a) for d, a in zip(d_prologue, prologue_arrays, strict=True))
+        if 1 in wanted:
+            if narrow:
+                d_rhs = gemm_t(lhs.astype(compute), d_product, None if dense else group_sizes,
+                               prologue=prologue,
+                               prologue_operands=tuple(zip(prologue_arrays, prologue_axes, strict=True)),
+                               out_dtype=rhs.dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
+            else:
+                operand = (lhs.astype(compute) if prologue is None
+                           else prologue(lhs, *prologue_arrays).astype(lhs.dtype))
+                d_rhs = gemm_t(operand.astype(work), d_product, None if dense else group_sizes,
+                               out_dtype=rhs.dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
+            d_rhs = jnp.swapaxes(d_rhs, 1, 2) if transpose_rhs else d_rhs
+        leaves = [d_lhs, d_rhs, np.zeros(group_sizes.shape, jax.dtypes.float0),
+                  *(d_prologue or (None,) * len(prologue_arrays)),
+                  *(_as_cotangent(d, a) for d, a in zip(d_epilogue, epilogue_arrays, strict=True))]
+        return tuple(leaves[index] for index in live)
 
-    differentiable = generation.linear_tangent(forward, backward, portable)
+    differentiable = generation.linear_tangent(forward, backward, portable, live_cotangents=True)
     return differentiable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays)
 
 
@@ -167,7 +183,7 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
         if prologue is not None:
             lhs = prologue(lhs, *prologue_arrays).astype(lhs.dtype)
         lhs = jnp.where(routed[:, None], lhs, 0)
-        wide = jnp.promote_types(lhs.dtype, jnp.float32)  # an fp64 product's sum in fp64
+        wide = at_least_fp32(lhs.dtype)  # an fp64 product's sum in fp64
         matrix = jnp.zeros((group_sizes.shape[0], lhs.shape[1], rhs.shape[1]), wide)
         _, pullback = jax.vjp(lambda matrix: grouped_matmul.xla_ragged_dot(
             lhs, matrix, group_sizes, precision=precision, preferred_element_type=wide), matrix)
@@ -225,11 +241,11 @@ def _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, epilogue, e
     matrix = jnp.swapaxes(rhs, 1, 2) if transpose_rhs else rhs
     if compute is not None:
         # Summed and kept at least fp32 (an fp64 product's in fp64), the accumulator the epilogue reads.
-        wide = jnp.promote_types(compute, jnp.float32)
+        wide = at_least_fp32(compute)
         summed = grouped_matmul.portable_projection(lhs, matrix, group_sizes, compute, precision, wide)
     else:
         product = lhs if prologue is None else prologue(lhs, *prologue_arrays).astype(lhs.dtype)
-        wide = jnp.promote_types(lhs.dtype, jnp.float32)
+        wide = at_least_fp32(lhs.dtype)
         summed = grouped_matmul.xla_ragged_dot(product, matrix.astype(lhs.dtype), group_sizes,
                                                precision=precision, preferred_element_type=wide)
     outs = _as_tuple(summed if epilogue is None else epilogue(summed, *epilogue_arrays))
@@ -336,11 +352,18 @@ def _tupled(hook, *args) -> tuple:
     return _as_tuple(hook(*args))
 
 
-def _grouped(lhs, rhs, group_sizes):
-    """`rhs` with a group axis and the group sizes: a dense product is one group of every row."""
-    if group_sizes is None:
-        return rhs[None], jnp.full((1,), lhs.shape[0], jnp.int32)
-    return rhs, group_sizes.astype(jnp.int32)
+def _grouped(lhs, rhs, group_sizes, layer=None):
+    """`rhs` with a group axis and the group sizes: a dense product is one group of every row. A stacked
+    `rhs` at `layer` (`gemm`) is its every layer's groups as one axis, the sizes `group_sizes` at the
+    layer's and zero at every other's, so a launch reads the layer's matrices in place."""
+    sizes = (jnp.full((1,), lhs.shape[0], jnp.int32) if group_sizes is None
+             else group_sizes.astype(jnp.int32))
+    if layer is None:
+        return (rhs[None] if group_sizes is None else rhs), sizes
+    stack = rhs[:, None] if group_sizes is None else rhs
+    layers, groups = stack.shape[:2]
+    stacked = jnp.zeros((layers, groups), jnp.int32).at[layer].set(sizes)
+    return stack.reshape(layers * groups, *stack.shape[2:]), stacked.reshape(layers * groups)
 
 
 def _split(operands: tuple, hook: str) -> tuple[tuple, tuple]:

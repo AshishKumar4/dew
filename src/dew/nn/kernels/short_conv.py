@@ -27,9 +27,8 @@ pre-activation gradients, so each token's conv, silu, norm and their gradients a
 run reads the K-1 tokens before it and computes K-1 past its end, `(K - 1) / steps` extra.
 
 The conv selector (`CONV`) runs them where their requirements hold and XLA's conv elsewhere, reported
-as the call's route ('short_conv'). Both launches are the tuner's (`dew.nn.kernels.tuning`): each
-takes the config measured for its GPU and shape where there is one, `TILE` and `WALK` without, and its
-float64 gate holds at every config of its space (tests/test_short_conv.py).
+as the call's route ('short_conv'). Each launch takes its one config, `TILE` and `WALK`
+(`dew.nn.kernels.tuning`), whose float64 gate tests/test_short_conv.py holds.
 
 The arithmetic is `causal_conv1d`'s in fp32, each output rounded once to its dtype: the conv's
 products summed tap by tap, as XLA sums them, and the sigmoid's quotient and the norm's root and
@@ -349,22 +348,14 @@ class Walk:
 
 
 TILE = Tile(rows=16, warps=4)
-"""The forward's launch without a measurement: 16 tokens a tile, each window loaded at once."""
-
-TILES = frozenset(Tile(rows, warps) for rows in (8, 16, 32) for warps in (2, 4, 8))
-"""The forward's configs the tuner measures: each holds the float64 gate (tests/test_short_conv.py) and
-compiles within every GPU's block (tests/test_kernel_configs.py)."""
+"""The forward's launch: 16 tokens a tile, each window loaded at once."""
 
 WALK = Walk(segments=8, steps=64, warps=4)
-"""The backward's launch without a measurement, its runs no longer than a row's share: eight runs a
-tile, with a 128-channel block 1024 elements, eight an fp32 register of each of four warps' threads,
-and 64 tokens a run, whose K-1 extra tokens are 5% of it at the K of 4 every mixer uses."""
-
-WALKS = frozenset(Walk(segments, steps, warps) for segments in (4, 8, 16) for steps in (32, 64)
-                  for warps in (4, 8))
-"""The backward's configs the tuner measures, held and compiled as `TILES` are. A run sums its taps'
-products token by token, so its rounding grows with its steps: runs of 128 put the 0.8B's bf16 tap
-gradients 2.06 times as far from float64 as XLA's on an A100, past the gate."""
+"""The backward's launch, its runs no longer than a row's share: eight runs a tile, with a 128-channel
+block 1024 elements, eight an fp32 register of each of four warps' threads, and 64 tokens a run, whose
+K-1 extra tokens are 5% of it at the K of 4 every mixer uses. A run sums its taps' products token by
+token, so its rounding grows with its steps: runs of 128 put the 0.8B's bf16 tap gradients 2.06 times
+as far from float64 as XLA's on an A100, past the gate."""
 
 
 def _inputs(x, w, bias, valid, documents):
@@ -410,9 +401,10 @@ class _ConvLaunch(tuning.KernelOp):
 @dataclasses.dataclass(frozen=True)
 class ConvForward(_ConvLaunch):
     """Every piece's forward in one launch (`_forward_kernel`): at one decoding row the conv's cost is
-    its launches. A program takes a `Tile`, `TILE` without a measurement."""
+    its launches. A program takes a `Tile`, `TILE`."""
 
     config_cls: ClassVar[type[Tile]] = Tile
+
     ROWS: ClassVar[tuple[str, ...]] = ('x', 'valid', 'documents')
 
     def _fwd(self, x: jax.Array, taps: jax.Array, bias: jax.Array | None, valid: jax.Array | None,
@@ -440,17 +432,15 @@ class ConvForward(_ConvLaunch):
     def _get_heuristics_config(self, ba) -> Tile:
         return TILE
 
-    def _get_autotuning_configs(self, ba) -> set[Tile]:
-        return set(TILES)
-
 
 @dataclasses.dataclass(frozen=True)
 class ConvBackward(_ConvLaunch):
     """One piece's backward (`_backward_kernel`): the projection's gradient at the piece's columns,
     written into the gradient the piece before wrote (`before`, aliased) where there is one, and each
-    tile's tap and bias gradients. A program walks a `Walk`, `WALK` without a measurement."""
+    tile's tap and bias gradients. A program walks a `Walk`, `WALK` at the call's length (`_walk`)."""
 
     config_cls: ClassVar[type[Walk]] = Walk
+
     ROWS: ClassVar[tuple[str, ...]] = ('x', 'valid', 'documents', 'before', 'dy')
 
     def _fwd(self, x: jax.Array, taps: jax.Array, bias: jax.Array | None, valid: jax.Array | None,
@@ -487,9 +477,6 @@ class ConvBackward(_ConvLaunch):
 
     def _get_heuristics_config(self, ba) -> Walk:
         return self._walk(ba, WALK)
-
-    def _get_autotuning_configs(self, ba) -> set[Walk]:
-        return {self._walk(ba, walk) for walk in WALKS}
 
     @staticmethod
     def _walk(ba, walk: Walk) -> Walk:

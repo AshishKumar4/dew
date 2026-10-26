@@ -39,6 +39,7 @@ from dew.nn.kernels.templates import (
     attention_mosaic,
     attention_portable,
     attention_triton,
+    mosaic_sm90,
 )
 
 PINS = {attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2),
@@ -752,10 +753,10 @@ def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
         return attention_mosaic.forward(*operands, **forward_options)
 
     def mosaic_backward(query, key, value, spans, hooks, dout):
-        # From the plain-JAX training forward's residuals, a guarded one's (the Triton forward walks without
-        # the fold's reach, so a row past it would take the fold's divergence).
-        residuals = attention_portable.attend(query, key, value, spans, hooks, **tiles, residuals=True,
-                                              **forward_options)[1:]
+        # From the mainloop's own training forward's residuals, a guarded one's (its overflowed rows walk
+        # again guarded, in the launch's form).
+        residuals = attention_mosaic.forward(query, key, value, spans, hooks, residuals=True,
+                                             **forward_options)[1:]
         return attention_mosaic.backward(query, key, value, spans, hooks, dout, residuals=residuals,
                                          **options)
 
@@ -777,9 +778,8 @@ def _mosaic_takes(family: Family) -> bool:
     (`attention_mosaic.refused`)."""
     query, _, value, extra, _ = family.draw(0)
     hooks = _hooks(jnp.asarray(query), jax.tree.map(jnp.asarray, extra))
-    tiles = attention_mosaic.BACKWARD_DEFAULTS["wgmma"]
     return attention_mosaic.refused(jnp.dtype(family.dtype), query.shape[-1], value.shape[-1], hooks,
-                                    backward=True, tile=(tiles.block_q, tiles.block_k)) is None
+                                    backward=True, family=mosaic_sm90.WGMMA) is None
 
 
 def _held_empty(family: Family, found, label: str) -> None:

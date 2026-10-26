@@ -22,6 +22,7 @@ from dew.nn.protocols import (
     VocabularyRows,
     head_table,
 )
+from dew.nn.visibility import block_ends, block_starts
 from dew.objectives.base import Variables, part, thaw
 
 
@@ -201,6 +202,51 @@ class DecisionModel:
         picked = jnp.take(full, jnp.asarray(ids.reshape(-1)), axis=-1)
         return picked.astype(jnp.promote_types(picked.dtype, jnp.float32)).reshape(
             *answers.shape[:2], *ids.shape)[:, :, :width]
+
+
+def key_runs(slots: jax.Array, segments: jax.Array, options: int, *, causal: bool = False) -> jax.Array:
+    """Each token's key runs `[B, L, options + 2, 2]` in the parallel layout, the visibility `_read`
+    gives its backbone as runs (`AttentionMetadata.key_runs`): a token reads its own document's keys but
+    another option's, over `slots` `[B, L]` (0 shared, k for option k's tokens) and `segments` `[B, L]`
+    (`DecisionInputs`), and under `causal` none after it. The runs are the document's fragments: its
+    prefix, each of its options, its suffix, each a run of its own, in which the layout's positions never
+    decrease (`layout._parallel` restarts them only between options). A document's options lie back to
+    back, as `layout._parallel` lays them, its shared tokens only before the first and after the last: a
+    shared token between two options would lie in no fragment. A shared token reads every fragment;
+    an option's token the prefix, its own option and the suffix; padding (segment 0), trailing, its own
+    span. An unread fragment is `(0, 0)`. `options` is the layout's option capacity (the last axis of
+    `DecisionInputs.options`), so the runs' count is static."""
+    length = slots.shape[1]
+    index = jnp.arange(length, dtype=jnp.int32)
+    first, last = block_starts(segments), block_ends(segments)
+    # Each document's number in its row, which the per-document reductions key by.
+    documents = jnp.cumsum(index[None, :] == first, axis=1) - 1
+
+    def spans(slot_row, document_row):
+        # Each option's span in each token's document, `[options, L]` twice, empty past the keys.
+        def span(option):
+            hit = slot_row == option
+            lo = jax.ops.segment_min(jnp.where(hit, index, length), document_row, num_segments=length)
+            hi = jax.ops.segment_max(jnp.where(hit, index + 1, 0), document_row, num_segments=length)
+            return lo[document_row], hi[document_row]
+        return jax.vmap(span)(jnp.arange(1, options + 1))
+
+    option_lo, option_hi = jax.vmap(spans)(slots, documents)
+    option_lo, option_hi = (jnp.moveaxis(bound, 1, 2) for bound in (option_lo, option_hi))
+    held = option_hi > option_lo
+    any_option = jnp.any(held, axis=-1)
+    prefix_hi = jnp.where(any_option, jnp.min(jnp.where(held, option_lo, length), axis=-1), last)
+    suffix_lo = jnp.where(any_option, jnp.max(jnp.where(held, option_hi, 0), axis=-1), last)
+    lo = jnp.concatenate([first[..., None], option_lo, suffix_lo[..., None]], axis=-1)
+    hi = jnp.concatenate([prefix_hi[..., None], option_hi, last[..., None]], axis=-1)
+    # An option's token reads no other option.
+    fragment = jnp.arange(options + 2)
+    read = ((slots[..., None] == 0) | (fragment == 0) | (fragment == options + 1)
+            | (fragment == slots[..., None]))
+    if causal:
+        hi = jnp.minimum(hi, index[None, :, None] + 1)
+    kept = read & (hi > lo)
+    return jnp.stack([jnp.where(kept, lo, 0), jnp.where(kept, hi, 0)], axis=-1).astype(jnp.int32)
 
 
 def _array(applied: object) -> jax.Array:

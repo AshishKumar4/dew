@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact
-from tuned import each_config
+from tuned import each_config, taken
 
 from dew.nn.kernels import recurrence, tuning
 from dew.nn.precision import FP32_SUMS
@@ -180,7 +180,7 @@ def summed(hooks: recurrence.Hooks):
 
 @pytest.mark.parametrize('hooks', HOOKS + FORMED, ids=str)
 def test_every_hook_combination_steps_as_its_float64_form(hooks):
-    """A decode token through the launch, at each config of its space, within tests/reference_error.py's
+    """A decode token through the launch, at its config, within tests/reference_error.py's
     rule of the XLA form's fp32 run against its float64 run: its output, its state and, under a conv,
     its moved history, which is the history's own bits (`summed`'s fp32 run). The idle row's output is
     zeros and its state and history are its inputs' bits."""
@@ -199,6 +199,18 @@ def test_every_hook_combination_steps_as_its_float64_form(hooks):
         if hooks.conv is not None:
             np.testing.assert_array_equal(np.asarray(history), np.asarray(reference[1]))
             np.testing.assert_array_equal(np.asarray(history)[1], np.asarray(given.held)[1])
+
+
+def test_a_column_block_pin_is_refused_where_a_hook_reads_a_whole_head():
+    """A hook reading a head's whole state (a conv, the epilogue's norm) takes a whole-head launch: a pin
+    of a block of value columns is refused as the step traces, a whole-head pin taken."""
+    hooks = next(form for form in HOOKS + FORMED if form.conv is not None or form.output is not None)
+    given = operands(hooks)
+    step = functools.partial(recurrence.step, hooks)
+    with tuning.pinned({recurrence.StepLaunch: recurrence.Launch(8, 4)}), pytest.raises(tuning.Unpinnable):
+        jax.jit(step).trace(given)
+    with tuning.pinned({recurrence.StepLaunch: recurrence.Launch(0, 4)}):
+        assert taken(recurrence.StepLaunch, step, given) == [recurrence.Launch(0, 4)]
 
 
 @pytest.mark.parametrize('hooks', [HOOKS[0], HOOKS[-1]], ids=str)

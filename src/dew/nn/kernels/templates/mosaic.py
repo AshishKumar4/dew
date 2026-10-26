@@ -39,8 +39,12 @@ barriers."""
 def compiler_params(*, approx_math: bool = False) -> plgpu.CompilerParams:
     """A mainloop's compiler parameters: Mosaic GPU's warpgroup lowering, whose arrays are a warpgroup's,
     and with `approx_math` the hardware's approximate exponential and reciprocal (ex2.approx, as Triton's
-    exp2 and FlashAttention's are)."""
-    return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup, approx_math=approx_math)
+    exp2 and FlashAttention's are). No shared memory is reserved for reductions across warps: a block's
+    warpgroups reduce at once, so each takes its own scratch, the consumers' from the kernel's allocations
+    (`Family.column_sums`), and a reduction that would take Mosaic GPU's implicit scratch fails to lower
+    rather than share it."""
+    return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup, approx_math=approx_math,
+                                reduction_scratch_bytes=0)
 
 
 def meet(halves) -> None:
@@ -52,6 +56,11 @@ def meet(halves) -> None:
         plgpu.barrier_wait(barrier)
 
 
+def meeting(consumers: int):
+    """The barriers two consumer warpgroups `meet` at: two, of `consumers` arrivals each."""
+    return plgpu.Barrier(num_arrivals=consumers, num_barriers=2)
+
+
 def staging(name: str, shaped) -> dict:
     """Each consumer warpgroup's staging buffer for each operand a tile reads (`shaped`: its tile's shape and
     its operand) and a barrier for each, as `{name}_smems` and `{name}_barriers`."""
@@ -60,17 +69,31 @@ def staging(name: str, shaped) -> dict:
             f'{name}_barriers': [plgpu.Barrier(num_barriers=2) for _ in shaped]}
 
 
-STAGED_BYTES = 256
-"""The widest row, in bytes, a consumer stages an output in at a time: a consumer's 256 bf16 columns
-written to shared memory as one 512-byte row conflicted on its banks 195 times as often as in two
-256-byte halves (ncu, Qwen3's down projection forward: 18.3M conflicts against 94K, the kernel 16%
-slower)."""
+STAGED_BYTES = 128
+"""The widest row, in bytes, a consumer stages an output in at a time: a swizzle's row. A consumer's 256
+bf16 columns written to shared memory as one 512-byte row conflicted on its banks 195 times as often as in
+two 256-byte halves (ncu, Qwen3's down projection forward: 18.3M conflicts against 94K, the kernel 16%
+slower); 128-byte chunks, two of them buffered (`output_staging`), stage a 256-column bf16 tile in half its
+width, which leaves the ring a stage more (unmeasured for conflicts at 128 bytes)."""
+
+OUTPUT_BUFFERS = 2
+"""The chunk buffers a consumer stages an output tile through: one written while the last one's store
+reads it."""
 
 
 def staged_columns(columns: int, dtypes) -> int:
     """The columns of each chunk a consumer stages a `columns`-wide output tile in: the most that divide the
     tile within `STAGED_BYTES` of the widest output (a 192-column tile's bf16 output in chunks of 64)."""
     return math.gcd(columns, STAGED_BYTES // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
+
+
+def output_staging(columns: int, dtypes) -> tuple[int, int]:
+    """The columns of each chunk a consumer stages a `columns`-wide output tile in (`staged_columns`) and
+    the chunk buffers it holds (`OUTPUT_BUFFERS`, at most its chunks): the tile's output staged in two
+    chunks' shared memory rather than its whole width, CUTLASS's sub-tiled epilogue, which leaves the
+    mainloop's ring the rest of the block (its StageCountAutoCarveout)."""
+    chunk = staged_columns(columns, dtypes)
+    return chunk, min(columns // chunk, OUTPUT_BUFFERS)
 
 
 def interpreted(interpret) -> plgpu.InterpretGPUParams | None:
@@ -194,8 +217,8 @@ class Ring:
         return int(self.smem.shape[0])
 
     def slot(self, counter):
-        """The slot step `counter` uses."""
-        return lax.rem(counter, jnp.asarray(self.stages, counter.dtype))
+        """The slot step `counter` (traced, or a Python int) uses."""
+        return counter % self.stages
 
     def load(self, counter, view) -> None:
         """The producer's load of step `counter` from `view`, once its slot is free."""
@@ -238,6 +261,82 @@ def ring(block: tuple, dtype, stages: int, *, consumers: int = 1) -> dict:
 
 PRODUCER_REGISTERS = 40
 """The registers a thread of a cooperative block's producer warpgroup holds: it only issues loads."""
+
+THREADS = 128
+"""The threads of a role: a warpgroup's, each family's compute and producer roles alike."""
+
+SMEM_ALIGNMENT = 1024
+"""The bytes each shared-memory allocation of a Mosaic GPU kernel starts at a multiple of (its lowering's
+`SMEM_ALIGNMENT`)."""
+
+BARRIER_BYTES = 8
+"""A barrier's shared memory."""
+
+
+def allocated(*sizes: int) -> int:
+    """The shared memory allocations of `sizes` bytes take, each rounded up to `SMEM_ALIGNMENT`."""
+    return sum(-(-size // SMEM_ALIGNMENT) * SMEM_ALIGNMENT for size in sizes)
+
+SWIZZLE_BYTES = 128
+"""The widest swizzle a shared-memory block's rows are staged at, which an MMA reads conflict-free."""
+
+
+def live_registers(family: "Family", carried, *phases) -> int:
+    """The registers a consumer thread of `family` holds over a live set: the tiles it carries across its
+    walk (`carried`, each `(rows, columns, dtype)`: its accumulators, a running statistic) and the largest
+    of its `phases`' tiles held at once (a step's operand fragments, a rewrite's operands), each tile's
+    32-bit words spread over a role's threads, and what it holds beside them (`Family.held_registers`).
+    The one register estimate every Mosaic template's launches state (`base.Template.registers`), which
+    a legal config holds within a thread's budget (`base.Template.legal`)."""
+    def words(tiles) -> float:
+        return sum(rows * columns * jnp.dtype(dtype).itemsize / 4 for rows, columns, dtype in tiles)
+
+    phase = max((words(tiles) for tiles in phases), default=0.0)
+    return int(-(-(words(carried) + phase) // THREADS)) + family.held_registers
+
+
+def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int], dtype) -> int:
+    """The registers a consumer thread holds at a `(rows, columns, depth)` GEMM tile of `consumers` roles
+    of `family` (`live_registers`): its share of the fp32 accumulator carried, and a step's operand
+    fragments where its products read registers (`Family.operands_in_registers`; the right operand's in
+    each of its `rhs_copies` warps whole)."""
+    rows, columns, depth = block
+    share = rows // consumers
+    fragments = ([(share, depth, dtype), (depth, columns * family.rhs_copies, dtype)]
+                 if family.operands_in_registers else [])
+    return live_registers(family, [(share, columns, jnp.float32)], fragments)
+
+
+def held_rows(family: "Family", consumers: int, columns: int) -> int:
+    """The most rows, in whole roles of `consumers` consumers of `family` (`Family.role_rows` each), whose
+    fp32 accumulator of `columns` columns their threads hold beside what they hold besides
+    (`Family.held_registers`): the rows a derived tile's registers bound (docs/design/kernel-templates.md
+    §7). A family whose products read registers holds a step's fragments too (`tile_registers`), which
+    its derivation checks at each step."""
+    share = (family.registers(consumers) - family.held_registers) * THREADS // columns
+    return share // family.role_rows * family.role_rows * consumers
+
+
+def deepest[C](make: Callable[[int], C], holds: Callable[[C], bool], most: int) -> C | None:
+    """`make(stages)` at the most stages, from `most` down to two (one loading beside one consumed), that
+    `holds` (a launch's legality: its ring within a block's shared memory); None where none does. A
+    derived ring is the deepest a block holds (CUTLASS's StageCountAutoCarveout's rule: the block's shared
+    memory less what else it stages, over a stage's bytes)."""
+    return next((made for made in map(make, range(most, 1, -1)) if holds(made)), None)
+
+
+def band(multiprocessors: int, block_m: int, block_n: int, column_tiles: int,
+         group_row_tiles: int | None = None) -> int:
+    """The planar snake's column tiles a band for a wave of one program a multiprocessor sharing its
+    blocks in the L2 (`grid_block_n`): the power of two, at most `column_tiles`, nearest below the band
+    that reads each operand fewest times from the device. The rows' and the columns' blocks balanced
+    (a wave as near a square of output tiles as their sides allow: √(programs · rows / columns)) or,
+    where the rows split into groups of `group_row_tiles` row tiles each, wider while a wave still spans
+    each group's row tiles whole (programs over a group's row tiles), whose columns' blocks it then
+    reads once a group."""
+    balanced = math.sqrt(multiprocessors * block_m / block_n)
+    spanning = multiprocessors / group_row_tiles if group_row_tiles else 0.0
+    return 1 << (max(1, min(int(max(balanced, spanning)), column_tiles)).bit_length() - 1)
 
 
 def consumer_registers(consumers: int) -> int:
@@ -317,9 +416,9 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     streams (`streams`, `opened`, `stream` the producer's, `walk` and `passed` the consumer's), its products
     (`product` into a fresh accumulator, `products`, `register_products` and `staged_products` in place,
     `settled`), and its accumulator's layouts (`layout`, `row`, `column`, which `zeros`, `full`, `iota`,
-    `rows_of`, `columns_of` and `as_row` read). It is generic in its streams' allocations (`Allocated`,
-    `streams`'), its opened streams (`Opened`, `opened`'s) and the accumulator its products issue into in
-    place (`Accumulator`: a warpgroup accumulator ref, or a register array)."""
+    `rows_of`, `columns_of`, `column_zeros`, `column_sums` and `as_row` read). It is generic in its streams'
+    allocations (`Allocated`, `streams`'), its opened streams (`Opened`, `opened`'s) and the accumulator its
+    products issue into in place (`Accumulator`: a warpgroup accumulator ref, or a register array)."""
 
     name: str
     rows: int
@@ -328,6 +427,45 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     bounded_loads: bool
     """Whether a load past an operand's extent reads zeros (TMA's) rather than past it (cp.async's), so an
     operand need not be padded to whole tiles."""
+    role_rows: int
+    """The rows a consumer role's products cover at least: one warpgroup's (wgmma's one MMA of 64 rows,
+    mma.sync's four warps of 16 each)."""
+    held_registers: int = 40
+    """The registers a consumer thread holds beside its accumulator and operand fragments (addresses,
+    indices, the walk's carry): CUTLASS's cooperative sm90 kernel's 168 less its accumulator's 128."""
+    operands_in_registers: bool
+    """Whether a product reads its operands from registers a consumer loads them into (mma.sync's), where
+    warpgroup MMA reads both from shared memory."""
+    rhs_copies: int = 1
+    """The warps of a role each holding the right operand's whole fragment (mma.sync's four warps along
+    the rows each hold every column's, JAX's `MMALayouts`' `rhs` replicated over its warps)."""
+    widest_product: int | None = None
+    """The most columns one product spans (warpgroup MMA's 256, wgmma's widest N), which a tile's columns
+    are at most; None where a tile's columns are many products' (mma.sync's 8 each), held by its
+    registers alone (`tile_registers`)."""
+    copy_extent: int | None = None
+    """The most elements one asynchronous copy moves along a dimension of its box after the copy's tiling
+    (TMA's, 256): an operand block tiled in 8 rows by a swizzled row stays far below it at any tile its
+    registers hold, and a one-dimensional side operand's block, untiled, is at most it
+    (`grouped_matmul._Mosaic.fitting`); None where cp.async moves a block (mma.sync's)."""
+    most_shared: int
+    """The most shared memory a block of any GPU of the family holds (CUDA's opt-in limit), which bounds
+    the stages a generated tile takes; a GPU's own (`generation.shared_budget`) bounds the tiles its
+    launches keep."""
+
+    @abc.abstractmethod
+    def registers(self, consumers: int) -> int:
+        """The registers a thread of each of `consumers` consumer roles may hold."""
+
+    @abc.abstractmethod
+    def column_unit(self, dtype) -> int:
+        """The columns a tile's width steps by for operands of `dtype`: the swizzle a block's rows are
+        staged in, or the row its stores lay over a role's threads."""
+
+    @abc.abstractmethod
+    def depths(self, dtype) -> tuple[int, ...]:
+        """The depths a step may take for operands of `dtype`, widest first: the swizzles its products
+        read a block's rows at."""
 
     @property
     @abc.abstractmethod
@@ -345,11 +483,33 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     def column(self) -> plgpu_core.SomeLayout:
         """A column vector's layout: the accumulator's reduced over its rows."""
 
+    def warpgroups(self, consumers: int) -> int:
+        """The warpgroups a program of `consumers` compute roles runs: theirs, and a producer's where the
+        family streams from a role of its own (`roles`)."""
+        return consumers
+
+    def staged(self, value: jax.Array, buffer) -> Ref:
+        """`value` in the shared-memory tile `buffer`, in its dtype, for a product to read: a register right
+        operand's way to an MMA (`staged_products` stages left ones). Mosaic GPU brackets a store with the
+        warpgroup's barriers (its automatic barriers), so every warp's reads of `buffer` are done before it
+        and its writes seen after; the family publishes them to its asynchronous readers (`published`)."""
+        buffer[...] = value.astype(buffer.dtype)
+        self.published()
+        return buffer
+
+    def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
+        """`issue(acc) -> acc` issuing products in place (`products`) into a fresh fp32 accumulator of
+        `shape` (zero), its value once they are done: a register accumulator's, which a family whose
+        accumulator is a ref scopes (wgmma's)."""
+        del interpret
+        return issue(self.zeros(shape))
+
     @abc.abstractmethod
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
-               interpret: bool, approx_math: bool = True) -> Callable:
+               interpret: bool, approx_math: bool = True, name: str | None = None) -> Callable:
         """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own, with
-        `approx_math` the hardware's approximate exponential and reciprocal (`compiler_params`)."""
+        `approx_math` the hardware's approximate exponential and reciprocal (`compiler_params`), named
+        `name` where given (Mosaic names its kernel and its compile reports by it)."""
 
     @abc.abstractmethod
     def scoped(self, body, *allocations, streams) -> None:
@@ -410,6 +570,24 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     def loaded(self, copies) -> None:
         """Each `(view, ref, barrier)` copied whole into its shared-memory `ref`."""
 
+    def output_columns(self, columns: int, dtypes) -> int:
+        """The columns of a `columns`-wide output tile a consumer stages in shared memory at once
+        (`persist`'s stores): the whole tile's, where a family stages it whole."""
+        del dtypes
+        return columns
+
+    def stores(self, dtype) -> bool:
+        """Whether a tile of `dtype` in the accumulator's layout reaches global memory (`persist`'s stores,
+        `stored`): any dtype, unless the family's path to global memory refuses it."""
+        del dtype
+        return True
+
+    def published(self) -> None:
+        """A consumer's writes to shared memory made visible to the readers that read it asynchronously
+        (warpgroup MMA, TMA), before any of them reads it: a family whose products read shared memory
+        through its consumers' own loads (mma.sync's) has nothing to publish."""
+        plgpu.commit_smem()
+
     @abc.abstractmethod
     def stored(self, parts, views, *, smem) -> None:
         """Each of `parts` written whole to its view of `views`, through `smem` where the family stores so."""
@@ -461,10 +639,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """fp32 zeros in the accumulator's layout (two-dimensional) or a row's (one-dimensional)."""
         return self.full(shape, 0.0)
 
-    def full(self, shape: tuple[int, ...], value: float) -> jax.Array:
-        """fp32 `value` in the accumulator's layout or a row's (`zeros`)."""
+    def full(self, shape: tuple[int, ...], value: float, dtype=jnp.float32) -> jax.Array:
+        """`value` in `dtype` (fp32 unless given) in the accumulator's layout or a row's (`zeros`)."""
         layout = self.layout if len(shape) == 2 else self.row
-        return plgpu.layout_cast(jnp.full(shape, value, jnp.float32), layout)
+        return plgpu.layout_cast(jnp.full(shape, value, dtype), layout)
 
     def iota(self, shape: tuple[int, int], dimension: int) -> jax.Array:
         """Indices along `dimension` of a tile in the accumulator's layout."""
@@ -482,6 +660,38 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """A tile read from `ref` (`[rows, columns]`) in the accumulator's layout."""
         return plgpu.load(ref, layout=self.layout, optimized=False)
 
+    def column_zeros(self, count: int) -> jax.Array:
+        """fp32 zeros `[count]` in a column's layout (`columns_of`'s), the carry of a tile's key sums."""
+        return plgpu.layout_cast(jnp.zeros((count,), jnp.float32), self.column)
+
+    column_scratch: int
+    """The fp32 entries of shared memory a consumer's `column_sums` takes: a reduction across the warps
+    holding a tile's rows takes one register's partial sums at a time."""
+
+    reduction_scratch: int = 0
+    """The bytes of shared memory the family's kernels reserve for Mosaic GPU's implicit reductions across
+    warps (its compiler parameters' `reduction_scratch_bytes`): none where a reduction takes the consumer's
+    own (`column_sums`)."""
+
+    def column_sums(self, value: jax.Array, scratch, interpret: bool) -> jax.Array:
+        """The sums of `value`'s columns `[columns]` in a column's layout, `value` `[rows, columns]` in the
+        accumulator's layout: across the warps holding its rows, through the consumer's own `scratch`
+        (`column_scratch` fp32 entries), as the block's other warpgroups reduce at once."""
+        if interpret:
+            return value.sum(axis=0)
+
+        def sums(ctx, tile, scratch):
+            del ctx
+            return tile.reduce("add", axis=0, scratch=scratch)
+
+        # Mosaic GPU's own reduction across the warps, through the given scratch; inline_mgpu passes the
+        # launch context first and takes the tile and its scratch.
+        summed: Callable[..., jax.Array] = plgpu.inline_mgpu(
+            arg_types=(self.layout, plgpu.RefType()),
+            return_type=plgpu.ShapeDtypeStruct((value.shape[1],), jnp.dtype(jnp.float32),
+                                               layout=self.column))(sums)
+        return summed(value, scratch)
+
     def as_row(self, vector: jax.Array) -> jax.Array:
         """`vector` `[rows]` in a row's layout, whatever its own."""
         return plgpu.layout_cast(vector, self.row)
@@ -490,15 +700,30 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
 class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     """A family whose loads a producer warpgroup issues by TMA into `Ring`s, beside one or two consumer
     warpgroups at `setmaxnreg` budgets (`roles`): sm90's and sm100's. Its walk acquires each step's slots as
-    the step reads them and releases them once its products are done (`Slots`)."""
+    the step reads them and releases them once its products are done (`Slots`). Its products read their
+    operands from the rings, a block's rows staged at the widest swizzle, 128 bytes."""
     bounded_loads = True
+    operands_in_registers = False
+    copy_extent = 256
+
+    def registers(self, consumers: int) -> int:
+        return consumer_registers(consumers)
+
+    def column_unit(self, dtype) -> int:
+        return SWIZZLE_BYTES // jnp.dtype(dtype).itemsize
+
+    def depths(self, dtype) -> tuple[int, ...]:
+        return (SWIZZLE_BYTES // jnp.dtype(dtype).itemsize,)
+
+    def warpgroups(self, consumers: int) -> int:
+        return consumers + 1
 
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
-               interpret: bool, approx_math: bool = True) -> Callable:
+               interpret: bool, approx_math: bool = True, name: str | None = None) -> Callable:
         return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
                             num_threads=consumers + 1, thread_name="wg",
                             compiler_params=compiler_params(approx_math=approx_math),
-                            interpret=interpreted(interpret))
+                            interpret=interpreted(interpret), kernel_name=name)
 
     def scoped(self, body, *allocations, streams) -> None:
         pl.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations, **streams,
@@ -524,15 +749,19 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
 
         streamed(rings, tiles, lo, hi)
 
+    def output_columns(self, columns: int, dtypes) -> int:
+        # Two chunk buffers, not the whole tile (`output_staging`).
+        return math.prod(output_staging(columns, dtypes))
+
     def persist(self, streams, tiles: tuple[int, ...], schedule: Callable, consumer: Callable, *,
                 consumers: int, axis: str, outputs: tuple, interpret: bool, in_flight: int = 0) -> None:
         # The producer loads every tile's steps into the rings at a counter running across the tiles, so
         # a tile's first loads go out while the consumers store the last one; each consumer stages its
-        # share of each output (`staged_columns` wide chunks) and stores it by TMA, waiting only for the
-        # last store's reads of the staging before it writes the next.
+        # share of each output in chunks (`output_staging`: two buffers of `staged_columns`) and stores each
+        # by TMA, waiting only for a buffer's last store to read it before it writes it again.
         rings = self.opened(streams)
-        staging = [plgpu.SMEM((consumers, shape[1] // staged_columns(shape[1], (dtype,)), shape[0],
-                               staged_columns(shape[1], (dtype,))), dtype)
+        staging = [plgpu.SMEM((consumers, output_staging(shape[1], (dtype,))[1], shape[0],
+                               output_staging(shape[1], (dtype,))[0]), dtype)
                    for shape, dtype in outputs]
 
         def producer():
@@ -556,15 +785,16 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
             def run(index):
                 def store(output, value, ref, place):
                     smem = smems[output].at[index]
-                    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-                    chunks, width = smem.shape[0], smem.shape[-1]
-                    for chunk in range(chunks):
-                        smem[chunk] = value[:, chunk * width:(chunk + 1) * width].astype(smem.dtype)
-                    plgpu.commit_smem()
+                    buffers, width = smem.shape[0], smem.shape[-1]
                     row_start, first, stored, column, most = place
-                    for chunk in range(chunks):
-                        store_rows(smem.at[chunk], ref, row_start, first, stored, column + chunk * width,
-                                   most)
+                    for chunk in range(value.shape[1] // width):
+                        if chunk == 0 or chunk >= buffers:
+                            # The buffer's last store (the last tile's, at its first chunk) has read it.
+                            plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+                        buffer = smem.at[chunk % buffers]
+                        buffer[...] = value[:, chunk * width:(chunk + 1) * width].astype(smem.dtype)
+                        plgpu.commit_smem()
+                        store_rows(buffer, ref, row_start, first, stored, column + chunk * width, most)
 
                 @plgpu.nd_loop(tiles, collective_axes=axis, init_carry=jnp.int32(0))
                 def _(loop: plgpu.NDLoopInfo, carry):

@@ -326,15 +326,6 @@ def test_an_unseen_member_of_a_family_takes_its_familys_facts_and_its_own_device
     assert cost.seconds(cost.Cost(programs=40, device_bytes=1e6, program_flops=1e9), target) > 0
 
 
-def test_a_devices_calibration_replaces_its_familys_model_values_and_nothing_else():
-    """The opt-in calibration's facts take the place of the family's model latency and L2 bandwidth; the
-    rates stay the family's."""
-    target = GpuTarget("sm90", "an H100", 227 * 1024, multiprocessors=132, clock_hz=1.83e9,
-                       calibration={"load_latency": 500.0, "l2_bandwidth": 1.0e13})
-    assert (target.load_latency, target.l2_bandwidth) == (500.0, 1.0e13)
-    assert target.tensor_rates == TARGETS["sm90"].tensor_rates and target.wgmma
-
-
 def test_a_gpu_the_table_does_not_name_keeps_the_resources_its_device_reports():
     """A CUDA device of a generation no row names (a B200, sm100) takes its multiprocessors and its
     block's shared memory from the device, and Hopper's warpgroup MMA from its capability, 9.0 alone,

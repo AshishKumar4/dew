@@ -254,5 +254,8 @@ def compile_tpu_kernels(cases, generation: str) -> list[dict]:
                 lowered = jax.jit(fn).trace(*placed).lower()
             lowered.compile()
         except Exception as error:  # A case that does not lower or compile is its own failure.
-            record["error"] = f"{type(error).__name__}: {str(error)[-800:]}"
+            # Mosaic TPU's refusal leads with its reason and ends with diagnostics: both ends kept.
+            text = str(error)
+            text = text if len(text) <= 1600 else f"{text[:800]} ... {text[-800:]}"
+            record["error"] = f"{type(error).__name__}: {text}"
     return found

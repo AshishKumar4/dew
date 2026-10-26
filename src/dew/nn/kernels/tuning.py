@@ -383,12 +383,13 @@ _told: set[str] = set()
 
 @dataclasses.dataclass(frozen=True)
 class KernelOp(tokamax.Op):
-    """One Pallas launch whose config is measured per GPU model and shape.
+    """One Pallas launch: its heuristic (a template's derived) config, or, where an opt-in tuning run
+    measured its variants on this GPU model (`tune`), the fastest of them.
 
     A subclass declares `config_cls` (a frozen dataclass), `_fwd(..., config,
-    return_residuals)` returning `(outputs, None)`, `_get_autotuning_configs`
-    and `_get_heuristics_config`, and names its token-counted arguments in
-    `ROWS`. `revision` is part of its stored picks' identity: a kernel whose
+    return_residuals)` returning `(outputs, None)` and `_get_heuristics_config`,
+    states its tunable neighbours in `variants`, and names its token-counted
+    arguments in `ROWS`. `revision` is part of its stored picks' identity: a kernel whose
     speed changes raises it, and picks measured for the old revision stop
     matching. A kernel whose inputs must hold more than random values to run
     (group sizes, indices) overrides `operands`. A template names in `HOOKS`
@@ -412,6 +413,8 @@ class KernelOp(tokamax.Op):
             if (collected := cache.KERNEL_SEEN.value) is not None:
                 collected.found.append((self, keyed))
             config = self._chosen(ba, keyed)
+            if collected is not None:
+                collected.found.taken.append((config, ba))
         if cache.KERNEL_LAUNCHES.value:
             # Dew chose the launch for this GPU (`generation`); tokamax's device check would ask
             # each traced array for its devices (`keyed`).
@@ -429,16 +432,36 @@ class KernelOp(tokamax.Op):
         pins = dict(cache.KERNEL_PINS.value)
         if type(self) in pins:
             pin = pins[type(self)]
-            if pin not in keyed.autotuning_configs:
+            if not self.pinnable(keyed, pin):
                 raise Unpinnable(type(self).__name__, pin, self.unpinnable(keyed, pin))
             return pin
         pick = _pick(keyed) or self._nearest(keyed)
-        return ba.heuristics_config if pick is None else pick.fastest_config
+        # A pick measured at another shape of its key the launch's own shapes cannot take is not taken.
+        if pick is None or not self.pinnable(ba, pick.fastest_config):
+            return ba.heuristics_config
+        return pick.fastest_config
+
+    def variants(self, ba: tokamax.BoundArguments) -> tuple[Hashable, ...]:
+        """The configs an opt-in tuning run (`tune`) times for `ba`: the launch's heuristic alone, or, where
+        it states them, its derived config first and a few legal neighbours of it (the next legal block
+        either side, a stage more or fewer), each proven against the accuracy gate at its tests' shapes
+        (tests/tuned.py). Nothing else is timed, and a tuner's win over the first is a gap in the
+        derivation, fixed there for the whole family."""
+        return (ba.heuristics_config,)
+
+    def _get_autotuning_configs(self, ba: tokamax.BoundArguments) -> set[Hashable]:
+        return set(self.variants(ba))
+
+    def pinnable(self, ba: tokamax.BoundArguments, config: Hashable) -> bool:
+        """Whether a pin (or a stored pick) may name `config` for the launch of `ba`: any config of its
+        type, where the launch states no rules of its own."""
+        del ba
+        return isinstance(config, self.config_cls)
 
     def unpinnable(self, ba: tokamax.BoundArguments, config: Hashable) -> str:
-        """Why the legal configs of `ba`'s launch do not hold `config`."""
+        """Why the launch of `ba` cannot take `config`."""
         del ba, config
-        return "not in its space at this launch's key"
+        return f"it is no {self.config_cls.__name__}"
 
     def keyed(self, ba: tokamax.BoundArguments) -> tokamax.BoundArguments:
         """`ba` as its key reads it, where its space, heuristic and measurement
@@ -702,8 +725,6 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None) -> Timing
         return Timings(dict.fromkeys(ba.autotuning_configs, error))
     finally:
         _detach(profiler, evicting, flush)
-        # Every config measured before an exit, a failed one's or another subscriber's too, is logged.
-        observed(op, ba, {**timings, **_benchmarks(read, flushes)}, get_default_device())
     return Timings({**timings, **_benchmarks(read, flushes)})
 
 
@@ -715,35 +736,6 @@ def _benchmarks(read: Mapping, flushes: set[str]) -> dict[Hashable, tokamax.Benc
         benchmarks[config] = tokamax.BenchmarkData(compile_time_ms=compiling, lower_time_ms=lowering,
                                                    metadata={}, evaluation_times_ms=times)
     return benchmarks
-
-
-def observed(op: KernelOp, ba: tokamax.BoundArguments, measured: Mapping[Hashable, object],
-             device) -> None:
-    """Log each config `_measured` timed or saw exhaust the device's resources, with the launch's features
-    and estimate where it states them, where `DEW_TIMINGS` asks (`kernels.timings`): after the timing
-    loop, on the measuring thread, so logging never runs beside a measurement and changes no pick. A
-    failure to log raises, failing the tune: logging was asked for."""
-    from . import timings as log
-    if log.directory() is None:
-        return
-    from .templates import cost, features
-
-    target = generation.gpu_target()
-    call = json.dumps(_launch_json(ba), sort_keys=True)
-    rows = []
-    for config, measurement in measured.items():
-        found = features.features(op, ba, config, target)
-        timed = measurement if isinstance(measurement, tokamax.BenchmarkData) else None
-        rows.append(log.observation(
-            type(op).__name__, call, json.dumps(encoded(config), sort_keys=True), device=device,
-            method=log.CUPTI_EVICTED, status='resource_exhausted' if timed is None else 'timed',
-            samples_ms=() if timed is None else tuple(timed.evaluation_times_ms),
-            lower_ms=None if timed is None else timed.lower_time_ms,
-            compile_ms=None if timed is None else timed.compile_time_ms,
-            estimate_s=None if found is None else cost.seconds(found.legacy, target),
-            features=None if found is None else found.row(),
-            error=measurement if isinstance(measurement, BaseException) else None))
-    log.record(rows)
 
 
 def _config(fastest: Timings | None) -> Hashable:
@@ -801,21 +793,6 @@ def _read(path: str) -> tuple[Keyed, list]:
     return read, foreign
 
 
-def store_calibration(device_kind: str, facts: Mapping[str, float]) -> None:
-    """Merge `facts` (`generation.CALIBRATED`) measured on a GPU of `device_kind` by the opt-in calibration
-    into its calibrated facts (`generation.calibration`), one writer at a time, the file replaced whole
-    (`write_atomically`)."""
-    unknown = set(facts) - generation.CALIBRATED
-    if unknown:
-        raise ValueError(f"a calibration states {sorted(generation.CALIBRATED)}, not {sorted(unknown)}")
-    path = cache.device_facts_path(device_kind)
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with filelock.FileLock(path + '.lock'):
-        stored = generation.calibration(device_kind)
-        merged = {**stored, **{name: float(value) for name, value in facts.items()}}
-        write_atomically(path, json.dumps(merged))
-
-
 def _stored_picks(kind: str) -> dict[tuple[tokamax.Op, str], _Picks]:
     """The picks stored for GPUs of `kind` that this checkout reads (`_read`), by op,
     none where the process keeps no picks (`dew.cache.keeps_picks`)."""
@@ -851,19 +828,31 @@ def launches() -> Iterator[None]:
         yield
 
 
-class _Seen:
-    """The launches a lowering traced under `seen`, each its op and keyed
-    arguments; hashed by identity, as `dew.cache.KERNEL_SEEN` keys on it."""
+class Seen(list[Launch]):
+    """The launches traced under `seen`, each its op and keyed arguments, in the order they traced, and
+    `taken`, the config each took as it traced (`KernelOp._chosen`: a pin, a pick, the nearest pick or
+    its heuristic) and the arguments it took it for (its own shapes, which its heuristic reads), in the
+    same order."""
 
     def __init__(self) -> None:
-        self.found: list[Launch] = []
+        super().__init__()
+        self.taken: list[tuple[Hashable, tokamax.BoundArguments]] = []
+
+
+class _Seen:
+    """The launches a lowering traced under `seen` (`Seen`); hashed by identity, as
+    `dew.cache.KERNEL_SEEN` keys on it."""
+
+    def __init__(self) -> None:
+        self.found = Seen()
 
 
 @contextlib.contextmanager
-def seen() -> Iterator[list[Launch]]:
+def seen() -> Iterator[Seen]:
     """Each kernel launch traced within whose config is read from picks, its
-    op and keyed arguments (`KernelOp.keyed`), recorded as it traces: a fresh
-    collection each time, so a trace cached before traces again."""
+    op and keyed arguments (`KernelOp.keyed`) and the config it took
+    (`Seen.taken`), recorded as it traces: a fresh collection each time, so
+    a trace cached before traces again."""
     collected = _Seen()
     with cache.KERNEL_SEEN(collected):
         yield collected.found
@@ -941,7 +930,7 @@ def _settle(found: list[Launch], *, measure: bool) -> int:
     def decided() -> str | None:
         if jax.process_index() != 0:
             return None
-        decisions, measured, nearest = [], [], []
+        decisions, timed, nearest = [], [], []
         for op, ba in found:
             if (fastest := _pick(ba)) is not None:
                 decisions.append((ba, fastest))
@@ -949,15 +938,15 @@ def _settle(found: list[Launch], *, measure: bool) -> int:
             if measure and cache.measures_picks():
                 timings = _measured(op, ba)
                 if timings.prune_errors():
-                    measured.append((ba, timings))
+                    timed.append((ba, timings))
                     decisions.append((ba, timings.prune()))
                     continue
                 _log.warning("no config of %s compiled or ran; it keeps its heuristic: %s",
                              type(op).__name__, next(iter(timings.values()), None))
             if (near := op._stored_nearest(ba)) is not None:
                 nearest.append((ba, near))
-        if measured:
-            _store(kind, measured)
+        if timed:
+            _store(kind, timed)
         return json.dumps([json.loads(dumps_picks(kind, chosen)) for chosen in (decisions, nearest)])
 
     text = coordination.broadcast_from_process_zero(coordination.agreed("settling kernel configs", decided))

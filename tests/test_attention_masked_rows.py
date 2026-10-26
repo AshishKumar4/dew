@@ -118,3 +118,16 @@ def test_a_row_its_key_starts_empty_reads_its_blocks_later_keys(implementation):
     np.testing.assert_array_equal(out[0, 0], np.asarray(value)[0, 1])
     np.testing.assert_array_equal(out[1, 1], np.asarray(value)[1, 2])
     np.testing.assert_array_equal(out[1, 0], 0)
+
+
+@pytest.mark.parametrize("implementation", ["reference", "xla", "template"])
+def test_a_row_whose_window_holds_no_valid_key_reads_nothing(implementation):
+    """Key validity can empty a causal window: a row whose window of two holds only invalid keys reads
+    exactly zero on every implementation, and a row beside it that holds one reads that key's value."""
+    query, key, value = qkv((1, 6, 2, 8), jnp.float32)
+    valid = jnp.asarray([[1, 1, 0, 0, 1, 0]], bool)
+    out = np.asarray(scaled_dot_product_attention(query, key, value, causal=True, sliding_window=2,
+                                                  key_valid=valid, implementation=implementation))
+    np.testing.assert_array_equal(out[0, 3], 0)
+    np.testing.assert_array_equal(out[0, 2], np.asarray(value)[0, 1])
+    np.testing.assert_array_equal(out[0, 5], np.asarray(value)[0, 4])

@@ -2419,7 +2419,7 @@ The cache's validity, derived, 2026-10-04. Each attention cache stored a
 in order, so the mask always equalled the cursor's `filled_slots`. A decode
 step rewrote it in every layer, in 28 one-microsecond kernels, only to store
 it in the state passed to the next step. The mask is now derived where it is
-read (`dew.nn.attention.cached_validity`), in the attention, Llama 4, MLA,
+read (`dew.nn.kv_cache.cached_validity`), in the attention, Llama 4, MLA,
 the DSA pool and DeepSeek V4, and serving no longer places or zeroes it. The
 served tokens and log-probabilities are bitwise the same at 32, 64 and 128
 slots, and the device's busy time a run went from 1393.7 to 1388.3 ms at 32

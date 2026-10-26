@@ -10,14 +10,19 @@ share its tensor cores, shared memory and special-function units, so it does the
 another; and while one waits for its next step's operands, the others' work hides the wait. A program
 of `steps` pipeline steps, `stages` of them in flight, issues each step's loads `stages - 1` steps
 before it needs them, so each step waits at least the global load latency over `stages - 1`; a
-multiprocessor's `resident` programs (`resident`) wait together (Little's law). Per multiprocessor,
+multiprocessor's `resident` programs (`resident`) wait together (Little's law). A mainloop that keeps
+`in_flight` steps' products running past their step holds their stages too, so it loads `stages - 1 -
+in_flight` ahead, and with none ahead each step's wait and its transfer (its staged bytes at the
+program's share of the bandwidth) are serial with its work. Per multiprocessor,
 
     program  = max(program_flops / tensor rate, program_staged / shared-memory rate,
                    program_exponentials / special-function rate)
-             + serial_staged / shared-memory rate + serial_exponentials / special-function rate
-    waiting  = steps · load latency / (stages - 1)
+             + serial_staged / shared-memory rate
+             + serial_exponentials / special-function rate
+    waiting  = steps · load latency / min(stages - 1 - in_flight, steps)
     tile     = program + serial_stored / (memory bandwidth / multiprocessors)
-    compute  = ceil(programs / (multiprocessors · resident)) · max(resident · tile, waiting)
+    compute  = ceil(programs / (multiprocessors · resident))
+               · max(min(resident, ceil(programs / multiprocessors)) · tile, waiting)
     memory   = device_bytes / memory bandwidth
     l2       = l2_bytes / L2 bandwidth
     seconds  = max(compute, memory, l2) + programs * steps * grid step seconds (TPU's)
@@ -73,7 +78,9 @@ size plus one reservation."""
 class Cost:
     """One launch's work at one config, as the model reads it (the module's docstring). `mode` names
     the tensor cores' arithmetic ('16bit' or 'tf32', `GpuTarget.tensor_rates`) and is read only where
-    `program_flops` is nonzero."""
+    `program_flops` is nonzero. `in_flight`: the steps whose products a program keeps running past their
+    step (a mainloop's MMAs in flight), each holding its stage, so `stages - 1 - in_flight` steps load
+    ahead."""
     programs: float
     device_bytes: float
     program_flops: float = 0.0
@@ -87,6 +94,7 @@ class Cost:
     serial_exponentials: float = 0.0
     l2_bytes: float = 0.0
     serial_stored: float = 0.0
+    in_flight: int = 0
 
 
 def seconds(cost: Cost, target: generation.GpuTarget) -> float:
@@ -103,11 +111,19 @@ def seconds(cost: Cost, target: generation.GpuTarget) -> float:
     latency = facts.load_latency
     program = program_seconds(cost, rate, clock) + cost.serial_stored * multiprocessors / bandwidth
     waiting = 0.0 if latency is None else waiting_seconds(cost, latency, clock)
+    if cost.stages - 1 - cost.in_flight < 1:
+        # No step loads ahead: each waits for its own load, its transfer at the program's share of the
+        # memory's bandwidth, serial with the products (H100 PCIe sweeps: a two-stage warpgroup-MMA tile,
+        # which loads nothing ahead, ran 1.16 to 1.94 times its three-stage twin, R1/R3-sweep-h100).
+        program += waiting + cost.program_staged * multiprocessors / bandwidth
+        waiting = 0.0
     waves = math.ceil(cost.programs / (multiprocessors * cost.resident))
+    # A multiprocessor holds no more programs at once than a wave gives it.
+    resident = min(cost.resident, max(math.ceil(cost.programs / multiprocessors), 1))
     l2 = 0.0 if facts.l2_bandwidth is None else cost.l2_bytes / facts.l2_bandwidth
     step = facts.grid_step_seconds
     stepping = 0.0 if step is None else cost.programs * cost.steps * step
-    return max(waves * max(cost.resident * program, waiting), cost.device_bytes / bandwidth, l2) + stepping
+    return max(waves * max(resident * program, waiting), cost.device_bytes / bandwidth, l2) + stepping
 
 
 def program_seconds(cost: Cost, rate: float, clock: float) -> float:
@@ -121,10 +137,27 @@ def program_seconds(cost: Cost, rate: float, clock: float) -> float:
             + cost.serial_exponentials / (EXPONENTIALS_PER_CLOCK * clock))
 
 
+WRITE_GRANULE = 256
+"""The fewest bytes of a contiguous run of an output's row a write moves at the memory's full rate, two
+128-byte L2 lines: a launch writing shorter runs is charged as if each were this long (`written`). An
+H100's bf16 kernel gradients at 64 columns (128-byte runs) ran 1.15 to 1.43 times the best tile where
+fp32's 64 columns (256-byte runs) ran 1.01 to 1.13, both at the device-bytes floor; counted, the model's
+Mosaic picks over the H100 PCIe sweeps ran within 10% of the best at 23 of 28 records, from 22, its A100
+and L4 picks unchanged; 384 or 512 bytes counted worse (R1/R3-sweep-*, scripts/eval_sweeps.py)."""
+
+
+def written(nbytes: float, run: float) -> float:
+    """The device bytes writing `nbytes` in contiguous runs of `run` bytes moves: as if each run were
+    at least `WRITE_GRANULE` long."""
+    return nbytes * max(1.0, WRITE_GRANULE / run) if run > 0 else nbytes
+
+
 def waiting_seconds(cost: Cost, latency: float, clock: float) -> float:
-    """The seconds a program's steps wait on loads `latency` clocks long, its stages in flight hiding
-    `stages - 1` steps of it (Little's law, the module's docstring)."""
-    return cost.steps * latency / max(cost.stages - 1, 1) / clock
+    """The seconds a program's steps wait on loads `latency` clocks long, the steps loading ahead
+    (`stages - 1 - in_flight`) hiding as many steps of it, and never more steps than it takes (Little's
+    law, the module's docstring)."""
+    ahead = cost.stages - 1 - cost.in_flight
+    return cost.steps * latency / max(min(ahead, math.ceil(cost.steps)), 1) / clock
 
 
 def resident(target: generation.GpuTarget, staged: int, threads: int, registers: int) -> int:
