@@ -351,33 +351,46 @@ class Fit(pygrain.MapTransform):
 
     def _apart(self, grouped: GroupedExamples) -> Batch | Rejected:
         """Grouped examples' labelled rows, each as an example of its own lays it out (`QuestionRows`
-        spreads them), where no consistency term reads their groups."""
-        rows = []
+        spreads them), where no consistency term reads their groups: an example that does not fit is
+        left out as it would be alone, its siblings kept."""
+        rows, reasons = [], set()
         for example in grouped.examples:
             labels = example.labels()
             if not labels:
+                reasons.add("unlabelled")
                 continue
             asked = (example.questions if self.layout.joint
                      else {name: example.questions[name] for name in labels})
             fitted = self._rows(example, asked)
             if isinstance(fitted, Rejected):
-                return fitted
+                reasons.add(fitted.reason)
+                continue
             rows.extend(fitted)
-        return {"decision_rows": tuple(rows)} if rows else Rejected("unlabelled")
+        if rows:
+            return {"decision_rows": tuple(rows)}
+        return Rejected("unfit" if "unfit" in reasons else "unlabelled")
 
     def _longest(self, row: FittedRow) -> int:
-        """The most tokens `row` encodes to: each answered choice given a "none of the above" beside
-        its options where the training encoding may add one (`Encoding`), the longest it lays out."""
-        example = row.example
+        """The most tokens `row` encodes to where the training encoding may give each answered choice a
+        "none of the above" (`Encoding`): the longest of the row as it is, with the option added beside
+        every answered choice's options, and with it in place of each one's right option. A row of a
+        question each is these three exactly, since its layout may trim its options together
+        (`QuestionLayout`), so that adding one can shorten the row; a row of several questions lays
+        them out untrimmed, where adding the option beside every one is the longest."""
         if not self.none_of_the_above:
             return row.length
+        example = row.example
         labels = example.labels()
-        asked = {name: (_none_of_the_above(question, labels[name], drop=False)[0]
-                        if name in example.answers and isinstance(question, Choice) else question)
-                 for name in row.names for question in (example.questions[name],)}
-        laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked,
-                                tokens=row.tokens.tolist())
-        return sum(len(each.tokens) for each in laid)
+
+        def laid_out(drop: bool) -> int:
+            asked = {name: (_none_of_the_above(question, labels[name], drop=drop)[0]
+                            if name in example.answers and isinstance(question, Choice) else question)
+                     for name in row.names for question in (example.questions[name],)}
+            laid = self.layout.rows(self.tokenizer, self.specials, example.state, asked,
+                                    tokens=row.tokens.tolist())
+            return sum(len(each.tokens) for each in laid)
+
+        return max(row.length, laid_out(drop=False), laid_out(drop=True))
 
     def _unit(self, grouped: GroupedExamples) -> Batch | Rejected:
         """Grouped examples' rows as one unit, which the packer places in one window: each example's

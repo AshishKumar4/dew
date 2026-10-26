@@ -27,7 +27,14 @@ from dew.decision import (
     Noul,
     StateFirstLayout,
 )
-from dew.decision.objective import DecisionStatistics, Encoding, Fit, _window_groups
+from dew.decision.objective import (
+    DecisionStatistics,
+    Encoding,
+    Fit,
+    QuestionRows,
+    _encoded_unit,
+    _window_groups,
+)
 from dew.decision.task import laid_out
 from dew.nn import categorical
 from dew.objectives.base import Ratio, Step
@@ -203,6 +210,25 @@ def test_grouped_examples_without_a_consistency_term_are_their_examples_rows():
         np.testing.assert_array_equal(np.asarray(grouped[name]), np.asarray(alone[name]), err_msg=name)
 
 
+def test_grouped_examples_without_a_consistency_term_keep_the_examples_that_fit():
+    """Without a consistency term an example of grouped examples that no row holds is left out as it
+    would be alone, and its siblings' rows are kept."""
+    objective = DecisionObjective(tiny_backbone().clone(max_seq_len=LAYOUT.max_len), tokenizer=TOKENIZER,
+                                  specials=SPECIALS, layout=LAYOUT)
+    fit = Fit(LAYOUT, TOKENIZER, SPECIALS, objective.model.head, context_length=None, grouped=False)
+    fits = Example("the customer was charged twice", {"billing": Noul("Is this about billing?")},
+                   {"billing": "true"})
+    unfit = Example("the client paid two times", {"charge": Noul("Is this a charging problem? " * 400)},
+                    {"charge": "true"})
+    assert fit.map({"example": unfit}) == Rejected("unfit")
+    together = GroupedExamples((fits, unfit), groups=(Group("billing", {
+        "0.billing": {"true": "yes", "false": "no"}, "1.charge": {"true": "yes", "false": "no"}}),))
+    def rows(element):
+        return [(each["decision"].names, each["decision"].length)
+                for each in QuestionRows().flat_map(element)]
+    assert rows(fit.map({"example": together})) == rows(fit.map({"example": fits}))
+
+
 def test_grouped_examples_read_from_their_own_rows_fields():
     """A store's row of grouped examples' fields (`examples` and `groups`) trains as such a row does:
     its three members one group of the window that holds them."""
@@ -243,6 +269,36 @@ def test_a_unit_is_budgeted_for_the_options_its_training_adds():
     assert not isinstance(fitted, Rejected) and "decision_unit" in fitted
     augmented = dataclasses.replace(plain, none_of_the_above=1.0)
     assert augmented.map({"example": pair}) == Rejected("unfit")
+
+
+def test_a_unit_the_fit_holds_fits_its_window_however_training_draws_its_options():
+    """Every draw of the training encoding's "none of the above", beside the right option or in its
+    place, lays a unit out within the window the fit held it in. Adding an option can shorten a row,
+    since the options of a row share its budget and more of them are cut harder (`QuestionLayout`), so
+    the row with the option added is not the longest: here the row with it in place of the right one
+    is, and the windows between the two units' lengths hold the one but not the other."""
+    options = ["a" * 60, "b" * 60, "c" * 60, "d", "e"]
+    pair = GroupedExamples(tuple(Example("", {"q": Choice("x", options)}, {"q": options[0]})
+                                 for _ in range(2)),
+                           groups=(Group("same", {f"{index}.q": {option: option for option in options}
+                                                  for index in range(2)}),))
+    head = DecisionObjective(tiny_backbone().clone(max_seq_len=512), tokenizer=TOKENIZER, specials=SPECIALS,
+                             layout=StateFirstLayout(max_len=512)).model.head
+    windows = range(256, 424, 8)
+    held = []
+    for window in windows:
+        layout = StateFirstLayout(max_len=window)
+        fitted = Fit(layout, TOKENIZER, SPECIALS, head, context_length=None, grouped=True,
+                     none_of_the_above=1.0).map({"example": pair})
+        if isinstance(fitted, Rejected):
+            continue
+        held.append(window)
+        encoding = Encoding(layout, TOKENIZER, SPECIALS, width=len(options) + 1, none_of_the_above=1.0,
+                            grouped=True)
+        for seed in range(16):
+            unit = _encoded_unit(encoding, fitted["decision_unit"], np.random.default_rng(seed))
+            assert len(unit["tokens"]) <= window, (window, seed, len(unit["tokens"]))
+    assert held and held[0] > windows[0], held
 
 
 def test_grouped_examples_name_questions_they_ask_once_each():
