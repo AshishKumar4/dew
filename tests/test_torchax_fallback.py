@@ -824,6 +824,7 @@ def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_pre
     transformers' full forward of that row's prefix (its float64 twin's the truth), Cohere 2's window
     included; its greedy generation's tokens are the full forward's argmax at each step."""
     from dew.inference import TextGeneration
+    from dew.sampling import Sampling
 
     torch.manual_seed(0)
     model = PACKED_MODELS[family]().eval()
@@ -879,7 +880,9 @@ def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_pre
                     truth_fn=theirs(wide, float64))
 
     prompt, _, _ = draw(0)
-    generated = np.asarray(TextGeneration(loaded.model, loaded.variables)(prompt, steps, key=0).tokens)
+    task = TextGeneration(loaded.model, loaded.variables, sampling=Sampling(temperature=0.0))
+    generated = np.asarray(task(prompt.tolist(), steps, key=0).tokens)
+    assert (generated[:, :prompt.shape[1]] == prompt).all()
     full = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(generated)))
     np.testing.assert_array_equal(generated[:, prompt.shape[1]:], full[:, prompt.shape[1] - 1:-1].argmax(-1))
 
