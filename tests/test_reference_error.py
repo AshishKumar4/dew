@@ -1015,8 +1015,9 @@ def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path
         assert_as_exact(jax.jit(lambda index, inputs: squared(inputs)), reference, draw_recorded, "recorded",
                         seeds=seeds, truth_fn=truth)
         with pytest.raises(AssertionError):
-            assert_as_exact(lambda index, inputs: {"y": inputs["x"] ** 2}, reference, draw_recorded,
-                            "recorded with its subtraction missing", seeds=seeds, truth_fn=truth)
+            assert_as_exact(lambda index, inputs: {"y": jnp.asarray(inputs["x"]) ** 2}, reference,
+                            draw_recorded, "recorded with its subtraction missing", seeds=seeds,
+                            truth_fn=truth)
     if not proxy:
         with pytest.raises(ValueError):
             recorder.record_case("site", draw, evaluate, None, truth_proxy=squared)
