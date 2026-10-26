@@ -89,7 +89,7 @@ import jax
 import ml_dtypes
 import numpy as np
 import pytest
-from interop_support import assert_restores, assert_same_stored_tensors
+from interop_support import assert_restores, assert_same_stored_tensors, written_tensors
 from model_support import cached_round_trips, flat_tree, streamed_export
 from reference_error import (
     FACTOR,
@@ -1219,16 +1219,6 @@ def test_standalone_glm5_export_preserves_native_and_source_computation(variant,
             actual_leaves = flat_tree(restored.variables[collection])
             for name, value in flat_tree(variables[collection]).items():
                 np.testing.assert_array_equal(actual_leaves[name], value)
-
-
-def written_tensors(directory) -> dict:
-    """Every tensor the safetensors shards in `directory` hold."""
-    from safetensors.numpy import load_file
-
-    written = {}
-    for shard in sorted(Path(directory).glob("*.safetensors")):
-        written.update(load_file(str(shard)))
-    return written
 
 
 def assert_same_tensors(written: dict, expected: dict) -> None:
