@@ -22,11 +22,10 @@ class Block:
 
 @dataclasses.dataclass(frozen=True)
 class Doubling(Template):
-    """A launch over `x [rows, width]` whose program stages `rows` of fp32 rows and costs `seconds`."""
+    """A launch over `x [rows, width]` whose program stages `rows` of fp32 rows."""
 
     config_cls: ClassVar[type[Block]] = Block
     name: ClassVar[str] = "doubling"
-    seconds: dict = dataclasses.field(default_factory=dict, hash=False, compare=False)
 
     def _fwd(self, x, *, config, return_residuals=False):
         return x * 2, None
@@ -36,9 +35,6 @@ class Doubling(Template):
 
     def staged_bytes(self, ba, config, target):
         return config.rows * ba.arguments["x"].shape[1] * 4
-
-    def cost(self, ba, config, target):
-        return self.seconds.get(config.rows, 1.0)
 
 
 def bound(op, width=512):
@@ -54,16 +50,13 @@ def test_a_templates_configs_are_the_ones_a_block_of_the_device_holds():
         assert op.fitting(bound(op), generation.gpu_target()) == (Block(8), Block(16), Block(32), Block(64))
 
 
-def test_a_templates_heuristic_is_its_fastest_fitting_config_the_first_of_equals():
-    """The cost model's fastest config that fits, where several tie the first of the space's order, so
-    the pick never rides a set's iteration."""
-    fewer = Doubling(seconds={8: 4.0, 16: 3.0, 32: 2.0, 64: 1.0})
-    with generation.assumed("sm86"):
-        assert fewer._get_heuristics_config(bound(fewer)) == Block(32)
-        assert Doubling()._get_heuristics_config(bound(Doubling())) == Block(8)
-        assert Doubling(seconds={16: 0.5, 32: 0.5})._get_heuristics_config(bound(Doubling())) == Block(16)
-    with generation.assumed("sm80"):
-        assert fewer._get_heuristics_config(bound(fewer)) == Block(64)
+def test_a_fixed_spaces_heuristic_is_its_first_config_that_fits():
+    """A launch naming a fixed space takes its first config that fits the device, nothing ranked (bible
+    §6): 64 rows of 512 fp32 columns stage 128 KiB, past an A10's block, so its first fitting there is the
+    first of the space as on an A100."""
+    for name in ("sm86", "sm80"):
+        with generation.assumed(name):
+            assert Doubling()._get_heuristics_config(bound(Doubling())) == Block(8)
 
 
 def test_a_target_that_reports_no_block_takes_the_least_any_gpu_holds():
@@ -159,7 +152,8 @@ def test_a_call_runs_the_first_implementation_that_runs_it_on_the_device_or_the_
 def _selected(kernels: dict, generic: tuple = (), named: str | None = None) -> str:
     """The kernel a selector over `kernels` (name to whether it takes the call), the `generic` ones
     (taking every call) after them, runs, `named` as `generation.chosen` names it; a kernel `None`
-    names takes no call but by name, as CUTLASS's grouped GEMM (`grouped_matmul.NAMED`)."""
+    names takes no call but by name, as CUTLASS's grouped GEMM off its declared cells
+    (`grouped_matmul.DECLARED_ONLY`)."""
     def requirement(takes):
         if takes is None:
             return Requirement[None]("named", lambda case: False, "", row=generation.INHERENT,

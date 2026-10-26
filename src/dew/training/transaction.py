@@ -251,6 +251,14 @@ def compact_qk(tree):
     return jax.tree_util.tree_map_with_path(compact, tree)
 
 
+def loss_scale(dynamic_scale: bool | dynamic_scale_lib.DynamicScale) -> dynamic_scale_lib.DynamicScale | None:
+    """The dynamic loss scale a trainer's `dynamic_scale` asks for: Flax's at its defaults for True,
+    the one given (its growth interval and factors), or none."""
+    if isinstance(dynamic_scale, dynamic_scale_lib.DynamicScale):
+        return dynamic_scale
+    return dynamic_scale_lib.DynamicScale() if dynamic_scale else None
+
+
 def _advance_scale(scale: dynamic_scale_lib.DynamicScale, finite: jax.Array):
     # Flax's growth comparison uses the incoming streak, including at restart.
     grow = scale.fin_steps == scale.growth_interval

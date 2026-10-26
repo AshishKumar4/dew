@@ -48,7 +48,8 @@ from dew.training.memory import (
 )
 
 if TYPE_CHECKING:
-    from dew.training.trainer import Rollout, StepFn
+    from dew.training.rollout import Rollout
+    from dew.training.trainer import StepFn
 
 _log = logging.getLogger(__name__)
 
