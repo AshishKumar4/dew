@@ -69,7 +69,7 @@ from dew.nn import linear
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, recurrence_chunk
 from dew.nn.mixer_base import MEMORY_RESIDUALS
-from dew.nn.sharding import LOW_RANK_FACTORS
+from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
 from dew.optim import newton_schulz
 from dew.quantization import FROZEN_FP8, QUANTIZATION, frozen_fp8_kernel
 
@@ -289,7 +289,7 @@ class InContextMemory(nn.Module):
     def _gate(self, name: str, gate: Gate, x: jax.Array) -> jax.Array:
         """The gate's value a token and head `[B, S, H]`, in at least float32."""
         if gate.value is not None:
-            return jnp.full((*x.shape[:2], self.heads), gate.value, at_least_fp32(self.dtype))
+            return rows_like(jnp.full((*x.shape[:2], self.heads), gate.value, at_least_fp32(self.dtype)), x)
         return gate.scale * jax.nn.sigmoid(self._logit(name, gate, x))
 
     def _kept(self, x: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -298,9 +298,10 @@ class InContextMemory(nn.Module):
         wide = at_least_fp32(self.dtype)
         gate = self.retention
         if gate is None:
-            return jnp.ones((*x.shape[:2], self.heads), wide), jnp.zeros((*x.shape[:2], self.heads), wide)
+            nothing = rows_like(jnp.zeros((*x.shape[:2], self.heads), wide), x)
+            return nothing + 1, nothing
         if gate.value is not None:
-            alpha = jnp.full((*x.shape[:2], self.heads), gate.value, wide)
+            alpha = rows_like(jnp.full((*x.shape[:2], self.heads), gate.value, wide), x)
             return 1 - alpha, jnp.log1p(-alpha)
         logit = self._logit("retention", gate, x)
         # log(1 - s sigmoid(z)) = log((1 - s) + e^-z) - log(1 + e^-z): finite wherever s is at most one,
@@ -365,16 +366,21 @@ class InContextMemory(nn.Module):
         wide = at_least_fp32(self.dtype)
         initial, heads = self._initial(features)
         tokens = coordinates_of(call.metadata, batch, length)
-        real = jnp.ones((batch, length), bool) if tokens.valid is None else jnp.asarray(tokens.valid, bool)
+        # Every array of rows this call makes is placed as the stream's rows are (`rows_like`), so an
+        # Explicit axis that splits them splits these alike, a scan's carry and a cache among them.
+        real = (rows_like(jnp.ones((batch, length), bool), x) if tokens.valid is None
+                else jnp.asarray(tokens.valid, bool))
         if tokens.segments is not None:
             real = real & (tokens.segments != 0)
         # Each token's rank among its document's real tokens, which the chunks count from whatever
         # logical positions the call gives, as the chunked path compacts the real tokens from 0.
         places = counted_places(tokens.segments, tokens.valid)
-        places = jnp.broadcast_to(jnp.arange(length)[None], (batch, length)) if places is None else places
+        if places is None:
+            places = rows_like(jnp.broadcast_to(jnp.arange(length)[None], (batch, length)), x)
         # A forward carrying the dropout stream gives each token and head a key of its own, which every
         # application of its network draws from (an adapter's branch drops its input, `dew.lora`).
-        keys = (jax.random.key_data(jax.random.split(self.make_rng("dropout"), (batch, length, self.heads)))
+        keys = (rows_like(jax.random.key_data(jax.random.split(self.make_rng("dropout"),
+                                                               (batch, length, self.heads))), x)
                 if self.has_rng("dropout") else None)
         steps = _Steps(query.astype(wide), key.astype(wide), value.astype(wide), theta, mu, a, real, places,
                        keys)
@@ -463,8 +469,10 @@ class InContextMemory(nn.Module):
         its first call allocates it."""
         batch, features, wide = steps.real.shape[0], steps.key.shape[-1], at_least_fp32(self.dtype)
         allocated = self.has_variable("cache", STATE)
-        held = self.variable("cache", STATE, jnp.zeros, (batch, self.heads, features, features), wide)
-        kept = self.variable("cache", KEPT, jnp.zeros, (batch, self.heads), wide)
+        held = self.variable("cache", STATE, lambda: rows_like(
+            jnp.zeros((batch, self.heads, features, features), wide), steps.real))
+        kept = self.variable("cache", KEPT, lambda: rows_like(
+            jnp.zeros((batch, self.heads), wide), steps.real))
         reads, state, share = self._recurrent(hooks, initial, heads, steps, log_kept,
                                               max_segments=max_segments, held=held.value, kept=kept.value)
         if allocated:
@@ -566,8 +574,7 @@ class InContextMemory(nn.Module):
     def _stepped(self, initial: dict, heads: _Heads, steps: _Steps, carry: tuple | None = None
                  ) -> tuple[jax.Array, tuple]:
         """The readouts `[B, S, H, F]` token by token, and the carry after the last token."""
-        batch = steps.real.shape[0]
-        rows = jax.tree.map(lambda leaf: jnp.broadcast_to(leaf, (batch, *leaf.shape)), initial)
+        rows = _rows(initial, steps.real)
         if carry is None:
             carry = (rows, rows, jax.tree.map(jnp.zeros_like, rows))
         sequence = jax.tree.map(lambda field: jnp.moveaxis(field, 1, 0), steps)
@@ -582,7 +589,7 @@ class InContextMemory(nn.Module):
             field, order.reshape(*order.shape, *(1,) * (field.ndim - 2)), axis=1), steps)
         laid = jax.tree.map(lambda field: sequence_blocks(field, self.chunk, leading=True), gathered)
         count = laid.real.shape[0]
-        rows = jax.tree.map(lambda leaf: jnp.broadcast_to(leaf, (batch, *leaf.shape)), initial)
+        rows = _rows(initial, steps.real)
         carry = (rows, jax.tree.map(jnp.zeros_like, rows))
         _, reads = jax.lax.scan(functools.partial(self._chunk, heads=heads), carry, laid)
         reads = jnp.moveaxis(reads, 0, 1).reshape(batch, count * self.chunk, *reads.shape[3:])[:, :length]
@@ -621,13 +628,12 @@ class InContextMemory(nn.Module):
         """A cached call: the cache's state continued token by token, its first call allocating it. The
         call's first document continues the row's, whose real tokens the cache has counted; a document
         that starts in the call starts from W_0, and the cache then counts that document's."""
-        batch = steps.real.shape[0]
-        rows = jax.tree.map(lambda leaf: jnp.zeros((batch, *leaf.shape), leaf.dtype), initial)
+        rows = jax.tree.map(jnp.zeros_like, _rows(initial, steps.real))
         allocated = self.has_variable("cache", STATE)
         start = self.variable("cache", START, lambda: rows)
         state = self.variable("cache", STATE, lambda: rows)
         momentum = self.variable("cache", MOMENTUM, lambda: rows)
-        seen = self.variable("cache", COUNT, jnp.zeros, (batch,), jnp.int32)
+        seen = self.variable("cache", COUNT, lambda: jnp.zeros_like(steps.real, jnp.int32)[:, 0])
         places = steps.places + jnp.where(_documents(steps)[1], seen.value[:, None], 0)
         reads, carry = self._stepped(initial, heads, steps._replace(places=places),
                                      (start.value, state.value, momentum.value))
@@ -706,7 +712,14 @@ def _documents(steps: _Steps) -> tuple[jax.Array, jax.Array]:
 def _at_last(values: jax.Array, real: jax.Array, held: jax.Array) -> jax.Array:
     """`values` `[B, S, ...]` at each row's last real token, and `held` `[B, ...]` in a row with none."""
     last = jnp.max(jnp.where(real, jnp.arange(real.shape[1]), 0), axis=1)
-    return jnp.where(_lead(jnp.any(real, axis=1), held), values[jnp.arange(real.shape[0]), last], held)
+    at = jnp.take_along_axis(values, _lead(last, values), axis=1)[:, 0]
+    return jnp.where(_lead(jnp.any(real, axis=1), held), at, held)
+
+
+def _rows(initial: dict, real: jax.Array) -> dict:
+    """W_0's weights `[H, ...]` for every row `[B, H, ...]`, placed as the rows of `real` `[B, S]` are."""
+    return jax.tree.map(lambda leaf: rows_like(jnp.broadcast_to(leaf, (real.shape[0], *leaf.shape)), real),
+                        initial)
 
 
 def _within(values: jax.Array, begins: jax.Array) -> jax.Array:
