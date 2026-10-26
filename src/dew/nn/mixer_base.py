@@ -205,7 +205,8 @@ class MixerBase:
     """The names (`dew.nn.mixer_base.RESIDUALS`) the mixer this kind
     builds marks for a remat policy to keep, or every name where None: a
     decoder skips a remat rung that keeps nothing more of its layers' names
-    than the next (`CausalTransformer.recompute_more`)."""
+    than the next (`CausalTransformer.recompute_more`). The class's default,
+    which every reader takes through `marks`."""
 
     keeps_cache = True
     """Whether the mixer this kind builds keeps a decode cache, which a loop's
@@ -216,6 +217,11 @@ class MixerBase:
     (`dew.nn.inputs.Admitted`) as the separate decode and prefill calls
     would, or keeps no cache for it to read: one that does not read the
     call's layout would take its one row of tokens as one sequence."""
+
+    def marks(self) -> tuple[str, ...] | None:
+        """The names this kind's mixer marks (`residuals`): its class's,
+        unless its configuration chooses the path it runs."""
+        return self.residuals
 
     def mixed_refusal(self, ctx: MixerContext) -> str | None:
         """Why the mixer this kind builds over `ctx` would not run a server's
