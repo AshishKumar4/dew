@@ -44,7 +44,6 @@ from dew.interop.pretrained import Pretrained
 from dew.interop.safetensors_io import read_file, write_file
 from dew.lora import Adapter, AdapterBase, LoRA, Target
 from dew.nn.kernels import generation
-from dew.nn.kernels.selection import KernelRefused
 from dew.nn.sharding import ADAPTER_RANK, declarations, declared_axes, parameter_path
 from dew.objectives.base import Step
 from dew.objectives.diffusion import DiffusionObjective
@@ -536,8 +535,9 @@ def test_an_adapter_on_gate_and_up_keeps_its_branch_where_the_row_joins_them(dec
     """A row that joins gate and up into one GEMM (`dew.nn.joined`, an A100's)
     leaves an adapted model's projections to their own calls, which the
     adapter intercepts, in a scanned stack too, its route saying why; the join
-    chosen for it raises (`selection.KernelRefused`), and the branch moves the
-    logits off the base model's."""
+    chosen for it hands the call to them too (a join's requirements are
+    handoffs), so the adapted logits are those with the projections apart, and
+    the branch moves them off the base model's."""
     adapter = LoRA(rank=3, modules=("gate_proj", "up_proj")).apply(
         decoder.model, decoder.variables, key=0, layouts=decoder.layouts)
     model = adapter.model.clone(scan_layers=scan)
@@ -549,11 +549,10 @@ def test_an_adapter_on_gate_and_up_keeps_its_branch_where_the_row_joins_them(dec
         jax.eval_shape(model.apply, variables, tokens)
     assert {(route.kernel, route.preferred, route.refusal and route.refusal.code) for route in found
             if route.choice == "gate_up"} == {("apart", "joined", "intercepted")}
-    with row_joins("gate_up"), pytest.raises(KernelRefused) as refused:
-        model.apply(variables, tokens)
-    assert [refusal.code for refusal in refused.value.refusals] == ["intercepted"]
     with row_joins("gate_up", joins=False):
         apart = np.asarray(model.apply(variables, tokens))
+    with row_joins("gate_up"):
+        np.testing.assert_array_equal(np.asarray(model.apply(variables, tokens)), apart)
     assert np.max(np.abs(apart - np.asarray(decoder.model.apply(decoder.variables, tokens)))) > 1e-2
 
 
