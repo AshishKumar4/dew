@@ -36,6 +36,7 @@ from dew.optim import (
     Power,
     PowerTail,
     ScheduleBase,
+    clips_qk,
     learning_rate,
     muon_weight_dimension_numbers,
     rates_of,
@@ -400,8 +401,10 @@ def qk_stats(layers=1, heads=4, rows=3, values=None, nope=None, kv_heads=None, h
 
 
 def test_muonclip_without_stats_steps_like_muon():
-    """No maxima, no clip: the transform steps aside bitwise, leaving every
-    run whose loss never opened the collection on Muon's step."""
+    """No maxima, no clip: called without them, as a loop of plain optax calls may, the transform
+    steps aside bitwise, leaving the weights on Muon's step. Its state marks the optimizer as one that
+    reads them (`clips_qk`), through the chain that composes it, so a run asks its objective for them;
+    Muon's does not."""
     params, grads = qk_tree()
     muon = muon_solver()
     clipped = muonclip_solver()
@@ -410,6 +413,7 @@ def test_muonclip_without_stats_steps_like_muon():
     updates, state = clipped.update(grads, initial, params)
     moved = stepped(params, updates, initial, state)
     assert largest_difference(moved, optax.apply_updates(params, expected)) == 0.0
+    assert clips_qk(initial) and not clips_qk(muon.init(params))
 
 
 def test_a_quiet_clip_steps_like_muon():
@@ -771,11 +775,11 @@ def test_policy_steps_carry_live_qk_statistics_to_muonclip(kind):
 
     model = tiny_decoder(num_layers=1)
     if kind == "dpo":
-        objective = DPOObjective(model, 5, qk_stats=True)
+        objective = DPOObjective(model, 5)
     elif kind == "ppo":
-        objective = PPOObjective(model, 5, critic=Critic(), qk_stats=True, beta=.01)
+        objective = PPOObjective(model, 5, critic=Critic(), beta=.01)
     else:
-        objective = GRPOObjective(model, 5, qk_stats=True, beta=.01 if kind == "grpo-kl" else 0.)
+        objective = GRPOObjective(model, 5, beta=.01 if kind == "grpo-kl" else 0.)
     rows = jax.device_count()
     ids = jnp.asarray(np.random.default_rng(7).integers(0, 32, (rows, 6)), jnp.int32)
     if kind == "dpo":
@@ -806,7 +810,7 @@ def test_policy_steps_carry_live_qk_statistics_to_muonclip(kind):
     assert np.max(peaks) > threshold
     # The reference must not determine the clip, even when its logits are much larger.
     reference = None if initial.ema is None else jax.tree.map(lambda leaf: leaf * 3, initial.averaged)
-    _, aux = objective.loss(variables, batch, Step(jnp.array(0), jax.random.key(1), reference))
+    _, aux = objective.loss(variables, batch, Step(jnp.array(0), jax.random.key(1), reference, qk_stats=True))
     observed = aux.qk_stats["policy"] if kind == "ppo" and aux.qk_stats is not None else aux.qk_stats
     assert observed is not None
     for got, want in zip(jax.tree.leaves(compact_qk(observed)), jax.tree.leaves(expected), strict=True):

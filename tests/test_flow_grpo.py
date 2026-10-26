@@ -1022,20 +1022,52 @@ def test_a_transitions_density_and_kl_hold_at_float32s_largest_variances():
                                      "a narrow transition's KL")
 
 
-def test_a_transitions_kl_keeps_its_half_where_the_error_is_near_float32s_least():
-    """A transition's KL of an error near float32's least over a variance as small is on its float64
-    value: the half is taken in the quotient's exponent, where half the error alone is below the normal
-    range, which XLA:CPU flushes to zero. A mean 2**-63 from its reference under a variance of 2**-126
-    has a KL of 0.5, not 0; one 1.25 * 2**-63 away under 1.3 * 2**-126, an inexact one."""
+KL_EDGES = {
+    # 1.25 * 2**-63 from its reference under 1.3 * 2**-126, an inexact row; 2**-63 under 2**-126, a KL
+    # of 0.5 where half the error flushed to zero; and 0.5 under 2**-126, whose JVP along 4 is 2**127
+    # where the quotient's tangent before its half was 2**128, and whose VJP of a 2**-126 cotangent is
+    # 0.5 where the halved cotangent flushed.
+    "least": (np.ldexp(np.asarray([1.3, 1.0, 1.0], np.float32), -126),
+              np.asarray([np.ldexp(1.25, -63), np.ldexp(1.0, -63), 0.5], np.float32),
+              np.asarray([1.0, 1.0, np.ldexp(1.0, -126)], np.float32)),
+    # A variance whose double fits and one whose double overflows, each 1e18 from its reference under a
+    # cotangent near 1: the KL's derivative to the squared error, 1 / (2 variance), is below float32's
+    # normal range, and its slope to the mean is not.
+    "largest": (np.asarray([1e38, 2.5e38], np.float32), np.asarray([1e18, 1e18], np.float32),
+                np.asarray([1.0, 0.7], np.float32)),
+}
+
+
+@pytest.mark.parametrize("edge", list(KL_EDGES))
+def test_a_transitions_kl_and_its_derivatives_hold_at_float32s_edges(edge):
+    """A transition's KL, its JVP along a tangent of 4 and its VJP of a cotangent, to the mean, stay on
+    their float64 values (check 1) at variances near float32's least and largest: the KL is one division
+    of operands in range, and its derivative each element's slope `(mean - reference) / variance`
+    against the tangent, so no step leaves the range its result keeps (`KL_EDGES`' rows)."""
     from dew.sampling.flow import GaussianTransition
 
-    variance = np.ldexp(np.asarray([1.3, 1.0], np.float32), -126)
-    mean = np.zeros((2, 3, 4), np.float32)
+    variance, offset, cotangent = KL_EDGES[edge]
+    mean = np.zeros((len(variance), 3, 4), np.float32)
     reference_mean = mean.copy()
-    reference_mean[:, 0, 0] = np.ldexp(np.asarray([1.25, 1.0], np.float32), -63)
-    transition = GaussianTransition(jnp.asarray(mean), jnp.asarray(variance))
-    kl = np.asarray(transition.kl(jnp.asarray(reference_mean)))
-    assert np.all(np.isfinite(kl))
-    error = np.square(reference_mean[:, 0, 0])
-    truth = error.astype(np.float64) / (2 * variance.astype(np.float64))
-    assert_as_exact_as_the_reference(kl, error / np.float32(2) / variance, truth, "a KL near float32's least")
+    reference_mean[:, 0, 0] = offset
+    tangent = np.zeros_like(mean)
+    tangent[:, 0, 0] = 4
+
+    def kl(at):
+        return GaussianTransition(at, jnp.asarray(variance)).kl(jnp.asarray(reference_mean))
+
+    value, moved = jax.jvp(kl, (jnp.asarray(mean),), (jnp.asarray(tangent),))
+    _, pullback = jax.vjp(kl, jnp.asarray(mean))
+    pulled_back = np.asarray(pullback(jnp.asarray(cotangent))[0])[:, 0, 0]
+    difference = -offset
+    wide = (difference.astype(np.float64), variance.astype(np.float64), cotangent.astype(np.float64))
+    outputs = {
+        "KL": (value, difference**2 / np.float32(2) / variance, wide[0] ** 2 / (2 * wide[1])),
+        "JVP": (moved, np.float32(2) * difference * np.float32(4) / np.float32(2) / variance,
+                wide[0] * 4 / wide[1]),
+        "VJP": (pulled_back, cotangent * difference / variance, wide[2] * wide[0] / wide[1]),
+    }
+    for name, (dew, reference, truth) in outputs.items():
+        assert np.all(np.isfinite(np.asarray(dew))), name
+        assert_as_exact_as_the_reference(np.asarray(dew), reference, truth,
+                                         f"a KL's {name} near float32's {edge}")

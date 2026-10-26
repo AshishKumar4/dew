@@ -28,6 +28,7 @@ from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step, model_rngs
 from dew.objectives.lm import LMObjective
+from dew.objectives.routing import ExpertBalance
 from dew.state import TrainState
 from dew.training.distributed import Layout, MeshSpec, shard_batch
 from dew.training.transaction import write_back
@@ -59,9 +60,8 @@ def batch():
 
 def objective_for(model):
     sparse = model.mixture is not None
-    return LMObjective(model, 8, qk_stats=True,
-                       balance_rate=0.01 if sparse else None,
-                       aux_loss_alpha=0.001 if sparse else None,
+    return LMObjective(model, 8,
+                       balance=ExpertBalance(balance_rate=0.01, aux_loss_alpha=0.001) if sparse else None,
                        mtp_weight=0.2 if model.num_nextn_predict_layers else None)
 
 
@@ -72,7 +72,7 @@ def training_step(model):
     optimizer = optax.sgd(1e-3, momentum=0.9)
 
     def step(variables, state, tokens, key):
-        info = Step(jnp.zeros((), jnp.int32), key, None)
+        info = Step(jnp.zeros((), jnp.int32), key, None, qk_stats=True)
         (loss, aux), grads = jax.value_and_grad(
             lambda params: objective.scalar_loss({**variables, "params": params},
                                        tokens, info),
@@ -125,7 +125,7 @@ def drawn_steps(plain, stepped, *, routed: bool, within=contextlib.nullcontext, 
     objective = objective_for(plain)
     scored = jax.jit(lambda variables, tokens, key: objective.token_scores(
         variables, tokens, train=True, rngs=model_rngs(key, training=True), routing=True,
-        depths=objective.mtp_weight is not None, qk_stats=objective.qk_stats).routing)
+        depths=objective.mtp_weight is not None, qk_stats=True).routing)
     inferred = jax.jit(lambda variables, tokens: objective.token_scores(
         variables, tokens, routing=True).routing)
 
@@ -316,7 +316,7 @@ def gradient_step(model):
 
     def step(variables, key):
         def loss(params):
-            info = Step(jnp.zeros((), jnp.int32), jax.random.wrap_key_data(key), None)
+            info = Step(jnp.zeros((), jnp.int32), jax.random.wrap_key_data(key), None, qk_stats=True)
             return objective.scalar_loss({**variables, "params": params}, batch(), info)
 
         (value, aux), grads = jax.value_and_grad(loss, has_aux=True)(variables["params"])
