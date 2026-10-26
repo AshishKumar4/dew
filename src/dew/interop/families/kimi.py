@@ -58,7 +58,7 @@ from collections.abc import Mapping
 
 import numpy as np
 
-from dew import records
+from dew import _records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
     ACTIVATIONS,
@@ -123,8 +123,8 @@ _K3_WRAPPER_FIELDS = ('text_config', 'tie_word_embeddings', 'vision_config',
 def _layer_schedule(linear: Mapping[str, object], layers: int) -> tuple[str, ...]:
     """One kind per layer from the 1-based `kda_layers` and `full_attn_layers`
     (`is_kda_layer`, configuration_kimi.py:136-140; any other layer is MLA)."""
-    kda = records.integers(linear.get('kda_layers'), 'linear_attn_config.kda_layers')
-    full = records.integers(linear.get('full_attn_layers'), 'linear_attn_config.full_attn_layers')
+    kda = _records.integers(linear.get('kda_layers'), 'linear_attn_config.kda_layers')
+    full = _records.integers(linear.get('full_attn_layers'), 'linear_attn_config.full_attn_layers')
     if sorted((*kda, *full)) != list(range(1, layers + 1)):
         refuse('linear_attn_config.kda_layers/full_attn_layers',
                 f'the two 1-based lists must name each of the {layers} layers once')
@@ -137,10 +137,10 @@ def _situ(text: Mapping[str, object]) -> SituFields:
     beta = text.get('activation_situ_beta')
     linear = text.get('activation_situ_linear_beta')
     return native_fields(Situ)(
-        beta=float(records.number(beta, "activation_situ_beta")) if beta else 1.0,
+        beta=float(_records.number(beta, "activation_situ_beta")) if beta else 1.0,
         linear_beta=None
         if linear is None
-        else float(records.number(linear, "activation_situ_linear_beta")),
+        else float(_records.number(linear, "activation_situ_linear_beta")),
     )
 
 
@@ -160,7 +160,7 @@ def _mixture(text: Mapping[str, object], layers: int) -> MixtureFields | None:
     top_k = record_int(text, 'num_experts_per_token')
     first = record_int(text, 'first_k_dense_replace', 0)
     every = record_int(text, 'moe_layer_freq', 1)
-    score = records.text(text.get('moe_router_activation_func', 'sigmoid'), 'moe_router_activation_func')
+    score = _records.text(text.get('moe_router_activation_func', 'sigmoid'), 'moe_router_activation_func')
     if score not in ('sigmoid', 'softmax'):
         refuse('moe_router_activation_func', 'the reference scores by sigmoid or softmax')
     groups, per_token = record_int(text, 'num_expert_group', 1), record_int(text, 'topk_group', 1)
@@ -176,7 +176,7 @@ def _mixture(text: Mapping[str, object], layers: int) -> MixtureFields | None:
         groups=groups if groups > per_token else 1,
         groups_per_token=per_token if groups > per_token else 1,
         expert_features=width, shared_features=width * shared,
-        latent_features=None if latent is None else records.integer(latent, 'routed_expert_hidden_size'),
+        latent_features=None if latent is None else _records.integer(latent, 'routed_expert_hidden_size'),
         latent_norm=bool(text.get('latent_moe_use_norm', False)) and latent is not None,
     )
     return mixture
@@ -198,11 +198,11 @@ def _decoder(text: Mapping[str, object], tied: bool, max_seq_len: int) -> Decode
     heads = record_int(text, 'num_attention_heads')
     if text.get('num_key_value_heads') not in (None, heads):
         refuse('num_key_value_heads', 'the MLA expands one key and value per query head')
-    activation = records.text(text.get('hidden_act', 'silu'), 'hidden_act')
+    activation = _records.text(text.get('hidden_act', 'silu'), 'hidden_act')
     if activation != 'situ' and activation not in ACTIVATIONS:
         refuse(f"hidden_act {activation!r}", f"the gated MLP supports situ and {sorted(ACTIVATIONS)}")
     layers = record_int(text, 'num_hidden_layers')
-    linear = records.record(text.get('linear_attn_config'), 'linear_attn_config')
+    linear = _records.record(text.get('linear_attn_config'), 'linear_attn_config')
     types = _layer_schedule(linear, layers)
     hidden = record_int(text, 'hidden_size')
     kinds: dict[str, KindFields] = {}
@@ -214,7 +214,8 @@ def _decoder(text: Mapping[str, object], tied: bool, max_seq_len: int) -> Decode
             'linear_num_heads': record_int(linear, 'num_heads'),
             'linear_head_dim': record_int(linear, 'head_dim'),
             'linear_conv_kernel_dim': record_int(linear, 'short_conv_kernel_size'),
-            'linear_lower_bound': None if bound is None else float(records.number(bound, 'gate_lower_bound')),
+            'linear_lower_bound': (None if bound is None
+                                   else float(_records.number(bound, 'gate_lower_bound'))),
             'use_full_rank_gate': bool(linear.get('use_full_rank_gate', False))}})
     if 'full_attention' in types:
         kinds['full_attention'] = native_fields(LayerKind)(mixer=None)
@@ -252,7 +253,7 @@ def _decoder(text: Mapping[str, object], tied: bool, max_seq_len: int) -> Decode
         mlp=_situ(text) if activation == "situ" else ACTIVATIONS[activation],
         kinds=kinds, mixture=_mixture(text, layers),
         attention_residuals=None if block is None else native_fields(AttentionResiduals)(
-            block_size=records.integer(block, "attn_res_block_size")))
+            block_size=_records.integer(block, "attn_res_block_size")))
     return config
 
 
@@ -268,7 +269,7 @@ def _kimi_linear_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
             f"config fields {extended}",
             "they are K3's additions, which Kimi Linear's modeling_kimi.py does not compute",
         )
-    linear = records.record(hf_config.get('linear_attn_config'), 'linear_attn_config')
+    linear = _records.record(hf_config.get('linear_attn_config'), 'linear_attn_config')
     extra = sorted(set(linear) - _LINEAR_ATTN_FIELDS)
     if extra:
         refuse(f'linear_attn_config fields {extra}', "Kimi Linear's KimiDeltaAttention reads no such field")
@@ -281,7 +282,7 @@ def _kimi_linear_config(hf_config: Mapping[str, object], used: set[str]) -> Deco
                 '(modeling_kimi.py:684-685)')
     if hf_config.get('hidden_act') == 'situ':
         refuse('hidden_act situ', "Kimi Linear's modeling_kimi.py registers no SiTU")
-    tied = records.boolean(hf_config.get('tie_word_embeddings', False), 'tie_word_embeddings')
+    tied = _records.boolean(hf_config.get('tie_word_embeddings', False), 'tie_word_embeddings')
     # model_max_length is a keyword the release's config.json carries and
     # KimiLinearConfig stores without reading; NoPE MLA and KDA have no
     # position limit to take from it.
@@ -304,11 +305,11 @@ def _kimi_k3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
     if unknown:
         refuse(f"text_config fields {unknown}", "KimiLinearConfig has no such field to compute")
     refuse_encoder_fields(text)
-    linear = records.record(text.get('linear_attn_config'), 'linear_attn_config')
+    linear = _records.record(text.get('linear_attn_config'), 'linear_attn_config')
     extra = sorted(set(linear) - _LINEAR_ATTN_FIELDS - _K3_LINEAR_ATTN_FIELDS)
     if extra:
         refuse(f'linear_attn_config fields {extra}', 'KimiDeltaAttention reads no such field')
-    tied = records.boolean(hf_config.get('tie_word_embeddings', False), 'tie_word_embeddings')
+    tied = _records.boolean(hf_config.get('tie_word_embeddings', False), 'tie_word_embeddings')
     used.update(_K3_WRAPPER_FIELDS)
     # KimiLinearConfig's own default (configuration_kimi_k3.py:55).
     capacity, _ = context_lengths(text, 4096)

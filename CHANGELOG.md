@@ -14,6 +14,55 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   program, and a resumed run continues its checkpoint's plan untimed. Dew's tests keep a frontier's
   first plan (`DEW_UNTIMED_FRONTIER`, a test setting like `DEW_WIDE_CPU_ARITHMETIC`). The sharded LM head maps over the axes that
   split its tokens alone, every other axis left automatic, in place of holding every axis manual.
+- `OptimConfig` and `ScheduleSpec` move from `dew.config` to `dew.optim`, beside the optimizers and
+  schedules they build; `Wandb` moves to `dew.training` (`dew.training.tracker`), beside the tracker that
+  reads it; and
+  `record_argument` moves from `dew.data.dataset` to `dew.registry`, beside the records it reads and
+  writes. Import each from its new module.
+- Every component record is the registry's class record, `{"class", "fields"}`, written by
+  `dew.registry.to_record` and its class found by `dew.registry.component`. A component built around
+  parameters states its record as `recorded_fields()` (`dew.registry.Recorded`): a condition encoder's
+  `to_json` is now `recorded_fields`, and an autoencoder records its module and `record_arguments`, any
+  subclass, no registration needed. `InputSpec.to_json`, `Condition.to_json` and `AutoEncoder.to_json`
+  give way to `to_record(value, InputSpec)` and the like; `from_json` and `encoders.rebuild` to
+  `InputSpec.bound`, `Condition.bound`, `AutoEncoder.bound` and `ConditionEncoder.bound`. A decision
+  head records `{"class"}` for `{"name"}`; earlier runs' head and autoencoder records still load.
+- The train state moves to `dew.state`, and a variables tree's operations (`Path`, `select`, `freeze`, `thaw`,
+  `without`, `part`, `everything`, `under`, `PARAMETER_ROOTS`) from `dew.objectives.base` to `dew.batch`.
+  `ModelConfig` moves from `dew.config` to `dew.registry`, the records' one owner; its wrappers are any
+  `dew.registry.Wrapper`.
+  `dew.coordination` becomes the private `dew._coordination`; a hook calls `dew.distributed` (`agreed`,
+  `collective_host`, ...), whose `agreement_patience(seconds)` replaces `AGREEMENT_PATIENCE_SECONDS`.
+  `dew.records` becomes the private `dew._records`. Import each name from its new module.
+- Data plans are read by version 6 and cache generations by schema 2: a stream's
+  shards are named by their files' places, which the same files mounted at
+  another path keep, so a streamed cache fill serves there; and arrays are
+  fingerprinted by their dtypes' names, so float8, int4 and other types of one
+  byte layout no longer collide. A data position saved under plan version 5 is
+  refused, and a generation or fill segment of schema 1 is refused as stale:
+  fill the cache again.
+- An earlier run's record is read through `dew.inference.tasks.earlier_shapes` at `SavedRun.pinned`, the one reader of earlier component shapes (a decision head or layout named by class name alone), carried to 1.0; `Head.from_record` reads an import path only, and `DecideSettings.of` is gone: a decision run's settings read as every task's do (`saved_settings`). An image run's input fields record through the registry.
+- `dew.inference.tasks.SavedRun` is the one pinned context every run loader reads (a task's `from_run`, `Pretrained.from_run`, `Adapter.from_run`, `dew.pipeline`, `dew export`): `SavedRun.pinned(directory, step, trust)` replaces `run_record`, and `run.objective` and `run.variables(...)` replace each loader's own lookup and restore. `Pretrained.from_run` reads a run's task through its settings (`saved_settings`) instead of parsing their fields again. `Decide.from_run` and `DewLM.from_run` take `trust` as the other tasks do.
+- A block- or masked-diffusion objective over a loaded source takes the source's
+  end-of-sequence ids (`Pretrained.eos_token_ids`, or `eos_token_ids=`), and its
+  task and saved run (`BlockSettings`, `MaskedSettings`) stop a response there,
+  as the source's own task does; they generated past it.
+- An LM, DPO, GRPO or PPO objective over a loaded source adds the source's
+  end-of-sequence ids to every policy it builds whose sampling names none: its
+  previews, task, saved run and the GRPO collector stop there.
+- The batch contract moves to `dew.batch` and the mesh's axis names and rules to `dew.mesh`, so the
+  data, models, objectives and trainer read them from one module below them all: `Batch`,
+  `Variables`, `FROZEN`, `merge`, `VALID_ROWS`, `EXAMPLE_ROWS`, `Coordinates` and its token helpers
+  (from `dew.objectives.base` and `dew.nn.inputs`) and `scored_targets` (from
+  `dew.objectives.lm.objective`); the axis names, `DEFAULT_RULES`, `axis_rules`, `logical_spec`,
+  `row_axes`, `batch_axes` and `LayoutRefused` (from `dew.nn.sharding`). Import them from their
+  new modules; the old ones no longer hold them.
+- A decision run's calibration takes its probabilities through SciPy's `softmax` and fits each
+  temperature with SciPy's bounded L-BFGS-B on its inverse, at least 1e-3, in place of a hand-written
+  softmax and Newton loop; the grouping, ragged rows and soft targets are as before.
+- An S3 store's conditional writes go through s3fs's own call (`call_s3`), as its reads and plain writes
+  do, so a profile's server-side encryption (a KMS key, SSE-C) and its bucket's regional client reach
+  them; a refused condition is still `PreconditionFailed`.
 - 8-bit Adam state codes each moment value among the six codes around its estimate, its decade by its
   logarithm, instead of searching the whole map: on an A100, lm-dense's update takes 27.32 ms against
   60.39, its full-remat step 167.9 against 196.3 ms and compiles in 82.3 against 209.8 s, the codes

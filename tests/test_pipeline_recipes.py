@@ -6,12 +6,12 @@ import re
 
 import numpy as np
 
+from dew.batch import VALID_ROWS
 from dew.data import ByteTokenizer, Loading, Memory, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.decision import Choice, DecisionObjective, Example, Specials, StateFirstLayout, decisions
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import VALID_ROWS
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
 

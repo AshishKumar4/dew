@@ -15,7 +15,7 @@ from collections.abc import Mapping
 
 from flax.traverse_util import flatten_dict
 
-from dew import records
+from dew import _records
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     FUSED_EXPERTS,
@@ -52,7 +52,7 @@ def _trailing_sharers(hf_config: Mapping[str, object], layers: int, default: int
     """`num_kv_shared_layers` as the indices of the trailing layers that share
     their providers' keys and values (`first_kv_shared_layer_idx`,
     modeling_gemma3n.py:1178, modeling_gemma4.py:1068), None for none."""
-    count = records.integer(hf_config.get("num_kv_shared_layers", default), "num_kv_shared_layers")
+    count = _records.integer(hf_config.get("num_kv_shared_layers", default), "num_kv_shared_layers")
     if not 0 <= count < layers:
         refuse(f"num_kv_shared_layers {count}", f"it has to leave a provider among {layers} layers")
     return tuple(range(layers - count, layers)) or None
@@ -63,7 +63,7 @@ def _gemma_layer_types(hf_config: Mapping[str, object], used: set[str], *,
     period = 6
     if not last_full and hf_config.get('layer_types') is None:
         used.add('sliding_window_pattern')
-        period = records.integer(hf_config.get("sliding_window_pattern", 6), "sliding_window_pattern")
+        period = _records.integer(hf_config.get("sliding_window_pattern", 6), "sliding_window_pattern")
     types = specified_layer_types(hf_config, used,
                                   ('sliding_attention',) * (period - 1) + ('full_attention',))
     # Gemma4TextConfig rewrites the final layer before building the model.
@@ -89,8 +89,8 @@ def _gemma4_rope(entries: Mapping[str, object]) -> tuple[float, float | None, fl
     partial rotary); the sliding layers rotate all of theirs. Anything but
     those two shapes refuses with the entry named.
     """
-    full = records.record(entries.get('full_attention') or {}, 'rope_parameters.full_attention')
-    sliding = records.record(entries.get('sliding_attention') or {}, 'rope_parameters.sliding_attention')
+    full = _records.record(entries.get('full_attention') or {}, 'rope_parameters.full_attention')
+    sliding = _records.record(entries.get('sliding_attention') or {}, 'rope_parameters.sliding_attention')
     factor = sliding.get('partial_rotary_factor')
     if factor not in (None, 1, 1.0):
         refuse(f"rope_parameters.sliding_attention partial_rotary_factor {factor}",
@@ -109,8 +109,8 @@ def _gemma4_rope(entries: Mapping[str, object]) -> tuple[float, float | None, fl
         if extra or full.get('factor', 1.0) not in (1, 1.0):
             refuse("rope_parameters.full_attention scaling",
                     "the backbone applies plain rotary positions at rope_theta")
-        partial = records.number(factor, 'rope_parameters.full_attention partial_rotary_factor')
-        theta = records.number(
+        partial = _records.number(factor, 'rope_parameters.full_attention partial_rotary_factor')
+        theta = _records.number(
             full.get("rope_theta", 1000000.0), "rope_parameters.full_attention rope_theta"
         )
     elif rope_type in ('default', 'none'):
@@ -122,7 +122,7 @@ def _gemma4_rope(entries: Mapping[str, object]) -> tuple[float, float | None, fl
     else:
         refuse(f"rope_parameters.full_attention (rope_type {rope_type!r})",
                 "the backbone applies plain rotary positions at rope_theta")
-    local = records.number(local, 'rope_parameters.sliding_attention rope_theta')
+    local = _records.number(local, 'rope_parameters.sliding_attention rope_theta')
 
     return theta, (None if local == theta else local), partial
 
@@ -154,10 +154,10 @@ def _gemma_softcaps(hf_config: Mapping[str, object], used: set[str],
                  'attn_logit_softcapping'))
     scalar = hf_config.get('query_pre_attn_scalar')
     if scalar is not None:
-        config['attention_scale'] = records.number(scalar, 'query_pre_attn_scalar') ** -0.5
+        config['attention_scale'] = _records.number(scalar, 'query_pre_attn_scalar') ** -0.5
     softcap = hf_config.get('final_logit_softcapping')
     if softcap is not None:
-        config['final_logit_softcap'] = records.number(softcap, 'final_logit_softcapping')
+        config['final_logit_softcap'] = _records.number(softcap, 'final_logit_softcapping')
 
 
 def _gemma2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
@@ -178,7 +178,7 @@ def _gemma2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     _gemma_softcaps(hf_config, used, config)
     softcap = hf_config.get('attn_logit_softcapping')
     if softcap is not None:
-        config['attn_logit_softcap'] = records.number(softcap, 'attn_logit_softcapping')
+        config['attn_logit_softcap'] = _records.number(softcap, 'attn_logit_softcapping')
     return config
 
 
@@ -209,7 +209,7 @@ def _gemma3n_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
     ropes = read_rope(hf_config, used, _GEMMA3_ROPE)
     config = base_config(hf_config, used, qk_norm=True, scale_after_cast=False,
                           tie_embeddings=True, layer_types=layer_types, rope=ropes)
-    layers = records.integer(config.get('num_layers'), 'num_layers')
+    layers = _records.integer(config.get('num_layers'), 'num_layers')
     sparsity = hf_config.get('activation_sparsity_pattern')
     if sparsity is None:
         # The reference default is the first ten layers at 0.95 when there
@@ -229,9 +229,9 @@ def _gemma3n_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
     # AltUp's own checks name the reference's fields, so a config out of
     # their range is refused here; that is why the value is built before its
     # record, which states all four of AltUp's fields.
-    altup = AltUp(num_inputs=records.integer(hf_config.get('altup_num_inputs', 4), 'altup_num_inputs'),
-                  active_idx=records.integer(hf_config.get('altup_active_idx', 0), 'altup_active_idx'),
-                  coef_clip=None if clip is None else records.number(clip, 'altup_coef_clip'),
+    altup = AltUp(num_inputs=_records.integer(hf_config.get('altup_num_inputs', 4), 'altup_num_inputs'),
+                  active_idx=_records.integer(hf_config.get('altup_active_idx', 0), 'altup_active_idx'),
+                  coef_clip=None if clip is None else _records.number(clip, 'altup_coef_clip'),
                   correct_scale=bool(hf_config.get('altup_correct_scale', True)))
     config.update(
         sandwich_norms=True,
@@ -239,16 +239,16 @@ def _gemma3n_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderF
         attention_scale=1.0,
         v_norm=True,
         activation_sparsity_pattern=tuple(float(fraction) for fraction in sparsity),
-        laurel_rank=records.integer(hf_config.get("laurel_rank", 64), "laurel_rank"),
+        laurel_rank=_records.integer(hf_config.get("laurel_rank", 64), "laurel_rank"),
         altup=NativeFields(AltUp, dataclasses.asdict(altup)),
-        per_layer_input_dim=records.integer(
+        per_layer_input_dim=_records.integer(
             hf_config.get("hidden_size_per_layer_input", 256), "hidden_size_per_layer_input"
         ),
-        per_layer_input_vocab=records.integer(
+        per_layer_input_vocab=_records.integer(
             hf_config.get("vocab_size_per_layer_input", 262144), "vocab_size_per_layer_input"
         ),
         kv_shared_layers=_trailing_sharers(hf_config, layers, 15),
-        final_logit_softcap=records.number(
+        final_logit_softcap=_records.number(
             hf_config.get("final_logit_softcapping", 30.0), "final_logit_softcapping"
         ),
     )
@@ -290,8 +290,8 @@ def gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
                           tie_embeddings=True, layer_types=layer_types, rope=Ropes(10000.0))
     # The reference's final-layer rewrite takes precedence over an explicit pattern.
     config['layer_types'] = layer_types
-    sliding_dim = records.integer(config.get('head_dim'), 'head_dim')
-    kv_heads = records.integer(config.get('num_kv_heads'), 'num_key_value_heads')
+    sliding_dim = _records.integer(config.get('head_dim'), 'head_dim')
+    kv_heads = _records.integer(config.get('num_kv_heads'), 'num_key_value_heads')
     k_eq_v = k_eq_v or bool(hf_config.get('attention_k_eq_v', False))
     used.update(('attention_k_eq_v', 'enable_moe_block', 'per_layer_config',
                  'global_head_dim', 'num_global_key_value_heads'))
@@ -315,26 +315,26 @@ def gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
             if not isinstance(entry, Mapping):
                 continue
             if entry.get('head_dim') is not None:
-                full_dim = records.integer(entry['head_dim'], 'per_layer_config head_dim')
+                full_dim = _records.integer(entry['head_dim'], 'per_layer_config head_dim')
             if entry.get('num_key_value_heads') is not None:
-                stated = records.integer(entry['num_key_value_heads'],
+                stated = _records.integer(entry['num_key_value_heads'],
                               'per_layer_config num_key_value_heads')
                 if full_kv != kv_heads and stated != full_kv:
                     refuse("per_layer_config num_key_value_heads",
                             f"the full layers name both {full_kv} and {stated}")
                 full_kv = stated
     else:
-        full_dim = records.integer(hf_config.get('global_head_dim', 512), 'global_head_dim')
+        full_dim = _records.integer(hf_config.get('global_head_dim', 512), 'global_head_dim')
         global_kv = hf_config.get('num_global_key_value_heads')
         if global_kv is not None and k_eq_v:
-            full_kv = records.integer(global_kv, 'num_global_key_value_heads')
+            full_kv = _records.integer(global_kv, 'num_global_key_value_heads')
     # Proportional rope rotates a fraction of the full layers' head dims
     # and passes the rest through; sliding layers rotate all of theirs.
     stated = hf_config.get('rope_parameters')
-    entries = GEMMA4_ROPE if stated is None else records.record(stated, 'rope_parameters')
+    entries = GEMMA4_ROPE if stated is None else _records.record(stated, 'rope_parameters')
     rope_theta, rope_local_theta, partial = _gemma4_rope(entries)
     used.update(('rope_parameters', 'rope_theta'))
-    per_layer = records.integer(
+    per_layer = _records.integer(
         hf_config.get("hidden_size_per_layer_input", 0), "hidden_size_per_layer_input"
     )
     sharing = _trailing_sharers(hf_config, len(layer_types), 0)
@@ -362,9 +362,9 @@ def gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
         use_double_wide_mlp=bool(hf_config.get("use_double_wide_mlp", False)) and sharing is not None,
         kv_shared_layers=sharing,
         per_layer_input_dim=per_layer or None,
-        per_layer_input_vocab=records.integer(
+        per_layer_input_vocab=_records.integer(
             hf_config.get(
-                "vocab_size_per_layer_input", records.integer(hf_config["vocab_size"], "vocab_size")
+                "vocab_size_per_layer_input", _records.integer(hf_config["vocab_size"], "vocab_size")
             ),
             "vocab_size_per_layer_input",
         ),
@@ -379,7 +379,7 @@ def gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
     used.add('attention_logit_cap')
     softcap = hf_config.get('final_logit_softcapping')
     if softcap is not None:
-        config['final_logit_softcap'] = records.number(softcap, 'final_logit_softcapping')
+        config['final_logit_softcap'] = _records.number(softcap, 'final_logit_softcapping')
     if full_kv != kv_heads:
         kinds_of(config).setdefault('full_attention', native_fields(LayerKind)())['num_kv_heads'] = full_kv
     # Every released Gemma 4 checkpoint carries the layer_scalar buffer the
@@ -399,9 +399,9 @@ def gemma4_config(hf_config: Mapping[str, object], used: set[str], *,
 
 def parallel_experts(hf_config: Mapping[str, object]) -> MixtureFields:
     """The routed branch a Gemma 4 layer runs beside its dense MLP."""
-    return native_fields(Mixture)(experts=records.integer(hf_config['num_experts'], 'num_experts'),
-            top_k=records.integer(hf_config['top_k_experts'], 'top_k_experts'),
-            expert_features=records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size'),
+    return native_fields(Mixture)(experts=_records.integer(hf_config['num_experts'], 'num_experts'),
+            top_k=_records.integer(hf_config['top_k_experts'], 'top_k_experts'),
+            expert_features=_records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size'),
             parallel=True)
 
 

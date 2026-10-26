@@ -8,8 +8,15 @@ import optax
 import pytest
 from learning_gate import assert_learns
 
-from dew.config import OptimConfig
-from dew.optim import OPTIMIZER_MAP, QUANTIZED_SIZE, QuantizedMoments, dequantized, dynamic_map, quantized
+from dew.optim import (
+    OPTIMIZER_MAP,
+    QUANTIZED_SIZE,
+    OptimConfig,
+    QuantizedMoments,
+    dequantized,
+    dynamic_map,
+    quantized,
+)
 
 LR = 1e-2
 BLOCK = 256

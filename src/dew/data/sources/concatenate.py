@@ -9,6 +9,7 @@ from functools import cached_property
 import grain.python as grain
 import numpy as np
 
+from dew._records import integer
 from dew.data.dataset import Records
 from dew.data.pipeline import Dataset
 from dew.data.sources.base import (
@@ -22,7 +23,6 @@ from dew.data.sources.base import (
     tokenizer_contract,
 )
 from dew.data.steps.text import stated_rules
-from dew.records import integer
 
 COUNTED = (*_COUNTS, "held_out")
 """The facts that count a store's records, which a concatenation's sources add."""

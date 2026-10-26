@@ -17,12 +17,12 @@ from typing import TYPE_CHECKING
 import grain.python as grain
 import numpy as np
 
+from dew._records import record
+from dew.batch import token_ids
 from dew.data.facts import shaped, unshaped
-from dew.nn.inputs import token_ids
-from dew.records import record
 
 if TYPE_CHECKING:
-    from dew.data.dataset import Batch
+    from dew.batch import Batch
 
 IDS_KEY = "input_ids"
 """Batch key holding the `[B, 2, S]` pair ids, chosen at index 0."""

@@ -35,9 +35,9 @@ from pathlib import Path
 import numpy as np
 import torch
 from diffusers_reference_helpers import perturb, recording, saved_pipeline, tiny_qwen3_encoder
-from torch_precision import float64
 from diffusers_wan_reference import float64_scheduler
 from reference_releases import RELEASES
+from torch_precision import float64
 
 DIFFUSERS = RELEASES["diffusers-0.40"]["diffusers"]
 SOURCE = Path(__file__).resolve().parents[1] / "tests/fixtures/hf/z-image-source"

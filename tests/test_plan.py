@@ -19,10 +19,10 @@ from dew.checkpoints import Checkpoints
 from dew.data import Loading, presets
 from dew.data.compile import compile
 from dew.data.sources.tokens import TokenFiles
+from dew.mesh import LayoutRefused
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.kernels.generation import chosen
-from dew.nn.sharding import LayoutRefused
 from dew.objectives.lm import LMObjective
 from dew.objectives.lm.chunked import chunked_tile
 from dew.registry import mixers
@@ -608,3 +608,19 @@ def test_a_frontier_keeps_its_first_plan_unless_another_is_faster_beyond_the_spr
     assert faster([[1.0, 1.1], [2.0, 2.1]]) == 0
     assert faster([[1.0, 2.0], [0.9, 1.5]]) == 0
     assert faster([[3.0], [2.0], [1.0]]) == 2
+
+
+def test_arrays_of_one_byte_layout_and_other_dtypes_fingerprint_apart():
+    """float8 e4m3fn and e4m3fnuz, and int4 and uint4, share one byte layout (`dtype.str` '<V1'): an
+    array of each holding the same bytes fingerprints apart, as the same values of one dtype do not."""
+    import ml_dtypes
+
+    from dew.data.plan import fingerprint
+
+    raw = np.arange(8, dtype=np.uint8)
+    pairs = ((ml_dtypes.float8_e4m3fn, ml_dtypes.float8_e4m3fnuz), (ml_dtypes.int4, ml_dtypes.uint4))
+    for first, second in pairs:
+        assert np.dtype(first).str == np.dtype(second).str
+        assert fingerprint(raw.view(first)) != fingerprint(raw.view(second))
+        assert fingerprint(raw.view(first)) == fingerprint(raw.copy().view(first))
+

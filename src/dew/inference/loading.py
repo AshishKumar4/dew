@@ -22,13 +22,14 @@ import numpy as np
 from etils import epath
 from jax.typing import DTypeLike
 
+from dew.batch import Variables
 from dew.cache import persist_compilations
 from dew.checkpoints import PYTHON_RUN, RUN_FILE
 from dew.data.text import Tokenizer
 from dew.inference.images import TextToImage
 from dew.inference.tasks import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.nn.inputs import Media, ModelInputs, pad_token_rows
-from dew.objectives.base import SavedTask, Variables
+from dew.objectives.base import SavedTask
 from dew.registry import dtype_name
 
 if TYPE_CHECKING:
@@ -109,33 +110,25 @@ def pipeline(
 def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
               dtype: str | None, param_dtype: str | None, ema: bool | None,
               step: int | str | None, trust: Sequence[str]) -> SavedTask:
-    """The task the run's recorded objective declares (`Objective.saved_task`)."""
-    from dew.inference.tasks import run_record
-    from dew.records import text
-    from dew.registry import objectives
+    """The task the run's recorded objective declares (`Objective.saved_task`), loaded at the step
+    pinned here; the packages its record may import stay trusted for the process once pinned
+    (`dew.registry.import_trusted`), so the task's own load reads it too."""
+    from dew.inference.tasks import SavedRun
 
-    record, step = run_record(str(root), step, trust)
-    kind = text(record['objective'], 'objective')
-    task = objectives[kind].saved_task
+    run = SavedRun.pinned(str(root), step, trust)
+    task = run.objective.saved_task
     if task is None:
-        raise TypeError(f"a run of the {kind!r} objective ({objectives[kind].__name__}) loads as no task: "
-                        "its class declares no `saved_task`")
-    return task.from_run(str(root), ema=ema, step=step, mesh=mesh, layout=layout,
+        raise TypeError(f"a run of {run.objective.__name__} loads as no task: its class declares no "
+                        "`saved_task`")
+    return task.from_run(run.directory, ema=ema, step=run.step, mesh=mesh, layout=layout,
                          dtype=dtype, param_dtype=param_dtype)
 
 
 def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
                  dtype: str | None, param_dtype: str | None,
-                 revision: str | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
+                 revision: str | None) -> SavedTask:
     from dew.inference.projections import packed_owned
-    from dew.interop import (
-        Pretrained,
-        PretrainedBlockDecoder,
-        PretrainedDecoder,
-        PretrainedFallback,
-        PretrainedMaskedDecoder,
-        PretrainedPipeline,
-    )
+    from dew.interop import Pretrained, PretrainedPipeline
     from dew.training.distributed import MeshSpec as DefaultMesh
 
     storage = "auto" if param_dtype is None else param_dtype
@@ -146,15 +139,10 @@ def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | 
                               layout=layout))
     if not isinstance(loaded, PretrainedPipeline):
         # The task owns the weights it loaded: their projections pack once, where they were placed.
+        # (Public bundle.pipeline borrows weights; packing here may relinquish the unpacked device
+        # buffers without invalidating a caller's tree.)
         loaded = replace(loaded, variables=packed_owned(loaded.model, loaded.variables))
-    match loaded:
-        case PretrainedPipeline():
-            return loaded.text_to_image()
-        case PretrainedBlockDecoder():
-            return loaded.block_generation()
-        case PretrainedDecoder() | PretrainedMaskedDecoder() | PretrainedFallback():
-            return loaded.text_generation()
-    raise TypeError(f"{source} loaded as {type(loaded).__name__}, which has no generation task")
+    return loaded.pipeline()
 
 
 def place(variables: Variables, mesh: MeshSpec | Mesh | None, layout: Layout | None) -> Variables:
