@@ -926,7 +926,8 @@ def leaf_summary(reference, truth) -> RecordedLeaf:
                         zero_sizes=own[~sized])
 
 
-def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None) -> _Draws:
+def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None,
+           row_conditioned: bool = False) -> _Draws:
     """Every leaf's errors (`_Draws`) over `seeds`: both functions run on `draw(seed)`'s inputs, truth
     `truth_fn` on them (by default `reference_fn` on them widened to float64). With `reference_seeds`,
     the reference runs on those draws instead, each held to its own draw's truth (`null_runs`), and a
@@ -934,7 +935,10 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     With `orders`, each arm also runs at every other order of its own draw (`orders(inputs)` past its
     first, the draw itself), held to that draw's one truth: each arm's worst row is its worst over the
     orders, measured rows of float64 zero included, and its values finite at every one; its errors and
-    its rows of float64 zero are the draw's own order's."""
+    its rows of float64 zero are the draw's own order's. With `row_conditioned`, each leaf's pooled
+    errors are its rows' own, each weighed by the reference's error on it (`_row_conditioned`)."""
+    if row_conditioned and getattr(reference_fn, "recorded", False):
+        raise ValueError("a recorded reference keeps no row's own error; row-conditioned pooling reads them")
     if orders is not None and getattr(reference_fn, "recorded", False):
         raise ValueError("a recorded reference holds its recorded draws alone, never another order of them")
     mine, theirs, worst, zero_rows, finite, names, widths = [], [], [], [], [], None, None
@@ -967,6 +971,10 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
             # The reference against itself on the same inputs is one evaluation (`seeds_for`'s sizing).
             reference = dew if dew_fn is reference_fn and theirs_at is mine_at else reference_fn(*theirs_at)
             evidence = _evidence(dew, reference, truth, their_truth)
+            if row_conditioned and row is None:
+                # The draw's own order's rows, each weighed by the reference's error on it.
+                evidence = [(*weighed, *entry[2:]) for weighed, entry in zip(
+                    _row_conditioned(dew, reference, truth), evidence, strict=True)]
             row = evidence if row is None else [
                 (first[0], first[1], float(np.fmax(first[2], other[2])), float(np.fmax(first[3], other[3])),
                  first[4], first[5] and other[5]) for first, other in zip(row, evidence, strict=True)]
@@ -977,6 +985,27 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         finite.append([entry[5] for entry in row])
     return _Draws(names, np.asarray(mine), np.asarray(theirs), np.asarray(worst).reshape(len(mine), -1, 2),
                   zero_rows, np.asarray(finite), widths)
+
+
+def _row_conditioned(dew, reference, truth) -> list[tuple[float, float]]:
+    """Each leaf's row-conditioned evidence on one draw, in `_pooled`'s form: the sum over its rows of
+    Dew's squared row error over the reference's, and the count of those rows. A row is a unit of its
+    own, so where a diverging computation's rows differ by orders of magnitude in their conditioning the
+    few worst-conditioned rows do not decide the pooled ratio alone: each row's ratio counts once. A
+    leaf of rank under two is one row; a row the reference holds exactly is unmeasured, its zero rows
+    held by the zero-row rule."""
+    weighed = []
+    for leaf, their_leaf, true in zip(jax.tree.leaves(dew), jax.tree.leaves(reference),
+                                      jax.tree.leaves(truth), strict=True):
+        true = np.asarray(true, np.float64)
+        if true.ndim < 2:
+            mine = np.asarray([root_mean(np.square(np.asarray(leaf, np.float64) - true))])
+            theirs = np.asarray([root_mean(np.square(np.asarray(their_leaf, np.float64) - true))])
+        else:
+            mine, theirs = row_errors(leaf, true)[1], row_errors(their_leaf, true)[1]
+        kept = theirs > 0
+        weighed.append((float(np.sum(np.square(_over(mine[kept], theirs[kept])))), float(kept.sum())))
+    return weighed
 
 
 def _leaf_paths(tree) -> list[str]:
@@ -1189,7 +1218,8 @@ def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str]) -> N
 
 
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None,
-                    orders=None, library_fn=None, library_row: int | None = None) -> None:
+                    orders=None, library_fn=None, library_row: int | None = None,
+                    row_conditioned: bool = False) -> None:
     """Check 1 of the gate: on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst (NARROW_FACTORS' factor at rows of one or
@@ -1237,6 +1267,12 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     reference's error and that arm's, seed by seed (`_Draws.against_larger`). Every other rule is as
     above; a site without it is judged against the reference alone.
 
+    `row_conditioned` pools each leaf's rows as units of their own, each weighed by the reference's
+    error on it (`_row_conditioned`), for a computation whose rows' conditioning spans orders of
+    magnitude within a draw (a diverging inner loop): the pooled ratio is the root of the mean of the
+    rows' squared ratios and its interval is resampled by seeds. A recorded reference keeps no row's own
+    error and is refused.
+
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
     (tests/certified.py)."""
@@ -1247,17 +1283,22 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     narrow_leaves: list[str] = []
     if (library_fn is None) != (library_row is None):
         raise ValueError(f"{label}: a library arm is the owner's exception, named with its ledger row")
+    if library_fn is not None and row_conditioned:
+        raise ValueError(f"{label}: a library arm judges against the larger arm's error, which row-conditioned "
+                         f"pooling does not keep")
     _refuse_numpy_arms(draw, dew_fn, reference_fn)
     dew_fn, reference_fn = _arms(dew_fn, reference_fn)
     library_fn = None if library_fn is None else _arms(library_fn, library_fn)[1]
     truth_fn = _truth_program(truth_fn)
 
     def drawn(start, stop):
-        draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders)
+        draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders,
+                       row_conditioned=row_conditioned)
         if library_fn is not None:
             # The truth is the site's own, so both arms are measured from the same float64 values.
             draws = draws.against_larger(_drawn(dew_fn, library_fn, draw, range(start, stop),
-                                                truth_fn or reference_fn, orders=orders))
+                                                truth_fn or reference_fn, orders=orders,
+                                                row_conditioned=row_conditioned))
         narrow_leaves[:] = [name for name, width in zip(draws.names, draws.widths, strict=True)
                             if width in NARROW_FACTORS]
         return draws
@@ -1460,7 +1501,8 @@ def recording(path) -> dict[str, np.ndarray]:
 
 def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: int = 0,
               truth_fn=None, two_stage: bool = True, dew_fn=None, orders=None,
-              paired: bool = False, library_fn=None) -> list[tuple[str, int, list[str]]]:
+              paired: bool = False, library_fn=None,
+              row_conditioned: bool = False) -> list[tuple[str, int, list[str]]]:
     """Check 1 run `runs` times on an equally exact pair, the reference against itself on disjoint
     draws: each run's verdict, "pass", "over" or "inconclusive", the stage it reached and its findings
     (`_judgement`'s, each naming its leaf and rule), a run judged as `assert_as_exact` judges a site
@@ -1487,11 +1529,13 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
         def drawn(start, stop, base=base):
             draws = _drawn(dew_fn or reference_fn, reference_fn, draw, range(base + start, base + stop),
                            truth_fn, orders=orders,
-                           reference_seeds=None if paired else range(base + span + start, base + span + stop))
+                           reference_seeds=None if paired else range(base + span + start, base + span + stop),
+                           row_conditioned=row_conditioned)
             if library_fn is not None:
                 seeds_here = range(base + start, base + stop)
                 draws = draws.against_larger(_drawn(dew_fn or reference_fn, library_fn, draw, seeds_here,
-                                                    truth_fn or reference_fn, orders=orders))
+                                                    truth_fn or reference_fn, orders=orders,
+                                                    row_conditioned=row_conditioned))
             return draws
 
         over, unresolved, stage = _staged(drawn, seeds, label, two_stage=two_stage)
