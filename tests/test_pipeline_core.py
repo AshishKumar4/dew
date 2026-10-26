@@ -7,6 +7,7 @@ import itertools
 import json
 import multiprocessing
 import os
+import threading
 import weakref
 from uuid import uuid4
 
@@ -683,6 +684,64 @@ def test_worker_boundary_keeps_downstream_record_steps_and_exact_positions(worke
         resumed.set_state(state)
         assert listed(resumed, 8) == expected
         resumed.close()
+
+
+def operators(dataset) -> int:
+    """The Grain datasets `dataset` reads through, itself included."""
+    seen, pending = set(), [dataset]
+    while pending:
+        node = pending.pop()
+        if id(node) not in seen:
+            seen.add(id(node))
+            pending.extend(node.parents)
+    return len(seen)
+
+
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_adjacent_record_steps_read_through_one_grain_operator(read):
+    """Adjacent record steps lower as one Grain operator, as tf.data fuses maps and filters: a draw,
+    a map, a filter and two maps read through as many Grain datasets as the filter alone, and make
+    the records the steps make one after another."""
+    built = []
+
+    def watched(dataset):
+        built.append(dataset)
+        return dataset
+
+    def read_through(chain):
+        built.clear()
+        rows = list(chain.grain(watched, identity="watched@1").read(read).loading(READ))
+        return operators(built[0]), rows
+
+    alone, kept = read_through(Pipeline(source(8)).filter(odd_id))
+    steps = Pipeline(source(8)).random_map(WideDraw()).map(Shift(1)).filter(odd_id).map(Shift(10))
+    fused, made = read_through(steps.map(Tagged()))
+    assert fused == alone
+    assert [int(row["id"]) for row in kept] == [1, 3, 5, 7]
+    assert [(int(row["id"]), int(row["tag"])) for row in made] == [(id, id * 10) for id in (11, 13, 15, 17)]
+
+
+def odd_id(row) -> bool:
+    return bool(int(row["id"]) % 2)
+
+
+@dataclasses.dataclass(frozen=True)
+class Thread:
+    """The record with the thread that ran this step on it, under `field`."""
+
+    field: str
+
+    def __call__(self, row):
+        return {**row, self.field: threading.get_ident()}
+
+
+def test_a_step_after_a_filter_runs_on_the_thread_that_ran_the_steps_before_it():
+    """A step written after a filter runs where the steps before it ran, on the read's own threads,
+    where it once ran alone in the reading process after the filter's records were counted out."""
+    chain = Pipeline(source(16)).map(Thread("before")).filter(odd_id).map(Thread("after"))
+    rows = list(chain.read("indexed").loading(Loading(workers=0, threads=4, read_buffer=4)))
+    assert [int(row["id"]) for row in rows] == list(range(1, 16, 2))
+    assert all(row["after"] == row["before"] != threading.get_ident() for row in rows)
 
 
 def test_worker_processes_read_a_global_order_in_the_batches_one_process_reads():
