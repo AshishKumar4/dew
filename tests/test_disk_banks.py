@@ -287,3 +287,23 @@ def test_a_decision_release_streams_its_wrappers_float64_layers_as_the_resident_
             assert actual.dtype == expected.dtype == jnp.float64
             np.testing.assert_array_equal(actual, expected)
             assert source.stats().misses >= len(model.bank_sites[0].view.groups)
+
+
+def test_a_config_naming_expert_dtype_alone_streams_as_the_unquantized_load(tmp_path):
+    """`expert_dtype` names a quantized source's expert storage only beside its quantization config
+    (`codecs.source_quantization`): a config that states it alone is the unquantized checkpoint the
+    loader reads, and the banks stream it as the resident load computes it."""
+    from dew.inference.banks import SafetensorsBanks
+
+    config = {**json.loads((FIXTURE / "config.json").read_text()), "expert_dtype": "fp4"}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    shutil.copy2(FIXTURE / "model.safetensors", tmp_path / "model.safetensors")
+    with SafetensorsBanks(tmp_path, cache_bytes=0, param_dtype="float32") as source:
+        model = decoder(source.config, None)
+        resident = HeldBanks(translate_weights(
+            read_weights(FIXTURE), translate_config(config), "mixtral"
+        )).place(model, mesh=single_mesh(), layout=DEVICE)
+        streamed = source.stream(model, mesh=single_mesh(), layout=DEVICE)
+        tokens = jnp.asarray(np.load(FIXTURE / "input_ids.npy"))
+        score = jax.jit(model.apply)
+        np.testing.assert_array_equal(score(streamed, tokens), score(resident, tokens))
