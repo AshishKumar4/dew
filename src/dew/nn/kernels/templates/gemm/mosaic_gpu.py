@@ -118,6 +118,9 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
       reads the columns' block whole) and writes its output in the longest runs.
     - Consumers: as many roles as the family has (`Family.consumers`), a warpgroup each, or one where
       rows a tile must divide (not grouped) take no whole role for each, or where no tile of them holds.
+    - Programs: as many a multiprocessor as the family's registers hold at those consumers
+      (`Family.programs`), each staging its share of the multiprocessor's shared memory
+      (`mosaic.program_shared`); a wave is all of them.
     - Rows: the most, in whole roles of its consumers, its consumers' registers hold
       (`mosaic.held_rows`, `mosaic.tile_registers`), and no more than the call's rows rounded up to a
       role's or, where grouped, half a group's in whole roles, at least one role (each group takes a
@@ -140,11 +143,13 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
 
     def tiled(consumers: int) -> Tiles | None:
         role = family.role_rows * consumers
+        programs = family.programs(consumers)
+        shared = mosaic.program_shared(family.most_shared, programs)
         most_rows = max(role, rows // 2 // role * role if grouped else -(-rows // role) * role)
         fallback = None
         for block_n in columns:
             for block_m in range(min(most_rows, mosaic.held_rows(family, consumers, block_n)), 0, -role):
-                band = mosaic.band(multiprocessors, block_m, block_n, width // block_n,
+                band = mosaic.band(multiprocessors * programs, block_m, block_n, width // block_n,
                                    -(-rows // block_m) if grouped else None)
                 # More rows before a deeper step: each reads the columns' block fewer times a FLOP, where
                 # a step's depth only sets how many steps a tile takes (and, in registers, its fragments').
@@ -152,7 +157,7 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
                     tile = mosaic.deepest(
                         lambda stages, block_m=block_m, block_n=block_n, step=step, band=band: Tiles(
                             block_m, block_n, step, stages, band, warpgroups=consumers, family=family.name),
-                        holds, family.most_shared // ((block_m + block_n) * step))
+                        holds, shared // ((block_m + block_n) * step))
                     if tile is None:
                         continue
                     if tile.stages >= busy:

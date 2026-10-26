@@ -886,14 +886,19 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             serial_stored=(config.block_m * config.block_n * out
                            if self.STORES_SERIALLY and config.warpgroups == 1 else 0))
 
-    def _multiprocessors(self, interpret: bool) -> int:
-        # The interpreter runs one block (jax/_src/pallas/mosaic_gpu/interpret).
-        return 1 if interpret else _multiprocessors(generation.gpu_target())
+    def program_shared(self, config: mosaic_gpu.Tiles, target) -> int:
+        # The programs its family runs on a multiprocessor at once share its shared memory.
+        return mosaic.program_shared(super().program_shared(config, target), _programs(config))
+
+    def _launched(self, config: mosaic_gpu.Tiles, interpret: bool) -> int:
+        """The programs the persistent kernel launches: its family's programs on each multiprocessor
+        (`Family.programs`); the interpreter runs one block (jax/_src/pallas/mosaic_gpu/interpret)."""
+        return 1 if interpret else _multiprocessors(generation.gpu_target()) * _programs(config)
 
     @staticmethod
     def _in_flight(config: mosaic_gpu.Tiles, target) -> float:
         """The row tiles a band of the planar snake keeps in flight at once on `target`."""
-        return max(1.0, _multiprocessors(target) / config.grid_block_n)
+        return max(1.0, _multiprocessors(target) * _programs(config) / config.grid_block_n)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -944,7 +949,7 @@ class MosaicGmm(_Mosaic):
         # Never set: the launch is not eligible for exact sums; a dense call is one group, as any.
         del exact_sums, dense
         return mosaic_gpu.gmm(tokens, kernel, sizes, tiles=config, transpose_rhs=trans_rhs,
-                              out_dtype=out_dtype, multiprocessors=self._multiprocessors(interpret),
+                              out_dtype=out_dtype, multiprocessors=self._launched(config, interpret),
                               interpret=INTERPRETED if interpret else False,
                               prologue_operands=prologue_operands, epilogue_operands=epilogue_operands,
                               **hooks.kernel_options()), None
@@ -1014,7 +1019,7 @@ class MosaicTgmm(_Mosaic):
              return_residuals: bool = False):
         del dense  # a dense call is one group, as any
         return mosaic_gpu.tgmm(tokens, cotangent, sizes, tiles=config, out_dtype=out_dtype,
-                               multiprocessors=self._multiprocessors(interpret),
+                               multiprocessors=self._launched(config, interpret),
                                interpret=INTERPRETED if interpret else False, prologue=hooks.before(),
                                prologue_operands=prologue_operands, prologue_axes=hooks.prologue_axes,
                                exact_sums=exact_sums), None
@@ -1536,6 +1541,11 @@ production route, which no measurement ranks against the template's."""
 def _bundle(config: mosaic_gpu.Tiles, dtype) -> mosaic.Family:
     """The bundle `config` runs on, for operands of `dtype` (`mosaic_gpu.family_of`)."""
     return mosaic_gpu.family_of(config, dtype)
+
+
+def _programs(config: mosaic_gpu.Tiles) -> int:
+    """The programs of a launch at `config` a multiprocessor runs at once (`mosaic.Family.programs`)."""
+    return _bundle(config, jnp.bfloat16).programs(config.warpgroups)
 
 
 _GMMS = (MosaicGmm(), MosaicTpuGmm(), Gmm(), CutlassGmm())
