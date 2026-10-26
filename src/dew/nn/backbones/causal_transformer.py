@@ -36,6 +36,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.dense import Dense
+from dew.nn.dropout import Dropout
 from dew.objectives.base import merge
 from dew.records import JSON
 from dew.registry import from_record, read_arguments
@@ -863,7 +864,7 @@ class CausalTransformer(nn.Module):
             embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
                             else nn.initializers.normal(self.initializer_range)))
         if self.embedding_dropout_rate:
-            self.embedding_dropout = nn.Dropout(self.embedding_dropout_rate, name="embedding_dropout")
+            self.embedding_dropout = Dropout(self.embedding_dropout_rate, name="embedding_dropout")
         if self.embedding_norm:
             self.embedding_layernorm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,

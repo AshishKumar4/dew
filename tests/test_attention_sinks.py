@@ -55,7 +55,8 @@ def test_sinks_a_softcap_and_dropout_compose_on_one_reference_path(dropout_rate)
         sink = jnp.broadcast_to(sinks[None, :, None, None], (2, 4, 6, 1))
         weights = jax.nn.softmax(jnp.concatenate([logits, sink], -1), axis=-1)[..., :-1]
         if dropout_rate:
-            kept = jax.random.bernoulli(rng, 1 - dropout_rate, weights.shape)
+            # The draw keeps the units a float32 run keeps, in every precision (`dew.nn.dropout`).
+            kept = jax.random.bernoulli(rng, jnp.float32(1 - dropout_rate), weights.shape)
             weights = weights * kept / (1 - dropout_rate)
         truth = jnp.einsum("bhqk,bkhd->bqhd", weights, value[:, :, group])
         assert_computes_the_oracle(

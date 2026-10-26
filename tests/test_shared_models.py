@@ -19,7 +19,8 @@ def test_image_transport_keeps_native_pixels_and_preparation_keys(service, tmp_p
     import numpy as np
     from test_inference import make_run
 
-    from dew.sampling import CFG, Heun, TextToImage
+    from dew.inference import TextToImage
+    from dew.sampling import CFG, Heun
 
     progress = load("progress", "site/live/container")
     client = load("model_client", "site/live/container")

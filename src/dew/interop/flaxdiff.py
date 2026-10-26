@@ -37,8 +37,8 @@ from dew.nn.scan_orders import ScanOrder
 
 if TYPE_CHECKING:
     from dew.diffusion.process import Process
+    from dew.inference.images import TextToImage
     from dew.registry import DtypeName
-    from dew.sampling.pipelines import TextToImage
 
 # FlaxDiff 0.2's DiTs held these at their root; Dew nests them under the
 # conditioning embed and the output head.
@@ -268,11 +268,12 @@ def text_to_image(directory: str | os.PathLike, config: Mapping[str, object], *,
     schedule, 200 steps unless the call names another count.
     """
     from dew.diffusion.presets import EDM
+    from dew.inference.images import TextToImage
     from dew.inputs import Field, InputSpec
     from dew.nn.dit import TextContext
     from dew.nn.text_encoders import check_tree
     from dew.registry import models, resolve_dtype
-    from dew.sampling import CFG, EulerAncestral, TextToImage
+    from dew.sampling import CFG, EulerAncestral
 
     architecture = records.text(config.get("architecture"), "architecture")
     if architecture not in _ARCHITECTURES:
