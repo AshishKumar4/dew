@@ -297,7 +297,7 @@ def test_a_resumed_state_carried_far_is_as_exact_as_the_references(natural):
     """fp32, one query over one key whose logit is 40 to 87 above a resumed state's maximum (0), the
     state's weighted values 2^60 to 2^100 times a normal draw and its denominator 1, the key's value a
     normal draw: the output is the state's share carried over that distance. The factor the state takes
-    to the key's maximum keeps the residual of its exponent's conversion to base 2 (`Forward.carry`,
+    to the key's maximum keeps the residual of its exponent's conversion to base 2 (`Forward.power`,
     `natural_exp`), so each mainloop holds check 1 against the reference's `exp`, where the hardware's base-2
     exponential of `x * log2(e)` rounded is about `|x|` ulps off. The Triton mainloop compiles on a GPU,
     whose exp2 is the hardware's own; XLA's CPU computes exp2 through exp."""
@@ -626,7 +626,7 @@ def test_the_accurate_forms_rescale_takes_the_plain_factor_where_its_correction_
 def test_the_accurate_forms_rescale_is_as_exact_as_its_exponent_rounded_once(raw):
     """`algebra.carried`'s factor `exp((m - safe) * scale)` for maxima drawn either side of 0, whose
     difference rounds, compensated for that rounding and, raw, for its product with the scale's: check 1
-    against the factor of the rounded exponent (`Forward.carry`), from float64. A compensation of the
+    against the factor of the rounded exponent (`Forward.power`), from float64. A compensation of the
     wrong sign or scale would err past it."""
     spec = algebra.Forward("full", 4, ids=False, scale=0.125, natural=True, initial=not raw)
     assert spec.raw == raw
@@ -637,7 +637,7 @@ def test_the_accurate_forms_rescale_is_as_exact_as_its_exponent_rounded_once(raw
                 jax.random.uniform(streams[1], (4096,), jnp.float32, 0.0, 40.0))
 
     def rounded(m, safe):
-        return spec.carry(m - safe)
+        return spec.power(m - safe)
 
     def exact(m, safe):
         # In float64 the exponent's difference and its product with the scale are exact.

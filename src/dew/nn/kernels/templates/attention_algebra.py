@@ -121,18 +121,12 @@ class Forward:
                 or self.queries is not None)
 
     def power(self, x: jax.Array) -> jax.Array:
-        """The exponential the logits are in: exp2 folded, the raw form's scaled difference, `natural_exp`
-        natural."""
-        if self.base2:
-            return jnp.exp2(x)
-        return natural_exp(x, self.scale) if self.raw else natural_exp(x)
-
-    def carry(self, x: jax.Array) -> jax.Array:
-        """The factor a softmax state takes from one maximum to another `x` below it: exp2 folded, and
-        natural `natural_exp`, as exact as the reference's `jnp.exp` on every backend, whose state (a resumed
-        partial, a sink) may be any size: a Mosaic launch of approximate math lowers `jnp.exp` to the
-        hardware's base-2 exponential of `x * log2(e)` rounded, about `|x|` ulps off for a state carried
-        far, where `natural_exp` keeps that product's residual."""
+        """The exponential the logits are in, a key's weight and the factor a softmax state takes from one
+        maximum to another `x` below it alike: exp2 folded; natural, `natural_exp` of the raw form's scaled
+        difference or of the scaled logits', as exact as the reference's `jnp.exp` on every backend, whose
+        state (a resumed partial, a sink) may be any size: a Mosaic launch of approximate math lowers
+        `jnp.exp` to the hardware's base-2 exponential of `x * log2(e)` rounded, about `|x|` ulps off for a
+        state carried far, where `natural_exp` keeps that product's residual."""
         if self.base2:
             return jnp.exp2(x)
         return natural_exp(x, self.scale) if self.raw else natural_exp(x)
@@ -426,7 +420,7 @@ def natural_exp(x: jax.Array, scale: float = 1.0) -> jax.Array:
     weight: one rounding more than `jnp.exp` no longer, where XLA had folded `exp2(x * log2(e))` back to
     `exp(x)` until JAX 0.12 stopped reassociating constant products (jax-ml/jax 2d3744395). The residual is
     about an fp32 ulp of the exponent, whose square is below the exponential's rounding. The factors that
-    carry a state take it too (`Forward.carry`); the backward's weights keep `jnp.exp`, as the reference
+    carry a state take it too (`Forward.power`); the backward's weights keep `jnp.exp`, as the reference
     does."""
     # Normalize the factor before splitting: at a tiny raw scale its residual would be subnormal.
     factor, exponent = np.frexp(scale * LOG2E)
@@ -706,18 +700,18 @@ def carried(spec: Forward, m: jax.Array, safe: jax.Array) -> jax.Array:
     """The factor `exp(m - safe)` a state takes from its maximum `m` to `safe` (`peak`, `merge`), in the
     accurate form with its exponent compensated (`peak`)."""
     if not spec.natural:
-        return spec.carry(m - safe)
+        return spec.power(m - safe)
     # TwoSum: m - safe is difference + error exactly; raw, the scale's product with it is split exactly too
     # (TwoProduct over truncated halves, whose products are exact, so a compiler's contraction of any of
     # them into a fused multiply-add changes no bit); exp's derivative is itself.
     difference, error = two_sum(m, -safe)
-    alpha = spec.carry(difference)
+    alpha = spec.power(difference)
     if spec.raw:
         product, rounding = two_product(difference, np.float32(spec.scale), bit_split=True)
         alpha = natural_exp(product)
         error = rounding + error * spec.scale
     corrected = alpha * (1.0 + error)
-    return jnp.where(finite(corrected), corrected, spec.carry(difference))
+    return jnp.where(finite(corrected), corrected, spec.power(difference))
 
 
 def weights(spec: Forward, s: jax.Array, m: jax.Array) -> jax.Array:
