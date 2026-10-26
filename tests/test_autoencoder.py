@@ -293,15 +293,17 @@ def test_a_local_pipelines_autoencoder_loads_from_its_vae_folder(tmp_path):
 
 def test_autoencoders_of_one_module_share_its_programs():
     """An autoencoder's encode and decode are the process's programs over its module
-    (`dew.nn.kernels.options.program`): two loads of one module share them, so the second reuses the
-    first's compiles, and their frames come back bit for bit alike."""
+    (`dew.nn.kernels.options.program`): a second load of one module encodes and decodes with no compile
+    of its own, and its frames come back bit for bit as the first's."""
+    from dew.telemetry.instrumentation import Compiles
+
     first, second = tiny_vae(), tiny_vae()
-    assert first is not second
-    assert first.encode_single_frame.func is second.encode_single_frame.func
-    assert first.decode_single_frame.func is second.decode_single_frame.func
     frames = jax.random.uniform(jax.random.key(1), (2, IMAGE_SIZE, IMAGE_SIZE, 3), minval=-1.0)
     latents = first.encode_batch(first.params, frames, jax.random.key(2))
-    again = second.encode_batch(second.params, frames, jax.random.key(2))
+    decoded = first.decode_batch(first.params, latents)
+    with Compiles("_encoded") as encodes, Compiles("_decoded") as decodes:
+        again = second.encode_batch(second.params, frames, jax.random.key(2))
+        redecoded = second.decode_batch(second.params, again)
+    assert (encodes.count, decodes.count) == (0, 0)
     np.testing.assert_array_equal(np.asarray(again), np.asarray(latents))
-    np.testing.assert_array_equal(np.asarray(second.decode_batch(second.params, again)),
-                                  np.asarray(first.decode_batch(first.params, latents)))
+    np.testing.assert_array_equal(np.asarray(redecoded), np.asarray(decoded))
