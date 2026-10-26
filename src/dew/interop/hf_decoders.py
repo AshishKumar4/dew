@@ -116,7 +116,7 @@ def _wrapper_text(hf_config: Mapping[str, object], used: set) -> DecoderFields:
     return translate_config(_text_config(hf_config))
 
 
-def _typed(hf_config: Mapping[str, object], nested: Mapping[str, object], part: str) -> dict[str, object]:
+def _typed(hf_config: Mapping[str, object], nested: Mapping[str, object], part: str) -> Mapping[str, object]:
     """A wrapper's nested `part` config (text, vision or audio), typed as its wrapper declares it where it
     names no type: `<wrapper model_type>_<part>`, the class the wrapper config builds from a raw dict
     (its `sub_configs`), so a checkpoint's copy need not repeat the tag. A stated type stays."""
@@ -130,7 +130,7 @@ def _text_config(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     if not isinstance(text, Mapping):
         refuse("text_config",
                 f"a wrapper carries its decoder under text_config, got {text!r}")
-    text = _typed(hf_config, text, "text")
+    text = dict(_typed(hf_config, text, "text"))
     if hf_config.get("model_type") != "llama4":
         # These conditional models own their lm_head at wrapper scope; the
         # nested text model has no head. Llama4 nests a complete causal LM.
