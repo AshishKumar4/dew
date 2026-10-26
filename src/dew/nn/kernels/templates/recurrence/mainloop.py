@@ -55,7 +55,7 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn import precision
 from dew.nn.inputs import cu_seqlens
 from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra
-from dew.nn.kernels.templates import mosaic, mosaic_sm80, mosaic_sm90
+from dew.nn.kernels.templates import cost, mosaic, mosaic_sm80, mosaic_sm90
 
 FAMILIES: dict[str, mosaic.Family] = {"mma.sync": mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16)),
                                       "wgmma": mosaic_sm90.WGMMA}
@@ -287,7 +287,7 @@ class _Call:
     delta: bool
     family: mosaic.Family
     interpret: bool
-    multiprocessors: int
+    target: generation.GpuTarget
 
     @property
     def gates(self) -> _Operand:
@@ -595,22 +595,29 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     its launch (`recurrence_solved`, ...). `held` is what a consumer thread holds in registers (`_Held`).
     Where `planned` collects launches, the launch's record instead (`Launch`, its `work`), and zeros.
 
-    A `persistent` launch runs `grid`'s tiles on as many programs as the device has multiprocessors
-    (`Family.persist`), its streams' rings running on across them, two deep where they do
-    (`mosaic.RingFamily`'s) and a block's shared memory holds two (`Family.most_shared`), so a tile's loads
-    go out under the last tile's work: a launch of one-step tiles
-    whose program holds a multiprocessor's registers alone (each launch's 255 registers a thread an H100
-    holds one of, long-scoreboard stalls 51 to 73% of its time, SE-family-h100-80a38c02d). Its program
-    gives its tile's walk (`_walk`) for the grid's indices `_axis` reads."""
+    A `persistent` launch runs `grid`'s tiles on as many programs as the device's multiprocessors hold at
+    once (`cost.resident`, at their stated registers; `Family.persist`), its streams' rings running on across
+    them, two deep where they do (`mosaic.RingFamily`'s) and a multiprocessor holds as many programs two deep
+    as one, so a tile's loads go out under the last tile's work: a launch of one-step tiles whose program
+    holds a multiprocessor's registers alone (each launch's 255 registers a thread an H100 holds one of,
+    long-scoreboard stalls 51 to 73% of its time, SE-family-h100-80a38c02d). An A100's launches held one
+    program each, a quarter of the warps fla's held, with registers for two (SE-family-a100-8c5b5b16a).
+    Its program gives its tile's walk (`_walk`) for the grid's indices `_axis` reads."""
     family = call.family
     landed = _landed(landing or {})
     staging = (*staging, landed)
     tiles = math.prod(grid)
+    threads = 128 * family.warpgroups(1)
     if persistent:
-        deep = {"walked": family.streams(blocks, 2, 1)}
-        stages = 2 if (isinstance(family, mosaic.RingFamily)
-                       and _allocated(family, deep, staging) <= family.most_shared) else 1
-        programs = min(tiles, call.multiprocessors)
+        def shared(depth: int) -> int:
+            return _allocated(family, {"walked": family.streams(blocks, depth, 1)}, staging)
+
+        def holding(depth: int) -> int:
+            return cost.resident(call.target, shared(depth), threads, held.registers(family))
+
+        stages = 2 if (isinstance(family, mosaic.RingFamily) and shared(2) <= family.most_shared
+                       and holding(2) == holding(1)) else 1
+        programs = min(tiles, (call.target.multiprocessors or 1) * holding(stages))
     else:
         programs = tiles
     # The walked streams and those loaded once, each its own allocation (a pipelined family's stages are
@@ -628,7 +635,7 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
             # A persistent program's work is its tiles' (`work` is a tile's), the most any program takes.
             each = -(-tiles // programs)
             flops = work.flops * _products(call.held.parts) * each
-            collected.append(Launch(name, programs, 128 * family.warpgroups(1),
+            collected.append(Launch(name, programs, threads,
                                     _allocated(family, streams, staging), held.registers(family),
                                     work.steps * each, stages, stepped, flops, work.exponentials * each,
                                     moved))
@@ -1491,7 +1498,7 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     rows = chunks * CHUNK
     given = held = _Operand(rows, _parts(dtype), dtype)
     call = _Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
-                 interpret, generation.gpu_target().multiprocessors or 1)
+                 interpret, generation.gpu_target())
     hi, lo = prefix(laid(g).reshape(chunks, CHUNK, -1))
     # A decay a head's prefix a head's row of vectors `[HV, R]`, one a key dimension's tiles `[R, HV * Dk]`.
     hi, lo = (x.reshape(rows, -1) if per_key else x.reshape(rows, heads).T for x in (hi, lo))
