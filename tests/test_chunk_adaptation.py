@@ -26,7 +26,7 @@ VOCAB = 16
 FEATURES = 8
 LENGTH = 12
 ROWS = 16
-LEVEL = ContinuumLevel(hidden=4)
+LEVEL = ContinuumLevel(hidden=16)
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 
 ADAPTATION_SEEDS = 8
@@ -36,9 +36,10 @@ ADAPTATION_SEEDS = 8
 SELECTED_SEEDS = 256
 """Check 1's declared seeds for a level whose `up` alone steps, sized paired by `seeds_for` on armada."""
 
-GRADIENT_SEEDS = 8
-"""Check 1's declared seeds for the outer gradient through the windows' steps, sized paired by
-`seeds_for` on armada."""
+GRADIENT_SEEDS = {("documents", 0.1): 8, ("documents", 0.5): 8, ("packed", 0.1): 8, ("packed", 0.5): 8,
+                  ("padded", 0.1): 8, ("padded", 0.5): 8}
+"""Check 1's declared seeds for the outer gradient through the windows' steps over each layout and
+rate, sized paired by `seeds_for` on armada."""
 
 LEVEL_SEEDS = 8
 """Check 1's declared seeds for the gradient through the level against its formula (`seeds_for`)."""
@@ -212,7 +213,8 @@ def test_training_differentiates_through_every_step(kind, rate):
             lambda variables, hidden: fn(variables, hidden, targets, weights))(variables, hidden, cotangent)
 
     assert_as_exact(jax.jit(differentiated(dew)), jax.jit(differentiated(reference)), gradient_draw,
-                    f"the gradient through the windows' steps over {kind}, rate {rate}", seeds=GRADIENT_SEEDS)
+                    f"the gradient through the windows' steps over {kind}, rate {rate}",
+                    seeds=GRADIENT_SEEDS[kind, rate])
 
 
 def test_a_level_at_its_start_is_the_identity():
