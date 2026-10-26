@@ -30,14 +30,8 @@ from dew.decision import (
     Schema,
     StateFirstLayout,
 )
-from dew.decision.objective import (
-    DecisionStatistics,
-    Encoding,
-    Fit,
-    QuestionRows,
-    _encoded_unit,
-    _window_groups,
-)
+from dew.decision.objective import DecisionStatistics
+from dew.decision.rows import Encoding, Fit, QuestionRows, _encoded_unit, _window_groups
 from dew.decision.task import laid_out
 from dew.nn import categorical
 from dew.objectives.base import Ratio, Step
@@ -232,9 +226,11 @@ def test_grouped_examples_without_a_consistency_term_keep_the_examples_that_fit(
     assert rows(fit.map({"example": together})) == rows(fit.map({"example": fits}))
 
 
-def test_grouped_examples_read_from_their_own_rows_fields():
+@pytest.mark.parametrize("asked", ["wire", "question"])
+def test_grouped_examples_read_from_their_own_rows_fields(asked):
     """A store's row of grouped examples' fields (`examples` and `groups`) trains as such a row does:
-    its three members one group of the window that holds them."""
+    its three members one group of the window that holds them, its questions in the wire format or
+    `Question`s, as an example's row holds either."""
     from dew.data import Memory
     from dew.data.compile import compile
     from dew.decision import decisions
@@ -242,7 +238,8 @@ def test_grouped_examples_read_from_their_own_rows_fields():
     layout = StateFirstLayout(max_len=512)
     objective = DecisionObjective(tiny_backbone().clone(max_seq_len=512), tokenizer=TOKENIZER,
                                   specials=SPECIALS, layout=layout, consistency=0.5)
-    noul = {"type": "noul", "instructions": "Is this about billing?"}
+    noul = ({"type": "noul", "instructions": "Is this about billing?"} if asked == "wire"
+            else Noul("Is this about billing?"))
     row = {"examples": [{"state": state, "questions": {"billing": noul}, "answers": answers}
                         for state, answers in (("charged twice", {"billing": "true"}),
                                                ("paid two times", {}),
@@ -400,7 +397,7 @@ def test_a_group_maps_every_option_of_every_member_onto_one_canonical_set():
 def test_a_questions_own_none_of_the_above_maps_as_its_group_says():
     """A choice whose own option is named "none of the above" keeps its group's mapping, where no
     augmentation added it: its slot maps to its canonical option, not to none."""
-    from dew.decision.objective import NONE_OF_THE_ABOVE
+    from dew.decision.rows import NONE_OF_THE_ABOVE
 
     options = ["billing", "tech", NONE_OF_THE_ABOVE]
     keys = {"billing": "b", "tech": "t", NONE_OF_THE_ABOVE: "n"}
