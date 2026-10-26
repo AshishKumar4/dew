@@ -2305,7 +2305,7 @@ def parse_args(argv=None):
     parser.add_argument("--elastic", action="store_true",
                         help="read the training records through a compiled global order, whose "
                              "saved position is a global record count")
-    parser.add_argument("--release", help="the decision release the decision_publish mode places and publishes")
+    parser.add_argument("--release", help="the decision release decision_publish places and publishes")
     parser.add_argument("--profile-dir", help="directory the scheduled profile window writes")
     parser.add_argument("--cell", help="read,cache|nocache|published,rejecting|all,packed|rows for the "
                                        "matrix mode")
