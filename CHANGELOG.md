@@ -5,6 +5,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- 8-bit Adam state codes each moment value among the six codes around its estimate, its decade by its
+  logarithm, instead of searching the whole map: on an A100, lm-dense's update takes 27.32 ms against
+  60.39, its full-remat step 167.9 against 196.3 ms and compiles in 82.3 against 209.8 s, the codes
+  the search's (`dew.optim.quantized`).
 - `OptimConfig(state_dtype='int8')` stores adam's and adamw's moments blockwise in 8 bits
   (`dew.optim.int8_moments`, bitsandbytes' and torchao's 8-bit Adam): a quarter of float32's state, the
   update computed from the moments dequantized to fp32. On an A100, lm-dense's full-remat step peaks at
