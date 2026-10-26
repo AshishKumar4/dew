@@ -742,7 +742,7 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call):
         if streamed:
             # The chunk's vectors streamed with its tiles, loaded a tile ahead (`_vector_views`).
             views |= _vector_views(n, h, **vectors)
-        *merges, lower_tile, scaled_tile = staging
+        merges, (lower_tile, scaled_tile) = staging[:3], (staging[:2] if len(staging) == 3 else staging[3:])
 
         def read(refs):
             """The vectors as a row's (gates, lows, writes) and a column's (gates, lows), from their streams'
@@ -801,7 +801,13 @@ def _solved(k, v, hi, lo, beta, taken, call: _Call):
         + _fragments(call, (held, CHUNK, CHUNK), (call.given, CHUNK, call.block))))
     out_type = (held.shape(call.heads * CHUNK), held.shape(call.heads * width),
                 held.shape(call.heads * value_width))
-    staging = (*_merges(call), _staging(held, (CHUNK, CHUNK))[0], _staging(held, (CHUNK, call.block))[0])
+    # The inverse's application stages in the doubling's merge tiles where they are its form (an fp32 call's
+    # bf16 parts, a block a chunk wide), done by then: apart, an fp32 call's launch took 242864 bytes of
+    # shared memory, past an H100's block (SE-family-h100-e0de17766).
+    merging = _merges(call)
+    reused = (held.parts > 1 and merging[0][0].dtype == held.stored and call.block == CHUNK)
+    staging = merging if reused else (*merging, _staging(held, (CHUNK, CHUNK))[0],
+                                      _staging(held, (CHUNK, call.block))[0])
     return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"),
                    blocks=_streamed(keys=((CHUNK, width), call.given),
