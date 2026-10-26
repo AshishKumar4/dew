@@ -1056,6 +1056,7 @@ def test_a_scheduled_rate_is_as_near_float64_as_optaxs(name):
             rates[f"step {step}"] = stepped_rate["w"]
         return rates
 
+    @as_given
     def truth(multipliers):
         built = [optax_schedule(name, rate_fields(name, float(multiplier))) for multiplier in multipliers]
         # optax counts in int32, which divides to float32: a float64 count keeps the schedule float64.

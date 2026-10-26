@@ -1154,9 +1154,11 @@ def test_a_change_moves_by_its_intervals_lower_end_and_one_leaf_is_enough():
 
     dew, reference, errors, truth = _set_errors(4.0, 4.0)
 
+    @as_given
     def two(x, mine, theirs):
         return {"moved": dew(x, mine, theirs)["y"], "kept": reference(x, mine, theirs)["y"]}
 
+    @as_given
     def two_original(x, mine, theirs):
         return {"moved": reference(x, mine, theirs)["y"], "kept": reference(x, mine, theirs)["y"]}
 
@@ -1165,8 +1167,9 @@ def test_a_change_moves_by_its_intervals_lower_end_and_one_leaf_is_enough():
 
     assert_moves(two_original, two, errors, "one leaf", seeds=8, truth_fn=two_truth)
 
+    @as_given
     def infinite(x, mine, theirs):
-        return {"y": x + jnp.inf}
+        return {"y": x + np.inf}
 
     with pytest.raises(AssertionError):
         assert_moves(reference, infinite, errors, "infinite", seeds=8, truth_fn=truth)

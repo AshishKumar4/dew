@@ -12,7 +12,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from reference_error import widened
+from reference_error import as_given, widened
 
 TINY_DECODER_FIELDS = {"hidden_size": 64, "num_hidden_layers": 4, "num_attention_heads": 4,
                        "num_key_value_heads": 2, "head_dim": 16, "intermediate_size": 128, "vocab_size": 256,
@@ -346,7 +346,7 @@ def torch_logits(source, precision=None):
     def run(ids):
         with (precision or contextlib.nullcontext)(), torch.no_grad():
             return source(torch.from_numpy(np.asarray(ids)).long()).logits.double().numpy()
-    return run
+    return as_given(run)
 
 
 def token_draw(salt: int, vocab: int, shape: tuple[int, ...]):
