@@ -737,9 +737,12 @@ def mask_id(family: Family) -> int:
 
 
 GENERATION_SEEDS: Mapping[str, int] = {f"{family} generation {leaf}": 8 for family in ALL
-                                       for leaf in ("raw", "policy")}
+                                       for leaf in ("raw", "policy")} | {
+    "causal_transformer+gated_delta_hybrid generation raw": 32,
+    "causal_transformer+gated_delta_hybrid generation policy": 64,
+    "multimodal_transformer+gemma3 generation policy": 32}
 """Check 1's declared seeds for each family's cached generation, raw and under its policy, sized by
-`seeds_for` on armada."""
+`seeds_for` paired with the cached arm on armada: 8, but where named."""
 
 
 def generation(family: Family, directory: Path) -> None:
