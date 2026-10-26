@@ -33,6 +33,7 @@ from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.config import MetricConfig, ModelConfig, ObjectiveConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data.dataset import Loader
+from dew.data.images import CAPTIONS
 from dew.diffusion import presets
 from dew.inputs import Condition, ConditionEncoder, Field, InputSpec
 from dew.nn.attention import Stage
@@ -201,15 +202,16 @@ CASES = [
                     "bias": True, "expert_features": 16, "shared_features": 16},
         "num_nextn_predict_layers": 1,
     }, seq_len=SEQ_LEN, label="glm4_moe"),
-    # Llama 4's stack at toy width: chunked rotated layers around a global
-    # layer under the llama4 kind, the routed layers scaling their inputs.
+    # Llama 4's stack at toy width: chunked rotated layers, adjacent pairs under the weightless L2
+    # norm, around a global layer without positions tuning its temperature; the routed layers scale
+    # their inputs.
     Case("causal_transformer", {
         **LM, "head_dim": 8, "qk_norm": False,
         "layer_types": ("chunked_attention", "full_attention"),
-        "kinds": {"chunked_attention": {"chunk": 4, "mixer": {
-                      "class": "llama4", "fields": {"use_rope": True, "floor_scale": 4.0}}},
-                  "full_attention": {"mixer": {"class": "llama4", "fields": {"use_rope": False,
-                                               "floor_scale": 4.0}}}},
+        "kinds": {"chunked_attention": {"chunk": 4, "qk_norm": True, "mixer": {
+                      "class": "attention", "fields": {"rotary_pairs": "adjacent", "qk_norm_weight": False}}},
+                  "full_attention": {"mixer": {"class": "attention", "fields": {
+                      "nope": True, "temperature_tuning": (4.0, 0.1)}}}},
         "mixture": {"experts": 8, "top_k": 1, "layers": (1,), "score_function": "sigmoid",
                     "norm_topk_prob": False, "scale_inputs": True, "expert_features": 16,
                     "shared_features": 16},
@@ -713,7 +715,7 @@ def test_a_val_metric_records_its_own_constructors_defaults():
     back. A run's metrics are such records, so a bare alias in their place is refused where the
     run is written: in its record, on its command line and in its fields."""
     clip = MetricConfig("clip")
-    assert clip.defaults == {"modelname": CLIP_CHECKPOINT, "field": "text"}
+    assert clip.defaults == {"modelname": CLIP_CHECKPOINT, "field": CAPTIONS}
     assert from_record(MetricConfig, to_record(clip, MetricConfig)) == clip
     run = unet_run(JSON_UNET)
     with pytest.raises(TypeError):
