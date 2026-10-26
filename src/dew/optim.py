@@ -762,7 +762,7 @@ def int8_moments(b1: float, b2: float, eps: float, eps_root: float, nesterov: bo
                          if held(leaf) else None, params))
 
     def encoded(moment, part, signed, salt):
-        return (moment, None) if part[1] is None else quantized(moment, maps[signed], block)
+        return (moment, None) if part[1] is None else quantized(moment, block, signed=signed)
 
     return _stored_moments(b1, b2, eps, eps_root, nesterov, _Store(
         zeros=zeros,
@@ -787,18 +787,47 @@ def dequantized(codes: jax.Array, scales: jax.Array, values: jax.Array, block: i
     return (blocked * scales[..., None]).reshape(fractions.shape)
 
 
-def quantized(moment: jax.Array, values: jax.Array, block: int) -> tuple[jax.Array, jax.Array]:
+CODE_WINDOW = 6
+"""The codes around a value's estimated one (`_estimated_codes`) that `quantized` compares it with: the
+estimate is within two of the code below the value, whose search they settle."""
+
+
+def _estimated_codes(fractions: jax.Array, *, signed: bool) -> jax.Array:
+    """Where each of `fractions` falls in `dynamic_map(signed=signed)`, to within two codes: its decade
+    by its base-10 logarithm, and its place among the decade's evenly spaced values, the map's own
+    layout (a decade `e` of 0 to 6 holds `2 ** e` values each side of 0, `2 ** (e + 1)` unsigned, the
+    means of as many even steps from a tenth of the decade's top to its top)."""
+    magnitude = jnp.abs(fractions)
+    decade = jnp.clip(jnp.floor(jnp.log10(magnitude)) + 7, 0, 6).astype(jnp.int32)
+    count = jnp.left_shift(1, decade + (0 if signed else 1))
+    top = jnp.power(jnp.float32(10), (decade - 6).astype(jnp.float32))
+    step = jnp.float32(0.9) / count.astype(jnp.float32)
+    place = jnp.clip(jnp.floor((magnitude / top - jnp.float32(0.1)) / step), 0, count - 1).astype(jnp.int32)
+    if not signed:
+        return count - 1 + place  # past 0 and the 2 ** (e + 1) - 2 values of the decades below
+    # 0 is code 127, each decade's positive values follow the 2 ** e - 1 of the decades below it, and
+    # its negative values mirror them below 0.
+    return jnp.where(fractions < 0, 127 - count - place, 127 + count + place)
+
+
+def quantized(moment: jax.Array, block: int, *, signed: bool) -> tuple[jax.Array, jax.Array]:
     """`moment` in 8 bits, its codes and its blocks' scales: each block of `block` values along its last
-    axis scaled by its largest magnitude (at least 1e-12), and each value coded by the nearest of `values`,
-    ascending, a value halfway between two taking the larger, as torchao's `quantize_8bit_with_qmap` does."""
+    axis scaled by its largest magnitude (at least 1e-12), and each value coded by the nearest value of
+    `dynamic_map(signed=signed)`, a value halfway between two taking the larger, as torchao's
+    `quantize_8bit_with_qmap` does. The code below each value is found among the `CODE_WINDOW` around
+    its estimate (`_estimated_codes`), compared at once: a search of the whole map ran its eight halvings
+    one after another, five times fp32 state's update on an A100 (docs/performance.md)."""
+    values = jnp.asarray(dynamic_map(signed=signed))
+    last = values.shape[0] - 1
     blocked = moment.reshape(*moment.shape[:-1], -1, block)
     scales = jnp.maximum(jnp.max(jnp.abs(blocked), axis=-1), 1e-12)
     fractions = (blocked / scales[..., None]).reshape(moment.shape)
-    # Unrolled, the search fuses with the rest of the quantization: its default loop ran each of its eight
-    # halvings over the whole moment, and took a step's peak above fp32 state's (docs/performance.md).
-    below = jnp.clip(jnp.searchsorted(values, fractions, side="right", method="scan_unrolled") - 1, 0,
-                     values.shape[0] - 1)
-    above = jnp.minimum(below + 1, values.shape[0] - 1)
+    first = _estimated_codes(fractions, signed=signed) - CODE_WINDOW // 2 - 1
+    window = first[..., None] + jnp.arange(1, CODE_WINDOW + 1)
+    # The codes at most each value: those of the window's that are, past the codes below it.
+    held = (window < 0) | ((window <= last) & (values[jnp.clip(window, 0, last)] <= fractions[..., None]))
+    below = jnp.clip(first + jnp.sum(held, axis=-1, dtype=jnp.int32), 0, last)
+    above = jnp.minimum(below + 1, last)
     nearest = jnp.where(fractions - values[below] >= (values[above] - values[below]) * 0.5, above, below)
     return nearest.astype(jnp.uint8), scales
 
