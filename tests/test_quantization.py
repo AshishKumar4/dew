@@ -860,7 +860,7 @@ def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_mode
                     seeds=PACKED_SEEDS, truth_fn=truth)
 
 
-SPLIT_SEEDS = 8
+SPLIT_SEEDS = 16
 """The split quantized tree's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on
 armada."""
 
