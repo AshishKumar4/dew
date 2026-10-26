@@ -74,7 +74,7 @@ from dew.optim import newton_schulz
 from dew.quantization import FROZEN_FP8, QUANTIZATION, frozen_fp8_kernel
 
 from .attention import FORWARD_MODE, LayerNorm
-from .inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places, valid_order
+from .inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places, sequence_blocks, valid_order
 from .precision import at_least_fp32, l2norm
 
 CARRY = MEMORY_RESIDUALS[0]
@@ -580,14 +580,8 @@ class InContextMemory(nn.Module):
         order, _ = valid_order(steps.real)
         gathered = jax.tree.map(lambda field: jnp.take_along_axis(
             field, order.reshape(*order.shape, *(1,) * (field.ndim - 2)), axis=1), steps)
-        count = -(-length // self.chunk)
-        padding = count * self.chunk - length
-
-        def chunks(field: jax.Array) -> jax.Array:
-            padded = jnp.pad(field, ((0, 0), (0, padding)) + ((0, 0),) * (field.ndim - 2))
-            return jnp.moveaxis(padded.reshape(batch, count, self.chunk, *field.shape[2:]), 1, 0)
-
-        laid = jax.tree.map(chunks, gathered)
+        laid = jax.tree.map(lambda field: sequence_blocks(field, self.chunk, leading=True), gathered)
+        count = laid.real.shape[0]
         rows = jax.tree.map(lambda leaf: jnp.broadcast_to(leaf, (batch, *leaf.shape)), initial)
         carry = (rows, jax.tree.map(jnp.zeros_like, rows))
         _, reads = jax.lax.scan(functools.partial(self._chunk, heads=heads), carry, laid)
