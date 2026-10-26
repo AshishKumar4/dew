@@ -369,3 +369,27 @@ def test_a_backward_its_forward_does_not_show_is_not_assembled(tmp_path):
     config = json.loads((tmp_path / "frozen" / "config.json").read_text())
     with pytest.raises(ValueError):
         verify_mapping(config, remote=tmp_path / "frozen")
+
+
+def test_a_slot_release_over_a_model_of_parts_loads_its_backbone_by_its_own_code(tmp_path):
+    """A slot release whose backbone is a repository of remote code reads that code where the load opts
+    in, as the backbone alone does: its decoder verifies from parts and holds the backbone's own
+    variables, and it computes the backbone's logits."""
+    import shutil
+
+    from test_slot_sources import BACKBONE
+
+    alone, release = tmp_path / "renamed", tmp_path / "release"
+    write_source(alone, "renamed")
+    shutil.copytree(alone, release)
+    for name in ("tokenizer.json", "tokenizer_config.json"):
+        shutil.copy(BACKBONE / name, release / name)
+    (release / "readout.json").write_text(json.dumps({"readout": "slot_lm", "head_dim": 8, "n_slots": 16}))
+    backbone = Pretrained.load(alone, dtype="float32", attention_impl="reference", trust_remote_code=True)
+    loaded = Pretrained.load(release, dtype="float32", attention_impl="reference", trust_remote_code=True)
+    assert type(loaded.model) is type(backbone.model)
+    for ours, theirs in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(backbone.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    ids = np.random.default_rng(1693).integers(0, TINY["vocab_size"], (2, 12)).astype(np.int32)
+    np.testing.assert_array_equal(np.asarray(loaded.model.apply(loaded.variables, ids)),
+                                  np.asarray(backbone.model.apply(backbone.variables, ids)))
