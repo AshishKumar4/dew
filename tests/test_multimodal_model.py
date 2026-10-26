@@ -583,3 +583,18 @@ def test_source_backward_trained_export_and_frozen_buffers_match_reference(famil
             for actual, original in zip(jax.tree.leaves(tree),
                                         jax.tree.leaves(loaded.variables[collection]), strict=True):
                 np.testing.assert_array_equal(actual, original)
+
+
+@pytest.mark.parametrize("fixture", ["gemma3n-vision-tiny", "gemma-3n-audio-tiny"])
+def test_a_gemma3n_config_without_its_audio_placeholder_takes_the_config_class_default(fixture):
+    """Gemma3nConfig defaults audio_token_id (262273, configuration_gemma3n.py:460 at transformers
+    5.17.0), so a wrapper config that leaves it out translates as transformers' config class reads it:
+    one with an audio tower names that placeholder, and one without states no audio either way."""
+    from dew.interop.hf_decoders import translate_wrapper_config
+
+    config = json.loads((FIXTURE.parent / fixture / "config.json").read_text())
+    stated = translate_wrapper_config(config)
+    del config["audio_token_id"]
+    defaulted = translate_wrapper_config(config)
+    audio = None if stated["audio"] is None else 262273
+    assert defaulted == {**stated, "audio_token_id": audio}

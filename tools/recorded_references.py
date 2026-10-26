@@ -75,11 +75,12 @@ def record_reference(label: str, draw, evaluate, proxy, *, package: str, repo: s
     return written
 
 
-def record_case(label: str, draw, evaluate, proxy, *, truth_proxy=None, store_inputs: bool = True,
+def record_case(label: str, draw, evaluate, proxy=None, *, truth_proxy=None, store_inputs: bool = True,
                 summary: bool = False) -> dict[str, np.ndarray]:
     """`label`'s recording: `draw(seed)` gives a seed's inputs (a dict of arrays), `evaluate(inputs)` the
     reference's outputs and their float64 truth (dicts), and `proxy(inputs)` (with `truth_proxy`) a
-    function that can run here, which plans the count. The recorded reference then confirms it,
+    function that can run here, which plans the count. With no proxy, the recorded reference alone
+    sizes the count, recording the draws its doublings take. The recorded reference then confirms it,
     recording further seeds as `seeds_for` asks, and the recording keeps exactly the confirmed count's
     draws and their redraw, (1 + REDRAW) times it. Where `draw` is a seeded function the test can call
     again, `store_inputs=False` records the outputs alone and each draw's `input_digest`, and the test
@@ -89,9 +90,13 @@ def record_case(label: str, draw, evaluate, proxy, *, truth_proxy=None, store_in
     its truth's sketch
     (`truth_sketch`), which the test's own float64 path is held to (`indexed_recording`'s `truth_fn`):
     kilobytes where outputs over (1 + REDRAW) times the seeds are gigabytes."""
-    planned = seeds_for(jax.jit(proxy), lambda seed: (draw(seed),), label,
-                        truth_fn=None if truth_proxy is None else jax.jit(truth_proxy))
-    print(f"{label}: planned {planned} seeds on the proxy", flush=True)
+    if proxy is None and truth_proxy is not None:
+        raise ValueError("a planning truth requires its proxy")
+    # Without a proxy nothing is drawn ahead: the recorded reference's own doublings draw what they read.
+    planned = (0 if proxy is None else
+               seeds_for(jax.jit(proxy), lambda seed: (draw(seed),), label,
+                         truth_fn=None if truth_proxy is None else jax.jit(truth_proxy)))
+    print(f"{label}: starting with {planned} seeds", flush=True)
     records = []
 
     def ensure(count):

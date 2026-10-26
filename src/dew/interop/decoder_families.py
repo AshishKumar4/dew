@@ -14,7 +14,14 @@ from dew.interop.families.deepseek import (
 from dew.interop.families.deepseek_v41 import DEEPSEEK_V41
 from dew.interop.families.dory import DORY
 from dew.interop.families.falcon import FALCON
-from dew.interop.families.gemma import GEMMA, GEMMA2, GEMMA3_TEXT, GEMMA3N_TEXT, GEMMA4_TEXT
+from dew.interop.families.gemma import (
+    GEMMA,
+    GEMMA2,
+    GEMMA3_TEXT,
+    GEMMA3N_TEXT,
+    GEMMA4_TEXT,
+    GEMMA4_UNIFIED_TEXT,
+)
 from dew.interop.families.glm import GLM4_MOE, GLM5_NEXT_TEXT, GLM_MOE_DSA
 from dew.interop.families.gpt2 import GPT2, GPT_NEO, GPTJ
 from dew.interop.families.gpt_bigcode import GPT_BIGCODE
@@ -91,6 +98,7 @@ ENTRIES = (
     OLMO3,
     GEMMA3N_TEXT,
     GEMMA4_TEXT,
+    GEMMA4_UNIFIED_TEXT,
     GEMMA3_TEXT,
     GEMMA2,
     GEMMA,

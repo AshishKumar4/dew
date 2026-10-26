@@ -182,8 +182,7 @@ class WeightLayout:
             return np.dtype(self.dtype)
         return np.dtype(self._leaf(variables, self.paths[0], scalar_mode).dtype)
 
-    def export(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> np.ndarray:
-        """The source tensor, built from its leaves and brought to the host."""
+    def _leaves(self, variables: Mapping[str, object], scalar_mode: str | None):
         leaves = []
         for path in self.paths:
             node = self._leaf(variables, path, scalar_mode)
@@ -197,34 +196,47 @@ class WeightLayout:
                         f"holds {node.shape}")
                 node = node[self.expert_index]
             leaves.append(node)
-        if (len(leaves) == 1 and self.transpose is not None
-                and jax.dtypes.canonicalize_dtype(leaves[0].dtype) == leaves[0].dtype):
-            # One leaf is transposed on its device and copied to the host
-            # contiguous: numpy copies a transposed bfloat16 kernel at 0.15
-            # GiB/s on the RTX 3090 box's CPU, where the round trip over PCIe
-            # moves several GiB/s.
-            value = np.asarray(jnp.transpose(jnp.asarray(leaves[0]), self.transpose))
+        return leaves
+
+    def _source(self, leaves, *, on_host: bool):
+        xp = np if on_host else jnp
+        arrays = [xp.asarray(leaf) for leaf in leaves]
+        if self.concatenate is None:
+            value = arrays[0]
+        elif self.chunks is None:
+            value = xp.concatenate(arrays, axis=self.concatenate)
         else:
-            arrays = [np.asarray(leaf) for leaf in leaves]
-            if self.concatenate is None:
-                value = arrays[0]
-            elif self.chunks is None:
-                value = np.concatenate(arrays, axis=self.concatenate)
-            else:
-                axis = self.concatenate % arrays[0].ndim
-                runs = [array.reshape(*array.shape[:axis], self.chunks, -1, *array.shape[axis + 1:])
-                        for array in arrays]
-                value = np.concatenate(runs, axis=axis + 1)
-                value = value.reshape(*value.shape[:axis], -1, *value.shape[axis + 2:])
-            if self.transpose is not None:
-                value = value.transpose(self.transpose)
+            axis = self.concatenate % arrays[0].ndim
+            runs = [array.reshape(*array.shape[:axis], self.chunks, -1, *array.shape[axis + 1:])
+                    for array in arrays]
+            value = xp.concatenate(runs, axis=axis + 1)
+            value = value.reshape(*value.shape[:axis], -1, *value.shape[axis + 2:])
+        if self.transpose is not None:
+            value = value.transpose(self.transpose)
         if self.padded is not None:
-            value = np.pad(np.asarray(value), (0, self.padded - value.shape[0]))
+            value = xp.pad(value, (0, self.padded - value.shape[0]))
         if value.size != math.prod(self.shape):
             raise ValueError(
                 f"{self.name} assembles {value.shape} from {self.paths}, which does not "
                 f"fill the source's {self.shape}")
-        value = np.ascontiguousarray(value).reshape(self.shape)
+        return value.reshape(self.shape)
+
+    def source_array(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> jax.Array:
+        """The source-shaped JAX array, preserving compute precision and differentiation.
+
+        Checkpoint storage casts and the host transfer belong to `export`, so a gradient in float64
+        keeps its precision even where its parameter's checkpoint uses a narrower dtype.
+        """
+        return jnp.asarray(self._source(self._leaves(variables, scalar_mode), on_host=False))
+
+    def export(self, variables: Mapping[str, object], scalar_mode: str | None = None) -> np.ndarray:
+        """The source tensor, built from its leaves and brought to contiguous host storage."""
+        leaves = self._leaves(variables, scalar_mode)
+        # A single transposed bfloat16 kernel copies at 0.15 GiB/s on the RTX 3090 box's CPU;
+        # transposing on its device before the contiguous host copy reaches several GiB/s.
+        device_transpose = (len(leaves) == 1 and self.transpose is not None
+                            and jax.dtypes.canonicalize_dtype(leaves[0].dtype) == leaves[0].dtype)
+        value = np.ascontiguousarray(self._source(leaves, on_host=not device_transpose)).reshape(self.shape)
         return value if self.dtype is None else value.astype(self.dtype)
 
     def restore(self, tensor: np.ndarray, shape: tuple[int, ...]) -> np.ndarray:

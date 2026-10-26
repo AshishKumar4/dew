@@ -239,7 +239,7 @@ QUESTION_FIELDS = (QuestionField("kinds", (), np.int32), QuestionField("question
 real ones), `spans`, `option_spans`, `options` (the real ones), and where its options stand under
 labels (`Labels`) `readout`, each question's answer cue. Every producer, packer and consumer of a
 row's questions reads their names, shapes and fills here; a training row extends them
-(`dew.decision.objective.TRAINING_FIELDS`)."""
+(`dew.decision.rows.TRAINING_FIELDS`)."""
 
 
 def question_fields(row: Encoded, count: int, width: int, labelled: bool = False) -> dict[str, np.ndarray]:
