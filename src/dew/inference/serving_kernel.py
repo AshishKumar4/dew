@@ -463,7 +463,7 @@ def state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
 
 
 def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
-              options: Mapping[str, str | bool] | None = None) -> jax.stages.Wrapped:
+              options: Mapping[str, bool | int | str] | None = None) -> jax.stages.Wrapped:
     """Compile the step program over a state split into resident and carried halves.
 
     The matrix half is donated so XLA updates the cache in place instead of
@@ -562,7 +562,7 @@ Qwen3-0.6B at 64 slots, about 5 ms before 9 of a run's 16 admitting steps
 (docs/performance.md). Only a GPU backend is handed them."""
 
 
-def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[str, bool]
+def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[str, bool | int | str]
                     ) -> tuple[jax.stages.Wrapped, jax.stages.Wrapped]:
     """`_compiled` over `formats`, once per layout and model `options`
     (`dew.nn.kernels.options.compiler_options`), for the decoding step and
