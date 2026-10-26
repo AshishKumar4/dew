@@ -11,7 +11,7 @@ from abc import ABC, abstractmethod
 import jax
 import jax.numpy as jnp
 
-from dew.nn.precision import at_least_fp32, correctly_rounded_divide, wide_cpu_arithmetic
+from dew.nn.precision import at_least_fp32, correctly_rounded_divide
 
 
 def expand(coefficient, x):
@@ -31,22 +31,13 @@ def divided(numerator, rate):
     whatever the backend's own division does. A float32, bfloat16 or float16 quotient is
     `dew.nn.precision.correctly_rounded_divide`'s of the operands widened to float32, rounded to its
     dtype, as PyTorch's float32 opmath gives it, under any compiler flags. A float64 one is the plain
-    division, but in a process running wide CPU arithmetic (`dew.nn.precision.WIDE_CPU_ARITHMETIC`,
-    Dew's test setting, whose float64 truths read it) a CPU's is the division by a full-shape divisor,
-    the rate plus the numerator times zero: XLA:CPU rewrites a division by a broadcast into a
-    multiplication by its reciprocal, two roundings where the division makes one
-    (openxla/xla#51148), and no simplification folds that divisor back to the broadcast (folding
-    would change an infinite numerator's NaN). Other backends keep the division as written, the
-    rewrite being the CPU compiler's alone."""
+    division."""
     numerator, rate = jnp.asarray(numerator), jnp.asarray(rate)
     dtype = jnp.result_type(numerator, rate)
     if not jnp.issubdtype(dtype, jnp.floating):
         return numerator / rate
     if dtype == jnp.float64:
-        if not wide_cpu_arithmetic():
-            return numerator / rate
-        return jax.lax.platform_dependent(numerator, rate, cpu=lambda value, by: value / (by + value * 0),
-                                          default=lambda value, by: value / by)
+        return numerator / rate
     return correctly_rounded_divide(numerator.astype(jnp.float32), rate.astype(jnp.float32)).astype(dtype)
 
 

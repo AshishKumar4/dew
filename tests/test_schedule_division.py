@@ -35,8 +35,8 @@ def draw(seed):
 def test_a_schedules_division_keeps_zeros_infinities_and_mixed_operands():
     """A signed zero, a zero divisor of either sign, an overflowing quotient and exact quotients by
     negative divisors are IEEE's, bit for bit, as is a float32 state over a float16 rate or a Python
-    float; a float64 state over a broadcast rate is float64's correctly rounded quotient, which
-    XLA:CPU's reciprocal would round twice."""
+    float; a float64 state over a broadcast rate is the plain float64 division, which keeps its exact
+    quotients and its zeros and infinities, wherever the backend rounds an inexact one."""
     numerator = np.asarray([-0.0, 0.0, 1.0, 2.0 ** 127, 3.0, -2.0, np.inf, 1.0, -1.0, 6.0, -1.0, 7.0],
                            np.float32)
     rate = np.asarray([1.0, -1.0, 0.0, 0.25, np.inf, 0.0, 2.0, -1.0, -1.0, -3.0, 3.0, -0.0], np.float32)
@@ -50,7 +50,8 @@ def test_a_schedules_division_keeps_zeros_infinities_and_mixed_operands():
     np.testing.assert_array_equal(np.asarray(divided(states, 0.3)).view(np.uint32),
                                   (states / np.float32(0.3)).view(np.uint32))
     with jax.enable_x64(new_val=True):
-        wide, by = np.full((4, 3), 3.0), np.full((4, 1), 5.0)
+        wide = np.asarray([[6.0, -0.0, np.inf], [1.0, 0.0, -2.0]])
+        by = np.asarray([[3.0], [-4.0]])
         np.testing.assert_array_equal(np.asarray(jax.jit(divided)(wide, by)), wide / by)
 
 
