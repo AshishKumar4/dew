@@ -15,7 +15,7 @@ from flax.typing import Dtype
 from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.inputs import PLAIN_CALL, AttentionMetadata, MixerCall, coordinates
-from dew.nn.memory import Gate, InContextMemory, LinearMemory, MLPMemory, Objective, ResidualMemory
+from dew.nn.memory import CARRY, Gate, InContextMemory, LinearMemory, MLPMemory, Objective, ResidualMemory
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import L2NORM_EPS
 
@@ -427,7 +427,8 @@ def test_an_orthogonalized_step_follows_the_paper_with_muons_iteration():
 
 
 def decoder(**fields):
-    """A tiny decoder alternating attention and Titans-style memory layers."""
+    """A tiny decoder of two Titans-style memory layers, which a scanned stack scans as one group, then
+    two attention layers."""
     from model_support import TINY_DECODER
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -436,50 +437,63 @@ def decoder(**fields):
 
     memory = InContextMemory(network=MLPMemory(hidden=(16,)), heads=2, head_features=8, chunk=4,
                              learning_rate=Gate(scale=0.5), momentum=Gate(), retention=Gate(bias=-2.0))
-    return CausalTransformer(**{"vocab_size": 37, **TINY_DECODER, "num_layers": 4, "dtype": "float32",
-                                "layer_types": ("memory", "attention") * 2,
+    return CausalTransformer(**{"vocab_size": 37, **TINY_DECODER, "num_layers": 4, "dtype": jnp.float32,
+                                "layer_types": ("memory", "memory", "attention", "attention"),
                                 "kinds": {"memory": LayerKind(mixer=InContextMemoryMixer(memory))}, **fields})
 
 
-def test_a_memory_layer_kind_trains_scans_and_decodes_in_a_decoder():
-    """A decoder whose layer kind is a memory: its scanned stack computes the plain loop's logits bit for
-    bit from the same tree; one gradient step changes the memories' initial networks and projections;
-    and its cached decode, token by token after a prefill, gives the full pass's last logits on par
-    against float64 (check 1)."""
+def test_a_memory_decoder_trains_scans_remats_and_decodes():
+    """A decoder whose first two layers are memories, which its scanned stack scans as one group: the
+    scanned stack computes the plain loop's logits bit for bit from the same tree; its gradient, and
+    the gradient under a remat policy that keeps each memory's chunk carry (`CARRY`), are the plain
+    loop's, on par against float64 (check 1), and reach every memory's initial network; and its cached
+    decode, token by token after a prefill, gives the full pass's last logits (check 1)."""
+    from model_support import model_draw
+
+    from dew.nn.backbones.decoder_block import RematPolicy
+
     plain, scanned = decoder(), decoder(scan_layers=True)
-    ids = jax.random.randint(jax.random.key(1), (2, LENGTH), 0, 37)
-    variables = plain.init(jax.random.key(0), ids)
+    rematted = decoder(scan_layers=True, remat=RematPolicy(save=(CARRY,)))
+    wide = decoder(dtype=jnp.float64)
+    draw_model = model_draw(plain, (2, LENGTH), 37)
+    variables, ids = draw_model(0)
     np.testing.assert_array_equal(np.asarray(plain.apply(variables, ids)),
                                   np.asarray(scanned.apply(variables, ids)))
-    loss = jax.jit(jax.grad(lambda held: jnp.mean(plain.apply(held, ids) ** 2)))
-    gradient = loss(variables)["params"]
-    memory = gradient["layers_0"]["self_attn"]
-    assert {"initial", "q_proj", "k_proj", "v_proj", "o_proj", "learning_rate", "momentum",
-            "retention"} <= set(memory)
-    assert all(np.abs(np.asarray(leaf)).max() > 0 for leaf in jax.tree.leaves(memory["initial"]))
 
-    def decoded(tokens):
-        cache = plain.apply(variables, tokens.shape[0], method=plain.init_cache, mutable=["cache"])[1]
-        logits, cache = plain.apply({**variables, **cache}, tokens[:, :6], decode=True, mutable=["cache"])
+    def trained(model):
+        """The model's logits and its parameters' gradient under a cotangent."""
+        @jax.jit
+        def run(variables, ids, cotangent):
+            logits, pull = jax.vjp(lambda held: model.apply(held, ids), variables)
+            return logits, pull(cotangent)[0]["params"]
+        return run
+
+    def draw_with_cotangent(seed: int):
+        cotangent = np.random.default_rng([1648, seed]).standard_normal((2, LENGTH, 37)).astype(np.float32)
+        return *draw_model(seed), cotangent
+
+    for name, model in (("scanned", scanned), ("rematted", rematted)):
+        assert_as_exact(trained(model), trained(plain), draw_with_cotangent,
+                        f"{name} memory decoder gradient", seeds=MEMORY_SEEDS, truth_fn=trained(wide))
+    gradient = trained(rematted)(*draw_with_cotangent(0))[1]
+    for index in (0, 1):
+        assert all(np.abs(np.asarray(leaf)).max() > 0
+                   for leaf in jax.tree.leaves(gradient[f"layers_{index}"]["self_attn"]["initial"]))
+
+    @jax.jit
+    def decoded(variables, ids):
+        cache = scanned.apply(variables, ids.shape[0], method=scanned.init_cache, mutable=["cache"])[1]
+        logits, cache = scanned.apply({**variables, **cache}, ids[:, :6], decode=True, mutable=["cache"])
         for t in range(6, LENGTH):
-            logits, cache = plain.apply({**variables, **cache}, tokens[:, t:t + 1], decode=True,
-                                        mutable=["cache"])
+            logits, cache = scanned.apply({**variables, **cache}, ids[:, t:t + 1], decode=True,
+                                          mutable=["cache"])
         return logits[:, -1]
 
-    def full(tokens):
-        return plain.apply(variables, tokens)[:, -1]
+    def last(model):
+        return jax.jit(lambda variables, ids: model.apply(variables, ids)[:, -1])
 
-    def draw_ids(seed):
-        return (np.random.default_rng([1646, seed]).integers(0, 37, (2, LENGTH), dtype=np.int32),)
-
-    wide = decoder(dtype="float64")
-
-    def truth(tokens):
-        widened = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), variables)
-        return wide.apply(widened, tokens)[:, -1]
-
-    assert_as_exact(jax.jit(decoded), jax.jit(full), draw_ids, "memory decoder decode", seeds=MEMORY_SEEDS,
-                    truth_fn=truth)
+    assert_as_exact(decoded, last(plain), draw_model, "memory decoder decode", seeds=MEMORY_SEEDS,
+                    truth_fn=last(wide))
 
 
 def test_muon_steps_each_memory_heads_matrices_on_their_own():
