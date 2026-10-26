@@ -1552,3 +1552,34 @@ def test_a_float64_decoder_saves_and_reloads_in_float64(tmp_path):
         ids = jnp.asarray(np.load(FIXTURES / "qwen3-tiny" / "input_ids.npy"))
         np.testing.assert_array_equal(np.asarray(again.model.apply(again.variables, ids)),
                                       np.asarray(loaded.model.apply(loaded.variables, ids)))
+
+
+@pytest.mark.parametrize("fixture", ["qwen2-tiny", "qwen3-tiny"])
+def test_a_qwen_config_without_a_window_bound_windows_the_layers_transformers_windows(fixture):
+    """A 32-layer Qwen config that turns the window on but states neither `layer_types` nor
+    `max_window_layers` windows the layers its own transformers class does (the last four, from the
+    class's default bound of 28), so the model reads what transformers' model reads."""
+    from transformers import AutoConfig
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.registry import from_record
+
+    config = json.loads((FIXTURES / fixture / "config.json").read_text())
+    unbound = ("layer_types", "max_window_layers")
+    stated = {name: value for name, value in config.items() if name not in unbound}
+    config = {**stated, "num_hidden_layers": 32, "use_sliding_window": True, "sliding_window": 4096}
+    model = from_record(CausalTransformer, translate_config(config))
+    expected = AutoConfig.for_model(config["model_type"], **{
+        name: value for name, value in config.items() if name != "model_type"}).layer_types
+    windows = tuple("sliding_attention" if model.kind_of(kind).window else "full_attention"
+                    for kind in model.per_layer_types)
+    assert windows == tuple(expected)
+    assert windows.count("sliding_attention") == 4
+
+
+def test_a_config_of_a_type_transformers_lacks_reads_its_layers_by_its_familys_convention():
+    """Dream (no transformers class) reads by Qwen2's convention, whose class takes a null head_dim
+    as Dream's own config does: the record is the one without it."""
+    config = json.loads((FIXTURES / "dream-tiny" / "config.json").read_text())
+    assert translate_config({**config, "head_dim": None}) == translate_config(
+        {name: value for name, value in config.items() if name != "head_dim"})

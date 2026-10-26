@@ -571,6 +571,26 @@ def specified_layer_types(hf_config: Mapping[str, object], used: set[str],
     return tuple(cycle[index % len(cycle)] for index in range(count))
 
 
+def native_layer_types(hf_config: Mapping[str, object], used: set[str], convention: str) -> tuple[str, ...]:
+    """The config's `layer_types`, else the ones the `convention` the family reads it by derives from it
+    through its transformers class (`AutoConfig.for_model`), as transformers builds the model: Qwen2's
+    and Qwen3's window from `max_window_layers` on under `use_sliding_window`, at the class's own
+    default of that bound. A config of another type is read by that convention's rule, which tier 2
+    then checks against the type's own class; one the class refuses is not that convention's."""
+    if hf_config.get('layer_types') is not None:
+        return specified_layer_types(hf_config, used)
+    from huggingface_hub.errors import StrictDataclassError
+    from transformers import AutoConfig
+
+    used.update(('use_sliding_window', 'sliding_window', 'max_window_layers'))
+    fields = {name: value for name, value in hf_config.items() if name != 'model_type'}
+    try:
+        resolved = AutoConfig.for_model(convention, **fields)
+    except StrictDataclassError as error:
+        refuse(f"its fields under {convention}'s config class", str(error))
+    return _records.strings(resolved.layer_types, 'layer_types')
+
+
 def decoder_kinds(layer_types: tuple[str, ...], window: int | None,
            local_theta: float | None, full_theta: float | None,
            full_head_dim: int | None) -> dict[str, KindFields]:

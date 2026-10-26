@@ -30,6 +30,7 @@ from dew.interop.decoder_parts import (
     dew_path,
     kind_mixers,
     kinds_of,
+    native_layer_types,
     plain_partial_rope,
     prediction_path,
     read_rope,
@@ -43,19 +44,6 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
-
-
-def qwen_layer_types(hf_config: Mapping[str, object], used: set[str]) -> tuple[str, ...]:
-    """The layer kinds a Qwen2Config states: its layer_types, else the window
-    from max_window_layers on under use_sliding_window. OuroConfig copies the rule."""
-    layers = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
-    if hf_config.get('layer_types') is not None:
-        return specified_layer_types(hf_config, used)
-    used.update(('use_sliding_window', 'sliding_window'))
-    enabled = hf_config.get('use_sliding_window', False) and hf_config.get('sliding_window') is not None
-    first = _records.integer(hf_config.get('max_window_layers', layers), 'max_window_layers')
-    return tuple('sliding_attention' if enabled and index >= first else 'full_attention'
-                 for index in range(layers))
 
 
 def _qwen35_rope(hf_config: Mapping[str, object]) -> tuple[float, float]:
@@ -89,8 +77,8 @@ _QWEN_READS = frozenset({'layer_types', 'sliding_window', 'attention_bias'})
 def qwen2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
     # Qwen2Attention biases q, k and v and builds o_proj without one
     # (modeling_qwen2.py:189-192), whatever the config says.
-    config = base_config(hf_config, used, rope=PLAIN_SPELLING, layer_types=qwen_layer_types(hf_config, used),
-                          reads=_QWEN_READS)
+    config = base_config(hf_config, used, rope=PLAIN_SPELLING,
+                         layer_types=native_layer_types(hf_config, used, 'qwen2'), reads=_QWEN_READS)
     config.update(attention_bias=True, o_proj_bias=False)
     return config
 
@@ -106,7 +94,7 @@ def _qwen3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     rope = read_rope(hf_config, used, PLAIN_SPELLING, yarn_max_pos=_records.integer(hf_config.get(
         'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'))
     return base_config(hf_config, used, qk_norm=True, rope=rope,
-                        layer_types=qwen_layer_types(hf_config, used), reads=_QWEN_READS)
+                        layer_types=native_layer_types(hf_config, used, 'qwen3'), reads=_QWEN_READS)
 
 
 def _sparse_step_layers(hf_config: Mapping[str, object], layers: int, used: set[str]) -> tuple[int, ...]:
