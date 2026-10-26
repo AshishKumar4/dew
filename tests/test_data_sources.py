@@ -518,6 +518,29 @@ def test_an_export_whose_writer_stops_commits_nothing_and_the_next_commits_only_
     assert [stored[index] for index in range(len(stored))] == rows[:6]
 
 
+@pytest.mark.parametrize("kind", ["jsonl", "text"])
+def test_one_small_file_streams_to_every_reader_each_reading_its_own_lines(tmp_path, kind):
+    """One file smaller than a shard is one physical shard. A streamed read by more readers than that
+    cuts it into as many parts, each the lines that start in an even cut of the file, as Hadoop
+    splits a text file: every share reads lines of its own, and together they read each once, where
+    a read by more readers and workers than shards was refused. Fewer lines than parts are refused."""
+    lines = [json.dumps({"id": index, "pad": "x" * (index % 9)}) for index in range(40)]
+    path = tmp_path / f"rows.{'jsonl' if kind == 'jsonl' else 'txt'}"
+    path.write_text("".join(line + "\n" for line in lines))
+    files = Files(str(path), format=kind)
+    assert len(files.manifest().shards) == 1
+    shares = []
+    for share in range(4):
+        rows = streamed(files.manifest(), partition=DataPartition(share, 4), loading=Loading(workers=0))
+        shares.append([row["id"] if kind == "jsonl" else json.loads(row["text"])["id"] for row in rows])
+    assert all(shares)
+    assert sorted(itertools.chain(*shares)) == list(range(40))
+    (tmp_path / "two.jsonl").write_text(lines[0] + "\n" + lines[1] + "\n")
+    with pytest.raises(ValueError):
+        streamed(Files(str(tmp_path / "two.jsonl")).manifest(), partition=DataPartition(0, 4),
+                 loading=Loading(workers=0))
+
+
 def test_a_corrupt_export_manifest_is_refused_and_never_falls_back_to_raw_shards():
     root = Store(f"memory://corrupt-export-{uuid4().hex}")
     export(Memory([{"id": 1}]), root.url)
