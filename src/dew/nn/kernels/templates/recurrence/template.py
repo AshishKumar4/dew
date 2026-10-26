@@ -145,14 +145,11 @@ class Mosaic(base.Template[mainloop.Tiles]):
           idle the whole walk, SE-rx-ncu-b106b18d8); the narrowest legal where none fills them;
         - stages: the deepest ring of the states launch's steps a block holds (`mosaic.deepest`, within the
           family's most shared memory, `Family.most_shared`), one where none of two or more is legal.
-        None where no block is legal, or the family stores none of the call's tiles (`mainloop.stores`): the
-        launch refuses the call."""
+        None where no block is legal: the launch refuses the call."""
         family = bundle(target)
         if family is None:
             return None
-        _, columns, held = _widths(ba, family)
-        if not mainloop.stores(family, held):
-            return None
+        _, columns, _ = _widths(ba, family)
         legal = [tiles for tiles in (self._staged(ba, block, target) for block in self._blocks(ba, family))
                  if tiles is not None]
         if not legal:
@@ -217,8 +214,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         """Whether the mainloop runs the call on `target`: 16-bit or fp32 operands, a decay a key dimension's
         in a 16-bit call under a declared floor its sub-chunks factor under (`mainloop.per_key_refusal`), a
         bundle for the target's
-        family that stores the call's tiles (`mainloop.stores`: mma.sync's no 16-bit tile on JAX 0.12), the
-        tensor rate its cost model reads, and a config whose launches the device holds at the
+        family, the tensor rate its cost model reads, and a config whose launches the device holds at the
         call's widths (`fits`: their shared memory and registers). Off a GPU (a CPU's), where the rule runs
         its bundle interpreted, the target is the interpreted bundle's generation (`launched`)."""
         if generation.backend() == "cpu" and bundle(target) is None:
@@ -228,7 +224,6 @@ class Mosaic(base.Template[mainloop.Tiles]):
         factored = arguments["g"].ndim == 3 or mainloop.per_key_refusal(dtype, arguments.get("floor")) is None
         family = bundle(target)
         if not (dtype in (jnp.bfloat16, jnp.float16, jnp.float32) and factored and family is not None
-                and mainloop.stores(family, dtype)
                 and generation.effective(target).tensor_rate("16bit") is not None):
             return False
         return bool(self.fits(ba, target))
