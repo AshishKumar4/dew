@@ -229,12 +229,14 @@ def _chunk_delta_forward(query, key, value, g, beta, state, chunk_size, starts, 
     Dv = value.shape[-1]
     steps = chunked(query, key, value, g, beta, chunk_size, starts=starts, delta=delta, scale=scale)
     T = S + steps.padding
-    # XLA:CPU workaround, on a CPU alone (row 1701): under a jitted scan over the
+    # XLA:CPU workaround, on a CPU alone (row 1701), kept because a CPU user's
+    # results are wrong without it (bible §5): under a jitted scan over the
     # layers the chunk loop's zero initial state came back with other values in
     # most processes (GLM-5-Next off by 8.7, 10.1 or NaN, byte-identical
-    # modules; still so on base 8c5b5b16a, test_layer_stack's scanned
-    # GLM-5-Next). The barrier materializes the zero. Remove it when XLA:CPU no
-    # longer returns an uninitialized scan carry here.
+    # modules). Without it a scanned GLM-5-Next's whole output is NaN at base
+    # 0b28dd7d7 (test_layer_stack, probe a079ff009). The barrier materializes
+    # the zero. Remove it when XLA:CPU no longer returns an uninitialized scan
+    # carry here.
     if generation.placed_platform() == 'cpu':
         state = jax.lax.optimization_barrier(state)
     grown, last, kept, last_token = _peeled_chunk_inputs(steps, value, g, beta, starts, chunk_size)
