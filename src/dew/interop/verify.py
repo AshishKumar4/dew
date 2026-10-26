@@ -37,7 +37,7 @@ import tempfile
 import warnings
 from collections.abc import Collection, Iterator, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, field, replace
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -138,9 +138,11 @@ class ModelSource:
     remote: Path | None = None
     references: Mapping[str, str] = field(default_factory=dict)
     """Each auto class's remote class reference, for the classes the `auto_map` names."""
-    revision: str | None = None
-    """The Hub commit the remote code was fetched at, which names that code; None for transformers' own
-    classes and for a local directory's code, which no commit names."""
+    pinned: sources.SourceReference | None = None
+    """Where the remote code was fetched: its repository, the Hub commit the load resolved and the folder
+    `subfolder` selected, which together name that code (a commit names the whole repository, whose
+    folders may each hold code of their own); None for transformers' own classes. A local directory's
+    reference names no commit, so no code."""
 
     def config_class(self) -> type[PretrainedConfig]:
         from transformers import AutoConfig
@@ -166,8 +168,9 @@ class ModelSource:
 
     def recordable(self) -> bool:
         """Whether a verification of these classes may be recorded for a later load (`_record_key`):
-        transformers' own, which its release names, or remote code at the commit that names it."""
-        return self.remote is None or self.revision is not None
+        transformers' own, which its release names, or remote code at the commit and folder that name
+        it."""
+        return self.remote is None or (self.pinned is not None and self.pinned.revision is not None)
 
     def _remote_class(self, auto: str):
         from transformers.dynamic_module_utils import get_class_from_dynamic_module
@@ -176,12 +179,12 @@ class ModelSource:
 
     @classmethod
     def of(cls, model_type: str, hf_config: Mapping[str, object], remote: Path | None,
-           revision: str | None = None) -> ModelSource:
-        """The classes `hf_config` names: with `remote` (the opted-in repository, fetched at `revision`
-        where it is the Hub's), each of `_REMOTE_CLASSES` its `auto_map` names is the repository's own,
-        the others transformers'. A class in another repository (transformers' `repo--module.Class`) is
-        refused: its code is neither the repository's, which the load pinned, nor named by the commit a
-        verification is recorded under (`revision`)."""
+           pinned: sources.SourceReference | None = None) -> ModelSource:
+        """The classes `hf_config` names: with `remote` (the opted-in repository's code, fetched where
+        `pinned` names), each of `_REMOTE_CLASSES` its `auto_map` names is the repository's own, the
+        others transformers'. A class in another repository (transformers' `repo--module.Class`) is
+        refused: its code is neither the repository's, which the load pinned, nor named by the reference
+        a verification is recorded under (`pinned`)."""
         held = _records.record(hf_config.get('auto_map') or {}, 'auto_map')
         if remote is None or not any(auto in held for auto in _REMOTE_CLASSES):
             return cls(model_type)
@@ -191,7 +194,7 @@ class ModelSource:
         if elsewhere:
             raise _refuse(model_type, f"its auto_map names {elsewhere} in another repository, whose code the "
                           "load neither pinned nor verifies; load a repository that holds its own code")
-        return cls(model_type, Path(remote), references, revision)
+        return cls(model_type, Path(remote), references, pinned)
 
 
 class VerifiedMappingWarning(UserWarning):
@@ -690,17 +693,17 @@ def _trained(reference: PreTrainedModel, assembly: parts.Assembly, family: decod
 
 
 def verify_mapping(hf_config: Mapping[str, object], *, remote: Path | None = None,
-                   revision: str | None = None) -> VerifiedMapping | Unmapped:
+                   pinned: sources.SourceReference | None = None) -> VerifiedMapping | Unmapped:
     """Check an unregistered model_type against transformers before its weights download.
 
     The first candidate is the decoder assembled from the registered families' parts (`PARTS`,
     `dew.interop.parts`), each read from the source's own code; the whole-family `CONVENTIONS`
     follow. `remote` is the repository whose remote code the user opted into running
     (`Pretrained.load(..., trust_remote_code=True)`): the type's config and model classes are then
-    its own, by its config's `auto_map`, and `revision` the Hub commit that code was fetched at. A
-    verification passed before, under the same config, transformers release, Dew implementation and
-    remote code commit, is read back without the probe (`_recorded`); a local directory's code, which
-    no commit names, is verified at each load.
+    its own, by its config's `auto_map`, and `pinned` the repository, Hub commit and folder that code
+    was fetched at. A verification passed before, under the same config, transformers release, Dew
+    implementation and remote code at the same commit and folder, is read back without the probe
+    (`_recorded`); a local directory's code, which no commit names, is verified at each load.
 
     transformers builds its class for the type from `shrink(hf_config)` with
     random weights (`scatter_weights`) and saves it as safetensors; each
@@ -721,7 +724,7 @@ def verify_mapping(hf_config: Mapping[str, object], *, remote: Path | None = Non
     from transformers import __version__
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
-    source = ModelSource.of(model_type, hf_config, remote, revision)
+    source = ModelSource.of(model_type, hf_config, remote, pinned)
     if model_type not in CONFIG_MAPPING and len(source.references) < len(_REMOTE_CLASSES):
         raise _refuse(model_type, f"transformers {__version__} has no class for it, and its repo's own "
                       "code is run only where the load opts in (trust_remote_code=True) and its config's "
@@ -750,8 +753,8 @@ _VERIFIED = 'verified'
 def _record_key(hf_config: Mapping[str, object], source: ModelSource) -> str:
     """What a verification holds for: the config, the transformers and torch releases, Dew's own
     implementation (every source file of `dew`, so any change of a reader, the shrink or a model
-    verifies again) and the commit the remote code was fetched at (`ModelSource.revision`), as one
-    digest."""
+    verifies again) and the repository, commit and folder the remote code was fetched at
+    (`ModelSource.pinned`), as one digest."""
     from transformers import __version__
 
     import dew
@@ -759,7 +762,8 @@ def _record_key(hf_config: Mapping[str, object], source: ModelSource) -> str:
     digest = hashlib.sha256()
     import importlib.metadata
 
-    digest.update(json.dumps({'config': hf_config, 'transformers': __version__, 'remote': source.revision,
+    remote = None if source.pinned is None else asdict(source.pinned)
+    digest.update(json.dumps({'config': hf_config, 'transformers': __version__, 'remote': remote,
                               'torch': importlib.metadata.version('torch')},
                              sort_keys=True, default=str).encode())
     package = Path(dew.__file__).parent
