@@ -126,6 +126,9 @@ def adapted_scores(model: nn.Module, variables, hidden, targets, weights, layout
     rows, length = targets.shape
     window = adaptation.window
     valid, documents = layout
+    if valid is not None:
+        # A padding slot weighs nothing, whatever weight it is given.
+        weights = jnp.where(jnp.asarray(valid, bool), weights, 0)
     runs, windows = window_keys(valid, documents, rows, length, window)
     blocks = -(-length // window)
     # The last block's slots past the row weigh nothing and belong to the row's last window.
