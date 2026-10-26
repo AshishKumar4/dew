@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.inputs import PLAIN_CALL, AttentionMetadata, MixerCall, coordinates
 from dew.nn.memory import Gate, InContextMemory, LinearMemory, MLPMemory, Objective, ResidualMemory
@@ -155,6 +155,27 @@ def test_a_memory_follows_its_papers_update(name):
     module = layer(name)
     assert_as_exact(applied(module), written(module, dtype=jnp.float32), drawn(module), f"{name} memory",
                     seeds=MEMORY_SEEDS, truth_fn=written(module, dtype=jnp.float64))
+
+
+def test_a_self_generated_target_carries_the_outer_gradient():
+    """The self-modifying memory trains through its own target: the gradients of its stream and of
+    every parameter, the value projection's included, which reaches the output only through the target
+    the network makes of each value, are the token-by-token reference's, on par against float64
+    (check 1). The inner gradient holds the target fixed; the outer one does not, so the value
+    projection's gradient is not zero."""
+    module = layer("self_modifying")
+    draw = drawn(module)
+
+    def draw_with_cotangent(seed: int):
+        cotangent = np.random.default_rng([1647, seed]).standard_normal((ROWS, LENGTH, WIDTH))
+        return *draw(seed), cotangent.astype(np.float32)
+
+    run = jax.jit(with_gradients(lambda x, params: module.apply(params, x)))
+    assert_as_exact(run, jax.jit(with_gradients(written(module, dtype=jnp.float32))), draw_with_cotangent,
+                    "self-generated gradients", seeds=MEMORY_SEEDS,
+                    truth_fn=with_gradients(written(module, dtype=jnp.float64)))
+    gradient = run(*draw_with_cotangent(0))[2]["params"]["v_proj"]["kernel"]
+    assert np.abs(np.asarray(gradient)).max() > 0
 
 
 def packed(segments: np.ndarray) -> MixerCall:
