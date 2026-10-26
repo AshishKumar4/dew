@@ -604,6 +604,26 @@ def mode_token_budget(args) -> dict:
     return {"step": int(state.step), "updates": int(state.updates), "logged": len(tracker.losses)}
 
 
+def mode_schedule_fit(args) -> dict:
+    """`--steps` of `token_trainer` on a schedule of `--tokens` read in two orders, the first stage for
+    60 committed tokens (`dew.data.schedule`): the step the run reached, the record its first stage
+    ended at in the saved position, and the parameters beside the report."""
+    from dew import position
+    from dew.data import presets, schedule
+    from dew.data.sources.tokens import TokenFiles
+
+    def ordered(seed: int):
+        windows = TokenFiles(args.tokens).shuffle(seed).repeat()
+        return windows.pipe(presets.token_windows, seq_len=args.seq_len, batch=None)
+
+    trainer = token_trainer(args.name, args.out.parent, fsdp=1, seq_len=args.seq_len)
+    state = trainer.fit(schedule([(ordered(0), 60), (ordered(1), None)]).batch(BATCH), steps=args.steps)
+    dump_params(args.out.with_suffix(".npz"), state.variables)
+    _, saved = restored_state(trainer)
+    completed = [] if saved is None else position.read(saved.encode()).completed
+    return {"step": int(as_numpy(state.step)), "stage_ends": [end for _, end in completed]}
+
+
 def mode_steps(args) -> dict:
     """`--steps` more steps of the executable fit runs, from the directory's state.
 
@@ -2326,7 +2346,7 @@ def mode_matrix(args) -> dict:
             "batches": batches}
 
 
-MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget,
+MODES = {"matrix": mode_matrix, "token_budget": mode_token_budget, "schedule_fit": mode_schedule_fit,
          "decision_publish": mode_decision_publish,
          "host_training": mode_host_training, "step_fits": mode_step_fits,
          "whole_validation": mode_whole_validation, "host_fields": mode_host_fields,

@@ -860,7 +860,8 @@ def _analyzed(
         order: Mapping[str, object] = {
             "phases": [child.order for child in lowered],
             "members": _members(source.pipelines),
-            "until_steps": list(source.until_steps),
+            # A run's phases on the step clock keep the key their plans were written with.
+            "until_steps" if source.clock == "steps" else "until_tokens": list(source.ends),
         }
     else:
         written = stages if isinstance(source, Mixture) else _written(source, stages)
