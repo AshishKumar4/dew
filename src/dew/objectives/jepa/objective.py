@@ -33,7 +33,7 @@ import optax
 from flax import linen as nn
 
 from dew.artifacts import Representations
-from dew.batch import Variables, part, thaw, under
+from dew.batch import Variables, dicts, part, thaw, under
 from dew.inputs import Field, InputSpec, unit_range
 from dew.nn.precision import accumulated, at_least_fp32
 from dew.nn.sharding import explicit_spec, whole_spec
@@ -154,8 +154,8 @@ class JepaObjective(Objective[Ratio]):
         self.mask = mask
         self.sample = sample
         self.label_key = label_key
-        self.encoder_variables = encoder_variables
-        self.predictor_variables = predictor_variables
+        self.encoder_variables = dicts(encoder_variables)
+        self.predictor_variables = dicts(predictor_variables)
         self.is_video = len(sample.shape) == 4
         self.inputs = InputSpec(sample=sample)
         self.ema = EMASpec(
