@@ -169,6 +169,7 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives import Step
     from dew.objectives.lm import LMObjective
+    from dew.objectives.routing import ExpertBalance
     from dew.optim import scale_by_qk_clip, stepped
 
     # QK-Clip bounds logits only where no QK-norm divides the kernels' scale
@@ -179,9 +180,10 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
                               mixture={"experts": 4, "top_k": 2, "bias": True,
                                        "score_function": "softmax"})
     objective = LMObjective(model, 10, head_chunks=1, mtp_weight=.3,
-                            loss_role=Role.ASSISTANT, balance_rate=.02,
-                            aux_loss_alpha=None if auxiliary is None else .2,
-                            seq_aux=auxiliary != "global", qk_stats=True)
+                            loss_role=Role.ASSISTANT,
+                            balance=ExpertBalance(balance_rate=.02,
+                                                  aux_loss_alpha=None if auxiliary is None else .2,
+                                                  seq_aux=auxiliary != "global"))
     optimizer = optax.chain(optax.clip_by_global_norm(.5), optax.sgd(.03), scale_by_qk_clip(.05))
     train = Trainer(objective, optimizer, key=jax.random.PRNGKey(7), accumulation=2,
                     dynamic_scale=True)
@@ -207,7 +209,7 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
     actual, actual_loss, _, _, accepted, _ = run(partial, data[1])
     assert bool(accepted) and int(actual.updates) == 1
     combined = jax.tree.map(lambda a, b: jnp.concatenate((a, b)), *data)
-    info = Step(jnp.array(0), jax.random.fold_in(key, 0), start)
+    info = Step(jnp.array(0), jax.random.fold_in(key, 0), start, qk_stats=True)
     (expected_loss, aux), gradient = jax.value_and_grad(
         lambda p: objective.scalar_loss({**start, "params": p}, combined, info),
         has_aux=True)(start["params"])
@@ -230,6 +232,93 @@ def test_real_lm_mtp_router_and_qk_update_matches_combined_batch(auxiliary):
         for depth, (losses, _, _) in enumerate(scores.depths, 1):
             numerator += .3 / 2 * jnp.sum(losses * roles[:, depth + 1:])
         np.testing.assert_allclose(expected_loss, numerator / jnp.sum(roles[:, 1:]), rtol=1e-6)
+
+
+def _maxima(tree):
+    """The `max_logits` leaves of a `qk` collection."""
+    return [leaf for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]
+            if any(getattr(entry, "key", None) == "max_logits" for entry in path)]
+
+
+@pytest.mark.parametrize("staged", [False, pytest.param(True, marks=pytest.mark.mesh)],
+                         ids=["whole", "staged"])
+def test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima(staged):
+    """An optimizer that holds a QK-Clip, composed however it is (`clips_qk`), has the run ask its
+    objective for the attention logit maxima (`Step.qk_stats`), a masked-diffusion objective's as an
+    LM's, and its update over two pooled microbatches is `scale_by_qk_clip`'s at both microbatches'
+    per-head maximum, bit for bit (the step's own update is zero). The second microbatch reads only a
+    token whose embedding, as the mask token's, is zero, so each of its logits is 0, which the run
+    shows reading it first; the first's maxima are the window's after it. A threshold no head reaches
+    moves nothing. Pipelined over two stages, each layer sows its geometry once a microbatch, and the
+    clip reads it as one count (`compact_qk`)."""
+    from dew.diffusion.discrete import MDLM
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.objectives.diffusion.masked import MaskedDiffusionObjective
+    from dew.optim import scale_by_qk_clip, stepped
+    from dew.training import MeshSpec
+
+    # QK-Clip bounds logits only where no QK-norm divides the kernels' scale back out.
+    model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=2, num_heads=2, mlp_features=16,
+                              max_seq_len=8, causal=False, qk_norm=False)
+    silent, mask = 14, 15
+    variables = model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32))
+    table = variables["params"]["embed_tokens"]["embedding"]
+    variables = {**variables, "params": {**variables["params"], "embed_tokens": {
+        "embedding": table.at[jnp.asarray([silent, mask])].set(0.0)}}}
+    objective = MaskedDiffusionObjective(model, MDLM(mask_id=mask)(), seq_len=8, head_chunks=1,
+                                         variables=variables, ema_decay=None)
+    rows = 2 * jax.device_count()
+    spoken = {"text": jnp.asarray(np.random.default_rng(6).integers(0, silent, size=(rows, 8)), jnp.int32)}
+    quiet = {"text": jnp.full((rows, 8), silent, jnp.int32)}
+    placement = {"mesh": MeshSpec(fsdp=2, stage=2), "microbatches": 2} if staged else {}
+
+    def clip(threshold):
+        return optax.chain(optax.sgd(0.0), scale_by_qk_clip(threshold))
+
+    def trained(threshold, first, second):
+        train = Trainer(objective, clip(threshold), key=jax.random.PRNGKey(3), accumulation=2, **placement)
+        initial = train.initial_state()
+        # The step consumes the state: what the expectation reads of it is taken first.
+        start = jax.tree.map(np.asarray, initial.variables["params"])
+        opt_state = jax.tree.map(np.asarray, initial.opt_state)
+        run = train.compile(initial, first)
+        partial, *_ = run(initial, first)
+        pooled = jax.tree.map(np.asarray, partial.accumulation.qk_stats)
+        final, *_ = run(partial, second)
+        assert int(final.updates) == 1
+        return start, opt_state, pooled, jax.tree.map(np.asarray, final.variables["params"])
+
+    _, _, heard, _ = trained(.05, quiet, spoken)
+    assert all(np.all(peak == 0) for peak in _maxima(heard))
+    start, opt_state, pooled, final = trained(.05, spoken, quiet)
+    assert max(float(np.max(peak)) for peak in _maxima(pooled)) > .05
+    both = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: np.maximum(leaf, 0) if any(getattr(entry, "key", None) == "max_logits"
+                                                      for entry in path) else leaf, pooled)
+    zero = jax.tree.map(np.zeros_like, start)
+    updates, after = jax.jit(clip(.05).update)(zero, opt_state, start, qk_stats=both)
+    expected = jax.tree.map(np.asarray, stepped(start, updates, opt_state, after))
+    jax.tree.map(np.testing.assert_array_equal, final, expected)
+    assert any(not np.array_equal(after, before) for after, before in
+               zip(jax.tree.leaves(final), jax.tree.leaves(start), strict=True))
+    start, _, _, still = trained(1e30, spoken, quiet)
+    jax.tree.map(np.testing.assert_array_equal, still, start)
+
+
+def test_a_run_whose_objective_returns_no_maxima_is_refused_under_a_qk_clip():
+    """An optimizer that clips by the attention logit maxima is refused a step whose objective
+    returns none (`Aux.qk_stats`), which the same run without the clip takes: the clip would leave
+    the logits it bounds unbounded with no sign of it, as a decision run's did."""
+    from dew.optim import scale_by_qk_clip
+
+    def stepped(optimizer):
+        train = Trainer(Tiny(), optimizer, key=jax.random.PRNGKey(0))
+        initial = train.initial_state()
+        return train.compile(initial, batches()[0])(initial, batches()[0])
+
+    stepped(optax.sgd(.1))
+    with pytest.raises(ValueError):
+        stepped(optax.chain(optax.sgd(.1), scale_by_qk_clip(1.)))
 
 
 def test_replay_preserves_half_precision_cotangents_and_integer_support():
@@ -375,7 +464,7 @@ def test_a_clipped_run_stores_its_stepped_kernels_times_the_clip():
                               max_seq_len=16, qk_norm=False)
 
     def objective_of(of):
-        return LMObjective(of, 10, head_chunks=1, loss_role=Role.ASSISTANT, qk_stats=True)
+        return LMObjective(of, 10, head_chunks=1, loss_role=Role.ASSISTANT)
 
     constant = optax.stateless(lambda updates, _: jax.tree.map(lambda g: jnp.full_like(g, step), updates))
     train = Trainer(objective_of(model), optax.chain(constant, scale_by_qk_clip(tau)),
@@ -413,7 +502,7 @@ def test_a_clipped_run_stores_its_stepped_kernels_times_the_clip():
     def paper(of):
         def clipped(params, tokens):
             # The logits the step's own loss sows, on the weights before the step.
-            info = Step(jnp.array(0), jax.random.PRNGKey(0), None)
+            info = Step(jnp.array(0), jax.random.PRNGKey(0), None, qk_stats=True)
             _, aux = objective_of(of).loss({**host.variables, "params": params}, batch_of(tokens), info)
             s_max = jnp.max(aux.qk_stats["layers_0"]["self_attn"]["max_logits"][0], axis=0)
             gamma = clip_scale(s_max, tau)

@@ -54,10 +54,12 @@ class ValidTargets:
         from dew.batch import scored_targets
 
         segments = element.get(f"{self.field}_segment_ids")
+        blocks = element.get(f"{self.field}_block_groups")
         roles = None if self.role is None else np.asarray(element[f"{self.field}_roles"])[None]
         return int(scored_targets(np, np.asarray(element[self.field])[None], self.pad_id, None,
                                   None if segments is None else np.asarray(segments)[None],
-                                  roles=roles, role=self.role).sum())
+                                  roles=roles, role=self.role,
+                                  blocks=None if blocks is None else np.asarray(blocks)[None]).sum())
 
 
 @dataclasses.dataclass(frozen=True)
@@ -87,7 +89,7 @@ _RULE = ("_dew_target_role", "_dew_target_pad")
 """The fields a counted record carries its count's rule in, each where the rule sets it."""
 
 
-_COUNTED = ("text", "text_segment_ids", "text_roles")
+_COUNTED = ("text", "text_segment_ids", "text_roles", "text_block_groups")
 """The fields a record's targets are counted from (`ValidTargets`), as they are first named."""
 
 _BOUND = "_dew_target_fields"
@@ -115,15 +117,19 @@ def rebound(element: Batch, kept: Batch, renamed: Mapping[str, str]) -> Batch:
 
 
 def targets_changed(given: Batch, output: Batch) -> bool:
-    """Whether a step that made `output` of `given` changed a field its targets are counted from:
-    each read where the record names it before the step and where `output` names it after
-    (`rebound`), so a projection that moves a field, or names another field as it was, changes
-    nothing; a field the step removed pins the count, which nothing it still holds could give
-    again."""
-    pairs = [(before, after) for before, after in zip(_bound(given), _bound(output), strict=True)
-             if before in given]
-    return ("" not in _bound(output) and all(after in output for _, after in pairs)
-            and any(output[after] is not given[before] for before, after in pairs))
+    """Whether a step that made `output` of `given` changed what its targets are counted from: a field the
+    count reads that `given` held and `output` holds as a different array, or a counted field that `output`
+    holds and `given` did not, as a map adding a row's blocks does. Each is read where the record names it
+    before the step and where `output` names it after (`rebound`), so a projection that moves a field, or
+    names another field as it was, changes nothing; a field the step removed pins the count, which nothing it
+    still holds could give again."""
+    pairs = list(zip(_bound(given), _bound(output), strict=True))
+    held = [(before, after) for before, after in pairs if before in given]
+    if "" in _bound(output) or any(after not in output for _, after in held):
+        return False
+    replaced = any(output[after] is not given[before] for before, after in held)
+    arrived = any(before not in given and after in output for before, after in pairs)
+    return replaced or arrived
 
 
 def recounted(given: Batch, output: Batch) -> Batch:
@@ -179,7 +185,8 @@ class CountRule:
                 f"drop the roles {self.roles!r}; keep them among the stage's fields")
         rule = {name: value for name, value in zip(_RULE, (self.role, self.pad_id), strict=True)
                 if value is not None}
-        held = {**window, **rule, _BOUND: (field, f"{field}_segment_ids", self.roles or f"{field}_roles")}
+        held = {**window, **rule, _BOUND: (field, f"{field}_segment_ids", self.roles or f"{field}_roles",
+                                          f"{field}_block_groups")}
         return {**held, "_dew_valid_targets": _scored(held)}
 
 
