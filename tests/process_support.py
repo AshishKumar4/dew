@@ -98,7 +98,8 @@ def start_process(command: Sequence[str], devices: int, *,
 
 def spawn(mode: str, out: Path, processes: int = 1, process_id: int = 0,
           coordinator: str | None = None, devices: int | None = None, *,
-          script: Path = WORKER, **flags) -> subprocess.Popen[str]:
+          script: Path = WORKER, environment: Mapping[str, str] | None = None,
+          **flags) -> subprocess.Popen[str]:
     command = [sys.executable, str(script), mode, "--out", str(out),
                "--processes", str(processes), "--process-id", str(process_id)]
     if coordinator is not None:
@@ -109,7 +110,8 @@ def spawn(mode: str, out: Path, processes: int = 1, process_id: int = 0,
             command.append(flag)
         elif value is not None:
             command += [flag, str(value)]
-    return start_process(command, MESH_DEVICES // processes if devices is None else devices)
+    return start_process(command, MESH_DEVICES // processes if devices is None else devices,
+                         environment=environment)
 
 
 def terminate(process: subprocess.Popen[str]) -> None:
