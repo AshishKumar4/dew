@@ -31,7 +31,6 @@ import numpy as np
 import optax
 
 from dew.hashing import fmix32
-from dew.nn.kernels.generation import backend
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import LogicalAxes, declarations, declared_axes
 
@@ -424,39 +423,19 @@ NEWTON_SCHULZ = (3.4445, -4.7750, 2.0315)
 """Muon's quintic Newton-Schulz coefficients, Jordan's (modded-nanogpt), optax's default."""
 
 
-def newton_schulz(update: jax.Array, steps: int = 5,
-                  dimension_numbers: optax.contrib.MuonDimensionNumbers | None = None) -> jax.Array:
-    """`update` orthogonalized by Muon's quintic Newton-Schulz: each matrix over its Frobenius norm (plus
-    1e-8), the wide way round, then `a X + (b A + c A A) X` with `A = X X^T`, `steps` times (`NEWTON_SCHULZ`).
-
-    A rank-2 update is one matrix, its rows the reduction axis (a Linen kernel's); `dimension_numbers` name
-    another update's reduction and output axes as Muon's do, its other axes a stack of matrices. On the
-    CPU each matrix iterates alone (`jax.lax.map`): batched, XLA:CPU's products leave the iteration, which
-    grows small singular values about 3.44 times a step, ten times further from float64; a GPU's batched
-    ones round as one matrix's (an A100: 5.2e-6 either way), and keep the stack in one program (ledger 1650).
-    """
+def _orthogonalized(update: jax.Array, steps: int,
+                    dimension_numbers: optax.contrib.MuonDimensionNumbers | None) -> jax.Array:
+    """`update` orthogonalized by Muon's `steps` quintic Newton-Schulz iterations (`NEWTON_SCHULZ`), optax's
+    own: its Muon transform with no momentum (`scale_by_muon`, `beta` 0 and no Nesterov step) hands back
+    the update it is given orthogonalized, bit for bit its `orthogonalize_via_newton_schulz`, which optax
+    0.2.8 does not export. A leaf with no `dimension_numbers` is one matrix, its rows the reduction axis
+    (a Linen kernel's), its other axes a stack of such matrices."""
     numbers = optax.contrib.MuonDimensionNumbers() if dimension_numbers is None else dimension_numbers
-    reduction, output = (tuple(int(axis) % update.ndim for axis in np.atleast_1d(axes))
-                         for axes in (numbers.reduction_axis, numbers.output_axis))
-    stacked = tuple(axis for axis in range(update.ndim) if axis not in reduction + output)
-    order = stacked + reduction + output
-    sizes = tuple(math.prod(update.shape[axis] for axis in axes) for axes in (stacked, reduction, output))
-    def orthogonalized(matrix):
-        return _newton_schulz_matrix(matrix, steps)
-
-    stack = update.transpose(order).reshape(sizes)
-    matrices = jax.lax.map(orthogonalized, stack) if backend() == "cpu" else jax.vmap(orthogonalized)(stack)
-    return matrices.reshape([update.shape[axis] for axis in order]).transpose(np.argsort(order))
-
-
-def _newton_schulz_matrix(matrix: jax.Array, steps: int) -> jax.Array:
-    a, b, c = (jnp.asarray(value, matrix.dtype) for value in NEWTON_SCHULZ)
-    wide = matrix.T if matrix.shape[0] > matrix.shape[1] else matrix
-    wide = wide / (jnp.linalg.norm(wide) + jnp.asarray(1e-8, matrix.dtype))
-    for _ in range(steps):
-        gram = wide @ wide.T
-        wide = a * wide + (b * gram + c * gram @ gram) @ wide
-    return wide.T if matrix.shape[0] > matrix.shape[1] else wide
+    muon = optax.contrib.scale_by_muon(NEWTON_SCHULZ, steps, beta=0.0, nesterov=False,
+                                       weight_dimension_numbers=numbers)
+    orthogonal, _ = muon.update(update, muon.init(update))
+    assert isinstance(orthogonal, jax.Array), "one array's update is an array"
+    return orthogonal
 
 
 class M3State(NamedTuple):
@@ -478,7 +457,7 @@ def scale_by_m3(*, beta1: float, beta2: float, beta3: float, alpha: float, eps: 
 
     Each update adds `beta1 g` to the fast momentum `M1` and `beta2 g**2` to the second moment `V`, the
     algorithm's sums, neither decaying, and orthogonalizes `M1` by `ns_steps` Newton-Schulz iterations,
-    Muon's (`newton_schulz`, each leaf shaped by its `weight_dimension_numbers`, a tree or a function of
+    Muon's (`_orthogonalized`, each leaf shaped by its `weight_dimension_numbers`, a tree or a function of
     the updates as Muon's are; a leaf with none is one matrix, its rows the reduction). Its state is
     kept in float32 at least (`at_least_fp32`), so a bfloat16 matrix's momenta and gradients sum without
     rounding to its width, and the directions come back in that dtype. Once every
@@ -493,10 +472,10 @@ def scale_by_m3(*, beta1: float, beta2: float, beta3: float, alpha: float, eps: 
 
     def orthogonalized(moment):
         if weight_dimension_numbers is None:
-            return jax.tree.map(lambda leaf: newton_schulz(leaf, ns_steps), moment)
+            return jax.tree.map(lambda leaf: _orthogonalized(leaf, ns_steps, None), moment)
         numbers = (weight_dimension_numbers(moment) if callable(weight_dimension_numbers)
                    else weight_dimension_numbers)
-        return jax.tree.map(lambda leaf, shape: newton_schulz(leaf, ns_steps, shape), moment, numbers,
+        return jax.tree.map(lambda leaf, shape: _orthogonalized(leaf, ns_steps, shape), moment, numbers,
                             is_leaf=lambda node: node is None)
 
     def init_fn(params) -> M3State:
@@ -771,7 +750,7 @@ def int8_moments(b1: float, b2: float, eps: float, eps_root: float, nesterov: bo
                          if held(leaf) else None, params))
 
     def encoded(moment, part, signed, salt):
-        return (moment, None) if part[1] is None else quantized(moment, maps[signed], block)
+        return (moment, None) if part[1] is None else quantized(moment, block, signed=signed)
 
     return _stored_moments(b1, b2, eps, eps_root, nesterov, _Store(
         zeros=zeros,
@@ -796,18 +775,49 @@ def dequantized(codes: jax.Array, scales: jax.Array, values: jax.Array, block: i
     return (blocked * scales[..., None]).reshape(fractions.shape)
 
 
-def quantized(moment: jax.Array, values: jax.Array, block: int) -> tuple[jax.Array, jax.Array]:
+CODE_WINDOW = 6
+"""The codes around a value's estimated one (`_estimated_codes`) that `quantized` compares it with: the
+estimate is within two of the code below the value, whose search they settle."""
+
+
+def _estimated_codes(fractions: jax.Array, *, signed: bool) -> jax.Array:
+    """Where each of `fractions` falls in `dynamic_map(signed=signed)`, to within two codes: its decade
+    by its base-10 logarithm, and its place among the decade's evenly spaced values, the map's own
+    layout (a decade `e` of 0 to 6 holds `2 ** e` values each side of 0, `2 ** (e + 1)` unsigned, the
+    means of as many even steps from a tenth of the decade's top to its top)."""
+    magnitude = jnp.abs(fractions)
+    decade = jnp.clip(jnp.floor(jnp.log10(magnitude)) + 7, 0, 6).astype(jnp.int32)
+    count = jnp.left_shift(1, decade + (0 if signed else 1))
+    top = jnp.power(jnp.float32(10), (decade - 6).astype(jnp.float32))
+    step = jnp.float32(0.9) / count.astype(jnp.float32)
+    place = jnp.clip(jnp.floor((magnitude / top - jnp.float32(0.1)) / step), 0, count - 1).astype(jnp.int32)
+    if not signed:
+        return count - 1 + place  # past 0 and the 2 ** (e + 1) - 2 values of the decades below
+    # 0 is code 127, each decade's positive values follow the 2 ** e - 1 of the decades below it, and
+    # its negative values mirror them below 0.
+    return jnp.where(fractions < 0, 127 - count - place, 127 + count + place)
+
+
+def quantized(moment: jax.Array, block: int, *, signed: bool) -> tuple[jax.Array, jax.Array]:
     """`moment` in 8 bits, its codes and its blocks' scales: each block of `block` values along its last
-    axis scaled by its largest magnitude (at least 1e-12), and each value coded by the nearest of `values`,
-    ascending, a value halfway between two taking the larger, as torchao's `quantize_8bit_with_qmap` does."""
+    axis scaled by its largest magnitude (at least 1e-12), and each value coded by the nearest value of
+    `dynamic_map(signed=signed)`, a value halfway between two taking the larger, as torchao's
+    `quantize_8bit_with_qmap` does. The code below each value is found among the `CODE_WINDOW` around
+    its estimate (`_estimated_codes`), each compared apart from the others: a search of the whole map
+    ran its eight halvings one after another (docs/performance.md)."""
+    values = jnp.asarray(dynamic_map(signed=signed))
+    last = values.shape[0] - 1
     blocked = moment.reshape(*moment.shape[:-1], -1, block)
     scales = jnp.maximum(jnp.max(jnp.abs(blocked), axis=-1), 1e-12)
     fractions = (blocked / scales[..., None]).reshape(moment.shape)
-    # Unrolled, the search fuses with the rest of the quantization: its default loop ran each of its eight
-    # halvings over the whole moment, and took a step's peak above fp32 state's (docs/performance.md).
-    below = jnp.clip(jnp.searchsorted(values, fractions, side="right", method="scan_unrolled") - 1, 0,
-                     values.shape[0] - 1)
-    above = jnp.minimum(below + 1, values.shape[0] - 1)
+    # The codes at most each value: those of the window's that are, past the codes below it. One code at
+    # a time, the comparisons fuse with the coding; a window axis held six of each value's at once.
+    first = _estimated_codes(fractions, signed=signed) - CODE_WINDOW // 2 - 1
+    below = first
+    for code in (first + offset for offset in range(1, CODE_WINDOW + 1)):
+        below = below + ((code < 0) | ((code <= last) & (values[jnp.clip(code, 0, last)] <= fractions)))
+    below = jnp.clip(below, 0, last)
+    above = jnp.minimum(below + 1, last)
     nearest = jnp.where(fractions - values[below] >= (values[above] - values[below]) * 0.5, above, below)
     return nearest.astype(jnp.uint8), scales
 
@@ -1531,4 +1541,4 @@ class Exponential(ScheduleBase):
 
 __all__ = ["NEWTON_SCHULZ", "BoundsState", "Cosine", "DeltaState", "Exponential", "Linear", "M3State",
            "OneCycle", "ParamGroup", "Power", "PowerProfilesState", "PowerTail", "QKClipState",
-           "ScheduleBase", "delta_gradient_descent", "newton_schulz", "scale_by_m3", "stepped"]
+           "ScheduleBase", "delta_gradient_descent", "scale_by_m3", "stepped"]
