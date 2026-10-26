@@ -22,8 +22,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.coordination import stop_at_exit
-from dew.objectives.base import Variables
+from dew._coordination import stop_at_exit
+from dew.batch import Variables
 
 
 class Timed[T](Future[T]):
@@ -117,7 +117,7 @@ class Engine:
 
     A request's callback runs on the serving thread, inside its kind's step, and may `reload` or
     `close` from there. A program that ends without `close` stops the thread after the step in
-    progress (`dew.coordination.stop_at_exit`)."""
+    progress (`dew._coordination.stop_at_exit`)."""
 
     def __init__(self, *kinds: Kind, name: str = "serving-engine") -> None:
         if not kinds:

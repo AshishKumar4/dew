@@ -32,13 +32,14 @@ import jax
 import tyro
 
 import dew
-from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
+from dew.config import ObjectiveConfig, TrainerConfig
 from dew.config.lm import LMRunConfig
 from dew.data import ByteTokenizer, Files, HFTokenizer, Hub, Loading, presets, text
 from dew.data.compile import iterate
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
 from dew.objectives.lm import Perplexity
-from dew.optim import Cosine
+from dew.optim import Cosine, OptimConfig
+from dew.registry import ModelConfig
 from dew.training import Evaluation, MeshSpec
 
 SMOKE_TEXT = (
@@ -124,7 +125,8 @@ def main(config: Config) -> Path:
             "dtype": "float32" if config.smoke else "bfloat16"}),
         data=data, validation=validation, tokenizer=config.tokenizer,
         objective=ObjectiveConfig("masked_diffusion", {
-            "steps": config.sample_steps, "ema_decay": 0.9 if config.smoke else 0.999}),
+            "steps": config.sample_steps, "ema_decay": 0.9 if config.smoke else 0.999,
+            "eos_token_ids": () if tokenizer.eos_id is None else (tokenizer.eos_id,)}),
         optim=OptimConfig(weight_decay=0.03, clip_grads=1.0, learning_rate=Cosine(
             peak_value=config.learning_rate, warmup_steps=config.warmup_steps,
             end_value=config.learning_rate / 10)),
@@ -137,7 +139,6 @@ def main(config: Config) -> Path:
     # task its objective saved, and both the score and the samples read it.
     run_dir = config.out / "checkpoints" / name
     task = dew.pipeline(str(run_dir))
-    task = replace(task, eos_token_ids=() if tokenizer.eos_id is None else (tokenizer.eos_id,))
     scored = Evaluation.run(MaskedDiffusionObjective(task.model, task.process, config.sequence_length),
                             task.variables, whole, key=jax.random.key(0), metrics=[Perplexity()],
                             loss=True)

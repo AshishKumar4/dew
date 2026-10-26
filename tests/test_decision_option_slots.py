@@ -21,6 +21,7 @@ from flax import linen as nn
 from reference_error import assert_as_exact, widened, with_gradients
 from safetensors.numpy import load_file
 
+from dew.batch import VALID_ROWS, part, thaw
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer, HFTokenizer
 from dew.decision import (
@@ -33,11 +34,11 @@ from dew.decision import (
     Question,
     Specials,
 )
-from dew.decision.joint_checkpoint import StoredJointHead
 from dew.decision.layout import compacted
 from dew.decision.task import laid_out
+from dew.interop import Pretrained
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import VALID_ROWS, Step, part, thaw
+from dew.objectives.base import Step
 
 FIXTURES = Path(__file__).parent / "fixtures"
 TINY = FIXTURES / "joint_checkpoint" / "tiny"
@@ -58,7 +59,7 @@ def stored_batch():
         length = inputs.tokens.shape[1]
         padded = np.stack([np.pad(states[case], ((0, length - len(states[case])), (0, 0))) for case in CASES])
     table = load_file(BACKBONE / "model.safetensors")["lm_head.weight"]
-    return StoredJointHead.load(TINY, attention_impl="xla"), table, inputs, padded
+    return Pretrained.load(TINY, dtype="float32", attention_impl="xla"), table, inputs, padded
 
 
 def with_slots(inputs: DecisionInputs, slots: int | None) -> DecisionInputs:
@@ -93,14 +94,14 @@ def test_the_stored_joint_head_scores_compacted_options_as_it_scores_the_grid():
 
     def scores(slots):
         laid = with_slots(inputs, slots)
-        return np.asarray(loaded.head.apply({"params": loaded.params}, states, laid, table))
+        return np.asarray(loaded.model.apply(loaded.variables, states, laid, table))
 
     grid, fewest, more = scores(None), scores(most), scores(most + 5)
     real = np.asarray(inputs.options)
     for compact in (fewest, more):
         np.testing.assert_allclose(compact[real], grid[real], rtol=0, atol=1e-5 * np.abs(grid[real]).max())
         assert not np.any(compact[~real])
-    drawn = [jax.eval_shape(loaded.head.init, jax.random.key(0), states, with_slots(inputs, slots), table)
+    drawn = [jax.eval_shape(loaded.model.init, jax.random.key(0), states, with_slots(inputs, slots), table)
              for slots in (None, most, most + 5)]
     assert drawn[0] == drawn[1] == drawn[2]
 

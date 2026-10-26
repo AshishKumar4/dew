@@ -11,9 +11,9 @@ from affine_run import Regression, dataset
 from model_support import largest_difference
 
 from dew.checkpoints import Checkpoints, Ranking
-from dew.config import OptimConfig, RunConfig
+from dew.config import RunConfig
 from dew.objectives.base import EMASpec
-from dew.optim import PowerProfilesState, power_profiles
+from dew.optim import OptimConfig, PowerProfilesState, power_profiles
 from dew.training import Layout, Trainer
 from dew.training.posthoc import coefficients, exponent, power_decay
 

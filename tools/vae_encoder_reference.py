@@ -49,8 +49,8 @@ def walk(encoder, image, probe, dtype):
 
 
 def main():
-    from torch_precision import widened
     from reference_source import saved_fixture
+    from torch_precision import widened
 
     if len(sys.argv) != 2:
         raise SystemExit(__doc__)

@@ -11,7 +11,7 @@ given it as `[V, D]` rows.
 
 import functools
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from typing import ClassVar, NamedTuple
 
 import jax
@@ -20,7 +20,8 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew import records
+from dew import _records
+from dew._records import JSON
 from dew.decision.layout import DecisionInputs, Encoded
 from dew.decision.questions import KINDS, Choice, Noul, Score
 from dew.nn.activations import gelu_exact_torch
@@ -35,8 +36,7 @@ from dew.nn.mixers import AttentionMixer
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import accumulated, at_least_fp32, capped_logits, scaled_logits
 from dew.nn.scatter import DROPPED
-from dew.records import JSON
-from dew.registry import from_record, import_path, imported, record_fields
+from dew.registry import Record, component, from_record, import_path, record_fields
 
 
 def _layer_norm(dtype: Dtype | None, name: str) -> nn.Module:
@@ -80,27 +80,21 @@ class Head(nn.Module):
             raise ValueError("this head reads one question a row; lay the rows out with a "
                              "QuestionLayout or use a joint head")
 
-    def record(self) -> JSON:
-        """Return the head as a run records it: its class by import path (`dew.registry`) and its
-        fields but the width, which the backbone it reads gives, so any head reloads, one of a
-        package the run trusts too."""
+    def record(self) -> Record:
+        """Return the head as a run records it, the registry's class record (`dew.registry.component`):
+        its class by import path and its fields but the width, which the backbone it reads gives, so
+        any head reloads, one of a package the run trusts too."""
+        # The class record `to_record(self, Head)` writes, its fields the registry's but for the width.
         fields = record_fields(self, type(self))
         del fields[self.width_field]
-        return {"name": import_path(type(self)), "fields": fields}
+        return {"class": import_path(type(self)), "fields": fields}
 
     @staticmethod
-    def from_record(record: JSON, width: int) -> "Head":
+    def from_record(record: JSON | Mapping[str, object], width: int) -> "Head":
         """Rebuild the head a run recorded, reading states `width` wide, in the numerics it
-        recorded. A record of an earlier run names its head by class name alone, one of this
-        module's, and is read as that class's path."""
-        held = records.record(record, "head")
-        name = records.text(held.get("name"), "head.name")
-        path = name if ":" in name else f"{__name__}:{name}"
-        head = imported(path)
-        if not (isinstance(head, type) and issubclass(head, Head)):
-            raise ValueError(f"a run's head is a decision head (`Head`), not {path!r}")
-        fields = {**records.record(held.get("fields"), "head.fields"), head.width_field: width}
-        return from_record(head, fields)
+        recorded. An earlier run's record is read through `dew.inference.tasks.earlier_shapes`."""
+        head, fields = component(Head, _records.record(record, "head"))
+        return from_record(head, {**fields, head.width_field: width})
 
 
 class DecisionHead(Head):
@@ -611,14 +605,14 @@ class SlotReadout(Head):
         if held < labels:
             raise ValueError(f"{held} slot rows hold fewer than the {labels} labels")
         real = min(width, labels)
-        ids = jnp.asarray(self.label_ids, jnp.int32)
+        ids = np.asarray(self.label_ids, np.int32)
         drawn_dtype = _wide(jnp.float32 if table is None else table.dtype, self.dtype)
 
         def drawn(key):
             if table is None:
                 rows = jax.random.normal(key, (labels, self.features), drawn_dtype) * self.features ** -0.5
             else:
-                rows = jnp.take(table, ids, axis=0).astype(drawn_dtype)
+                rows = table.take(ids, axis=0).astype(drawn_dtype)
             return jnp.pad(rows, ((0, held - labels), (0, 0)))
 
         slots = self.param("slots", drawn)

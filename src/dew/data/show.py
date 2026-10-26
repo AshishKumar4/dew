@@ -10,7 +10,7 @@ from typing import Protocol, runtime_checkable
 
 import numpy as np
 
-from dew.data.dataset import Batch
+from dew.batch import Batch
 from dew.data.pipeline import (
     Batched,
     BatchStage,

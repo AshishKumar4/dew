@@ -60,9 +60,9 @@ def refused_runs(args) -> dict:
     import jax
     from jax.sharding import NamedSharding, PartitionSpec as P
 
+    from dew.batch import freeze
     from dew.checkpoints import Checkpoints, averaged
-    from dew.coordination import PeerFailure
-    from dew.objectives.base import freeze
+    from dew.distributed import PeerFailure
     from dew.training import Layout, MeshSpec
 
     trainer = token_trainer("start", args.run_dir, args.fsdp_size, args.seq_len)

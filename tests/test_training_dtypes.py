@@ -84,8 +84,8 @@ def test_family_embedding_gradients_sum_repeated_ids_in_master_precision(family)
     cotangents. Its fp32 master retains contributions lost by accumulation in bf16."""
     from dew.decision.head import DecisionHead, JointSchemaHead
     from dew.nn.text_encoders import CLIPTextTransformer, CLIPVisionTransformer
-    from dew.nn.vision.gemma3n import Gemma3nProjectorModule
-    from dew.nn.vision.siglip import SiglipVision, SiglipVisionTransformer
+    from dew.nn.vision.gemma3n import Gemma3nProjector
+    from dew.nn.vision.siglip import SiglipVision
 
     dtype = jnp.bfloat16
     clip = CLIPTextTransformer(vocab_size=3, hidden_size=2, num_layers=0, num_heads=1,
@@ -95,11 +95,11 @@ def test_family_embedding_gradients_sum_repeated_ids_in_master_precision(family)
         "clip-position": (clip, lambda module, ids: module.position_embedding(ids), "position_embedding"),
         "clip-vision": (CLIPVisionTransformer(hidden_size=2, num_layers=0, num_heads=1,
                                              image_size=2, patch_size=1, dtype=dtype),
-                        lambda module, ids: module.position_embedding(ids), "position_embedding"),
-        "siglip": (SiglipVisionTransformer(SiglipVision(hidden_size=2, num_layers=0, num_heads=1,
-                                                        image_size=2, patch_size=1), dtype=dtype),
-                   lambda module, ids: module.position_embedding(ids), "position_embedding"),
-        "gemma3n": (Gemma3nProjectorModule(2, 2, vocab_size=3, dtype=dtype),
+                        lambda module, ids: module.trunk.position_table(ids), "position_table"),
+        "siglip": (SiglipVision(hidden_size=2, num_layers=0, num_heads=1,
+                                image_size=2, patch_size=1).build().clone(dtype=dtype),
+                   lambda module, ids: module.position_table(ids), "position_table"),
+        "gemma3n": (Gemma3nProjector(2, 2, vocab_size=3, dtype=dtype),
                     lambda module, ids: module.embedding(ids), "embedding"),
         "decision": (DecisionHead(2, layers=0, dtype=dtype),
                      lambda module, ids: module.type_embedding(ids), "type_embedding"),

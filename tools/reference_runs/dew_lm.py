@@ -119,13 +119,12 @@ def build(args: argparse.Namespace) -> Run:
 
     from work import measure
 
-    from dew.config import OptimConfig
+    from dew.batch import coordinates
     from dew.interop import Pretrained
     from dew.nn.backbones.causal_transformer import CausalTransformer
-    from dew.nn.inputs import coordinates
     from dew.nn.multimodal import MultimodalTransformer
     from dew.objectives.lm import TEXT_KEY, LMObjective
-    from dew.optim import Cosine, ParamGroup
+    from dew.optim import Cosine, OptimConfig, ParamGroup
     from dew.training import MeshSpec, Trainer
     from dew.training.distributed import batch_shardings
     from dew.training.planning import Timer

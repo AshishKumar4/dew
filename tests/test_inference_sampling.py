@@ -174,9 +174,10 @@ def test_a_source_binds_a_chain_only_for_controls_its_policy_lacks(task):
     assert bound.logits is None and bound.n == 2
     assert (bound.sampling.repetition_penalty, bound.sampling.typical_p) == (2.0, 0.9)
     rare = replace(altered, generation_config={**altered.generation_config, "epsilon_cutoff": 0.01})
+    # Its unset top_k samples the top 50, as transformers' chain does (`TRANSFORMERS_TOP_K`).
     assert [type(transform) for transform in rare.text_generation().logits] == [
-        decoding.RepetitionPenalty, decoding.Temperature, decoding.TopP, decoding.MinP, decoding.Typical,
-        decoding.EpsilonCutoff]
+        decoding.RepetitionPenalty, decoding.Temperature, decoding.TopK, decoding.TopP, decoding.MinP,
+        decoding.Typical, decoding.EpsilonCutoff]
     override = rare.text_generation(sampling=Sampling(temperature=0))
     assert override.logits is None and override.sampling.repetition_penalty == 1.0 and override.n == 2
     plain = override([[1, 2]], 6, key=jax.random.key(1), n=1)
@@ -224,6 +225,20 @@ def test_a_call_policy_takes_the_tasks_eos_and_pad_ids(task):
     np.testing.assert_array_equal(drawn.tokens[0, 4:], 11)
     named = bound([[1, 2]], 4, key=1, sampling=Sampling(temperature=0, eos_token_ids=12, pad_token_id=0))
     assert named.lengths.tolist() == [4] and not named.terminated.any()
+
+
+@pytest.mark.parametrize(("stated", "cut"), [({}, 50), ({"top_k": None}, 50), ({"top_k": 0}, None),
+                                             ({"top_k": 7}, 7)], ids=["absent", "null", "zero", "seven"])
+def test_a_sampled_source_cuts_to_the_top_k_transformers_generate_samples_from(task, stated, cut):
+    """A sampled source that leaves top_k unset samples from transformers' top 50, as its `generate`
+    does; a stated 0 asks for no cut, and any other count is its cut."""
+    from pathlib import Path
+
+    from dew.interop.pretrained import PretrainedDecoder
+
+    source = PretrainedDecoder(task.model, task.variables, None, {}, Path("."), {},
+                               generation_config={"do_sample": True, **stated})
+    assert source.text_generation().sampling.top_k == cut
 
 
 @pytest.mark.parametrize("changed", [{"temperature": True}, {"top_p": np.True_}, {"top_k": True},

@@ -36,7 +36,7 @@ if TYPE_CHECKING:
     from jax.typing import ArrayLike
     from transformers import PreTrainedConfig, PreTrainedTokenizerBase
 
-    from dew.data.dataset import Batch
+    from dew.batch import Batch
     from dew.data.pipeline import Dataset
     from dew.data.sources.base import Read
 

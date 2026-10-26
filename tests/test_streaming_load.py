@@ -52,6 +52,23 @@ def test_a_transposed_read_across_many_tiles_is_the_strided_copy_bit_for_bit(dty
                   (slice(None), slice(3, 4), slice(0, 6))]:
         np.testing.assert_array_equal(small.read(index), whole_small[index])
 
+    for transposed, shape in ((False, (10, 20, 131)), (True, (131, 10, 20))):
+        headed = SourceLeaf((member,), storage, transposed=transposed).reshape(shape)
+        member[3, 5] += 7
+        native = member.T if transposed else member
+        expected = native.reshape(shape).astype(storage)
+        index = (slice(1, 9), slice(None, None, 2), slice(1, 19, 3))
+        np.testing.assert_array_equal(headed.read(index), expected[index])
+        np.testing.assert_array_equal(headed.read(), expected)
+
+    headed = small.reshape((3, 4, 2, 3))
+    small_members[1][2, 1] += 4
+    expected = np.stack([one.T.reshape(4, 2, 3) for one in small_members]).astype(storage)
+    index = (slice(1, 3), slice(None), slice(0, 1), slice(None))
+    np.testing.assert_array_equal(headed.read(index), expected[index])
+    with pytest.raises(ValueError):
+        small.reshape((6, 4, 3))
+
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 def test_an_eager_translation_swaps_kernels_in_tiles_as_the_strided_copy_does(dtype):
@@ -108,6 +125,28 @@ def test_an_eager_and_a_streamed_binding_bind_aliases_alike(copy):
     assert sorted(layout.name for layout in eager_layouts) == ["embed", "lm_head", "norm"]
     for ours, theirs in zip(jax.tree.leaves(eager), jax.tree.leaves(streamed), strict=True):
         assert ours.dtype == theirs.dtype and ours.tobytes() == theirs.tobytes()
+
+
+@pytest.mark.mesh
+def test_a_mesh_resident_leaf_can_change_its_sharding_before_host_transport():
+    from jax.sharding import Mesh, NamedSharding, PartitionSpec
+
+    from dew.training.host import place_leaf
+
+    mesh = Mesh(np.asarray(jax.devices()[:2]), ("fsdp",))
+    values = np.arange(8 * 12, dtype=np.float32).reshape(8, 12)
+    current = place_leaf(values, NamedSharding(mesh, PartitionSpec("fsdp")))
+    for spec in (PartitionSpec(), PartitionSpec(None, "fsdp"), PartitionSpec("fsdp")):
+        target = NamedSharding(mesh, spec)
+        current = place_leaf(current, target)
+        assert current.sharding == target
+        np.testing.assert_array_equal(current, values)
+    host = NamedSharding(mesh, PartitionSpec("fsdp"), memory_kind="pinned_host")
+    held = place_leaf(current, host)
+    assert held.sharding == host
+    np.testing.assert_array_equal(held, values)
+    returned = place_leaf(held, current.sharding)
+    np.testing.assert_array_equal(returned, values)
 
 
 @pytest.mark.mesh
