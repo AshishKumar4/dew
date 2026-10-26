@@ -600,6 +600,12 @@ PORT_CELLS: dict[tuple[str, str], str] = {
     ('wgmma', 'forward'): "on an H100 PCIe, 16-bit, the port's forward 0.602 ms against the template's "
                           "0.776 on Qwen3.5-27B's gated delta net and 0.484 against 0.634 on Qwen3-Next's "
                           "(SE-family-h100-e0de17766)",
+    ('mma.sync', 'forward'): "on an A100 SXM4 40GB, 16-bit, the port's forward 0.892 ms against the "
+                             "template's 1.40 to 1.78 on Qwen3.5-27B's gated delta net and 0.690 against "
+                             "1.22 on Qwen3-Next's (SE-family-a100-e0de17766)",
+    ('mma.sync', 'training'): "on an A100 SXM4 40GB, 16-bit, the port's forward and gradient 4.82 ms against "
+                              "the template's 5.97 on Qwen3.5-27B's gated delta net and 3.81 against 4.60 on "
+                              "Qwen3-Next's (SE-family-a100-e0de17766)",
 }
 """The cells, each an instruction family and a product (`PortCase.product`), where a receipt shows the fla
 port faster than the recurrence template, the port running them (owner, bible da64ae5): the list shrinks as
