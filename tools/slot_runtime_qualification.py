@@ -568,7 +568,7 @@ def verdict(args, pool):
         return (np.asarray(seed, np.int64),)
 
     original.recorded = recorded.recorded = exact.recorded = True
-    count = seeds_for(recorded_pilots(original, len(pool["pilot"])), draw, "released slot runtime",
+    count = seeds_for(recorded_pilots(original, draw, len(pool["pilot"])), draw, "released slot runtime",
                       dew_fn=served, truth_fn=exact)
     if count > pool["count"]:
         raise Inconclusive(f"the reference requires {count} draws; the fixed set has only {pool['count']}")
