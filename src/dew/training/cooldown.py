@@ -12,11 +12,7 @@ import math
 from collections.abc import Mapping
 from typing import Literal
 
-import jax
-import optax
-
 from dew._records import JSON, is_share, share
-from dew.optim import RateState
 from dew.training.budget import every_step, recorded
 from dew.training.cadence import Tokens
 
@@ -99,52 +95,36 @@ class Branch:
         return recorded(self.at)
 
 
-def scaled_rates(opt_state: optax.OptState, base: optax.OptState, factor: float) -> optax.OptState:
-    """`opt_state` training at `factor` times the learning rate each injected solver of `base` holds:
-    a scheduled rate's rate-valued fields (`dew.optim.RateState`), which its values are proportional to,
-    or a constant rate's own value (`optax.inject_hyperparams`). The schedule's count is `opt_state`'s."""
-    def scaled(state, held):
-        if not _injected(state):
-            return state
-        rate = held.hyperparams_states.get("learning_rate")
-        if isinstance(rate, RateState):
-            current = state.hyperparams_states["learning_rate"]
-            rates = {path: value * factor for path, value in rate.rates.items()}
-            return state._replace(hyperparams_states={**state.hyperparams_states,
-                                                      "learning_rate": current._replace(rates=rates)})
-        return state._replace(hyperparams={**state.hyperparams,
-                                           "learning_rate": held.hyperparams["learning_rate"] * factor})
-
-    return jax.tree.map(scaled, opt_state, base, is_leaf=_injected)
+def scaled(rates: Mapping[str | None, Mapping[str, float]], factor: float
+           ) -> dict[str | None, dict[str, float]]:
+    """A config's rates (`OptimConfig.rates`), each group's every rate-valued field times `factor`:
+    the rates a branch trains at, which `dew.optim.with_rates` sets in the optimizer's state. A
+    schedule's values are proportional to its rate-valued fields (`ScheduleBase.values`), so its
+    every value is the run's times `factor`."""
+    return {group: {name: value * factor for name, value in held.items()} for group, held in rates.items()}
 
 
-def check_branches(branches: tuple[Branch, ...], suites: Mapping[str, object], opt_state: optax.OptState
-                   ) -> None:
-    """Refuse cooldown branches a run could neither score nor decay: one with no validation suite to
-    score them, or an optimizer holding no learning rate a branch can scale (`holds_rate`)."""
+def check_branches(branches: tuple[Branch, ...], suites: Mapping[str, object], *, configured: bool,
+                   rollout: bool, scheduled: bool) -> None:
+    """Refuse cooldown branches a run could not score, decay or read as it reads on: one with no
+    validation suite to score them; an optimizer that is no `OptimConfig`, whose rates the branch could
+    not scale (`configured`); a rollout's (`rollout`), whose acquisition one reader at a time owns; and
+    a schedule's of stages that end on the committed-token clock (`scheduled`), whose stages the
+    branch's reads would not end."""
     if not branches:
         return
     if not suites:
         raise ValueError("a cooldown branch is scored by the run's validation suites, and this run "
                          "scores none: pass validation=, or eval_every= or metrics= over its val split")
-    if not holds_rate(opt_state):
-        raise ValueError("a cooldown decays the learning rate the optimizer's state holds, an OptimConfig's "
-                         "or optax.inject_hyperparams' constant one; this optimizer's state holds none "
-                         "it can scale")
-
-
-def holds_rate(opt_state: optax.OptState) -> bool:
-    """Whether an optimizer state's learning rates are all ones a cooldown can scale (`scaled_rates`),
-    and it holds one: an `OptimConfig`'s solvers' are, as is a constant one `optax.inject_hyperparams`
-    holds; one computed each update from a step count alone is not."""
-    injected = [node for node in jax.tree.leaves(opt_state, is_leaf=_injected) if _injected(node)]
-    rates = [node.hyperparams_states.get("learning_rate") for node in injected
-             if "learning_rate" in node.hyperparams]
-    return bool(rates) and all(rate is None or isinstance(rate, RateState) for rate in rates)
-
-
-def _injected(node: optax.OptState) -> bool:
-    return isinstance(node, optax.InjectStatefulHyperparamsState)
+    if not configured:
+        raise ValueError("a cooldown scales the rates an OptimConfig's solvers hold; this trainer's "
+                         "optimizer is an optax transformation")
+    if rollout:
+        raise ValueError("a cooldown branch reads a stream of its own, and a rollout's acquisition is "
+                         "one reader's at a time: cooldowns of rollout runs are not built")
+    if scheduled:
+        raise ValueError("a cooldown branch of a schedule's stages ending on the committed-token clock "
+                         "would not end them as the run does: cooldowns of token schedules are not built")
 
 
 __all__ = ["Branch", "Cooldowns"]

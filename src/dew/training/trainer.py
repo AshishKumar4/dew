@@ -32,7 +32,6 @@ import numpy as np
 import optax
 from flax import linen as nn
 from flax.training import dynamic_scale as dynamic_scale_lib
-from flax.training.early_stopping import EarlyStopping
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
@@ -72,6 +71,7 @@ from dew.distributed.batches import (
     shard_batch,
     split_fields,
 )
+from dew.distributed.host import snapshot
 from dew.distributed.placement import (
     Layout,
     MeshSpec,
@@ -132,7 +132,7 @@ from dew.training._fit import (
 )
 from dew.training._lowering import Lowered
 from dew.training.budget import Pause, Plateau, run_length, run_steps, run_tokens
-from dew.training.cooldown import Branch, Cooldowns, check_branches, scaled_rates
+from dew.training.cooldown import Cooldowns, check_branches, scaled
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
     check_batch,
@@ -1407,6 +1407,13 @@ class Trainer(Generic[Loss, Effects]):
         seen = 0
         run.notice = PreemptionNotice()
         run.committed = plan.real(interval)
+        if (pending := run.stop_control.pop("cooldown", None)) is not None:
+            # A branch a preemption cut short runs again before the run reads on from where it stood.
+            state, cut = self._cooled(plan, run, state, shardings, position, int(pending))
+            if cut:
+                run.preempted = run.current
+                self._wind_down(plan, run, interval, state, shardings, position, profiler)
+                return state
         while not plan.ended(run.current, plan.real(interval)):
             # A schedule's stage ends where the commits reach its tokens.
             self._scheduled(plan, run, interval)
@@ -1475,8 +1482,9 @@ class Trainer(Generic[Loss, Effects]):
                 if run.first_step is None:
                     loss.block_until_ready()
                     run.first_step = time.perf_counter() - run.started
-                if self._between_steps(plan, run, interval, state, shardings, position,
-                                       loss, aux, accepted):
+                stopped, state = self._between_steps(plan, run, interval, state, shardings, position,
+                                                     loss, aux, accepted)
+                if stopped:
                     break
             # The step row is complete once its scope exits; closing the
             # window here keeps the last iteration inside the capture.
@@ -1607,7 +1615,8 @@ class Trainer(Generic[Loss, Effects]):
         state, shardings = placed()
         if int(state.step) != current:
             raise ValueError(f"the checkpoint of step {current} holds a state at step {int(state.step)}")
-        check_branches(plan.branches, plan.suites, state.opt_state)
+        check_branches(plan.branches, plan.suites, configured=self._config is not None,
+                       rollout=self.rollout is not None, scheduled=plan.dataset.token_ends is not None)
         started = FitStarted(current, steps,
             checkpoints.source(current) if checkpoints is not None and position is not None else None,
             sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
@@ -1716,7 +1725,7 @@ class Trainer(Generic[Loss, Effects]):
 
     def _between_steps(self, plan: FitPlan, run: FitRun, interval: Interval, state: TrainState,
                        shardings: Placement[TrainState], position, loss: jax.Array,
-                       aux: dict[str, jax.Array], accepted: jax.Array) -> bool:
+                       aux: dict[str, jax.Array], accepted: jax.Array) -> tuple[bool, TrainState]:
         """The cadenced work after one step of `fit`: the log, the validation,
         the checkpoints, and the preemption notice. Returns whether the
         notice stops the run at this step, whose checkpoint is then written."""
@@ -1765,10 +1774,11 @@ class Trainer(Generic[Loss, Effects]):
         scores = (
             {} if run.evaluation is None or run.evaluation.step != current else dict(run.evaluation.scores)
         )
-        for branch in plan.branches:
-            # Before the step's save, so a run stopped inside a branch resumes to run it again.
-            if branch.due(current, real, before):
-                self._cooled(plan, run, state, shardings, position, branch)
+        cut = False
+        for index, branch in enumerate(plan.branches):
+            # Before the step's save: a preemption inside the branch saves this step to run it again.
+            if not cut and branch.due(current, real, before):
+                state, cut = self._cooled(plan, run, state, shardings, position, index)
         if not ending:
             self._saves(plan, run, interval, state, position, scores, evaluation_due=evaluation_due,
                         full=paused)
@@ -1777,9 +1787,9 @@ class Trainer(Generic[Loss, Effects]):
         # Asked at every step on every process, as JAX's agreement needs; the last step ends the run.
         # A pause falls on the same step on every process, so where it is reached none asks.
         if run.stopped:
-            return True
+            return True, state
         assert run.notice is not None
-        if paused or (not ending and run.notice.reached(current)):
+        if paused or cut or (not ending and run.notice.reached()):
             self._take(plan, run, interval, state, unlogged=True)
             if checkpoints is not None and interval.last_saved != current:
                 self._read_taken(run)
@@ -1790,46 +1800,66 @@ class Trainer(Generic[Loss, Effects]):
                 run.paused = current
             else:
                 run.preempted = current
-            return True
-        return False
+            return True, state
+        return False, state
 
     def _cooled(self, plan: FitPlan, run: FitRun, state: TrainState, shardings: Placement[TrainState],
-                position: bytes | None, branch: Branch) -> None:
-        """Train the cooldown `branch` from `state`, on the run's batches from its data `position`, by the
-        run's own compiled steps at its rate times the branch's decay (`scaled_rates`); score every
-        suite on it as `cooldown_<split>` at the run's step, and discard it, the run's state and stream
-        left as they were (`dew.training.cooldown`)."""
+                position: bytes | None, index: int) -> tuple[TrainState, bool]:
+        """Train the run's cooldown branch `index` from `state`, on the run's batches from its data
+        `position`, by the run's own compiled steps at its rates times the branch's decay (`scaled`);
+        score every suite on it as `cooldown_<split>` at the run's step, and discard it. The run's
+        moving state waits on the host and its stream is closed meanwhile, so the devices hold one
+        state and one prefetcher, as the run's plan sized them (`Timer`). Returns the run's state, and
+        whether a preemption cut the branch short: unscored, and pending in the run's control
+        (`Checkpoints.control`), which a resume from this step runs first (`dew.training.cooldown`)."""
+        branch = plan.branches[index]
         if position is None:
             raise ValueError("a cooldown branch reads on from the run's data position, and this stream "
                              "keeps none")
+        assert run.partition is not None and run.train is not None and run.notice is not None
+        assert self._config is not None
         steps, began = branch.cooldowns.steps(run.current, self.accumulation), time.perf_counter()
+        at = state.step
         self._display.note(f"Cooldown branch from step {run.current}: {steps} steps")
+        moving, frozen = apart(state)
+        restore, step_at = snapshot(moving), jax.device_put(np.asarray(int(at), at.dtype), at.sharding)
+        run.train.close()
+        run.ahead = None
         branched = FitRun(run.started, current=run.current, partition=run.partition, reads=run.reads,
                           compiled=run.compiled)
-        assert run.partition is not None
         branched.train = self._prefetched(plan, branched, plan.dataset.train(run.partition), position)
-        # A copy of the state, which the branch's steps donate.
-        cooled = jax.device_put(state, shardings, may_alias=False)
+        cooled, done, cut = state, 0, False
         try:
-            for index in range(steps):
+            while done < steps and not (cut := run.notice.reached()):
                 batch = agreed_next("cooldown read", branched.train)
                 if batch is None:
-                    self._display.note(f"The training data ran out {index} steps into the cooldown")
                     break
-                if self.rollout is not None:
-                    batch, _ = self._rolled_out(cooled, batch)
                 device, _ = split_fields(batch)
-                step, _, cooled = self._compiled_for(run.compiled, cooled, device, branched)
-                factor = branch.cooldowns.factor(index // self.accumulation, steps // self.accumulation)
-                cooled = step(dataclasses.replace(
-                    cooled, opt_state=scaled_rates(cooled.opt_state, state.opt_state, factor)), device)[0]
-                branched.current += 1
+                step, _, cooled = self._compiled_for(run.compiled, cooled, device, branched,
+                                                     reported=run.current)
+                rates = scaled(self._config.rates(), branch.cooldowns.factor(done // self.accumulation,
+                                                                             steps // self.accumulation))
+                cooled = dataclasses.replace(cooled, opt_state=with_rates(cooled.opt_state, rates))
+                cooled = step(cooled, device)[0]
+                done, branched.current = done + 1, branched.current + 1
         finally:
             branched.train.close()
-        suites = {f"cooldown_{name}": suite for name, suite in plan.suites.items()}
-        self._evaluation(dataclasses.replace(plan, suites=suites, summaries=()),
-                         dataclasses.replace(cooled, step=state.step), shardings, {})
+        if cut:
+            run.stop_control["cooldown"] = index
+        elif done < steps:
+            self._display.note(f"The training data ran out {done} steps into the cooldown from step "
+                               f"{run.current}, which records no score")
+        else:
+            suites = {f"cooldown_{name}": suite for name, suite in plan.suites.items()}
+            self._evaluation(dataclasses.replace(plan, suites=suites, summaries=()),
+                             dataclasses.replace(cooled, step=step_at), shardings, {})
+        for leaf in jax.tree.leaves(apart(cooled)[0]):
+            if not leaf.is_deleted():
+                leaf.delete()
+        restored = together(restore(), frozen)
+        run.train = self._prefetched(plan, run, plan.dataset.train(run.partition), position)
         run.other += time.perf_counter() - began
+        return restored, cut
 
     def _best_model(self, final: TrainState, run: FitRun) -> TrainState:
         """`final` with the model state of the step the run ranked best (`MODEL_STATE`): read from
@@ -1874,7 +1904,7 @@ class Trainer(Generic[Loss, Effects]):
             run.best.offer(ranking, dataclasses.replace(state, compute=None))
         winners = checkpoints._candidates(ranking) if (
             evaluation_due and checkpoints is not None and (plan.checkpoint_every or plan.best)) else ()
-        if not run.stopped and scores and self._plateau(plan, run, scores):
+        if not run.stopped and scores and plan.plateaued(run, scores):
             self._take(plan, run, interval, state, unlogged=True)
             run.stopped = True
             run.stop_control['stop_reason'] = 'validation plateau'
@@ -2030,38 +2060,6 @@ class Trainer(Generic[Loss, Effects]):
             plateau = dataclasses.replace(plateau, metric=metric, mode=stopping.mode, split=stopping.split)
         return selection, plateau, pause
 
-    @staticmethod
-    def _plateau(plan: FitPlan, run: FitRun, scores: Mapping[str, float]) -> bool:
-        stop = plan.stop
-        if stop is None:
-            return False
-        assert isinstance(stop.metric, (Metric, TrainingScalar, Summary)), (
-            "fit binds the stopping selector before stepping"
-        )
-        name = f'{stop.split}/{stop.metric.name}'
-        if name not in scores:
-            return False
-        value = scores[name] if stop.mode == 'min' else -scores[name]
-        if not math.isfinite(value):
-            return False
-        key = f'plateau:{name}'
-        held = run.stop_control.get(key)
-        rule = {'mode': stop.mode, 'evals': stop.evals, 'min_delta': stop.min_delta}
-        if held is not None and held.get('rule') != rule:
-            raise ValueError(
-                "Plateau policy differs from the resumed checkpoint; resume with the same stopping rule"
-            )
-        if held is not None and held.get('step') == run.current:
-            return held['bad'] >= stop.evals
-        # Flax's recurrence, which stops at its `patience`-th bad evaluation past the first.
-        stopping = EarlyStopping(min_delta=stop.min_delta, patience=stop.evals - 1)
-        if held is not None:
-            stopping = stopping.replace(best_metric=held['best'], patience_count=held['bad'])
-        stopping = stopping.update(value)
-        run.stop_control[key] = {'best': stopping.best_metric, 'bad': stopping.patience_count,
-                                 'step': run.current, 'rule': rule}
-        return stopping.should_stop
-
     def _warm_evaluations(self, plan: FitPlan, state: TrainState, shardings: Placement[TrainState]) -> None:
         """Compile the programs the run's evaluations run beside a step's compile, where any runs
         between steps (`FitPlan.evaluates_midway`): every suite warms (`Evaluation.run`'s `warm`),
@@ -2193,8 +2191,8 @@ class Trainer(Generic[Loss, Effects]):
         return batch, time.perf_counter() - began
 
     def _compiled_for(self, compiled: dict[Signature, tuple[CompiledStep, StepFlops | None]],
-                      state: TrainState, batch: Batch,
-                      run: FitRun) -> tuple[CompiledStep, StepFlops | None, TrainState]:
+                      state: TrainState, batch: Batch, run: FitRun,
+                      reported: int | None = None) -> tuple[CompiledStep, StepFlops | None, TrainState]:
         """Return the step compiled for this batch's abstract signature (`batch_signature`),
         compiling on first sight, and the state to step, a fresh copy where the plan timed steps
         on it (`Timer`). A compile reads `run`'s pending log first: it holds the devices idle
@@ -2206,7 +2204,8 @@ class Trainer(Generic[Loss, Effects]):
         another program, compiled as one: an executable refuses it. A step
         that begins a ramp's or a schedule's stage gets its state with the
         window a rejection left part filled dropped (`_staged`), the state
-        a timed trial steps on too.
+        a timed trial steps on too. A compile reports at `reported`, a
+        cooldown branch's at the run's step, else at the state's.
         """
         state = self._staged(state, run.current)
         timer = Timer(state, batch)
@@ -2225,7 +2224,7 @@ class Trainer(Generic[Loss, Effects]):
             links = {axis: AxisLink(link.bytes_per_second, link.spread)
                      for axis, link in self.links.items()}
             self._report(StepCompiled(seconds, recompute_record(self.objective), links, self.memory,
-                                      self.plan), int(timer.state.step))
+                                      self.plan), int(timer.state.step) if reported is None else reported)
             self._unproven = True
         return (*compiled[signature], timer.state)
 

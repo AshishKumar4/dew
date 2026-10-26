@@ -6,10 +6,12 @@ from __future__ import annotations
 
 import dataclasses
 import datetime
+import math
 import time
 from collections.abc import Iterator, Mapping, Sequence
 
 import jax
+from flax.training.early_stopping import EarlyStopping
 from jax.sharding import Mesh
 
 from dew import position
@@ -21,7 +23,7 @@ from dew.data.dataset import DataPartition, Loader, PhasedStream, Reader
 from dew.data.pipeline import Dataset
 from dew.distributed.batches import DevicePrefetchIterator, Signature
 from dew.distributed.placement import MeshSpec, Placement
-from dew.objectives.base import Initializer, Metric
+from dew.objectives.base import Initializer, Metric, TrainingScalar
 from dew.optim import OptimConfig
 from dew.state import TrainState
 from dew.telemetry.profile import region
@@ -206,6 +208,39 @@ class FitPlan:
         return {"log_every": recorded(self.log_every), "eval_every": recorded(self.eval_every),
                 "checkpoint_every": recorded(self.checkpoint_every), **local, **suites,
                 **{f"warmup_steps.{name}": value for name, value in warmups.items()}}
+
+    def plateaued(self, run: FitRun, scores: Mapping[str, float]) -> bool:
+        """Whether the run's `Plateau` stops it at this step's `scores`: its count of evaluations
+        without improvement held in the run's control, so a resume counts on (`Checkpoints.control`)."""
+        stop = self.stop
+        if stop is None:
+            return False
+        assert isinstance(stop.metric, (Metric, TrainingScalar, Summary)), (
+            "fit binds the stopping selector before stepping"
+        )
+        name = f'{stop.split}/{stop.metric.name}'
+        if name not in scores:
+            return False
+        value = scores[name] if stop.mode == 'min' else -scores[name]
+        if not math.isfinite(value):
+            return False
+        key = f'plateau:{name}'
+        held = run.stop_control.get(key)
+        rule = {'mode': stop.mode, 'evals': stop.evals, 'min_delta': stop.min_delta}
+        if held is not None and held.get('rule') != rule:
+            raise ValueError(
+                "Plateau policy differs from the resumed checkpoint; resume with the same stopping rule"
+            )
+        if held is not None and held.get('step') == run.current:
+            return held['bad'] >= stop.evals
+        # Flax's recurrence, which stops at its `patience`-th bad evaluation past the first.
+        stopping = EarlyStopping(min_delta=stop.min_delta, patience=stop.evals - 1)
+        if held is not None:
+            stopping = stopping.replace(best_metric=held['best'], patience_count=held['bad'])
+        stopping = stopping.update(value)
+        run.stop_control[key] = {'best': stopping.best_metric, 'bad': stopping.patience_count,
+                                 'step': run.current, 'rule': rule}
+        return stopping.should_stop
 
     def due(self, step: int, real: int = 0, before: int = 0) -> tuple[str, ...]:
         """The suites whose own cadence falls on `step`, which brought the committed tokens from

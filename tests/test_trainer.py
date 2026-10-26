@@ -1241,9 +1241,11 @@ def test_a_cadence_may_be_a_share_of_the_run(tmp_path, written, expected):
     assert sorted({step for step, scalars in tracker.scalars if "own/spread" in scalars}) == [2, 4, 6, 8]
 
 
-def cooldown_run(schedule, steps: int, accumulation: int, tracker=None, cooldowns=None) -> TrainState:
-    """Regression on AdamW at `schedule` for `steps`, scored once at its end, with any `cooldowns`."""
-    trainer = make_trainer(tracker=tracker, accumulation=accumulation,
+def cooldown_run(schedule, steps: int, accumulation: int, tracker=None, cooldowns=None,
+                 directory=None) -> TrainState:
+    """Regression on AdamW at `schedule` for `steps`, scored once at its end, with any `cooldowns`,
+    checkpointed in `directory` where one is given."""
+    trainer = make_trainer(directory, tracker=tracker, accumulation=accumulation,
                            optimizer=OptimConfig(optimizer="adamw", learning_rate=schedule))
     return trainer.fit(dataset(val=val_batches(2)), steps=steps, log_every=steps, eval_every=steps,
                        cooldowns=cooldowns)
@@ -1275,6 +1277,39 @@ def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the
     plain = cooldown_run(stable, 3 * at, accumulation)
     for ours, theirs in zip(jax.tree.leaves(branched.variables), jax.tree.leaves(plain.variables),
                             strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+
+
+def test_a_cooldown_a_preemption_cuts_short_runs_again_on_resume(tmp_path, monkeypatch):
+    """A preemption that reaches a run inside a cooldown branch stops it at the step the branch left
+    from, its state as it stood there, unscored; the resume runs the branch again first, recording
+    the score an uninterrupted run records, and trains on to the parameters a run with no cooldown
+    reaches, bit for bit."""
+    from dew.optim import Linear
+    from dew.training.cooldown import Cooldowns
+    from dew.training.runtime import PreemptionNotice
+
+    stable, cooldowns = Linear(2.0 ** -4, decay_start=64, decay_steps=128), Cooldowns(at=(4,), length=4)
+    uninterrupted = RecordingTracker()
+    cooldown_run(stable, 12, 1, uninterrupted, cooldowns)
+    expected = {step: scalars["cooldown_val/loss"] for step, scalars in uninterrupted.scalars
+                if "cooldown_val/loss" in scalars}
+    asked = []
+    # Steps 1-3 ask once each; the branch from step 4 asks before each of its steps, and its second
+    # ask finds the notice.
+    monkeypatch.setattr(PreemptionNotice, "reached", lambda self: asked.append(1) or len(asked) == 5)
+    stopped = RecordingTracker()
+    with pytest.raises(Preempted):
+        cooldown_run(stable, 12, 1, stopped, cooldowns, tmp_path)
+    assert not any("cooldown_val/loss" in scalars for _, scalars in stopped.scalars)
+    assert Checkpoints(str(tmp_path / "run")).latest == 4
+    monkeypatch.setattr(PreemptionNotice, "reached", lambda self: False)
+    resumed = RecordingTracker()
+    state = cooldown_run(stable, 12, 1, resumed, cooldowns, tmp_path)
+    assert {step: scalars["cooldown_val/loss"] for step, scalars in resumed.scalars
+            if "cooldown_val/loss" in scalars} == expected
+    plain = cooldown_run(stable, 12, 1)
+    for ours, theirs in zip(jax.tree.leaves(state.variables), jax.tree.leaves(plain.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 
