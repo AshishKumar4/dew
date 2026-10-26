@@ -590,6 +590,12 @@ class PortCase:
     product: str = 'forward'
 
     @property
+    def cell(self) -> tuple[str | None, str]:
+        """The call's cell, its device's instruction family and its product (`selection.Celled`,
+        `PORT_CELLS`)."""
+        return self.family, self.product
+
+    @property
     def widest(self) -> int:
         """The widest keys the port takes in the call's dtype."""
         return fla_gdn.WIDEST_KEYS if self.dtype.itemsize == 2 else fla_gdn.WIDEST
@@ -622,23 +628,24 @@ the port takes in their dtype. Packed documents take the port at any bound: it s
 where they pass, as many as the tokens' chunks, a row's and one, whatever the bound
 (`chunked_launch.Sequences`)."""
 
-PORT_CELLS: dict[tuple[str | None, str], str] = {
-    ('wgmma', 'forward'): "on an H100 80GB HBM3, 16-bit, the port's forward 0.440 ms against the template's "
-                          "0.559 on Qwen3.5-27B's gated delta net and 0.276 against 0.489 on Qwen3-Next's "
-                          "(SE-family-h100-b0980aaff; on an H100 PCIe 0.602 against 0.776, "
-                          "SE-family-h100-e0de17766)",
-    ('mma.sync', 'forward'): "on an A100 SXM4 40GB, 16-bit, the port's forward 0.892 ms against the "
-                             "template's 1.213 on Qwen3.5-27B's gated delta net and 0.690 against 0.942 on "
-                             "Qwen3-Next's (SE-family-a100-1a31d279a)",
-    ('mma.sync', 'training'): "on an A100 SXM4 40GB, 16-bit, the port's forward and gradient 4.77 ms against "
-                              "the template's 5.53 on Qwen3.5-27B's gated delta net (its gradient the "
-                              "port's, the fast backward's launches not holding an A100's registers) "
-                              "(SE-family-a100-1a31d279a)",
+PORT_CELLS: dict[tuple[str | None, str], tuple[str, str]] = {
+    ('wgmma', 'forward'): ('fla', "on an H100 80GB HBM3, 16-bit, the port's forward 0.440 ms against the "
+                                  "template's 0.559 on Qwen3.5-27B's gated delta net and 0.276 against 0.489 "
+                                  "on Qwen3-Next's (SE-family-h100-b0980aaff; on an H100 PCIe 0.602 against "
+                                  "0.776, SE-family-h100-e0de17766)"),
+    ('mma.sync', 'forward'): ('fla', "on an A100 SXM4 40GB, 16-bit, the port's forward 0.892 ms against the "
+                                     "template's 1.213 on Qwen3.5-27B's gated delta net and 0.690 against "
+                                     "0.942 on Qwen3-Next's (SE-family-a100-1a31d279a)"),
+    ('mma.sync', 'training'): ('fla', "on an A100 SXM4 40GB, 16-bit, the port's forward and gradient 4.77 ms "
+                                      "against the template's 5.53 on Qwen3.5-27B's gated delta net (its "
+                                      "gradient the port's, the fast backward's launches not holding an "
+                                      "A100's registers) (SE-family-a100-1a31d279a)"),
 }
-"""The cells, each an instruction family and a product (`PortCase.product`), where a receipt shows the fla
-port faster than the recurrence template, the port running them (owner, bible da64ae5): the list shrinks as
-the template wins its cells, and no cell is picked or ranked at run time. Training on an H100 is the
-template's: its fast backward took 1.851 ms against the port's 2.400 (SE-family-h100-b0980aaff; 2.56
+"""The cells, each an instruction family and a product (`PortCase.cell`), where a receipt shows the fla
+port faster than the recurrence template, each its old route's kernel and that receipt: the delta rule's
+selector runs the port on them where it takes the call (`Op.declared`, owner, bible da64ae5); the list
+shrinks as the template wins its cells, and no cell is picked or ranked at run time. Training on an H100 is
+the template's: its fast backward took 1.851 ms against the port's 2.400 (SE-family-h100-b0980aaff; 2.56
 against 3.14 on an H100 PCIe, SE-family-h100-e0de17766)."""
 
 MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (
@@ -649,23 +656,22 @@ MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (
     Requirement('device', lambda case: case.family is not None,
                 "no GPU runs the call: off one, the mainloop runs interpreted where a call names it",
                 row=INHERENT, kind='measured'),
-    Requirement('declared', lambda case: (case.family, case.product) not in PORT_CELLS,
-                lambda case: f"a declared port cell: {PORT_CELLS[case.family, case.product]}",
-                row='bible da64ae5', kind='measured'),
 )
 """What the recurrence template's Mosaic GPU mainloop (`templates.recurrence.template.Mosaic`) needs of a
 call: the port's trace and placement (its custom VJP, a Pallas call's results), its own launches' call
-(`Template.eligible`: dtypes, widths, a bundle for the device's family, a config that fits), a GPU, and a
-cell the port is not declared faster on (`PORT_CELLS`)."""
+(`Template.eligible`: dtypes, widths, a bundle for the device's family, a config that fits), and a GPU.
+A declared port cell runs the port first (`PORT_CELLS`, `GATED_DELTA`'s declared cells)."""
 
 MOSAIC = Kernel('mosaic_gpu', MOSAIC_SUPPORTS)
 
 
 GATED_DELTA: Op[PortCase] = Op('gated_delta_rule',
-                               (MOSAIC, Kernel('fla', PORT_SUPPORTS), Kernel('xla', (), generic=True)))
-"""The delta rule's selector: the first of its kernels that takes the call, by what each takes (no table
-of GPUs): the recurrence template at its derived tiles on every cell it takes but the declared port cells
-(`PORT_CELLS`), else the port on any GPU Dew's Triton kernels run on, else the portable math."""
+                               (MOSAIC, Kernel('fla', PORT_SUPPORTS), Kernel('xla', (), generic=True)),
+                               declared=PORT_CELLS)
+"""The delta rule's selector: on a declared port cell (`PORT_CELLS`) the port where it takes the call;
+otherwise the first of its kernels that takes the call, by what each takes (no table of GPUs): the
+recurrence template at its derived tiles, else the port on any GPU Dew's Triton kernels run on, else the
+portable math."""
 
 
 def port_kernel(query, key, value, g, beta, state=None, starts=None, *, max_segments: int | None = None,
