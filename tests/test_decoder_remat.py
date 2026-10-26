@@ -255,11 +255,13 @@ def test_recomputed_pipeline_preserves_updates_and_sown_values(shape, scan):
             yield
 
     def placed(step):
+        # Both arms are Dew's programs, each compiled once as the gate compiles two Dew arms (row 1801).
+        compiled = without_ynn(committed(step))
+
         def on_mesh(variables, state, tokens, key):
             variables, tokens = place(variables, tokens)
             with staged():
-                # Both arms are Dew's programs, each compiled as the gate compiles two Dew arms.
-                return jax.device_get(without_ynn(committed(step))(variables, state, tokens, key))
+                return jax.device_get(compiled(variables, state, tokens, key))
         return on_mesh
 
     draw = drawn_steps(plain, stepped, routed=shape == "sparse", within=staged, place=place)

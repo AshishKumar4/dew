@@ -95,6 +95,7 @@ A custom `step(objective, optimizer)` factory is responsible for the accepted an
 - `log_every` is the interval between training log lines.
 - `eval_every=None` disables evaluation. With an interval, evaluation also runs at the end.
 - `checkpoint_every` controls periodic saves when a checkpointer exists. The normal completion path can still save a final checkpoint when a checkpointer is present.
+- Each of the three, an `EvalSuite`'s own `every` and `Checkpoints(local_every=)` may be a share of the run such as `"5%"`, resolved once against its planned length: the whole updates nearest that share of its steps, epochs or examples, at least one, or for a token budget alone each time the committed tokens pass a multiple of that share. A schedule's warmup (`Cosine`, `Power` and `Linear`'s `warmup_steps`, `OneCycle`'s `warmup_fraction`) takes a share too, of the run's updates. The run's start records what each resolved to, and the warmups of the schedules its optimizer runs (`FitStarted.cadences`).
 - `metrics` reduce evaluation artifacts and require evaluation to be enabled.
 - `preview=True` explicitly requests generated/display artifacts during evaluation; adding a scalar tracker alone does not request them.
 

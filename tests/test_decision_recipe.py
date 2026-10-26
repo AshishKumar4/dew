@@ -365,6 +365,31 @@ class Fitted(DecisionRunConfig):
         return objective, dataset
 
 
+def test_a_decision_run_builds_its_source_as_its_source_options_say():
+    """A decision run's `--source.text-only` and `--source.prediction-depths` reach its source's load:
+    over Qwen3.5, a wrapper with a vision tower and a prediction depth, the run's backbone is the
+    language model alone, with no tower and no depth, where by default it builds both."""
+    from dew.config import SourceOptions
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+
+    default = Fitted(data=TICKETS)
+    trainer = dataclasses.replace(default.trainer, multi_host=False, compilation_cache_dir=None)
+
+    def backbone(options: SourceOptions):
+        run = dataclasses.replace(default, pretrained=str(QWEN), trainer=trainer, source=options)
+        objective, _ = run.prepare().train("x")
+        return objective.model.backbone, objective.variables
+
+    whole, _ = backbone(SourceOptions())
+    assert not isinstance(whole, CausalTransformer) and whole.language_model.num_nextn_predict_layers == 1
+    text, variables = backbone(SourceOptions(text_only=True, prediction_depths=0))
+    assert isinstance(text, CausalTransformer) and text.num_nextn_predict_layers == 0
+    import jax
+
+    paths = [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_flatten_with_path(variables)[0]]
+    assert paths and not any("mtp_" in path or "vision" in path or "visual" in path for path in paths)
+
+
 def test_a_lora_decision_runs_source_loads_onto_its_trainers_mesh():
     """A decision run that trains an adapter over a source reads the source onto its trainer's mesh
     (`TrainerConfig.source_placement`), as an LM run does: its objective's frozen base is device
