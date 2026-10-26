@@ -859,6 +859,30 @@ def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_mode
                     seeds=PACKED_SEEDS, truth_fn=truth)
 
 
+def test_a_program_finds_every_quantized_tower_its_models_hold():
+    """The options a program compiles with read the quantization of every model it is handed and every
+    tower those hold (`quantizations`): a quantized text transformer inside a condition's encoder record,
+    inside the tuple of a task's encoders, counts as a quantized denoiser handed alone does, and an
+    unquantized one adds nothing."""
+    from dew.nn.kernels.options import quantizations
+
+    pytest.importorskip("qwix")
+
+    @dataclasses.dataclass(frozen=True)
+    class Encoder:
+        transformer: nn.Module
+        params: dict
+
+    spec = Quantization(dtype="int8")
+    plain = tiny()
+    quantized = spec.apply(plain)
+    weights = {"params": {"kernel": np.zeros((2, 2), np.float32)}}
+    assert quantizations(plain, (("textcontext", Encoder(plain, weights)),)) == []
+    held = quantizations((("textcontext", Encoder(quantized, weights)),))
+    assert [found.dtype for found in held] == ["int8"]
+    assert quantizations(quantized) == held
+
+
 SPLIT_SEEDS = 8
 """The split quantized tree's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on
 armada."""

@@ -8,18 +8,17 @@ facts with the run's own XLA flags.
 
 from __future__ import annotations
 
+import dataclasses
 import functools
 from collections.abc import Callable, Mapping
-from typing import TYPE_CHECKING, ClassVar, NamedTuple, Protocol, TypedDict, Unpack, runtime_checkable
+from typing import ClassVar, NamedTuple, Protocol, TypedDict, Unpack, runtime_checkable
 
 import jax
+import numpy as np
 from jax.sharding import Sharding
 
 from dew.devices import xla_flag
 from dew.nn.kernels.generation import backend, gpu_target
-
-if TYPE_CHECKING:
-    from flax import linen as nn
 
 
 class QuantizedDtypes(Protocol):
@@ -41,12 +40,42 @@ class Quantized(Protocol):
     _dew_quantization: ClassVar[QuantizedDtypes]
 
 
-def compiler_options(*models: nn.Module) -> dict[str, bool]:
+def quantizations(*models: object) -> list[QuantizedDtypes]:
+    """The quantization every model class among `models` carries (`Quantized`), and every tower they
+    hold: each module a model, a task's encoder or any record it is handed holds in its fields,
+    a tuple's or a mapping's entries, at any depth, so a quantized text encoder inside a condition's
+    encoder counts as the denoiser beside it does. Arrays and their trees are not walked."""
+    found: list[QuantizedDtypes] = []
+    seen: set[int] = set()
+
+    def walk(value: object) -> None:
+        if id(value) in seen or isinstance(value, (jax.Array, np.ndarray, str, bytes, int, float, type)):
+            return
+        seen.add(id(value))
+        if isinstance(value, Quantized):
+            found.append(type(value)._dew_quantization)
+        if isinstance(value, Mapping):
+            for entry in value.values():
+                walk(entry)
+        elif isinstance(value, (tuple, list)):
+            for entry in value:
+                walk(entry)
+        elif dataclasses.is_dataclass(value):
+            for field in dataclasses.fields(value):
+                if field.name not in ("parent", "name"):
+                    walk(getattr(value, field.name, None))
+
+    for model in models:
+        walk(model)
+    return found
+
+
+def compiler_options(*models: object) -> dict[str, bool]:
     """The XLA options a program that runs `models` compiles with on the default device, for its
-    `jax.jit(..., compiler_options=)`. Every program Dew compiles over a task's model or
-    autoencoder, or over an objective's modules, takes them. JAX takes compiler options on a
-    program's outermost jit alone, so a module's own jitted method runs under the options of the
-    program that calls it.
+    `jax.jit(..., compiler_options=)`. Every program Dew compiles over a task's model,
+    autoencoder or encoders, or over an objective's modules, takes them, for every tower they hold
+    (`quantizations`). JAX takes compiler options on a program's outermost jit alone, so a module's
+    own jitted method runs under the options of the program that calls it.
 
     XLA's Triton GEMM fusion computes some int8 dots as two or four times their product
     (openxla/xla#51016), silently, on every GPU measured (`GpuTarget.int8_triton_gemm`). A program
@@ -55,8 +84,7 @@ def compiler_options(*models: nn.Module) -> dict[str, bool]:
     and then the program does not compile rather than compute wrong. A run that sets
     `xla_gpu_enable_triton_gemm` in XLA_FLAGS keeps its own setting.
     """
-    specs = [layer._dew_quantization for layer in map(type, models) if isinstance(layer, Quantized)]
-    int8 = any("int8" in (spec.dtype, spec.bwd_qtype) for spec in specs)
+    int8 = any("int8" in (spec.dtype, spec.bwd_qtype) for spec in quantizations(*models))
     if (not int8 or backend() != "gpu" or gpu_target().int8_triton_gemm
             or xla_flag("xla_gpu_enable_triton_gemm") is not None):
         return {}
@@ -78,7 +106,7 @@ class JitArguments(TypedDict, total=False):
     out_shardings: Placements
 
 
-def program[**P, R](function: Callable[P, R], *models: nn.Module,
+def program[**P, R](function: Callable[P, R], *models: object,
                     step: Mapping[str, bool | int] | None = None,
                     **arguments: Unpack[JitArguments]) -> jax.stages.Wrapped:
     """`function` jitted with the XLA options a program over `models` compiles with
