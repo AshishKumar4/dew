@@ -18,12 +18,12 @@ def aligned(element: Batch, fields: tuple[str, ...], beside: tuple[str, ...] = (
     beside its `beside` fields, on axes of their own and read as they are. A record whose fields
     differ in length is refused: packed or cut into windows, each field would be cut at other places,
     one field's tokens standing beside another's from elsewhere, which no reader tells."""
-    lengths = {name: len(element[name]) for name in fields}
+    tokens = {name: np.asarray(element[name]) for name in fields}
+    lengths = {name: len(value) for name, value in tokens.items()}
     if len(set(lengths.values())) > 1:
         raise ValueError(f"a record's token fields {list(fields)} hold one entry a token, so one length; "
                          f"this record's hold {lengths}")
-    return {**{name: np.asarray(element[name]) for name in fields},
-            **{name: element[name] for name in beside}}
+    return {**tokens, **{name: element[name] for name in beside}}
 
 
 @dataclasses.dataclass(frozen=True)
