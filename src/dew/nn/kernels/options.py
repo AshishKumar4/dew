@@ -114,5 +114,6 @@ class _Placed(NamedTuple):
 @functools.cache
 def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, bool | int], ...],
                      **arguments) -> jax.stages.Wrapped:
-    placed = {name: value.tree() if isinstance(value, _Placed) else value for name, value in arguments.items()}
+    placed = {name: value.tree() if isinstance(value, _Placed) else value
+              for name, value in arguments.items()}
     return jax.jit(function, compiler_options=dict(options), **placed)

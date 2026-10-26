@@ -32,6 +32,7 @@ from flax import linen as nn
 
 from dew.artifacts import ImageGrid
 from dew.nn.conv import Conv
+from dew.nn.kernels.options import program
 from dew.objectives.base import Variables
 
 from .common import ImageMetric, paired
@@ -123,10 +124,16 @@ def _published_variables() -> Variables:
                                       for stage in range(len(STAGES))})
 
 
-@functools.cache
+def _distances(network: LPIPSNetwork, variables: Variables, images, references):
+    """The published network's distance between each pair of `images` and `references`."""
+    return network.apply(variables, images, references)
+
+
 def _distance():
+    """The published network's distance, its program the process's one (`program`) and its weights
+    loaded once (`_published_variables`)."""
     network, variables = LPIPSNetwork.published()
-    return jax.jit(lambda images, references: network.apply(variables, images, references))
+    return functools.partial(program(_distances, network, static_argnums=0), network, variables)
 
 
 class LPIPS(ImageMetric):

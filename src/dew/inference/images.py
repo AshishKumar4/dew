@@ -353,9 +353,9 @@ class TextToImage:
         by the task's towers as the training step encodes its blank (`DiffusionObjective.encode`)."""
         leaves = jax.tree.leaves(tokens)
         if leaves and leaves[0].shape[0] != 1:
-            return _encode(plan.sharding)(self.inputs.encoders, self.variables, plan.place(plan.pad(tokens)))
+            return _encoder(plan.sharding)(self.inputs.encoders, self.variables, plan.place(plan.pad(tokens)))
         # Host tokens, which reach the encoders' devices as the call places them.
-        return _encode(None)(self.inputs.encoders, self.variables, jax.tree.map(np.asarray, tokens))
+        return _encoder(None)(self.inputs.encoders, self.variables, jax.tree.map(np.asarray, tokens))
 
 
     def prepare(
@@ -638,8 +638,7 @@ class TextToImage:
         plan, process = settled.plan, settled.process
         given = plan.place(plan.pad(settled.tokens))
         if "given" not in settled.encoded:
-            given = program(_encoded, static_argnums=(0,), in_shardings=(None, plan.sharding),
-                            out_shardings=plan.sharding)(self.inputs.encoders, self.variables, given)
+            given = _encoder(plan.sharding)(self.inputs.encoders, self.variables, given)
         if settled.null_tokens is None:
             null = {}
         elif "null" in settled.encoded:
@@ -822,6 +821,11 @@ def _encoded(encoders, params, tokens):
     """The conditions' encodings of `tokens` (`encode_conditions`), each row's where its rows sit."""
     # A task without conditions holds no encoder weights.
     return encode_conditions(encoders, params["encoders"] if encoders else {}, tokens)
+
+
+def _encoder(rows: jax.sharding.NamedSharding | None):
+    """The program that encodes rows placed by `rows` (`_encoded`), placed as they are."""
+    return program(_encoded, static_argnums=(0,), in_shardings=(None, rows), out_shardings=rows)
 
 
 def _encoded_rows(conditions: Mapping[str, Conditioning]) -> int:
