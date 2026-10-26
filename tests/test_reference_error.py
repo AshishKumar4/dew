@@ -264,6 +264,27 @@ def test_a_library_arm_holds_dew_to_the_larger_of_its_error_and_the_references()
     assert [(verdict, stage) for verdict, stage, _ in verdicts] == [("pass", 1), ("pass", 1)], verdicts
 
 
+def test_a_reference_compiled_with_options_of_its_own_runs_as_given():
+    """A reference compiled with compiler options of its own (a trainer step's, `as_a_step`) runs as
+    given: the gate would nest it in its own jit, which a jit with options of its own refuses (row
+    1800)."""
+    from reference_error import _arms
+
+    own = jax.jit(lambda x: {"y": x * 2}, compiler_options={"xla_cpu_enable_fast_math": False})
+    def doubled(x):
+        return {"y": jnp.asarray(x) + jnp.asarray(x)}
+
+    mine, theirs = _arms(doubled, as_given(own))
+    assert theirs.as_given and not getattr(mine, "without_ynn", False)
+    # Unmarked, the gate nests it in its own jit, which a jit with options of its own refuses.
+    _, nested = _arms(doubled, own)
+    with pytest.raises(ValueError):
+        nested(np.ones(4, np.float32))
+    assert_as_exact(doubled, as_given(own),
+                    lambda seed: (np.random.default_rng(seed).standard_normal(64).astype(np.float32),),
+                    "a reference with options", seeds=8)
+
+
 def test_a_float64_truth_runs_as_one_compiled_program():
     """The gate compiles a JAX truth (`_truth_program`): its first call runs as given and every later
     one is the compiled program's, whose values are the eager truth's own. A NumPy truth (its first
