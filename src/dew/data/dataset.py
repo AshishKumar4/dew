@@ -391,14 +391,15 @@ class Loading:
 
         A worker for each CPU, as tf.data's parallelism takes each schedulable one, where there is
         more than one: on one CPU a worker adds a process and no parallelism, so the reading process
-        reads. On four CPUs of an eight-core host, an image read in three workers read 11% fewer
-        images a second than in eight (armada, 2026-10-26). At most `max_workers` of them, and no
-        more than half the memory the process may still take holds (`ram_budget_mb` where given),
-        each a process of its own (`WORKER_PROCESS_BYTES`) holding its `worker_buffer` batches and
-        `read_buffer` reads, the read buffer itself no more reads than that half holds. `records`
-        are the batches the read makes without workers, `SAMPLED_BATCHES` of which are measured;
-        `reads` is how many reads make one: one where the order is read by batch, its rows where it
-        streams records. A read that makes no batch reads without workers."""
+        reads. On four CPUs of an eight-core host an image read in four workers read as many images
+        a second as in eight, within 2%, and in three 11% fewer (armada, 2026-10-26). At most
+        `max_workers` of them, and no more than half the memory the process may still take holds
+        (`ram_budget_mb` where given), each a process of its own (`WORKER_PROCESS_BYTES`) holding
+        its `worker_buffer` batches and `read_buffer` reads, the read buffer itself no more reads
+        than that half holds. `records` are the batches the read makes without workers,
+        `SAMPLED_BATCHES` of which are measured; `reads` is how many reads make one: one where the
+        order is read by batch, its rows where it streams records. A read that makes no batch reads
+        without workers."""
         if self.workers != "auto":
             return self
         sampled = list(itertools.islice(records, SAMPLED_BATCHES))
