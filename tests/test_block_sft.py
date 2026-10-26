@@ -705,8 +705,9 @@ def clipped_run(obj, batch, limit):
 
 
 def assert_clipped_at_the_maxima(start, opt_state, passes, final, limit):
-    """`final`'s parameters are `qk_clip(limit)`'s update at the passes' merged maxima, applied to `start` with
-    its rescale (`stepped`) bit for bit, and the clip moved some of them. Returns the maxima it clipped at."""
+    """`final`'s parameters are `qk_clip(limit)`'s update at the passes' merged maxima, applied to `start`
+    with its rescale (`stepped`) bit for bit, and the clip moved some of them. Returns the maxima it
+    clipped at."""
     maxima = jax.tree.map(np.asarray, merged(passes))
     zero = jax.tree.map(np.zeros_like, start["params"])
     applied, after = jax.jit(qk_clip(limit).update)(zero, opt_state, start["params"], qk_stats=maxima)
