@@ -6,7 +6,7 @@ from collections.abc import Mapping, Sequence
 import jax
 import jax.numpy as jnp
 import numpy as np
-from reference_error import assert_as_exact, seeds_for, widened, without_ynn
+from reference_error import as_given, assert_as_exact, seeds_for, widened
 
 from dew.inference.serving import Server
 from dew.inference.tasks import TextGeneration
@@ -56,6 +56,7 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
     # once, and a draw's prompts share no page with another's, their tokens drawn apart.
     server = Server.from_task(task, **serving)
 
+    @as_given
     def served(row, drawn):
         tickets, shared, before = [], [], server.prefix_hits
         for index, request in enumerate(requests):
@@ -71,9 +72,12 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
         return tuple(np.asarray(generation.raw_log_probs[0], np.float32) for generation in generations)
 
     def explicit(model, wide_weights: bool = False):
-        forward = without_ynn(lambda weights, tokens, groups: jax.nn.log_softmax(
+        """The full forward's scores of each request's draws, a host loop over the requests whose
+        forward compiles as Dew's users compile it, as the server's programs do."""
+        forward = jax.jit(lambda weights, tokens, groups: jax.nn.log_softmax(
             model.apply(weights, tokens, **groups)))
 
+        @as_given
         def scored(row, drawn):
             weights = widened(variables) if wide_weights else variables
             scores = []

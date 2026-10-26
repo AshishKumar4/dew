@@ -19,7 +19,7 @@ from episode_support import ToolPolicy
 from flax import linen as nn
 from jax.experimental import checkify
 from model_support import Digits, decoder, serving_task as task
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 from serving_support import Served, assert_served_as_exact
 from sharded import assert_sharded
 from steady_state import guarded, steady_state
@@ -857,6 +857,7 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
         return {"raw": np.concatenate([generation.raw_log_probs[0, :generation.lengths[0]]
                                        for generation in generations])}
 
+    @as_given
     def served(seed):
         _, alone, rows_served = drawn(int(seed))
         for row, lone in zip(rows_served, alone, strict=True):
@@ -882,8 +883,8 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
                                                    drawn_ids]))
         return {"raw": np.concatenate(picked)}
 
-    assert_as_exact(served, lambda seed: likelihoods(drawn(int(seed))[1]), lambda seed: (np.int32(seed),),
-                    f"a server on {mesh}", seeds=MESH_SEEDS, truth_fn=truth)
+    assert_as_exact(served, as_given(lambda seed: likelihoods(drawn(int(seed))[1])),
+                    lambda seed: (np.int32(seed),), f"a server on {mesh}", seeds=MESH_SEEDS, truth_fn=truth)
 
 
 @pytest.mark.mesh(devices=4)

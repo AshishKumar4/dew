@@ -18,7 +18,7 @@ import optax
 import pytest
 from block_support import VOCAB, block_causal, model, wrapped
 from model_support import TINY_DECODER, model_draw
-from reference_error import assert_as_exact, seeds_for, without_ynn
+from reference_error import as_given, assert_as_exact, seeds_for
 from serving_support import Served, assert_served_as_exact
 
 from dew.batch import BLOCKS_FIELD, coordinates
@@ -106,9 +106,14 @@ def test_a_prefix_run_trains_the_block_mask_on_par_with_float64():
         tokens = jax.random.randint(jax.random.fold_in(jax.random.key(1), seed), (BATCH, ROW), 0, VOCAB)
         return init(jax.random.fold_in(jax.random.key(0), seed), tokens[:, :-1]), tokens
 
-    reference = without_ynn(lambda params, tokens: masked(decoder, params, tokens))
-    truth = without_ynn(lambda params, tokens: masked(wide, params, tokens))
-    dew = without_ynn(lambda params, tokens: trained(objective, params, tokens))
+    def reference(params, tokens):
+        return masked(decoder, params, tokens)
+
+    def truth(params, tokens):
+        return masked(wide, params, tokens)
+
+    def dew(params, tokens):
+        return trained(objective, params, tokens)
     seeds = seeds_for(reference, draw, "prefix run loss", truth_fn=truth)
     assert_as_exact(dew, reference, draw, "prefix run loss", seeds=seeds, truth_fn=truth)
 
@@ -521,9 +526,14 @@ def test_a_prefix_run_trains_and_serves_through_a_wrapper_of_a_block_reading_dec
         scores = scorer.token_scores(variables, batch)
         return scores.losses, scores.weights
 
-    reference = without_ynn(lambda variables, tokens: scored(bare, language_model(variables), tokens))
-    truth = without_ynn(lambda variables, tokens: scored(wide, language_model(variables), tokens))
-    dew = without_ynn(lambda variables, tokens: scored(objective, variables, tokens))
+    def reference(variables, tokens):
+        return scored(bare, language_model(variables), tokens)
+
+    def truth(variables, tokens):
+        return scored(wide, language_model(variables), tokens)
+
+    def dew(variables, tokens):
+        return scored(objective, variables, tokens)
     seeds = seeds_for(reference, draw, "wrapped prefix run loss", truth_fn=truth)
     assert_as_exact(dew, reference, draw, "wrapped prefix run loss", seeds=seeds, truth_fn=truth)
     variables = wrapper.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
@@ -590,8 +600,9 @@ def test_a_prefix_runs_harness_scores_a_continuation_as_its_generation_reads_it(
             logits = model.apply(variables, tokens[:, :-1], block_groups=blocks[:, :-1])
             picked = jnp.take_along_axis(jax.nn.log_softmax(logits), tokens[:, 1:, None], axis=-1)[..., 0]
             return picked[:, CONTEXT - 1:].sum(axis=-1)
-        return without_ynn(scored)
+        return scored
 
+    @as_given
     def harness(variables, tokens):
         task = TextGeneration(decoder, variables, RunProcessor(ByteTokenizer()), prefix=prefix)
         rows = [(None, row[:CONTEXT].tolist(), row[CONTEXT:].tolist()) for row in np.asarray(tokens)]

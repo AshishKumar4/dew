@@ -10,6 +10,7 @@ import numpy as np
 import optax
 from flax import linen as nn
 from interop_support import scaled_gap
+from reference_error import as_given
 
 from dew.artifacts import Representations
 from dew.diffusion.schedules import expand
@@ -254,6 +255,7 @@ def as_a_step(trainer, variables, micro, gradient):
 def float32_update(gradient):
     """The update a trainer's sgd(1) step is held to (`applied`): `gradient(variables)`, the objective's
     own, applied in float32 as the trainer applies it."""
+    @as_given
     def update(variables):
         grads = jax.tree.map(np.asarray, gradient(variables))
         return jax.tree.map(lambda before, grad: applied(before, (before - grad).astype(np.float32)),
