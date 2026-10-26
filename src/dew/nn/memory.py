@@ -61,29 +61,35 @@ class Objective:
     """The loss a token's prediction `f(W; k)` takes against its target, summed over the features:
     `dot`, -<p, v> (linear attention's, Nested Learning Eq 17); `l2`, 1/2 ||p - v||^2 (Titans Eq 12
     with Appendix C's 1/2); `lp`, ||p - v||_p^p (Miras Eq 10); `huber`, Huber's loss of each feature's
-    error at `delta` (Miras Eq 13)."""
+    error at `delta` (Miras Eq 13); `l2_or_l1`, the l2 loss while the whole error's norm is at most
+    `delta`, else `delta` times its l1 norm (Miras Eq 16, Yaad's Eq 26), so past `delta` every feature
+    steps `delta` times its error's sign, however small its own error."""
 
-    kind: Literal["dot", "l2", "lp", "huber"] = "l2"
+    kind: Literal["dot", "l2", "lp", "huber", "l2_or_l1"] = "l2"
     p: float = 3.0
     delta: float = 1.0
 
     def __post_init__(self):
-        if self.kind not in ("dot", "l2", "lp", "huber"):
-            raise ValueError(f"an objective is dot, l2, lp or huber, not {self.kind!r}")
+        if self.kind not in ("dot", "l2", "lp", "huber", "l2_or_l1"):
+            raise ValueError(f"an objective is dot, l2, lp, huber or l2_or_l1, not {self.kind!r}")
         if self.kind == "lp" and self.p < 1:
             raise ValueError(f"an lp objective takes p >= 1, got {self.p}")
-        if self.kind == "huber" and self.delta <= 0:
-            raise ValueError(f"a huber objective takes a positive delta, got {self.delta}")
+        if self.kind in ("huber", "l2_or_l1") and self.delta <= 0:
+            raise ValueError(f"a {self.kind} objective takes a positive delta, got {self.delta}")
 
     def __call__(self, prediction: jax.Array, target: jax.Array) -> jax.Array:
         error = prediction - target
         if self.kind == "dot":
             return -jnp.sum(prediction * target, axis=-1)
+        squares = 0.5 * jnp.sum(jnp.square(error), axis=-1)
         if self.kind == "l2":
-            return 0.5 * jnp.sum(jnp.square(error), axis=-1)
-        if self.kind == "lp":
-            return jnp.sum(jnp.abs(error) ** self.p, axis=-1)
+            return squares
         size = jnp.abs(error)
+        if self.kind == "lp":
+            return jnp.sum(size ** self.p, axis=-1)
+        if self.kind == "l2_or_l1":
+            # ||p - v|| <= delta, squared on both sides.
+            return jnp.where(2 * squares <= self.delta ** 2, squares, self.delta * jnp.sum(size, axis=-1))
         return jnp.sum(jnp.where(size <= self.delta, 0.5 * jnp.square(error),
                                  self.delta * (size - 0.5 * self.delta)), axis=-1)
 
