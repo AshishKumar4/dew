@@ -76,6 +76,17 @@ class Volatile(Protocol):
 
 
 @runtime_checkable
+class Costly(Protocol):
+    """A step that costs more to run on a record than reading what it made back from a cache costs,
+    as measured (`tools/benchmark_data.py automatic-cache`), and makes it from the record alone: so a
+    chain that runs it first caches what it makes with no `cache=` (`dew.data.compile._automatic`).
+    An image decode is not one: an image a record names by path is read from storage the record's
+    content does not key."""
+
+    costly: bool
+
+
+@runtime_checkable
 class SingleReader(Protocol):
     single_reader: bool
 
@@ -296,17 +307,11 @@ class Pack:
         return (*self.fields, *(name for name, _ in self.along))
 
     def document(self, element: Batch) -> Batch:
-        """`element` as a document a window packs: its `packed` fields alone. Its `fields` hold one
-        entry a token, so a record whose fields differ in length is refused: packed, its fields would
-        be cut at different places, the windows holding one field's tokens beside another's from
-        other places, which no packer tells."""
-        from dew.data.steps.generic import Fields
+        """`element` as a document a window packs: its `packed` fields alone, its token `fields` of one
+        length (`dew.data.steps.generic.aligned`), its `along` fields beside them."""
+        from dew.data.steps.generic import aligned
 
-        lengths = {name: len(element[name]) for name in self.fields}
-        if len(set(lengths.values())) > 1:
-            raise ValueError(f"a packed record's fields {list(self.fields)} hold one entry a token, so one "
-                             f"length; this record's hold {lengths}")
-        return Fields(self.packed).map(element)
+        return aligned(element, self.fields, tuple(name for name, _ in self.along))
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """Rows of `seq_len` tokens along `fields`, the last of them a target: `seq_len - 1` inputs."""
@@ -405,6 +410,10 @@ class Cached(Protocol):
 @dataclasses.dataclass(frozen=True)
 class Artifact:
     cache: Cached
+    automatic: bool = False
+    """Whether the compiler placed it (`dew.data.compile._automatic`) rather than the chain: it holds
+    the records its prefix makes, so a run reads the same records with or without it and its plan
+    names none (`dew.data.cache.automatic_root`)."""
 
 
 type Stage = (

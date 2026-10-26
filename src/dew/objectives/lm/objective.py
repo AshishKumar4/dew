@@ -1095,8 +1095,8 @@ class LMObjective(TokenScorer):
     `text_block_groups` (the data stage `dew.data.steps.blocks.Blocks`) trains the same way, whatever
     `prefix` says, so a run's blocks may be any runs of a row: a layer's attention chunk (`LayerKind.chunk`)
     would cut one, and the loss would drop a target its source never saw. A run reads blocks only where a
-    trunk layer that reads them has no chunk, or one of `seq_len` places or more, and a prefix run on any
-    other model is refused where it is built.
+    trunk layer that reads them has no chunk, and a prefix run on any other model is refused where it is
+    built.
 
     `model` may be a loaded source (`LMObjective(qwen, seq_len=512)`), and
     `variables` and `processor` override its own (`Objective.bind_model`).
