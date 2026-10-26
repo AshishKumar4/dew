@@ -120,9 +120,11 @@ def _placed(runs: list[list[np.ndarray]], selected: Sequence[np.ndarray], capaci
 
 def _patch_streams(values: Mapping[str, object], image_id: int, video_id: int | None, *,
                    kernel: int, table_size: int, patch_size: int, retains_slots: bool = False
-                   ) -> dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]]:
-    """Return each modality's patch frames, their coordinates and their pooled
-    lengths, by the placeholder id that stands in the prompt for them.
+                   ) -> dict[int, tuple[np.ndarray, np.ndarray, list[np.ndarray]]]:
+    """Return each modality's patch frames, their coordinates and each item's
+    projector slots its placeholders read, by the placeholder id that stands in
+    the prompt for them: a tower that keeps its patch slots reads its valid
+    patches' own, a pooling one its pooled blocks in order.
 
     The source flattens its video and frame axes, not its prompt rows
     (modeling_gemma4.py:2476-2488), so the two streams stay separate here and
@@ -130,7 +132,7 @@ def _patch_streams(values: Mapping[str, object], image_id: int, video_id: int | 
     arrives whole: its pixels with its positions, its coordinates inside the
     position table, and its patches in complete pooling blocks.
     """
-    streams: dict[int, tuple[np.ndarray, np.ndarray, np.ndarray]] = {}
+    streams: dict[int, tuple[np.ndarray, np.ndarray, list[np.ndarray]]] = {}
     for pixel_name, position_name, token_id, ndim in (
         ("pixel_values", "image_position_ids", image_id, 3),
         ("pixel_values_videos", "video_position_ids", video_id, 4),
@@ -163,7 +165,9 @@ def _patch_streams(values: Mapping[str, object], image_id: int, video_id: int | 
         counts = valid_patches.sum(axis=1)
         if not retains_slots and (frames.shape[1] % kernel ** 2 or np.any(counts % kernel ** 2)):
             raise ValueError("patch counts must divide into complete pooling blocks")
-        streams[token_id] = (frames, coordinates, counts if retains_slots else counts // kernel ** 2)
+        streams[token_id] = (frames, coordinates,
+                             [np.flatnonzero(valid) for valid in valid_patches] if retains_slots
+                             else [np.arange(count // kernel ** 2) for count in counts])
     return streams
 
 
@@ -413,9 +417,9 @@ class Processor:
         """Row-align the processor's image and video features to their placeholders.
 
         It runs in two halves. The first reads the processor's output into
-        `chunks`, one feature block per image, with `lengths` its placeholder
-        count, `shape` the padded block shape and `capacity` the slots one
-        image occupies; `grid` and `patch_positions` carry the per-family
+        `chunks`, one feature block per image, with `selected` the projector
+        slots its placeholders read, `shape` the padded block shape and
+        `capacity` the slots one image occupies; `grid` and `patch_positions` carry the per-family
         extras. The second copies each chunk into `padded` at its row and image
         slot and writes `indices`, the slot each placeholder token reads.
 
@@ -441,11 +445,11 @@ class Processor:
                 raise ValueError("mm_token_type_ids must identify each image and video placeholder")
             chunks, grid, merge = self._qwen_frames(values, tokens, runs)
             shape = (max(chunk.shape[0] for chunk in chunks), chunks[0].shape[-1])
-            lengths = np.prod(grid, axis=1) // merge ** 2
+            selected = [np.arange(length) for length in np.prod(grid, axis=1) // merge ** 2]
             capacity = shape[0] // merge ** 2
         elif "image_position_ids" in values or "video_position_ids" in values:
-            chunks, patch_positions, lengths, kernel = self._positioned_chunks(values, tokens, runs,
-                                                                               image_id, video_id)
+            chunks, patch_positions, selected, kernel = self._positioned_chunks(values, tokens, runs,
+                                                                                image_id, video_id)
             shape = (max(chunk.shape[0] for chunk in chunks), chunks[0].shape[-1])
             pixel_dtype = np.result_type(*(chunk.dtype for chunk in chunks))
             capacity = shape[0] // kernel ** 2
@@ -453,7 +457,7 @@ class Processor:
             count = self.record.get("tokens_per_image")
             if type(count) is not int or count < 1 or pixels.ndim != 4:
                 raise ValueError("fixed-resolution pixel_values require a positive tokens_per_image")
-            lengths = np.full(pixels.shape[0], count, np.int32)
+            selected = [np.arange(count)] * pixels.shape[0]
             capacity = count
             chunks, shape = list(pixels), pixels.shape[1:]
         if len(chunks) != int(image_counts.sum()):
@@ -467,11 +471,6 @@ class Processor:
             padded_grid[..., 1:] = merge
         padded_positions = (None if patch_positions is None else np.full(
             (tokens.shape[0], width, shape[0], 2), -1, np.int32))
-        selected = [np.arange(length) for length in lengths]
-        if patch_positions is not None:
-            geometry = towers.from_record(_records.record(self.record["tower"], "tower")).geometry()
-            if geometry.retains_patch_slots:
-                selected = [np.flatnonzero((position >= 0).all(axis=-1)) for position in patch_positions]
         indices, places = _placed(runs, selected, capacity, tokens.shape, "projector's feature count")
         groups = None if gemma else np.full(tokens.shape, -1, np.int32)
         token_lengths = np.zeros((tokens.shape[0], width), np.int32)
@@ -504,10 +503,11 @@ class Processor:
         runs: list[list[np.ndarray]],
         image_id: int,
         video_id: int | None,
-    ) -> tuple[list[np.ndarray], list[np.ndarray], list[int], int]:
+    ) -> tuple[list[np.ndarray], list[np.ndarray], list[np.ndarray], int]:
         """The per-patch position layout's feature blocks, in placeholder order:
-        each image or video's patches, their positions and placeholder count,
-        and the vision pooling kernel that sets how many slots one fills."""
+        each image or video's patches, their positions and the projector slots
+        its placeholders read (`_patch_streams`), and the vision pooling kernel
+        that sets how many slots one fills."""
         # The tower's geometry as its translation reads it, the reference's defaults included.
         tower = towers.from_record(_records.record(self.record["tower"], "tower")).geometry()
         kernel, patch_size, table_size = tower.block_size, tower.patch_size, tower.position_size
@@ -520,8 +520,8 @@ class Processor:
         ordered = _in_text_order(patches, tokens, runs)
         if not ordered:
             raise ValueError("pixels require image or video placeholders")
-        chunks, patch_positions, lengths = (list(part) for part in zip(*ordered, strict=True))
-        return chunks, patch_positions, [int(length) for length in lengths], kernel
+        chunks, patch_positions, selected = (list(part) for part in zip(*ordered, strict=True))
+        return chunks, patch_positions, selected, kernel
 
     def _audio(self, values: Mapping[str, object], tokens: np.ndarray
                ) -> tuple[dict[str, jax.Array], dict[str, jax.Array]]:
