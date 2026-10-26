@@ -199,7 +199,8 @@ def test_tier_three_admits_a_causal_lm_it_can_train_and_refuses_the_rest():
     refusal its own: BERT configured as a decoder (`is_decoder`) is one, each position reading the
     tokens before it, and configured as an encoder it reads the later tokens too and is refused; a
     speculative drafter is no model on its own (`DrafterRefused`), whatever its type; a rotary whose
-    tables transformers recomputes from each call's positions (dynamic NTK) cannot be traced; BioGPT's
+    tables transformers recomputes from each call's positions (dynamic NTK) is admitted, its tables
+    computed in the trace (`functional_rotaries`); BioGPT's
     training forward draws its layer drop on the host, which a traced step would fix; a quantized
     source is refused, tier 3 reading float weights; and one whose shrunken model does not run at the
     probe's length (a BERT decoder of 8 positions) is `ProbeUnavailable`, not a model none computes."""
@@ -207,10 +208,10 @@ def test_tier_three_admits_a_causal_lm_it_can_train_and_refuses_the_rest():
     from dew.interop.pretrained import TorchRoute, source_route
 
     assert isinstance(source_route(tiny_config("bert", is_decoder=True).to_dict()), TorchRoute)
+    dynamic = {"rope_type": "dynamic", "rope_theta": 10000.0, "factor": 2.0}
+    assert isinstance(source_route(tiny_config("cohere", rope_parameters=dynamic).to_dict()), TorchRoute)
     cohere = tiny_config("cohere").to_dict()
     for refused in (tiny_config("bert", is_decoder=False).to_dict(),
-                    tiny_config("cohere", rope_parameters={"rope_type": "dynamic", "rope_theta": 10000.0,
-                                                           "factor": 2.0}).to_dict(),
                     tiny_config("biogpt").to_dict(),
                     {**cohere, "quantization_config": {"quant_method": "gptq", "bits": 4, "group_size": 64,
                                                        "desc_act": False, "sym": True}}):

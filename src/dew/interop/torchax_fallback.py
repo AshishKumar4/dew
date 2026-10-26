@@ -36,6 +36,7 @@ import warnings
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import FunctionType
 from typing import TYPE_CHECKING, Self
 
 import jax
@@ -53,7 +54,14 @@ from dew.interop.pickles import host_dtype, host_view
 from dew.interop.pretrained import PretrainedFallback, source_processor
 from dew.interop.weights import AUTO
 from dew.nn.attention import cache_positions
-from dew.nn.inputs import COORDINATES_FIELD, VALIDITY_FIELD, Coordinates, coordinates, real_slots
+from dew.nn.inputs import (
+    COORDINATES_FIELD,
+    VALIDITY_FIELD,
+    Coordinates,
+    coordinates,
+    document_reach,
+    real_slots,
+)
 from dew.nn.kv_cache import filled_slots
 from dew.nn.precision import at_least_fp32, configured_precision, float32_products, scaled
 from dew.nn.protocols import Lacks, OutputTable
@@ -65,7 +73,7 @@ if TYPE_CHECKING:
     import torch
     from jax.extend.core import Jaxpr
     from torchax.interop import JittableModule
-    from transformers import PretrainedConfig, PreTrainedModel
+    from transformers import PreTrainedModel
 
     from dew.nn.backbones.decoder_stack import DecoderBank
 
@@ -128,10 +136,6 @@ def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
                          "which tier 3 runs")
     fields = {key: value for key, value in unmapped.fields.items() if key != "model_type"}
     config = AutoConfig.for_model(model_type, **fields, experts_implementation=EXPERTS)
-    if (moving := _position_dependent_rope(config)) is not None:
-        raise ValueError(f"model_type {model_type!r} rotates by rope_type {moving!r}, whose tables "
-                         "transformers recomputes from each call's positions, which a traced program "
-                         "cannot branch on (ledger 1493, H5)")
     _registered()
     model = AutoModelForCausalLM.from_config(config, trust_remote_code=False, dtype=torch.float32,
                                              attn_implementation=_PROBE).eval()
@@ -151,6 +155,7 @@ def admitted(unmapped: verify.Unmapped) -> TorchAdmission:
     # any layer drop run only there, and a draw on the host would be fixed for every step.
     from torchax.interop import JittableModule, extract_all_buffers
 
+    functional_rotaries(model)
     jittable = JittableModule(model)
     params = {name: host_view(leaf, name) for name, leaf in jittable.params.items()}
     buffers = {name: host_view(leaf, name) for name, leaf in extract_all_buffers(model)[1].items()}
@@ -435,15 +440,129 @@ def _registered() -> None:
     AttentionMaskInterface.register(_PROBE, ALL_MASK_ATTENTION_FUNCTIONS["eager"])
 
 
-def _position_dependent_rope(config: PretrainedConfig) -> str | None:
-    """The rope_type of `config`'s rotary whose tables transformers recomputes from each call's
-    positions ('dynamic', 'longrope'; `dynamic_rope_update`), or None: its `rope_parameters`, one
-    record or one per layer kind, as transformers' config class normalizes them (empty for a model
-    with no rotary)."""
-    stated = config.to_dict().get("rope_parameters") or {}
-    kinds = stated.values() if all(isinstance(entry, Mapping) for entry in stated.values()) else [stated]
-    return next((entry.get("rope_type") for entry in kinds
-                 if entry.get("rope_type") in ("dynamic", "longrope")), None)
+_MOVING = ("dynamic", "longrope")
+"""The rope types whose tables transformers recomputes from each call's positions (`dynamic_rope_update`)."""
+
+
+@functools.cache
+def _moving_rotary_code():
+    """The code of transformers' `dynamic_rope_update` wrapper, which every rotary whose forward it
+    decorates shares."""
+    from transformers.modeling_rope_utils import dynamic_rope_update
+
+    wrapper = dynamic_rope_update(lambda module, x, position_ids: None)
+    if not isinstance(wrapper, FunctionType):
+        raise TypeError("transformers' dynamic_rope_update wraps a forward in no Python function")
+    return wrapper.__code__
+
+
+def _recomputes_tables(module: torch.nn.Module) -> bool:
+    """Whether `module`'s class forward is `dynamic_rope_update`'s wrapper, under any decorator around
+    it (`torch.no_grad()`'s)."""
+    function = type(module).forward
+    while isinstance(function, FunctionType):
+        if function.__code__ is _moving_rotary_code():
+            return True
+        function = vars(function).get("__wrapped__")
+    return False
+
+
+def functional_rotaries(model: torch.nn.Module) -> int | None:
+    """Replace each rotary of `model` whose tables transformers recomputes from each call's positions
+    (a 'dynamic' or 'longrope' rope_type under `dynamic_rope_update`, which mutates its buffers from the
+    call's largest position and so cannot run in a traced program) with `_functional_rotary`, which
+    computes the same tables from each token's reach (`_reaching`) inside the trace. Returns the position
+    past which a cache's keys go stale (LongRoPE's original context, which `Serving.cache_rebuild_position`
+    names), or None. A rotary that recomputes per layer kind is refused by name."""
+    rebuild = None
+    for name, module in list(model.named_modules()):
+        if not _recomputes_tables(module):
+            continue
+        rope_type = vars(module)["rope_type"]
+        if not isinstance(rope_type, str):
+            if moving := sorted(kind for kind, value in rope_type.items() if value in _MOVING):
+                raise ValueError(f"{type(module).__name__} recomputes its {moving} layers' tables per call, "
+                                 "which tier 3 computes for one rotary a model, not per layer kind")
+            continue
+        if rope_type not in _MOVING:
+            continue
+        parent, _, attribute = name.rpartition(".")
+        replacement = _functional_rotary()(module)
+        setattr(model.get_submodule(parent), attribute, replacement)
+        if rope_type == "longrope":
+            rebuild = replacement.original
+    return rebuild
+
+
+@functools.cache
+def _functional_rotary() -> type:
+    """The torch module `functional_rotaries` substitutes (built on first use, so importing this module
+    imports no torch)."""
+    import torch
+    from transformers import PretrainedConfig
+    from transformers.modeling_rope_utils import ROPE_INIT_FUNCTIONS
+
+    class FunctionalRotary(torch.nn.Module):
+        """A 'dynamic' or 'longrope' rotary computed inside a traced program: each token's tables are the
+        ones transformers' rotary computes for a call reaching that token's reach (`_reaching`: its
+        document's furthest place, or its row's), with transformers' own initializer (`ROPE_INIT_FUNCTIONS`)
+        and amplitude, as `dynamic_rope_update` updates them at batch one. LongRoPE's short and long
+        tables are the rotary's own at its original context and one past it; dynamic NTK's is its
+        initializer's at the reach, which a traced length broadcasts per token."""
+
+        def __init__(self, replaced: torch.nn.Module):
+            super().__init__()
+            held = vars(replaced)
+            self.config: PretrainedConfig = held["config"]
+            self.rope_type: str = held["rope_type"]
+            self.attention_scaling: float = held["attention_scaling"]
+            self.original = 0
+            if self.rope_type == "longrope":
+                self.original = int(self.config.rope_parameters["original_max_position_embeddings"])
+                long, _ = ROPE_INIT_FUNCTIONS["longrope"](self.config, None, seq_len=self.original + 1)
+                self.register_buffer("short_inv_freq", replaced.get_buffer("original_inv_freq").clone(),
+                                     persistent=False)
+                self.register_buffer("long_inv_freq", long, persistent=False)
+
+        def forward(self, x, position_ids, layer_type=None):
+            reach = _reach_of(position_ids)[..., None]
+            if self.rope_type == "longrope":
+                inv_freq = torch.where(reach + 1 > self.original, self.get_buffer("long_inv_freq"),
+                                       self.get_buffer("short_inv_freq"))
+            else:
+                inv_freq, _ = ROPE_INIT_FUNCTIONS[self.rope_type](self.config, None, seq_len=reach + 1)
+            freqs = position_ids[..., None].float() * inv_freq.float()
+            emb = torch.cat((freqs, freqs), dim=-1)
+            return ((emb.cos() * self.attention_scaling).to(dtype=x.dtype),
+                    (emb.sin() * self.attention_scaling).to(dtype=x.dtype))
+
+    return FunctionalRotary
+
+
+_REACH: contextvars.ContextVar[jax.Array | None] = contextvars.ContextVar("dew_reach", default=None)
+"""Each token's reach `[B, S]` in the traced call (`_reaching`), which a functional rotary reads."""
+
+
+@contextlib.contextmanager
+def _reaching(reach: jax.Array | None):
+    """Run a traced call whose tokens reach `reach` `[B, S]`: each token's document's furthest place
+    (`dew.nn.inputs.document_reach`) in a laid call, each decoding row's furthest token in a decoding
+    one; None for a plain call, whose rows each reach their furthest position."""
+    token = _REACH.set(reach)
+    try:
+        yield
+    finally:
+        _REACH.reset(token)
+
+
+def _reach_of(position_ids):
+    """Each token's reach, a torch view of `_REACH`, or its row's largest position."""
+    from torchax.interop import torch_view
+
+    reach = _REACH.get()
+    if reach is None:
+        return position_ids.max(dim=-1, keepdim=True).values.expand_as(position_ids)
+    return torch_view(reach)
 
 
 def refuse_quantized(config: Mapping[str, object]) -> None:
@@ -560,21 +679,22 @@ class TorchGraph:
         positions = None if laid is None else laid.places()
         valid = None if laid is None or laid.valid is None else jnp.asarray(laid.valid, bool)
         arguments = (dict(params), dict(buffers), tokens, key, positions, documents, valid, visible,
-                     key_places, head_input, None)
+                     key_places, head_input, None, None)
         (logits, hidden), _ = self._run(arguments, train=train, precision=precision,
                                         max_segments=max_segments)
         return logits, hidden
 
     def step(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array], tokens: jax.Array, *,
              cache: Mapping[int, Mapping[str, jax.Array]], slots: jax.Array, filled: jax.Array,
-             positions: jax.Array, precision: jax.lax.PrecisionLike = None
+             positions: jax.Array, reach: jax.Array | None = None, precision: jax.lax.PrecisionLike = None
              ) -> tuple[jax.Array, dict[int, dict[str, jax.Array]]]:
         """A decoding call: the logits for `tokens` at their `positions` `[B, S]` (which transformers'
         rotary reads), each layer writing its keys and values into `cache` at `slots` and attending
-        over its row's `filled` slots (`_Cached`), and every layer's cache after the call."""
+        over its row's `filled` slots (`_Cached`), and every layer's cache after the call. `reach` is
+        each token's reach (`_reaching`), its row's furthest position where None."""
         (logits, _), written = self._run(
             (dict(params), dict(buffers), tokens, None, positions, None, None, None, None, None,
-             (dict(cache), slots, filled)), train=False, precision=precision, max_segments=1)
+             (dict(cache), slots, filled), reach), train=False, precision=precision, max_segments=1)
         return logits, written
 
     def _run(self, arguments: tuple, *, train: bool, precision: jax.lax.PrecisionLike, max_segments: int):
@@ -597,7 +717,7 @@ class TorchGraph:
                positions: jax.typing.ArrayLike | None = None, documents: jax.typing.ArrayLike | None = None,
                valid: jax.typing.ArrayLike | None = None, visible: jax.typing.ArrayLike | None = None,
                key_places: jax.typing.ArrayLike | None = None, head_input: jax.typing.ArrayLike | None = None,
-               cache: tuple | None = None, *, train: bool,
+               cache: tuple | None = None, reach: jax.typing.ArrayLike | None = None, *, train: bool,
                precision: jax.lax.PrecisionLike = None, max_segments: int = 1):
         """The forward over these arguments traced once (`jax.make_jaxpr`), its output shapes, and the
         draws it made (`_Draws`): on torchax's device, a key's, or on the host, fixed by the trace. Its
@@ -607,8 +727,10 @@ class TorchGraph:
         draws = _Draws()
 
         def forward(params, buffers, tokens, key, positions, documents, valid, visible, key_places,
-                    head_input, cache):
+                    head_input, cache, reach):
             arguments = env.j2t_iso((dict(params), dict(buffers), tokens, positions, head_input))
+            if reach is None and documents is not None:
+                reach = document_reach(documents, valid, positions)
             cached = None if cache is None else _Cached(*cache)
             attending = (contextlib.nullcontext() if self.attention_impl is None else _attending(
                 _Attending(self.attention_impl, documents, valid, max_segments, train, key, visible,
@@ -616,7 +738,7 @@ class TorchGraph:
             self.module.train(train)
             try:
                 with (env, env.override_property(prng=key) if key is not None else contextlib.nullcontext(),
-                      draws, attending):
+                      draws, attending, _reaching(reach)):
                     outputs = env.t2j_iso(self.module.functional_call(_forward, *arguments))
             finally:
                 self.module.eval()
@@ -625,7 +747,7 @@ class TorchGraph:
         with configured_precision(precision):
             closed, shapes = jax.make_jaxpr(forward, return_shape=True)(
                 dict(params), dict(buffers), tokens, key, positions, documents, valid, visible, key_places,
-                head_input, cache)
+                head_input, cache, reach)
         return closed, shapes, draws
 
     def export(self, model: nn.Module, variables: Mapping[str, object],
@@ -876,6 +998,9 @@ class TorchCausalLM(nn.Module):
     max_seq_len: int = 2048
     """The slots a decode cache holds a row, the tokens a row may reach (`Bounded`): `load` sets the
     source's own context, `max_position_embeddings`, or the load's `max_seq_len`."""
+    rebuild: int | None = None
+    """The position past which cached keys go stale, LongRoPE's original context, where the source's
+    rotary switches tables there (`functional_rotaries`), or None (`Serving.cache_rebuild_position`)."""
 
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
@@ -912,6 +1037,23 @@ class TorchCausalLM(nn.Module):
         # The tokens that write: those the validity marks less the padding a row numbers 0 in its documents.
         real = real_slots({**fields, **packing}, jnp.shape(tokens)[:2])
         return self._decoded(tokens, real, None if laid is None else laid.positions)
+
+    @property
+    def cache_rebuild_position(self) -> int | None:
+        return self.rebuild
+
+    def inference_projection_groups(self, variables: Mapping[str, Mapping]) -> tuple:
+        """None: a tier-3 model's projections are transformers' modules, which a server does not pack."""
+        del variables
+        return ()
+
+    def mixed_admission_refusal(self) -> str:
+        return ("a tier-3 model runs transformers' forward over Dew's cache, whose mixed step (one row of "
+                "every slot's tokens) no check holds against its separate decode and prefill calls")
+
+    def split_prefill_refusal(self) -> str:
+        return ("a tier-3 model runs transformers' forward over Dew's cache, whose prefill in pieces no "
+                "check holds against its whole prefill; serve it with whole-prompt admission")
 
     def init_cache(self, batch_size: int) -> None:
         """Open the decode cache of `batch_size` rows (`Decoding`), every slot unfilled: one decoding
@@ -951,16 +1093,20 @@ class TorchCausalLM(nn.Module):
         slots, _ = cache_positions(self, rows, width, real)
         filled = filled_slots(self.get_variable("cache", "cache_index"), self.max_seq_len)
         places = jnp.maximum(slots, 0) if positions is None else jnp.asarray(positions, jnp.int32)
+        # A decoding call's tokens reach their row's furthest real one, as a rotary's tables read it.
+        furthest = jnp.max(jnp.where(real, places, -1), axis=1, keepdims=True)
         held = {layer: dict(variable.value) for layer, variable in cache.items()}
-        logits, written = self._step(self.variables, tokens, held, slots, filled, places)
+        logits, written = self._step(self.variables, tokens, held, slots, filled, places,
+                                     jnp.broadcast_to(furthest, places.shape))
         for layer, variable in cache.items():
             variable.value = written[layer]
         return logits.astype(at_least_fp32(logits.dtype))
 
-    def _step(self, variables, tokens, held, slots, filled, places):
+    def _step(self, variables, tokens, held, slots, filled, places, reach=None):
         params, buffers, compute = self._operands(variables)
+        precision = float32_products(compute, self.precision)
         return self.graph.step(params, buffers, tokens, cache=held, slots=slots, filled=filled,
-                               positions=places, precision=float32_products(compute, self.precision))
+                               positions=places, reach=reach, precision=precision)
 
     def logits(self, tokens, *, train: bool = False, **packing) -> jax.Array:
         """The logits of the whole rows, as `__call__` returns them: in at least float32
@@ -1130,6 +1276,7 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
             model = AutoModelForCausalLM.from_config(
                 stated, dtype=stated.dtype if storage == "auto" else storage, experts_implementation=EXPERTS)
     model.eval()
+    rebuild = functional_rotaries(model)
     jittable = JittableModule(model)
     head = model.get_output_embeddings()
     if not isinstance(head, torch.nn.Module):
@@ -1169,7 +1316,7 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     context = model.config.to_dict().get(named)
     capacity = (max_seq_len if max_seq_len is not None
                 else context_lengths({"max_position_embeddings": context})[0])
-    built = {"dtype": resolve_dtype(dtype), "max_seq_len": capacity}
+    built = {"dtype": resolve_dtype(dtype), "max_seq_len": capacity, "rebuild": rebuild}
     module = (TorchCausalLM(graph, vocab, **built) if head_name is None
               else TorchTableLM(graph, vocab, head=head_name, **built))
     source = str(name_or_dir) if revision is None else f"{name_or_dir}@{revision}"
