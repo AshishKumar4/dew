@@ -30,7 +30,7 @@ concurrency:
 
 env:
   # The armada runner every armada job uses.
-  ARMADA: github:AshishKumar4/armada#fb5e31258507559e12df70fa03c4ab4d81be0660
+  ARMADA: github:AshishKumar4/armada#86b89027297c4ae692f149a8bdb2bb7006d22a0c
 
 jobs:
   # A commit this workflow passed on another push, as one proved on
@@ -275,6 +275,9 @@ jobs:
         # most tests import, and the daily run, which proves the commit again with every file): 160,
         # or a background run's share.
         if [ -n "$BACKGROUND_POOL" ]; then bound="--pool=$BACKGROUND_POOL --deadline=6000"; else bound="--deadline=2700"; fi
+        # A train's run (ci/batch-*, ci/fix-*) starts before any other while the fleet is full, and lanes' runs at a
+        # head (verdict.sh, at -10) end their newest containers to let it in (owner, bible §4).
+        case "$GITHUB_REF_NAME" in ci/batch-*|ci/fix-*) bound="$bound --priority=10" ;; esac
         if [ "$DEW_TEST_CACHE" = off ] || ! $armada verdict ${{ github.sha }}; then
           setsid $armada run ${{ github.sha }} $bound --label="${{ github.ref_name }}" \
             > >(tee "$RUNNER_TEMP/suite.log") 2> >(tee "$RUNNER_TEMP/suite.err" >&2) &
