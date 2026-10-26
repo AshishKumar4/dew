@@ -327,6 +327,14 @@ class BoundsState(NamedTuple):
     bounds: Mapping[str, jax.Array]
 
 
+def clips_qk(opt_state) -> bool:
+    """Whether an optimizer state holds a QK-Clip's (`QKClipState`), however the optimizer composes it:
+    a run then asks its objective for the step's attention logit maxima (`dew.objectives.Step.qk_stats`)
+    and hands them to the update."""
+    return any(isinstance(node, QKClipState) for node in jax.tree.leaves(
+        opt_state, is_leaf=lambda node: isinstance(node, QKClipState)))
+
+
 def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArgs:
     """Rescale the query and key projections of every head past `tau`.
 
@@ -337,9 +345,10 @@ def scale_by_qk_clip(tau: float = 100.0) -> optax.GradientTransformationExtraArg
     one rounding of `gamma * (W + update)`, the paper's.
 
     The per-head maxima arrive as `qk_stats`, the `qk` collection the model
-    sowed, which the trainer forwards from the loss's `Aux`. Without them
-    the transform steps aside, leaving every other optimizer and every run
-    whose loss never opened the collection on its old update."""
+    sowed, which a run asks its objective for when its optimizer's state
+    holds this transform's (`clips_qk`) and forwards from the loss's `Aux`,
+    refusing a step whose objective returns none. Called without them, as a
+    loop of plain optax calls may, the transform steps aside."""
     if tau <= 0:
         raise ValueError(f"the clip threshold bounds positive logits, got {tau}")
 

@@ -195,9 +195,12 @@ A reloaded run behaves like the live one: the same processor, chat template and 
 |---|---|
 | Token coordinates | Packed, padded and cached rows give the same result as separate ones, in every mixer (attention, GDN, KDA, Mamba). |
 | Layer identity | Quantization survives fused projections, scanned layers and pipeline stages. |
-| One LM head | Full logits, the chunked loss and scoring compute the head the same way, quantized or not, sharded or not. |
+| One vocabulary head | Full logits, the chunked loss and scoring compute the head the same way, quantized or not, sharded or not, and every token objective (LM, RL, preference, masked and block diffusion) runs it by one policy (`dew.objectives.lm.head`): whole logits where they fit, tiled with its gradient in the forward or the backward as the fit ladder moves it, reported in the step's program. |
 | Loading readers | Every model family loads and exports through one reversible weight-layout plan. |
 | Checkpoint state | Saving and restoring derive from the training state's own schema; restore casts and places once. |
+| Optimizer observations | An optimizer that reads what the step's model observed, a QK-Clip's attention logit maxima, says so in its own state (`clips_qk`), however it is composed; the run asks the objective for them through the step (`Step.qk_stats`) and pools them across microbatches, and a step whose objective returns none is refused, never left unclipped. No objective or run configuration carries a flag for it. |
+| Router training | One policy, `dew.objectives.routing.ExpertBalance`, trains the routers of every objective that composes it: the balancing bias, the balance loss and the z-loss, each optional. The model opens the routers' collection, the policy's terms join the loss statistics, and the bias counts commit once per update, however many microbatches the update pools. |
+| Block visibility | A prefix run trains and serves one mask: the blocks a layer that reads blocks sees whole come from one rule (`dew.nn.visibility.prefix_blocks`, `prompt_blocks`), which the data stage (`dew.data.steps.blocks.Blocks`), the loss's counted targets, `TextGeneration` and `Server` all read; off, no block field exists and every program is exactly causal. |
 
 Each seam requires one standing end-to-end test that runs every implementation registered for it. The [roadmap](../roadmap.md#ci-and-tooling) tracks the registry-wide coverage still to add.
 

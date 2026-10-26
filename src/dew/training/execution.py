@@ -196,7 +196,7 @@ class HostExecution:
         self.accelerator, self.cpu = accelerator, cpu
         self.sites = bank_sites(objective) if objective.bank_sites else ()
         self.device = device
-        self.unstack = jax.jit(functools.partial(logical, sites=self.sites))
+        self.unstack = functools.partial(program(logical, static_argnames="sites"), sites=self.sites)
 
     def forward(self, step: Mapping[str, bool | int]):
         """The loss and its pullback, compiled for the objective's modules as they are now, under the
