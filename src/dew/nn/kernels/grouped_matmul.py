@@ -1473,13 +1473,25 @@ OLD_ROUTES: dict[tuple[str, str, str], tuple[str, str]] = {
         ('triton', "R10: 1.263x Triton's time, geomean of 6 grouped rows"),
     ('mma.sync', 'kernel_gradient', 'grouped'):
         ('triton', "R10: 1.093x Triton's time, geomean of 6 grouped rows"),
-    ('mma.sync', 'forward', 'dense'): ('triton', "R10: 1.169x Triton's time, geomean of 4 dense rows"),
+    ('mma.sync', 'forward', 'dense'):
+        ('xla', "DENSE1 (A100, 2d1bbd051): Mosaic 1.923x and Triton 1.947x XLA's dot (cuBLAS), geomean of 10 "
+                "projections at 8192 tokens"),
+    ('mma.sync', 'input_gradient', 'dense'):
+        ('xla', "DENSE1 (A100): Mosaic 2.881x, Triton 1.839x XLA's dot"),
+    ('mma.sync', 'kernel_gradient', 'dense'):
+        ('xla', "DENSE1 (A100): Mosaic 1.964x, Triton 1.735x XLA's dot"),
+    ('wgmma', 'forward', 'dense'):
+        ('xla', "DENSE1 (H100, 2d1bbd051): Mosaic 1.067x and Triton 1.616x XLA's dot (cuBLAS), geomean of 10 "
+                "projections at 8192 tokens"),
+    ('wgmma', 'input_gradient', 'dense'): ('xla', "DENSE1 (H100): Mosaic 1.048x, Triton 1.738x XLA's dot"),
+    ('wgmma', 'kernel_gradient', 'dense'): ('xla', "DENSE1 (H100): Mosaic 1.049x, Triton 1.149x XLA's dot"),
 }
 """The cells where an old route measured faster than the template, each with its receipt (owner, bible
-da64ae5): (instruction family, product, grouped or dense) to (the old route, the receipt). The template is
-the default on every other cell; a cell leaves the list once the template measures at least as fast on it
-(geomean over the receipt's rows). Nothing is ranked at runtime. A call the template cannot run (its
-legality) takes the next route in `GROUPED`'s order, which is no cell of this list."""
+da64ae5): (instruction family, product, grouped or dense) to (the old route, the receipt). A listed cell
+runs its old route: every launch before it in `GROUPED`'s order steps aside (`_measured_slower`). The
+template is the default on every other cell; a cell leaves the list once the template measures at least as
+fast on it (geomean over the receipt's rows). Nothing is ranked at runtime. A call the template cannot run
+(its legality) takes the next route in `GROUPED`'s order, which is no cell of this list."""
 
 
 def _cell(case: "GroupedCase") -> tuple[str, str, str] | None:
@@ -1505,9 +1517,14 @@ def _old_route_reason(case: "GroupedCase") -> str:
     return f"{route} measured faster on this cell ({', '.join(cell or ())}): {receipt}"
 
 
-MEASURED_SLOWER = _Need('old_route', lambda case: _cell(case) not in OLD_ROUTES, _old_route_reason,
-                        row='bible da64ae5', kind='measured')
-"""What keeps the Mosaic GPU launches off an `OLD_ROUTES` cell unless named, so the old route runs it."""
+def _measured_slower(name: str) -> _Need:
+    """What keeps launch `name` off an `OLD_ROUTES` cell whose old route is another, unless named, so the
+    old route runs it."""
+    def holds(case: "GroupedCase") -> bool:
+        cell = _cell(case)
+        return cell not in OLD_ROUTES or OLD_ROUTES[cell][0] == name
+
+    return _Need('old_route', holds, _old_route_reason, row='bible da64ae5', kind='measured')
 
 
 NAMED = _Need('named', lambda case: False,
@@ -1530,12 +1547,12 @@ _TGMMS = (MosaicTgmm(), MosaicTpuTgmm(), Tgmm(), CutlassTgmm())
 
 GROUPED: selection.Op[GroupedCase] = selection.Op('grouped_matmul', (
     *(_launch_kernel(launch.name, *((NAMED,) if launch.name == 'cutlass' else
-                                    (MEASURED_SLOWER,) if launch.name == 'mosaic_gpu' else ()))
+                                    (_measured_slower(launch.name),)))
       for launch in _GMMS),
     selection.Kernel[GroupedCase]('xla', (), generic=True)))
 """The grouped selector, in a fixed order, the template first (owner, bible da64ae5): Mosaic GPU's launch
-where it takes the call and the call is no `OLD_ROUTES` cell, the TPU's launch on a TPU, Triton's where they
-refuse or on a listed cell, else XLA's program; CUTLASS's launches only by name (`NAMED`). Every
+where it takes the call, the TPU's launch on a TPU, Triton's where they refuse, else XLA's program, but an
+`OLD_ROUTES` cell runs its old route; CUTLASS's launches only by name (`NAMED`). Every
 implementation shares the template's signature, so each binds the call's own arguments, `_GMMS`' for a
 product, `_TGMMS`' for a kernel gradient."""
 

@@ -1533,35 +1533,30 @@ def test_an_interpreted_fp32_sum_that_cancels_at_mixed_magnitudes_is_its_float64
     assert float(product.interpreted(declared, lhs, rhs, (((1,), (0,)), ((), ())))[0, 0]) == 1.0
 
 
-HOOKED_RECEIPTS = {
-    # (shape, case): (Mosaic ms, Triton ms), GMMSB-h100-main at eb378b58d (an H100's tools/bench_scoreboard).
-    ("llama-3-8b gate_up", "plain"): (5.925, 10.191),
-    ("llama-3-8b gate_up", "norm"): (8.171, 12.815),
-    ("llama-3-8b gate_up", "bias"): (5.970, 9.322),
-    ("qwen3-8b gate_up", "plain"): (4.919, 8.818),
-    ("qwen3-8b gate_up", "norm"): (6.950, 11.036),
-    ("qwen3-8b gate_up", "bias"): (4.996, 7.912),
-}
-"""The two Hopper launches' measured times for a dense projection, plain and with each hook the chooser
-ranks right (the gated prologue joins once the model's facts rank it, row 1336)."""
-
-@pytest.mark.parametrize(("shape", "case"), list(HOOKED_RECEIPTS), ids=lambda key: str(key))
-def test_hoppers_chooser_against_the_hooked_receipts(shape, case):
-    """The chooser's launch for a hooked dense projection on an H100 is the one measured faster."""
-    width = {"llama-3-8b gate_up": 28672, "qwen3-8b gate_up": 24576}[shape]
-    bf16, f32 = (functools.partial(jax.ShapeDtypeStruct, dtype=dtype)
-                 for dtype in (jnp.bfloat16, jnp.float32))
-    x, w = bf16((16384, 4096)), bf16((4096, width))
-    hooks = {"plain": {},
-             "norm": {"prologue": normed, "prologue_operands": ((f32((16384,)), ("rows",)),
-                                                                 (f32((4096,)), ("depth",)))},
-             "bias": {"epilogue": biased, "epilogue_operands": ((f32((width,)), ("columns",)),)}}[case]
-
-    def product(x, w):
-        return template.gemm(x, w, None, out_dtype=jnp.bfloat16, **hooks)
-
-    with generation.assumed("sm90"), generation.routes() as taken:
-        jax.jit(product).trace(x, w)
-    mosaic, triton = HOOKED_RECEIPTS[(shape, case)]
-    faster = "mosaic_gpu" if mosaic < triton else "triton"
-    assert {route.kernel for route in taken if route.choice == 'grouped_matmul'} == {faster}
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+def test_each_cell_runs_the_template_unless_its_old_route_measured_faster(generation_name):
+    """On each GPU family, every product (forward, input gradient, kernel gradient; grouped and dense) runs
+    the template's Mosaic launch, unless `grouped_matmul.OLD_ROUTES` lists its cell, which runs its old
+    route (owner, bible da64ae5): nothing ranks a launch at runtime."""
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    rows, depth, width, groups = 4096, 1024, 2048, 8
+    sizes = jnp.full((groups,), rows // groups, jnp.int32)
+    x, dy = bf16((rows, depth)), bf16((rows, width))
+    calls = {
+        ("forward", "grouped"): (lambda: template.gemm(x, bf16((groups, depth, width)), sizes,
+                                                       out_dtype=jnp.bfloat16)),
+        ("input_gradient", "grouped"): (lambda: template.gemm(dy, bf16((groups, depth, width)), sizes,
+                                                              transpose_rhs=True, out_dtype=jnp.bfloat16)),
+        ("kernel_gradient", "grouped"): lambda: template.gemm_t(x, dy, sizes, out_dtype=jnp.bfloat16),
+        ("forward", "dense"): lambda: template.gemm(x, bf16((depth, width)), None, out_dtype=jnp.bfloat16),
+        ("input_gradient", "dense"): (lambda: template.gemm(dy, bf16((depth, width)), None,
+                                                            transpose_rhs=True, out_dtype=jnp.bfloat16)),
+        ("kernel_gradient", "dense"): lambda: template.gemm_t(x, dy, None, out_dtype=jnp.bfloat16),
+    }
+    family = "wgmma" if generation.gpu_target(generation_name).wgmma else "mma.sync"
+    for (made, shape), call in calls.items():
+        cell = (family, made, shape)
+        expected = grouped_matmul.OLD_ROUTES[cell][0] if cell in grouped_matmul.OLD_ROUTES else "mosaic_gpu"
+        with generation.assumed(generation_name), generation.routes() as taken:
+            jax.eval_shape(call)
+        assert _kernels(taken) == {expected}, (cell, _kernels(taken))
