@@ -5,17 +5,18 @@ truth's twin is built inside tools/torch_precision.py's `float64`, by its `float
 
 A promotion is `.double()`, `.to(...)` or `.type(...)` at float64 (`torch.float64`, `torch.double`, or a
 name bound only to one) on a module, or the unbound `torch.nn.Module.double(module)` and its `to` and
-`type`. A module is what the file proves one, flow by flow in each scope: a constructor's result (a
-class the file imports, `torch.nn`'s and transformers' among them, or one it defines on such a base), a
-library's reader (`from_pretrained`, `from_config`, `from_single_file`), a deep copy of a module, a
-module-preserving call on one (`eval()`, `cpu()`, `to(device)`), a function of the file that returns
-one, and a name or attribute chain bound to any of these until it is bound to something else; a
-function of the file that promotes a parameter to another (`walk(model, ..., dtype)`) promotes the
-module it is given at the float64 it is given. A
-forward's result, an attribute of a module (a tensor or a submodule) and an item of one are not, nor
-is a module built inside `float64` or `widened`, or at float64 by its `dtype`. Blind spots, documented:
-a module the file receives (a parameter, a factory it is passed, an attribute another method set), a
-loop's target, and a submodule promoted by its attribute.
+`type`, or a call of a function of the file that promotes its parameter to another
+(`walk(model, ..., dtype)`), given a module there and float64 as the dtype. A module is what the file
+proves one, flow by flow in each scope: a constructor's result (a class the file imports, `torch.nn`'s
+and transformers' among them, a capitalized attribute of anything, or a class the file defines on such
+a base), a library's reader (`from_pretrained`, `from_config`, `from_single_file`), a deep copy of a
+module, a module-preserving call on one (`eval()`, `cpu()`, `to(device)`), a function of the file that
+returns one, and a name or attribute chain bound to any of these until it is bound to something else.
+A forward's result, an attribute of a module (a tensor or a submodule) and an item of one are not, nor
+is a module built inside `float64` or `widened` (or a context a condition picks from them, whose branch
+the promotion's own condition is read to share), or at float64 by its `dtype`. Blind spots: a module
+the file receives (a parameter, a factory it is passed, an attribute another method set), a loop's
+target, and a submodule promoted by its attribute.
 """
 
 from __future__ import annotations
@@ -77,6 +78,10 @@ class _File:
         return scopes.resolved(node, self.tables.get(id(node), {}))
 
     def _wide(self, node: ast.expr) -> bool:
+        """Whether a `with` item is a float64 context (WIDE), or one where a condition picks it, as
+        `float64() if wide else nullcontext()` does for the arm the condition widens."""
+        if isinstance(node, ast.IfExp):
+            return self._wide(node.body) or self._wide(node.orelse)
         called = self.resolved(node.func) if isinstance(node, ast.Call) else ""
         return any(called == path or called.endswith("." + path) for path in WIDE)
 

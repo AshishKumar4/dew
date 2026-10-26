@@ -66,6 +66,11 @@ PROMOTIONS = {
     "a module built inside float64": ("from tools.torch_precision import float64\nimport torch\n"
                                       "with float64():\n    model = torch.nn.Linear(4, 4)\n"
                                       "    model.double()\nmodel.to(torch.float64)", 0),
+    "a module built inside float64 where a condition picks it": (
+        "import contextlib\nimport torch\nfrom tools.torch_precision import float64\ndef run(wide):\n"
+        "    with float64() if wide else contextlib.nullcontext():\n"
+        "        model = torch.nn.Linear(4, 4)\n"
+        "        model = model.to(torch.float64) if wide else model", 0),
     "a module built at float64": ("import torch\nmodel = torch.nn.Linear(4, 4, dtype=torch.float64)\n"
                                   "model.double()", 0),
     "a factory it is passed": ("def twin(build):\n    model = build()\n    model.double()", 0),
