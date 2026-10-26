@@ -27,43 +27,52 @@ Two computations give the one function. A row of one document runs chunk by chun
 compacted to the front (`valid_order`), each chunk's gradients one `vmap` at the chunk's start, the
 momentum and retention across the chunk one associative scan of their affine steps, and the chunk's
 readouts one `vmap` over its states. A packed row, and a cached call, run token by token (`_stepped`),
-which is the definition. The state is the network's parameters, a traced carry: the network runs
-unbound over W, each head's as the module its scope stores (`_AtScope`), and W_0 is this layer's own
-parameter, so the layer composes with a scanned layer stack and remat; the chunk's carry is named
-(`CARRY`) for a remat policy. The heads run one after another, each vectorized over its rows and
-tokens, so a method interceptor the model computes under finds each head's sites at their paths.
+which is the definition. The state is the network's parameters, a traced carry. Each head's network
+is this layer's child (`head_0`, ...), whose parameters are its W_0, and every application runs that
+child at its own scope over the weights the step holds, read-only (`_substituted`), so the layer
+composes with a scanned layer stack and remat, and a method interceptor the model computes under finds
+each head's sites at their paths, as at any child; the chunk's carry is named (`CARRY`) for a remat
+policy. The heads run one after another, each vectorized over its rows and tokens, and may hold
+different trees (an adapter on one head alone).
 
 An adapter on an inner kernel (`dew.lora`) adds its branch, s drop(x) A B, at every application, as it
 does at any Dense, its dropout drawing from each token's key in a forward that carries the dropout
 stream. Its update is W_0's: the B factor rides the state with no step of its own, so a retention
 forgets it as it forgets W_0, and the memory computes what the adapter's merge computes. A checkpoint's
 input quantization at an inner site (`dew.quantization`) rounds that site's input at every application
-alike. A frozen FP8 record's codes at an inner kernel stand for W_0's kernel, as they decode: in a
-memory only W_0 is frozen, and each application multiplies the state the steps move from it.
+alike, and Qwix's quantized training quantizes every product of the moving weights, its stochastic
+rounding drawing from each token's key. A frozen FP8 record's codes at an inner kernel stand for W_0's
+kernel, as they decode: in a memory only W_0 is frozen, and each application multiplies the state the
+steps move from it. Qwix's serving quantization, which stores a weight quantized for its products to
+read, is refused for the inner weights, which move with every token (`QuantizedServingRefused`).
 
 A linear memory (`LinearMemory`) on its given target, with no momentum, no orthogonalized or slow
-weights and each token reading its own step, is a row of the shared linear recurrence
-(`dew.nn.kernels.recurrence`), and runs there: on the dot objective its step writes theta k v^T, its
-retention the decay, at any chunk (the gradient is the same at every state); on the l2 objective at
-chunk 1 without retention it is the delta rule with beta theta (Titans takes the gradient before the
-retention, the gated delta rule after it, so those differ). A call runs the recurrence's chunked op
-(`recurrence_chunk.chunk`, on its kernels where they take the call) and a cached token its decode step
-(`recurrence.step`). The recurrence starts each document from zero, so W_0 enters as its own term: the
-delta rule's state is W - W_0, written with the values v - W_0^T k, and the dot rule's W - P_t W_0, P_t
-the product of the shares the document kept; each readout adds P_t W_0^T q (P_t one for the delta
-rule). That readout is computed in at least float32 and rounded once to the layer's dtype.
+weights and each token reading its own step, whose heads each compute the linear map of their input by
+their kernel (no wrapper rounds or drops their inputs or quantizes their products, `nonlinear_input`),
+is a row of the shared linear recurrence (`dew.nn.kernels.recurrence`), and runs there: on the dot
+objective its step writes theta k v^T, its retention the decay, at any chunk (the gradient is the same
+at every state); on the l2 objective at chunk 1 without retention it is the delta rule with beta theta
+(Titans takes the gradient before the retention, the gated delta rule after it, so those differ). A
+call runs the recurrence's chunked op (`recurrence_chunk.chunk`, on its kernels where they take the
+call) and a cached token its decode step (`recurrence.step`). The recurrence starts each document from
+zero, so W_0 enters as its own term: the delta rule's state is W - W_0, written with the values
+v - W_0^T k, and the dot rule's W - P_t W_0, P_t the product of the shares the document kept; each
+readout adds P_t W_0^T q (P_t one for the delta rule). That readout is computed in at least float32 and
+rounded once to the layer's dtype.
 """
 
 from __future__ import annotations
 
 import dataclasses
 import functools
-from collections.abc import Callable
 from typing import ClassVar, Literal, NamedTuple
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn, traverse_util
+from flax.core import lift
+from flax.linen.transforms import lift_direct_transform
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.interpreters.ad import JVPTracer
@@ -74,7 +83,7 @@ from dew.nn.kernels import recurrence, recurrence_chunk
 from dew.nn.mixer_base import DELTA_RESIDUALS, MEMORY_RESIDUALS
 from dew.nn.sharding import LOW_RANK_FACTORS, rows_like
 from dew.optim import _orthogonalized
-from dew.quantization import FROZEN_FP8, QUANTIZATION, frozen_fp8_kernel
+from dew.quantization import decoded_frozen_fp8, quantizes
 
 from .attention import FORWARD_MODE, LayerNorm
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places, sequence_blocks, valid_order
@@ -262,9 +271,11 @@ class InContextMemory(nn.Module):
             raise ValueError("a view read as the stream itself is one head's; project it to split heads")
         super().__post_init__()
 
-    def _inner(self, *, wide: bool) -> nn.Module:
-        """The inner network, at the state's precision where `wide` (the gradients), else the layer's."""
-        return self.network.clone(dtype=at_least_fp32(self.dtype) if wide else self.dtype, parent=None)
+    def setup(self):
+        # Each head's network, a child at its own scope (`head_0`, ...) whose parameters are that head's
+        # W_0, computing at the dtype each use's operands carry (`_applied`).
+        for head in range(self.heads):
+            setattr(self, f"head_{head}", self.network.copy(dtype=None))
 
     def _views(self, x: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array, int]:
         """The queries, keys and values `[B, S, H, F]` and the views' width F."""
@@ -312,52 +323,55 @@ class InContextMemory(nn.Module):
         log_kept = jnp.logaddexp(jnp.log1p(-gate.scale), -logit) - jax.nn.softplus(-logit)
         return 1 - gate.scale * jax.nn.sigmoid(logit), log_kept
 
-    def _scope(self, head: int) -> tuple[str, ...]:
-        """The scopes head `head`'s network is stored under, from the model's root: the path its
-        parameters take, by which a method interceptor finds its modules (`_AtScope`)."""
-        return (*self.path, "initial", f"head_{head}")
+    def _heads(self, features: int) -> tuple[_Head, ...]:
+        """Each head's network as this call computes it (`_Head`).
 
-    def _initial(self, features: int) -> tuple[dict, _Heads]:
-        """W_0's moving weights stacked over the heads `[H, ...]`, in the state's precision, and what the
-        heads hold beside them (`_Heads`).
+        A head's network is its own child, so its parameters are its network's own (`head_0/...`): a
+        matrix is one an optimizer steps on its own (Muon orthogonalizes it apart from the other heads')
+        and a vector a vector, as its network declares them, and the heads may hold different trees (an
+        adapter or an input quantization on one head alone). The first call of an initialization runs
+        each network once at its scope over a zero vector of the view's width, so whatever draws there
+        draws as at any child: W_0, an adapter's factors, a quantization's annotations. A head's
+        frozen FP8 kernel is W_0's as its codes decode (`dew.quantization.decoded_frozen_fp8`): in a
+        memory only W_0 is frozen, and every application multiplies the state the steps move from it.
 
-        Each head's parameters are its network's own (`initial/head_0`, ...), so a head's matrix is one
-        an optimizer steps on its own (Muon orthogonalizes it apart from the other heads') and a vector a
-        vector, as its network declares them. They are drawn at their scope, so an adapter's branch on
-        them draws its factors there, as `dew.lora` draws any target's. A head's other collections at
-        that scope (a checkpoint's input scales, `dew.quantization`) reach every application of its
-        network; a frozen FP8 kernel's codes there are W_0's kernel as they decode (`_decoded_codes`).
-        The heads step as one stacked state, so they hold one structure. The `slow` weights and an
-        adapter's A factors are held; the rest move (`_gradient` on an adapter's B factor)."""
-        network = self._inner(wide=False)
-
-        def drawn(key: jax.Array) -> dict:
-            example = jnp.zeros((1, features), jnp.float32)
-            return {f"head_{head}": _unnested(self._scope(head), _AtScope(network, self._scope(head)).init(
-                one, example)["params"]) for head, one in enumerate(jax.random.split(key, self.heads))}
-
-        # A wrapper's packing (a frozen FP8 record's codes in a kernel's place) leaves a stored W_0 another
-        # structure than a fresh draw's, which a param's check against its initializer would refuse.
-        stored = (nn.meta.unbox(self.get_variable("params", "initial"))
-                  if self.has_variable("params", "initial") else self.param("initial", drawn))
-        others = {collection: tree["initial"] for collection, tree in self.variables.items()
-                  if collection != "params" and "initial" in tree}
-        heads = [_decoded_codes({"params": stored[name], **{collection: tree[name] for collection, tree
-                                                             in others.items() if name in tree}})
-                 for name in (f"head_{head}" for head in range(self.heads))]
-        if any(jax.tree.structure(head) != jax.tree.structure(heads[0]) for head in heads):
-            raise ValueError("an in-context memory's heads step as one state, so they hold one structure "
-                             "of variables: an adapter or a quantization on one head's network is on all")
-        stacked = jax.tree.map(lambda *leaves: jnp.stack(leaves), *heads)
+        A weight stored quantized for serving (Qwix's, `dew.quantization.quantize_for_serving`) is
+        refused (`QuantizedServingRefused`): a served product reads the stored value, and an inner
+        weight moves with every token, so there is none to store."""
+        networks = [getattr(self, f"head_{head}") for head in range(self.heads)]
+        if self.is_initializing():
+            for network in networks:
+                network(jnp.zeros((features,), jnp.float32))
         wide = at_least_fp32(self.dtype)
-        flat = traverse_util.flatten_dict(jax.tree.map(lambda leaf: leaf.astype(wide), stacked.pop("params")))
-        unknown = sorted(set(self.slow) - {path[0] for path in flat})
-        if unknown:
-            raise ValueError(f"slow names {unknown}, which are none of the network's parameters "
-                             f"{sorted({path[0] for path in flat})}")
-        held = {path for path in flat if path[0] in self.slow or path[-1] == ADAPTER_A}
-        return (traverse_util.unflatten_dict({path: leaf for path, leaf in flat.items() if path not in held}),
-                _Heads(traverse_util.unflatten_dict({path: flat[path] for path in held}), stacked))
+        heads = []
+        for network in networks:
+            variables = decoded_frozen_fp8(dict(nn.meta.unbox(network.variables)))
+            flat = traverse_util.flatten_dict(dict(variables.pop("params", {})))
+            served = sorted("/".join(path) for path, leaf in flat.items()
+                            if not isinstance(leaf, jax.Array | np.ndarray))
+            if served:
+                raise QuantizedServingRefused("/".join(network.path), served)
+            unknown = sorted(set(self.slow) - {path[0] for path in flat})
+            if unknown:
+                raise ValueError(f"slow names {unknown}, which are none of the network's parameters "
+                                 f"{sorted({path[0] for path in flat})}")
+            held = {path for path in flat if path[0] in self.slow or path[-1] == ADAPTER_A}
+            heads.append(_Head(
+                network,
+                traverse_util.unflatten_dict({path: flat[path].astype(wide) for path in held}),
+                variables,
+                traverse_util.unflatten_dict({path: leaf.astype(wide) for path, leaf in flat.items()
+                                              if path not in held})))
+        return tuple(heads)
+
+    def nonlinear_input(self, name: str) -> bool:
+        """Whether this call computes the submodule `name` (a head's network), or a module under it,
+        other than as the linear map of its input by its stored kernel, an adapter's branch added: as
+        the Qwix quantization the call runs under selects it (`dew.quantization.quantizes`), and as a
+        method interceptor answers for itself (`dew.lora`'s dropout on a training forward, a
+        checkpoint's input quantization). A linear memory runs the shared recurrence only where every
+        head computes that map (`_route`)."""
+        return quantizes(self, name)
 
     @nn.compact
     def __call__(self, x: jax.Array, call: MixerCall = PLAIN_CALL) -> jax.Array:
@@ -367,7 +381,7 @@ class InContextMemory(nn.Module):
         mu = (jnp.zeros_like(theta) if self.momentum is None else self._gate("momentum", self.momentum, x))
         a, log_kept = self._kept(x)
         wide = at_least_fp32(self.dtype)
-        initial, heads = self._initial(features)
+        heads = self._heads(features)
         tokens = coordinates_of(call.metadata, batch, length)
         # Every array of rows this call makes is placed as the stream's rows are (`rows_like`), so an
         # Explicit axis that splits them splits these alike, a scan's carry and a cache among them.
@@ -380,25 +394,18 @@ class InContextMemory(nn.Module):
         places = counted_places(tokens.segments, tokens.valid)
         if places is None:
             places = rows_like(jnp.broadcast_to(jnp.arange(length)[None], (batch, length)), x)
-        # A forward carrying the dropout stream gives each token and head a key of its own, which every
-        # application of its network draws from (an adapter's branch drops its input, `dew.lora`).
-        keys = (rows_like(jax.random.key_data(jax.random.split(self.make_rng("dropout"),
-                                                               (batch, length, self.heads))), x)
-                if self.has_rng("dropout") else None)
         steps = _Steps(query.astype(wide), key.astype(wide), value.astype(wide), theta, mu, a, real, places,
-                       keys)
-        # A collection beside the weights (an input's quantizer) makes the network no linear map of its
-        # input, which the recurrence's rows are.
-        hooks, segments = None if heads.collections else self._recurrence(), tokens.max_segments
+                       self._keys(x))
+        hooks, segments = self._route(), tokens.max_segments
         if hooks is not None:
-            read = (self._recurrent_decoded(hooks, initial, heads, steps, log_kept, segments) if call.decode
-                    else self._recurrent(hooks, initial, heads, steps, log_kept, max_segments=segments)[0])
+            read = (self._recurrent_decoded(hooks, heads, steps, log_kept, segments) if call.decode
+                    else self._recurrent(hooks, heads, steps, log_kept, max_segments=segments)[0])
         elif call.decode:
-            read = self._decoded(initial, heads, steps)
+            read = self._decoded(heads, steps)
         elif tokens.max_segments > 1:
-            read = self._stepped(initial, heads, steps)[0]
+            read = self._stepped(heads, steps)[0]
         else:
-            read = self._chunked(initial, heads, steps)
+            read = self._chunked(heads, steps)
         read = read.astype(self.dtype or x.dtype)
         if self.output:
             read = Dense(x.shape[-1], use_bias=False, dtype=self.dtype, precision=self.precision,
@@ -407,15 +414,38 @@ class InContextMemory(nn.Module):
             read = read.reshape(batch, length, -1)
         return read
 
+    def _keys(self, x: jax.Array) -> dict[str, jax.Array] | None:
+        """Each token and head's key data `[B, S, H, ...]` of every RNG stream the call carries but
+        `params` (a training forward's `dropout` and `stochastic_rounding`, `training_rngs`), each split
+        from its own stream, so the streams stay as apart as the call holds them; None without any. An
+        application folds its use into its token's key (`_applied`)."""
+        assert self.scope is not None, "a bound memory has a scope"
+        streams = sorted(name for name in self.scope.rngs if name != "params")
+        batch, length = x.shape[:2]
+        return {name: rows_like(jax.random.key_data(jax.random.split(self.make_rng(name),
+                                                                     (batch, length, self.heads))), x)
+                for name in streams} or None
+
     @property
     def residuals(self) -> tuple[str, ...]:
-        """The residuals this layer marks for a remat policy (`dew.nn.mixer_base.RESIDUALS`): a linear
-        memory on the shared recurrence its rule's (the delta rule's port saves its decay, inverse and
-        memory; the dot rule's portable math marks none), any other its chunk scan's carry."""
+        """The residuals this layer may mark for a remat policy (`dew.nn.mixer_base.RESIDUALS`): those of
+        every path its configuration can take, as the call's wrappers decide between them and the
+        configuration does not see the wrappers (`_route`). A linear memory on the shared recurrence
+        marks its rule's (the delta rule's port saves its decay, inverse and memory; the dot rule's
+        portable math marks none), and on the general path, as any other memory, its chunk scan's
+        carry."""
         hooks = self._recurrence()
-        if hooks is None:
-            return MEMORY_RESIDUALS
-        return DELTA_RESIDUALS if hooks.delta else ()
+        return (*(DELTA_RESIDUALS if hooks is not None and hooks.delta else ()), *MEMORY_RESIDUALS)
+
+    def _route(self) -> recurrence.Hooks | None:
+        """This call's row of the shared linear recurrence (`_recurrence`), or None where its
+        configuration is none or a head computes other than the linear map of its input by its kernel
+        (`nonlinear_input`): an input's quantizer, Qwix's quantized products, an adapter's dropout on a
+        training forward."""
+        hooks = self._recurrence()
+        if hooks is None or any(self.nonlinear_input(f"head_{head}") for head in range(self.heads)):
+            return None
+        return hooks
 
     # A linear memory on the shared recurrence.
 
@@ -436,25 +466,26 @@ class InContextMemory(nn.Module):
         # The l2 rule's log decay is zero: with a decay the delta rule takes the port's kernels.
         return recurrence.Hooks(decay="scalar", delta=self.objective.kind == "l2", write_gate=True, scale=1.0)
 
-    def _recurrent(self, hooks: recurrence.Hooks, initial: dict, heads: _Heads, steps: _Steps,
+    def _recurrent(self, hooks: recurrence.Hooks, heads: tuple[_Head, ...], steps: _Steps,
                    log_kept: jax.Array, *, max_segments: int, held: jax.Array | None = None,
                    kept: jax.Array | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """The readouts `[B, S, H, F]` of a linear memory of W_0 `initial` `[H, ...]` through the shared
-        recurrence, its state after them `[B, H, F, F]` and each token's log of the share of W_0 its
-        document keeps `[B, S, H]`: the recurrence's chunked op, or its decode step for a cached call
-        of one token, continuing the state `held` and the share `kept` `[B, H]` a cache holds. The
-        recurrence starts each document from zero, so W_0 enters as its own term (the module
-        docstring), the network at W_0 over a token's views: an adapter's branch on its kernel included,
-        which the recurrence's state never holds."""
+        """The readouts `[B, S, H, F]` of a linear memory through the shared recurrence, its state after
+        them `[B, H, F, F]` and each token's log of the share of W_0 its document keeps `[B, S, H]`: the
+        recurrence's chunked op, or its decode step for a cached call of one token, continuing the state
+        `held` and the share `kept` `[B, H]` a cache holds. The recurrence starts each document from
+        zero, so W_0 enters as its own term (the module docstring), each head's network at its W_0 over
+        a token's views: an adapter's branch on its kernel included, which the recurrence's state never
+        holds."""
         real = steps.real
         # A padding token neither steps nor decays the memory.
         beta = jnp.where(real[..., None], steps.theta, 0.0)
         log_decay = jnp.where(real[..., None], log_kept, 0.0)
 
         def read_w0(view: jax.Array, use: int) -> jax.Array:
-            return self._each_head(lambda head: jax.vmap(jax.vmap(functools.partial(
-                self._applied, heads, head, _head(initial, head, 0), wide=True, use=use)))(
-                    view[:, :, head], _head(steps.keys, head, 2)), axis=2)
+            return jnp.stack([jax.vmap(jax.vmap(functools.partial(
+                self._applied, head, head.initial, wide=True, use=use)))(
+                    view[:, :, index], _at(steps.keys, index, 2))
+                for index, head in enumerate(heads)], axis=2)
 
         value = steps.value - read_w0(steps.key, GRADIENT) if hooks.delta else steps.value
         begins, continued = _documents(steps)
@@ -475,7 +506,7 @@ class InContextMemory(nn.Module):
         wide = at_least_fp32(self.dtype)
         return out.astype(wide) + jnp.exp(share)[..., None] * read_w0(steps.query, READ), state, share
 
-    def _recurrent_decoded(self, hooks: recurrence.Hooks, initial: dict, heads: _Heads, steps: _Steps,
+    def _recurrent_decoded(self, hooks: recurrence.Hooks, heads: tuple[_Head, ...], steps: _Steps,
                            log_kept: jax.Array, max_segments: int) -> jax.Array:
         """A linear memory's cached call (`_recurrent`), the cache holding the recurrence's state
         (`STATE`) and the log of W_0's share each row's document keeps (`KEPT`), zero for a fresh row;
@@ -486,8 +517,8 @@ class InContextMemory(nn.Module):
             jnp.zeros((batch, self.heads, features, features), wide), steps.real))
         kept = self.variable("cache", KEPT, lambda: rows_like(
             jnp.zeros((batch, self.heads), wide), steps.real))
-        reads, state, share = self._recurrent(hooks, initial, heads, steps, log_kept,
-                                              max_segments=max_segments, held=held.value, kept=kept.value)
+        reads, state, share = self._recurrent(hooks, heads, steps, log_kept, max_segments=max_segments,
+                                              held=held.value, kept=kept.value)
         if allocated:
             held.value = state
             kept.value = _at_last(share, steps.real, kept.value)
@@ -495,36 +526,34 @@ class InContextMemory(nn.Module):
 
     # The function, token by token and chunk by chunk.
 
-    def _applied(self, heads: _Heads, head: int, fast: dict, x: jax.Array, keys: jax.Array | None = None, *,
+    def _applied(self, head: _Head, fast: dict, x: jax.Array, keys: dict[str, jax.Array] | None = None, *,
                  wide: bool, use: int) -> jax.Array:
-        """Head `head`'s network at its moving weights `fast` and its held ones over one token's vector
+        """`head`'s network at its moving weights `fast` and the ones it holds over one token's vector
         `x`, at the state's precision where `wide` (the gradients) and else the layer's dtype (a
-        readout), as the module its scope stores (`_AtScope`): so a method interceptor the model
-        computes under finds its sites there, an adapter's branch among them (`dew.lora`), its dropout
-        drawing from the token's `keys` (key data, None without the dropout stream) for this `use`."""
-        params = _joined(_head(heads.held, head, 0), fast)
+        readout), run at its own scope (`_substituted`): so a method interceptor the model computes
+        under finds its sites there, an adapter's branch and a quantization among them, each RNG stream
+        drawing from the token's `keys` (key data, None without any) folded with this `use`."""
+        params = _joined(head.held, fast)
         if not wide:
             dtype = self.dtype or x.dtype
             params = jax.tree.map(lambda leaf: leaf.astype(dtype) if self.dtype is not None else leaf, params)
             x = x.astype(dtype)
-        scope = self._scope(head)
-        variables = {collection: _nested(scope, tree) for collection, tree in
-                     {"params": params, **_head(heads.collections, head, 0)}.items()}
-        rngs = {} if keys is None else {"dropout": jax.random.fold_in(jax.random.wrap_key_data(keys), use)}
-        out = _AtScope(self._inner(wide=wide), scope).apply(variables, x, rngs=rngs)
+        rngs = {} if keys is None else {name: jax.random.fold_in(jax.random.wrap_key_data(data), use)
+                                        for name, data in keys.items()}
+        out = _substituted(head.network, {**head.collections, "params": params}, rngs, x)
         if not isinstance(out, jax.Array):
             raise TypeError(f"an in-context memory's network maps a vector to one, got {type(out).__name__}")
         return out
 
-    def _gradient(self, heads: _Heads, head: int, state: dict, key: jax.Array, target: jax.Array,
-                  keys: jax.Array | None) -> dict:
+    def _gradient(self, head: _Head, state: dict, key: jax.Array, target: jax.Array,
+                  keys: dict[str, jax.Array] | None) -> dict:
         """One head's gradient of the objective at the moving weights `state` for one token, in the
         state's precision, each matrix orthogonalized where `orthogonalize` asks. An adapter's B factor
         rides the state, so a retention forgets the adapter's update s A B as it forgets W_0's, and the
         memory computes what the adapter's merge computes; it takes no step of its own, which goes to the
         kernel it updates, whose gradient is the whole map's."""
         gradient = jax.grad(lambda fast: self.objective(
-            self._applied(heads, head, fast, key, keys, wide=True, use=GRADIENT), target))(state)
+            self._applied(head, fast, key, keys, wide=True, use=GRADIENT), target))(state)
 
         def stepped(path: tuple, leaf: jax.Array) -> jax.Array:
             if path[-1].key == ADAPTER_B:
@@ -534,67 +563,66 @@ class InContextMemory(nn.Module):
 
         return jax.tree_util.tree_map_with_path(stepped, gradient)
 
-    def _target(self, heads: _Heads, head: int, state: dict, value: jax.Array, keys: jax.Array | None
+    def _target(self, head: _Head, state: dict, value: jax.Array, keys: dict[str, jax.Array] | None
                 ) -> jax.Array:
         """A token's target: its value view, or the network's image of it at `state` (Nested Learning
         Eq 84). The inner gradient holds it fixed (`_gradient` differentiates the prediction alone); the
         outer one runs through it, to the value projection and the state that made it."""
         if self.target == "given":
             return value
-        return self._applied(heads, head, state, value, keys, wide=True, use=TARGET)
+        return self._applied(head, state, value, keys, wide=True, use=TARGET)
 
-    def _step(self, heads: _Heads, head: int, state: dict, key: jax.Array, value: jax.Array,
-              keys: jax.Array | None) -> dict:
+    def _step(self, head: _Head, state: dict, key: jax.Array, value: jax.Array,
+              keys: dict[str, jax.Array] | None) -> dict:
         """One head's gradient for one token at `state`, of the objective against its target there."""
-        return self._gradient(heads, head, state, key, self._target(heads, head, state, value, keys), keys)
+        return self._gradient(head, state, key, self._target(head, state, value, keys), keys)
 
-    def _read(self, heads: _Heads, head: int, state: dict, query: jax.Array, keys: jax.Array | None
+    def _read(self, head: _Head, state: dict, query: jax.Array, keys: dict[str, jax.Array] | None
               ) -> jax.Array:
         """One head's readout of a token at `state`, at the layer's dtype."""
-        return self._applied(heads, head, state, query, keys, wide=False, use=READ)
+        return self._applied(head, state, query, keys, wide=False, use=READ)
 
-    def _each_head[Run](self, run: Callable[[int], Run], axis: int) -> Run:
-        """`run(head)` for every head, stacked at `axis`: each head's network runs at its own scope
-        (`_applied`), so the heads are a loop, each vectorized over its rows and tokens."""
-        runs = [run(head) for head in range(self.heads)]
-        return jax.tree.map(lambda *leaves: jnp.stack(leaves, axis=axis), *runs)
-
-    def _token(self, carry: tuple, step: _Steps, initial: dict, heads: _Heads) -> tuple:
-        """One token's update and readout over every row and head: the definition."""
+    def _token(self, carry: tuple, step: _Steps, heads: tuple[_Head, ...]) -> tuple:
+        """One token's update and readout over every row and head: the definition. The carry holds each
+        head's start, state and momentum, rows first."""
         start, state, momentum = carry
         query, key, value, theta, mu, a, real, place, keys = step
         first, boundary = real & (place == 0), real & (place % self.chunk == 0)
 
-        def reset(fresh: dict, held: dict) -> dict:
+        def reset(fresh, held):
             return jax.tree.map(lambda f, h: jnp.where(_lead(first, h), f, h), fresh, held)
 
-        def keep(new: dict, old: dict) -> dict:
+        def keep(new, old):
             return jax.tree.map(lambda n, o: jnp.where(_lead(real, n), n, o), new, old)
 
+        initial = tuple(_rows(head.initial, real) for head in heads)
         state = reset(initial, state)
         momentum = reset(jax.tree.map(jnp.zeros_like, initial), momentum)
         start = reset(initial, jax.tree.map(lambda s, w: jnp.where(_lead(boundary, s), w, s), start, state))
-        gradient = self._each_head(lambda head: jax.vmap(functools.partial(self._step, heads, head))(
-            _head(start, head, 1), key[:, head], value[:, head], _head(keys, head, 1)), axis=1)
-        new_momentum = jax.tree.map(lambda s, g: _lead(mu, s) * s - _lead(theta, g) * g, momentum, gradient)
-        new_state = jax.tree.map(lambda w, s: _lead(a, w) * w + s, state, new_momentum)
-        state, momentum = keep(new_state, state), keep(new_momentum, momentum)
+        gradient = tuple(jax.vmap(functools.partial(self._step, head))(
+            start[index], key[:, index], value[:, index], _at(keys, index, 1))
+            for index, head in enumerate(heads))
+        moved = tuple(jax.tree.map(functools.partial(_momentum_step, mu[:, index], theta[:, index]),
+                                   momentum[index], gradient[index]) for index in range(self.heads))
+        stepped = tuple(jax.tree.map(functools.partial(_state_step, a[:, index]), state[index], moved[index])
+                        for index in range(self.heads))
+        state, momentum = keep(stepped, state), keep(moved, momentum)
         read = state if self.commit == "token" else start
-        reads = self._each_head(lambda head: jax.vmap(functools.partial(self._read, heads, head))(
-            _head(read, head, 1), query[:, head], _head(keys, head, 1)), axis=1)
-        return (start, state, momentum), reads
+        reads = [jax.vmap(functools.partial(self._read, head))(
+            read[index], query[:, index], _at(keys, index, 1)) for index, head in enumerate(heads)]
+        return (start, state, momentum), jnp.stack(reads, axis=1)
 
-    def _stepped(self, initial: dict, heads: _Heads, steps: _Steps, carry: tuple | None = None
+    def _stepped(self, heads: tuple[_Head, ...], steps: _Steps, carry: tuple | None = None
                  ) -> tuple[jax.Array, tuple]:
         """The readouts `[B, S, H, F]` token by token, and the carry after the last token."""
-        rows = _rows(initial, steps.real)
         if carry is None:
+            rows = tuple(_rows(head.initial, steps.real) for head in heads)
             carry = (rows, rows, jax.tree.map(jnp.zeros_like, rows))
         sequence = jax.tree.map(lambda field: jnp.moveaxis(field, 1, 0), steps)
-        carry, reads = jax.lax.scan(lambda held, step: self._token(held, step, rows, heads), carry, sequence)
+        carry, reads = jax.lax.scan(lambda held, step: self._token(held, step, heads), carry, sequence)
         return jnp.moveaxis(reads, 0, 1), carry
 
-    def _chunked(self, initial: dict, heads: _Heads, steps: _Steps) -> jax.Array:
+    def _chunked(self, heads: tuple[_Head, ...], steps: _Steps) -> jax.Array:
         """The readouts `[B, S, H, F]` of rows of one document, chunk by chunk (the module docstring)."""
         batch, length = steps.real.shape
         order, _ = valid_order(steps.real)
@@ -602,53 +630,62 @@ class InContextMemory(nn.Module):
             field, order.reshape(*order.shape, *(1,) * (field.ndim - 2)), axis=1), steps)
         laid = jax.tree.map(lambda field: sequence_blocks(field, self.chunk, leading=True), gathered)
         count = laid.real.shape[0]
-        rows = _rows(initial, steps.real)
+        rows = tuple(_rows(head.initial, steps.real) for head in heads)
         carry = (rows, jax.tree.map(jnp.zeros_like, rows))
         _, reads = jax.lax.scan(functools.partial(self._chunk, heads=heads), carry, laid)
         reads = jnp.moveaxis(reads, 0, 1).reshape(batch, count * self.chunk, *reads.shape[3:])[:, :length]
         inverse = jnp.argsort(order, axis=1)
         return jnp.take_along_axis(reads, inverse.reshape(*inverse.shape, 1, 1), axis=1)
 
-    def _chunk(self, carry: tuple, step: _Steps, *, heads: _Heads) -> tuple:
-        """One chunk of every row: its gradients at its start, its states, its readouts `[B, C, H, F]`."""
+    def _chunk(self, carry: tuple, step: _Steps, *, heads: tuple[_Head, ...]) -> tuple:
+        """One chunk of every row: its gradients at its start, its states, its readouts `[B, C, H, F]`.
+        The carry holds each head's state and momentum, rows first."""
         state, momentum = carry
         state, momentum = checkpoint_name((state, momentum), CARRY)
-        gradient = self._each_head(lambda head: jax.vmap(jax.vmap(
-            functools.partial(self._step, heads, head), in_axes=(None, 0, 0, 0)))(
-                _head(state, head, 1), step.key[:, :, head], step.value[:, :, head],
-                _head(step.keys, head, 2)), axis=2)
         real = step.real[..., None]
         theta, mu, a = (jnp.where(real, field, fill) for field, fill in
                         ((step.theta, 0.0), (step.mu, 1.0), (step.a, 1.0)))
         # Each token's affine step of (S, W): S' = mu S + u, W' = a W + c S + u, with c = mu for a
         # real token and 0 for a padding one, which leaves both as they are.
         c = jnp.where(real, mu, 0.0)
-        update = jax.tree.map(lambda g: -_lead(theta, g) * g, gradient)
         matrices = jnp.stack([jnp.stack([mu, jnp.zeros_like(mu)], -1), jnp.stack([c, a], -1)], -2)
+        laid = [self._chunk_head(head, state[index], momentum[index], step, theta[:, :, index],
+                                 matrices[:, :, index], index) for index, head in enumerate(heads)]
+        lasts, moments, reads = zip(*laid, strict=True)
+        return (lasts, moments), jnp.stack(reads, axis=2)
+
+    def _chunk_head(self, head: _Head, state: dict, momentum: dict, step: _Steps, theta: jax.Array,
+                    matrices: jax.Array, index: int) -> tuple[dict, dict, jax.Array]:
+        """One head's chunk of every row (`_chunk`), from its state and momentum `[B, ...]`, its step
+        sizes `[B, C]` and affine steps `[B, C, 2, 2]`: its state and momentum after the chunk and its
+        readouts `[B, C, F]`."""
+        keys = _at(step.keys, index, 2)
+        gradient = jax.vmap(jax.vmap(functools.partial(self._step, head), in_axes=(None, 0, 0, 0)))(
+            state, step.key[:, :, index], step.value[:, :, index], keys)
+        update = jax.tree.map(lambda g: -_lead(theta, g) * g, gradient)
         composed, offsets = jax.lax.associative_scan(_composed, (matrices, (update, update)), axis=1)
         moment = jax.tree.map(lambda s0, bs: _scaled(composed[..., 0, 0], s0) + bs, momentum, offsets[0])
         states = jax.tree.map(lambda s0, w0, bw: _scaled(composed[..., 1, 0], s0)
                               + _scaled(composed[..., 1, 1], w0) + bw, momentum, state, offsets[1])
         # Each token reads its own state, or with commit per chunk the state the chunk entered.
-        read, axis, mapped = (states, 2, 0) if self.commit == "token" else (state, 1, None)
-        reads = self._each_head(lambda head: jax.vmap(jax.vmap(
-            functools.partial(self._read, heads, head), in_axes=(mapped, 0, 0)))(
-                _head(read, head, axis), step.query[:, :, head], _head(step.keys, head, 2)), axis=2)
+        read, mapped = (states, 0) if self.commit == "token" else (state, None)
+        reads = jax.vmap(jax.vmap(functools.partial(self._read, head), in_axes=(mapped, 0, 0)))(
+            read, step.query[:, :, index], keys)
         last = jax.tree.map(lambda leaf: leaf[:, -1], (states, moment))
-        return last, reads
+        return *last, reads
 
-    def _decoded(self, initial: dict, heads: _Heads, steps: _Steps) -> jax.Array:
+    def _decoded(self, heads: tuple[_Head, ...], steps: _Steps) -> jax.Array:
         """A cached call: the cache's state continued token by token, its first call allocating it. The
         call's first document continues the row's, whose real tokens the cache has counted; a document
         that starts in the call starts from W_0, and the cache then counts that document's."""
-        rows = jax.tree.map(jnp.zeros_like, _rows(initial, steps.real))
+        rows = jax.tree.map(jnp.zeros_like, tuple(_rows(head.initial, steps.real) for head in heads))
         allocated = self.has_variable("cache", STATE)
         start = self.variable("cache", START, lambda: rows)
         state = self.variable("cache", STATE, lambda: rows)
         momentum = self.variable("cache", MOMENTUM, lambda: rows)
         seen = self.variable("cache", COUNT, lambda: jnp.zeros_like(steps.real, jnp.int32)[:, 0])
         places = steps.places + jnp.where(_documents(steps)[1], seen.value[:, None], 0)
-        reads, carry = self._stepped(initial, heads, steps._replace(places=places),
+        reads, carry = self._stepped(heads, steps._replace(places=places),
                                      (start.value, state.value, momentum.value))
         if allocated:
             start.value, state.value, momentum.value = carry
@@ -656,53 +693,62 @@ class InContextMemory(nn.Module):
         return reads
 
 
-class _AtScope(nn.Module):
-    """`network` run as the module the scopes `names` hold, the last its own: built under them, its
-    modules take the paths the model stores them under, where a method interceptor finds its sites (an
-    adapter's targets, `dew.lora`), while the network runs unbound over the weights it is given."""
+class QuantizedServingRefused(ValueError):
+    """An in-context memory refusing inner weights stored quantized for serving (Qwix's, at the head
+    network `network`'s `leaves`): a served product reads a stored quantized weight, and an inner weight
+    moves with every token, so there is none to store. Its projections serve; quantized training
+    (`dew.quantization.Quantization.apply`) quantizes every product of the moving weights."""
+
+    def __init__(self, network: str, leaves: list[str]):
+        super().__init__(f"{network}'s weights {leaves} are stored quantized for serving, which an "
+                         "in-context memory's inner weights cannot be: they move with every token, so there "
+                         "is no stored value to serve. Select its projections for serving, or train it "
+                         "quantized")
+        self.network, self.leaves = network, leaves
+
+    def __reduce__(self):
+        return type(self), (self.network, self.leaves)
+
+
+class _Head(NamedTuple):
+    """One head's network as a call computes it: the child at its scope (`network`), the parameters it
+    holds at W_0 (`held`: the `slow` ones and an adapter's A factors), its other collections as stored
+    (an input's scale), and the W_0 of its moving weights (`initial`), all in the state's precision."""
 
     network: nn.Module
-    names: tuple[str, ...]
-
-    @nn.compact
-    def __call__(self, x: jax.Array) -> jax.Array:
-        if len(self.names) == 1:
-            return self.network.copy(name=self.names[0])(x)
-        return _AtScope(self.network, self.names[1:], name=self.names[0])(x)
-
-
-class _Heads(NamedTuple):
-    """What each head's network holds beside its moving weights, every leaf stacked over the heads
-    `[H, ...]`: its held parameters, the `slow` ones and an adapter's A factors, and its other
-    collections by name, as stored (a checkpoint's input scales)."""
-
     held: dict
     collections: dict
+    initial: dict
 
 
-def _decoded_codes(variables: dict) -> dict:
-    """One head's variables with each frozen FP8 kernel (`dew.quantization.FROZEN_FP8`) decoded into its
-    params (`frozen_fp8_kernel`), as a merge decodes it. The codes stood for a kernel that never moves;
-    in the memory only W_0 is frozen, and every application multiplies the state the steps move from it,
-    as the network computes."""
-    quantization = variables.get(QUANTIZATION, {})
-    codes = traverse_util.flatten_dict(quantization)
-    sites = {path[:-1] for path in codes if path[-1] == FROZEN_FP8[0]}
-    if not sites:
-        return variables
-    kernels = {(*site, "kernel"): frozen_fp8_kernel(_unnested(site, quantization)) for site in sites}
-    rest = {path: leaf for path, leaf in codes.items() if not (path[:-1] in sites and path[-1] in FROZEN_FP8)}
-    variables = {**variables, "params": traverse_util.unflatten_dict(
-        {**traverse_util.flatten_dict(variables["params"]), **kernels})}
-    del variables[QUANTIZATION]
-    return {**variables, QUANTIZATION: traverse_util.unflatten_dict(rest)} if rest else variables
+def _substituted(network: nn.Module, variables: dict, rngs: dict[str, jax.Array], x: jax.Array) -> jax.Array:
+    """The bound `network` over `x` at its own scope, its variables `variables` and its RNG streams
+    `rngs` in place of the ones it stores, every collection read-only: one lifted transform on Flax's
+    `lift.pack`. A method interceptor finds the network at its path, as at any child. `nn.map_variables`
+    substitutes the variables alone: its `rngs` filters the enclosing scope's streams, whose keys Flax
+    draws by trace-time counters, so inside the memory's scans and vmaps every token and row would draw
+    one key; here each call's streams are the token's own (`InContextMemory._keys`)."""
+    def transform(fn, scopes, *args):
+        def run(scope_fn, repack, variable_groups, rng_groups, *args):
+            (group,) = variable_groups
+            if len(group) != 1:
+                raise ValueError("an in-context memory's network runs at its one scope, sharing no module")
+            inner = scope_fn(((variables,),), ((rngs,),), mutable_filter=False)
+            return fn(inner, *args), repack(inner)
+        return lift.pack(run, (True,), (False,), (True,), name="memory")(scopes, *args)
+
+    return lift_direct_transform(transform, (_call,), network, x)
+
+
+def _call(network: nn.Module, x: jax.Array) -> jax.Array:
+    return network(x)
 
 
 class _Steps(NamedTuple):
     """A call's per-token fields, rows then tokens first: the views `[B, S, H, F]`, the gates
     `[B, S, H]`, the real tokens `[B, S]`, each one's rank among its document's real tokens `[B, S]`,
-    its first at 0, from which its chunks count, and each token and head's dropout key data
-    `[B, S, H, ...]`, None without the dropout stream."""
+    its first at 0, from which its chunks count, and each token and head's key data of every RNG stream
+    `[B, S, H, ...]`, None without any (`InContextMemory._keys`)."""
 
     query: jax.Array
     key: jax.Array
@@ -712,7 +758,7 @@ class _Steps(NamedTuple):
     a: jax.Array
     real: jax.Array
     places: jax.Array
-    keys: jax.Array | None
+    keys: dict[str, jax.Array] | None
 
 
 def _documents(steps: _Steps) -> tuple[jax.Array, jax.Array]:
@@ -730,7 +776,7 @@ def _at_last(values: jax.Array, real: jax.Array, held: jax.Array) -> jax.Array:
 
 
 def _rows(initial: dict, real: jax.Array) -> dict:
-    """W_0's weights `[H, ...]` for every row `[B, H, ...]`, placed as the rows of `real` `[B, S]` are."""
+    """A head's W_0 for every row `[B, ...]`, placed as the rows of `real` `[B, S]` are."""
     return jax.tree.map(lambda leaf: rows_like(jnp.broadcast_to(leaf, (real.shape[0], *leaf.shape)), real),
                         initial)
 
@@ -745,23 +791,9 @@ def _within(values: jax.Array, begins: jax.Array) -> jax.Array:
     return jax.lax.associative_scan(combined, (begins, values), axis=1)[1]
 
 
-def _head(tree, head: int, axis: int):
-    """Every leaf of `tree` at head `head` of its `axis`; None stays None."""
-    return jax.tree.map(lambda leaf: jnp.take(leaf, head, axis=axis), tree)
-
-
-def _nested(names: tuple[str, ...], tree: dict) -> dict:
-    """`tree` under the scopes `names`, the first outermost."""
-    for name in reversed(names):
-        tree = {name: tree}
-    return tree
-
-
-def _unnested(names: tuple[str, ...], tree) -> dict:
-    """The subtree of `tree` the scopes `names` hold, the first outermost."""
-    for name in names:
-        tree = tree[name]
-    return dict(tree)
+def _at(keys: dict[str, jax.Array] | None, head: int, axis: int) -> dict[str, jax.Array] | None:
+    """Each stream's key data in `keys` at head `head` of its `axis`; None stays None."""
+    return None if keys is None else {name: jnp.take(data, head, axis=axis) for name, data in keys.items()}
 
 
 def _joined(held: dict, moving: dict) -> dict:
@@ -775,9 +807,19 @@ def _lead(scalars: jax.Array, leaf: jax.Array) -> jax.Array:
     return scalars.reshape(*scalars.shape, *(1,) * (leaf.ndim - scalars.ndim))
 
 
+def _momentum_step(mu: jax.Array, theta: jax.Array, momentum: jax.Array, gradient: jax.Array) -> jax.Array:
+    """`mu S - theta g` for a head's leaf `[B, ...]` and its rows' gates `[B]`."""
+    return _lead(mu, momentum) * momentum - _lead(theta, gradient) * gradient
+
+
+def _state_step(a: jax.Array, state: jax.Array, momentum: jax.Array) -> jax.Array:
+    """`a W + S` for a head's leaf `[B, ...]` and its rows' kept shares `[B]`."""
+    return _lead(a, state) * state + momentum
+
+
 def _scaled(scalars: jax.Array, leaf: jax.Array) -> jax.Array:
-    """`leaf` `[B, H, ...]` times `scalars` `[B, C, H]`, broadcast to `[B, C, H, ...]`."""
-    return scalars.reshape(*scalars.shape, *(1,) * (leaf.ndim - 2)) * leaf[:, None]
+    """`leaf` `[B, ...]` times `scalars` `[B, C]`, broadcast to `[B, C, ...]`."""
+    return scalars.reshape(*scalars.shape, *(1,) * (leaf.ndim - 1)) * leaf[:, None]
 
 
 def _composed(first: tuple, second: tuple) -> tuple:
@@ -795,4 +837,5 @@ def _composed(first: tuple, second: tuple) -> tuple:
     return matrix, (s, w)
 
 
-__all__ = ["CARRY", "Gate", "InContextMemory", "LinearMemory", "MLPMemory", "Objective", "ResidualMemory"]
+__all__ = ["CARRY", "Gate", "InContextMemory", "LinearMemory", "MLPMemory", "Objective",
+           "QuantizedServingRefused", "ResidualMemory"]
