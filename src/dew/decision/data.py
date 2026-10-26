@@ -214,10 +214,13 @@ class GroupedExamples:
         `"<example index>.<question>"`."""
         if isinstance(row, GroupedExamples):
             return row
-        held = json_value(row.get("examples"), "examples")
-        if not isinstance(held, list):
+        held = row.get("examples")
+        if not isinstance(held, (list, tuple)):
             raise ValueError(f"examples is a list of examples, got {type(held).__name__}")
-        examples = [Example.of(record(example, f"examples.{index}")) for index, example in enumerate(held)]
+        # Each example as `Example.of` reads one: its questions `Question`s or in the wire format.
+        examples = [Example.of(example if isinstance(example, Example)
+                               else record(example, f"examples.{index}"))
+                    for index, example in enumerate(held)]
         return cls(tuple(examples), groups_of(json_value(row.get("groups"), "groups")))
 
 
