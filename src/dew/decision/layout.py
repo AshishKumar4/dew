@@ -227,6 +227,25 @@ def question_fields(row: Encoded, count: int, width: int, labelled: bool = False
     return fields
 
 
+class _Pieces:
+    """An encoder whose texts the renderer reads through the layout's cache of pieces (`_piece`):
+    a corpus's rows repeat their templates, instructions and options."""
+
+    def __init__(self, encoder: Tokenizer):
+        self.same = _same(encoder)
+
+    def encode(self, text: str, *, add_special_tokens: bool = False) -> list[int]:
+        del add_special_tokens
+        return list(_piece(self.same, text))
+
+
+MEDIA_MARK = ("media",)
+"""The mark of a row's images (`Encoded.media`), which no question's mark, a `(name, part)` pair, is."""
+
+INSTRUCTIONS_MARK = "instructions"
+"""The part of a question's mark that its instructions take, beside its options' slots."""
+
+
 def render(value: JSON) -> str:
     """Return a value as the model reads it: text as it is, and anything structured as JSON."""
     match value:
@@ -242,7 +261,7 @@ def context_tokens(tokenizer: Tokenizer, context: JSON | None, length: int) -> n
     is refused (ValueError), never cut: a cut would answer from part of what the caller gave."""
     if context is None:
         return np.zeros(0, np.int32)
-    tokens = tokenizer.encode(render(context), add_special_tokens=False)
+    tokens = rendered_chunks([Chunk(render(context))], tokenizer, "pieces").tokens
     if len(tokens) > length:
         raise ValueError(f"the context is {len(tokens)} tokens, more than the {length} its cross-attention "
                          "reads (context_length)")
@@ -1146,102 +1165,86 @@ class JointLayout(Layout):
     def rows(self, encoder: Tokenizer, specials: Specials, state: JSON, questions: Mapping[str, Question],
              *, orders: Mapping[str, Sequence[int]] | None = None, media: Sequence[int] = (),
              tokens: Sequence[int] | None = None) -> list[Encoded]:
-        same = _same(encoder)
-
-        def piece(text: str) -> list[int]:
-            return list(_piece(same, text))
-
+        """The request's one row, rendered as chunks (`dew.decision.renderer`, piece by piece as the
+        joint release encodes it): each run of text between the turn's other parts one chunk, the
+        images, each copy of the state and the schema chunks of ids, and each question's and option's
+        tokens the marks its chunks carry."""
+        pieces = _Pieces(encoder)
         if media and not any(isinstance(segment, Media) for segment in self.segments):
             raise ValueError("this joint layout's segments have no place for images")
-        schema, laid = self._schema(piece, questions, orders)
-        state_ids = list(self.state(encoder, specials, state) if tokens is None else tokens)
+        schema = rendered_chunks(self._schema(questions, orders), pieces, "pieces")
+        state_ids = tuple(self.state(encoder, specials, state) if tokens is None else tokens)
         whole = len(state_ids)
         # The turn's markup and the text beside it are read as one piece each, as the turn writes them.
         before, after = self.framing.around(encoder)
         parts: list[str | Segment] = [before, *self.segments, after]
-        laid_out: list[tuple[Segment | None, list[int]]] = []
-        index = 0
-        while index < len(parts):
-            part = parts[index]
+        laid_out: list[tuple[Segment | None, Chunk]] = []
+        for part in parts:
             if isinstance(part, (str, Text)):
-                text = ""
-                while index < len(parts):
-                    joined = parts[index]
-                    if isinstance(joined, str):
-                        text += joined
-                    elif isinstance(joined, Text):
-                        text += joined.text
-                    else:
-                        break
-                    index += 1
-                laid_out.append((None, piece(text)))
+                text = part if isinstance(part, str) else part.text
+                if laid_out and laid_out[-1][0] is None and laid_out[-1][1].ids is None:
+                    laid_out[-1] = (None, Chunk(laid_out[-1][1].text + text))
+                else:
+                    laid_out.append((None, Chunk(text)))
                 continue
-            in_row = not (isinstance(part, Schema) and part.stream == "context")
-            own = (schema if isinstance(part, Schema) and in_row else list(media) if isinstance(part, Media)
-                   else [])
-            laid_out.append((part, own))
-            index += 1
-        room = self.max_len - sum(len(ids) for segment, ids in laid_out if not isinstance(segment, State))
+            if isinstance(part, Schema) and not self.schema_in_context:
+                chunk = Chunk(ids=schema.tokens,
+                              marks=tuple((key, *span) for key, span in schema.marks.items()))
+            elif isinstance(part, Media) and media:
+                chunk = Chunk(ids=tuple(media), marks=((MEDIA_MARK, 0, len(media)),))
+            else:
+                chunk = Chunk(ids=())
+            laid_out.append((part, chunk))
+        # The row without its state, each copy a chunk of no ids, rendered as the row is.
+        room = self.max_len - len(rendered_chunks([chunk for _, chunk in laid_out], pieces, "pieces").tokens)
         copies = [segment for segment, _ in laid_out if isinstance(segment, State)]
-        counts = allocated([whole] * len(copies), copies, room, self.max_state_tokens)
-        kept_ids = [list(_kept(state_ids, count, copy.keep))
-                    for count, copy in zip(counts, copies, strict=True)]
+        counts = iter(allocated([whole] * len(copies), copies, room, self.max_state_tokens))
+        chunks = [Chunk(ids=_kept(state_ids, next(counts), segment.keep)) if isinstance(segment, State)
+                  else chunk for segment, chunk in laid_out]
         # A row without a state segment keeps none of the state.
-        kept_count = min((len(ids) for ids in kept_ids), default=0)
-        copied = iter(kept_ids)
-        row: list[int] = []
-        offset, place = 0, None
-        for segment, ids in laid_out:
-            if isinstance(segment, State):
-                ids = next(copied)
-            if isinstance(segment, Schema) and not self.schema_in_context:
-                offset = len(row)
-            if isinstance(segment, Media) and media:
-                place = (len(row), len(row) + len(ids))
-            row.extend(ids)
-
-        def moved(span: tuple[int, int]) -> tuple[int, int]:
-            return span[0] + offset, span[1] + offset
-
-        shifted = tuple(Laid(question.name, question.kind, moved(question.span),
-                             tuple(moved(option) for option in question.options), question.order)
-                        for question in laid)
+        kept_count = min((len(chunk.ids or ()) for (segment, _), chunk in zip(laid_out, chunks, strict=True)
+                          if isinstance(segment, State)), default=0)
+        row = rendered_chunks(chunks, pieces, "pieces")
+        marks = schema.marks if self.schema_in_context else row.marks
+        laid = tuple(Laid(name, kind_of(question), marks[(name, INSTRUCTIONS_MARK)],
+                          tuple(marks[(name, number)] for number in range(len(slots))), tuple(slots))
+                     for (name, question), slots in zip(questions.items(), self._slots(questions, orders),
+                                                        strict=True))
         if self.schema_in_context:
             # The schema is the row's context, its spans the context's own positions.
-            return [Encoded(tuple(row), shifted, None, None, whole, kept_count, place,
-                            context=tuple(schema), spans_in_context=True)]
-        return [Encoded(tuple(row), shifted, None, None, whole, kept_count, place)]
+            return [Encoded(row.tokens, laid, None, None, whole, kept_count, row.marks.get(MEDIA_MARK),
+                            context=schema.tokens, spans_in_context=True)]
+        return [Encoded(row.tokens, laid, None, None, whole, kept_count, row.marks.get(MEDIA_MARK))]
 
-    def _schema(self, piece: Callable[[str], list[int]], questions: Mapping[str, Question],
-                orders: Mapping[str, Sequence[int]] | None) -> tuple[list[int], list[Laid]]:
-        """The schema's tokens (`Schema`), and each question laid out in them, its spans the
-        schema's own positions."""
-        schema = piece("\n\nSCHEMA FIELDS:\n")
-        laid = []
-        for index, (name, question) in enumerate(questions.items()):
-            schema.extend(piece(f"\nFIELD {index + 1}\nID: {name}\nTYPE: {question.kind}\nINSTRUCTION: "))
-            start = len(schema)
-            schema.extend(piece(_compact(question.instructions)))
-            span = (start, len(schema))
-            schema.extend(piece("\nALLOWED OPTIONS:\n"))
+    def _slots(self, questions: Mapping[str, Question],
+               orders: Mapping[str, Sequence[int]] | None) -> list[list[int]]:
+        """Each question's option slots: the order a request gives (`orders`), else the joint order."""
+        return [_slots(len(self.options(question)), (orders or {})[name]) if name in (orders or {})
+                else self.order(question) for name, question in questions.items()]
+
+    def _schema(self, questions: Mapping[str, Question],
+                orders: Mapping[str, Sequence[int]] | None) -> list[Chunk]:
+        """The schema's chunks (`Schema`), each a piece the joint release encodes alone, each
+        question's instructions marked `(name, INSTRUCTIONS_MARK)` and the option it shows n-th
+        `(name, n)`."""
+        chunks = [Chunk("\n\nSCHEMA FIELDS:\n")]
+        slotted = zip(questions.items(), self._slots(questions, orders), strict=True)
+        for index, ((name, question), slots) in enumerate(slotted):
+            instructions = _compact(question.instructions)
+            chunks += [Chunk(f"\nFIELD {index + 1}\nID: {name}\nTYPE: {question.kind}\nINSTRUCTION: "),
+                       Chunk(instructions, marks=(((name, INSTRUCTIONS_MARK), 0, len(instructions)),)),
+                       Chunk("\nALLOWED OPTIONS:\n")]
             described = self.options(question)
-            order = (orders or {}).get(name)
-            slots = (_slots(len(described), order) if order is not None
-                     else self.order(question))
-            spans = []
             for number, slot in enumerate(slots):
                 key, description = described[slot]
-                schema.extend(piece(f"OPTION {number + 1}: "))
-                start = len(schema)
                 semantics: dict[str, JSON] = {"option_id": key}
                 if description is not None:
                     semantics["description"] = description
-                schema.extend(piece(_compact(semantics)))
-                spans.append((start, len(schema)))
-                schema.extend(piece("\n"))
-            schema.extend(piece("END FIELD\n"))
-            laid.append(Laid(name, kind_of(question), span, tuple(spans), tuple(slots)))
-        return schema, laid
+                text = _compact(semantics)
+                chunks += [Chunk(f"OPTION {number + 1}: "),
+                           Chunk(text, marks=(((name, number), 0, len(text)),)), Chunk("\n")]
+            chunks.append(Chunk("END FIELD\n"))
+        return chunks
 
     @staticmethod
     def options(question: Question) -> tuple[tuple[str, JSON], ...]:
