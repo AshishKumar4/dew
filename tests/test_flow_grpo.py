@@ -1113,7 +1113,8 @@ judged as leaves of their own, so a small row is not read as a large one's float
 
 def _assert_kl_outputs(dew, plain, truth, bounds, label):
     """Each output of `_kl_derivatives` against the float64 truth, element by element as the gate rules
-    (rows 1722 and 1778): where the plain float32 arm (`_plain_kl`) is finite, on par with it (check 1,
+    (rows 1722 and 1778): where the plain float32 arm (`_plain_kl`) is finite, on par with it (the grid's
+    one-draw rule, `assert_as_exact_as_the_reference` at FACTOR until the gate's switch-over to PARITY;
     unscaled, its rows whole and its zero rows included, each band of `BAND` binades of the rows' sizes a
     leaf of its own, an element the plain arm leaves out of a row taking the truth in both arms); where
     it overflows, finite wherever the truth is a normal float32 and within the derived bound of the
