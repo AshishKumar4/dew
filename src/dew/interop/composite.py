@@ -81,5 +81,9 @@ class SourceKind:
     """A source's metadata codec, registered by import path in `registry.source_kinds`."""
 
     @staticmethod
-    def describe(directory: Path) -> CompositeSource | None:
+    def describe(directory: Path, overrides: Mapping[str, object] | None = None) -> CompositeSource | None:
+        """The composite `directory` holds, or None for another kind of source. `overrides` is the
+        load's `modeling_overrides` over the release's own (`pretrained.with_overrides`): what the
+        description derives from its native component's configuration, a row layout from its
+        attention, is derived from the configuration the native loader builds under them."""
         raise NotImplementedError

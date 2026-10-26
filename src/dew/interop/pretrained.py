@@ -436,7 +436,8 @@ class Pretrained:
         param_dtype = AUTO if param_dtype == AUTO else dtype_name(param_dtype)
         # The reference refuses a folder outside the source before anything is fetched.
         directory, reference, composite = _source_metadata(
-            sources.SourceReference(str(name_or_dir), revision, subfolder), selected, fallback)
+            sources.SourceReference(str(name_or_dir), revision, subfolder), selected, fallback,
+            modeling_overrides)
         loaded, extracted = _loaded_kind(
             reference, directory, composite, fallback=fallback, gguf_file=gguf_file,
             single_file=single_file, dduf_file=dduf_file, placed=placed, streaming=streaming or not weights,
@@ -1173,10 +1174,12 @@ def _loaded_kind(reference: sources.SourceReference, directory: Path, composite:
     return loaded, False
 
 
-def _overridden(config: Mapping[str, object], overrides: Mapping[str, object] | None) -> Mapping[str, object]:
+def with_overrides(config: Mapping[str, object],
+                   overrides: Mapping[str, object] | None) -> Mapping[str, object]:
     """`config` with `overrides`, a `modeling_overrides` record, over the source's own: each attention
     kind it names takes its mode, the others keep the source's. The decoder translation reads and
-    checks the result (`decoder_parts.modeling_overrides`)."""
+    checks the result (`decoder_parts.modeling_overrides`), and a composite's description what it
+    derives from it (`SourceKind.describe`)."""
     if overrides is None:
         return config
     own = _records.record(config.get("modeling_overrides", {}), "modeling_overrides")
@@ -1547,26 +1550,29 @@ def _selected_payload(fallback: str | None, **files: str | None) -> list[str]:
 
 
 
-def _source_metadata(requested: sources.SourceReference, selected: list, fallback: str | None
+def _source_metadata(requested: sources.SourceReference, selected: list, fallback: str | None,
+                     overrides: Mapping[str, object] | None
                      ) -> tuple[Path, sources.SourceReference, CompositeSource | None]:
     """Resolve one metadata snapshot of `requested` before any component's weights are read: the
     snapshot, the reference pinned to its commit (none for a local directory), and the composite
-    release its selected folder describes. Explicit payload/fallback selections take precedence over
-    composite metadata."""
+    release its selected folder describes under the load's `overrides`. Explicit payload/fallback
+    selections take precedence over composite metadata."""
     directory = sources.snapshot(requested.name, requested.revision, weights=False)
     commit = None if os.path.isdir(requested.name) else directory.name
     reference = replace(requested, revision=commit, subfolder=requested.subfolder or None)
     composite = (None if selected or fallback is not None
-                 else _composite_description(reference.directory(directory)))
+                 else _composite_description(reference.directory(directory), overrides))
     return directory, reference, composite
 
 
-def _composite_description(directory: Path) -> CompositeSource | None:
-    """A registered composite's metadata, without reading or placing its weights."""
+def _composite_description(directory: Path,
+                           overrides: Mapping[str, object] | None = None) -> CompositeSource | None:
+    """A registered composite's metadata under the load's `overrides`, without reading or placing its
+    weights."""
     from dew.registry import source_kinds
 
     for provider in source_kinds.values():
-        description = provider.describe(directory)
+        description = provider.describe(directory, overrides)
         if description is not None:
             return description
     return None
@@ -1787,7 +1793,7 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
     mamba_ssm = mamba2.is_mamba_ssm(config)
     if mamba_ssm:
         config = mamba2.config_from_mamba_ssm(config)
-    config = _overridden(config, overrides)
+    config = with_overrides(config, overrides)
     family = config.get("model_type")
     config, route, language = _routed(config, remote=remote, text_only=text_only, overrides=overrides)
     if isinstance(route, TorchRoute):
