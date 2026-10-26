@@ -54,6 +54,50 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(tmp_path):
     assert decide.name == "tickets" and set(decide.calibration.temperatures.types) == {"choice"}
 
 
+def test_a_decision_run_scores_each_split_with_its_own_metrics_and_ranks_by_their_summary(tmp_path):
+    """A decision run names its validation splits and each one's metrics (`--val-metrics`): accuracy on
+    every split and the Brier score on `test` alone, in place of the task's own suite. A summary weighs
+    both splits' accuracy into one (`--val-summaries`), formed at each evaluation, which scores both, and
+    the run ranks its checkpoints by it (`--trainer.best summary/board`)."""
+    table = tmp_path / "tickets.csv"
+    tickets = [("charged twice for March", "billing"), ("the site is down", "technical"),
+               ("how much is the pro plan", "sales"), ("refund my last invoice", "billing")] * 6
+    with table.open("w", newline="") as file:
+        writer = csv.writer(file)
+        writer.writerow(["text", "label"])
+        writer.writerows(tickets)
+    train, held = Files(str(table), format="csv").holdout(0.5)
+
+    def asked(rows):
+        return rows.pipe(decisions, question="team").read("memory").batch(8).loading(Loading(workers=0))
+
+    config = DecisionRunConfig.cli([
+        "--pretrained", str(TINY), "--trainer.name", "splits",
+        "--trainer.checkpoint-dir", str(tmp_path / "runs"),
+        "--trainer.steps", "2", "--trainer.eval-every", "1", "--trainer.checkpoint-every", "1",
+        "--trainer.log-every", "1", "--trainer.multi-host", "False",
+        "--trainer.compilation-cache-dir", "None",
+        "--model.dtype", "float32", "--trainer.best", "summary/board",
+        "--val-metrics", '[{"name": "accuracy"}, {"name": "brier", "split": "test"}]',
+        "--val-summaries", json.dumps([{"name": "board", "weights": {"val/accuracy": 1, "test/accuracy": 3},
+                                        "better": "higher"}])],
+        default=DecisionRunConfig(data=asked(train), validation={"val": asked(held), "test": asked(held)}))
+    config.run()
+    run = tmp_path / "runs" / "splits"
+    logged = [json.loads(line) for line in (run / "tracking" / "scalars.jsonl").read_text().splitlines()]
+    scores = {}
+    for row in logged:
+        scores.setdefault(row["step"], {}).update(row["scalars"])
+    for step in (1, 2):
+        names = {name for name in scores[step] if name.split("/")[0] in ("val", "test", "summary")}
+        assert names == {"val/loss", "val/accuracy", "test/loss", "test/accuracy", "test/brier",
+                         "summary/board"}
+        assert scores[step]["summary/board"] == (scores[step]["val/accuracy"]
+                                                 + 3 * scores[step]["test/accuracy"]) / 4
+    recorded = DecisionRunConfig.from_dict(json.loads((run / "run.json").read_text()))
+    assert (recorded.val_metrics, recorded.val_summaries) == (config.val_metrics, config.val_summaries)
+
+
 QWEN = Path(__file__).parent / "fixtures" / "hf" / "qwen38-dense-tiny"
 
 

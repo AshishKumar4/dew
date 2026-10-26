@@ -91,6 +91,7 @@ from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages
 from dew.training.budget import Pause, run_length, run_steps
 from dew.training.display import TrainingDisplay
 from dew.training.distributed import Layout, MeshSpec
+from dew.training.evaluation import EvalSuite, Summary
 from dew.training.profiling import ProfileWindow
 from dew.training.quantization import quantize_trunk
 from dew.training.selection import Best
@@ -267,10 +268,13 @@ class MetricConfig(_Configured):
     `ObjectiveConfig` holds an objective's: a CLIP metric's `modelname`, an
     FID's `weights`. `defaults` holds every other argument the class defaults,
     so a metric whose default model changes later scores a recorded run as it
-    did.
+    did. `split` is the validation split it scores, every split where None.
     """
 
     name: str
+    fields: JsonDict = dataclasses.field(default_factory=dict)
+    defaults: JsonDict = dataclasses.field(default_factory=dict)
+    split: str | None = None
 
     @staticmethod
     def _member(name: str) -> type:
@@ -1232,7 +1236,7 @@ class RunConfig:
     """The optional settings `cli` turns on by their own flags, each with the
     subcommand its flags imply."""
     RESUMABLE: ClassVar[tuple[str, ...]] = ("trainer", "optim", "data", "validation", "data_seed",
-                                            "val_metrics")
+                                            "val_metrics", "val_summaries")
     """The fields a run resumed under its name may change: how it trains and optimizes, what it reads
     and scores, and, in a kind of run that adds them, how it previews. Every other field says what
     it trains, which the resume must keep (`check_resume`), and so does `trainer.quantization`, which
@@ -1265,13 +1269,21 @@ class RunConfig:
     """
     val_metrics: (Annotated[tuple[MetricConfig, ...], record_argument(tuple[MetricConfig, ...])]
                   | None) = None
-    """The metrics scored on every validation pass, each with the arguments the run gives it (a
-    CLIP metric's model, an FID's weights), one JSON list on the command line:
-    `--val-metrics '[{"name": "clip", "fields": {"modelname": "openai/clip-vit-base-patch32"}}]'`.
-    None is the kind of run's own (`default_metrics`): perplexity for a language model, a decision
-    run's accuracy, calibration, risk-coverage and log loss, a JEPA run's probes, CLIP for an image
-    run, each where its data holds a validation split. A metric given is asked for whatever the data
-    holds, so data with no validation split refuses it; `[]` scores none.
+    """The metrics each validation split scores, each with the arguments the run gives it (a CLIP
+    metric's model, an FID's weights) and the split it scores, every split where it names none
+    (`MetricConfig.split`), one JSON list on the command line: `--val-metrics '[{"name": "accuracy"},
+    {"name": "brier", "split": "test"}]'` scores accuracy on every split and the Brier score on `test`.
+    A split no metric names scores none; `[]` scores none anywhere. None scores the kind of run's own
+    on every split (`default_metrics`): perplexity for a language model, a decision run's accuracy,
+    calibration, risk-coverage and log loss, a JEPA run's probes, CLIP for an image run. A metric
+    given is asked for whatever the data holds: a split the run does not validate, or data with no
+    validation split, refuses it.
+    """
+    val_summaries: Annotated[tuple[Summary, ...], record_argument(tuple[Summary, ...])] = ()
+    """Scalars weighed from each evaluation's split scores, a board's weighted index, each formed where
+    the evaluation scored every split it weighs and logged as `summary/<name>`, which `--trainer.best
+    summary/<name>` ranks by (`dew.training.evaluation.Summary`): `--val-summaries '[{"name": "board",
+    "weights": {"val/accuracy": 1, "test/accuracy": 2}, "better": "higher"}]'`.
     """
 
     def __post_init__(self) -> None:
@@ -1524,10 +1536,26 @@ class RunConfig:
         return config.build()
 
     def validation_metrics(self, *, validates: bool) -> tuple[Metric, ...]:
-        """The metrics each validation pass scores, built (`metric`): `val_metrics`, or the kind of
-        run's own where it names none (`default_metrics`), by what the run's data `validates`."""
-        configs = self.default_metrics(validates=validates) if self.val_metrics is None else self.val_metrics
-        return tuple(self.metric(config) for config in configs)
+        """The kind of run's own metrics (`default_metrics`), built (`metric`), by what the run's data
+        `validates`: what each split scores where `val_metrics` names none (`suites`)."""
+        return tuple(self.metric(config) for config in self.default_metrics(validates=validates))
+
+    def suites(self, dataset: Loader, validation: Mapping[str, Reader] | None,
+               ) -> Mapping[str, EvalSuite] | None:
+        """Each split the run validates, `validation`'s or `dataset.val` as `val`, with the metrics
+        `val_metrics` names for it built (`metric`); None where `val_metrics` names none, so each scores
+        the kind's own. A metric for a split the run does not validate is refused."""
+        if self.val_metrics is None:
+            return None
+        splits = dict(validation) if validation is not None else (
+            {"val": dataset.val} if dataset.val is not None else {})
+        named = {config.split for config in self.val_metrics if config.split is not None}
+        if (self.val_metrics and not splits) or not named <= set(splits):
+            raise ValueError(f"val_metrics score {sorted(named) or 'every split'}, and the run validates "
+                             f"{sorted(splits) or 'none'}")
+        return {split: EvalSuite(reader, tuple(self.metric(config) for config in self.val_metrics
+                                                if config.split in (None, split)))
+                for split, reader in splits.items()}
 
     def chain(self) -> Dataset:
         """The run's `data`. Raises ValueError for a run that names none: a run trains on the chain
@@ -1614,13 +1642,16 @@ class RunConfig:
         each prefetched batch into the one the step trains on, as an on-policy
         objective samples it. `validation` names the splits each evaluation
         scores in place of `dataset.val`, as `Trainer.fit` takes them: a held-out
-        split and a test set are logged as `val/...` and `test/...`. With no
+        split and a test set are logged as `val/...` and `test/...`. `metrics` are
+        the kind's own, which each split scores where `val_metrics` names none. With no
         `trainer.best`, the first split's loss ranks the checkpoints; a `Best`
         over a metric names its split. `after` runs on the state training ends
         on and the run's directory before the checkpoint is published, as a
         decision run fits its calibration there, so what it writes is published.
         """
         dataset, validation = self.compiled(objective.data(), dataset, validation)
+        # Each split scores the metrics `val_metrics` names for it, or else `metrics`, the kind's.
+        suites = self.suites(dataset, validation)
         sized, dataset, steps = self.trainer.resolved(dataset)
         self = dataclasses.replace(self, trainer=sized)
         if self.trainer.quantization is not None:
@@ -1679,8 +1710,9 @@ class RunConfig:
                 eval_every=trainer.eval_interval(dataset),
                 checkpoint_every=trainer.checkpoint_interval(dataset),
                 checkpoint_final=trainer.checkpoint_final,
-                metrics=metrics, preview=trainer.wandb is not None,
-                best=trainer.best_policies(), stop=trainer.stop, validation=validation,
+                metrics=metrics if suites is None else (), preview=trainer.wandb is not None,
+                best=trainer.best_policies(), stop=trainer.stop,
+                validation=validation if suites is None else suites, summaries=self.val_summaries,
             )
             if after is not None:
                 after(state, checkpoints.directory)
