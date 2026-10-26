@@ -248,12 +248,13 @@ class _Operand:
         return [ref.at[p * self.rows + row, pl.ds(column, columns)] for p in range(self.parts)]
 
     def store(self, ref, value, row, rows: int, column, columns: int, *, family: mosaic.Family,
-              smem) -> None:
+              smem, wait: bool = True) -> None:
         """`value` `[rows, columns]` as its parts at `row` and `column`, through `smem` (a `[rows, columns]`
-        tile of its stored dtype the launch lands its stores in, `_landed`)."""
+        tile of its stored dtype the launch lands its stores in, `_landed`), its last copy left in flight
+        unless `wait` (`Family.stored`, `_walk_stores`)."""
         pieces = _split(value.astype(jnp.float32)) if self.parts > 1 else (value,)
         family.stored([piece.astype(self.stored) for piece in pieces],
-                      self.views(ref, row, rows, column, columns), smem=smem)
+                      self.views(ref, row, rows, column, columns), smem=smem, wait=wait)
 
     def landing(self, rows: int, columns: int) -> tuple:
         """A store's `landing` entry (`_kernel`): a `[rows, columns]` tile in its stored dtype."""
@@ -560,6 +561,20 @@ def _products(parts: int) -> int:
     """The products an fp32 call's issue takes for one of its operands' (`_Issuer`): its parts' pairs whose
     orders sum under `parts`."""
     return sum(1 for i in range(parts) for j in range(parts) if i + j < parts)
+
+
+def _walk_stores(family: mosaic.Family, stores: int):
+    """A walk step's `stores` stores, each through its own landing tile and left in flight (`wait=False`):
+    `before()` ahead of each waits until at most `stores - 1` of the thread's stores still read their tiles,
+    the oldest of them the same tile's in the step before, so a step's stores overlap the next step's work
+    (the states walk waited out each, 9.5% of its samples, SE-sass-h100-be7214123). `_sequence_walk` waits
+    them out after its last step."""
+    return lambda: family.store_wait(stores - 1)
+
+
+def _memory_landing(call: _Call, bv: int) -> dict:
+    """A walk's memory's landing tiles, one a key slice `[block, bv]` (`_walk_stores`): `{memory0, ...}`."""
+    return {f"memory{i}": call.memories.landing(call.block, bv) for i in range(call.width // call.block)}
 
 
 def _landed(landing: dict) -> dict:
@@ -1029,6 +1044,8 @@ def _sequence_walk(call: _Call, memory: _Operand, name: str, entering: tuple, wa
         carry = family.walk(chunks, ((walked_step, start, start + count),), carry, (), call.interpret,
                             first=start)[0]
         state = carry if prefetch is None else carry[0]
+        # The steps' stores left in flight (`_walk_stores`) done reading their tiles before the program ends.
+        family.store_wait(0)
 
         @pl.when(written > 0)
         def _():
@@ -1089,11 +1106,15 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
             rows = tuple(family.rows_of(ref.at[h, span]) for ref in (hi_ref, lo_ref))
             return ends, rows, None if delta else family.rows_of(beta_ref.at[h, span])
 
+        # Each key slice of the memory and the corrected values, a store each in flight.
+        before_store = _walk_stores(family, width // call.block + 1)
+
         def step(n, slots, state, accumulators, loaded=None):
             span, last = pl.ds(n * CHUNK, CHUNK), n * CHUNK + CHUNK - 1
             for i, part in enumerate(state):
+                before_store()
                 memories.store(h_ref, part, memory(n, i), call.block, j * bv, bv, family=family,
-                               smem=landing["memory"])
+                               smem=landing[f"memory{i}"], wait=False)
             tile = _tile(slots, "values", values).value()
             if delta:
                 def weights(i):
@@ -1104,8 +1125,9 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
                 betas = family.rows_of(beta_ref.at[h, span]) if loaded is None else loaded[2]
                 written = algebra.weighted("apply_u", None, tile, betas, issue)
                 corrected = algebra.corrected(written, None, state, held.dtype, issue)
+            before_store()
             held.store(corrected_ref, corrected, n * CHUNK, CHUNK, h * value_width + j * bv, bv,
-                       family=family, smem=landing["corrected"])
+                       family=family, smem=landing["corrected"], wait=False)
             if call.per_key:
                 gated = corrected
                 decay = [algebra.raised(*(family.rows_of(ref.at[last, pl.ds(h * width + i * call.block,
@@ -1158,7 +1180,7 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
                    grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
                    live=lambda refs: refs[7][lax.axis_index("sequences"), 1] > 0, work=work, held=held_tiles,
                    staging=(*_staging(held, (call.block, bv)), _column_scratch(call)), once=initials,
-                   landing={"memory": memories.landing(call.block, bv), "corrected": held.landing(CHUNK, bv),
+                   landing={**_memory_landing(call, bv), "corrected": held.landing(CHUNK, bv),
                             "final": ((call.block, bv), jnp.float32)})(
         k, k if w is None else w, u, hi, lo, beta, h0, sequences)
 
@@ -1711,12 +1733,16 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
         walked = family.opened(streams["walked"], views)
         leaving = family.opened(streams["once"], final_views)
 
+        # Each key slice of the memory's gradient and the corrected values', a store each in flight.
+        before_store = _walk_stores(family, width // call.block + 1)
+
         def step(f, slots, grad, accumulators):
             n = chunks - 1 - f
             span, last = pl.ds(n * CHUNK, CHUNK), n * CHUNK + CHUNK - 1
             for i, part in enumerate(grad):
+                before_store()
                 memories.store(dh_ref, part, memory(n, i), call.block, j * bv, bv, family=family,
-                               smem=landing["memory"])
+                               smem=landing[f"memory{i}"], wait=False)
 
             def block(name, operand, i):
                 return _tile(slots, name, operand, columns=pl.ds(i * call.block, call.block))
@@ -1729,8 +1755,9 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
                 grad, functools.partial(block, "keys", given), functools.partial(block, "w", held),
                 functools.partial(block, "queries", given), out.value(), local, gate, low, ending,
                 ending_low, scale, held.dtype, issue)
+            before_store()
             held.store(dv_ref, dv, n * CHUNK, CHUNK, h * value_width + j * bv, bv, family=family,
-                       smem=landing["corrected"])
+                       smem=landing["corrected"], wait=False)
             return grad, accumulators
 
         _sequence_walk(call, final, "final", (leaving, final_views), (walked, views), step,
@@ -1759,7 +1786,7 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
                    live=lambda refs: refs[8][lax.axis_index("sequences"), 1] > 0,
                    staging=(*_staging(held, (call.block, bv)), (plgpu.SMEM((CHUNK, bv), held.stored),)),
                    once=finals,
-                   landing={"memory": memories.landing(call.block, bv), "corrected": held.landing(CHUNK, bv),
+                   landing={**_memory_landing(call, bv), "corrected": held.landing(CHUNK, bv),
                             "final": ((call.block, bv), jnp.float32)})(q, k, w, do, local, hi, lo, dht,
                                                                         sequences)
 
