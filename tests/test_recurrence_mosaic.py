@@ -24,7 +24,6 @@ from test_recurrence_chunk import FORMED, HOOKS, SEEDS as HOOK_SEEDS, draw as ho
 
 from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk, mosaic_rule, recomputing
-from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import mosaic
 from dew.nn.kernels.templates.base import Unfitted
 from dew.nn.kernels.templates.recurrence import mainloop, template
@@ -132,16 +131,14 @@ def on_the_mainloop(hooks: recurrence.Hooks, case: str, dtype):
     takes them (`chunk(..., mainloop='mosaic')`, at its derived tiles); else, the route refusing them (a
     launch's registers past a thread's), the mainloop's rule at its narrowest value block, one chunk in
     flight (`mosaic_rule`), whose arithmetic is the same at any tiles. None where the mainloop's rule refuses
-    the call too (checked): a call whose tiles the device's family stores none of (`mainloop.stores`), or an
-    fp32 call's decay a key dimension (`mainloop.per_key_refusal`)."""
+    the call too (checked): an fp32 call's decay a key dimension (`mainloop.per_key_refusal`)."""
     (operands,) = draw(dtype, 0, **geometry(case))
     if taken(operands, hooks):
         return functools.partial(chunk, hooks, mainloop='mosaic')
     with pytest.raises(REFUSED):
         jax.eval_shape(functools.partial(chunk, hooks, mainloop='mosaic'), operands)
     family = mainloop.family_of() or mainloop.INTERPRETED
-    if (not mainloop.stores(family, dtype)
-            or (SHAPES[case].get('per_key') and mainloop.per_key_refusal(dtype, hooks.floor))):
+    if SHAPES[case].get('per_key') and mainloop.per_key_refusal(dtype, hooks.floor):
         # The portable math's arm is test_recurrence_chunk's.
         with pytest.raises(NotImplementedError):
             jax.eval_shape(functools.partial(mosaic_rule, tiles=mainloop.Tiles(32, 1), floor=hooks.floor),
@@ -194,8 +191,7 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles_as_exact_as_its_referen
     reference's (check 1, as `test_the_mosaic_forward_is_as_exact_as_its_reference`'s). Its variants, which
     the opt-in tuner times (`Mosaic.variants`), lead with those tiles, each legal there and on par too. An
     fp32 call it refuses: a launch's registers at its narrowest tiles pass a thread's (the fp32 solve's
-    merges hold the inverse's three parts). A call whose tiles its family stores none of (`mainloop.stores`)
-    it refuses before any."""
+    merges hold the inverse's three parts)."""
     assert generation.family(UNSEEN.generation) == 'mma.sync'
     case = 'one sequence'
     hooks = recurrence.Hooks(decay='scalar', scale=SHAPES[case]['key_width'] ** -0.5)
@@ -203,12 +199,6 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles_as_exact_as_its_referen
     bound = template.MOSAIC.bind(operands.query, operands.key, operands.value, operands.log_decay,
                                  operands.beta, operands.state, operands.starts)
     budget = generation.shared_budget(UNSEEN)
-    if not mainloop.stores(mainloop.FAMILIES['mma.sync'], dtype):
-        # Its family stores none of the call's tiles (mma.sync's 16-bit ones on JAX 0.12): refused.
-        with generation.assumed(UNSEEN):
-            assert template.MOSAIC.derived(bound, UNSEEN) is None
-            assert not template.MOSAIC.eligible(bound, UNSEEN)
-        return
     if dtype == jnp.float32:
         with generation.assumed(UNSEEN):
             assert template.MOSAIC.derived(bound, UNSEEN) is None
@@ -247,8 +237,7 @@ def test_a_gated_delta_net_named_onto_the_template_runs_it_and_matches_the_porta
     its probe ahead of the gates (`on_the_port`, which binds no launches) takes the selector's own pick, not
     a refusal, and the rule then takes the template, its output on par from float64 with the portable
     rule's (the layer's own float64 forward the truth). The layer computes in bf16, the call the template's
-    launches hold on every family (an fp32 call's solve holds more registers than a thread has); where the
-    device's family stores no bf16 tile (`mainloop.stores`), the named route is refused."""
+    launches hold on every family (an fp32 call's solve holds more registers than a thread has)."""
     from dew.nn.linear import GatedDeltaNet
 
     x = jax.random.normal(jax.random.key(23), (1, 72, 64)).astype(jnp.bfloat16)
@@ -257,10 +246,6 @@ def test_a_gated_delta_net_named_onto_the_template_runs_it_and_matches_the_porta
     with generation.chosen(gated_delta_rule='xla'):
         params = layer.init(jax.random.key(29), x)
         want = layer.apply(params, x)
-    if not mainloop.stores(mainloop.family_of() or mainloop.INTERPRETED, jnp.bfloat16):
-        with generation.chosen(gated_delta_rule='mosaic_gpu'), pytest.raises((*REFUSED, KernelRefused)):
-            layer.apply(params, x)
-        return
     with generation.chosen(gated_delta_rule='mosaic_gpu'), generation.routes() as taken:
         got = layer.apply(params, x)
     assert any(route.choice == 'gated_delta_rule' and route.kernel == 'mosaic_gpu' for route in taken)
@@ -498,8 +483,7 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_shared_memory(target):
     are derived), and no launch the template's legality holds spills a register (`resource_failures`): the
     gate's three resources. Lowering alone takes no device's budget: a launch past an A100's shared memory
     lowered and failed on the GPU (the fast backward's readout's third staging tile). The gated delta
-    rule's 16-bit call, the production cell, derives tiles on every family that stores its tiles
-    (`mainloop.stores`; mma.sync's no 16-bit one on JAX 0.12, which refuses it). A GPU host's ptxas builds
+    rule's 16-bit call, the production cell, derives tiles on every family. A GPU host's ptxas builds
     for its own GPU and those before it, not a newer one's (an A100's refuses sm_90a), so there the newer
     targets are the CPU suite's alone."""
     if jax.default_backend() == 'gpu':
@@ -511,7 +495,6 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_shared_memory(target):
     plans, refused = {}, []
     found = compile_mosaic_kernels(compiled_cases(target, plans, refused), target)
     failed = resource_failures(found, plans, mainloop.FAMILIES[generation.family(target)])
-    if mainloop.stores(mainloop.FAMILIES[generation.family(target)], jnp.bfloat16):
-        failed += [f"{case}: no tiles derived" for case in refused
-                   if case.startswith("qwen3.5-27b-gdn bfloat16") and "fast backward" not in case]
+    failed += [f"{case}: no tiles derived" for case in refused
+               if case.startswith("qwen3.5-27b-gdn bfloat16") and "fast backward" not in case]
     assert not failed, "\n".join(failed)

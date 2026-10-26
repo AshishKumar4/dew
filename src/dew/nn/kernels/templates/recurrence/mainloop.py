@@ -128,21 +128,6 @@ def per_key_refusal(dtype, floor: float | None) -> str | None:
     return None
 
 
-def stores(family: mosaic.Family, dtype) -> bool:
-    """Whether `family`'s launches store every tile a call of `dtype` writes (`Family.stores`): its output
-    and the tiles it holds between launches in `dtype` or, an fp32 call's, as bf16 parts, and its memories
-    in fp32."""
-    return not unstored(family, dtype)
-
-
-def unstored(family: mosaic.Family, dtype) -> list:
-    """The dtypes of the tiles a call of `dtype` writes that `family`'s launches store none of (`stores`)."""
-    held = _Operand(0, _parts(dtype), jnp.dtype(dtype))
-    return [jnp.dtype(stored).name for stored in dict.fromkeys((jnp.dtype(dtype), jnp.dtype(held.stored),
-                                                              jnp.dtype(jnp.float32)))
-            if not family.stores(stored)]
-
-
 def _parts(dtype) -> int:
     """The parts a product takes an operand of `dtype` as: three for fp32, one for 16 bits."""
     return PARTS if jnp.dtype(dtype) == jnp.float32 else 1
@@ -1450,9 +1435,6 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
         raise NotImplementedError(f"the mainloop takes 16-bit and fp32 operands, not {dtype}")
     if per_key and (refused := per_key_refusal(dtype, floor)):
         raise NotImplementedError(refused)
-    if missing := unstored(family, dtype):
-        raise NotImplementedError(f"a {jnp.dtype(dtype).name} call writes {', '.join(missing)} tiles, which "
-                                  f"its family's launches store none of (`Family.stores`)")
     scale = key_width ** -0.5 if scale is None else scale
     block = block_of(family)
     width, columns = (-(-x // block) * block for x in (key_width, value_width))
