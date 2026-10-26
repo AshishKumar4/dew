@@ -34,13 +34,13 @@ from typing import TYPE_CHECKING, ClassVar, Literal, NamedTuple
 import jax
 import jax.numpy as jnp
 import numpy as np
-from flax import linen as nn, struct
-from flax.traverse_util import unflatten_dict
+from flax import linen as nn
 from jax.typing import ArrayLike
 
 from dew._coordination import agreed, collective_host
 from dew.artifacts import Artifact, TextSamples, TokenScores
 from dew.batch import (
+    BLOCKS_FIELD,
     COORDINATES_FIELD,
     FROZEN,
     VALID_ROWS,
@@ -49,10 +49,12 @@ from dew.batch import (
     PathFilter,
     Variables,
     freeze,
+    leaves_by_path,
     merge,
     real_slots,
     scored_targets,
     shifted_span,
+    sown_nodes,
     thaw,
     token_layout,
 )
@@ -64,10 +66,9 @@ from dew.nn.cross_attention import crosses_alone
 from dew.nn.flops import MissingFlopsCount, counted_flops, frozen_training_flops, parameter_flops
 from dew.nn.inputs import CONTEXT, CONTEXT_LENGTHS, ModelInputs, pad_token_rows, rotate_rows
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
-from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_moments
+from dew.nn.moe import ROUTER_COLLECTION
 from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import (
-    AffineHead,
     CountedLogits,
     CountedLogitsTraining,
     CountedPredictions,
@@ -76,20 +77,20 @@ from dew.nn.protocols import (
     DecoderTraining,
     Lacks,
     LayerStates,
-    OutputTable,
     SteppedInContext,
     TokenModel,
     head_table,
+    refuse_block_reading,
+    refuse_prefix,
 )
 from dew.nn.sharding import LOGITS, constrain
+from dew.nn.visibility import prefix_groups
 from dew.objectives.base import (
     OMITTED,
     Aux,
     EMASpec,
-    Objective,
     Omitted,
     Prediction,
-    ProgramModule,
     Ratio,
     Shown,
     Step,
@@ -99,17 +100,16 @@ from dew.objectives.base import (
 )
 from dew.objectives.lm.adaptation import ChunkAdaptation, adapted_scores
 from dew.objectives.lm.chunked import (
-    chunked_tile,
     final_read,
     fused_head_loss,
-    head_cross_entropy,
     logits_cross_entropy,
     logits_support_log_probs,
     model_logits,
-    reads_states,
     refuse_without_logits,
     support_log_probs,
 )
+from dew.objectives.lm.head import HeadedObjective
+from dew.objectives.routing import ExpertBalance, RoutedStatistics, apply_routed, reduce_routed
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
@@ -117,6 +117,10 @@ if TYPE_CHECKING:
 
 TEXT_KEY = "text"
 """Batch key the token pipeline packs `[B, seq_len + 1]` int32 ids under."""
+
+
+BLOCKS_KEY = "text_block_groups"
+"""Batch key `[B, seq_len + 1]` int32 block ids are read under, written by `dew.data.steps.blocks.Blocks`."""
 
 
 @dataclass(frozen=True)
@@ -172,19 +176,14 @@ def _streamed_depths(model: nn.Module) -> bool:
     return isinstance(model, DecoderTraining) and model.mtp_hyper_connections is not None
 
 
-def _check_terms(model: nn.Module, *, aux_loss_alpha: float | None, mtp_weight: float | None,
-                 z_loss: float, router_z_loss: float = 0.0) -> None:
+def _check_terms(model: nn.Module, *, mtp_weight: float | None, z_loss: float) -> None:
     """Refuse a weight the term it scales cannot carry.
 
     The checks run in the order the constructor takes the arguments. The
-    balance loss and the prediction depths' cross entropy are weighted
-    positively or left out. The depths have to exist for a weight on them
-    to move anything. The log partition's weight is finite and nonnegative.
+    prediction depths' cross entropy is weighted positively or left out. The
+    depths have to exist for a weight on them to move anything. The log
+    partition's weight is finite and nonnegative.
     """
-    if aux_loss_alpha is not None and aux_loss_alpha <= 0:
-        raise ValueError(
-            f"aux_loss_alpha scales the balance loss, so it is positive, "
-            f"got {aux_loss_alpha}; None adds no balance loss")
     if mtp_weight is not None:
         depths = model.num_nextn_predict_layers if isinstance(model, DecoderTraining) else 0
         if depths < 1:
@@ -199,10 +198,6 @@ def _check_terms(model: nn.Module, *, aux_loss_alpha: float | None, mtp_weight: 
         raise ValueError(
             f"z_loss weights the squared log partition, so it is finite and "
             f"nonnegative, got {z_loss}; 0 adds nothing")
-    if not (0 <= router_z_loss < float("inf")):
-        raise ValueError(
-            f"router_z_loss weights the routers' squared log partitions, so it is "
-            f"finite and nonnegative, got {router_z_loss}; 0 adds nothing")
 
 
 def _check_indexer(model: nn.Module, indexer: IndexerTraining,
@@ -241,61 +236,34 @@ def _is_indexer(path: tuple[str, ...]) -> bool:
     return INDEXER in path
 
 
-def _sown_nodes(tree, *markers: str) -> list[tuple[tuple[str, ...], Mapping]]:
-    """Find every node of a sown collection that holds all of `markers`, with
-    its path: the module path that sowed it.
-
-    A sown collection nests by module path, so what a layer sowed is the
-    branch that names the keys it sowed under. The search stops at such a
-    branch rather than descending into the arrays below it, and walks the
-    children it does descend into in sorted key order.
-    """
-    found: list[tuple[tuple[str, ...], Mapping]] = []
-
-    def visit(node, path: tuple[str, ...]) -> None:
-        if not isinstance(node, Mapping):
-            return
-        if all(marker in node for marker in markers):
-            found.append((path, node))
-            return
-        for key in sorted(node):
-            visit(node[key], (*path, key))
-
-    visit(tree, ())
-    return found
-
-
 def _indexer_kls(sown: Variables) -> list[jax.Array]:
     """Collect every attention layer's sown per-query indexer KL.
 
     Each is `[B, S]`, and they come back in the tree's key order.
     """
     kls: list[jax.Array] = []
-    for _, node in _sown_nodes(sown, "kl"):
+    for _, node in sown_nodes(sown, "kl"):
         (kl,) = node["kl"]
         kls.append(kl)
     return kls
 
 
-def _leaves(tree: Variables) -> dict[tuple[str, ...], jax.Array]:
-    """Every leaf of a variables subtree, by its dict-key path."""
-    return {tuple(entry.key for entry in path): leaf
-            for path, leaf in jax.tree_util.tree_leaves_with_path(tree)}
-
-
 def _prepared(tokens: ModelInputs | jax.Array, segment_ids: jax.Array | None = None,
-              positions: jax.Array | None = None, coordinates: Coordinates | None = None) -> ModelInputs:
+              positions: jax.Array | None = None, coordinates: Coordinates | None = None,
+              block_groups: jax.Array | None = None) -> ModelInputs:
     """The rows as `ModelInputs`, bare ids cast to int32, their packing among the token fields.
 
     A packed batch from a data pipeline carries its windows' `coordinates`
     (`dew.batch.Coordinates`, the packer's); a rollout's names each row's
-    `segment_ids` and `positions`. Either comes beside the ids or in the
+    `segment_ids` and `positions`. A batch's `block_groups` (a prefix run's
+    blocks) come the same way. Either comes beside the ids or in the
     `ModelInputs`; a field named both ways is refused. Everything after reads
     the packing off what this returns (`dew.batch.token_layout`).
     """
     prepared = tokens if isinstance(tokens, ModelInputs) else ModelInputs(jnp.asarray(tokens, jnp.int32))
     columns = {name: column for name, column in (("positions", positions), ("segment_ids", segment_ids),
-                                                 (COORDINATES_FIELD, coordinates))
+                                                 (COORDINATES_FIELD, coordinates),
+                                                 (BLOCKS_FIELD, block_groups))
                if column is not None}
     for name in columns:
         if name in prepared.token_fields:
@@ -346,14 +314,39 @@ def _unpadded(values: jax.Array, padding: jax.Array) -> tuple[jax.Array, jax.Arr
 
 
 def batch_text(batch) -> ModelInputs:
-    """The batch's `text` rows as `_prepared` gives them, a packed batch's
-    `text_coordinates` folded in."""
+    """The batch's `text` rows as `_prepared` gives them, a packed batch's `text_coordinates` folded in,
+    and its `text_block_groups` beside them."""
     stale = sorted({"text_segment_ids", "text_positions"} & set(batch))
     if stale:
         raise ValueError(f"a packed batch lays its documents out in text_coordinates "
                          f"(dew.batch.coordinates), not {', '.join(stale)}")
     laid = batch.get("text_coordinates")
-    return _prepared(batch[TEXT_KEY], coordinates=None if laid is None else jax.tree.map(jnp.asarray, laid))
+    blocks = batch.get(BLOCKS_KEY)
+    return _prepared(batch[TEXT_KEY], coordinates=None if laid is None else jax.tree.map(jnp.asarray, laid),
+                     block_groups=None if blocks is None else jnp.asarray(blocks, jnp.int32))
+
+
+def prefixed_fields(fields: Mapping[str, jax.Array | Coordinates], shape: tuple[int, ...],
+                    prefix: int | Literal["prompt"] | None, roles, *,
+                    xp=jnp) -> Mapping[str, jax.Array | Coordinates]:
+    """`fields` with the blocks a prefix run reads where they carry none: each document's first `prefix`
+    places (`prefix_blocks`), or under "prompt" its tokens before its first assistant token, read from the
+    rows' `roles` (`role_blocks`). A run's prefix is its loss's mask whatever built the batch, a precompiled
+    loader or a raw stream included, so the blocks it trains on are the ones it serves; the data stage
+    `Blocks` writes the same. `shape` is the rows' `[B, S]`, `xp` the array module (the host's counts read
+    numpy, the loss jax.numpy)."""
+    if prefix is None or BLOCKS_FIELD in fields:
+        return fields
+    _, documents = token_layout(fields, xp=xp)
+    real = real_slots(fields, shape, xp=xp)
+    if prefix == "prompt" and roles is None:
+        raise ValueError(f"a prompt prefix run reads each row's roles ({ROLES_KEY}) to find its "
+                         "prompt, and this batch has none")
+    laid = fields.get(COORDINATES_FIELD)
+    positions = laid.positions if isinstance(laid, Coordinates) else fields.get("positions")
+    groups = prefix_groups(xp.ones(shape, xp.int32) if documents is None else documents, real, prefix,
+                           positions=positions, roles=roles, assistant=Role.ASSISTANT, xp=xp)
+    return {**fields, BLOCKS_FIELD: groups}
 
 
 def text_preview[S](phase: str, setup: Callable[[], S | None],
@@ -380,116 +373,13 @@ def text_preview[S](phase: str, setup: Callable[[], S | None],
                        texts=tuple(decode(row[keep].tolist()) for row, keep in zip(rows, kept, strict=True)))
 
 
-# The `moe` leaf a balanced router keeps. DeepSeek V4's hash router keeps
-# the frozen token-to-expert table it selects by in the same collection
-# (dew.nn.moe.Router), and no load-balance update moves that.
-ROUTER_BIAS = "e_score_correction_bias"
-
-
-def _router_queries(shape: tuple[int, ...], queries: jax.Array | None,
-                    documents: jax.Array | None) -> jax.Array:
-    """The real queries of a router, including a prediction depth's shifted inputs."""
-    if queries is None:
-        return jnp.ones(shape, bool)
-    width = shape[1]
-    valid = queries[:, :width].astype(bool)
-    for offset in range(1, queries.shape[1] - width + 1):
-        valid = valid & queries[:, offset:offset + width].astype(bool)
-        if documents is not None:
-            valid = valid & (documents[:, :width] == documents[:, offset:offset + width])
-    return valid
-
-
-def _selected_counts(indices: jax.Array, valid: jax.Array, experts: int) -> jax.Array:
-    """Each row's integer expert counts over its real queries."""
-    weights = jnp.broadcast_to(valid[..., None], indices.shape).astype(jnp.int32)
-    return jax.vmap(lambda ids, weight: jnp.bincount(ids.ravel(), weights=weight.ravel(),
-                                                   length=experts))(indices, weights)
-
-
-def router_counts(moe: Variables, routing: Variables, queries: jax.Array | None = None,
-                  documents: jax.Array | None = None) -> Variables:
-    """Count the slots each router the forward ran selected, at the path of
-    the balancing bias it keeps in `moe`.
-
-    The routers that ran are the ones `routing` holds sown `indices` for, so
-    a router the forward skipped (a prediction depth left out, a draft stage)
-    counts nothing; one that selects by a hash table keeps no bias and
-    counts nothing either."""
-    biases = _leaves(moe)
-    counts = {}
-    for path, node in _sown_nodes(routing, "indices"):
-        if (*path, ROUTER_BIAS) in biases:
-            (indices,) = node["indices"]
-            valid = _router_queries(indices.shape[:2], queries, documents)
-            counts[(*path, ROUTER_BIAS)] = jnp.sum(
-                _selected_counts(indices, valid, biases[(*path, ROUTER_BIAS)].shape[0]), axis=0)
-    return unflatten_dict(counts)
-
-
-def _updated_bias(bias: jax.Array, counts: jax.Array, rate: float) -> jax.Array:
-    dtype = jnp.result_type(bias.dtype, rate, jnp.float32)
-    correction = load_balance_update(counts, jnp.asarray(rate, dtype))
-    return (bias.astype(dtype) + correction).astype(bias.dtype)
-
-
-def router_z_terms(routing: Variables, weight: float, batch: Batch, queries: jax.Array | None = None,
-                   documents: jax.Array | None = None) -> tuple[Ratio, ...]:
-    """Return ST-MoE's router z-loss, one `Ratio` per router.
-
-    This is eq. 5 of ST-MoE (arXiv 2202.08906): `weight` times the squared log
-    partition of the gate logits, summed over the positions the router saw and
-    divided by their count. The count adds across micro-batches, so a step's term
-    is the mean over its routed positions, and the routers' terms add up, as
-    lm-engine's per-layer `(logsumexp(logits) ** 2).mean()` does. The positions
-    are `batch`'s rows' (`Objective.row_mean`).
-    """
-    terms = []
-    # lm-engine: moe/module.py at 45b6b57b, before its 0.1 and router_aux_loss_coef.
-    for _, node in _sown_nodes(routing, "log_z"):
-        (log_z,) = node["log_z"]
-        valid = _router_queries(log_z.shape, queries, documents)
-        dtype = at_least_fp32(log_z.dtype)
-        total = Objective.row_mean(jnp.where(valid, jnp.square(log_z.astype(dtype)), 0), batch).total
-        mass = Objective.row_mean(valid.astype(dtype), batch).total
-        terms.append(Ratio(weight * total, mass))
-    return tuple(terms)
-
-
-def router_moments(scores: jax.Array, indices: jax.Array, batch: Batch,
-                   queries: jax.Array | None = None, documents: jax.Array | None = None) -> RouterMoments:
-    """Return one router's routed-position statistics over `batch`'s rows (`Objective.row_mean`).
-
-    `scores` is `[rows, positions, experts]` and `indices` the experts each
-    position chose, `[rows, positions, top_k]`.
-    """
-    experts = scores.shape[-1]
-    dtype = at_least_fp32(scores.dtype)
-    valid = _router_queries(scores.shape[:2], queries, documents)
-    # These counts enter a floating loss, unlike the exact integer bias effects.
-    summed = Objective.row_mean(jnp.where(valid[..., None], scores.astype(dtype), 0), batch, axis=(0, 1))
-    chosen = _selected_counts(indices, valid, experts)
-    counts = Objective.row_mean(chosen, batch, axis=0).total.astype(dtype)
-    positions = Objective.row_mean(valid.astype(dtype), batch).total
-    return RouterMoments(summed.total, counts, positions, indices.shape[-1])
-
-
-def _router_scores(routing: Variables) -> list[tuple[jax.Array, jax.Array]]:
-    """Collect every router's sown (scores, indices), in the tree's key order."""
-    found: list[tuple[jax.Array, jax.Array]] = []
-    for _, node in _sown_nodes(routing, "scores", "indices"):
-        (scores,), (indices,) = node["scores"], node["indices"]
-        found.append((scores, indices))
-    return found
-
-
 def _global_qk_max(qk) -> jax.Array | None:
     """Return the largest per-head maximum anywhere in the sowed `qk` dict.
 
     None when no layer sowed one.
     """
     found: list[jax.Array] = []
-    for _, node in _sown_nodes(qk, "max_logits"):
+    for _, node in sown_nodes(qk, "max_logits"):
         logged = node["max_logits"]
         found.append(jnp.max(logged[0] if isinstance(logged, (tuple, list)) else logged))
     return jnp.max(jnp.stack(found)) if found else None
@@ -531,15 +421,6 @@ class Scores(NamedTuple):
     logits: jax.Array | None = None
 
 
-@struct.dataclass
-class LMStatistics:
-    """The prediction's statistics, next to the separately normalized router terms."""
-    prediction: Ratio
-    sequence: tuple[Ratio, ...]
-    global_routers: tuple[RouterMoments, ...]
-    router_z: tuple[Ratio, ...] = ()
-
-
 def _phase_filter(model: nn.Module, indexer: IndexerTraining | None,
                   terms: Mapping[str, object]) -> PathFilter | None:
     """The leaves an indexer phase trains, once it is checked against the
@@ -554,18 +435,20 @@ def _phase_filter(model: nn.Module, indexer: IndexerTraining | None,
 _DEFAULT_SAMPLING = Sampling()
 
 
-class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
+class TokenScorer(HeadedObjective[Ratio | RoutedStatistics, Variables]):
     """Scores a causal decoder's tokens: the machinery the LM, preference and
     policy losses share, without a loss of its own.
 
     It holds the decoder (`model`, a loaded source among them, with
     `variables` and `processor` overriding its own through
     `Objective.bind_model`), the row length `seq_len`, and how the head is
-    scored: `head_chunks`, `head_tile` and `qk_stats` (`LMObjective`
-    describes each). `samples` draws previews. A loss built on it keeps no
-    average unless it sets `ema`; `LMObjective` adds the language-model
-    terms and loss, and the options only they read, `pad_id` and
-    `token_accuracy`.
+    scored: `head_chunks` and `head_tile`, the head policy every token objective takes
+    (`dew.objectives.lm.head`; `LMObjective` describes each).
+    `samples` draws previews. `balance` trains the routers of a mixture as
+    `ExpertBalance` describes (`dew.objectives.routing`), which every scorer
+    composes. A loss built on it keeps no average unless it sets `ema`;
+    `LMObjective` adds the language-model terms and loss, and the options
+    only they read, `pad_id` and `token_accuracy`.
     """
 
     saved_task = TextGeneration
@@ -573,20 +456,13 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     shown: Mapping[str, Shown] = {"ce": Shown(better="lower"), "perplexity": Shown(better="lower"),
              "token_accuracy": Shown(better="higher", percent=True)}
 
-    # tests/test_packed_grpo.py covers the tiled default.
-    keeps_whole_logits: ClassVar[bool] = True
-    """Whether the head's default (`head_tile` None) keeps the whole fp32 logits for the backward pass.
-
-    A plain LM step does, and the trainer's fit ladder tiles it when the step does
-    not fit (`recompute_more`). An objective whose devices also hold rollouts or a
-    frozen reference, as GRPO's and DPO's do, keeps the tiled head as its default,
-    so the loss's temporaries stay one tile in size whatever the vocabulary.
-    """
-
     counts_tokens = True
 
     loss_role: Role | None = None
     """The role whose targets alone count (`LMObjective`); None counts every target."""
+
+    prefix: int | Literal["prompt"] | None = None
+    """The prefix run's blocks (`LMObjective`): a document's first tokens, or its prompt; None is causal."""
 
     mtp_weight: float | None = None
     """The multi-token prediction depths' weight (`LMObjective`); None trains none."""
@@ -602,11 +478,6 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     """How the model's continuum level steps in context by the loss it scores (`LMObjective`);
     None reads the level as it is trained."""
 
-    head_fused: bool = True
-    """Whether a tiled head scored for its weighted sums takes their gradient in its forward
-    (`token_scores`' `z_loss`, `LMObjective`'s training loss): the fit ladder turns it off where the
-    fused chunk does not fit (`LMObjective.unfuse_head`), and tiling the head turns it on."""
-
     scored_fields: ClassVar[tuple[str, ...] | None] = None
     """The batch fields `_evaluation_scores` reads, which alone enter its compiled program (`evaluate`),
     so a batch's other fields (rollouts, rewards) neither enter it nor key it; None passes the batch whole."""
@@ -620,25 +491,28 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     def __init__(self, model, seq_len: int, *, head_chunks: int = 4,
                  head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
                  samples: Samples | None = None, variables: Variables | None | Omitted = OMITTED,
-                 qk_stats: bool = False, processor: Processor | None | Omitted = OMITTED):
+                 balance: ExpertBalance | None = None,
+                 processor: Processor | None | Omitted = OMITTED):
         """Bind the decoder and set how its tokens are scored; the class docstring describes each argument."""
         self.eos_token_ids = ended(model, OMITTED)
         model = self.bind_model(model, variables=variables, processor=processor)
         _check_reads(model)
         self.model = model
         self.seq_len = seq_len
-        self.head_chunks = head_chunks
-        self.head_tile = _head_tile(head_tile, self.keeps_whole_logits)
-        # Each decoder a fused loss traced, by identity, and whether its head was one matrix
-        # (`chunked.head_table`): past a nonlinear head transform, beside an adapter's factors or
-        # in place of a frozen FP8 kernel no matrix is, and no head is fused. A decoder not yet
-        # traced is taken to have one.
-        self._head_matrices: dict[int, tuple[object, bool]] = {}
+        self.use_head(head_chunks, head_tile)
         self.samples = samples
-        self.qk_stats = qk_stats
+        self.balance = balance
         self.inputs = InputSpec(sample=Field(TEXT_KEY, (seq_len + 1,)))
         if samples is not None and samples.max_new_tokens > 0:
             self._prompt = prompt_batch(samples.prompt)
+
+    def reduce_loss(self, stats: Ratio | RoutedStatistics) -> tuple[jax.Array, jax.Array]:
+        """The objective value of the statistics, with the router terms `balance` adds (`reduce_routed`)."""
+        return reduce_routed(self.balance, stats)
+
+    def apply_effects(self, variables: Variables, effects: Variables) -> Variables:
+        """`variables` with the router counts `balance` took applied, once per committed update."""
+        return apply_routed(self.balance, variables, effects)
 
     def _missing_flops(self, model) -> str | None:
         """What the forward and training counts both lack, or None."""
@@ -653,13 +527,13 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         return None
 
     def _token_geometry(self, batch: Batch) -> tuple[np.ndarray, Mapping[str, jax.Array | Coordinates]]:
-        """The host's tokens and their fields, a packed batch's coordinates
-        among them: what the loss reads."""
+        """The host's tokens and their fields, a packed batch's coordinates and blocks among them: what the
+        loss reads."""
         raw = batch[TEXT_KEY]
         prepared = raw if isinstance(raw, ModelInputs) else ModelInputs(raw)
-        laid = batch.get("text_coordinates")
-        fields = prepared.token_fields if laid is None else {**prepared.token_fields, COORDINATES_FIELD: laid}
-        return np.asarray(prepared.tokens), fields
+        extra = {name: batch[key] for name, key in ((COORDINATES_FIELD, "text_coordinates"),
+                                                    (BLOCKS_FIELD, BLOCKS_KEY)) if key in batch}
+        return np.asarray(prepared.tokens), {**prepared.token_fields, **extra}
 
     def _counted_tokens(self, batch: Batch):
         """Host input geometry: each real token, and the documents."""
@@ -743,13 +617,12 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         """
         valid, documents = self._counted_tokens(batch)
         tokens, fields = self._token_geometry(batch)
-        mask, _ = token_layout(fields, xp=np)
         depth_rows = []
         for depth in range(1, model.num_nextn_predict_layers + 1):
             span = valid.shape[1] - 1 - depth
             admitted = shifted_span(valid.shape, depth, valid=valid, segments=documents, xp=np)[:, :-1]
             segments = None if documents is None else documents[:, :span]
-            scored = self._scored(np, tokens, mask, documents, self._batch_roles(batch, np), depth)
+            scored = self._scored(np, tokens, fields, self._batch_roles(batch, np), depth)
             depth_rows.append((self._row_lengths(admitted, segments), self._row_lengths(scored, segments)))
         return depth_rows
 
@@ -785,15 +658,12 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     def _prediction_lengths(self, batch: Batch, depth: int = 0) -> np.ndarray:
         """Each row's targets the loss scores at `depth` (`scored_targets`)."""
         tokens, fields = self._token_geometry(batch)
-        scored = self._scored(np, tokens, *token_layout(fields, xp=np), self._batch_roles(batch, np), depth)
+        scored = self._scored(np, tokens, fields, self._batch_roles(batch, np), depth)
         return np.sum(scored, axis=-1, dtype=np.int64)
 
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
         return self.model.bank_sites
-
-    def program_key(self) -> tuple[ProgramModule, ...]:
-        return (ProgramModule(self.model, self.head_tile, trained=True),)
 
     def fresh_variables(self, key: jax.Array, held: Variables | None) -> Variables:
         return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
@@ -818,7 +688,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         if self.adaptation is not None:
             raise ValueError("an objective that steps its continuum level in context scores what no "
                              "generation draws yet: a generation reads the level it starts with")
-        return TextGeneration(self.model, params, sampling=self.sampled(sampling))
+        return TextGeneration(self.model, params, sampling=self.sampled(sampling), prefix=self.prefix)
 
     def task_settings(self) -> TextSettings | None:
         """The decoder's row length, preview budget, sampling policy (`sampled`), and tokenizer or
@@ -831,7 +701,20 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
                             max_new_tokens=0 if samples is None else samples.max_new_tokens,
                             sampling=self.sampled(Sampling() if samples is None else samples.sampling),
                             tokenizer=recorded_tokenizer(self.processor),
-                            processor=recorded_processor(self.processor))
+                            processor=recorded_processor(self.processor), prefix=self.prefix)
+
+    def _refuse_blocks(self, prepared: ModelInputs, depths: bool) -> None:
+        """Refuse a batch's blocks where no trunk layer reads them, where prediction depths would read
+        them beyond their source, which `scored_targets` does not account for, or where a layer's chunk could
+        cut one (`refuse_block_reading`): a batch's blocks are runs of any place in a row, a prefix run's
+        among them, since its batch may carry blocks of its own. The check is static, since a trace cannot
+        read the runs' places."""
+        if BLOCKS_FIELD not in prepared.token_fields:
+            return
+        if depths:
+            raise ValueError("a batch's blocks train the trunk's targets alone: a prediction depth reads "
+                             "blocks beyond its own source, so depths are refused with blocks")
+        refuse_block_reading(self.model, "a batch's blocks")
 
     def token_scores(self, params, tokens, train: bool = False, rngs=None,
                      segment_ids=None, positions=None, routing: bool = False,
@@ -882,6 +765,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         every column, so the head is applied once.
         """
         prepared = _prepared(tokens, segment_ids, positions)
+        self._refuse_blocks(prepared, depths)
         inputs, targets = self._rows(prepared.tokens)
         packing = prepared.slice_tokens(stop=-1).kwargs()
         params = thaw(params)
@@ -892,18 +776,18 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
             replay["routed_experts"] = jnp.asarray(routed)[:, :-1]
             if covered is not None:
                 replay["routed"] = jnp.asarray(covered, bool)[:, :-1]
-        collections = ((["router"] if routing else []) + (["qk"] if qk_stats else [])
+        collections = (([ROUTER_COLLECTION] if routing else []) + (["qk"] if qk_stats else [])
                        + ([INDEXER_COLLECTION] if indexer else []))
         stream_depth = depths and _streamed_depths(self.model)
         opened = [*collections, 'prediction_inputs'] if stream_depth else collections
         hidden, gathered = self._hidden_states(params, inputs, train, rngs, opened,
                                                {**packing, **replay}, layers)
-        sown = gathered.get("router", {}) if routing else None
-        qk = gathered.get("qk") if qk_stats else None
+        sown = gathered.get(ROUTER_COLLECTION, {}) if routing else None
+        qk = gathered.get("qk", {}) if qk_stats else None
         kls = gathered.get(INDEXER_COLLECTION) if indexer else None
         kept = tuple(self._layer_states().layer_state(gathered, index) for index in layers)
         predict = self.token_accuracy if predict is None else predict
-        table = self._fused_head(params) if z_loss is not None else None
+        table = self.fused_head(self.model, params) if z_loss is not None else None
         dtype = at_least_fp32(hidden.dtype)
         weights = self._row_weights(prepared, roles, dtype)
         total, (losses, predicted, log_z), whole = self._head_scores(
@@ -923,7 +807,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
                 # A routed depth balances, counts and indexes like a trunk layer.
                 states, depth_sown = states
                 if routing:
-                    sown = {**(sown or {}), **depth_sown.get("router", {})}
+                    sown = {**(sown or {}), **depth_sown.get(ROUTER_COLLECTION, {})}
                 if qk_stats:
                     qk = {**(qk or {}), **depth_sown.get("qk", {})}
                 if indexer:
@@ -935,9 +819,8 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
                     depth_total, (depth_losses, _, _) = fused_head_loss(
                         state, table, targets[:, depth:], depth_weights, tile=self.head_tile, predict=False)
                 else:
-                    depth_losses, _, _ = head_cross_entropy(
-                        self.model, params, state, targets[:, depth:], self.head_chunks,
-                        tile=self.head_tile, predict=False)
+                    depth_losses, _, _ = self.head_terms(self.model, params, state, targets[:, depth:],
+                                                         predict=False)
                 depth_scores.append((depth_losses, depth_weights, depth_total))
         return Scores(losses, weights, log_z, correct, hidden, kept, sown, depth_scores, qk, kls, total,
                       whole)
@@ -961,8 +844,7 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
             total, scores = fused_head_loss(hidden, table, targets, weights, z_loss=float(z_loss or 0.0),
                                             tile=self.head_tile, predict=predict)
             return total, scores, None
-        return None, head_cross_entropy(self.model, params, hidden, targets, self.head_chunks,
-                                        tile=self.head_tile, predict=predict), None
+        return None, self.head_terms(self.model, params, hidden, targets, predict=predict), None
 
     def _row_weights(self, prepared, roles, dtype):
         """Weight the targets the row itself scores (`scored_targets`), and
@@ -972,44 +854,20 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
                 f"text_roles has shape {tuple(roles.shape)} for "
                 f"{tuple(prepared.tokens.shape)} ids; the roles align with the input "
                 "tokens, one per token")
-        return self._scored(jnp, prepared.tokens, *token_layout(prepared.token_fields), roles).astype(dtype)
+        return self._scored(jnp, prepared.tokens, prepared.token_fields, roles).astype(dtype)
 
     def _depth_weights(self, prepared, roles, dtype, depth: int):
         """Weight the targets one prediction depth scores: depth d's state at
         p scores the target d further out (`scored_targets`)."""
-        return self._scored(jnp, prepared.tokens, *token_layout(prepared.token_fields), roles,
-                            depth).astype(dtype)
+        return self._scored(jnp, prepared.tokens, prepared.token_fields, roles, depth).astype(dtype)
 
-    def _scored(self, xp, tokens, mask, documents, roles, depth: int = 0):
+    def _scored(self, xp, tokens, fields, roles, depth: int = 0):
         """The targets this objective scores at `depth` (`scored_targets`), its `loss_role`'s alone,
         in `xp`: the loss's weights on the device and the FLOP count's on the host read one rule."""
+        mask, documents = token_layout(fields, xp=xp)
         return scored_targets(xp, tokens, self.pad_id, mask, documents, depth, roles=roles,
-                              role=None if self.loss_role is None else int(self.loss_role))
-
-    def tile_head(self, tile: tuple[int, int] | None = None) -> str | None:
-        """Move a head that keeps its whole logits to `tile`, and report what it moved to.
-
-        `tile` defaults to the generation's tile (`chunked.chunked_tile`).
-        """
-        if self.head_tile is not None:
-            return None
-        self.head_tile = chunked_tile() if tile is None else tile
-        self.head_fused = True
-        return f"the head tiled {self.head_tile}"
-
-    def _fused_head(self, params) -> OutputTable | None:
-        """The head as the one matrix a summed loss takes its gradient through in the forward
-        (`token_scores`' `z_loss`), None where it keeps the whole logits, is not fused or is no
-        matrix. What the trace finds of the decoder's head is kept (`_head_matrices`)."""
-        if self.head_tile is None or not reads_states(self.model):
-            return None
-        head = head_table(self.model, params)
-        self._head_matrices[id(self.model)] = (self.model, head is not None)
-        return head if self.head_fused else None
-
-    def restore_head(self, tile: tuple[int, int] | None, *, fused: bool) -> None:
-        self.head_tile = tile
-        self.head_fused = fused
+                              role=None if self.loss_role is None else int(self.loss_role),
+                              blocks=fields.get(BLOCKS_FIELD))
 
     def _layer_states(self) -> LayerStates:
         """The model as the reader of its layers' states that a request for `layers` needs."""
@@ -1071,8 +929,8 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
         params = thaw(params)
         targets = tokens[:, 1:]
         if temperature != 1.0:
-            losses, _, _ = head_cross_entropy(self.model, params, scores.hidden, targets, self.head_chunks,
-                                              tile=self.head_tile, predict=False, temperature=temperature)
+            losses, _, _ = self.head_terms(self.model, params, scores.hidden, targets, predict=False,
+                                           temperature=temperature)
             log_probs = -losses
         if support is not None:
             ids, columns = (jnp.asarray(value, jnp.int32) for value in support)
@@ -1187,19 +1045,10 @@ class LMObjective(TokenScorer):
     The trainer takes its whole initial state from `init`, which starts
     from `variables` (described below).
 
-    `balance_rate` moves each sparse layer's routing bias against its load
-    by this much every step, which is DeepSeek's aux-loss-free balancing. The
-    model has to have that bias (`bias=True` on the CausalTransformer's
-    mixture). Unset, the bias does not change.
-
-    `aux_loss_alpha` scales DeepSeek V2's expert-level balance loss
-    (`dew.nn.moe.global_router_loss`), summed over every sparse
-    layer, and `seq_aux` chooses its per-sequence form
-    (`dew.nn.moe.sequence_router_losses`). The released V2 configs set both
-    under these names. Unset, it adds nothing. A packed row's sequences are
-    its documents, each balanced alone and their losses averaged, as DeepSeek
-    defines it for the sequences its model trains on; Megatron-LM and MaxText
-    balance a packed row as one sequence, so their packed loss differs.
+    `balance` trains the routers of a mixture as `ExpertBalance` describes (`dew.objectives.routing`): the
+    aux-loss-free balancing bias, DeepSeek V2's balance loss and ST-MoE's router z-loss, each optional. The
+    bias needs a mixture with `bias=True`. None, the default, adds no router term and leaves the routers'
+    bias where it is.
 
     `loss_role` counts only the targets whose `text_roles` entry matches
     it, for SFT on the chat data path (`dew.data.chat.Role`). None
@@ -1212,10 +1061,11 @@ class LMObjective(TokenScorer):
     model needs `num_nextn_predict_layers` above zero. Unset leaves
     the term out and the depths untrained.
 
-    `qk_stats` opens the `qk` collection where the attention layers record
-    their per-head logit maxima, and reports them for the optimizer's
-    QK-Clip. The recipe sets it when the optimizer is `muonclip`. Unset, the
-    collection stays closed and costs no extra matmul.
+    A step whose optimizer clips by the attention logit maxima (`Step.qk_stats`,
+    a QK-Clip such as `muonclip`'s) opens the `qk` collection where the
+    attention layers record their per-head maxima, reports the largest as
+    `qk/max_logit` and returns them for the clip. Otherwise the collection
+    stays closed and costs no extra matmul.
 
     `indexer` trains DeepSeek-V3.2's lightning indexer, one
     `IndexerTraining` phase at a time, on a model whose mla mixer has the
@@ -1225,8 +1075,8 @@ class LMObjective(TokenScorer):
     starting tree for that phase may omit the indexer's weights, as
     a dense checkpoint does, and the fresh init fills them. The sparse
     phase reads a whole tree, either layout. The warm-up trains nothing
-    but the indexer, so the terms of the main loss (`balance_rate`,
-    `aux_loss_alpha`, `mtp_weight`, `loss_role`, `z_loss`) are refused there.
+    but the indexer, so the terms of the main loss (`balance`, `mtp_weight`, `loss_role`, `z_loss`) are
+    refused there.
 
     `z_loss` adds PaLM's auxiliary to the cross entropy: this
     coefficient times the squared log partition of every counted
@@ -1234,13 +1084,19 @@ class LMObjective(TokenScorer):
     keeps the logits from drifting away from normalised log
     probabilities. Zero adds nothing.
 
-    `router_z_loss` is the routers' own z-loss (ST-MoE, arXiv
-    2202.08906): this coefficient times the squared log partition of
-    every router's gate logits, averaged over the positions each router saw
-    in the step and summed over the routers (`router_z_terms`). It is added
-    next to the balance loss. lm-engine's MoE adds 0.1 of it to its switch
-    loss before `router_aux_loss_coef`, which corresponds to
-    `router_z_loss = 0.1 * aux_loss_alpha` here. Zero adds nothing.
+    `prefix` trains a prefix run: the blocks a layer that reads blocks sees whole
+    (`AttentionMixer.bidirectional_blocks`). Each document's first `prefix` tokens, or with "prompt" its
+    tokens before the first assistant token (a chat row's roles), form one block, and each token of a block
+    sees the block's later tokens too. The loss scores no target in its source's block, which the state
+    would read off; every other target counts as usual. Serving reads the same blocks (`TextGeneration`'s
+    `prefix`): a prompt's first `prefix` tokens, or the whole prompt under "prompt", are one block. None, the
+    default, trains causally. A model none of whose trunk layers reads blocks is refused, as is an int above
+    `seq_len`, and `mtp_weight`, whose prediction depths read blocks beyond their source. A batch carrying
+    `text_block_groups` (the data stage `dew.data.steps.blocks.Blocks`) trains the same way, whatever
+    `prefix` says, so a run's blocks may be any runs of a row: a layer's attention chunk (`LayerKind.chunk`)
+    would cut one, and the loss would drop a target its source never saw. A run reads blocks only where a
+    trunk layer that reads them has no chunk, and a prefix run on any other model is refused where it is
+    built.
 
     `model` may be a loaded source (`LMObjective(qwen, seq_len=512)`), and
     `variables` and `processor` override its own (`Objective.bind_model`).
@@ -1269,14 +1125,11 @@ class LMObjective(TokenScorer):
         head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
         samples: Samples | None = None,
         variables: Variables | None | Omitted = OMITTED,
-        balance_rate: float | None = None,
-        aux_loss_alpha: float | None = None,
-        seq_aux: bool = True,
+        balance: ExpertBalance | None = None,
         loss_role: Role | None = None,
+        prefix: int | Literal["prompt"] | None = None,
         mtp_weight: float | None = None,
         z_loss: float = 0.0,
-        router_z_loss: float = 0.0,
-        qk_stats: bool = False,
         indexer: IndexerTraining | None = None,
         token_accuracy: bool = True,
         processor: Processor | None | Omitted = OMITTED,
@@ -1284,11 +1137,15 @@ class LMObjective(TokenScorer):
     ):
         """Build the objective; the class docstring describes each argument."""
         super().__init__(model, seq_len, head_chunks=head_chunks, head_tile=head_tile, samples=samples,
-                         variables=variables, qk_stats=qk_stats, processor=processor)
+                         variables=variables, balance=balance, processor=processor)
         self.pad_id = pad_id
         self.token_accuracy = token_accuracy
-        _check_terms(self.model, aux_loss_alpha=aux_loss_alpha, mtp_weight=mtp_weight, z_loss=z_loss,
-                     router_z_loss=router_z_loss)
+        refuse_prefix(self.model, prefix, longest=seq_len)
+        if prefix is not None and mtp_weight is not None:
+            raise ValueError("a prefix run trains the trunk's targets alone: a prediction depth reads "
+                             "blocks beyond its own source, so mtp_weight is refused with prefix")
+        self.prefix = prefix
+        _check_terms(self.model, mtp_weight=mtp_weight, z_loss=z_loss)
         if adaptation is not None:
             if not _steps_in_context(self.model):
                 raise ValueError("adaptation steps a continuum level, which this model does not have "
@@ -1297,18 +1154,13 @@ class LMObjective(TokenScorer):
                 raise ValueError("adaptation scores through a level stepped in context, which a preview's "
                                  "generation does not step; train it without samples")
         self.adaptation = adaptation
-        self.balance_rate = balance_rate
-        self.aux_loss_alpha = aux_loss_alpha
-        self.seq_aux = seq_aux
         self.loss_role = loss_role
         self.mtp_weight = mtp_weight
         self.z_loss = z_loss
-        self.router_z_loss = router_z_loss
         self.indexer = indexer
         self.phase = _phase_filter(self.model, indexer, {
-            "balance_rate": balance_rate, "aux_loss_alpha": aux_loss_alpha,
-            "mtp_weight": mtp_weight, "loss_role": loss_role, "z_loss": z_loss or None,
-            "router_z_loss": router_z_loss or None})
+            "balance": balance, "mtp_weight": mtp_weight, "loss_role": loss_role,
+            "z_loss": z_loss or None})
         self.ema = EMASpec.constant(ema_decay)
 
     @property
@@ -1334,7 +1186,7 @@ class LMObjective(TokenScorer):
         if self.indexer is not None:
             tree = thaw(tree)
             drawn = jax.eval_shape(self.fresh_variables, key, None)
-            missing = _leaves(drawn["params"]).keys() - _leaves(tree["params"]).keys()
+            missing = leaves_by_path(drawn["params"]).keys() - leaves_by_path(tree["params"]).keys()
             if self._warmup and missing:
                 outside = sorted("/".join(path) for path in missing if not _is_indexer(path))
                 if outside:
@@ -1344,17 +1196,40 @@ class LMObjective(TokenScorer):
                 tree = merge(self.fresh_variables(key, None), tree)
         return tree if self.phase is None else freeze(tree, self.phase)
 
+    def _text(self, batch) -> ModelInputs:
+        """The batch's rows (`batch_text`) with the prefix's blocks where the batch carries none
+        (`prefixed_fields`)."""
+        prepared = batch_text(batch)
+        fields = prefixed_fields(prepared.token_fields, jnp.shape(prepared.tokens), self.prefix,
+                                 batch.get(ROLES_KEY))
+        return (prepared if fields is prepared.token_fields
+                else dataclasses.replace(prepared, token_fields=fields))
+
+    def _token_geometry(self, batch: Batch) -> tuple[np.ndarray, Mapping[str, jax.Array | Coordinates]]:
+        """`TokenScorer._token_geometry`, with the prefix's blocks where the batch carries none, so the
+        host counts the targets the loss scores (`prefixed_fields`)."""
+        tokens, fields = super()._token_geometry(batch)
+        roles = batch.get(ROLES_KEY)
+        return tokens, prefixed_fields(fields, tokens.shape, self.prefix,
+                                       None if roles is None else np.asarray(roles), xp=np)
+
     def data(self, tokenizer=None):
         from dew.data.pipeline import ObjectiveData
+        from dew.data.steps.blocks import Blocks
         from dew.data.steps.text import CountTargets, FixedTokens
 
         geometry = FixedTokens(self.seq_len, extra=1)
-        if self.loss_role is None and self.pad_id is None:
+        blocks: tuple[Blocks, ...] = ()
+        if self.prefix == "prompt":
+            blocks = (Blocks(prompt=True, fills=True),)
+        elif self.prefix is not None:
+            blocks = (Blocks(prefix=self.prefix, fills=True),)
+        if self.loss_role is None and self.pad_id is None and self.prefix is None:
             return ObjectiveData(train=(geometry,), evaluate=(geometry,))
         counted = CountTargets(
             role=None if self.loss_role is None else int(self.loss_role), pad_id=self.pad_id
         )
-        return ObjectiveData(train=(counted, geometry), evaluate=(counted, geometry))
+        return ObjectiveData(train=(*blocks, counted, geometry), evaluate=(*blocks, counted, geometry))
 
     def _indexer_term(self, sown, prepared: ModelInputs, batch: Batch) -> tuple[jax.Array, jax.Array]:
         """Sum the batch's indexer KL over the layers that sowed one, with
@@ -1382,16 +1257,16 @@ class LMObjective(TokenScorer):
         The main loss is never scored, since nothing it reaches moves.
         """
         assert self.indexer is not None
-        prepared = batch_text(batch)
+        prepared = self._text(batch)
         inputs, _ = self._rows(prepared.tokens)
-        collections = [INDEXER_COLLECTION] + (["qk"] if self.qk_stats else [])
+        collections = [INDEXER_COLLECTION] + (["qk"] if step.qk_stats else [])
         _, gathered = self._hidden_states(
             thaw(params), inputs, train=step.training, rngs=model_rngs(step.key, training=step.training),
             collections=collections, packing=prepared.slice_tokens(stop=-1).kwargs())
         statistics, kl = self._warmup_statistics(gathered[INDEXER_COLLECTION], prepared, batch)
         reported = {"indexer_kl": kl}
-        qk = gathered.get("qk") if self.qk_stats else None
-        if self.qk_stats:
+        qk = gathered.get("qk", {}) if step.qk_stats else None
+        if step.qk_stats:
             peak = _global_qk_max(qk)
             if peak is not None:
                 reported["qk/max_logit"] = peak
@@ -1404,26 +1279,12 @@ class LMObjective(TokenScorer):
         total, mass = self._indexer_term(sown, prepared, batch)
         return Ratio(self.indexer.weight * total, mass), total / jnp.where(mass > 0, mass, 1)
 
-    def program_key(self) -> tuple[ProgramModule, ...]:
-        """The decoder, its head fused where its training loss takes the head's gradient in the
-        forward: a tiled head the model holds as one matrix (`token_scores`' `z_loss`), outside an
-        indexer's warm-up, which scores no head."""
-        model = self.model
-        fused = (self.head_fused and self.head_tile is not None and reads_states(model)
-                 and isinstance(model, AffineHead) and not self._warmup
-                 and self._head_matrices.get(id(model), (None, True))[1])
-        return (ProgramModule(self.model, self.head_tile, trained=True, head_fused=fused),)
+    def fuses_head(self) -> bool:
+        """The training loss takes a tiled head's gradient in its forward (`token_scores`' `z_loss`),
+        outside an indexer's warm-up, which scores no head."""
+        return not self._warmup
 
-    def unfuse_head(self) -> str | None:
-        """Move a tiled head to take its gradient in the backward, and report the move; None where
-        the step's program does not change, a head no step fuses. A tiled head is unfused either
-        way, so a decoder traced later does not fuse a head its rung unfused."""
-        moved = self.program_key()[0].head_fused
-        if self.head_tile is not None:
-            self.head_fused = False
-        return f"the head tiled {self.head_tile}, its gradient taken in the backward" if moved else None
-
-    def loss(self, variables, batch, step: Step) -> tuple[Ratio | LMStatistics, Aux[Variables]]:
+    def loss(self, variables, batch, step: Step) -> tuple[Ratio | RoutedStatistics, Aux[Variables]]:
         if self._warmup:
             return self._warmup_loss(variables, batch, step)
         statistics, aux, _ = self._scored_loss(variables, batch, step, train=step.training,
@@ -1436,16 +1297,17 @@ class LMObjective(TokenScorer):
 
         A teacher compares these (`Objective.predict`). The logits are the whole
         `[B, seq_len, vocab]` fp32 tensor that the chunked loss never holds, because a
-        distillation's KL reads every column. `aux_loss_alpha`'s router terms have
-        their own normalization, so they cannot share a distillation's token mass and
-        are refused; `balance_rate` balances without a loss term. The indexer warm-up
+        distillation's KL reads every column. The balance loss's and the router z-loss's terms
+        normalize per router, so they cannot share a distillation's token mass and are refused;
+        a `balance_rate` alone balances without a loss term. The indexer warm-up
         scores no tokens, so it has nothing to distill.
         """
         if self._warmup:
             raise ValueError("the indexer warm-up scores no token, so it has no prediction")
-        if self.aux_loss_alpha is not None or self.router_z_loss:
+        balance = self.balance
+        if balance is not None and (balance.aux_loss_alpha is not None or balance.router_z_loss):
             raise ValueError(
-                "aux_loss_alpha's and router_z_loss's router terms normalise per router, and a "
+                "the balance loss's and the router z-loss's router terms normalize per router, and a "
                 "distillation mixes terms over the counted tokens; balance the "
                 "student's routers with balance_rate instead")
         statistics, aux, scores = self._scored_loss(params, batch, step, train=train, layers=layers,
@@ -1456,7 +1318,7 @@ class LMObjective(TokenScorer):
 
     def _scored_loss(self, params, batch, step: Step, *, train: bool, layers: Sequence[int] = (),
                      summed: bool = False, logits: bool = False, predict: bool | None = None
-                     ) -> tuple[Ratio | LMStatistics, Aux[Variables], Scores]:
+                     ) -> tuple[Ratio | RoutedStatistics, Aux[Variables], Scores]:
         """Compute the loss's statistics and reports, with the scores they came from.
 
         `summed` takes the cross entropies, the z-loss and the depths' as
@@ -1465,15 +1327,14 @@ class LMObjective(TokenScorer):
         `logits` scores them from the whole logits and keeps those
         (`token_scores`'s `logits`). `predict` is `token_scores`'.
         """
-        prepared = batch_text(batch)
-        rate = self.balance_rate
-        alpha = self.aux_loss_alpha
+        prepared = self._text(batch)
+        balance = self.balance
         summed = summed and VALID_ROWS not in batch
         scores = self.token_scores(
             params, prepared, train=train, rngs=model_rngs(step.key, training=train),
-            routing=rate is not None or alpha is not None or bool(self.router_z_loss),
+            routing=balance is not None,
             depths=self.mtp_weight is not None, roles=self._batch_roles(batch),
-            qk_stats=self.qk_stats, indexer=self.indexer is not None, layers=layers,
+            qk_stats=step.qk_stats, indexer=self.indexer is not None, layers=layers,
             z_loss=self.z_loss if summed else None, logits=logits, predict=predict)
         losses, weights, log_z, correct, _, _, routing, depths, qk, kls, sums, _ = scores
         mass = jax.lax.stop_gradient(self.row_mean(weights, batch).total)
@@ -1507,115 +1368,24 @@ class LMObjective(TokenScorer):
             total, queries = self._indexer_term(kls, prepared, batch)
             reported["indexer_kl"] = total / jnp.where(queries > 0, queries, 1)
             prediction = Ratio(prediction.total + self.indexer.weight * total, mass)
-        statistics: Ratio | LMStatistics = prediction
-        queries = (self._query_weights(prepared, bool)
-                   & (self.row_weights(batch, weights.shape[0]) > 0)[:, None])
-        documents = token_layout(prepared.token_fields)[1]
-        if alpha is not None:
-            laid = prepared.token_fields.get(COORDINATES_FIELD)
-            statistics, reported["aux_loss"] = self._router_statistics(
-                prediction, routing, alpha, batch, queries, documents,
-                max_segments=laid.max_segments if isinstance(laid, Coordinates) else None)
-        if self.router_z_loss:
-            router_z = router_z_terms(routing or {}, self.router_z_loss, batch, queries, documents)
-            if not router_z:
-                raise ValueError(
-                    "router_z_loss needs routers that sow their gate's log partition "
-                    "(dew.nn.moe.Router); this model's routers sow none")
-            statistics = (LMStatistics(prediction, (), (), router_z) if isinstance(statistics, Ratio)
-                          else dataclasses.replace(statistics, router_z=router_z))
-            reported["router_z_loss"] = jnp.sum(jnp.stack([term.mean()[0] for term in router_z]))
+        statistics: Ratio | RoutedStatistics = prediction
         effects = None
-        if rate is not None:
-            effects, load = self._router_load(params, routing, queries, documents)
-            reported.update(load)
-        if self.qk_stats:
+        if balance is not None:
+            queries = (self._query_weights(prepared, bool)
+                       & (self.row_weights(batch, weights.shape[0]) > 0)[:, None])
+            statistics, effects, metrics = balance.compose(
+                params, prediction, routing or {}, batch, queries, prepared.token_fields)
+            reported.update(metrics)
+        if step.qk_stats:
             peak = _global_qk_max(qk)
             if peak is not None:
                 reported["qk/max_logit"] = peak
         return statistics, Aux(reported, qk_stats=qk, effects=effects), scores
 
-    def _router_statistics(self, prediction: Ratio, routing, alpha: float, batch: Batch,
-                           queries: jax.Array, documents: jax.Array | None, *,
-                           max_segments: int | None = None
-                           ) -> tuple[LMStatistics, jax.Array]:
-        """Add the balance loss's own statistics beside the prediction's.
-
-        Each router term normalises by its own count, not by the counted
-        tokens, so the terms travel as separate statistics and only
-        `reduce_loss` adds them up. The reported number is what they add.
-        """
-        if not routing:
-            raise ValueError("aux_loss_alpha requires a model with a mixture")
-        routers = _router_scores(routing)
-        sequence = []
-        if self.seq_aux:
-            for scores, indices in routers:
-                valid = _router_queries(scores.shape[:2], queries, documents)
-                moments = sequence_router_moments(
-                    scores, indices, valid,
-                    None if documents is None else documents[:, :scores.shape[1]],
-                    max_segments=max_segments)
-                losses = global_router_loss(moments, alpha)
-                supported = (moments.positions > 0).astype(losses.dtype)
-                sequence.append(Ratio(self.row_mean(losses, batch).total,
-                                      self.row_mean(supported, batch).total))
-        global_routers = (() if self.seq_aux else
-                          tuple(router_moments(s, i, batch, queries, documents) for s, i in routers))
-        statistics = LMStatistics(prediction, tuple(sequence), global_routers)
-        combined, _ = self.reduce_loss(statistics)
-        prediction_loss, _ = prediction.mean()
-        return statistics, combined - prediction_loss
-
-    def _router_load(self, params: Variables, routing, queries: jax.Array, documents: jax.Array | None
-                     ) -> tuple[Variables, dict[str, jax.Array]]:
-        """Count what each balanced router selected, and report how evenly.
-
-        The counts are the effect the optimizer applies once per commit;
-        the report is each router's busiest and idlest share of the batch.
-        """
-        if "moe" not in params or routing is None:
-            raise ValueError("balance_rate requires a mixture with bias=True")
-        counts = router_counts(params["moe"], routing, queries, documents)
-        shares = [count / jnp.maximum(jnp.sum(count), 1) for count in jax.tree.leaves(counts)]
-        if not shares:
-            raise ValueError(
-                "balance_rate requires routers that keep a balancing bias, "
-                "and these select by their hash table alone")
-        return counts, {"moe/max_load": jnp.mean(jnp.stack([x.max() for x in shares])),
-                        "moe/min_load": jnp.mean(jnp.stack([x.min() for x in shares]))}
-
-    def reduce_loss(self, stats: Ratio | LMStatistics) -> tuple[jax.Array, jax.Array]:
-        if isinstance(stats, Ratio):
-            return stats.mean()
-        value, active = stats.prediction.mean()
-        for term in stats.sequence:
-            auxiliary, supported = term.mean()
-            value, active = value + auxiliary, active | supported
-        for term in stats.global_routers:
-            if self.aux_loss_alpha is None:
-                raise ValueError("global router statistics require aux_loss_alpha")
-            value = value + global_router_loss(term, self.aux_loss_alpha)
-            active = active | (term.positions > 0)
-        for term in stats.router_z:
-            auxiliary, supported = term.mean()
-            value, active = value + auxiliary, active | supported
-        return value, active
-
-    def apply_effects(self, variables: Variables, effects: Variables) -> Variables:
-        rate = self.balance_rate
-        if rate is None:
-            raise ValueError("router count effects require balance_rate")
-        moe = variables["moe"]
-        biases = _leaves(moe)
-        balanced = {path: _updated_bias(biases[path], count, rate)
-                    for path, count in _leaves(effects).items()}
-        return {"moe": merge(moe, unflatten_dict(balanced))}
-
     def evaluate(self, params, batch, step: Step):
         """Score the complete batch teacher-forced, using EMA when present; the
         rows and roles are read outside the compiled scoring."""
-        prepared = {TEXT_KEY: batch_text(batch), ROLES_KEY: self._batch_roles(batch)}
+        prepared = {TEXT_KEY: self._text(batch), ROLES_KEY: self._batch_roles(batch)}
         return super().evaluate(params, prepared, step)
 
     def _evaluation_scores(self, params, batch, step) -> TokenScores:
@@ -1623,12 +1393,12 @@ class LMObjective(TokenScorer):
         assert scores.correct is not None
         return TokenScores(scores.losses, scores.weights, scores.correct)
 
-    def _validation_scores(self, params, batch, step: Step) -> tuple[Ratio | LMStatistics, TokenScores]:
+    def _validation_scores(self, params, batch, step: Step) -> tuple[Ratio | RoutedStatistics, TokenScores]:
         """The validation loss and the batch's scores, from one scoring of it:
         the loss's, or in the warm-up, whose loss is the indexer's KL alone
         (`_warmup_loss`), the tokens' with the KL the trunk sows."""
         if self._warmup:
-            prepared = batch_text(batch)
+            prepared = self._text(batch)
             scores = self.token_scores(params, prepared, roles=self._batch_roles(batch), indexer=True,
                                        predict=True)
             statistics, _ = self._warmup_statistics(scores.indexer, prepared, batch)
@@ -1665,15 +1435,3 @@ class Perplexity:
         if count == 0:
             raise ValueError("no counted target in the validation pass")
         return float(np.exp(total / count))
-
-
-def _head_tile(tile, keeps_whole_logits: bool) -> tuple[int, int] | None:
-    """The head's tile: None keeps the whole logits; 'whole' and 'tiled' name
-    the choice; None on an objective that does not keep them by default is
-    the generation's tile (`chunked_tile`). A config's pair is a list, and
-    the tile is a static argument, so it becomes a tuple."""
-    if tile == 'whole' or (tile is None and keeps_whole_logits):
-        return None
-    if tile is None or tile == 'tiled':
-        return chunked_tile()
-    return (int(tile[0]), int(tile[1]))

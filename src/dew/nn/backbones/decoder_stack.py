@@ -26,6 +26,7 @@ from dew.mesh import STAGE_AXIS
 from ..hyper_connections import Carried
 from ..kv_cache import CURSOR
 from ..mla import INDEXER_COLLECTION
+from ..moe import ROUTER_COLLECTION
 from ..sharding import microbatched
 from .decoder_block import DecoderBlock
 from .layer_plan import LayerSpec, group_layers, group_name
@@ -81,7 +82,7 @@ def _layer_written(tree, values, index):
         tree, values)
 
 
-WRITTEN = ('cache', 'router', 'qk', INDEXER_COLLECTION)
+WRITTEN = ('cache', ROUTER_COLLECTION, 'qk', INDEXER_COLLECTION)
 """The collections a decoder block writes: its decode cache, and what its
 router, its attention and its sparse indexer sow, which a looped pass keeps
 apart per pass (`PassView`)."""

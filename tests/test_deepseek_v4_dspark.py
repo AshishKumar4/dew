@@ -35,7 +35,7 @@ from flax.traverse_util import flatten_dict
 from dew.interop import Pretrained
 from dew.nn.inputs import ModelInputs
 from dew.objectives.lm import LMObjective
-from dew.objectives.lm.objective import router_counts
+from dew.objectives.routing import ExpertBalance, router_counts
 from dew.sampling import Sample, Sampling, Speculative, generate
 
 ROOT = Path(__file__).parent / "fixtures" / "hf"
@@ -71,7 +71,7 @@ def test_load_balancing_moves_the_routers_the_trunk_ran_and_no_other(source):
     """The drafter's stages keep balancing biases of their own, which an LM
     forward does not run; counting and moving the biases follows the routers
     the forward sowed choices for, so the trunk's move and the stages' stay."""
-    objective = LMObjective(source.model, 8, balance_rate=1e-3)
+    objective = LMObjective(source.model, 8, balance=ExpertBalance(balance_rate=1e-3))
     tokens = jax.random.randint(jax.random.key(0), (2, 9), 0, source.model.vocab_size)
     sown = objective.token_scores(source.variables, tokens, routing=True).routing
     counts = router_counts(source.variables["moe"], sown)
