@@ -1787,7 +1787,7 @@ class Trainer(Generic[Loss, Effects]):
         assert run.notice is not None
         if paused or cut or (not ending and run.notice.reached()):
             self._take(plan, run, interval, state, unlogged=True)
-            if checkpoints is not None and interval.last_saved != current:
+            if checkpoints is not None and interval.resumable != current:
                 self._read_taken(run)
                 run.other += self._saved_checkpoint(
                     checkpoints, current, state, position, interval,
@@ -1997,7 +1997,7 @@ class Trainer(Generic[Loss, Effects]):
             # The last step's branch, its main model scored and saved first, which a resume from the
             # step runs again where a preemption cuts it short.
             state, cut = self._cooled(plan, run, state, shardings, position, run.cooling)
-            if cut and checkpoints is not None and interval.last_saved != current:
+            if cut and checkpoints is not None and interval.resumable != current:
                 # Whatever the final-save policy, the step the branch resumes from is written whole.
                 run.other += self._saved_checkpoint(checkpoints, current, state, position, interval,
                                                     training_best=False, control=run.stop_control)
@@ -2260,7 +2260,7 @@ class Trainer(Generic[Loss, Effects]):
             weights_only=weights_only, rung=self._checkpoint_rung(), artifact=self._artifact(),
             boxed=self._boxed_axes())
         self._report(CheckpointRequested(checkpoints.directory), step, write)
-        interval.saved(step)
+        interval.saved(step, resumable=not weights_only)
         self._display.status("")
         return time.perf_counter() - paused
 

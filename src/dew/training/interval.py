@@ -121,6 +121,9 @@ class Interval:
     last_log_time: float
     last_saved: int | None
     tokens_before_log: int = 0
+    resumable: int | None = None
+    """The step of the last checkpoint a resume can read, its whole state (`Checkpoints.latest`), where
+    `last_saved` may be a save of weights alone."""
     logged_tokens: jax.Array | None = None
     book: Book | None = None
     fresh: Book | None = None
@@ -174,7 +177,8 @@ class Interval:
     def resumed(cls, control: dict, *, last_saved: int | None) -> Interval:
         """An interval from now on, its token clock read off a checkpoint's `control`
         (`committed_tokens`), which it takes the clock's field out of."""
-        return cls(time.time(), last_saved=last_saved, tokens_before_log=committed_tokens(control))
+        return cls(time.time(), last_saved=last_saved, tokens_before_log=committed_tokens(control),
+                   resumable=last_saved)
 
     @property
     def token_control(self) -> dict[str, int]:
@@ -217,9 +221,12 @@ class Interval:
                                       norms=self.fresh.norms, commits=self.fresh.commits)
         return taken
 
-    def saved(self, step: int) -> None:
-        """Start the next checkpoint interval after the one saved at `step`."""
+    def saved(self, step: int, *, resumable: bool = True) -> None:
+        """Start the next checkpoint interval after the one saved at `step`, a step a resume can read
+        where `resumable`."""
         self.last_saved, self.steps = step, 0
+        if resumable:
+            self.resumable = step
         if self.book is not None and self.fresh is not None:
             self.book = self.book._replace(loss=self.fresh.loss)
 

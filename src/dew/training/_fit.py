@@ -306,13 +306,13 @@ class FitRun:
     def ends_here(self, interval: Interval) -> bool:
         """Whether a stream that may run out has, so this step is the run's last: its next batch is
         read now, agreed as every such read is, and kept for the step that takes it (`ahead`), the
-        position the step saves taken before it. An endless stream never ends here, and a run whose
-        stream is closed (`Trainer._wind_down`) ends on this step without another read."""
+        position the step saves taken before it. A run whose stream is closed (`Trainer._wind_down`)
+        ends on this step without another read, and an endless stream never ends here otherwise."""
+        if self.ahead is None and self.train is None:
+            return True
         if self.endless:
             return False
         if self.ahead is None:
-            if self.train is None:
-                return True
             self.ahead = (waited_read(self, interval, agree=True),)
         return self.ahead[0] is None
 

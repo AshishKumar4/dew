@@ -1310,13 +1310,15 @@ def test_a_cooldown_a_preemption_cuts_short_runs_again_on_resume(tmp_path):
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 
-@pytest.mark.parametrize("final", [True, False], ids=["final-save", "no-final-save"])
-def test_a_cooldown_at_the_runs_last_step_a_preemption_cuts_short_runs_on_resume(tmp_path, final):
+@pytest.mark.parametrize("saves", ["final", "none", "weights-best"])
+def test_a_cooldown_at_the_runs_last_step_a_preemption_cuts_short_runs_on_resume(tmp_path, saves):
     """A cooldown at the run's last step runs after the step's final save, and one a preemption cuts
     short stays pending beside the checkpoints (`Checkpoints.cooldown`), its step written whole even
-    where the run writes no final checkpoint: the resume runs it, recording what an uninterrupted run
-    records, and completes the run, and a fit of the completed run runs nothing again."""
+    where the run writes no final checkpoint or its best's weights alone: the resume runs it,
+    recording what an uninterrupted run records, and completes the run, and a fit of the completed run
+    runs nothing again."""
     from dew.optim import Linear
+    from dew.training import Best
     from dew.training.cooldown import Cooldowns
 
     stable, cooldowns = Linear(2.0 ** -4, decay_start=64, decay_steps=128), Cooldowns(at=(8,), length=4)
@@ -1326,10 +1328,11 @@ def test_a_cooldown_at_the_runs_last_step_a_preemption_cuts_short_runs_on_resume
                 if "cooldown_val/loss" in scalars}
     assert list(expected) == [8]
     optimizer = OptimConfig(optimizer="adamw", learning_rate=stable)
+    best = Best(lambda scores: scores["val/loss"], weights_only=True) if saves == "weights-best" else None
     with pytest.raises(Preempted):
         make_trainer(tmp_path, tracker=Preempting(7), optimizer=optimizer).fit(
             dataset(val=val_batches(2)), steps=8, log_every=1, eval_every=8, cooldowns=cooldowns,
-            checkpoint_final=final)
+            checkpoint_final=saves == "final", best=best)
     assert Checkpoints(str(tmp_path / "run")).latest == 8
     assert Checkpoints(str(tmp_path / "run")).cooldown(8) is not None
     resumed, again = RecordingTracker(), RecordingTracker()
