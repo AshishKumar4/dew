@@ -875,8 +875,9 @@ DECODE_SEEDS = {"cohere": 8, "cohere2": 8}
 
 def test_a_tier_3_source_generates_through_the_pipeline_loader_as_its_bundle_does(tmp_path):
     """`dew.pipeline` of a tier-3 source on Dew's attention gives the text generation its loaded bundle
-    describes: under the source's own sampling, the same tokens from the same prompts."""
+    describes: one greedy sample a prompt, the same tokens from the same prompts."""
     from dew.inference import pipeline
+    from dew.sampling import Sampling
 
     torch.manual_seed(0)
     model = PACKED_MODELS["cohere"]().eval()
@@ -888,9 +889,10 @@ def test_a_tier_3_source_generates_through_the_pipeline_loader_as_its_bundle_doe
         task = pipeline(str(tmp_path), dtype="float32")
     with pytest.warns(TransformersTierWarning):
         loaded = Pretrained.load(tmp_path, dtype="float32")
-    prompts = [[3, 5, 7, 2], [9, 4, 6, 8]]
-    np.testing.assert_array_equal(np.asarray(task(prompts, 3, key=0).tokens),
-                                  np.asarray(loaded.text_generation()(prompts, 3, key=0).tokens))
+    prompts, greedy = [[3, 5, 7, 2], [9, 4, 6, 8]], Sampling(temperature=0.0)
+    np.testing.assert_array_equal(
+        np.asarray(task(prompts, 3, key=0, n=1, sampling=greedy).tokens),
+        np.asarray(loaded.text_generation()(prompts, 3, key=0, n=1, sampling=greedy).tokens))
 
 
 @pytest.mark.parametrize("stated", ["mask", "segments"])
