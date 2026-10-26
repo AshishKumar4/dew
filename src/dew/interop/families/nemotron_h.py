@@ -241,9 +241,18 @@ def _prediction_path(name: str, config: Mapping[str, object]) -> tuple[str, ...]
 
     leaves = {**(_STEP_START if index % blocks == 0 else {}),
               **(_STEP_END if index % blocks == blocks - 1 else {})}
-    return prediction_path(name, "mtp", index // blocks, _records.integer(
+    return prediction_path(name, "mtp", step_depth(name, config), _records.integer(
         config.get("num_nextn_predict_layers", 0), "num_nextn_predict_layers"), ".".join(parts[3:]),
         leaves, block)
+
+
+def step_depth(name: str, config: Mapping[str, object]) -> int | None:
+    """The prediction step of an `mtp.layers.{i}.*` tensor, block i of the steps laid end to end
+    (`_step_blocks` each), or None for the trunk's."""
+    parts = name.split(".")
+    if parts[0] != "mtp" or len(parts) < 4 or parts[1] != "layers" or not parts[2].isdigit():
+        return None
+    return int(parts[2]) // _step_blocks(config)
 
 
 def weight_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
@@ -296,6 +305,7 @@ NEMOTRON_H = DecoderFamily(
     "NemotronHForCausalLM",
     lambda model: {},
     weight_path=weight_path,
+    prediction_depth=step_depth,
     export_path=export_path,
     packed=PACKED,
     preserve_source_layout=True,

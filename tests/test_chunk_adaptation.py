@@ -13,7 +13,7 @@ import numpy as np
 import optax
 import pytest
 from affine_run import Replaying, dataset
-from reference_error import assert_as_exact, over_windows, windows, with_gradients
+from reference_error import assert_as_exact, assert_grows_no_faster, over_windows, windows, with_gradients
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.continuum import ContinuumLevel
@@ -67,8 +67,14 @@ three, past gradient descent's 2 (the configurations below it peak at 1.64), and
 by up to 10^4 over its windows, so one draw's error is too heavy-tailed for its paired ratio to narrow
 within 512 seeds: each seed pools this many independent draws. The corner's one-token window (growth
 to 10^13 over eleven steps) and its outer gradient do not narrow by pooling (at 128 draws a seed the
-documents gradient's interval still spans [0.45, 1.95] around a ratio below 1), and await the gate's
-rule for a draw's conditioning (ledger)."""
+documents gradient's interval still spans [0.45, 1.95] around a ratio below 1), so they hold the
+claims a diverging computation has instead (`test_the_diverging_corner_grows_no_faster_than_the_loop`).
+"""
+
+CORNER_SEEDS = {"losses": 32, "gradient": 64}
+"""The growth check's seeds at the corner (`assert_grows_no_faster`): over 12 runs of 32 seeds, and 128
+more where a leaf did not pass, Dew passed the one-token window's losses at every run and the documents
+gradient at 10 (2 inconclusive, its loss), so the gradient takes twice as many."""
 
 
 def corner(rate: float, scale: float, window: int) -> bool:
@@ -268,7 +274,8 @@ def test_training_differentiates_through_every_step(kind, rate, scale):
     """The outer loss's gradient flows through each window's step to the level's start, the head
     and the states: the gradient of the weighted losses, second order through the steps, on par with
     the literal loop's (check 1), over each layout and at rates of a tenth and a half, the half over
-    weights where its step is stable (the divergent corner's gradient awaits the gate, `CORNER_WINDOWS`)."""
+    weights where its step is stable (the divergent corner's gradient holds growth instead,
+    `test_the_diverging_corner_grows_no_faster_than_the_loop`)."""
     fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
     adaptation = ChunkAdaptation(window=3, rate=rate)
 
@@ -290,6 +297,45 @@ def test_training_differentiates_through_every_step(kind, rate, scale):
     arms = pooled(differentiated(dew), differentiated(reference), gradient_draw, rate, scale, 3)
     assert_as_exact(*arms, f"the gradient through the windows' steps over {kind}, rate {rate}, scale {scale}",
                     seeds=GRADIENT_SEEDS[kind, rate, scale])
+
+
+@pytest.mark.parametrize("kind", LAYOUTS)
+def test_the_diverging_corner_grows_no_faster_than_the_loop(kind):
+    """At the corner (`corner`: 0.5 N(0, 1) weights stepped by a half), where a draw's rounding grows by
+    up to 10^13 over the windows and no pooled ratio resolves (`CORNER_WINDOWS`), the scan holds the
+    claims a diverging computation has (`assert_grows_no_faster`, ledger 1714): every value finite, and
+    its error growing over the steps no faster than the literal loop's, for the one-token window's
+    losses token by token and for the outer gradient one window's loss at a time, each window's loss
+    reading the level every earlier window stepped. Its accuracy is check 1's on the stable
+    configurations above, which run the same code."""
+    fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
+
+    def arms(window):
+        adaptation = ChunkAdaptation(window=window, rate=0.5)
+        return (lambda *inputs: adapted_scores(MODEL, *inputs, fields, adaptation, predict=False,
+                                               logits=False).losses,
+                lambda *inputs: equation_71(MODEL, *inputs, fields, adaptation))
+
+    def by_token(losses):
+        return lambda *inputs: jnp.moveaxis(losses(*inputs), -1, 0)
+
+    def by_window(losses):
+        def gradients(variables, hidden, targets, weights):
+            def window(at):
+                kept = (jnp.arange(LENGTH) // 3 == at).astype(weights.dtype)
+                return with_gradients(lambda variables, hidden: jnp.sum(
+                    weights * kept * losses(variables, hidden, targets, weights)))(
+                        variables, hidden, jnp.ones((), weights.dtype))
+            return jax.tree.map(lambda *steps: jnp.stack(steps), *map(window, range(LENGTH // 3)))
+        return gradients
+
+    def drawn(seed):
+        return draw(seed, scale=0.5)
+
+    assert_grows_no_faster(*map(by_token, arms(1)), drawn, f"the one-token window's losses over {kind}",
+                           seeds=CORNER_SEEDS["losses"])
+    assert_grows_no_faster(*map(by_window, arms(3)), drawn, f"the gradient a window's loss at a time over "
+                           f"{kind}", seeds=CORNER_SEEDS["gradient"])
 
 
 def test_a_level_at_its_start_is_the_identity():

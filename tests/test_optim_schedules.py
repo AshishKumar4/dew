@@ -12,8 +12,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import pytest
 
-from dew.optim import Cosine, Exponential, OneCycle, OptimConfig, ParamGroup, stepped
+from dew.optim import Cosine, Exponential, Linear, OneCycle, OptimConfig, ParamGroup, Power, stepped
 
 TORCH = np.load(Path(__file__).resolve().parent / "fixtures" / "torch_optim" / "reference.npz")
 EPOCHS, PER_EPOCH = 6, 2
@@ -145,3 +146,53 @@ def test_a_bounded_group_clamps_its_parameters_and_no_others():
     # The clamp is exact: the bounds themselves, where the step overshot them.
     np.testing.assert_array_equal(moved["delay"], [0.0, 3.0])
     np.testing.assert_allclose(moved["kernel"], [-0.45, 3.45], rtol=1e-5)
+
+
+@pytest.mark.parametrize("schedule", [
+    lambda warmup: Cosine(1.0, warmup_steps=warmup, decay_steps=100),
+    lambda warmup: Linear(1.0, warmup_steps=warmup, decay_steps=100),
+    lambda warmup: Power(1.0, warmup_steps=warmup, a=0.5),
+], ids=["cosine", "linear", "power"])
+def test_a_warmup_may_be_a_share_of_the_run(schedule):
+    """A warmup written as a share of the run is the whole updates nearest that share of its updates,
+    and the schedule it makes is the one written with those updates: 5% of 200 is 10, and of a
+    cosine's own 100-step horizon 5 where the run states none."""
+    shared, written = schedule("5%"), schedule(10)
+    for step in (0, 3, 9, 10, 11, 50, 99):
+        assert float(shared.values(200)(step)) == float(written.values(200)(step))
+    assert shared.warmup(200) == 10
+    if isinstance(shared, Cosine):
+        assert shared.warmup(None) == 5
+
+
+@pytest.mark.parametrize("warmup", ["0%", "101%", "5", "five%"])
+def test_a_warmup_that_is_neither_steps_nor_a_share_is_refused(warmup):
+    with pytest.raises(ValueError):
+        Cosine(1.0, warmup_steps=warmup, decay_steps=100).values(200)
+
+
+
+def test_a_one_cycle_rise_may_be_a_share_of_the_run():
+    """OneCycle's `warmup_fraction` may be written as a share: `30%` is the schedule 0.3 makes, step for
+    step, and its warmup is the steps to its peak, torch's 0.3 * 100 - 1."""
+    shared, written = OneCycle(1.0, warmup_fraction="30%"), OneCycle(1.0, warmup_fraction=0.3)
+    for step in (0, 10, 28, 29, 30, 60, 99):
+        assert float(shared.values(100)(step)) == float(written.values(100)(step))
+    assert shared.warmup(100) == written.warmup(100) == 29
+    assert OptimConfig(learning_rate=shared).warmups(100) == {"learning_rate": 29}
+    with pytest.raises(ValueError):
+        OneCycle(1.0, warmup_fraction="30").values(100)
+
+
+def test_a_config_records_the_warmups_of_the_schedules_its_optimizer_runs():
+    """A config records the warmups of the schedules its solvers run (`ParamGroup.rate`): where every
+    group names its own, the config's rate runs nowhere and is not resolved, so a share of a run with
+    no planned length is no error; a group naming none runs the config's rate, recorded once."""
+    unused = Power(1.0, warmup_steps="5%", a=0.5)
+    own = OptimConfig(learning_rate=unused, param_groups=(
+        ParamGroup("weights", ("kernel",), schedule=Cosine(1.0, warmup_steps=4, decay_steps=10)),
+        ParamGroup("rest", ("*",), schedule=Cosine(1.0, warmup_steps=2, decay_steps=10))))
+    assert own.warmups(None) == {"param_groups.weights.schedule": 4, "param_groups.rest.schedule": 2}
+    inherited = OptimConfig(learning_rate=unused, param_groups=(
+        ParamGroup("weights", ("kernel",)), ParamGroup("rest", ("*",))))
+    assert inherited.warmups(200) == {"learning_rate": 10}
