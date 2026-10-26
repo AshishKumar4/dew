@@ -330,9 +330,8 @@ def opens_frontier(split: int, whole: int, mesh: Mesh) -> bool:
     whose collectives the rung's freed memory lets XLA's scheduler overlap with compute. Measured, not
     ranked: Qwen3.5-0.8B on an A100-40 ran 1205.6 ms a step in four microbatches, 1174.1 whole under
     'minimal'; Qwen3.5-9B by fsdp over two A100-80s left 168 of 169 ms of collectives exposed, 15 under
-    'minimal'. A CPU's collectives are its host's copies, nothing to overlap, so its devices open none,
-    and a run over several compiles the steps one device's plan does."""
-    return split != whole or (mesh.devices.size > 1 and mesh.devices.flat[0].platform != "cpu")
+    'minimal'."""
+    return split != whole or mesh.devices.size > 1
 
 
 def plan_step[LossT, EffectsT](
