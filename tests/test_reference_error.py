@@ -195,6 +195,37 @@ def test_the_gate_compiles_two_dew_arms_without_ynnpack_and_one_beside_a_given_a
     assert_as_exact(dew, host, draw, "a NumPy arm as given", seeds=8)
 
 
+def test_a_numpy_arm_is_refused_unless_it_is_given_and_windows_keep_their_arms_policy():
+    """An arm the gate would compile that returns NumPy values is refused (a NumPy reference compiled
+    would compute in JAX); passed `as_given` it runs as given. A window loop of a given arm is
+    classified by that arm, so its Dew partner compiles with the fusions as it does without windows.
+    A paired sizing of one function against itself stays paired, its draws from SIZING_FROM on."""
+    from reference_error import SIZING_FROM, _arms, as_given, assert_as_exact, over_windows, seeds_for
+
+    def dew(x):
+        return x * 2
+
+    def numpy(x):
+        return np.asarray(x) * 2
+
+    def draw(seed):
+        return (np.random.default_rng(seed).standard_normal(8).astype(np.float32),)
+
+    with pytest.raises(TypeError, match="as_given"):
+        assert_as_exact(dew, numpy, draw, "a NumPy arm unmarked", seeds=8)
+    assert_as_exact(dew, as_given(numpy), draw, "a NumPy arm as given", seeds=8)
+    windowed, _ = _arms(over_windows(dew), over_windows(as_given(numpy)))
+    assert not getattr(windowed.fn, "without_ynn", False)
+    seen = []
+
+    def drawn(seed):
+        seen.append(seed)
+        return draw(seed)
+
+    seeds_for(dew, drawn, "paired against itself", dew_fn=dew)
+    assert min(seen[1:]) >= SIZING_FROM
+
+
 def test_an_arm_of_dew_programs_compiles_them_as_the_gate_compiles_its_other_arm(monkeypatch):
     """Beside another Dew arm, an arm of Dew's own programs (`dew_programs`) runs with Dew's compile
     seam holding WITHOUT_YNN open (`compiled_with`), so a program it compiles through the seam
