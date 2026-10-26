@@ -35,8 +35,8 @@ from dew.interop.decoder_parts import (
     base_config,
     dew_path,
     layer_depth_path,
-    plain_partial_rope,
     prediction_path,
+    read_partial_rope,
     read_rope,
     record_float,
     record_int,
@@ -93,17 +93,17 @@ def _minimax_m2_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
                  'output_router_logits', 'router_aux_loss_coef'))
     head_dim = _records.integer(hf_config.get('head_dim', 128), 'head_dim')
     rotary_dim = _records.integer(hf_config.get('rotary_dim', head_dim), 'rotary_dim')
-    # The release states its rotary under rope_scaling, which transformers reads as rope_parameters.
-    theta, factor = plain_partial_rope(
-        {**hf_config, 'rope_parameters': hf_config.get('rope_scaling') or hf_config.get('rope_parameters')},
-        _MINIMAX_M2_SPELLING, default_factor=rotary_dim / head_dim, reference='MiniMax-M2')
+    # The release states its rotary under rope_scaling, which transformers reads as rope_parameters
+    # and MiniMaxM2RotaryEmbedding builds through its rope_type (modeling_minimax_m2.py:150-165).
+    ropes, factor = read_partial_rope(hf_config, used, _MINIMAX_M2_SPELLING,
+                                      default_factor=rotary_dim / head_dim)
     if 'rotary_dim' in hf_config and factor * head_dim != rotary_dim:
         refuse('rotary_dim', 'it disagrees with partial_rotary_factor * head_dim')
     if not 0 < factor <= 1 or int(head_dim * factor) % 2:
         refuse('rotary_dim', 'partial rotary must rotate a positive even head slice')
-    used.update(('rotary_dim', 'partial_rotary_factor', 'rope_parameters', 'rope_scaling', 'rope_theta'))
+    used.add('rotary_dim')
     config = base_config({**hf_config, 'head_dim': head_dim}, used, qk_norm=True,
-                          rope=Ropes(theta), reads=frozenset())
+                          rope=ropes, reads=frozenset())
     config.update(qk_norm_scope='projection', partial_rotary_factor=factor,
                   partial_rotary_type='default')
     config['mixture'] = native_fields(Mixture)(
@@ -280,9 +280,7 @@ def deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
     three things from the config: `layer_types`, one entry per layer; the MLA
     `mixer` record; and the routed `mixture`.
     """
-    ropes = read_rope(hf_config, used, PLAIN_SPELLING, yarn_max_pos=_records.integer(hf_config.get(
-        'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'),
-        ramps=('yarn',), per_kind=False)
+    ropes = read_rope(hf_config, used, PLAIN_SPELLING, ramps=('yarn',), per_kind=False)
     config = base_config(hf_config, used, rope=ropes)
     layer_types = _records.strings(config.get('layer_types'), 'layer_types')
     model_type = hf_config['model_type']
@@ -1118,6 +1116,8 @@ MINIMAX_M2 = DecoderFamily(
     weight_path=partial(renamed_path, _MINIMAX_M2_NAMES),
     export_path=partial(renamed_name, _MINIMAX_M2_NAMES),
     preserve_source_layout=True,
+    padding_idx=True,
+    defaults={'max_position_embeddings': 196608},
 )
 
 
@@ -1134,6 +1134,7 @@ DEEPSEEK_V4 = DecoderFamily(
     prepare=deepseek_v4_prepare,
     preserve_source_layout=True,
     tied_head_names=('head.weight', 'embed.weight'),
+    padding_idx=True,
 )
 
 DEEPSEEK_V32 = DecoderFamily(
@@ -1145,6 +1146,8 @@ DEEPSEEK_V32 = DecoderFamily(
     lambda model: {},
     weight_path=layer_depth_path,
     preserve_source_layout=True,
+    padding_idx=True,
+    defaults={'max_position_embeddings': 163840},
 )
 
 DEEPSEEK_V2 = DecoderFamily(
@@ -1165,6 +1168,7 @@ DEEPSEEK_V2 = DecoderFamily(
     defaults={'n_shared_experts': 2, 'n_routed_experts': 64, 'routed_scaling_factor': 1.0,
               'topk_method': 'greedy', 'norm_topk_prob': False, 'first_k_dense_replace': 0,
               'q_lora_rank': 1536, 'max_position_embeddings': 2048},
+    padding_idx=True,
 )
 
 
@@ -1200,4 +1204,5 @@ DEEPSEEK_V3 = DecoderFamily(
               'routed_scaling_factor': 2.5, 'n_group': 8, 'topk_group': 4, 'norm_topk_prob': True,
               'first_k_dense_replace': 3, 'num_key_value_heads': 128, 'q_lora_rank': 1536,
               'max_position_embeddings': 4096, 'num_nextn_predict_layers': 1},
+    padding_idx=True,
 )

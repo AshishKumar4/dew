@@ -35,6 +35,7 @@ import tyro
 
 from dew._hashing import fmix32
 from dew.mesh import LogicalAxes
+from dew.nn.kernels.generation import backend
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import declarations, declared_axes
 from dew.registry import JsonDict, from_record, record_argument, schedules, to_record
@@ -356,9 +357,10 @@ def newton_schulz(update: jax.Array, steps: int = 5,
     1e-8), the wide way round, then `a X + (b A + c A A) X` with `A = X X^T`, `steps` times (`NEWTON_SCHULZ`).
 
     A rank-2 update is one matrix, its rows the reduction axis (a Linen kernel's); `dimension_numbers` name
-    another update's reduction and output axes as Muon's do, its other axes a stack of matrices. Each
-    matrix iterates alone (`jax.lax.map`): batched, XLA:CPU's products leave the iteration, which grows
-    small singular values about 3.44 times a step, ten times further from float64 (ledger 1650).
+    another update's reduction and output axes as Muon's do, its other axes a stack of matrices. On the
+    CPU each matrix iterates alone (`jax.lax.map`): batched, XLA:CPU's products leave the iteration, which
+    grows small singular values about 3.44 times a step, ten times further from float64; a GPU's batched
+    ones round as one matrix's (an A100: 5.2e-6 either way), and keep the stack in one program (ledger 1650).
     """
     numbers = optax.contrib.MuonDimensionNumbers() if dimension_numbers is None else dimension_numbers
     reduction, output = (tuple(int(axis) % update.ndim for axis in np.atleast_1d(axes))
@@ -366,8 +368,11 @@ def newton_schulz(update: jax.Array, steps: int = 5,
     stacked = tuple(axis for axis in range(update.ndim) if axis not in reduction + output)
     order = stacked + reduction + output
     sizes = tuple(math.prod(update.shape[axis] for axis in axes) for axes in (stacked, reduction, output))
-    matrices = jax.lax.map(lambda matrix: _newton_schulz_matrix(matrix, steps),
-                           update.transpose(order).reshape(sizes))
+    def orthogonalized(matrix):
+        return _newton_schulz_matrix(matrix, steps)
+
+    stack = update.transpose(order).reshape(sizes)
+    matrices = jax.lax.map(orthogonalized, stack) if backend() == "cpu" else jax.vmap(orthogonalized)(stack)
     return matrices.reshape([update.shape[axis] for axis in order]).transpose(np.argsort(order))
 
 

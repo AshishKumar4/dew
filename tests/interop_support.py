@@ -335,3 +335,41 @@ def nvfp4_qdq_case(kind: str) -> tuple[Path, dict[str, np.ndarray]]:
     with np.load(directory / "reference.npz") as reference:
         return directory, dict(reference)
 
+
+def clearing_selections(loaded, draw, label: str):
+    """`draw`, for a decoder that selects discontinuously (a mixture's routing, Gemma 3n's gaussian
+    top-k), redrawn until its selections clear `selection_margins.MARGIN`, so the float32 runs and the
+    float64 run select alike (`selection_margins.clearing`); `draw` itself otherwise."""
+    import jax.numpy as jnp
+    import selection_margins
+
+    if not selection_margins.selects(loaded.model_config):
+        return draw
+    captured = selection_margins.capture(loaded.model)
+
+    def clears(inputs):
+        selections = captured(loaded.variables, jnp.asarray(inputs[0]))
+        return selection_margins.margin(loaded.model_config, selections, label) > selection_margins.MARGIN
+
+    return selection_margins.clearing(draw, clears)
+
+
+def torch_logits(source, precision=None):
+    """A transformers causal LM's logits over int ids as float64 numpy, inside `precision` (a context
+    manager factory, `tools.torch_precision.float64` for a float64 twin, whose code's float32 casts it
+    widens), with no gradient."""
+    import contextlib
+
+    import torch
+
+    def run(ids):
+        with (precision or contextlib.nullcontext)(), torch.no_grad():
+            return source(torch.from_numpy(np.asarray(ids)).long()).logits.double().numpy()
+    return run
+
+
+def token_draw(salt: int, vocab: int, shape: tuple[int, ...]):
+    """Check 1's draw of `shape` token ids below `vocab`, a stream of its own by `salt`."""
+    def draw(seed):
+        return (np.random.default_rng([salt, seed]).integers(0, vocab, shape).astype(np.int32),)
+    return draw

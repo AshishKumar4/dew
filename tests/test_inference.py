@@ -28,6 +28,7 @@ from dew.config import MetricConfig, ObjectiveConfig, TrainerConfig
 from dew.config.diffusion import DiffusionRunConfig
 from dew.data import ByteTokenizer, presets
 from dew.data.dataset import Loader
+from dew.data.images import CAPTIONS
 from dew.data.sources import source
 from dew.data.sources.files import Files
 from dew.diffusion.presets import EDM, Flow
@@ -268,7 +269,9 @@ def validated_run(directory, *, validates: bool, **fields):
     encoder = objective.inputs.conditions["textcontext"].encoder
     images = np.tile(np.linspace(0, 255, RES, dtype=np.float32)[None, :, None, None],
                      (8, 1, RES, 3)).astype(np.uint8)
-    batch = {"image": images, "text": encoder.tokenize(["a", "b", "c", "d", "e", "f", "g", "h"])}
+    # As a run's data holds it (`DiffusionObjective.data`): the captions' tokens and the captions as text.
+    captions = ["a", "b", "c", "d", "e", "f", "g", "h"]
+    batch = {"image": images, "text": encoder.tokenize(captions), CAPTIONS: np.asarray(captions)}
     data = Loader(train=lambda partition: Replaying(lambda position: batch),
                   val=(lambda partition: iter([batch])) if validates else None, records=None, batch=8)
     checkpoints = Checkpoints(str(directory / "checkpoints"), keep=1)

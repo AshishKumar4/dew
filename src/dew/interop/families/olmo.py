@@ -8,9 +8,7 @@ from __future__ import annotations
 
 from collections.abc import Mapping
 
-from dew import _records
 from dew.interop.decoder_parts import (
-    DEFAULT_MAX_SEQ_LEN,
     DecoderFamily,
     DecoderFields,
     RopeSpelling,
@@ -44,8 +42,7 @@ def _olmo3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     both on the released 7B).
     """
     layer_types = specified_layer_types(hf_config, used, ('sliding_attention',) * 3 + ('full_attention',))
-    ropes = read_rope(hf_config, used, _SPELLING, yarn_max_pos=_records.integer(hf_config.get(
-        'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'))
+    ropes = read_rope(hf_config, used, _SPELLING)
     config = base_config(hf_config, used, qk_norm=True, layer_types=layer_types,
                           scale_after_cast=False, rope=ropes)
     config.update(sandwich_norms=True, pre_norms=False, qk_norm_scope='projection')
@@ -62,5 +59,7 @@ OLMO3 = DecoderFamily(
     sandwich_norms=True,
     preserve_source_layout=True,
     # Olmo3Config's norm epsilon, window and context.
-    defaults={'rms_norm_eps': 1e-5, 'sliding_window': 4096, 'max_position_embeddings': 2048},
+    defaults={'rms_norm_eps': 1e-5, 'sliding_window': 4096, 'max_position_embeddings': 2048,
+              'pad_token_id': 1},
+    padding_idx=True,
 )

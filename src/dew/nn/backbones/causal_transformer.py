@@ -525,6 +525,7 @@ class CausalTransformer(nn.Module):
             head_dim=(self.features_per_head if kind.head_dim is None else kind.head_dim),
             partial_rotary_factor=self._kind_rotary(kind),
             sinks=self.attention_sinks if kind.sinks is None else kind.sinks,
+            qk_norm=self.qk_norm if kind.qk_norm is None else kind.qk_norm,
             mixer=kind.mixer)
 
     def _kind_rotary(self, kind: LayerKind) -> float | None:
@@ -597,7 +598,7 @@ class CausalTransformer(nn.Module):
         """Return one layer's mixer geometry as a `MixerContext` built from the resolved kind.
 
         `head_dim`, `rope_theta`, `window`, the two rotary ramps, the partial
-        rotary and the sinks take the layer kind's resolved values
+        rotary, the sinks and the query-key norm take the layer kind's resolved values
         (`kind_of`), and the precision the model's layers take (`products`). Every other field
         is the model's field of the same name. A kind builds its `DecoderBlock` factory
         from this context and its own record, and `setup` chooses the mixer
@@ -611,7 +612,7 @@ class CausalTransformer(nn.Module):
             "k_eq_v": self.attention_k_eq_v and kind.window is None,
             "kv_shared": kv_shared, "kv_store_key": layer_type,
             "partial_rotary_factor": kind.partial_rotary_factor, "attention_sinks": kind.sinks,
-            "init_std": self.init_stds[0], "output_init_std": self.init_stds[1],
+            "qk_norm": kind.qk_norm, "init_std": self.init_stds[0], "output_init_std": self.init_stds[1],
             "precision": self.precision}
         return MixerContext(**resolved, **{field.name: getattr(self, field.name)
                                            for field in dataclasses.fields(MixerContext)

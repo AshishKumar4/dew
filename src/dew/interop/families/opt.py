@@ -93,4 +93,6 @@ OPT = DecoderFamily(
     export_path=partial(renamed_name, _OPT_NAMES),
     preserve_source_layout=False,
     tied_head_names=('lm_head.weight', 'model.decoder.embed_tokens.weight'),
+    defaults={'pad_token_id': 1},
+    padding_idx=True,
 )

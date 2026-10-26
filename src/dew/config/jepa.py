@@ -11,8 +11,10 @@ from __future__ import annotations
 import dataclasses
 from typing import ClassVar
 
+import jax
+import jax.numpy as jnp
+
 from dew.config import ObjectiveConfig, Prepared, RunConfig, media_field
-from dew.data.compile import fitted
 from dew.data.pipeline import ObjectiveData
 from dew.inputs import Field
 from dew.objectives.jepa.masking import MultiBlockMask
@@ -59,8 +61,7 @@ class JepaRunConfig(RunConfig):
         computes as the encoder does, its compute dtype and attention kernel."""
         # Compiled once, before the objective, whose EMA ramps over the run's length: JEPA reads its
         # batches as the chain makes them, with no stages of its own.
-        dataset, held = fitted(self.chain(), self.validation, objective=ObjectiveData(),
-                                seed=self.data_seed)
+        dataset, held = self.compiled(ObjectiveData(), self.chain(), self.validation)
         sample = self.sample()
         video = sample.key == "video"
         if video != (models[self.model.name] is models["jepa_video_encoder"]):
@@ -75,10 +76,23 @@ class JepaRunConfig(RunConfig):
             **{key: fields[key] for key in ("dtype", "attention_impl") if key in fields}}).build()
         mask = MultiBlockMask.for_grid(grid, num_targets=self.num_target_blocks, scale=self.target_scale,
                                        aspect=self.target_aspect, scan_order=encoder.scan_order)
-        ramp = ({} if "momentum_steps" in self.objective.fields
-                else {"momentum_steps": self.trainer.total_updates(dataset)})
+        ramp = {}
+        if "momentum_steps" not in self.objective.fields:
+            updates = self.trainer.total_updates(dataset)
+            if updates is None:
+                raise ValueError("a run bounded by tokens alone counts no updates ahead for the target "
+                                 "encoder's momentum to ramp over; set --objective.momentum_steps")
+            ramp = {"momentum_steps": updates}
+        adapted = {}
+        if self.lora is not None:
+            # A fresh encoder's draw from the run's key, frozen under the factors that train.
+            key = jax.random.key(self.trainer.key)
+            base = encoder.init(key, jnp.zeros((1, *sample.shape)),
+                                jnp.arange(mask.num_context, dtype=jnp.int32)[None])
+            adapter = self.lora.apply(encoder, base, key=jax.random.fold_in(key, 1))
+            encoder, adapted = adapter.model, {"encoder_variables": adapter.variables}
         objective = self.objective.build(encoder=encoder, predictor=predictor, mask=mask, sample=sample,
-                                         **ramp)
+                                         **ramp, **adapted)
         probes = () if not self.probe_classes else (
             LinearProbe(self.probe_classes), KnnProbe(self.probe_classes, k=self.knn_k))
         return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=probes,

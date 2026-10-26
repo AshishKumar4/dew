@@ -209,4 +209,6 @@ MODERNBERT = DecoderFamily(
     weight_path=_modernbert_path, export_path=partial(renamed_name, _MODERNBERT_NAMES, leaves=_HEAD),
     prepare=_modernbert_prepare, spelling=_nested, packed=_MODERNBERT_PACKED, preserve_source_layout=False,
     tied_head_names=('decoder.weight', 'model.embeddings.tok_embeddings.weight'),
+    defaults={'pad_token_id': 50283},
+    padding_idx=True,
 )

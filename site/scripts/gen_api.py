@@ -41,7 +41,7 @@ import lint_scopes as scopes
 
 DEW_GROUPS: list[tuple[str, list[str]]] = [
     ("Top level", ["dew", "dew.batch", "dew.mesh"]),
-    ("Training", ["dew.training", "dew.state", "dew.optim", "dew.training.quantization",
+    ("Training", ["dew.training", "dew.training.budget", "dew.state", "dew.optim", "dew.training.quantization",
                   "dew.training.runtime", "dew.training.distributed", "dew.training.posthoc"]),
     ("Objectives", ["dew.objectives", "dew.objectives.base", "dew.objectives.lm", "dew.objectives.diffusion",
                     "dew.objectives.diffusion.adversarial",
@@ -230,7 +230,7 @@ def public_entries(module: griffe.Module) -> Iterator[Entry]:
 
 
 def is_flax_module(cls: griffe.Class) -> bool:
-    return any(re.search(r"(^|\.)(nn\.)?Module$", str(base)) and "linen" in str(base) or str(base) == "nn.Module"
+    return any((re.search(r"(^|\.)(nn\.)?Module$", str(base)) and "linen" in str(base)) or str(base) == "nn.Module"
                for base in cls.bases)
 
 

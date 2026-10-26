@@ -14,7 +14,6 @@ from collections.abc import Callable, Mapping
 from dew import _records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
-    DEFAULT_MAX_SEQ_LEN,
     FUSED_EXPERTS,
     LINEAR_FIELDS,
     MOE_SHARED,
@@ -31,8 +30,8 @@ from dew.interop.decoder_parts import (
     kind_mixers,
     kinds_of,
     native_layer_types,
-    plain_partial_rope,
     prediction_path,
+    read_partial_rope,
     read_rope,
     record_int,
     refuse,
@@ -46,17 +45,17 @@ from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 
 
-def _qwen35_rope(hf_config: Mapping[str, object]) -> tuple[float, float]:
-    """Return (rope_theta, partial_rotary_factor) for a qwen3_5_text config.
+def _qwen35_rope(hf_config: Mapping[str, object], used: set[str]) -> tuple[Ropes, float]:
+    """Return (the rotary's base and ramp, partial_rotary_factor) for a qwen3_5_text or qwen3_next
+    config (`read_partial_rope`).
 
-    The family's rope is one flat entry carrying the mRoPE layout beside the
-    base and the fraction. Only plain rope maps; a scaled type or a scaling
-    field refuses. The fraction is the entry's, else the config's own, else the
+    The family's rope is one entry carrying the mRoPE layout beside the base
+    and the fraction, which is the entry's, else the config's own, else the
     class default of 0.25 (configuration_qwen3_5.py:111 sets it as a kwarg and
     modeling_rope_utils.py:755-757 lets the entry's value win). The reference
-    reads it as a rope of int(head_dim * factor) dims
-    (modeling_qwen3_5.py:117-124), the 'default' convention of
-    `dew.nn.rope.rotary_freqs`.
+    reads it as a rope of int(head_dim * factor) dims, building any rope_type
+    over them (modeling_qwen3_5.py:93-124; modeling_qwen3_next.py:77-110), the
+    'default' convention of `dew.nn.rope.rotary_freqs`.
 
     mrope_section and mrope_interleaved describe how the three grids of an
     image share the rotated pairs. With one position per token every grid has
@@ -65,9 +64,8 @@ def _qwen35_rope(hf_config: Mapping[str, object]) -> tuple[float, float]:
     exactly. Wrapper loading keeps the three-axis layout on its attention mixer
     for visual inputs.
     """
-    return plain_partial_rope(hf_config, PLAIN_SPELLING, default_factor=0.25,
-                              reference='Qwen3_5TextRotaryEmbedding',
-                              layout=('mrope_section', 'mrope_interleaved'))
+    return read_partial_rope(hf_config, used, PLAIN_SPELLING, default_factor=0.25,
+                             layout=('mrope_section', 'mrope_interleaved'))
 
 
 _QWEN_READS = frozenset({'layer_types', 'sliding_window', 'attention_bias'})
@@ -91,8 +89,7 @@ def _qwen3_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     ramp: Qwen3's model cards extend to 131072 tokens with it, and
     DeepSeek-R1-0528-Qwen3-8B ships it.
     """
-    rope = read_rope(hf_config, used, PLAIN_SPELLING, yarn_max_pos=_records.integer(hf_config.get(
-        'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'))
+    rope = read_rope(hf_config, used, PLAIN_SPELLING)
     return base_config(hf_config, used, qk_norm=True, rope=rope,
                         layer_types=native_layer_types(hf_config, used, 'qwen3'), reads=_QWEN_READS)
 
@@ -213,11 +210,10 @@ def _qwen_hybrid_config(hf_config: Mapping[str, object], used: set[str], *,
     interval = _records.integer(hf_config.get('full_attention_interval', 4), 'full_attention_interval')
     layer_types = specified_layer_types(hf_config, used,
                                         ('linear_attention',) * (interval - 1) + ('full_attention',))
+    ropes, partial = _qwen35_rope(hf_config, used)
     config = base_config(hf_config, used, qk_norm=True, scale_after_cast=False,
-                          layer_types=layer_types, rope=Ropes(10000.0))
+                          layer_types=layer_types, rope=ropes)
     used.add('full_attention_interval')
-    rope_theta, partial = _qwen35_rope(hf_config)
-    used.update(('rope_parameters', 'rope_theta', 'partial_rotary_factor'))
     kinds = dict(kinds_of(config))
     if 'linear_attention' in layer_types:
         kinds['linear_attention'] = native_fields(LayerKind)(mixer=None)
@@ -236,7 +232,6 @@ def _qwen_hybrid_config(hf_config: Mapping[str, object], used: set[str], *,
         # the q/k norms included.
         scale_offset=True,
         output_gate=True,
-        rope_theta=rope_theta,
         partial_rotary_factor=partial,
         partial_rotary_type='default',
         kinds=kinds,
@@ -284,13 +279,10 @@ def _qwen3_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
     (modeling_qwen3_next.py:813-818); the others stay dense at
     intermediate_size.
     """
+    # The release spells its rope flat: rope_theta beside a null rope_scaling. A ramp there is
+    # the YaRN its model card suggests past 256K, which Qwen3NextRotaryEmbedding builds
+    # (modeling_qwen3_next.py:77-110) and `_qwen35_rope` reads.
     config = _qwen_hybrid_config(hf_config, used, mixer={'fused_in_proj': True})
-    # The release spells its rope flat: rope_theta beside a null rope_scaling.
-    # A ramp there is the YaRN its model card suggests past 256K, which the
-    # plain rotary of this block does not apply.
-    used.add('rope_scaling')
-    if hf_config.get('rope_scaling') is not None:
-        refuse('rope_scaling', 'the Qwen3-Next rotary is plain at rope_theta')
     used.update(('num_experts', 'norm_topk_prob', 'moe_intermediate_size',
                  'shared_expert_intermediate_size', 'num_experts_per_tok',
                  'output_router_logits', 'router_aux_loss_coef'))
@@ -394,6 +386,8 @@ QWEN3_NEXT = DecoderFamily(
     weight_path=qwen35_moe_path,
     packed=FUSED_EXPERTS,
     preserve_source_layout=True,
+    padding_idx=True,
+    defaults={'max_position_embeddings': 32768},
 )
 
 QWEN3_5_MOE_TEXT = DecoderFamily(
@@ -406,6 +400,8 @@ QWEN3_5_MOE_TEXT = DecoderFamily(
     weight_path=qwen35_moe_path,
     packed=FUSED_EXPERTS,
     preserve_source_layout=True,
+    padding_idx=True,
+    defaults={'max_position_embeddings': 32768},
 )
 
 QWEN3_5_TEXT = DecoderFamily(
@@ -419,6 +415,8 @@ QWEN3_5_TEXT = DecoderFamily(
     lambda model: {},
     weight_path=_qwen35_path,
     preserve_source_layout=True,
+    padding_idx=True,
+    defaults={'max_position_embeddings': 32768},
 )
 
 QWEN3_MOE = DecoderFamily(
@@ -431,6 +429,7 @@ QWEN3_MOE = DecoderFamily(
     preserve_source_layout=True,
     # Qwen3MoeConfig's defaults for the fields its decoder reads.
     defaults={'max_position_embeddings': 32768},
+    padding_idx=True,
 )
 
 QWEN3 = DecoderFamily(
@@ -443,6 +442,7 @@ QWEN3 = DecoderFamily(
     preserve_source_layout=False,
     # Qwen3Config's defaults for the fields its decoder reads.
     defaults={'num_key_value_heads': 32, 'head_dim': 128, 'max_position_embeddings': 32768},
+    padding_idx=True,
 )
 
 QWEN2_MOE = DecoderFamily(
@@ -458,6 +458,7 @@ QWEN2_MOE = DecoderFamily(
     preserve_source_layout=True,
     # Qwen2MoeConfig's defaults for the fields its decoder reads.
     defaults={'num_key_value_heads': 16, 'max_position_embeddings': 32768},
+    padding_idx=True,
 )
 
 QWEN2 = DecoderFamily(
@@ -470,4 +471,5 @@ QWEN2 = DecoderFamily(
     preserve_source_layout=False,
     # Qwen2Config's defaults for the fields its decoder reads.
     defaults={'num_key_value_heads': 32, 'max_position_embeddings': 32768},
+    padding_idx=True,
 )

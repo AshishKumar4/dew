@@ -121,4 +121,5 @@ GPT_NEOX = DecoderFamily(
     export_weights=decoder_tensors,
     preserve_source_layout=False,
     tied_head_names=('embed_out.weight', 'gpt_neox.embed_in.weight'),
+    defaults={'max_position_embeddings': 2048},
 )
