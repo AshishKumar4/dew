@@ -12,13 +12,15 @@ from collections.abc import Iterator, Mapping, Sequence
 import jax
 from jax.sharding import Mesh
 
+from dew import position
 from dew._coordination import agreed_next
 from dew.batch import Batch
-from dew.data.dataset import Loader, Reader
+from dew.data.dataset import DataPartition, Loader, PhasedStream, Reader
 from dew.data.pipeline import Dataset
 from dew.distributed.batches import DevicePrefetchIterator, Signature
-from dew.distributed.placement import MeshSpec
-from dew.objectives.base import Metric
+from dew.distributed.placement import MeshSpec, Placement
+from dew.objectives.base import Initializer, Metric
+from dew.state import TrainState
 from dew.telemetry.profile import region
 from dew.training.budget import Plateau
 from dew.training.evaluation import EvalSuite, Evaluation, Summary
@@ -57,10 +59,11 @@ def split_metrics(suites: Mapping[str, EvalSuite]) -> dict[str, tuple[Metric, ..
 def declarations(suites: Mapping[str, EvalSuite], metrics: Sequence[Metric],
                  summaries: Sequence[Summary], *, loss: bool) -> dict[str, tuple[Metric | Summary, ...]]:
     """Every score a fit declares, by split: each suite's metrics (fit's own `metrics` as `val` where it
-    validates no suite) and the summaries under theirs (`Summary.SPLIT`). Its selections resolve against
-    this and its rankings read their aggregates' scores off it, one declaration for both. A summary is
-    refused where it repeats another's name or weighs a score no evaluation records (`Summary.check`,
-    the objective's validation loss only where it defines one, `loss`)."""
+    validates no suite) and the summaries in their namespace (`Summary.SPLIT`), which no split can be
+    named. Its selections resolve against this and its rankings read their aggregates' scores off it,
+    one declaration for both. A summary is refused where it repeats another's name or weighs a score
+    no evaluation records (`Summary.check`, the objective's validation loss only where it defines one,
+    `loss`)."""
     names = [summary.name for summary in summaries]
     if len(names) != len(set(names)):
         raise ValueError(f"summaries are named apart, and {names} repeats one")
@@ -94,7 +97,7 @@ class FitPlan:
     held_best: bool = False  # a restore_best without Checkpoints (`HeldBest`)
     """Every validation split by name, its metrics and cadence resolved."""
     summaries: tuple[Summary, ...] = ()
-    """The scalars each evaluation that scores every split they weigh forms (`Summary`)."""
+    """The scalars each step whose evaluations score every split they weigh forms (`Summary`)."""
     declared: Mapping[str, tuple[Metric | Summary, ...]] = dataclasses.field(default_factory=dict)
     """Every score the fit declares, by split (`declarations`)."""
     observe: Observe | None = None
@@ -167,6 +170,9 @@ class FitRun:
     training: dict[str, jax.Array] = dataclasses.field(default_factory=dict)
     source: Iterator[Batch] | None = None
     train: DevicePrefetchIterator | None = None
+    partition: DataPartition | None = None
+    """The share of the training data this process reads, where the stream opens again at a stage of
+    a schedule (`Trainer._scheduled`)."""
     tracing: bool = False
     traced: int = 0
     other: float = 0.0
@@ -242,3 +248,44 @@ def unrecorded_parts(objective: str, dataset: Dataset | Loader, *, optimized: bo
     reasons += [f"{name} is given to the trainer, which a run's record does not state"
                 for name, part in given.items() if part is not None]
     return reasons
+
+
+def stage_reached(plan: FitPlan, run: FitRun, interval: Interval) -> tuple[PhasedStream, bytes, int] | None:
+    """Where the run's commits reached the tokens of the schedule's stage it stands in
+    (`dew.data.pipeline.schedule`), on every process alike, as the committed tokens are the pool's: its
+    stream opened again where the step that reached them left it, the stages that step's commit passed
+    ended there, reading nothing, and the stage it now reads; what the prefetch worker read ahead of
+    the end is dropped untrained. The last stage's tokens, where they end the data, are the run's token
+    budget (`dew.training.budget.run_tokens`). None before a stage's end, which the devices' count is
+    read for before each step while it lies ahead, as a token budget's is."""
+    ends = plan.dataset.token_ends
+    state = None if run.train is None else run.train.source_state
+    if ends is None or state is None:
+        return None
+    stage = len(position.read(state).completed)
+    if stage >= len(ends) - 1 or (committed := interval.real_tokens) < (end := ends[stage] or 0):
+        return None
+    assert run.train is not None and run.partition is not None
+    run.train.close()
+    run.train = None
+    run.source = source = plan.dataset.train(run.partition)
+    if not isinstance(source, PhasedStream):
+        raise TypeError("a schedule reads its stages as phases")
+    while stage < len(ends) - 1 and committed >= end:
+        state, stage = source.ending(state), stage + 1
+        end = ends[stage] or 0
+    return source, state, stage
+
+
+@dataclasses.dataclass(frozen=True)
+class Start:
+    """What `Trainer.place` reads before it places the state (`Trainer._started`): the objective's
+    held tree and the key, the state's shapes and which frozen leaves its init passes through
+    (`traced_start`), the checkpoint step a run resumes from, and the state's placement."""
+
+    initializer: Initializer
+    key: jax.Array
+    abstract: TrainState
+    through: dict[int, int]
+    resume: int | None
+    shardings: Placement[TrainState]

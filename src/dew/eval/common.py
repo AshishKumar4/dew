@@ -21,8 +21,8 @@ class Mean[Scored: Artifact]:
     `fn` scores one artifact and batch, returning per-example values or a
     `(total, count)` pair. `better` (`higher` or `lower`) is required, so
     checkpoint ranking never assumes the wrong direction. `reads` names the
-    artifact type `fn` scores. `name` is unprefixed, such as `accuracy`,
-    because evaluation adds `val/` or the split name. The running totals
+    artifact type `fn` scores. `name` is unprefixed, such as `accuracy`:
+    evaluation adds `val/` or the split name, and refuses a name with a '/'. The running totals
     belong to the evaluation pass, not to this object.
     """
 
@@ -34,10 +34,6 @@ class Mean[Scored: Artifact]:
     def __post_init__(self) -> None:
         if self.better not in ("higher", "lower"):
             raise ValueError("better must be higher or lower")
-        if "/" in self.name:
-            raise ValueError(
-                "name must be unprefixed, such as accuracy; evaluation adds val/ or the split name"
-            )
 
     @property
     def shown(self) -> Shown:

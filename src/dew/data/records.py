@@ -318,8 +318,8 @@ def _source(source: Source | Mixture | Phases) -> dict[str, JSON]:
         return {"mix": [_chain(child) for child in source.pipelines], "weights": list(source.weights),
                 "tokens": tokens}
     if isinstance(source, Phases):
-        return {"phases": [_chain(child) for child in source.pipelines],
-                "until_steps": list(source.until_steps)}
+        clock = "until_steps" if source.clock == "steps" else "until_tokens"
+        return {"phases": [_chain(child) for child in source.pipelines], clock: list(source.ends)}
     written = _typed(source, Source, "store")
     if not isinstance(written, dict):
         raise _Unrecordable(f"the store ({type(source).__name__}) is written as no record of its class")
@@ -472,10 +472,12 @@ def _read_source(written: Mapping[str, object]) -> Source | Mixture | Phases:
         return Mixture(tuple(_read_chain(record(child, "corpus")) for child in corpora),
                        numbers(written.get("weights"), "weights"), counted)
     if "phases" in written:
-        until = _entries(written.get("until_steps"), "until_steps")
+        clock = "until_tokens" if "until_tokens" in written else "until_steps"
+        until = _entries(written.get(clock), clock)
         phases = _entries(written["phases"], "phases")
         return Phases(tuple(_read_chain(record(child, "phase")) for child in phases),
-                      tuple(None if step is None else integer(step, "until_steps") for step in until))
+                      tuple(None if end is None else integer(end, clock) for end in until),
+                      "tokens" if clock == "until_tokens" else "steps")
     return from_record(Source, written)
 
 
