@@ -424,7 +424,9 @@ def _orthogonalized(update: jax.Array, steps: int,
     numbers = optax.contrib.MuonDimensionNumbers() if dimension_numbers is None else dimension_numbers
     muon = optax.contrib.scale_by_muon(NEWTON_SCHULZ, steps, beta=0.0, nesterov=False,
                                        weight_dimension_numbers=numbers)
-    return muon.update(update, muon.init(update))[0]
+    orthogonal, _ = muon.update(update, muon.init(update))
+    assert isinstance(orthogonal, jax.Array), "one array's update is an array"
+    return orthogonal
 
 
 class M3State(NamedTuple):
