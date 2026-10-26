@@ -539,13 +539,14 @@ def test_corpora_from_different_tokenizers_are_not_mixed(tmp_path):
 # Mixture phases
 # --------------------------------------------------------------------------
 
-def phased_packed(*entries: tuple[object, int | None]) -> Loader:
-    """Phases each of one token store's packed rows, or a mix of several's (`{url: weight}`), until
-    its step, each in a run's order, in batches of four."""
-    def phase(stores: str | dict[str, float]) -> Pipeline:
-        return ordered(packed(stores)) if isinstance(stores, str) else mixed_packed(stores)
+def packed_stage(stores: str | dict[str, float]) -> Pipeline:
+    """One token store's packed rows in a run's order, or a mix of several's (`{url: weight}`)."""
+    return ordered(packed(stores)) if isinstance(stores, str) else mixed_packed(stores)
 
-    return trained(phases(*((phase(stores), until) for stores, until in entries)))
+
+def phased_packed(*entries: tuple[str | dict[str, float], int | None]) -> Loader:
+    """Phases each of `packed_stage`'s rows until its step, in batches of four."""
+    return trained(phases(*((packed_stage(stores), until) for stores, until in entries)))
 
 
 def test_phases_switch_the_mixture_at_a_step(tmp_path):
@@ -630,10 +631,7 @@ def test_phases_are_a_list_of_ends_and_refuse_a_ramp(tmp_path):
 
 def scheduled_packed(*entries: tuple[str | dict[str, float], float | None]) -> Loader:
     """`phased_packed`'s stages as a schedule, each for its committed tokens (`schedule`)."""
-    def stage(stores: str | dict[str, float]) -> Pipeline:
-        return ordered(packed(stores)) if isinstance(stores, str) else mixed_packed(stores)
-
-    return trained(schedule([(stage(stores), tokens) for stores, tokens in entries]))
+    return trained(schedule([(packed_stage(stores), tokens) for stores, tokens in entries]))
 
 
 def test_a_schedule_reads_a_stage_until_the_run_ends_it_then_reads_as_its_phases_do(tmp_path):
@@ -1134,6 +1132,24 @@ def test_a_schedule_ends_its_stage_at_the_step_whose_commit_reaches_its_tokens(t
     ran_on = token_trainer(tmp_path / "ran-on", accumulation=accumulation).fit(phased, steps=last)
     assert_same(parameters(state), parameters(ran_on),
                 "a schedule whose data ends against phases running on to its last step")
+
+
+def test_a_configured_run_on_a_schedule_ends_where_its_data_does(tmp_path):
+    """A run configured with no length, on a schedule whose last stage ends its data at its tokens, is
+    bounded by them as a fit of the schedule is (`budget_tokens`): `RunConfig.train` trains to the step
+    whose commit reaches them, where `Trainer.fit` on the same schedule ends."""
+    from dew.config import RunConfig, TrainerConfig
+    from dew.optim import OptimConfig
+
+    first = Pipeline(Memory(Indexed(1, 64))).shuffle(0).repeat()
+    second = Pipeline(Memory(Indexed(2, 64))).shuffle(1).repeat()
+    data = schedule([(first, 50), (second, 30)]).batch(8)
+    fitted = token_trainer(tmp_path / "fitted").fit(data)
+    config = RunConfig(optim=OptimConfig(optimizer="sgd", learning_rate=0.5), trainer=TrainerConfig(
+        checkpoint_dir=str(tmp_path / "configured"), steps=None, epochs=None, tokens=None, log_every=1,
+        eval_every=None, checkpoint_every=None))
+    configured = config.train(TokenCounted(), data, name="scheduled")
+    assert 1 < int(configured.step) == int(fitted.step)
 
 
 # Every stage's batch is a multiple of the eight simulated devices, because a
