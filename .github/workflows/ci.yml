@@ -142,9 +142,13 @@ jobs:
   # run reruns what its change reaches, and the whole suite where it cannot place it: from main, for a fix on a
   # train (ci/fix-*) from the train's tip it fixes, its first parent, for a base/<producer> promote
   # (ci/base-<sha>-*) from the producer branch's tip it merges onto, <sha>, and for a push to base/kernels from
-  # the tip it moved from (main where it is new).
+  # the last push whose run went green (the tip it moved from before any did; main where it is new).
   scope:
     runs-on: ubuntu-latest
+    # Reads the last green run on base/kernels, which its pushes are scoped from.
+    permissions:
+      actions: read
+      contents: read
     outputs:
       policy: ${{ steps.policy.outputs.policy }}
     steps:
@@ -155,12 +159,18 @@ jobs:
       env:
         DEW_TEST_CACHE: ${{ (github.event_name == 'schedule' || startsWith(github.ref_name, 'ci/full-')) && 'off' || '' }}
         BEFORE: ${{ github.event.before }}
+        GH_TOKEN: ${{ github.token }}
       run: |
         if [ -z "$DEW_TEST_CACHE" ]; then
           case "$GITHUB_REF_NAME" in
             ci/fix-*) from=HEAD^1 ;;
             ci/base-*) from=${GITHUB_REF_NAME#ci/base-}; from=${from%%-*} ;;
-            base/kernels) from=$BEFORE; git cat-file -e "$from^{commit}" 2>/dev/null || from=origin/main ;;
+            # From the last push whose run went green: a newer push cancels a pending run (the group's), and only
+            # the newest tip of a branch fixed forward needs a run, which covers what the cancelled ones changed.
+            base/kernels)
+              green="repos/$GITHUB_REPOSITORY/actions/workflows/ci.yml/runs?branch=base/kernels&status=success"
+              from=$(gh api "$green&per_page=1" -q '.workflow_runs[0].head_sha // empty')
+              git cat-file -e "${from:-$BEFORE}^{commit}" 2>/dev/null && from=${from:-$BEFORE} || from=origin/main ;;
             *) from=origin/main ;;
           esac
           DEW_TEST_CACHE=$(python3 tools/armada/ci.py policy "$from")
