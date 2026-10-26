@@ -115,7 +115,7 @@ def test_forward_diffusion_invertible(cls, make, steps, family, sample_shape):
     def written(x0, noise, alpha, sigma):
         return (alpha * x0 + sigma * noise - noise * sigma) / alpha
 
-    assert_as_exact(jax.jit(round_trip), written, draw, "invertible", seeds=SEEDS['invertible'],
+    assert_as_exact(jax.jit(round_trip), as_given(written), draw, "invertible", seeds=SEEDS['invertible'],
                     truth_fn=lambda x0, noise, alpha, sigma: x0)
 
 
@@ -414,7 +414,8 @@ def test_edm_preset_samples_on_the_karras_grid():
     def karras(t):
         return (40 ** 0.2 + (1 - t) * (0.01 ** 0.2 - 40 ** 0.2)) ** 5
 
-    assert_as_exact(process.sampler_schedule.sigmas, karras, times, "karras grid", seeds=SEEDS['karras grid'])
+    assert_as_exact(process.sampler_schedule.sigmas, as_given(karras), times, "karras grid",
+                    seeds=SEEDS['karras grid'])
 
     def weighted(t):
         return {"weight": process.weight(t),
@@ -487,7 +488,8 @@ def test_presets_rebuild_from_their_fields(rng):
         sigma = 3 * t / (1 + 2 * t)
         return {"alpha": 1 - sigma, "sigma": sigma}
 
-    assert_as_exact(lambda t: dict(zip(("alpha", "sigma"), process.schedule.rates(t), strict=True)), shifted,
+    assert_as_exact(lambda t: dict(zip(("alpha", "sigma"), process.schedule.rates(t), strict=True)),
+                    as_given(shifted),
                     lambda seed: (drawn(seed, 7).uniform(0, 1, ROWS).astype(np.float32),), "flow rates",
                     seeds=SEEDS['flow rates'])
     draws = process.schedule.sample_t(rng, 1 << 18)
