@@ -55,6 +55,7 @@ from dew.nn.precision import (
 from dew.nn.rope import YarnScaling, deinterleaved, rotary_freqs, rotate, yarn_query_scale
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import index_scores, selection_mask, sparse_latent_attention, top_k_selection
+from dew.quantization import quantizes
 
 
 def open_latent_cache(module: nn.Module, key, value_dim: int, index_keys, max_seq_len: int, *, valid=None):
@@ -717,13 +718,14 @@ class MultiHeadLatentAttention(nn.Module):
                 and not self.nonlinear_input("kv_b_proj"))
 
     def nonlinear_input(self, name: str) -> bool:
-        """Whether this call computes the submodule `name` other than as a
-        linear map of its input. The layer's own Dense is linear; a method
-        interceptor that changes that answers for itself: `dew.lora`'s dropout
+        """Whether this call computes the submodule `name`, or a module under
+        it, other than as the linear map of its input by its stored kernel. The
+        layer's own Dense is that map unless the Qwix quantization the call runs
+        under quantizes its products (`dew.quantization.quantizes`); a method
+        interceptor that changes it answers for itself: `dew.lora`'s dropout
         draws on its targets' inputs, and a checkpoint's input quantization
         (`dew.quantization`) rounds them."""
-        del name
-        return False
+        return quantizes(self, name)
 
     def _scaled_query(self, q_pass, q_rot):
         """The whole query with YaRN's mscale on it, as every kernel reads it."""
