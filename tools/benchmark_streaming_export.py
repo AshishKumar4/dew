@@ -19,9 +19,9 @@ import threading
 import time
 from pathlib import Path
 
+from dew.distributed.placement import MeshSpec
 from dew.interop import Pretrained
 from dew.telemetry.benchmark import resident_memory
-from dew.training.distributed import MeshSpec
 
 
 def _resident_gb() -> tuple[float, float]:

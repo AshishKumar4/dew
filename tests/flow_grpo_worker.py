@@ -45,11 +45,11 @@ def main() -> None:
     from dew.artifacts import ImageGrid
     from dew.data.dataset import Loader
     from dew.diffusion import FlowMatchingScheduler, FlowMatchPredictionTransform, Process
+    from dew.distributed.batches import shard_batch, split_fields, with_host
     from dew.inputs import CharTable, Condition, Field, InputSpec
     from dew.nn.backbones.dit import SimpleDiT
     from dew.objectives.rl import FlowGRPOObjective, FlowRollout
     from dew.training import MeshSpec, Trainer
-    from dew.training.distributed import shard_batch, split_fields, with_host
 
     inputs = InputSpec(Field("image", (4, 4, 1)), {
         "textcontext": Condition(CharTable.from_pretrained(tokens=3, features=4))})

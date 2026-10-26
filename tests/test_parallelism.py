@@ -22,9 +22,9 @@ from token_support import write_token_corpus
 from dew.artifacts import Representations
 from dew.data import Loading
 from dew.data.dataset import DataPartition, Loader, replayed
+from dew.distributed.batches import DevicePrefetchIterator, shard_batch
 from dew.objectives.base import Aux, Objective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
-from dew.training.distributed import DevicePrefetchIterator, shard_batch
 from dew.training.evaluation import WARM_BATCHES
 
 # Needs the eight simulated CPU devices conftest configures; the GPU lane skips it.

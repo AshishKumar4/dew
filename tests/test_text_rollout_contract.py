@@ -89,17 +89,10 @@ def forward(model):
     return jax.jit(model.apply)
 
 
-def row_logits(model, params, prompt, lengths, tokens, positions=None):
-    """Each row's logits for its drawn `tokens`, from one full forward over every row's unpadded prompt and
-    the tokens drawn before each, right-padded to the longest as a learner scores a batch of rollouts, at
-    `positions` where given (a row each, the prompt's and the tokens', continued past the row's end): a
-    causal model reads no padding at a real position, and the batch's products take a learner's shapes.
-    In the model's dtype: an array a row, a step each."""
-    width, lengths = prompt.shape[1], np.asarray(lengths)
-    contexts = [np.concatenate([prompt[row, width - length:], tokens[row, :-1]])
-                for row, length in enumerate(lengths)]
-    longest = max(len(context) for context in contexts)
-    rows = np.zeros((len(contexts), longest), np.int32)
+def _right_padded(model, params, contexts, width: int, positions=None):
+    """One full forward over `contexts`, a row each, right-padded to `width`, at `positions` where given
+    (a row each, continued past the row's end): a causal model reads no padding at a real position."""
+    rows = np.zeros((len(contexts), width), np.int32)
     for row, context in enumerate(contexts):
         rows[row, :len(context)] = context
     extra = {}
@@ -107,10 +100,29 @@ def row_logits(model, params, prompt, lengths, tokens, positions=None):
         placed = np.asarray(positions)
         extra["positions"] = jnp.asarray(np.stack([
             np.concatenate([placed[row, :len(context)],
-                            placed[row, len(context) - 1] + np.arange(1, longest - len(context) + 1)])
+                            placed[row, len(context) - 1] + np.arange(1, width - len(context) + 1)])
             for row, context in enumerate(contexts)]))
-    logits = forward(model)(params, jnp.asarray(rows), **extra)
-    return [logits[row, length - 1:length - 1 + tokens.shape[1]] for row, length in enumerate(lengths)]
+    return forward(model)(params, jnp.asarray(rows), **extra)
+
+
+def row_logits(model, params, prompt, lengths, tokens, positions=None):
+    """Each row's logits for its drawn `tokens`, from full forwards over every row's unpadded tokens,
+    right-padded as a learner scores a batch of rollouts, at `positions` where given (a row each, the
+    prompt's and the tokens', continued past the row's end). The first token's are a forward over the
+    prompts alone at the prompt batch's width, the shapes the cached prefill computes them at, so a GPU
+    picks each product's kernel as it does there; the later tokens' are one forward over each prompt and
+    the tokens drawn before it, at its longest row. A cached decode step projects one token a row, ROWS
+    of them, where that forward projects every token of a row, ROWS x (prompt + step), so the later
+    steps' ratio holds what a GPU's kernel for each shape rounds apart too: on an A100, kpool's at 1.35 and
+    1.26 (row 1543, a float32 dot's error by the rows cuBLAS's kernel takes, 1.5e-7 to 4.1e-7 at K=512).
+    In the model's dtype: an array a row, a step each."""
+    width, lengths = prompt.shape[1], np.asarray(lengths)
+    prompts = [prompt[row, width - length:] for row, length in enumerate(lengths)]
+    contexts = [np.concatenate([alone, tokens[row, :-1]]) for row, alone in enumerate(prompts)]
+    first = _right_padded(model, params, prompts, width, positions)
+    later = _right_padded(model, params, contexts, max(len(context) for context in contexts), positions)
+    return [jnp.concatenate([first[row, length - 1:length], later[row, length:length - 1 + tokens.shape[1]]])
+            for row, length in enumerate(lengths)]
 
 
 def policy_scores(model, params, prompt, lengths, tokens, sampling, positions=None) -> dict:

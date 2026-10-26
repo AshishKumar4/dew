@@ -384,7 +384,7 @@ def test_two_processes_train_the_step_one_process_trains(tmp_path):
     pool = run_pool("steps", tmp_path / "pool", 2, fsdp_size=2, steps=steps,
                     name="pool", run_dir=tmp_path / "pool-run")
 
-    from dew.training.distributed import shard_batch
+    from dew.distributed.batches import shard_batch
 
     trainer = worker.build_trainer("single", tmp_path / "single-run", fsdp=2)
     state, _, _ = trainer.place()
