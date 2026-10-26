@@ -170,7 +170,10 @@ def _summed_products(left: jax.Array, left_shift: jax.Array, right: jax.Array,
     does), the row's products shifted together as `_shift` asks for its largest and their sum,
     summed plainly: every term a plain float32 sum keeps, it keeps
     (`[2**120, -2**120, 2**-100]` sums to `2**-100`), and a row no product of which overflows is the
-    plain sum."""
+    plain sum. A product below float32's least beside products that reach its largest and cancel
+    (`[2**126, -2**126, 2**-146]`) is lost as the plain sum loses it, which flushes it: keeping it
+    would take a second sum at its own scale, which the gate's rule, no accuracy below plain
+    float32's, does not ask."""
     (left_part, left_power), (right_part, right_power) = _split(left), _split(right)
     products = left_part * right_part
     powers = jnp.where(products != 0, left_power + right_power + left_shift + right_shift, FLOOR)
