@@ -24,6 +24,7 @@ on CPU:
 import json
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -313,8 +314,6 @@ def test_a_load_builds_and_reads_only_the_prediction_depths_it_keeps(tmp_path, f
         load(misshapen)
     loaded = load(misshapen, prediction_depths=0)
     assert decoder(loaded).num_nextn_predict_layers == 0
-    import jax
-
     leaves = jax.tree_util.tree_flatten_with_path(loaded.variables)[0]
     paths = [jax.tree_util.keystr(path) for path, _ in leaves]
     assert not any("mtp_" in path for path in paths)
@@ -328,23 +327,30 @@ def test_a_load_builds_and_reads_only_the_prediction_depths_it_keeps(tmp_path, f
                                   np.asarray(loaded.model.apply(loaded.variables, ids)))
 
 
-@pytest.mark.parametrize(("fixture", "kept", "stages"), [("deepseek-v4-dspark-tiny", 0, 3),
-                                                         ("deepseek-v41-tiny", 1, 3)])
-def test_a_drafters_stages_are_the_prediction_depths_a_load_keeps(tmp_path, fixture, kept, stages):
-    """A DSpark drafter's stages are the depths `prediction_depths` counts: a load keeps the first that
-    many, none at 0, and saves as a checkpoint of those, reloading to them."""
+@pytest.mark.parametrize("fixture", ["deepseek-v4-dspark-tiny", "deepseek-v41-tiny"])
+def test_a_drafter_is_kept_whole_or_not_at_all(tmp_path, fixture):
+    """A DSpark drafter's stages draft as one, its heads on its last: a count of all its stages keeps
+    it whole, `prediction_depths=0` builds none of it and saves a checkpoint of the trunk alone, which
+    reloads to the trunk, and a count between is refused."""
     from dew.interop import Pretrained
+
+    def load(directory, **options):
+        return Pretrained.load(directory, dtype="float32", attention_impl="reference", **options)
 
     def drafted(loaded) -> int:
         dspark = loaded.model.dspark
         return 0 if dspark is None else dspark.stages
 
     source = FIXTURES / fixture
-    assert drafted(Pretrained.load(source, dtype="float32", attention_impl="reference")) == stages
-    loaded = Pretrained.load(source, dtype="float32", attention_impl="reference", prediction_depths=kept)
-    assert drafted(loaded) == kept
+    assert drafted(load(source)) == drafted(load(source, prediction_depths=3)) == 3
+    with pytest.raises(ValueError):
+        load(source, prediction_depths=1)
+    loaded = load(source, prediction_depths=0)
+    assert drafted(loaded) == 0
+    leaves = jax.tree_util.tree_flatten_with_path(loaded.variables)[0]
+    assert not any("dspark_" in jax.tree_util.keystr(path) for path, _ in leaves)
     loaded.save(tmp_path / "saved")
-    assert drafted(Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="reference")) == kept
+    assert drafted(load(tmp_path / "saved")) == 0
 
 
 @pytest.mark.parametrize("depths", [-1, True])
