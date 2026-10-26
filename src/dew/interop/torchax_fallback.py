@@ -387,10 +387,21 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
         keys, values = (write_cache(held[name], incoming, call.cache.slots)
                         for name, incoming in (("cached_key", k), ("cached_value", v)))
         call.cache.written[module.layer_idx] = {"cached_key": keys, "cached_value": values}
-        mask = causal_attention_mask(call.cache.slots, keys.shape[1], window, key_valid=call.cache.filled)
-        out = scaled_dot_product_attention(q, keys.astype(q.dtype), values.astype(q.dtype),
-                                           implementation=call.implementation, mask=mask, softcap=softcap,
-                                           sinks=sinks, **dropping)
+        keys, values = keys.astype(q.dtype), values.astype(q.dtype)
+        if q.shape[1] == 1 and not drawn:
+            # One token a row reads its row's filled slots before its own, from its window's first: a
+            # key count and start a row, which the decode kernels take as Dew's decoders give them
+            # (`CausalSelfAttention._decode_attention`); a padding token reads one key, its output unused.
+            slot = call.cache.slots[:, 0]
+            reads = jnp.maximum(slot + 1, 1).astype(jnp.int32)
+            starts = None if window is None else jnp.maximum(slot + 1 - window, 0).astype(jnp.int32)
+            out = scaled_dot_product_attention(q, keys, values, implementation=call.implementation,
+                                               causal=False, softcap=softcap, sinks=sinks,
+                                               key_value_seq_lengths=reads, key_value_seq_starts=starts)
+        else:
+            mask = causal_attention_mask(call.cache.slots, keys.shape[1], window, key_valid=call.cache.filled)
+            out = scaled_dot_product_attention(q, keys, values, implementation=call.implementation, mask=mask,
+                                               softcap=softcap, sinks=sinks, **dropping)
     elif call.visible is not None:
         # The call's own visibility is the whole of it; a window counts the stated keys' positions.
         visible = jnp.asarray(call.visible, bool)
@@ -881,15 +892,20 @@ class TorchCausalLM(nn.Module):
 
     @nn.compact
     def __call__(self, tokens, train: bool = False, decode: bool = False, attention_mask=None,
-                 positions=None) -> jax.Array:
-        """The logits of `tokens`, in at least float32: of whole rows, or with `decode` of a decoding
-        call into the cache `init_cache` opened, `attention_mask` `[B, S]` the tokens that write and
-        `positions` `[B, S]` their places in their rows (their slots where None)."""
-        if decode:
-            return self._decoded(tokens, attention_mask, positions)
-        packing = {name: value for name, value in ((VALIDITY_FIELD, attention_mask), ("positions", positions))
-                   if value is not None}
-        return self.logits(tokens, train=train, **packing)
+                 positions=None, **packing) -> jax.Array:
+        """The logits of `tokens`, in at least float32: of whole rows laid as `logits` lays them, or
+        with `decode` of a decoding call into the cache `init_cache` opened, `attention_mask` `[B, S]`
+        the tokens that write and `positions` `[B, S]` their places in their rows (their slots where
+        None), or the rows' `coordinates` stating both; a decoding row holds one document."""
+        fields = {name: value for name, value in ((VALIDITY_FIELD, attention_mask), ("positions", positions))
+                  if value is not None}
+        if not decode:
+            return self.logits(tokens, train=train, **fields, **packing)
+        laid = self._laid(tokens, {**fields, **packing})
+        if laid is not None and laid.max_segments > 1:
+            raise ValueError("a decoding row continues one document, and these rows hold several")
+        return self._decoded(tokens, None if laid is None else laid.valid,
+                             None if laid is None else laid.positions)
 
     def init_cache(self, batch_size: int) -> None:
         """Open the decode cache of `batch_size` rows (`Decoding`), every slot unfilled: one decoding
@@ -1149,8 +1165,11 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     torch.nn.Module.to(model, "meta")
     graph = TorchGraph(jittable, persistent, attention_impl=attention_impl if attends else None,
                        shapes={"params": _shapes(params), "buffers": _shapes(buffers)})
-    # The decode cache's slots: the load's, else the source's own context.
-    capacity = max_seq_len if max_seq_len is not None else context_lengths(config)[0]
+    # The decode cache's slots: the load's, else the source's own context as its config class reads it
+    # (an alias, CTRL's `n_positions`, included).
+    context = getattr(model.config, "max_position_embeddings", None)
+    capacity = (max_seq_len if max_seq_len is not None
+                else context_lengths({"max_position_embeddings": context})[0])
     built = {"dtype": resolve_dtype(dtype), "max_seq_len": capacity}
     module = (TorchCausalLM(graph, vocab, **built) if head_name is None
               else TorchTableLM(graph, vocab, head=head_name, **built))
