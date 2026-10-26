@@ -421,7 +421,7 @@ UNSEEN = {
 }
 """GPUs no row measured, one of each family (`test_grouped_gemm.UNSEEN`'s): a Hopper-class part with fewer
 multiprocessors, a smaller block and another L2 bandwidth than an H100's, and an Ampere-class one with an
-sm86's block, whose family this mainloop has no bundle for (`attention_mosaic_program.BUNDLES`)."""
+sm86's block, whose family this mainloop is not qualified on (`attention_mosaic_program.QUALIFIED`)."""
 
 
 def _bound(op, *arrays, **options):

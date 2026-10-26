@@ -441,7 +441,7 @@ OLD_ROUTES: dict[tuple[str, str], tuple[str, str]] = {
 }
 """Attention's declared cells (bible §4, owner 10-25), by (instruction family, product) as the GEMMs' and the
 recurrence's: for each family whose Mosaic template has a routed mainloop
-(`attention_mosaic_program.BUNDLES`), the old route that keeps the calls it takes there, its receipts showing
+(`attention_mosaic_program.bundle`), the old route that keeps the calls it takes there, its receipts showing
 it measured faster than the template, with the receipt. Attention has one product: a call's kernel is chosen
 before it is differentiated (`attention_route.attend`'s `custom_vjp`), so its forward and its training run one
 kernel, and the receipts cover both. Every other call of such a family takes the template; a family without a
@@ -467,9 +467,9 @@ def _attention_preferred(case: AttentionCase) -> str:
     if case.dtype not in CUDNN_DTYPES:
         # No fused GPU kernel takes another dtype, so no measurement prefers one.
         return 'xla'
-    family = generation.family(device_generation())
-    if family in attention_mosaic_program.BUNDLES:
-        old = OLD_ROUTES.get((family, 'attention'))
+    family = attention_mosaic_program.bundle(device_generation(), case.dtype)
+    if family is not None:
+        old = OLD_ROUTES.get((family.name, 'attention'))
         return old[0] if old is not None and not ATTENTION.kernel(old[0]).failed(case) else 'template'
     if _narrow(case):
         return measured_kernel('attention_narrow', 'triton')

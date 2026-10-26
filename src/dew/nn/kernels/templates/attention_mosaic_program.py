@@ -1,5 +1,5 @@
 """What the attention template's Mosaic GPU launches share (`attention_mosaic`, design §6): the bundles it
-runs on (`BUNDLES`), its configs (`Tiles`, `BackwardTiles`), its legality rule (`refused`), and what a
+runs on (`bundle`), its configs (`Tiles`, `BackwardTiles`), its legality rule (`refused`), and what a
 forward's and a backward's programs read alike: the call's padding to a launch's blocks, its spans' block map
 and each tile's coordinates (`_Program`, `_Spans`, `_coords`), its hooks' parameters and state (`_Hooked`,
 `_param`)."""
@@ -15,7 +15,8 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels.templates import attention_algebra as algebra, mosaic, mosaic_sm90
+from dew.nn.kernels import generation
+from dew.nn.kernels.templates import attention_algebra as algebra, bundles, mosaic, mosaic_sm90
 from dew.nn.kernels.templates.attention import (
     Hooks,
     KeySpans,
@@ -29,7 +30,27 @@ from dew.nn.kernels.templates.attention import (
     whole,
 )
 
-BUNDLES: dict[str, mosaic.Family] = {mosaic_sm90.WGMMA.name: mosaic_sm90.WGMMA}
+QUALIFIED = frozenset({mosaic_sm90.WGMMA.name})
+"""The instruction families the attention mainloop is qualified on: wgmma's. mma.sync's bundle
+(`bundles.of`) does not yet pass Mosaic GPU's layout inference in the attention programs (its MMA layouts'
+stores and transposed views), so its calls take the frozen Triton mainloop by legality."""
+
+
+def bundle(generation_name: str | None, dtype) -> mosaic.Family | None:
+    """The bundle the attention mainloop runs on a device of `generation_name` for operands of `dtype`: the
+    shared registry's (`bundles.of`) where attention is qualified on its family (`QUALIFIED`); None elsewhere,
+    whose calls another mainloop takes by legality."""
+    family = None if generation_name is None else bundles.of(generation_name, dtype)
+    return family if family is not None and family.name in QUALIFIED else None
+
+
+def bundle_of(tiles: "Tiles | BackwardTiles", dtype) -> mosaic.Family:
+    """The bundle `tiles` run on: the current device's (`generation.gpu_target`), whose family their legality
+    matched (`MosaicForward.legal`)."""
+    family = bundle(generation.gpu_target().generation, dtype)
+    if family is None or family.name != tiles.family:
+        raise ValueError(f"{tiles}: this device's attention bundle is {family.name if family else None}")
+    return family
 """The instruction families this mainloop runs on (`generation.family`), each by its bundle: wgmma's. A
 family without one (mma.sync's, until its thin mainloop) takes another mainloop (`MosaicForward.eligible`,
 `MosaicBackward.eligible`)."""
@@ -40,7 +61,7 @@ class Tiles:
     """A forward launch's config: each consumer's query block (`block_q`), the key tile (`block_k`), the key
     and value tiles in flight (`stages`), the consumers a program (`consumers`: on wgmma FlashAttention-3's
     two warpgroups take turns on the tensor cores, one's softmax under the other's products) and the
-    instruction family whose bundle runs it (`family`, `BUNDLES`)."""
+    instruction family whose bundle runs it (`family`, `bundle`)."""
 
     block_q: int
     block_k: int

@@ -3,7 +3,7 @@
 each launch's one config derived from the instruction family's and the device's facts and the call's extents
 (`derived`), legal where its programs stage within the device's block and a consumer's registers hold its live
 set (`legal`): no table, no sweep, no space ranked. A GPU nobody measured of a family with a bundle here
-(`BUNDLES`) takes its own facts' config. The launches are `attention_mosaic_forward`'s and
+(`bundle`) takes its own facts' config. The launches are `attention_mosaic_forward`'s and
 `attention_mosaic_backward`'s; what they share, `attention_mosaic_program`'s."""
 
 import dataclasses
@@ -46,7 +46,6 @@ from dew.nn.kernels.templates.attention_mosaic_forward import (
     _trained_forward,
 )
 from dew.nn.kernels.templates.attention_mosaic_program import (
-    BUNDLES,
     DROPPING,
     BackwardTiles,
     Tiles,
@@ -54,6 +53,8 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _padded,
     _parts,
     _width,
+    bundle,
+    bundle_of,
     refused,
     whole_tiles,
 )
@@ -119,7 +120,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     the call's own arrays as arguments, padded by a launch to its config's blocks; the score hook (and the
     forward's output hook) as fields keyed by what they compute (`hook_program`); the configs of the
     target's family (`fits`), a consumer's registers its roles' share (`register_budget`), where its bundle
-    is one of `BUNDLES` and the call is one it takes (`refused`)."""
+    has a bundle here (`bundle`) and the call is one it takes (`refused`)."""
 
     name = "mosaic_gpu"
     GENERATES = True
@@ -138,7 +139,8 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
     def register_budget(self, config: Config) -> int:
         """A consumer thread's share of the registers (`Family.registers`): the family's roles share the
         file (`mosaic.roles`)."""
-        return BUNDLES[config.family].registers(config.consumers)
+        # A consumer's budget is its family's, whatever the operands' dtype (`mosaic.Family.registers`).
+        return bundle_of(config, jnp.bfloat16).registers(config.consumers)
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         return self.declined(ba, target) is None
@@ -149,7 +151,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         process (`grouped_matmul._Mosaic.eligible`: the interpreter's callbacks are ordered effects, which a
         GPU process's lowering cannot carry), or no config fits the device (`derived`)."""
         name = generation.family(target.generation)
-        family = BUNDLES.get(name or "")
+        family = bundle(target.generation, ba.arguments["query"].dtype)
         if family is None:
             return f"the Mosaic mainloop has no bundle for {name or target.generation} yet"
         if (reason := self.refusal(ba, family)) is not None:
@@ -161,17 +163,17 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         return None
 
     def legal(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> bool:
-        """Whether a launch of `ba` runs at `config` on `target`: the target's family's bundle (`BUNDLES`),
+        """Whether a launch of `ba` runs at `config` on `target`: the target's family's bundle (`bundle`),
         tiles its program takes (`whole_tiles`), a call the launch takes (`refusal`), and the block and
         registers `Template.legal` holds it to. A pinned or stored config is held to it as a derived one."""
-        family = BUNDLES.get(config.family)
+        family = bundle(target.generation, ba.arguments["query"].dtype)
         return (family is not None and config.family == generation.family(target.generation)
                 and whole_tiles(family, config) and self.refusal(ba, family) is None
                 and super().legal(ba, config, target))
 
     def _family(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> mosaic.Family | None:
         """The target's family's bundle where the launch takes the call there, else None."""
-        family = BUNDLES.get(generation.family(target.generation) or "")
+        family = bundle(target.generation, ba.arguments["query"].dtype)
         return None if family is None or self.refusal(ba, family) is not None else family
 
     WALKED: ClassVar[str] = "block_k"
@@ -181,7 +183,8 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
         """The configs next to the derived `config` an opt-in tuning run times beside it (`variants`): the
         walked tile one unit size either side (`_extents`), a stage fewer and more, a consumer fewer and
         more, each alone; `variants` keeps the legal ones."""
-        family, query = BUNDLES[config.family], ba.arguments["query"]
+        query = ba.arguments["query"]
+        family = bundle_of(config, query.dtype)
         walked = getattr(config, self.WALKED)
         extents = _extents(family, query.dtype, max(walked * 2, query.shape[1], ba.arguments["key"].shape[1]))
         sizes = [size for size in extents if size in (walked // 2, walked * 2)]
@@ -194,7 +197,7 @@ class _Mainloop[Config: (Tiles, BackwardTiles)](AttentionLaunch, Template[Config
 
     def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> Config:
         target = generation.gpu_target()
-        family = BUNDLES.get(generation.family(target.generation) or "")
+        family = bundle(target.generation, ba.arguments["query"].dtype)
         if family is not None and (reason := self.refusal(ba, family)):
             raise NotImplementedError(reason)
         config = self.derived(ba, target)
@@ -253,7 +256,7 @@ class MosaicForward(_Mainloop[Tiles]):
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> int:
         """The program's shared memory (`_forward_allocations`, `_staged`), at the call's widths as the launch
         stages them (`_width`)."""
-        family = BUNDLES[config.family]
+        family = bundle_of(config, ba.arguments["query"].dtype)
         query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
         width, value_width = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
         steps = _padded(query.shape[1], key.shape[1], config)[1] // config.block_k
@@ -261,7 +264,7 @@ class MosaicForward(_Mainloop[Tiles]):
                                             bool(ba.arguments.get("residuals")), min(config.stages, steps)))
 
     def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
-        family = BUNDLES[config.family]
+        family = bundle_of(config, ba.arguments["query"].dtype)
         query, value = ba.arguments["query"], ba.arguments["value"]
         return _forward_registers(family, config, _width(value.shape[-1], family, query.dtype), query.dtype,
                                   bool(ba.arguments.get("residuals")))
@@ -397,7 +400,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
 
     def _fwd(self, query, key, value, dout, start, end, query_ids, key_ids, score_params, initial, residuals,
              *, interpret: bool, config: BackwardTiles, return_residuals: bool = False):
-        family = BUNDLES[config.family]
+        family = bundle_of(config, query.dtype)
         spans = self.spans(start, end, query_ids, key_ids)
         hooks = Hooks(self.score_mod, tuple(map(Param, score_params, self.score_kinds)), initial)
         if reason := refused(query.dtype, query.shape[3], value.shape[3], hooks, backward=True,
@@ -441,7 +444,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
                      target: generation.GpuTarget) -> int:
         """The larger of its launches' programs' shared memory (`_dq_allocations`, `_dkv_allocations`,
         `_staged`); a fused backward's dK/dV program's alone."""
-        family = BUNDLES[config.family]
+        family = bundle_of(config, ba.arguments["query"].dtype)
         query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
         dtype = query.dtype
         width, value_width = (_width(array.shape[-1], family, dtype) for array in (query, value))
@@ -456,7 +459,7 @@ class MosaicBackward(_Mainloop[BackwardTiles]):
         return max(dq, dkv)
 
     def registers(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int:
-        family = BUNDLES[config.family]
+        family = bundle_of(config, ba.arguments["query"].dtype)
         query, value = ba.arguments["query"], ba.arguments["value"]
         width, value_width = (_width(array.shape[-1], family, query.dtype) for array in (query, value))
         return max(_backward_registers(family, config, width, value_width, query.dtype,

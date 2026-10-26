@@ -35,7 +35,6 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn.kernels.templates import attention_algebra as algebra, attention_portable, mosaic
 from dew.nn.kernels.templates.attention import Hooks, KeySpans, Split, padded_call
 from dew.nn.kernels.templates.attention_mosaic_program import (
-    BUNDLES,
     Tiles,
     _block,
     _columns,
@@ -50,6 +49,7 @@ from dew.nn.kernels.templates.attention_mosaic_program import (
     _streamed,
     _views_of,
     approximate,
+    bundle_of,
     refused,
 )
 
@@ -103,7 +103,7 @@ def _plain_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: Ke
     (`algebra.stepped`), four `[block_q, Dv]` fp32 tiles beside its logits, which a block of the columns
     holds within a consumer's registers (ledger 1617). Each block's output is exact on its own (its rows'
     shifts its own columns' room, `algebra.room`); the rare launch takes its logits once a block."""
-    family = BUNDLES[tiles.family]
+    family = bundle_of(tiles, query.dtype)
     call, spec, (q, k, v), (spans_of, hooked) = _prepared(query, key, value, spans, hooks, scale=scale,
                                                           natural=natural, tiles=tiles, family=family)
 
@@ -150,7 +150,7 @@ def _trained_forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: 
     (`algebra.walked_launches`): the fold's rewalk is this kernel's natural launch, and rows whose weighted
     values overflowed take the plain-JAX mainloop's guarded training walk (its normalized split sums, shift
     -1, `algebra.split_residuals`), which this kernel's single pass does not take."""
-    family = BUNDLES[tiles.family]
+    family = bundle_of(tiles, query.dtype)
     call, spec, (q, k, v), (spans_of, hooked) = _prepared(query, key, value, spans, hooks, scale=scale,
                                                           natural=natural, tiles=tiles, family=family)
     value_width = value.shape[3]
