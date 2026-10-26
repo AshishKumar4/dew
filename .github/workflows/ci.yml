@@ -245,7 +245,8 @@ jobs:
         # Each client runs in a session of its own, so the interrupt a cancelled run sends this shell
         # reaches it and it cancels its armada job; the shell waits on them, where a trap runs.
         trap 'for group in ${gangs:-} ${suite:-}; do kill -INT -- "-$group" 2>/dev/null || true; done' INT TERM
-        # A base/<producer> promote, a push to base/kernels and the background whole suite run no gangs: main's trains run them.
+        # A base/<producer> promote, a push to base/kernels and the background whole suite run no gangs: main's
+        # trains run them.
         case "$GITHUB_REF_NAME" in ci/base-*|base/kernels|ci/full-whole-*) gangless=1 ;; *) gangless= ;; esac
         if [ -z "$PROVEN" ] && [ -z "$gangless" ]; then
           # A gang member lost before the start fails it within 300 s (armada#22).
