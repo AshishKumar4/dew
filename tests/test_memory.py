@@ -667,6 +667,57 @@ def test_a_frozen_fp8_inner_kernel_is_w0_as_its_codes_decode():
     np.testing.assert_array_equal(np.asarray(frozen), np.asarray(decoded))
 
 
+def explicit_rows_run(module: InContextMemory):
+    """`module`'s forward over whole rows, the gradients of its weights and stream under a cotangent,
+    its forward over rows packing two documents (`segments`), and a prefill of six tokens continued one
+    a cached call."""
+    decode = MixerCall(decode=True)
+
+    @jax.jit
+    def run(x, params, cotangent, segments):
+        full, pull = jax.vjp(lambda held, x: module.apply(held, x), params, x)
+        laid = coordinates(segments=segments, max_segments=2)
+        call = MixerCall(metadata=AttentionMetadata(coordinates=laid))
+        _, cache = module.apply(params, x[:, :1], decode, mutable=["cache"])
+        prefill, cache = module.apply({**params, **cache}, x[:, :6], decode, mutable=["cache"])
+        reads = [prefill]
+        for t in range(6, LENGTH):
+            token, cache = module.apply({**params, **cache}, x[:, t:t + 1], decode, mutable=["cache"])
+            reads.append(token)
+        return full, pull(cotangent), module.apply(params, x, call), jnp.concatenate(reads, axis=1)
+
+    return run
+
+
+@pytest.mark.mesh(devices=2)
+@pytest.mark.parametrize("name", ["titans", "gated_linear_attention", "cms"])
+def test_a_memory_runs_its_rows_split_over_an_explicit_axis(name):
+    """Rows split over an Explicit data axis, as a run's batch is: a memory's forward, the gradients of
+    its weights and stream, its forward over packed documents and a prefill continued token by token
+    through its cache, each on the general chunk scan, the token scan or a linear memory's recurrence,
+    are what one device computes, on par against float64 (check 1)."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    module = layer(name)
+    mesh = jax.make_mesh((2,), ("data",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    run, draw = explicit_rows_run(module), drawn(module)
+    segments = np.broadcast_to(np.where(np.arange(LENGTH) < 5, 1, 2), (ROWS, LENGTH)).astype(np.int32)
+
+    def placed(seed: int):
+        x, params = draw(seed)
+        cotangent = np.random.default_rng([1651, seed]).standard_normal((*x.shape[:2], WIDTH))
+        return x, params, cotangent.astype(np.float32), segments
+
+    def split(x, params, cotangent, segments):
+        with jax.set_mesh(mesh):
+            rows, whole = NamedSharding(mesh, PartitionSpec("data")), NamedSharding(mesh, PartitionSpec())
+            return jax.device_get(run(jax.device_put(x, rows), jax.device_put(params, whole),
+                                      jax.device_put(cotangent, rows), jax.device_put(segments, rows)))
+
+    assert_as_exact(split, run, placed, f"{name} memory rows split", seeds=MEMORY_SEEDS,
+                    truth_fn=explicit_rows_run(module.clone(dtype=jnp.float64)))
+
+
 def test_a_memory_refuses_a_bidirectional_decoder():
     """A memory reads each token's prefix alone, so a decoder that asks its layers for the whole row
     (`causal=False`, a masked diffusion model's) refuses to build one; the same decoder causal builds."""
