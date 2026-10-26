@@ -36,6 +36,7 @@ from dew.training.distributed import (
     split_fields,
     with_host,
 )
+from dew.training.interval import Tokens
 
 
 @dataclass(frozen=True)
@@ -49,7 +50,7 @@ class EvalSuite:
 
     data: Reader
     metrics: Sequence[Metric] = ()
-    every: int | None = None
+    every: int | str | Tokens | None = None
 
 
 @dataclass(frozen=True)

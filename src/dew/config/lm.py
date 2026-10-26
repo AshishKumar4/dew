@@ -217,7 +217,7 @@ class LMRunConfig(DecoderRunConfig):
                                  attention_impl=str(self.model.fields.get("attention_impl", "auto")),
                                  max_seq_len=reach, revision=reference.revision,
                                  # An adapter keeps its source as it is.
-                                 **self.trainer.source_placement(frozen=self.lora is not None))
+                                 **self.source_keywords(frozen=self.lora is not None))
         if not same_vocabulary(written, loaded, reference.name):
             raise ValueError(f"the token files were written with {written}, and {self.pretrained} "
                              "expects its own tokenizer's ids. Retokenize with "

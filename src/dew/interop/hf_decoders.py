@@ -27,6 +27,7 @@ import functools
 import json
 import operator
 import os
+import re
 import tempfile
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import asdict
@@ -617,6 +618,7 @@ def read_wrapper(
     param_dtype: str = "float32",
     lazy: bool = False,
     checked: Checked = NOTHING_CHECKED,
+    depths: int | None = None,
 ) -> tuple[Variables, tuple[Reading, ...], tuple[WeightLayout, ...]]:
     """Map wrapper weights into language, tower, projector and audio trees,
     and return them with the language model's readings (`read_decoder`),
@@ -627,13 +629,15 @@ def read_wrapper(
     text family's own map, including the top-level tied head copy, and the
     tower and projector halves ride theirs. `lazy` leaves the language
     model's leaves unread; the towers and projectors are small and read
-    whole. `checked` names the spellings the load already checked equal.
+    whole. `checked` names the spellings the load already checked equal, and `depths` the
+    language model's prediction depths the load keeps (`read_decoder`).
     """
     sources, aliases = _wrapper_sources(hf_tensors, hf_tensors.__getitem__, record, checked)
     tables = {group: {local: hf_tensors[name] for local, name in held.items()}
               for group, held in sources.items()}
     language, readings = read_decoder(tables["language_model"], record["text"], param_dtype=param_dtype,
-                                      lazy=lazy, checked=_renamed(checked, sources["language_model"]))
+                                      lazy=lazy, checked=_renamed(checked, sources["language_model"]),
+                                      depths=depths)
     variables = {"language_model": language}
     placed = {}
     if record["tower"] is not None:
@@ -714,22 +718,36 @@ def _stack_experts(params: LazyTree) -> None:
         mlp['experts'] = stacked
 
 
-def held_depths(fields: dict, params: Mapping[str, object]) -> None:
+def held_depths(fields: dict, params: Mapping[str, object], kept: int | None = None) -> None:
     """Set `fields` to build the prediction depths `params`, translated
     weights, hold. A released config names its depths whether or not its
     checkpoint holds them, and transformers builds and saves the trunk alone
     (re-saves of DeepSeek-V3 and Qwen3.5), so a checkpoint holding none of
     the depths its config names is the trunk it holds; one holding some
-    loads them, and refuses a missing one."""
-    if fields.get("num_nextn_predict_layers") and not any(str(name).startswith("mtp_") for name in params):
+    loads them, and refuses a missing one. Where a load keeps only the first
+    `kept` depths (`Pretrained.load(prediction_depths=)`, which `read_decoder`
+    dropped the others of), the fields build no more than those."""
+    declared = int(fields.get("num_nextn_predict_layers") or 0)
+    held = declared if any(_depth_index(name) is not None for name in params) else 0
+    if kept is not None:
+        held = min(held, kept)
+    if declared and not held:
         # The trunk alone: no depth, nor the kinds and residual streams only depths build.
         dspark = fields.get("dspark")
-        kept = {*fields.get("layer_types", ()),
-                *([dspark["layer_type"]] if isinstance(dspark, Mapping) else [])}
+        kept_kinds = {*fields.get("layer_types", ()),
+                      *([dspark["layer_type"]] if isinstance(dspark, Mapping) else [])}
         fields.update(num_nextn_predict_layers=0, mtp_layer_type=None, mtp_feedforward_type=None,
                       mtp_hyper_connections=None)
         if isinstance(fields.get("kinds"), Mapping):
-            fields["kinds"] = {name: kind for name, kind in fields["kinds"].items() if name in kept}
+            fields["kinds"] = {name: kind for name, kind in fields["kinds"].items() if name in kept_kinds}
+    elif held < declared:
+        fields["num_nextn_predict_layers"] = held
+
+
+def _depth_index(name: str) -> int | None:
+    """The prediction depth a parameter named `mtp_<depth>` holds, else None."""
+    match = re.fullmatch(r"mtp_(\d+)", str(name))
+    return None if match is None else int(match[1])
 
 
 def translate_weights(
@@ -755,6 +773,7 @@ def read_decoder(
     param_dtype: str = "float32",
     lazy: bool = False,
     checked: Checked = NOTHING_CHECKED,
+    depths: int | None = None,
 ) -> tuple[Variables, tuple[Reading, ...]]:
     """Map HF tensors into a CausalTransformer tree, with parameters in FP32 by
     default, and return it with the readings it placed (`DecoderFamily.readings`),
@@ -777,6 +796,8 @@ def read_decoder(
     and cast only when it is placed (`dew.interop.streaming`); `prepare` and an
     interleaved split still run here. Otherwise each leaf is read whole here.
 
+    `depths` keeps the first that many prediction depths (`mtp_*`), the others' leaves dropped
+    before any is read (`held_depths`).
     `model_type` names the source's own family when the caller read it from a
     config.json. Without it, the family comes from the record, which describes
     what the backbone would be built from, so it cannot tell apart two families
@@ -811,6 +832,17 @@ def read_decoder(
             name,
         )
     _stack_experts(params)
+    if depths is not None:
+        def dropped(name: str) -> bool:
+            index = _depth_index(name)
+            return index is not None and index >= depths
+
+        for name in [name for name in params if dropped(name)]:
+            del params[name]
+        # Nor does the source the load binds name them, so a save writes the depths it kept alone.
+        readings = tuple(reading for reading in readings
+                         if not any(part.path is not None and len(part.path) > 1 and dropped(part.path[1])
+                                    for part in reading.parts))
     return (variables if lazy else materialize(variables)), readings
 
 

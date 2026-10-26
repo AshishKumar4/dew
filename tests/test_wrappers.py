@@ -271,6 +271,59 @@ def test_a_text_only_load_takes_a_checkpoint_without_its_prediction_depth():
     assert not any(str(name).startswith("mtp_") for name in text.variables["params"])
 
 
+def _misshapen_depths(source: Path, target: Path, depth: str) -> Path:
+    """A copy of `source` whose tensors of the prediction depth `depth` names are of a shape no decoder
+    reads, so a load that builds or reads that depth refuses it."""
+    import shutil
+
+    from safetensors.numpy import save_file
+
+    shutil.copytree(source, target)
+    for shard in target.glob("*.safetensors"):
+        tensors = load_file(shard)
+        save_file({name: np.zeros((3,), array.dtype) if name.startswith(depth) else array
+                   for name, array in tensors.items()}, shard, metadata={"format": "pt"})
+    return target
+
+
+@pytest.mark.parametrize(("fixture", "depth", "declared"), [("glm4-moe-tiny", "model.layers.2.", 1),
+                                                            ("deepseek-v41-tiny", "mtp.1.", 3)])
+def test_a_load_builds_and_reads_only_the_prediction_depths_it_keeps(tmp_path, fixture, depth, declared):
+    """`prediction_depths` keeps the first that many of a decoder's prediction depths: 0 builds the
+    trunk alone, and a count below the checkpoint's builds those first depths. The others are neither
+    built nor read, so a copy whose other depths no decoder could read loads as the source does, to the
+    same trunk logits, and saves its kept depths alone, reloading to the same model."""
+    from dew.interop import Pretrained
+
+    source = FIXTURES / fixture
+    whole = Pretrained.load(source, dtype="float32", attention_impl="reference")
+    assert whole.model.num_nextn_predict_layers == declared
+    kept = 0 if declared == 1 else 1
+    misshapen = _misshapen_depths(source, tmp_path / "misshapen", depth)
+    with pytest.raises(ValueError):
+        Pretrained.load(misshapen, dtype="float32", attention_impl="reference")
+    loaded = Pretrained.load(misshapen, dtype="float32", attention_impl="reference", prediction_depths=kept)
+    assert loaded.model.num_nextn_predict_layers == kept
+    assert sorted(name for name in loaded.variables["params"] if str(name).startswith("mtp_")) == [
+        f"mtp_{index}" for index in range(kept)]
+    ids = jnp.arange(8, dtype=jnp.int32)[None] % loaded.model.vocab_size
+    np.testing.assert_array_equal(np.asarray(loaded.model.apply(loaded.variables, ids)),
+                                  np.asarray(whole.model.apply(whole.variables, ids)))
+    loaded.save(tmp_path / "saved")
+    reloaded = Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="reference")
+    assert reloaded.model.num_nextn_predict_layers == kept
+    np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
+                                  np.asarray(loaded.model.apply(loaded.variables, ids)))
+
+
+@pytest.mark.parametrize("depths", [-1, True])
+def test_a_prediction_depth_count_below_zero_is_refused(depths):
+    from dew.interop import Pretrained
+
+    with pytest.raises(ValueError):
+        Pretrained.load(FIXTURES / "glm4-moe-tiny", dtype="float32", prediction_depths=depths)
+
+
 def test_a_text_only_load_keeps_what_the_wrapper_declares_for_its_language_model(tmp_path):
     """What a wrapper declares at its own scope governs its language model alone: block reading its
     modeling overrides turn on still admits a future block mate, and its end-of-text id still ends

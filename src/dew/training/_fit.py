@@ -17,7 +17,7 @@ from dew.telemetry.profile import region
 from dew.training.budget import Plateau
 from dew.training.distributed import DevicePrefetchIterator, Signature
 from dew.training.evaluation import EvalSuite, Evaluation, Summary
-from dew.training.interval import Interval, Taken
+from dew.training.interval import Cadence, Interval, Taken, Tokens
 from dew.training.observe import Observe
 from dew.training.runtime import PreemptionNotice
 from dew.training.selection import Best, HeldBest
@@ -40,16 +40,24 @@ def declarations(suites: Mapping[str, EvalSuite], metrics: Sequence[Metric],
     return declared
 
 
+def falls(every: Cadence | str | datetime.timedelta, step: int, real: int, before: int) -> bool:
+    """Whether a cadence of steps (`int`) or of committed tokens (`Tokens`, the step having brought them
+    from `before` to `real`) falls on `step`; a duration or none never does here."""
+    if isinstance(every, Tokens):
+        return every.due(real, before)
+    return isinstance(every, int) and bool(every) and step % every == 0
+
+
 @dataclasses.dataclass(frozen=True)
 class FitPlan:
     """What one `Trainer.fit` call was asked for."""
 
     dataset: Loader
     steps: int | None
-    log_every: int
-    eval_every: int | None
+    log_every: int | Tokens
+    eval_every: Cadence
     tokens: int | None
-    checkpoint_every: int | datetime.timedelta | None
+    checkpoint_every: Cadence | datetime.timedelta
     checkpoint_final: bool
     local_every: int | None
     metrics: Sequence[Metric]
@@ -106,16 +114,19 @@ class FitPlan:
     def evaluates_midway(self) -> bool:
         """Whether an evaluation can run before the end's: on a cadence shorter than the run, or to
         rank a checkpoint written before its end."""
-        def before_end(every: int | datetime.timedelta | None) -> bool:
+        def before_end(every: Cadence | str | datetime.timedelta) -> bool:
+            if isinstance(every, Tokens):
+                return self.tokens is None or every.every < self.tokens
             return bool(every) and (self.steps is None or not isinstance(every, int) or every < self.steps)
 
         cadences = (self.eval_every, *(suite.every for suite in self.suites.values()))
         return any(map(before_end, cadences)) or bool(
             (self.validation or self.best or self.stop) and before_end(self.checkpoint_every))
 
-    def due(self, step: int) -> tuple[str, ...]:
-        """The suites whose own cadence falls on `step`."""
-        return tuple(name for name, suite in self.suites.items() if suite.every and step % suite.every == 0)
+    def due(self, step: int, real: int = 0, before: int = 0) -> tuple[str, ...]:
+        """The suites whose own cadence falls on `step`, which brought the committed tokens from
+        `before` to `real` (`falls`)."""
+        return tuple(name for name, suite in self.suites.items() if falls(suite.every, step, real, before))
 
 
 @dataclasses.dataclass
@@ -129,6 +140,8 @@ class FitRun:
     evaluation: Evaluation | None = None
     last_checkpoint: float = 0.0
     checkpoint_due: bool = False
+    committed: int = 0
+    """The run's committed tokens after its last step, where a token budget reads them (`FitPlan.real`)."""
     stop_control: dict = dataclasses.field(default_factory=dict)
     last_local_saved: int | None = None
     stopped: bool = False
