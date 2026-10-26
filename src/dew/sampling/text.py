@@ -62,6 +62,7 @@ from dew.nn.protocols import (
     ProjectionGroup,
     Selective,
     Serving,
+    refuse_prefix,
 )
 from dew.nn.visibility import served_blocks
 from dew.objectives.base import Variables
@@ -811,6 +812,7 @@ def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tok
     """
     ids = local_rows(inputs.tokens)
     fields = {name: jax.tree.map(local_rows, value) for name, value in inputs.token_fields.items()}
+    refuse_prefix(model, prefix, longest=None)
     if prefix is not None and BLOCKS_FIELD not in fields:
         fields = {**fields, BLOCKS_FIELD: served_blocks(real_slots(fields, ids.shape, xp=np), prefix)}
     conditioning = {name: local_rows(value, host=False) for name, value in inputs.conditioning.items()}

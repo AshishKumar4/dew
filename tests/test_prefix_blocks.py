@@ -150,6 +150,41 @@ def test_a_prefix_runs_batch_without_blocks_trains_on_the_blocks_it_serves(prefi
             objective.scored_tokens(unroled)
 
 
+HOLED = np.asarray([[1, 1, 0, 0, 1, 1, 1, 1, 1]], bool)
+"""A row's validity with a hole inside its one document."""
+HOLED_ROLES = np.asarray([[Role.USER, Role.ASSISTANT] + [Role.USER] * 3 + [Role.ASSISTANT] * 4], np.int8)
+"""The row's roles: a user token, the assistant's, and past the hole another user turn and the assistant's."""
+HOLED_BLOCKS = {2: [[1, 1, -1, -1, -1, -1, -1, -1, -1]], "prompt": [[1, -1, -1, -1, -1, -1, -1, -1, -1]]}
+"""The row's blocks under each prefix: its first two tokens, or its user turn before its first assistant
+token; past the hole no token is a block's."""
+
+
+@pytest.mark.parametrize("prefix", [2, "prompt"])
+def test_a_document_runs_on_across_a_hole_in_its_validity(prefix):
+    """Masked slots inside a row's one document neither restart its places nor open another document, as
+    the decoder's coordinates count them (`coordinates`, `document_starts`): under a prefix of 2 its block
+    is its first two tokens, under "prompt" its first, the user's turn before its first assistant token.
+    The row without blocks trains bit for bit as with those blocks given, and the host counts the same
+    targets."""
+    from dew.data.chat import ROLES_KEY
+    from dew.objectives.base import Step
+
+    decoder = blocky()
+    objective = LMObjective(decoder, SEQ, prefix=prefix)
+    tokens = jax.random.randint(jax.random.key(1), (1, ROW), 0, VOCAB)
+    params = decoder.init(jax.random.key(0), tokens[:, :-1])
+    bare = {TEXT_KEY: tokens, "text_attention_mask": HOLED, ROLES_KEY: HOLED_ROLES}
+    given = {**bare, "text_block_groups": np.asarray(HOLED_BLOCKS[prefix], np.int32)}
+    step = Step(jnp.asarray(0), jax.random.key(2), None)
+
+    def trained(batch):
+        return jax.value_and_grad(objective.scalar_loss, has_aux=True)(params, batch, step)
+
+    for got, want in zip(jax.tree.leaves(trained(bare)), jax.tree.leaves(trained(given)), strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    np.testing.assert_array_equal(objective.scored_tokens(bare), objective.scored_tokens(given))
+
+
 def test_a_prefix_runs_task_serves_the_blocks_the_run_trained_on():
     """A prefix run's task serves the trained mask: its greedy cached rollout is bit for bit the rollout
     the same model's causal task gives a request that carries the run's blocks itself, each prompt's
@@ -192,6 +227,20 @@ def test_a_prefix_run_is_refused_where_its_model_or_its_length_cannot_take_it():
         LMObjective(blocky(), SEQ, prefix=0)
     with pytest.raises(ValueError):
         LMObjective(blocky().clone(num_nextn_predict_layers=1), SEQ, prefix=PREFIX, mtp_weight=0.1)
+
+
+def test_generate_refuses_a_prefix_its_model_or_its_value_cannot_take():
+    """`generate(..., prefix=)` refuses as a prefix run's objective and task do (`refuse_prefix`): a causal
+    decoder, which would serve the prompt causally, and a prefix of no tokens."""
+    from dew.sampling import generate
+
+    sampling = Sampling(temperature=0, pad_token_id=0)
+    prompt = ModelInputs(jnp.asarray([[1, 2, 3, 4]], jnp.int32))
+    for decoder, prefix in ((model(full_attention={}), PREFIX), (blocky(), 0)):
+        decoder = decoder.clone(max_seq_len=128)
+        variables = decoder.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+        with pytest.raises(ValueError):
+            generate(decoder, variables, prompt, NEW, key=1, sampling=sampling, prefix=prefix)
 
 
 def test_a_served_prompt_shorter_than_its_prefix_is_refused():
