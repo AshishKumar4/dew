@@ -1080,3 +1080,55 @@ def test_a_rotary_that_recomputes_its_tables_decodes_as_transformers_generates(r
     reference.set_attn_implementation("eager")
     assert_as_exact(ours, theirs(reference), draw, f"{rope} steps", seeds=MOVING_SEEDS[f"{rope} steps"],
                     truth_fn=theirs(wide, float64))
+
+
+LONGCAT = {"vocab_size": 256, "hidden_size": 64, "num_hidden_layers": 4, "num_layers": 2,
+           "num_attention_heads": 4, "max_position_embeddings": 64, "ffn_hidden_size": 96, "q_lora_rank": 32,
+           "kv_lora_rank": 16,
+           "qk_nope_head_dim": 8, "qk_rope_head_dim": 8, "head_dim": 8, "v_head_dim": 8, "moe_topk": 2,
+           "n_routed_experts": 4, "zero_expert_num": 2, "expert_ffn_hidden_size": 32,
+           "routed_scaling_factor": 2.0, "bos_token_id": 1, "eos_token_id": 2, "pad_token_id": None}
+"""A tiny Longcat Flash: routed experts beside identity ('zero') experts, which transformers runs as a
+Python loop over the experts a call routes to (`_LOOPED_EXPERTS`)."""
+LONGCAT_SEEDS = 8
+"""Longcat's declared check-1 seeds, sized by `seeds_for` on armada."""
+
+
+def test_experts_transformers_loops_over_run_at_static_shapes_as_transformers_computes_them(tmp_path):
+    """Longcat Flash's experts, which transformers runs as a loop whose shapes the routing decides, run in
+    tier 3 at static shapes (`functional_experts`): its logits over drawn ids, among whose routes identity
+    experts are, hold check 1 against transformers' forward, its float64 twin the truth."""
+    torch.manual_seed(0)
+    model = transformers.LongcatFlashForCausalLM(transformers.LongcatFlashConfig(**LONGCAT)).eval()
+    model.save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32")
+    with float64():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager").eval()
+        wide.load_state_dict(model.state_dict())
+    routes = []
+    hook = model.model.layers[0].mlp.experts.register_forward_hook(
+        lambda module, inputs, output: routes.append(inputs[1].clone()))
+    forward = jax.jit(loaded.model.apply)
+
+    def draw(seed):
+        return (np.random.default_rng([0x1496, seed]).integers(0, 256, (2, 12)).astype(np.int32),)
+
+    def ours(tokens):
+        return np.asarray(forward(loaded.variables, tokens), np.float64)
+
+    def theirs(source, precision=contextlib.nullcontext):
+        def run(tokens):
+            with precision(), torch.no_grad():
+                return source(torch.from_numpy(tokens).long()).logits.double().numpy()
+        return run
+
+    reference = copy.deepcopy(model)
+    reference.set_attn_implementation("eager")
+    theirs(model)(*draw(0))
+    hook.remove()
+    identity = routes[0] >= LONGCAT["n_routed_experts"]
+    assert identity.any() and not identity.all()
+    assert_as_exact(ours, theirs(reference), draw, "longcat logits", seeds=LONGCAT_SEEDS,
+                    truth_fn=theirs(wide, float64))
