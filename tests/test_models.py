@@ -55,9 +55,9 @@ def test_a_bf16_vae_block_rounds_where_diffusers_flax_vae_does(channels):
     convolution casts (vae_flax.py:154-209)."""
     from diffusers.models import vae_flax
 
-    from dew.nn.autoencoders.vae import FlaxResnetBlock2D
+    from dew.nn.autoencoders.vae import _resnet
 
-    ours = FlaxResnetBlock2D(*channels, groups=8)
+    ours = _resnet(channels[1], 8, jnp.float32)
     theirs = vae_flax.FlaxResnetBlock2D(*channels, groups=8)
     x = np.random.default_rng(5).standard_normal((2, 8, 8, channels[0])).astype(np.float32) * 3
     params = theirs.init(jax.random.key(0), jnp.asarray(x))
