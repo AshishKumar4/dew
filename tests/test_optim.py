@@ -700,7 +700,7 @@ def test_the_threshold_rides_optimizer_opts():
 
     # The truth's Muon keeps its momentum in the parameters' float64, where the config's holds float32.
     wide = muon_solver(optimizer_opts={'mu_dtype': None})
-    assert_as_exact(without_ynn(clipped), without_ynn(paper(muon)), lambda seed: qk_tree(seed=seed),
+    assert_as_exact(clipped, paper(muon), lambda seed: qk_tree(seed=seed),
                     "the clip at a configured threshold", seeds=THRESHOLD_SEEDS, truth_fn=paper(wide))
 
 
@@ -1062,7 +1062,10 @@ def test_a_scheduled_rate_is_as_near_float64_as_optaxs(name):
         return {f"step {step}": jnp.stack([values(jnp.asarray(step, jnp.float64)) for values in built])
                 for step in range(10)}
 
-    assert_as_exact(dew, optax_rates, draw, f"the {name} rate", seeds=RATE_SEEDS, truth_fn=truth)
+    # Each arm builds its schedules from the draw's multipliers on the host and reads their rates off
+    # its runs' states, as given.
+    assert_as_exact(as_given(dew), as_given(optax_rates), draw, f"the {name} rate", seeds=RATE_SEEDS,
+                    truth_fn=truth)
 
 
 @pytest.mark.parametrize("name", ["constant", "cosine"])
