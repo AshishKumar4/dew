@@ -1048,8 +1048,9 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
     ({"tools/armada/session.py": "# the session\n"}, "off"),
     ({".github/workflows/ci.yml": "on: []\n"}, "off"),
     ({"Makefile": "all:\n"}, "off"),
+    ({"CHANGELOG.md": "# Changes\n\n- an entry\n"}, "on"),
 ], ids=["a source module", "a docs page", "a notebook", "a tool", "the project", "a lock",
-        "the test session", "a workflow", "a file no record places"])
+        "the test session", "a workflow", "a file no record places", "the changelog"])
 def test_the_policy_reruns_what_a_change_reaches_and_everything_where_it_cannot_place_it(
         ci, tmp_path, changed, policy):
     """CI's test cache policy for a change from main: each file's own inputs decide ('on') where the records
