@@ -193,7 +193,7 @@ index 3dbb6a0..efbd370 100644
 +}
 +
 +// The `block_idx`-th block of the padded block space (varlen_num_blocks) as (bidb, block within the
-+// sequence), or (-1, 0) in a gap or past the batch: a binary search over cu_seqlens for the last
++// sequence), or (-1, 0) before the first sequence, in a gap or past the batch: a binary search over cu_seqlens for the last
 +// sequence starting at or before it. Without cu_seqlens, the sequences hold seqlen_static rows'
 +// blocks each.
 +template <int kBlock>
@@ -217,7 +217,7 @@ index 3dbb6a0..efbd370 100644
 +    block = block_idx % blocks;
 +    seqlen = bidb < num_batch ? (seqused ? seqused[bidb] : seqlen_static) : 0;
 +  }
-+  return block < cute::ceil_div(seqlen, kBlock) ? cute::make_tuple(bidb, block) : cute::make_tuple(-1, 0);
++  return 0 <= block && block < cute::ceil_div(seqlen, kBlock) ? cute::make_tuple(bidb, block) : cute::make_tuple(-1, 0);
 +}
 +
  template <bool Varlen, int kBlock> struct SeqlenInfo {
