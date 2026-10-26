@@ -1232,10 +1232,7 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
                        range(first + held, first + (2 * count if dew_fn is None else count)), truth_fn)
         drawn = fresh if drawn is None else drawn.joined(fresh)
         if dew_fn is None:
-            halves = drawn.theirs[:count], drawn.theirs[count:2 * count]
-            wide = [name for index, name in enumerate(drawn.names)
-                    if np.sum(halves[0][:, index]) > 0 and np.sum(halves[1][:, index]) > 0
-                    and not _resolves(*_interval(halves[0][:, index], control=halves[1][:, index]))]
+            wide = _unresolved_against_itself(drawn.theirs, drawn.names, count)
         else:
             wide = [name for index, name in enumerate(drawn.names)
                     if np.sum(drawn.theirs[:, index]) > 0
@@ -1246,6 +1243,32 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
     compared = "the reference compared with itself" if dew_fn is None else "Dew paired with the reference"
     raise AssertionError(f"{label}: {compared} does not resolve {PARITY} within {most} seeds at {wide[:4]}; "
                          f"give the site larger inputs or fewer shared factors")
+
+
+def _unresolved_against_itself(errors: np.ndarray, names, count: int) -> list[str]:
+    """The leaves the reference compared with itself does not resolve at `count` seeds: `errors`, its
+    squared errors a seed (rows) and a leaf (columns), on seeds 0 to `count` against `count` to twice
+    it (`_interval`'s control); a leaf with no error on either half is resolved."""
+    halves = errors[:count], errors[count:2 * count]
+    return [name for index, name in enumerate(names)
+            if np.sum(halves[0][:, index]) > 0 and np.sum(halves[1][:, index]) > 0
+            and not _resolves(*_interval(halves[0][:, index], control=halves[1][:, index]))]
+
+
+def seeds_resolving(errors: np.ndarray, names, label: str, *, start: int = FEWEST_SEEDS) -> int:
+    """`seeds_for`'s count for the reference compared with itself, from its errors already measured:
+    `errors` holds its squared errors a seed (rows, from seed 0) and a leaf (columns), such as a
+    recording's merged shards, and the count is the fewest, doubling from `start`, that resolves
+    every leaf (`_unresolved_against_itself`), as `seeds_for` doubles. Fails where the rows held
+    run out first: the recording then holds too few seeds for its site."""
+    count = max(start, FEWEST_SEEDS)
+    while 2 * count <= len(errors):
+        wide = _unresolved_against_itself(errors, names, count)
+        if not wide:
+            return count
+        count *= 2
+    raise AssertionError(f"{label}: the reference compared with itself does not resolve {PARITY} within the "
+                         f"{len(errors)} seeds recorded, {len(errors) // 2} a half")
 
 
 def recording(path) -> dict[str, np.ndarray]:
