@@ -915,7 +915,7 @@ def run_caching(config: Caching) -> None:
     result = {"schema": 1, "config": asdict(config), "host": platform.processor() or platform.machine(),
               "cpus": os.cpu_count(), "seconds": rows}
     config.output.write_text(json.dumps(result, indent=2, default=str) + "\n")
-    print(json.dumps(result), flush=True)
+    print(json.dumps(result, default=str), flush=True)
 
 
 if __name__ == "__main__":
