@@ -1609,6 +1609,35 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
                               description.tokenizer_folder, **description.fields)
 
 
+def _routed(config: Mapping[str, object], *, remote: Path | None, text_only: bool,
+            overrides: Mapping[str, object] | None
+            ) -> tuple[Mapping[str, object], SourceRoute, decoder_parts.WrapperFields | None]:
+    """A native source's config, its route and, where `text_only` takes a wrapper's language model
+    alone, that model's wrapper fields, decided before any weight downloads, on the config alone: a
+    format the codec cannot read, a family's refusal, an unregistered decoder checked against
+    transformers (tiers 2 and 3). The language model reads as its text family's checkpoint
+    (`decoders.language_model_config`); a route that reads no `overrides` refuses them."""
+    route = source_route(config, remote=remote)
+    language = route.wrapper if text_only and isinstance(route, WrapperRoute) else None
+    if language is not None:
+        if decoders.bundles(config):
+            raise ValueError(f"{config.get('model_type')} reads its media bundle whole as one decoder "
+                             "family; text_only takes a wrapper whose language model is its own text "
+                             "family's checkpoint")
+        if source_quantization(config) is not None:
+            raise ValueError("text_only takes an unquantized wrapper: a quantized one's module selection "
+                             "names the wrapper's modules, which its text checkpoint renames")
+        config = decoders.language_model_config(config, language)
+        route = source_route(config, remote=remote)
+    elif text_only and isinstance(route, DiffusionGemmaRoute):
+        raise ValueError("text_only takes a media wrapper's language model; DiffusionGemma's decoder is "
+                         "its whole model")
+    if isinstance(route, TorchRoute | DiffusionGemmaRoute):
+        _unread_overrides(overrides, "the transformers forward" if isinstance(route, TorchRoute)
+                          else "a diffusion Gemma's text tower")
+    return config, route, language
+
+
 def _load_native_source(source: sources.SourceReference, root: Path, *,
                         gguf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
                         dtype: str, param_dtype: str, attention_impl: str,
@@ -1638,26 +1667,7 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
         config = mamba2.config_from_mamba_ssm(config)
     config = _overridden(config, overrides)
     family = config.get("model_type")
-    # Before any weight downloads, on the config alone: a format the codec cannot read, a family's
-    # refusal, an unregistered decoder checked against transformers (tiers 2 and 3).
-    route = source_route(config, remote=remote)
-    # A wrapper's language model alone reads as its text family's checkpoint.
-    language = route.wrapper if text_only and isinstance(route, WrapperRoute) else None
-    if language is not None:
-        if decoders.bundles(config):
-            raise ValueError(f"{family} reads its media bundle whole as one decoder family; text_only "
-                             "takes a wrapper whose language model is its own text family's checkpoint")
-        if source_quantization(config) is not None:
-            raise ValueError("text_only takes an unquantized wrapper: a quantized one's module selection "
-                             "names the wrapper's modules, which its text checkpoint renames")
-        config = decoders.language_model_config(config, language)
-        route = source_route(config, remote=remote)
-    elif text_only and isinstance(route, DiffusionGemmaRoute):
-        raise ValueError("text_only takes a media wrapper's language model; DiffusionGemma's decoder is "
-                         "its whole model")
-    if isinstance(route, TorchRoute | DiffusionGemmaRoute):
-        _unread_overrides(overrides, "the transformers forward" if isinstance(route, TorchRoute)
-                          else "a diffusion Gemma's text tower")
+    config, route, language = _routed(config, remote=remote, text_only=text_only, overrides=overrides)
     if isinstance(route, TorchRoute):
         from dew.interop import torchax_fallback
         selected = source if component is None else source.component(component.config_folder)
