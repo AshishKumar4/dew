@@ -106,7 +106,7 @@ def test_a_runtime_verdict_refuses_records_from_a_different_experiment(tmp_path,
             edited(tmp_path / "native.json", parameter_dtypes=["bfloat16"])
         elif changed == "precision":
             edited(tmp_path / "author.json", precision={**tool.IEEE, "float32_matmul": "high"})
-        elif changed is not None:
+        elif changed in ("device", "dtype", "phase"):
             field = "compute_dtype" if changed == "dtype" else changed
             edited(tmp_path / "author.json", **{field: {"device": "cuda", "dtype": "bfloat16",
                                                         "phase": "truth"}[changed]})
