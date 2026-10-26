@@ -22,7 +22,12 @@ from dew.nn.precision import L2NORM_EPS
 WIDTH, HEADS, FEATURES, LENGTH, CHUNK, ROWS = 32, 2, 16, 12, 4, 8
 MEMORY_SEEDS = 8
 """The declared seeds for check 1 of the memories (`assert_as_exact`): `seeds_for` on armada sizes every
-configuration, its token-by-token path included, at 8 over the drawn weights."""
+configuration, its token-by-token, decoded, packed, cached and recurrence paths included, at 8 over the
+drawn weights."""
+SEEDS = {"self-generated gradients": 256, "memory decoder gradient": 256, "memory decoder decode": 32}
+"""The sites `seeds_for` on armada sizes past `MEMORY_SEEDS`: the self-modifying memory's and the memory
+decoder's gradients, every parameter's leaf, at 256, each reference compared with itself, and the
+decoder's last logits after a cached decode at 32."""
 
 CONFIGURATIONS = {
     # TTT-Linear (Sec 2.7): f(x) = x + LN(W x), the L2 reconstruction (Eq 4), eta(x) = eta_base sigmoid(.).
@@ -291,7 +296,7 @@ def test_a_self_generated_target_carries_the_outer_gradient():
 
     run = jax.jit(with_gradients(lambda x, params: module.apply(params, x)))
     assert_as_exact(run, jax.jit(with_gradients(written(module, dtype=jnp.float32))), draw_with_cotangent,
-                    "self-generated gradients", seeds=MEMORY_SEEDS,
+                    "self-generated gradients", seeds=SEEDS["self-generated gradients"],
                     truth_fn=with_gradients(written(module, dtype=jnp.float64)))
     gradient = run(*draw_with_cotangent(0))[2]["params"]["v_proj"]["kernel"]
     assert np.abs(np.asarray(gradient)).max() > 0
@@ -472,7 +477,8 @@ def test_a_memory_decoder_trains_scans_remats_and_decodes():
 
     for name, model in (("scanned", scanned), ("rematted", rematted)):
         assert_as_exact(trained(model), trained(plain), draw_with_cotangent,
-                        f"{name} memory decoder gradient", seeds=MEMORY_SEEDS, truth_fn=trained(wide))
+                        f"{name} memory decoder gradient", seeds=SEEDS["memory decoder gradient"],
+                        truth_fn=trained(wide))
     gradient = trained(rematted)(*draw_with_cotangent(0))[1]
     for index in (0, 1):
         assert all(np.abs(np.asarray(leaf)).max() > 0
@@ -490,8 +496,8 @@ def test_a_memory_decoder_trains_scans_remats_and_decodes():
     def last(model):
         return jax.jit(lambda variables, ids: model.apply(variables, ids)[:, -1])
 
-    assert_as_exact(decoded, last(plain), draw_model, "memory decoder decode", seeds=MEMORY_SEEDS,
-                    truth_fn=last(wide))
+    assert_as_exact(decoded, last(plain), draw_model, "memory decoder decode",
+                    seeds=SEEDS["memory decoder decode"], truth_fn=last(wide))
 
 
 def test_muon_steps_each_memory_heads_matrices_on_their_own():
