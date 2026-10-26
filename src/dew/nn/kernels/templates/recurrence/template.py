@@ -142,9 +142,14 @@ class Mosaic(base.Template[mainloop.Tiles]):
           launch, a program a value block, sequence and value head walking its sequence's chunks in turn,
           has as many programs as the device has multiprocessors (fla's chunk_fwd_h runs the 27B gated
           delta net's 192 programs a 32-wide block on an A100's 108, where 64 wide its 96 left twelve
-          idle the whole walk, SE-rx-ncu-b106b18d8); the narrowest legal where none fills them;
-        - stages: the deepest ring of the states launch's steps a block holds (`mosaic.deepest`, within the
-          family's most shared memory, `Family.most_shared`), one where none of two or more is legal.
+          idle the whole walk, SE-rx-ncu-b106b18d8); the narrowest legal where none fills them; of
+          those at which the call's fast backward holds where it holds at any (`_backward_holds`: its
+          launches take the states launch's block, an H100's reverse launch 328 registers 64 wide);
+        - output block: the widest legal beside it (`_staged`), the output launch's registers apart from the
+          states launch's: on an A100 the output launch holds 264 registers 32 wide, where the states
+          launch's 384 programs 16 wide took two waves of 593 us (SE-family-a100-0c8018352);
+        - stages: the deepest ring of the states launch's steps of which a multiprocessor holds as many
+          programs as one stage's (`states_held`, `_staged`), one where none of two or more is legal.
         None where no block is legal: the launch refuses the call."""
         family = bundle(target)
         if family is None:
@@ -154,6 +159,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
                  if tiles is not None]
         if not legal:
             return None
+        legal = [tiles for tiles in legal if self._backward_holds(ba, tiles, target)] or legal
         arguments = ba.arguments
         batch, length, heads, _ = arguments["value"].shape
         sequences = batch * (1 if arguments.get("starts") is None
@@ -161,6 +167,30 @@ class Mosaic(base.Template[mainloop.Tiles]):
         filling = [tiles for tiles in legal if target.multiprocessors is None
                    or columns // tiles.block_v * sequences * heads >= target.multiprocessors]
         return filling[0] if filling else legal[-1]
+
+    def _backward_holds(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles,
+                        target: generation.GpuTarget) -> bool:
+        """Whether the call's fast backward's launches, past the forward's, hold at `tiles` (`mainloop.holds`;
+        a call taking none, `_launches`', holds)."""
+        forward = self._launches(ba, tiles, target, backward=False)
+        both = self._launches(ba, tiles, target, backward=True)
+        family = bundle(target)
+        assert family is not None
+        return mainloop.holds(both[len(forward):], family, generation.shared_budget(target))
+
+    def states_held(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
+                    ) -> int:
+        """The programs of the states launch at `tiles` a multiprocessor of `target` holds at once
+        (`mainloop.held_programs`, as its persistent launches')."""
+        states = self._states(ba, tiles, target)
+        family = bundle(target)
+        assert family is not None
+        return mainloop.held_programs(family, target, states.shared)
+
+    def _states(self, ba: tokamax.BoundArguments, tiles: mainloop.Tiles, target: generation.GpuTarget
+                ) -> mainloop.Launch:
+        return next(launch for launch in self._launches(ba, tiles, target, backward=False)
+                    if launch.name.startswith("recurrence_states"))
 
     def _blocks(self, ba: tokamax.BoundArguments, family: mosaic.Family) -> list[int]:
         """The value blocks a call takes on `family`'s bundle, widest first (`derived`'s first rule before
@@ -172,17 +202,25 @@ class Mosaic(base.Template[mainloop.Tiles]):
 
     def _staged(self, ba: tokamax.BoundArguments, block: int, target: generation.GpuTarget
                 ) -> mainloop.Tiles | None:
-        """`block`'s tiles at the deepest ring of the states launch's steps a block holds (`mosaic.deepest`,
-        within `Family.most_shared` over a step's bytes), else one stage; None where neither is legal."""
+        """`block`'s tiles with the widest output block legal beside it (`Tiles.block_o`), at the deepest
+        ring of the states launch's steps of which a multiprocessor holds as many programs as one stage's
+        (`states_held`; `mosaic.deepest`, within `Family.most_shared` over a step's bytes), else one stage;
+        None where no output block is legal beside it. The ring deepest alone held an A100's states launch
+        to one program a multiprocessor, where its registers held three (SE-family-a100-8c5b5b16a)."""
         family = bundle(target)
         assert family is not None
-        launches = self._launches(ba, mainloop.Tiles(block, 1), target, backward=False)
-        states = next(launch for launch in launches if launch.name.startswith("recurrence_states"))
-        deepest = mosaic.deepest(lambda stages: mainloop.Tiles(block, stages),
-                                 lambda tiles: self.legal(ba, tiles, target),
-                                 family.most_shared // max(states.step_bytes, 1))
-        single = mainloop.Tiles(block, 1)
-        return deepest or (single if self.legal(ba, single, target) else None)
+        shallowest = next((tiles for tiles in (mainloop.Tiles(block, 1, None if wide == block else wide)
+                                               for wide in self._blocks(ba, family))
+                           if self.legal(ba, tiles, target)), None)
+        if shallowest is None:
+            return None
+        programs = self.states_held(ba, shallowest, target)
+        step = self._states(ba, shallowest, target).step_bytes
+        deepest = mosaic.deepest(lambda stages: dataclasses.replace(shallowest, stages=stages),
+                                 lambda tiles: (self.legal(ba, tiles, target)
+                                                and self.states_held(ba, tiles, target) >= programs),
+                                 family.most_shared // max(step, 1))
+        return deepest or shallowest
 
     def neighbours(self, ba: tokamax.BoundArguments, config: mainloop.Tiles) -> list[mainloop.Tiles]:
         """The tiles the opt-in tuner times beside the derived `config` (`variants`; the gate holds at each):
@@ -195,7 +233,7 @@ class Mosaic(base.Template[mainloop.Tiles]):
         at = blocks.index(config.block_v)
         beside = [self._staged(ba, blocks[index], target) for index in (at - 1, at + 1)
                   if 0 <= index < len(blocks)]
-        other = mainloop.Tiles(config.block_v, config.stages - 1 if config.stages > 1 else 2)
+        other = dataclasses.replace(config, stages=config.stages - 1 if config.stages > 1 else 2)
         return [tiles for tiles in (*beside, other) if tiles is not None]
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: mainloop.Tiles,

@@ -549,12 +549,11 @@ def ampere(generation_name: str = "sm80"):
 @pytest.mark.skipif(not AMPERE_CLASS, reason="no mma.sync kernel this GPU and JAX lower")
 @pytest.mark.parametrize("out_dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("sizes", [name for name in SIZES if any(SIZES[name])])
-def test_an_ampere_gpu_runs_triton_unnamed_and_mosaics_launch_by_name(sizes, out_dtype):
-    """Without warpgroup MMA, Triton's launch runs the grouped forward unnamed, a cell where it measured
-    faster than the template (`grouped_matmul.OLD_ROUTES`): the Mosaic GPU forward's mma.sync tile
-    (`mosaic_gpu.derived`) runs where the call names it until it measures at least as fast; named, each is
-    as exact as XLA's ragged dot rounded to its output dtype from float64, unrouted rows and empty groups
-    included."""
+def test_an_ampere_gpu_runs_mosaics_launch_unnamed_and_tritons_by_name(sizes, out_dtype):
+    """Without warpgroup MMA, the Mosaic GPU forward's mma.sync tile (`mosaic_gpu.derived`) runs the grouped
+    forward unnamed, a cell no old route measured faster on (`grouped_matmul.OLD_ROUTES`, CONSUMERS3), and
+    Triton's launch where the call names it; named, each is as exact as XLA's ragged dot rounded to its
+    output dtype from float64, unrouted rows and empty groups included."""
     x, w, dy, group = operands(SIZES[sizes], jnp.bfloat16)
     truth = oracle.products(x, w, dy, SIZES[sizes])
     group_sizes = jnp.asarray(SIZES[sizes], jnp.int32)
@@ -581,7 +580,7 @@ def test_an_ampere_gpu_runs_triton_unnamed_and_mosaics_launch_by_name(sizes, out
         assert {type(launch).__name__ for launch, _ in ran} == {kernel} and got.dtype == out_dtype
         check(got, reference, truth[0], group, f"sm80 forward through {kernel} to {jnp.dtype(out_dtype)}")
     _, ran = running()
-    assert {type(launch).__name__ for launch, _ in ran} == {"Gmm"}
+    assert {type(launch).__name__ for launch, _ in ran} == {"MosaicGmm"}
 
 
 @pytest.mark.skipif(not AMPERE_CLASS, reason="no mma.sync kernel this GPU and JAX lower")

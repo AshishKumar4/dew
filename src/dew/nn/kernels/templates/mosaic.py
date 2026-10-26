@@ -29,6 +29,8 @@ from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
+from dew.nn.kernels.templates import cost
+
 Ref = state_types.AbstractRef | state_types.TransformedRef
 Operand = Ref | jax.Array
 """A product's operand: a tile in shared memory (a ref) or in registers (an array)."""
@@ -318,6 +320,13 @@ def tile_registers(family: "Family", consumers: int, block: tuple[int, int, int]
     return live_registers(family, [(share, columns, jnp.float32)], fragments)
 
 
+def program_shared(block: int, programs: int) -> int:
+    """The shared memory each of `programs` programs a multiprocessor runs at once may stage, on a GPU whose
+    block holds `block` bytes: the multiprocessor's (the block's and one reservation,
+    `cost.RESERVED_SHARED`) split between them, less each one's own reservation."""
+    return (block + cost.RESERVED_SHARED) // programs - cost.RESERVED_SHARED
+
+
 def held_rows(family: "Family", consumers: int, columns: int) -> int:
     """The most rows, in whole roles of `consumers` consumers of `family` (`Family.role_rows` each), whose
     fp32 accumulator of `columns` columns their threads hold beside what they hold besides
@@ -486,6 +495,14 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     """The most shared memory a block of any GPU of the family holds (CUDA's opt-in limit), which bounds
     the stages a generated tile takes; a GPU's own (`generation.shared_budget`) bounds the tiles its
     launches keep."""
+
+    def programs(self, consumers: int) -> int:
+        """The most programs of one launch a multiprocessor's registers hold at once, each `consumers`
+        consumer roles: one where the family's roles split the register file between them (warpgroup
+        MMA's consumers beside its producer, `consumer_registers`). Each stages its share of the
+        multiprocessor's shared memory (`program_shared`), which may hold no tile at that many."""
+        del consumers
+        return 1
 
     @abc.abstractmethod
     def registers(self, consumers: int) -> int:

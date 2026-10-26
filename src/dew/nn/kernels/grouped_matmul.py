@@ -766,7 +766,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if family is None or config.family != family.name or not self._divides(ba, config):
             return False
         dtype = ba.arguments['tokens'].dtype
-        if (config.warpgroups > family.consumers or config.cluster != 1 or config.stages < 2
+        if (config.warpgroups > family.consumers or config.programs > family.programs(config.warpgroups)
+                or config.cluster != 1 or config.stages < 2
                 or config.block_m % (family.role_rows * config.warpgroups)
                 or config.block_n % family.column_unit(dtype) or config.block_k not in family.depths(dtype)):
             return False
@@ -886,14 +887,19 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             serial_stored=(config.block_m * config.block_n * out
                            if self.STORES_SERIALLY and config.warpgroups == 1 else 0))
 
-    def _multiprocessors(self, interpret: bool) -> int:
-        # The interpreter runs one block (jax/_src/pallas/mosaic_gpu/interpret).
-        return 1 if interpret else _multiprocessors(generation.gpu_target())
+    def program_shared(self, config: mosaic_gpu.Tiles, target) -> int:
+        # The programs a multiprocessor runs at once share its shared memory.
+        return mosaic.program_shared(super().program_shared(config, target), config.programs)
+
+    def _launched(self, config: mosaic_gpu.Tiles, interpret: bool) -> int:
+        """The programs the persistent kernel launches: the tile's programs on each multiprocessor
+        (`Tiles.programs`); the interpreter runs one block (jax/_src/pallas/mosaic_gpu/interpret)."""
+        return 1 if interpret else _multiprocessors(generation.gpu_target()) * config.programs
 
     @staticmethod
     def _in_flight(config: mosaic_gpu.Tiles, target) -> float:
         """The row tiles a band of the planar snake keeps in flight at once on `target`."""
-        return max(1.0, _multiprocessors(target) / config.grid_block_n)
+        return max(1.0, _multiprocessors(target) * config.programs / config.grid_block_n)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -944,7 +950,7 @@ class MosaicGmm(_Mosaic):
         # Never set: the launch is not eligible for exact sums; a dense call is one group, as any.
         del exact_sums, dense
         return mosaic_gpu.gmm(tokens, kernel, sizes, tiles=config, transpose_rhs=trans_rhs,
-                              out_dtype=out_dtype, multiprocessors=self._multiprocessors(interpret),
+                              out_dtype=out_dtype, multiprocessors=self._launched(config, interpret),
                               interpret=INTERPRETED if interpret else False,
                               prologue_operands=prologue_operands, epilogue_operands=epilogue_operands,
                               **hooks.kernel_options()), None
@@ -1014,7 +1020,7 @@ class MosaicTgmm(_Mosaic):
              return_residuals: bool = False):
         del dense  # a dense call is one group, as any
         return mosaic_gpu.tgmm(tokens, cotangent, sizes, tiles=config, out_dtype=out_dtype,
-                               multiprocessors=self._multiprocessors(interpret),
+                               multiprocessors=self._launched(config, interpret),
                                interpret=INTERPRETED if interpret else False, prologue=hooks.before(),
                                prologue_operands=prologue_operands, prologue_axes=hooks.prologue_axes,
                                exact_sums=exact_sums), None
@@ -1462,13 +1468,11 @@ def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]
 
 
 OLD_ROUTES: dict[tuple[str, str, str], tuple[str, str]] = {
-    ('mma.sync', 'forward', 'grouped'):
-        ('triton', "R10 (852bb4bd3, A100): the template's mma.sync tile 1.017x Triton's time, geomean of 6 "
-                   "grouped MoE rows"),
     ('mma.sync', 'input_gradient', 'grouped'):
-        ('triton', "R10: 1.263x Triton's time, geomean of 6 grouped rows"),
+        ('triton', "CONSUMERS3 (b1241ba7b, A100, two programs a multiprocessor): the template's mma.sync "
+                   "tile 1.239x Triton's time, geomean of 6 grouped MoE rows (its forward 0.828x)"),
     ('mma.sync', 'kernel_gradient', 'grouped'):
-        ('triton', "R10: 1.093x Triton's time, geomean of 6 grouped rows"),
+        ('triton', "CONSUMERS3: 1.358x Triton's time, geomean of 6 grouped rows"),
     ('mma.sync', 'forward', 'dense'):
         ('xla', "DENSE1 (A100, 2d1bbd051): Mosaic 1.923x and Triton 1.947x XLA's dot (cuBLAS), geomean of 10 "
                 "projections at 8192 tokens"),

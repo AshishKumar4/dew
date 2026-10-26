@@ -220,8 +220,9 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles_as_exact_as_its_referen
     """The recurrence template on a GPU no row names (`UNSEEN`): its facts and its family's bundle's
     (mma.sync's) alone derive the call's tiles (`template.Mosaic.derived`): every launch's shared memory as
     the bundle declares it within a block of it (`mainloop.planned`), with two chunks in flight unless two
-    are past it; at those tiles the forward, on the bundle interpreted, is on par from float64 with its
-    reference's (check 1, as `test_the_mosaic_forward_is_as_exact_as_its_reference`'s). Its variants, which
+    are past it or leave a multiprocessor fewer of the states launch's programs (`Mosaic.states_held`); at
+    those tiles the forward, on the bundle interpreted, is on par from float64 with its reference's (check 1,
+    as `test_the_mosaic_forward_is_as_exact_as_its_reference`'s). Its variants, which
     the opt-in tuner times (`Mosaic.variants`), lead with those tiles, each legal there and on par too. An
     fp32 call it refuses: a launch's registers at its narrowest tiles pass a thread's (the fp32 solve's
     merges hold the inverse's three parts)."""
@@ -245,7 +246,9 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles_as_exact_as_its_referen
         assert template.MOSAIC.registers(bound, picked) <= template.MOSAIC.register_budget(picked)
         if picked.stages == 1:
             wider = mainloop.Tiles(picked.block_v, 2)
-            assert template.MOSAIC.staged_bytes(bound, wider, UNSEEN) > budget
+            assert (template.MOSAIC.staged_bytes(bound, wider, UNSEEN) > budget
+                    or template.MOSAIC.states_held(bound, wider, UNSEEN)
+                    < template.MOSAIC.states_held(bound, picked, UNSEEN))
         variants = template.MOSAIC.variants(bound)
         assert variants[0] == picked and len(set(variants)) == len(variants)
         assert all(template.MOSAIC.legal(bound, tiles, UNSEEN) for tiles in variants)
