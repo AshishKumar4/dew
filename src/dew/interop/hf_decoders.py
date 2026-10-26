@@ -849,8 +849,11 @@ def read_decoder(
             index = _depth_index(name)
             return index is not None and index >= depths
 
-        for name in [name for name in params if dropped(name)]:
-            del params[name]
+        # Every collection a depth holds leaves of (its parameters, its routers' correction biases).
+        for collection in variables.values():
+            if isinstance(collection, dict):
+                for name in [name for name in collection if dropped(name)]:
+                    del collection[name]
         # Nor does the source the load binds name them, so a save writes the depths it kept alone.
         readings = tuple(reading for reading in readings
                          if not any(part.path is not None and len(part.path) > 1 and dropped(part.path[1])

@@ -612,7 +612,7 @@ def test_every_run_kind_reads_its_source_options_from_the_command_line(kind):
     from dew.decision.config import DecisionRunConfig
 
     kinds = {"lm": LMRunConfig, "decision": DecisionRunConfig, "diffusion": DiffusionRunConfig}
-    run = kinds[kind].cli(["--source.text-only", "True", "--source.prediction-depths", "0",
+    run = kinds[kind].cli(["--source.text-only", "--source.prediction-depths", "0",
                            "--trainer.multi-host", "False"])
     assert run.source == SourceOptions(text_only=True, prediction_depths=0)
     keywords = run.source_keywords(frozen=False)
