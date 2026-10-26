@@ -1556,7 +1556,7 @@ def test_each_cell_runs_the_template_unless_its_old_route_measured_faster(genera
         ("kernel_gradient", "dense"): (lambda x, dy: template.gemm_t(x, dy, None, out_dtype=jnp.bfloat16),
                                        x, dy),
     }
-    family = "wgmma" if generation.gpu_target(generation_name).wgmma else "mma.sync"
+    family = generation.family(generation_name)
     for (made, shape), (call, *operands) in calls.items():
         cell = (family, made, shape)
         expected = grouped_matmul.OLD_ROUTES[cell][0] if cell in grouped_matmul.OLD_ROUTES else "mosaic_gpu"
