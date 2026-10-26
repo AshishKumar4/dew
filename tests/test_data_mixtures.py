@@ -27,12 +27,14 @@ import numpy as np
 import optax
 import pytest
 from affine_run import FEATURES, Affine
+from recording import RecordingTracker
 from token_support import write_token_corpus
 
+from dew import position
 from dew.batch import VALID_ROWS, freeze, thaw
-from dew.data import Files, Loading, Memory, phases, presets
+from dew.data import Files, Loading, Memory, phases, presets, schedule
 from dew.data.compile import compile, held, publish, validation
-from dew.data.dataset import CAPTION, DataPartition, GlobalStream, Loader, Ramp, Stage, ramped
+from dew.data.dataset import CAPTION, DataPartition, GlobalStream, Loader, PhasedStream, Ramp, Stage, ramped
 from dew.data.images import EncodeCaptions
 from dew.data.pipeline import DeviceStep, Pipeline, mix
 from dew.data.plan import Manifest, Plan
@@ -626,6 +628,72 @@ def test_phases_are_a_list_of_ends_and_refuse_a_ramp(tmp_path):
                                                                samples=8)).train(DataPartition())
 
 
+def scheduled_packed(*entries: tuple[str | dict[str, float], float | None]) -> Loader:
+    """`phased_packed`'s stages as a schedule, each for its committed tokens (`schedule`)."""
+    def stage(stores: str | dict[str, float]) -> Pipeline:
+        return ordered(packed(stores)) if isinstance(stores, str) else mixed_packed(stores)
+
+    return trained(schedule([(stage(stores), tokens) for stores, tokens in entries]))
+
+
+def test_a_schedule_reads_a_stage_until_the_run_ends_it_then_reads_as_its_phases_do(tmp_path):
+    """A stage of a schedule reads on until the run ends it, where its commits reached its tokens
+    (`PhasedStream.ending`). Ended after three steps, it reads what phases switching at that step
+    read, the first stage's corpus continuing in the second where the stage left it, not where the
+    rows read past the end did, on one process or two; its position holds where the stage ended, and a
+    position past that resumes there."""
+    _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
+    both = {first: 1.0, second: 1.0}
+    whole = pooled(phased_packed((first, 3), (both, None)).train, 1, 7, rows=windows_of)
+    def open_stream(partition: DataPartition) -> PhasedStream:
+        stream = scheduled_packed((first, 1000), (both, None)).train(partition)
+        assert isinstance(stream, PhasedStream)
+        return stream
+
+    stream = open_stream(DataPartition())
+    assert packed_rows(stream, 3) == whole[:3]
+    state = stream.get_state()
+    # Read ahead of the end, as a prefetch worker reads: the first corpus alone, never trained on.
+    assert all(corpus_of(row) == 0 for step in packed_rows(stream, 2) for row in step)
+
+    ended = open_stream(DataPartition()).ending(state)
+    assert position.read(ended).completed[0][1] == 12
+    for processes in (1, 2):
+        assert pooled(open_stream, processes, 4, ended, rows=windows_of) == whole[3:7]
+    resumed = open_stream(DataPartition())
+    resumed.set_state(ended)
+    packed_rows(resumed, 2)
+    past = resumed.get_state()
+    again = open_stream(DataPartition())
+    again.set_state(past)
+    assert packed_rows(again, 2) == whole[5:7]
+
+
+def test_a_schedule_counts_the_tokens_of_every_stage_but_its_last(tmp_path):
+    """Every stage but the last commits a count of tokens, at least one; the last runs on, or ends
+    the data at its own. Only a stage on the token clock, and not the last, ends where the run
+    stands, and phases on the step clock end at their steps."""
+    _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
+    for stages in ((), ((ordered(packed(first)), None), (ordered(packed(second)), 10)),
+                   ((ordered(packed(first)), 0.5), (ordered(packed(second)), None))):
+        with pytest.raises(ValueError):
+            schedule(stages)
+    def opened(loader: Loader) -> PhasedStream:
+        stream = loader.train(DataPartition())
+        assert isinstance(stream, PhasedStream)
+        return stream
+
+    stream = opened(scheduled_packed((first, 10), (second, None)))
+    packed_rows(stream, 1)
+    ended = stream.ending(stream.get_state())
+    with pytest.raises(ValueError):
+        opened(scheduled_packed((first, 10), (second, None))).ending(ended)
+    phased = opened(phased_packed((first, 3), (second, None)))
+    packed_rows(phased, 1)
+    with pytest.raises(ValueError):
+        phased.ending(phased.get_state())
+
+
 # --------------------------------------------------------------------------
 # The batch ramp: MaxText's schedule
 # --------------------------------------------------------------------------
@@ -975,6 +1043,97 @@ def assert_same(left: dict, right: dict, why: str) -> None:
     assert set(left) == set(right)
     for name in left:
         np.testing.assert_array_equal(left[name], right[name], err_msg=f"{why}: {name}")
+
+
+def endless_chains(name: str) -> tuple[Pipeline, Pipeline]:
+    """A chain a fit reads without being given a repeat, and the chain it reads: phases or a mix whose
+    corpora repeat themselves read as written; phases of passes batched on their own, repeated after
+    each phase's batch as the chain's own repeat at its end is; and phases or a mix whose repeats are
+    bounded, repeated before the batch."""
+    first = Pipeline(Memory(Indexed(1, 64))).shuffle(0)
+    second = Pipeline(Memory(Indexed(2, 64))).shuffle(1)
+    if name == "phases":
+        chain = phases((first.repeat(), 3), (second.repeat(), None)).batch(8)
+        return chain, chain
+    if name == "mix":
+        chain = mix([first.repeat(), second.repeat()]).batch(8)
+        return chain, chain
+    if name == "batched-phases":
+        chain = phases((first.batch(8), 3), (second.batch(8), None))
+        return chain, chain.repeat()
+    if name == "bounded-phases":
+        # The phases' shared take bounds the one that repeats itself: the chain repeats after it.
+        bounded = phases((first.repeat(), 2), (second, None)).take(16)
+        return bounded.batch(8), bounded.repeat().batch(8)
+    members = [first.repeat().take(12), second.repeat().take(12)]
+    return mix(members).batch(8), mix(members).repeat().batch(8)
+
+
+@pytest.mark.parametrize("name", ["phases", "mix", "batched-phases", "bounded-phases", "bounded-mix"])
+def test_a_fit_repeats_a_chain_only_where_its_read_can_end(tmp_path, name):
+    """A fit reads a dataset without a repeat endlessly by adding one where its read can end
+    (`analysis.reach`): phases whose corpora repeat themselves, and a mix of members that all do, are
+    read as written, while phases of batched passes and a mix of bounded repeats repeat as before,
+    landing where the chain written with that repeat lands."""
+    chain, read = endless_chains(name)
+    fitted = regression_trainer(tmp_path / "fitted").fit(chain, steps=5)
+    written = regression_trainer(tmp_path / "written").fit(compile(read, seed=0), steps=5)
+    assert_same(parameters(fitted), parameters(written), f"{name} as the fit reads it")
+
+
+class TokenCounted(Regression):
+    """`Regression` whose records each commit `id % 3 + 1` real tokens, so the steps of a run commit
+    unevenly."""
+
+    counts_tokens = True
+
+    def scored_tokens(self, batch):
+        return np.asarray(batch["id"]) % 3 + 1
+
+
+def token_trainer(directory: Path, tracker: RecordingTracker | None = None,
+                  accumulation: int = 1) -> Trainer:
+    return Trainer(TokenCounted(), optax.sgd(0.5), key=jax.random.key(0), accumulation=accumulation,
+                   layout=Layout(min_shard=1, tolerance=1.0),
+                   checkpoints=Checkpoints(str(directory), keep=8), tracker=tracker)
+
+
+@pytest.mark.parametrize("accumulation", [1, 2])
+def test_a_schedule_ends_its_stage_at_the_step_whose_commit_reaches_its_tokens(tmp_path, accumulation):
+    """A run on a schedule ends its first stage at the step whose commit brings the run's committed
+    tokens to the stage's 50: it lands where phases switching at that step land, its parameters bit
+    for bit, the read ahead of the end untrained, and its saved position holds where the stage
+    ended. A run stopped before the end, or at the step that reached it, resumes to the same
+    parameters."""
+    first = Pipeline(Memory(Indexed(1, 64))).shuffle(0).repeat()
+    second = Pipeline(Memory(Indexed(2, 64))).shuffle(1).repeat()
+    data = schedule([(first, 50), (second, None)]).batch(8)
+    tracker = RecordingTracker()
+    scheduled = token_trainer(tmp_path / "scheduled", tracker, accumulation)
+    whole = parameters(scheduled.fit(data, steps=8, log_every=1))
+    committed = list(itertools.accumulate(scalars["train/tokens"] for _, scalars in tracker.scalars
+                                          if "train/tokens" in scalars))
+    step = next(index + 1 for index, tokens in enumerate(committed) if tokens >= 50)
+    assert 1 < step < 8
+    phased = phases((first, step), (second, None)).batch(8)
+    switched = token_trainer(tmp_path / "phased", accumulation=accumulation).fit(phased, steps=8)
+    assert_same(whole, parameters(switched), "the schedule against phases switching where its commits did")
+    assert scheduled.checkpoints is not None
+    _, saved = scheduled.checkpoints.restore(share=DataPartition())
+    assert saved is not None and position.read(saved).completed[0][1] == step * 8
+    for stopped in (2, step):
+        token_trainer(tmp_path / f"stopped-{stopped}", accumulation=accumulation).fit(data, steps=stopped)
+        resumed = token_trainer(tmp_path / f"stopped-{stopped}", accumulation=accumulation).fit(data, steps=8)
+        assert_same(whole, parameters(resumed), f"resumed from step {stopped}")
+    # The last stage's own tokens end the data: the run's last step is the one whose commit reaches
+    # them, saved as a token budget's last step is, where phases running on to that step land.
+    last = next(index + 1 for index, tokens in enumerate(committed) if tokens >= committed[step - 1] + 30)
+    ended = token_trainer(tmp_path / "ended", accumulation=accumulation)
+    state = ended.fit(schedule([(first, 50), (second, committed[step - 1] + 30 - 50)]).batch(8))
+    assert int(state.step) == last and ended.checkpoints is not None and ended.checkpoints.latest == last
+    ran_on = token_trainer(tmp_path / "ran-on", accumulation=accumulation).fit(phased, steps=last)
+    assert_same(parameters(state), parameters(ran_on),
+                "a schedule whose data ends against phases running on to its last step")
 
 
 # Every stage's batch is a multiple of the eight simulated devices, because a
