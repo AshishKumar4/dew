@@ -9,6 +9,7 @@ tracker, and what a failure does to the run.
 Local resume combines Dew's run and data-position policies; Orbax oracles the stored state.
 """
 
+import collections
 import contextlib
 import dataclasses
 import itertools
@@ -26,6 +27,7 @@ import optax
 import orbax.checkpoint as ocp
 import pytest
 from affine_run import BATCH, FEATURES, Counting, Features, Regression, Spread, dataset, raw_leaf, val_batches
+from flax.core import FrozenDict, freeze as frozen_dict
 from recording import Preempting, RecordingTracker
 from steady_state import steady_state
 from token_support import write_token_corpus
@@ -1337,14 +1339,100 @@ class Counted(Objective):
         return loss, Aux({}, variables={"stats": {"seen": variables["stats"]["seen"] + 1}})
 
 
-def test_aux_variables_are_written_back_into_the_state_and_checkpointed(tmp_path):
-    trainer = make_trainer(tmp_path, objective=Counted(), optimizer=optax.adamw(1e-2, weight_decay=1.0))
+class FrozenCounted(Counted):
+    """`Counted`, its collection written back in a Flax `FrozenDict`, as Flax's `apply` writes one
+    under `flax_return_frozendict`."""
+
+    def loss(self, variables, batch, step):
+        loss = jnp.sum(variables["params"]["w"] ** 2)
+        return loss, Aux({}, variables=frozen_dict({"stats": {"seen": variables["stats"]["seen"] + 1}}))
+
+
+class ListedCounted(Counted):
+    """`Counted`, its count held in a list, which the loss writes back as a Flax `FrozenDict`."""
+
+    def fresh_variables(self, key, held):
+        return {"params": {"w": jnp.ones((2,))}, "stats": {"seen": [{"count": jnp.zeros(())}]}}
+
+    def loss(self, variables, batch, step):
+        loss = jnp.sum(variables["params"]["w"] ** 2)
+        count = variables["stats"]["seen"][0]["count"] + 1
+        return loss, Aux({}, variables={"stats": {"seen": [frozen_dict({"count": count})]}})
+
+
+class FrozenListedCounted(Counted):
+    """`ListedCounted`, its count starting in a Flax `FrozenDict` in its list, which the loss writes back
+    as a dict."""
+
+    def fresh_variables(self, key, held):
+        return {"params": {"w": jnp.ones((2,))}, "stats": {"seen": [frozen_dict({"count": jnp.zeros(())})]}}
+
+    def loss(self, variables, batch, step):
+        loss = jnp.sum(variables["params"]["w"] ** 2)
+        count = variables["stats"]["seen"][0]["count"] + 1
+        return loss, Aux({}, variables={"stats": {"seen": [{"count": count}]}})
+
+
+def seen(stats) -> float:
+    """How many steps a `Counted` collection counted, held as `Counted` or `ListedCounted` holds it."""
+    held = stats["seen"]
+    return float(held[0]["count"] if isinstance(held, list) else held)
+
+
+@pytest.mark.parametrize("objective", [Counted, FrozenCounted, ListedCounted, FrozenListedCounted],
+                         ids=["dict", "frozen", "listed", "frozen-listed"])
+def test_aux_variables_are_written_back_into_the_state_and_checkpointed(tmp_path, objective):
+    """A collection the loss writes back replaces the state's, in the state's dicts whichever Flax
+    container it comes in, under a mapping or a list."""
+    trainer = make_trainer(tmp_path, objective=objective(), optimizer=optax.adamw(1e-2, weight_decay=1.0))
     state = trainer.fit(dataset(), steps=3, log_every=1)
-    assert float(state.variables["stats"]["seen"]) == 3.0
+    nodes = jax.tree.leaves(state.variables, is_leaf=lambda node: isinstance(node, FrozenDict))
+    assert not any(isinstance(node, FrozenDict) for node in nodes)
+    assert seen(state.variables["stats"]) == 3.0
     assert set(state.opt_state[0].mu) == {"w"}
 
     restored, _ = trainer.checkpoints.restore()
-    assert float(restored["variables"]["stats"]["seen"]) == 3.0
+    assert seen(restored["variables"]["stats"]) == 3.0
+
+
+class ListedParameters(Objective):
+    """Parameters held in a list, as a stack of layers can be."""
+
+    ema = None
+
+    def fresh_variables(self, key, held):
+        return {"params": {"layers": [{"w": jnp.ones((2,))}]}}
+
+    def loss(self, variables, batch, step):
+        return jnp.sum(variables["params"]["layers"][0]["w"] ** 2), Aux({})
+
+
+def test_a_supplied_state_whose_parameters_and_moments_hold_a_frozen_dict_in_a_list_trains(tmp_path):
+    """A state handed to fit is held whole as dicts of its own: its variables under any mapping, and a
+    Flax `FrozenDict` in a list both where a parameter sits and where the optimizer's moments of it do,
+    so the step's gradients and moments share one structure."""
+    trainer = make_trainer(tmp_path, objective=ListedParameters(), optimizer=optax.adam(1e-2))
+    initial = trainer.initial_state()
+    adam = initial.opt_state[0]
+    frozen = {"layers": [frozen_dict(initial.variables["params"]["layers"][0])]}
+    moments = adam._replace(mu={"layers": [frozen_dict(adam.mu["layers"][0])]},
+                            nu={"layers": [frozen_dict(adam.nu["layers"][0])]})
+    supplied = dataclasses.replace(initial, variables=collections.OrderedDict(params=frozen),
+                                   opt_state=(moments, *initial.opt_state[1:]))
+    state = trainer.fit(dataset(), steps=2, log_every=1, state=supplied)
+    nodes = jax.tree.leaves(state, is_leaf=lambda node: isinstance(node, FrozenDict))
+    assert int(state.step) == 2 and not any(isinstance(node, FrozenDict) for node in nodes)
+
+
+def test_a_supplied_state_holding_a_frozen_dict_in_a_list_trains_as_its_dicts_do(tmp_path):
+    """A state handed to fit holds its trees as dicts of its own, a Flax `FrozenDict` in a list
+    included, so the collection its loss writes back keeps the state's structure."""
+    trainer = make_trainer(tmp_path, objective=ListedCounted(), optimizer=optax.adamw(1e-2, weight_decay=1.0))
+    initial = trainer.initial_state()
+    stats = {"seen": [frozen_dict({"count": initial.variables["stats"]["seen"][0]["count"]})]}
+    state = trainer.fit(dataset(), steps=3, log_every=1,
+                        state=dataclasses.replace(initial, variables={**initial.variables, "stats": stats}))
+    assert seen(state.variables["stats"]) == 3.0
 
 
 # --------------------------------------------------------------------------

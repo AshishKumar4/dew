@@ -725,34 +725,40 @@ def test_runs_of_other_task_settings_or_a_single_run_do_not_average(decide, tmp_
         Decide.averaged(runs)
 
 
-def test_an_averaged_task_of_any_layout_saves_reloads_and_serves_as_it_was(decide, tmp_path):
-    """An average of runs over a question layout other than Laya's, its temperatures refit on held-out
-    answers, saves to a directory of its own as a run (`save`), which `from_run` reads back with its
-    weights, calibration and provenance, answering every case as the task it was. Saving it there
-    again keeps it; a run's own directory, which holds other weights, refuses it."""
+@pytest.mark.parametrize("kind", ["marker", "state-first"])
+def test_an_averaged_task_of_any_layout_saves_reloads_and_serves_as_it_was(decide, tmp_path, kind):
+    """An average of runs, its temperatures refit on held-out answers, saves to a directory of its own
+    as a run (`save`), which `from_run` and `dew.pipeline` read back with its weights, calibration and
+    provenance, answering every case as the task it was: under Laya's markers and a layout of the state
+    first (the joint release's in test_decision_joint_checkpoint). Saving it there again keeps it; a
+    run's own directory, which holds other weights, refuses it."""
     import dataclasses
 
     from dew.decision import StateFirstLayout
+    from dew.inference.loading import pipeline
 
-    other = replace(decide, layout=StateFirstLayout(max_len=decide.layout.max_len,
-                                                    head_max_len=decide.layout.head_max_len))
-    runs = trained_runs(other, tmp_path, 2)
+    if kind == "state-first":
+        decide = replace(decide, layout=StateFirstLayout(max_len=decide.layout.max_len,
+                                                         head_max_len=decide.layout.head_max_len))
+    runs = trained_runs(decide, tmp_path, 2)
     held_out = answered() * 10
     task = Decide.averaged(runs, calibrate_on=held_out)
     assert task.calibration != Calibration()
     directory = str(tmp_path / "averaged")
     task.save(directory)
-    reloaded = Decide.from_run(directory)
-    assert reloaded.layout == task.layout and reloaded.weights == task.weights
-    assert reloaded.calibration == task.calibration
-    for leaf, own in zip(jax.tree.leaves(reloaded.variables), jax.tree.leaves(task.variables), strict=True):
-        assert np.array_equal(np.asarray(leaf), np.asarray(own))
-    for request in CASES.values():
-        questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
-        found, expected = reloaded(request["state"], questions), task(request["state"], questions)
-        assert found.keys() == expected.keys()
-        for name in expected:
-            np.testing.assert_equal(dataclasses.asdict(found[name]), dataclasses.asdict(expected[name]))
-    reloaded.save(directory)
+    for reloaded in (Decide.from_run(directory), pipeline(directory)):
+        assert isinstance(reloaded, Decide)
+        assert reloaded.layout == task.layout and reloaded.weights == task.weights
+        assert reloaded.calibration == task.calibration
+        for leaf, own in zip(jax.tree.leaves(reloaded.variables), jax.tree.leaves(task.variables),
+                             strict=True):
+            assert np.array_equal(np.asarray(leaf), np.asarray(own))
+        for request in CASES.values():
+            questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
+            found, expected = reloaded(request["state"], questions), task(request["state"], questions)
+            assert found.keys() == expected.keys()
+            for name in expected:
+                np.testing.assert_equal(dataclasses.asdict(found[name]), dataclasses.asdict(expected[name]))
+    Decide.from_run(directory).save(directory)
     with pytest.raises(ValueError):
         task.save(runs[0])
