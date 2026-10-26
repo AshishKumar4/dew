@@ -83,8 +83,14 @@ class Template[Config: Hashable](tuning.KernelOp):
         """Whether a program of the launch of `ba` at `config` fits a block of `target`
         (`generation.shared_budget`) and its threads hold their registers (`registers`,
         `register_budget`): a generated kernel spills nothing."""
-        return (self.staged_bytes(ba, config, target) <= generation.shared_budget(target)
-                and self._held(ba, config))
+        return self.staged_bytes(ba, config, target) <= self.program_shared(config, target) and self._held(
+            ba, config)
+
+    def program_shared(self, config: Config, target: generation.GpuTarget) -> int:
+        """The shared memory a program of the launch at `config` may stage on `target`: a block's
+        (`generation.shared_budget`), where one program runs on a multiprocessor at a time."""
+        del config
+        return generation.shared_budget(target)
 
     def fits(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[Config, ...]:
         """The configs the launch takes on `target` that are legal there (`legal`): its generated one
@@ -139,10 +145,10 @@ class Template[Config: Hashable](tuning.KernelOp):
         if not self._held(ba, config):
             return f"its threads hold {registers} registers live, past the {budget} a thread has"
         target = generation.gpu_target()
-        staged = self.staged_bytes(ba, config, target)
-        if staged > generation.shared_budget(target):
-            return (f"its programs stage {staged} bytes of shared memory, past the "
-                    f"{generation.shared_budget(target)} a block of {target.generation} holds")
+        staged, shared = self.staged_bytes(ba, config, target), self.program_shared(config, target)
+        if staged > shared:
+            return (f"its programs stage {staged} bytes of shared memory, past the {shared} a program of it "
+                    f"on {target.generation} holds")
         return "its blocks, ring or schedule are not ones the launch's kernel takes for this call"
 
     def estimate(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[float, Config]:
