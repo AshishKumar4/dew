@@ -269,7 +269,7 @@ def test_a_remote_generation_of_more_shards_than_its_mirror_holds_reads_every_re
         rows.finish()
         rows.close()
         cache.publish(key, source)
-        sizes = [entry["size"] for entry in cache.generation(key).manifest["shards"].values()]
+        sizes = [entry["bytes"] for entry in cache.generation(key).manifest["shards"].values()]
         assert len(sizes) > readers
         mirrored = Cache(url, storage_options=options, mirror_bytes=readers * max(sizes))
         generation = mirrored.generation(key)
