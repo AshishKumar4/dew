@@ -36,7 +36,13 @@ from flax.training.early_stopping import EarlyStopping
 from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
-from dew._coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
+from dew._coordination import (
+    agree_process_phase,
+    agreed,
+    agreed_next,
+    agreed_same,
+    broadcast_from_process_zero,
+)
 from dew._records import JSON, boolean, json_value, record
 from dew.batch import FROZEN, Batch, Variables, owned_dicts, select
 from dew.checkpoints import Checkpoints, Ranking
@@ -104,12 +110,7 @@ from dew.objectives.base import (
 from dew.optim import clips_qk, learning_rate, with_rates
 from dew.state import MODEL_STATE, Accumulation, TrainState, apart, kept_window, together
 from dew.telemetry import profile as telemetry_profile
-from dew.telemetry.instrumentation import (
-    StepFlops,
-    compilation_cache_counts,
-    count_compilation_cache,
-    model_flops_utilization,
-)
+from dew.telemetry.instrumentation import StepFlops, compilation_cache_counts, count_compilation_cache
 from dew.telemetry.profile import region
 from dew.telemetry.records import (
     AxisLink,
@@ -131,6 +132,7 @@ from dew.training._fit import (
 )
 from dew.training._lowering import Lowered
 from dew.training.budget import Pause, Plateau, run_length, run_steps, run_tokens
+from dew.training.cooldown import Branch, Cooldowns, check_branches, scaled_rates
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
     check_batch,
@@ -148,7 +150,7 @@ from dew.training.distributed import (
     traced_start,
 )
 from dew.training.evaluation import EvalSuite, Evaluation, Summary
-from dew.training.interval import Interval, held
+from dew.training.interval import Interval, held, throughput
 from dew.training.memory import (
     climb_to,
     device_tokens,
@@ -1276,6 +1278,7 @@ class Trainer(Generic[Loss, Effects]):
         state: TrainState | None = None,
         observe: Observe | None = None,
         device_prefetch: int = PREFETCH_DEPTH,
+        cooldowns: Cooldowns | None = None,
     ) -> TrainState:
         """Train until the step or real-token cap is reached, resuming the latest checkpoint.
 
@@ -1285,11 +1288,10 @@ class Trainer(Generic[Loss, Effects]):
 
         Every `log_every` steps, the tracker receives the loss, the objective's metrics and the throughput.
 
-        `tokens` stops at the first microbatch that reaches this real-token
-        budget, from the same counter as `train/tokens`, persisted in checkpoints.
-        Padding never counts. With both caps the first reached ends the run;
-        with `steps=None`, a decaying schedule needs its own step horizon. `examples`
-        trains on the chain's first records, each once (`Loader.example_steps`).
+        `tokens` stops at the first microbatch that reaches this real-token budget, from the same counter
+        as `train/tokens`, persisted in checkpoints. Padding never counts. With both caps the first reached
+        ends the run; with `steps=None`, a decaying schedule needs its own step horizon. `examples` trains
+        on the chain's first records, each once (`Loader.example_steps`).
 
         Every `eval_every` steps, and at the end, the validation split is scored. The objective's
         artifacts go to the tracker and to `metrics`, whose reductions are logged as `val/<name>`.
@@ -1298,13 +1300,12 @@ class Trainer(Generic[Loss, Effects]):
         `<name>/<metric>`. Each of `summaries` weighs those scores into one, `evaluation/summary/<name>`,
         formed at a step that scored every split it weighs, which `best` and `Plateau` rank by.
 
-        `restore_best=True` returns the model the run ranked best: the final
-        state with the counters, variables and EMA of the best step
-        (`MODEL_STATE`), read from its best checkpoint, a weights-only one
-        included, or without `Checkpoints` from the copy it held
-        (`HeldBest`). Its optimizer state and the rest stay the final step's,
-        so it is the best model, not a point to resume training from, which
-        the run's checkpoints are.
+        `restore_best=True` returns the model the run ranked best: the final state with the counters,
+        variables and EMA of the best step (`MODEL_STATE`), read from its best checkpoint, a weights-only
+        one included, or without `Checkpoints` from the copy it held (`HeldBest`). Its optimizer state
+        and the rest stay the final step's, so it is the best model, not a point to resume training
+        from, which the run's checkpoints are. `cooldowns` branch the run into cooldowns, each scored by
+        every suite as `cooldown/<split>/<metric>` and discarded (`dew.training.cooldown.Cooldowns`).
 
         Every `checkpoint_every` steps (or "5%", `FitPlan.cadences`), the state and data position are written;
         `checkpoint_final=True` also writes the final state, independently of that cadence. A
@@ -1358,6 +1359,7 @@ class Trainer(Generic[Loss, Effects]):
                 metrics=metrics, preview=preview, best=selection, stop=plateau, suites=suites, pause=pause,
                 held_best=restore_best and checkpoints is None, observe=observe, summaries=tuple(summaries),
                 declared=declared,
+                branches=() if cooldowns is None else cooldowns.branches(steps, tokens, self.accumulation),
             )
             trained = self._training_loop(plan, run, profiler, tracer, profile, checkpoints, state)
             # The state a checkpoint would hold: the step rebuilds its narrow copies.
@@ -1401,7 +1403,7 @@ class Trainer(Generic[Loss, Effects]):
                                                   resumed=initial is None and interval.last_saved is not None)
         if complete:
             return state
-        compiled: dict[Signature, tuple[CompiledStep, StepFlops | None]] = {}
+        compiled: dict[Signature, tuple[CompiledStep, StepFlops | None]] = run.compiled
         seen = 0
         run.notice = PreemptionNotice()
         run.committed = plan.real(interval)
@@ -1605,6 +1607,7 @@ class Trainer(Generic[Loss, Effects]):
         state, shardings = placed()
         if int(state.step) != current:
             raise ValueError(f"the checkpoint of step {current} holds a state at step {int(state.step)}")
+        check_branches(plan.branches, plan.suites, state.opt_state)
         started = FitStarted(current, steps,
             checkpoints.source(current) if checkpoints is not None and position is not None else None,
             sum(leaf.size for leaf in jax.tree.leaves(state.variables["params"])), mesh.devices.size,
@@ -1762,6 +1765,10 @@ class Trainer(Generic[Loss, Effects]):
         scores = (
             {} if run.evaluation is None or run.evaluation.step != current else dict(run.evaluation.scores)
         )
+        for branch in plan.branches:
+            # Before the step's save, so a run stopped inside a branch resumes to run it again.
+            if branch.due(current, real, before):
+                self._cooled(plan, run, state, shardings, position, branch)
         if not ending:
             self._saves(plan, run, interval, state, position, scores, evaluation_due=evaluation_due,
                         full=paused)
@@ -1785,6 +1792,44 @@ class Trainer(Generic[Loss, Effects]):
                 run.preempted = current
             return True
         return False
+
+    def _cooled(self, plan: FitPlan, run: FitRun, state: TrainState, shardings: Placement[TrainState],
+                position: bytes | None, branch: Branch) -> None:
+        """Train the cooldown `branch` from `state`, on the run's batches from its data `position`, by the
+        run's own compiled steps at its rate times the branch's decay (`scaled_rates`); score every
+        suite on it as `cooldown/<split>` at the run's step, and discard it, the run's state and stream
+        left as they were (`dew.training.cooldown`)."""
+        if position is None:
+            raise ValueError("a cooldown branch reads on from the run's data position, and this stream "
+                             "keeps none")
+        steps, began = branch.cooldowns.steps(run.current, self.accumulation), time.perf_counter()
+        self._display.note(f"Cooldown branch from step {run.current}: {steps} steps")
+        branched = FitRun(run.started, current=run.current, partition=run.partition, reads=run.reads,
+                          compiled=run.compiled)
+        assert run.partition is not None
+        branched.train = self._prefetched(plan, branched, plan.dataset.train(run.partition), position)
+        # A copy of the state, which the branch's steps donate.
+        cooled = jax.device_put(state, shardings, may_alias=False)
+        try:
+            for index in range(steps):
+                batch = agreed_next("cooldown read", branched.train)
+                if batch is None:
+                    self._display.note(f"The training data ran out {index} steps into the cooldown")
+                    break
+                if self.rollout is not None:
+                    batch, _ = self._rolled_out(cooled, batch)
+                device, _ = split_fields(batch)
+                step, _, cooled = self._compiled_for(run.compiled, cooled, device, branched)
+                factor = branch.cooldowns.factor(index // self.accumulation, steps // self.accumulation)
+                cooled = step(dataclasses.replace(
+                    cooled, opt_state=scaled_rates(cooled.opt_state, state.opt_state, factor)), device)[0]
+                branched.current += 1
+        finally:
+            branched.train.close()
+        suites = {f"cooldown/{name}": suite for name, suite in plan.suites.items()}
+        self._evaluation(dataclasses.replace(plan, suites=suites, summaries=()),
+                         dataclasses.replace(cooled, step=state.step), shardings, {})
+        run.other += time.perf_counter() - began
 
     def _best_model(self, final: TrainState, run: FitRun) -> TrainState:
         """`final` with the model state of the step the run ranked best (`MODEL_STATE`): read from
@@ -2279,10 +2324,10 @@ class Trainer(Generic[Loss, Effects]):
             work = None if read.training is None else float(read.training)
             scalars = {"train/loss": float(read.loss),
                        **{f"train/{k}": float(v) for k, v in read.aux.items()},
-                       **self._throughput(elapsed, counts.since_log, counts.samples, counts.flops,
-                                          waited=counts.waited, compiling=counts.compiling,
-                                          training_flops=work, tokens=None if read.tokens is None
-                                          else _TokenCount.host(read.tokens))}
+                       **throughput(elapsed, counts.since_log, counts.samples, counts.flops,
+                                    self.device_mesh.devices.size, waited=counts.waited,
+                                    compiling=counts.compiling, training_flops=work,
+                                    tokens=None if read.tokens is None else _TokenCount.host(read.tokens))}
             scalars["train/accepted"] = float(read.accepted)
             if read.committed is not None:
                 norms, commits = read.committed
@@ -2447,50 +2492,3 @@ class Trainer(Generic[Loss, Effects]):
         self._report(ProfileWindowRecord(profile.directory, run.traced), run.current)
         agreed("profile announcement", lambda: self._display.note(
             f"Wrote profile for {run.traced} steps to {profile.directory}"))
-
-    def _throughput(self, elapsed: float, steps: int, samples: int, flops: StepFlops | None, *,
-                    waited: float = 0.0, compiling: float = 0.0,
-                    training_flops: float | None = None, tokens: float | None = None) -> dict[str, float]:
-        """Compute the interval's rates from the records it read and its FLOPs.
-
-        The FLOPs are the ones the compiler measured for each step's own
-        shape; `flops` is None when a shape's measurement was unavailable.
-        train/flops is the objective's analytical training work on real rows a
-        step, over the whole mesh, on any device: 3*forward for full FT,
-        explicit frozen/trainable matrix work for PEFT. train/mfu is that work
-        over the whole mesh's peak, where the device's peak is known. train/hfu keeps hardware HLO
-        work including remat; train/hlo_flops_util is the former HLO model
-        count with recomputation removed (`StepFlops.utilizations`). No HLO
-        count substitutes for MFU.
-
-        `compiling` is the seconds the interval spent compiling the step for
-        shapes it met for the first time (a bucket length, a ramp's stage).
-        The rates are over the rest of `elapsed`, so a step that compiled
-        does not read as a slow step, and the compile is reported on its own
-        as train/compile_s. `waited` is the seconds the loop waited on its
-        next batch, reported per step as train/data_wait_ms. The loop
-        dispatches steps ahead of the device, so a wait the device's queued
-        work covers costs no device time; a wait near the step time is a
-        stalled input.
-        """
-        stepping = elapsed - compiling
-        if stepping <= 0 or steps <= 0:
-            return {}
-        step_time = stepping / steps
-        scalars = {"train/step_time_ms": step_time * 1000,
-                   "train/samples_per_sec": samples / stepping,
-                   "train/data_wait_ms": waited / steps * 1000}
-        if compiling > 0:
-            scalars["train/compile_s"] = compiling
-        if tokens is not None:
-            scalars["train/tokens"] = float(tokens) / steps
-            scalars["train/tokens_per_s"] = float(tokens) / stepping
-        # A batch whose work could not be counted carries NaN (`_counted_batch`),
-        # so an interval holding one, on any process, reports no train/flops or train/mfu.
-        if training_flops is not None and math.isfinite(training_flops):
-            scalars["train/flops"] = float(training_flops) / steps
-            per_device = float(training_flops) / self.device_mesh.devices.size
-            utilization = model_flops_utilization(per_device / steps, step_time)
-            if utilization is not None:
-                scalars["train/mfu"] = utilization
-        return scalars if flops is None else {**scalars, **flops.utilizations(steps, step_time)}

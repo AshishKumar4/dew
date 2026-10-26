@@ -14,6 +14,7 @@ import contextlib
 import dataclasses
 import itertools
 import json
+import math
 import os
 import subprocess
 import sys
@@ -1238,6 +1239,72 @@ def test_a_cadence_may_be_a_share_of_the_run(tmp_path, written, expected):
     scored = sorted({step for step, scalars in tracker.scalars if "often/spread" in scalars})
     assert (logged, scored) == expected
     assert sorted({step for step, scalars in tracker.scalars if "own/spread" in scalars}) == [2, 4, 6, 8]
+
+
+def cooldown_run(schedule, steps: int, accumulation: int, tracker=None, cooldowns=None) -> TrainState:
+    """Regression on AdamW at `schedule` for `steps`, scored once at its end, with any `cooldowns`."""
+    trainer = make_trainer(tracker=tracker, accumulation=accumulation,
+                           optimizer=OptimConfig(optimizer="adamw", learning_rate=schedule))
+    return trainer.fit(dataset(val=val_batches(2)), steps=steps, log_every=steps, cooldowns=cooldowns)
+
+
+@pytest.mark.parametrize("accumulation", [1, 2])
+def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the_run_as_it_was(accumulation):
+    """A linear cooldown of four updates from the fourth of a warmup-stable-decay run is the run whose
+    decay begins there: the branch's `cooldown/val/loss`, recorded at the step it branched from, is that
+    run's final `val/loss` bit for bit (its rates, 2^-4 times 1, 3/4, 1/2 and 1/4, exact), and the run
+    it branched from ends where a run with no cooldown ends, its parameters bit for bit."""
+    from dew.optim import Linear
+    from dew.telemetry.records import FitStarted
+    from dew.training.cooldown import Cooldowns
+
+    peak, at = 2.0 ** -4, 4 * accumulation
+    stable = Linear(peak, decay_start=64, decay_steps=128)
+    tracker = RecordingTracker()
+    branched = cooldown_run(stable, 3 * at, accumulation, tracker,
+                            Cooldowns(at=(at,), length=at, shape="linear"))
+    cooled = {step: scalars["cooldown/val/loss"] for step, scalars in tracker.scalars
+              if "cooldown/val/loss" in scalars}
+    decayed = RecordingTracker()
+    cooldown_run(Linear(peak, decay_start=4, decay_steps=8), 2 * at, accumulation, decayed)
+    finals = [scalars["val/loss"] for _, scalars in decayed.scalars if "val/loss" in scalars]
+    assert cooled == {at: finals[-1]}
+    started = next(value for _, value in tracker.artifacts if isinstance(value, FitStarted))
+    assert started.cadences["cooldowns.at"] == [at]
+    plain = cooldown_run(stable, 3 * at, accumulation)
+    for ours, theirs in zip(jax.tree.leaves(branched.variables), jax.tree.leaves(plain.variables),
+                            strict=True):
+        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+
+
+def test_a_cooldown_resolves_its_points_and_lengths_as_shares_of_the_run():
+    """A cooldown's point is a step or a share of the run, resolved as a cadence's is, and its length a
+    step count or a share of the steps the run has taken; it decays as 1 - sqrt(u / U), or linearly."""
+    from dew.training.cadence import Tokens
+    from dew.training.cooldown import Cooldowns
+
+    cooldowns = Cooldowns(at=("25%", 6), length="50%")
+    assert [branch.at for branch in cooldowns.branches(16, None, 1)] == [4, 6]
+    (shared,) = Cooldowns(at=("25%",)).branches(None, 96, 1)
+    assert shared.at == Tokens(24) and shared.due(3, 30, 20) and not shared.due(4, 50, 30)
+    assert cooldowns.steps(4, 1) == 2 and cooldowns.steps(12, 2) == 6
+    assert [cooldowns.factor(update, 4) for update in range(4)] == [1.0, 0.5, 1.0 - math.sqrt(0.5),
+                                                                    1.0 - math.sqrt(0.75)]
+    linear = Cooldowns(at=(4,), shape="linear")
+    assert [linear.factor(update, 4) for update in range(4)] == [1.0, 0.75, 0.5, 0.25]
+
+
+@pytest.mark.parametrize("refused", ["unscored", "unscaled", "inside"])
+def test_a_cooldown_a_run_could_not_score_decay_or_begin_on_an_update_is_refused(refused):
+    """A run with no validation to score its branches, an optimizer holding no learning rate a branch can
+    scale, and a point inside an update's window are refused before the run trains."""
+    from dew.training.cooldown import Cooldowns
+
+    trainer = make_trainer(optimizer=optax.sgd(0.1) if refused == "unscaled" else OptimConfig(),
+                           accumulation=2 if refused == "inside" else 1)
+    with pytest.raises(ValueError):
+        trainer.fit(dataset(val=None if refused == "unscored" else val_batches(2)), steps=8,
+                    cooldowns=Cooldowns(at=(3 if refused == "inside" else 4,)))
 
 
 def test_the_run_start_records_the_cadences_and_warmups_it_resolved(tmp_path):

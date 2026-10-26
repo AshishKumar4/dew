@@ -27,6 +27,7 @@ from dew.state import TrainState
 from dew.telemetry.profile import region
 from dew.training.budget import Plateau, every_step, recorded
 from dew.training.cadence import Cadence, Tokens
+from dew.training.cooldown import Branch
 from dew.training.evaluation import EvalSuite, Evaluation, Summary
 from dew.training.interval import Interval, Taken
 from dew.training.observe import Observe
@@ -102,6 +103,8 @@ class FitPlan:
     """Every validation split by name, its metrics and cadence resolved."""
     summaries: tuple[Summary, ...] = ()
     """The scalars each step whose evaluations score every split they weigh forms (`Summary`)."""
+    branches: tuple[Branch, ...] = ()
+    """The run's cooldown branches (`dew.training.cooldown`)."""
     declared: Mapping[str, tuple[Metric | Summary, ...]] = dataclasses.field(default_factory=dict)
     """Every score the fit declares, by split (`declarations`)."""
     observe: Observe | None = None
@@ -198,6 +201,8 @@ class FitPlan:
         suites = {f"{name}.every": recorded(suite.every) for name, suite in self.suites.items()
                   if suite.every != self.eval_every}
         local = {} if self.local_every is None else {"local_every": recorded(self.local_every)}
+        if self.branches:
+            local["cooldowns.at"] = [branch.recorded() for branch in self.branches]
         return {"log_every": recorded(self.log_every), "eval_every": recorded(self.eval_every),
                 "checkpoint_every": recorded(self.checkpoint_every), **local, **suites,
                 **{f"warmup_steps.{name}": value for name, value in warmups.items()}}
@@ -255,6 +260,9 @@ class FitRun:
     reads: dict[Signature, tuple[bool, ...]] = dataclasses.field(default_factory=dict)
     """Which leaves of a batch of each signature its compiled step reads
     (`step_reads`), which the prefetcher alone places."""
+    compiled: dict[Signature, tuple] = dataclasses.field(default_factory=dict)
+    """The step compiled for each batch signature the run met, with its measured FLOPs
+    (`Trainer._compiled_for`), which its cooldown branches step too."""
 
     def read(self) -> Batch:
         """The training stream's next batch, read through this run each time:
