@@ -61,6 +61,16 @@ SCORE_FUNCTIONS = ('softmax', 'sigmoid', 'sqrtsoftplus')
 GROUPED_MATMULS = ('auto', 'xla', 'pallas')
 EXPERT_DISPATCHES = ('global', 'exchange')
 
+# What a router writes and reads, by name. Its choices, scores and log partitions are sown under
+# `ROUTER_COLLECTION` where a caller opens it, and its balancing bias is a variable of
+# `EXPERT_BIAS_COLLECTION`, which the step that balances the load rewrites (`dew.objectives.routing`).
+ROUTER_COLLECTION = 'router'
+ROUTER_INDICES = 'indices'
+ROUTER_SCORES = 'scores'
+ROUTER_LOG_Z = 'log_z'
+EXPERT_BIAS_COLLECTION = 'moe'
+EXPERT_BIAS = 'e_score_correction_bias'
+
 # DeepSeek divides the selected weights by their sum plus this, so a token
 # whose sigmoid scores are all zero stays finite
 # (modeling_deepseek_v3.py:166, maxtext layers/moe.py:839). In fp32 the term
@@ -293,17 +303,18 @@ class Router(nn.Module):
             (self.in_features, self.num_experts), jnp.float32)
         if self.expert_bias:
             self.bias = self.variable(
-                'moe', 'e_score_correction_bias', jnp.zeros,
+                EXPERT_BIAS_COLLECTION, EXPERT_BIAS, jnp.zeros,
                 (self.num_experts,), jnp.float32)
         if self.media_bias:
-            self.bias_vl = self.variable('moe', 'media_bias', jnp.zeros, (self.num_experts,), jnp.float32)
+            self.bias_vl = self.variable(
+                EXPERT_BIAS_COLLECTION, 'media_bias', jnp.zeros, (self.num_experts,), jnp.float32)
         if self.hash_vocab is not None:
             if self.expert_bias or self.expert_groups > 1 or self.routing_block is not None:
                 raise ValueError(
                     "hash routing selects by the token table alone, so it has no "
                     "balancing bias, no expert groups and no routing blocks")
             self.tid2eid = self.variable(
-                'moe', 'tid2eid', jnp.zeros, (self.hash_vocab, self.top_k), jnp.int32)
+                EXPERT_BIAS_COLLECTION, 'tid2eid', jnp.zeros, (self.hash_vocab, self.top_k), jnp.int32)
 
     def __call__(self, x, tokens=None, media=None, routes: Routes | None = None, blocks=None):
         logits = self.logits(x)
@@ -314,11 +325,11 @@ class Router(nn.Module):
         # written only when a caller opens the 'router' collection, and never
         # into the tree init returns, where it is not a variable.
         if not self.is_initializing():
-            self.sow('router', 'indices', indices)
+            self.sow(ROUTER_COLLECTION, ROUTER_INDICES, indices)
             # The V2 balance loss reads the scores beside the choices.
-            self.sow('router', 'scores', scores)
+            self.sow(ROUTER_COLLECTION, ROUTER_SCORES, scores)
             # The router z-loss squares each position's log partition.
-            self.sow('router', 'log_z', jax.nn.logsumexp(logits, axis=-1))
+            self.sow(ROUTER_COLLECTION, ROUTER_LOG_Z, jax.nn.logsumexp(logits, axis=-1))
         if self.normalize_weights and self.score_function == 'softmax' and not self.bias_in_weights:
             weights = renormalized_softmax(logits, indices)
         else:
