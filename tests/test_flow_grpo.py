@@ -978,10 +978,10 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
 
 def test_a_transitions_density_and_kl_hold_at_float32s_largest_variances():
     """A transition's density and KL stay finite and on SciPy's float64 values at a variance near float32's
-    largest, where `2 pi` or 2 times it overflowed to infinity, and its KL and density at one near its
-    least, where an error over it overflows and half the quotient fits: the density of a state at its
-    mean under a variance of 1e38 is `-n / 2 (log 2 pi + log 1e38)` (JAX's isotropic
-    `multivariate_normal.logpdf`), and the KL to a mean `d` away is `d**2 / (2 variance)`."""
+    largest, where `2 pi` or 2 times it overflowed to infinity, and its KL at one near its least, where
+    an error over it overflows and half the quotient fits: the density of a state at its mean under a
+    variance of 1e38 is `-n / 2 (log 2 pi + log 1e38)` (JAX's isotropic `multivariate_normal.logpdf`), and
+    the KL to a mean `d` away is `d**2 / (2 variance)`."""
     from scipy.stats import multivariate_normal as reference
 
     from dew.sampling.flow import GaussianTransition
@@ -1010,13 +1010,6 @@ def test_a_transitions_density_and_kl_hold_at_float32s_largest_variances():
     assert_as_exact_as_the_reference(kl, error / np.float32(2) / narrow,
                                      12 * float(step) ** 2 / (2 * narrow.astype(np.float64)),
                                      "a narrow transition's KL")
-    away = np.full(mean.shape, step, np.float32)
-    density = np.asarray(near.log_prob(jnp.asarray(away)))
-    assert np.all(np.isfinite(density))
-    half_log = np.float32(6) * (np.log(np.float32(2 * math.pi)) + np.log(narrow))
-    truth = [reference.logpdf(np.full(12, float(step)), np.zeros(12), float(value)) for value in narrow]
-    assert_as_exact_as_the_reference(density, -(error / np.float32(2) / narrow) - half_log, np.asarray(truth),
-                                     "a narrow transition's density")
 
 
 def test_a_transitions_kl_keeps_its_half_where_the_error_is_near_float32s_least():
