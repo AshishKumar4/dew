@@ -15,48 +15,17 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import TINY_DECODER, model_draw
+from block_support import VOCAB, block_causal, model, wrapped
+from model_support import model_draw
 from reference_error import assert_as_exact
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.kernels import generation
 from dew.nn.mixers import AttentionMixer
 
-VOCAB = 37
 LENGTH = 8
 
 
-def model(layers: int = TINY_DECODER["num_layers"], **kinds):
-    """A float32 decoder of `layers` layers of the kinds `kinds` names, in turn, each with its fields."""
-    types = tuple(kinds) * (layers // len(kinds))
-    return CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER, "dtype": "float32", "num_layers": layers,
-                                "layer_types": types, "kinds": kinds})
-
-
-def block_causal(blocks=None, images=None, *, segments=None, valid=None, window=None) -> np.ndarray:
-    """The keys each query keeps, `[B, Q, K]`: a key at or before the query, or of an image of the query's
-    (equal ids, -1 none), within a causal window of w, which keeps the keys fewer than w real tokens behind
-    the query and every one ahead (Gemma's `AND(sliding_window, OR(causal, blockwise))`); or of a block of
-    the query's, whatever the window (transformers' `block_sequence_ids`); inside the query's document (0
-    padding, which sees nothing) and among the real keys `valid`."""
-    rows, length = np.shape(next(groups for groups in (blocks, images) if groups is not None))
-
-    def same(groups):
-        if groups is None:
-            return np.zeros((rows, length, length), bool)
-        groups = np.asarray(groups)
-        return (groups[:, :, None] == groups[:, None, :]) & (groups[:, :, None] >= 0)
-
-    keep = np.tril(np.ones((length, length), bool))[None] | same(images)
-    real = np.ones((rows, length), bool) if valid is None else np.asarray(valid, bool)
-    if window is not None:
-        places = np.maximum(np.cumsum(real, axis=1) - 1, 0)
-        keep = keep & ((places[:, :, None] - places[:, None, :]) < window)
-    keep = keep | same(blocks)
-    if segments is not None:
-        segments = np.asarray(segments)
-        keep = keep & (segments[:, :, None] == segments[:, None, :]) & (segments[:, :, None] != 0)
-    return keep & real[:, None, :]
 
 
 BLOCKS = np.asarray([[-1, 0, 0, 0, -1, 1, 1, -1], [2, 2, -1, 3, 3, 3, 3, -1]], np.int32)
@@ -312,16 +281,6 @@ def test_a_multimodal_wrappers_cached_rollout_reads_its_blocks_as_its_full_pass_
     """A multimodal wrapper hands its language model the call's groups (`MultimodalTransformer`): text alone
     through its cache, a prefill, a cached call and single steps, with blocks inside each call, on par with
     its full pass over the same groups from float64 (check 1)."""
-    from dew.nn.multimodal import MultimodalTransformer
-    from dew.nn.vision import GemmaProjector, SiglipVision
-
-    def wrapped(decoder):
-        return MultimodalTransformer(
-            decoder, SiglipVision(hidden_size=16, intermediate_size=32, num_layers=1, num_heads=2,
-                                  image_size=8, patch_size=4),
-            GemmaProjector(text_width=TINY_DECODER["emb_features"], patches_per_side=2, tokens_per_side=1),
-            family="gemma3", image_token_id=1)
-
     decoder = model(full_attention={"mixer": AttentionMixer(bidirectional_blocks=True)})
     wrapper = wrapped(decoder)
     groups = jnp.asarray(CACHED_BLOCKS)
