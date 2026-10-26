@@ -47,6 +47,7 @@ from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.blocks import TokenEmbedding
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
+from dew.nn.dropout import Dropout
 from dew.nn.flops import matching_lengths, patch_lengths
 from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.mixer_base import MixerContext
@@ -724,7 +725,7 @@ class T5EncoderTransformer(nn.Module):
             self._layer(name=f"layers_{index}")
             for index in range(self.num_layers)]
         self.final_norm = RMSNorm(epsilon=self.layer_norm_epsilon, dtype=self.dtype, name="final_layer_norm")
-        self.dropout = nn.Dropout(rate=self.dropout_rate)
+        self.dropout = Dropout(rate=self.dropout_rate)
 
     def __call__(self, input_ids, attention_mask=None, train: bool = False):
         hidden_states = self.dropout(self.embed_tokens(jnp.asarray(input_ids)), deterministic=not train)

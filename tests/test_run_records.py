@@ -139,7 +139,7 @@ def test_the_live_run_holds_the_committed_layout_and_samples_an_image():
     import numpy as np
     from flax.core import unfreeze
 
-    from dew.sampling import TextToImage
+    from dew.inference import TextToImage
     from dew.training import MeshSpec
 
     repo, revision = LIVE_PIN.read_text().strip().split("@")

@@ -144,7 +144,7 @@ def draws(step: Path, config: dict) -> tuple[np.ndarray, list[np.ndarray], np.nd
     draws from the key the walk hands it (`_ancestral_noise`)."""
     from flax import struct
 
-    from dew.sampling import TextToImage
+    from dew.inference import TextToImage
     from dew.sampling.solvers import Solver
     from dew.sampling.solvers.sigma import _ancestral_noise
 

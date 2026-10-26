@@ -25,6 +25,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
 from dew.nn.dense import Dense, DenseGeneral
+from dew.nn.dropout import Dropout, kept
 
 from .attention_kernels import (
     ATTENTION,
@@ -306,7 +307,8 @@ def max_attention_logits(query: jax.Array, key: jax.Array, *, causal: bool = Fal
                          sliding_window: int | None = None,
                          mask: jax.Array | None = None,
                          bias: jax.Array | None = None) -> jax.Array:
-    """Return the largest pre-softmax logit per query head: `[batch, heads]`, fp32.
+    """Return the largest pre-softmax logit per query head: `[batch, heads]`, at least fp32
+    (`at_least_fp32` of the operands'), so a float64 model's maxima are float64.
 
     The logits are the scaled dot products the kernels softmax. Masked
     positions read -inf, so causality and packing never trip the maximum.
@@ -318,11 +320,12 @@ def max_attention_logits(query: jax.Array, key: jax.Array, *, causal: bool = Fal
     heads = query.shape[-2]
     key = repeat_kv_heads(key, heads)
     scale = 1.0 / math.sqrt(query.shape[-1])
+    wide = at_least_fp32(jnp.result_type(query.dtype, key.dtype))
     logits = float32_einsum('...qhd,...khd->...hqk',
-                            query.astype(jnp.float32) * jnp.asarray(scale, jnp.float32),
-                            key.astype(jnp.float32), precision=operand_precision(jnp.float32))
+                            query.astype(wide) * jnp.asarray(scale, wide),
+                            key.astype(wide), precision=operand_precision(wide))
     if bias is not None:
-        logits = logits + bias.astype(jnp.float32)
+        logits = logits + bias.astype(wide)
     combined = combined_attention_mask(
         query.shape[-3], key.shape[-3], causal, sliding_window, mask)
     if combined is not None:
@@ -481,14 +484,6 @@ def group_normalized(x, scale, bias, groups: int, epsilon: float, activation, re
     return (y if activation is None else activation(y)).astype(dtype)
 
 
-@functools.partial(normalized_in_fp32, static_argnums=(3, 4, 5))
-def layer_normalized(x, scale, bias, epsilon: float, requested, dtype):
-    """Normalize `x` over its last axis as flax's `LayerNorm`
-    (`_moment_normalized`). `scale` and `bias` of None are the affine-free
-    norm."""
-    return _moment_normalized(x, scale, bias, (-1,), epsilon, requested).astype(dtype)
-
-
 def l2_normalized(x, eps: float = 1e-12):
     """torch's `F.normalize`: `x` over its L2 norm on the last axis, the norm
     held at `eps` at least.
@@ -585,29 +580,11 @@ class RMSNorm(nn.Module):
         return stream, normed.reshape(stream.shape)
 
 
-class LayerNorm(nn.Module):
-    """Normalize the last axis as flax's `nn.LayerNorm` does, op for op.
-
-    The parameter tree and the fp32 arithmetic are flax's, so checkpoints move
-    both ways and forward values match bit for bit. The backward pass keeps the
-    input as it arrived (`normalized_in_fp32`) where flax keeps fp32 copies.
-    Other axes, masks, pmapped axes and the exact variance are flax's to serve.
-    """
-    epsilon: float = 1e-6
-    use_scale: bool = True
-    use_bias: bool = True
-    dtype: Dtype | None = None
-    param_dtype: Dtype = jnp.float32
-
-    @nn.compact
-    def __call__(self, x):
-        width = (x.shape[-1],)
-        scale = self.param('scale', nn.initializers.ones, width,
-                           self.param_dtype) if self.use_scale else None
-        bias = self.param('bias', nn.initializers.zeros, width,
-                          self.param_dtype) if self.use_bias else None
-        return layer_normalized(x, scale, bias, self.epsilon, self.dtype,
-                                canonicalize_dtype(x, scale, bias, dtype=self.dtype))
+class LayerNorm(nn.remat(nn.LayerNorm, policy=jax.checkpoint_policies.nothing_saveable)):
+    """flax's `nn.LayerNorm`, rematerialized saving nothing: its backward pass keeps the input as
+    it arrived and its parameters, not the two fp32 copies flax's own differentiation keeps
+    (2.35 GiB of them on one SimpleDiT step). The parameter tree, the arithmetic
+    and the module's name are flax's, so checkpoints and scopes move both ways."""
 
 
 class GroupNorm(nn.Module):
@@ -1235,7 +1212,7 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
         if dropout_rng is None:
             raise ValueError("training attention dropout requires dropout_rng")
         keep = 1.0 - dropout_rate
-        drawn = jax.random.bernoulli(dropout_rng, keep, weights.shape)
+        drawn = kept(dropout_rng, keep, weights.shape)
         weights = weights * (drawn.astype(dtype) / jnp.asarray(keep, dtype))
     if sinks is None:
         return weighted_values('...hqk,...khd->...qhd', weights, value, precision=precision)
@@ -2212,7 +2189,7 @@ class BasicTransformerBlock(nn.Module):
         norm = RMSNorm if self.norm == "rms" else LayerNorm
         self.norm1, self.norm2, self.norm3 = (norm(epsilon=self.norm_epsilon, dtype=self.dtype)
                                               for _ in range(3))
-        self.dropout = nn.Dropout(self.dropout_rate)
+        self.dropout = Dropout(self.dropout_rate)
 
     def _dropped(self, x, train: bool):
         return self.dropout(x, deterministic=not train)

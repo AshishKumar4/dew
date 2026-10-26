@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import { runsLive } from '../src/data/live-notebooks.mjs';
 
 test('Run live needs a CPU notebook that imports only what the live context serves', () => {
-	const sampling = 'from dew.sampling import TextToImage\nimport dew.interop';
+	const sampling = 'from dew.inference import TextToImage\nimport dew.interop';
 	assert.equal(runsLive('CPU', ['x = 1', sampling]), true);
 	assert.equal(runsLive('GPU', [sampling]), false);
 	assert.equal(runsLive('CPU', [sampling, 'from dew import Trainer']), false);
