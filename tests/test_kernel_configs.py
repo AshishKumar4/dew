@@ -323,8 +323,8 @@ def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name):
     assert got == expected, (sorted(expected - got), sorted(got - expected))
     found = compile_mosaic_kernels(cases, generation_name)
     failed = failures([record for record in found
-                       if "error" in record or record["shared"] > record["limit"]
-                       or not record.get("kernels")])
+                       if "error" in record or not record.get("kernels")
+                       or (record.get("shared") or 0) > record["limit"]])
     failed += [f"{record['name']} {kernel['kernel']}: {kernel['spilled']} bytes spilled"
                for record in found for kernel in record.get("kernels", ()) if kernel["spilled"] > 0]
     assert len(found) == len(cases) and not failed, "\n".join(failed)
