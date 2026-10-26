@@ -444,8 +444,8 @@ def split_scores(model, wide_model, shape, vocab: int, objective_of, adjusted, l
     `wide_model`, `model` in float64, on them widened; its top-1 hits at the first draw one device's.
     A draw's variables are `model`'s initial ones as `adjusted` sets them. Returns the mesh, and the
     first draw's variables and batch placed on it."""
+    from dew.distributed.batches import shard_batch
     from dew.training import Layout, MeshSpec
-    from dew.training.distributed import shard_batch
 
     def draw(seed):
         tokens = jax.random.randint(jax.random.fold_in(jax.random.key(1), seed), shape, 0, vocab)

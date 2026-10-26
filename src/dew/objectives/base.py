@@ -59,6 +59,7 @@ if TYPE_CHECKING:
 
     from dew.data.pipeline import DeviceStep, ObjectiveData
     from dew.data.text import Tokenizer
+    from dew.distributed.placement import Layout, MeshSpec
     from dew.inference.images import TextToImage
     from dew.inference.tasks import BlockGeneration, MaskedGeneration, Processor, TextGeneration
     from dew.inputs import InputSpec
@@ -66,7 +67,6 @@ if TYPE_CHECKING:
     from dew.nn.backbones.decoder_stack import DecoderBank
     from dew.sampling.guidance import Guidance
     from dew.state import TrainState
-    from dew.training.distributed import Layout, MeshSpec
 
     type Task = TextGeneration | BlockGeneration | MaskedGeneration | TextToImage
 
@@ -928,7 +928,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         it as `holds` do, and its options cover them. `step` are the XLA options of the training step
         the program is part of (`dew.training.memory.step_compiler_options`), beside its modules' own,
         so a host step's programs compile as the resident step does. Keep only the current
-        specialization, not a history of old models or steps.
+        specialization, not a history of old models or steps. The cache is the objective's, so its
+        programs live as long as it does: the process-wide seam every other outer program shares
+        (`dew.nn.kernels.options.program`) would keep each objective alive with them.
         """
         programs = tuple((program.module, (program.head_tile, program.head_fused))
                          for program in self.program_key())
