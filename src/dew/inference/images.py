@@ -41,9 +41,9 @@ if TYPE_CHECKING:
     from jax.sharding import Mesh
     from PIL.Image import Image as PILImage
 
+    from dew.distributed.placement import Layout, MeshSpec
     from dew.objectives.diffusion import DiffusionObjective
     from dew.quantization import Quantization
-    from dew.training.distributed import Layout, MeshSpec
 
 @dataclass(frozen=True)
 class _Resolved:

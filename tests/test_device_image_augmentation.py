@@ -88,7 +88,8 @@ def test_device_pipeline_reads_host_batches_the_step_augments_and_resumes_exactl
         for name in expected:
             np.testing.assert_array_equal(actual[name], expected[name])
         assert not np.array_equal(first["image"], expected["image"])
-        from dew.training.distributed import DevicePrefetchIterator, MeshSpec
+        from dew.distributed.batches import DevicePrefetchIterator
+        from dew.distributed.placement import MeshSpec
 
         mesh = MeshSpec().build([jax.devices()[0]])
         with DevicePrefetchIterator(stream, mesh) as prefetch:
@@ -107,7 +108,8 @@ def test_the_device_steps_jitter_rows_an_explicit_mesh_axis_types():
     """A run whose data axis is Explicit (`MeshSpec(explicit=("data",))`) places its rows typed
     by that axis; the compiled device steps crop, flip and jitter them into the pictures the
     unplaced batch makes, within one uint8 code of a compilation's rounding."""
-    from dew.training.distributed import MeshSpec, shard_batch, split_fields
+    from dew.distributed.batches import shard_batch, split_fields
+    from dew.distributed.placement import MeshSpec
 
     data = loaded(batch=8, seed=5, crop_scale=(0.5, 0.9))
     stream = data.train(DataPartition())
@@ -228,7 +230,8 @@ def test_without_augmentation_each_picture_is_its_record_resized_by_opencvs_area
 
 
 def test_device_pixels_are_not_fetched_back_when_the_trainer_places_them():
-    from dew.training.distributed import MeshSpec, shard_batch
+    from dew.distributed.batches import shard_batch
+    from dew.distributed.placement import MeshSpec
 
     stream = loaded().train(DataPartition())
     try:
@@ -313,11 +316,11 @@ def test_a_device_steps_rows_keep_their_explicit_axis_where_the_run_reads_them()
 
     from dew import Field, InputSpec, Trainer
     from dew.diffusion.presets import Flow
+    from dew.distributed.batches import shard_batch, split_fields
     from dew.nn.backbones import SimpleDiT
     from dew.objectives.diffusion import DiffusionObjective
     from dew.sampling import Euler
     from dew.training import Layout, MeshSpec
-    from dew.training.distributed import shard_batch, split_fields
 
     objective = DiffusionObjective(SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2,
                                              mlp_ratio=1),
