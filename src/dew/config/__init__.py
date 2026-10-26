@@ -54,6 +54,7 @@ from dew.data import records
 from dew.data.compile import fitted
 from dew.data.dataset import Loader, Ramp, Reader, ramped
 from dew.data.pipeline import Dataset, ObjectiveData
+from dew.distributed.placement import Layout, MeshSpec
 from dew.files import write_atomically
 from dew.inputs import Field
 from dew.lora import LoRA
@@ -80,13 +81,13 @@ from dew.state import TrainState
 from dew.telemetry.records import RunRecord, TrialFinished, json_value, packages_installed
 from dew.training.budget import Pause, run_length, run_steps
 from dew.training.display import TrainingDisplay
-from dew.training.distributed import Layout, MeshSpec
 from dew.training.evaluation import EvalSuite, Summary
 from dew.training.profiling import ProfileWindow
 from dew.training.quantization import quantize_trunk
+from dew.training.rollout import Rollout
 from dew.training.selection import Best
 from dew.training.tracker import LocalTracker, Tracker, Trackers, Wandb, WandbTracker
-from dew.training.trainer import Rollout, Trainer
+from dew.training.trainer import Trainer
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
@@ -1133,8 +1134,13 @@ class RunConfig:
         """The run a class record (`record`) names, as its class, which must be
         this one or derive from it."""
         if record.get("rebuildable") is False:
-            raise ValueError("this run was defined in Python, so no record rebuilds it; it loads for "
-                             "inference through dew.pipeline or a task's from_run")
+            reasons = record.get("reasons", [])
+            stated = "".join(f"; {reason}" for reason in reasons) if isinstance(reasons, list) else ""
+            raise ValueError("this run was defined in Python without a recorded RunConfig, so no "
+                             f"record rebuilds it{stated}. It resumes through the Python that built it, and "
+                             "loads for inference through dew.pipeline or a task's from_run; a run built as "
+                             "a RunConfig in Python and trained with run() writes a run.json that rebuilds "
+                             "it (docs/recipes.md, Python experiments)")
         registry.import_trusted(record, trust)
         named = registry.class_record(record)
         if named is None:

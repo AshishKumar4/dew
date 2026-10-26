@@ -49,6 +49,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.extend.core import Literal, primitives
 
 from dew.batch import COORDINATES_FIELD, VALIDITY_FIELD, Coordinates, coordinates, real_slots
+from dew.distributed.placement import Layout
 from dew.interop import sources, verify
 from dew.interop.decoder_parts import context_lengths
 from dew.interop.generation_config import read_generation_config
@@ -63,7 +64,6 @@ from dew.nn.precision import at_least_fp32, configured_precision, float32_produc
 from dew.nn.protocols import Lacks, OutputTable
 from dew.nn.sharding import Suffix, parameter_path
 from dew.registry import resolve_dtype
-from dew.training.distributed import Layout
 
 if TYPE_CHECKING:
     import torch

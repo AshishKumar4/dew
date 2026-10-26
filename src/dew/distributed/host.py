@@ -21,7 +21,7 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, Sharding, Sing
 from jax.tree_util import KeyPath
 
 from dew.batch import Variables
-from dew.training.distributed import Placement
+from dew.distributed.placement import Placement
 
 
 def companion_mesh(accelerator: Mesh, devices=None) -> Mesh:
