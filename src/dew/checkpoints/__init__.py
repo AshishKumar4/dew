@@ -813,28 +813,27 @@ def _held_apart(state_tree: dict, frozen: Mapping[str, Mapping[str, str]]) -> di
     return held
 
 
-def _position_leaves(state_tree: dict, restore_args: dict, metadata, *,
-                     from_local: bool) -> None:
-    """Add the data position to the leaves and the args a typed restore reads.
+def _host_read(*, from_local: bool) -> ocp.ArrayRestoreArgs:
+    """How a leaf that no template places is read. It is typed as a host
+    array, so Orbax reads no sharding file and warns about none. A local
+    checkpoint knows device arrays only, so its leaves land on one of this
+    process's devices and come home from there."""
+    if from_local:
+        return ocp.ArrayRestoreArgs(sharding=jax.sharding.SingleDeviceSharding(jax.local_devices()[0]))
+    return ocp.ArrayRestoreArgs(restore_type=np.ndarray)
+
+
+def _position_reads(metadata, *, from_local: bool) -> tuple[dict, dict]:
+    """The data position's restore template and the args that read it.
 
     The table's shape follows the process count and the iterator's position,
-    so it comes from the checkpoint's own metadata rather than the template. A
-    local checkpoint holds it as a device array, replicated like the step.
+    so it comes from the checkpoint's own metadata rather than the run's
+    template. `read_position` reads the table on the host, so it is read
+    there (`_host_read`) wherever the state goes.
     """
-    target = next(iter(jax.tree.leaves(state_tree)), None)
-    target_sharding = getattr(target, "sharding", None)
-    position_sharding = (
-        jax.sharding.NamedSharding(target_sharding.mesh, jax.sharding.PartitionSpec())
-        if isinstance(target_sharding, jax.sharding.NamedSharding) else
-        jax.sharding.SingleDeviceSharding(jax.local_devices()[0]))
-    state_tree["position"] = jax.tree.map(
-        lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype),
-        dict(metadata['position']))
-    restore_args['position'] = jax.tree.map(
-        lambda leaf: (ocp.ArrayRestoreArgs(sharding=position_sharding,
-                                           global_shape=leaf.shape)
-                      if from_local else ocp.RestoreArgs()),
-        state_tree['position'])
+    template = jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype),
+                            dict(metadata['position']))
+    return template, jax.tree.map(lambda _: _host_read(from_local=from_local), template)
 
 
 def _filled(template, restored: dict, step: int):
@@ -1500,7 +1499,7 @@ class Checkpoints:
         averages = tuple(_averages_of(profiles))
         wanted = _with_averages(jax.tree.map(lambda _: ocp.PLACEHOLDER, opt_state), averages)
         wanted = {'opt_state': wanted}
-        host = ocp.ArrayRestoreArgs(restore_type=np.ndarray)
+        host = _host_read(from_local=False)
         restored = persistent.restore(step, args=ocp.args.PyTreeRestore(
             item=wanted, partial_restore=True, restore_args=jax.tree.map(lambda _: host, wanted)))
         return tuple(_averages_of(_power_profiles(restored['opt_state'])))
@@ -1762,13 +1761,9 @@ class Checkpoints:
         if 'position' not in metadata or (snapshot.custom_metadata or {}).get('tree'):
             return None
         checkpointer = self._open_local() if from_local else self._open()
-        # A local checkpoint holds the table as a device array, replicated, which one device reads.
-        read = (ocp.ArrayRestoreArgs(sharding=jax.sharding.SingleDeviceSharding(jax.local_devices()[0]))
-                if from_local else ocp.ArrayRestoreArgs(restore_type=np.ndarray))
-        wanted = {'position': jax.tree.map(lambda meta: jax.ShapeDtypeStruct(meta.shape, meta.dtype),
-                                           dict(metadata['position']))}
+        wanted, read = _position_reads(metadata, from_local=from_local)
         restored = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
-            item=wanted, partial_restore=True, restore_args=jax.tree.map(lambda _: read, wanted)))
+            item={'position': wanted}, partial_restore=True, restore_args={'position': read}))
         table = jax.tree.map(np.asarray, dict(restored['position']))
         return read_position(table, self.local_path if from_local else self.path(step), share)
 
@@ -1819,12 +1814,7 @@ class Checkpoints:
         frozen = (snapshot.custom_metadata or {}).get('frozen') or {}
         held: dict[str, dict] | None = None
         if template is None:
-            # Typed as host arrays, so orbax reads no sharding file and warns
-            # about none. A local checkpoint knows device arrays only, so its
-            # leaves land on one device and come home from there.
-            untyped = (
-                ocp.ArrayRestoreArgs(sharding=jax.sharding.SingleDeviceSharding(jax.devices()[0]))
-                if from_local else ocp.ArrayRestoreArgs(restore_type=np.ndarray))
+            untyped = _host_read(from_local=from_local)
             restored = checkpointer.restore(step, args=ocp.args.PyTreeRestore(
                 restore_args=jax.tree.map(lambda _: untyped, dict(metadata))))
             if from_local:
@@ -1849,8 +1839,9 @@ class Checkpoints:
                 state_tree['ema'], targets = _plane_template(state_tree['ema'], deltas)
             _refuse_reshaped(state_tree, metadata, where)
             restore_args = jax.tree.map(lambda want: _read(want, want.dtype), state_tree)
-            if 'position' in stored and not isinstance(template, Mapping) and share is not None:
-                _position_leaves(state_tree, restore_args, metadata, from_local=from_local)
+            if 'position' in stored and not mapping and share is not None:
+                state_tree['position'], restore_args['position'] = _position_reads(
+                    metadata, from_local=from_local)
             try:
                 # partial_restore: a key the checkpoint holds and the template
                 # does not is skipped instead of refused. A template asking for

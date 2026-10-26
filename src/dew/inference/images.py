@@ -353,9 +353,11 @@ class TextToImage:
         by the task's towers as the training step encodes its blank (`DiffusionObjective.encode`)."""
         leaves = jax.tree.leaves(tokens)
         if leaves and leaves[0].shape[0] != 1:
-            return _encoder(plan.sharding)(self.inputs.encoders, self.variables, plan.place(plan.pad(tokens)))
+            encode = _encoder(plan.sharding, self.inputs.encoders)
+            return encode(self.inputs.encoders, self.variables, plan.place(plan.pad(tokens)))
         # Host tokens, which reach the encoders' devices as the call places them.
-        return _encoder(None)(self.inputs.encoders, self.variables, jax.tree.map(np.asarray, tokens))
+        return _encoder(None, self.inputs.encoders)(self.inputs.encoders, self.variables,
+                                                    jax.tree.map(np.asarray, tokens))
 
 
     def prepare(
@@ -638,7 +640,7 @@ class TextToImage:
         plan, process = settled.plan, settled.process
         given = plan.place(plan.pad(settled.tokens))
         if "given" not in settled.encoded:
-            given = _encoder(plan.sharding)(self.inputs.encoders, self.variables, given)
+            given = _encoder(plan.sharding, self.inputs.encoders)(self.inputs.encoders, self.variables, given)
         if settled.null_tokens is None:
             null = {}
         elif "null" in settled.encoded:
@@ -652,7 +654,7 @@ class TextToImage:
                             out_shardings=plan.sharding)
             return given, null, noise(process, plan.keys(settled.request), settled.shape)
         start = process.times(settled.count)[0] if settled.times is None else settled.times[0]
-        starting = program(_image_start, *([] if self.autoencoder is None else [self.autoencoder.model]),
+        starting = program(_image_start, *(() if self.autoencoder is None else self.autoencoder.towers()),
                            static_argnums=(0, 1, 2),
                            in_shardings=(None, plan.sharding, plan.sharding, None, None),
                            out_shardings=plan.sharding)
@@ -824,9 +826,10 @@ def _encoded(encoders, params, tokens):
     return encode_conditions(encoders, params["encoders"] if encoders else {}, tokens)
 
 
-def _encoder(rows: jax.sharding.NamedSharding | None):
-    """The program that encodes rows placed by `rows` (`_encoded`), placed as they are."""
-    return program(_encoded, static_argnums=(0,), in_shardings=(None, rows), out_shardings=rows)
+def _encoder(rows: jax.sharding.NamedSharding | None, encoders):
+    """The program that encodes rows placed by `rows` (`_encoded`) with `encoders`, placed as they are,
+    under the options its towers compile with (`compiler_options`)."""
+    return program(_encoded, encoders, static_argnums=(0,), in_shardings=(None, rows), out_shardings=rows)
 
 
 def _encoded_rows(conditions: Mapping[str, Conditioning]) -> int:

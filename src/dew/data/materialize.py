@@ -26,7 +26,7 @@ import numpy as np
 
 from dew._records import JSON, integer, json_value, record
 from dew.batch import Batch
-from dew.data.analysis import _analyzed, _identity, _label, _name
+from dew.data.analysis import _analyzed, _identity, _label, _name, written
 from dew.data.dataset import Ranges, Records
 from dew.data.lowering import (
     _cache_inputs,
@@ -40,6 +40,7 @@ from dew.data.lowering import (
 )
 from dew.data.mixing import CorpusCounts
 from dew.data.pipeline import (
+    Artifact,
     FlatMap,
     Map,
     Mixture,
@@ -149,6 +150,10 @@ def _memory_inputs(
     rows: list[tuple[tuple[int, ...], Record]] = []
     consumed = 0
     if artifact_at is not None:
+        # A cache the compiler placed numbers its rows as the maps it stands for do (`_memory_stages`):
+        # by input, as no map expands one (`dew.data.compile._automatic`).
+        stage = pipeline.stages[artifact_at]
+        automatic = isinstance(stage, Artifact) and stage.automatic
         filled, manifest, prefix = _fill(pipeline, source, artifact_at, "memory")
         cached = filled.mapped(_cache_inputs(source, stored), manifest, transform=prefix, source=source)
         try:
@@ -165,6 +170,9 @@ def _memory_inputs(
                 for child, value in enumerate(_CachedOutputs().flat_map(outputs)):
                     if isinstance(value, Rejected):
                         counter.rejected[value.reason] += 1
+                    elif automatic:
+                        rows.append((source.identifiers[index] if isinstance(source, _Memory) else (index,),
+                                     value))
                     else:
                         rows.append(((index, child), value))
             cached.finish()
@@ -210,6 +218,11 @@ def _memory_stages(
     # memory read this one reads on from, a count step or a layout.
     counting = isinstance(source, _Memory) and any(
         isinstance(value, Mapping) and "_dew_valid_targets" in value for value in source.held)
+    # A count step a cache ran before the stages left (`_memory_inputs`) counted these rows too.
+    counting = counting or any(isinstance(stage, Map) and isinstance(stage.step, CountTargets)
+                               for stage in pipeline.stages[:consumed])
+    # The layout facts are numbered by the stages the chain wrote, a cache the compiler placed none.
+    placed = consumed - len(written(pipeline.stages[:consumed]))
     for stage in pipeline.stages[consumed:eager]:
         counting = counting or isinstance(stage, (Windows, Pack)) or (
             isinstance(stage, Map) and isinstance(stage.step, CountTargets))
@@ -220,7 +233,7 @@ def _memory_stages(
         elif isinstance(stage, Windows):
             from dew.data.steps.windows import IndexedWindows
 
-            derived[f"accepted_before_windows_{consumed}"] = fingerprint(
+            derived[f"accepted_before_windows_{consumed - placed}"] = fingerprint(
                 [list(identifier) for identifier, _ in rows]
             )
             rule = LayoutRule.of(record(value, "layout document") for _, value in rows)
@@ -233,7 +246,7 @@ def _memory_stages(
         elif isinstance(stage, Pack):
             from dew.data.packing import _Held, _PackedRows, refuse_overlong
 
-            derived[f"accepted_before_pack_{consumed}"] = fingerprint(
+            derived[f"accepted_before_pack_{consumed - placed}"] = fingerprint(
                 [list(identifier) for identifier, _ in rows]
             )
             rule = LayoutRule.of(record(value, "layout document") for _, value in rows)
@@ -398,7 +411,7 @@ def _memory_order(
             facts,
             tuple(identifier for identifier, _ in rows),
             inputs,
-            pipeline.stages[:consumed],
+            written(pipeline.stages[:consumed]),
             documents,
         ),
         stages=remaining,

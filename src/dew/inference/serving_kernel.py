@@ -25,7 +25,7 @@ from dew.inference.tasks import cache_sized
 from dew.mesh import logical_spec
 from dew.nn.attention import CROSS_KEY, CROSS_VALUE
 from dew.nn.inputs import Admitted, ModelInputs, default_placement
-from dew.nn.kernels.options import compiler_options
+from dew.nn.kernels.options import Option, compiler_options
 from dew.nn.kernels.tuning import tune
 from dew.nn.kv_cache import POOLED, ROW_CURSORS, TABLE, as_words, from_words, grouped, is_paged, leaf_name
 from dew.nn.protocols import Serving
@@ -463,7 +463,7 @@ def state_shardings(mesh: Mesh | None, state: Slots) -> Slots:
 
 
 def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
-              options: Mapping[str, str | bool] | None = None) -> jax.stages.Wrapped:
+              options: Mapping[str, Option] | None = None) -> jax.stages.Wrapped:
     """Compile the step program over a state split into resident and carried halves.
 
     The matrix half is donated so XLA updates the cache in place instead of
@@ -550,7 +550,7 @@ def opened_in(formats: Formats) -> jax.stages.Wrapped:
     return jax.jit(opened, static_argnums=(0, 2, 3, 4), out_shardings=formats)
 
 
-_PROGRAMS: dict[tuple[tuple[Format, ...], str, NamedSharding | None, tuple[tuple[str, bool], ...]],
+_PROGRAMS: dict[tuple[tuple[Format, ...], str, NamedSharding | None, tuple[tuple[str, Option], ...]],
                 tuple[jax.stages.Wrapped, jax.stages.Wrapped]] = {}
 """One pair of step programs per resident layout; see `decode_programs`."""
 
@@ -562,7 +562,7 @@ Qwen3-0.6B at 64 slots, about 5 ms before 9 of a run's 16 admitting steps
 (docs/performance.md). Only a GPU backend is handed them."""
 
 
-def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[str, bool]
+def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[str, Option]
                     ) -> tuple[jax.stages.Wrapped, jax.stages.Wrapped]:
     """`_compiled` over `formats`, once per layout and model `options`
     (`dew.nn.kernels.options.compiler_options`), for the decoding step and
@@ -577,7 +577,7 @@ def decode_programs(formats: Formats, rows: NamedSharding | None, options: dict[
     and take its formats as placements, neither of which that seam's
     arguments carry."""
     leaves, structure = jax.tree_util.tree_flatten(formats)
-    key = (tuple(leaves), str(structure), rows, tuple(options.items()))
+    key = (tuple(leaves), str(structure), rows, tuple(sorted(options.items())))
     programs = _PROGRAMS.get(key)
     if programs is None:
         halves = split_donated(formats)

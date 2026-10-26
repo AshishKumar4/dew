@@ -8,7 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from recording import RecordingTracker
-from reference_error import assert_as_exact
+from reference_error import as_given, assert_as_exact
 
 from dew.batch import VALID_ROWS
 from dew.config import RunConfig, TrainerConfig
@@ -55,6 +55,7 @@ def chain(x: np.ndarray) -> Pipeline:
     return Pipeline(Memory({"x": x})).batch(BATCH)
 
 
+@as_given
 def descended(x):
     """The losses of each step and the weight after them, of Adam on `Pulled` over the first EXAMPLES
     records of `x` read in order, pass after pass, in batches of BATCH (the last holding the one
@@ -88,6 +89,7 @@ def losses(tracker: RecordingTracker) -> list[float]:
     return [scalars["train/loss"] for _, scalars in tracker.scalars if "train/loss" in scalars]
 
 
+@as_given
 def trained(x, directory=None, stops: tuple[Pause | None, ...] = (None,)):
     """The losses of every step and the final weight of an examples run over `x`, fitted once under
     each of `stops` in turn, each fit resuming the one before from `directory`."""
@@ -156,7 +158,8 @@ def test_a_paused_run_resumed_trains_on_as_one_that_never_paused(tmp_path):
     run does, step for step and in its weight (check 1): the budget, not the pause, sized its
     schedule, and its checkpoint held its data position."""
     directories = iter(range(1 << 20))
-    assert_as_exact(lambda x: trained(x, tmp_path / str(next(directories)), (Pause(0.5), None)), trained,
+    assert_as_exact(as_given(lambda x: trained(x, tmp_path / str(next(directories)), (Pause(0.5), None))),
+                    trained,
                     records, "paused run", seeds=PAUSE_SEEDS, truth_fn=descended)
 
 
