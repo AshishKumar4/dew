@@ -474,8 +474,8 @@ def test_splash_sizes_its_backward_to_a_v5es_scoped_vmem(dtype, width, softcap, 
     at width 128, which the TPU tier's test run refused at 18.6 MiB, and width 256, refused at 16.2 to 22.3
     MiB; the forward keeps its own. The backward forms its delta from the weights in the dq kernel's
     blocks (`splash_block_sizes`)."""
-    from dew.nn.attention import splash_block_sizes
     from dew.nn.kernels import generation
+    from dew.nn.kernels.splash import block_sizes as splash_block_sizes
 
     with generation.assumed("v5e"):
         sizes = splash_block_sizes(2048, 2048, width=width, itemsize=jnp.dtype(dtype).itemsize,
@@ -488,8 +488,8 @@ def test_splash_sizes_its_backward_to_a_v5es_scoped_vmem(dtype, width, softcap, 
 def test_splash_keeps_its_backward_blocks_where_a_tpus_limit_is_unmeasured():
     """A TPU whose scoped VMEM limit no measurement states (a v6e) keeps the backward's whole blocks:
     the limit is the target's default, which no TPU reports, so none is assumed."""
-    from dew.nn.attention import splash_block_sizes
     from dew.nn.kernels import generation
+    from dew.nn.kernels.splash import block_sizes as splash_block_sizes
 
     with generation.assumed("v6e"):
         sizes = splash_block_sizes(2048, 2048, width=128, itemsize=4, softcap=True)

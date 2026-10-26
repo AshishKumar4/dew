@@ -76,7 +76,7 @@ def flash_built_for(device: str, architectures: tuple[str, ...]) -> bool:
 # 16 query heads over 8, 128 wide, causal) took 1.28 ms forward and backward
 # at 1024 with the fused backward, against 1.81 at 512 with separate dq and
 # dkv kernels and 1.42 at 512 fused, with the same errors against fp32
-# (docs/performance.md). `splash_block_sizes` narrows this to a divisor of
+# (docs/performance.md). `splash.block_sizes` narrows this to a divisor of
 # each sequence, as the mask blocking needs.
 SPLASH_BLOCK = 1024
 # The kernel tiles the key axis by lanes: the compute block must be a whole

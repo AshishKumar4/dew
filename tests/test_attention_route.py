@@ -45,7 +45,7 @@ from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.generation import INHERENT
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_route
-from dew.nn.sharding import DEFAULT_RULES
+from dew.mesh import DEFAULT_RULES
 
 HEADS, KV_HEADS, WIDTH = 4, 2, 32
 MESH_TENSOR, MESH_HEADS = 4, 8

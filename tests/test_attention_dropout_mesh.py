@@ -14,7 +14,7 @@ from test_attention_dropout import RATE
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.kernels.templates.attention import dropout_keep, dropout_seed
-from dew.nn.sharding import DEFAULT_RULES
+from dew.mesh import DEFAULT_RULES
 
 
 @pytest.mark.mesh(devices=8)

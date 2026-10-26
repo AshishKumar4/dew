@@ -283,7 +283,7 @@ def test_row_fields_split_as_the_query_rows_do_where_the_heads_contend_for_the_a
     bands its own rows'. The same output as the whole sequence's."""
     from flax import linen as nn
 
-    from dew.nn.sharding import DEFAULT_RULES
+    from dew.mesh import DEFAULT_RULES
     from dew.training import MeshSpec
 
     length, window = 64, 8

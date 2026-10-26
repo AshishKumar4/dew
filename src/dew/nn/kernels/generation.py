@@ -260,7 +260,7 @@ class GpuTarget:
     @property
     def scoped_vmem(self) -> int | None:
         """A TPU's scoped VMEM limit in bytes at XLA's default, past which a Mosaic kernel refuses to
-        compile (`dew.nn.attention.splash_block_sizes`); None where no rule states it."""
+        compile (`dew.nn.kernels.splash.block_sizes`); None where no rule states it."""
         return self.architecture.scoped_vmem
 
     @property
