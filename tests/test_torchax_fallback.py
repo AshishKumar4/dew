@@ -965,7 +965,7 @@ def test_a_slot_release_over_a_tier_3_backbone_scores_and_serves_by_transformers
             scores = (head["slot"][:len(question.options)] @ answer
                       + lines @ head["k.weight"].T @ (head["q.weight"] @ answer) / math.sqrt(SLOT_HEAD))
             return {"scores": scores.double().numpy()}
-        return run
+        return as_given(run)
 
     def truth(seed):
         with float64():
