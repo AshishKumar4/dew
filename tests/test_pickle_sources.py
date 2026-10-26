@@ -8,8 +8,11 @@ directory, so the whole load is checked against its transformers logits.
 """
 
 import json
+import multiprocessing
+import os
 import shutil
 import sys
+import tempfile
 from pathlib import Path
 
 import jax
@@ -61,6 +64,52 @@ def test_a_pickle_checkpoint_converts_once_and_then_loads_without_torch(tmp_path
     assert float(np.max(np.abs(logits(first) - reference))) < 1e-5
     assert len(conversions) == 1 and sorted((cache / "dew" / "converted").iterdir()) == conversions
     assert jax.tree.all(jax.tree.map(np.array_equal, first.variables, second.variables))
+
+
+def _converting(root: str, rounds: int, barrier, failures) -> None:
+    """One pool process: each round, once every process is at the barrier, convert and read that round's
+    pickle (`sources.tensor_file`, as a release's readout loads), each failure to find its weights put on
+    `failures`."""
+    os.environ["XDG_CACHE_HOME"] = str(Path(root) / "cache")
+    from dew.interop import sources
+
+    for round_ in range(rounds):
+        barrier.wait()
+        try:
+            sources.tensor_file(Path(root) / f"release-{round_}" / "readout_head.pt")
+        except FileNotFoundError as failure:
+            failures.put(f"{round_}: {failure}")
+
+
+def test_processes_converting_one_pickle_at_once_each_read_its_weights():
+    """A pool's processes loading one release's pickle at once each convert it and read the conversion,
+    round after round, under a cache on the home directory's filesystem, where a pool's ~/.cache lies (an
+    overlay in CI, whose listing of a folder another process was rewriting a file in found no weights).
+    Each conversion is published whole, so every read finds them."""
+    rounds, processes = 16, 8
+    home = Path.home() / ".cache"
+    home.mkdir(parents=True, exist_ok=True)
+    root = tempfile.mkdtemp(dir=home, prefix="dew-pickle-race-")
+    try:
+        for round_ in range(rounds):
+            release = Path(root) / f"release-{round_}"
+            release.mkdir()
+            torch.save({f"w{index}": torch.randn(64, 64) for index in range(8)}, release / "readout_head.pt")
+        context = multiprocessing.get_context("spawn")
+        barrier, failures = context.Barrier(processes), context.Queue()
+        pool = [context.Process(target=_converting, args=(root, rounds, barrier, failures))
+                for _ in range(processes)]
+        for process in pool:
+            process.start()
+        for process in pool:
+            process.join()
+        assert [process.exitcode for process in pool] == [0] * processes
+        found = []
+        while not failures.empty():
+            found.append(failures.get())
+        assert not found, found[:3]
+    finally:
+        shutil.rmtree(root, ignore_errors=True)
 
 
 def test_sharded_pickles_read_through_their_index_in_their_stored_dtype(tmp_path, cache):
