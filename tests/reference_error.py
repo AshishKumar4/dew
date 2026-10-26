@@ -1220,13 +1220,14 @@ def recorded_pilots(reference_fn, draw, count: int):
     """A view of `reference_fn`, a recorded reference (one `.recorded`), that holds `count` pilot draws
     from SIZING_FROM on, disjoint from every verdict's seeds and recorded with Dew's arm and the truth
     from the same inputs: the draws a paired sizing of it takes (`seeds_for`). The view is the site's
-    own; `reference_fn` is left as it is. Its last pilot is read now (`draw`'s inputs at it), so a
-    recording that does not hold them all is refused here, not at the doubling that reaches them."""
+    own; `reference_fn` is left as it is. Every pilot is read now (`draw`'s inputs at each), so a
+    recording that does not hold them all is refused here, not at the doubling that reaches one."""
     if not getattr(reference_fn, "recorded", False):
         raise ValueError("pilots belong to a recorded reference; a live one draws its own from SIZING_FROM")
     if count < 1:
         raise ValueError(f"a recording of {count} pilots")
-    reference_fn(*draw(SIZING_FROM + count - 1))
+    for seed in range(SIZING_FROM, SIZING_FROM + count):
+        reference_fn(*draw(seed))
 
     @functools.wraps(reference_fn)
     def view(*inputs):
