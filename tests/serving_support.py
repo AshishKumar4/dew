@@ -52,14 +52,17 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
                                  .tokens)[0, -budget:] for index, request in enumerate(requests))
         return row, drawn
 
+    # One server for every draw, as a deployment serves request after request: its programs compile
+    # once, and a draw's prompts share no page with another's, their tokens drawn apart.
+    server = Server.from_task(task, **serving)
+
     def served(row, drawn):
-        server = Server.from_task(task, **serving)
-        tickets, shared = [], []
+        tickets, shared, before = [], [], server.prefix_hits
         for index, request in enumerate(requests):
             tickets.append(server.submit(served_inputs(row, request, vocab), budget, key=index))
             if hits is not None:
                 server.run()
-                shared.append(server.prefix_hits)
+                shared.append(server.prefix_hits - before)
         server.run()
         assert hits is None or shared == list(hits), shared
         generations = [ticket.result().host() for ticket in tickets]
@@ -91,7 +94,6 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
     # Paired: the server and the full forward run one model's arithmetic over the same weights and tokens,
     # their errors moving together across draws, which a hybrid stack's recurrence spreads too widely for
     # the reference compared with itself to resolve (`seeds_for`).
-    seeds = seeds_for(explicit(decoder), draw, label, truth_fn=explicit(wide, wide_weights=True),
-                      dew_fn=served)
-    assert_as_exact(served, explicit(decoder), draw, label, seeds=seeds,
-                    truth_fn=explicit(wide, wide_weights=True))
+    reference, truth = explicit(decoder), explicit(wide, wide_weights=True)
+    seeds = seeds_for(reference, draw, label, truth_fn=truth, dew_fn=served)
+    assert_as_exact(served, reference, draw, label, seeds=seeds, truth_fn=truth)
