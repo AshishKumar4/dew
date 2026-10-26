@@ -729,7 +729,10 @@ def quantized(moment: jax.Array, values: jax.Array, block: int) -> QuantizedMome
     blocked = moment.reshape(*moment.shape[:-1], -1, block)
     scales = jnp.maximum(jnp.max(jnp.abs(blocked), axis=-1), 1e-12)
     fractions = (blocked / scales[..., None]).reshape(moment.shape)
-    below = jnp.clip(jnp.searchsorted(values, fractions, side="right") - 1, 0, values.shape[0] - 1)
+    # Unrolled, the search fuses with the rest of the quantization: its default loop ran each of its eight
+    # halvings over the whole moment, 3.3x an A100's fp32 Adam step on a 234M-parameter decoder.
+    below = jnp.clip(jnp.searchsorted(values, fractions, side="right", method="scan_unrolled") - 1, 0,
+                     values.shape[0] - 1)
     above = jnp.minimum(below + 1, values.shape[0] - 1)
     nearest = jnp.where(fractions - values[below] >= (values[above] - values[below]) * 0.5, above, below)
     return QuantizedMoment(nearest.astype(jnp.uint8), scales)
