@@ -5,6 +5,17 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- `Trainer.fit(examples=N)` and `--trainer.examples N` bound a run to the chain's
+  first N records, counted before packing and each read once, its steps (and so
+  its schedule) the ones the data plan counts for them. `Pause(fraction)`, as
+  `stop=` or `--trainer.stop.fraction`, ends a run at that fraction of its
+  budget, to resume as one that never paused. A training stream that runs out
+  ends the run with its final checkpoint, on every process at the same step,
+  instead of raising `StopIteration`.
+- A JEPA run's target momentum ramps over its optimizer updates, the steps
+  over its accumulation, where it ramped over its steps; its `--lora` adapts
+  the encoder, which the run used to record and ignore. An LM run bounded by
+  `--trainer.tokens` alone trains over data with no epoch length.
 - A confident target's loss gradient is the rest of its row's probability summed directly, as arXiv:2610.31642's eq. 7 takes it, through every chunked head (the tiled, whole, fused and vocabulary-split heads) and the whole-logits loss (`logits_cross_entropy`). Each took the target's entry as its share less one, which rounds to 0 once the share rounds to 1, so the row's gradient stopped summing to zero by the rest mass, about 2e-9 at a margin of 20 and 4e-18 at 40. The forward pass reduces one more operand per row for it, and the loss values are unchanged.
 - An autoencoder's latent normalization is one traced map, `dew.nn.autoencoders.LatentAffine`, which
   `AutoEncoder.encode` and `decode` apply through one hook, `latent_affine(params, dtype)`: a configured

@@ -315,6 +315,44 @@ def _windowed(pipeline: Pipeline, objective: ObjectiveData) -> Pipeline:
     return dataclasses.replace(windows, stages=(*windows.stages, *pipeline.stages[at:]))
 
 
+def _bounded(pipeline: Pipeline, examples: int) -> Pipeline:
+    """`pipeline`'s training read bounded to its first `examples` records as they reach the first
+    stage that packs or windows them, or its batch where none does: the records the objective's
+    steps make, not the windows a pack lays them in. A repeat without end goes before the bound
+    where none is written, so the records may span passes, and the batch keeps the short one the
+    bound ends inside, filled and marked, so each record bounded is read once (`Loader.examples`).
+    Refuses a bound it cannot place: a repeat with a count before it, or any repeat after it, the
+    batch's included, a mixed corpus that packs on its own, and phases, which end by steps. A chain
+    without a batch is left for `compile` to refuse."""
+    if examples < 1:
+        raise ValueError(f"examples must be at least 1, got {examples}")
+    if isinstance(pipeline.source, Phases):
+        raise ValueError("phases end each phase at a step, so their run is bounded in steps, not examples")
+    if any(isinstance(stage, (Pack, Windows)) for child in children(pipeline) for stage in _steps(child)):
+        raise ValueError(f"{_name(pipeline)} packs inside a corpus it mixes, so its records reach the mix as "
+                         "windows; pack after the mix to bound the run in examples")
+    batched = _until(pipeline.stages, (BatchStage, TokenBudget))
+    if batched == len(pipeline.stages):
+        return pipeline
+    at = _until(pipeline.stages[:batched], (Pack, Windows))
+    repeats = [stage for stage in pipeline.stages[:at] if isinstance(stage, Repeat)]
+    if any(stage.epochs is not None for stage in repeats) or any(
+            isinstance(stage, Repeat) for stage in pipeline.stages[at:]):
+        raise ValueError(f"{_name(pipeline)} repeats with a count, or after the records it packs or batches, "
+                         f"which a bound of {examples} examples would cut or repeat; leave the repeat out")
+    bound = (Limit(examples),) if repeats else (Repeat(None), Limit(examples))
+    batch = dataclasses.replace(pipeline.stages[batched], drop_remainder=False)
+    return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], *bound, *pipeline.stages[at:batched],
+                                                 batch, *pipeline.stages[batched + 1:]))
+
+
+def _lays_out(pipeline: Pipeline) -> bool:
+    """Whether `pipeline` packs or windows its records itself, before its batch, which its preparation
+    may move into its source (`_promoted`), where a bound would come after the windows."""
+    return any(isinstance(stage, (Pack, Windows))
+               for stage in pipeline.stages[:_until(pipeline.stages, (BatchStage, TokenBudget))])
+
+
 _KEYED_ABOVE = (Map, RandomMap, Filter, BatchStage, Prefetch, Workers, Repeat, Limit, Slice, MapBatch)
 """The stages above a streamed mix that hold none of its rows across a saved position, so the mix's
 members may be restored by key beneath them: a shuffle's window, a packer's remainder or an
@@ -494,13 +532,15 @@ def compile(
     seed: int = 0,
     rejections: Literal["drop", "mask"] = "drop",
     resume: Literal["exact", "non-exact"] = "exact",
+    examples: int | None = None,
 ) -> Loader:
     """Check every leaf before opening readers, then build both branches.
-    With no `read`, the sources choose it (`_preferred_read`)."""
+    With no `read`, the sources choose it (`_preferred_read`). `examples` bounds the training read to
+    its first that many records before they are packed (`_bounded`), a run's `examples=` budget."""
     branches = (train,) if validation is None else (train, validation)
     read = read or train.mode or _preferred_read(branches, provision=provision)
     loading = loading or train._loading or _DEFAULT_LOADING
-    if isinstance(train.source, Phases):
+    if isinstance(train.source, Phases) and examples is None:
         return _compile_phases(
             train,
             validation=validation,
@@ -514,8 +554,9 @@ def compile(
             resume=resume,
         )
     staged = _staged(train, validation, objective=objective, read=read, provision=provision, loading=loading,
-                     seed=seed, rejections=rejections)
-    return _compiled(staged, _coordinated(staged.train), host=host, resume=resume)
+                     seed=seed, rejections=rejections, examples=examples)
+    loader = _compiled(staged, _coordinated(staged.train), host=host, resume=resume)
+    return loader if examples is None else dataclasses.replace(loader, examples=examples)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -543,6 +584,7 @@ def _staged(
     loading: Loading,
     seed: int,
     rejections: Literal["drop", "mask"],
+    examples: int | None = None,
 ) -> _Staged:
     if rejections == "mask":
         raise ValueError(
@@ -552,6 +594,11 @@ def _staged(
     batch_tokens = None if stated is None else stated.tokens
     counts: dict[str, CorpusCounts] = {}
     validation_counts: dict[str, CorpusCounts] = {}
+    # A chain's own layout is bounded as written, before preparation could plan it into its source; the
+    # objective's goes in with its preparation, so the bound follows that.
+    written = None if examples is None or not _lays_out(train) else examples
+    if written is not None:
+        train = _bounded(train, written)
     branches = _prepared(
         (train,) if validation is None else (train, validation),
         read,
@@ -560,9 +607,11 @@ def _staged(
         objective=objective,
         counts=(counts,) if validation is None else (counts, validation_counts),
     )
-    original = branches[0]
-    if not any(isinstance(stage, BatchStage) for stage in original.stages):
+    if not any(isinstance(stage, BatchStage) for stage in branches[0].stages):
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
+    if examples is not None and written is None:
+        branches = (_bounded(branches[0], examples), *branches[1:])
+    original = branches[0]
     train, *scored = _made(branches, read, (counts, validation_counts)[: len(branches)], training=True)
     validation = scored[0] if scored else None
     # A memory read that kept none of the scored records scores none.
@@ -1046,17 +1095,21 @@ def fitted[Entry](
     *,
     objective: ObjectiveData,
     seed: int = 0,
+    examples: int | None = None,
 ) -> tuple[Loader, Mapping[str, Reader | Entry] | None]:
     """`dataset` and each validation dataset as `Trainer.fit` reads them,
     compiled with the objective's own stages and the run's data `seed`,
     their stores provisioned. A training dataset without a repeat repeats
-    before its batch, so a run's length is its steps, epochs or tokens; a
-    validation dataset without a batch takes the training batch, and is read
-    and loaded as it asks. A Loader is already compiled, and an entry that is
-    no Dataset (a reader, an evaluation suite) is passed on as it is."""
+    before its batch, so a run's length is its steps, epochs or tokens, or
+    with `examples` reads that many records before they are packed and ends
+    (`compile`'s `examples`); a validation dataset without a batch takes the
+    training batch, and is read and loaded as it asks. A Loader is already
+    compiled, and an entry that is no Dataset (a reader, an evaluation suite)
+    is passed on as it is."""
     if isinstance(dataset, Dataset):
-        train = _endless(dataset._chain())
-        loader = compile(train, objective=objective, provision=True, seed=seed)
+        chain = dataset._chain()
+        loader = compile(chain if examples is not None else _endless(chain), objective=objective,
+                         provision=True, seed=seed, examples=examples)
     else:
         loader = dataset
     named = {"val": validation} if isinstance(validation, Dataset) else validation

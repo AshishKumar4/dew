@@ -18,9 +18,8 @@ from dew.checkpoints import Checkpoints, Keep, Metrics, Ranking
 from dew.data.dataset import DataPartition
 from dew.objectives.base import Aux, Objective, Shown
 from dew.telemetry.records import FitEnded
-from dew.training import Trainer
+from dew.training import Best, Plateau, Trainer
 from dew.training.evaluation import MetricScores
-from dew.training.trainer import Best, Plateau
 
 
 class Overfit(Objective):
@@ -154,6 +153,36 @@ def test_an_aggregate_reads_a_split_on_its_own_cadence_as_nan_where_it_was_not_s
     run.checkpoints.wait()
     assert run.checkpoints.resolve('best:aggregate:0') == 1
     assert run.checkpoints.resolve('best:aggregate:1') == 2
+
+
+@pytest.mark.parametrize("end", ["stream", "plateau"])
+def test_a_run_that_ends_off_a_rare_suites_cadence_is_ranked_by_it_at_its_last_step(tmp_path, end):
+    """Whatever ends a run, its last step is scored by every suite before its checkpoint is saved: a
+    training stream that runs out after four batches, or a plateau that stops the run at step 4. Both
+    suites rise as training does, so each one's best is the last step, which the frequent suite ranks
+    there; the rare suite, scored every third step, would never rank it from a checkpoint saved before
+    that suite scored it."""
+    from dew.training import EvalSuite
+
+    metric = Value('value', Shown(better='lower'))
+
+    class Ending(Counting):
+        def __next__(self):
+            if self.index == 4:
+                raise StopIteration
+            batch = super().__next__()
+            return {**batch, 'validation': np.zeros(len(batch['x']), bool)}
+
+    loaded = dataclasses.replace(data(), train=lambda partition: Ending()) if end == "stream" else data()
+    run = trainer(tmp_path / 'run')
+    state = run.fit(loaded, steps=10, log_every=1, eval_every=1, metrics=[metric],
+                    validation={'often': data().val, 'rare': EvalSuite(data().val, (metric,), 3)},
+                    best=[Best(lambda scores: scores[('often', metric)], mode='max'),
+                          Best(lambda scores: scores[('rare', metric)], mode='max')],
+                    stop=Plateau(metric, evals=3, split='often') if end == "plateau" else None)
+    run.checkpoints.wait()
+    assert int(state.step) == 4
+    assert run.checkpoints.resolve('best:aggregate:0') == run.checkpoints.resolve('best:aggregate:1') == 4
 
 
 def test_an_aggregate_reads_a_training_scalar_whose_name_has_parts(tmp_path):
