@@ -87,35 +87,36 @@ def top_margin(values: np.ndarray, kept: int) -> np.ndarray:
     return np.where(np.isfinite(next_best), (chosen - next_best) / scale, np.inf)
 
 
-def indexer_margin(scores: np.ndarray, agreements: np.ndarray, budget: int) -> float:
-    """The smallest margin of a lightning indexer's top-`budget` over its causal `scores` `[..., S, T]`:
-    the gap between the kept and the next visible key's score over the query's largest, and where both
-    are an exact zero tie of keys every head disagrees with (`agreements` `[..., S, H, T]` before their
-    relu), the tie's own (`indexer_tie_margin`). A query that sees no more keys than `budget` decides
+def indexer_margins(scores: np.ndarray, agreements: np.ndarray, candidates: np.ndarray, budget: int, *,
+                    relative: bool = True) -> np.ndarray:
+    """Each query's margin `[..., S]` of a lightning indexer's top-`budget` over the keys `candidates`
+    `[..., S, T]` lets it score (`scores` `[..., S, T]`): the gap between the kept and the next
+    candidate's score, and where both are an exact zero tie of keys every head disagrees with
+    (`agreements` `[..., S, H, T]`, its heads' before their relu), the least distance of a tied key's
+    best agreement from zero: a key every head disagrees with by a rounding's width scores zero in one
+    run and a little above or below it in another, entering or leaving a tie that index order breaks.
+    `relative`, each over the query's largest score or agreement; else as they are, for a site that
+    states its margin in the scores' own units. A query with no more candidates than `budget` decides
     nothing."""
-    queries, keys = scores.shape[-2:]
-    if keys <= budget:
-        return np.inf
-    visible = np.tril(np.ones((queries, keys), bool), keys - queries)
-    ranked = -np.sort(-np.where(visible, scores, -np.inf), axis=-1)
+    tiny = np.finfo(np.float32).tiny
+    ranked = -np.sort(-np.where(candidates, scores, -np.inf), axis=-1)
+    if ranked.shape[-1] <= budget:
+        return np.full(ranked.shape[:-1], np.inf)
     kept, rejected = ranked[..., budget - 1], ranked[..., budget]
     tied = (kept == 0) & (rejected == 0)
-    scale = np.maximum(np.abs(ranked[..., 0]), np.finfo(np.float32).tiny)
-    gaps = np.where(np.isfinite(rejected) & ~tied, (kept - rejected) / scale, np.inf)
-    ties = np.where(tied, indexer_tie_margin(scores, agreements, visible), np.inf)
-    return float(min(np.min(gaps), np.min(ties)))
+    gap = kept - rejected
+    best = np.min(np.where(candidates & (scores == 0), np.abs(agreements.max(axis=-2)), np.inf), axis=-1)
+    if relative:
+        gap = gap / np.maximum(np.abs(ranked[..., 0]), tiny)
+        largest = np.max(np.where(candidates, np.abs(agreements).max(axis=-2), 0), axis=-1)
+        best = best / np.maximum(largest, tiny)
+    return np.where(tied, best, np.where(np.isfinite(rejected), gap, np.inf))
 
 
-def indexer_tie_margin(scores: np.ndarray, agreements: np.ndarray, visible: np.ndarray) -> np.ndarray:
-    """Each query's margin `[..., S]` over the visible keys it scores zero: the least distance of such a
-    key's best head agreement from zero, over the query's largest agreement. A key every head
-    disagrees with by a rounding's width scores zero in one run and a little above or below it in
-    another, so it enters or leaves a tie that index order breaks."""
-    best = agreements.max(axis=-2)
-    zero = visible & (scores == 0)
-    largest = np.max(np.where(visible, np.abs(agreements).max(axis=-2), 0), axis=-1)
-    return (np.min(np.where(zero, np.abs(best), np.inf), axis=-1)
-            / np.maximum(largest, np.finfo(np.float32).tiny))
+def causal(scores: np.ndarray) -> np.ndarray:
+    """The keys each of `scores`' queries sees `[S, T]`: those at or before it, the queries the last."""
+    queries, keys = scores.shape[-2:]
+    return np.tril(np.ones((queries, keys), bool), keys - queries)
 
 
 def margin(config, captured, label: str) -> float:
@@ -128,7 +129,7 @@ def margin(config, captured, label: str) -> float:
     query that sees no more keys than its budget decides nothing. Where its budget ends in a tie of
     keys every head disagrees with, scored zero and ordered by index, the tie holds only while each
     such key's heads stay below zero: its margin is the least distance of those keys' best agreement
-    from zero (`indexer_tie_margin`), over the query's largest agreement."""
+    from zero, over the query's largest agreement (`indexer_margins`)."""
     fields = config.get("mixer", {}).get("fields", {})
     sparsities = config.get("activation_sparsity_pattern", ())
     smallest, seen = np.inf, 0
@@ -158,8 +159,9 @@ def margin(config, captured, label: str) -> float:
             continue
         raise AssertionError(f"{label}: a selection {names} was captured that no margin reads")
     for operands in indexers.values():
-        smallest = min(smallest, indexer_margin(operands["scores"], operands["agreements"],
-                                                fields["index_topk"]))
+        scores = operands["scores"]
+        smallest = min(smallest, float(np.min(indexer_margins(scores, operands["agreements"], causal(scores),
+                                                              fields["index_topk"]))))
     # A model that selects shows its selections here, or the draw would pass unfiltered.
     for operands in routers.values():
         # A Router chooses its best groups by their scores, then its experts among the groups kept.
