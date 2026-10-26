@@ -92,8 +92,8 @@ def program[**P, R](function: Callable[P, R], *models: nn.Module,
     they step (`dew.inference.serving_kernel.decode_programs`)."""
     options = {**compiler_options(*models), **(step or {})}
     return _program(
-        function, tuple(sorted(options.items())), arguments.get("static_argnums", ()),
-        arguments.get("static_argnames", ()),
+        function, tuple(sorted(options.items())), static_argnums=arguments.get("static_argnums"),
+        static_argnames=arguments.get("static_argnames"),
         in_shardings=_Placed.of(arguments["in_shardings"]) if "in_shardings" in arguments else None,
         out_shardings=_Placed.of(arguments["out_shardings"]) if "out_shardings" in arguments else None)
 
@@ -119,12 +119,18 @@ class _Placed(NamedTuple):
 
 
 @functools.cache
-def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, bool | int], ...],
-                     static_argnums: int | tuple[int, ...], static_argnames: str | tuple[str, ...], *,
+def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, bool | int], ...], *,
+                     static_argnums: int | tuple[int, ...] | None = None,
+                     static_argnames: str | tuple[str, ...] | None = None,
                      in_shardings: _Placed | None = None, out_shardings: _Placed | None = None
                      ) -> jax.stages.Wrapped:
-    # None leaves a placement to jit, as `program`'s caller did; a placement of None is a `_Placed`.
-    arguments: JitArguments = {"static_argnums": static_argnums, "static_argnames": static_argnames}
+    # Each argument `program`'s caller left out is left to jit (an explicit placement of None is a
+    # `_Placed`): jit reads static positions from static names only where it is given no positions.
+    arguments: JitArguments = {}
+    if static_argnums is not None:
+        arguments["static_argnums"] = static_argnums
+    if static_argnames is not None:
+        arguments["static_argnames"] = static_argnames
     if in_shardings is not None:
         arguments["in_shardings"] = in_shardings.tree()
     if out_shardings is not None:
