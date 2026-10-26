@@ -12,12 +12,14 @@ staging tiles' swizzle is Mosaic GPU's inference.
 
 - solve (a decay a head, the delta rule): a chunk's `(I + A)^-1` for `A = tril(beta_s (k_s . k_t) exp2(g_s -
   g_t), -1)` (`algebra.system`), inverted by doubling on the chunk's tile (`algebra.doubled`): a family's
-  product is a warpgroup's 64 rows, which hold no 16-row block of their own;
+  product is a warpgroup's 64 rows, which hold no 16-row block of their own; and in the same program the
+  weighted keys and values below, the inverse applied in registers (`_solved`);
 - intra (a decay a key dimension): each chunk's scores and system, each pair's decay factored over its
   sub-chunks on the tensor cores (`algebra.key_decayed_pairs`, which the call's declared floor bounds), the
   system inverted in the same program under the delta rule;
-- weighted: `w = A (k beta exp2(g))` and `u = A (v beta)` (`algebra.weighted`), and under a decay a key
-  dimension the keys decayed to their chunk's end (`algebra.key_decayed_write`);
+- weighted: `w = A (k beta exp2(g))` and `u = A (v beta)` (`algebra.weighted`) from a stored inverse (a
+  decay a key dimension's, the backward's recomputed forward), and under a decay a key dimension the keys
+  decayed to their chunk's end (`algebra.key_decayed_write`);
 - states: each sequence's chunks in order over a value block, the memory `[Dk, BV]` carried in fp32 key
   slices of 64, each chunk storing the memory it enters and its corrected values (`algebra.corrected`,
   `scalar_write`, `carried`);
@@ -590,8 +592,8 @@ def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, s
     laid call's chunks and sequences are as many as its worst case, most of them empty): its streams'
     allocations (of `blocks`, `stages` deep, and of `once`'s blocks, loaded once, one deep; `Family.opened`
     takes them with their views), its staging tiles and its stores' (`landing`, `_landed`) scoped, named for
-    its launch (`recurrence_solve`, ...). `held` is what a consumer thread holds in registers (`_Held`). Where
-    `planned` collects launches, the launch's record instead (`Launch`, its `work`), and zeros.
+    its launch (`recurrence_solved`, ...). `held` is what a consumer thread holds in registers (`_Held`).
+    Where `planned` collects launches, the launch's record instead (`Launch`, its `work`), and zeros.
 
     A `persistent` launch runs `grid`'s tiles on as many programs as the device has multiprocessors
     (`Family.persist`), its streams' rings running on across them, two deep where they do
@@ -717,23 +719,30 @@ def _walk(streams, views, step, call: _Call, *, steps: int = 1, prologue: Callab
     family.roles(1, consumer, lambda: family.stream(streams, views, 0, steps))
 
 
-def _solve(k, hi, lo, beta, taken, call: _Call):
-    """`(I + A)^-1` of each chunk and value head under a decay a head, `[R, HV * C]` as `call.held`, fla's
-    kkt_solve in one program: the keys' products (`algebra.keyed`) inverted by doubling on the chunk's tile
-    (`algebra.doubled`), its merges in fp16 in a 16-bit call (`_merges`)."""
-    width, held, family = call.width, dataclasses.replace(call.held, rows=call.rows), call.family
+def _solved(k, v, hi, lo, beta, taken, call: _Call):
+    """`(a [R, HV * C], w [R, HV * Dk], u [R, HV * Dv])` as `call.held` of each chunk and value head under a
+    decay a head, fla's kkt_solve and recompute_w_u in one program (FlashQLA's first kernel): the keys'
+    products (`algebra.keyed`) inverted by doubling on the chunk's tile (`algebra.doubled`, its merges in
+    fp16 in a 16-bit call, `_merges`), stored less its unit diagonal (`a`, the backward's), and applied in
+    registers to the decayed write-gated keys and the write-gated values (`algebra.weighted`), the inverse
+    staged once for every block's product: one launch's tiles and one load of the keys, where two launches
+    stored and loaded the inverse between them."""
+    width, value_width, family = call.width, call.value_width, call.family
+    held = dataclasses.replace(call.held, rows=call.rows)
 
-    def program(k_ref, hi_ref, lo_ref, beta_ref, column_hi_ref, column_lo_ref, taken_ref, a_ref, *, streams,
-                staging, landing):
+    def program(k_ref, v_ref, hi_ref, lo_ref, beta_ref, column_hi_ref, column_lo_ref, taken_ref, a_ref, w_ref,
+                u_ref, *, streams, staging, landing):
         n, h = _axis("chunks"), _axis("heads")
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
-        views = _views(keys=call.given.views(k_ref, row, CHUNK, h // call.group * width, width))
+        views = _views(keys=call.given.views(k_ref, row, CHUNK, h // call.group * width, width),
+                       values=call.given.views(v_ref, row, CHUNK, h * value_width, value_width))
         vectors = {"gate": hi_ref, "low": lo_ref, "write": beta_ref, "column_gate": column_hi_ref,
                    "column_low": column_lo_ref}
         streamed = family.copies_vectors
         if streamed:
-            # The chunk's vectors streamed with its keys, loaded a tile ahead (`_vector_views`).
+            # The chunk's vectors streamed with its tiles, loaded a tile ahead (`_vector_views`).
             views |= _vector_views(n, h, **vectors)
+        *merges, lower_tile, scaled_tile = staging
 
         def read(refs):
             """The vectors as a row's (gates, lows, writes) and a column's (gates, lows), from their streams'
@@ -746,38 +755,61 @@ def _solve(k, hi, lo, beta, taken, call: _Call):
             del index
             found = read(slots) if streamed else loaded
             assert found is not None, "a family that streams no vectors loads them in the prologue"
-            rows, columns = found
-            keys = [_tile(slots, "keys", call.given, columns=pl.ds(c * call.block, call.block))
-                    for c in range(width // call.block)]
-            issue = _Issuer(call)
-            product = functools.reduce(jnp.add, (issue("intra", key, key.T) for key in keys))
-            system = algebra.keyed(product, *rows, *columns)
+            (gate, low, betas), columns = found
+
+            def block(name, c):
+                return _tile(slots, name, call.given, columns=pl.ds(c * call.block, call.block))
+
+            product = functools.reduce(jnp.add, (_Issuer(call)("intra", key, key.T)
+                                                 for key in map(functools.partial(block, "keys"),
+                                                                range(width // call.block))))
+            system = algebra.keyed(product, gate, low, betas, *columns)
             # The inverse less its unit diagonal, which `algebra.weighted` adds outside its product.
-            inverse = (algebra.doubled(-system, _merging(staging, call))
-                       - jnp.where(_diagonal(CHUNK, family), 1.0, 0.0))
-            held.store(a_ref, inverse, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
+            lower = (algebra.doubled(-system, _merging(merges, call))
+                     - jnp.where(_diagonal(CHUNK, family), 1.0, 0.0))
+            held.store(a_ref, lower, row, CHUNK, h * CHUNK, CHUNK, family=family, smem=landing["square"])
+            # The inverse staged once (the first set) for every block's product, a block staged in the
+            # second: `_Issuer` keeps a staged value for the products after it that take it.
+            sets = [lower_tile, scaled_tile]
+            issue = _Issuer(call, {"apply_u": sets, "apply_w": sets})
+            for c in range(value_width // call.block):
+                u = algebra.weighted("apply_u", lower, block("values", c).value().astype(held.dtype), betas,
+                                     issue)
+                held.store(u_ref, u, row, CHUNK, h * value_width + c * call.block, call.block, family=family,
+                           smem=landing["block"])
+            decay = lax.broadcast_in_dim(algebra.raised(gate, low), (CHUNK, call.block), (0,))
+            for c in range(width // call.block):
+                w = algebra.weighted("apply_w", lower, block("keys", c).value().astype(held.dtype), betas,
+                                     issue, decay)
+                held.store(w_ref, w, row, CHUNK, h * width + c * call.block, call.block, family=family,
+                           smem=landing["block"])
             return carry, accumulators
 
         _walk(streams, views, step, call, prologue=None if streamed else lambda: read(None))
 
-    # The prefix twice, read as a row's vectors and a column's: Mosaic GPU's layout inference takes two loads
-    # of one view as one.
-    # The keys' products, then the inverse's doubling.
-    work = Work(2 * CHUNK * CHUNK * width + _inverse_flops())
-    # The keys' products' sum and the system's pairs, then the doubling's inverse, power and product, beside
-    # the masks; an fp32 call's merges split the inverse and the power into their parts.
+    # The keys' products and the inverse's doubling, then the inverse against each key and value block.
+    work = Work(2 * CHUNK * CHUNK * width + _inverse_flops() + 2 * CHUNK * CHUNK * (width + value_width))
+    # The keys' products' sum and the system's pairs; then the doubling's inverse, power and product, beside
+    # the masks (an fp32 call's merges split the inverse and the power into their parts); then the inverse
+    # held beside a block's product, its decay and its keys or values.
     held_tiles = _Held(phases=(
         [_f32(CHUNK, CHUNK)] * 2 + _fragments(call, (call.given, CHUNK, call.block), (call.given, CHUNK,
                                                                                          call.block)),
         [_f32(CHUNK, CHUNK)] * 3 + _masks(CHUNK, CHUNK) * 2
-        + (_held(held, CHUNK, CHUNK) * 2 if held.parts > 1 else [])))
-    return _kernel(program, call, out_type=held.shape(call.heads * CHUNK), grid=(call.chunks, call.heads),
+        + (_held(held, CHUNK, CHUNK) * 2 if held.parts > 1 else []),
+        [_f32(CHUNK, CHUNK)] + [_f32(CHUNK, call.block)] * 2 + _held(call.given, CHUNK, call.block)
+        + _fragments(call, (held, CHUNK, CHUNK), (call.given, CHUNK, call.block))))
+    out_type = (held.shape(call.heads * CHUNK), held.shape(call.heads * width),
+                held.shape(call.heads * value_width))
+    staging = (*_merges(call), _staging(held, (CHUNK, CHUNK))[0], _staging(held, (CHUNK, call.block))[0])
+    return _kernel(program, call, out_type=out_type, grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"),
-                   blocks=_streamed(keys=((CHUNK, width), call.given))
+                   blocks=_streamed(keys=((CHUNK, width), call.given),
+                                    values=((CHUNK, value_width), call.given))
                    | _vector_blocks(call, "gate", "low", "write", "column_gate", "column_low"),
-                   stages=1, live=_taken(6), work=work, held=held_tiles, staging=_merges(call),
-                   landing={"square": held.landing(CHUNK, CHUNK)}, persistent=True)(k, hi, lo, beta, hi, lo,
-                                                                                    taken)
+                   stages=1, live=_taken(7), work=work, held=held_tiles, staging=staging,
+                   landing={"square": held.landing(CHUNK, CHUNK), "block": held.landing(CHUNK, call.block)},
+                   persistent=True)(k, v, hi, lo, beta, hi, lo, taken)
 
 
 def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
@@ -1356,7 +1388,7 @@ def kept_forward(q, k, v, g, beta, h0=None, *, tiles: Tiles, starts=None, max_se
                  family: mosaic.Family | None = None, interpret: bool = False,
                  floor: float | None = None) -> tuple[jax.Array, jax.Array, tuple]:
     """`forward`'s `(o, final)` and what the fast backward takes rather than compute again (`gradients`'
-    `inverse` and `kept`): each chunk's inverse under a decay a head (`_solve`'s, None otherwise), as fla's
+    `inverse` and `kept`): each chunk's inverse under a decay a head (`_solved`'s, None otherwise), as fla's
     backward keeps its `A`, and the launches' weighted keys, memories and corrected values, `(w, h,
     corrected)`, which the port keeps unless a remat rung recomputes them (`recurrence_chunk.RECOMPUTED`),
     the caller's choice."""
@@ -1449,8 +1481,12 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     elif per_key:
         (scores,) = _intra(q, k, hi, lo, beta, taken, call, scale=scale)
         (keys,) = _weighted(k, v, None, hi, lo, beta, taken, call)
+    elif delta and inverse is None:
+        # The forward's residuals come in pairs: a recomputed forward has neither.
+        assert kept is None, "a kept forward keeps its inverse"
+        a, w, u = _solved(k, v, hi, lo, beta, taken, call)
     elif delta:
-        a = _solve(k, hi, lo, beta, taken, call) if inverse is None else inverse
+        a = inverse
         if kept is None:
             w, u = _weighted(k, v, a, hi, lo, beta, taken, call)
     if kept is not None and delta and not per_key:
@@ -1953,7 +1989,7 @@ def _scores_back(q, k, corrected, do, hi, lo, taken, call: _Call, *, scale: floa
 def _system_back(a, k, v, dw, du, hi, lo, beta, taken, call: _Call):
     """`dL [R, HV * C]` as `call.held`: the WY representation's backward's system part a chunk and value head
     at a time (fla's prepare_wy_repr_bwd's, `algebra.system_gradient`) from `w`'s and `u`'s gradients `dw`,
-    `du` (`call.held`) and the inverse `a` less its unit diagonal (`_solve`'s), which `_keys_back` takes.
+    `du` (`call.held`) and the inverse `a` less its unit diagonal (`_solved`'s), which `_keys_back` takes.
     Apart from `_keys_back` and `_values_back`, each launch's tiles a thread's registers hold (in one they
     spilled 360 bytes a thread on an H100's)."""
     width, value_width, family = call.width, call.value_width, call.family
