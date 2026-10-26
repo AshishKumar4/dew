@@ -302,6 +302,25 @@ def test_a_framing_carries_its_marks_through_a_trimming_template_and_refuses_one
                                        chat_template=rewriting)).rows(qwen, SPECIALS, STATE, {"team": TEAM})
 
 
+class Marked:
+    """An encoder whose every text, the empty one too, opens with a marker id: a vocabulary whose
+    encoding of nothing is not nothing."""
+
+    def encode(self, text, *, add_special_tokens=False):
+        del add_special_tokens
+        return [7, *text.encode()]
+
+
+def test_every_piece_is_encoded_an_empty_one_too():
+    """Under `pieces` each text chunk is encoded alone, an empty one as the encoder encodes nothing,
+    and an absent segment is a chunk of no ids: a context of no text is the encoder's own empty
+    encoding, as a release that encodes each piece it writes reads it."""
+    from dew.decision.layout import context_tokens
+
+    assert render([Chunk(""), Chunk(ids=()), Chunk("a")], Marked(), "pieces").tokens == (7, 7, 97)
+    assert list(context_tokens(Marked(), "", 8)) == [7]
+
+
 def test_the_renderer_is_its_own_module_beside_the_value_renderer():
     """`dew.decision.renderer` is the row renderer, and `dew.decision.render` still renders a value."""
     import dew.decision
