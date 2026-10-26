@@ -27,7 +27,7 @@ from jax.sharding import SingleDeviceSharding
 
 from dew.batch import Variables
 from dew.nn.protocols import ProjectionGroup, Serving
-from dew.quantization import QUANTIZATION, QuantizedClass
+from dew.quantization import QUANTIZATION, Quantization, QuantizedClass
 
 
 def _node(variables: Variables, collection: str, path: Sequence[str]) -> dict:
@@ -103,21 +103,27 @@ def _declares(model: nn.Module) -> TypeGuard[Serving]:
     return isinstance(model, Serving) and not isinstance(type(model), AdaptedClass)
 
 
+def _quantization(model: nn.Module | Serving) -> Quantization | None:
+    """The quantization `model`'s class carries (`QuantizedClass`), None for none."""
+    layer = type(model)
+    return layer._dew_quantization if isinstance(layer, QuantizedClass) else None
+
+
+def _selected_alike(spec: Quantization | None, group: ProjectionGroup) -> bool:
+    """Whether `spec`'s rules select a group's packed site and its members alike (one rule, or none, for
+    all of them), so the group computes the same packed or apart; any group where nothing quantizes."""
+    if spec is None:
+        return True
+    return len({spec.rule_for((*group.path, name)) for name in (*group.members, group.packed)}) == 1
+
+
 def _projection_groups(model: nn.Module, variables: dict) -> tuple[ProjectionGroup, ...]:
     """`projection_groups` over a tree of plain dicts, which reading costs no copy."""
     if not _declares(model):
         return ()
-    layer = type(model)
-    spec = layer._dew_quantization if isinstance(layer, QuantizedClass) else None
-
-    def selected_alike(group: ProjectionGroup) -> bool:
-        if spec is None:
-            return True
-        rules = {spec.rule_for((*group.path, name)) for name in (*group.members, group.packed)}
-        return len(rules) == 1
-
+    spec = _quantization(model)
     return tuple(group for group in _declared(model, variables)
-                 if _concatenates(variables, group) and selected_alike(group))
+                 if _concatenates(variables, group) and _selected_alike(spec, group))
 
 
 def _declared(model: Serving, variables: Variables) -> tuple[ProjectionGroup, ...]:
@@ -310,15 +316,12 @@ def unpacked(model: nn.Module, variables: Variables) -> Variables:
     as the rules name it. A tree that holds no group to split is returned as it is."""
     from dew.quantization import split_columns
 
-    layer = type(model)
-    spec = layer._dew_quantization if isinstance(layer, QuantizedClass) else None
+    spec = _quantization(model)
 
     def splits(group: ProjectionGroup) -> bool:
         stored = _node(variables, "params", group.path)[group.packed].values()
         plain = all(isinstance(leaf, (jax.Array, np.ndarray)) for leaf in stored)
-        if spec is None or spec.weight_only or plain:
-            return True
-        return len({spec.rule_for((*group.path, name)) for name in (*group.members, group.packed)}) == 1
+        return plain or spec is None or spec.weight_only or _selected_alike(spec, group)
 
     groups = tuple(group for group in _held_packed(model, variables) if splits(group))
     if not groups:
