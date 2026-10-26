@@ -10,8 +10,9 @@ from collections.abc import Iterator, Mapping, Sequence
 
 import jax
 
+from dew import position
 from dew._coordination import agreed_next
-from dew.data.dataset import DataPartition, Loader
+from dew.data.dataset import DataPartition, Loader, PhasedStream, Reader
 from dew.objectives.base import Batch, Metric
 from dew.telemetry.profile import region
 from dew.training.budget import Plateau
@@ -176,3 +177,50 @@ def waited_read(run: FitRun, interval: Interval, *, agree: bool) -> Batch | None
     if batch is None and not run.current:
         raise ValueError("the training data holds no batch to train on")
     return batch
+
+
+def suites(dataset: Loader, validation: Mapping[str, Reader | EvalSuite] | None,
+            metrics: Sequence[Metric], eval_every: int | None) -> dict[str, EvalSuite]:
+    """Every split `fit` validates, by name, with its metrics and cadence
+    resolved: `dataset.val` alone is the one suite `val`."""
+    if validation is None:
+        if metrics and dataset.val is None:
+            # Else the metrics would never be scored, and the run would not say so.
+            raise ValueError("metrics score validation data: give the dataset a val split, or validation=")
+        # `val` is read only when a pass is scheduled; a dataset need not hold one.
+        validation = {"val": dataset.val} if (eval_every or metrics) and dataset.val is not None else {}
+    elif not validation:
+        raise ValueError("validation must contain a split")
+    suites = {}
+    for name, entry in validation.items():
+        suite = entry if isinstance(entry, EvalSuite) else EvalSuite(entry)
+        suites[name] = EvalSuite(suite.data, tuple(suite.metrics) or tuple(metrics),
+                                 eval_every if suite.every is None else suite.every)
+    return suites
+
+
+def stage_reached(plan: FitPlan, run: FitRun, interval: Interval) -> tuple[PhasedStream, bytes, int] | None:
+    """Where the run's commits reached the tokens of the schedule's stage it stands in
+    (`dew.data.pipeline.schedule`), on every process alike, as the committed tokens are the pool's: its
+    stream opened again where the step that reached them left it, the stages that step's commit passed
+    ended there, reading nothing, and the stage it now reads; what the prefetch worker read ahead of
+    the end is dropped untrained. The last stage's tokens, where they end the data, are the run's token
+    budget (`Trainer._fitted`). None before a stage's end, which the devices' count is read for before
+    each step while it lies ahead, as a token budget's is."""
+    ends = plan.dataset.token_ends
+    state = None if run.train is None else run.train.source_state
+    if ends is None or state is None:
+        return None
+    stage = len(position.read(state).completed)
+    if stage >= len(ends) - 1 or (committed := interval.real_tokens) < (end := ends[stage] or 0):
+        return None
+    assert run.train is not None and run.partition is not None
+    run.train.close()
+    run.train = None
+    run.source = source = plan.dataset.train(run.partition)
+    if not isinstance(source, PhasedStream):
+        raise TypeError("a schedule reads its stages as phases")
+    while stage < len(ends) - 1 and committed >= end:
+        state, stage = source.ending(state), stage + 1
+        end = ends[stage] or 0
+    return source, state, stage
