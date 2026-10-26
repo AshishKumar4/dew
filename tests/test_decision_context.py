@@ -354,7 +354,7 @@ def test_a_context_its_cross_attention_cannot_hold_is_refused_never_cut():
     """A context of more tokens than the cross-attention reads is refused, by a task and over the wire
     (ValueError, which a server turns into the request's own refusal), and refuses a run's data where
     its fitting reads the record; one of exactly that many is read whole."""
-    from dew.decision.objective import Fit
+    from dew.decision.rows import Fit
 
     objective = conditioned(16, (0,))
     task = Decide(objective.model, objective.init(jax.random.key(0)), objective.layout, objective.tokenizer,

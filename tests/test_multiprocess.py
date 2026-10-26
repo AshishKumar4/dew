@@ -15,6 +15,7 @@ leaves, so the production join and the rendezvous right after it are what
 every pool test runs.
 """
 
+import collections
 import json
 import os
 import re
@@ -30,6 +31,7 @@ import multiprocess_worker as worker
 import numpy as np
 import pytest
 from lane_environment import MESH_DEVICES
+from interop_support import assert_same_stored_tensors, written_tensors
 from process_support import (
     free_port,
     report_of,
@@ -134,6 +136,26 @@ def test_a_real_token_budget_agrees_across_processes_after_logging_ticks(tmp_pat
     assert [report["step"] for report in reports] == [3, 3]
     assert [report["updates"] for report in reports] == [3, 3]
     assert [report["logged"] for report in reports] == [3, 0]
+
+
+@pytest.mark.distributed
+def test_a_decision_release_partitioned_over_a_pool_publishes_its_readout(tmp_path):
+    """A slot release placed over two processes, its readout partitioned across them, publishes every
+    tensor it saves: its readout gathered home to process 0 beside its backbone, written to
+    safetensors as `SafetensorsReload` writes them and exported as `NCCLPush` sends them, the tensors
+    the release saves and exports on one host."""
+    from test_slot_sources import slot_release
+
+    from dew.interop import Pretrained
+
+    source, _ = slot_release(tmp_path, "head")
+    reports = run_pool("decision_publish", tmp_path / "out", 2, release=source, run_dir=tmp_path / "served")
+    assert [report["partitioned"] for report in reports] == [True, True]
+    host = Pretrained.load(source, dtype="float32", attention_impl="xla", on_host=True)
+    host.save(tmp_path / "saved")
+    assert_same_stored_tensors(written_tensors(tmp_path / "served"), written_tensors(tmp_path / "saved"))
+    assert_same_stored_tensors(dumped_params(tmp_path / "out" / "process0.json"),
+                               {name: np.asarray(value) for name, value in host.export().items()})
 
 
 def document_corpus(directory: Path, documents: int, length) -> Corpus:
@@ -560,11 +582,12 @@ def elastic_checkpoint(tmp_path_factory):
 
 
 @pytest.mark.distributed
+@pytest.mark.parametrize("records", ["resident", "http"])
 @pytest.mark.parametrize("processes", [1, 4])
-def test_a_pool_position_resumes_on_another_process_count(tmp_path, elastic_checkpoint,
-                                                          processes):
+def test_a_pool_position_resumes_on_another_process_count(tmp_path, request, records, processes):
     """Two processes save where the run's data stopped, and one process or
-    four take it over.
+    four take it over, over records held in memory or fetched over HTTP by
+    every process into one global order.
 
     Real processes, because a pool is where the position is gathered onto
     every host, written by orbax from process zero and read back by
@@ -574,10 +597,13 @@ def test_a_pool_position_resumes_on_another_process_count(tmp_path, elastic_chec
     global batches that run trained on, and the loss is a mean over the
     step's rows, so which process holds which row cannot change them.
     """
+    resident = records == "resident"
+    saved = request.getfixturevalue("elastic_checkpoint" if resident else "online_checkpoint")
     directory = tmp_path / "resumed-run"
-    shutil.copytree(elastic_checkpoint["run_dir"], directory)
-    flags = {"name": "elastic", "elastic": True, "fsdp_size": 1,
-             "steps": 2 * POOL_STEPS, "records": RECORDS}
+    shutil.copytree(saved["run_dir"], directory)
+    flags = {"name": "elastic", "elastic": True} if resident else {
+        "name": "online", "online": request.getfixturevalue("online_server"), "environment": ONLINE}
+    flags |= {"fsdp_size": 1, "steps": 2 * POOL_STEPS, "records": RECORDS}
 
     resumed = run_pool("fit", tmp_path / "resumed", processes, run_dir=directory, **flags)
     whole = run_pool("fit", tmp_path / "whole", processes,
@@ -609,15 +635,23 @@ ONLINE = {"NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}
 
 @pytest.mark.distributed
 def test_processes_fetch_disjoint_shares_of_one_online_order(tmp_path):
-    """Two processes each fetch their own share of one shuffled catalog over HTTP: the first pass's
-    shares cover the corpus once, and the read is cut per share, so neither fetches the other's."""
-    with serving(served) as address:
+    """Two processes each fetch their own share of one pass of a shuffled catalog over HTTP, to its end:
+    their shares cover the corpus once, and the server answers each url once, so neither fetched a
+    record of the other's share."""
+    answered, lock = collections.Counter(), threading.Lock()
+
+    def counted(request) -> None:
+        with lock:
+            answered[request.path] += 1
+        served(request)
+
+    with serving(counted) as address:
         reports = run_pool("online_data", tmp_path / "out", 2, online=address, records=RECORDS,
                            environment=ONLINE)
     shards = [report["records"] for report in reports]
     assert not set(shards[0]) & set(shards[1]), "both processes read the same record"
     assert sorted(shards[0] + shards[1]) == list(range(RECORDS))
-    assert [report["lowering"] for report in reports] == ["per-share", "per-share"]
+    assert answered == {f"/{index}": 1 for index in range(RECORDS)}
 
 
 @pytest.mark.distributed
@@ -682,27 +716,6 @@ def test_an_online_pool_trains_on_what_its_records_hold(online_checkpoint, elast
     for index in range(2):
         assert_identical_parameters(dumped_params(online_checkpoint["out"] / f"process{index}.json"),
                                     dumped_params(elastic_checkpoint["out"] / f"process{index}.json"))
-
-
-@pytest.mark.distributed
-@pytest.mark.parametrize("processes", [1, 4])
-def test_an_online_pool_position_resumes_on_another_process_count(tmp_path, online_server,
-                                                                   online_checkpoint, processes):
-    """An online run that two processes saved in one global order resumes on one process or four,
-    fetching from where the saved global count stopped: the resumed pool lands where a pool of its
-    size that nobody stopped does, at the same position, on the same parameters."""
-    directory = tmp_path / "resumed-run"
-    shutil.copytree(online_checkpoint["run_dir"], directory)
-    flags = {"name": "online", "online": online_server, "fsdp_size": 1, "steps": 2 * POOL_STEPS,
-             "records": RECORDS, "environment": ONLINE}
-    resumed = run_pool("fit", tmp_path / "resumed", processes, run_dir=directory, **flags)
-    whole = run_pool("fit", tmp_path / "whole", processes, run_dir=tmp_path / "whole-run", **flags)
-    for index, report in enumerate(resumed):
-        assert report["restored_step"] == POOL_STEPS
-        assert report["step"] == 2 * POOL_STEPS
-        assert report["dataset_state"] == whole[index]["dataset_state"]
-        assert_same_parameters(dumped_params(tmp_path / "resumed" / f"process{index}.json"),
-                               dumped_params(tmp_path / "whole" / f"process{index}.json"))
 
 
 @pytest.mark.distributed
@@ -1464,6 +1477,23 @@ def test_composite_rejection_and_partial_restart_agree_across_processes(tmp_path
     for report in pool:
         for want, got in zip(single["state"], report["state"], strict=True):
             np.testing.assert_allclose(got, want, rtol=1e-6, atol=1e-7)
+
+
+@pytest.mark.distributed
+def test_a_pool_serves_a_prefix_run_as_one_process_and_refuses_a_short_prompt_together(tmp_path):
+    """A prefix run's task over a request two processes each hold a share of, as one global array, answers
+    the rows one process answers: each prompt's blocks are made of the process's own rows inside the
+    request's agreed check. A prompt too short for the prefix in one rank's share alone is refused on both
+    ranks, neither left waiting on its peer's agreement."""
+    worker_script = Path(__file__).with_name("prefix_worker.py")
+    reports = run_pool("prefix_generation", tmp_path / "pool", 2, script=worker_script, devices=2,
+                       fsdp_size=2, timeout=240)
+    single = run_worker("prefix_generation", tmp_path / "single.json", script=worker_script, fsdp_size=1,
+                        devices=1)
+
+    assert [report["refused"] for report in reports] == [True, True] and single["refused"]
+    assert reports[0]["tokens"] + reports[1]["tokens"] == single["tokens"]
+    assert reports[0]["lengths"] + reports[1]["lengths"] == single["lengths"]
 
 
 @pytest.mark.distributed

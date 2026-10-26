@@ -24,9 +24,9 @@ import jax
 import jax.numpy as jnp
 
 from dew._records import integer, text
-from dew.config import ObjectiveConfig, Prepared, RunConfig
+from dew.config import DecoderRunConfig, MetricConfig, ObjectiveConfig, Prepared
 from dew.data.text import HFTokenizer, tokenizer_for
-from dew.objectives.lm.objective import Perplexity, Samples
+from dew.objectives.lm.objective import Samples
 from dew.optim import OptimConfig
 from dew.registry import DtypeName, ModelConfig, objectives, resolve_dtype
 from dew.sampling.text import Sampling
@@ -41,17 +41,20 @@ class Tokens(NamedTuple):
 
 
 @dataclasses.dataclass(frozen=True)
-class LMRunConfig(RunConfig):
-    """A `RunConfig` plus the settings specific to language models."""
+class LMRunConfig(DecoderRunConfig):
+    """A decoder's run (`DecoderRunConfig`) plus the settings specific to language models."""
 
-    RESUMABLE: ClassVar[tuple[str, ...]] = (*RunConfig.RESUMABLE, "prompt", "max_new_tokens", "sampling")
+    RESUMABLE: ClassVar[tuple[str, ...]] = (*DecoderRunConfig.RESUMABLE, "prompt", "max_new_tokens",
+                                            "sampling")
 
     objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("lm"))
     """The objective and its arguments: lm, masked_diffusion (MDLM),
     block_diffusion (the official DiffusionGemma fine-tuning objective), or
     any objective by its import path that `LMObjective`'s arguments build:
-    the decoder, `seq_len`, its starting `variables`, `samples`, `processor`
-    and `qk_stats`."""
+    the decoder, `seq_len`, its starting `variables`, `samples` and
+    `processor`. A step whose optimizer clips by the attention logit maxima
+    (`muonclip`) asks the objective for them (`Step.qk_stats`), whichever
+    objective it is."""
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
     optim: OptimConfig = dataclasses.field(
@@ -77,9 +80,13 @@ class LMRunConfig(RunConfig):
     """The dtype `pretrained`'s parameters are stored and trained in."""
 
     def __post_init__(self) -> None:
+        super().__post_init__()
         if self.pretrained is None and self.pretrained_param_dtype != "float32":
             raise ValueError("--pretrained-param-dtype stores a --pretrained checkpoint's parameters; "
                              "this run loads none")
+        if self.pretrained is None and self.loops:
+            raise ValueError("--loop-* run a --pretrained checkpoint's block in passes; a fresh decoder "
+                             "states its loop in --model")
         if self.objective.name == objectives.paths["block_diffusion"] and self.pretrained is None:
             raise ValueError("block_diffusion fine-tuning requires --pretrained")
 
@@ -95,7 +102,7 @@ class LMRunConfig(RunConfig):
         inference record holds the built model for `dew.pipeline`. An adapter
         binds to the model and the tree training starts from, the loaded weights
         or a fresh draw from the run's key, so the objective trains its factors
-        alone. Perplexity scores each validation pass.
+        alone. Each validation pass scores `val_metrics`, perplexity by default.
         """
         tokens = self.tokens()
         if objectives.label(self.objective.name) == "block_diffusion" and tokens.packed:
@@ -120,6 +127,7 @@ class LMRunConfig(RunConfig):
             model = self.model.build(max_seq_len=context, vocab_size=table)
         else:
             source, run = self.pretrained_source(written, vocab_size, context)
+            source = self.looped(source)
             model, fields = source.model, dict(source.model_config)
         if source is None:
             run = dataclasses.replace(run, model=dataclasses.replace(self.model, fields=fields))
@@ -140,14 +148,17 @@ class LMRunConfig(RunConfig):
         else:
             objective = self.objective.build(
                 model=model if source is None else source, seq_len=tokens.seq_len, variables=variables,
-                samples=samples, processor=self.processor(), qk_stats=self.optim.optimizer == "muonclip")
+                samples=samples, processor=self.processor())
         # Compiled once: the run's length and its cadences are read off this loader, which `train` trains on.
         loaded, held = self.compiled(objective.data(), self.chain(), self.validation)
-        # The run's own default metric, asked for where it holds a validation split to score.
         scored = self.trainer.eval_interval(loaded) is not None and bool(held)
-        validation = (Perplexity(),) if scored else ()
+        validation = run.validation_metrics(validates=scored)
         return Prepared(run, lambda name: run.train(objective, loaded, name=name, metrics=validation,
                                                      validation=held))
+
+    def default_metrics(self, *, validates: bool) -> tuple[MetricConfig, ...]:
+        """Perplexity, where the run evaluates a validation split it holds."""
+        return (MetricConfig("perplexity"),) if validates else ()
 
     def tokens(self) -> Tokens:
         """The token windows this run trains on, as its chain states them (`Dataset.facts`): their

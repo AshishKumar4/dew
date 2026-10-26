@@ -28,6 +28,7 @@ from dew.interop.hf_decoders import translate_config
 from dew.nn.sharding import pipeline_microbatches
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
+from dew.objectives.routing import ExpertBalance
 from dew.registry import models
 from dew.training import Layout, MeshSpec
 from dew.training.distributed import shard_batch
@@ -350,7 +351,7 @@ def test_a_scanned_moe_stack_sows_and_balances_like_the_plain_loop():
 
     outcomes = []
     for model in (plain, scanned):
-        objective = LMObjective(model, 11, balance_rate=0.01, aux_loss_alpha=0.1)
+        objective = LMObjective(model, 11, balance=ExpertBalance(balance_rate=0.01, aux_loss_alpha=0.1))
         loss, aux = objective.scalar_loss(variables, batch, step)
         assert aux.effects is not None
         outcomes.append((float(loss), {name: float(value) for name, value in aux.metrics.items()},
@@ -444,7 +445,8 @@ def loss_and_grads(objective, spec, variables, batch, devices=None, microbatches
 
 
 @mesh_lane
-@pytest.mark.parametrize("build, balance", [(tiny, {}), (routed, {"balance_rate": 0.01})],
+@pytest.mark.parametrize("build, balance",
+                         [(tiny, {}), (routed, {"balance": ExpertBalance(balance_rate=0.01)})],
                          ids=["dense", "moe"])
 def test_a_pipeline_over_two_stages_has_the_loss_and_gradient_of_one(build, balance):
     """Four layers over two stages fed four microbatches, against the same
