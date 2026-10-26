@@ -1,0 +1,302 @@
+"""Test-time training over the task loss: a continuum level stepped in context (Nested Learning,
+arXiv 2512.24695, section 7.1, equation 71; `dew.objectives.lm.adaptation`, `dew.nn.continuum`).
+
+Each claim is held to a literal reading of equation 71, a Python loop over each document's windows
+that steps the level by `rate` times its window's summed weighted gradient, written here apart from
+the scan, on par with it by check 1 against its own float64 run."""
+
+from pathlib import Path
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import optax
+import pytest
+from affine_run import Replaying, dataset
+from reference_error import assert_as_exact, with_gradients
+
+from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.continuum import ContinuumLevel
+from dew.nn.ngpt import NGPT
+from dew.objectives.lm import TEXT_KEY, LMObjective, Samples
+from dew.objectives.lm.adaptation import ChunkAdaptation, adapted_scores
+from dew.training import Checkpoints, Trainer
+
+VOCAB = 16
+FEATURES = 8
+LENGTH = 7
+ROWS = 3
+LEVEL = ContinuumLevel(hidden=4)
+FIXTURES = Path(__file__).parent / "fixtures" / "hf"
+
+ADAPTATION_SEEDS = 8
+"""Check 1's declared seeds for the scan against equation 71's literal loop (`seeds_for`)."""
+
+GRADIENT_SEEDS = 8
+"""Check 1's declared seeds for the outer gradient through the windows' steps (`seeds_for`)."""
+
+LEVEL_SEEDS = 8
+"""Check 1's declared seeds for the gradient through the level against its formula (`seeds_for`)."""
+
+OBJECTIVE_SEEDS = 8
+"""Check 1's declared seeds for a level that never steps against the plain objective (`seeds_for`)."""
+
+
+def decoder(continuum: ContinuumLevel | None = LEVEL, **options) -> CausalTransformer:
+    """A test-size decoder in float32, its continuum level on its final states."""
+    return CausalTransformer(vocab_size=VOCAB, emb_features=FEATURES, num_layers=1, num_heads=2, head_dim=4,
+                             mlp_features=16, max_seq_len=32, attention_impl="xla", continuum=continuum,
+                             **options)
+
+
+MODEL = decoder()
+
+
+def drawn_variables(seed: int, model: CausalTransformer = MODEL):
+    """`model`'s variables drawn at 0.5 N(0, 1), its level's `up` among them, so the level moves the
+    states from its first window."""
+    rng = np.random.default_rng(seed)
+    shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, LENGTH), jnp.int32)))
+    return jax.tree.map(lambda leaf: (0.5 * rng.standard_normal(leaf.shape)).astype(np.float32), shapes)
+
+
+def equation_71(model, variables, hidden, targets, weights, documents, adaptation: ChunkAdaptation):
+    """Equation 71 read literally, document by document of each row: each window of `window` tokens
+    reads the level it opened with, and after it the level steps by `rate` times the summed gradient
+    of its tokens' weighted next-token losses. The losses are each token's log-softmax, apart from
+    Dew's own cross entropy."""
+    params = variables["params"]
+
+    def window_losses(level, states, window_targets):
+        held = {**variables, "params": {**params, "continuum": level}}
+        logits = model.apply(variables, model.apply(held, states, method="continuum_states"),
+                             method="head_logits")
+        return -jnp.take_along_axis(jax.nn.log_softmax(logits), window_targets[:, None], axis=-1)[:, 0]
+
+    rows = []
+    for row in range(targets.shape[0]):
+        losses, start = [], 0
+        while start < targets.shape[1]:
+            end = start
+            while end < targets.shape[1] and documents[row][end] == documents[row][start]:
+                end += 1
+            level = params["continuum"]
+            for opened in range(start, end, adaptation.window):
+                closed = min(opened + adaptation.window, end)
+                window, pull = jax.vjp(lambda at, row=row, opened=opened, closed=closed: window_losses(
+                    at, hidden[row, opened:closed], targets[row, opened:closed]), level)
+                losses.append(window)
+                (gradient,) = pull(weights[row, opened:closed].astype(window.dtype))
+                level = {name: jax.tree.map(lambda leaf, grad: leaf - adaptation.rate * grad, part,
+                                            gradient[name])
+                         if not adaptation.select or name in adaptation.select else part
+                         for name, part in level.items()}
+            start = end
+        rows.append(jnp.concatenate(losses))
+    return jnp.stack(rows)
+
+
+def documents_of(*, packed: bool) -> np.ndarray:
+    """Each row's documents: one a row, or three rows packed differently, a document starting
+    inside a window's span of slots."""
+    if not packed:
+        return np.zeros((ROWS, LENGTH), np.int32)
+    return np.asarray([[1, 1, 2, 2, 2, 2, 2], [1, 1, 1, 1, 1, 2, 3], [1, 2, 2, 2, 3, 3, 3]], np.int32)
+
+
+def draw(seed: int):
+    """A draw's variables, final states, targets and weights, one of them zero."""
+    rng = np.random.default_rng(seed)
+    weights = rng.uniform(0.5, 1.5, (ROWS, LENGTH)).astype(np.float32)
+    weights[0, 3] = 0.0
+    return (drawn_variables(seed), rng.standard_normal((ROWS, LENGTH, FEATURES)).astype(np.float32),
+            rng.integers(0, VOCAB, (ROWS, LENGTH)).astype(np.int32), weights)
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["documents", "packed"])
+@pytest.mark.parametrize(("window", "rate"), [(1, 0.5), (3, 0.5), (3, 0.0), (16, 0.5)])
+def test_the_scan_steps_the_level_as_equation_71(*, packed, window, rate):
+    """Each target's loss is equation 71's: its window read at the level stepped by every window of
+    its document before it, on par with the literal loop (check 1), at a window of one token (online
+    SGD), of three, of more than the row (the level as trained), and at rate zero; one document a row
+    and packed rows, whose documents each start from the level's start, one of them inside a block."""
+    documents = documents_of(packed=packed)
+    adaptation = ChunkAdaptation(window=window, rate=rate)
+    layout = (None, jnp.asarray(documents) if packed else None)
+
+    def dew(variables, hidden, targets, weights):
+        return adapted_scores(MODEL, variables, hidden, targets, weights, layout, adaptation,
+                              predict=False, logits=False).losses
+
+    def reference(variables, hidden, targets, weights):
+        return equation_71(MODEL, variables, hidden, targets, weights, documents, adaptation)
+
+    assert_as_exact(jax.jit(dew), reference, draw, f"equation 71 at a window of {window}, rate {rate}",
+                    seeds=ADAPTATION_SEEDS)
+
+
+def test_only_the_selected_parts_step():
+    """A selection steps those parts of the level and holds the rest at their trained values: with
+    `up` alone stepping, each loss is equation 71's with `down` fixed (check 1)."""
+    adaptation = ChunkAdaptation(window=2, rate=0.5, select=("up",))
+    documents = documents_of(packed=False)
+
+    def dew(variables, hidden, targets, weights):
+        return adapted_scores(MODEL, variables, hidden, targets, weights, (None, None), adaptation,
+                              predict=False, logits=False).losses
+
+    def reference(variables, hidden, targets, weights):
+        return equation_71(MODEL, variables, hidden, targets, weights, documents, adaptation)
+
+    assert_as_exact(jax.jit(dew), reference, draw, "up alone stepping", seeds=ADAPTATION_SEEDS)
+
+
+@pytest.mark.parametrize("packed", [False, True], ids=["documents", "packed"])
+def test_training_differentiates_through_every_step(*, packed):
+    """The outer loss's gradient flows through each window's step to the level's start, the head
+    and the states: the gradient of the weighted losses, second order through the steps, on par with
+    the literal loop's (check 1)."""
+    documents = documents_of(packed=packed)
+    adaptation = ChunkAdaptation(window=3, rate=0.5)
+    layout = (None, jnp.asarray(documents) if packed else None)
+
+    def gradient_draw(seed):
+        variables, hidden, targets, weights = draw(seed)
+        return variables, hidden, targets, weights, np.float32(1.0)
+
+    def dew(variables, hidden, targets, weights):
+        return jnp.sum(weights * adapted_scores(MODEL, variables, hidden, targets, weights, layout,
+                                                adaptation, predict=False, logits=False).losses)
+
+    def reference(variables, hidden, targets, weights):
+        return jnp.sum(weights * equation_71(MODEL, variables, hidden, targets, weights, documents,
+                                             adaptation))
+
+    def differentiated(fn):
+        return lambda variables, hidden, targets, weights, cotangent: with_gradients(
+            lambda variables, hidden: fn(variables, hidden, targets, weights))(variables, hidden, cotangent)
+
+    assert_as_exact(jax.jit(differentiated(dew)), differentiated(reference), gradient_draw,
+                    "the gradient through the windows' steps", seeds=GRADIENT_SEEDS)
+
+
+def test_a_level_at_its_start_is_the_identity():
+    """A decoder gains its continuum level as the identity: `up` starts at zero, so its logits are
+    the same decoder's without the level, bit for bit, and its head reads no table (`output_table`),
+    the level standing before it."""
+    plain = decoder(None)
+    tokens = jnp.asarray(np.random.default_rng(0).integers(0, VOCAB, (2, LENGTH)), jnp.int32)
+    variables = MODEL.init(jax.random.key(3), tokens)
+    without = {**variables, "params": {name: part for name, part in variables["params"].items()
+                                       if name != "continuum"}}
+    np.testing.assert_array_equal(np.asarray(MODEL.apply(variables, tokens)),
+                                  np.asarray(plain.apply(without, tokens)))
+    assert MODEL.apply(variables, method="output_table") is None
+    assert plain.apply(without, method="output_table") is not None
+
+
+def test_the_gradient_through_the_level_is_its_formula():
+    """The level is `x + up(silu(down(x)))` on the final states before the head: the logits and
+    their gradients for every variable, the level's among them, on par with that formula written
+    over the decoder without it (check 1)."""
+    plain = decoder(None)
+    tokens = jnp.asarray(np.random.default_rng(1).integers(0, VOCAB, (2, LENGTH)), jnp.int32)
+
+    def level_draw(seed):
+        return drawn_variables(seed), np.random.default_rng(seed).standard_normal(
+            (2, LENGTH, VOCAB)).astype(np.float32)
+
+    def dew(variables):
+        return MODEL.apply(variables, tokens)
+
+    def formula(variables):
+        level = variables["params"]["continuum"]
+        without = {**variables, "params": {name: part for name, part in variables["params"].items()
+                                           if name != "continuum"}}
+        states = plain.apply(without, tokens, method="hidden_states")
+        read = states + jax.nn.silu(states @ level["down"]["kernel"]) @ level["up"]["kernel"]
+        return plain.apply(without, read, method="logits_from_hidden")
+
+    assert_as_exact(jax.jit(with_gradients(dew)), with_gradients(formula), level_draw,
+                    "the gradient through the level", seeds=LEVEL_SEEDS)
+
+
+def test_a_level_that_never_steps_scores_as_the_plain_objective():
+    """At rate zero the level never moves, so the adapted objective's per-token losses are the
+    plain objective's over the same decoder, its level read as trained, on par (check 1): the scan
+    and its windows add nothing but their order."""
+    adapted = LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(window=3, rate=0.0))
+    plain = LMObjective(MODEL, LENGTH)
+
+    def objective_draw(seed):
+        rng = np.random.default_rng(seed)
+        return drawn_variables(seed), rng.integers(0, VOCAB, (ROWS, LENGTH + 1)).astype(np.int32)
+
+    def scored(objective):
+        return lambda variables, tokens: objective.token_scores(variables, tokens).losses
+
+    assert_as_exact(jax.jit(scored(adapted)), scored(plain), objective_draw, "a level that never steps",
+                    seeds=OBJECTIVE_SEEDS)
+
+
+def test_a_run_trains_the_level_and_resumes_as_it_ran(tmp_path):
+    """A run of the adapted objective trains through the Trainer, the level's start among its
+    parameters, and a run resumed from its checkpoint ends where the uninterrupted one does, bit for
+    bit: the loss reads the batch and the variables alone."""
+    objective = LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(window=3, rate=0.1))
+
+    def rows():
+        # The batch for each step, its position the stream's checkpointed state.
+        return Replaying(lambda position: {TEXT_KEY: np.random.default_rng(position).integers(
+            0, VOCAB, (8, LENGTH + 1)).astype(np.int32)})
+
+    def trainer(directory):
+        return Trainer(objective, optax.adam(3e-3), key=jax.random.key(0),
+                       checkpoints=Checkpoints(str(directory)))
+
+    whole = trainer(tmp_path / "whole").fit(dataset(rows), steps=4, log_every=1, checkpoint_every=2)
+    trainer(tmp_path / "halves").fit(dataset(rows), steps=2, log_every=1, checkpoint_every=2)
+    resumed = trainer(tmp_path / "halves").fit(dataset(rows), steps=4, log_every=1, checkpoint_every=2)
+    start = objective.init(jax.random.key(0))["params"]["continuum"]
+    assert not np.array_equal(np.asarray(whole.variables["params"]["continuum"]["up"]["kernel"]),
+                              np.asarray(start["up"]["kernel"]))
+    for ran, again in zip(jax.tree.leaves(whole.variables), jax.tree.leaves(resumed.variables), strict=True):
+        np.testing.assert_array_equal(np.asarray(ran), np.asarray(again))
+
+
+def test_what_the_adaptation_cannot_serve_is_refused():
+    """An adaptation needs a level to step, takes a window of a token or more and a rate of zero or
+    more, and steps parts the level has. No generation steps the level yet, so an adapted objective
+    takes no previews, refuses a rollout's policy and records no task (ValueError, TypeError)."""
+    with pytest.raises(ValueError):
+        LMObjective(decoder(None), LENGTH, adaptation=ChunkAdaptation())
+    with pytest.raises(ValueError):
+        ChunkAdaptation(window=0)
+    with pytest.raises(ValueError):
+        ChunkAdaptation(rate=-1.0)
+    with pytest.raises(ValueError):
+        LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(), samples=Samples(prompt=[1, 2], max_new_tokens=2))
+    objective = LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation(select=("sideways",)))
+    variables = objective.init(jax.random.key(0))
+    with pytest.raises(ValueError):
+        objective.token_scores(variables, jnp.zeros((1, LENGTH + 1), jnp.int32))
+    adapted = LMObjective(MODEL, LENGTH, adaptation=ChunkAdaptation())
+    with pytest.raises(ValueError):
+        adapted.policy(variables)
+    assert adapted.task_settings() is None
+    with pytest.raises(TypeError):
+        adapted.build_task(variables)
+    with pytest.raises(ValueError):
+        decoder(ngpt=NGPT(std=0.02, alpha=0.05))
+
+
+def test_a_level_has_no_transformers_counterpart_so_export_refuses_it():
+    """A continuum level is no field of any transformers config, so a decoder with one exports no
+    config that reads back as it (ValueError), where the same decoder without it exports."""
+    from dew.interop import Pretrained
+    from dew.interop.hf_decoders import export_config
+
+    loaded = Pretrained.load(FIXTURES / "llama-tiny", dtype="float32", attention_impl="reference")
+    export_config(loaded.model)
+    with pytest.raises(ValueError):
+        export_config(loaded.model.clone(continuum=LEVEL))
