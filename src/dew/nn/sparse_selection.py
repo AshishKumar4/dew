@@ -20,19 +20,25 @@ from dew.nn.precision import accumulated, at_least_fp32, float32_einsum, float32
 from dew.nn.scatter import DROPPED
 
 
-def index_scores(query, keys, weights, precision=None):
-    """The lightning indexer's score of each query against each key,
-    `sum_h w_h relu(q_h . k) / sqrt(head_dim) / sqrt(n_heads)`, at least in
-    fp32 (`at_least_fp32`): queries `[B, S, H, D]` against keys `[B, T, D]`
-    every query shares or `[B, S, T, D]` per query, weighted by `weights`
-    `[B, S, H]`, as `[B, S, T]`. Both contractions take `precision`. The
-    V3.2 indexer scores its keys, GLM's k-pool its pooled keys and DeepSeek
-    V4 its compressed entries through it."""
-    heads, width = query.shape[-2:]
+def index_agreements(query, keys, precision=None):
+    """Each lightning indexer head's agreement of each query with each key, `q_h . k` before its relu,
+    at least in fp32 (`at_least_fp32`): queries `[B, S, H, D]` against keys `[B, T, D]` every query
+    shares or `[B, S, T, D]` per query, as `[B, S, H, T]`, under `precision`. A key every head
+    disagrees with scores zero (`index_scores`), however near zero its agreements sit."""
     wide = at_least_fp32(query.dtype)
     shared = 'bshd,btd->bsht' if keys.ndim == 3 else 'bshd,bstd->bsht'
-    scores = jnp.maximum(float32_einsum(shared, query.astype(wide),
-                                    keys.astype(wide), precision=precision), 0) * width ** -0.5
+    return float32_einsum(shared, query.astype(wide), keys.astype(wide), precision=precision)
+
+
+def index_scores(agreements, weights, width: int, precision=None):
+    """The lightning indexer's score of each query against each key,
+    `sum_h w_h relu(q_h . k) / sqrt(head_dim) / sqrt(n_heads)`, at least in
+    fp32, from its heads' `agreements` `[B, S, H, T]` (`index_agreements`) of
+    queries `width` wide, weighted by `weights` `[B, S, H]`, as `[B, S, T]`;
+    the head sum takes `precision`. The V3.2 indexer scores its keys, GLM's
+    k-pool its pooled keys and DeepSeek V4 its compressed entries through it."""
+    heads, wide = agreements.shape[-2], agreements.dtype
+    scores = jnp.maximum(agreements, 0) * width ** -0.5
     # The head sum as a [1, H] by [H, T] product per query: written as the
     # einsum over the scores first, it ran a third slower forward and backward
     # on an H100 at the V3.2 indexer's 64 heads over 4096 keys.

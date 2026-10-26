@@ -62,8 +62,9 @@ def references(tmp_path_factory):
     cell is a test of its own, so CI spreads a model's layouts over tasks
     rather than running them all in one. Its tool module is the one each
     test runs: the one-device state the references hold (`_initial`) lives
-    in that module, so a layout's state is checked against it bit for bit
-    rather than drawn again by a module of its own."""
+    in that module, so each layout starts from that state itself rather than
+    a draw of its own, and its stepped state is judged against the reference
+    by the tool's verdict (`verdict`), never bit for bit across layouts."""
     tool = load("layout_parity")
     return tool, tool.References(directory=tmp_path_factory.mktemp("layout-references"), prepare=True)
 

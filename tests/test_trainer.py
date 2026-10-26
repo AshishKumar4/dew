@@ -18,6 +18,7 @@ import os
 import subprocess
 import sys
 import threading
+from collections.abc import Mapping
 from pathlib import Path
 
 import jax
@@ -1405,6 +1406,107 @@ class ListedParameters(Objective):
 
     def loss(self, variables, batch, step):
         return jnp.sum(variables["params"]["layers"][0]["w"] ** 2), Aux({})
+
+
+MAPPINGS = {"dict": dict, "frozen": frozen_dict, "ordered": collections.OrderedDict}
+"""The kinds of mapping a caller's tree may hold its collections in."""
+
+
+def held_count(kind: str, container: str, count) -> dict:
+    """A `stats` collection of `count`, `{"count": count}` in a mapping of `kind`, as `container` holds
+    it: the mapping itself, or in a list or a tuple."""
+    node = MAPPINGS[kind]({"count": count})
+    return {"seen": node if container == "mapping" else [node] if container == "list" else (node,)}
+
+
+def counted(stats):
+    """The count `held_count` holds."""
+    seen = stats["seen"]
+    return (seen if isinstance(seen, Mapping) else seen[0])["count"]
+
+
+class Kinded(Counted):
+    """`Counted`, its count starting in mappings of `started`'s kind and written back in `written`'s,
+    each held as `container` holds it (`held_count`)."""
+
+    def __init__(self, started: str, written: str, container: str):
+        self.started, self.written, self.container = started, written, container
+
+    def fresh_variables(self, key, held):
+        stats = held_count(self.started, self.container, jnp.zeros(()))
+        return {"params": {"w": jnp.ones((2,))}, "stats": stats}
+
+    def loss(self, variables, batch, step):
+        loss = jnp.sum(variables["params"]["w"] ** 2)
+        stats = held_count(self.written, self.container, counted(variables["stats"]) + 1)
+        return loss, Aux({}, variables={"stats": stats})
+
+
+@pytest.mark.parametrize("container", ["mapping", "list", "tuple"])
+@pytest.mark.parametrize("kind", list(MAPPINGS))
+@pytest.mark.parametrize("entry", ["init", "supplied", "write-back"])
+def test_a_tree_of_any_kind_of_mapping_is_held_as_dicts_where_it_enters(tmp_path, entry, kind, container):
+    """A tree a run is handed holds its collections in any kind of mapping (a dict, a Flax
+    `FrozenDict`, an `OrderedDict`), under a list or a tuple too: where the objective's init returns
+    it, where a supplied state holds it and where the loss writes it back, the state holds it as
+    dicts, so every step's tree has one structure and the run counts every step."""
+    objective = Kinded(kind if entry == "init" else "dict", kind if entry == "write-back" else "dict",
+                       container)
+    trainer = make_trainer(tmp_path, objective=objective, optimizer=optax.sgd(1e-2))
+    supplied = None
+    if entry == "supplied":
+        initial = trainer.initial_state()
+        stats = held_count(kind, container, counted(initial.variables["stats"]))
+        supplied = dataclasses.replace(initial, variables={**initial.variables, "stats": stats})
+    state = trainer.fit(dataset(), steps=3, log_every=1, state=supplied)
+    others = [node for node in jax.tree.leaves(
+        state, is_leaf=lambda node: isinstance(node, Mapping) and type(node) is not dict)
+        if isinstance(node, Mapping)]
+    assert not others and float(counted(state.variables["stats"])) == 3.0
+
+
+@jax.tree_util.register_pytree_node_class
+class MomentumRecord(Mapping):
+    """An optimizer's state that is a mapping of its own kind, read by attribute: its momentum."""
+
+    def __init__(self, momentum):
+        self.momentum = momentum
+
+    def __getitem__(self, key):
+        return {"momentum": self.momentum}[key]
+
+    def __iter__(self):
+        return iter(("momentum",))
+
+    def __len__(self):
+        return 1
+
+    def tree_flatten(self):
+        return (self.momentum,), None
+
+    @classmethod
+    def tree_unflatten(cls, aux, children):
+        return cls(*children)
+
+
+def recorded_momentum() -> optax.GradientTransformation:
+    """Momentum kept in a `MomentumRecord`."""
+    def init(params):
+        return MomentumRecord(jax.tree.map(jnp.zeros_like, params))
+
+    def update(updates, state, params=None):
+        momentum = jax.tree.map(lambda held, gradient: 0.9 * held + gradient, state.momentum, updates)
+        return jax.tree.map(lambda held: -1e-2 * held, momentum), MomentumRecord(momentum)
+
+    return optax.GradientTransformation(init, update)
+
+
+def test_a_supplied_state_keeps_an_optimizer_record_that_is_a_mapping_of_its_own_kind(tmp_path):
+    """Only container mappings become dicts where a state enters: an optimizer's record that is a
+    mapping of its own kind stays one, its fields read as its update reads them."""
+    trainer = make_trainer(tmp_path, objective=Counted(), optimizer=recorded_momentum())
+    state = trainer.fit(dataset(), steps=2, log_every=1, state=trainer.initial_state())
+    assert int(state.step) == 2 and isinstance(state.opt_state, MomentumRecord)
 
 
 def test_a_supplied_state_whose_parameters_and_moments_hold_a_frozen_dict_in_a_list_trains(tmp_path):
