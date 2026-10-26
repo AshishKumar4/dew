@@ -25,7 +25,8 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from dew.coordination import agreed, agreed_same, broadcast_from_process_zero, collective_host
+from dew._coordination import agreed, agreed_same, broadcast_from_process_zero, collective_host
+from dew.batch import Batch, Variables
 from dew.data.dataset import rows_of
 from dew.diffusion.presets import Preset
 from dew.diffusion.process import Process
@@ -33,7 +34,7 @@ from dew.diffusion.schedules.source import SourceGrid
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.precision import at_least_fp32, weighted_total
-from dew.objectives.base import OMITTED, Aux, Batch, Omitted, Ratio, Shown, Step, Variables
+from dew.objectives.base import OMITTED, Aux, Omitted, Ratio, Shown, Step
 from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.rl.advantage import group_normalised
 from dew.rl.surrogate import clipped_surrogate_terms
@@ -48,7 +49,7 @@ REWARDS_KEY = "rewards"
 """The batch field that holds each image's reward, the score its trajectory got."""
 
 if TYPE_CHECKING:
-    from dew.training.state import TrainState
+    from dew.state import TrainState
 
 Predictor = Callable[[jax.Array, jax.Array], tuple[jax.Array, jax.Array]]
 
@@ -96,7 +97,7 @@ class FlowGRPOObjective(DiffusionObjective):
     shown: Mapping[str, Shown] = {"loss": Shown(), "reward": Shown(better="higher")}
     # With beta > 0 the EMA slot holds the frozen reference, so pipelines,
     # evaluation and previews read the live weights.
-    _ema_is_reference = True
+    ema_is_reference = True
 
     def __init__(self, model: nn.Module, process: Process | Preset, inputs: InputSpec, *,
                  sde: FlowSDE = _DEFAULT_SDE, beta: float = 0.0,

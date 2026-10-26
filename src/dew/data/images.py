@@ -14,13 +14,13 @@ import grain.python as grain
 import numpy as np
 from numpy.typing import ArrayLike
 
-from dew.data.dataset import Batch
+from dew._records import record
+from dew.batch import Batch
 from dew.data.facts import resized, shaped, unshaped
 from dew.data.image_augmentation import JITTER
 from dew.data.image_codec import as_rgb, decode_image
 from dew.data.pipeline import DeviceStep, Rejected
 from dew.data.plan import callable_name
-from dew.records import record
 
 if TYPE_CHECKING:
     import jax
@@ -73,8 +73,8 @@ def _payload(image: bytes | Mapping[str, object] | ArrayLike) -> bytes | ArrayLi
     body = image.get("bytes")
     if isinstance(body, bytes):
         return body
+    from dew._records import text
     from dew.data.storage import Store
-    from dew.records import text
 
     return Store(text(image.get("path"), "image.path")).read()
 
@@ -567,7 +567,7 @@ class ConfigureCaption:
         return unshaped(facts, "caption")
 
     def __call__(self, metadata: Mapping[str, object]) -> Caption:
-        from dew.records import strings
+        from dew._records import strings
 
         labels = record(metadata.get("class_names", {}), "class names").get("label")
         return (

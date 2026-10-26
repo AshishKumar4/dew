@@ -84,10 +84,11 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
     from diffusion_stubs import batch_for
     from diffusion_support import images_of, saved_after_one_step
 
-    from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
+    from dew.config import ObjectiveConfig, TrainerConfig
     from dew.config.diffusion import DiffusionRunConfig
     from dew.inference import TextToImage
     from dew.inputs import TextCondition
+    from dew.registry import ModelConfig
 
     config = DiffusionRunConfig(
         model=ModelConfig(

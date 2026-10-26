@@ -25,6 +25,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 
+from dew.mesh import LogicalAxes
 from dew.nn.attention import (
     LayerNorm,
     RMSNorm,
@@ -53,7 +54,7 @@ from dew.nn.precision import (
     float32_einsum,
 )
 from dew.nn.rope import YarnScaling, deinterleaved, rotary_freqs, rotate, yarn_query_scale
-from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
+from dew.nn.sharding import RESIDUAL, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import index_scores, selection_mask, sparse_latent_attention, top_k_selection
 
 
