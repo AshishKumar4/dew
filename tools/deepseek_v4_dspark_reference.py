@@ -177,8 +177,12 @@ def build(module, seed: int, widen: bool = False):
     """The toy Transformer in fp32, or fp64 when `widen`, with its fp32
     weights drawn and each hash row a fresh permutation of the experts
     truncated to the top-k, so a token takes two distinct experts."""
+    from torch_precision import float64
+
     torch.manual_seed(seed)
-    net = module.Transformer(module.ModelArgs(**TINY))
+    # Built inside `float64` when widened, so every value its constructor computes is float64's.
+    with float64() if widen else contextlib.nullcontext():
+        net = module.Transformer(module.ModelArgs(**TINY))
     net = net.double() if widen else net.float()
     generator = torch.Generator().manual_seed(seed)
     for name, tensor in net.named_parameters():
@@ -252,14 +256,13 @@ def released_outputs(module, seed: int, ids: torch.Tensor, widen: bool = False):
 
 @contextlib.contextmanager
 def widened_transformers(module):
-    """transformers in float64: `v41.widened`'s `.float()` and the pins
-    transformers adds, `.to(torch.float32)` and the compressors'
-    `softmax(dtype=torch.float32)` (modeling_deepseek_v4.py:57, :408, :540,
-    :665), each made float64."""
-    from torch_precision import dtype_widened, replaced, widened_to
+    """transformers in float64: `v41.widened`, the shared `float64` context
+    with its `.to(torch.float32)`, and the pin it leaves, the compressors'
+    `Tensor.softmax(dtype=torch.float32)` (modeling_deepseek_v4.py:57, :408,
+    :540, :665), made float64."""
+    from torch_precision import dtype_widened, replaced
 
-    with replaced((torch.Tensor, "to", widened_to(torch.Tensor.to)),
-                  (torch.Tensor, "softmax", dtype_widened(torch.Tensor.softmax))), v41.widened(module):
+    with replaced((torch.Tensor, "softmax", dtype_widened(torch.Tensor.softmax))), v41.widened(module):
         yield
 
 

@@ -199,8 +199,12 @@ def build(model_module, engram_module, args, seed: int, widen: bool = False):
     weights drawn. `float` and `double` leave the complex rotary tables as
     they were built. The vision half draws from a generator of its own, so
     the decoder's weights are the same with it or without."""
+    from torch_precision import float64
+
     torch.manual_seed(seed)
-    net = model_module.Transformer(args, tokenizer())
+    # Built inside `float64` when widened, so every value its constructor computes is float64's.
+    with float64() if widen else contextlib.nullcontext():
+        net = model_module.Transformer(args, tokenizer())
     net = net.double() if widen else net.float()
     generator = torch.Generator().manual_seed(seed)
     media = torch.Generator().manual_seed(seed + 2)
@@ -599,17 +603,17 @@ def search(first: int, count: int):
 
 @contextlib.contextmanager
 def widened(model_module):
-    """The reference in fp64: the default dtype, and every fp32 pin of
-    model.py and the stand-ins widened, which are their `.float()` casts, the
-    MoE accumulator's and the first pre-mix's float32 (model.py:893, :1161)
-    and the rotary tables' float32 frequencies (:376, :384), rebuilt."""
-    from torch_precision import default_dtype, dtype_widened, float_as, replaced
+    """The reference in fp64: the shared `float64` context (its `.float()`
+    casts, float32 constructors and tables, the rotary tables' float32
+    frequencies, model.py:376, :384, rebuilt), and the two pins it leaves, the
+    MoE accumulator's and the first pre-mix's float32 `zeros_like` and
+    `new_zeros` (model.py:893, :1161)."""
+    from torch_precision import dtype_widened, float64, replaced
 
     model_module.precompute_freqs_cis.cache_clear()
     try:
-        with replaced(float_as(torch.float64), (torch, "zeros_like", dtype_widened(torch.zeros_like)),
-                      (torch.Tensor, "new_zeros", dtype_widened(torch.Tensor.new_zeros)),
-                      (torch, "arange", dtype_widened(torch.arange))), default_dtype(torch.float64):
+        with float64(), replaced((torch, "zeros_like", dtype_widened(torch.zeros_like)),
+                                 (torch.Tensor, "new_zeros", dtype_widened(torch.Tensor.new_zeros))):
             yield
     finally:
         model_module.precompute_freqs_cis.cache_clear()
