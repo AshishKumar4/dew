@@ -98,7 +98,7 @@ from dew.objectives.rl.sessions import (
     SEGMENT_IDS_KEY,
 )
 from dew.objectives.supervised import Accuracy, CrossEntropy, Supervised
-from dew.registry import models
+from dew.registry import models, objectives
 from dew.sampling import Euler, Sampling
 from dew.training import Trainer
 
@@ -294,7 +294,18 @@ JEPA_ENCODER = {"patch_size": 4, "emb_features": 32, "num_layers": 1, "num_heads
 JEPA_PREDICTOR = {"grid": JEPA_GRID, "emb_features": 32, "predictor_features": 16, "num_layers": 1,
                   "num_heads": 2, "mlp_ratio": 2}
 
-FAMILIES: Mapping[str, tuple[Family, ...]] = {
+def registered[V](registry: Mapping[str, object], rows: Mapping[str, V], kind: str) -> Mapping[str, V]:
+    """`rows` keyed by every name `registry` holds and no other: a registered member without a row, or a
+    row naming nothing registered, stops this file's collection by name, so the matrix covers every
+    member Dew registers before it lands."""
+    missing, unknown = sorted(set(registry) - set(rows)), sorted(set(rows) - set(registry))
+    if missing or unknown:
+        raise ValueError(f"the matrix's {kind} rows lack the registered {missing} and name the "
+                         f"unregistered {unknown}")
+    return rows
+
+
+FAMILIES: Mapping[str, tuple[Family, ...]] = registered(models, {
     "causal_transformer": (
         Family("causal_transformer", "causal_transformer", DECODER_LM | {TEXT}, 256,
                built("causal_transformer", **DECODER)),
@@ -372,7 +383,7 @@ FAMILIES: Mapping[str, tuple[Family, ...]] = {
                                   described((FRAMES, PIXELS, PIXELS, 3))),),
     "jepa_predictor": (Family("jepa_predictor", "jepa_predictor", frozenset({ENCODES}), 0,
                               built("jepa_predictor", **JEPA_PREDICTOR), described((PIXELS, PIXELS, 3))),),
-}
+}, "family")
 """Every registered family's fixtures, keyed by its registry name."""
 
 UNREGISTERED: tuple[Family, ...] = (
@@ -403,6 +414,11 @@ def loaded(family: Family) -> Loaded:
     """Each fixture once per process, its tree on the host: the trainer
     donates the device buffers it is given, and a host tree hands it copies."""
     held = family.load()
+    if family.registered is not None:
+        # The cells count a family by the fixtures that build it: the nearest registered class its model
+        # is, an adapter's the family it adapts, a family's its own over one it extends.
+        nearest = next(name for kind in type(held.model).__mro__ for name in models if models[name] is kind)
+        assert nearest == family.registered, (family, nearest)
     if held.variables is None:
         return held
     variables = jax.device_get(held.variables)
@@ -1038,6 +1054,11 @@ METHODS: tuple[Method, ...] = (
            refuse_block_diffusion, trains=("block_diffusion",),
            within=lambda family: family.name in KINDS),
 )
+
+
+TRAINED: Mapping[str, Method] = registered(
+    objectives, {name: method for method in METHODS for name in method.trains}, "objective")
+"""The row that trains each registered objective."""
 
 
 def cells(supported: bool) -> list:
