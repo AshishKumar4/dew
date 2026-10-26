@@ -846,7 +846,8 @@ def test_a_recorded_reference_is_drawn_by_its_index_and_covers_the_redraw(tmp_pa
                 indexed_recording({**stored, "site.truth.y": truth.astype(narrow)}, "site", seeds)
 
 
-def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path):
+@pytest.mark.parametrize("proxy", [True, False])
+def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path, proxy):
     """tools/recorded_references.py records a reference over the seeds its own recording resolves, and
     their redraw; check 1 then judges Dew against the recording by its index."""
     from tool_support import load
@@ -863,7 +864,7 @@ def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path
     def squared(inputs):
         return {"y": inputs["x"] * inputs["x"] - 1}
 
-    recorded = recorder.record_case("site", draw, evaluate, squared)
+    recorded = recorder.record_case("site", draw, evaluate, squared if proxy else None)
     seeds = int(recorded["site.seeds"])
     assert seeds >= 8 and len(recorded["site.input.x"]) == 5 * seeds
     path = tmp_path / "recorded.npz"
@@ -873,6 +874,12 @@ def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path
         draw_recorded, reference, truth = indexed_recording(dict(stored), "site", seeds)
         assert_as_exact(jax.jit(lambda index, inputs: squared(inputs)), reference, draw_recorded, "recorded",
                         seeds=seeds, truth_fn=truth)
+        with pytest.raises(AssertionError):
+            assert_as_exact(lambda index, inputs: {"y": inputs["x"] ** 2}, reference, draw_recorded,
+                            "recorded with its subtraction missing", seeds=seeds, truth_fn=truth)
+    if not proxy:
+        with pytest.raises(ValueError):
+            recorder.record_case("site", draw, evaluate, None, truth_proxy=squared)
 
 
 def test_check_one_holds_an_empty_leaf_exact_by_construction():

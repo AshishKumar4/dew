@@ -1,6 +1,7 @@
 """Disk-backed MoE banks read at execution, not once at trace or load time."""
 
 import json
+import shutil
 from importlib import import_module
 from pathlib import Path
 
@@ -182,6 +183,24 @@ def test_an_incomplete_disk_checkpoint_is_refused_before_inference(tmp_path):
         SafetensorsBanks(tmp_path)
 
 
+def test_disk_banks_read_safetensors_alone_before_converting_the_model(tmp_path):
+    """A source that ships its weights as a pickle alone is refused before any translation, which would
+    hold the whole model; the same source with its safetensors streams."""
+    import torch
+    from safetensors.torch import load_file
+
+    from dew.inference.banks import SafetensorsBanks
+
+    original = Path(__file__).parent / "fixtures/hf/qwen38-dense-tiny"
+    shutil.copy2(original / "config.json", tmp_path / "config.json")
+    torch.save(load_file(original / "model.safetensors"), tmp_path / "pytorch_model.bin")
+    with pytest.raises(FileNotFoundError):
+        SafetensorsBanks(tmp_path)
+    shutil.copy2(original / "model.safetensors", tmp_path / "model.safetensors")
+    with SafetensorsBanks(tmp_path) as source:
+        assert source.stats().misses == 0
+
+
 def test_disk_loading_rejects_unbounded_layouts_before_reading_rows():
     from dew.inference.banks import SafetensorsBanks
 
@@ -228,6 +247,61 @@ def test_a_long_disk_scan_is_the_resident_moe(tmp_path):
         model = decoder(source.config, None)
         resident = HeldBanks(translate_weights(
             tensors, translate_config(source.config), "mixtral"
+        )).place(model, mesh=single_mesh(), layout=DEVICE)
+        streamed = source.stream(model, mesh=single_mesh(), layout=DEVICE)
+        tokens = jnp.asarray(np.load(FIXTURE / "input_ids.npy"))
+        score = jax.jit(model.apply)
+        np.testing.assert_array_equal(score(streamed, tokens), score(resident, tokens))
+
+
+def test_a_decision_release_streams_its_wrappers_float64_layers_as_the_resident_load(tmp_path):
+    """A slot release over a media wrapper streams its native backbone's layers from disk: the banked
+    float64 forward, its blocks read both ways, is the resident load's bit for bit, and reads every
+    row it runs."""
+    from dew.inference.banks import SafetensorsBanks
+    from dew.interop import Pretrained
+
+    directory = tmp_path / "source"
+    shutil.copytree(Path(__file__).parent / "fixtures/hf/qwen38-dense-tiny", directory)
+    (directory / "readout.json").write_text(json.dumps({
+        "readout": "slot_lm", "n_slots": 16, "head_dim": 8, "attention": "noncausal"}))
+    with jax.enable_x64(new_val=True):
+        bundle = Pretrained.load(directory, weights=False, dtype="float64", param_dtype="float64",
+                                  attention_impl="reference")
+        model = bundle.model.clone(language_model=bundle.model.language_model.clone(
+            scan_layers=True, bank_layers=1))
+        with SafetensorsBanks(directory, cache_bytes=0, param_dtype="float64", read_ahead=False) as source:
+            streamed = source.stream(model, mesh=single_mesh(), layout=DEVICE)
+            assert source.stats().misses == 0
+            resident = Pretrained.load(directory, dtype="float64", param_dtype="float64",
+                                       attention_impl="reference")
+            placed = HeldBanks(resident.variables).place(model, mesh=single_mesh(), layout=DEVICE)
+            tokens = jnp.asarray([[1, 8, 4, 6, 7, 2]], jnp.int32)
+            groups = jnp.asarray([[0, 0, 0, 1, 1, 1]], jnp.int32)
+
+            def score(variables):
+                return model.apply(variables, tokens, block_groups=groups)
+
+            expected = jax.jit(score)(placed)
+            actual = jax.jit(score)(streamed)
+            assert actual.dtype == expected.dtype == jnp.float64
+            np.testing.assert_array_equal(actual, expected)
+            assert source.stats().misses >= len(model.bank_sites[0].view.groups)
+
+
+def test_a_config_naming_expert_dtype_alone_streams_as_the_unquantized_load(tmp_path):
+    """`expert_dtype` names a quantized source's expert storage only beside its quantization config
+    (`codecs.source_quantization`): a config that states it alone is the unquantized checkpoint the
+    loader reads, and the banks stream it as the resident load computes it."""
+    from dew.inference.banks import SafetensorsBanks
+
+    config = {**json.loads((FIXTURE / "config.json").read_text()), "expert_dtype": "fp4"}
+    (tmp_path / "config.json").write_text(json.dumps(config))
+    shutil.copy2(FIXTURE / "model.safetensors", tmp_path / "model.safetensors")
+    with SafetensorsBanks(tmp_path, cache_bytes=0, param_dtype="float32") as source:
+        model = decoder(source.config, None)
+        resident = HeldBanks(translate_weights(
+            read_weights(FIXTURE), translate_config(config), "mixtral"
         )).place(model, mesh=single_mesh(), layout=DEVICE)
         streamed = source.stream(model, mesh=single_mesh(), layout=DEVICE)
         tokens = jnp.asarray(np.load(FIXTURE / "input_ids.npy"))

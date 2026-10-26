@@ -245,11 +245,12 @@ def persist_compilations() -> None:
     without it. A process Dew readies for training turns it on (`dew.training.runtime.
     ready_process`, from `prepare_process` or the first `fit`), and a task where it is loaded,
     `dew.pipeline` or a saved run's record (`dew.inference.tasks.SavedRun.pinned`). JAX's own switch,
-    JAX_ENABLE_COMPILATION_CACHE=false (`jax_enable_compilation_cache`), turns it off, and a
-    process pool whose processes key a step apart turns it off the same way. JAX writes entries
-    from process 0 alone, so a pool takes the directory only where every process reads it as one
-    (`_shared_by_pool`): caches apart would find a step on one process and compile it on another,
-    which waits for ever for its peers. Reading the settings is what makes it idempotent and what
+    JAX_ENABLE_COMPILATION_CACHE=false (`jax_enable_compilation_cache`), turns it off. JAX writes
+    entries from process 0 alone, so a pool takes the directory only where every process reads it
+    as one (`_shared_by_pool`): caches apart would find a step on one process and compile it on
+    another, which waits for ever for its peers. Each process keys a step by its own topology, so a
+    CPU pool's other processes, whose topologies are their own devices, compile what process 0
+    loads (docs/guides/multi-node.md). Reading the settings is what makes it idempotent and what
     leaves a trainer's own directory, or a caller's, alone.
 
     JAX settles whether a process uses the cache at its first compile: one that compiled with the

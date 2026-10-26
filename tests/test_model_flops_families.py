@@ -165,6 +165,25 @@ def test_text_and_vision_towers_count_all_projection_maps():
     assert vision.model_flops(IMAGE) == expected
 
 
+@pytest.mark.parametrize("fixture", ["gemma-3n-audio-tiny", "gemma-4-audio-tiny",
+                                     "gemma4-unified-native-tiny"])
+def test_a_media_wrapper_counts_its_decoder_and_refuses_an_audio_encoders_work(fixture):
+    """A media wrapper's model FLOPs are its language model's over the real tokens. An audio encoder's
+    work over its frames has no count, so a wrapper with one refuses, Gemma 3n's and Gemma 4's alike;
+    Gemma 4 Unified's audio is a projector of raw frames, left out of the count as a vision projector's
+    is, so it counts its language model's work."""
+    from dew.interop import Pretrained
+
+    model = Pretrained.load(Path(__file__).parent / "fixtures" / "hf" / fixture, weights=False,
+                            dtype="float32").model
+    lengths = np.array([5, 3], np.int64)
+    if fixture == "gemma4-unified-native-tiny":
+        assert model.model_flops(lengths) == model.language_model.model_flops(lengths) > 0
+    else:
+        with pytest.raises(MissingFlopsCount):
+            model.model_flops(lengths)
+
+
 def test_patch_lengths_retain_video_frames_and_reject_partial_patches():
     np.testing.assert_array_equal(patch_lengths((2, 4, 8, 3), (1, 2, 2), 2), [16, 16])
     with pytest.raises(MissingFlopsCount):
