@@ -26,6 +26,7 @@ import optax
 import pytest
 import torch
 import transformers
+from interop_support import token_draw
 from jax.sharding import PartitionSpec as P
 from reference_error import (
     assert_as_exact,
@@ -1112,8 +1113,7 @@ def test_experts_transformers_loops_over_run_at_static_shapes_as_transformers_co
         lambda module, inputs, output: routes.append(inputs[1].clone()))
     forward = jax.jit(loaded.model.apply)
 
-    def draw(seed):
-        return (np.random.default_rng([0x1496, seed]).integers(0, 256, (2, 12)).astype(np.int32),)
+    draw = token_draw(0x1496, LONGCAT["vocab_size"], (2, 12))
 
     def ours(tokens):
         return np.asarray(forward(loaded.variables, tokens), np.float64)
