@@ -555,3 +555,32 @@ def test_param_groups_with_schedules_momentum_and_bounds_round_trip():
     loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
     assert loaded == config
     assert loaded.optim.param_groups[0].bounds == (0.0, 24.0)
+
+
+def test_every_kind_of_run_scores_the_metrics_it_names_and_its_own_by_default():
+    """`val_metrics` is every run's (`RunConfig`): where it names none, each kind scores its own where
+    its data validates (`default_metrics`): a language model its perplexity, a decision run its
+    held-out suite, a JEPA run its probes; `()` scores none, and a metric named is what each scores,
+    its record round tripping through the command line and run.json alike."""
+    from dew.config import MetricConfig
+    from dew.config.jepa import JepaRunConfig
+    from dew.config.lm import LMRunConfig
+    from dew.decision.config import DecisionRunConfig
+    from dew.decision.metrics import AURC, ECE, Accuracy
+    from dew.decision.scoring import Brier, LogLoss
+    from dew.objectives.jepa.probes import KnnProbe, LinearProbe
+    from dew.objectives.lm.objective import Perplexity
+
+    def kinds(run):
+        return [type(metric) for metric in run.validation_metrics(validates=True)]
+
+    assert kinds(LMRunConfig()) == [Perplexity] and LMRunConfig().validation_metrics(validates=False) == ()
+    assert kinds(DecisionRunConfig()) == [Accuracy, ECE, AURC, LogLoss]
+    assert kinds(JepaRunConfig()) == [] and kinds(JepaRunConfig(probe_classes=7)) == [LinearProbe, KnnProbe]
+    linear, knn = JepaRunConfig(probe_classes=7, knn_k=5).validation_metrics(validates=False)
+    assert (linear.num_classes, knn.num_classes, knn.k) == (7, 7, 5)
+    named = LMRunConfig.cli(["--val-metrics", '[{"name": "brier"}]'])
+    assert named.val_metrics == (MetricConfig("brier"),) and kinds(named) == [Brier]
+    assert LMRunConfig.from_dict(named.to_dict()) == named
+    for run in (LMRunConfig, DecisionRunConfig, JepaRunConfig):
+        assert run(val_metrics=[]).validation_metrics(validates=True) == ()

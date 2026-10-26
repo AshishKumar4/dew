@@ -25,7 +25,7 @@ from typing import TYPE_CHECKING, Annotated, ClassVar
 
 import jax
 
-from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
+from dew.config import DecoderRunConfig, MetricConfig, ModelConfig, ObjectiveConfig, OptimConfig, Prepared
 from dew.data.dataset import record_argument
 from dew.data.text import HFTokenizer
 from dew.decision.head import DecisionHead, JointSchemaHead
@@ -39,10 +39,11 @@ from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.cross_attention import ContextEncoder, CrossAttention
 from dew.nn.protocols import RematChoosing
 from dew.records import number, record
+from dew.registry import import_path
 from dew.training.state import TrainState
 
 if TYPE_CHECKING:
-    from dew.interop import Pretrained
+    pass
 
 
 @dataclasses.dataclass(frozen=True)
@@ -60,10 +61,10 @@ class JointShape:
 
 
 @dataclasses.dataclass(frozen=True)
-class DecisionRunConfig(RunConfig):
+class DecisionRunConfig(DecoderRunConfig):
     """A run, plus the decision objective's own knobs."""
 
-    RESUMABLE: ClassVar[tuple[str, ...]] = (*RunConfig.RESUMABLE, "calibrate")
+    RESUMABLE: ClassVar[tuple[str, ...]] = (*DecoderRunConfig.RESUMABLE, "calibrate")
 
     objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("decision"))
     """The decision objective and its arguments: its scoring rule (`loss`),
@@ -79,20 +80,6 @@ class DecisionRunConfig(RunConfig):
     subfolder: str | None = None
     """The checkpoint's folder inside a repository that bundles several, such as `multilingual`."""
     revision: str | None = None
-    loop_steps: int | None = None
-    """The passes a looped checkpoint runs its block (`CausalTransformer.loop`), such
-    as Ouro's at 1, 2 or 4; None keeps the checkpoint's own."""
-    loop_layers: tuple[int, int] | None = None
-    """The block of layers [first, end) that `loop_steps` repeats: a pretrained
-    decoder with no loop gains one over its own layers, as Qwen 3.5's middle block
-    repeated twice; None keeps a looped checkpoint's block."""
-    loop_backprop_steps: int | None = None
-    """Train through the last k passes of the loop alone, with earlier passes
-    cut from backpropagation; None keeps the loop's own choice."""
-    loop_remat: bool = False
-    """Checkpoint every pass of the loop, including the first, and recompute
-    it in the backward pass; requires a loop and leaves decoding unchanged.
-    False keeps a checkpoint's own choice."""
     remat: str | None = None
     """A `REMAT_POLICIES` name for the loaded backbone's layers, applied before
     looping and LoRA. The trainer's fitting ladder starts here; a policy
@@ -169,9 +156,8 @@ class DecisionRunConfig(RunConfig):
         if self.context_layers is not None:
             derived["context_encoder"] = self.context_encoder
         if LayaCheckpoint.exists(self.pretrained, subfolder=self.subfolder, revision=self.revision):
-            if any(choice is not None for choice in (self.lora, self.head, self.loop_steps,
-                                                    self.loop_layers, self.loop_backprop_steps,
-                                                    self.remat, self.context_layers)) or self.loop_remat:
+            if any(choice is not None for choice in (self.lora, self.head, self.remat,
+                                                    self.context_layers)) or self.loops:
                 raise ValueError("--lora, --head, --remat, --context-layers and the loop shape a fresh "
                                  "backbone; a Laya checkpoint trains whole under its own head")
             start = Decide.from_pretrained(self.pretrained, subfolder=self.subfolder, revision=self.revision,
@@ -190,10 +176,7 @@ class DecisionRunConfig(RunConfig):
                     raise ValueError(f"--remat chooses a decoder's layer policy (RematChoosing), which "
                                      f"{type(start.model).__name__} does not support")
                 start = dataclasses.replace(start, model=start.model.with_remat(remat_policy(self.remat)))
-            if (self.loop_steps is not None or self.loop_layers is not None
-                    or self.loop_backprop_steps is not None or self.loop_remat):
-                start = looping(start, self.loop_steps, self.loop_layers,
-                                backprop_steps=self.loop_backprop_steps, remat=self.loop_remat or None)
+            start = self.looped(start)
             if self.context_layers is not None:
                 # Drawn from a key of their own, apart from the adapter's and the head's.
                 blocks = CrossAttention(self.context_layers, self.context_length)
@@ -239,27 +222,16 @@ class DecisionRunConfig(RunConfig):
             if jax.process_index() == 0:
                 calibrated.save(directory)
 
-        # The task's own default metrics, asked for where its data holds held-out rows to score.
-        metrics = tuple(default_metrics()) if held else ()
+        metrics = self.validation_metrics(validates=bool(held))
         after = calibrate if self.calibrate and held else None
         return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=metrics,
                                                       summary=summary, after=after, validation=held))
 
-
-def looping(start: Pretrained, steps: int | None, layers: tuple[int, int] | None, *,
-            backprop_steps: int | None = None, remat: bool | None = None) -> Pretrained:
-    """A loaded checkpoint whose block runs `steps` passes: a looped one's own block, or `layers`,
-    which gives a decoder with no loop one over its own layers. Refused where neither names a block,
-    or a new block's passes are not stated. `backprop_steps` and `remat` choose
-    the loop's backward memory; None keeps a looped checkpoint's own value."""
-    from dew.nn.protocols import Looping
-
-    looped = (start.model.with_passes(steps, layers, backprop_steps=backprop_steps, remat=remat)
-              if isinstance(start.model, Looping) else None)
-    if looped is None:
-        raise ValueError(f"this {type(start.model).__name__} has no loop: --loop-layers names the block of "
-                         "its layers to repeat and --loop-steps how many times")
-    return dataclasses.replace(start, model=looped)
+    def default_metrics(self, *, validates: bool) -> tuple[MetricConfig, ...]:
+        """The task's own held-out suite (`default_metrics`), where the data holds held-out rows."""
+        if not validates:
+            return ()
+        return tuple(MetricConfig(import_path(type(metric))) for metric in default_metrics())
 
 
 type Budgets = dict[str, int | Framing | tuple[Segment, ...] | None]

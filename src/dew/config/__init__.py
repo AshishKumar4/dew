@@ -115,6 +115,8 @@ narrows each one where it builds it, so the values are read there."""
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
 
+    from dew.interop import Pretrained
+
     # tyro reads the runtime annotation, a Union of the aliased specs, and a
     # type checker cannot read a variable in a type expression. Both get what
     # they need: the base class statically, the union at runtime.
@@ -1229,9 +1231,10 @@ class RunConfig:
     _FLAG_SELECTED: ClassVar[Mapping[str, str]] = {"lora": "lora", "trainer.stop": "pause"}
     """The optional settings `cli` turns on by their own flags, each with the
     subcommand its flags imply."""
-    RESUMABLE: ClassVar[tuple[str, ...]] = ("trainer", "optim", "data", "validation", "data_seed")
-    """The fields a run resumed under its name may change: how it trains and optimizes, what it reads,
-    and, in a kind of run that adds them, how it evaluates and previews. Every other field says what
+    RESUMABLE: ClassVar[tuple[str, ...]] = ("trainer", "optim", "data", "validation", "data_seed",
+                                            "val_metrics")
+    """The fields a run resumed under its name may change: how it trains and optimizes, what it reads
+    and scores, and, in a kind of run that adds them, how it previews. Every other field says what
     it trains, which the resume must keep (`check_resume`), and so does `trainer.quantization`, which
     changes the forward pass the weights train through."""
 
@@ -1260,6 +1263,26 @@ class RunConfig:
     initialized from the run's key. The objective then trains only the adapter's
     factors, and the run's record stores the model with the adapter attached.
     """
+    val_metrics: (Annotated[tuple[MetricConfig, ...], record_argument(tuple[MetricConfig, ...])]
+                  | None) = None
+    """The metrics scored on every validation pass, each with the arguments the run gives it (a
+    CLIP metric's model, an FID's weights), one JSON list on the command line:
+    `--val-metrics '[{"name": "clip", "fields": {"modelname": "openai/clip-vit-base-patch32"}}]'`.
+    None is the kind of run's own (`default_metrics`): perplexity for a language model, a decision
+    run's accuracy, calibration, risk-coverage and log loss, a JEPA run's probes, CLIP for an image
+    run, each where its data holds a validation split. A metric given is asked for whatever the data
+    holds, so data with no validation split refuses it; `[]` scores none.
+    """
+
+    def __post_init__(self) -> None:
+        # A record carries every sequence as a JSON list and a command line writes one too; the field
+        # is a tuple, so the value is one.
+        if self.val_metrics is not None:
+            object.__setattr__(self, "val_metrics", tuple(self.val_metrics))
+            stray = [metric for metric in self.val_metrics if not isinstance(metric, MetricConfig)]
+            if stray:
+                raise TypeError(f"val_metrics holds metrics' records, {{'name': ..., 'fields': {{...}}}}, "
+                                f"not {stray!r}")
 
     def to_dict(self) -> dict[str, JSON]:
         """Return a JSON-safe record of the run.
@@ -1486,8 +1509,25 @@ class RunConfig:
             raise ValueError(f"{type(self).__name__} builds the objective it names around its whole model; "
                              "name an objective, and train an adapter as a kind of run that attaches one")
         objective = self.objective.build(model=self.model.build())
-        return Prepared(self, lambda name: self.train(objective, self.chain(), name=name,
+        scored = self.validation_metrics(validates=self.validation is not None)
+        return Prepared(self, lambda name: self.train(objective, self.chain(), name=name, metrics=scored,
                                                       validation=self.validation))
+
+    def default_metrics(self, *, validates: bool) -> tuple[MetricConfig, ...]:
+        """The metrics a validation pass scores where `val_metrics` names none, by what the run's data
+        `validates`: a kind of run's own, none for a run that names its objective alone."""
+        del validates
+        return ()
+
+    def metric(self, config: MetricConfig) -> Metric:
+        """`config` built with what this kind of run derives for it where it states none of its own."""
+        return config.build()
+
+    def validation_metrics(self, *, validates: bool) -> tuple[Metric, ...]:
+        """The metrics each validation pass scores, built (`metric`): `val_metrics`, or the kind of
+        run's own where it names none (`default_metrics`), by what the run's data `validates`."""
+        configs = self.default_metrics(validates=validates) if self.val_metrics is None else self.val_metrics
+        return tuple(self.metric(config) for config in configs)
 
     def chain(self) -> Dataset:
         """The run's `data`. Raises ValueError for a run that names none: a run trains on the chain
@@ -1686,5 +1726,56 @@ class RunConfig:
         return finished
 
 
-__all__ = ["JsonDict", "MetricConfig", "ModelConfig", "ObjectiveConfig", "OptimConfig", "Prepared",
-           "RunConfig", "ScheduleSpec", "TrainerConfig", "Wandb", "flag_selected"]
+@dataclasses.dataclass(frozen=True)
+class DecoderRunConfig(RunConfig):
+    """A run over a loaded decoder, which may run a block of its layers in passes: the pass count, the
+    block, the passes trained through and their recomputation (`CausalTransformer.with_passes`), each
+    the run's choice over the checkpoint's own. The language-model and the decision runs take it."""
+
+    loop_steps: int | None = None
+    """The passes a looped checkpoint runs its block (`CausalTransformer.loop`), such
+    as Ouro's at 1, 2 or 4; None keeps the checkpoint's own."""
+    loop_layers: tuple[int, int] | None = None
+    """The block of layers [first, end) that `loop_steps` repeats: a pretrained
+    decoder with no loop gains one over its own layers, as Qwen 3.5's middle block
+    repeated twice; None keeps a looped checkpoint's block."""
+    loop_backprop_steps: int | None = None
+    """Train through the last k passes of the loop alone, with earlier passes
+    cut from backpropagation; None keeps the loop's own choice."""
+    loop_remat: bool = False
+    """Checkpoint every pass of the loop, including the first, and recompute
+    it in the backward pass; requires a loop and leaves decoding unchanged.
+    False keeps a checkpoint's own choice."""
+
+    @property
+    def loops(self) -> bool:
+        """Whether the run asks anything of a loop (`looped`)."""
+        return (self.loop_steps is not None or self.loop_layers is not None
+                or self.loop_backprop_steps is not None or self.loop_remat)
+
+    def looped(self, start: Pretrained) -> Pretrained:
+        """`start` with its block run as the run asks (`looping`), as loaded where it asks nothing."""
+        if not self.loops:
+            return start
+        return looping(start, self.loop_steps, self.loop_layers, backprop_steps=self.loop_backprop_steps,
+                       remat=self.loop_remat or None)
+
+
+def looping(start: Pretrained, steps: int | None, layers: tuple[int, int] | None, *,
+            backprop_steps: int | None = None, remat: bool | None = None) -> Pretrained:
+    """A loaded checkpoint whose block runs `steps` passes: a looped one's own block, or `layers`,
+    which gives a decoder with no loop one over its own layers. Refused where neither names a block,
+    or a new block's passes are not stated. `backprop_steps` and `remat` choose
+    the loop's backward memory; None keeps a looped checkpoint's own value."""
+    from dew.nn.protocols import Looping
+
+    looped = (start.model.with_passes(steps, layers, backprop_steps=backprop_steps, remat=remat)
+              if isinstance(start.model, Looping) else None)
+    if looped is None:
+        raise ValueError(f"this {type(start.model).__name__} has no loop: --loop-layers names the block of "
+                         "its layers to repeat and --loop-steps how many times")
+    return dataclasses.replace(start, model=looped)
+
+
+__all__ = ["DecoderRunConfig", "JsonDict", "MetricConfig", "ModelConfig", "ObjectiveConfig", "OptimConfig",
+           "Prepared", "RunConfig", "ScheduleSpec", "TrainerConfig", "Wandb", "flag_selected", "looping"]

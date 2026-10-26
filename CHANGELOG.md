@@ -5,6 +5,14 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- Every run names the metrics its validation passes score, `--val-metrics` (`RunConfig.val_metrics`), which
+  only a diffusion run held: where it names none, each kind scores its own (`default_metrics`): a
+  language model its perplexity, a decision run accuracy, calibration error, the risk-coverage area and
+  the log loss, a JEPA run its probes, an image run CLIP; `[]` scores none.
+  `DiffusionRunConfig.build_eval_metrics` is `validation_metrics(validates=...)`.
+- A language-model run loops a `--pretrained` decoder as a decision run does: `--loop-steps`,
+  `--loop-layers`, `--loop-backprop-steps` and `--loop-remat` are both runs' (`DecoderRunConfig`), and
+  `looping` is `dew.config.looping`.
 - `OptimConfig(state_dtype='int8')` stores adam's and adamw's moments blockwise in 8 bits
   (`dew.optim.int8_moments`, bitsandbytes' and torchao's 8-bit Adam): a quarter of float32's state, the
   update computed from the moments dequantized to fp32. On an A100, lm-dense's full-remat step peaks at
