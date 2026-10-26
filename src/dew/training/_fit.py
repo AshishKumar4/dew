@@ -286,7 +286,7 @@ class FitRun:
     """The suites `evaluation` scored at its step, which a run whose stream ends there scores once."""
     ahead: tuple[Batch | None] | None = None
     """The next batch, or None for the stream's end, read before the step that takes it, where a
-    save had to know whether the run ends there (`Trainer._ends_here`)."""
+    save had to know whether the run ends there (`ends_here`)."""
     best: HeldBest = dataclasses.field(default_factory=HeldBest)
     """The log taken at the latest logging step and not yet read."""
     stepped: tuple[jax.Array, dict[str, jax.Array], jax.Array] | None = None
@@ -298,6 +298,23 @@ class FitRun:
     compiled: dict[Signature, tuple] = dataclasses.field(default_factory=dict)
     """The step compiled for each batch signature the run met, with its measured FLOPs
     (`Trainer._compiled_for`), which its cooldown branches step too."""
+    cooling: Mapping[str, object] | None = None
+    """The cooldown branch the run is to run at its current step before it reads on, resolved
+    (`dew.training.cooldown.Pending`): one its checkpoints kept unfinished, as the pool agreed it, or
+    one due at its last step, which runs after the step's final save (`Trainer._wind_down`)."""
+
+    def ends_here(self, interval: Interval) -> bool:
+        """Whether a stream that may run out has, so this step is the run's last: its next batch is
+        read now, agreed as every such read is, and kept for the step that takes it (`ahead`), the
+        position the step saves taken before it. An endless stream never ends here, and a run whose
+        stream is closed (`Trainer._wind_down`) ends on this step without another read."""
+        if self.endless:
+            return False
+        if self.ahead is None:
+            if self.train is None:
+                return True
+            self.ahead = (waited_read(self, interval, agree=True),)
+        return self.ahead[0] is None
 
     def read(self) -> Batch:
         """The training stream's next batch, read through this run each time:

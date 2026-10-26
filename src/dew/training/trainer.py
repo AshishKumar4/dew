@@ -1407,13 +1407,12 @@ class Trainer(Generic[Loss, Effects]):
         seen = 0
         run.notice = PreemptionNotice()
         run.committed = plan.real(interval)
-        if checkpoints is not None and (pending := checkpoints.cooldown(run.current)) is not None:
+        if run.cooling is not None and not plan.ended(run.current, plan.real(interval)):
             # A branch a preemption cut short runs again before the run reads on from where it stood.
-            state, cut = self._cooled(plan, run, state, shardings, position, pending)
+            state, cut = self._cooled(plan, run, state, shardings, position, run.cooling)
             if cut:
                 run.preempted = run.current
-                self._wind_down(plan, run, interval, state, shardings, position, profiler)
-                return state
+                return self._wind_down(plan, run, interval, state, shardings, position, profiler)
         while not plan.ended(run.current, plan.real(interval)):
             # A schedule's stage ends where the commits reach its tokens.
             self._scheduled(plan, run, interval)
@@ -1495,8 +1494,7 @@ class Trainer(Generic[Loss, Effects]):
                     run.tracing = False
                     assert profiler is not None
                     self._stop_trace(run, profile, profiler)
-        self._wind_down(plan, run, interval, state, shardings, position, profiler)
-        return state
+        return self._wind_down(plan, run, interval, state, shardings, position, profiler)
 
     def _closed(self, run: FitRun, primary: BaseException | None,
                 profiler: Profiler | None) -> BaseException | None:
@@ -1579,8 +1577,11 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError(
                 "checkpoint_every asks for checkpoints and this trainer has no "
                 "checkpointer; pass Checkpoints(directory) to write any")
-        # A cooldown a preemption cut short at the run's last step still runs (`_cooled`).
-        pending = checkpoints is not None and checkpoints.cooldown(current) is not None
+        # A cooldown a preemption cut short, which a resume from its step runs first, as every process
+        # agrees it, its last step's too (`_cooled`).
+        kept = None if checkpoints is None else checkpoints.cooldown(current)
+        run.cooling = broadcast_from_process_zero(kept)
+        pending = run.cooling is not None
         complete = (plan.ended(current, interval.real_tokens) and checkpoints is not None
                     and checkpoints.latest is not None and not pending)
         # The step the run reads from, as the pre-read's empty-stream check reads it, and the FLOP
@@ -1761,9 +1762,10 @@ class Trainer(Generic[Loss, Effects]):
         # A run's last step, its budget's or the step after which its stream runs out, is scored and saved
         # once, by `_wind_down`, with every suite: never here before a rarer suite has. Only a step that
         # evaluates or pauses could save first (a ranked save scores every suite), so only there is the
-        # stream read ahead (`_ends_here`): no other step's save waits on a batch a stream has yet to make.
+        # stream read ahead (`FitRun.ends_here`): no other step's save waits on a batch a stream has yet to
+        # make.
         ending = plan.finished(current, real) or (
-            (evaluation_due or plan.paused(current, real)) and self._ends_here(run, interval))
+            (evaluation_due or plan.paused(current, real)) and run.ends_here(interval))
         paused = not ending and plan.paused(current, real)
         ranked = bool((plan.validation or plan.best or plan.stop) and run.checkpoint_due)
         if not ending and (evaluation_due or ranked):
@@ -1777,10 +1779,13 @@ class Trainer(Generic[Loss, Effects]):
         scores = (
             {} if run.evaluation is None or run.evaluation.step != current else dict(run.evaluation.scores)
         )
-        # Before the step's save, so a preemption inside the branch saves this step to run it again. The
-        # points share one length and decay, so those due together are one branch.
+        # Before the step's save, so a preemption inside the branch saves this step to run it again; at
+        # the run's last step, after its final save (`_wind_down`). The points share one length and
+        # decay, so those due together are one branch.
         due = next((branch for branch in plan.branches if branch.due(current, real, before)), None)
         branch = None if due is None else due.pending(current, self.accumulation)
+        if ending:
+            run.cooling, branch = branch, None
         state, cut = (state, False) if branch is None else self._cooled(plan, run, state, shardings, position,
                                                                          branch)
         if not ending:
@@ -1820,14 +1825,16 @@ class Trainer(Generic[Loss, Effects]):
         if position is None:
             raise ValueError("a cooldown branch reads on from the run's data position, and this stream "
                              "keeps none")
-        assert run.partition is not None and run.train is not None and run.notice is not None
+        assert run.partition is not None and run.notice is not None
         began, at, held = time.perf_counter(), state.step, held_rates(state.opt_state)
         self._display.note(f"Cooldown branch from step {run.current}: {steps} steps")
         if checkpoints is not None:
             checkpoints.cooling(pending)
         moving, frozen = apart(state)
         restore, step_at = snapshot(moving), jax.device_put(np.asarray(int(at), at.dtype), at.sharding)
-        run.train.close()
+        reading = run.train is not None
+        if run.train is not None:
+            run.train.close()
         run.ahead = None
         branched = FitRun(run.started, current=run.current, partition=run.partition, reads=run.reads,
                           compiled=run.compiled)
@@ -1847,7 +1854,10 @@ class Trainer(Generic[Loss, Effects]):
                 done, branched.current = done + 1, branched.current + 1
         finally:
             branched.train.close()
-        if not cut and done < steps:
+        run.cooling = pending if cut else None
+        if cut:
+            self._display.note(f"Preempted inside the cooldown from step {run.current}, which a resume runs")
+        elif done < steps:
             self._display.note(f"The training data ran out {done} steps into the cooldown from step "
                                f"{run.current}, which records no score")
         elif not cut:
@@ -1860,7 +1870,8 @@ class Trainer(Generic[Loss, Effects]):
             if not leaf.is_deleted():
                 leaf.delete()
         restored = together(restore(), frozen)
-        run.train = self._prefetched(plan, run, plan.dataset.train(run.partition), position)
+        if reading:
+            run.train = self._prefetched(plan, run, plan.dataset.train(run.partition), position)
         run.other += time.perf_counter() - began
         return restored, cut
 
@@ -1920,13 +1931,13 @@ class Trainer(Generic[Loss, Effects]):
         if (checkpoints is not None and interval.last_saved != current
                 and (run.checkpoint_due or candidate or (final and plan.checkpoint_final) or full)):
             self._read_taken(run)
-            # A save of weights alone is no step to resume from, so not the run's last (`_ends_here`).
+            # A save of weights alone is no step to resume from, so not the run's last (`FitRun.ends_here`).
             run.other += self._saved_checkpoint(
                 checkpoints, current, state, position, interval, scores=scores, ranking=ranking,
                 training_best=not plan.validation and not plan.best, control=run.stop_control,
                 weights_only=not run.checkpoint_due and not run.stopped and not full
                 and not (final and plan.checkpoint_final) and bool(winners)
-                and all(rank.weights_only for rank in winners) and not self._ends_here(run, interval))
+                and all(rank.weights_only for rank in winners) and not run.ends_here(interval))
             run.last_checkpoint = time.perf_counter()
         if run.local_due and checkpoints is not None and run.last_local_saved != current:
             self._read_taken(run)
@@ -1935,7 +1946,7 @@ class Trainer(Generic[Loss, Effects]):
             run.last_local_saved = current
 
     def _wind_down(self, plan: FitPlan, run: FitRun, interval: Interval, state: TrainState,
-                   shardings: Placement[TrainState], position, profiler: Profiler | None) -> None:
+                   shardings: Placement[TrainState], position, profiler: Profiler | None) -> TrainState:
         """`fit` after its last step: the stream closed, a preemption
         announced, the trace window stopped, the final validation of every
         suite the step has not scored (skipped on a preemption or a pause,
@@ -1994,23 +2005,16 @@ class Trainer(Generic[Loss, Effects]):
         # A token update may cross the pause and the budget at once, which still saves the whole state.
         self._saves(plan, run, interval, state, position, scores, evaluation_due=bool(scores), final=True,
                     full=plan.paused(current, plan.real(interval)))
+        if run.cooling is not None and run.preempted is None and run.paused is None:
+            # The last step's branch, its main model scored and saved first, which a resume from the
+            # step runs again where a preemption cuts it short.
+            state, cut = self._cooled(plan, run, state, shardings, position, run.cooling)
+            run.preempted = current if cut else None
         if plan.observe:
             plan.observe.last(current, state)
         if checkpoints is not None:
             checkpoints.wait()
-
-    def _ends_here(self, run: FitRun, interval: Interval) -> bool:
-        """Whether a stream that may run out has, so this step is the run's last: its next batch is
-        read now, agreed as every such read is, and kept for the step that takes it (`ahead`), the
-        position the step saves taken before it. An endless stream never ends here, and a run whose
-        stream is closed (`_wind_down`) ends on this step without another read."""
-        if run.endless:
-            return False
-        if run.ahead is None:
-            if run.train is None:
-                return True
-            run.ahead = (waited_read(run, interval, agree=True),)
-        return run.ahead[0] is None
+        return state
 
     def _fit_policies(self, best, stop, scored, checkpoint_every, steps, tokens):
         """The run's best selection and its stop policy: a `Plateau` with its metric bound to the
