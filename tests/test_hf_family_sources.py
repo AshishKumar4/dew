@@ -389,6 +389,7 @@ def test_a_qwen35_wrapper_turns_its_three_axis_rotary_by_a_yarn_record(tmp_path)
     model = loaded.model
     forward = jax.jit(lambda variables, inputs: model.apply(variables, inputs.tokens, **inputs.kwargs()))
 
+    @as_given
     def ours(values):
         return np.asarray(forward(loaded.variables, processor.from_hf(values)), np.float64)[valid]
 
@@ -398,7 +399,7 @@ def test_a_qwen35_wrapper_turns_its_three_axis_rotary_by_a_yarn_record(tmp_path)
                 tensors = {name: torch.from_numpy(np.asarray(value)) for name, value in values.items()}
                 logits = source(**tensors, use_cache=False).logits
             return logits.double().numpy()[valid]
-        return run
+        return as_given(run)
 
     assert_as_exact(ours, theirs(reference), draw, "Qwen 3.5 wrapper YaRN logits", seeds=WRAPPER_SEEDS,
                     truth_fn=theirs(wide, float64))
@@ -418,6 +419,6 @@ def test_a_phi3_record_spelled_yarn_is_the_longrope_its_source_reads(tmp_path):
     reference, wide = _reference(directory)
     forward = jax.jit(loaded.model.apply)
     draw = token_draw(0x15943, config["vocab_size"], (ROWS, config["max_position_embeddings"]))
-    assert_as_exact(lambda ids: np.asarray(forward(loaded.variables, jnp.asarray(ids)), np.float64),
+    assert_as_exact(as_given(lambda ids: np.asarray(forward(loaded.variables, jnp.asarray(ids)), np.float64)),
                     torch_logits(reference), draw, "phi3 'yarn' logits", seeds=8,
                     truth_fn=torch_logits(wide, float64))
