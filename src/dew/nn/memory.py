@@ -415,12 +415,13 @@ class InContextMemory(nn.Module):
         return read
 
     def _keys(self, x: jax.Array) -> dict[str, jax.Array] | None:
-        """Each token and head's key data `[B, S, H, ...]` of every RNG stream the call carries but
-        `params` (a training forward's `dropout` and `stochastic_rounding`, `training_rngs`), each split
-        from its own stream, so the streams stay as apart as the call holds them; None without any. An
-        application folds its use into its token's key (`_applied`)."""
+        """Each token and head's key data `[B, S, H, ...]` of every RNG stream the call carries, each
+        split from its own stream, so the streams stay as apart as the call holds them: a training
+        forward's `dropout` and `stochastic_rounding` (`training_rngs`), and an initialization's
+        `params`, which a stream the network asks for and the call lacks falls back to, as at any
+        child; None without any. An application folds its use into its token's key (`_applied`)."""
         assert self.scope is not None, "a bound memory has a scope"
-        streams = sorted(name for name in self.scope.rngs if name != "params")
+        streams = sorted(self.scope.rngs)
         batch, length = x.shape[:2]
         return {name: rows_like(jax.random.key_data(jax.random.split(self.make_rng(name),
                                                                      (batch, length, self.heads))), x)
