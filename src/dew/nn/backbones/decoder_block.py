@@ -16,6 +16,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.dense import Dense
+from dew.nn.dropout import Dropout
 from dew.records import JSON
 
 from ..activations import GatedActivation, gated_product
@@ -770,7 +771,7 @@ class DecoderBlock(nn.Module):
             self.engram_layer = self.engram(name='engram')
         if self.cross is not None:
             self.cross_attention = self.cross(name=CROSS_ATTENTION)
-        self.dropout = nn.Dropout(rate=self.dropout_rate)
+        self.dropout = Dropout(rate=self.dropout_rate)
 
     def projection_groups(self) -> tuple[ProjectionGroup, ...]:
         """The packed groups its mixer and its feed-forward declare (`ProjectionSites`)."""

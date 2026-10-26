@@ -140,7 +140,8 @@ def _decided[C](op: Op[C], case: C, named: str | None,
                            and (insisted is None or (first.generic and kernel.generic)))]
     refusal = None
     for kernel in candidates:
-        failed = kernel.failed(case, forced=insisted is not None)
+        # A kernel a call names passes what the targets measured of it, whether or not the call insists.
+        failed = kernel.failed(case, forced=insisted is not None or (kernel is first and named is not None))
         if not failed:
             return kernel, preferred, refusal
         if kernel is first:

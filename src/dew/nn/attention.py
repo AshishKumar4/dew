@@ -25,6 +25,7 @@ from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
 from dew.nn.dense import Dense, DenseGeneral
+from dew.nn.dropout import Dropout
 
 from .attention_kernels import (
     ATTENTION,
@@ -320,7 +321,8 @@ def max_attention_logits(query: jax.Array, key: jax.Array, *, causal: bool = Fal
                          sliding_window: int | None = None,
                          mask: jax.Array | None = None,
                          bias: jax.Array | None = None) -> jax.Array:
-    """Return the largest pre-softmax logit per query head: `[batch, heads]`, fp32.
+    """Return the largest pre-softmax logit per query head: `[batch, heads]`, at least fp32
+    (`at_least_fp32` of the operands'), so a float64 model's maxima are float64.
 
     The logits are the scaled dot products the kernels softmax. Masked
     positions read -inf, so causality and packing never trip the maximum.
@@ -332,11 +334,12 @@ def max_attention_logits(query: jax.Array, key: jax.Array, *, causal: bool = Fal
     heads = query.shape[-2]
     key = repeat_kv_heads(key, heads)
     scale = 1.0 / math.sqrt(query.shape[-1])
+    wide = at_least_fp32(jnp.result_type(query.dtype, key.dtype))
     logits = float32_einsum('...qhd,...khd->...hqk',
-                            query.astype(jnp.float32) * jnp.asarray(scale, jnp.float32),
-                            key.astype(jnp.float32), precision=operand_precision(jnp.float32))
+                            query.astype(wide) * jnp.asarray(scale, wide),
+                            key.astype(wide), precision=operand_precision(wide))
     if bias is not None:
-        logits = logits + bias.astype(jnp.float32)
+        logits = logits + bias.astype(wide)
     combined = combined_attention_mask(
         query.shape[-3], key.shape[-3], causal, sliding_window, mask)
     if combined is not None:
@@ -495,14 +498,6 @@ def group_normalized(x, scale, bias, groups: int, epsilon: float, activation, re
     return (y if activation is None else activation(y)).astype(dtype)
 
 
-@functools.partial(normalized_in_fp32, static_argnums=(3, 4, 5))
-def layer_normalized(x, scale, bias, epsilon: float, requested, dtype):
-    """Normalize `x` over its last axis as flax's `LayerNorm`
-    (`_moment_normalized`). `scale` and `bias` of None are the affine-free
-    norm."""
-    return _moment_normalized(x, scale, bias, (-1,), epsilon, requested).astype(dtype)
-
-
 def l2_normalized(x, eps: float = 1e-12):
     """torch's `F.normalize`: `x` over its L2 norm on the last axis, the norm
     held at `eps` at least.
@@ -599,29 +594,11 @@ class RMSNorm(nn.Module):
         return stream, normed.reshape(stream.shape)
 
 
-class LayerNorm(nn.Module):
-    """Normalize the last axis as flax's `nn.LayerNorm` does, op for op.
-
-    The parameter tree and the fp32 arithmetic are flax's, so checkpoints move
-    both ways and forward values match bit for bit. The backward pass keeps the
-    input as it arrived (`normalized_in_fp32`) where flax keeps fp32 copies.
-    Other axes, masks, pmapped axes and the exact variance are flax's to serve.
-    """
-    epsilon: float = 1e-6
-    use_scale: bool = True
-    use_bias: bool = True
-    dtype: Dtype | None = None
-    param_dtype: Dtype = jnp.float32
-
-    @nn.compact
-    def __call__(self, x):
-        width = (x.shape[-1],)
-        scale = self.param('scale', nn.initializers.ones, width,
-                           self.param_dtype) if self.use_scale else None
-        bias = self.param('bias', nn.initializers.zeros, width,
-                          self.param_dtype) if self.use_bias else None
-        return layer_normalized(x, scale, bias, self.epsilon, self.dtype,
-                                canonicalize_dtype(x, scale, bias, dtype=self.dtype))
+class LayerNorm(nn.remat(nn.LayerNorm, policy=jax.checkpoint_policies.nothing_saveable)):
+    """flax's `nn.LayerNorm`, rematerialized saving nothing: its backward pass keeps the input as
+    it arrived and its parameters, not the two fp32 copies flax's own differentiation keeps
+    (2.35 GiB of them on one SimpleDiT step). The parameter tree, the arithmetic
+    and the module's name are flax's, so checkpoints and scopes move both ways."""
 
 
 class GroupNorm(nn.Module):
@@ -1896,17 +1873,18 @@ def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_i
     in `reference_attention`. The kernel
     lets equal segment ids attend, so padding (id 0) reads other padding where
     `document_mask` reads nothing; no document's query reads padding either way.
+    The kernel is JAX's, vendored with its backward's delta formed from the
+    weights (`dew.nn.kernels.splash`).
     """
-    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
+    from dew.nn.kernels import splash
 
-    kernel = splash_attention_kernel.make_splash_mha(
+    kernel = splash.make_splash_mha(
         descriptor, block_sizes=splash_block_sizes(query.shape[-3], key.shape[-3], width=query.shape[-1],
                                                    itemsize=query.dtype.itemsize,
                                                    softcap=softcap is not None),
-        head_shards=1, q_seq_shards=1, attn_logits_soft_cap=softcap, interpret=interpret)
+        attn_logits_soft_cap=softcap, interpret=interpret)
     scale = jnp.asarray(1.0 / math.sqrt(query.shape[-1]), query.dtype)
-    segments = (None if segment_ids is None
-                else splash_attention_kernel.SegmentIds(*document_ids(segment_ids)))
+    segments = None if segment_ids is None else splash.SegmentIds(*document_ids(segment_ids))
 
     def example(q, k, v, ids):
         return kernel(q, k, v, segment_ids=ids, sinks=sinks)
@@ -1914,11 +1892,6 @@ def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_i
     attended = jax.vmap(example)(jnp.moveaxis(query, -2, -3) * scale,
                                  jnp.moveaxis(key, -2, -3), jnp.moveaxis(value, -2, -3),
                                  segments)
-    # jax types every splash kernel's call as either variant, whatever save_residuals it was made with.
-    if isinstance(attended, tuple):
-        # Only a save_residuals=True kernel returns a pair, and this one is
-        # built without it; the check narrows the kernel's union return type.
-        raise ValueError("splash returned residuals this path has no consumer for")
     return jnp.moveaxis(attended, -3, -2)
 
 
@@ -1946,13 +1919,12 @@ def splash_block_sizes(q_len: int, kv_len: int, *, width: int, itemsize: int, so
     requires, and stays a multiple of `SPLASH_LANES`, as the key compute block
     requires. The backward forms each query's delta from its weights, sum_k p
     * dp, in a pass of the dq kernel's own before its dq and dkv kernels
-    (`BlockSizes.delta_from_weights`): the flash form, rowsum(o * do), leaves
+    (`dew.nn.kernels.splash`): the flash form, rowsum(o * do), leaves
     the output's rounding where a query reads one key, whose dq is exactly
     zero (1.2e-6 from a causal first query on a v5e, where the reference's is
     0); the sum of its weights cancels there, as the softmax's derivative
-    does. It reads each logits block three times where the fused kernel read
-    it once. Its blocks are set because a kernel built without them raises
-    "Need to specify backward blocks." at its first gradient. On a TPU whose scoped
+    does. It reads each logits block three times where a fused kernel would
+    read it once. Every block is set: the kernel takes no default. On a TPU whose scoped
     VMEM limit is measured (`GpuTarget.scoped_vmem`), past which a kernel fails
     to compile, they halve together, as measured (half of `SPLASH_BLOCK`
     compiled on every config), while they stay whole lanes, until its plan fits
@@ -1960,7 +1932,7 @@ def splash_block_sizes(q_len: int, kv_len: int, *, width: int, itemsize: int, so
     kernels set none), so the limit is the target's default, which a TPU does
     not report: where it is unmeasured the blocks stay whole.
     """
-    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
+    from dew.nn.kernels import splash
 
     block_q, block_kv = math.gcd(SPLASH_BLOCK, q_len), math.gcd(SPLASH_BLOCK, kv_len)
     budget = generation.gpu_target().scoped_vmem
@@ -1968,10 +1940,10 @@ def splash_block_sizes(q_len: int, kv_len: int, *, width: int, itemsize: int, so
     while (budget is not None and splash_backward_vmem(back_q, back_kv, width, itemsize, softcap) > budget
            and min(back_q, back_kv) > SPLASH_LANES):
         back_q, back_kv = back_q // 2, back_kv // 2
-    return splash_attention_kernel.BlockSizes(
+    return splash.BlockSizes(
         block_q=block_q, block_kv=block_kv, block_kv_compute=block_kv,
         block_q_dkv=back_q, block_kv_dkv=back_kv, block_kv_dkv_compute=back_kv,
-        block_q_dq=back_q, block_kv_dq=back_kv, delta_from_weights=True)
+        block_q_dq=back_q, block_kv_dq=back_kv)
 
 
 def splash_mask_descriptor(q_len: int, kv_len: int, heads: int, causal: bool,
@@ -2300,7 +2272,7 @@ class BasicTransformerBlock(nn.Module):
         norm = RMSNorm if self.norm == "rms" else LayerNorm
         self.norm1, self.norm2, self.norm3 = (norm(epsilon=self.norm_epsilon, dtype=self.dtype)
                                               for _ in range(3))
-        self.dropout = nn.Dropout(self.dropout_rate)
+        self.dropout = Dropout(self.dropout_rate)
 
     def _dropped(self, x, train: bool):
         return self.dropout(x, deterministic=not train)

@@ -159,8 +159,8 @@ def convolution_profile(directory):
 
 
 def checkpoint(args):
+    from dew.inference import TextToImage
     from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
-    from dew.sampling import TextToImage
 
     pipeline = TextToImage.from_pretrained('dewml/hybrid-dit-176m',
                                            revision='8d891d967319e51cd0e73d3e5b7c29d68a238b52')

@@ -652,12 +652,35 @@ def test_the_backward_walks_many_key_tiles(case):
 @pytest.mark.parametrize("case", ["causal-documents-window", *IRREGULAR])
 @pytest.mark.parametrize("config", attention_triton.BACKWARD_SPACE, ids=str)
 def test_every_backward_config_on_a_gpu(config, case):
-    """Every config of the backward's space, bf16, a softcap, sinks and ALiBi: over causal documents
-    under a window, and over the irregular full and causal calls (`IRREGULAR`)."""
+    """Every config of the backward's space, bf16, a softcap, sinks and ALiBi, over causal documents
+    under a window and over the irregular full and causal calls (`IRREGULAR`): each config the launch takes
+    at the call (`TritonBackward.fitting`: its threads within their registers, its programs within a block's
+    shared memory) on par with the reference, and each other refused where it is pinned
+    (`tuning.Unpinnable`), so no call runs it."""
+    import tokamax
+
+    from dew.nn.kernels import generation
+
+    call = {**CASES, **IRREGULAR}[case]
+    # The launch's operands as the backward pads them: whole blocks of queries and keys, 32 wide.
+    queries, keys = (-(-count // attention_triton.BLOCK) * attention_triton.BLOCK for count in geometry(call))
+    arrays = {"query": jax.ShapeDtypeStruct((ROWS, queries, 4, 32), jnp.bfloat16),
+              "key": jax.ShapeDtypeStruct((ROWS, keys, 2, 32), jnp.bfloat16),
+              "value": jax.ShapeDtypeStruct((ROWS, keys, 2, 32), jnp.bfloat16)}
+    op = attention_triton.TritonBackward()
+    takes = config in op.fitting(tokamax.BoundArguments(op, arrays), generation.gpu_target())
     tiles = attention_triton.Tiles
-    check_backward({**CASES, **IRREGULAR}[case], SCORE_HOOKS["softcap-sinks-alibi"], jnp.bfloat16,
-                   tiles(config.block_q, config.block_k, config.dq_warps, config.dq_stages),
-                   tiles(config.block_q, config.block_k, config.dkv_warps, config.dkv_stages))
+
+    def run():
+        check_backward(call, SCORE_HOOKS["softcap-sinks-alibi"], jnp.bfloat16,
+                       tiles(config.block_q, config.block_k, config.dq_warps, config.dq_stages),
+                       tiles(config.block_q, config.block_k, config.dkv_warps, config.dkv_stages))
+
+    if takes:
+        run()
+    else:
+        with pytest.raises(tuning.Unpinnable):
+            run()
 
 
 SHARED_BYTES = (
