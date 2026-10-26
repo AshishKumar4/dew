@@ -181,6 +181,19 @@ def test_a_runtime_verdict_sizes_native_paired_with_the_author_on_their_shared_r
             assert not args.output.exists()
 
 
+def test_a_common_shift_of_a_phases_logits_moves_none_of_its_probabilities(tmp_path):
+    """The claim is each question's options' probabilities, so a shift every option of a phase shares
+    is out of it: native's equal options at 2**24, exact in float32, are the author's and the truth's
+    equal options at zero, one half each, and the verdict holds them equal."""
+    def logits(phase, seed, question):
+        return np.full(2, 2.0 ** 24 if phase == "native" else 0.0)
+
+    with run_from("slot_runtime_qualification", "tools") as tool:
+        args, pool = recorded_runs(tool, tmp_path, 2, logits)
+        tool.verdict(args, pool)
+        assert json.loads(args.output.read_text())["verdict"] == "green"
+
+
 @pytest.fixture
 def reference_tool():
     with run_from("slot_runtime_qualification", "tools") as module:
