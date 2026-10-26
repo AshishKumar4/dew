@@ -1045,17 +1045,36 @@ def assert_same(left: dict, right: dict, why: str) -> None:
         np.testing.assert_array_equal(left[name], right[name], err_msg=f"{why}: {name}")
 
 
-@pytest.mark.parametrize("combined", ["phases", "mix"])
-def test_a_fit_reads_corpora_that_repeat_themselves_as_they_are_written(tmp_path, combined):
-    """A fit reads a dataset without a repeat endlessly by adding one. Phases whose corpora repeat
-    themselves, and a mix of members that all do, already read endlessly, so the fit reads them as
-    written, landing where the same chain compiled as it is lands."""
-    first = Pipeline(Memory(Indexed(1, 64))).shuffle(0).repeat()
-    second = Pipeline(Memory(Indexed(2, 64))).shuffle(1).repeat()
-    chain = (phases((first, 3), (second, None)) if combined == "phases" else mix([first, second])).batch(8)
-    read = regression_trainer(tmp_path / "fitted").fit(chain, steps=5)
-    compiled = regression_trainer(tmp_path / "compiled").fit(compile(chain, seed=0), steps=5)
-    assert_same(parameters(read), parameters(compiled), f"{combined} as the fit reads it")
+def endless_chains(name: str) -> tuple[Pipeline, Pipeline]:
+    """A chain a fit reads without being given a repeat, and the chain it reads: phases or a mix whose
+    corpora repeat themselves read as written; phases of passes batched on their own, repeated after
+    each phase's batch as the chain's own repeat at its end is; and a mix whose members' repeats are
+    bounded, repeated before its batch."""
+    first = Pipeline(Memory(Indexed(1, 64))).shuffle(0)
+    second = Pipeline(Memory(Indexed(2, 64))).shuffle(1)
+    if name == "phases":
+        chain = phases((first.repeat(), 3), (second.repeat(), None)).batch(8)
+        return chain, chain
+    if name == "mix":
+        chain = mix([first.repeat(), second.repeat()]).batch(8)
+        return chain, chain
+    if name == "batched-phases":
+        chain = phases((first.batch(8), 3), (second.batch(8), None))
+        return chain, chain.repeat()
+    members = [first.repeat().take(12), second.repeat().take(12)]
+    return mix(members).batch(8), mix(members).repeat().batch(8)
+
+
+@pytest.mark.parametrize("name", ["phases", "mix", "batched-phases", "bounded-mix"])
+def test_a_fit_repeats_a_chain_only_where_its_read_can_end(tmp_path, name):
+    """A fit reads a dataset without a repeat endlessly by adding one where its read can end
+    (`analysis.reach`): phases whose corpora repeat themselves, and a mix of members that all do, are
+    read as written, while phases of batched passes and a mix of bounded repeats repeat as before,
+    landing where the chain written with that repeat lands."""
+    chain, read = endless_chains(name)
+    fitted = regression_trainer(tmp_path / "fitted").fit(chain, steps=5)
+    written = regression_trainer(tmp_path / "written").fit(compile(read, seed=0), steps=5)
+    assert_same(parameters(fitted), parameters(written), f"{name} as the fit reads it")
 
 
 class TokenCounted(Regression):
@@ -1100,6 +1119,16 @@ def test_a_schedule_ends_its_stage_at_the_step_whose_commit_reaches_its_tokens(t
         resumed.fit(data, steps=stopped)
         assert_same(whole, parameters(token_trainer(tmp_path / f"stopped-{stopped}").fit(data, steps=8)),
                     f"resumed from step {stopped}")
+    # The last stage's own tokens end the data: the run's last step is the one whose commit reaches
+    # them, saved as a token budget's last step is, where phases running on to that step land.
+    last = next(index + 1 for index, tokens in enumerate(committed) if tokens >= committed[step - 1] + 30)
+    ended = token_trainer(tmp_path / "ended")
+    state = ended.fit(schedule([(first, 50), (second, committed[step - 1] + 30 - 50)]).batch(8))
+    assert int(state.step) == last and ended.checkpoints is not None and ended.checkpoints.latest == last
+    phased = phases((first, step), (second, None)).batch(8)
+    ran_on = token_trainer(tmp_path / "ran-on").fit(phased, steps=last)
+    assert_same(parameters(state), parameters(ran_on),
+                "a schedule whose data ends against phases running on to its last step")
 
 
 # Every stage's batch is a multiple of the eight simulated devices, because a

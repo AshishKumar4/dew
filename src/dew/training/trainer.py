@@ -283,6 +283,10 @@ def loss_scale(dynamic_scale: bool | dynamic_scale_lib.DynamicScale) -> dynamic_
 class Trainer(Generic[Loss, Effects]):
     """Runs an `Objective`: gradients, sharding, EMA, checkpoints and logging."""
 
+    _restaged: bool = False
+    """Whether a schedule's stage has begun in this fit, whose batches may be shaped as no earlier
+    stage's were (`_scheduled`): the step lays its accumulation window out for them."""
+
     def __init__(
         self,
         objective: Objective[Loss, Effects],
@@ -1059,7 +1063,8 @@ class Trainer(Generic[Loss, Effects]):
                         lambda variables: narrowed(variables, candidate.copies),
                         out_shardings=candidate.shardings.compute)(current.variables))
                 if (window > 1 and self.step is None and (current.accumulation is None or (
-                        self._ramp and not current.accumulation.replays(candidate.prepared.accumulation)))):
+                        (self._ramp or self._restaged)
+                        and not current.accumulation.replays(candidate.prepared.accumulation)))):
                     # The window, and with it the split, is the state's from here on.
                     current = dataclasses.replace(self._initialize_accumulation(
                         current, candidate.micro, candidate.shapes, window=window),
@@ -1273,7 +1278,8 @@ class Trainer(Generic[Loss, Effects]):
             with self._traced_on(cpu):
                 batch = transfer(batch, batch_shardings(cpu, batch))
                 if self.accumulation > 1 and (current.accumulation is None or (
-                        self._ramp and not current.accumulation.replays(prepared.accumulation))):
+                        (self._ramp or self._restaged)
+                        and not current.accumulation.replays(prepared.accumulation))):
                     current = self._initialize_accumulation(current, batch, shapes, window=self.accumulation)
                 # The device steps run in the accelerator's forward (`HostExecution`).
                 advanced, loss, aux, committed = body(current, model_batch(batch), 0, batch_tokens(batch))
@@ -1361,11 +1367,10 @@ class Trainer(Generic[Loss, Effects]):
         `prepare_process` readies it: a program that never called that gets Dew's
         log handler, and one whose JAX opened on the CPU beside an NVIDIA GPU stops.
         """
-        run_length(steps, epochs, tokens, examples)
+        # A schedule whose last stage ends its data bounds the run as tokens= does (`_fitted`).
+        run_length(steps, epochs, tokens, examples, required=False)
         ready_process()
-        loader, validation = fitted(dataset, validation, objective=self.objective.data(), examples=examples)
-        if (tokens is not None or loader.token_ends is not None) and not self.objective.counts_tokens:
-            raise ValueError("tokens= and a schedule's stages need an objective that counts real tokens")
+        loader, validation, tokens = self._fitted(dataset, validation, examples, tokens)
         self._device, self._prefetch = loader.device, device_prefetch
         steps = run_steps(loader, steps, epochs, tokens, self.accumulation, examples)
         count_compilation_cache()
@@ -1445,8 +1450,9 @@ class Trainer(Generic[Loss, Effects]):
         compiled: dict[Signature, tuple[CompiledStep, StepFlops | None]] = {}
         seen = 0
         run.notice = PreemptionNotice()
-        # A schedule's stages end where the commits reach their tokens, its last where its data does.
-        while not plan.ended(run.current, plan.real(interval)) and not self._scheduled(plan, run, interval):
+        while not plan.ended(run.current, plan.real(interval)):
+            # A schedule's stage ends where the commits reach its tokens.
+            self._scheduled(plan, run, interval)
             # The window's capture opens before this iteration's first read, so the step row records
             # the read it waits on rather than a compile that ran before capture began.
             if (profiler is not None and profile is not None
@@ -1607,6 +1613,7 @@ class Trainer(Generic[Loss, Effects]):
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None else None)
             self._ramp = run.source.stages if isinstance(run.source, RampedStream) else ()
+            self._restaged = False
             # The steps a stage after the first begins at, each where an update does (`Ramp.stages`).
             self._stage_starts = frozenset(accumulate((after.records - stage.records) // stage.batch
                                                       for stage, after in pairwise(self._ramp)))
@@ -1636,6 +1643,9 @@ class Trainer(Generic[Loss, Effects]):
         """`source`'s batches placed ahead of the step by the prefetch worker, which restores it to
         `position` first, once a pool's processes agree their streams read the same records."""
         assert run.partition is not None
+        if position is not None and isinstance(source, PhasedStream):
+            # A schedule's stage opens where the position stands: the pool agrees on the one it reads.
+            source.set_state(position)
         if jax.process_count() > 1:
             # Each process opened its own stream over its own copy of the
             # corpus, and none reads a record before all agree it is one.
@@ -1647,27 +1657,20 @@ class Trainer(Generic[Loss, Effects]):
         return DevicePrefetchIterator(source, self.device_mesh, self._prefetch, source_state=position,
                                       reads=run.reads, prepare=prepare)
 
-    def _scheduled(self, plan: FitPlan, run: FitRun, interval: Interval) -> bool:
+    def _scheduled(self, plan: FitPlan, run: FitRun, interval: Interval) -> None:
         """End the stage of a schedule the run stands in (`dew.data.pipeline.schedule`) at the step
         whose commit reached its tokens, on every process alike, as the committed tokens are the
         pool's: the stream opens again where that step left it, in the next stage, and what the
-        prefetch worker read ahead of the end is dropped untrained. Returns whether the data ends
-        here, the last stage having reached its tokens. The devices' count is read before each step
-        only while a stage's end lies ahead."""
+        prefetch worker read ahead of the end is dropped untrained. The last stage's tokens, where
+        they end the data, are the run's token budget (`_fitted`). The devices' count is read before
+        each step while a stage's end lies ahead, as a token budget's is."""
         ends = plan.dataset.token_ends
         state = None if run.train is None else run.train.source_state
         if ends is None or state is None:
-            return False
+            return
         stage = len(positions.read(state).completed)
-        end = ends[stage] if stage < len(ends) else None
-        if end is None:
-            return False
-        committed = interval.real_tokens
-        if committed < end:
-            return False
-        if stage == len(ends) - 1:
-            self._display.note(f"The schedule's data ended at step {run.current}")
-            return True
+        if stage >= len(ends) - 1 or interval.real_tokens < (end := ends[stage] or 0):
+            return
         assert run.train is not None and run.partition is not None
         run.train.close()
         run.train = None
@@ -1675,17 +1678,32 @@ class Trainer(Generic[Loss, Effects]):
         if not isinstance(source, PhasedStream):
             raise TypeError("a schedule reads its stages as phases")
         # A stage a single step's commit passed ends where it starts, reading nothing.
-        while stage < len(ends) - 1 and committed >= (ends[stage] or 0):
+        committed = interval.real_tokens
+        while stage < len(ends) - 1 and committed >= end:
             state, stage = source.ending(state), stage + 1
+            end = ends[stage] or 0
         self._display.note(f"Stage {stage} of the schedule begins at step {run.current}, after "
                            f"{committed} committed tokens")
+        # Its batches may be shaped as no earlier stage's were: the step's accumulation window, empty at
+        # the commit the stage begins after, is laid out for them (`_runner`).
+        self._restaged = True
         run.train = self._prefetched(plan, run, source, state)
         run.source = None  # Lifetime transferred to the prefetch worker.
-        last = ends[-1]
-        ended = stage == len(ends) - 1 and last is not None and committed >= last
-        if ended:
-            self._display.note(f"The schedule's data ended at step {run.current}")
-        return ended
+
+    def _fitted(self, dataset: Dataset | Loader,
+                validation: Dataset | Mapping[str, Dataset | Reader | EvalSuite] | None, examples: int | None,
+                tokens: int | None) -> tuple[Loader, Mapping[str, Reader | EvalSuite] | None, int | None]:
+        """`dataset` and `validation` as the fit reads them (`fitted`), and the run's token budget:
+        `tokens`, or where a schedule's last stage ends the data at its tokens, the first reached."""
+        loader, validation = fitted(dataset, validation, objective=self.objective.data(), examples=examples)
+        last = None if loader.token_ends is None else loader.token_ends[-1]
+        tokens = last if tokens is None else tokens if last is None else min(tokens, last)
+        if tokens is not None and not self.objective.counts_tokens:
+            raise ValueError("tokens= and a schedule's stages need an objective that counts real tokens")
+        if loader.token_ends is not None and not self.objective.counts_tokens:
+            raise ValueError("a schedule's stages end at committed tokens, which needs an objective that "
+                             "counts real tokens")
+        return loader, validation, tokens
 
     def _local_devices(self) -> list:
         """This process's devices of the mesh, whose memory the fit check reads."""

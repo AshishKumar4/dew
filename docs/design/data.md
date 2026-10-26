@@ -218,14 +218,14 @@ A schedule's stages switch on the run's committed-token clock; `phases` switch a
 ```python
 pretrain = mix(sources, weights=[.75, .12, .05, .05, .03], by="tokens").map(text.tokenize(tok)).pack(seq_len=8192)
 anneal   = mix(high_quality, weights=[.40, .25, .15, .15, .05], by="tokens").map(text.tokenize(tok)).pack(seq_len=8192)
-longctx  = long_docs.map(text.tokenize(tok)).pack(seq_len=65_536)
+longdocs = long_docs.map(text.tokenize(tok)).pack(seq_len=8192)
 
 data = schedule([
     (pretrain.shuffle(seed=0, window=10**6).batch(1024), 13e12),
     (anneal.shuffle(seed=1, window=10**6).batch(1024),   0.5e12),
-    (longctx.batch(128),                                 0.1e12),
+    (longdocs.batch(1024),                               0.1e12),
 ])
-trainer.fit(data, validation=val, tokens=13.6e12)
+trainer.fit(data, validation=val)
 ```
 
 ```mermaid
@@ -235,10 +235,10 @@ gantt
   section Committed tokens (T)
   pretrain mix, 8k      :0, 13000
   anneal mix, 8k        :13000, 13500
-  long context, 64k     :13500, 13600
+  long documents, 8k    :13500, 13600
 ```
 
-Each stage runs for its committed valid target tokens, the same clock as `fit(tokens=)`, and ends at the step whose commit reaches them, on every process alike: the trainer reads the committed tokens before each step while a stage's end lies ahead, and at the end opens the stream again where that step left it, so what the prefetch worker read past the end is dropped untrained. The saved position holds where each finished stage ended, and a resume reads the stages after it from there. A corpus shared between stages continues from where the earlier stage left it. A stage that one step's commit passes reads nothing, and the last stage runs on (`None`) or ends the data at its own tokens. A new sequence length recompiles the step once.
+Each stage runs for its committed valid target tokens, the same clock as `fit(tokens=)`, and ends at the step whose commit reaches them, on every process alike: the trainer reads the committed tokens before each step while a stage's end lies ahead, and at the end opens the stream again where that step left it, so what the prefetch worker read past the end is dropped untrained. The saved position holds where each finished stage ended, and a resume reads the stages after it from there. A corpus shared between stages continues from where the earlier stage left it. A stage that one step's commit passes reads nothing, and the last stage runs on (`None`) or ends the data at its own tokens, the run's token budget then (the first reached, beside `fit(tokens=)`). Every stage reads rows the objective reads, one sequence length for a language model's. While a stage's end lies ahead the trainer waits for each step's count before the next, as a token budget does.
 
 ### Offline preparation, published once
 
