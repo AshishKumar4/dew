@@ -9,10 +9,6 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   `dew.nn.precision`, beside the float32 algorithm it dispatches to; `dew.inputs.unit_range` and
   `dew.nn.mp.mp_silu` divide through it, where XLA took their division by a constant as a product
   with its rounded reciprocal.
-- A tiled LM head's backward adds each vocabulary tile's state product to the state gradient apart
-  from the GEMM that made it: XLA took the addition into the GEMM, whose sum then could not split, and
-  on an H100 the state gradient sat about twice as far from float64 as the whole head's; apart it is
-  nearer than the whole head's, and faster.
 - Every outer program Dew compiles goes through one seam (`dew.nn.kernels.options.program`): an image
   task's encode, noise and solver start, a bank's stacking, an autoencoder's encode and decode, LPIPS's
   and FID's networks and a host step's unstack, so two loads of one module share its programs. The seam
