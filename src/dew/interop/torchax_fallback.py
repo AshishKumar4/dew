@@ -610,8 +610,8 @@ def _functional_experts() -> type:
             self.routed: int = vars(replaced)["num_routed_experts"]
             self.activation = gated_activation(replaced.get_submodule("act_fn"))
             if self.routed:
-                self.gate_up_proj = replaced.get_parameter("gate_up_proj")
-                self.down_proj = replaced.get_parameter("down_proj")
+                self.gate_up_proj: torch.Tensor = replaced.get_parameter("gate_up_proj")
+                self.down_proj: torch.Tensor = replaced.get_parameter("down_proj")
 
         def forward(self, hidden_states, top_k_index, top_k_weights):
             from torchax.interop import jax_view, torch_view
@@ -620,10 +620,11 @@ def _functional_experts() -> type:
             identity = index >= self.routed
             slots = jnp.zeros((*index.shape, x.shape[-1]), x.dtype)
             if self.routed:
-                gate_up = jax_view(self.get_parameter("gate_up_proj"))[:self.routed]
+                # Under the trace these are its views of the parameters, not torch's parameters.
+                gate_up = jax_view(self.gate_up_proj)[:self.routed]
                 width = gate_up.shape[1] // 2
                 kernels = (jnp.swapaxes(gate_up[:, :width], 1, 2), jnp.swapaxes(gate_up[:, width:], 1, 2),
-                           jnp.swapaxes(jax_view(self.get_parameter("down_proj")), 1, 2))
+                           jnp.swapaxes(jax_view(self.down_proj), 1, 2))
                 compute = expert_compute_dtype(x, *kernels, dtype=None)
 
                 def project(tokens, sizes, _ids, held):
@@ -1389,7 +1390,6 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
             model = AutoModelForCausalLM.from_config(
                 stated, dtype=stated.dtype if storage == "auto" else storage, experts_implementation=EXPERTS)
     model.eval()
-    rebuild = functional_parts(model)
     jittable = JittableModule(model)
     head = model.get_output_embeddings()
     if not isinstance(head, torch.nn.Module):
@@ -1403,8 +1403,10 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     # values, which some forwards do.
     if head_name is not None and not (_plain_head(model, head) if weights else _shrunk_plain_head(config)):
         head_name = None
+    # After the head's eager check: the functional parts and Dew's attention run only inside the traced
+    # forward. The parts keep their parameters, which the jittable module holds already.
+    rebuild = functional_parts(model)
     if attends:
-        # After the head's eager check: Dew's attention runs only inside the traced forward.
         _registered()
         model.set_attn_implementation(_ATTENTION)
     # Host views of torch's storage: nothing reaches a device before the

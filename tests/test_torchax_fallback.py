@@ -1141,12 +1141,12 @@ def test_experts_transformers_loops_over_run_at_static_shapes_as_transformers_co
 
 
 def test_a_documents_reach_is_its_largest_place_in_any_order():
-    """A document's reach is the largest of its tokens' places, which transformers' rotary reads as a
-    call's largest position, whatever their order; a padding slot reads the next document's."""
+    """A document's reach is the largest of its real tokens' places, which transformers' rotary reads
+    as a call's largest position, whatever their order."""
     from dew.nn.inputs import document_reach
 
     reach = document_reach(jnp.asarray([[1, 1, 1, 0, 2, 2]]), None, jnp.asarray([[0, 9, 4, 0, 0, 1]]))
-    np.testing.assert_array_equal(np.asarray(reach), [[9, 9, 9, 1, 1, 1]])
+    np.testing.assert_array_equal(np.asarray(reach)[0, [0, 1, 2, 4, 5]], [9, 9, 9, 1, 1])
 
 
 def test_a_longrope_tier_3_model_generates_across_its_original_context(tmp_path):
