@@ -880,6 +880,19 @@ def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_pre
     assert_as_exact(ours, theirs(reference), draw, f"{family} cached logits", seeds=DECODE_SEEDS[family],
                     truth_fn=theirs(wide, float64))
 
+    # The rows' coordinates state the same validity and positions as their separate fields.
+    prompt, valid, _ = draw(0)
+    places = np.maximum(np.cumsum(valid, axis=1) - 1, 0).astype(np.int32)
+
+    def prefilled(**fields):
+        cache = loaded.model.apply(loaded.variables, 2, method="init_cache", mutable=["cache"])[1]
+        return loaded.model.apply({**loaded.variables, **cache}, prompt, decode=True, mutable=["cache"],
+                                  **fields)[0]
+
+    np.testing.assert_array_equal(
+        prefilled(coordinates=coordinates(prompt.shape, valid=valid, positions=places)),
+        prefilled(attention_mask=valid, positions=places))
+
     prompt, _, _ = draw(0)
     task = TextGeneration(loaded.model, loaded.variables, sampling=Sampling(temperature=0.0))
     generated = np.asarray(task(prompt.tolist(), steps, key=0).tokens)
@@ -917,3 +930,14 @@ def test_a_tier_3_source_generates_and_serves_as_a_native_decoder_does(tmp_path)
     ticket = server.submit(prompt, 6, key=0)
     server.run()
     np.testing.assert_array_equal(np.asarray(ticket.result().tokens), np.asarray(direct.tokens))
+
+
+def test_a_tier_3_models_cache_holds_the_context_its_config_class_reads(tmp_path):
+    """A source that states its context under another name (CTRL's `n_positions`, which its config
+    class reads as `max_position_embeddings`) decodes within that context: its cache's slots."""
+    model = transformers.CTRLLMHeadModel(transformers.CTRLConfig(
+        n_positions=32, n_embd=64, n_layer=2, n_head=4, dff=128, vocab_size=256)).eval()
+    model.save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32", fallback="torchax")
+    assert loaded.model.max_seq_len == 32
