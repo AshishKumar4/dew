@@ -156,10 +156,10 @@ vocabulary width, sized by `seeds_for`."""
 
 @pytest.mark.parametrize("width", sorted(UNCONFIDENT_SEEDS))
 def test_a_labels_derivative_over_unconfident_rows_is_on_par_with_autodiffs(width):
-    """Where no label is confident, the label loss's derivative, every other class's probability and
-    at the label minus their sum (arXiv:2610.31642, eq. 7), is on par with autodiff's of the log-softmax
-    written out (check 1): the sum, rounded once, loses nothing to `p - 1` at a row of few classes or
-    many."""
+    """Where no label is confident, the label loss's derivative is on par with autodiff's of the
+    log-softmax written out (check 1), at a row of few classes and of many: below a half the label's
+    entry is `p - 1`, rounded once, where eq. 7's minus the others' sum carries the partition's
+    rounding of each (arXiv:2610.31642)."""
     labels = jnp.arange(4) % width
 
     def draw(seed):
