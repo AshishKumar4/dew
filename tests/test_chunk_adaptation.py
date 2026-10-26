@@ -37,8 +37,8 @@ ADAPTATION_SEEDS = 8
 SELECTED_SEEDS = 8
 """Check 1's declared seeds for a level whose `up` alone steps, sized paired by `seeds_for` on armada."""
 
-GRADIENT_SEEDS = {("documents", 0.1): 8, ("documents", 0.5): 8, ("packed", 0.1): 8, ("packed", 0.5): 8,
-                  ("padded", 0.1): 8, ("padded", 0.5): 8}
+GRADIENT_SEEDS = {("documents", 0.1): 16, ("documents", 0.5): 16, ("packed", 0.1): 256, ("packed", 0.5): 32,
+                  ("padded", 0.1): 32, ("padded", 0.5): 16}
 """Check 1's declared seeds for the outer gradient through the windows' steps over each layout and
 rate, sized paired by `seeds_for` on armada."""
 
