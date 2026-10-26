@@ -729,10 +729,12 @@ def test_a_hybrid_stack_reads_a_shared_prefix_with_the_state_its_prompt_left(req
     an earlier one past its deepest boundary reads both its pages; one agreeing only through its first
     page reads none, unless a state is kept there; a state evicted from a store of one entry takes its
     reuse with it. Each request draws what it draws alone and scores it as a full forward does (check 1)."""
-    hybrid = hybrid_task()
-    task = TextGeneration(hybrid.model, hybrid.variables, sampling=Sampling(temperature=0, pad_token_id=0))
+    # A vocabulary of 64 and eight draws a request, so each request's scores spread enough to measure.
+    model = hybrid_task().model.clone(vocab_size=64)
+    task = TextGeneration(model, model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32)),
+                          sampling=Sampling(temperature=0, pad_token_id=0))
     assert_served_as_exact(task, requests, f"hybrid shared prefix {hits}",
-                           serving={**HYBRID_SHARED, **options}, hits=hits)
+                           serving={**HYBRID_SHARED, **options}, hits=hits, budget=8)
 
 
 def served_alongside(bound, slots=4, admission=2, **options):
