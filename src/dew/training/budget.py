@@ -40,6 +40,15 @@ def run_steps(loader: Loader, steps: int | None, epochs: int | None, tokens: int
     return loader.epoch_steps(epochs, accumulation)
 
 
+def run_tokens(loader: Loader, tokens: int | None, *, counts_tokens: bool) -> int | None:
+    """The run's token budget: `tokens`, or where a schedule's last stage ends the data at its tokens
+    (`dew.data.pipeline.schedule`), the first reached; refused where the objective counts none."""
+    if (tokens is not None or loader.token_ends is not None) and not counts_tokens:
+        raise ValueError("tokens= and a schedule's stages need an objective that counts real tokens")
+    last = None if loader.token_ends is None else loader.token_ends[-1]
+    return last if tokens is None else tokens if last is None else min(tokens, last)
+
+
 @dataclasses.dataclass(frozen=True)
 class Plateau:
     """Stops training after `evals` eligible evaluations without an improvement larger than `min_delta`. A
@@ -83,4 +92,4 @@ class Pause:
         return step, real
 
 
-__all__ = ["Pause", "Plateau", "run_length", "run_steps"]
+__all__ = ["Pause", "Plateau", "run_length", "run_steps", "run_tokens"]
