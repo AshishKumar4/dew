@@ -321,8 +321,6 @@ def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
     assert not failed, "\n".join(failed)
 
 
-
-
 def test_the_resource_gate_refuses_a_spilling_mosaic_kernel():
     """A record the gate reads (`mosaic_failures`): a kernel past its shared memory, its tensor memory or
     spilling fails; within all three, none."""
