@@ -78,7 +78,7 @@ def qwen2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFiel
     # Qwen2Attention biases q, k and v and builds o_proj without one
     # (modeling_qwen2.py:189-192), whatever the config says.
     config = base_config(hf_config, used, rope=PLAIN_SPELLING,
-                         layer_types=native_layer_types(hf_config, used, 'qwen3'), reads=_QWEN_READS)
+                         layer_types=native_layer_types(hf_config, used, 'qwen2'), reads=_QWEN_READS)
     config.update(attention_bias=True, o_proj_bias=False)
     return config
 
