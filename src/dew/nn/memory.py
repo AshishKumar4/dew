@@ -526,13 +526,12 @@ class InContextMemory(nn.Module):
         gradient = jax.grad(lambda fast: self.objective(
             self._applied(heads, head, fast, key, keys, wide=True, use=GRADIENT), target))(state)
 
-        def stepped(path: tuple[str, ...], leaf: jax.Array) -> jax.Array:
-            if path[-1] == ADAPTER_B:
+        def stepped(path: tuple, leaf: jax.Array) -> jax.Array:
+            if path[-1].key == ADAPTER_B:
                 return jnp.zeros_like(leaf)
             return newton_schulz(leaf, self.orthogonalize) if self.orthogonalize and leaf.ndim == 2 else leaf
 
-        return traverse_util.unflatten_dict({path: stepped(path, leaf) for path, leaf in
-                                             traverse_util.flatten_dict(gradient).items()})
+        return jax.tree_util.tree_map_with_path(stepped, gradient)
 
     def _target(self, heads: _Heads, head: int, state: dict, value: jax.Array, keys: jax.Array | None
                 ) -> jax.Array:
@@ -553,7 +552,7 @@ class InContextMemory(nn.Module):
         """One head's readout of a token at `state`, at the layer's dtype."""
         return self._applied(heads, head, state, query, keys, wide=False, use=READ)
 
-    def _each_head(self, run: Callable[[int], jax.Array | dict], axis: int) -> jax.Array | dict:
+    def _each_head[Run](self, run: Callable[[int], Run], axis: int) -> Run:
         """`run(head)` for every head, stacked at `axis`: each head's network runs at its own scope
         (`_applied`), so the heads are a loop, each vectorized over its rows and tokens."""
         runs = [run(head) for head in range(self.heads)]
@@ -685,12 +684,12 @@ def _decoded_codes(variables: dict) -> dict:
     params (`frozen_fp8_kernel`), as a merge decodes it. The codes stood for a kernel that never moves;
     in the memory only W_0 is frozen, and every application multiplies the state the steps move from it,
     as the network computes."""
-    codes = traverse_util.flatten_dict(variables.get(QUANTIZATION, {}))
+    quantization = variables.get(QUANTIZATION, {})
+    codes = traverse_util.flatten_dict(quantization)
     sites = {path[:-1] for path in codes if path[-1] == FROZEN_FP8[0]}
     if not sites:
         return variables
-    kernels = {(*site, "kernel"): frozen_fp8_kernel({leaf: codes[(*site, leaf)] for leaf in FROZEN_FP8})
-               for site in sites}
+    kernels = {(*site, "kernel"): frozen_fp8_kernel(_unnested(site, quantization)) for site in sites}
     rest = {path: leaf for path, leaf in codes.items() if not (path[:-1] in sites and path[-1] in FROZEN_FP8)}
     variables = {**variables, "params": traverse_util.unflatten_dict(
         {**traverse_util.flatten_dict(variables["params"]), **kernels})}
