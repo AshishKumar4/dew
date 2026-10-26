@@ -17,14 +17,17 @@ from test_decision_objective import SPECIALS, TOKENIZER, tiny_backbone
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import Rejected
 from dew.decision import (
+    NONE_OF_THE_ABOVE,
     Choice,
     DecisionObjective,
     Example,
+    Framing,
     Group,
     GroupedExamples,
     JointLayout,
     JointSchemaHead,
     Noul,
+    Schema,
     StateFirstLayout,
 )
 from dew.decision.objective import (
@@ -271,31 +274,62 @@ def test_a_unit_is_budgeted_for_the_options_its_training_adds():
     assert augmented.map({"example": pair}) == Rejected("unfit")
 
 
-def test_a_unit_the_fit_holds_fits_its_window_however_training_draws_its_options():
-    """Every draw of the training encoding's "none of the above", beside the right option or in its
-    place, lays a unit out within the window the fit held it in. Adding an option can shorten a row,
-    since the options of a row share its budget and more of them are cut harder (`QuestionLayout`), so
-    the row with the option added is not the longest: here the row with it in place of the right one
-    is, and the windows between the two units' lengths hold the one but not the other."""
+def _trimmed_pair() -> tuple[GroupedExamples, int]:
+    """Two rows of a question each whose options share the row's budget, so that adding one cuts them
+    all harder (`QuestionLayout`) and the row with the option added is shorter than the row with it in
+    place of the right one; and the encoding's options."""
     options = ["a" * 60, "b" * 60, "c" * 60, "d", "e"]
     pair = GroupedExamples(tuple(Example("", {"q": Choice("x", options)}, {"q": options[0]})
                                  for _ in range(2)),
                            groups=(Group("same", {f"{index}.q": {option: option for option in options}
                                                   for index in range(2)}),))
-    head = DecisionObjective(tiny_backbone().clone(max_seq_len=512), tokenizer=TOKENIZER, specials=SPECIALS,
-                             layout=StateFirstLayout(max_len=512)).model.head
-    windows = range(256, 424, 8)
+    return pair, len(options) + 1
+
+
+def _joint_pair() -> tuple[GroupedExamples, int]:
+    """Two joint rows of two questions each, which the encoding augments apart, one with a "none of
+    the above" of its own, as long as the rest of its question; and the encoding's options."""
+    asked = {"a": Choice("x", {"a": None, NONE_OF_THE_ABOVE: "x" * 200}), "b": Choice("x", ["b"])}
+    pair = GroupedExamples(tuple(Example("", asked, {"a": "a", "b": "b"}) for _ in range(2)),
+                           groups=(Group("same", {f"{index}.b": {"b": "b"} for index in range(2)}),))
+    return pair, 3
+
+
+def _joint_layout(window: int) -> JointLayout:
+    return JointLayout(max_len=window, framing=Framing(system="", prefill="", template=False),
+                       segments=(Schema(),))
+
+
+UNITS = {
+    "trimmed": (_trimmed_pair, lambda window: StateFirstLayout(max_len=window), 1.0, range(256, 424, 8),
+                None),
+    "joint": (_joint_pair, _joint_layout, 0.5, range(896, 1248, 16),
+              JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)),
+}
+
+
+@pytest.mark.parametrize("case", list(UNITS))
+def test_a_unit_the_fit_holds_fits_its_window_however_training_draws_its_options(case):
+    """Every draw of the training encoding's "none of the above", beside the right option or in its
+    place, question by question, lays a unit out within the window the fit held it in. A row of a
+    question each may be longest with the option in place of the right one, since adding one can cut
+    the options harder (`trimmed`); a joint row's questions draw apart, and a question that offers the
+    option already keeps its own (`joint`). The windows between the unit as it is and at its longest
+    hold the one but not the other."""
+    build, layout_of, rate, windows, head = UNITS[case]
+    pair, width = build()
+    model = DecisionObjective(tiny_backbone().clone(max_seq_len=2048), tokenizer=TOKENIZER, specials=SPECIALS,
+                              layout=layout_of(2048), **({} if head is None else {"head": head})).model
     held = []
     for window in windows:
-        layout = StateFirstLayout(max_len=window)
-        fitted = Fit(layout, TOKENIZER, SPECIALS, head, context_length=None, grouped=True,
-                     none_of_the_above=1.0).map({"example": pair})
+        layout = layout_of(window)
+        fitted = Fit(layout, TOKENIZER, SPECIALS, model.head, context_length=None, grouped=True,
+                     none_of_the_above=rate).map({"example": pair})
         if isinstance(fitted, Rejected):
             continue
         held.append(window)
-        encoding = Encoding(layout, TOKENIZER, SPECIALS, width=len(options) + 1, none_of_the_above=1.0,
-                            grouped=True)
-        for seed in range(16):
+        encoding = Encoding(layout, TOKENIZER, SPECIALS, width=width, none_of_the_above=rate, grouped=True)
+        for seed in range(32):
             unit = _encoded_unit(encoding, fitted["decision_unit"], np.random.default_rng(seed))
             assert len(unit["tokens"]) <= window, (window, seed, len(unit["tokens"]))
     assert held and held[0] > windows[0], held
