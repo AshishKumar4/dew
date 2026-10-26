@@ -627,8 +627,11 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     def stored(self, parts, views, *, smem, wait: bool = True) -> None:
         """Each of `parts` written whole to its view of `views`, through `smem` where the family stores so.
         Unless `wait`, the last copy out of `smem` stays in flight as one store group, so the caller's
-        next work overlaps it: it waits (`store_wait`) before writing `smem` again, alternating two
-        landing tiles to keep one store in flight while it fills the other."""
+        next work overlaps it, and the caller owns `smem`'s reuse: it waits (`store_wait`) before writing
+        `smem` again, an earlier deferred store's or an add's (`added`) reads of it included, so stores
+        into other tiles stay in flight past the call (`store_wait(stores - 1)` keeps one a tile). A call
+        of several parts still waits for each part's reads before writing the next, every earlier store
+        group with it."""
 
     def store_wait(self, pending: int) -> None:
         """Waits until at most `pending` of this thread's deferred stores (`stored(wait=False)`) still read
@@ -908,8 +911,10 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         loaded(copies)
 
     def stored(self, parts, views, *, smem, wait: bool = True) -> None:
-        # An add still reading `smem` (`added`) done first.
-        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+        # An add still reading `smem` (`added`) done first, unless the caller defers and so waits itself
+        # (`Family.stored`): waiting here would drain its other tiles' deferred stores too.
+        if wait:
+            plgpu.wait_smem_to_gmem(0, wait_read_only=True)
         stored(parts, views, smem=smem, wait=wait)
 
     def store_wait(self, pending: int) -> None:
