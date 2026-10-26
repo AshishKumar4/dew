@@ -321,12 +321,13 @@ def test_a_stacked_matrix_is_read_in_place_at_a_layer(generation_name):
         return jnp.concatenate([x[:split].astype(wide) @ matrices[0],
                                 x[split:].astype(wide) @ matrices[1]]).astype(out)
 
-    # Named: an Ampere GPU runs mma.sync's tile by name (`grouped_matmul.MMA_SYNC_MEASURED`).
-    with generation.assumed(generation_name), generation.chosen(grouped_matmul="mosaic_gpu"):
+    with generation.assumed(generation_name):
         assert_as_exact(with_gradients(dew), jax.jit(with_gradients(plain)), draw,
                         f"stacked layer on {generation_name}", seeds=SEEDS,
                         truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64, out=jnp.float64)))
-        with tuning.seen() as launches:
+        # The forward's Mosaic launch, named: an Ampere GPU runs mma.sync's tile by name
+        # (`grouped_matmul.MMA_SYNC_MEASURED`).
+        with generation.chosen(grouped_matmul="mosaic_gpu"), tuning.seen() as launches:
             jax.jit(dew).trace(*draw(0)[:2])
     read = {ba.arguments['kernel'].shape for op, ba in launches if isinstance(op, grouped_matmul.MosaicGmm)}
     assert read == {(layers * groups, depth, width)}
