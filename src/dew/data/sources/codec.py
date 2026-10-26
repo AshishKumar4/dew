@@ -302,9 +302,14 @@ def content_fingerprint(value: Value, *, opaque: bool = False) -> bytes:
 
 
 def fingerprint(values: Iterable[Value]) -> str:
+    return encoded_fingerprint(encode(value) for value in values)
+
+
+def encoded_fingerprint(encoded: Iterable[bytes]) -> str:
+    """`fingerprint` of the values `encoded` holds, each as `encode` wrote it, for a caller that holds
+    their encodings already."""
     digest = hashlib.sha256()
-    for value in values:
-        encoded = encode(value)
-        digest.update(struct.pack("<Q", len(encoded)))
-        digest.update(encoded)
+    for each in encoded:
+        digest.update(struct.pack("<Q", len(each)))
+        digest.update(each)
     return digest.hexdigest()

@@ -22,7 +22,7 @@ from dew.data.pipeline import Record, Rejected
 from dew.data.plan import array_digest
 from dew.data.retention import LocalRetention
 from dew.data.sources.base import Read, Shard, ShardManifest, Source, _indexed_manifest, _uncounted, url_label
-from dew.data.sources.codec import decode, fingerprint
+from dew.data.sources.codec import decode, encode, encoded_fingerprint
 from dew.data.sources.index import ArrayIndex
 from dew.data.sources.records import ArrayRecords
 from dew.data.storage import Store, Versioned, local
@@ -316,12 +316,16 @@ def completion_facts(row_id: str, payload: bytes) -> Mapping[str, object]:
     checks every one against the record it reads (`_completion`)."""
     outputs = _decode_outputs(payload)
     accepted = _accepted(outputs)
+    # Each output encoded once for both digests (`encoded_fingerprint`).
+    encoded = [encode(value) for value in outputs]
+    kept = [each for value, each in zip(outputs, encoded, strict=True)
+            if value is not None and not isinstance(value, Rejected)]
     return {
         "id": row_id,
         "fanout": len(accepted),
         "outputs": [[row_id, index] for index in range(len(accepted))],
-        "sha256": fingerprint(accepted),
-        "payload_sha256": fingerprint(outputs),
+        "sha256": encoded_fingerprint(kept),
+        "payload_sha256": encoded_fingerprint(encoded),
         "lengths": [_fact(value, "_dew_length") for value in accepted],
         "valid_targets": [_fact(value, "_dew_valid_targets") for value in accepted],
         "rules": [_rule(value) for value in accepted],
