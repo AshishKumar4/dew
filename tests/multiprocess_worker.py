@@ -423,8 +423,8 @@ def mode_data(args) -> dict:
 
 def mode_online_data(args) -> dict:
     """The first pass of records fetched from the pool's server, each process fetching its share of the
-    shuffled catalog (`online_pipeline`): the records it read, by the image each url's bytes hold, and
-    the plan's lowering. A training order reads on past its pass, so the pass is its batches."""
+    shuffled catalog (`online_pipeline`): the records it read, by the image each url's bytes hold. A
+    training order reads on past its pass, so the pass is its batches."""
     import itertools
 
     import jax
@@ -442,8 +442,7 @@ def mode_online_data(args) -> dict:
                    for record in batch_records(batch)]
     finally:
         stream.close()
-    return {"process_index": jax.process_index(), "records": records,
-            "lowering": None if data.plan is None else data.plan.lowering}
+    return {"process_index": jax.process_index(), "records": records}
 
 
 def mode_packed(args) -> dict:
