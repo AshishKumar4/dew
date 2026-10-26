@@ -358,6 +358,40 @@ def test_a_wrappers_nested_prediction_layer_is_the_depth_a_load_drops(tmp_path, 
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(other))
 
 
+@pytest.mark.parametrize("text_only", [False, True], ids=["wrapper", "text"])
+def test_a_discarded_depths_conflicting_spellings_are_never_compared(tmp_path, text_only):
+    """A depth `prediction_depths=0` drops is read by none, its spellings neither: a copy of Qwen3.5
+    spelling one of its prediction layer's tensors twice, as `mtp.*` and `model.language_model.mtp.*`,
+    unequal, is refused where the load keeps the depth, and loads to the source's trunk where it
+    drops it, leaf for leaf."""
+    import shutil
+
+    from safetensors.numpy import save_file
+
+    from dew.interop import Pretrained
+
+    def load(directory, **options):
+        return Pretrained.load(directory, dtype="float32", attention_impl="reference", text_only=text_only,
+                               **options)
+
+    source = FIXTURES / "qwen38-dense-tiny"
+    spelled = tmp_path / "spelled"
+    shutil.copytree(source, spelled)
+    for shard in spelled.glob("*.safetensors"):
+        tensors = load_file(shard)
+        depth = next((name for name in tensors if name.startswith("mtp.")), None)
+        if depth is not None:
+            tensors[f"model.language_model.{depth}"] = tensors[depth] + 1
+            save_file(tensors, shard, metadata={"format": "pt"})
+    with pytest.raises(ValueError):
+        load(spelled)
+    ours, theirs = load(spelled, prediction_depths=0).variables, load(source, prediction_depths=0).variables
+    leaves = [jax.tree_util.tree_flatten_with_path(tree)[0] for tree in (ours, theirs)]
+    assert [path for path, _ in leaves[0]] == [path for path, _ in leaves[1]]
+    for (_, mine), (_, other) in zip(*leaves, strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(other))
+
+
 @pytest.mark.parametrize("fixture", ["deepseek-v4-dspark-tiny", "deepseek-v41-tiny"])
 def test_a_drafter_is_kept_whole_or_not_at_all(tmp_path, fixture):
     """A DSpark drafter's stages draft as one, its heads on its last: a count of all its stages keeps
