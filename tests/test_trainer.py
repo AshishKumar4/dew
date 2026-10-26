@@ -1280,12 +1280,15 @@ def test_a_cooldown_branch_scores_what_a_run_decayed_there_scores_and_leaves_the
         np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 
 
-def test_a_cooldown_a_preemption_cuts_short_runs_again_on_resume(tmp_path):
+@pytest.mark.parametrize("best", [False, True], ids=["unranked", "weights-best"])
+def test_a_cooldown_a_preemption_cuts_short_runs_again_on_resume(tmp_path, best):
     """A preemption that reaches a run as it branches into a cooldown stops it at the step the branch
-    left from, its state as it stood there, unscored; the resume runs the branch again first, recording
-    the score an uninterrupted run records, and trains on to the parameters a run with no cooldown
-    reaches, bit for bit."""
+    left from, its state as it stood there, unscored, and saved whole in the step's one save, though a
+    weights-only best would have kept the step's weights alone; the resume runs the branch again first,
+    recording the score an uninterrupted run records, and trains on to the parameters a run with no
+    cooldown reaches, bit for bit."""
     from dew.optim import Linear
+    from dew.training import Best
     from dew.training.cooldown import Cooldowns
 
     stable, cooldowns = Linear(2.0 ** -4, decay_start=64, decay_steps=128), Cooldowns(at=(4,), length=4)
@@ -1296,9 +1299,11 @@ def test_a_cooldown_a_preemption_cuts_short_runs_again_on_resume(tmp_path):
     optimizer = OptimConfig(optimizer="adamw", learning_rate=stable)
     # The notice step 3's log sends reaches the run after step 4, as its branch begins.
     stopped = Preempting(3)
+    ranked = {"eval_every": 4, "best": Best(lambda scores: scores["val/loss"], weights_only=True)} if best else {
+        "eval_every": 12}
     with pytest.raises(Preempted):
         make_trainer(tmp_path, tracker=stopped, optimizer=optimizer).fit(
-            dataset(val=val_batches(2)), steps=12, log_every=1, eval_every=12, cooldowns=cooldowns)
+            dataset(val=val_batches(2)), steps=12, log_every=1, cooldowns=cooldowns, **ranked)
     assert not any("cooldown_val/loss" in scalars for _, scalars in stopped.scalars)
     assert Checkpoints(str(tmp_path / "run")).latest == 4
     resumed = RecordingTracker()

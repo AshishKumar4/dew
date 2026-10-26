@@ -1775,17 +1775,19 @@ class Trainer(Generic[Loss, Effects]):
             run.cooling, branch = branch, None
         state, cut = (state, False) if branch is None else self._cooled(plan, run, state, shardings, position,
                                                                          branch)
+        # Asked at every step on every process, as JAX's agreement needs, before the step's save, so a
+        # stop's save is its one save, whole; the last step ends the run. A pause falls on the same step
+        # on every process, so where it is reached none asks.
+        assert run.notice is not None
+        stopping = paused or cut or (not ending and run.notice.reached())
         if not ending:
             self._saves(plan, run, interval, state, position, scores, evaluation_due=evaluation_due,
-                        full=paused)
+                        full=stopping)
         if plan.observe:
             plan.observe.at(current, state)
-        # Asked at every step on every process, as JAX's agreement needs; the last step ends the run.
-        # A pause falls on the same step on every process, so where it is reached none asks.
         if run.stopped:
             return True, state
-        assert run.notice is not None
-        if paused or cut or (not ending and run.notice.reached()):
+        if stopping:
             self._take(plan, run, interval, state, unlogged=True)
             if checkpoints is not None and interval.resumable != current:
                 self._read_taken(run)
