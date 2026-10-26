@@ -222,6 +222,46 @@ def test_a_jepa_run_without_probes_trains_and_validates_its_loss(tmp_path, size)
     assert not any("probe" in name for report in reports for name in report)
 
 
+def test_a_jepa_run_trains_its_lora_factors_and_ramps_their_momentum_over_its_updates(tmp_path):
+    """`--lora` adapts the run's encoder: its factors train under `params` over a frozen draw of it.
+    The target's momentum ramps over the run's updates, its steps over its accumulation: falling from
+    1 to 0 over four steps of two, it holds the first update's target where it starts and averages the
+    second's halfway, so a factor that starts at zero ends half the online one."""
+    import jax
+    import numpy as np
+
+    from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
+    from dew.data import TFDS, Loading, presets
+    from dew.lora import LoRA
+    from dew.objectives.base import FROZEN
+
+    images = TFDS("dew_images", path=str(REPO_ROOT / "tests" / "fixtures" / "tfds" / "dew_images" / "1.0.0"),
+                  split="all")
+    run = JepaRunConfig(
+        model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
+                                           "num_heads": 2, "mlp_ratio": 2, "dtype": "float32",
+                                           "attention_impl": "xla"}),
+        objective=ObjectiveConfig("jepa", {"momentum": (1.0, 0.0)}),
+        predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
+        lora=LoRA(rank=2, modules=("up_proj",)),
+        data=images.pipe(presets.images, 16, batch=8).read("memory").loading(Loading(workers=0)),
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=4, accumulation=2, log_every=1,
+                              eval_every=None, checkpoint_every=None))
+    trained = run.prepare().train("jepa-lora")
+    assert int(trained.updates) == 2
+    factors = trained.variables["params"]["context_encoder"]
+    assert factors and all(path[-1].key in ("lora_A", "lora_B")
+                           for path, _ in jax.tree_util.tree_leaves_with_path(factors))
+    assert jax.tree.leaves(trained.variables[FROZEN]["context_encoder"])
+    for path, online in jax.tree_util.tree_leaves_with_path(factors):
+        if path[-1].key == "lora_B":
+            target = trained.ema["params"]["context_encoder"]
+            for key in path:
+                target = target[key.key]
+            assert np.any(np.asarray(online))
+            np.testing.assert_array_equal(np.asarray(target), 0.5 * np.asarray(online))
+
+
 def test_param_groups_on_the_command_line_read_their_schedules_as_records():
     """A group's schedule is the record that names it, as the run's record
     writes it, and the config's own rate is one value: a number, or a schedule's record that steps

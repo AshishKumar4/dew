@@ -640,17 +640,14 @@ class TensorBoardTracker(_OwnedTracker):
 
 
 def _text(tag: str, payload: str) -> Summary.Value:
-    """A text-plugin summary value: the string tensor a text tab reads."""
-    from tensorboard.compat.proto import summary_pb2, tensor_pb2, tensor_shape_pb2, types_pb2
+    """A text-plugin summary value: the one-string tensor a text tab reads, its metadata and tensor
+    built as TensorBoard's own TensorFlow-free `text_pb` builds them."""
+    from tensorboard.compat.proto.summary_pb2 import Summary
+    from tensorboard.plugins.text.metadata import create_summary_metadata
+    from tensorboard.util.tensor_util import make_tensor_proto
 
-    return summary_pb2.Summary.Value(
-        tag=tag,
-        metadata=summary_pb2.SummaryMetadata(
-            plugin_data=summary_pb2.SummaryMetadata.PluginData(plugin_name='text')),
-        tensor=tensor_pb2.TensorProto(
-            dtype=types_pb2.DT_STRING, string_val=[payload.encode()],
-            tensor_shape=tensor_shape_pb2.TensorShapeProto(
-                dim=[tensor_shape_pb2.TensorShapeProto.Dim(size=1)])))
+    return Summary.Value(tag=tag, metadata=create_summary_metadata(display_name=None, description=None),
+                         tensor=make_tensor_proto([payload], dtype=np.object_))
 
 
 def _picture(tag: str, encoded: bytes, frame: np.ndarray) -> Summary.Value:
