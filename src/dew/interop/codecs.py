@@ -2,9 +2,10 @@
 
 `source_quantization` reads a config's `quantization_config` into one codec
 and refuses every other format by name. A codec knows which tensors of a
-checkpoint are the parts of one quantized weight, decodes them in float32
-one tensor at a time, and encodes dense weights back into those parts for
-`Pretrained.save`:
+checkpoint are the parts of one quantized weight, decodes them one tensor
+at a time, in float32 or straight into the dtype the load keeps them in
+(`SourceQuantization.dequantize`), and encodes dense weights back into those
+parts for `Pretrained.save`:
 
 - DeepSeek's block-scaled FP8 (`quant_method: fp8`; V3, V3.2 and the
   finegrained FP8 of Qwen3 and MiniMax): `<m>.weight` in float8_e4m3fn
@@ -289,8 +290,10 @@ class SourceQuantization:
 
     def dequantize(self, tensors: Mapping[str, np.ndarray], *,
                    param_dtype: str = "float32") -> dict[str, np.ndarray]:
-        """Decode each quantized weight in float32, keep it in `param_dtype`
-        and drop its parts. Every other tensor passes through unchanged."""
+        """Each quantized weight in the dtype `param_dtype` keeps it in, its parts dropped: decoded in
+        float32 and cast, or straight into that dtype where the format decodes so (`decode_kept`), under
+        `AUTO` in the dtype the format decodes to (MXFP4's bf16). `read` and `decode` give a weight's
+        float32 value; this gives its storage. Every other tensor passes through unchanged."""
         out = dict(tensors)
         names = self.names(tensors)
         for name in names:

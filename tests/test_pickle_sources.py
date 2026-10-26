@@ -89,14 +89,17 @@ def _converting(root: str, worker: int, rounds: int, barrier) -> None:
 
 def test_processes_converting_one_pickle_at_once_each_read_its_weights():
     """A pool's processes loading one release's pickle at once each convert it and read the conversion,
-    round after round, under a cache on the home directory's filesystem, where a pool's ~/.cache lies: an
+    round after round, under a cache on the filesystem Dew's own cache lies on (a pool's ~/.cache): an
     overlay in CI, where a listing of the folder another process was replacing a file in found no weights
     (eight processes, forty rounds: some forty misses before the conversion was published whole, none
     under a tmpfs). Each conversion is published whole, so every read finds its weights."""
+    from dew.cache import dew_cache_dir
+
     rounds, workers = 8, 8
-    home = Path.home() / ".cache"
-    home.mkdir(parents=True, exist_ok=True)
-    root = tempfile.mkdtemp(dir=home, prefix="dew-pickle-race-")
+    # Beside Dew's own cache, on its filesystem: the home directory's unless XDG_CACHE_HOME moves it.
+    caches = Path(dew_cache_dir()).parent
+    caches.mkdir(parents=True, exist_ok=True)
+    root = tempfile.mkdtemp(dir=caches, prefix="dew-pickle-race-")
     context = multiprocessing.get_context("spawn")
     barrier = context.Barrier(workers)
     pool = []

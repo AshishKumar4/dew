@@ -654,7 +654,7 @@ class TextToImage:
                             out_shardings=plan.sharding)
             return given, null, noise(process, plan.keys(settled.request), settled.shape)
         start = process.times(settled.count)[0] if settled.times is None else settled.times[0]
-        starting = program(_image_start, *([] if self.autoencoder is None else [self.autoencoder.model]),
+        starting = program(_image_start, *(() if self.autoencoder is None else self.autoencoder.towers()),
                            static_argnums=(0, 1, 2),
                            in_shardings=(None, plan.sharding, plan.sharding, None, None),
                            out_shardings=plan.sharding)

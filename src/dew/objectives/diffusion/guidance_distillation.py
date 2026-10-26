@@ -25,6 +25,7 @@ from dew.diffusion.schedules import NoiseScheduler, expand
 from dew.diffusion.transforms import PredictionTransform, broadcast_rates
 from dew.inputs import InputSpec
 from dew.lora import unadapted
+from dew.nn.kernels.options import Held
 from dew.nn.protocols import Lacks
 from dew.objectives.base import TEACHER, Aux, ProgramModule, Step, model_rngs
 from dew.registry import to_record
@@ -85,6 +86,10 @@ class GuidanceDistillationObjective(DiffusionObjective):
         """The student, then the teacher's modules, which the step does not train."""
         return (*super().program_key(),
                 *(program._replace(trained=False) for program in self.teacher.program_key()))
+
+    def towers(self) -> tuple[Held, ...]:
+        """The student's towers, then the teacher's, whose own encoders condition its targets."""
+        return (*super().towers(), *self.teacher.towers())
 
     def substitute(self, modules: Sequence[nn.Module]) -> None:
         self.model, *teacher = modules
