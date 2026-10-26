@@ -88,6 +88,10 @@ def assert_served_as_exact(task: TextGeneration, requests: Sequence[Served], lab
             return tuple(scores)
         return scored
 
-    seeds = seeds_for(explicit(decoder), draw, label, truth_fn=explicit(wide, wide_weights=True))
+    # Paired: the server and the full forward run one model's arithmetic over the same weights and tokens,
+    # their errors moving together across draws, which a hybrid stack's recurrence spreads too widely for
+    # the reference compared with itself to resolve (`seeds_for`).
+    seeds = seeds_for(explicit(decoder), draw, label, truth_fn=explicit(wide, wide_weights=True),
+                      dew_fn=served)
     assert_as_exact(served, explicit(decoder), draw, label, seeds=seeds,
                     truth_fn=explicit(wide, wide_weights=True))
