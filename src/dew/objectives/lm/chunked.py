@@ -1102,27 +1102,13 @@ def _sharded_head(mesh, hidden, table, targets, excluded, cap, columns, head, co
             return total.reshape(1), outputs
         return head(hidden, table, targets, excluded, cap, columns)
 
-    # The map holds every axis manual, those that split no token too: in a map
-    # that leaves axes automatic, JAX lowers a collective's reducer with its
-    # add wrapped in a sharding constraint, and XLA's CPU compiler, which
-    # widens a bf16 reduction to fp32 (AllReducePromotion), aborts on a
-    # reducer whose root is not the add. Under a bf16 policy the split head's
-    # states come back through such a reduction. The states and the head name
-    # the axes of one device on their first dimension, where they split
-    # nothing, so the transpose sums neither over them. An axis whose shards
-    # do not divide the tokens leaves both whole over it, as the tile loops
-    # compute them anyway, and the transpose sums the copies' shares.
-    alone = tuple(axis for axis in mesh.axis_names if mesh.shape[axis] == 1 and axis not in mesh.manual_axes)
-
-    def naming(entry):
-        return (*mesh_axes(entry), *alone) or None
-
+    # The map is over the axes that split the tokens, the head's among them: every other axis stays
+    # automatic, as the computation it leaves alone is.
     outputs = (spec, spec if predict else None, spec)
-    inputs = (P(naming(spec[0]), *spec[1:], None), P(naming(held[0]), *held[1:]), spec, P(), P(),
-              jax.tree.map(lambda terms: P(naming(held[0])), columns))
+    inputs = (P(*spec, None), held, spec, P(), P(), jax.tree.map(lambda terms: P(held[0]), columns))
     return jax.shard_map(local, in_specs=inputs,
-                         out_specs=(P(tuple(sorted(axes)) + alone), outputs) if sums else outputs,
-                         axis_names=set(mesh.axis_names) - set(mesh.manual_axes), check_vma=False)(
+                         out_specs=(P(tuple(sorted(axes))), outputs) if sums else outputs,
+                         axis_names=axes - set(mesh.manual_axes), check_vma=False)(
         hidden, table, targets, excluded, cap, columns)
 
 
