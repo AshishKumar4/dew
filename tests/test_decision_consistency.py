@@ -335,6 +335,29 @@ def test_a_unit_the_fit_holds_fits_its_window_however_training_draws_its_options
     assert held and held[0] > windows[0], held
 
 
+def test_a_question_whose_own_none_of_the_above_is_right_trains_as_it_is_asked():
+    """A grouped question that offers "none of the above" and is answered by it is left as it is by
+    every draw of the augmentation: its options, its gold and the canonical options its group maps are
+    those of the row without augmentation, its own option still the group's."""
+    asked = {name: Choice("x", {key: None, NONE_OF_THE_ABOVE: "neither"}) for name, key in (("q", "a"),
+                                                                                         ("r", "b"))}
+    example = Example("the state", asked, {"q": NONE_OF_THE_ABOVE, "r": NONE_OF_THE_ABOVE},
+                      groups=(Group("same", {"q": {"a": "yes", NONE_OF_THE_ABOVE: "none"},
+                                             "r": {"b": "yes", NONE_OF_THE_ABOVE: "none"}}),))
+    def encoded(rate, seed):
+        encoding = Encoding(LAYOUT, TOKENIZER, SPECIALS, width=4, shuffle=False, none_of_the_above=rate,
+                            grouped=True)
+        return encoding(example, ["q", "r"], np.random.default_rng(seed))
+    for seed in range(8):
+        augmented, plain = encoded(1.0, seed), encoded(0.0, seed)
+        assert augmented.keys() == plain.keys()
+        for name in plain:
+            np.testing.assert_array_equal(np.asarray(augmented[name]), np.asarray(plain[name]),
+                                          err_msg=f"{name} at seed {seed}")
+    canonical = np.asarray(encoded(0.0, 0)["canonical"])
+    assert sorted(canonical[0, :2].tolist()) == sorted(canonical[1, :2].tolist()) == [0, 1]
+
+
 def test_grouped_examples_name_questions_they_ask_once_each():
     """A group names questions the examples ask (`<index>.<question>` in a row's fields), none an
     example already groups, each mapping its options onto the group's canonical keys."""
