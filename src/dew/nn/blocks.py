@@ -359,10 +359,11 @@ class Downsample(nn.Module):
 
 
 class ResidualBlock(nn.Module):
-    """Norm, activation, convolution, the projected time embedding added,
-    norm, activation, convolution, plus the input (through a 1x1 convolution
-    when the width changes). `norm_groups` of 0 swaps the group norms for
-    RMS norms."""
+    """Norm, activation, convolution, the projected time embedding added
+    where the call gives one (an AutoencoderKL's blocks take none), norm,
+    activation, convolution, plus the input (through a 1x1 convolution when
+    the width changes). `norm_groups` of 0 swaps the group norms for RMS
+    norms."""
     features: int
     kernel_size: tuple = (3, 3)
     activation: Callable = jax.nn.swish
@@ -371,6 +372,9 @@ class ResidualBlock(nn.Module):
     precision: PrecisionLike = None
     norm_epsilon: float = 1e-4
     dropout: float = 0.0
+    shortcut: str = "residual_conv"
+    """The 1x1 convolution's name: Dew's UNets' `residual_conv`, or an AutoencoderKL's
+    `conv_shortcut`, under which diffusers' Flax checkpoints load and are written as they are."""
 
     @nn.nowrap
     def spatial_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
@@ -396,15 +400,16 @@ class ResidualBlock(nn.Module):
         self.norm2 = norm()
 
     @nn.compact
-    def __call__(self, x: jax.Array, temb: jax.Array, *, train: bool = False):
+    def __call__(self, x: jax.Array, temb: jax.Array | None = None, *, train: bool = False):
         conv = partial(Conv, features=self.features, kernel_size=self.kernel_size,
                        strides=(1, 1), dtype=self.dtype, precision=self.precision)
         out = conv(name="conv1")(self.norm1(x))
 
-        temb = DenseGeneral(features=self.features, name="temb_projection",
-                            dtype=self.dtype, precision=self.precision,
-                            dot_general=float32_dot_general)(temb)
-        out = out + temb[:, None, None, :]
+        if temb is not None:
+            temb = DenseGeneral(features=self.features, name="temb_projection",
+                                dtype=self.dtype, precision=self.precision,
+                                dot_general=float32_dot_general)(temb)
+            out = out + temb[:, None, None, :]
 
         out = self.norm2(out)
         if self.dropout:
@@ -413,5 +418,5 @@ class ResidualBlock(nn.Module):
 
         residual = x
         if residual.shape != out.shape:
-            residual = conv(kernel_size=(1, 1), name="residual_conv")(residual)
+            residual = conv(kernel_size=(1, 1), name=self.shortcut)(residual)
         return out + residual
