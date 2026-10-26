@@ -118,13 +118,14 @@ PARAPHRASED = GroupedExamples(
 member unlabelled; and an ungrouped question beside one of them."""
 
 
-@pytest.mark.parametrize("layout", [JointLayout(max_len=1024), StateFirstLayout(max_len=512)],
+@pytest.mark.parametrize("layout", [JointLayout(max_len=4096), StateFirstLayout(max_len=512)],
                          ids=["joint", "state-first"])
 def test_examples_grouped_across_rows_train_in_one_window_and_agree_as_one_group(layout):
     """Questions grouped across examples (`GroupedExamples`) train as one unit: under a joint layout and
     a layout of a question a row, packed beside an ungrouped example, their rows land in one window and
     their members, labelled or not, are one group of it, mapped onto its canonical options; the term
-    is `group_divergence` over those members' logits, computed apart from the window."""
+    is `group_divergence` over those members' logits, computed apart from the window. A window holds the
+    unit's three joint rows, each with its schema, in 4096 tokens."""
     backbone = tiny_backbone().clone(max_seq_len=layout.max_len)
     head = (JointSchemaHead(32, width=16, routing_layers=1, layers=1, heads=2, feedforward=32)
             if layout.joint else None)
