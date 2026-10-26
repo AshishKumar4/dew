@@ -240,12 +240,15 @@ def _grouped(group_of: GroupOf, encoded: Encoded, asked: Mapping[str, Question],
 
 def _none_of_the_above(question: Choice, label: int, *, drop: bool) -> tuple[Choice, int]:
     """`question` with a "none of the above" option last, and without its
-    right option when `drop`; the new label."""
+    right option when `drop`; the new label. A question that offers the option
+    already keeps it where it stands, as its own description writes it, and
+    one whose right option it is stays as it is, so the option added never
+    shortens a question, nor does dropping lengthen it past the one added."""
     described = dict(zip(question.options, question.descriptions, strict=True))
     right = question.options[label]
-    if drop:
+    if drop and right != NONE_OF_THE_ABOVE:
         described.pop(right)
-    described[NONE_OF_THE_ABOVE] = "none of the other options fits"
+    described.setdefault(NONE_OF_THE_ABOVE, "none of the other options fits")
     options = list(described)
     return Choice(question.instructions, described), options.index(NONE_OF_THE_ABOVE if drop else right)
 
@@ -376,7 +379,9 @@ class Fit(pygrain.MapTransform):
         every answered choice's options, and with it in place of each one's right option. A row of a
         question each is these three exactly, since its layout may trim its options together
         (`QuestionLayout`), so that adding one can shorten the row; a row of several questions lays
-        them out untrimmed, where adding the option beside every one is the longest."""
+        them out untrimmed, where adding the option beside every one is the longest: it lengthens each
+        question by the option or leaves it as it is (`_none_of_the_above`), and the state takes the
+        room the rest leaves."""
         if not self.none_of_the_above:
             return row.length
         example = row.example
