@@ -29,7 +29,7 @@ from flax import linen as nn
 
 from dew._coordination import agreed, collective_host
 from dew.artifacts import ImageGrid, VideoGrid
-from dew.batch import FROZEN, Batch, Variables, merge, thaw, under
+from dew.batch import FROZEN, Batch, Variables, dicts, merge, thaw, under
 from dew.diffusion.presets import Preset, build_process
 from dew.diffusion.process import Process, aligned_conditions
 from dew.diffusion.schedules import FlowMatchingScheduler, expand
@@ -468,7 +468,7 @@ class DiffusionObjective(Objective[Ratio]):
         self.process = build_process(process)
         self.inputs = inputs
         self.autoencoder = autoencoder
-        self.variables = variables
+        self.variables = dicts(variables)
         self.uncertainty = None if uncertainty is None else Uncertainty(uncertainty)
         _check_end_to_end(end_to_end, alignment, autoencoder, inputs)
         check_solver(self.process, solver, steps, grid)
@@ -961,7 +961,7 @@ class FlowDistillationObjective(DiffusionObjective):
             raise ValueError(f"{name} distills a velocity model on the linear path; build the process with "
                              "presets.Flow()")
         self.teacher = unadapted(self.model) if teacher is None else teacher
-        self.teacher_variables = teacher_weights(self.variables, teacher_variables)
+        self.teacher_variables = dicts(teacher_weights(self.variables, teacher_variables))
 
     def program_key(self) -> tuple[ProgramModule, ...]:
         """The student, then the frozen teacher."""
