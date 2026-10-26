@@ -898,8 +898,7 @@ def test_a_local_save_that_fails_in_the_background_ends_the_pool(tmp_path):
     coordinator = f"127.0.0.1:{free_port()}"
     (directory / "out").mkdir()
     pool = [spawn("fit", directory / "out" / f"process{index}.json", processes=2, process_id=index,
-                  coordinator=coordinator, **local_flags(directory),
-                  fail_local_save=LOCAL_EVERY * 2 if index == 1 else None)
+                  coordinator=coordinator, **local_flags(directory), fail_local_save=LOCAL_EVERY * 2)
             for index in range(2)]
     outputs = []
     for process in pool:
