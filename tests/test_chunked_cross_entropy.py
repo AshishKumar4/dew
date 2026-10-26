@@ -15,6 +15,7 @@ exact but the predictions, an excluded column's zero gradient, and a float64
 head's float64 arithmetic.
 """
 
+import functools
 import math
 
 import jax
@@ -1241,17 +1242,7 @@ def test_a_confident_targets_logit_gradient_is_the_rest_of_the_rows_eq_7(path, m
     to 0 once the share rounds to 1, and then the row stops summing to zero. The target's entry is
     negative."""
     targets = np.full((3,), label, np.int32)
-    head = identity_head()
-
-    def loss(logits):
-        if path == "logits":
-            return chunked.logits_cross_entropy(logits, targets)[0].sum()
-        if path == "fused":
-            return fused_head_loss(logits, head, targets, jnp.ones(targets.shape))[0]
-        tile = (3, 3) if path == "tiled" else None
-        return chunked_cross_entropy(logits, head, targets, 1, tile=tile)[0].sum()
-
-    gradient = jax.jit(jax.grad(loss))
+    gradient = jax.jit(jax.grad(functools.partial(path_loss, path, targets)))
     assert_as_exact(gradient, lambda logits: label_derivative(logits, label),
                     lambda seed: confident(margin, seed, label),
                     f"{path} at margin {margin}, column {label}", seeds=CONFIDENT_SEEDS)
@@ -1423,15 +1414,30 @@ def test_a_vocabulary_split_heads_unlikely_target_keeps_its_log_partition_share(
     lead, target = 0, 5
     targets = np.full((4,), target, np.int32)
 
-    def partition(logits, matrix):
-        head = OutputTable(matrix, vocab_major=False, precision=jax.lax.Precision.HIGHEST)
-        return chunked_cross_entropy(logits, head, targets, 1, tile=tile)[2].sum()
-
-    gradient = jax.jit(jax.grad(partition))
+    gradient = jax.jit(jax.grad(functools.partial(split_head_term, 2, targets, tile)))
 
     assert_as_exact(vocabulary_split(gradient), softmax,
                     lambda seed: confident(margin, seed, lead, width=8, count=4),
                     f"vocabulary-split at margin {margin}, {tile}", seeds=CONFIDENT_SEEDS)
+
+
+def path_loss(path: str, targets: np.ndarray, logits: jax.Array) -> jax.Array:
+    """The summed cross entropy of `logits` (each row a token's) at `targets` through one of the heads:
+    the whole-logits head, the fused one, or the chunked one tiled or whole over an identity table."""
+    head = identity_head()
+    if path == "logits":
+        return chunked.logits_cross_entropy(logits, targets)[0].sum()
+    if path == "fused":
+        return fused_head_loss(logits, head, targets, jnp.ones(targets.shape))[0]
+    tile = (3, 3) if path == "tiled" else None
+    return chunked_cross_entropy(logits, head, targets, 1, tile=tile)[0].sum()
+
+
+def split_head_term(term: int, targets: np.ndarray, tile, logits: jax.Array, matrix: jax.Array) -> jax.Array:
+    """The chunked head's `term` (0 the loss, 2 the log partition) of `logits` against `matrix`, a
+    hidden-major table, summed: the vocabulary-split tests' function, `vocabulary_split` its mesh."""
+    head = OutputTable(matrix, vocab_major=False, precision=jax.lax.Precision.HIGHEST)
+    return chunked_cross_entropy(logits, head, targets, 1, tile=tile)[term].sum()
 
 
 def unconfident(seed: int, width: int = 7, count: int = 3) -> tuple[np.ndarray]:
@@ -1454,17 +1460,8 @@ def test_an_unconfident_targets_logit_gradient_is_on_par_with_autodiffs(path):
     its share less one, rounded once, where the rest of the row summed carries each class's rounding of
     the partition (`dew.nn.categorical.label_entry`, the rule every head reads)."""
     targets = np.arange(3, dtype=np.int32)
-    head = identity_head()
-
-    def loss(logits):
-        if path == "logits":
-            return chunked.logits_cross_entropy(logits, targets)[0].sum()
-        if path == "fused":
-            return fused_head_loss(logits, head, targets, jnp.ones(targets.shape))[0]
-        tile = (3, 3) if path == "tiled" else None
-        return chunked_cross_entropy(logits, head, targets, 1, tile=tile)[0].sum()
-
-    gradient, reference = jax.jit(jax.grad(loss)), written_gradient(targets)
+    gradient = jax.jit(jax.grad(functools.partial(path_loss, path, targets)))
+    reference = written_gradient(targets)
     label = f"{path} at an unconfident target"
     with jax.default_matmul_precision("highest"):
         seeds = seeds_for(reference, unconfident, label, dew_fn=gradient)
@@ -1480,11 +1477,8 @@ def test_a_vocabulary_split_heads_unconfident_target_gradient_is_on_par_with_aut
     shard."""
     targets = np.arange(4, dtype=np.int32) * 2
 
-    def loss(logits, matrix):
-        head = OutputTable(matrix, vocab_major=False, precision=jax.lax.Precision.HIGHEST)
-        return chunked_cross_entropy(logits, head, targets, 1, tile=tile)[0].sum()
-
-    split, reference = vocabulary_split(jax.jit(jax.grad(loss))), written_gradient(targets)
+    split = vocabulary_split(jax.jit(jax.grad(functools.partial(split_head_term, 0, targets, tile))))
+    reference = written_gradient(targets)
     label = f"vocabulary-split at an unconfident target, {tile}"
 
     def draw(seed):
