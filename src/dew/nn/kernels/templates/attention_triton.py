@@ -21,7 +21,7 @@ import tokamax
 from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention_algebra as algebra, cost as costs
+from dew.nn.kernels.templates import attention_algebra as algebra
 from dew.nn.kernels.templates.attention import (
     ACCURATE,
     DKV_GRADS,
@@ -59,9 +59,10 @@ class Tiles:
 
 
 FORWARD_DEFAULT = Tiles(128, 64, 4, 2)
-"""The forward config first in its space, which a pick of tied estimates takes (`Template.estimate`):
-within 6% of the fastest at Qwen3-8B, causal and full, on an A100 and an H100 (ATT-ZERO3-a100 and
-ATT-ZERO4-h100, 2026-10-21), where the space's first config otherwise, 32 by 32, ran 2-3 times it."""
+"""The forward config first in its space, the launch's own where it fits (`Template.fitting`'s first,
+nothing ranked): within 6% of the fastest at Qwen3-8B, causal and full, on an A100 and an H100
+(ATT-ZERO3-a100 and ATT-ZERO4-h100, 2026-10-21), where the space's first config otherwise, 32 by 32, ran
+2-3 times it."""
 
 SPACE = (FORWARD_DEFAULT, *(tiles for tiles in (Tiles(block_q, block_k, warps, stages)
                                                 for block_q in (32, 64, 128) for block_k in (32, 64, 128)
@@ -97,12 +98,6 @@ def refused(spans: KeySpans, hooks: Hooks | None = None) -> str | None:
         return ("the Triton mainloop is frozen and takes no probability dropout (the route runs a dropping "
                 "call on the reference path, ledger row 1521)")
     return None
-
-
-def _mode(dtype) -> str:
-    """The arithmetic a launch's products take (`_dot`): IEEE fp32 for fp32 operands, else 16-bit
-    products summed in fp32."""
-    return 'fp32' if dtype == jnp.float32 else '16bit'
 
 
 def _tile_param(ref, kind: Kind, head, queries: jax.Array, keys: pl.Slice | None):
@@ -373,35 +368,6 @@ class TritonForward(AttentionLaunch, Template[Tiles]):
         if ba.arguments.get("residuals"):
             words += rows * value_width
         return words // (32 * config.warps)
-
-    def cost(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> float:
-        """Every key tile of the call (a bound: the spans are traced, so a sparse call visits fewer),
-        each staging its key and value tiles once and taking a `block_q` by `block_k` product of the
-        queries with the keys and of the weights with the values, and as many exponentials; its inputs
-        read once, the output written once in their dtype and the residuals in fp32."""
-        query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
-        batch, queries, heads, width = query.shape
-        keys, value_width = key.shape[1], value.shape[-1]
-        tiles = keys // config.block_k
-        size = jnp.dtype(query.dtype).itemsize
-        rows = 2 * batch * heads * queries * 4 if ba.arguments.get("residuals") else 0
-        # Every array it reads at its dtype (operands, spans, hook parameters, initial state), and the
-        # output and residuals it writes.
-        read = sum(leaf.size * jnp.dtype(leaf.dtype).itemsize for leaf in jax.tree.leaves(dict(ba.arguments))
-                   if hasattr(leaf, "dtype"))
-        programs = batch * heads * (queries // config.block_q)
-        staged = float(config.block_q * width * size + tiles * config.block_k * (width + value_width) * size)
-        return costs.seconds(costs.Cost(
-            programs=programs,
-            device_bytes=read + batch * queries * heads * value_width * size + rows,
-            program_flops=tiles * 2.0 * config.block_q * config.block_k * (width + value_width),
-            program_staged=staged,
-            program_exponentials=float(tiles * config.block_q * config.block_k),
-            mode=_mode(query.dtype), steps=tiles, stages=config.stages,
-            resident=costs.resident(target, self.staged_bytes(ba, config, target), 32 * config.warps,
-                                    self.registers(ba, config)),
-            # Every query block stages its queries and every key tile it walks, from the L2.
-            l2_bytes=programs * staged), target)
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         return _eligible(ba, target)
@@ -690,7 +656,7 @@ class BackwardTiles:
 
 
 BACKWARD_DEFAULT = BackwardTiles(64, 64, 4, 2, 4, 2)
-"""The backward config first in its space, which a pick of tied estimates takes: within 7% of the fastest
+"""The backward config first in its space, the launch's own where it fits: within 7% of the fastest
 joint config of both launches at a llama shape and at head width 64, causal, on an A100 and an H100
 (DPROF3-a100 and DPROF3-h100, 2026-10-21)."""
 
@@ -762,11 +728,6 @@ class TritonBackward(AttentionLaunch, Template[BackwardTiles]):
         """The larger of its two launches' registers a thread (`_backward_registers`)."""
         return max(_backward_registers(ba, config, dq=True), _backward_registers(ba, config, dq=False))
 
-    def cost(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget) -> float:
-        """Both launches' (`_launch_cost`): every tile of the call (a bound: the spans are traced, so a
-        sparse call visits fewer)."""
-        return sum(_launch_cost(ba, config, target, self.score_kinds, dq=dq) for dq in (True, False))
-
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         return _eligible(ba, target)
 
@@ -780,67 +741,6 @@ def _backward_registers(ba: tokamax.BoundArguments, config: BackwardTiles, *, dq
     if dq:
         return (config.block_q * width + tile) // (32 * config.dq_warps)
     return (config.block_k * (width + value_width) + tile) // (32 * config.dkv_warps)
-
-
-def _backward_staged(ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget) -> int:
-    """`TritonBackward.staged_bytes`, the larger launch's shared memory."""
-    return TritonBackward().staged_bytes(ba, config, target)
-
-
-def _launch_cost(ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget,
-                 kinds: tuple[Kind, ...], *, dq: bool) -> float:
-    """One backward launch's seconds: its programs, each staging the tiles it walks once a visit and
-    taking its products and exponentials over every tile, the dQ launch two passes of the logits and
-    dP and then dS K, the dK/dV launch the logits, dP, P^T dO and dS^T Q; every array it reads at its
-    dtype, its fp32 gradients and row statistics written, and its hook parameters' gradients."""
-    query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
-    batch, queries, heads, width = query.shape
-    keys, value_width = key.shape[1], value.shape[-1]
-    size = jnp.dtype(query.dtype).itemsize
-    read = sum(leaf.size * jnp.dtype(leaf.dtype).itemsize for leaf in jax.tree.leaves(dict(ba.arguments))
-               if hasattr(leaf, "dtype"))
-    if dq:
-        programs, tiles = batch * heads * (queries // config.block_q), keys // config.block_k
-        products, exponentials = 3 * width + 2 * value_width, 2
-        walked = 2 * config.block_k * (width + value_width)
-        written = 4 * batch * queries * heads * (width + 5)
-        for param, kind in zip(ba.arguments["score_params"], kinds, strict=True):
-            # A head's gradient is written as partials a query block; a query's or a tile's whole.
-            written += 4 * (queries // config.block_q * batch * heads if kind == Kind.HEAD
-                            else param.size if kind in DQ_GRADS else 0)
-    else:
-        programs, tiles = batch * heads * (keys // config.block_k), queries // config.block_q
-        products, exponentials = 2 * width + 2 * value_width, 1
-        # Its row statistics are the dQ launch's four outputs, one more than that launch's inputs.
-        read += 4 * batch * heads * queries
-        walked = config.block_q * (width + value_width)
-        written = 4 * batch * keys * heads * (width + value_width)
-        written += 4 * sum(param.size for param, kind in zip(ba.arguments["score_params"], kinds, strict=True)
-                           if kind == Kind.KEY)
-    wide = 0
-    if not dq and query.dtype == jnp.float16:
-        # fp16's dV product runs in fp32 (`algebra.value_operands`), after the launch's 16-bit work.
-        products, wide = products - value_width, value_width
-    warps, stages = (config.dq_warps, config.dq_stages) if dq else (config.dkv_warps, config.dkv_stages)
-    staged = float(tiles * walked * size)
-    seconds = costs.seconds(costs.Cost(
-        programs=programs,
-        device_bytes=read + written,
-        program_flops=tiles * 2.0 * config.block_q * config.block_k * products,
-        program_staged=staged,
-        program_exponentials=float(tiles * config.block_q * config.block_k * exponentials),
-        mode=_mode(query.dtype), steps=tiles, stages=stages,
-        resident=costs.resident(target, _backward_staged(ba, config, target), 32 * warps,
-                                _backward_registers(ba, config, dq=dq)),
-        # Every program stages each tile it walks from the L2: a smaller tile of the other axis, more
-        # programs re-reading the same operands.
-        l2_bytes=programs * staged), target)
-    if wide:
-        seconds += costs.seconds(costs.Cost(
-            programs=programs, device_bytes=0,
-            program_flops=tiles * 2.0 * config.block_q * config.block_k * wide, program_staged=0.0,
-            program_exponentials=0.0, mode='fp32'), target)
-    return seconds
 
 
 def _geometry(query, key, value, start, end, query_ids, key_ids, block_q: int, block_k: int):
