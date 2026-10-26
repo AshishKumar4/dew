@@ -501,26 +501,20 @@ _LAUNCH = tuple(_launches(code, row) for code, row in (
     ('widths', 'roadmap: recurrence step widths')))
 
 
-_STEPPED = Requirement[DecodeCase](
-    'stepped', lambda case: False,
-    "the step kernel decodes beside the caller's own conv and norm: the fused step won at one row alone, "
-    "0.157 ms against 0.165 on an H100, and lost at 32 and 128 rows (SE-decode-h100-d5e0ebadb)",
-    row='ledger 1424', kind='measured')
-"""The fused step's measured refusal: a call naming it (`generation.chosen`) runs it."""
-
 DELTA_DECODE: Op[DecodeCase] = Op('delta_decode', (
-    Kernel('fused', (*_LAUNCH, _STEPPED, Requirement('unfused', lambda case: case.fuses,
-                                                     "the caller has no conv, gates or gated norm for the "
-                                                     "fused step to take; its token runs the step alone",
-                                                     row=INHERENT, kind='handoff'))),
+    Kernel('fused', (*_LAUNCH, Requirement('unfused', lambda case: case.fuses,
+                                           "the caller has no conv, gates or gated norm for the fused step "
+                                           "to take; its token runs the step alone", row=INHERENT,
+                                           kind='handoff'))),
     Kernel('step', _LAUNCH),
-    Kernel('xla', (), generic=True)))
-"""The decode selector of both recurrence callers (a gated delta net's layer, `decode_step`'s): the first of
-its kernels that takes the token, by what each takes (no table of GPUs): the step (`recurrence.step`
-alone, `decode_gated_delta_rule`) between a caller's own conv and norm on any GPU Dew's Triton kernels
-run on, the fused step (`recurrence.step` with the layer's conv, gates and norm) where a call names it,
-else the portable recurrence ('xla'), a kernel the token does not take handing it to the next. Both
-kernels update the state in place, which JAX's Pallas gives no tangent."""
+    Kernel('xla', (), generic=True)), lambda case: 'step')
+"""The decode selector of both recurrence callers (a gated delta net's layer, `decode_step`'s), by what each
+kernel takes (no table of GPUs): the step (`recurrence.step` alone, `decode_gated_delta_rule`) between a
+caller's own conv and norm on any GPU Dew's Triton kernels run on, its preference (the fused step won at
+one row alone, 0.157 ms against 0.165 on an H100, and lost at 32 and 128 rows, SE-decode-h100-d5e0ebadb);
+the fused step (`recurrence.step` with the layer's conv, gates and norm) where a call names it; else the
+portable recurrence ('xla'), a kernel the token does not take handing it to the next. Both kernels update
+the state in place, which JAX's Pallas gives no tangent."""
 
 
 def recurrent_gated_delta_rule(query, key, value, g, beta, state=None):

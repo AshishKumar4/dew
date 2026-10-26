@@ -1281,13 +1281,14 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
     # A sequence's chunks, the mean over the laid sequences; two products a chunk.
     steps = call.chunks / sequences.shape[0]
     work = Work(4 * CHUNK * width * bv * steps, steps)
-    final, after = _final_landing(call, bv)
+    final_landing, after = _final_landing(call, bv)
     return _kernel(program, call, out_type=out_type, grid=(value_width // bv, sequences.shape[0], call.heads),
                    grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=tiles.stages,
                    live=lambda refs: refs[7][lax.axis_index("sequences"), 1] > 0, work=work,
                    held=_states_held(call, values, keys, bv),
                    staging=(*_staging(held, (call.block, bv)), _column_scratch(call)), once=initials,
-                   landing={**_memory_landing(call, bv), "corrected": held.landing(CHUNK, bv), **final},
+                   landing={**_memory_landing(call, bv), "corrected": held.landing(CHUNK, bv),
+                            **final_landing},
                    after=after,
                    # Its last write's column sums an fp32 call's alone (`_columns`).
                    reduces=held.parts > 1)(
@@ -1891,14 +1892,15 @@ def _reverse(q, k, w, do, local, hi, lo, dht, sequences, call: _Call, tiles: Til
         [_f32(CHUNK, bv)] * 3 + _held(given, CHUNK, bv)
         + _held(held, call.block, bv) + _held(memories, call.block, bv) + _held(held, CHUNK, bv)
         + _fragments(call, (given, CHUNK, call.block), (held, CHUNK, call.block)),))
-    final, after = _final_landing(call, bv)
+    final_landing, after = _final_landing(call, bv)
     return _kernel(program, call, out_type=out_type, grid=(value_width // bv, sequences.shape[0], call.heads),
                    grid_names=("blocks", "sequences", "heads"), blocks=blocks, stages=2, work=work,
                    held=held_tiles,
                    live=lambda refs: refs[8][lax.axis_index("sequences"), 1] > 0,
                    staging=(*_staging(held, (call.block, bv)), (plgpu.SMEM((CHUNK, bv), held.stored),)),
                    once=finals,
-                   landing={**_memory_landing(call, bv), "corrected": held.landing(CHUNK, bv), **final},
+                   landing={**_memory_landing(call, bv), "corrected": held.landing(CHUNK, bv),
+                            **final_landing},
                    after=after)(q, k, w, do, local, hi, lo, dht, sequences)
 
 
