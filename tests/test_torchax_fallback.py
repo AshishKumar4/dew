@@ -879,7 +879,11 @@ def test_a_tier_3_source_generates_through_the_pipeline_loader_as_its_bundle_doe
     from dew.inference import pipeline
 
     torch.manual_seed(0)
-    PACKED_MODELS["cohere"]().eval().save_pretrained(tmp_path)
+    model = PACKED_MODELS["cohere"]().eval()
+    # Cohere's class defaults name its full vocabulary's special tokens; this one's are inside its 256.
+    for config in (model.config, model.generation_config):
+        config.bos_token_id, config.eos_token_id, config.pad_token_id = 1, 2, 0
+    model.save_pretrained(tmp_path)
     with pytest.warns(TransformersTierWarning):
         task = pipeline(str(tmp_path), dtype="float32")
     with pytest.warns(TransformersTierWarning):
