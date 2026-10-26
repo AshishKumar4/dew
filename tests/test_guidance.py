@@ -14,6 +14,7 @@ import pytest
 from diffusion_support import apg_walked
 from flax import linen as nn
 from reference_error import (
+    as_given,
     assert_as_exact,
     assert_as_exact_as_the_reference,
     declared_seeds,
@@ -182,6 +183,7 @@ def test_cfg_plus_plus_takes_the_papers_ddim_update(interval):
 
     schedule = process.schedule
 
+    @as_given
     def walk(x_T):
         dtype = x_T.dtype.type
         x = x_T

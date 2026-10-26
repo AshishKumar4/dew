@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, without_ynn
+from reference_error import assert_as_exact
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Step
@@ -147,7 +147,7 @@ def test_a_prediction_applies_the_head_once_and_scores_the_logits_it_returns():
     # losses and the model's own logits of its states (check 1).
     wide = LMObjective(model.clone(dtype=jnp.float64), 8, ema_decay=None, pad_id=vocab, head_tile=(4, 16))
     with jax.default_matmul_precision("highest"):
-        assert_as_exact(without_ynn(prediction_of), without_ynn(scored(objective)), draw, "a prediction",
+        assert_as_exact(prediction_of, scored(objective), draw, "a prediction",
                         seeds=PREDICTION_SEEDS, truth_fn=scored(wide))
 
 
@@ -201,7 +201,6 @@ def test_a_training_steps_tiled_head_contracts_the_vocabulary_three_times_and_ma
                        head_tile=(tile_tokens, 16))
     with jax.default_matmul_precision("highest"):
         for objective, label in ((fused, "fused"), (unfused, "unfused")):
-            assert_as_exact(without_ynn(stepped(objective, training=True)),
-                            without_ynn(stepped(fused, training=False)), draw,
+            assert_as_exact(stepped(objective, training=True), stepped(fused, training=False), draw,
                             f"a {label} head's step, tiles of {tile_tokens}", seeds=HEAD_STEP_SEEDS,
                             truth_fn=stepped(wide, training=False))
