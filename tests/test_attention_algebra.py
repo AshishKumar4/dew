@@ -429,7 +429,7 @@ def test_the_headroom_guard_leaves_ordinary_inputs_bitwise_unchanged(causal):
 @pytest.mark.parametrize("natural", [False, True], ids=["folded", "natural"])
 def test_a_training_step_holding_its_sums_and_anchor_row_is_the_gathering_steps_arithmetic(natural):
     """`algebra.training_step` as a mainloop that holds its split sums in two blocks of value columns
-    (`Keys.accumulate`) and keeps the anchor's value row (`Keys.picked`, `Argmax.row`) runs it, Mosaic's
+    (`Keys.accumulate`) and keeps the anchor's value row (`KeptRows`, `Argmax.row`) runs it, Mosaic's
     training forward, against the step that sums whole rows and gathers the row by key (`rows`), the plain-JAX
     and Triton mainloops': the same state, anchor, row sums and split sums, bitwise, over bf16 key tiles whose
     maximum moves, ties among them. Each product is exact in float64 and rounded once, so a column block's is
@@ -446,11 +446,11 @@ def test_a_training_step_holding_its_sums_and_anchor_row_is_the_gathering_steps_
     def dot(a, b):
         return jnp.asarray(np.asarray(a, np.float64) @ np.asarray(b, np.float64), jnp.float32)
 
-    def keys_at(index, accumulate=None, picked=None):
+    def keys_at(index, accumulate=None):
         positions = algebra.Coords(jnp.arange(queries)[:, None], index * tile + jnp.arange(tile)[None, :])
         value = values[index * tile:(index + 1) * tile]
         return algebra.Keys(positions, jnp.asarray(logits[index], jnp.float32), lambda: value, dot,
-                            accumulate, picked=picked)
+                            accumulate)
 
     nothing = jnp.zeros((queries,), jnp.float32)
     start = algebra.started(spec, None, queries, width, None)
@@ -471,7 +471,7 @@ def test_a_training_step_holding_its_sums_and_anchor_row_is_the_gathering_steps_
                                                            for _ in columns))
     kept = (algebra.Partial(jnp.zeros((), jnp.float32), start.m, start.total), anchor, nothing, nothing)
     for index in range(tiles):
-        kept = algebra.training_step(spec, kept, keys_at(index, accumulate, picked))
+        kept = algebra.training_step(spec, kept, keys_at(index, accumulate), algebra.KeptRows(picked))
 
     (state, arg, own, others), (kept_state, kept_arg, kept_own, kept_others) = gathered, kept
     for mine, theirs in ((kept_state.m, state.m), (kept_state.total, state.total), (kept_arg.peak, arg.peak),
