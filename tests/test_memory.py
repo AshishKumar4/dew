@@ -62,9 +62,9 @@ def test_yaads_objective_switches_by_the_whole_errors_norm():
 
 def test_an_l2_linear_memory_runs_the_gated_delta_rule():
     """A linear memory on the l2 objective that steps every token is the delta rule: traced for an
-    H100, its call takes the gated delta rule's kernels through the shared recurrence's dispatch, and
-    the same memory chunked by four, whose gradients wait for their chunk's start, decides no such
-    route."""
+    H100, its call takes the gated delta rule's kernels through the shared recurrence's dispatch, a route
+    each product (forward, training; `recurrence_chunk.PORT_CELLS`), and the same memory chunked by four,
+    whose gradients wait for their chunk's start, decides no such route."""
     from dew.nn.kernels import generation
 
     def routes(module: InContextMemory) -> list[tuple[str, str]]:
@@ -74,7 +74,7 @@ def test_an_l2_linear_memory_runs_the_gated_delta_rule():
             jax.eval_shape(module.apply, params, x)
         return [(route.choice, route.kernel) for route in found if route.choice == "gated_delta_rule"]
 
-    assert routes(layer("delta_rule")) == [("gated_delta_rule", "fla")]
+    assert routes(layer("delta_rule")) == [("gated_delta_rule", "fla")] * 2
     assert routes(layer("delta_rule").clone(chunk=CHUNK)) == []
 
 
