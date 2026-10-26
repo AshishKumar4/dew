@@ -26,6 +26,7 @@ from recording import RecordingTracker
 from reference_error import (
     assert_as_exact,
     assert_as_exact_as_the_reference,
+    assert_fp32_reduction_bound,
     declared_seeds,
     indexed_recording,
     recording,
@@ -1040,26 +1041,22 @@ def _plain_kl(mean, reference, variance, mean_tangent, reference_tangent, varian
     return {name: np.asarray(value) for name, value in jax.jit(plain)(*map(jnp.asarray, inputs)).items()}
 
 
-UNIT = 2.0**-24
-"""float32's unit roundoff."""
-
-
 def _kl_bounds(mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent):
     """Each output's derived bound where the plain float32 arm overflows and has no reference (the
-    gate's ruling): the rounding count of its plain formula times float32's unit roundoff times the
-    float64 magnitude of its terms, check 2's form: a KL of n coordinates rounds n + 2 times (each
-    difference, each square, the n - 1 additions, the division), a VJP to the mean three times, and a
-    JVP twice the KL's and six more over its terms' absolute sum, so a sum that cancels is bounded by
-    what it cancelled."""
+    gate's ruling), check 2's form (`assert_fp32_reduction_bound`): the float64 magnitude of its terms
+    and the rounding count of its plain formula, a KL of n coordinates n + 2 (each difference, each
+    square, the n - 1 additions, the division), a VJP to the mean three, the variance's the KL's and
+    two more, and a JVP twice the KL's and six more over its terms' absolute sum, so a sum that
+    cancels is bounded by what it cancelled. Each as `(magnitudes, roundings)`."""
     wide = [np.asarray(value, np.float64) for value in
             (mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent)]
     difference, moving = wide[0] - wide[1], wide[3] - wide[4]
     count = difference.shape[1]
     divergence = np.sum(difference**2, axis=1) / (2 * wide[2])
     terms = np.sum(np.abs(difference * moving), axis=1) / wide[2] + divergence * np.abs(wide[5]) / wide[2]
-    return {"KL": (count + 3) * UNIT * divergence, "JVP": (2 * count + 12) * UNIT * terms,
-            "VJP to the mean": 4 * UNIT * np.abs(wide[6][:, None] * difference / wide[2][:, None]),
-            "VJP to the variance": (count + 6) * UNIT * np.abs(wide[6] * divergence / wide[2])}
+    return {"KL": (divergence, count + 2), "JVP": (terms, 2 * count + 10),
+            "VJP to the mean": (np.abs(wide[6][:, None] * difference / wide[2][:, None]), 3),
+            "VJP to the variance": (np.abs(wide[6] * divergence / wide[2]), count + 4)}
 
 
 def _kl_derivatives(mean, reference, variance, mean_tangent, reference_tangent, variance_tangent, cotangent):
@@ -1112,7 +1109,8 @@ def _assert_kl_outputs(dew, plain, truth, bounds, label):
             assert_as_exact_as_the_reference(value[held], reference[held], exact[held], f"{label}: {name}")
         unheld = ~np.isfinite(reference) & (kinds == "normal")
         assert np.all(np.isfinite(value[unheld])), name
-        assert np.all(np.abs(value[unheld] - exact[unheld]) <= bounds[name][unheld]), name
+        magnitudes, roundings = bounds[name]
+        assert_fp32_reduction_bound(value[unheld], exact[unheld], magnitudes[unheld], roundings)
         over = kinds == "over"
         assert np.all(np.isinf(value[over]) & (np.sign(value[over]) == np.sign(exact[over]))), name
         assert np.all(_below_normal(value[kinds == "below"])), name
