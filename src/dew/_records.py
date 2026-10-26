@@ -55,8 +55,8 @@ def duration(value: str) -> datetime.timedelta:
     return datetime.timedelta(microseconds=micros)
 
 
-def is_share(value: object) -> bool:
-    """Whether `value` is written as a share of a run, such as `5%` (`share`)."""
+def is_share(value: int | str | datetime.timedelta | None) -> bool:
+    """Whether `value`, a cadence or warmup as written, is a share of a run, such as `5%` (`share`)."""
     return isinstance(value, str) and value.endswith("%")
 
 
