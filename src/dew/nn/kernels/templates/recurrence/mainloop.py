@@ -39,6 +39,7 @@ six of the parts' whose orders sum under three, an fp32 product's accuracy.
 
 Decode is not on the mainloop: a one-token step takes `recurrence.step` (row 1424 for its Mosaic form)."""
 
+import contextlib
 import contextvars
 import dataclasses
 import functools
@@ -55,21 +56,23 @@ from jax.experimental.pallas import mosaic_gpu as plgpu
 from dew.nn import precision
 from dew.nn.inputs import cu_seqlens
 from dew.nn.kernels import chunked_launch, generation, recurrence_algebra as algebra
-from dew.nn.kernels.templates import mosaic, mosaic_sm80, mosaic_sm90
-
-FAMILIES: dict[str, mosaic.Family] = {"mma.sync": mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16)),
-                                      "wgmma": mosaic_sm90.WGMMA}
-"""The bundles the mainloop issues by, by the instruction family each claims (`generation.family`)."""
+from dew.nn.kernels.templates import bundles, mosaic, mosaic_sm80, mosaic_sm90
 
 INTERPRETED = mosaic_sm90.WGMMA
 """The bundle Mosaic GPU's interpreter runs the mainloop by off a GPU of a family it claims (a CPU): wgmma's,
 whose producer role, TMA rings and barriers the interpreter models (its products the dots they compute)."""
 
 
-def family_of() -> mosaic.Family | None:
-    """The bundle of the device's instruction family, None where the mainloop has none (a CPU's)."""
-    name = generation.family(generation.device_generation())
-    return None if name is None else FAMILIES.get(name)
+def bundle_dtype(dtype) -> jnp.dtype:
+    """The 16-bit operands a call of `dtype`'s products take on a bundle (`bundles.of`'s dtype): its own, an
+    fp32 call's bf16 parts."""
+    return jnp.dtype(jnp.bfloat16 if jnp.dtype(dtype) == jnp.float32 else dtype)
+
+
+def family_of(dtype=jnp.bfloat16) -> mosaic.Family | None:
+    """The bundle of the device's instruction family for a call of `dtype` (`bundles.of`), None where the
+    mainloop has none (a CPU's)."""
+    return bundles.of(generation.device_generation(), bundle_dtype(dtype))
 
 CHUNK = 64
 """Tokens a chunk, fla's."""
@@ -1557,7 +1560,7 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     head the solve's but where its `inverse` is given, and the weighted and states launches' but where their
     `kept` values, `(w, h, corrected)`, are (`kept_forward`'s; its final memory then None). The solve stores
     its inverse where the call `keeps` it (`_solved`)."""
-    family = family_of() if family is None else family
+    family = family_of(jnp.result_type(q, k, v)) if family is None else family
     if family is None:
         raise NotImplementedError(f"the mainloop has no bundle for the "
                                   f"{generation.family(generation.device_generation())!r} family")
@@ -1619,10 +1622,11 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
 
 def planned(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, starts=None,
             max_segments: int | None = None, delta: bool = True, backward: bool = False,
-            floor: float | None = None) -> tuple[Launch, ...]:
+            floor: float | None = None, target: generation.GpuTarget | None = None) -> tuple[Launch, ...]:
     """The launches a call over operands of these shapes (`jax.ShapeDtypeStruct`s, `forward`'s) runs at
-    `tiles` by `family`'s bundle, in order, as planned (`Launch`): its arrays abstract (`jax.eval_shape`), its
-    kernels declared and not built (`_kernel`); with `backward`, the fast backward's too (`gradients`)."""
+    `tiles` by `family`'s bundle on `target` (the device's, or the assumed one's, where None), in order, as
+    planned (`Launch`): its arrays abstract (`jax.eval_shape`), its kernels declared and not built
+    (`_kernel`); with `backward`, the fast backward's too (`gradients`)."""
     found: list[Launch] = []
 
     def run(q, k, v, g, beta, h0, starts):
@@ -1637,7 +1641,8 @@ def planned(q, k, v, g, beta, h0=None, *, tiles: Tiles, family: mosaic.Family, s
         finally:
             _PLANNED.reset(token)
 
-    jax.eval_shape(run, q, k, v, g, beta, h0, starts)
+    with contextlib.nullcontext() if target is None else generation.assumed(target):
+        jax.eval_shape(run, q, k, v, g, beta, h0, starts)
     return tuple(found)
 
 

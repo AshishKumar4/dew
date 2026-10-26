@@ -30,7 +30,7 @@ from test_recurrence_chunk import (
 
 from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk, mosaic_rule
-from dew.nn.kernels.templates import mosaic
+from dew.nn.kernels.templates import bundles, mosaic
 from dew.nn.kernels.templates.base import Unfitted
 from dew.nn.kernels.templates.recurrence import mainloop, template
 
@@ -243,7 +243,7 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles_as_exact_as_its_referen
     if dtype == jnp.float32:
         with generation.assumed(UNSEEN):
             assert template.MOSAIC.derived(bound, UNSEEN) is None
-            narrowest = mainloop.Tiles(mainloop.FAMILIES['mma.sync'].narrowest_columns(jnp.bfloat16), 1)
+            narrowest = mainloop.Tiles(bundles.of('sm80', jnp.bfloat16).narrowest_columns(jnp.bfloat16), 1)
             assert template.MOSAIC.registers(bound, narrowest) > template.MOSAIC.register_budget(narrowest)
         return
     with generation.assumed(UNSEEN):
@@ -263,7 +263,7 @@ def test_an_unseen_gpus_facts_derive_the_templates_tiles_as_exact_as_its_referen
     def dew(given: Chunk, tiles: mainloop.Tiles):
         return mosaic_rule(given.query, given.key, given.value, given.log_decay, given.beta, given.state,
                            tiles=tiles, starts=given.starts, scale=hooks.scale,
-                           family=mainloop.FAMILIES['mma.sync'])
+                           family=bundles.of('sm80', jnp.bfloat16))
 
     truth = jax.jit(functools.partial(token_by_token, hooks))
     reference = truth if dtype == jnp.float32 else jax.jit(functools.partial(chunk_on, 'fla', hooks))
@@ -343,7 +343,7 @@ def compiled_cases(target: str, plans: dict, refused: list) -> list:
     its label into `plans` (`mainloop.planned`), each call the template refuses into `refused`."""
     from fla_gdn_support import KernelCase
 
-    family, facts = mainloop.FAMILIES[generation.family(target)], generation.gpu_target(target)
+    family, facts = bundles.of(target, jnp.bfloat16), generation.gpu_target(target)
     rows, length = 1, 256
 
     def cases(name: str, dtype, *, training: bool, packed: bool) -> list:
@@ -487,7 +487,7 @@ def test_the_mosaic_mainloop_compiles_within_each_gpus_shared_memory(target):
 
     plans, refused = {}, []
     found = compile_mosaic_kernels(compiled_cases(target, plans, refused), target)
-    failed = resource_failures(found, plans, mainloop.FAMILIES[generation.family(target)])
+    failed = resource_failures(found, plans, bundles.of(target, jnp.bfloat16))
     failed += [f"{case}: no tiles derived" for case in refused
                if case.startswith("qwen3.5-27b-gdn bfloat16") and "fast backward" not in case]
     assert not failed, "\n".join(failed)

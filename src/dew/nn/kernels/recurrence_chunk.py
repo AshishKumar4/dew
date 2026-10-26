@@ -776,7 +776,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     without the `delta` rule, on the recurrence template's Mosaic GPU mainloop
     (`templates.recurrence.mainloop.forward`): `fla_rule`'s operands and results, the operands in their
     common dtype and beta with them, the decay and the memory fp32, on one device, by the bundle of its
-    instruction family (`mainloop.family_of`), interpreted off a GPU of a family a bundle claims (Mosaic GPU's
+    instruction family (`mainloop.family_of`, `bundles.of`), interpreted off a GPU (Mosaic GPU's
     interpreter, `mainloop.INTERPRETED`'s). Its gradient: the gated delta rule's in a 16-bit call on the
     mainloop (`mainloop.gradients`, fla's DAG, fla's rounding) where its launches hold on the device
     (`mainloop.backward_holds`); on a GPU, a 16-bit delta rule's call the port takes (`PORT_SUPPORTS`) the
@@ -793,7 +793,7 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, tiles, starts=None,
     query, key, value, beta = (x.astype(dtype) for x in (query, key, value, beta))
     g = g.astype(jnp.float32)
     # Interpreted off a GPU (an assumed one's calls lower for it); a GPU no bundle claims runs no launch.
-    device, interpret = mainloop.family_of(), generation.backend() != 'gpu'
+    device, interpret = mainloop.family_of(dtype), generation.backend() != 'gpu'
     if family is None and device is None and not interpret:
         raise NotImplementedError(f"the recurrence template has no bundle for the "
                                   f"{generation.family(generation.device_generation())!r} family")
