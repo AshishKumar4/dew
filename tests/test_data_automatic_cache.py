@@ -1,5 +1,6 @@
 """Automatic caching: a chain's leading deterministic maps read back from what an earlier run made."""
 
+import itertools
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -155,10 +156,11 @@ def test_a_laid_out_chain_keeps_its_plan_and_resumes_across_its_automatic_cache(
         return compile(LAYOUTS[layout]().repeat(2).batch(2, drop_remainder=False), read=how,
                        loading=Loading(workers=0, threads=1, read_buffer=1, cache=cache))
 
-    # A first run reads the whole chain, which fills its caches; the next reads them back.
+    # A first run reads past a pass of every corpus, which fills its caches (a mixture draws on without
+    # end); the next reads them back.
     filling = loader(cache=True).train(DataPartition())
     try:
-        list(filling)
+        list(itertools.islice(filling, 4 * RECORDS))
     finally:
         filling.close()
     cached = loader(cache=True)
