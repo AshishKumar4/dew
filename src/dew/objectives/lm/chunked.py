@@ -414,18 +414,23 @@ def _capped(raw, cap, columns: _Columns, temperature: float):
     """A tile's logits from its fp32 head product `raw`, through the per-column terms, the softcap and
     the temperature (`capped_logits`), and the pullback `_head_backward` takes their cotangent through:
     the one head calculus the bounded, whole and fused heads share, each a schedule over it. The cap's
-    gradient sums every logit's share, rounded once (`compensated_sum`): the plain reduction its
-    transpose is rounds as it goes, and over a whole head's logits sat 1.58 times as far from float64
-    as the tiled head's sums of its tiles' on a CPU without YNNPACK's fusions."""
+    gradient sums the logits' shares of it, rounded once (`compensated_sum`), in the cap's own shape: the
+    plain reduction its transpose is rounds as it goes, and over a whole head's logits sat 1.58 times
+    as far from float64 as the tiled head's sums of its tiles' on a CPU without YNNPACK's fusions."""
     if cap is None:
         return jax.vjp(lambda raw, cap, terms: capped_logits(terms.logits(raw), cap, temperature), raw, cap,
                        columns)
     logits, pullback = jax.vjp(lambda raw, caps, terms: capped_logits(terms.logits(raw), caps, temperature),
                                raw, jnp.broadcast_to(jnp.asarray(cap, raw.dtype), raw.shape), columns)
 
+    shape = jnp.shape(cap)
+    lead = raw.ndim - len(shape)
+    # The axes the cap broadcasts along: those it lacks, and those it holds once.
+    axes = (*range(lead), *(lead + axis for axis, size in enumerate(shape) if size == 1))
+
     def pulled(cotangent):
         d_raw, d_caps, d_terms = pullback(cotangent)
-        d_cap = compensated_sum(d_caps, tuple(range(d_caps.ndim)))
+        d_cap = compensated_sum(d_caps, axes).reshape(shape)
         return d_raw, d_cap.astype(jnp.asarray(cap).dtype), d_terms
 
     return logits, pulled
@@ -529,7 +534,7 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, gro
             d_states = jax.lax.dynamic_update_slice_in_dim(
                 d_states, added_to(prior, states_tile), start, axis=1)
             if d_cap is not None:
-                d_cap = d_cap + cap_tile
+                d_cap = added_to(d_cap, cap_tile)
             return d_states, added_to(d_matrix, matrix_tile), d_cap, d_tile
 
         d_states, d_matrix, d_cap, d_tile = _over_tiles(
@@ -548,11 +553,12 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, gro
     d_states, d_table, d_cap, d_columns = _over_tiles(
         (running_sum(flat.shape, work),
          jnp.zeros(table.shape, table.dtype),
-         None if softcap is None else jnp.zeros_like(softcap),
+         None if softcap is None else running_sum(jnp.shape(softcap), work),
          jax.tree.map(lambda terms: jnp.zeros(terms.shape, work), columns)),
         table.shape[0], vocab_tile, vocabulary)
     d_columns = jax.tree.map(lambda gradient, terms: gradient.astype(terms.dtype), d_columns, columns)
     d_states = running_total(d_states)
+    d_cap = None if d_cap is None else running_total(d_cap).astype(jnp.asarray(softcap).dtype)
     return d_states.reshape(hidden.shape).astype(hidden.dtype), d_table, None, None, d_cap, d_columns
 
 
