@@ -4,7 +4,7 @@ import dataclasses
 import functools
 import hashlib
 import json
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import ClassVar, Literal
 
@@ -68,25 +68,11 @@ class Example:
                     f"targets.{name} is a distribution over the question's {count} options, "
                     f"got {list(target)}"
                 )
-        grouped: set[str] = set()
         for group in self.groups:
             _asked(self.questions, list(group.members))
-            if len(group.members) < 2:
-                raise ValueError(f"group {group.name!r} holds {len(group.members)} question; a group "
-                                 "holds two or more")
-            if grouped & set(group.members):
-                raise ValueError(f"questions {sorted(grouped & set(group.members))} stand in two groups")
-            grouped |= set(group.members)
-            canonical = None
-            for name, mapped in group.members.items():
-                if set(mapped) != set(self.questions[name].options):
-                    raise ValueError(f"group {group.name!r} maps question {name!r}'s options "
-                                     f"{sorted(mapped)}, not its {list(self.questions[name].options)}")
-                keys = set(mapped.values())
-                if canonical is not None and keys != canonical:
-                    raise ValueError(f"group {group.name!r}'s members map onto other canonical keys: "
-                                     f"{sorted(canonical)} and {sorted(keys)}")
-                canonical = keys
+        def question(name: str) -> Question:
+            return self.questions[name]
+        _checked_groups([(group.name, group.members) for group in self.groups], question)
 
     @classmethod
     def of(cls, row: "Example | Mapping[str, object]") -> "Example":
@@ -140,6 +126,100 @@ class Example:
         return np.eye(len(self.questions[name].options))[self.labels()[name]]
 
 
+def _checked_groups[K](groups: Sequence[tuple[str, Mapping[K, Mapping[str, str]]]],
+                        question: Callable[[K], Question]) -> None:
+    """Refuse groups that do not ask one thing: each `(name, members)` two members or more, no member
+    in two groups, and each member mapping every option of its question (`question(member)`) onto
+    canonical keys its group's members share."""
+    grouped: set = set()
+    for name, members in groups:
+        if len(members) < 2:
+            raise ValueError(f"group {name!r} holds {len(members)} question; a group holds two or more")
+        if grouped & set(members):
+            raise ValueError(f"questions {sorted(map(str, grouped & set(members)))} stand in two groups")
+        grouped |= set(members)
+        canonical = None
+        for member, mapped in members.items():
+            options = question(member).options
+            if set(mapped) != set(options):
+                raise ValueError(f"group {name!r} maps question {member!r}'s options {sorted(mapped)}, "
+                                 f"not its {list(options)}")
+            keys = set(mapped.values())
+            if canonical is not None and keys != canonical:
+                raise ValueError(f"group {name!r}'s members map onto other canonical keys: "
+                                 f"{sorted(canonical)} and {sorted(keys)}")
+            canonical = keys
+
+
+@dataclass(frozen=True)
+class GroupedExamples:
+    """Examples whose rows train together, so a consistency term (`DecisionObjective.consistency`)
+    holds questions asked across them to one answer: the same question negated, paraphrased or its
+    options re-ordered in rows of their own, under any layout.
+
+    `groups` names each set of such questions, `(name, members)`, its members keyed by the example's
+    index in `examples` and the question's name there, each mapping its question's every option key
+    onto canonical keys the members share, as an example's own `Group` does. An example's own groups
+    hold too, numbered with these. The examples' rows train in one packed window, as a unit the
+    packer does not split (`DecisionObjective.data`): a unit too long for a window is refused."""
+
+    examples: tuple[Example, ...]
+    groups: tuple[tuple[str, Mapping[tuple[int, str], Mapping[str, str]]], ...] = ()
+
+    def __post_init__(self):
+        object.__setattr__(self, "examples", tuple(Example.of(example) for example in self.examples))
+        if not self.examples:
+            raise ValueError("grouped examples hold one example or more")
+        for name, members in self.groups:
+            for index, asked in members:
+                if not 0 <= index < len(self.examples) or asked not in self.examples[index].questions:
+                    raise ValueError(f"group {name!r} names question {asked!r} of example {index}, "
+                                     f"which the {len(self.examples)} examples do not ask")
+            own = {(index, member) for index, example in enumerate(self.examples)
+                   for group in example.groups for member in group.members}
+            if own & set(members):
+                raise ValueError(f"group {name!r} holds questions {sorted(own & set(members))} an "
+                                 "example already groups")
+        def question(key: tuple[int, str]) -> Question:
+            return self.examples[key[0]].questions[key[1]]
+        _checked_groups(list(self.groups), question)
+
+    def group_of(self, index: int, name: str) -> tuple[int, Mapping[str, str]] | None:
+        """The unit-wide index of the group example `index`'s question `name` stands in, counting each
+        example's own groups after these, and the member's map onto its canonical keys, or None."""
+        for number, (_, members) in enumerate(self.groups):
+            if (index, name) in members:
+                return number, members[index, name]
+        number = len(self.groups) + sum(len(example.groups) for example in self.examples[:index])
+        found = self.examples[index].group_of(name)
+        return None if found is None else (number + found[0], found[1].members[name])
+
+    @classmethod
+    def of(cls, row: "GroupedExamples | Mapping[str, object]") -> "GroupedExamples":
+        """Return grouped examples as they are, or build them from a row with `examples` (each as
+        `Example.of` reads one) and `groups`: each group's name mapping `"<index>.<question>"` to the
+        question's options mapped onto canonical keys."""
+        if isinstance(row, GroupedExamples):
+            return row
+        held = json_value(row.get("examples"), "examples")
+        if not isinstance(held, list):
+            raise ValueError(f"examples is a list of examples, got {type(held).__name__}")
+        examples = [Example.of(record(example, f"examples.{index}")) for index, example in enumerate(held)]
+        groups = []
+        for name, members in record(row.get("groups", {}), "groups").items():
+            mapped = {}
+            for member, options in record(members, f"groups.{name}").items():
+                index, _, question = member.partition(".")
+                if not index.isdigit() or not question:
+                    raise ValueError(f"groups.{name} names a member as '<example index>.<question>', "
+                                     f"got {member!r}")
+                mapped[int(index), question] = {
+                    key: records.text(canonical, f"groups.{name}.{member}.{key}")
+                    for key, canonical in record(options, f"groups.{name}.{member}").items()}
+            groups.append((name, mapped))
+        return cls(tuple(examples), tuple(groups))
+
+
 def groups_of(value: JSON) -> tuple[Group, ...]:
     """A row's `groups`, as `Example.groups` holds them: a mapping of each group's name to its members,
     each member's option keys mapped to canonical keys, or None for none."""
@@ -191,11 +271,14 @@ def _slots(stated: Mapping[str, object]) -> dict[str, int]:
 
 @dataclass(frozen=True)
 class ParseExample:
-    """A row of an example's fields as its `Example`, or a row that holds its `Example` already as it is."""
+    """A row of an example's fields as its `Example`, a row of grouped examples' fields (`examples`) as
+    its `GroupedExamples`, or a row that holds either already as it is."""
 
     def __call__(self, row: Mapping[str, object]) -> Mapping[str, object]:
         held = row.get("example")
-        return {"example": held if isinstance(held, Example) else Example.of(row)}
+        if isinstance(held, (Example, GroupedExamples)):
+            return {"example": held}
+        return {"example": GroupedExamples.of(row) if "examples" in row else Example.of(row)}
 
 
 @dataclass(frozen=True)
@@ -217,7 +300,7 @@ class ParseTable:
     context: str | None = None
 
     def __call__(self, row: Mapping[str, object]) -> Mapping[str, object]:
-        if "state" in row and "questions" in row:
+        if ("state" in row and "questions" in row) or "examples" in row:
             return ParseExample()(row)
         label = row[self.label]
         if not isinstance(label, (str, int, float, bool)):

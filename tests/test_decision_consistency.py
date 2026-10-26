@@ -2,8 +2,9 @@
 over a canonical option set, by the generalized Jensen-Shannon divergence of their answers
 (`categorical.group_divergence`, checked in test_categorical); the groups ride a row's encoding and a
 packed window, a weight of zero reads none of them, and the layouts that would split a group's members
-across rows refuse it."""
+across rows train as one unit."""
 
+import dataclasses
 import itertools
 
 import jax
@@ -14,17 +15,21 @@ from decision_support import decision_rows
 from test_decision_objective import SPECIALS, TOKENIZER, tiny_backbone
 
 from dew.data.dataset import DataPartition
+from dew.data.pipeline import Rejected
 from dew.decision import (
     Choice,
     DecisionObjective,
     Example,
     Group,
+    GroupedExamples,
     JointLayout,
     JointSchemaHead,
     Noul,
     StateFirstLayout,
 )
 from dew.decision.objective import DecisionStatistics, Encoding, Fit, _window_groups
+from dew.decision.task import laid_out
+from dew.nn import categorical
 from dew.objectives.base import Ratio, Step
 
 LAYOUT = JointLayout(max_len=1024)
@@ -99,17 +104,98 @@ def test_a_weight_of_zero_reads_no_groups_and_a_weight_adds_the_term_beside_the_
     assert "consistency" in aux.metrics
 
 
-def test_groups_a_layout_would_split_across_rows_refuse_a_run_that_reads_them():
-    """A layout of a question a row lays a group's members out in different rows: with a consistency
-    term its examples with groups refuse the run, and without one their groups are not read."""
+PARAPHRASED = GroupedExamples(
+    (Example("the customer was charged twice", {"billing": Noul("Is this about billing?")},
+             {"billing": "true"}),
+     Example("the client paid two times", {"charge": Noul("Is this a charging problem?"),
+                                           "team": Choice("Which team?", ["billing", "tech", "sales"])},
+             {"team": "billing"}),
+     Example("charged twice, the customer was", {"other": Noul("Is this about something else?")}, {})),
+    groups=(("billing", {(0, "billing"): {"true": "yes", "false": "no"},
+                         (1, "charge"): {"true": "yes", "false": "no"},
+                         (2, "other"): {"true": "no", "false": "yes"}}),))
+"""One question asked in three rows of their own: paraphrased, its state reworded, and negated, one
+member unlabelled; and an ungrouped question beside one of them."""
+
+
+@pytest.mark.parametrize("layout", [JointLayout(max_len=1024), StateFirstLayout(max_len=512)],
+                         ids=["joint", "state-first"])
+def test_examples_grouped_across_rows_train_in_one_window_and_agree_as_one_group(layout):
+    """Questions grouped across examples (`GroupedExamples`) train as one unit: under a joint layout and
+    a layout of a question a row, packed beside an ungrouped example, their rows land in one window and
+    their members, labelled or not, are one group of it, mapped onto its canonical options; the term
+    is `group_divergence` over those members' logits, computed apart from the window."""
+    backbone = tiny_backbone().clone(max_seq_len=layout.max_len)
+    objective = DecisionObjective(backbone, tokenizer=TOKENIZER, specials=SPECIALS, layout=layout,
+                                  consistency=0.5)
+    reader = decision_rows([PARAPHRASED, NEGATED], None, objective=objective.data(),
+                           tokens=layout.max_len)
+    [batch] = list(itertools.islice(reader.train(DataPartition()), 1))
+    groups = np.asarray(batch["groups"])
+    inputs = laid_out(batch, objective.bounds.segments)
+    variables = objective.init(jax.random.key(0))
+    logits = objective.model.logits(variables, inputs)
+    # A padding question scores over an even, finite distribution, as the loss reads it.
+    empty = ~jnp.any(jnp.asarray(inputs.options), axis=-1, keepdims=True)
+    logits = jnp.where(empty, 0.0, logits)
+    asked = np.asarray(inputs.kinds) > 0
+    shared = [group for group in np.unique(groups[asked]) if group >= 0
+              and np.sum(groups == group) == 3]
+    assert len(shared) == 1, groups
+    members = np.argwhere(groups == shared[0])
+    # Each member's row: the window's row at the start of its instructions.
+    rows = {int(np.asarray(inputs.segments)[member[0], np.asarray(inputs.spans)[tuple(member)][0]])
+            for member in members}
+    assert len(rows) == (1 if layout.joint else 3)
+    canonical = np.asarray(batch["canonical"])
+    options = np.asarray(inputs.options) | np.asarray(empty)
+    apart, _ = categorical.group_divergence(
+        jnp.stack([logits[tuple(member)] for member in members])[None],
+        jnp.zeros((1, len(members)), jnp.int32),
+        jnp.stack([canonical[tuple(member)] for member in members])[None],
+        jnp.stack([options[tuple(member)] for member in members])[None])
+    together, _ = categorical.group_divergence(logits, jnp.asarray(groups), jnp.asarray(canonical),
+                                               jnp.asarray(options))
+    np.testing.assert_array_equal(np.asarray([together[tuple(member)] for member in members]),
+                                  np.asarray(apart[0]))
+
+
+def test_a_unit_no_window_holds_is_rejected_and_one_without_a_label_is_too():
+    """A unit of rows the packer places whole: past a window's tokens it is rejected as unfit, and with
+    no labelled question as unlabelled; an example's own groups under a layout of a question a row are
+    such a unit, where the run once refused them."""
     layout = StateFirstLayout(max_len=512)
-    head = DecisionObjective(tiny_backbone().clone(max_seq_len=512), tokenizer=TOKENIZER, specials=SPECIALS,
-                             layout=layout).model.head
-    reading = Fit(layout, TOKENIZER, SPECIALS, head, context_length=None, grouped=True)
+    objective = DecisionObjective(tiny_backbone().clone(max_seq_len=512), tokenizer=TOKENIZER,
+                                  specials=SPECIALS, layout=layout, consistency=0.5)
+    fit = Fit(layout, TOKENIZER, SPECIALS, objective.model.head, context_length=None, grouped=True,
+              bounds=objective.bounds)
+    unit = fit.map({"example": NEGATED})
+    assert not isinstance(unit, Rejected) and "decision_unit" in unit
+    long = GroupedExamples(tuple(Example("charged " * 200, {"billing": Noul("Is this about billing?")},
+                                         {"billing": "true"}) for _ in range(3)),
+                           groups=(("billing", {(index, "billing"): {"true": "yes", "false": "no"}
+                                                for index in range(3)}),))
+    assert isinstance(fit.map({"example": long}), Rejected)
+    unlabelled = dataclasses.replace(PARAPHRASED, examples=tuple(
+        dataclasses.replace(example, answers={}) for example in PARAPHRASED.examples))
+    assert fit.map({"example": unlabelled}) == Rejected("unlabelled")
+
+
+def test_grouped_examples_name_questions_they_ask_once_each():
+    """A group names questions the examples ask (`<index>.<question>` in a row's fields), none an
+    example already groups, each mapping its options onto the group's canonical keys."""
     with pytest.raises(ValueError):
-        reading.map({"example": NEGATED})
-    ignoring = Fit(layout, TOKENIZER, SPECIALS, head, context_length=None, grouped=False)
-    ignoring.map({"example": NEGATED})
+        GroupedExamples(PARAPHRASED.examples, groups=(("billing", {(3, "billing"): {}, (0, "billing"): {}}),))
+    with pytest.raises(ValueError):
+        GroupedExamples((NEGATED, PARAPHRASED.examples[0]),
+                        groups=(("billing", {(0, "billing"): {"true": "yes", "false": "no"},
+                                             (1, "billing"): {"true": "yes", "false": "no"}}),))
+    row = {"examples": [{"state": "a", "questions": {"q": {"kind": "noul", "instructions": "q?"}},
+                         "answers": {"q": "true"}},
+                        {"state": "b", "questions": {"q": {"kind": "noul", "instructions": "q?"}}}],
+           "groups": {"same": {"0.q": {"true": "yes", "false": "no"}, "1.q": {"true": "yes", "false": "no"}}}}
+    grouped = GroupedExamples.of(row)
+    assert grouped.group_of(1, "q") == (0, {"true": "yes", "false": "no"})
 
 
 def test_a_group_maps_every_option_of_every_member_onto_one_canonical_set():
