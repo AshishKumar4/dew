@@ -16,7 +16,7 @@ from jax.sharding import Mesh
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations, with_gradients
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
-from dew.nn.kernels.templates import cost, mosaic_sm80
+from dew.nn.kernels.templates import cost
 from dew.nn.kernels.templates.gemm import mosaic_gpu, template
 from dew.nn.moe import expert_projection
 from tools import grouped_oracle as oracle
@@ -533,11 +533,10 @@ def test_a_tile_of_192_columns_stages_every_column_it_writes():
 
 
 AMPERE_CLASS = jax.default_backend() == "cpu" or (
-    jax.default_backend() == "gpu" and not generation.gpu_target().wgmma and mosaic_sm80.staging_solved())
+    jax.default_backend() == "gpu" and not generation.gpu_target().wgmma)
 """Whether this process runs mma.sync's kernels: a CPU interprets them as an A100's; a GPU without warpgroup
-MMA (an A100, an A10, an L4) runs them on its own facts where its JAX's layout inference places them
-(`mosaic_sm80.staging_solved`), where one with warpgroup MMA lowers them for its own device, whose pipelines
-its Mosaic sizes past its block (SM80-h100)."""
+MMA (an A100, an A10, an L4) runs them on its own facts, where one with warpgroup MMA lowers them for its
+own device, whose pipelines its Mosaic sizes past its block (SM80-h100)."""
 
 
 def ampere(generation_name: str = "sm80"):

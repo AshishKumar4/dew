@@ -269,15 +269,12 @@ def _gemm_mainloop_cases(generation_name: str, *, every_consumer_count: bool = F
 def test_each_gemm_mainloop_compiles_at_its_picks_within_each_gpus_resources(generation_name):
     """Every GEMM Mosaic GPU mainloop a generation runs (`_gemm_mainloop_cases`: warpgroup MMA's forward,
     input and kernel gradients and hooked forms on an H100; mma.sync's forward and input gradient on an
-    A100, an A10 and an L4 where this JAX's layout inference places its tiles), at the tile its launch
+    A100, an A10 and an L4), at the tile its launch
     derives from the generation's facts, compiled by Mosaic for a compile-only device of the generation on
     this CPU through ptxas: within the block's shared memory, spilling nothing (a derived tile holds its
     registers: `Template.legal`)."""
     from kernel_compile import compile_mosaic_kernels
 
-    if not generation.gpu_target(generation_name).wgmma and not mosaic_sm80.staging_solved():
-        # A CPU interprets mma.sync's tiles at any JAX; lowered for the GPU, they need its layout inference.
-        pytest.skip("this JAX's layout inference places no mma.sync tile but its 128x256 (STAGING_SOLVED)")
     cases = _gemm_mainloop_cases(generation_name)
     # Every form the generation's family runs derives a tile at these shapes: an eligibility regression
     # fails here rather than leaving the gate fewer cases.
