@@ -156,7 +156,7 @@ A global count-preserving or memory-materialized plan resumes across process cou
 
 Each factory returns an exclusively owned iterator. Final `close()` must not race iteration or checkpoint operations. `request_stop()`, where supplied, is a nonblocking signal safe alongside both. The compiler's host stages forward ownership and position.
 
-`DevicePrefetchIterator(iterator, mesh, depth=2, source_state=None)` in `dew.training.distributed` takes ownership after successful construction. It starts reading and restoring on the first `next()`; closing an unused iterator only finalizes it. Use it in a context manager or call `close(timeout=5.0)`.
+`DevicePrefetchIterator(iterator, mesh, depth=2, source_state=None)` in `dew.distributed.batches` takes ownership after successful construction. It starts reading and restoring on the first `next()`; closing an unused iterator only finalizes it. Use it in a context manager or call `close(timeout=5.0)`.
 
 Depth is positive. The queue contains at most that many device batches plus one in flight. Saved source state names the last delivered batch, not speculative read-ahead. EOF or failure follows already queued batches; early close discards unread work and reports finalization errors.
 
