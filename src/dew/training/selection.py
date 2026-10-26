@@ -112,7 +112,7 @@ def _declared_shown(metric: Metric | Summary) -> Shown | None:
 
 
 def rankings(best: Sequence[Best], scores: Mapping[str, float], *, validation: str | None,
-             declared: Mapping[str, Sequence[Metric]], objective) -> tuple[Ranking, ...]:
+             declared: Mapping[str, Sequence[Metric | Summary]], objective) -> tuple[Ranking, ...]:
     """How an evaluation's `scores` rank its state: by each `best` policy, a threshold it misses
     ranking nothing (a NaN), or without one by the `validation` split's loss, else the training
     loss. A step no evaluation scored ranks nothing, and asks no aggregate. `declared` (each

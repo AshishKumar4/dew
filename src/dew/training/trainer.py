@@ -1318,10 +1318,9 @@ class Trainer(Generic[Loss, Effects]):
     ) -> TrainState:
         """Train until the step or real-token cap is reached, resuming the latest checkpoint.
 
-        An explicit `state` is the run's initial state, in place of initializing one
-        and of restoring a checkpoint: a float64 truth's widened copy of another
-        run's initial state, say. It is not a continuation, which is a checkpoint's
-        alone: its input reader starts at the position `dataset` supplies.
+        An explicit `state` is the run's initial state, in place of initializing one and of restoring a
+        checkpoint (a float64 truth's widened copy of another run's, say), not a continuation, which is a
+        checkpoint's alone: its input reader starts at the position `dataset` supplies.
 
         Every `log_every` steps, the tracker receives the loss, the objective's metrics and the throughput.
 
@@ -1376,10 +1375,8 @@ class Trainer(Generic[Loss, Effects]):
         count_compilation_cache()
         self._schedule(None if steps is None else steps // self.accumulation)
         suites = _suites(loader, validation, metrics, eval_every)
-        summaries = self._summaries(summaries, suites)
-        declared = declarations(suites, metrics, summaries)
-        selection, plateau, pause = self._fit_policies(best, stop, declared, checkpoint_every, steps,
-                                                       tokens)
+        declared = declarations(suites, metrics, summaries := self._summaries(summaries, suites))
+        selection, plateau, pause = self._fit_policies(best, stop, declared, checkpoint_every, steps, tokens)
         self._preflight(loader, plateau, suites, preview=preview,
                         loss=(self.checkpoints is not None or restore_best) and not selection)
         preview = preview and self.tracker is not None

@@ -636,7 +636,7 @@ class MetricScores[Statistics, Additions](Mapping):
 
     def __init__(
         self,
-        declared: Mapping[str, Sequence[Metric]],
+        declared: Mapping[str, Sequence[Metric | Summary]],
         scores: Mapping[str, float],
         objective: Objective[Statistics, Additions],
     ):
