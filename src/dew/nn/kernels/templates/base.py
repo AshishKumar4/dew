@@ -1,10 +1,11 @@
-"""What every algorithm template shares: a launch whose configs fit the device and whose heuristic is
-its cost model's fastest fitting config (`Template`), and one call of a template's implementations
-(`Call`), whose eligibility a selector over them reads (`dew.nn.kernels.selection`).
+"""What every algorithm template shares: a launch whose config fits the device, derived from its facts
+(`Template.derived`) or a fixed space's first that fits, nothing ranked (bible §6), and one call of a
+template's implementations (`Call`), whose eligibility a selector over them reads
+(`dew.nn.kernels.selection`).
 
-A template's launch declares the configs it is proven over (`space`), the shared memory a program
-stages at each (`staged_bytes`), and the seconds it estimates at each on a target (`cost`,
-`dew.nn.kernels.templates.cost`). The launch takes its heuristic, the same on every run.
+A template's launch declares the config it derives (`derived`) or the fixed set it names (`space`), and
+the shared memory a program stages at each (`staged_bytes`). The launch takes its heuristic, the same on
+every run.
 """
 
 import dataclasses
@@ -20,8 +21,8 @@ from dew.nn.kernels.templates import cost
 class Template[Config: Hashable](tuning.KernelOp):
     """A template's launch, its configs all of one `Config` type. A template that generates its kernel
     (`derived`, docs/design/kernel-templates.md §0) derives its one config from the device's and its
-    family's facts and the call's extents; one that does not yet names a fixed set (`space`) the cost
-    model picks its heuristic from, ties going to the first in `space`'s order. `staged_bytes` and
+    family's facts and the call's extents; one that does not yet names a fixed set (`space`), whose first
+    that fits is its heuristic. `staged_bytes` and
     `registers` say whether a config fits a block of the device (`legal`, `fitting`), which a pin of any
     legal config is checked by. An implementation that does not run a call on a target says so in
     `eligible`. A hook is a plain JAX callable the kernel's body traces, and the ops beside the launch
@@ -64,15 +65,6 @@ class Template[Config: Hashable](tuning.KernelOp):
         del config
         return cost.THREAD_REGISTERS
 
-    def costed(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> cost.Cost:
-        """The work, bytes and geometry the estimate of the launch of `ba` at `config` on `target` reads
-        (`cost.Cost`)."""
-        raise NotImplementedError(f"{type(self).__name__} declares no cost")
-
-    def cost(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> float:
-        """The seconds the launch of `ba` is estimated to take at `config` on `target`: its `costed`
-        record's (`cost.seconds`)."""
-        return cost.seconds(self.costed(ba, config, target), target)
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         """Whether the implementation runs the call `ba` on `target` (its dtypes, its widths, the
@@ -151,17 +143,10 @@ class Template[Config: Hashable](tuning.KernelOp):
                     f"on {target.generation} holds")
         return "its blocks, ring or schedule are not ones the launch's kernel takes for this call"
 
-    def estimate(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[float, Config]:
-        """The seconds `cost` estimates for the launch on `target` and its config: its generated one
-        (`derived`), or the fitting config of its `space` `cost` estimates fastest, the first of
-        `space`'s order where several tie."""
-        fits = self.fitting(ba, target)
-        costs = [self.cost(ba, config, target) for config in fits]
-        fastest = min(range(len(fits)), key=lambda index: (costs[index], index))
-        return costs[fastest], fits[fastest]
 
     def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> Config:
-        return self.estimate(ba, generation.gpu_target())[1]
+        # The derived config, or a fixed space's first that fits: nothing ranks configs (bible §6).
+        return self.fitting(ba, generation.gpu_target())[0]
 
     def neighbours(self, ba: tokamax.BoundArguments, config: Config) -> Sequence[Config]:
         """The configs next to a generating launch's derived `config` an opt-in tuning run may time beside

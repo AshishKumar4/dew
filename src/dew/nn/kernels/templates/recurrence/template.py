@@ -267,7 +267,8 @@ class Mosaic(base.Template[mainloop.Tiles]):
         return bool(self.fits(ba, target))
 
     def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> mainloop.Tiles:
-        return self.estimate(ba, self.launched())[1]
+        # Its derived config on the target it launches for (`Template.estimate` and its ranking are gone).
+        return self.fitting(ba, self.launched())[0]
 
 
 MOSAIC = Mosaic()
