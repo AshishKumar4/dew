@@ -82,6 +82,7 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 - An S3 store's conditional writes go through s3fs's own call (`call_s3`), as its reads and plain writes
   do, so a profile's server-side encryption (a KMS key, SSE-C) and its bucket's regional client reach
   them; a refused condition is still `PreconditionFailed`.
+  timed against the batch whole a rung up on every backend.
 - 8-bit Adam state codes each moment value among the six codes around its estimate, its decade by its
   logarithm, instead of searching the whole map: on an A100, lm-dense's update takes 27.32 ms against
   60.39, its full-remat step 167.9 against 196.3 ms and compiles in 82.3 against 209.8 s, the codes
