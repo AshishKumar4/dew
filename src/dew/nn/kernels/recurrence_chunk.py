@@ -980,8 +980,11 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
     contraction (`recurrence.Hooks`), as its kernels clamp each pairwise decay to at most one; else
     on a TPU's Pallas scan where its tiling covers the geometry, or the portable math, the skip added
     after; only the portable math without `kernels`. `g` is the log decay the rate and the write gate
-    `beta` form (`recurrence.log_gates`), which the kernels form themselves. Returns the output in
-    `work`, unrounded, and the memory `[B, Hv, Dk, Dv]`."""
+    `beta` form (`recurrence.log_gates`), which the kernels form themselves. A kernel takes head and
+    state widths padded with zero columns to powers of two (`_scan_widths`), which change no real
+    output or gradient, the outputs cut back: Nemotron-H 4B's 80-wide heads took the portable math, 6.89
+    ms a forward against mamba_ssm's 0.89 (SE-ssd-mamba-h100-0428aad7b). Returns the output in `work`,
+    unrounded, and the memory `[B, Hv, Dk, Dv]`."""
     rate = given['rate'].astype(work)
     skip = given['skip'].astype(work) if hooks.skip else jnp.zeros(rate.shape, work)
     operand = jnp.result_type(query, key, value)
@@ -991,21 +994,32 @@ def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict
     # The SSD's memory is `[P, N]`, values by keys: the template's `[N, P]` transposed.
     carried = (rows_like(jnp.zeros((batch, heads, head_dim, state_size), work), x) if state is None
                else jnp.swapaxes(state, -1, -2).astype(work))
-    case = scan_case(x, B, chunk_size, tpu=kernels)
+    columns, rows = _scan_widths(head_dim), _scan_widths(state_size)
+    wide_x, wide_B, wide_C = _padded(x, 3, columns), _padded(B, 3, rows), _padded(C, 3, rows)
+    case = scan_case(wide_x, wide_B, chunk_size, tpu=kernels)
     # Without `kernels` the caller's route is the portable math.
     kernel = select(SCAN, case, None if kernels else 'xla').kernel
-    if kernel == 'pallas':
-        out, final = _ssd_ported(x, beta, rate, B, C, skip, carried, chunk_size, starts)
-        return out.astype(work), jnp.swapaxes(final.astype(work), -1, -2)
-    if kernel == 'tpu':
-        out, final = _ssd_tpu(x, beta, rate, B, C, skip, carried, chunk_size, starts, case.tpu, work)
-        return out, jnp.swapaxes(final, -1, -2)
+    if kernel in ('pallas', 'tpu'):
+        wide_state = _padded(_padded(carried, 2, columns), 3, rows)
+        if kernel == 'pallas':
+            out, final = _ssd_ported(wide_x, beta, rate, wide_B, wide_C, skip, wide_state, chunk_size, starts)
+            out, final = out.astype(work), final.astype(work)
+        else:
+            out, final = _ssd_tpu(wide_x, beta, rate, wide_B, wide_C, skip, wide_state, chunk_size, starts,
+                                  case.tpu, work)
+        return out[..., :head_dim], jnp.swapaxes(final[..., :head_dim, :state_size], -1, -2)
     group = heads // key.shape[2]
     if group > 1:
         query, key = (jnp.repeat(t, group, axis=2) for t in (query, key))
     out, final = chunk_delta_rule(query, key, value, g[..., None], beta, state, chunk_size, starts=starts,
                                   delta=False, scale=1.0, dtype=work)
     return recurrence.skipped(hooks, out, value, given, work), final
+
+
+def _scan_widths(width: int) -> int:
+    """A scan kernel's width for a head or state `width` (`_rated_scan`): the power of two at or past it, at
+    least 16, the smallest block Triton's dot takes (`SSD_SUPPORTS`)."""
+    return max(16, 1 << (width - 1).bit_length())
 
 
 RESET_DECAY = -1e4

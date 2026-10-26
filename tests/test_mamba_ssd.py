@@ -154,6 +154,33 @@ def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
                         seeds=seeds, truth_fn=truth)
 
 
+def test_the_port_takes_widths_padded_to_powers_of_two():
+    """A scan whose head and state widths are no powers of two (Nemotron-H 4B's 80-wide heads) runs on the
+    port over its operands padded with zero columns (`recurrence_chunk._rated_scan`), its route the port's:
+    its output, final state and every operand's gradient the port's over the padded operands, cut back,
+    bit for bit."""
+    (x, dt, A, B, C, D, h0), starts = scan_operands(2, 40, 4, 20, 2, 24, documents=True)
+    keys = jax.random.split(jax.random.key(3))
+    dy, dfinal = jax.random.normal(keys[0], x.shape), jax.random.normal(keys[1], h0.shape)
+
+    def padded(t, *widths):
+        """`t` padded with zero columns on its last axes to `widths`."""
+        ends = [(0, wide - size) for wide, size in zip(widths, t.shape[-len(widths):], strict=True)]
+        return jnp.pad(t, [(0, 0)] * (t.ndim - len(widths)) + ends)
+
+    with row_names_port(), generation.routes() as found:
+        got = jax.jit(through(16, starts, dy, dfinal))(x, dt, A, B, C, D, h0)
+    assert ("ssd", "pallas") in {(route.choice, route.kernel) for route in found}
+    wide = (padded(x, 32), dt, A, padded(B, 32), padded(C, 32), D, padded(h0, 32, 32))
+    with row_names_port():
+        want = jax.jit(through(16, starts, padded(dy, 32), padded(dfinal, 32, 32)))(*wide)
+    cut = {"y": (..., slice(20)), "final": (..., slice(20), slice(24)), "x": (..., slice(20)),
+           "B": (..., slice(24)), "C": (..., slice(24)), "h0": (..., slice(20), slice(24))}
+    for name, value in got.items():
+        np.testing.assert_array_equal(np.asarray(value), np.asarray(want[name][cut.get(name, ...)]),
+                                      err_msg=name)
+
+
 LAYER_SEEDS = {"float32": 256, "bfloat16": 32}
 """The layer site's declared draws in each dtype (`seeds_for`, paired: the port and the XLA scan read
 the same rounded projections, so their upstream rounding is shared)."""
