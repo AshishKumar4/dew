@@ -515,9 +515,8 @@ class Trainer(Generic[Loss, Effects]):
         self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
         self._display = TrainingDisplay()
         self._refusal: str | None = None
-        # The fit ladder's rungs past the objective's head and remat: a step that fit only without its narrow
-        # copies, or under XLA's defaults, keeps that for later compiles. A resumed run starts at its
-        # checkpoint's rung, and says so if its first compile has to climb past it (`_climb_to`).
+        # The ladder's rungs past the objective's head and remat that a step fit at (no narrow copies, XLA's
+        # defaults) stay for later compiles; a resumed run starts at its checkpoint's rung (`_climb_to`).
         self._narrow, self._xla_defaults = True, False
         # Why this run's checkpoints describe no model to load, said once.
         self._unrecorded: str | None = None
@@ -1192,7 +1191,10 @@ class Trainer(Generic[Loss, Effects]):
 
         def run(current, batch):
             with self._traced_on(mesh):
-                if candidate.copies and current.compute is None:
+                # Each shape plans its copies (`_at_base_rung`), and a step reads the state with its own.
+                if not candidate.copies:
+                    current = dataclasses.replace(current, compute=None)
+                elif current.compute is None:
                     current = dataclasses.replace(current, compute=jax.jit(
                         lambda variables: narrowed(variables, candidate.copies),
                         out_shardings=candidate.shardings.compute)(current.variables))
@@ -1305,9 +1307,8 @@ class Trainer(Generic[Loss, Effects]):
             self._refuse_unpipelined(schedule)
         prepared = self._initialize_accumulation(state, batch, shapes, window=window, shape_only=True)
         copies = self._narrow_copies(state, batch) if (self._narrow if narrow is None else narrow) else {}
-        if copies:
-            prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
-                lambda variables: narrowed(variables, copies), prepared.variables))
+        prepared = dataclasses.replace(prepared, compute=jax.eval_shape(
+            lambda variables: narrowed(variables, copies), prepared.variables) if copies else None)
         return shapes, copies, prepared
 
     def _jitted(self, shapes, copies: dict, shardings: Placement[TrainState], placement,

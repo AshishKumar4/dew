@@ -331,17 +331,16 @@ def plan_step[LossT, EffectsT](
         xla_defaults: bool, narrow: bool, base: tuple[int, int] | None, resumed: JSON,
         frontier: bool) -> tuple[list[Planned], tuple[Probe, ...]]:
     """The first of `candidates` (`splits`) and the objective's rungs to fit the devices (`planned`), each
-    lowered by `lower` at the objective's rung and `narrow` once and compiled under its `options`, or
-    XLA's defaults on the half rung above, the head back at the run's own tile `base` at each remat rung
-    (`recompute_more`). The first rung drops the narrow copies, which a plan above it takes back where its
-    rung and split fit with them. A split that misses at a rung with a half rung above (`remat_half`) is
+    lowered by `lower` at the objective's rung and `narrow` once, compiled under its `options` or XLA's
+    defaults on the half rung above, the head at the run's tile `base` at each remat rung (`recompute_more`).
+    The first rung climbed drops the narrow copies, which a plan above it, the frontier's too, takes back
+    where its rung and split fit with them. A split missing at a rung with a half rung (`remat_half`) is
     compiled there, the plan staying where it fits; climbing and the frontier pass every half rung asked
-    (`onward`). What each compile measured (`Forecast`) orders the splits asked. `resumed`, the rung a
-    checkpoint trained the shape on, is warned of where it does not fit. Where nothing fits, it raises
-    with the closest candidate's numbers. Beside the plans come every compile the search made. Where the
-    plan splits the batch and `frontier` asks, the frontier's other point follows: the batch in
-    `candidates[0]` microbatches a remat rung up (`remat_more`), the head tiled and unfused, where it fits
-    (docs/performance.md). The objective is left at the last plan's rung, each plan holding its own."""
+    (`onward`). Each compile's measure (`Forecast`) orders the splits; `resumed`, a checkpoint's rung, is
+    warned of where it misses; where nothing fits it raises with the closest candidate's numbers. Where the
+    plan splits and `frontier` asks, the batch whole a remat rung up (`remat_more`), the head tiled and
+    unfused, follows where it fits (docs/performance.md), above any rung that dropped the copies. Each
+    compile made comes beside the plans; the objective is left at the last plan's rung, each plan its own."""
     probes: list[Probe] = []
     refusals: list[RuntimeError] = []
     lowered: dict[tuple[int, str], Candidate] = {}
@@ -420,6 +419,12 @@ def plan_step[LossT, EffectsT](
         return onward(lambda: recompute_more(objective, base))
 
     def found(split: int) -> Planned:
+        nonlocal narrow, fitted
+        if not narrow and dropped not in (None, rung()):
+            # A rung above the copies' may recompute the casts they save: a plan keeps them where it fits.
+            kept, narrow = fitted, True
+            if not fits_here(split):
+                fitted, narrow = kept, False
         assert fitted is not None
         modules = tuple(entry.module for entry in objective.program_key())
         return Planned(split, *fitted, xla_defaults, narrow, current(), modules, head_tile_of(objective),
@@ -428,16 +433,11 @@ def plan_step[LossT, EffectsT](
     split = planned(candidates, first, fits, climb, lambda split: forecast.likely(rung(), split))
     if split is None or fitted is None:
         raise RuntimeError(unplanned(probes)) from (refusals[-1] if refusals else None)
-    if dropped not in (None, rung()):
-        # A rung above the copies' may recompute the casts they save: the plan keeps them where it fits so.
-        kept, narrow = fitted, True
-        if not fits_here(split):
-            fitted, narrow = kept, False
     plans = [found(split)]
     if frontier and split != candidates[0] and onward(lambda: remat_more(objective)):
         objective.tile_head()
         objective.unfuse_head()
-        xla_defaults = False
+        xla_defaults, narrow = False, narrow and dropped is None
         lowered.clear()
         _log.info("timing the plan against its batch whole at remat %r, %s", recompute_record(objective),
                      "the head tiled" if head_tile_of(objective) is not None else "the whole logits kept")
