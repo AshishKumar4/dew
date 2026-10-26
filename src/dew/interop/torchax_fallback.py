@@ -32,19 +32,21 @@ import importlib.metadata
 import json
 import math
 import warnings
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Self
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
+from flax.core.scope import Variable
 from flax.typing import Dtype, PrecisionLike
 from jax.extend.core import Literal, primitives
 
 from dew.interop import sources, verify
+from dew.interop.decoder_parts import context_lengths
 from dew.interop.generation_config import read_generation_config
 from dew.interop.pickles import host_dtype, host_view
 from dew.interop.pretrained import PretrainedFallback, source_processor
@@ -280,6 +282,23 @@ class _Attending:
     visible: jax.Array | None = None
     places: jax.Array | None = None
     key_places: jax.Array | None = None
+    cache: _Cached | None = None
+    """A decoding call's cache (`_Cached`): each layer writes its keys and values at the call's slots
+    and attends over its row's whole cache."""
+
+
+@dataclass(frozen=True)
+class _Cached:
+    """A decoding call's per-layer key and value caches as Dew's attention reads and writes them:
+    `held` by `layer_idx` (`cached_key`, `cached_value`, `[rows, capacity, kv_heads, dim]`), the slot
+    each token writes `[B, S]` (-1 for a token that writes none) and the filled slots after this call
+    `[B, capacity]`; `written` collects each layer's caches after its write, which the traced call
+    returns (`TorchGraph`)."""
+
+    held: Mapping[int, Mapping[str, jax.Array]]
+    slots: jax.Array
+    filled: jax.Array
+    written: dict[int, dict[str, jax.Array]] = field(default_factory=dict)
 
 
 _ATTENDING: contextvars.ContextVar[_Attending | None] = contextvars.ContextVar("dew_attending", default=None)
@@ -322,7 +341,8 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
     key folded by the layer, and a training call that drops with no key is refused."""
     from torchax.interop import jax_view, torch_view
 
-    from dew.nn.attention import scaled_dot_product_attention
+    from dew.nn.attention import causal_attention_mask, scaled_dot_product_attention
+    from dew.nn.kv_cache import write_cache
     from dew.nn.local_attention import compacted
     from dew.nn.visibility import windowed
 
@@ -355,7 +375,21 @@ def _dew_attention(module, query, key, value, attention_mask, scaling=None, drop
             q, k, v, implementation=call.implementation, causal=True, sliding_window=window,
             softcap=softcap, sinks=sinks, segment_ids=segment_ids, max_segments=max_segments, **dropping)
 
-    if call.visible is not None:
+    if call.cache is not None:
+        # The call's tokens join the row's cache at their slots, and each attends over the whole row:
+        # what it has filled, causal by slot and within the window, as Dew's decoders attend a cache.
+        held = call.cache.held.get(module.layer_idx)
+        if held is None:
+            # A cache being opened: its layer's keys and values give its shape, and nothing is held.
+            held = {"cached_key": jnp.zeros_like(k), "cached_value": jnp.zeros_like(v)}
+        keys, values = (write_cache(held[name], incoming, call.cache.slots)
+                        for name, incoming in (("cached_key", k), ("cached_value", v)))
+        call.cache.written[module.layer_idx] = {"cached_key": keys, "cached_value": values}
+        mask = causal_attention_mask(call.cache.slots, keys.shape[1], window, key_valid=call.cache.filled)
+        out = scaled_dot_product_attention(q, keys.astype(q.dtype), values.astype(q.dtype),
+                                           implementation=call.implementation, mask=mask, softcap=softcap,
+                                           sinks=sinks, **dropping)
+    elif call.visible is not None:
         # The call's own visibility is the whole of it; a window counts the stated keys' positions.
         visible = jnp.asarray(call.visible, bool)
         if window is not None and call.key_places is not None:
@@ -511,11 +545,29 @@ class TorchGraph:
         positions = None if laid is None else laid.places()
         valid = None if laid is None or laid.valid is None else jnp.asarray(laid.valid, bool)
         arguments = (dict(params), dict(buffers), tokens, key, positions, documents, valid, visible,
-                     key_places, head_input)
+                     key_places, head_input, None)
+        (logits, hidden), _ = self._run(arguments, train=train, precision=precision,
+                                        max_segments=max_segments)
+        return logits, hidden
+
+    def step(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array], tokens: jax.Array, *,
+             cache: Mapping[int, Mapping[str, jax.Array]], slots: jax.Array, filled: jax.Array,
+             positions: jax.Array, precision: jax.lax.PrecisionLike = None
+             ) -> tuple[jax.Array, dict[int, dict[str, jax.Array]]]:
+        """A decoding call: the logits for `tokens` at their `positions` `[B, S]` (which transformers'
+        rotary reads), each layer writing its keys and values into `cache` at `slots` and attending
+        over its row's `filled` slots (`_Cached`), and every layer's cache after the call."""
+        (logits, _), written = self._run(
+            (dict(params), dict(buffers), tokens, None, positions, None, None, None, None, None,
+             (dict(cache), slots, filled)), train=False, precision=precision, max_segments=1)
+        return logits, written
+
+    def _run(self, arguments: tuple, *, train: bool, precision: jax.lax.PrecisionLike, max_segments: int):
         traced, shapes, draws = self.traced(*arguments, train=train, precision=precision,
                                             max_segments=max_segments)
-        logits, hidden = jax.tree.unflatten(jax.tree.structure(shapes),
-                                            _accumulating(traced, *jax.tree.leaves(arguments)))
+        outputs = jax.tree.unflatten(jax.tree.structure(shapes),
+                                     _accumulating(traced, *jax.tree.leaves(arguments)))
+        key = arguments[3]
         if draws.host:
             raise ValueError(
                 f"tier 3 traces this model's training forward once, and it draws on the host "
@@ -523,38 +575,42 @@ class TorchGraph:
                 f"that rate to 0 in its config, or train a family Dew loads natively")
         if draws.device and key is None:
             raise ValueError("this model's training forward draws (dropout) and was given no 'dropout' rng")
-        return logits, hidden
+        return outputs
 
     def traced(self, params: Mapping[str, jax.typing.ArrayLike], buffers: Mapping[str, jax.typing.ArrayLike],
                tokens: jax.typing.ArrayLike, key: jax.Array | None,
                positions: jax.typing.ArrayLike | None = None, documents: jax.typing.ArrayLike | None = None,
                valid: jax.typing.ArrayLike | None = None, visible: jax.typing.ArrayLike | None = None,
                key_places: jax.typing.ArrayLike | None = None, head_input: jax.typing.ArrayLike | None = None,
-               *, train: bool,
+               cache: tuple | None = None, *, train: bool,
                precision: jax.lax.PrecisionLike = None, max_segments: int = 1):
         """The forward over these arguments traced once (`jax.make_jaxpr`), its output shapes, and the
-        draws it made (`_Draws`): on torchax's device, a key's, or on the host, fixed by the trace."""
+        draws it made (`_Draws`): on torchax's device, a key's, or on the host, fixed by the trace. Its
+        outputs are the forward's and, for a decoding call (`cache`, the held caches, slots and filled
+        slots of `_Cached`), every layer's cache after it."""
         env = _environment()
         draws = _Draws()
 
         def forward(params, buffers, tokens, key, positions, documents, valid, visible, key_places,
-                    head_input):
+                    head_input, cache):
             arguments = env.j2t_iso((dict(params), dict(buffers), tokens, positions, head_input))
+            cached = None if cache is None else _Cached(*cache)
             attending = (contextlib.nullcontext() if self.attention_impl is None else _attending(
                 _Attending(self.attention_impl, documents, valid, max_segments, train, key, visible,
-                           positions, key_places)))
+                           positions, key_places, cached)))
             self.module.train(train)
             try:
                 with (env, env.override_property(prng=key) if key is not None else contextlib.nullcontext(),
                       draws, attending):
-                    return env.t2j_iso(self.module.functional_call(_forward, *arguments))
+                    outputs = env.t2j_iso(self.module.functional_call(_forward, *arguments))
             finally:
                 self.module.eval()
+            return outputs, ({} if cached is None else cached.written)
 
         with configured_precision(precision):
             closed, shapes = jax.make_jaxpr(forward, return_shape=True)(
                 dict(params), dict(buffers), tokens, key, positions, documents, valid, visible, key_places,
-                head_input)
+                head_input, cache)
         return closed, shapes, draws
 
     def export(self, model: nn.Module, variables: Mapping[str, object],
@@ -780,7 +836,14 @@ class TorchCausalLM(nn.Module):
     are built from, keep each document's attention to itself and give
     transformers' rotary each token's place in its document (`_laid`); one on
     transformers' own attention reads plain token rows, refusing a packing
-    field by name. Neither has a cached decode.
+    field by name.
+
+    A model on Dew's attention decodes (`init_cache`, `__call__(..., decode=True)`) as Dew's decoders
+    do: each attention layer's keys and values join a cache of `max_seq_len` slots a row, under the
+    names Dew's caches use (`cache_index`, the row's filled slots; `cached_key`, `cached_value`), at
+    the slots its valid tokens fill in order, transformers' rotary reading the tokens' `positions`
+    (their slots where none are given), and each token attends over its row's filled slots up to its
+    own. One on transformers' own attention has no cache Dew's attention writes, and refuses one.
 
     `hidden_states` are the states the output head reads, the final norm's
     output, which a reader of a backbone's states takes (a decision readout,
@@ -795,6 +858,9 @@ class TorchCausalLM(nn.Module):
     dtype: Dtype | None = None
     final_logit_softcap: float | None = None
     precision: PrecisionLike = None
+    max_seq_len: int = 2048
+    """The slots a decode cache holds a row, the tokens a row may reach (`Bounded`): `load` sets the
+    source's own context, `max_position_embeddings`, or the load's `max_seq_len`."""
 
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]:
@@ -811,9 +877,71 @@ class TorchCausalLM(nn.Module):
         """None: a causal LM is not trained to fill masked tokens."""
         return None
 
-    def __call__(self, tokens, train: bool = False) -> jax.Array:
-        logits, _ = self._run(tokens, train)
+    def __call__(self, tokens, train: bool = False, decode: bool = False, attention_mask=None,
+                 positions=None) -> jax.Array:
+        """The logits of `tokens`, in at least float32: of whole rows, or with `decode` of a decoding
+        call into the cache `init_cache` opened, `attention_mask` `[B, S]` the tokens that write and
+        `positions` `[B, S]` their places in their rows (their slots where None)."""
+        if decode:
+            return self._decoded(tokens, attention_mask, positions)
+        packing = {name: value for name, value in ((VALIDITY_FIELD, attention_mask), ("positions", positions))
+                   if value is not None}
+        return self.logits(tokens, train=train, **packing)
+
+    def init_cache(self, batch_size: int) -> None:
+        """Open the decode cache of `batch_size` rows (`Decoding`), every slot unfilled."""
+        self._cached(batch_size)
+
+    def with_cache_capacity(self, capacity: int) -> Self:
+        """The model with a decode cache of `capacity` slots a row (`CacheCapacity`)."""
+        return self.clone(max_seq_len=capacity)
+
+    def _cached(self, rows: int) -> dict[int, Variable]:
+        """Each attention layer's cache variable by its `layer_idx`, opened at `rows` rows of
+        `max_seq_len` slots where it is not yet: its keys' and values' shapes and dtypes are those
+        one decoding token of each row writes (`TorchGraph.step` over no held cache)."""
+        if self.graph.attention_impl is None:
+            raise Lacks("cache", "this model runs transformers' own attention, and a decode cache is the one "
+                                 "Dew's attention writes")
+        tokens = jnp.zeros((rows, 1), jnp.int32)
+        slots = jnp.zeros((rows, 1), jnp.int32)
+        filled = jnp.ones((rows, 1), bool)
+        _, shapes = jax.eval_shape(lambda held: self._step(held, tokens, {}, slots, filled, slots),
+                                   self.graph.shapes)
+
+        def opened(written: Mapping[str, jax.ShapeDtypeStruct]) -> Callable[[], dict[str, jax.Array]]:
+            def zeros():
+                return {"cache_index": jnp.zeros((rows,), jnp.int32),
+                        **{name: jnp.zeros((rows, self.max_seq_len, *shape.shape[2:]), shape.dtype)
+                           for name, shape in written.items()}}
+            return zeros
+
+        return {layer: self.variable("cache", f"layer_{layer}", opened(written))
+                for layer, written in sorted(shapes.items())}
+
+    def _decoded(self, tokens, attention_mask, positions) -> jax.Array:
+        tokens = jnp.asarray(tokens)
+        rows, width = tokens.shape[:2]
+        valid = (jnp.ones((rows, width), bool) if attention_mask is None
+                 else jnp.asarray(attention_mask, bool))
+        cache = self._cached(rows)
+        cursor = next(iter(cache.values())).value["cache_index"]
+        # A valid token fills its row's next slot, an invalid one none (-1), as Dew's caches fill.
+        slots = jnp.where(valid, cursor[:, None] + jnp.cumsum(valid, axis=1, dtype=jnp.int32) - 1, -1)
+        after = cursor + jnp.sum(valid, axis=1, dtype=jnp.int32)
+        filled = jnp.arange(self.max_seq_len)[None, :] < after[:, None]
+        places = jnp.maximum(slots, 0) if positions is None else jnp.asarray(positions, jnp.int32)
+        held = {layer: {name: value for name, value in variable.value.items() if name != "cache_index"}
+                for layer, variable in cache.items()}
+        logits, written = self._step(self.variables, tokens, held, slots, filled, places)
+        for layer, variable in cache.items():
+            variable.value = {"cache_index": after, **written[layer]}
         return logits.astype(at_least_fp32(logits.dtype))
+
+    def _step(self, variables, tokens, held, slots, filled, places):
+        params, buffers, compute = self._operands(variables)
+        return self.graph.step(params, buffers, tokens, cache=held, slots=slots, filled=filled,
+                               positions=places, precision=float32_products(compute, self.precision))
 
     def logits(self, tokens, *, train: bool = False, **packing) -> jax.Array:
         """The logits of the whole rows, as `__call__` returns them: in at least float32
@@ -882,16 +1010,21 @@ class TorchCausalLM(nn.Module):
 
     def _over(self, held, tokens, laid, visible, key_places, head_input, *,
               train: bool) -> tuple[jax.Array, jax.Array]:
-        params = {name: self._compute(leaf) for name, leaf in held["params"].items()}
-        buffers = {name: jnp.asarray(leaf) for name, leaf in held.get("buffers", {}).items()}
+        params, buffers, compute = self._operands(held)
         key = self.make_rng("dropout") if train and self.has_rng("dropout") else None
-        # Torch's operators state no precision, so the forward's products take the one its compute
-        # dtype does (`float32_products`): `dtype`, or the dtype its floating parameters hold.
-        compute = self.dtype or jnp.result_type(*[leaf for leaf in params.values()
-                                                  if jnp.issubdtype(leaf.dtype, jnp.floating)])
         return self.graph(params, buffers, jnp.asarray(tokens), train=train, key=key,
                           precision=float32_products(compute, self.precision), laid=laid, visible=visible,
                           key_places=key_places, head_input=head_input)
+
+    def _operands(self, held) -> tuple[dict[str, jax.Array], dict[str, jax.Array], Dtype]:
+        """The forward's parameters at `dtype`, its buffers, and the dtype its products take: torch's
+        operators state no precision, so the products take the one its compute dtype does
+        (`float32_products`), `dtype` or the dtype its floating parameters hold."""
+        params = {name: self._compute(leaf) for name, leaf in held["params"].items()}
+        buffers = {name: jnp.asarray(leaf) for name, leaf in held.get("buffers", {}).items()}
+        compute = self.dtype or jnp.result_type(*[leaf for leaf in params.values()
+                                                  if jnp.issubdtype(leaf.dtype, jnp.floating)])
+        return params, buffers, compute
 
     def _compute(self, leaf) -> jax.Array:
         value = jnp.asarray(leaf)
@@ -950,11 +1083,6 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
             f"attention_impl={attention_impl!r} selects a Dew kernel, and this source runs "
             f"transformers' own attention ({'fallback=torchax' if admission is None else admission.why}); "
             "leave attention_impl at 'auto'")
-    if max_seq_len is not None:
-        raise ValueError(
-            "max_seq_len sizes Dew's decode cache and rotary table, which tier 3 "
-            "does not build; leave it unset and feed rows no longer than the model's "
-            "max_position_embeddings")
     if not (directory / "config.json").is_file():
         raise FileNotFoundError(
             f"fallback='torchax' builds the model a transformers config.json describes, and "
@@ -1016,8 +1144,11 @@ def load(name_or_dir: str | Path, directory: Path, revision: str | None, *, dtyp
     torch.nn.Module.to(model, "meta")
     graph = TorchGraph(jittable, persistent, attention_impl=attention_impl if attends else None,
                        shapes={"params": _shapes(params), "buffers": _shapes(buffers)})
-    module = (TorchCausalLM(graph, vocab, dtype=resolve_dtype(dtype)) if head_name is None
-              else TorchTableLM(graph, vocab, dtype=resolve_dtype(dtype), head=head_name))
+    # The decode cache's slots: the load's, else the source's own context.
+    capacity = max_seq_len if max_seq_len is not None else context_lengths(config)[0]
+    built = {"dtype": resolve_dtype(dtype), "max_seq_len": capacity}
+    module = (TorchCausalLM(graph, vocab, **built) if head_name is None
+              else TorchTableLM(graph, vocab, head=head_name, **built))
     source = str(name_or_dir) if revision is None else f"{name_or_dir}@{revision}"
     processor = source_processor(directory, config, config, module, source=source)
     versions = {name: importlib.metadata.version(name) for name in ("transformers", "torchax", "torch")}
