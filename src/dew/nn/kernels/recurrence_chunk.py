@@ -620,20 +620,23 @@ where they pass, as many as the tokens' chunks, a row's and one, whatever the bo
 (`chunked_launch.Sequences`)."""
 
 PORT_CELLS: dict[tuple[str | None, str], str] = {
-    ('wgmma', 'forward'): "on an H100 PCIe, 16-bit, the port's forward 0.602 ms against the template's "
-                          "0.776 on Qwen3.5-27B's gated delta net and 0.484 against 0.634 on Qwen3-Next's "
-                          "(SE-family-h100-e0de17766)",
+    ('wgmma', 'forward'): "on an H100 80GB HBM3, 16-bit, the port's forward 0.440 ms against the template's "
+                          "0.559 on Qwen3.5-27B's gated delta net and 0.276 against 0.489 on Qwen3-Next's "
+                          "(SE-family-h100-b0980aaff; on an H100 PCIe 0.602 against 0.776, "
+                          "SE-family-h100-e0de17766)",
     ('mma.sync', 'forward'): "on an A100 SXM4 40GB, 16-bit, the port's forward 0.892 ms against the "
-                             "template's 1.40 to 1.78 on Qwen3.5-27B's gated delta net and 0.690 against "
-                             "1.22 on Qwen3-Next's (SE-family-a100-e0de17766)",
-    ('mma.sync', 'training'): "on an A100 SXM4 40GB, 16-bit, the port's forward and gradient 4.82 ms against "
-                              "the template's 5.97 on Qwen3.5-27B's gated delta net and 3.81 against 4.60 on "
-                              "Qwen3-Next's (SE-family-a100-e0de17766)",
+                             "template's 1.213 on Qwen3.5-27B's gated delta net and 0.690 against 0.942 on "
+                             "Qwen3-Next's (SE-family-a100-1a31d279a)",
+    ('mma.sync', 'training'): "on an A100 SXM4 40GB, 16-bit, the port's forward and gradient 4.77 ms against "
+                              "the template's 5.53 on Qwen3.5-27B's gated delta net (its gradient the "
+                              "port's, the fast backward's launches not holding an A100's registers) "
+                              "(SE-family-a100-1a31d279a)",
 }
 """The cells, each an instruction family and a product (`PortCase.product`), where a receipt shows the fla
 port faster than the recurrence template, the port running them (owner, bible da64ae5): the list shrinks as
 the template wins its cells, and no cell is picked or ranked at run time. Training on an H100 is the
-template's: its fast backward took 2.56 ms against the port's 3.14 (the same receipt)."""
+template's: its fast backward took 1.851 ms against the port's 2.400 (SE-family-h100-b0980aaff; 2.56
+against 3.14 on an H100 PCIe, SE-family-h100-e0de17766)."""
 
 MOSAIC_SUPPORTS: tuple[Requirement[PortCase], ...] = (
     *PORT_SUPPORTS[:2],
