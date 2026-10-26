@@ -614,10 +614,9 @@ ONLINE = {"NO_PROXY": "127.0.0.1", "no_proxy": "127.0.0.1"}
 
 @pytest.mark.distributed
 def test_processes_fetch_disjoint_shares_of_one_online_order(tmp_path):
-    """Two processes each fetch their own share of one shuffled catalog over HTTP: the first pass's
-    shares cover the corpus once, and the server answers every url, the two together asking for
-    fewer than two passes' worth, so neither fetched the other's share (each reads a little of its
-    next pass ahead)."""
+    """Two processes each fetch their own share of one pass of a shuffled catalog over HTTP, to its end:
+    their shares cover the corpus once, and the server answers each url once, so neither fetched a
+    record of the other's share."""
     answered, lock = collections.Counter(), threading.Lock()
 
     def counted(request) -> None:
@@ -631,8 +630,7 @@ def test_processes_fetch_disjoint_shares_of_one_online_order(tmp_path):
     shards = [report["records"] for report in reports]
     assert not set(shards[0]) & set(shards[1]), "both processes read the same record"
     assert sorted(shards[0] + shards[1]) == list(range(RECORDS))
-    assert set(answered) == {f"/{index}" for index in range(RECORDS)}
-    assert sum(answered.values()) < 2 * RECORDS, answered
+    assert answered == {f"/{index}": 1 for index in range(RECORDS)}
 
 
 @pytest.mark.distributed
