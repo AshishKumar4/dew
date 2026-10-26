@@ -1010,3 +1010,22 @@ def test_a_transitions_density_and_kl_hold_at_float32s_largest_variances():
     assert_as_exact_as_the_reference(kl, error / np.float32(2) / narrow,
                                      12 * float(step) ** 2 / (2 * narrow.astype(np.float64)),
                                      "a narrow transition's KL")
+
+
+def test_a_transitions_kl_keeps_its_half_where_the_error_is_near_float32s_least():
+    """A transition's KL of an error near float32's least over a variance as small is on its float64
+    value: the half is taken in the quotient's exponent, where half the error alone is below the normal
+    range, which XLA:CPU flushes to zero. A mean 2**-63 from its reference under a variance of 2**-126
+    has a KL of 0.5, not 0; one 1.25 * 2**-63 away under 1.3 * 2**-126, an inexact one."""
+    from dew.sampling.flow import GaussianTransition
+
+    variance = np.ldexp(np.asarray([1.3, 1.0], np.float32), -126)
+    mean = np.zeros((2, 3, 4), np.float32)
+    reference_mean = mean.copy()
+    reference_mean[:, 0, 0] = np.ldexp(np.asarray([1.25, 1.0], np.float32), -63)
+    transition = GaussianTransition(jnp.asarray(mean), jnp.asarray(variance))
+    kl = np.asarray(transition.kl(jnp.asarray(reference_mean)))
+    assert np.all(np.isfinite(kl))
+    error = np.square(reference_mean[:, 0, 0])
+    truth = error.astype(np.float64) / (2 * variance.astype(np.float64))
+    assert_as_exact_as_the_reference(kl, error / np.float32(2) / variance, truth, "a KL near float32's least")
