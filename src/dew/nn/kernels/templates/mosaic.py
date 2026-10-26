@@ -497,10 +497,10 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     launches keep."""
 
     def programs(self, consumers: int) -> int:
-        """The programs of one launch a multiprocessor runs at once, each `consumers` consumer roles: one
-        where the family's roles split the register file between them (warpgroup MMA's consumers beside
-        its producer, `consumer_registers`). Each stages its share of the multiprocessor's shared memory
-        (`program_shared`)."""
+        """The most programs of one launch a multiprocessor's registers hold at once, each `consumers`
+        consumer roles: one where the family's roles split the register file between them (warpgroup
+        MMA's consumers beside its producer, `consumer_registers`). Each stages its share of the
+        multiprocessor's shared memory (`program_shared`), which may hold no tile at that many."""
         del consumers
         return 1
 

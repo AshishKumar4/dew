@@ -766,7 +766,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if family is None or config.family != family.name or not self._divides(ba, config):
             return False
         dtype = ba.arguments['tokens'].dtype
-        if (config.warpgroups > family.consumers or config.cluster != 1 or config.stages < 2
+        if (config.warpgroups > family.consumers or config.programs > family.programs(config.warpgroups)
+                or config.cluster != 1 or config.stages < 2
                 or config.block_m % (family.role_rows * config.warpgroups)
                 or config.block_n % family.column_unit(dtype) or config.block_k not in family.depths(dtype)):
             return False
@@ -887,18 +888,18 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                            if self.STORES_SERIALLY and config.warpgroups == 1 else 0))
 
     def program_shared(self, config: mosaic_gpu.Tiles, target) -> int:
-        # The programs its family runs on a multiprocessor at once share its shared memory.
-        return mosaic.program_shared(super().program_shared(config, target), _programs(config))
+        # The programs a multiprocessor runs at once share its shared memory.
+        return mosaic.program_shared(super().program_shared(config, target), config.programs)
 
     def _launched(self, config: mosaic_gpu.Tiles, interpret: bool) -> int:
-        """The programs the persistent kernel launches: its family's programs on each multiprocessor
-        (`Family.programs`); the interpreter runs one block (jax/_src/pallas/mosaic_gpu/interpret)."""
-        return 1 if interpret else _multiprocessors(generation.gpu_target()) * _programs(config)
+        """The programs the persistent kernel launches: the tile's programs on each multiprocessor
+        (`Tiles.programs`); the interpreter runs one block (jax/_src/pallas/mosaic_gpu/interpret)."""
+        return 1 if interpret else _multiprocessors(generation.gpu_target()) * config.programs
 
     @staticmethod
     def _in_flight(config: mosaic_gpu.Tiles, target) -> float:
         """The row tiles a band of the planar snake keeps in flight at once on `target`."""
-        return max(1.0, _multiprocessors(target) * _programs(config) / config.grid_block_n)
+        return max(1.0, _multiprocessors(target) * config.programs / config.grid_block_n)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1541,11 +1542,6 @@ production route, which no measurement ranks against the template's."""
 def _bundle(config: mosaic_gpu.Tiles, dtype) -> mosaic.Family:
     """The bundle `config` runs on, for operands of `dtype` (`mosaic_gpu.family_of`)."""
     return mosaic_gpu.family_of(config, dtype)
-
-
-def _programs(config: mosaic_gpu.Tiles) -> int:
-    """The programs of a launch at `config` a multiprocessor runs at once (`mosaic.Family.programs`)."""
-    return _bundle(config, jnp.bfloat16).programs(config.warpgroups)
 
 
 _GMMS = (MosaicGmm(), MosaicTpuGmm(), Gmm(), CutlassGmm())
