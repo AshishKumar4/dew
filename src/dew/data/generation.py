@@ -440,7 +440,9 @@ class Generation:
 
     @cached_property
     def _page(self):
-        @lru_cache(maxsize=4)
+        # Every page of the input index: inputs are paged by their key's digest, so a read in any order
+        # visits each page all the time, which a few pages held would read and check again each time.
+        @lru_cache(maxsize=256)
         def opened(page: str) -> dict:
             return json.loads(_checked(Store(self.url, self.storage_options), self.manifest["pages"][page]))
 
@@ -458,11 +460,16 @@ class Generation:
 
     @cached_property
     def _shard(self):
-        @lru_cache(maxsize=2)
+        verified: set[str] = set()
+
+        # A shuffled read visits every shard all the time: each is checked whole once (its size and
+        # digest), which stands for every record in it (`outputs`), and its readers are kept open.
+        @lru_cache(maxsize=64)
         def opened(path: str) -> ArrayRecords:
             root = Store(self.manifest["root"], self.storage_options)
-            mirrored = root.cached()
-            _checked(mirrored, self.manifest["shards"][path])
+            if path not in verified:
+                _checked(root.cached(), self.manifest["shards"][path])
+                verified.add(path)
             return ArrayRecords((root.child(path).url,), self.storage_options)
 
         return opened
@@ -519,13 +526,11 @@ class Generation:
     def outputs(self, row_id: RowId) -> Outputs:
         row_key = _row_key(row_id)
         entry = self._page(input_page(row_key))[row_key]
+        # The shard it reads from was checked whole (`_shard`), so its record is the one written.
         payload = self._shard(entry["shard"])[entry["record"]]
         if not isinstance(payload, bytes):
             raise ValueError(f"committed cache record is not bytes: {self.url}")
-        values = _decode_outputs(payload)
-        if fingerprint(values) != entry["payload_sha256"]:
-            raise ValueError(f"committed cache completion is corrupt for {row_key}")
-        return values
+        return _decode_outputs(payload)
 
     def __len__(self) -> int:
         return self.manifest["rows"]

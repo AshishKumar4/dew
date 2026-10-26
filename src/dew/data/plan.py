@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import hashlib
 import importlib.metadata
 import inspect
@@ -260,6 +261,28 @@ def _environment(recorded: Mapping[str, object]) -> dict[str, JSON]:
             "modules": [step["modules"] for step in steps]}
 
 
+@functools.cache
+def _checkout_facts() -> tuple[str, bool, str]:
+    """The process's checkout as a manifest names it: its revision, whether it is clean, and the
+    fingerprint of its lock files and installed distributions. Read once a process: the reads run
+    git three times and parse every installed distribution's metadata, about a second, which every
+    cache key and plan of a run would pay again for facts a run does not change."""
+    locked = [_checkout.ROOT / name for name in ("pyproject.toml", "uv.lock", "constraints.txt")]
+    dependencies = {
+        distribution.metadata["Name"]: distribution.version
+        for distribution in importlib.metadata.distributions()
+        if distribution.metadata["Name"]
+    }
+    lock = fingerprint(
+        {
+            "files": {path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in locked
+                      if path.is_file()},
+            "installed": dependencies,
+        }
+    )
+    return _checkout.revision() or "unversioned", _checkout.clean(), lock
+
+
 @dataclasses.dataclass(frozen=True)
 class Manifest:
     """The dependency manifest shared by an execution plan and its cache.
@@ -292,23 +315,7 @@ class Manifest:
         ran: Sequence[StepIdentity] = (),
         fill: Mapping[str, object] | None = None,
     ) -> Manifest:
-        revision, clean = _checkout.revision() or "unversioned", _checkout.clean()
-        locked = [_checkout.ROOT / name for name in ("pyproject.toml", "uv.lock", "constraints.txt")]
-        dependencies = {
-            distribution.metadata["Name"]: distribution.version
-            for distribution in importlib.metadata.distributions()
-            if distribution.metadata["Name"]
-        }
-        lock = fingerprint(
-            {
-                "files": {
-                    path.name: hashlib.sha256(path.read_bytes()).hexdigest()
-                    for path in locked
-                    if path.is_file()
-                },
-                "installed": dependencies,
-            }
-        )
+        revision, clean, lock = _checkout_facts()
         return cls(
             source,
             tuple(steps),

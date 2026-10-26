@@ -114,6 +114,12 @@ class Memory(Dataset):
         return f"memory:{self.identity or self.fingerprint()['sha256']}"
 
     def fingerprint(self) -> Mapping[str, object]:
+        return self._fingerprint
+
+    @cached_property
+    def _fingerprint(self) -> Mapping[str, object]:
+        """Its content, hashed once, as its records are read once (`_held`): a plan, a cache key and
+        a description each read it."""
         rows = self.records("indexed")
         return {
             "store": "memory",
