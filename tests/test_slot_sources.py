@@ -115,6 +115,39 @@ def test_a_cached_slot_release_reopens_with_the_hub_offline(tmp_path):
             np.testing.assert_array_equal(head[native], stored[name])
 
 
+@pytest.mark.parametrize("released, overridden", [("noncausal", "causal"), ("causal", "block_bidirectional")])
+def test_a_loads_attention_override_lays_the_rows_its_backbone_reads_and_saves_as_that_release(
+        tmp_path, released, overridden):
+    """A load's modeling_overrides reach a slot release's row layout as they reach its backbone: a
+    release loaded with its full attention overridden is the release that declares that attention,
+    its rows laid in blocks where its backbone reads blocks and scored alike, and it saves and reloads
+    as that release."""
+    from dew.decision import Question
+
+    def release(name, attention):
+        source = tmp_path / name
+        shutil.copytree(REFERENCE, source)
+        (source / "readout.json").write_text(json.dumps({"readout": "head", "head_dim": 8, "n_slots": 16,
+                                                         "attention": attention}))
+        return source
+
+    load = {"dtype": "float32", "attention_impl": "reference"}
+    bundle = Pretrained.load(release("released", released), **load,
+                             modeling_overrides={"attention": {"full_attention": overridden}})
+    declared = Decide.from_pretrained(
+        release("declared", "noncausal" if overridden == "block_bidirectional" else "causal"), **load)
+    bundle.save(tmp_path / "saved")
+    reloaded = Decide.from_pretrained(tmp_path / "saved", **load)
+    request = json.loads((REFERENCE / "requests.json").read_text())[0][0]
+    questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
+    expected = declared.layout.rows(declared.tokenizer, declared.specials, request["state"], questions)
+    for task in (Decide.of(bundle), reloaded):
+        rows = task.layout.rows(task.tokenizer, task.specials, request["state"], questions)
+        assert rows == expected
+        for actual, wanted in zip(task.scored(rows), declared.scored(expected), strict=True):
+            np.testing.assert_array_equal(actual, wanted)
+
+
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("readout", ["slot_lm", "head", "fresh_head"])
 @pytest.mark.parametrize("n_slots", [16, 32, 512])
