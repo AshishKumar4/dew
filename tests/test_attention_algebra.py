@@ -447,8 +447,8 @@ def test_a_training_walk_at_its_anchor_known_is_on_par_with_the_gathering_walk(n
     `argmax` over the logits alone), as Mosaic's training forward runs it, its split sums in the mainloop's
     accumulator (`Keys.accumulate`), against the step that finds the anchor as it walks and gathers the old
     anchor's value row where it moves (the plain-JAX and Triton mainloops'): the same maxima and anchor
-    keys, and its split sums, own weight and row sums on par (check 1, the gathering walk in float64 the
-    truth), over bf16 key tiles whose maximum moves, ties among them."""
+    keys, and its split sums, own weight and row sums on par (check 1 against their float64 values), over
+    bf16 key tiles whose maximum moves, ties among them."""
     queries, width, tile, tiles = 16, 32, 16, 4
     spec = algebra.Forward("full", tiles * tile, ids=False, scale=1.0, natural=natural)
 
@@ -493,13 +493,23 @@ def test_a_training_walk_at_its_anchor_known_is_on_par_with_the_gathering_walk(n
         state, arg, own, others_total = carry
         return state.acc, state.total, own, others_total, state.m, arg.peak, arg.key
 
+    def truth(logits, values):
+        # The walk's sums in float64, whose arithmetic assumes fp32 (`natural_exp`'s split product): each
+        # key's weight against the keys' largest logit, the anchor the first key holding it.
+        flat = jnp.moveaxis(logits, 0, 1).reshape(queries, tiles * tile)
+        e = (jnp.exp if natural else jnp.exp2)(flat - flat.max(axis=-1, keepdims=True))
+        at = jnp.arange(tiles * tile)[None, :] == jnp.argmax(flat, axis=-1)[:, None]
+        others = jnp.where(at, 0.0, e)
+        return others @ values, e.sum(axis=-1), jnp.where(at, e, 0.0).sum(axis=-1), others.sum(axis=-1)
+
     anchored, gathered = (jax.jit(functools.partial(walk, anchored=known)) for known in (True, False))
     logits, values = draw(0)
     # The maxima and anchor keys are the logits' own, exact in either walk.
     for mine, theirs in zip(anchored(logits, values)[4:], gathered(logits, values)[4:], strict=True):
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
     assert_as_exact(lambda *drawn: anchored(*drawn)[:4], lambda *drawn: gathered(*drawn)[:4], draw,
-                    f"anchored training walk {'natural' if natural else 'folded'}", seeds=ANCHORED_SEEDS)
+                    f"anchored training walk {'natural' if natural else 'folded'}", seeds=ANCHORED_SEEDS,
+                    truth_fn=truth)
 
 
 @pytest.mark.parametrize("edge", ["small scale", "large scale"])
