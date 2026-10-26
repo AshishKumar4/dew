@@ -465,7 +465,9 @@ class Trainer(Generic[Loss, Effects]):
             step=jnp.zeros((), jnp.int32),
             microstep=jnp.zeros((), jnp.int32),
             updates=jnp.zeros((), jnp.int32),
-            scale=None if self._loss_scale is None else jax.tree.map(jnp.asarray, self._loss_scale),
+            # A state of its own, the given scale's leaves copied: the step donates the state.
+            scale=None if self._loss_scale is None else jax.tree.map(
+                lambda leaf: jnp.array(leaf, copy=True), self._loss_scale),
             window_size=jnp.asarray(self.accumulation, jnp.int32),
             variables=params,
             opt_state=self._boxed_init(initialized, params["params"]),

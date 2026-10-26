@@ -579,15 +579,18 @@ def mode_steps(args) -> dict:
 
 
 
-def failing_local_directory(directory: Path | None, step: int):
+def failing_local_directory(checkpoints, directory: Path | None, step: int):
     """An observation (`Observe`'s call, which every process makes alike) that, at step `step - 1`,
-    puts a file where `directory` was, a process's local checkpoint directory (None on the processes
-    whose saves go on), so that process's local save at `step` fails in orbax's background thread as
-    a full or read-only disk would make it fail."""
+    waits for every save in flight (`Checkpoints.wait`) and puts a file where `directory` was, a
+    process's local checkpoint directory (None on the processes whose saves go on), so that process's
+    local save at `step` fails in orbax's background thread as a full or read-only disk would make it
+    fail, and none before it."""
     def observed(state):
-        if directory is not None and int(state.step) == step - 1 and directory.is_dir():
-            directory.rename(directory.with_name(directory.name + ".moved"))
-            directory.write_text("not a directory")
+        if int(state.step) == step - 1:
+            checkpoints.wait()
+            if directory is not None and directory.is_dir():
+                directory.rename(directory.with_name(directory.name + ".moved"))
+                directory.write_text("not a directory")
     return observed
 
 
@@ -617,7 +620,7 @@ def mode_fit(args) -> dict:
         # The last process's local directory fails.
         failing = (Path(args.local_dir) / f"process{args.process_id}"
                    if args.process_id == args.processes - 1 else None)
-        observe = Observe(1, failing_local_directory(failing, args.fail_local_save))
+        observe = Observe(1, failing_local_directory(checkpoints, failing, args.fail_local_save))
     if args.block_after:
         # The source's last batch trains the step `block_after` past where the run restored.
         observe = Observe(1, blocked(checkpoints, loader, (restored_step or 0) + args.block_after,
