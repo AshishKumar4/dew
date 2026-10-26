@@ -28,6 +28,7 @@ from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Aux, EMASpec, Objective, Ratio
 from dew.objectives.lm import LMObjective
+from dew.objectives.routing import ExpertBalance
 from dew.training import Layout, Trainer
 from dew.training.host import companion_mesh, transfer
 
@@ -200,8 +201,8 @@ def test_dropout_composite_replay_restarts_with_effects_and_ema_intact(tmp_path)
     model = CausalTransformer(vocab_size=16, emb_features=8, num_layers=2, num_heads=2,
                               mlp_features=16, max_seq_len=8, scan_layers=True, dropout_rate=.4,
                               mixture=Mixture(experts=4, top_k=2, bias=True))
-    objective = LMObjective(model, 8, head_chunks=1, aux_loss_alpha=.2, seq_aux=False,
-                            balance_rate=.01, ema_decay=.9)
+    objective = LMObjective(model, 8, head_chunks=1, ema_decay=.9,
+                            balance=ExpertBalance(balance_rate=.01, aux_loss_alpha=.2, seq_aux=False))
     checkpoints = Checkpoints(str(tmp_path / "dropout"))
     def make(checkpoints=None):
         return Trainer(objective, optax.chain(optax.clip_by_global_norm(.5), optax.adam(.001)),

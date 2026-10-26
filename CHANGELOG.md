@@ -5,15 +5,37 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- Every outer program Dew compiles goes through one seam (`dew.nn.kernels.options.program`): an image
+  task's encode, noise and solver start, a bank's stacking, an autoencoder's encode and decode, LPIPS's
+  and FID's networks and a host step's unstack, so two loads of one module share its programs. The seam
+  holds placement trees by their structure and leaves. An objective's own programs and the serving
+  kernel's donated step programs stay apart, as their docstrings say.
 - The library holds no CPU-only algorithm (bible §5): a vocabulary row's fused logsumexp is one
   plain pass on every platform, which Dew's CPU test setting takes in float64 and rounds once
   (`dew.nn.precision.widened_reduction`, beside `accumulated`), in place of a CPU-only blocked
   reduction; a float64 schedule division is the plain division; and a plan over several devices is
   timed against the batch whole a rung up on every backend: it keeps the first plan unless the other's
-  every sample beats it (`dew.training.planning.faster`), so two runs of one configuration train one
-  program, and a resumed run continues its checkpoint's plan untimed. Dew's tests keep a frontier's
-  first plan (`DEW_UNTIMED_FRONTIER`, a test setting like `DEW_WIDE_CPU_ARITHMETIC`). The sharded LM head maps over the axes that
-  split its tokens alone, every other axis left automatic, in place of holding every axis manual.
+  every sample beats it (`dew.training.planning.faster`), so samples that overlap never switch it (two
+  runs timed apart may still keep different plans), and a resumed run continues its checkpoint's plan
+  untimed. Dew's tests keep a frontier's first plan (`DEW_UNTIMED_FRONTIER`, a test setting like
+  `DEW_WIDE_CPU_ARITHMETIC`).
+- Gemma 4 Unified (`google/gemma-4-12B`, `model_type` `gemma4_unified`) loads as a native media wrapper:
+  its encoder-free vision patches and raw audio frames project into the Gemma 4 decoder, either medium
+  optional, and every attention kind reads each vision block whole. Its model FLOPs count its language
+  model, as a vision projector's work is left out; a wrapper with an audio encoder refuses the count.
+  A Gemma 4 audio clip's placeholders now read their valid frames by index, so a clip with masked frames
+  between valid ones maps each placeholder to its own frame.
+- `WeightLayout.source_array` assembles a source tensor in JAX at its compute dtype, traceable, as
+  `export` lays it out; `export` keeps the host copy and the stored dtype.
+- `record_case` takes no proxy: the recorded reference alone then sizes the count.
+- `SafetensorsBanks` streams a media wrapper's language model and the native backbone of a decision
+  release whose readout is stored apart (a slot release), besides a decoder: it reads the source through
+  `dew.interop.pretrained.native_backbone`, `Pretrained.load`'s own translation and tree check over the
+  safetensors alone. A wrapper's towers and projectors are read whole and stay resident. A config that
+  states `expert_dtype` without a quantization config is no longer refused.
+- `tools/slot_runtime_qualification.py` qualifies a released slot runtime against the authors' engine and
+  its float64 truth, the truth's weights streamed from those banks: phases pool, native, environment,
+  author, truth (`--partial` resumes a stopped phase) and verdict, one checkout's commit across them.
 - A loaded decoder's pad row takes no gradient wherever its source's table pads it. Kimi Linear, Kimi K3,
   Ouro, Dream, LLaDA-MoE and LLaDA2 now pad `pad_token_id` as their released code does, at their config
   class's own default where a config states none; Dew trained that row before. Qwen 3.5's wrappers load
@@ -22,6 +44,44 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   id counting back from the table's end. A verification of a repository's own code is recorded under
   the repository, Hub commit and folder it was fetched at, and a local directory's own code is verified
   at each load.
+- A run trains its routers by one policy, `dew.objectives.routing.ExpertBalance`, which `LMObjective`, `MaskedDiffusionObjective`, `GRPOObjective` and `DPOObjective` take as `balance`, and `PPOObjective` takes as `balance` too and passes to its policy: the aux-loss-free balancing bias (`balance_rate`), DeepSeek V2's balance loss (`aux_loss_alpha`, `seq_aux`) and ST-MoE's router z-loss (`router_z_loss`), each optional. The policy adds its terms to the loss statistics and its bias counts to the step's effects, and the commit applies the counts once per update. `LMObjective`'s four balance arguments are replaced by `balance`; a run recorded with them is refused, as one recorded with any argument its objective no longer takes. A masked-diffusion run balances the routers of an LLaDA-MoE mixture as an LM does. A GRPO, DPO or PPO run counts the response tokens its loss trains, and a DPO pair's two halves both count. A record names `balance` as the `ExpertBalance` it is, so `--objective.balance` reads for each of these objectives. The decision objectives do not take the policy yet.
+- Every token objective runs its vocabulary head by one policy (`dew.objectives.lm.head.HeadedObjective`):
+  the masked- and block-diffusion objectives take `head_chunks` and `head_tile` as an LM's, keep the whole
+  logits where they fit, and the fit ladder tiles them where they do not, where they scored a fixed
+  1024 x 8192 tile before; GRPO's evaluation scores at its own tile. `head_cross_entropy` takes the tile it
+  scores in, with no default.
+- A prefix run trains and serves one mask: `LMObjective(prefix=N | "prompt")` makes each document's first
+  tokens, or its prompt, a block the model's block-reading layers see whole, scores no target in its
+  source's block, and gives a served prompt the same block (`TextSettings.prefix`, `TextGeneration`,
+  `Server`). The data stage `dew.data.steps.blocks.Blocks` makes blocks for any chain from a prefix, a
+  chat row's roles, or a user's per-token runs (`given=`), and a run with blocks refuses a model whose trunk
+  reads none. A prediction depth reads blocks beyond its source, so a prefix run refuses `mtp_weight`, and
+  blocks need a trunk layer that reads them with no attention chunk, which cuts a block at any origin. A
+  prefix run's batch without blocks, a precompiled loader's, takes them at the scoring boundary, its
+  documents' places counted over their real tokens across any hole in their validity, as the decoder
+  counts them, in the data stage `Blocks` as in the loss; the stage a prefix run installs keeps a
+  record's own blocks, as the loss keeps a batch's; `generate(..., prefix=)` refuses a model or a
+  prefix the run would; lm-eval's likelihood (`dew.eval.harness`) scores a prefix run's continuation
+  through the blocks a server makes of its context.
+- MuonClip clips the attention of whatever objective a run trains, or refuses it: a run whose optimizer
+  holds a QK-Clip (`dew.optim.clips_qk`, its state a `QKClipState`) asks its objective for the step's
+  attention logit maxima (`Step.qk_stats`), so a masked- or block-diffusion run clips as an LM, RL or preference
+  run does, and the run refuses a step whose objective returns none, where a decision run trained unclipped
+  with no sign of it. `LMObjective`'s, `TokenScorer`'s and the RL objectives' `qk_stats`
+  argument is removed: the run asks for them.
+- Every run names its validation splits' metrics, `--val-metrics` (`RunConfig.val_metrics`), which only a
+  diffusion run held: each metric scores the split it names (`MetricConfig.split`) or every split, so a
+  decision run scores accuracy on `val` and the Brier score on `test`. Where it names none, each split
+  scores the kind's own (`default_metrics`): a language model's perplexity, a decision run's accuracy,
+  calibration error, risk-coverage area and log loss, a JEPA run's probes, an image run's CLIP.
+  `DiffusionRunConfig.build_eval_metrics` is `validation_metrics(validates=...)`.
+- A run weighs its splits' scores into named summaries, a board's weighted index (`--val-summaries`,
+  `Trainer.fit(summaries=)`, `dew.training.evaluation.Summary`): each formed once an evaluation, only
+  where it scored every split the summary weighs, logged as `summary/<name>`, and ranked by `Best`
+  (`--trainer.best summary/<name>`) and `Plateau`.
+- A language-model run loops a `--pretrained` decoder as a decision run does: `--loop-steps`,
+  `--loop-layers`, `--loop-backprop-steps` and `--loop-remat` are both runs' (`DecoderRunConfig`), and
+  `looping` is `dew.config.looping`.
 - Test-time training over the task loss: a decoder's continuum level (`CausalTransformer(continuum=ContinuumLevel(hidden))`) is stepped in context by the LM loss every `window` tokens of a document (`LMObjective(adaptation=ChunkAdaptation(...))`), Nested Learning's equation 71, each document from the trained start, training through every step.
 - A label's cross-entropy derivative in its own logit is `p - 1` while the label holds at most half its row and minus the rest of the row past it (`dew.nn.categorical.label_entry`), for the whole-logits head and the tiled, fused and vocabulary-split heads alike; the rest alone sat two to three times as far from float64 on unconfident rows.
 - `UNet2DCondition` stores its time embeddings' two maps flat, as `time_linear_1` and `time_linear_2`
@@ -31,9 +91,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   draws its bucket primes with `sympy.nextprime`, so `sympy` is a dependency.
 - A flow transition's density and KL hold at float32's edges: the density is JAX's isotropic
   `multivariate_normal.logpdf`, where `2 pi` times a variance near float32's largest overflowed, and the
-  KL takes the error's half from its quotient, rounded once, where 2 times such a variance or an error
-  over a variance near float32's least overflowed and half an error near its least flushed to zero (a KL
-  of 0 for 0.5).
+  KL is one division of operands in range, the variance doubled where that fits and else the error
+  halved, where 2 times such a variance or an error over a variance near float32's least overflowed and
+  half an error near its least flushed to zero (a KL of 0 for 0.5); its derivative is each element's
+  slope `(mean - reference) / variance` against the tangent, which neither overflows a tangent over a
+  variance near float32's least nor flushes a cotangent over one near its largest.
   Schulman's k3 KL estimate is one helper through `expm1`
   (`dew.rl.surrogate.sampled_kl`), which a small log ratio's `exp(d) - 1` rounded away.
 - A masked-diffusion row's reveals are its own under RBG keys too (`dew._distributions.counted`, the
@@ -95,7 +157,6 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 - An S3 store's conditional writes go through s3fs's own call (`call_s3`), as its reads and plain writes
   do, so a profile's server-side encryption (a KMS key, SSE-C) and its bucket's regional client reach
   them; a refused condition is still `PreconditionFailed`.
-  timed against the batch whole a rung up on every backend.
 - 8-bit Adam state codes each moment value among the six codes around its estimate, its decade by its
   logarithm, instead of searching the whole map: on an A100, lm-dense's update takes 27.32 ms against
   60.39, its full-remat step 167.9 against 196.3 ms and compiles in 82.3 against 209.8 s, the codes

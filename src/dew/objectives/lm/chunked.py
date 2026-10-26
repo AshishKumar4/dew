@@ -968,13 +968,13 @@ def fused_head_loss(hidden, head: OutputTable, targets, weights, *, z_loss: floa
     return jnp.sum(shares), terms
 
 
-def head_cross_entropy(model, variables, read, targets, chunks: int, *,
-                       tile: tuple[int, int] | None = (1024, 8192), predict: bool = True,
-                       temperature: float = 1.0, excluded: int | None = None) -> Terms:
+def head_cross_entropy(model, variables, read, targets, chunks: int, *, tile: tuple[int, int] | None,
+                       predict: bool = True, temperature: float = 1.0, excluded: int | None = None) -> Terms:
     """The cross entropy of what `final_read` gave, `read`, against `targets`.
 
     Final states are scored through `model`'s head over `variables`
-    (`chunked_cross_entropy`): the matrix `AffineHead.output_table` gives,
+    (`chunked_cross_entropy`) in `tile`, the head policy's (`dew.objectives.lm.head`; None keeps the
+    whole logits): the matrix `AffineHead.output_table` gives,
     its scale, bias, softcap and precision included. Where no matrix alone is the
     head (a prediction head past the final states, an adapter's factors on
     it), the model's exact logits (`LogitsFromHidden`), and the logits a

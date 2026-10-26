@@ -21,7 +21,8 @@ from flax import struct
 from jax.typing import ArrayLike
 
 from dew.diffusion.process import Denoiser, Process
-from dew.diffusion.schedules import RectifiedFlow, expand
+from dew.diffusion.schedules import RectifiedFlow, divided, expand
+from dew.nn.kernels.generation import linear_tangent
 from dew.nn.precision import at_least_fp32
 
 from .guidance import Guidance, Walk
@@ -96,17 +97,76 @@ class GaussianTransition:
         reference_mean = jnp.asarray(reference_mean, mean.dtype)
         if reference_mean.shape != mean.shape:
             raise ValueError("reference and policy transition means must share one shape")
-        error = jnp.square(mean - reference_mean).sum(axis=tuple(range(1, mean.ndim)))
+        difference = mean - reference_mean
         safe_variance = jnp.where(variance > 0, variance, 1)
+        error = jnp.square(difference).sum(axis=tuple(range(1, mean.ndim)))
         deterministic = jnp.where(error == 0, 0.0, jnp.inf)
-        # `error / (2 variance)` rounded once, by the division: the half is a step of the quotient's
-        # exponent, exact where the quotient fits, and of the error's where the quotient alone
-        # overflows, an error that large far above float32's least. Twice a variance near its largest
-        # overflows; half an error near its least is below the normal range, which XLA:CPU flushes to
-        # zero (a KL of 0 where it is 0.5).
-        quotient = error / safe_variance
-        halved = jnp.where(quotient == jnp.inf, error * 0.5 / safe_variance, quotient * 0.5)
-        return jnp.where(variance > 0, halved, jnp.where(variance == 0, deterministic, jnp.nan))
+        return jnp.where(variance > 0, _gaussian_kl(difference, safe_variance),
+                         jnp.where(variance == 0, deterministic, jnp.nan))
+
+
+def _divergence(difference: jax.Array, variance: jax.Array) -> jax.Array:
+    """`|difference|**2 / (2 variance)`, one row a `variance`, as one division of operands in range: the
+    variance doubled where that is finite, else the squared error halved, an error over so wide a
+    variance far above float32's least. Halving the error alone left half an error near its least below
+    the normal range, which XLA:CPU flushes to zero (a KL of 0 where it is 0.5), and halving the
+    quotient after overflowed where half of it fits. Its derivatives are `_gaussian_kl`'s."""
+    error = jnp.square(difference).sum(axis=tuple(range(1, difference.ndim)))
+    doubled = 2 * variance
+    wide = doubled == jnp.inf
+    return jnp.where(wide, error * 0.5, error) / jnp.where(wide, variance, doubled)
+
+
+@jax.custom_jvp
+def _directional(difference: jax.Array, variance: jax.Array) -> jax.Array:
+    """`_divergence` whose forward mode keeps its steps in float32's range where its result is: the
+    difference's tangent summed against the difference before one division by the variance
+    (`divided`), so a cancelling tangent (`[16, -16]` at a difference of 0.5 over 2**-126) sums to its
+    0 rather than to two overflowing products; the variance's coefficient `-KL / variance` as two
+    factors of about its root each (`_halves`), the tangent meeting one and then the other, so
+    neither a tangent over the variance first (`2**-126 / 2**32`) nor the coefficient alone (`2**249`
+    at the least) leaves the range the term keeps."""
+    return _divergence(difference, variance)
+
+
+@_directional.defjvp
+def _directional_jvp(primals, tangents):
+    """`_directional`'s tangent: the difference's summed before its division, the variance's through its
+    coefficient's halves."""
+    (difference, variance), (difference_tangent, variance_tangent) = primals, tangents
+    value = _divergence(difference, variance)
+    held, spread = _halves(value, variance)
+    along = divided((difference * difference_tangent).sum(axis=tuple(range(1, difference.ndim))), variance)
+    return value, along - held * variance_tangent * spread
+
+
+def _kl_pullback(saved, operands, cotangent):
+    """The KL's reverse mode: each element's slope `difference / variance` against the cotangent, so a
+    cotangent over a variance near float32's largest (whose `1 / (2 variance)` is below the normal
+    range) meets the slope, which is not; and the variance's coefficient's halves (`_halves`) one after
+    the other."""
+    del saved
+    difference, variance = operands
+    held, spread = _halves(_divergence(difference, variance), variance)
+    slope = divided(difference, expand(variance, difference))
+    return slope * expand(cotangent, difference), -(cotangent * spread) * held
+
+
+_gaussian_kl = linear_tangent(lambda difference, variance: (_divergence(difference, variance), ()),
+                              _kl_pullback, _directional)
+"""`_divergence` differentiated through Dew's seam (`dew.nn.kernels.generation.linear_tangent`): its
+forward mode `_directional`'s, its reverse mode `_kl_pullback`'s, each order keeping its steps in
+range."""
+
+
+def _halves(numerator: jax.Array, divisor: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`numerator / divisor` as two factors of about its root each: the numerator over a power of two,
+    and that power over the divisor (`divided`), the power half their exponents' sum, so a number
+    multiplied by one and then the other leaves float32's range only where the whole product does."""
+    _, top = jnp.frexp(numerator)
+    _, bottom = jnp.frexp(divisor)
+    power = (top + bottom) // 2
+    return jnp.ldexp(numerator, -power), divided(jnp.ldexp(jnp.ones_like(divisor), power), divisor)
 
 
 def flow_transition(x: ArrayLike, velocity: ArrayLike, sigma: ArrayLike,

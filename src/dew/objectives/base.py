@@ -272,6 +272,10 @@ class Step:
     witness: Witness | None = struct.field(pytree_node=False, default=None)
     """The evaluation's collector of what `sample` and `boundary` produce, which `Objective._loss` opens
     inside the trace of a recording step (`record`); None otherwise."""
+    qk_stats: bool = struct.field(pytree_node=False, default=False)
+    """Whether the run's optimizer reads the step's attention logit maxima (`dew.optim.clips_qk`, its
+    QK-Clip): the objective opens the `qk` collection in the model calls it trains through and returns
+    what they sowed (`Aux.qk_stats`). Static, as opening a collection changes the program."""
 
     def places(self, rows: int) -> tuple[jax.Array, int]:
         """The places among the update's examples of a batch's `rows` rows (`examples`) and how many
@@ -399,8 +403,9 @@ class Aux(Generic[Effects]):
     one-tuple of an fp32 `[rows, heads]` array of per-head logit maxima, and
     an MLA layer also holds `qk_nope`, an int scalar giving its nope width.
     Rows are the batch's rows, with microbatches concatenated under a
-    pipeline. It is None when the loss never opened the collection, and then
-    the clip does nothing."""
+    pipeline. It is None where the step asked for none (`Step.qk_stats`),
+    and empty where it asked and no layer sowed any; a run whose optimizer
+    clips by it refuses a step that returns None."""
     effects: Effects | None = None
     """Additive observations that `Objective.apply_effects` applies once per optimizer commit."""
     record: Evaluated | Recorded | None = None
@@ -923,7 +928,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         it as `holds` do, and its options cover them. `step` are the XLA options of the training step
         the program is part of (`dew.training.memory.step_compiler_options`), beside its modules' own,
         so a host step's programs compile as the resident step does. Keep only the current
-        specialization, not a history of old models or steps.
+        specialization, not a history of old models or steps. The cache is the objective's, so its
+        programs live as long as it does: the process-wide seam every other outer program shares
+        (`dew.nn.kernels.options.program`) would keep each objective alive with them.
         """
         programs = tuple((program.module, (program.head_tile, program.head_fused))
                          for program in self.program_key())

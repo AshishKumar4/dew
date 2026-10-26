@@ -9,7 +9,7 @@ import time
 import types
 from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import Any, ClassVar, Literal
 
 import jax
 import numpy as np
@@ -27,7 +27,7 @@ from dew.artifacts import Artifact, Artifacts
 from dew.batch import VALID_ROWS, Batch, Variables
 from dew.data.dataset import Closeable, DataPartition, Reader, rows_of, take_rows
 from dew.data.pipeline import Dataset
-from dew.objectives.base import Effects, Loss, Metric, Objective, Step, TrainingScalar, recorded_name
+from dew.objectives.base import Effects, Loss, Metric, Objective, Shown, Step, TrainingScalar, recorded_name
 from dew.training.distributed import (
     MeshSpec,
     row_origins,
@@ -50,6 +50,68 @@ class EvalSuite:
     data: Reader
     metrics: Sequence[Metric] = ()
     every: int | None = None
+
+
+@dataclass(frozen=True)
+class Summary:
+    """One scalar a run forms from each evaluation's split scores by a declared weighting, a board's
+    weighted index: `sum(weight * score) / sum(weight)` over `weights`, each score named as an evaluation
+    records it (`val/accuracy`, `test/loss`) and each weight positive. It is formed once a pass, where the
+    pass's splits are merged (`Trainer.fit`), and only at a step that scored every split it weighs, so a
+    step a rarer suite skips forms none rather than mix in its stale scores. It is logged as
+    `summary/<name>`, which `Best` and `Plateau` rank by, `better` the way it improves."""
+
+    name: str
+    weights: Mapping[str, float]
+    better: Literal["higher", "lower"]
+
+    SPLIT: ClassVar[str] = "summary"
+    """The split a summary's score is recorded under: `summary/<name>`."""
+
+    def __post_init__(self) -> None:
+        object.__setattr__(self, "weights", dict(self.weights))
+        if not self.weights:
+            raise ValueError(f"summary {self.name!r} weighs no score")
+        for score, weight in self.weights.items():
+            split, _, metric = score.partition("/")
+            if not split or not metric:
+                raise ValueError(f"summary {self.name!r} weighs {score!r}, which names no split/metric")
+            if not (weight > 0 and np.isfinite(weight)):
+                raise ValueError(f"summary {self.name!r} weighs {score!r} by {weight}, which is not positive")
+        if self.better not in ("higher", "lower"):
+            raise ValueError(f"summary {self.name!r} improves 'higher' or 'lower', not {self.better!r}")
+
+    @property
+    def splits(self) -> frozenset[str]:
+        """The splits it weighs, each of which an evaluation must score for it to be formed."""
+        return frozenset(score.partition("/")[0] for score in self.weights)
+
+    @property
+    def shown(self) -> Shown:
+        """Its direction, as a metric declares its own (`Best` reads it)."""
+        return Shown(better=self.better)
+
+    def formed(self, scores: Mapping[str, float], evaluated: Sequence[str]) -> dict[str, float]:
+        """`{summary/<name>: value}` from `scores`, where the evaluation that scored them `evaluated`
+        every split it weighs, and nothing where it did not."""
+        if not self.splits <= set(evaluated):
+            return {}
+        total = sum(self.weights.values())
+        value = sum(weight * float(scores[score]) for score, weight in self.weights.items()) / total
+        return {f"{self.SPLIT}/{self.name}": value}
+
+    def check(self, suites: Mapping[str, EvalSuite], loss: bool) -> None:
+        """Refuse a score no evaluation records: one of a split `suites` does not hold, or a metric its
+        suite does not score, its loss where the objective defines none (`loss`)."""
+        for score in self.weights:
+            split, _, metric = score.partition("/")
+            if split not in suites:
+                raise ValueError(f"summary {self.name!r} weighs {score!r}, and the run validates no split "
+                                 f"{split!r} ({sorted(suites)})")
+            declared = {scored.name for scored in suites[split].metrics}
+            if metric not in declared and not (metric == "loss" and loss):
+                raise ValueError(f"summary {self.name!r} weighs {score!r}, which split {split!r} does not "
+                                 f"score ({sorted(declared | ({'loss'} if loss else set()))})")
 
 
 @dataclass(frozen=True)
@@ -569,7 +631,7 @@ class MetricScores[Statistics, Additions](Mapping):
 
     def __init__(
         self,
-        declared: Mapping[str, Sequence[Metric]],
+        declared: Mapping[str, Sequence[Metric | Summary]],
         scores: Mapping[str, float],
         objective: Objective[Statistics, Additions],
     ):
