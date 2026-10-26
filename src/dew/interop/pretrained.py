@@ -1164,7 +1164,7 @@ def _loaded_kind(reference: sources.SourceReference, directory: Path, composite:
                                    attention_impl=attention_impl, max_seq_len=max_seq_len, weights=weights,
                                    overrides=overrides,
                                    remote=None if remote is None else reference.directory(remote),
-                                   text_only=text_only)
+                                   pinned=reference, text_only=text_only)
     return loaded, False
 
 
@@ -1382,7 +1382,7 @@ type SourceRoute = DecoderRoute | WrapperRoute | DiffusionGemmaRoute | VerifiedR
 def source_route(config: Mapping[str, object], *,
                  verified: Callable[..., verify.VerifiedMapping | verify.Unmapped] = verify.verify_mapping,
                  admitted: Callable[[verify.Unmapped], TorchAdmission] | None = None,
-                 remote: Path | None = None, revision: str | None = None) -> SourceRoute:
+                 remote: Path | None = None, pinned: sources.SourceReference | None = None) -> SourceRoute:
     """The route `Pretrained.load` reads `config`'s source by, or the refusal it raises for it, on the
     config alone: a storage format the codecs cannot decode, a registered family's or wrapper's own
     refusal of the config, a speculative drafter of any model_type (`decoder_parts.DrafterRefused`),
@@ -1391,8 +1391,8 @@ def source_route(config: Mapping[str, object], *,
     `verified` checks an unregistered decoder against transformers (`verify.verify_mapping`), and
     `admitted` decides whether tier 3 runs one it leaves unmapped (`torchax_fallback.admitted` when
     None); a census over many configs passes a memo of each. `remote` is the repository whose own
-    modeling code the load opted into running (`trust_remote_code`), and `revision` the Hub commit it
-    was fetched at, which a verification of that code is recorded under."""
+    modeling code the load opted into running (`trust_remote_code`), and `pinned` the repository, Hub
+    commit and folder it was fetched at, which a verification of that code is recorded under."""
     source_quantization(config)
     decoder_parts.refuse_drafter(config)
     family = config.get("model_type")
@@ -1401,7 +1401,7 @@ def source_route(config: Mapping[str, object], *,
     if _media_wrapper(config):
         return WrapperRoute(decoders.translate_wrapper_config(config))
     if isinstance(family, str) and family not in decoders.families():
-        match verified(config) if remote is None else verified(config, remote=remote, revision=revision):
+        match verified(config) if remote is None else verified(config, remote=remote, pinned=pinned):
             case verify.VerifiedMapping() as mapping:
                 return VerifiedRoute(mapping)
             case verify.Unmapped() as unmapped:
@@ -1565,8 +1565,9 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
         # in it, but its weights' snapshot is resolved and pinned here whenever it reads weights.
         routed = (mamba2.config_from_mamba_ssm(component.config) if mamba2.is_mamba_ssm(component.config)
                   else component.config)
-        remote = None if code is None else source.component(component.config_folder).directory(code)
-        forwarded = isinstance(source_route(routed, remote=remote, revision=source.revision), TorchRoute)
+        pinned = source.component(component.config_folder)
+        remote = None if code is None else pinned.directory(code)
+        forwarded = isinstance(source_route(routed, remote=remote, pinned=pinned), TorchRoute)
         reads_shared = not forwarded or bool(head_source.weight_file is None and prefix)
         if weights or reads_shared:
             weight_source = source.component(component.weights_folder)
@@ -1584,7 +1585,7 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
             gguf_file=None, component=component, tensors=tensors,
             placed=placed, streaming=streaming, dtype=dtype, param_dtype=param_dtype,
             attention_impl=attention_impl, max_seq_len=max_seq_len, weights=weights, overrides=overrides,
-            remote=remote)
+            remote=remote, pinned=pinned)
     else:
         _unread_overrides(overrides, "a release without a native backbone")
     missing = False
@@ -1631,7 +1632,8 @@ def _load_composite_source(source: sources.SourceReference, root: Path,
                               description.tokenizer_folder, **description.fields)
 
 
-def _routed(config: Mapping[str, object], *, remote: Path | None, revision: str | None, text_only: bool,
+def _routed(config: Mapping[str, object], *, remote: Path | None, pinned: sources.SourceReference | None,
+            text_only: bool,
             overrides: Mapping[str, object] | None
             ) -> tuple[Mapping[str, object], SourceRoute, decoder_parts.WrapperFields | None]:
     """A native source's config, its route and, where `text_only` takes a wrapper's language model
@@ -1639,8 +1641,8 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, revision: str 
     format the codec cannot read, a family's refusal, an unregistered decoder checked against
     transformers (tiers 2 and 3). The language model reads as its text family's checkpoint
     (`decoders.language_model_config`); a route that reads no `overrides` refuses them. `remote` and
-    `revision` are `source_route`'s."""
-    route = source_route(config, remote=remote, revision=revision)
+    `pinned` are `source_route`'s."""
+    route = source_route(config, remote=remote, pinned=pinned)
     language = route.wrapper if text_only and isinstance(route, WrapperRoute) else None
     if language is not None:
         if decoders.bundles(config):
@@ -1651,7 +1653,7 @@ def _routed(config: Mapping[str, object], *, remote: Path | None, revision: str 
             raise ValueError("text_only takes an unquantized wrapper: a quantized one's module selection "
                              "names the wrapper's modules, which its text checkpoint renames")
         config = decoders.language_model_config(config, language)
-        route = source_route(config, remote=remote, revision=revision)
+        route = source_route(config, remote=remote, pinned=pinned)
     elif text_only and isinstance(route, DiffusionGemmaRoute):
         raise ValueError("text_only takes a media wrapper's language model; DiffusionGemma's decoder is "
                          "its whole model")
@@ -1668,9 +1670,11 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
                         component: NativeComponent | None = None,
                         tensors: Mapping[str, np.ndarray] | None = None,
                         overrides: Mapping[str, object] | None = None,
-                        remote: Path | None = None, text_only: bool = False) -> tuple[Pretrained, bool]:
+                        remote: Path | None = None, pinned: sources.SourceReference | None = None,
+                        text_only: bool = False) -> tuple[Pretrained, bool]:
     """Decode native source weights and bind their processors and export layout, and whether the
-    bundle is a wrapper's language model taken alone (`text_only`).
+    bundle is a wrapper's language model taken alone (`text_only`). `remote` is the source's own code
+    where the load runs it, and `pinned` where it was fetched (`source_route`).
 
     Diffusers pipelines and the explicit torchax fallback have already taken
     their own routes; this boundary handles native decoders and media wrappers,
@@ -1690,7 +1694,7 @@ def _load_native_source(source: sources.SourceReference, root: Path, *,
         config = mamba2.config_from_mamba_ssm(config)
     config = _overridden(config, overrides)
     family = config.get("model_type")
-    config, route, language = _routed(config, remote=remote, revision=commit, text_only=text_only,
+    config, route, language = _routed(config, remote=remote, pinned=pinned, text_only=text_only,
                                       overrides=overrides)
     if isinstance(route, TorchRoute):
         from dew.interop import torchax_fallback
