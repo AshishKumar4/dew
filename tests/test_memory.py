@@ -102,7 +102,7 @@ def paper_loss(kind: str, objective: Objective):
         "lp": lambda prediction, target: jnp.sum(jnp.abs(prediction - target) ** objective.p),
         "huber": lambda prediction, target: jnp.sum(huber(prediction - target, objective.delta)),
         "l2_or_l1": lambda prediction, target: jnp.where(
-            jnp.linalg.norm(prediction - target) <= objective.delta,
+            jnp.sqrt(jnp.dot(prediction - target, prediction - target)) <= objective.delta,
             jnp.dot(prediction - target, prediction - target) / 2,
             objective.delta * jnp.linalg.norm(prediction - target, 1)),
     }
