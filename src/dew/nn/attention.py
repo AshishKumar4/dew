@@ -395,7 +395,7 @@ def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_af
     the normalized activation before multiplying and rounds the product
     again. `fp32_statistics=False` retains the input-dtype arithmetic.
     `implementation` selects the generation's measured kernel by default;
-    explicit 'pallas' interprets on CPU. The fused VJP retains only the
+    off a GPU, 'pallas' too runs XLA's arithmetic. The fused VJP retains only the
     narrow input, weight and per-row mean square, not fp32 activations.
     Unsupported variants run the checkpointed XLA reference instead
     (`norm_swiglu.rms_kernel`), including float64 and input-dtype statistics.

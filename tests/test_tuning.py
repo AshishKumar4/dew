@@ -20,23 +20,31 @@ from process_support import READ_ONLY, REPO_ROOT, fresh, keeping_picks, run_pool
 from reference_error import equations
 
 from dew.nn.activations import gated_product
-from dew.nn.attention import rms_normalized, stream_rms_normalized
+from dew.nn.attention import stream_rms_normalized
 from dew.nn.kernels import generation, norm_swiglu, tuning
 
 
+def seam(x, branch, scale):
+    """The fused pre-norm seam called itself (`norm_swiglu.stream_rms_norm`), interpreted on a CPU, XLA's
+    seam its portable arithmetic."""
+    def portable(x, branch, scale):
+        return stream_rms_normalized(x, branch, scale, 1e-6, x.dtype, scale_offset=True,
+                                     scale_after_cast=False, fp32_statistics=True, implementation="xla")
+
+    return norm_swiglu.stream_rms_norm(x, branch, scale, 1e-6, x.dtype, offset=True, after_cast=False,
+                                       portable=portable)
+
+
 def loss(x, branch, scale, gate, up):
-    stream, normed = stream_rms_normalized(x, branch, scale, 1e-6, x.dtype, scale_offset=True,
-                                           scale_after_cast=False, fp32_statistics=True,
-                                           implementation="pallas")
+    stream, normed = seam(x, branch, scale)
     # The product feeds the rest of the step, as a down projection reads it: a step whose gradient
     # never reads a fused kernel's output drops its forward launch (`generation.linear_tangent`).
-    product = gated_product("swiglu", implementation="pallas")(gate, up)
+    product = norm_swiglu.swiglu(gate, up, gated_product("swiglu", implementation="xla"))
     return jnp.sum(stream * normed) + jnp.sum(product * product)
 
 
 def plain(x, scale):
-    return rms_normalized(x, scale, 1e-6, x.dtype, scale_offset=True, scale_after_cast=False,
-                          fp32_statistics=True, implementation="pallas")
+    return seam(x, None, scale)[1]
 
 
 def step():

@@ -54,6 +54,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 - An S3 store's conditional writes go through s3fs's own call (`call_s3`), as its reads and plain writes
   do, so a profile's server-side encryption (a KMS key, SSE-C) and its bucket's regional client reach
   them; a refused condition is still `PreconditionFailed`.
+- Dew's fused kernels, the delta rules' decay and memory products and the frozen FP8 product take
+  their reverse mode through one `jax.experimental.hijax` linear map (`generation.linear_map`)
+  instead of `linear_call`, which JAX deprecates in favour of hijax (jax-ml/jax#41782): their
+  gradients still run the backward kernels, under a jit, a shard_map, a scan, a remat or a vmap.
 - 8-bit Adam state codes each moment value among the six codes around its estimate, its decade by its
   logarithm, instead of searching the whole map: on an A100, lm-dense's update takes 27.32 ms against
   60.39, its full-remat step 167.9 against 196.3 ms and compiles in 82.3 against 209.8 s, the codes

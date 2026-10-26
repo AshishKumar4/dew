@@ -209,7 +209,7 @@ def test_cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
     unrouted rows and empty groups included, and the CUDA branch's launches are CUTLASS's."""
     # The wheel is optional: a process without it, or whose wheel holds no kernel for its GPU, runs the
     # template's launches, which the suite checks apart.
-    here = generation.effective(generation.gpu_target()).generation
+    here = generation.gpu_target().generation
     if here not in grouped_matmul.cutlass_architectures():
         pytest.skip(f"no installed dew-cutlass holds kernels for {here}")
     group_sizes = jnp.asarray(SIZES[sizes], jnp.int32)
