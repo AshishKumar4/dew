@@ -225,6 +225,27 @@ class OutputTable:
 
 
 @runtime_checkable
+class SteppedInContext(Protocol):
+    """A model whose head reads parameters an objective steps in context, a window at a time
+    (`dew.nn.continuum`, `LMObjective(adaptation=...)`): the level's parameters within a tree of its
+    variables, None without a level; the tree with others in their place; and the two halves of the
+    head the steps run between, the level on final states (`continuum_states`) and the head past it
+    (`head_logits`). Its owner keeps the level's place in its tree, so an objective never reads it.
+    `in_context` says whether the model holds a level."""
+
+    @property
+    def in_context(self) -> bool: ...
+
+    def in_context_level(self, variables: VariableDict) -> VariableDict | None: ...
+
+    def with_in_context_level(self, variables: VariableDict, level: VariableDict) -> VariableDict: ...
+
+    def continuum_states(self, hidden: jax.Array) -> jax.Array: ...
+
+    def head_logits(self, states: jax.Array) -> jax.Array: ...
+
+
+@runtime_checkable
 class Logits(Protocol):
     """A token model's `[B, S, vocab]` fp32 logits over the whole sequence."""
 
