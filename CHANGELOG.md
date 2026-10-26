@@ -9,7 +9,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   plain pass on every platform, which Dew's CPU test setting takes in float64 and rounds once
   (`dew.nn.precision.widened_reduction`, beside `accumulated`), in place of a CPU-only blocked
   reduction; a float64 schedule division is the plain division; and a plan over several devices is
-  timed against the batch whole a rung up on every backend. The sharded LM head maps over the axes that
+  timed against the batch whole a rung up on every backend: it keeps the first plan unless the other's
+  every sample beats it (`dew.training.planning.faster`), so two runs of one configuration train one
+  program, and a resumed run continues its checkpoint's plan untimed. The sharded LM head maps over the axes that
   split its tokens alone, every other axis left automatic, in place of holding every axis manual.
 - 8-bit Adam state codes each moment value among the six codes around its estimate, its decade by its
   logarithm, instead of searching the whole map: on an A100, lm-dense's update takes 27.32 ms against

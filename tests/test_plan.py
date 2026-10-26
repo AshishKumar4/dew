@@ -382,13 +382,38 @@ def test_a_resumed_run_reads_its_batches_in_the_microbatches_its_checkpoint_trai
         windowed(tmp_path / "split", 4).fit(windows(corpus), steps=6, checkpoint_every=2)
 
 
-@pytest.mark.parametrize("seconds, split, remat", [([0.2, 0.1], 1, "minimal"), ([0.1, 0.2], 2, None)])
+@pytest.mark.mesh(devices=2)
+def test_a_resumed_run_continues_the_plan_its_frontier_chose_untimed(tmp_path):
+    """A run over two devices times its frontier, the batch whole as it fits and a rung up, and keeps one;
+    a run resumed from its checkpoint continues that plan without timing again, as the run it continues
+    compiled it, so the two train one program whatever a second timing would say."""
+    corpus = token_files(tmp_path)
+
+    def run(split):
+        trainer = windowed(tmp_path / "frontier", split)
+        trainer.device_mesh = MeshSpec().build(jax.devices()[:2])
+        return trainer
+
+    first = run(1)
+    first.fit(windows(corpus), steps=2, checkpoint_every=2)
+    assert [timing["remat"] for timing in first.plan["timed"]] == [None, "minimal"]
+    resumed = run(None)
+    resumed.fit(windows(corpus), steps=4, checkpoint_every=2)
+    assert resumed.plan["timed"] is None
+    assert (resumed.plan["split"], resumed.plan["remat"]) == (first.plan["split"], first.plan["remat"])
+
+
+@pytest.mark.parametrize("seconds, split, remat", [
+    ([[0.2, 0.21], [0.1, 0.12]], 1, "minimal"), ([[0.1, 0.12], [0.2, 0.21]], 2, None),
+    ([[0.2, 0.3], [0.1, 0.25]], 2, None)], ids=["whole", "split", "within-spread"])
 def test_a_split_plan_is_timed_against_its_batch_whole_a_rung_up_and_the_faster_kept(
         monkeypatch, seconds, split, remat):
     """Where the devices hold a byte less than the batch whole needs at the
     least recomputation, it fits split there, and whole one remat rung up with
-    the head tiled: both are compiled and timed, and the faster is the plan,
-    the objective at its rung, both times recorded."""
+    the head tiled: both are compiled and timed, and the plan is the whole one
+    only where its every sample beats the split one's (`faster`), the split one
+    where their samples overlap, the objective at its rung, each plan's fastest
+    sample recorded."""
     free(monkeypatch, needs(monkeypatch, lm(split=1)) - 1)
     trainer = lm()
     state, _, _ = trainer.place()
@@ -398,7 +423,7 @@ def test_a_split_plan_is_timed_against_its_batch_whole_a_rung_up_and_the_faster_
     assert (trainer.plan["split"], trainer.plan["remat"]) == (split, remat)
     assert trainer.objective.model.remat == (None if remat is None else REMAT_POLICIES[remat])
     assert [(plan["split"], plan["remat"], plan["seconds"]) for plan in trainer.plan["timed"]] == [
-        (2, None, seconds[0]), (1, "minimal", seconds[1])]
+        (2, None, min(seconds[0])), (1, "minimal", min(seconds[1]))]
     state, loss, *_ = step(state, BATCH)
     assert np.isfinite(float(loss))
 
@@ -413,7 +438,7 @@ def test_a_plan_over_several_devices_that_fits_whole_is_timed_against_its_batch_
     trainer.device_mesh = MeshSpec().build(jax.devices()[:2])
     state, _, _ = trainer.place()
     timed = []
-    trainer.compile(state, BATCH, lambda steps: (timed.append(len(steps)), [2.0, 1.0])[1])
+    trainer.compile(state, BATCH, lambda steps: (timed.append(len(steps)), [[2.0], [1.0]])[1])
     assert timed == [2]
     timings = [(plan["split"], plan["remat"]) for plan in trainer.plan["timed"]]
     assert timings == [(1, None), (1, "minimal")]
@@ -569,3 +594,14 @@ def test_two_processes_name_one_run_alike():
         assert done.returncode == 0, done.stderr[-3000:]
         keys.append(json.loads(done.stdout.splitlines()[-1]))
     assert keys[0] == keys[1]
+
+
+def test_a_frontier_keeps_its_first_plan_unless_another_is_faster_beyond_the_spread():
+    """`faster` takes a later plan only where its slowest sample beats every sample of the plan it would
+    replace: timings that overlap are the clock's noise, and keep the first."""
+    from dew.training.planning import faster
+
+    assert faster([[2.0, 2.1], [1.0, 1.1]]) == 1
+    assert faster([[1.0, 1.1], [2.0, 2.1]]) == 0
+    assert faster([[1.0, 2.0], [0.9, 1.5]]) == 0
+    assert faster([[3.0], [2.0], [1.0]]) == 2
