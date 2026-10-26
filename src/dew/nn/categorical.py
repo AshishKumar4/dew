@@ -71,12 +71,11 @@ def _probabilities_tangent(primals, tangents):
 
 def cross_entropy(logits: jax.Array, labels: jax.Array, where: jax.Array | None = None) -> jax.Array:
     """`-log p[labels]` over the last axis, `labels` of `logits.shape[:-1]`: the log partition less the
-    label's logit, each taken from the row's maximum, which reads the label's logit without building the
-    normalized row. Optax's `softmax_cross_entropy_with_integer_labels` subtracts the label's logit from
-    the whole log partition, maximum included, which rounds at the logits' magnitude rather than the
-    loss's: mamba-tiny's drawn tokens' raw scores sat 1.47 times as far from float64 as `log_softmax`'s,
-    and 1.00 times so taken here.
-    Its derivative is Barron, Gnanapragasam and Tschannen's (arXiv:2610.31642, eq. 7): each other
+    label's logit, each taken from the row's maximum (`target_loss`), which reads the label's logit
+    without building the normalized row. Optax's `softmax_cross_entropy_with_integer_labels` subtracts
+    the label's logit from the whole log partition, maximum included, which rounds at the logits'
+    magnitude rather than the loss's: mamba-tiny's drawn tokens' raw scores sat 1.47 times as far from
+    float64 as `log_softmax`'s, and 1.00 times so taken here. Its derivative is Barron, Gnanapragasam and Tschannen's (arXiv:2610.31642, eq. 7): each other
     class's probability, and at the label minus their sum, so the row's derivative sums to zero. The
     label's `p - 1` collapses to 0 once its margin over the other classes passes the dtype's precision
     (eq. 4; 16.6 in float32), while the others' probabilities stay until they underflow."""
@@ -87,9 +86,9 @@ def cross_entropy(logits: jax.Array, labels: jax.Array, where: jax.Array | None 
 def _label_loss(logits: jax.Array, labels: jax.Array) -> jax.Array:
     # An infinite maximum, a row excluded whole, shifts by 0, as `jax.nn.logsumexp` shifts.
     peak = jnp.max(logits, axis=-1, keepdims=True)
-    shifted = logits - jnp.where(jnp.isfinite(peak), peak, 0.0)
-    label = jnp.take_along_axis(shifted, labels[..., None], axis=-1)[..., 0]
-    return jnp.log(jnp.sum(jnp.exp(shifted), axis=-1)) - label
+    peak = jnp.where(jnp.isfinite(peak), peak, 0.0)
+    label = jnp.take_along_axis(logits, labels[..., None], axis=-1)[..., 0]
+    return target_loss(peak[..., 0], jnp.sum(jnp.exp(logits - peak), axis=-1), label)
 
 
 @_label_loss.defjvp
