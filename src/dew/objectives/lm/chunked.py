@@ -413,9 +413,22 @@ def _shared_cotangents(cotangents, group: tuple[str, ...]):
 def _capped(raw, cap, columns: _Columns, temperature: float):
     """A tile's logits from its fp32 head product `raw`, through the per-column terms, the softcap and
     the temperature (`capped_logits`), and the pullback `_head_backward` takes their cotangent through:
-    the one head calculus the bounded, whole and fused heads share, each a schedule over it."""
-    return jax.vjp(lambda raw, cap, terms: capped_logits(terms.logits(raw), cap, temperature), raw, cap,
-                   columns)
+    the one head calculus the bounded, whole and fused heads share, each a schedule over it. The cap's
+    gradient sums every logit's share, rounded once (`compensated_sum`): the plain reduction its
+    transpose is rounds as it goes, and over a whole head's logits sat 1.58 times as far from float64
+    as the tiled head's sums of its tiles' on a CPU without YNNPACK's fusions."""
+    if cap is None:
+        return jax.vjp(lambda raw, cap, terms: capped_logits(terms.logits(raw), cap, temperature), raw, cap,
+                       columns)
+    logits, pullback = jax.vjp(lambda raw, caps, terms: capped_logits(terms.logits(raw), caps, temperature),
+                               raw, jnp.broadcast_to(jnp.asarray(cap, raw.dtype), raw.shape), columns)
+
+    def pulled(cotangent):
+        d_raw, d_caps, d_terms = pullback(cotangent)
+        d_cap = compensated_sum(d_caps, tuple(range(d_caps.ndim)))
+        return d_raw, d_cap.astype(jnp.asarray(cap).dtype), d_terms
+
+    return logits, pulled
 
 
 def _head_backward(pullback, cotangent, product_matrix, states, precision: jax.lax.PrecisionLike, work,
