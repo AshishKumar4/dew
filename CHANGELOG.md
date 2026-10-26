@@ -5,6 +5,13 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A flow transition's density and KL hold at a variance near float32's largest: the density is JAX's
+  isotropic `multivariate_normal.logpdf`, and the KL halves after its division, where `2 pi` or 2 times
+  the variance overflowed. Schulman's k3 KL estimate is one helper through `expm1`
+  (`dew.rl.surrogate.sampled_kl`), which a small log ratio's `exp(d) - 1` rounded away.
+- A masked-diffusion row's reveals are its own under RBG keys too (`dew._distributions.counted`, the
+  rest of ledger 1669), and TensorBoard histograms are its own `histogram_pb`'s, the plugin's tensor.
+- The host CPU classifier is the CI's (tools/armada/host.py), not the library's: `dew._host` is gone.
 - 8-bit Adam state codes each moment value among the six codes around its estimate, its decade by its
   logarithm, instead of searching the whole map: on an A100, lm-dense's update takes 27.32 ms against
   60.39, its full-remat step 167.9 against 196.3 ms and compiles in 82.3 against 209.8 s, the codes

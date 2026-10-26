@@ -18,6 +18,7 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 from flax import struct
+from jax.scipy.stats import multivariate_normal
 from jax.typing import ArrayLike
 
 from dew.diffusion.process import Denoiser, Process
@@ -73,10 +74,11 @@ class GaussianTransition:
         if value.shape != mean.shape:
             raise ValueError("a transition density scores one next state per mean")
         safe_variance = jnp.where(variance > 0, variance, 1)
-        error = jnp.square(value - mean).sum(axis=tuple(range(1, value.ndim)))
-        dimensions = math.prod(value.shape[1:])
-        log_prob = -0.5 * (error / safe_variance
-                           + dimensions * jnp.log(2 * math.pi * safe_variance))
+        rows = value.shape[0]
+        # JAX's isotropic density (a scalar covariance, one per row): log(2 pi) and the log variance
+        # are summed apart, so a variance near float32's largest does not overflow 2 pi times it.
+        log_prob = jax.vmap(multivariate_normal.logpdf)(value.reshape(rows, -1), mean.reshape(rows, -1),
+                                                        jnp.broadcast_to(safe_variance, (rows,)))
         return jnp.where(variance > 0, log_prob, jnp.nan)
 
     def kl(self, reference_mean: ArrayLike) -> jax.Array:
@@ -94,7 +96,8 @@ class GaussianTransition:
         error = jnp.square(mean - reference_mean).sum(axis=tuple(range(1, mean.ndim)))
         safe_variance = jnp.where(variance > 0, variance, 1)
         deterministic = jnp.where(error == 0, 0.0, jnp.inf)
-        return jnp.where(variance > 0, error / (2 * safe_variance),
+        # Halved after the division, so a variance near float32's largest does not overflow twice it.
+        return jnp.where(variance > 0, error / safe_variance / 2,
                          jnp.where(variance == 0, deterministic, jnp.nan))
 
 

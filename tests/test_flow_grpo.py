@@ -973,3 +973,23 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     assert logged["evaluation/records"] == count * 2
     previews = [value for _, value in tracker.artifacts if not isinstance(value, RECORD_TYPES)]
     assert previews[0].images.shape == (min(4, count), 4, 4, 1)
+
+
+def test_a_transitions_density_and_kl_hold_at_float32s_largest_variances():
+    """A transition's density and KL stay finite and on SciPy's float64 values at a variance near float32's
+    largest, where `2 pi` or 2 times it overflowed to infinity: the density of a state at its mean under a
+    variance of 1e38 is `-n / 2 (log 2 pi + log 1e38)` (JAX's isotropic `multivariate_normal.logpdf`), and
+    the KL to a mean `d` away is `d**2 / (2 variance)`."""
+    from scipy.stats import multivariate_normal as reference
+
+    from dew.sampling.flow import GaussianTransition
+
+    variance = np.asarray([1e38, 2.5e38], np.float32)
+    mean = np.zeros((2, 3, 4), np.float32)
+    transition = GaussianTransition(jnp.asarray(mean), jnp.asarray(variance))
+    density = np.asarray(transition.log_prob(jnp.asarray(mean)))
+    expected = [reference.logpdf(np.zeros(12), np.zeros(12), float(value)) for value in variance]
+    np.testing.assert_allclose(density, expected, rtol=1e-6)
+    away = np.full_like(mean, 1e18)
+    kl = np.asarray(transition.kl(jnp.asarray(away)))
+    np.testing.assert_allclose(kl, 12 * 1e36 / (2 * variance.astype(np.float64)), rtol=1e-6)

@@ -208,3 +208,18 @@ def test_a_rollout_after_the_first_reuses_its_programs_and_reads_only_what_it_sc
     with steady_state(allow=("host_to_device",)):
         rolled = [rollout(state, batch(offset), key) for offset, key in zip((1, 2), keys[1:], strict=True)]
     assert all(rows[IDS_KEY].shape == (4, PROMPT_WIDTH + RESPONSE_WIDTH) for rows in rolled)
+
+
+def test_a_small_log_ratios_k3_estimate_keeps_its_leading_term():
+    """The k3 estimate `exp(d) - d - 1` of a log ratio `d` near zero is `d**2 / 2` to leading order. In
+    float32 `exp(d)` rounds to a spacing of `2**-24` about 1, which `- 1` leaves standing: at `d` of 1e-6
+    the estimate is off by most of itself. Through `expm1` (`dew.rl.surrogate.sampled_kl`) the rounding
+    is `expm1(d)`'s own, a spacing of `|d| 2**-24`, so the estimate is within `|d| 2**-23` of NumPy's
+    float64 `expm1(d) - d`."""
+    from dew.rl.surrogate import sampled_kl
+
+    log_ratio = np.asarray([1e-6, -1e-6, 3e-5, -2e-4, 0.1, -0.5], np.float32)
+    estimate = np.asarray(k3_kl(jnp.zeros_like(log_ratio), jnp.asarray(log_ratio)), np.float64)
+    wide = log_ratio.astype(np.float64)
+    assert np.all(np.abs(estimate - (np.expm1(wide) - wide)) <= np.abs(wide) * 2.0 ** -23)
+    np.testing.assert_array_equal(np.asarray(sampled_kl(jnp.asarray(log_ratio))), estimate)

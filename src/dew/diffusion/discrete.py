@@ -31,7 +31,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from dew._distributions import draw, row_draw, wellformed
+from dew._distributions import counted, draw, row_draw, wellformed
 from dew.diffusion.block import CanvasGeneration, through_eos
 from dew.diffusion.process import Conditioning
 from dew.diffusion.schedules import common
@@ -314,7 +314,7 @@ class Unmask:
         """`step`, row `i` drawing its reveals and tokens from `keys[i]` alone (`RowSolver`), as the
         row sampled by itself draws them."""
         chance = self._reveal_chance(process, t, t_next)
-        split = jax.vmap(jax.random.split)(keys)
+        split = jax.vmap(jax.random.split)(counted(keys))
         reveal = jax.vmap(lambda key: jax.random.uniform(key, x.shape[1:]))(split[:, 0]) < chance[:, None]
         revealed = denoise.masked(x) & reveal
         drawn = row_draw(split[:, 1], log_probs, revealed, REVEALED_UNDEFINED)
