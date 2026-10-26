@@ -76,7 +76,8 @@ def _at(config, place: Sequence[str]):
 
 def padding_variant(config: Mapping, case: str, place: Sequence[str], vocab_size: int | None = None) -> dict:
     """`config` with its pad id as `case` puts it, at `place` (a wrapper's text config, which its
-    language model is built from), and the vocabulary there `vocab_size` where given."""
+    language model is built from), and the vocabulary there `vocab_size` where given, with the embedding
+    size a config states beside it (LLaDA's table has that many rows, at least the vocabulary)."""
     import copy
 
     variant = copy.deepcopy(dict(config))
@@ -86,6 +87,8 @@ def padding_variant(config: Mapping, case: str, place: Sequence[str], vocab_size
         level["pad_token_id"] = PAD if case == "stated" else None
     if vocab_size is not None:
         level["vocab_size"] = vocab_size
+        if level.get("embedding_size") is not None:
+            level["embedding_size"] = max(level["embedding_size"], vocab_size)
     return variant
 
 
