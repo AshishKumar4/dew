@@ -32,6 +32,13 @@ draws the fixture's weights (every parameter, the sinks and the balancing
 bias too, from N(0, 0.1^2) at seed 0, as the class leaves the sinks empty)
 and its token ids, written in the class's split layout:
   python tools/remote_code_reference.py mimo-v2-tiny --draw
+
+`--padding` records instead the rows each release's own token lookup leaves
+untrained, under the fixture's config with its pad id stated, left out and
+null (`reference_source.record_padding`), as padding.json beside it. It reads
+the release's code and config alone, under each release's transformers as
+above:
+  /tmp/remote/bin/python tools/remote_code_reference.py --padding llada-tiny dream-tiny
 """
 
 import argparse
@@ -44,6 +51,7 @@ import numpy as np
 import torch
 import transformers
 from huggingface_hub import hf_hub_download
+from reference_source import config_lookups, record_padding
 from safetensors.torch import load_file, save_file
 from torch_precision import float64, float64_twin
 from transformers import AutoConfig
@@ -66,20 +74,31 @@ widens the pins its code carries (MiMo's router casts its logits with
 rotary `inv_freq`) in float64."""
 
 
-def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Module:
-    """The release's own model class over the fixture's config and weights,
-    or, with `draw`, weights it draws and writes as the fixture's."""
+def released_classes(name: str, workspace: Path):
+    """The release's own config of a dict (its code's files at its commit, beside the dict with the
+    release's `auto_map`, in `workspace`) and its model class over such a config."""
     repo, revision, files, auto = RELEASES[name]
-    directory = scratch / name
+    directory = workspace / name
     directory.mkdir(parents=True)
     for file in files:
         shutil.copy(hf_hub_download(repo, file, revision=revision), directory / file)
     released = json.loads(Path(hf_hub_download(repo, "config.json", revision=revision)).read_text())
-    config = json.loads((FIXTURES / name / "config.json").read_text())
-    (directory / "config.json").write_text(json.dumps({**config, "auto_map": released["auto_map"]}))
-    reader = getattr(transformers, auto)
-    model = reader.from_config(AutoConfig.from_pretrained(str(directory), trust_remote_code=True),
-                               trust_remote_code=True, attn_implementation="eager")
+
+    def configured(config: dict):
+        (directory / "config.json").write_text(json.dumps({**config, "auto_map": released["auto_map"]}))
+        return AutoConfig.from_pretrained(str(directory), trust_remote_code=True)
+
+    def model(config) -> torch.nn.Module:
+        return getattr(transformers, auto).from_config(config, trust_remote_code=True,
+                                                       attn_implementation="eager")
+    return configured, model
+
+
+def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Module:
+    """The release's own model class over the fixture's config and weights,
+    or, with `draw`, weights it draws and writes as the fixture's."""
+    configured, built = released_classes(name, scratch)
+    model = built(configured(json.loads((FIXTURES / name / "config.json").read_text())))
     if draw:
         torch.manual_seed(0)
         with torch.no_grad():
@@ -99,8 +118,14 @@ def main() -> None:
     parser.add_argument("names", nargs="*", default=sorted(RELEASES))
     parser.add_argument("--check", action="store_true", help="compare with logits.npy instead of writing")
     parser.add_argument("--draw", action="store_true", help="draw the fixture's weights and ids first")
+    parser.add_argument("--padding", action="store_true", help="record the rows each lookup leaves untrained")
     arguments = parser.parse_args()
     with tempfile.TemporaryDirectory() as scratch:
+        if arguments.padding:
+            for name in arguments.names:
+                record_padding(*config_lookups(*released_classes(name, Path(scratch) / "padding")),
+                               json.loads((FIXTURES / name / "config.json").read_text()), FIXTURES / name)
+            return
         for name in arguments.names:
             model = released_model(name, Path(scratch) / "fp32", arguments.draw)
             ids = torch.from_numpy(np.load(FIXTURES / name / "input_ids.npy").astype(np.int64))

@@ -102,26 +102,12 @@ class LayaCheckpoint:
         ModernBERT encoder and the head Laya's. A backbone under LoRA is written
         with its factors merged into their kernels (`Pretrained.bound`).
         """
-        from dew.interop.pretrained import PretrainedDecoder
-
         head = from_record(DecisionHead, self.model.head)
-        backbone = thaw(part(self.variables, "backbone"))
-        encoder = self.model.backbone
-        bundle = PretrainedDecoder.from_model(encoder, backbone).bound(encoder, backbone)
-        if bundle.adapter is None and any(isinstance(key, jax.tree_util.DictKey) and key.key in FACTORS
-                                          for path, _ in jax.tree_util.tree_leaves_with_path(backbone)
-                                          for key in path):
-            raise ValueError("the backbone carries LoRA factors its model binds to no adapter")
-        if bundle.config.get("model_type") != "modernbert":
-            raise ValueError("Laya's layout holds a ModernBERT encoder, "
-                             f"not a {bundle.config.get('model_type')}")
+        tensors, config = laya_tensors(self.model, self.variables)
         root = Path(directory)
         (root / "encoder").mkdir(parents=True, exist_ok=True)
-        tensors = {f"encoder.{name.removeprefix('model.')}": np.asarray(tensor)
-                   for name, tensor in bundle.export().items()}
-        tensors.update(_head_tensors(thaw(part(self.variables, "head"))["params"]))
         save_sharded(tensors, root, max_shard_size)
-        config = {**bundle.config, "architectures": ["ModernBertModel"]}
+        config = {**config, "architectures": ["ModernBertModel"]}
         (root / "encoder" / "config.json").write_text(json.dumps(config, indent=2) + "\n")
         self.tokenizer.save_pretrained(root / "tokenizer")
         (root / CONFIG_FILE).write_text(json.dumps({
@@ -130,6 +116,29 @@ class LayaCheckpoint:
             "option_layout": "parallel" if self.layout.parallel else "sequential",
             "temperature": list(self.temperatures), "temperature_by_options": self.bucket_temperatures,
         }, indent=2) + "\n")
+
+
+def laya_tensors(model: DecisionModel, variables: Variables
+                 ) -> tuple[dict[str, np.ndarray], Mapping[str, object]]:
+    """Every tensor of a Laya release of `model` over `variables`, by its name in `model.safetensors`
+    (the encoder's ModernBertModel tensors under `encoder.`, the head's under Laya's names), and the
+    encoder's config, which `LayaCheckpoint.save` writes and a release's `export` returns. A backbone
+    under LoRA has its factors merged into their kernels (`Pretrained.bound`)."""
+    from dew.interop.pretrained import PretrainedDecoder
+
+    backbone = thaw(part(variables, "backbone"))
+    encoder = model.backbone
+    bundle = PretrainedDecoder.from_model(encoder, backbone).bound(encoder, backbone)
+    if bundle.adapter is None and any(isinstance(key, jax.tree_util.DictKey) and key.key in FACTORS
+                                      for path, _ in jax.tree_util.tree_leaves_with_path(backbone)
+                                      for key in path):
+        raise ValueError("the backbone carries LoRA factors its model binds to no adapter")
+    if bundle.config.get("model_type") != "modernbert":
+        raise ValueError(f"Laya's layout holds a ModernBERT encoder, not a {bundle.config.get('model_type')}")
+    tensors = {f"encoder.{name.removeprefix('model.')}": np.asarray(tensor)
+               for name, tensor in bundle.export().items()}
+    tensors.update(_head_tensors(thaw(part(variables, "head"))["params"]))
+    return tensors, bundle.config
 
 
 def _head_tensors(params: Mapping[str, object]) -> dict[str, np.ndarray]:
