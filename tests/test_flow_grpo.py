@@ -990,11 +990,13 @@ def test_a_transitions_density_and_kl_hold_at_float32s_largest_variances():
     mean = np.zeros((2, 3, 4), np.float32)
     transition = GaussianTransition(jnp.asarray(mean), jnp.asarray(variance))
     density = np.asarray(transition.log_prob(jnp.asarray(mean)))
+    assert np.all(np.isfinite(density))
     half_log = np.float32(6) * (np.log(np.float32(2 * math.pi)) + np.log(variance))
     truth = [reference.logpdf(np.zeros(12), np.zeros(12), float(value)) for value in variance]
     assert_as_exact_as_the_reference(density, -half_log, np.asarray(truth), "a wide transition's density")
     away = np.full_like(mean, 1e18)
     kl = np.asarray(transition.kl(jnp.asarray(away)))
+    assert np.all(np.isfinite(kl))
     error = np.float32(12) * np.float32(1e18) ** 2
     assert_as_exact_as_the_reference(kl, error / np.float32(2) / variance,
                                      12 * 1e36 / (2 * variance.astype(np.float64)), "a wide transition's KL")
@@ -1003,6 +1005,7 @@ def test_a_transitions_density_and_kl_hold_at_float32s_largest_variances():
     near = GaussianTransition(jnp.asarray(mean), jnp.asarray(narrow))
     step = np.float32(np.sqrt(8 / 12))
     kl = np.asarray(near.kl(jnp.full_like(jnp.asarray(mean), step)))
+    assert np.all(np.isfinite(kl))
     error = np.sum(np.full(12, step) ** 2, dtype=np.float32)
     assert_as_exact_as_the_reference(kl, error / np.float32(2) / narrow,
                                      12 * float(step) ** 2 / (2 * narrow.astype(np.float64)),
