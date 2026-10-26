@@ -400,8 +400,14 @@ def _staging(operand: _Operand, *shapes) -> tuple:
 def _merges(call: _Call) -> tuple:
     """The inverse's staging tiles (`algebra.doubled`'s 'merge' products, both operands fp32 registers): three
     sets, the system's kept across the levels and each level's inverse across its two products, each set a
-    `[C, C]` tile an operand's part: an fp32 call's three bf16 parts, a 16-bit call's one fp16, 11 significand
-    bits past the TF32 fla merges in (10) where the inverse is rounded to the call's 8 after."""
+    `[C, C]` tile an operand's part: an fp32 call's three bf16 parts, a 16-bit call's one fp16, 11 significant
+    bits as the TF32 fla merges its blocks in, where the inverse is rounded to the call's 8 after. fla inverts
+    its 16-row diagonal blocks by fp32 forward substitution and merges in TF32; every doubling level here
+    rounds to fp16, about 2^-12 absolute on the inverse under aligned keys, a sixth of the bf16 rounding
+    both arms share. fp16's range holds the inverse of keys the layers normalize (`l2norm`: each entry at
+    most `beta |k_s| |k_t|`, at most one); unnormalized keys with `beta |k|^2` past two grow it
+    geometrically, past fp16's largest in about 16 tokens, where TF32's stays finite (template numerics
+    review 2026-10-26, P3-4)."""
     dtype, parts = (jnp.bfloat16, PARTS) if call.held.parts > 1 else (jnp.float16, 1)
     tile = (CHUNK, CHUNK)
     return tuple(tuple(plgpu.SMEM(tile, dtype) for _ in range(parts)) for _ in range(3))
