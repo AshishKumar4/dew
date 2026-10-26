@@ -81,6 +81,7 @@ if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
         MeshSpec,
         MLflowTracker,
         Observe,
+        Pause,
         Plateau,
         ProfileWindow,
         TensorBoardTracker,
@@ -95,7 +96,7 @@ __version__ = "0.1.0"
 
 _EXPORTS = {
     "Best": "dew.training", "Keep": "dew.training", "Plateau": "dew.training", "EvalSuite": "dew.training",
-    "Observe": "dew.training",
+    "Observe": "dew.training", "Pause": "dew.training",
     "Trainer": "dew.training", "TrainState": "dew.training", "Step": "dew.objectives.base",
     "Aux": "dew.objectives.base", "EMASpec": "dew.objectives.base", "MeshSpec": "dew.training",
     "Layout": "dew.training", "Checkpoints": "dew.training", "Tracker": "dew.training",
@@ -148,6 +149,7 @@ __all__ = [
     "MeshSpec",
     "Objective",
     "Observe",
+    "Pause",
     "Plateau",
     "Process",
     "ProfileWindow",
