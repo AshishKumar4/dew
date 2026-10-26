@@ -34,7 +34,7 @@ the portable math's issuer is XLA's (`portable`), a kernel's its own dot."""
 import functools
 import math
 from collections.abc import Callable
-from typing import Any, Protocol
+from typing import Protocol
 
 import jax
 import jax.numpy as jnp
@@ -715,34 +715,21 @@ def key_decayed_write(key, gate, low, last, last_low):
     return key * raised(last - gate, last_low - low)
 
 
-def key_gated_queries(queries: Callable[..., jax.Array], gates: Callable[..., tuple], columns: int) -> list:
-    """Each key block's gated queries `queries(c) exp2(gates(c))` (`gates(c)` the prefix's halves, `raised`)
-    rounded to their dtype: `key_decayed_output`'s operands against the memory, every value block's."""
-    gated = []
+def key_decayed_output(queries: Callable[..., jax.Array], gates: Callable[..., tuple], entered: Load,
+                       columns: int, scores, value, scale: float, issue: Issue):
+    """A chunk's output `[C, BV]`, fp32, a decay a key dimension: `scale (q exp2(g))_narrow S + tril(Aqk) v`,
+    each key block's gated queries `queries(c) exp2(gates(c))` (`gates(c)` the prefix's halves, `raised`)
+    rounded to their dtype against the memory entered `entered(c)` ('memory'), the scores `scores` (`Aqk`,
+    scaled) rounded to the values' dtype ('local')."""
+    out = jnp.zeros((scores.shape[0], value.shape[-1]), jnp.float32)
     for c in range(columns):
         query = queries(c)
-        gated.append((query * raised(*gates(c))).astype(query.dtype))
-    return gated
-
-
-def causal_scores(scores, dtype):
-    """The scores `scores` (`Aqk`, scaled) on and below the diagonal, rounded to `dtype`:
-    `key_decayed_output`'s
-    operand against the values, every value block's."""
+        gated = (query * raised(*gates(c))).astype(query.dtype)
+        out = out + issue("memory", gated, entered(c).astype(gated.dtype))
+    out = out * scale
     lag = _lags(scores.shape)
-    return jnp.where(lag >= 0, scores, 0.0).astype(dtype)
-
-
-def key_decayed_output(gated: Callable[[int], Any], entered: Load, columns: int, local, value, scale: float,
-                       issue: Issue):
-    """A chunk's output `[C, BV]`, fp32, a decay a key dimension: `scale (q exp2(g))_narrow S + tril(Aqk) v`,
-    each key block's gated queries `gated(c)` (`key_gated_queries`) against the memory entered `entered(c)`
-    ('memory'), the causal scores `local` (`causal_scores`) against the values ('local')."""
-    out = jnp.zeros((value.shape[0], value.shape[-1]), jnp.float32)
-    for c in range(columns):
-        query = gated(c)
-        out = out + issue("memory", query, entered(c).astype(query.dtype))
-    return out * scale + issue("local", local, value)
+    local = jnp.where(lag >= 0, scores, 0.0).astype(value.dtype)
+    return out + issue("local", local, value)
 
 
 # The fast backward of a decay a head under the delta rule, fla's arithmetic on a chunk's tiles (the port's
