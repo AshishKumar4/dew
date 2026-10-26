@@ -676,6 +676,42 @@ def test_a_summarized_recording_keeps_the_zero_rows_rule_for_its_small_rows():
     assert raised.type is GateFailure
 
 
+def test_a_recording_made_in_shards_is_the_recording_one_run_makes():
+    """A summarized recording made in shards of seeds (`record_shard`), each drawn as one run draws it,
+    and joined (`merge_shards`) is the recording `record_case`'s summary makes of the same reference:
+    the same declared count, evidence and sketches, whatever order the shards come in. Shards that
+    leave a seed out are refused."""
+    from tool_support import load
+
+    recorder = load("recorded_references")
+    _, live = _tiny_row(4)
+
+    def draw(seed):
+        x, w = _draw(seed)
+        return {"x": x, "w": w}
+
+    def evaluate(inputs):
+        with jax.enable_x64(new_val=False):
+            reference = jax.tree.map(np.asarray, live(inputs["x"], inputs["w"]))
+        truth = jax.tree.map(np.asarray, live(*(np.asarray(inputs[n], np.float64) for n in ("x", "w"))))
+        return reference, truth
+
+    with jax.enable_x64(new_val=True):
+        whole = recorder.record_case("site", draw, evaluate, lambda inputs: live(inputs["x"], inputs["w"]),
+                                     summary=True)
+        kept = len(whole["site.input_digest"])
+        cut = kept // 3
+        shards = [recorder.record_shard("site", draw, evaluate, seeds)
+                  for seeds in (range(cut, 2 * kept), range(cut))]
+        merged = recorder.merge_shards("site", shards)
+        assert merged.keys() == whole.keys()
+        for key, value in whole.items():
+            np.testing.assert_array_equal(merged[key], value, err_msg=key)
+        with pytest.raises(ValueError):
+            recorder.merge_shards("site", [shards[0], recorder.record_shard("site", draw, evaluate,
+                                                                            range(cut - 1))])
+
+
 def test_a_recorded_reference_is_drawn_by_its_index_and_covers_the_redraw(tmp_path):
     """A reference recorded over (1 + REDRAW)·K seeds: each draw reads its seed's inputs, the reference
     and truth read their recorded outputs at it, and check 1 judges Dew against them; a recording too
