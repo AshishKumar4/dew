@@ -184,7 +184,7 @@ def main(config: Config) -> Path:
     # share at once, with the extractor and the CLIP the flags name (`val_metrics`), and logs
     # them under its last step.
     state = run.train(objective, run.data, validation=run.validation, name=name,
-                      metrics=run.build_eval_metrics(),
+                      metrics=run.validation_metrics(validates=True),
                       summary={"prompts": list(PROMPTS)})
 
     # The run directory read back as a pipeline, which draws over every process's
