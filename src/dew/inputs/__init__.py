@@ -28,7 +28,7 @@ import numpy as np
 from dew import _records, registry
 from dew.batch import Batch, Variables
 from dew.nn.inputs import ModelInputs
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, divided
 from dew.nn.text_encoders import DEFAULT_MODEL
 from dew.registry import DtypeName
 
@@ -43,7 +43,8 @@ def unit_range(pixels: jax.typing.ArrayLike) -> jax.Array:
     stay float64.
     """
     pixels = jnp.asarray(pixels)
-    return (pixels.astype(at_least_fp32(pixels.dtype)) - 127.5) / 127.5
+    # IEEE division: XLA takes a division by a constant as a product with its rounded reciprocal.
+    return divided(pixels.astype(at_least_fp32(pixels.dtype)) - 127.5, 127.5)
 
 
 @dataclass(frozen=True)

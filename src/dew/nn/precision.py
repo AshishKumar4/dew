@@ -622,6 +622,22 @@ def _divide_jvp(primals, tangents):
     return correctly_rounded_divide(*primals), jax.jvp(jnp.divide, primals, tangents)[1]
 
 
+def divided(numerator, rate):
+    """`numerator / rate` as a source written in PyTorch divides a state by a rate, or an array by a
+    constant: IEEE division, whatever the backend's own division does (XLA takes a division by a
+    constant as a product with its rounded reciprocal, on a CPU and an A100 alike, row 1402). A
+    float32, bfloat16 or float16 quotient is `correctly_rounded_divide`'s of the operands widened to
+    float32, rounded to its dtype, as PyTorch's float32 opmath gives it, under any compiler flags. A
+    float64 one is the plain division."""
+    numerator, rate = jnp.asarray(numerator), jnp.asarray(rate)
+    dtype = jnp.result_type(numerator, rate)
+    if not jnp.issubdtype(dtype, jnp.floating):
+        return numerator / rate
+    if dtype == jnp.float64:
+        return numerator / rate
+    return correctly_rounded_divide(numerator.astype(jnp.float32), rate.astype(jnp.float32)).astype(dtype)
+
+
 def compensated_add(left, right):
     """Add two double-float values, `(hi, lo)` pairs whose sum is the value:
     `hi` is the sum rounded and `lo` what the rounding dropped (the his'
