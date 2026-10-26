@@ -57,13 +57,45 @@ def layer(name: str, dtype=jnp.float32) -> InContextMemory:
     return InContextMemory(heads=HEADS, head_features=FEATURES, dtype=dtype, **fields)
 
 
-def written(module: InContextMemory, *, dtype, segments=None, gradient=None):
+def huber(error, delta):
+    """Huber's loss of each coordinate of `error` (Miras Eq 13)."""
+    size = jnp.abs(error)
+    return jnp.where(size <= delta, error * error / 2, delta * (size - delta / 2))
+
+
+def paper_loss(kind: str, objective: Objective):
+    """The loss its paper writes for `kind`, of one token's prediction and target `[F]` at `objective`'s
+    `p` and `delta`, each written here from its equation: Nested Learning Eq 17's dot product, Titans
+    Eq 12's l2 (with Appendix C's half), Miras Eq 10's lp, Miras Eq 13's Huber of each coordinate, and
+    Miras Eq 16, the l2 objective while the whole error's norm is within delta and delta times the l1
+    objective past it."""
+    losses = {
+        "dot": lambda prediction, target: -jnp.dot(prediction, target),
+        "l2": lambda prediction, target: jnp.dot(prediction - target, prediction - target) / 2,
+        "lp": lambda prediction, target: jnp.sum(jnp.abs(prediction - target) ** objective.p),
+        "huber": lambda prediction, target: jnp.sum(huber(prediction - target, objective.delta)),
+        "l2_or_l1": lambda prediction, target: jnp.where(
+            jnp.linalg.norm(prediction - target) <= objective.delta,
+            jnp.dot(prediction - target, prediction - target) / 2,
+            objective.delta * jnp.linalg.norm(prediction - target, 1)),
+    }
+    return losses[kind]
+
+
+PAPER_KINDS = {"yaad": "l2_or_l1"}
+"""The loss a configuration's paper takes where its objective is not that kind: Yaad's Eq 26 selects
+Miras Eq 16, the switch between l2 and l1 by the whole error's norm."""
+
+
+def written(module: InContextMemory, *, dtype, segments=None, gradient=None, kind=None):
     """The paper's update as a function of the stream, token by token, in `dtype` (float64 for the
     truth): the views and gates from the layer's projections, the state in at least float32, each
     gradient at its chunk's start counted from its document's first token (`segments` `[S]`, one
-    document where None), and the readout at `dtype`."""
+    document where None) of the loss its paper writes (`paper_loss`, of `kind`, the objective's where
+    None), and the readout at `dtype`."""
     wide = jnp.promote_types(dtype, jnp.float32)
     grad_net, read_net = module.network.clone(dtype=wide), module.network.clone(dtype=dtype)
+    loss = paper_loss(kind or module.objective.kind, module.objective)
     firsts = np.arange(LENGTH) == 0 if segments is None else np.r_[True, segments[1:] != segments[:-1]]
 
     def gate(name, spec, x, p):
@@ -83,8 +115,8 @@ def written(module: InContextMemory, *, dtype, segments=None, gradient=None):
                 (head0, jax.tree.map(jnp.zeros_like, head0), head0, 0), (state, momentum, start, place))
             start = jax.tree.map(lambda w, s: jnp.where(place % module.chunk == 0, w, s), state, start)
             target = v_t if module.target == "given" else grad_net.apply({"params": start}, v_t)
-            g = (jax.grad(lambda held: module.objective(grad_net.apply({"params": held}, k_t), target))(start)
-                 if gradient is None else gradient(module.objective, grad_net, start, k_t, target))
+            g = (jax.grad(lambda held: loss(grad_net.apply({"params": held}, k_t), target))(start)
+                 if gradient is None else gradient(loss, grad_net, start, k_t, target))
             momentum = jax.tree.map(lambda s, gl: mu_t * s - theta_t * gl, momentum, g)
             state = jax.tree.map(lambda w, s: (1 - alpha_t) * w + s, state, momentum)
             cast = jax.tree.map(lambda leaf: leaf.astype(dtype), state)
@@ -153,8 +185,20 @@ def test_a_memory_follows_its_papers_update(name):
     """Each configuration computes its paper's update and readout token by token (`written`), on par
     with that written-out update in float32, against float64 (check 1)."""
     module = layer(name)
-    assert_as_exact(applied(module), written(module, dtype=jnp.float32), drawn(module), f"{name} memory",
-                    seeds=MEMORY_SEEDS, truth_fn=written(module, dtype=jnp.float64))
+    kind = PAPER_KINDS.get(name)
+    assert_as_exact(applied(module), written(module, dtype=jnp.float32, kind=kind), drawn(module),
+                    f"{name} memory", seeds=MEMORY_SEEDS,
+                    truth_fn=written(module, dtype=jnp.float64, kind=kind))
+
+
+def test_yaads_objective_switches_by_the_whole_errors_norm():
+    """Miras Eq 16 steps the l2 gradient while the error's norm is within delta and delta times the l1
+    gradient past it, over every coordinate alike: an error of (2, 0.1) steps (0.5, 0.5) at delta
+    0.5, where each coordinate's Huber would step (0.5, 0.1), and steps the error itself at delta 3."""
+    prediction, target = jnp.asarray([2.0, 0.1]), jnp.zeros(2)
+    for delta, step in ((0.5, [0.5, 0.5]), (3.0, [2.0, 0.1])):
+        gradient = jax.grad(Objective("l2_or_l1", delta=delta))(prediction, target)
+        np.testing.assert_array_equal(np.asarray(gradient), np.asarray(step, np.float32))
 
 
 def test_a_self_generated_target_carries_the_outer_gradient():
@@ -256,9 +300,9 @@ def test_an_orthogonalized_step_follows_the_paper_with_muons_iteration():
 
     module = layer("titans").clone(orthogonalize=5)
 
-    def gradient(objective, network, start, k, target):
+    def gradient(loss, network, start, k, target):
         """The paper's gradient with Muon's map on each matrix, in the reference's own precision."""
-        g = jax.grad(lambda held: objective(network.apply({"params": held}, k), target))(start)
+        g = jax.grad(lambda held: loss(network.apply({"params": held}, k), target))(start)
         return jax.tree.map(lambda leaf: newton_schulz(leaf, 5) if leaf.ndim == 2 else leaf, g)
 
     assert_as_exact(applied(module), written(module, dtype=jnp.float32, gradient=gradient), drawn(module),
