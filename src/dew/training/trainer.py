@@ -1684,8 +1684,10 @@ class Trainer(Generic[Loss, Effects]):
             end = ends[stage] or 0
         self._display.note(f"Stage {stage} of the schedule begins at step {run.current}, after "
                            f"{committed} committed tokens")
-        # Its batches may be shaped as no earlier stage's were: the step's accumulation window, empty at
-        # the commit the stage begins after, is laid out for them (`_runner`).
+        # An update pools one stage's batches: a window a rejection left part filled at the commit the
+        # stage begins after is dropped as a ramp's stage drops it (`_staged`), and laid out for the
+        # stage's batches, which may be shaped as no earlier stage's were (`_runner`).
+        self._stage_starts = self._stage_starts | {run.current}
         self._restaged = True
         run.train = self._prefetched(plan, run, source, state)
         run.source = None  # Lifetime transferred to the prefetch worker.

@@ -1048,8 +1048,8 @@ def assert_same(left: dict, right: dict, why: str) -> None:
 def endless_chains(name: str) -> tuple[Pipeline, Pipeline]:
     """A chain a fit reads without being given a repeat, and the chain it reads: phases or a mix whose
     corpora repeat themselves read as written; phases of passes batched on their own, repeated after
-    each phase's batch as the chain's own repeat at its end is; and a mix whose members' repeats are
-    bounded, repeated before its batch."""
+    each phase's batch as the chain's own repeat at its end is; and phases or a mix whose repeats are
+    bounded, repeated before the batch."""
     first = Pipeline(Memory(Indexed(1, 64))).shuffle(0)
     second = Pipeline(Memory(Indexed(2, 64))).shuffle(1)
     if name == "phases":
@@ -1061,11 +1061,15 @@ def endless_chains(name: str) -> tuple[Pipeline, Pipeline]:
     if name == "batched-phases":
         chain = phases((first.batch(8), 3), (second.batch(8), None))
         return chain, chain.repeat()
+    if name == "bounded-phases":
+        # The phases' shared take bounds the one that repeats itself: the chain repeats after it.
+        bounded = phases((first.repeat(), 2), (second, None)).take(16)
+        return bounded.batch(8), bounded.repeat().batch(8)
     members = [first.repeat().take(12), second.repeat().take(12)]
     return mix(members).batch(8), mix(members).repeat().batch(8)
 
 
-@pytest.mark.parametrize("name", ["phases", "mix", "batched-phases", "bounded-mix"])
+@pytest.mark.parametrize("name", ["phases", "mix", "batched-phases", "bounded-phases", "bounded-mix"])
 def test_a_fit_repeats_a_chain_only_where_its_read_can_end(tmp_path, name):
     """A fit reads a dataset without a repeat endlessly by adding one where its read can end
     (`analysis.reach`): phases whose corpora repeat themselves, and a mix of members that all do, are
@@ -1087,13 +1091,15 @@ class TokenCounted(Regression):
         return np.asarray(batch["id"]) % 3 + 1
 
 
-def token_trainer(directory: Path, tracker: RecordingTracker | None = None) -> Trainer:
-    return Trainer(TokenCounted(), optax.sgd(0.5), key=jax.random.key(0),
+def token_trainer(directory: Path, tracker: RecordingTracker | None = None,
+                  accumulation: int = 1) -> Trainer:
+    return Trainer(TokenCounted(), optax.sgd(0.5), key=jax.random.key(0), accumulation=accumulation,
                    layout=Layout(min_shard=1, tolerance=1.0),
                    checkpoints=Checkpoints(str(directory), keep=8), tracker=tracker)
 
 
-def test_a_schedule_ends_its_stage_at_the_step_whose_commit_reaches_its_tokens(tmp_path):
+@pytest.mark.parametrize("accumulation", [1, 2])
+def test_a_schedule_ends_its_stage_at_the_step_whose_commit_reaches_its_tokens(tmp_path, accumulation):
     """A run on a schedule ends its first stage at the step whose commit brings the run's committed
     tokens to the stage's 50: it lands where phases switching at that step land, its parameters bit
     for bit, the read ahead of the end untrained, and its saved position holds where the stage
@@ -1103,30 +1109,29 @@ def test_a_schedule_ends_its_stage_at_the_step_whose_commit_reaches_its_tokens(t
     second = Pipeline(Memory(Indexed(2, 64))).shuffle(1).repeat()
     data = schedule([(first, 50), (second, None)]).batch(8)
     tracker = RecordingTracker()
-    scheduled = token_trainer(tmp_path / "scheduled", tracker)
+    scheduled = token_trainer(tmp_path / "scheduled", tracker, accumulation)
     whole = parameters(scheduled.fit(data, steps=8, log_every=1))
     committed = list(itertools.accumulate(scalars["train/tokens"] for _, scalars in tracker.scalars
                                           if "train/tokens" in scalars))
     step = next(index + 1 for index, tokens in enumerate(committed) if tokens >= 50)
     assert 1 < step < 8
-    phased = token_trainer(tmp_path / "phased").fit(phases((first, step), (second, None)).batch(8), steps=8)
-    assert_same(whole, parameters(phased), "the schedule against phases switching where its commits did")
+    phased = phases((first, step), (second, None)).batch(8)
+    switched = token_trainer(tmp_path / "phased", accumulation=accumulation).fit(phased, steps=8)
+    assert_same(whole, parameters(switched), "the schedule against phases switching where its commits did")
     assert scheduled.checkpoints is not None
     _, saved = scheduled.checkpoints.restore(share=DataPartition())
     assert saved is not None and position.read(saved).completed[0][1] == step * 8
     for stopped in (2, step):
-        resumed = token_trainer(tmp_path / f"stopped-{stopped}")
-        resumed.fit(data, steps=stopped)
-        assert_same(whole, parameters(token_trainer(tmp_path / f"stopped-{stopped}").fit(data, steps=8)),
-                    f"resumed from step {stopped}")
+        token_trainer(tmp_path / f"stopped-{stopped}", accumulation=accumulation).fit(data, steps=stopped)
+        resumed = token_trainer(tmp_path / f"stopped-{stopped}", accumulation=accumulation).fit(data, steps=8)
+        assert_same(whole, parameters(resumed), f"resumed from step {stopped}")
     # The last stage's own tokens end the data: the run's last step is the one whose commit reaches
     # them, saved as a token budget's last step is, where phases running on to that step land.
     last = next(index + 1 for index, tokens in enumerate(committed) if tokens >= committed[step - 1] + 30)
-    ended = token_trainer(tmp_path / "ended")
+    ended = token_trainer(tmp_path / "ended", accumulation=accumulation)
     state = ended.fit(schedule([(first, 50), (second, committed[step - 1] + 30 - 50)]).batch(8))
     assert int(state.step) == last and ended.checkpoints is not None and ended.checkpoints.latest == last
-    phased = phases((first, step), (second, None)).batch(8)
-    ran_on = token_trainer(tmp_path / "ran-on").fit(phased, steps=last)
+    ran_on = token_trainer(tmp_path / "ran-on", accumulation=accumulation).fit(phased, steps=last)
     assert_same(parameters(state), parameters(ran_on),
                 "a schedule whose data ends against phases running on to its last step")
 
