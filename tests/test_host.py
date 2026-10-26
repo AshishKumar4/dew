@@ -1,9 +1,9 @@
 """The host's CPU class, the one key the shared XLA bundles and the CI's records take a host by
-(`dew._host.cpu_class`)."""
+(tools/armada/host.py's `cpu_class`)."""
 
 from tool_support import load
 
-from dew._host import cpu_class
+cpu_class = load("host", "tools/armada").cpu_class
 
 ZEN4 = "vendor_id\t: AuthenticAMD\ncpu family\t: 25\nmodel\t\t: 17\nmodel name\t: AMD EPYC 9654\n" * 2
 NEOVERSE = ("processor\t: 0\nBogoMIPS\t: 2000.00\nCPU implementer\t: 0x41\nCPU architecture: 8\n"
