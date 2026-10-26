@@ -70,13 +70,20 @@ output through a buffer read back row by row exhausts the solver at every tile b
 (AMPERE3, SM80-probe), which a thread's registers do not hold."""
 
 
+UNSOLVED_LINE = (0, 12)
+"""The JAX line whose layout inference exhausts the solver on mma.sync's tiles again,
+`_independent_components` and all: the GEMM forward's 128 x 128 x 32 tile failed to find a layout after 24
+minutes on the fork's 0.12.0.1.post23 (ns-gate1, a compile-only A100 on armada), where 0.11.2.post21 lowered
+and ran it (R10)."""
+
+
 def staging_solved() -> bool:
     """Whether this JAX's release (its version's numbers, a post release's last) is `STAGING_SOLVED` or
-    later."""
+    later on a line whose layout inference solves mma.sync's tiles (not `UNSOLVED_LINE`'s)."""
     import jax
     numbers = tuple(int(part.removeprefix("post")) for part in jax.__version__.split(".")
                     if part.removeprefix("post").isdigit())
-    return numbers >= STAGING_SOLVED
+    return STAGING_SOLVED <= numbers < UNSOLVED_LINE
 
 
 @dataclasses.dataclass(frozen=True)
