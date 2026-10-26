@@ -1105,8 +1105,11 @@ def _assert_kl_outputs(dew, plain, truth, bounds, label):
     for name, exact in truth.items():
         value, reference, kinds = np.asarray(dew[name]), np.asarray(plain[name]), _kinds(exact)
         held = np.isfinite(reference) & (kinds != "over")
-        if held.any():
-            assert_as_exact_as_the_reference(value[held], reference[held], exact[held], f"{label}: {name}")
+        # Where the plain arm and Dew both give the float64 value there is no error to compare.
+        measured = held & ~((value == exact) & (reference == exact))
+        if measured.any():
+            assert_as_exact_as_the_reference(value[measured], reference[measured], exact[measured],
+                                             f"{label}: {name}")
         unheld = ~np.isfinite(reference) & (kinds == "normal")
         assert np.all(np.isfinite(value[unheld])), name
         magnitudes, roundings = bounds[name]
