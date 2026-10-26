@@ -1012,8 +1012,8 @@ def test_the_head_gradient_accumulates_every_token_tile_before_it_rounds(dtype):
         """The library arm (BIBLE §7's exception, row 1543): the oracle's loss and state gradient, and
         its head gradient as the tiled head takes it, one fp32 product a block of its columns by a token
         tile, through the library, on the site's own logits' cotangent, the pieces summed exactly in
-        float64 on the host and rounded to `dtype` once; the loss and the state gradient the reference
-        program's own, so the exception reaches the head gradient alone. On an H100 PCIe a 128-token
+        float64 on the host and rounded to `dtype` once; the gate holds it to the head gradient alone
+        (`library_leaves`), the loss and the state gradient the oracle's. On an H100 PCIe a 128-token
         tile's product rounds 1.85 times as far from float64 as the 257-token whole product (per element
         3.8-7.3e-9 RMS against 1.9-4.5e-9, both cuBLASLt at beta 0 with a 32 MiB workspace;
         TL-h100-tokentiles-1725),
@@ -1032,7 +1032,7 @@ def test_the_head_gradient_accumulates_every_token_tile_before_it_rounds(dtype):
     drawn = with_cotangent(draw, full)
     assert_as_exact(jax.jit(pulled(tiled)), reference, drawn, f"{dtype} token tiles",
                     seeds=SEEDS["token tiles"], truth_fn=pulled(full), library_fn=library,
-                    library_row=1543)
+                    library_row=1543, library_leaves=("[2]",))
     _, d_hidden, d_head = pulled(tiled)(*drawn(0))
     assert d_hidden.dtype == d_head.dtype == dtype
 
