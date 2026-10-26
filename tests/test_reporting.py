@@ -337,6 +337,7 @@ def test_tensorboard_events_hold_the_fit_read_back_with_the_accumulator(tmp_path
         TENSORS,
         EventAccumulator,
     )
+    from tensorboard.util import tensor_util
 
     from dew.training import TensorBoardTracker
 
@@ -359,7 +360,9 @@ def test_tensorboard_events_hold_the_fit_read_back_with_the_accumulator(tmp_path
             for image in drawn] == [(2, (8, 8))]
     assert json.loads(reader.Tensors('val/samples/captions')[0]
                       .tensor_proto.string_val[0]) == ['a caption']
-    assert reader.Histograms('val/representation_std')[0].histogram_value.num == 3
+    # The histogram plugin's tensor (`histogram_pb`): each bucket's left edge, right edge and count.
+    buckets = tensor_util.make_ndarray(reader.Tensors('val/representation_std')[0].tensor_proto)
+    assert buckets.shape == (30, 3) and buckets[:, 2].sum() == 3
 
 
 def test_tensorboard_renders_clips_texts_token_losses_and_decisions(tmp_path):

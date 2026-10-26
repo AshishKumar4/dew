@@ -701,14 +701,12 @@ def _(value: TextSamples):
         {'prompt': value.prompt, 'texts': list(_texts(value))}))])
 
 
-def _histogram(tag: str, values: np.ndarray):
-    """A histogram-plugin summary value of `values`, in 30 buckets."""
-    from tensorboard.compat.proto.summary_pb2 import HistogramProto, Summary
+def _histogram(tag: str, values: np.ndarray) -> Summary.Value:
+    """A histogram-plugin summary value of `values`, in 30 buckets, as TensorBoard's own TensorFlow-free
+    `histogram_pb` builds it: the plugin's tensor of bucket edges and counts."""
+    from tensorboard.plugins.histogram.summary_v2 import histogram_pb
 
-    counts, edges = np.histogram(values, bins=30)
-    return Summary.Value(tag=tag, histo=HistogramProto(
-        min=values.min(), max=values.max(), num=values.size, sum=values.sum(),
-        sum_squares=(values ** 2).sum(), bucket_limit=edges[1:].tolist(), bucket=counts.tolist()))
+    return histogram_pb(tag, values, buckets=30).value[0]
 
 
 @_summarize.register
