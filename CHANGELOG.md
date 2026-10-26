@@ -22,7 +22,8 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   documents' places counted over their real tokens across any hole in their validity, as the decoder
   counts them, in the data stage `Blocks` as in the loss; the stage a prefix run installs keeps a
   record's own blocks, as the loss keeps a batch's; `generate(..., prefix=)` refuses a model or a
-  prefix the run would.
+  prefix the run would; lm-eval's likelihood (`dew.eval.harness`) scores a prefix run's continuation
+  through the blocks a server makes of its context.
 - MuonClip clips the attention of whatever objective a run trains, or refuses it: a run whose optimizer
   holds a QK-Clip (`dew.optim.clips_qk`, its state a `QKClipState`) asks its objective for the step's
   attention logit maxima (`Step.qk_stats`), so a masked- or block-diffusion run clips as an LM, RL or preference

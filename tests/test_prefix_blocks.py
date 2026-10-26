@@ -27,7 +27,7 @@ from dew.inference.tasks import TextGeneration
 from dew.nn.inputs import BLOCKS_FIELD, ModelInputs, coordinates
 from dew.nn.kv_cache import KVCache
 from dew.nn.mixers import AttentionMixer
-from dew.nn.visibility import prefix_blocks, prompt_blocks
+from dew.nn.visibility import prefix_blocks, prompt_blocks, served_blocks
 from dew.objectives.lm import TEXT_KEY, LMObjective
 from dew.objectives.lm.objective import batch_text
 from dew.sampling import Sampling
@@ -311,17 +311,30 @@ def test_the_prefix_option_puts_the_block_stage_before_the_counts():
 
 @pytest.mark.parametrize("prefix", [PREFIX, "prompt"])
 def test_a_prefix_runs_stage_keeps_the_blocks_a_record_carries(prefix):
-    """The stage a prefix run installs fills only a record without blocks: one that carries its own keeps
-    them, as the loss keeps a batch's (`prefixed_fields`), in its training and its evaluation readers,
-    and a prompt run's record that carries blocks needs no roles. A stage a pipeline names itself
+    """The rows a prefix run's compiled chain delivers (`fitted` with its objective's stages), to training
+    and to evaluation alike: a record that carries its own blocks keeps them, as the loss keeps a batch's
+    (`prefixed_fields`), and one without takes the prefix's, each document's first tokens or its prompt;
+    a prompt run's record that carries blocks needs no roles of its own. A stage a pipeline names itself
     replaces them."""
-    data = LMObjective(blocky(), SEQ, prefix=prefix).data()
+    from dew.data import Memory
+    from dew.data.compile import fitted
+    from dew.data.dataset import DataPartition
+
     own = np.asarray([0, 0, -1, -1, 1, 1, 1, -1, -1], np.int32)
-    record = {"text": np.zeros(ROW, np.int32), "text_segment_ids": SEGMENTS[1], "text_block_groups": own}
-    for stages in (data.train, data.evaluate):
-        [stage] = [step for step in stages if isinstance(step, Blocks)]
-        np.testing.assert_array_equal(stage.map(record)["text_block_groups"], own)
-    named = Blocks(prefix=PREFIX).map({**record, "text_positions": POSITIONS[1]})
+    roles = np.asarray([Role.USER] * 3 + [Role.ASSISTANT] * 3 + [Role.USER] + [Role.ASSISTANT] * 2, np.int8)
+    bare = {"text": np.arange(1, ROW + 1, dtype=np.int32), "text_segment_ids": SEGMENTS[1],
+            "text_roles": roles}
+    records = [{**bare, "text_block_groups": own}, bare]
+    filled = BLOCKS[1] if prefix == PREFIX else np.asarray([1, 1, 1, -1, -1, -1, 2, -1, -1], np.int32)
+    chain = Memory(records).batch(2).read("memory").workers(0)
+    loader, readers = fitted(chain, chain, objective=LMObjective(blocky(), SEQ, prefix=prefix).data())
+    for stream in (loader.train(DataPartition()), readers["val"](DataPartition())):
+        try:
+            delivered = next(stream)["text_block_groups"]
+        finally:
+            stream.close()
+        np.testing.assert_array_equal(delivered, np.stack([own, filled]))
+    named = Blocks(prefix=PREFIX).map({**records[0], "text_positions": POSITIONS[1]})
     np.testing.assert_array_equal(named["text_block_groups"], BLOCKS[1])
 
 
@@ -500,3 +513,41 @@ def test_a_shared_prefix_page_inside_a_block_is_reused_only_with_a_block_of_the_
     for ticket, prompt in zip(tickets, prompts, strict=True):
         lone = task(np.asarray([prompt]), NEW, key=0).host().tokens
         np.testing.assert_array_equal(ticket.result().host().tokens, lone)
+
+
+CONTEXT = 5
+"""The context ids of each harness row, its continuation the rest."""
+
+
+@pytest.mark.parametrize("prefix", [PREFIX, "prompt"])
+def test_a_prefix_runs_harness_scores_a_continuation_as_its_generation_reads_it(prefix):
+    """lm-eval's likelihood of a prefix run's continuation is read through the blocks a server makes of
+    its context (`served_blocks`), each continuation token in none: on par from float64 with an explicit
+    forward of the decoder over those blocks (check 1), where a causal read of the context, which the
+    run's generation never makes, is far off."""
+    from dew.data.text import ByteTokenizer
+    from dew.eval.harness import DewLM
+    from dew.inference.loading import RunProcessor
+
+    decoder = blocky()
+    wide = decoder.clone(dtype=jnp.float64, attention_impl="reference")
+    draw = model_draw(decoder, (BATCH, ROW), VOCAB)
+    context = np.broadcast_to(np.arange(ROW) < CONTEXT, (BATCH, ROW))
+    blocks = jnp.asarray(np.where(context, served_blocks(context, prefix), -1), jnp.int32)
+
+    def explicit(model):
+        def scored(variables, tokens):
+            logits = model.apply(variables, tokens[:, :-1], block_groups=blocks[:, :-1])
+            picked = jnp.take_along_axis(jax.nn.log_softmax(logits), tokens[:, 1:, None], axis=-1)[..., 0]
+            return picked[:, CONTEXT - 1:].sum(axis=-1)
+        return without_ynn(scored)
+
+    def harness(variables, tokens):
+        task = TextGeneration(decoder, variables, RunProcessor(ByteTokenizer()), prefix=prefix)
+        rows = [(None, row[:CONTEXT].tolist(), row[CONTEXT:].tolist()) for row in np.asarray(tokens)]
+        return np.asarray([value for value, _ in DewLM(task, batch_size=BATCH)._loglikelihood_tokens(rows)],
+                          np.float32)
+
+    seeds = seeds_for(explicit(decoder), draw, f"prefix {prefix} harness likelihood", truth_fn=explicit(wide))
+    assert_as_exact(harness, explicit(decoder), draw, f"prefix {prefix} harness likelihood", seeds=seeds,
+                    truth_fn=explicit(wide))
