@@ -25,7 +25,7 @@ from dew.training import Checkpoints, Trainer
 VOCAB = 16
 FEATURES = 8
 LENGTH = 12
-ROWS = 16
+ROWS = 64
 LEVEL = ContinuumLevel(hidden=4)
 FIXTURES = Path(__file__).parent / "fixtures" / "hf"
 
@@ -36,11 +36,8 @@ ADAPTATION_SEEDS = 8
 SELECTED_SEEDS = 8
 """Check 1's declared seeds for a level whose `up` alone steps, sized paired by `seeds_for` on armada."""
 
-GRADIENT_ROWS = 64
-"""The rows a draw of the gradient site holds over one document a row."""
-
-GRADIENT_SEEDS = {("documents", 0.1): 16, ("documents", 0.5): 16, ("packed", 0.1): 256, ("packed", 0.5): 256,
-                  ("padded", 0.1): 256, ("padded", 0.5): 512}
+GRADIENT_SEEDS = {("documents", 0.1): 8, ("documents", 0.5): 8, ("packed", 0.1): 8, ("packed", 0.5): 8,
+                  ("padded", 0.1): 8, ("padded", 0.5): 8}
 """Check 1's declared seeds for the outer gradient through the windows' steps over each layout and
 rate, sized paired by `seeds_for` on armada."""
 
@@ -63,24 +60,30 @@ MODEL = decoder()
 
 
 def drawn_variables(seed: int, model: CausalTransformer = MODEL):
-    """`model`'s variables drawn at 0.25 N(0, 1), its level's `up` among them, so the level moves the
-    states from its first window, and a step of a half moves it without amplifying a rounding past
-    what a draw resolves."""
+    """`model`'s variables drawn at 0.5 N(0, 1), its level's `up` among them, so the level moves the
+    states from its first window."""
     rng = np.random.default_rng(seed)
     shapes = jax.eval_shape(lambda: model.init(jax.random.key(0), jnp.zeros((1, LENGTH), jnp.int32)))
-    return jax.tree.map(lambda leaf: (0.25 * rng.standard_normal(leaf.shape)).astype(np.float32), shapes)
+    return jax.tree.map(lambda leaf: (0.5 * rng.standard_normal(leaf.shape)).astype(np.float32), shapes)
 
 
-def equation_71(model, variables, hidden, targets, weights, layout, adaptation: ChunkAdaptation):
-    """Equation 71 read literally, token by token of each row: a run of a document's real tokens starts
-    from the level's start; each real token reads its window's level, and at the first real token of
-    the run's next window the level steps by `rate` times the summed gradient of the window's weighted
-    next-token losses; a padding slot reads the level open at it. The losses are each token's
-    log-softmax, apart from Dew's own cross entropy."""
+def equation_71(model, variables, hidden, targets, weights, fields, adaptation: ChunkAdaptation):
+    """Equation 71 read literally, token by token along each row: a run of a document's real tokens
+    starts from the level's start; each real token reads its window's level, and at the first real
+    token of the run's next window the level steps by `rate` times the summed gradient of the window's
+    weighted next-token losses; a padding slot reads the level open at it and weighs nothing. A slot is
+    real where the mask marks it and its document is not 0, as every reader of rows takes it. The
+    losses are each token's log-softmax, apart from Dew's own cross entropy."""
     params = variables["params"]
     start = params["continuum"]
-    valid, documents = layout
     rows, length = targets.shape
+    valid = fields.get("attention_mask")
+    documents = fields.get("segment_ids")
+    real = (jnp.ones((rows, length), bool) if valid is None else jnp.asarray(valid, bool))
+    if documents is not None:
+        real = real & (jnp.asarray(documents) != 0)
+    documents = (jnp.zeros((rows, length), jnp.int32) if documents is None
+                 else jnp.asarray(documents, jnp.int32))
 
     def token_loss(level, state, target):
         held = {**variables, "params": {**params, "continuum": level}}
@@ -88,50 +91,51 @@ def equation_71(model, variables, hidden, targets, weights, layout, adaptation: 
                              method="head_logits")[0]
         return -jax.nn.log_softmax(logits)[target]
 
-    def step(level, gradient):
-        return {name: jax.tree.map(lambda leaf, grad: leaf - adaptation.rate * grad, part, gradient[name])
+    def choose(condition, first, second):
+        return jax.tree.map(lambda one, other: jnp.where(condition, one, other), first, second)
+
+    def stepped(level, summed):
+        return {name: jax.tree.map(lambda leaf, grad: leaf - adaptation.rate * grad, part, summed[name])
                 if not adaptation.select or name in adaptation.select else part
                 for name, part in level.items()}
 
-    def zeros():
-        return jax.tree.map(jnp.zeros_like, start)
+    zeros = jax.tree.map(jnp.zeros_like, start)
 
-    def row_losses(row_hidden, row_targets, row_weights, row_valid, row_documents):
-        level, summed, losses = start, zeros(), []
-        document, count, opened, begun = None, 0, -1, False
-        for slot in range(length):
-            real = row_valid is None or bool(row_valid[slot])
-            here = None if row_documents is None else int(row_documents[slot])
-            if real and (not begun or here != document):
-                level, summed, count, opened, document, begun = start, zeros(), 0, 0, here, True
-            if real and count // adaptation.window != opened:
-                level, summed, opened = step(level, summed), zeros(), count // adaptation.window
-            loss, pull = jax.vjp(lambda at, slot=slot: token_loss(at, row_hidden[slot], row_targets[slot]),
-                                 level)
-            if real:
-                (gradient,) = pull(row_weights[slot].astype(loss.dtype))
-                summed = jax.tree.map(jnp.add, summed, gradient)
-                count += 1
-            losses.append(loss)
-        return jnp.stack(losses)
+    def token(carry, slot):
+        level, summed, count, opened, document, begun = carry
+        state, target, weight, here_real, here = slot
+        new_run = here_real & (~begun | (here != document))
+        level, summed = choose(new_run, start, level), choose(new_run, zeros, summed)
+        count, opened = jnp.where(new_run, 0, count), jnp.where(new_run, 0, opened)
+        document, begun = jnp.where(new_run, here, document), begun | new_run
+        moved = here_real & (count // adaptation.window != opened)
+        level, summed = choose(moved, stepped(level, summed), level), choose(moved, zeros, summed)
+        opened = jnp.where(moved, count // adaptation.window, opened)
+        loss, pull = jax.vjp(lambda at: token_loss(at, state, target), level)
+        (gradient,) = pull(jnp.where(here_real, weight, 0).astype(loss.dtype))
+        summed = jax.tree.map(jnp.add, summed, gradient)
+        return (level, summed, count + here_real, opened, document, begun), loss
 
-    if valid is None and documents is None:
-        # Every row reads alike, one document and no padding: the rows run as one.
-        return jax.vmap(lambda h, t, w: row_losses(h, t, w, None, None))(hidden, targets, weights)
-    return jnp.stack([row_losses(hidden[row], targets[row], weights[row],
-                                 None if valid is None else valid[row],
-                                 None if documents is None else documents[row]) for row in range(rows)])
+    def row_losses(row_hidden, row_targets, row_weights, row_real, row_documents):
+        first = (start, zeros, jnp.int32(0), jnp.int32(-1), jnp.int32(0), jnp.zeros((), bool))
+        _, losses = jax.lax.scan(token, first, (row_hidden, row_targets, row_weights, row_real,
+                                                row_documents))
+        return losses
+
+    return jax.vmap(row_losses)(hidden, targets, weights, real, documents)
 
 
 LAYOUTS = ("documents", "packed", "padded")
 """One document a row; rows packed with documents of one to seven tokens, a document's number used
-again after another's; and those rows with padding inside documents and after them."""
+again after another's; and those rows with padding inside documents and after them, marked by a
+validity mask and document 0."""
 
 
-def layout_of(kind: str) -> tuple[np.ndarray | None, np.ndarray | None]:
-    """The rows' validity and documents for a layout of `LAYOUTS` (`dew.nn.inputs.token_layout`)."""
+def fields_of(kind: str) -> dict[str, np.ndarray]:
+    """The rows' token fields for a layout of `LAYOUTS`, or for the padded rows marked by document 0
+    alone (`segment_padded`) or by an all-true mask beside it (`unmarked_mask`)."""
     if kind == "documents":
-        return None, None
+        return {}
     rng = np.random.default_rng(0)
     rows = []
     for _ in range(ROWS):
@@ -141,15 +145,20 @@ def layout_of(kind: str) -> tuple[np.ndarray | None, np.ndarray | None]:
         rows.append(np.repeat(np.arange(len(lengths)) % 2 + 1, lengths)[:LENGTH])
     documents = np.asarray(rows, np.int32)
     if kind == "packed":
-        return None, documents
+        return {"segment_ids": documents}
     valid = np.ones_like(documents, bool)
     valid[:, -2:] = False
     valid[np.arange(ROWS), rng.integers(1, LENGTH - 2, ROWS)] = False
-    return valid, np.where(valid, documents, 0)
+    padded = np.where(valid, documents, 0)
+    if kind == "segment_padded":
+        return {"segment_ids": padded}
+    if kind == "unmarked_mask":
+        return {"segment_ids": padded, "attention_mask": np.ones_like(valid)}
+    return {"segment_ids": padded, "attention_mask": valid}
 
 
 def draw(seed: int, rows: int = ROWS):
-    """A draw's variables, final states, targets and weights over `rows` rows, one weight zero."""
+    """A draw's variables, final states, targets and weights over `rows` rows, two weights zero."""
     rng = np.random.default_rng(seed)
     weights = rng.uniform(0.5, 1.5, (rows, LENGTH)).astype(np.float32)
     weights[0, 3] = weights[5, 0] = 0.0
@@ -166,19 +175,41 @@ def test_the_scan_steps_the_level_as_equation_71(kind, window, rate):
     document a row, packed rows whose runs each start from the level's start, a number reused after
     another document's starting a run of its own, and padded rows whose padding reads the open window
     and splits no run."""
-    layout = layout_of(kind)
+    fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
     adaptation = ChunkAdaptation(window=window, rate=rate)
-    held = tuple(None if part is None else jnp.asarray(part) for part in layout)
 
     def dew(variables, hidden, targets, weights):
-        return adapted_scores(MODEL, variables, hidden, targets, weights, held, adaptation,
+        return adapted_scores(MODEL, variables, hidden, targets, weights, fields, adaptation,
                               predict=False, logits=False).losses
 
     def reference(variables, hidden, targets, weights):
-        return equation_71(MODEL, variables, hidden, targets, weights, layout, adaptation)
+        return equation_71(MODEL, variables, hidden, targets, weights, fields, adaptation)
 
     assert_as_exact(jax.jit(dew), jax.jit(reference), draw,
                     f"equation 71 over {kind} at a window of {window}, rate {rate}", seeds=ADAPTATION_SEEDS)
+
+
+PADDING_SEEDS = 8
+"""Check 1's declared seeds for padding marked by document 0 alone or beside an all-true mask,
+sized paired by `seeds_for` on armada."""
+
+
+@pytest.mark.parametrize("kind", ["segment_padded", "unmarked_mask"])
+def test_padding_steps_alike_however_it_is_marked(kind):
+    """Padding marked by document 0 alone, or by document 0 beside a mask that marks every slot,
+    is padding as a mask's is (`real_slots`): each loss is equation 71's over the real slots alone,
+    on par with the literal loop (check 1)."""
+    fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
+    adaptation = ChunkAdaptation(window=3, rate=0.5)
+
+    def dew(variables, hidden, targets, weights):
+        return adapted_scores(MODEL, variables, hidden, targets, weights, fields, adaptation,
+                              predict=False, logits=False).losses
+
+    def reference(variables, hidden, targets, weights):
+        return equation_71(MODEL, variables, hidden, targets, weights, fields, adaptation)
+
+    assert_as_exact(jax.jit(dew), jax.jit(reference), draw, f"padding marked as {kind}", seeds=PADDING_SEEDS)
 
 
 def test_only_the_selected_parts_step():
@@ -187,11 +218,11 @@ def test_only_the_selected_parts_step():
     adaptation = ChunkAdaptation(window=2, rate=0.5, select=("up",))
 
     def dew(variables, hidden, targets, weights):
-        return adapted_scores(MODEL, variables, hidden, targets, weights, (None, None), adaptation,
+        return adapted_scores(MODEL, variables, hidden, targets, weights, {}, adaptation,
                               predict=False, logits=False).losses
 
     def reference(variables, hidden, targets, weights):
-        return equation_71(MODEL, variables, hidden, targets, weights, (None, None), adaptation)
+        return equation_71(MODEL, variables, hidden, targets, weights, {}, adaptation)
 
     assert_as_exact(jax.jit(dew), jax.jit(reference), draw, "up alone stepping", seeds=SELECTED_SEEDS)
 
@@ -202,22 +233,19 @@ def test_training_differentiates_through_every_step(kind, rate):
     """The outer loss's gradient flows through each window's step to the level's start, the head
     and the states: the gradient of the weighted losses, second order through the steps, on par with
     the literal loop's (check 1), over each layout and at rates of a tenth and a half."""
-    layout = layout_of(kind)
+    fields = {name: jnp.asarray(value) for name, value in fields_of(kind).items()}
     adaptation = ChunkAdaptation(window=3, rate=rate)
-    held = tuple(None if part is None else jnp.asarray(part) for part in layout)
 
     def gradient_draw(seed):
-        # One document a row runs its rows as one, so it draws more of them, which a draw's heavier
-        # tail through three steps of a half needs to resolve.
-        variables, hidden, targets, weights = draw(seed, GRADIENT_ROWS if kind == "documents" else ROWS)
+        variables, hidden, targets, weights = draw(seed)
         return variables, hidden, targets, weights, np.float32(1.0)
 
     def dew(variables, hidden, targets, weights):
-        return jnp.sum(weights * adapted_scores(MODEL, variables, hidden, targets, weights, held,
+        return jnp.sum(weights * adapted_scores(MODEL, variables, hidden, targets, weights, fields,
                                                 adaptation, predict=False, logits=False).losses)
 
     def reference(variables, hidden, targets, weights):
-        return jnp.sum(weights * equation_71(MODEL, variables, hidden, targets, weights, layout, adaptation))
+        return jnp.sum(weights * equation_71(MODEL, variables, hidden, targets, weights, fields, adaptation))
 
     def differentiated(fn):
         return lambda variables, hidden, targets, weights, cotangent: with_gradients(

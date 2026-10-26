@@ -35,7 +35,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from dew.nn.inputs import sequence_blocks
+from dew.nn.inputs import real_slots, sequence_blocks, token_layout
 from dew.nn.protocols import SteppedInContext
 
 
@@ -111,12 +111,14 @@ def _where(choice: jax.Array, first, second):
                         first, second)
 
 
-def adapted_scores(model: nn.Module, variables, hidden, targets, weights, layout,
+def adapted_scores(model: nn.Module, variables, hidden, targets, weights, fields,
                    adaptation: ChunkAdaptation, *, predict: bool, logits: bool) -> Adapted:
     """A row's targets scored through its continuum level stepped in context (module docstring):
     `hidden` the final states `[B, S, features]`, `targets` `[B, S]`, `weights` each target's weight in
-    the loss, and `layout` the rows' validity and documents (`dew.nn.inputs.token_layout`). The model
-    owns the level's place in its variables (`SteppedInContext`)."""
+    the loss, and `fields` the rows' token fields, their documents and real slots read as every
+    reader of rows reads them (`token_layout`, `real_slots`: a validity mask, and a packed row's
+    document 0, are padding). A row's places (`positions`) move no window: each run counts its own.
+    The model owns the level's place in its variables (`SteppedInContext`)."""
     from dew.objectives.lm.chunked import logits_cross_entropy
 
     start = model.in_context_level(variables) if isinstance(model, SteppedInContext) else None
@@ -125,10 +127,13 @@ def adapted_scores(model: nn.Module, variables, hidden, targets, weights, layout
     steps = _stepped_mask(start, adaptation.select)
     rows, length = targets.shape
     window = adaptation.window
-    valid, documents = layout
+    marked, documents = token_layout(fields)
+    # Only padding or several documents let a window open inside a block; else every window is one.
+    straddles = marked is not None or documents is not None
+    valid = real_slots(fields, (rows, length)) if straddles else None
     if valid is not None:
         # A padding slot weighs nothing, whatever weight it is given.
-        weights = jnp.where(jnp.asarray(valid, bool), weights, 0)
+        weights = jnp.where(valid, weights, 0)
     runs, windows = window_keys(valid, documents, rows, length, window)
     blocks = -(-length // window)
     # The last block's slots past the row weigh nothing and belong to the row's last window.
@@ -136,9 +141,6 @@ def adapted_scores(model: nn.Module, variables, hidden, targets, weights, layout
     inputs = (*(sequence_blocks(value, window, leading=True) for value in (hidden, targets, weights)),
               *(sequence_blocks(jnp.pad(key, edge, mode="edge"), window, leading=True)
                 for key in (runs, windows)))
-    # Only padding or several documents let a window open inside a block; else every window is one.
-    straddles = valid is not None or documents is not None
-
     def level_states(level, states) -> jax.Array:
         return jnp.asarray(model.apply(model.with_in_context_level(variables, level), states,
                                        method="continuum_states"))
