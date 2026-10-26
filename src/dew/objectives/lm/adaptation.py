@@ -35,7 +35,7 @@ import jax
 import jax.numpy as jnp
 from flax import linen as nn
 
-from dew.batch import real_slots, token_layout
+from dew.batch import document_ranks, document_starts, real_slots, token_layout
 from dew.nn.inputs import sequence_blocks
 from dew.nn.protocols import SteppedInContext
 
@@ -74,31 +74,29 @@ class Adapted:
 
 
 def _stepped_mask(level: Mapping, select: tuple[str, ...]) -> Mapping:
-    """Whether each leaf of the level's parameters steps in context (`ChunkAdaptation.select`)."""
+    """Whether each leaf of the level's parameters steps in context (`ChunkAdaptation.select`), in the
+    level's own container (a dict or a `FrozenDict`), as every tree the scan maps beside it is."""
     unknown = sorted(set(select) - set(level))
     if unknown:
         raise ValueError(f"the continuum level has no part {unknown}; it has {sorted(level)}")
-    return {name: jax.tree.map(lambda _, name=name: not select or name in select, part)
-            for name, part in level.items()}
+    def stepped(path, _) -> bool:
+        part = path[0]
+        return not select or (isinstance(part, jax.tree_util.DictKey) and part.key in select)
+    return jax.tree_util.tree_map_with_path(stepped, level)
 
 
 def window_keys(valid, documents, rows: int, length: int, window: int) -> tuple[jax.Array, jax.Array]:
     """Each slot's window as `(run, window)` `[B, S]` each: the run of its document's real tokens it
     belongs to, numbered from 1 along the row (a padding slot the run before it, 0 before any), and
-    its window within the run, its real tokens counted from the run's first (-1 before any)."""
+    its window within the run, its document rank over `window` (`document_starts`,
+    `document_ranks`, the row's readers' own; -1 before any)."""
     real = jnp.ones((rows, length), bool) if valid is None else jnp.asarray(valid, bool)
     documents = (jnp.zeros((rows, length), jnp.int32) if documents is None
                  else jnp.asarray(documents, jnp.int32))
-    index = jnp.broadcast_to(jnp.arange(length), (rows, length))
-    # The last real slot before each slot, -1 before any.
-    last = jax.lax.cummax(jnp.where(real, index, -1), axis=1)
-    before = jnp.concatenate([jnp.full((rows, 1), -1), last[:, :-1]], axis=1)
-    previous = jnp.take_along_axis(documents, jnp.maximum(before, 0), axis=1)
-    starts = real & ((before < 0) | (previous != documents))
-    runs = jnp.cumsum(starts, axis=1)
-    counted = jnp.cumsum(real, axis=1)
-    opened = jax.lax.cummax(jnp.where(starts, counted - 1, -1), axis=1)
-    return runs, jnp.where(runs > 0, (counted - 1 - opened) // window, -1)
+    starts = document_starts(documents, real)
+    # A row's first real token opens its first run, which `document_starts` leaves to what precedes.
+    runs = jnp.cumsum(starts | (real & (jnp.cumsum(real, axis=1) == 1)), axis=1)
+    return runs, jnp.where(runs > 0, document_ranks(real, starts) // window, -1)
 
 
 def _rows(tree, rows: int):

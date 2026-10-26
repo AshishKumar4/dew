@@ -30,6 +30,23 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   run does, and the run refuses a step whose objective returns none, where a decision run trained unclipped
   with no sign of it. `LMObjective`'s, `TokenScorer`'s and the RL objectives' `qk_stats`
   argument is removed: the run asks for them.
+- The library holds no CPU-only algorithm (bible §5): a vocabulary row's fused logsumexp is one
+  plain pass on every platform, which Dew's CPU test setting takes in float64 and rounds once
+  (`dew.nn.precision.widened_reduction`, beside `accumulated`), in place of a CPU-only blocked
+  reduction; a float64 schedule division is the plain division; and a plan over several devices is
+  timed against the batch whole a rung up on every backend: it keeps the first plan unless the other's
+  every sample beats it (`dew.training.planning.faster`), so two runs of one configuration train one
+  program, and a resumed run continues its checkpoint's plan untimed. Dew's tests keep a frontier's
+  first plan (`DEW_UNTIMED_FRONTIER`, a test setting like `DEW_WIDE_CPU_ARITHMETIC`). The sharded LM head maps over the axes that
+  split its tokens alone, every other axis left automatic, in place of holding every axis manual.
+- A loaded decoder's pad row takes no gradient wherever its source's table pads it. Kimi Linear, Kimi K3,
+  Ouro, Dream, LLaDA-MoE and LLaDA2 now pad `pad_token_id` as their released code does, at their config
+  class's own default where a config states none; Dew trained that row before. Qwen 3.5's wrappers load
+  a YaRN or Llama 3.1 rope record, their three-axis rotary turning by its ramp. Tier 2's probe runs past
+  a rope ramp's original context and holds a convention's pad row to the source's table, a negative pad
+  id counting back from the table's end. A verification of a repository's own code is recorded under
+  the repository, Hub commit and folder it was fetched at, and a local directory's own code is verified
+  at each load.
 - Test-time training over the task loss: a decoder's continuum level (`CausalTransformer(continuum=ContinuumLevel(hidden))`) is stepped in context by the LM loss every `window` tokens of a document (`LMObjective(adaptation=ChunkAdaptation(...))`), Nested Learning's equation 71, each document from the trained start, training through every step.
 - A label's cross-entropy derivative in its own logit is `p - 1` while the label holds at most half its row and minus the rest of the row past it (`dew.nn.categorical.label_entry`), for the whole-logits head and the tiled, fused and vocabulary-split heads alike; the rest alone sat two to three times as far from float64 on unconfident rows.
 - `UNet2DCondition` stores its time embeddings' two maps flat, as `time_linear_1` and `time_linear_2`
@@ -37,9 +54,12 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   published UNet loads as before. An AutoencoderKL's resnets are `dew.nn.blocks.ResidualBlock` called
   without a time embedding, and `dew.nn.autoencoders.vae.FlaxResnetBlock2D` is gone. `dew.nn.engram`
   draws its bucket primes with `sympy.nextprime`, so `sympy` is a dependency.
-- A flow transition's density and KL hold at a variance near float32's largest: the density is JAX's
-  isotropic `multivariate_normal.logpdf`, and the KL halves after its division, where `2 pi` or 2 times
-  the variance overflowed. Schulman's k3 KL estimate is one helper through `expm1`
+- A flow transition's density and KL hold at float32's edges: the density is JAX's isotropic
+  `multivariate_normal.logpdf`, where `2 pi` times a variance near float32's largest overflowed, and the
+  KL takes the error's half from its quotient, rounded once, where 2 times such a variance or an error
+  over a variance near float32's least overflowed and half an error near its least flushed to zero (a KL
+  of 0 for 0.5).
+  Schulman's k3 KL estimate is one helper through `expm1`
   (`dew.rl.surrogate.sampled_kl`), which a small log ratio's `exp(d) - 1` rounded away.
 - A masked-diffusion row's reveals are its own under RBG keys too (`dew._distributions.counted`, the
   rest of ledger 1669), and TensorBoard histograms are its own `histogram_pb`'s, the plugin's tensor.
@@ -89,7 +109,9 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   new modules; the old ones no longer hold them.
 - A Hub split's shards are the files `datasets` resolves to it from the repository's listing, by its own
   default patterns (`dew.data.sources.hub.split_files`): `dev` and `valid` are `validation`'s, a sharded
-  name's split is its own and a lone file is `train`'s, where a name match missed them.
+  name's split is its own and a lone file is `train`'s, where a name match missed them. A listing of no
+  file gives none. Every Hub call holds tqdm's bar lock first, so streamed sources discovered at once no
+  longer delete it under each other's bars.
 - An immutable upload's `retries` (`Cache.retry`) re-read only an object it created that reads back
   otherwise; a failed transfer raises after its transport's own retries, not Dew's on top of them.
 - A decision run's calibration takes its probabilities through SciPy's `softmax` and fits each
@@ -98,6 +120,7 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 - An S3 store's conditional writes go through s3fs's own call (`call_s3`), as its reads and plain writes
   do, so a profile's server-side encryption (a KMS key, SSE-C) and its bucket's regional client reach
   them; a refused condition is still `PreconditionFailed`.
+  timed against the batch whole a rung up on every backend.
 - 8-bit Adam state codes each moment value among the six codes around its estimate, its decade by its
   logarithm, instead of searching the whole map: on an A100, lm-dense's update takes 27.32 ms against
   60.39, its full-remat step 167.9 against 196.3 ms and compiles in 82.3 against 209.8 s, the codes

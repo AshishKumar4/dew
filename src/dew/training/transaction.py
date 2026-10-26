@@ -26,7 +26,7 @@ from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
-from dew.batch import EXAMPLE_ROWS, Batch, Variables, merge
+from dew.batch import EXAMPLE_ROWS, Batch, Variables, dicts, merge
 from dew.data.dataset import rows_of
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import rows_spec
@@ -194,9 +194,11 @@ def ema_update(ema, params, decay):
 
 
 def write_back(params: Variables, variables: Variables | None) -> Variables:
-    """Replace nonparameter collections whole; the optimizer owns params."""
+    """Replace nonparameter collections whole; the optimizer owns params. A collection comes back in
+    the state's dicts whichever Flax container the objective's `apply` wrote it in (`dew.batch.dicts`)."""
     if variables is None:
         return params
+    variables = dicts(variables)
     if "params" in variables:
         raise ValueError("Aux.variables cannot carry the params collection; the optimizer owns it")
     for name, collection in variables.items():

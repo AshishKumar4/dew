@@ -136,7 +136,7 @@ class SlotSource(SourceKind):
         if labels != canonical or actual != picked:
             raise ValueError("the slot format records its canonical bare labels in tokenizer order")
         root = Path(directory)
-        Pretrained.save(bundle, root, max_shard_size=max_shard_size)
+        bundle.backbone().save(root, max_shard_size=max_shard_size)
         readout = {"readout": mode, "head_dim": fields.get("head_dim", 256), "n_slots": len(ids)}
         # The release's attention field states its full attention as the saved config's overrides do;
         # the rows' blocks may serve another kind as well.
@@ -148,14 +148,32 @@ class SlotSource(SourceKind):
         if mode == "head":
             import torch
 
-            params = bundle.head_variables["params"]
-            tensors = {}
-            for name, path in _PATHS.items():
-                host = np.array(jax.device_get(params[path[0]]), copy=True, order="C")
-                tensors[name] = torch.frombuffer(host, dtype=getattr(torch, str(host.dtype))).reshape(
-                    host.shape)
+            tensors = {name: torch.frombuffer(host, dtype=getattr(torch, str(host.dtype))).reshape(host.shape)
+                       for name, host in SlotSource.readout(bundle).items()}
             torch.save(tensors, root / "readout_head.pt")
         (root / "readout.json").write_text(json.dumps(readout, indent=2) + "\n")
+
+    @staticmethod
+    def readout(bundle: PretrainedDecision) -> dict[str, np.ndarray]:
+        """The slot-and-pointer head's tensors under the release's names (`readout_head.pt`), host
+        arrays in C order; none for the tied label readout, which reads the backbone's own head."""
+        if _records.text(_records.record(bundle.head.record(), "head")["class"], "head.class") != import_path(
+                SlotReadout):
+            return {}
+        params = bundle.head_variables["params"]
+        return {name: np.array(jax.device_get(params[path[0]]), copy=True, order="C")
+                for name, path in _PATHS.items()}
+
+    @staticmethod
+    def export(bundle: PretrainedDecision, variables: Mapping[str, object] | None = None
+               ) -> dict[str, np.ndarray]:
+        """Every tensor of the slot release `save` writes: the backbone's under their checkpoint names
+        and the slot-and-pointer head's under the release's (`readout_head.pt`), with `variables` in
+        place of the backbone's."""
+        from dew.decision.sources import joined_release
+
+        return joined_release(bundle.backbone().export(variables), SlotSource.readout(bundle),
+                              "the backbone's shards and readout_head.pt")
 
     @staticmethod
     def layout(*, max_len: int = 32768, keep: Literal["start", "end", "all"] = "all",
@@ -229,4 +247,4 @@ class SlotSource(SourceKind):
         layout = SlotSource.layout(labels=labels, blocks=blocks)
         return CompositeSource(NativeComponent(config), head, PretrainedDecision.from_components, "",
                                {"layout": layout, "calibration": Calibration(), "strict_specials": False,
-                                "writer": SlotSource.save})
+                                "writer": SlotSource.save, "exporter": SlotSource.export})

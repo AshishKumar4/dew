@@ -57,7 +57,7 @@ from dew.nn.precision import (
     running_sum,
     running_total,
     scaled_logits,
-    wide_cpu_arithmetic,
+    widened_reduction,
 )
 from dew.nn.protocols import (
     AffineHead,
@@ -217,23 +217,7 @@ def _row_terms(logits, predict: bool, labels) -> tuple[
     a single reduction over the row, on an RTX 4080 (jax 0.11.2), fp32
     logits of 4096 x 151936 took 3.9 ms against `jax.nn.logsumexp` and
     `jnp.argmax`'s 7.6, and 8192 x 50304 2.6 against 5.0.
-
-    In a process running wide CPU arithmetic (`dew.nn.precision.WIDE_CPU_ARITHMETIC`,
-    Dew's test setting), on a CPU the row reduces in levels of `ROW_BLOCK` columns, each level's
-    blocks' terms the next level's row, until one block is left
-    (`_row_blocks`): XLA's CPU compiler runs a reduction with a combine of
-    its own as one loop over the row, whose sum of exponentials rescales its
-    running total at each new maximum and rounds at each step, so its error
-    grows with the loop's length. Over 512 columns one loop held a whole
-    head's state gradient 3.9 times as far from float64 as
-    `jax.nn.logsumexp`'s over 52 orders of its columns; two levels of blocks
-    of the row's square root's width held a 2053-column head's 1.50 times as
-    far as the full pass's over drawn cotangents, where the vocabulary-tiled
-    head's 514-column tiles, each in shorter blocks, held 1.18 times
-    (tests/test_chunked_cross_entropy.py, row 1592). A GPU reduces a row as a
-    tree of its threads' partial sums already, where more levels are more
-    passes over the row for nothing, so other backends keep the one
-    reduction."""
+    """
     def combine(first, second):
         larger = jnp.maximum(first[0], second[0])
         total = rescaled(first[0], first[1], larger) + rescaled(second[0], second[1], larger)
@@ -249,41 +233,20 @@ def _row_terms(logits, predict: bool, labels) -> tuple[
     # The rest of the row leaves each row's target column out, so the target's entry is its rest summed
     # directly, never its share less one (`_softmax_cotangent`).
     operands = [logits, jnp.ones_like(logits), (columns != labels[..., None]).astype(logits.dtype)]
-    initial = [jnp.array(-jnp.inf, logits.dtype), jnp.array(0, logits.dtype), jnp.array(0, logits.dtype)]
+    starts = [-jnp.inf, 0, 0]
     if predict:
         operands.append(columns)
-        initial.append(jnp.array(jnp.iinfo(jnp.int32).max, jnp.int32))
+        starts.append(jnp.iinfo(jnp.int32).max)
 
     def reduced(*operands):
-        return jax.lax.reduce(operands, tuple(initial), combine, (operands[0].ndim - 1,))
+        initial = tuple(jnp.array(start, operand.dtype)
+                        for start, operand in zip(starts, operands, strict=True))
+        return jax.lax.reduce(operands, initial, combine, (operands[0].ndim - 1,))
 
-    def blocked(*operands):
-        row = list(operands)
-        while row[0].shape[-1] > ROW_BLOCK:
-            firsts = [reduced(*part) for part in _row_blocks(row)]
-            row = [jnp.concatenate([first[index] for first in firsts], axis=-1) for index in range(len(row))]
-        return reduced(*row)
-
-    terms = (jax.lax.platform_dependent(*operands, cpu=blocked, default=reduced) if wide_cpu_arithmetic()
-             else reduced(*operands))
-    return terms[0] + jnp.log(terms[1]), ((terms[0], terms[3]) if predict else None), terms[:3]
-
-
-ROW_BLOCK = 16
-"""The columns a level of `_row_terms`' CPU reduction reduces in one loop."""
-
-
-def _row_blocks(operands: list[jax.Array]) -> list[list[jax.Array]]:
-    """`operands`, rows over their last axis, as the parts one level of `_row_terms` reduces, each
-    part's blocks on a new last axis: blocks of `ROW_BLOCK` columns, and the columns left past the
-    last whole block as one more."""
-    width = operands[0].shape[-1]
-    block = ROW_BLOCK
-    whole = width - width % block
-    parts = [[x[..., :whole].reshape(*x.shape[:-1], whole // block, block) for x in operands]]
-    if whole < width:
-        parts.append([x[..., whole:][..., None, :] for x in operands])
-    return parts
+    # Dew's CPU test setting takes the row's sums in float64 (`widened_reduction`); a run, one fused pass.
+    terms = widened_reduction(reduced, *operands)
+    maximum, total, rest = terms[:3]
+    return maximum + jnp.log(total), ((maximum, terms[3]) if predict else None), (maximum, total, rest)
 
 
 class _ChunkTerms(NamedTuple):

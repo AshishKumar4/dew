@@ -11,6 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from flax.core import freeze as frozen_dict
 from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
 from steady_state import steady_state
 from test_training_transactions import SHORT_SCALE, Terms, Tiny, batches
@@ -81,7 +82,7 @@ def platforms_agree(resident, host, steps: int):
 def close(left, right, bound=STREAMED_BOUND):
     """`left`, a CPU-owned state, agrees with `right`, a device one, leaf by
     leaf; the frozen collection is compared per layer, the host's banks
-    (`execution.banked`) read row by row."""
+    (`dew.inference.banks.banked`) read row by row."""
     if isinstance(left, dict) and FROZEN in left:
         left = {**left, FROZEN: unbanked(left[FROZEN])}
     elif FROZEN in getattr(left, "variables", {}):
@@ -726,6 +727,25 @@ def test_place_streams_the_held_tree_and_releases_each_source():
         ).variables,
         resident.variables,
     )
+
+
+def test_a_tree_of_frozen_dicts_is_placed_as_a_tree_of_dicts_is():
+    """An objective given its tree as Flax `FrozenDict`s, as a loaded task holds one, holds it as
+    dicts: the placed arrays stream into it as they land and its frozen rows become the run's bank,
+    as a dict tree's do."""
+    model = decoder()
+    given = frozen_dict(freeze(
+        jax.tree.map(np.asarray, model.init(jax.random.key(1), jnp.zeros((1, 8), jnp.int32))),
+        lambda path: path[-2:] == ("q_proj", "kernel")))
+    objective = LMObjective(model, 8, head_chunks=1, variables=given)
+    state, _, _ = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=HOST).place()
+    held = objective.held_variables()
+    assert held is not None
+    for path, leaf in _named_leaves(held):
+        assert isinstance(leaf, jax.Array), path
+    bank = state.variables[FROZEN]["layers_0_1"]["mlp"]["gate_proj"]["kernel"]
+    assert held[FROZEN]["layers_0"]["mlp"]["gate_proj"]["kernel"] is bank
+    assert held[FROZEN]["layers_1"]["mlp"]["gate_proj"]["kernel"] is bank
 
 
 class _Scaled(DeviceStep):
