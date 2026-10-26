@@ -88,7 +88,7 @@ def top_margin(values: np.ndarray, kept: int) -> np.ndarray:
 
 
 def indexer_margins(scores: np.ndarray, agreements: np.ndarray, candidates: np.ndarray, budget: int, *,
-                    relative: bool = True) -> np.ndarray:
+                    relative: bool = True, stable: bool = True) -> np.ndarray:
     """Each query's margin `[..., S]` of a lightning indexer's top-`budget` over the keys `candidates`
     `[..., S, T]` lets it score (`scores` `[..., S, T]`): the gap between the kept and the next
     candidate's score, and where both are an exact zero tie of keys every head disagrees with
@@ -96,8 +96,9 @@ def indexer_margins(scores: np.ndarray, agreements: np.ndarray, candidates: np.n
     best agreement from zero: a key every head disagrees with by a rounding's width scores zero in one
     run and a little above or below it in another, entering or leaving a tie that index order breaks.
     `relative`, each over the query's largest score or agreement; else as they are, for a site that
-    states its margin in the scores' own units. A query with no more candidates than `budget` decides
-    nothing."""
+    states its margin in the scores' own units. Where the selections compared are not all `stable`
+    (torch's `topk` promises no order among equal scores), a tie has no margin at all. A query with no
+    more candidates than `budget` decides nothing."""
     tiny = np.finfo(np.float32).tiny
     ranked = -np.sort(-np.where(candidates, scores, -np.inf), axis=-1)
     if ranked.shape[-1] <= budget:
@@ -110,7 +111,7 @@ def indexer_margins(scores: np.ndarray, agreements: np.ndarray, candidates: np.n
         gap = gap / np.maximum(np.abs(ranked[..., 0]), tiny)
         largest = np.max(np.where(candidates, np.abs(agreements).max(axis=-2), 0), axis=-1)
         best = best / np.maximum(largest, tiny)
-    return np.where(tied, best, np.where(np.isfinite(rejected), gap, np.inf))
+    return np.where(tied, best if stable else 0.0, np.where(np.isfinite(rejected), gap, np.inf))
 
 
 def causal(scores: np.ndarray) -> np.ndarray:

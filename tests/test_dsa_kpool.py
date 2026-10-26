@@ -174,8 +174,8 @@ def float64_block(block):
 def boundary_gap(block: Glm5NextTextAttention, hidden: torch.Tensor, valid: torch.Tensor) -> float:
     """The smallest margin, over the valid queries, of the reference's pool selection
     (modeling_glm5_next.py:797-847 replayed) in its scores' units (`indexer_margins`): the gap
-    between the last selected pool's score and the best rejected one, or at an exact zero tie, how
-    near zero a tied pool's best head agreement sits."""
+    between the last selected pool's score and the best rejected one; a tie, which the reference's
+    topk breaks as it likes, has none."""
     indexer, q_a_proj, q_a_layernorm = block.indexer, block.q_a_proj, block.q_a_layernorm
     assert indexer is not None and q_a_proj is not None and q_a_layernorm is not None
     with torch.no_grad():
@@ -193,8 +193,9 @@ def boundary_gap(block: Glm5NextTextAttention, hidden: torch.Tensor, valid: torc
         visible = (slots[None, None, :] <= slots[None, :, None]) & valid[:, None, :]
         pool_end = pool_indices[..., -1].clamp(0, S - 1)
         candidates = visible.gather(-1, pool_end[:, None, :].expand(B, S, -1)) & pool_valid[:, None]
+    # The reference's torch topk orders equal scores as it likes, so a tie is no margin here.
     margins = indexer_margins(index_scores.numpy(), agreements.numpy(), candidates.numpy(),
-                              indexer.index_topk // indexer.index_kpool, relative=False)
+                              indexer.index_topk // indexer.index_kpool, relative=False, stable=False)
     return float(margins[valid.numpy()].min())
 
 
