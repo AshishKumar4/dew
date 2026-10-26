@@ -334,6 +334,9 @@ class Loading:
     worker_buffer: int = WORKER_BUFFER
     ram_budget_mb: int | None = None
     max_workers: int | None = None
+    cache: bool = True
+    """Whether a run reads its chains' leading deterministic steps from the records an earlier run
+    made of the same records (`dew.data.cache.automatic_root`), which changes none of them."""
 
     def resolved(self, records: pygrain.IterDataset) -> Loading:
         """Ask Grain to size workers and buffers within the host's RAM limit."""

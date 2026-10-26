@@ -29,7 +29,9 @@ from dew.data.analysis import (
     Measuring,
     _analyzed,
     _at,
+    _cache_key,
     _cache_manifest,
+    _cacheable,
     _capabilities,
     _configured,
     _cut,
@@ -89,6 +91,7 @@ from dew.data.pipeline import (
     Limit,
     Map,
     MapBatch,
+    MapWithIndex,
     Mixture,
     Native,
     ObjectiveData,
@@ -102,6 +105,7 @@ from dew.data.pipeline import (
     Shuffle,
     SingleReader,
     Slice,
+    Stage,
     TokenBudget,
     TokenGeometry,
     Windows,
@@ -133,6 +137,42 @@ class _OrderFacts(Protocol):
     def order_fingerprints(self) -> Mapping[str, str]: ...
 
 
+def _automatically(stage: Stage) -> bool:
+    """Whether the compiler placed `stage`, a cache the chain did not write (`_automatic`)."""
+    return isinstance(stage, Artifact) and stage.automatic
+
+
+def _automatic(pipeline: Pipeline, read: Read, root: str | None) -> Pipeline:
+    """`pipeline` with a cache at `root` after its leading deterministic record maps, where such a
+    cache could stand and the chain writes none: each corpus of a mixture or phases its own. The
+    maps are the ones a cache keys (`_cacheable`) and reads again unchanged (none `_volatile`); the
+    cache stands for them only in a memory or indexed read, by each input's place in a store whose
+    content is named, in a clean checkout whose steps are exact (`Manifest`), and nowhere else, so a
+    chain no cache could serve reads as it is written, never refused. It holds the records the maps
+    make, and fills, publishes, replays and evicts as `cache(url)` does (`Cache`), so a run reads the
+    same records with or without it (`Artifact.automatic`), and a run of the same maps over the same
+    records reads them back. Its root is the run's to name or refuse (`automatic_root`)."""
+    from dew.data.cache import Cache
+
+    if root is None or read == "streamed":
+        return pipeline
+    if isinstance(pipeline.source, (Mixture, Phases)):
+        return with_children(pipeline, lambda child: _automatic(child, read, root))
+    if any(isinstance(stage, Artifact) for stage in _steps(pipeline)):
+        return pipeline
+    def kept(stage: Stage) -> bool:
+        return isinstance(stage, (Map, MapWithIndex)) and _cacheable(stage) and not _volatile(stage)
+
+    at = next((index for index, stage in enumerate(pipeline.stages) if not kept(stage)), len(pipeline.stages))
+    if not at or not pipeline.source.supports(read):
+        return pipeline
+    key = _cache_key(pipeline.source, pipeline.stages[:at], read)
+    if key is None or not (key.clean and key.exact):
+        return pipeline
+    cached = Artifact(Cache(root), automatic=True)
+    return dataclasses.replace(pipeline, stages=(*pipeline.stages[:at], cached, *pipeline.stages[at:]))
+
+
 def _cache_references(pipeline: Pipeline, read: Read) -> tuple[str, ...]:
     """The caches each corpus of `pipeline` reads through, among its stages as its pipeline wrote
     them (`_written`), the ones a memory read already ran included, each named against the source
@@ -143,7 +183,8 @@ def _cache_references(pipeline: Pipeline, read: Read) -> tuple[str, ...]:
         while materialized(written):
             written = written.source
         references += [stage.cache.reference(_cache_manifest(written, stages[:index], read))
-                       for index, stage in enumerate(stages) if isinstance(stage, Artifact)]
+                       for index, stage in enumerate(stages)
+                       if isinstance(stage, Artifact) and not stage.automatic]
     return tuple(references)
 
 
@@ -444,6 +485,7 @@ def _prepared(
     training: bool = False,
     objective: ObjectiveData | None = None,
     counts: Sequence[dict[str, CorpusCounts]] | None = None,
+    automatic: str | None = None,
 ) -> tuple[Pipeline, ...]:
     """The one preparation compile, iterate, validation and publish lower from.
 
@@ -454,7 +496,8 @@ def _prepared(
     bind to the sources' metadata. With read='memory' and `counts`, the
     source-scoped steps run and materialize first, so run-scoped steps bind
     to measured facts; publication passes no counts and reads nothing before
-    its fill. The caller materializes what remains.
+    its fill. The caller materializes what remains. A training read caches
+    each corpus's leading deterministic steps under `automatic` (`_automatic`).
     """
     if read not in ("memory", "indexed", "streamed"):
         raise ValueError(f"unknown read mode {read!r}")
@@ -467,6 +510,7 @@ def _prepared(
     _capabilities(branches, read, provision)
     branches = _pin_sources(branches, read)
     _tokenizer_contract(branches)
+    branches = tuple(_automatic(branch, read, automatic) for branch in branches)
     if objective is not None:
         branches = tuple(
             _objective_branch(branch, objective, train=not scored, read=read)
@@ -586,6 +630,8 @@ def _staged(
     rejections: Literal["drop", "mask"],
     examples: int | None = None,
 ) -> _Staged:
+    from dew.data.cache import automatic_root
+
     if rejections == "mask":
         raise ValueError(
             "rejections='mask' needs an objective proven mask-safe; no objective currently declares it"
@@ -606,6 +652,7 @@ def _staged(
         training=True,
         objective=objective,
         counts=(counts,) if validation is None else (counts, validation_counts),
+        automatic=automatic_root(loading) if read != "streamed" else None,
     )
     if not any(isinstance(stage, BatchStage) for stage in branches[0].stages):
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
@@ -650,7 +697,8 @@ def _compiled(
         {"sources": [source.fingerprint() for source in sources]},
         sources,
         (
-            *(_identity(stage) for stage in _steps(original) if not isinstance(stage, (Workers, Prefetch))),
+            *(_identity(stage) for stage in _steps(original)
+              if not isinstance(stage, (Workers, Prefetch)) and not _automatically(stage)),
             *(StepIdentity.of(step) for step in host),
         ),
     )
