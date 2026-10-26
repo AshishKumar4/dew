@@ -7,9 +7,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 - `OptimConfig(state_dtype='int8')` stores adam's and adamw's moments blockwise in 8 bits
   (`dew.optim.int8_moments`, bitsandbytes' and torchao's 8-bit Adam): a quarter of float32's state, the
-  update computed from the moments dequantized to fp32 (an A100's full-remat step of a 234M-parameter
-  decoder: peak 3.22 GB against fp32 state's 4.22, 81.2 ms against 52.9). bf16 and 8-bit Adam share one
-  leafwise transform, and an 8-bit moment's codes and scales are placed by their parameters' axes.
+  update computed from the moments dequantized to fp32. On an A100, lm-dense's full-remat step peaks at
+  5.88 GB against fp32 state's 8.09 and takes 196.3 ms against 151.7 (`tools/benchmark_kernels.py
+  step --state-dtype int8`). bf16 and 8-bit Adam share one leafwise transform, and an 8-bit moment's
+  codes and scales are placed by their parameters' axes.
 - `Trainer.fit(examples=N)` and `--trainer.examples N` bound a run to the chain's
   first N records, counted before packing and each read once, its steps (and so
   its schedule) the ones the data plan counts for them. `Pause(fraction)`, as
