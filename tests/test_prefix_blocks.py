@@ -434,7 +434,7 @@ def test_a_prefix_run_and_a_batch_of_blocks_are_admitted_by_one_rule():
                 verdicts.append(True)
         return verdicts[0], verdicts[1]
 
-    assert admits(model()) == (False, False)
+    assert admits(model(full_attention={})) == (False, False)
     assert admits(chunked(2)) == (False, False)
     assert admits(chunked(2, unchunked=True)) == (True, True)
 
