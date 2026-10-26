@@ -342,11 +342,13 @@ def _rope_entry(entry: Mapping[str, object] | None, field: str,
     'original_max_position_embeddings' names a scaling whatever the type
     says; llama3 takes exactly its four (modeling_rope_utils.py:987-995).
 
-    `yarn_max_pos` is the caller's max_position_embeddings, which a YaRN
-    entry needs for the factor the reference falls back to. Passing it is
-    how a family whose attention builds the YaRN frequencies opts in; the
-    families that only rotate plainly leave it None and refuse the type.
-    `ramps` restricts the scaled types to those the caller's family computes.
+    YaRN maps too: every rotary class transformers 5.16.1 builds from a
+    rope_type dispatches `ROPE_INIT_FUNCTIONS` over it, llama3 and YaRN alike
+    (modeling_rope_utils.py:668-674), so a family whose class does takes
+    both. `yarn_max_pos` is the caller's max_position_embeddings, which a YaRN
+    entry reads where it omits its factor or its original length, as the
+    reference does. `ramps` restricts the scaled types to those the caller's
+    family computes, for a class that rotates otherwise.
     """
     if entry is None:
         return _Rope()
@@ -375,7 +377,7 @@ def _rope_entry(entry: Mapping[str, object] | None, field: str,
                 ),
             ),
         )
-    if rope_type == 'yarn' and yarn_max_pos is not None:
+    if rope_type == 'yarn':
         return _Rope(theta, yarn_record(entry, field, yarn_max_pos))
     if rope_type not in ('default', 'none'):
         refuse(f"{field} (rope_type {rope_type!r})",
@@ -391,12 +393,12 @@ def _rope_entry(entry: Mapping[str, object] | None, field: str,
 def read_rope_theta(entry: Mapping[str, object] | None, field: str) -> float | None:
     """Read one plain rope base frequency.
 
-    A llama3 entry refuses where only plain rope has a place, as in Gemma 4.
+    A ramp refuses where only plain rope has a place, as in Gemma 4.
     """
     rope = _rope_entry(entry, field)
     if rope.scaling is not None:
-        refuse(f"{field} (rope_type 'llama3')",
-                "this family's rotary positions take no llama3 ramp")
+        refuse(f"{field} (rope_type {rope.scaling['rope_type']!r})",
+                "this family's rotary positions take no ramp")
     return rope.theta
 
 
@@ -523,8 +525,7 @@ def rope_records(hf_config: Mapping[str, object], spelling: RopeSpelling
 
 
 def read_rope(hf_config: Mapping[str, object], used: set, spelling: RopeSpelling, *,
-              yarn_max_pos: int | None = None, ramps: tuple[str, ...] | None = None,
-              per_kind: bool = True) -> Ropes:
+              ramps: tuple[str, ...] | None = None, per_kind: bool = True) -> Ropes:
     """Read the rope of any HF spelling as the family's config class resolves it.
 
     `spelling` is the class's own (its `default_theta` among it), which every
@@ -535,10 +536,13 @@ def read_rope(hf_config: Mapping[str, object], used: set, spelling: RopeSpelling
     a record that names its type as plain clearing an earlier ramp. Each is
     then parsed once (`_rope_entry`): the full layers' base and ramp are the
     model's, the sliding layers' their kind's where they differ. YaRN reads
-    `yarn_max_pos`, as `_rope_entry` describes. `ramps` names the scaling
-    types the family computes; `per_kind=False` refuses nested records.
+    the config's max_position_embeddings, the class's default among a
+    family's `defaults`, as `_rope_entry` describes. `ramps` names the
+    scaling types the family computes; `per_kind=False` refuses nested records.
     """
     used.update(('rope_theta', 'rope_parameters', 'rope_scaling'))
+    stated = hf_config.get('max_position_embeddings')
+    yarn_max_pos = None if stated is None else records.integer(stated, 'max_position_embeddings')
     if spelling.local_field is not None:
         used.add(spelling.local_field)
     (full_field, full_record), sliding = rope_records(hf_config, spelling)
@@ -546,16 +550,55 @@ def read_rope(hf_config: Mapping[str, object], used: set, spelling: RopeSpelling
         refuse(full_field, 'this family reads one rotary record for every layer')
     full = _rope_entry(full_record, full_field, yarn_max_pos, ramps=ramps)
     theta = records.number(full_record['rope_theta'], f'{full_field} rope_theta')
-    full_ramp = full.scaling
+    nested = '.' in full_field
+    full_ramp = nested_ramp(full.scaling) if nested else full.scaling
     if sliding is None:
         return Ropes(theta, full_ramp)
     sliding_field, sliding_record = sliding
     local = _rope_entry(sliding_record, sliding_field, yarn_max_pos, ramps=ramps)
     sliding_theta = records.number(sliding_record['rope_theta'], f'{sliding_field} rope_theta')
-    sliding_ramp = local.scaling
+    sliding_ramp = nested_ramp(local.scaling)
     return Ropes(theta, full_ramp, None if sliding_theta == theta else sliding_theta,
                   None if sliding_ramp == full_ramp else sliding_ramp,
                   full_only=full.scaling is not None and local.scaling is None)
+
+
+def partial_rope_entry(record: Mapping[str, object], field: str, *, default_factor: float,
+                       max_pos: int | None, layout: tuple[str, ...] = ()) -> tuple[float, float, Ramp | None]:
+    """(rope_theta, partial_rotary_factor, ramp) of one rope record a rotary class turns a fraction
+    of each head by, building its rope_type through `ROPE_INIT_FUNCTIONS` (`_rope_entry`): the
+    fraction the record's, else `default_factor`, and the ramp over int(head_dim * factor) dims, as
+    `_compute_yarn_parameters` reads it (modeling_rope_utils.py:412-415) and
+    `dew.nn.rope.rotary_freqs` computes it under the 'default' partial convention. `layout` names
+    the record's fields that place the rotated pairs without changing their angles (Qwen 3.5's
+    mRoPE sections over text positions). The record states its base."""
+    factor = records.number(record.get('partial_rotary_factor', default_factor),
+                            f'{field} partial_rotary_factor')
+    entry = {key: value for key, value in record.items() if key not in ('partial_rotary_factor', *layout)}
+    rope = _rope_entry(entry, field, max_pos)
+    if rope.theta is None:
+        refuse(f"{field} without rope_theta", "the rotary indexes the record's own base")
+    return rope.theta, factor, rope.scaling
+
+
+def read_partial_rope(hf_config: Mapping[str, object], used: set, spelling: RopeSpelling, *,
+                      default_factor: float, layout: tuple[str, ...] = ()) -> tuple[Ropes, float]:
+    """(the rotary's base and ramp, partial_rotary_factor) of a config whose one rotary record turns
+    a fraction of each head (`partial_rope_entry`), as Glm4MoeRotaryEmbedding and
+    Qwen3_5TextRotaryEmbedding do: the record as the class resolves it (`rope_records`, a legacy
+    rope_scaling replacing rope_parameters whole), its fraction else the config's flat one else
+    `default_factor` (`convert_rope_params_to_dict`, modeling_rope_utils.py:742-760)."""
+    used.update(('rope_theta', 'rope_parameters', 'rope_scaling', 'partial_rotary_factor'))
+    (field, record), sliding = rope_records(hf_config, spelling)
+    if sliding is not None:
+        refuse(sliding[0], 'this family reads one rotary record for every layer')
+    stated = hf_config.get('max_position_embeddings')
+    theta, factor, ramp = partial_rope_entry(
+        record, field, layout=layout,
+        default_factor=records.number(hf_config.get('partial_rotary_factor', default_factor),
+                                      'partial_rotary_factor'),
+        max_pos=None if stated is None else records.integer(stated, 'max_position_embeddings'))
+    return Ropes(theta, ramp), factor
 
 
 def specified_layer_types(hf_config: Mapping[str, object], used: set[str],
@@ -612,15 +655,18 @@ _YARN_FIELDS = frozenset(field.name for field in dataclasses.fields(YarnScaling)
 _YARN_INERT = frozenset({'attn_factor'})
 
 
-def yarn_record(entry: Mapping[str, object], field: str, max_pos: int) -> YarnRamp:
+def yarn_record(entry: Mapping[str, object], field: str, max_pos: int | None) -> YarnRamp:
     """Read a YaRN rope entry into the mixer's yarn record.
 
     Keeps the reference's names; the mixer's YarnScaling is built from these
     keys. An explicit `attention_factor` rides along (the reference scales
-    cos/sin by it and derives none), while a partial rotary inside a YaRN
-    entry has no counterpart in the mixer's full-width ramp and raises a
-    ValueError. A missing factor falls back the way the reference does, to
-    the context ratio off the original length.
+    cos/sin by it and derives none). A partial rotary is its family's to read
+    beside the entry (`read_partial_rope`), which hands the ramp the rotated
+    width; inside the entry here it refuses. A missing original length is
+    `max_pos`, as the class's `standardize_rope_params` fills it, and a
+    missing factor the context ratio off it, as `_compute_yarn_parameters`
+    falls back (modeling_rope_utils.py:790-797, 426-427); a config naming
+    neither length is refused.
     """
     unknown = sorted(set(entry) - _YARN_FIELDS - _YARN_INERT)
     if unknown:
@@ -629,18 +675,22 @@ def yarn_record(entry: Mapping[str, object], field: str, max_pos: int) -> YarnRa
     partial = entry.get('partial_rotary_factor')
     if partial not in (None, 1, 1.0):
         refuse(f"{field} partial_rotary_factor {partial}",
-                "the mixer's YaRN ramp runs over the whole rope width")
+                "the family reads its partial rotary beside the ramp, which takes the rotated width")
+    original = entry.get('original_max_position_embeddings', max_pos)
+    if original is None:
+        refuse(f"{field} without original_max_position_embeddings",
+                "the config names no max_position_embeddings to stand for it")
+    original = records.integer(original, "original_max_position_embeddings")
     factor = entry.get('factor')
     if factor is None:
-        factor = float(max_pos) / records.number(
-            entry["original_max_position_embeddings"], "original_max_position_embeddings"
-        )
+        if max_pos is None:
+            refuse(f"{field} without a factor",
+                   "the config names no max_position_embeddings to derive it from")
+        factor = float(max_pos) / original
     return native_fields(YarnScaling)(
         rope_type="yarn",
         factor=records.number(factor, f"{field} factor"),
-        original_max_position_embeddings=records.integer(
-            entry["original_max_position_embeddings"], "original_max_position_embeddings"
-        ),
+        original_max_position_embeddings=original,
         beta_fast=records.number(entry.get("beta_fast") or 32, "beta_fast"),
         beta_slow=records.number(entry.get("beta_slow") or 1, "beta_slow"),
         mscale=(None if entry.get("mscale") is None else records.number(entry["mscale"], "mscale")),
@@ -786,26 +836,36 @@ def base_config(hf_config: Mapping[str, object], used: set[str], *,
                  'rms_norm_eps', 'tie_word_embeddings'))
     used.update(reads & {'attention_bias', 'mlp_bias'})
 
-    # A ramp lands under the field whose record it is: `rope_scaling` reads
-    # the llama3 ramp over the plain frequencies, `yarn` replaces them.
+    # A ramp both kinds share is the model's. Where the kinds' ramps differ, each lands on its own
+    # kind: a kind inherits the model's ramp, so a model-level one beside a kind's own would give
+    # that kind two (transformers dispatches each kind's record on its own).
+    apart = ropes.scaling is not None and (ropes.full_only or ropes.local_scaling is not None)
     if ropes.scaling is not None:
-        if ropes.full_only and 'sliding_attention' in layer_types:
+        if apart and 'sliding_attention' in layer_types:
             full = kinds.setdefault('full_attention', native_fields(LayerKind)())
-            if ropes.scaling['rope_type'] == 'llama3':
-                full['rope_scaling'] = ropes.scaling
-            else:
-                full['yarn'] = ropes.scaling
-        elif ropes.scaling['rope_type'] == 'llama3':
-            config['rope_scaling'] = ropes.scaling
+            full[ramp_field(ropes.scaling)] = ropes.scaling
         else:
-            config['yarn'] = ropes.scaling
+            config[ramp_field(ropes.scaling)] = ropes.scaling
     if ropes.local_scaling is not None:
-        sliding_kind = kinds['sliding_attention']
-        if ropes.local_scaling['rope_type'] == 'llama3':
-            sliding_kind['rope_scaling'] = ropes.local_scaling
-        else:
-            sliding_kind['yarn'] = ropes.local_scaling
+        kinds['sliding_attention'][ramp_field(ropes.local_scaling)] = ropes.local_scaling
     return config
+
+
+def nested_ramp(ramp: Ramp | None) -> Ramp | None:
+    """A ramp read from one layer type's record of nested rope_parameters, as transformers 5.16.1
+    computes it: its YaRN truncation is the config's top-level `rope_parameters.get("truncate", True)`
+    (modeling_rope_utils.py:474), which a nested dict, keyed by layer type, never states, so the
+    correction bounds always truncate whatever the record says."""
+    if ramp is None or ramp['rope_type'] != 'yarn':
+        return ramp
+    return native_fields(YarnScaling)(**{**ramp, 'truncate': True})
+
+
+def ramp_field(ramp: Ramp) -> str:
+    """The field a ramp lands under, on the model or a kind: `rope_scaling` reads the llama3 ramp
+    over the plain frequencies, `yarn` replaces them."""
+    return 'rope_scaling' if ramp['rope_type'] == 'llama3' else 'yarn'
+
 
 
 def softmax_top_k(hf_config: Mapping[str, object], used: set[str]) -> int:
@@ -852,7 +912,12 @@ def translate_family_config(hf_config: Mapping[str, object],
                 refuse(f"{alias}={value!r} beside {canonical}={spelled[canonical]!r}", "they name one field")
             spelled[canonical] = value
             used.add(alias)
-    config = family.translate_config({**(family.defaults if own else {}), **spelled}, used)
+    stated = {**(family.defaults if own else {}), **spelled}
+    config = family.translate_config(stated, used)
+    if family.padding_idx:
+        used.add('pad_token_id')
+        pad = stated.get('pad_token_id')
+        config['padding_idx'] = None if pad is None else records.integer(pad, 'pad_token_id')
     modeling_overrides(hf_config, config, used)
 
     return config, _unread(hf_config, used)
@@ -1759,6 +1824,14 @@ class DecoderFamily:
     """Config fields whose explicit null disables a component. Other null export fields remove
     a generic field the family does not read; these survive as JSON null instead of taking the
     source config class's default."""
+    padding_idx: bool = False
+    """Whether the source builds its token embeddings with padding_idx=config.pad_token_id
+    (nn.Embedding's, or Gemma's scaled word embedding over it), so the pad row takes no gradient
+    from its lookups: `translate_family_config` reads pad_token_id into
+    `CausalTransformer.padding_idx`, the class's own default among `defaults`, and the export
+    writes it back (ledger 1593). A family whose source passes none (GPT-NeoX, Falcon, BLOOM,
+    Nemotron-H) or whose source this table has not read (released remote code) leaves it False
+    and trains the row."""
 
     def readings(self, tensors: Mapping[str, np.ndarray],
                  config: Mapping[str, object]) -> tuple[Reading, ...]:

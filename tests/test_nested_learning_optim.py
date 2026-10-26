@@ -8,12 +8,14 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, seeds_for
 
 from dew.optim import delta_gradient_descent, newton_schulz, scale_by_m3
 
-M3_FACTORS = {"beta1": 0.9, "beta2": 0.99, "beta3": 0.5, "alpha": 0.3, "eps": 1e-8, "frequency": 3}
-"""M3's factors in the proofs below: three updates a chunk, so seven updates close two chunks."""
+M3_FACTORS = {"beta1": 0.9, "beta2": 0.99, "beta3": 0.5, "alpha": 0.3, "eps": 1e-2, "frequency": 3}
+"""M3's factors in the proofs below: three updates a chunk, so seven updates close two chunks. An `eps`
+of 1e-2 keeps an entry whose early gradients are near zero from dividing its direction by a near-zero
+root, which would let one entry's rounding stand for a draw's whole error."""
 NESTED_SEEDS = 8
 """Check 1's declared seeds for M3's directions and delta gradient descent's step."""
 
@@ -35,7 +37,8 @@ def newton_schulz_reference(matrix: np.ndarray, steps: int = 5) -> np.ndarray:
 def test_newton_schulz_orthogonalizes_a_matrix_and_a_stack_as_muons_iteration_does():
     """`newton_schulz` on a tall and a wide matrix, and on a stack of four 6 x 4 matrices whose stack axis
     sits between their reduction and output axes (Muon's dimension numbers), each matrix on par with
-    Muon's quintic iteration in NumPy from float64 (check 1), the stack's matrices each as alone."""
+    Muon's quintic iteration in NumPy from float64 (check 1), the stack's matrices each as alone, batched
+    or one at a time as the backend's products round them."""
     numbers = optax.contrib.MuonDimensionNumbers(reduction_axis=0, output_axis=2)
 
     @jax.jit
@@ -75,27 +78,34 @@ def m3_directions(gradients: np.ndarray) -> np.ndarray:
 def test_m3s_directions_are_algorithm_1s_across_its_chunks():
     """`scale_by_m3` over seven updates of a tree of matrices, one tall and one wide, two chunks closing:
     each direction on par with Algorithm 1's from float64 (check 1), the slow momentum's reaching the
-    updates from the second chunk on. Within a chunk the slow momentum and its orthogonalization hold
-    still, and each changes once, as the chunk closes; the first chunk's slow direction is zero."""
+    updates from the second chunk on, its products at full float32 as the reference's are (a GPU's
+    default float32 matmul is TF32; a run's precision is its own). Within a chunk the slow momentum and
+    its orthogonalization hold still, and each changes once, as the chunk closes; the first chunk's slow
+    direction is zero."""
     transform = scale_by_m3(**M3_FACTORS)
 
     @jax.jit
-    def directions(gradients):
+    def scanned(gradients):
         def step(state, gradient):
             direction, state = transform.update(gradient, state)
             return state, direction
         first = jax.tree.map(lambda sequence: sequence[0], gradients)
         return jax.lax.scan(step, transform.init(first), gradients)[1]
 
+    def directions(gradients):
+        with jax.default_matmul_precision("highest"):
+            return scanned(gradients)
+
     def draw(seed):
         rng = np.random.default_rng(seed)
-        return ({"attention": {"kernel": rng.standard_normal((7, 6, 4)).astype(np.float32)},
-                 "head": rng.standard_normal((7, 4, 6)).astype(np.float32)},)
+        return ({"attention": {"kernel": rng.standard_normal((7, 16, 12)).astype(np.float32)},
+                 "head": rng.standard_normal((7, 12, 16)).astype(np.float32)},)
 
     def reference(gradients):
         return jax.tree.map(m3_directions, gradients)
 
-    assert_as_exact(directions, reference, draw, "M3 directions", seeds=NESTED_SEEDS)
+    seeds = seeds_for(reference, draw, "M3 directions")
+    assert_as_exact(directions, reference, draw, "M3 directions", seeds=seeds)
     (gradients,) = draw(0)
     gradients = gradients["head"]
     state, held = transform.init(gradients[0]), []
