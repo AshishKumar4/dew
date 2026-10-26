@@ -698,9 +698,9 @@ def mode_fit(args) -> dict:
     except ValueError as refusal:
         if not args.refusal:
             raise
-        # A refusal the run expects: what it refused with, and the steps it saved before it.
-        return {"refused": type(refusal).__name__,
-                "written_steps": sorted(int(step) for step in checkpoints._open().all_steps())}
+        # A refusal the run expects: what it refused with, and the steps it observed and saved first.
+        return {"refused": type(refusal).__name__, "written_steps": checkpoints.committed(),
+                "observed": [] if observe is None else [step for step, _ in observe.values]}
     dump_params(args.out.with_suffix(".npz"), state.variables)
     if observe is not None:
         # Each observation is already whole on this host: written as it is, gathered by nothing.

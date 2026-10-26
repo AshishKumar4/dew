@@ -642,10 +642,12 @@ def test_a_pool_whose_processes_fetched_other_records_is_refused_before_it_train
 
     with serving(flaky) as address:
         reports = run_pool("fit", tmp_path / "out", 2, name="online", online=address, refusal=True,
-                           run_dir=tmp_path / "run", fsdp_size=1, steps=POOL_STEPS, records=RECORDS,
-                           environment=ONLINE)
-    # The same pool over a server that answers every url trains (`online_checkpoint`).
-    assert [(report["refused"], report["written_steps"]) for report in reports] == [("ValueError", [])] * 2
+                           observe_every=1, run_dir=tmp_path / "run", fsdp_size=1, steps=POOL_STEPS,
+                           records=RECORDS, environment=ONLINE)
+    # The same pool over a server that answers every url trains (`online_checkpoint`); this one
+    # observed no step and saved none.
+    assert [(report["refused"], report["observed"], report["written_steps"]) for report in reports] == [
+        ("ValueError", [], [])] * 2
 
 
 @pytest.fixture(scope="module")
