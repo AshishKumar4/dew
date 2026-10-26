@@ -54,6 +54,34 @@ def test_a_versioned_s3_read_is_the_filesystems_own_request():
             Store(f"s3://{bucket}/absent", options).get_versioned()
 
 
+def test_a_conditional_s3_write_is_the_filesystems_own_request():
+    """An S3 store's conditional writes send what its filesystem's options add to every request, as its
+    reads do: a write under a customer-provided key (SSE-C) puts the object with that key, which a read
+    of it then needs; a write whose condition fails raises PreconditionFailed, the stored object as it
+    was."""
+    import base64
+    import hashlib
+
+    secret = os.urandom(32)
+    sealed = {"SSECustomerAlgorithm": "AES256", "SSECustomerKey": base64.b64encode(secret).decode(),
+              "SSECustomerKeyMD5": base64.b64encode(hashlib.md5(secret).digest()).decode()}
+    with moto_bucket("sealed-put", s3_additional_kwargs=sealed) as (bucket, options):
+        fs = fsspec.filesystem("s3", **options)
+        sent = []
+        fs.s3.meta.events.register("before-parameter-build.s3.PutObject",
+                                   lambda params, **kwargs: sent.append(dict(params)))
+        store = Store(f"s3://{bucket}/value", options)
+        first = store.put_if_absent(b"first")
+        assert sent and all(sent[-1].get(name) == value for name, value in sealed.items())
+        with pytest.raises(PreconditionFailed):
+            store.put_if_absent(b"again")
+        second = store.put_if_match(b"second", first)
+        with pytest.raises(PreconditionFailed):
+            store.put_if_match(b"stale", first)
+        read = store.get_versioned()
+        assert (read.data, read.version) == (b"second", second)
+
+
 @pytest.mark.parametrize("publish", ["write", "put_if_absent"])
 def test_a_local_publication_has_a_plain_writes_mode_and_a_failed_one_leaves_nothing(tmp_path, monkeypatch,
                                                                                        publish):
@@ -135,6 +163,57 @@ def test_a_filesystem_of_its_own_supplies_conditional_writes():
         store.put_if_match(b"stale", first)
     assert store.get_versioned() == Versioned(b"second", second)
     assert store.put_immutable(b"second") == second
+
+
+def test_an_immutable_put_reads_again_only_an_upload_that_reads_back_otherwise():
+    """`put_immutable`'s retries are for an object it created that reads back with other bytes, which no
+    transport checks: it is read again, and returns once a read verifies, or raises an OSError after its
+    retries. A failed transfer raises at once, since the transport has retried it already."""
+    from fsspec.implementations.memory import MemoryFileSystem
+
+    calls = {"writes": 0, "reads": 0}
+
+    class Flaky(MemoryFileSystem):
+        protocol = "flaky"
+        garbled = 1
+        refused = False
+
+        @classmethod
+        def _strip_protocol(cls, path):
+            return super()._strip_protocol(path.replace("flaky://", "memory://", 1))
+
+        def ukey(self, path):
+            return hashlib.sha256(super().cat_file(path)).hexdigest()
+
+        def cat_file(self, path, *args, **kwargs):
+            calls["reads"] += 1
+            payload = super().cat_file(path, *args, **kwargs)
+            # The first `garbled` reads return other bytes, as a store that has yet to settle would.
+            return payload[::-1] if calls["reads"] <= type(self).garbled else payload
+
+        def put_conditional(self, path, payload, version):
+            calls["writes"] += 1
+            if type(self).refused:
+                raise ConnectionError("the transfer failed after the transport's own retries")
+            if (self.ukey(path) if self.exists(path) else None) != version:
+                raise FileExistsError(path)
+            self.pipe_file(path, payload)
+            return self.ukey(path)
+
+    fsspec.register_implementation("flaky", Flaky, clobber=True)
+    store = Store(f"flaky://storage-{uuid4().hex}/value")
+    assert store.put_immutable(b"payload", retries=2) == store.get_versioned().version
+    assert (calls["writes"], calls["reads"]) == (1, 3)
+    calls.update(writes=0, reads=0)
+    Flaky.garbled = 9
+    with pytest.raises(OSError):
+        Store(f"flaky://storage-{uuid4().hex}/value").put_immutable(b"payload", retries=2)
+    assert (calls["writes"], calls["reads"]) == (1, 3)
+    calls.update(writes=0, reads=0)
+    Flaky.refused = True
+    with pytest.raises(ConnectionError):
+        Store(f"flaky://storage-{uuid4().hex}/value").put_immutable(b"payload", retries=5)
+    assert (calls["writes"], calls["reads"]) == (1, 0)
 
 
 def test_two_finalizers_publish_only_one_snapshot(store):

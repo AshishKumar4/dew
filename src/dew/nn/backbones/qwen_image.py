@@ -31,7 +31,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.activations import gelu_tanh
 from dew.nn.attention import RMSNorm, scaled_dot_product_attention
-from dew.nn.blocks import sinusoidal_time
+from dew.nn.blocks import modulation, sinusoidal_time
 from dew.nn.dense import Dense
 from dew.nn.flops import (
     MissingFlopsCount,
@@ -290,25 +290,25 @@ class QwenImageTransformer(nn.Module):
         # read under `causal_condition`.
         wide = at_least_fp32(self.dtype)
         times = jnp.broadcast_to(jnp.asarray(time, wide).reshape(-1), (batch,))
-        embedded = self._time(jnp.concatenate([times, jnp.zeros((1,), wide)]))
-        embedded, zero = embedded[:batch], embedded[batch:]
-        projected = _dense(maps['modulation'][1], "modulation", self.dtype, self.precision)(
-            nn.silu(jnp.concatenate([embedded, zero])))
+        timed = self._time(jnp.concatenate([times, jnp.zeros((1,), wide)]))
+        projected = modulation(timed, self.features, 4, name="modulation", bias=False, dtype=self.dtype,
+                               precision=self.precision)
+        embedded = timed[:batch]
         sampled = jnp.split(projected[:batch], 4, axis=-1)
         still = jnp.split(projected[batch:], 4, axis=-1) if self.causal_condition else sampled
-        modulation = tuple(zip(still, sampled, strict=True))
+        modulations = tuple(zip(still, sampled, strict=True))
 
         rotation = axis_tables(_rotary_positions(lengths, text, rows, columns), self.axes_dims_rope, 10000.0,
                                dtype=wide)
         for index in range(self.num_layers):
-            joint = self._block(name=f"transformer_blocks_{index}")(joint, modulation, rotation, lengths,
+            joint = self._block(name=f"transformer_blocks_{index}")(joint, modulations, rotation, lengths,
                                                                      image_tokens)
 
         # Only the image's rows leave; the text's final norm and projection
         # are rows the source computes and its pipeline drops.
         image = joint[:, :image_tokens]
-        scale = _dense(maps['norm_out_linear'][1], "norm_out_linear", self.dtype, self.precision)(
-            nn.silu(embedded))
+        scale = modulation(embedded, self.features, 1, name="norm_out_linear", bias=False, dtype=self.dtype,
+                           precision=self.precision)
         image = _scaled(layer_norm(self.dtype, self.eps)(image), scale[:, None])
         output = _dense(maps['proj_out'][1], "proj_out", self.dtype, self.precision)(image)
         return output.reshape(batch, rows, columns, self.out_channels)

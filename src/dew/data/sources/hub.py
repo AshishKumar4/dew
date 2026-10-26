@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import uuid
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from functools import cached_property
 from pathlib import Path
@@ -27,6 +28,29 @@ def hold_progress_lock() -> None:
     from datasets.utils.tqdm import tqdm as bars
 
     bars.get_lock()
+
+
+def split_files(paths: Sequence[str], split: str) -> list[str]:
+    """The `paths` of a repository listing that `datasets` gives `split`, by its default patterns
+    (`datasets.data_files.get_data_patterns`), resolved as it resolves a split's patterns
+    (`DataFilesList.from_patterns`), over an empty in-memory copy of the listing: the listing itself,
+    which the Hub answered once and offline replays, is all the patterns read."""
+    from datasets.data_files import DataFilesList, get_data_patterns
+    from fsspec.implementations.memory import MemoryFileSystem
+
+    fs, root = MemoryFileSystem(), f"/dew-hub-listing/{uuid.uuid4().hex}"
+    for path in paths:
+        fs.pipe_file(f"{root}/{path}", b"")
+    base = f"memory://{root}"
+    try:
+        # A listing with no data files at all is datasets' FileNotFoundError (EmptyDatasetError).
+        patterns = {str(name): found for name, found in get_data_patterns(base).items()}
+        resolved = set(DataFilesList.from_patterns(list(patterns.get(split, ())), base_path=base))
+    except FileNotFoundError:
+        resolved = set()
+    finally:
+        fs.rm(root, recursive=True)
+    return sorted(url.split(root + "/", 1)[1] for url in resolved)
 
 
 @dataclass(frozen=True)
@@ -203,23 +227,20 @@ class Hub(Dataset):
         return {}
 
     def _selected(self, revision: str) -> tuple[list[str], Format]:
-        paths = self._listed(revision)
+        """This split's native shards at `revision`, in the first format of Parquet and JSONL that has
+        any: the files `datasets` resolves to the split from the revision's listing
+        (`datasets.data_files.get_data_patterns` and `resolve_pattern`, its sharded names, its split
+        keywords in file and directory names, `dev` for `validation` among them, a lone file as
+        `train`), under the configuration's directory where one is named."""
+        listed = [path for path in self._listed(revision)
+                  if self.name is None or f"/{self.name}/" in "/" + path]
+        paths = split_files(listed, self.split)
         # Not Arrow: the `.arrow` files a dataset repo holds are what `save_to_disk` and
         # `push_to_hub` write, Arrow's stream format, which no reader can cut into shards or count
         # without reading it whole; such a split streams its Parquet conversion, or is prepared.
         formats: tuple[Format, ...] = ("parquet", "jsonl")
         for format in formats:
-            matches = [
-                path
-                for path in paths
-                if path.endswith("." + format)
-                and (
-                    f"/{self.split}/" in "/" + path
-                    or Path(path).name.startswith(self.split + "-")
-                    or Path(path).stem == self.split
-                )
-                and (self.name is None or f"/{self.name}/" in "/" + path)
-            ]
+            matches = [path for path in paths if path.endswith("." + format)]
             if matches:
                 return matches, format
         return [], "parquet"
