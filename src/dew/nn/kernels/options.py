@@ -91,29 +91,42 @@ def program[**P, R](function: Callable[P, R], *models: nn.Module,
     keeps as long as the objective, and the serving kernel's step programs, which donate the cache
     they step (`dew.inference.serving_kernel.decode_programs`)."""
     options = {**compiler_options(*models), **(step or {})}
-    held = {name: _Placed.of(value) if name.endswith("shardings") else value
-            for name, value in arguments.items()}
-    return _program(function, tuple(sorted(options.items())), **held)
+    return _program(
+        function, tuple(sorted(options.items())), arguments.get("static_argnums", ()),
+        arguments.get("static_argnames", ()),
+        in_shardings=_Placed.of(arguments["in_shardings"]) if "in_shardings" in arguments else None,
+        out_shardings=_Placed.of(arguments["out_shardings"]) if "out_shardings" in arguments else None)
+
+
+_Structure = tuple[jax.tree_util.PyTreeDef]
+"""A tree's structure (`jax.tree.flatten`'s second result) in a one-element tuple: JAX declares
+`PyTreeDef` as a value, which a type admits only inside another, as `training.distributed.Signature`'s."""
 
 
 class _Placed(NamedTuple):
     """A tree of placements (`Placements`) as a program's cache holds it: its structure and its
     leaves, each hashable where a mapping of them is not."""
-    structure: jax.tree_util.PyTreeDef
+    structure: _Structure
     leaves: tuple
 
     @classmethod
     def of(cls, tree: Placements) -> _Placed:
         leaves, structure = jax.tree.flatten(tree)
-        return cls(structure, tuple(leaves))
+        return cls((structure,), tuple(leaves))
 
     def tree(self) -> Placements:
-        return jax.tree.unflatten(self.structure, self.leaves)
+        return jax.tree.unflatten(self.structure[0], self.leaves)
 
 
 @functools.cache
 def _program[**P, R](function: Callable[P, R], options: tuple[tuple[str, bool | int], ...],
-                     **arguments) -> jax.stages.Wrapped:
-    placed = {name: value.tree() if isinstance(value, _Placed) else value
-              for name, value in arguments.items()}
-    return jax.jit(function, compiler_options=dict(options), **placed)
+                     static_argnums: int | tuple[int, ...], static_argnames: str | tuple[str, ...], *,
+                     in_shardings: _Placed | None = None, out_shardings: _Placed | None = None
+                     ) -> jax.stages.Wrapped:
+    # None leaves a placement to jit, as `program`'s caller did; a placement of None is a `_Placed`.
+    arguments: JitArguments = {"static_argnums": static_argnums, "static_argnames": static_argnames}
+    if in_shardings is not None:
+        arguments["in_shardings"] = in_shardings.tree()
+    if out_shardings is not None:
+        arguments["out_shardings"] = out_shardings.tree()
+    return jax.jit(function, compiler_options=dict(options), **arguments)
