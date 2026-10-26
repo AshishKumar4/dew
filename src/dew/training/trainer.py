@@ -563,8 +563,8 @@ class Trainer(Generic[Loss, Effects]):
         The state is a fresh run's: its parameters, optimizer state and EMA, and, given one
         global `batch` as the run reads it, the accumulation its steps pool where `accumulation`
         is above 1, read in the first of the splits its plan may take whose devices hold it, the
-        trainer's own where it fixes one (`splits`). A CPU host leaves out the narrow copies a GPU step
-        reads (`TrainState.compute`).
+        trainer's own where it fixes one (`splits`). It leaves out the narrow copies a step may read
+        (`TrainState.compute`), which the plan drops first where the step does not fit with them.
         An `OptimConfig` is built over `steps`, as `fit(steps=...)` builds it. `capacity` is the
         bytes each device has, for a mesh whose devices report none: a CPU mesh of
         `--xla_force_host_platform_device_count` devices standing in for GPUs.
@@ -1679,11 +1679,12 @@ class Trainer(Generic[Loss, Effects]):
                          ) -> Validation:
         """`Layout.validate` of the whole state the run's steps keep between them reading `batch`'s
         shapes (a marked batch, as the stream gives it) in `split` microbatches: `state` with the
-        accumulation its window pools and the narrow copies its step builds."""
+        accumulation its window pools. The narrow copies are left out: the plan's first rung drops
+        them where the step does not fit with them (`dew.training.planning.plan_step`)."""
         device, _ = split_fields(batch)
         with self._traced_on(self.device_mesh) as schedule:
             _, _, whole = self._prepared(state, microbatch_shapes(device, split), schedule,
-                                         split * self.accumulation)
+                                         split * self.accumulation, narrow=False)
         return self._validated(whole, capacity)[1]
 
     def _fitting(self, state: TrainState, batch: Batch, capacity: int | None = None) -> Validation:
