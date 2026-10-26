@@ -49,6 +49,7 @@ from flax import traverse_util as flax_traverse
 from dew import _records
 from dew.interop import decoder_parts, hf_decoders as decoders, parts, sources
 from dew.interop.decoder_families import ENTRIES
+from dew.nn.blocks import padded_row
 from dew.objectives.base import Variables
 from dew.registry import models
 
@@ -570,12 +571,16 @@ def _agreement(convention: str, family: decoder_parts.DecoderFamily, model: nn.M
                checkpoint: Path, layers: int, pad: int | None) -> tuple[float, float]:
     """One candidate against the reference's saved checkpoint: its error and
     the bound, or `_Mismatch` naming how it differs. `pad` is the row the
-    reference's own table pads (its `padding_idx`), which takes no gradient
-    there (ledger 1593) and which eval logits do not show, so the candidate
-    pads that row or is no reading of the reference."""
-    if record.get('padding_idx') != pad:
-        raise _Mismatch(f"{convention} pads row {record.get('padding_idx')} of the token table where "
-                        f"{name}'s table pads {pad}")
+    reference's own table pads (its `padding_idx`, which torch counts from
+    the table's end where negative), which takes no gradient there (ledger
+    1593) and which eval logits do not show, so the candidate pads that row,
+    its own id read as its lookup reads it (`padded_row`), or is no reading
+    of the reference."""
+    stated = record.get('padding_idx')
+    row = padded_row(None if stated is None else _records.integer(stated, 'padding_idx'),
+                     _records.integer(record['vocab_size'], 'vocab_size'))
+    if row != pad:
+        raise _Mismatch(f"{convention} pads row {row} of the token table where {name}'s table pads {pad}")
     tensors = sources.load_shards(checkpoint)
     unmapped = _unmapped(tensors, record, family)
     if unmapped:
