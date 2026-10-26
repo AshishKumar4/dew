@@ -250,11 +250,10 @@ def test_a_float64_truth_runs_as_one_compiled_program():
         numpy = _truth_program(lambda x, w: {"y": np.asarray(x) @ np.asarray(w)})
         numpy(x, w)
         assert numpy.run is numpy.fn
-        # A truth that widens its inputs on the host and returns JAX values runs as given too.
+        # A truth that widens its inputs on the host and returns JAX values fails at its first call.
         hosted = _truth_program(lambda x, w: truth(np.asarray(x, np.float64), np.asarray(w, np.float64)))
-        hosted(x, w)
-        assert hosted.run is hosted.fn
-        np.testing.assert_array_equal(hosted(x, w)["y"], eager["y"])
+        with pytest.raises(jax.errors.TracerArrayConversionError):
+            hosted(x, w)
     given = as_given(truth)
     assert _truth_program(given) is given and _truth_program(_product) is _product
     assert _truth_program(None) is None
