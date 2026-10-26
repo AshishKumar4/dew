@@ -5,6 +5,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- Every outer program Dew compiles goes through one seam (`dew.nn.kernels.options.program`): an image
+  task's encode, noise and solver start, a bank's stacking, an autoencoder's encode and decode, LPIPS's
+  and FID's networks and a host step's unstack, so two loads of one module share its programs. The seam
+  holds placement trees by their structure and leaves. An objective's own programs and the serving
+  kernel's donated step programs stay apart, as their docstrings say.
 - `OptimConfig(state_dtype='int8')` stores adam's and adamw's moments blockwise in 8 bits
   (`dew.optim.int8_moments`, bitsandbytes' and torchao's 8-bit Adam): a quarter of float32's state, the
   update computed from the moments dequantized to fp32. On an A100, lm-dense's full-remat step peaks at
