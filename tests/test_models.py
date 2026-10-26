@@ -600,7 +600,7 @@ def test_group_norm_is_flax_s(rng, dtype, shape):
                     f"group norm {dtype} {shape}", seeds=GROUP_NORM_SEEDS, truth_fn=truth)
 
 
-OFFSET_GROUP_NORM_SEEDS = 32
+OFFSET_GROUP_NORM_SEEDS = 64
 """The offset group norm's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada."""
 
 
