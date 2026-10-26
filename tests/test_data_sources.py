@@ -466,6 +466,58 @@ def test_spark_directory_requires_success_marker(tmp_path):
     assert len(Files(str(tmp_path), format="parquet", spark=True).records("indexed")) == 2
 
 
+@dataclasses.dataclass(frozen=True)
+class ArrowFiles:
+    """A native writer of the caller's: an Arrow IPC file for each batch it is handed, each beside a
+    hidden checksum as Hadoop's writers leave one, stopping before its file `stop` where given."""
+
+    stop: int | None = None
+    format = "arrow"
+
+    def write(self, rows, directory, filesystem):
+        for number, batch in enumerate(rows):
+            if number == self.stop:
+                raise RuntimeError(f"the writer stopped before file {number}")
+            path = f"{directory}/part-{number:06d}.arrow"
+            with filesystem.open_output_stream(path) as stream, pa.ipc.new_file(stream, batch.schema) as file:
+                file.write_batch(batch)
+            with filesystem.open_output_stream(f"{directory}/.part-{number:06d}.arrow.crc") as stream:
+                stream.write(b"checksum")
+
+
+def test_a_native_writers_export_is_committed_by_the_one_publisher_and_read_back(tmp_path):
+    """An export hands its rows to a native writer of the caller's as one Arrow stream; the files it
+    writes, not the ones it hides, are committed by the manifest and `_SUCCESS` every export
+    commits, in their format, and read back in their order, a Spark reader's committed directory
+    among them."""
+    rows = [{"id": index, "text": str(index)} for index in range(10)]
+    manifest = export(Memory(rows), str(tmp_path), format=ArrowFiles(), rows_per_shard=4)
+    assert manifest["format"] == "arrow" and manifest["rows"] == 10
+    assert [Path(entry["path"]).name for entry in manifest["files"]] == [
+        f"part-{number:06d}.arrow" for number in range(3)]
+    encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    assert (tmp_path / "_SUCCESS").read_bytes() == hashlib.sha256(encoded).hexdigest().encode()
+    for read in (Files(str(tmp_path)), Files(str(tmp_path), format="arrow", spark=True)):
+        stored = read.records("indexed")
+        assert [stored[index] for index in range(len(stored))] == rows
+
+
+def test_an_export_whose_writer_stops_commits_nothing_and_the_next_commits_only_its_own(tmp_path):
+    """A writer that stops partway leaves its files uncommitted: no manifest and no `_SUCCESS`, so a
+    reader of committed directories refuses them. The next export to the same place commits its
+    own files alone, and its rows are what a read finds."""
+    rows = [{"id": index} for index in range(10)]
+    with pytest.raises(RuntimeError):
+        export(Memory(rows), str(tmp_path), format=ArrowFiles(stop=2), rows_per_shard=4)
+    assert not (tmp_path / "_dew_manifest.json").exists() and not (tmp_path / "_SUCCESS").exists()
+    assert len(list(tmp_path.rglob("part-*.arrow"))) == 2
+    with pytest.raises(ValueError):
+        Files(str(tmp_path), format="arrow", spark=True).records("indexed")
+    export(Memory(rows[:6]), str(tmp_path), format=ArrowFiles(), rows_per_shard=4)
+    stored = Files(str(tmp_path)).records("indexed")
+    assert [stored[index] for index in range(len(stored))] == rows[:6]
+
+
 def test_a_corrupt_export_manifest_is_refused_and_never_falls_back_to_raw_shards():
     root = Store(f"memory://corrupt-export-{uuid4().hex}")
     export(Memory([{"id": 1}]), root.url)
