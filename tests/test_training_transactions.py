@@ -256,7 +256,7 @@ def test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima(staged)
     from dew.diffusion.discrete import MDLM
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.diffusion.masked import MaskedDiffusionObjective
-    from dew.optim import scale_by_qk_clip
+    from dew.optim import scale_by_qk_clip, stepped
     from dew.training import MeshSpec
 
     # QK-Clip bounds logits only where no QK-norm divides the kernels' scale back out.
@@ -298,8 +298,8 @@ def test_a_masked_diffusion_run_clips_its_attention_at_its_pooled_maxima(staged)
         lambda path, leaf: np.maximum(leaf, 0) if any(getattr(entry, "key", None) == "max_logits"
                                                       for entry in path) else leaf, pooled)
     zero = jax.tree.map(np.zeros_like, start)
-    updates, _ = jax.jit(clip(.05).update)(zero, opt_state, start, qk_stats=both)
-    expected = jax.tree.map(np.asarray, optax.apply_updates(start, updates))
+    updates, after = jax.jit(clip(.05).update)(zero, opt_state, start, qk_stats=both)
+    expected = jax.tree.map(np.asarray, stepped(start, updates, opt_state, after))
     jax.tree.map(np.testing.assert_array_equal, final, expected)
     assert any(not np.array_equal(after, before) for after, before in
                zip(jax.tree.leaves(final), jax.tree.leaves(start), strict=True))
