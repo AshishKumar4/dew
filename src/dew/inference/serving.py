@@ -123,7 +123,7 @@ from dew.nn.inputs import (
     request_key,
 )
 from dew.nn.kernels.options import compiler_options
-from dew.nn.kv_cache import POOLED, ROW_CURSORS, TABLE, KVCache, is_paged, leaf_name
+from dew.nn.kv_cache import GROUPS, POOLED, ROW_CURSORS, TABLE, KVCache, is_paged, leaf_name
 from dew.nn.protocols import CrossAttending, Layered, ProjectionGroup, Serving
 from dew.nn.visibility import served_blocks
 from dew.sampling.decoding import Finishing, LogitsTransform, StopStrings
@@ -259,9 +259,10 @@ class _Row:
     salt: bytes = b""
     """What the prompt's keys depend on beside its tokens, its context's digest, under which its
     prefix pages are named (`dew.inference.pages`); empty for none."""
-    groups: np.ndarray | None = None
-    """The blocks of the prompt's tokens under the server's prefix run (`served_blocks`), None where it runs
-    causally."""
+    groups: dict[str, np.ndarray] = field(default_factory=dict)
+    """The groups of the prompt's tokens each group field the model reads holds (`dew.nn.kv_cache.GROUPS`),
+    -1 for a token in none: the blocks the server's prefix run makes (`served_blocks`) and the groups the
+    prompt carries. Empty where the row reads its prompt causally."""
 
 
 def _seated_in(group: int, free: list[list[int]], taken: list[int], row: _Row) -> tuple[int, _Row]:
@@ -520,6 +521,10 @@ class Server:
             shapes = jax.eval_shape(functools.partial(opened, model, pad_id=self.pad_id, slots=slots,
                                                       capacity=capacity), variables)
             rows.check(shapes.decoder.cache)
+            held = {leaf_name(path) for path, _ in jax.tree_util.tree_leaves_with_path(shapes.decoder.cache)}
+            self.group_fields = frozenset(name for name, leaf in GROUPS.items() if leaf in held)
+            """The group fields some layer reads whole (`dew.nn.kv_cache.GROUPS`), whose groups its cache
+            keeps beside the keys: the ones a served prompt's slot beside its tokens."""
             # None selects the one mixed forward of `_mixed_step`.
             self.mixed_refusal = mixed_refusal(model, shapes, rows.placement)
             """Why the admitting step prefills in a separate forward, or None when it runs one mixed forward.
@@ -711,8 +716,10 @@ class Server:
         """Queue one request and return a ticket that resolves to its `Generation`.
 
         `prompt` is one text prompt, `ModelInputs` row or token row, without
-        media or positions; a `ModelInputs` row may carry the context a
-        cross-attention decoder reads (`dew.nn.inputs.CONTEXT`). It is
+        media or noncanonical positions; a `ModelInputs` row may carry the
+        context a cross-attention decoder reads (`dew.nn.inputs.CONTEXT`) and
+        the image and block groups its layers read whole
+        (`dew.nn.kv_cache.GROUPS`), which slot beside its tokens. It is
         validated as `TextGeneration` validates it, against the server's
         capacity in place of the model's context.
         Without `max_new_tokens`, the task's default budget applies, its
@@ -746,10 +753,10 @@ class Server:
             if self.cross is not None and CONTEXT in conditioning:
                 context = self._request_context(conditioning.pop(CONTEXT),
                                                   conditioning.pop(CONTEXT_LENGTHS, None))
-            if set(inputs.token_fields) - {"attention_mask", "positions"} or conditioning:
+            if set(inputs.token_fields) - {"attention_mask", "positions", *GROUPS} or conditioning:
                 raise ValueError(
-                    "a served prompt carries tokens, validity and a cross-attention decoder's context "
-                    "only; media and custom token fields do not slot"
+                    "a served prompt carries tokens, validity, positions, image and block groups and a "
+                    "cross-attention decoder's context only; media and custom token fields do not slot"
                 )
             ids = np.asarray(inputs.tokens)
             fields = {name: np.asarray(value) for name, value in inputs.token_fields.items()}
@@ -768,37 +775,48 @@ class Server:
             raise ValueError("a served prompt cannot carry noncanonical positions")
         self.rows.refuse(int(valid[0].sum()), budget)
         tokens = ids[0][valid[0]].astype(np.int32)
-        groups = self._blocks_of(tokens)
+        groups = self._groups_of(tokens, {name: np.asarray(fields[name])[0][valid[0]].astype(np.int32)
+                                          for name in GROUPS if name in fields})
         salt = b""
-        if context is not None or groups is not None:
+        if context is not None or groups:
             hasher = hashlib.blake2b(digest_size=16)
             if context is not None:
                 # The context's dtype too, so equal bytes of another dtype salt apart.
                 array_fingerprint(hasher, np.asarray(context))
-            if groups is not None:
-                # A block's keys depend on the whole block, so its prefix pages are shared only with a prompt
-                # whose block holds the same tokens.
-                hasher.update(tokens[groups >= 0].tobytes())
+            for name, held in groups.items():
+                # A group's keys depend on the whole group, so its prefix pages are shared only with a prompt
+                # whose groups lie alike and hold the same tokens.
+                hasher.update(name.encode())
+                hasher.update(held.tobytes())
+                hasher.update(tokens[held >= 0].tobytes())
             salt = hasher.digest()
         return _Row(tokens, budget, seed, fold, Ticket(), context=context, salt=salt, groups=groups)
 
-    def _blocks_of(self, prompt: np.ndarray) -> np.ndarray | None:
-        """The blocks a request's prompt makes under the prefix run (`served_blocks`, which refuses a prompt
-        shorter than an int prefix), None where the server runs causally."""
-        if self.prefix is None:
-            return None
-        return served_blocks(np.ones((1, len(prompt)), bool), self.prefix)[0]
+    def _groups_of(self, prompt: np.ndarray, carried: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+        """The groups of a request's prompt the model reads (`_Row.groups`): those it carries, and the blocks
+        the prefix run makes (`served_blocks`, which refuses a prompt shorter than an int prefix). A group
+        field no layer reads is not slotted, as the model's call reads none of it."""
+        groups = {name: held for name, held in carried.items() if name in self.group_fields}
+        if self.prefix is not None:
+            if BLOCKS_FIELD in carried:
+                raise ValueError("a served prefix run makes each prompt's blocks; a prompt served under it "
+                                 f"carries no {BLOCKS_FIELD}")
+            groups[BLOCKS_FIELD] = served_blocks(np.ones((1, len(prompt)), bool), self.prefix)[0]
+        return groups
 
     def _piece_end(self, row: _Row) -> int:
         """Where the row's next prefill piece ends: the prompt's end, or `chunk` tokens on when the rows
-        prefill in pieces, and on past `chunk` to the end of a prefix block the cut would split. A layer
-        reads a block whole, so its tokens' keys and values are computed in one piece: a block longer
-        than `chunk` is one longer piece."""
+        prefill in pieces, and on past `chunk` to the end of a group the cut would split, a prefix block or
+        an image. A layer reads a group whole, so its tokens' keys and values are computed in one piece: a
+        group longer than `chunk` is one longer piece."""
         length, chunk = len(row.prompt), self.rows.chunk
         end = length if chunk is None else min(length, row.prefilled + chunk)
-        groups = row.groups
-        if groups is not None and end < length and groups[end] >= 0 and groups[end] == groups[end - 1]:
-            end = int(np.flatnonzero(groups == groups[end])[-1]) + 1
+        split = True
+        while split:
+            split = False
+            for held in row.groups.values():
+                if end < length and held[end] >= 0 and held[end] == held[end - 1]:
+                    end, split = int(np.flatnonzero(held == held[end])[-1]) + 1, True
         return end
 
     def _request_context(self, embeddings: ArrayLike, lengths: ArrayLike | None) -> np.ndarray:
@@ -937,13 +955,15 @@ class Server:
             cross[0].context_length, cross[1], cross[2])
         contexts = np.zeros((count, context_length, features), dtype)
         context_lengths = np.zeros((count,), np.int32)
-        blocks = None if self.prefix is None else np.full((count, width), -1, np.int32)
+        # A group field goes in where an admitted row carries it: prompts without groups keep the causal call.
+        pieces = {name: np.full((count, width), -1, np.int32)
+                  for name in sorted({name for _, _, row in chosen for name in row.groups})}
         for index, slot, row in chosen:
             piece = row.prompt[row.prefilled:ends[slot]]
             tokens[index, width - len(piece):] = piece
             valid[index, width - len(piece):] = True
-            if blocks is not None and row.groups is not None:
-                blocks[index, width - len(piece):] = row.groups[row.prefilled:row.prefilled + len(piece)]
+            for name, held in row.groups.items():
+                pieces[name][index, width - len(piece):] = held[row.prefilled:row.prefilled + len(piece)]
             slots[index], budgets[index], folds[index] = slot % size, row.budget, row.fold
             if isinstance(row.seed, int):
                 seeds[index], seeded[index] = row.seed, True
@@ -974,12 +994,13 @@ class Server:
                 history,
                 history_valid,
                 *([] if cross is None else [contexts, context_lengths]),
-                *([] if blocks is None else [blocks]),
+                *pieces.values(),
             ],
             self._admitted,
         )
         conditioning = {} if cross is None else {CONTEXT: placed[10], CONTEXT_LENGTHS: placed[11]}
-        fields = {"attention_mask": placed[1], **({} if blocks is None else {BLOCKS_FIELD: placed[-1]})}
+        fields = {"attention_mask": placed[1], **dict(zip(pieces, placed[len(placed) - len(pieces):],
+                                                          strict=True))}
         return Admission(ModelInputs(placed[0], fields, conditioning), *placed[2:10])
 
     def _settle(self) -> None:

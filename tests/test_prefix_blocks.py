@@ -367,10 +367,81 @@ def test_a_served_prefix_run_draws_what_each_request_draws_alone(prefix, serving
                for index, (prompt, budget) in enumerate(zip(SERVED_PROMPTS, SERVED_BUDGETS, strict=True))]
     server.run()
     for ticket, expected in zip(tickets, alone, strict=True):
-        served, lone = ticket.result().host(), expected.host()
-        np.testing.assert_array_equal(served.tokens, lone.tokens)
-        np.testing.assert_array_equal(served.lengths, lone.lengths)
-        np.testing.assert_array_equal(served.terminated, lone.terminated)
+        assert_drawn_alike(ticket.result(), expected)
+
+
+CARRIED_BLOCKS = [[-1, 0, 0, 0, -1], [-1, -1, 4, 4, 4, 4], [2, 2, -1, 5, 5, 5, -1]]
+"""Each served prompt's own blocks (`block_groups`), as a decision row lays its blocks out: runs of 2 to 4
+tokens, longer than `PIECES`' pieces, two in the last prompt."""
+
+
+def carried(prompt, blocks) -> ModelInputs:
+    """One prompt row carrying its own blocks."""
+    return ModelInputs(jnp.asarray([prompt], jnp.int32), {BLOCKS_FIELD: jnp.asarray([blocks], jnp.int32)})
+
+
+def greedy_blocky():
+    """The lone greedy task over `blocky`, the reference a served request is drawn against."""
+    decoder = blocky().clone(max_seq_len=128)
+    variables = decoder.init(jax.random.key(0), jnp.zeros((1, 4), jnp.int32))
+    return TextGeneration(decoder, variables, sampling=Sampling(temperature=0, pad_token_id=0))
+
+
+def assert_drawn_alike(served, alone) -> None:
+    """A served request's tokens, lengths and terminations are the lone task's."""
+    served, alone = served.host(), alone.host()
+    np.testing.assert_array_equal(served.tokens, alone.tokens)
+    np.testing.assert_array_equal(served.lengths, alone.lengths)
+    np.testing.assert_array_equal(served.terminated, alone.terminated)
+
+
+@pytest.mark.parametrize("serving", [{"slots": 2, "capacity": 64, "admission": 2}, PIECES],
+                         ids=["whole", "in-pieces"])
+def test_a_served_prompt_carrying_its_blocks_draws_what_it_draws_alone(serving):
+    """A prompt that carries its own blocks (`block_groups`) has them slotted beside its tokens and written
+    into its row's cache with its keys: greedy requests queued past the slots draw what the lone task
+    draws over the same inputs, a block longer than a piece prefilled in one piece."""
+    task = greedy_blocky()
+    requests = [carried(prompt, blocks)
+                for prompt, blocks in zip(SERVED_PROMPTS, CARRIED_BLOCKS, strict=True)]
+    alone = [task(request, budget, key=index)
+             for index, (request, budget) in enumerate(zip(requests, SERVED_BUDGETS, strict=True))]
+    server = Server.from_task(task, **serving)
+    assert server.group_fields == {BLOCKS_FIELD}
+    tickets = [server.submit(request, budget, key=index)
+               for index, (request, budget) in enumerate(zip(requests, SERVED_BUDGETS, strict=True))]
+    server.run()
+    for ticket, expected in zip(tickets, alone, strict=True):
+        assert_drawn_alike(ticket.result(), expected)
+
+
+def test_a_prefix_page_is_shared_only_between_prompts_whose_blocks_lie_alike():
+    """A prompt's prefix pages are named under its blocks (`_Row.salt`), as a block's keys read the whole
+    block: a prompt of the same tokens whose block ends sooner prefills its own pages, and one whose blocks
+    lie alike reads the first's full page, each drawing what it draws alone."""
+    task = greedy_blocky()
+    server = Server.from_task(task, slots=2, capacity=64, kv_cache=KVCache(page_size=4, pages=40),
+                              prefix_cache=True)
+    hits = []
+    for index, blocks in enumerate([[-1, 0, 0, 0, 0, 0, -1, -1], [-1, 0, 0, 0, -1, -1, -1, -1],
+                                    [-1, 0, 0, 0, 0, 0, -1, -1]]):
+        request = carried([3, 1, 4, 1, 5, 9, 2, 6], blocks)
+        ticket = server.submit(request, 3, key=index)
+        server.run()
+        assert_drawn_alike(ticket.result(), task(request, 3, key=index))
+        hits.append(server.prefix_hits)
+    # The last token stays to prefill, so the one full page of four is what a repeat shares.
+    assert hits == [0, 0, 4]
+
+
+def test_a_served_prefix_run_refuses_a_prompt_carrying_its_own_blocks():
+    """A prefix run makes each prompt's blocks itself, so a prompt served under it carrying blocks of its own
+    is refused rather than one of the two ignored."""
+    server = Server.from_task(TextGeneration(blocky().clone(max_seq_len=128), greedy_blocky().variables,
+                                             sampling=Sampling(temperature=0, pad_token_id=0), prefix=PREFIX),
+                              slots=2, capacity=64)
+    with pytest.raises(ValueError):
+        server.submit(carried(SERVED_PROMPTS[0], CARRIED_BLOCKS[0]), 2)
 
 
 def chunked(size: int, *, unchunked: bool = False):
