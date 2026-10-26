@@ -7,8 +7,9 @@ shares, held by check 1 against the source run live over drawn inputs, from its 
   context are the source's; Phi-3's config reads 'yarn' as LongRoPE, which its record is.
 - The pad row (ledger 1593): a family whose token embedding is nn.Embedding(padding_idx=pad_token_id)
   gives the pad row no gradient from its lookups, and the rest of the table the source's gradient;
-  a family whose source passes no padding_idx trains the row, as the source does. A remote source
-  CI cannot run is the lookup its cited code builds.
+  a family whose source passes no padding_idx trains the row, as the source does, with the pad id
+  stated, left out and null. A source whose own code CI does not run is held to a recording of it
+  (`RECORDED`).
 """
 import contextlib
 import json
@@ -23,6 +24,7 @@ from interop_support import assert_pads_as, clearing_selections, token_draw, tok
 from reference_error import assert_as_exact
 
 from dew.interop import Pretrained
+from tools.reference_source import PAD
 from tools.torch_precision import float64
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "hf"
@@ -45,49 +47,45 @@ and Qwen 3.5 MoE's text decoder's paired with the reference (`seeds_for(dew_fn=.
 the draw's weights and inputs, where the reference alone, heavy-tailed across draws, resolves within no
 512."""
 
-PAD = 3
-"""The pad id each pad-row draw states and fills a quarter of its positions with."""
+PADDED = {"llama-tiny", "mistral-tiny", "mixtral-tiny", "ministral-tiny",
+                "qwen2-tiny", "qwen2-moe-tiny", "qwen3-tiny", "qwen3-moe-tiny",
+                "qwen3-next-tiny", "qwen35-tiny", "glm4-moe-tiny", "gemma-tiny",
+                "gemma2-tiny", "gemma3-tiny", "gemma3n-tiny", "olmo3-tiny",
+                "starcoder2-tiny", "phi-tiny", "phi3-tiny", "opt-tiny", "gpt-oss-tiny",
+                "deepseek-v2-tiny", "deepseek-v3-tiny", "minimax-m2-tiny",
+                "mimo-v2-flash-tiny", "llama4-tiny", "granitemoe-tiny",
+                "deepseek-v32-tiny", "deepseek-v4-tiny", "diffusion-gemma-window-tiny",
+                "gemma4-moe-tiny", "glm5-next-tiny", "glm-moe-dsa-tiny", "modernbert-tiny",
+                "muse-glimmer-text-tiny", "qwen35-moe-text", "kimi-k25-tiny",
+                "kimi-linear-tiny", "kimi-k3-tiny", "ouro-tiny", "dream-tiny",
+                "llada-moe-tiny", "llada-moe-v2-tiny", "llada2-tiny", "llada21-tiny",
+                "llada22-tiny"}
+"""Families whose source pads a stated pad id, by fixture."""
 
-PADDED_SEEDS = {"llama-tiny": 8, "mistral-tiny": 8, "mixtral-tiny": 8, "ministral-tiny": 8,
-                "qwen2-tiny": 8, "qwen2-moe-tiny": 8, "qwen3-tiny": 8, "qwen3-moe-tiny": 8,
-                "qwen3-next-tiny": 8, "qwen35-tiny": 8, "glm4-moe-tiny": 8, "gemma-tiny": 8,
-                "gemma2-tiny": 8, "gemma3-tiny": 8, "gemma3n-tiny": 8, "olmo3-tiny": 8,
-                "starcoder2-tiny": 8, "phi-tiny": 8, "phi3-tiny": 8, "opt-tiny": 8, "gpt-oss-tiny": 8,
-                "deepseek-v2-tiny": 8, "deepseek-v3-tiny": 8, "minimax-m2-tiny": 8,
-                "mimo-v2-flash-tiny": 8, "llama4-tiny": 8, "granitemoe-tiny": 8,
-                "deepseek-v32-tiny": 8, "deepseek-v4-tiny": 8, "diffusion-gemma-window-tiny": 8,
-                "gemma4-moe-tiny": 8, "glm5-next-tiny": 8, "glm-moe-dsa-tiny": 8, "modernbert-tiny": 8,
-                "muse-glimmer-text-tiny": 8, "qwen35-moe-text": 8, "kimi-k25-tiny": 8,
-                "kimi-linear-tiny": 8, "kimi-k3-tiny": 8, "ouro-tiny": 8, "dream-tiny": 8,
-                "llada-moe-tiny": 8, "llada-moe-v2-tiny": 8, "llada2-tiny": 8, "llada21-tiny": 8,
-                "llada22-tiny": 8}
-"""Families whose source passes padding_idx, by fixture, with their declared check-1 seeds."""
+UNPADDED = {"gpt-neox-tiny", "falcon-tiny", "llada-tiny", "mimo-v2-tiny", "k2-horizon-tiny",
+            "deepseek-v41-tiny"}
+"""Families whose source pads none (GPTNeoXModel's and FalconModel's plain nn.Embedding, and the
+recorded sources `RECORDED` names). Dory's only source is vLLM's inference code, which runs no
+backward and whose VocabParallelEmbedding takes no pad id (vllm/model_executor/models/dory.py:232 at
+55076950), so it gives the pad row no gradient to match, and Dew trains it as any row."""
 
-UNPADDED_SEEDS = {"gpt-neox-tiny": 16, "falcon-tiny": 16, "llada-tiny": 16, "mimo-v2-tiny": 16,
-                  "k2-horizon-tiny": 16, "dory-tiny": 16, "deepseek-v41-tiny": 16}
-"""Families whose source passes none (GPTNeoXModel's and FalconModel's plain nn.Embedding, and the
-remote sources `REMOTE` cites)."""
+PAD_SEEDS = {True: 8, False: 16}
+"""The declared check-1 seeds of a lookup's gradient, by whether the lookup pads a row."""
 
-REMOTE = {
-    "kimi-k3-tiny": "modeling_kimi_linear.py:1093-1097 of moonshotai/Kimi-K3 at f831ab6",
-    "ouro-tiny": "modeling_ouro.py:496-500 of ByteDance/Ouro-1.4B at 574fa66",
-    "dream-tiny": "modeling_dream.py:602-605 of Dream-org/Dream-v0-Base-7B at 6572adb",
-    "llada-moe-tiny": "modeling_lladamoe.py:895-898 of inclusionAI/LLaDA-MoE-7B-A1B-Base at daccaf1",
-    "llada-moe-v2-tiny": "modeling_lladamoe_v2.py:1094-1097 of GSAI-ML/LLaDA-MoE-v2-30B-A3B-Base at 2a513f7",
-    "llada2-tiny": "modeling_llada2_moe.py:750-754 of inclusionAI/LLaDA2.0-mini at dad945c",
-    "llada21-tiny": "modeling_llada2_moe.py:761-765 of inclusionAI/LLaDA2.1-mini at 20e64e2",
-    "llada22-tiny": "modeling_llada2_moe.py:770-774 of inclusionAI/LLaDA2.2-flash at 9b78da3",
-    "llada-tiny": "modeling_llada.py:1035-1037 of GSAI-ML/LLaDA-8B-Base at 0f2787f, no padding_idx",
-    "mimo-v2-tiny": "modeling_mimo_v2.py:1584 of XiaomiMiMo/MiMo-V2.6-Pro-MOPD at 6a7f202, no padding_idx",
-    "k2-horizon-tiny": "modeling_k2_horizon.py:827-830 of IFM/K2-Horizon-0.9B at 383cb66, padding_idx from "
-                       "a `padding_idx` field K2HorizonConfig does not declare",
-    "dory-tiny": "vllm/model_executor/models/dory.py:232 at 55076950, a VocabParallelEmbedding",
-    "deepseek-v41-tiny": "inference/model.py:152-156, :1201 of deepseek-ai/DeepSeek-V4.1-Flash at dba1be0, "
-                         "a ParallelEmbedding",
+RECORDED = {
+    "kimi-linear-tiny": "tools/kimi_linear_reference.py padding",
+    "kimi-k3-tiny": "tools/kimi_k3_reference.py padding",
+    "ouro-tiny": "tools/ouro_reference.py --padding",
+    "k2-horizon-tiny": "tools/k2_horizon_reference.py --padding",
+    "deepseek-v41-tiny": "tools/deepseek_v41_reference.py --padding",
+    **dict.fromkeys(("llada-tiny", "dream-tiny", "mimo-v2-tiny"), "tools/remote_code_reference.py --padding"),
+    **dict.fromkeys(("llada-moe-tiny", "llada-moe-v2-tiny", "llada2-tiny", "llada21-tiny", "llada22-tiny"),
+                    "tools/llada_moe_reference.py --padding"),
 }
-"""Remote sources CI cannot run, by fixture, and where each builds its token embedding: an
-nn.Embedding(vocab_size, hidden_size, padding_idx=pad_token_id) where it pads, a lookup with no pad row
-where it does not."""
+"""Sources whose own code (its release's modeling files at their pinned commits, under the transformers
+each runs on) CI does not run, by fixture, with the writer that ran it and recorded, in PADDING beside
+the fixture, the rows its token lookup leaves untrained in each of PADDING_CASES
+(`reference_source.record_padding`)."""
 
 TEXT_STATED = {"kimi-k25-tiny", "kimi-k3-tiny"}
 """Wrappers whose language model is built from their text_config, whose pad id it reads
@@ -193,18 +191,40 @@ def test_a_yarn_record_extends_every_family_whose_source_builds_it(name, tmp_pat
                     truth_fn=torch_logits(wide, float64))
 
 
-def _padded_config(name: str) -> dict:
-    """The fixture's config with the pad id stated where its source's token embedding reads it."""
-    config = _fixture_config(name)
-    (config["text_config"] if name in TEXT_STATED else config)["pad_token_id"] = PAD
-    return config
+def _padding_case(name: str, case: str, directory: Path) -> tuple[dict, dict | None]:
+    """The fixture's config with its pad id as `case` puts it, where its source's token embedding reads it
+    (`padding_variant`), its vocabulary grown to hold a pad id the source resolves past the table (its
+    config class's default, where the config states none), and, where `RECORDED` names a recording of
+    the source, the case it recorded: the source's table's rows and those its lookup leaves untrained.
+    Another source's config is written at `directory` (`_written`), which transformers builds the source
+    from, and its case is None."""
+    from transformers import AutoConfig
+
+    from tools.reference_source import PADDING, padding_variant
+
+    place = ("text_config",) if name in TEXT_STATED else ()
+    if name in RECORDED:
+        recorded = json.loads((FIXTURES / name / PADDING).read_text())
+        assert recorded["place"] == list(place)
+        stated = recorded["cases"][case]
+        return padding_variant(_fixture_config(name), case, place, stated["vocab_size"]), stated
+    config = _written(padding_variant(_fixture_config(name), case, place), directory)
+    resolved = AutoConfig.from_pretrained(directory)
+    level = config
+    for key in place:
+        resolved, level = getattr(resolved, key), level[key]
+    pad = getattr(resolved, "pad_token_id", None)
+    if pad is not None and pad >= level["vocab_size"]:
+        shutil.rmtree(directory)
+        config = _written(padding_variant(_fixture_config(name), case, place, pad + 1), directory)
+    return config, None
 
 
-def _source_embedding(name: str, config: dict, directory: Path, table: np.ndarray):
+def _source_embedding(name: str, config: dict, directory: Path, table: np.ndarray, untrained):
     """The source's token embedding module over `config` (written at `directory`), holding `table`, and
     its float64 twin: the text model transformers builds from the config (`TEXT_MODELS`' class where no
-    base model maps it), or for a remote source CI cannot run, the lookup its cited code builds
-    (`REMOTE`)."""
+    base model maps it), or, where a recording of the source's own code gives the rows its lookup leaves
+    `untrained`, the nn.Embedding padding the one it recorded."""
     import importlib
 
     import torch
@@ -212,11 +232,11 @@ def _source_embedding(name: str, config: dict, directory: Path, table: np.ndarra
 
     from tools.torch_precision import float64_twin
 
-    if name in REMOTE:
-        pad = PAD if name in PADDED_SEEDS else None
+    if untrained is not None:
+        assert len(untrained) <= 1
 
         def built(dtype):
-            return torch.nn.Embedding(*table.shape, padding_idx=pad, dtype=dtype)
+            return torch.nn.Embedding(*table.shape, padding_idx=next(iter(untrained), None), dtype=dtype)
     else:
         settings = AutoConfig.from_pretrained(directory)
         text_model = TEXT_MODELS.get(config["model_type"])
@@ -227,34 +247,61 @@ def _source_embedding(name: str, config: dict, directory: Path, table: np.ndarra
             module, cls = text_model
             return getattr(importlib.import_module(module), cls)(settings).to(dtype)
     source = built(torch.float32)
-    lookup = source if name in REMOTE else source.get_input_embeddings()
+    lookup = source if untrained is not None else source.get_input_embeddings()
     with torch.no_grad():
         lookup.weight.copy_(torch.tensor(table))
     wide = float64_twin(source, lambda: built(torch.float64))
-    return lookup, wide if name in REMOTE else wide.get_input_embeddings()
+    return lookup, wide if untrained is not None else wide.get_input_embeddings()
 
 
-@pytest.mark.parametrize("name", sorted({**PADDED_SEEDS, **UNPADDED_SEEDS}))
-def test_the_pad_row_takes_the_gradient_its_source_gives_it(name, tmp_path):
-    """The family's token lookup is its source's (`assert_pads_as`): the decoder its reader builds from
-    a config stating a pad id pads the row the source's own token embedding module pads, and trains it
-    where the source does. The pad row is the reader's, decided where the config translates, and the
-    lookup's gradient reads no weight, so the decoder is built from the config, which several of these
-    sources state without a checkpoint or a causal LM to write one."""
+def _untrained(gradient) -> list[int]:
+    """The rows of a table's gradient that are zero throughout."""
+    return np.flatnonzero(~np.asarray(gradient).any(axis=-1)).tolist()
+
+
+@pytest.mark.parametrize("case", ("stated", "omitted", "null"))
+@pytest.mark.parametrize("name", sorted(PADDED | UNPADDED))
+def test_the_pad_row_takes_the_gradient_its_source_gives_it(name, case, tmp_path):
+    """The family's token lookup is its source's (`assert_pads_as`), with the config's pad id stated, left
+    out (the source's config class's default) and null: the decoder its reader builds leaves untrained
+    the rows the source's own token embedding leaves untrained when each row is looked up once, and its
+    gradient under drawn ids and cotangents holds check 1 against the source's. The pad row is the
+    reader's, decided where the config translates, and the lookup's gradient reads no weight, so the
+    decoder is built from the config, which several of these sources state without a checkpoint or a
+    causal LM to write one."""
+    import torch
+
     from dew.interop.hf_decoders import translate_config
     from dew.registry import models
 
     directory = tmp_path / name
-    config = _padded_config(name) if name in REMOTE else _written(_padded_config(name), directory)
+    config, recorded = _padding_case(name, case, directory)
     model = models.build("causal_transformer",
                          {**translate_config(config), "dtype": "float32", "attention_impl": "reference"})
     variables = model.init(jax.random.key(0), jnp.zeros((1, 2), jnp.int32))
-    lookup, wide = _source_embedding(name, config, directory, token_table(variables)[1])
-    assert (lookup.padding_idx is not None) == (name in PADDED_SEEDS)
+    table = token_table(variables)[1]
+    rows = jnp.arange(table.shape[0])[None]
     placeholders = [config[field] for field in PLACEHOLDERS.get(name, ())]
-    assert_pads_as(model, variables, lookup, wide, PAD, name,
-                   seeds={**PADDED_SEEDS, **UNPADDED_SEEDS}[name],
-                   looked_up=lambda ids: np.where(np.isin(ids, placeholders), 0, ids))
+
+    def looked_up(ids):
+        return np.where(np.isin(ids, placeholders), 0, ids)
+
+    if recorded is None:
+        lookup, wide = _source_embedding(name, config, directory, table, None)
+        torch.nn.Embedding.forward(lookup, torch.from_numpy(looked_up(np.asarray(rows[0])))).sum().backward()
+        untrained = _untrained(lookup.weight.grad.numpy())
+    else:
+        assert table.shape[0] == recorded["rows"]
+        untrained = recorded["untrained"]
+        lookup, wide = _source_embedding(name, config, directory, table, untrained)
+    looked = jax.grad(lambda params: jnp.sum(
+        model.apply({**variables, "params": params}, rows, method="token_embeddings")))(variables["params"])
+    assert _untrained(token_table({"params": looked})[1]) == untrained
+    if case == "stated":
+        assert (lookup.padding_idx is not None) == (name in PADDED)
+    padded = lookup.padding_idx is not None
+    assert_pads_as(model, variables, lookup, wide, lookup.padding_idx if padded else PAD, f"{name} {case}",
+                   seeds=PAD_SEEDS[padded], looked_up=looked_up)
 
 
 KIND_RAMPS = {
