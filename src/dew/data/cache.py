@@ -840,29 +840,31 @@ class _CachedIter(grain.IterDataset):
         self.published, self.input_parent = published, parent
 
     def __iter__(self) -> grain.DatasetIterator:
-        return _CachedIterator(self.input_parent.__iter__(), self.cache, self.key, self.shard, self.transform,
-                               self.published)
+        # A shard keeps its iterator's state either way, so a fill resumes onto its published generation.
+        # A shard the generation holds under another ID (another mount, a stream cut into more shards
+        # than it has) runs its steps and writes nothing, so the key holds no rows under its IDs. The
+        # writer opens before the shard's input does, so a writer the cache refuses leaves no input open.
+        published = self.published
+        writer = (_opened_writer(self.cache, self.key) if published is None
+                  else published if published.generation.holds((self.shard.id, 0))
+                  else _Computed())
+        with ExitStack() as opening:
+            opening.callback(writer.close)
+            parent = self.input_parent.__iter__()
+            opening.pop_all()
+        return _CachedIterator(parent, writer, self.shard, self.transform)
 
 
 class _CachedIterator(grain.DatasetIterator):
     def __init__(
         self,
         parent: grain.DatasetIterator,
-        cache: Cache,
-        key: DependencyManifest,
+        writer: _Writer | _Published | _Computed,
         shard: Shard,
         transform: Transform | None,
-        published: _Published | None,
     ):
         super().__init__(parent)
-        self.parent, self.shard, self.transform = parent, shard, transform
-        # A shard keeps its iterator's state either way, so a fill resumes onto its published generation.
-        # A shard the generation holds under another ID (another mount, a stream cut into more shards
-        # than it has) runs its steps and writes nothing, so the key holds no rows under its IDs.
-        self.writer: _Writer | _Published | _Computed = (
-            _opened_writer(cache, key) if published is None
-            else published if published.generation.holds((shard.id, 0))
-            else _Computed())
+        self.parent, self.writer, self.shard, self.transform = parent, writer, shard, transform
         self.ordinal = 0
 
     def __next__(self):

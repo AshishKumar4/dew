@@ -1,6 +1,7 @@
 """Artifact coverage, crash boundaries, duplicate records and bounded admission."""
 
 import contextlib
+import gc
 import hashlib
 import json
 import os
@@ -1215,12 +1216,14 @@ def test_a_streamed_generation_serves_its_files_at_another_mount(tmp_path):
     assert publish(chunked(first).pack(4, bins=2), cache, read="streamed").url != generation.url
 
 
+@pytest.mark.filterwarnings("error::pytest.PytestUnraisableExceptionWarning")
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
 def test_a_warm_cache_read_by_worker_processes_refuses_a_manifest_rewritten_since_it_was_committed(
         tmp_path, read):
     """Worker processes read a published generation's manifest checked against the size and digest
     its cache's CURRENT committed it under, as the process that compiled the read does: a manifest
-    rewritten since, the same records in other bytes, is refused, not read."""
+    rewritten since, the same records in other bytes, is refused, not read, and the read the refusal
+    stopped closes whole, no shard's iterator half built."""
     from dew.data.compile import compile, publish
     from dew.data.dataset import DataPartition, Loading
 
@@ -1240,6 +1243,7 @@ def test_a_warm_cache_read_by_worker_processes_refuses_a_manifest_rewritten_sinc
             next(reader)
     finally:
         reader.close()
+    gc.collect()
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed"])
