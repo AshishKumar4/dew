@@ -60,15 +60,15 @@ from dew.inputs import Field
 from dew.lora import AdapterRecord, LoRA
 from dew.objectives.base import Effects, Loss, Metric, Objective
 from dew.optim import (
-    BF16_STATE_OPTIMIZERS,
     OPTIMIZER_MAP,
+    STATE_OPTIMIZERS,
     Optimizer,
     ParamGroup,
     ScheduleBase,
     param_labels,
     power_profiles,
-    scaled,
-    scaled_solver,
+    rates_of,
+    scheduled_solver,
     weight_decay_mask,
 )
 from dew.quantization import InputQuantization, Quantization
@@ -507,14 +507,17 @@ class OptimConfig:
     Empty runs one optimizer over every parameter. `ParamGroup.mup` is lm-engine's muP split.
     """
     clip_grads: float = 0.0
-    state_dtype: Literal["float32", "bfloat16"] = "float32"
+    state_dtype: Literal["float32", "bfloat16", "int8"] = "float32"
     """The dtype of Adam's moments in memory.
 
     float32 stores adam's and adamw's two moments, and Muon's momentum, in
     float32 whatever the parameters' dtype, so bfloat16 or float16 weights
     train on full-precision moments. bfloat16 stores both with stochastic
     rounding (`dew.optim.bf16_moments`), for adam and adamw only. That halves
-    the optimizer state and reduces the update's memory traffic.
+    the optimizer state and reduces the update's memory traffic. int8 stores
+    both blockwise in 8 bits (`dew.optim.int8_moments`, bitsandbytes' and
+    torchao's 8-bit Adam), for adam and adamw only: a quarter of float32's,
+    about 2 bytes a parameter for the two.
     """
     forced_weight_normalization: bool = False
     """Whether to renormalize every magnitude-preserving weight (`dew.nn.mp.MPConv`) after each update.
@@ -540,8 +543,8 @@ class OptimConfig:
         none) times its multiplier, with its own weight decay, `b1` schedule and bounds
         (`ParamGroup.solver`); the global-norm clip still reads every gradient
         together, before the groups split them. Each solver holds its rate's
-        scale in its state (`dew.optim.scaled_solver`), so runs at
-        rates of one schedule's shape compile one step.
+        fields in its state (`dew.optim.scheduled_solver`), so runs at
+        rates of one schedule's timings compile one step.
         """
         opts = dict(self.optimizer_opts)
         if {'b1', 'b2'} & opts.keys():
@@ -549,12 +552,12 @@ class OptimConfig:
         given = {'b1': self.b1, 'b2': self.b2, 'weight_decay': self.weight_decay}
         opts.update({name: value for name, value in given.items() if value is not None})
         make: Callable[..., optax.GradientTransformation] = OPTIMIZER_MAP[self.optimizer]
-        if self.state_dtype == 'bfloat16':
-            if self.optimizer not in BF16_STATE_OPTIMIZERS:
+        if self.state_dtype != 'float32':
+            if self.optimizer not in STATE_OPTIMIZERS[self.state_dtype]:
                 raise ValueError(
-                    f"state_dtype='bfloat16' stores Adam's moments in bf16, which "
-                    f"{sorted(BF16_STATE_OPTIMIZERS)} have; {self.optimizer!r} does not")
-            make = BF16_STATE_OPTIMIZERS[self.optimizer]
+                    f"state_dtype={self.state_dtype!r} stores Adam's moments, which "
+                    f"{sorted(STATE_OPTIMIZERS[self.state_dtype])} have; {self.optimizer!r} does not")
+            make = STATE_OPTIMIZERS[self.state_dtype][self.optimizer]
         elif self.optimizer in ('adam', 'adamw'):
             opts = {'mu_dtype': 'float32', 'nu_dtype': 'float32', **opts}
         elif self.optimizer in ('muon', 'muonclip'):
@@ -571,7 +574,7 @@ class OptimConfig:
         else:
             if self.optimizer not in ('muon', 'muonclip'):
                 opts['mask'] = weight_decay_mask
-            solver = scaled_solver(make, *scaled(self.learning_rate), steps, opts)
+            solver = scheduled_solver(make, self.learning_rate, steps, opts)
 
         if self.clip_grads > 0:
             solver = optax.chain(optax.clip_by_global_norm(self.clip_grads), solver)
@@ -583,15 +586,15 @@ class OptimConfig:
             solver = power_profiles(solver, self.ema_profiles)
         return solver
 
-    def rate_scales(self) -> dict[str | None, float]:
-        """The rate scale each of `build`'s solvers holds in its state
-        (`dew.optim.scaled_solver`), by param group, or under None
+    def rates(self) -> dict[str | None, dict[str, float]]:
+        """The rate fields each of `build`'s solvers holds in its state
+        (`dew.optim.scheduled_solver`), by param group, or under None
         for the one solver of a config without groups. A resumed run sets
-        them over its checkpoint's (`with_rate_scales`), so the configured
+        them over its checkpoint's (`with_rates`), so the configured
         rate is the one it steps at."""
         if not self.param_groups:
-            return {None: scaled(self.learning_rate)[0]}
-        return {group.name: group.learning_rate(self.learning_rate)[0] for group in self.param_groups}
+            return {None: rates_of(self.learning_rate)}
+        return {group.name: group.rates(self.learning_rate) for group in self.param_groups}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1510,8 +1513,7 @@ class RunConfig:
         from dew.training import prepare_process, run_timestamp
 
         trainer = self.trainer
-        prepare_process(trainer.wandb, trainer.multi_host, trainer.xla_flags, trainer.compilation_cache_dir,
-                        layout=trainer.layout)
+        prepare_process(trainer.wandb, trainer.multi_host, trainer.xla_flags, trainer.compilation_cache_dir)
         prepared = self.prepare()
         stated = prepared.run.objective
         name = trainer.name or (f"{'run' if stated is None else objectives.label(stated.name)}-"

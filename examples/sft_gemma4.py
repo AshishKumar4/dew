@@ -130,7 +130,7 @@ def main(config: Config) -> Path:
 
     run = run_config(config, tokenizer, chat)
     prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
-                    run.trainer.compilation_cache_dir, layout=run.trainer.layout)
+                    run.trainer.compilation_cache_dir)
     # Only now: counting devices opens the backend, which has to come after
     # the pool forms, and a pool's count is every process's devices.
     run = replace(run, trainer=replace(run.trainer, mesh=MeshSpec(fsdp=jax.device_count())))

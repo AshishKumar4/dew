@@ -38,6 +38,7 @@ from dew.nn.inputs import (
     ModelInputs,
     PredictionPhase,
     Request,
+    host_rows,
     local_rows,
     mesh_of,
     next_position,
@@ -317,18 +318,36 @@ class Generation(Generic[ArrayT]):
 
     def host(self) -> Generation[np.ndarray]:
         """Return this process's real rows as host arrays, without the padding rows that fill the devices."""
-        return jax.tree.map(lambda leaf: local_rows(leaf)[:self.rows], self)
+        return jax.tree.map(lambda leaf: host_rows(leaf, self.rows), self)
 
     @functools.cached_property
     def text(self) -> tuple[str, ...]:
-        """Each real row's valid continuation, decoded on first access.
+        """Each real row's valid continuation, decoded on first access (`row_texts`)."""
+        return row_texts(self.decoder, self, self.prompt_width)
 
-        Raises `ValueError` when the generation has no processor to decode with.
-        """
-        if self.decoder is None:
-            raise ValueError("this generation carries no processor to decode with")
-        rows = self.host()
-        return self.decoder(rows.tokens, rows.lengths, self.prompt_width)
+
+def decoded_rows(processor, tokens: ArrayLike, lengths: ArrayLike, width: int) -> tuple[str, ...]:
+    """Each row's `lengths` tokens past `width`, as text, by `processor`: what a task's `decode` and a
+    generation's `text` both return (`row_texts`). Without a processor there is no text to return, and
+    it raises."""
+    if processor is None:
+        raise ValueError("this generation carries no processor to decode with")
+    rows, counts = np.asarray(tokens), np.asarray(lengths)
+    return tuple(processor.decode(rows[row:row + 1, width:width + int(counts[row])])[0]
+                 for row in range(rows.shape[0]))
+
+
+def row_texts(decoder, generation, prompt_width: int | None) -> tuple[str, ...]:
+    """A text or canvas generation's real rows decoded past their prompt by `decoder`, `decoded_rows`
+    over a processor: its rows on the host (`generation.host()`), each row's tokens past
+    `prompt_width`. A generation with no decoder, or with no prompt width to decode from, is refused
+    (ValueError) rather than decoded from the start of its tokens."""
+    if decoder is None:
+        raise ValueError("this generation carries no processor to decode with")
+    if prompt_width is None:
+        raise ValueError("this generation has no prompt width")
+    rows = generation.host()
+    return decoder(rows.tokens, rows.lengths, prompt_width)
 
 
 def prefill_state(model: nn.Module, params: Variables, inputs: ModelInputs, ops: DecodeOps,

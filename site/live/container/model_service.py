@@ -97,9 +97,9 @@ class NativeModels:
         import numpy as np
         import progress
 
-        from dew.inference import Server
+        from dew.inference import Server, TextToImage
         from dew.interop import PretrainedDecoder
-        from dew.sampling import CFG, DPMSolverMultistep, EulerAncestral, Heun, Sampling, TextToImage
+        from dew.sampling import CFG, DPMSolverMultistep, EulerAncestral, Heun, Sampling
 
         print("MODEL_PHASE", time.time(), "pipeline load", flush=True)
         self.np, self.progress = np, progress

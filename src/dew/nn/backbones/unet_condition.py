@@ -13,6 +13,7 @@ from dew.nn.attention import BasicTransformerBlock, GroupNorm
 from dew.nn.blocks import ResidualBlock, sinusoidal_time
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
+from dew.nn.dropout import Dropout
 from dew.nn.flops import MissingFlopsCount, projection_flops
 from dew.nn.precision import at_least_fp32, float32_dot_general
 
@@ -117,7 +118,7 @@ class _SpatialAttention(nn.Module):
             x = Conv(channels, (1, 1), padding="VALID", dtype=self.dtype, precision=self.precision,
                      name="output")(x.reshape(batch, height, width, channels))
         x = residual + x
-        return nn.Dropout(self.dropout)(x, deterministic=not train) if self.dropout else x
+        return Dropout(self.dropout)(x, deterministic=not train) if self.dropout else x
 
 
 class _Level(nn.Module):
