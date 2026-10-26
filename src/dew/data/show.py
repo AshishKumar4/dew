@@ -50,9 +50,10 @@ def _chain_lines(chain: Pipeline, depth: int = 0) -> list[str]:
         for weight, child in zip(source.weights, source.pipelines, strict=True):
             lines += [f"{indent}  weight {weight:g}:", *_chain_lines(child._chain(), depth + 2)]
     elif isinstance(source, Phases):
-        lines = [f"{indent}phases"]
-        for until, child in zip(source.until_steps, source.pipelines, strict=True):
-            lines += [f"{indent}  until step {until}:" if until is not None else f"{indent}  last:",
+        lines = [f"{indent}phases" if source.clock == "steps" else f"{indent}schedule"]
+        unit = "step" if source.clock == "steps" else "committed tokens"
+        for until, child in zip(source.ends, source.pipelines, strict=True):
+            lines += [f"{indent}  until {unit} {until}:" if until is not None else f"{indent}  last:",
                       *_chain_lines(child._chain(), depth + 2)]
     else:
         lines = [f"{indent}{type(source).__name__} {source.label()!r}"]
