@@ -1117,6 +1117,38 @@ def test_narrow_heads_take_the_kernel_their_target_measured_fastest(generation_n
     assert "row" not in refused
 
 
+@pytest.mark.parametrize("generation_name, call, kernel", [
+    ("sm90", {"causal": True}, "flash"),
+    ("sm90", {"causal": True, "softcap": 30.0}, "template"),
+    ("sm90", {"causal": True, "key_value_seq_lengths": True}, "template"),
+    ("sm90", {"causal": True, "mask": True}, None),
+    ("sm80", {"causal": True, "softcap": 30.0}, None),
+], ids=["h100-plain", "h100-softcap", "h100-lengths", "h100-mask", "a100-softcap"])
+def test_attention_runs_its_declared_cells_and_the_template_elsewhere(generation_name, call, kernel):
+    """On a family whose Mosaic template has a routed mainloop (wgmma's), a call runs its declared old route
+    where that takes it (`attention_kernels.OLD_ROUTES`: FlashAttention-3 on Hopper), the template on every
+    other call it takes (a softcap, key lengths), and the next kernel by legality on a call the template does
+    not take (an arbitrary mask); a family without one (mma.sync's) keeps its target row's route, which is
+    never the template but where a row names it (bible §4, owner 10-25). `kernel` None: neither the
+    template nor the declared route."""
+    from dew.nn.attention import resolve_implementation
+    from dew.nn.kernels import generation
+
+    query = jnp.zeros((2, 128, 4, 64), jnp.bfloat16)
+    keywords = {"causal": call["causal"], "softcap": call.get("softcap")}
+    if call.get("key_value_seq_lengths"):
+        keywords["key_value_seq_lengths"] = jnp.full((2,), 100, jnp.int32)
+    if call.get("mask"):
+        keywords["mask"] = jnp.ones((2, 1, 128, 128), bool)
+    with generation.assumed(generation_name), generation.routes() as found:
+        resolve_implementation("auto", query, query, **keywords)
+    (route,) = [route for route in found if route.choice == "attention"]
+    if kernel is None:
+        assert route.kernel not in ("template", "flash")
+    else:
+        assert route.kernel == kernel
+
+
 @pytest.mark.parametrize("dtype, kept", [(jnp.float16, False), (jnp.bfloat16, True)])
 def test_an_fp16_call_leaves_the_triton_route_as_a_declared_gap(dtype, kept):
     """A causal call of 16-wide heads where an L4's row prefers tokamax's Triton kernel: an fp16 one is
