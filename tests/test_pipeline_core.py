@@ -916,6 +916,21 @@ class Relabelled:
 
 
 @dataclasses.dataclass(frozen=True)
+class Blocked:
+    """A step that adds a prefix run's blocks to a token row, as a user's own map does, leaving the row's
+    count as it was: the row's first `prefix` tokens are one block."""
+
+    prefix: int
+
+    def __call__(self, row):
+        from dew.nn.visibility import prefix_blocks
+
+        places = np.arange(len(row["text"]), dtype=np.int32)
+        blocks = prefix_blocks(np.ones(len(places), np.int32), places, self.prefix, xp=np)
+        return {**row, "text_block_groups": blocks}
+
+
+@dataclasses.dataclass(frozen=True)
 class Scored:
     """A delivered row as its corpus and the targets the loss scores of it, by `role`'s rule."""
 
@@ -925,9 +940,10 @@ class Scored:
         from dew.data.steps.text import ValidTargets
 
         # A row whose roles a projection renamed reads them under their new name; a packed row's
-        # segments end its documents' targets at their boundaries.
+        # segments end its documents' targets at their boundaries, and its blocks leave out the
+        # targets they read whole.
         scored = {"text": row["text"], "text_roles": row.get("text_roles", row.get("roles")),
-                  **{name: row[name] for name in ("text_segment_ids",) if name in row}}
+                  **{name: row[name] for name in ("text_segment_ids", "text_block_groups") if name in row}}
         return {"source": row["source"],
                 "targets": np.int32(ValidTargets(role=self.role, measured=False)(scored))}
 
@@ -1047,6 +1063,21 @@ def test_a_rows_count_and_its_rule_ride_through_the_steps_that_leave_its_targets
     left, right = delivered([corpus(0, scored[0]), corpus(1, scored[1])], role, read)
     bound = {None: 7 + 7, 1: 3 + 2 if after == "renamed-text-then-cropped" else 1 + 3}[role]
     assert abs(int(left) - int(right)) <= bound
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
+def test_a_map_that_adds_blocks_to_a_counted_row_counts_its_targets_again(read):
+    """Blocks a user's map adds to a counted row (`text_block_groups`, a prefix run's) leave out the targets
+    they read whole, so the row's count is counted again where the blocks arrive (`recounted`). The mixture
+    weighs the corpus by what its rows deliver: the blocked corpus's rows score one role-1 target each, a
+    six-token block holding the other five, so the two corpora deliver equal targets, to within one row of
+    each (`delivered`)."""
+    from dew.data.steps.text import CountTargets
+
+    blocked = Pipeline(roled(0, 8, 6), name="blocked").filter_map(CountTargets(role=1)).map(Blocked(6))
+    plain = Pipeline(roled(1, 8, 3), name="plain").filter_map(CountTargets(role=1))
+    left, right = delivered([blocked, plain], 1, read)
+    assert abs(int(left) - int(right)) <= 1 + 3
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])

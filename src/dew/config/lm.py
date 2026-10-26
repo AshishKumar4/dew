@@ -50,8 +50,10 @@ class LMRunConfig(RunConfig):
     """The objective and its arguments: lm, masked_diffusion (MDLM),
     block_diffusion (the official DiffusionGemma fine-tuning objective), or
     any objective by its import path that `LMObjective`'s arguments build:
-    the decoder, `seq_len`, its starting `variables`, `samples`, `processor`
-    and `qk_stats`."""
+    the decoder, `seq_len`, its starting `variables`, `samples` and
+    `processor`. A step whose optimizer clips by the attention logit maxima
+    (`muonclip`) asks the objective for them (`Step.qk_stats`), whichever
+    objective it is."""
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
     optim: OptimConfig = dataclasses.field(
@@ -140,7 +142,7 @@ class LMRunConfig(RunConfig):
         else:
             objective = self.objective.build(
                 model=model if source is None else source, seq_len=tokens.seq_len, variables=variables,
-                samples=samples, processor=self.processor(), qk_stats=self.optim.optimizer == "muonclip")
+                samples=samples, processor=self.processor())
         # Compiled once: the run's length and its cadences are read off this loader, which `train` trains on.
         loaded, held = self.compiled(objective.data(), self.chain(), self.validation)
         # The run's own default metric, asked for where it holds a validation split to score.

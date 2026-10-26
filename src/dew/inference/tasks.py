@@ -17,7 +17,7 @@ import dataclasses
 import functools
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import TYPE_CHECKING, ClassVar, Protocol, Self
+from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, Self
 
 import jax
 import jax.numpy as jnp
@@ -37,7 +37,7 @@ from dew.inference.projections import packed_owned
 from dew.interop.sources import SourceReference
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
-from dew.nn.protocols import Bounded, CacheCapacity, TokenModel
+from dew.nn.protocols import Bounded, CacheCapacity, TokenModel, refuse_prefix
 from dew.objectives.base import UNREAD, Objective
 from dew.sampling import decoding, vocabulary
 from dew.sampling.decoding import LogitsTransform, Stopping, id_row
@@ -449,6 +449,8 @@ class TextSettings(TaskSettings):
     policy beside the common ones."""
 
     sampling: Sampling
+    prefix: int | Literal["prompt"] | None = None
+    """The prefix run's blocks a served prompt takes (`TextGeneration.prefix`); None serves causally."""
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -688,10 +690,14 @@ class TextGeneration(_NativeTextTask):
     logits: tuple[LogitsTransform, ...] | None = None
     stopping: tuple[Stopping, ...] = ()
     strategy: Strategy | None = None
+    prefix: int | Literal["prompt"] | None = None
+    """The prefix run the model trained (`LMObjective(prefix=...)`): a prompt's first tokens, or all of it
+    under "prompt", form one block the model reads whole. A request's own blocks stand; None is causal."""
     _stops: tuple[Stopping, ...] = dataclasses.field(default=(), init=False, repr=False, compare=False)
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        refuse_prefix(self.model, self.prefix, longest=cache_ceiling(self.model))
         object.__setattr__(self, "_stops", self._stop_criteria(self.sampling.stop))
 
     def _stop_criteria(self, strings: tuple[str, ...]) -> tuple[Stopping, ...]:
@@ -770,9 +776,7 @@ class TextGeneration(_NativeTextTask):
         `processor`: the previews' policy and budget become its defaults. A live objective
         (`LMObjective.build_task`) and a saved run (`from_run`) build it alike."""
         return cls(model, variables, processor, sampling=settings.sampling,
-                   max_new_tokens=settings.max_new_tokens or None)
-
-
+                   max_new_tokens=settings.max_new_tokens or None, prefix=settings.prefix)
 
     def __call__(self, request: Request, max_new_tokens: int | None = None, *,
                  key: int | jax.Array | None = None, n: int | None = None,
@@ -789,7 +793,7 @@ class TextGeneration(_NativeTextTask):
             generated = generate(cache_sized(self.model, capacity), self.placed, shaped, budget,
                                  key=random_key, sampling=policy, n=self.n if n is None else n, logits=chain,
                                  stopping=criteria, strategy=self.strategy if strategy is None else strategy,
-                                 trips=trips)
+                                 trips=trips, prefix=self.prefix)
             padding = shaped.tokens.shape[1] - inputs.tokens.shape[1]
             return self._decoded(_requested(generated, budget, padding))
 
