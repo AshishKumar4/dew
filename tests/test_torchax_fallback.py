@@ -873,6 +873,25 @@ DECODE_SEEDS = {"cohere": 8, "cohere2": 8}
 """Each family's declared check-1 seeds for its cached logits, sized by `seeds_for` on armada."""
 
 
+def test_a_tier_3_source_generates_through_the_pipeline_loader_as_its_bundle_does(tmp_path):
+    """`dew.pipeline` of a tier-3 source on Dew's attention gives the text generation its loaded bundle
+    describes: greedy, the same tokens from the same prompts."""
+    from dew.inference import pipeline
+    from dew.sampling import Sampling
+
+    torch.manual_seed(0)
+    PACKED_MODELS["cohere"]().eval().save_pretrained(tmp_path)
+    with pytest.warns(TransformersTierWarning):
+        task = pipeline(str(tmp_path), dtype="float32")
+    with pytest.warns(TransformersTierWarning):
+        loaded = Pretrained.load(tmp_path, dtype="float32")
+    prompts = [[3, 5, 7, 2], [9, 4]]
+    greedy = Sampling(temperature=0.0)
+    np.testing.assert_array_equal(
+        np.asarray(task(prompts, 3, key=0, sampling=greedy).tokens),
+        np.asarray(loaded.text_generation(sampling=greedy)(prompts, 3, key=0).tokens))
+
+
 @pytest.mark.parametrize("stated", ["mask", "segments"])
 @pytest.mark.parametrize("family", sorted(PACKED_MODELS))
 def test_a_tier_3_model_decodes_through_dews_cache_as_transformers_runs_each_prefix(family, stated, tmp_path):
