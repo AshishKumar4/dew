@@ -1465,24 +1465,56 @@ def _launch_kernel(name: str, *measured: _Need) -> selection.Kernel[GroupedCase]
                      f"{case.call.target.generation}", row='ledger 1295'), *measured))
 
 
-MMA_SYNC_MEASURED = _Need(
-    'mma_sync', lambda case: case.call.target.wgmma,
-    "an A100 ran the Mosaic GPU launches' mma.sync tiles slower than Triton's on the forward (1.08x) and "
-    "the input gradient (1.26x) (R10, 852bb4bd3), so they run where the call names them", row='R10',
-    kind='measured')
-"""What keeps the Mosaic GPU launches off a GPU without warpgroup MMA unless named: main's route there is
-Triton's, which mma.sync has not measured at least as fast as (BIBLE §4)."""
+OLD_ROUTES: dict[tuple[str, str, str], tuple[str, str]] = {
+    ('mma.sync', 'forward', 'grouped'):
+        ('triton', "R10 (852bb4bd3, A100): the template's mma.sync tile 1.017x Triton's time, geomean of 6 "
+                   "grouped MoE rows"),
+    ('mma.sync', 'input_gradient', 'grouped'):
+        ('triton', "R10: 1.263x Triton's time, geomean of 6 grouped rows"),
+    ('mma.sync', 'kernel_gradient', 'grouped'):
+        ('triton', "R10: 1.093x Triton's time, geomean of 6 grouped rows"),
+    ('mma.sync', 'forward', 'dense'): ('triton', "R10: 1.169x Triton's time, geomean of 4 dense rows"),
+}
+"""The cells where an old route measured faster than the template, each with its receipt (owner, bible
+da64ae5): (instruction family, product, grouped or dense) to (the old route, the receipt). The template is
+the default on every other cell; a cell leaves the list once the template measures at least as fast on it
+(geomean over the receipt's rows). Nothing is ranked at runtime. A call the template cannot run (its
+legality) takes the next route in `GROUPED`'s order, which is no cell of this list."""
+
+
+def _cell(case: "GroupedCase") -> tuple[str, str, str] | None:
+    """The `OLD_ROUTES` cell a call is: its GPU's instruction family, its product (a kernel gradient,
+    exactly summed or not, or an input gradient or a forward) and whether it is dense; None off a CUDA
+    GPU."""
+    target = generation.effective(case.call.target)
+    if generation.capability(target.generation) is None:
+        return None
+    arguments = next(iter(case.call.bound.values()))[1].arguments
+    if 'trans_rhs' not in arguments:
+        product = 'kernel_gradient exact' if arguments.get('exact_sums') else 'kernel_gradient'
+    else:
+        product = 'input_gradient' if arguments['trans_rhs'] else 'forward'
+    shape = 'dense' if arguments.get('dense') else 'grouped'
+    return ('wgmma' if target.wgmma else 'mma.sync', product, shape)
+
+
+def _old_route_reason(case: "GroupedCase") -> str:
+    """Why the template leaves a listed cell to its old route: the cell and its receipt."""
+    cell = _cell(case)
+    route, receipt = OLD_ROUTES[cell] if cell is not None else ('', '')
+    return f"{route} measured faster on this cell ({', '.join(cell or ())}): {receipt}"
+
+
+MEASURED_SLOWER = _Need('old_route', lambda case: _cell(case) not in OLD_ROUTES, _old_route_reason,
+                        row='bible da64ae5', kind='measured')
+"""What keeps the Mosaic GPU launches off an `OLD_ROUTES` cell unless named, so the old route runs it."""
 
 
 NAMED = _Need('named', lambda case: False,
               lambda case: "this launch runs only where a call names it (`generation.chosen`)",
-              row="owner, bible 67b4f84: a template replaces a production route once measured at least as "
-                  "fast", kind='measured')
-"""What keeps a launch off every call that does not name it: the TPU's, whose native run no measurement
-has shown at least as fast as main's route there, XLA's program (BIBLE §4: base/kernels reaches main with
-main's defaults), and CUTLASS's, a vendored kernel no measurement ranks against the template's. Mosaic
-GPU's launch keeps the place main's chooser gave it on an H100, where it measured faster than Triton's
-(test_gemm_template's HOOKED_RECEIPTS: 5.9 ms against 10.2 at Llama 3 8B's gate projection)."""
+              row="no production route", kind='measured')
+"""What keeps CUTLASS's launches off every call that does not name them: a vendored kernel that was never a
+production route, which no measurement ranks against the template's."""
 
 
 """The bundles by name, as a tile names its (`mosaic_gpu.Tiles.family`), for their class-wide facts."""
@@ -1497,13 +1529,13 @@ _GMMS = (MosaicGmm(), MosaicTpuGmm(), Gmm(), CutlassGmm())
 _TGMMS = (MosaicTgmm(), MosaicTpuTgmm(), Tgmm(), CutlassTgmm())
 
 GROUPED: selection.Op[GroupedCase] = selection.Op('grouped_matmul', (
-    *(_launch_kernel(launch.name, *((NAMED,) if launch.name in ('mosaic_tpu', 'cutlass') else
-                                    (MMA_SYNC_MEASURED,) if launch.name == 'mosaic_gpu' else ()))
+    *(_launch_kernel(launch.name, *((NAMED,) if launch.name == 'cutlass' else
+                                    (MEASURED_SLOWER,) if launch.name == 'mosaic_gpu' else ()))
       for launch in _GMMS),
     selection.Kernel[GroupedCase]('xla', (), generic=True)))
-"""The grouped selector, in a fixed order, main's route: Mosaic GPU's launch where it takes the call (an
-H100's, where it measured faster than Triton's; mma.sync's only by name, `MMA_SYNC_MEASURED`), Triton's
-where it refuses, else XLA's program; the TPU's and CUTLASS's launches only by name (`NAMED`). Every
+"""The grouped selector, in a fixed order, the template first (owner, bible da64ae5): Mosaic GPU's launch
+where it takes the call and the call is no `OLD_ROUTES` cell, the TPU's launch on a TPU, Triton's where they
+refuse or on a listed cell, else XLA's program; CUTLASS's launches only by name (`NAMED`). Every
 implementation shares the template's signature, so each binds the call's own arguments, `_GMMS`' for a
 product, `_TGMMS`' for a kernel gradient."""
 
