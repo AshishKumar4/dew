@@ -12,7 +12,7 @@ import jax
 import numpy as np
 import pytest
 import torch
-from interop_support import clearing_selections, token_draw, torch_logits
+from interop_support import assert_pads_as, clearing_selections, token_draw, torch_logits
 from reference_error import assert_as_exact
 
 from dew.interop import Pretrained, parts
@@ -199,6 +199,27 @@ def test_a_model_of_known_parts_loads_natively_from_its_own_code(tmp_path, name)
                     truth_fn=torch_logits(wide, float64))
 
 
+@pytest.mark.parametrize("name", sorted(SOURCES))
+def test_a_model_loaded_from_parts_pads_the_row_its_own_table_pads(tmp_path, name):
+    """A decoder assembled from parts reads its pad row off its source's own table, the nn.Embedding
+    the code builds with padding_idx=config.pad_token_id (ledger 1593), and its lookup's gradient is
+    that table's (`assert_pads_as`)."""
+    from transformers import AutoModelForCausalLM
+
+    directory = tmp_path / name
+    write_source(directory, name)
+    loaded = Pretrained.load(directory, dtype="float32", attention_impl="reference", trust_remote_code=True)
+
+    def built(dtype):
+        return AutoModelForCausalLM.from_pretrained(directory, trust_remote_code=True, dtype=dtype).eval()
+
+    reference = built(torch.float32)
+    wide = float64_twin(reference, lambda: built(torch.float64))
+    assert reference.get_input_embeddings().padding_idx == TINY["pad_token_id"]
+    assert_pads_as(loaded.model, loaded.variables, reference.get_input_embeddings(),
+                   wide.get_input_embeddings(), TINY["pad_token_id"], name, seeds=8)
+
+
 def test_a_remote_type_is_refused_without_its_code(tmp_path):
     """A type transformers has no class for runs its repository's code only where the load opts in."""
     write_source(tmp_path / "renamed", "renamed")
@@ -229,20 +250,71 @@ def test_a_part_whose_code_differs_is_not_assembled(tmp_path):
                        remote=tmp_path / "doubled")
 
 
-def test_a_passed_verification_is_read_back_by_its_key(tmp_path, monkeypatch):
-    """A verification is recorded under its key in Dew's cache, and a later one under the same config,
-    transformers, Dew and code reads the record rather than probing again: here the record's own
-    reference string comes back."""
-    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
-    write_source(tmp_path / "renamed", "renamed")
-    config = json.loads((tmp_path / "renamed" / "config.json").read_text())
-    first = verify_mapping(config, remote=tmp_path / "renamed")
-    assert isinstance(first, VerifiedMapping)
-    (record,) = (tmp_path / "cache" / "dew" / "verified").glob("*/mapping.json")
-    stored = json.loads(record.read_text())
-    record.write_text(json.dumps({**stored, "reference": "the recorded reference"}))
-    second = verify_mapping(config, remote=tmp_path / "renamed")
-    assert isinstance(second, VerifiedMapping) and second.reference == "the recorded reference"
+_LOADED = """
+import sys
+from dew.interop import Pretrained
+Pretrained.load(sys.argv[1], subfolder=sys.argv[2] or None, dtype="float32", attention_impl="reference",
+                trust_remote_code=True)
+"""
+"""A load of the source `argv[1]` names, at the folder `argv[2]` selects, running its own code."""
+
+
+def _offline_load(root, source, subfolder: str = ""):
+    """A load of `source` (at `subfolder`) in a process of its own, offline over the Hub cache at
+    `root`/hub with Dew's cache at `root`/cache."""
+    import os
+    import subprocess
+    import sys
+
+    env = {**os.environ, "HF_HUB_CACHE": str(root / "hub"), "HF_HUB_OFFLINE": "1",
+           "XDG_CACHE_HOME": str(root / "cache"), "JAX_PLATFORMS": "cpu"}
+    return subprocess.run([sys.executable, "-c", _LOADED, str(source), subfolder], capture_output=True,
+                          text=True, env=env)
+
+
+def test_a_verification_of_remote_code_is_recorded_under_its_commit(tmp_path):
+    """A passed verification of a repository's own code is recorded under the Hub commit the load
+    fetched that code at, beside the config, transformers, torch and Dew it ran under, so the same code
+    at another commit is verified and recorded again; a local directory's code, which no commit names,
+    is verified at each load and recorded under none. Each load runs offline over a Hub cache holding
+    the repository at a commit, in a process of its own."""
+    from interop_support import hub_cache
+
+    write_source(tmp_path / "repo", "renamed")
+    # The same code, under two repositories at two commits.
+    repos = [f"dew/renamed-{index}" for index in range(2)]
+    for index, repo in enumerate(repos):
+        hub_cache(tmp_path / "hub", repo, tmp_path / "repo", commit=f"{index}" * 40)
+    verified = tmp_path / "cache" / "dew" / "verified"
+
+    def load(source) -> None:
+        run = _offline_load(tmp_path, source)
+        assert run.returncode == 0, run.stderr[-2000:]
+
+    load(tmp_path / "repo")
+    assert not list(verified.glob("*/mapping.json"))
+    for count, repo in enumerate(repos, 1):
+        load(repo)
+        assert len(list(verified.glob("*/mapping.json"))) == count
+
+
+def test_each_code_folder_at_one_commit_is_verified_on_its_own(tmp_path):
+    """A commit names a whole repository, whose folders (`subfolder`) may each hold code of their own:
+    two folders at one commit, each beside the same config, one the renamed Llama and the other the same
+    code that trains otherwise than it evaluates (`_hooked`), are verified each, so the second is refused
+    after the first's verification is recorded, as it is refused alone."""
+    from interop_support import hub_cache
+
+    (tmp_path / "repo").mkdir()
+    write_source(tmp_path / "repo" / "plain", "renamed")
+    write_source(tmp_path / "repo" / "hooked", "renamed", _hooked)
+    configs = [json.loads((tmp_path / "repo" / folder / "config.json").read_text())
+               for folder in ("plain", "hooked")]
+    assert configs[0] == configs[1]
+    hub_cache(tmp_path / "hub", "dew/renamed", tmp_path / "repo")
+    plain = _offline_load(tmp_path, "dew/renamed", "plain")
+    assert plain.returncode == 0, plain.stderr[-2000:]
+    assert _offline_load(tmp_path, "dew/renamed", "hooked").returncode != 0
 
 
 @pytest.mark.parametrize("name", sorted(SOURCES))

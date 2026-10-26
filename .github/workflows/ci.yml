@@ -30,7 +30,7 @@ concurrency:
 
 env:
   # The armada runner every armada job uses.
-  ARMADA: github:AshishKumar4/armada#fb5e31258507559e12df70fa03c4ab4d81be0660
+  ARMADA: github:AshishKumar4/armada#86b89027297c4ae692f149a8bdb2bb7006d22a0c
 
 jobs:
   # A commit this workflow passed on another push, as one proved on
@@ -258,12 +258,16 @@ jobs:
         # A base/<producer> promote, a push to base/kernels and the background whole suite run no gangs: main's
         # trains run them.
         case "$GITHUB_REF_NAME" in ci/base-*|base/kernels|ci/full-whole-*) gangless=1 ;; *) gangless= ;; esac
+        # A train's jobs (ci/batch-*, ci/fix-*), its gangs and its suite alike, start before any other while the
+        # fleet is full, and lanes' runs at a head (verdict.sh, at -10) end their newest containers to let them in
+        # (owner, bible §4); one priority for both, so the suite never recalls its own gangs' containers.
+        case "$GITHUB_REF_NAME" in ci/batch-*|ci/fix-*) priority=--priority=10 ;; *) priority= ;; esac
         if [ -z "$PROVEN" ] && [ -z "$gangless" ]; then
           # A gang member lost before the start fails it within 300 s (armada#22).
           items=$(python3 tools/armada/ci.py gangs)
           echo "$items" | setsid $armada map --commit=${{ github.sha }} --items=- --size=medium \
             --pool="$(echo "$items" | python3 -c 'import json, sys; print(sum(gang["gang"] for gang in json.load(sys.stdin)))')" \
-            --deadline=1800 --gang-start-timeout=300 \
+            --deadline=1800 --gang-start-timeout=300 $priority \
             --label="${{ github.ref_name }}" -- python3 tools/armada/ci.py pytest \
             --python="$(tr -d '\n' < .python-version)" --report=/tmp/dew-gang.xml \
             -- -k "{select}" --basetemp=/tmp/dew-gang tests/test_multihost.py \
@@ -276,7 +280,7 @@ jobs:
         # or a background run's share.
         if [ -n "$BACKGROUND_POOL" ]; then bound="--pool=$BACKGROUND_POOL --deadline=6000"; else bound="--deadline=2700"; fi
         if [ "$DEW_TEST_CACHE" = off ] || ! $armada verdict ${{ github.sha }}; then
-          setsid $armada run ${{ github.sha }} $bound --label="${{ github.ref_name }}" \
+          setsid $armada run ${{ github.sha }} $bound $priority --label="${{ github.ref_name }}" \
             > >(tee "$RUNNER_TEMP/suite.log") 2> >(tee "$RUNNER_TEMP/suite.err" >&2) &
           suite=$!
         fi

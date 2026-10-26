@@ -80,7 +80,7 @@ def platforms_agree(resident, host, steps: int):
 def close(left, right, bound=STREAMED_BOUND):
     """`left`, a CPU-owned state, agrees with `right`, a device one, leaf by
     leaf; the frozen collection is compared per layer, the host's banks
-    (`execution.banked`) read row by row."""
+    (`dew.inference.banks.banked`) read row by row."""
     if isinstance(left, dict) and FROZEN in left:
         left = {**left, FROZEN: unbanked(left[FROZEN])}
     elif FROZEN in getattr(left, "variables", {}):
