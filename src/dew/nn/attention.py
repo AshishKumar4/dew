@@ -1900,17 +1900,18 @@ def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_i
     in `reference_attention`. The kernel
     lets equal segment ids attend, so padding (id 0) reads other padding where
     `document_mask` reads nothing; no document's query reads padding either way.
+    The kernel is JAX's, vendored with its backward's delta formed from the
+    weights (`dew.nn.kernels.splash`).
     """
-    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
+    from dew.nn.kernels import splash
 
-    kernel = splash_attention_kernel.make_splash_mha(
+    kernel = splash.make_splash_mha(
         descriptor, block_sizes=splash_block_sizes(query.shape[-3], key.shape[-3], width=query.shape[-1],
                                                    itemsize=query.dtype.itemsize,
                                                    softcap=softcap is not None),
-        head_shards=1, q_seq_shards=1, attn_logits_soft_cap=softcap, interpret=interpret)
+        attn_logits_soft_cap=softcap, interpret=interpret)
     scale = jnp.asarray(1.0 / math.sqrt(query.shape[-1]), query.dtype)
-    segments = (None if segment_ids is None
-                else splash_attention_kernel.SegmentIds(*document_ids(segment_ids)))
+    segments = None if segment_ids is None else splash.SegmentIds(*document_ids(segment_ids))
 
     def example(q, k, v, ids):
         return kernel(q, k, v, segment_ids=ids, sinks=sinks)
@@ -1918,11 +1919,6 @@ def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_i
     attended = jax.vmap(example)(jnp.moveaxis(query, -2, -3) * scale,
                                  jnp.moveaxis(key, -2, -3), jnp.moveaxis(value, -2, -3),
                                  segments)
-    # jax types every splash kernel's call as either variant, whatever save_residuals it was made with.
-    if isinstance(attended, tuple):
-        # Only a save_residuals=True kernel returns a pair, and this one is
-        # built without it; the check narrows the kernel's union return type.
-        raise ValueError("splash returned residuals this path has no consumer for")
     return jnp.moveaxis(attended, -3, -2)
 
 
@@ -1950,13 +1946,12 @@ def splash_block_sizes(q_len: int, kv_len: int, *, width: int, itemsize: int, so
     requires, and stays a multiple of `SPLASH_LANES`, as the key compute block
     requires. The backward forms each query's delta from its weights, sum_k p
     * dp, in a pass of the dq kernel's own before its dq and dkv kernels
-    (`BlockSizes.delta_from_weights`): the flash form, rowsum(o * do), leaves
+    (`dew.nn.kernels.splash`): the flash form, rowsum(o * do), leaves
     the output's rounding where a query reads one key, whose dq is exactly
     zero (1.2e-6 from a causal first query on a v5e, where the reference's is
     0); the sum of its weights cancels there, as the softmax's derivative
-    does. It reads each logits block three times where the fused kernel read
-    it once. Its blocks are set because a kernel built without them raises
-    "Need to specify backward blocks." at its first gradient. On a TPU whose scoped
+    does. It reads each logits block three times where a fused kernel would
+    read it once. Every block is set: the kernel takes no default. On a TPU whose scoped
     VMEM limit is measured (`GpuTarget.scoped_vmem`), past which a kernel fails
     to compile, they halve together, as measured (half of `SPLASH_BLOCK`
     compiled on every config), while they stay whole lanes, until its plan fits
@@ -1964,7 +1959,7 @@ def splash_block_sizes(q_len: int, kv_len: int, *, width: int, itemsize: int, so
     kernels set none), so the limit is the target's default, which a TPU does
     not report: where it is unmeasured the blocks stay whole.
     """
-    from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
+    from dew.nn.kernels import splash
 
     block_q, block_kv = math.gcd(SPLASH_BLOCK, q_len), math.gcd(SPLASH_BLOCK, kv_len)
     budget = generation.gpu_target().scoped_vmem
@@ -1972,10 +1967,10 @@ def splash_block_sizes(q_len: int, kv_len: int, *, width: int, itemsize: int, so
     while (budget is not None and splash_backward_vmem(back_q, back_kv, width, itemsize, softcap) > budget
            and min(back_q, back_kv) > SPLASH_LANES):
         back_q, back_kv = back_q // 2, back_kv // 2
-    return splash_attention_kernel.BlockSizes(
+    return splash.BlockSizes(
         block_q=block_q, block_kv=block_kv, block_kv_compute=block_kv,
         block_q_dkv=back_q, block_kv_dkv=back_kv, block_kv_dkv_compute=back_kv,
-        block_q_dq=back_q, block_kv_dq=back_kv, delta_from_weights=True)
+        block_q_dq=back_q, block_kv_dq=back_kv)
 
 
 def splash_mask_descriptor(q_len: int, kv_len: int, heads: int, causal: bool,
