@@ -19,14 +19,19 @@ class Blocks(grain.MapTransform):
     trains. `prompt=True` makes each document's tokens before its first assistant token a block, read from
     the record's `<field>_roles` (a chat row's), which a row without refuses. `given` names a per-token field
     of the record, -1 for none, whose blocks are the runs of consecutive tokens in one document that carry one
-    number, each run a block of its own. Padding is -1, and an unpacked record is one document. A count the
-    record carries is counted again over its blocks (`recounted`), so counts agree with the loss.
+    number, each run a block of its own. Padding is -1, and an unpacked record is one document. A prefix's
+    and a prompt's blocks follow the one rule a prefix run's loss reads (`prefix_groups`): a document's
+    places, where the record gives none, count its own tokens. With `fills`, a record that carries its own
+    blocks keeps them, as the loss keeps a batch's (`prefixed_fields`): the stage a prefix run installs
+    (`LMObjective.data`) fills the others. A count the record carries is counted again over its blocks
+    (`recounted`), so counts agree with the loss.
     """
 
     prefix: int | None = None
     prompt: bool = False
     given: str | None = None
     field: str = "text"
+    fills: bool = False
 
     def __post_init__(self) -> None:
         if [self.prefix is not None, self.prompt, self.given is not None].count(True) != 1:
@@ -36,19 +41,22 @@ class Blocks(grain.MapTransform):
 
     def map(self, element: Batch) -> Batch:
         from dew.data.chat import Role
-        from dew.nn.visibility import prefix_blocks, role_blocks
+        from dew.nn.visibility import prefix_groups
 
+        if self.fills and f"{self.field}_block_groups" in element:
+            return element
         length = len(element[self.field])
         segments = element.get(f"{self.field}_segment_ids")
         segments = np.ones(length, np.int32) if segments is None else np.asarray(segments, np.int32)
-        if self.prefix is not None:
-            places = element.get(f"{self.field}_positions")
-            places = np.arange(length, dtype=np.int32) if places is None else np.asarray(places, np.int32)
-            groups = prefix_blocks(segments, places, self.prefix, xp=np)
-        elif self.given is not None:
+        if self.given is not None:
             groups = _given_groups(segments, _named(element, self.given))
         else:
-            groups = role_blocks(segments, _named(element, f"{self.field}_roles"), Role.ASSISTANT, xp=np)
+            places = element.get(f"{self.field}_positions")
+            roles = None if self.prefix is not None else _named(element, f"{self.field}_roles")[None]
+            groups = prefix_groups(segments[None], segments[None] != 0,
+                                   "prompt" if self.prefix is None else self.prefix,
+                                   positions=None if places is None else np.asarray(places, np.int32)[None],
+                                   roles=roles, assistant=Role.ASSISTANT, xp=np)[0]
         blocked = {**element, f"{self.field}_block_groups": np.asarray(groups, np.int32)}
         return recounted(element, blocked)
 

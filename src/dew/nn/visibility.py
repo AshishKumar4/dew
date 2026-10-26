@@ -10,6 +10,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.nn.inputs import coordinates, document_starts
+
 
 def windowed(query, key, window: int, *, causal: bool):
     """Whether each key coordinate lies within the window of each query coordinate (broadcast): a
@@ -68,6 +70,27 @@ def _cummax(values, xp):
     if xp is np:
         return np.maximum.accumulate(values, axis=-1)
     return jax.lax.cummax(values, axis=values.ndim - 1)
+
+
+def prefix_groups(documents, real, prefix: int | Literal["prompt"], *, positions=None, roles=None,
+                  assistant: int = -1, xp=jnp):
+    """The blocks a prefix run of `prefix` reads in rows `[B, S]`: each document's first `prefix` places
+    (`prefix_blocks`), or under "prompt" its tokens before its first `assistant` token by the rows'
+    `roles` (`role_blocks`). `documents` number each row's documents and `real` marks its real tokens: a
+    document runs on across a hole in its validity, its starts and its places, where no `positions` give
+    them, counted over its real tokens as the decoder's coordinates count them (`document_starts`,
+    `coordinates`). The data stage `Blocks` and the loss of a batch without blocks (`LMObjective`) read
+    this one rule."""
+    documents = xp.asarray(documents).astype(xp.int32)
+    segments = xp.where(real, documents, 0).astype(xp.int32)
+    if prefix == "prompt":
+        starts = document_starts(documents, real, xp=xp)
+        return role_blocks(segments, xp.asarray(roles), assistant, starts=starts, xp=xp)
+    if positions is None:
+        places = coordinates(segments.shape, segments=documents, valid=real, xp=xp).positions
+    else:
+        places = xp.broadcast_to(xp.asarray(positions), segments.shape)
+    return prefix_blocks(segments, places, prefix, xp=xp)
 
 
 def prompt_blocks(valid, prefix: int | Literal["prompt"], *, xp=jnp):

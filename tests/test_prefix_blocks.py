@@ -80,9 +80,15 @@ def masked(decoder, params, tokens):
 
 
 def test_the_stage_makes_each_documents_first_tokens_the_blocks_of_its_packed_rows():
+    """Each document's first tokens make its block, by the places the record gives or, where it gives
+    none, by each document's own count of its tokens, as the loss counts them (`prefix_groups`)."""
     for segments, positions, expected in zip(SEGMENTS, POSITIONS, BLOCKS, strict=True):
         record = {"text": np.zeros(ROW, np.int32), "text_segment_ids": segments, "text_positions": positions}
         np.testing.assert_array_equal(Blocks(prefix=PREFIX).map(record)["text_block_groups"], expected)
+        unplaced = {name: value for name, value in record.items() if name != "text_positions"}
+        np.testing.assert_array_equal(Blocks(prefix=PREFIX).map(unplaced)["text_block_groups"], expected)
+    two = {"text": np.zeros(6, np.int32), "text_segment_ids": np.asarray([1, 1, 1, 2, 2, 2], np.int32)}
+    np.testing.assert_array_equal(Blocks(prefix=2).map(two)["text_block_groups"], [1, 1, -1, 2, 2, -1])
 
 
 def test_a_prefix_run_trains_the_block_mask_on_par_with_float64():
@@ -299,8 +305,24 @@ def test_a_count_the_record_carries_is_counted_again_over_its_blocks():
 
 def test_the_prefix_option_puts_the_block_stage_before_the_counts():
     data = LMObjective(blocky(), SEQ, prefix="prompt").data()
-    assert data.train[0] == Blocks(prompt=True)
+    assert data.train[0] == Blocks(prompt=True, fills=True)
     assert isinstance(data.train[1], CountTargets)
+
+
+@pytest.mark.parametrize("prefix", [PREFIX, "prompt"])
+def test_a_prefix_runs_stage_keeps_the_blocks_a_record_carries(prefix):
+    """The stage a prefix run installs fills only a record without blocks: one that carries its own keeps
+    them, as the loss keeps a batch's (`prefixed_fields`), in its training and its evaluation readers,
+    and a prompt run's record that carries blocks needs no roles. A stage a pipeline names itself
+    replaces them."""
+    data = LMObjective(blocky(), SEQ, prefix=prefix).data()
+    own = np.asarray([0, 0, -1, -1, 1, 1, 1, -1, -1], np.int32)
+    record = {"text": np.zeros(ROW, np.int32), "text_segment_ids": SEGMENTS[1], "text_block_groups": own}
+    for stages in (data.train, data.evaluate):
+        [stage] = [step for step in stages if isinstance(step, Blocks)]
+        np.testing.assert_array_equal(stage.map(record)["text_block_groups"], own)
+    named = Blocks(prefix=PREFIX).map({**record, "text_positions": POSITIONS[1]})
+    np.testing.assert_array_equal(named["text_block_groups"], BLOCKS[1])
 
 
 SERVED_PROMPTS = [[3, 1, 4, 1, 5], [2, 7, 1, 8, 2, 8], [9, 9, 9, 9, 9, 9, 9]]

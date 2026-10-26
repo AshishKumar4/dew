@@ -52,8 +52,6 @@ from dew.nn.inputs import (
     COORDINATES_FIELD,
     Coordinates,
     ModelInputs,
-    coordinates,
-    document_starts,
     pad_token_rows,
     real_slots,
     rotate_rows,
@@ -79,7 +77,7 @@ from dew.nn.protocols import (
     whole_block,
 )
 from dew.nn.sharding import LOGITS, constrain
-from dew.nn.visibility import prefix_blocks, role_blocks, same_group
+from dew.nn.visibility import prefix_groups, same_group
 from dew.objectives.base import (
     FROZEN,
     OMITTED,
@@ -342,23 +340,13 @@ def prefixed_fields(fields: Mapping[str, jax.Array | Coordinates], shape: tuple[
         return fields
     _, documents = token_layout(fields, xp=xp)
     real = real_slots(fields, shape, xp=xp)
-    ids = xp.ones(shape, xp.int32) if documents is None else xp.asarray(documents).astype(xp.int32)
-    # A document runs on across a hole in its validity: its starts and places count its real tokens
-    # (`document_starts`, `coordinates`), as the decoder's coordinates do.
-    segments = xp.where(real, ids, 0).astype(xp.int32)
-    if prefix == "prompt":
-        if roles is None:
-            raise ValueError(f"a prompt prefix run reads each row's roles ({ROLES_KEY}) to find its "
-                             "prompt, and this batch has none")
-        groups = role_blocks(segments, xp.asarray(roles), Role.ASSISTANT,
-                             starts=document_starts(ids, real, xp=xp), xp=xp)
-    else:
-        laid = fields.get(COORDINATES_FIELD)
-        given = laid.positions if isinstance(laid, Coordinates) else fields.get("positions")
-        rows = (shape[0], shape[1])
-        places = (coordinates(rows, segments=ids, valid=real, xp=xp).positions if given is None
-                  else xp.broadcast_to(xp.asarray(given), shape))
-        groups = prefix_blocks(segments, places, prefix, xp=xp)
+    if prefix == "prompt" and roles is None:
+        raise ValueError(f"a prompt prefix run reads each row's roles ({ROLES_KEY}) to find its "
+                         "prompt, and this batch has none")
+    laid = fields.get(COORDINATES_FIELD)
+    positions = laid.positions if isinstance(laid, Coordinates) else fields.get("positions")
+    groups = prefix_groups(xp.ones(shape, xp.int32) if documents is None else documents, real, prefix,
+                           positions=positions, roles=roles, assistant=Role.ASSISTANT, xp=xp)
     return {**fields, BLOCKS_FIELD: groups}
 
 
@@ -1216,9 +1204,9 @@ class LMObjective(TokenScorer):
         geometry = FixedTokens(self.seq_len, extra=1)
         blocks: tuple[Blocks, ...] = ()
         if self.prefix == "prompt":
-            blocks = (Blocks(prompt=True),)
+            blocks = (Blocks(prompt=True, fills=True),)
         elif self.prefix is not None:
-            blocks = (Blocks(prefix=self.prefix),)
+            blocks = (Blocks(prefix=self.prefix, fills=True),)
         if self.loss_role is None and self.pad_id is None and self.prefix is None:
             return ObjectiveData(train=(geometry,), evaluate=(geometry,))
         counted = CountTargets(
