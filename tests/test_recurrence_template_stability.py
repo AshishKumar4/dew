@@ -75,9 +75,9 @@ def launched(fn, *args) -> set[str]:
 
 def assert_finite(fn, truth, operands, regime: str) -> None:
     """`fn`'s leaves finite wherever the float64 truth's are, on `operands`."""
-    mine = jax.tree.leaves(fn(*operands))
+    mine = jax.tree.leaves(jax.jit(fn)(*operands))
     with jax.enable_x64(new_val=True):
-        exact = jax.tree.leaves(truth(*widened(operands)))
+        exact = jax.tree.leaves(jax.jit(truth)(*widened(operands)))
     for ours, theirs in zip(mine, exact, strict=True):
         finite = np.isfinite(np.asarray(theirs))
         assert np.all(np.isfinite(np.asarray(ours, np.float64))[finite]), (
@@ -93,13 +93,12 @@ def test_the_template_stays_finite_and_on_par_with_the_port_where_chunked_forms_
     port = functools.partial(chunk_on, 'fla', HOOKS)
     exact = functools.partial(token_by_token, HOOKS)
     if product == 'forward':
-        dew, reference, truth = (jax.jit(fn) for fn in (template, port, exact))
+        dew, reference, truth = template, port, exact
 
         def draws(seed):
             return (bf16(stressed(HOOKS, regime, seed)[0]),)
     else:
-        dew, reference, truth = (jax.jit(with_gradients(restarting(fn, regime)))
-                                 for fn in (template, port, exact))
+        dew, reference, truth = (with_gradients(restarting(fn, regime)) for fn in (template, port, exact))
 
         def draws(seed):
             operands, (out, final) = cotangents(HOOKS, regime, seed)
