@@ -727,6 +727,47 @@ def test_a_memory_refuses_a_bidirectional_decoder():
         decoder(causal=False).init(jax.random.key(0), ids)
 
 
+def test_a_memory_decoder_names_and_climbs_to_the_residuals_its_path_marks(capsys):
+    """A memory kind declares the residuals its path marks (`MixerBase.residuals`): a linear memory on
+    the delta rule, which runs the rule's port, its decay, inverse and memory, each of which a policy
+    saving it alone keeps for the backward, so its decoder's remat ladder takes the rung recomputing
+    the rule's memory alone; Titans' memory its chunk scan's carry, kept alike, and a ladder without
+    that rung."""
+    from jax.ad_checkpoint import print_saved_residuals
+    from model_support import TINY_DECODER
+
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.nn.backbones.decoder_block import RematPolicy
+    from dew.nn.kernels.generation import chosen
+    from dew.nn.mixer_base import DELTA_RESIDUALS
+    from dew.nn.mixers.memory import InContextMemoryMixer
+
+    def kept(memory: InContextMemory) -> tuple[tuple[str, ...], list]:
+        kind = InContextMemoryMixer(memory)
+        model = CausalTransformer(**{"vocab_size": 37, **TINY_DECODER, "dtype": jnp.float32, "mixer": kind})
+        ids = jax.random.randint(jax.random.key(3), (2, LENGTH), 0, 37)
+        variables = model.init(jax.random.key(4), ids)
+
+        def saves(name: str) -> bool:
+            capsys.readouterr()
+            loss = jax.checkpoint(lambda held: jnp.sum(model.apply(held, ids) ** 2),
+                                  policy=RematPolicy(save=(name,)).checkpoint_policy())
+            print_saved_residuals(loss, variables)
+            return f"named '{name}'" in capsys.readouterr().out
+
+        assert all(saves(name) for name in kind.residuals)
+        climbed = [model]
+        while (stronger := climbed[-1].recompute_more()) is not None:
+            climbed.append(stronger)
+        return kind.residuals, [rung.recompute_record() for rung in climbed]
+
+    with chosen(gated_delta_rule="fla"):
+        delta, delta_rungs = kept(layer("delta_rule"))
+    titans, titans_rungs = kept(layer("titans"))
+    assert set(DELTA_RESIDUALS) <= set(delta) and "all_but_delta_memory" in delta_rungs
+    assert CARRY in titans and "all_but_delta_memory" not in titans_rungs
+
+
 def test_muon_steps_each_memory_heads_matrices_on_their_own():
     """A memory decoder trains under Muon: each head's inner matrices are matrices Muon orthogonalizes on
     their own, by Linen's kernel convention (inputs into outputs), its biases take AdamW's update, and
