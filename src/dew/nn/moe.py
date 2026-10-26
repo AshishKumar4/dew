@@ -38,7 +38,7 @@ from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
 from .kernels import grouped_matmul
-from .kernels.generation import backend, triton_runs
+from .kernels.generation import triton_runs
 from .kernels.grouped_matmul import GROUPED, portable_projection
 from .kernels.selection import select, selected
 from .kernels.templates.gemm import template
@@ -445,7 +445,8 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     'xla' runs `jax.lax.ragged_dot`; 'auto' and 'pallas' the GEMM template
     (`dew.nn.kernels.templates.gemm.template.gemm`), its launches where they run
     the call (a GPU of sm80 on that states the tensor rate their cost model
-    reads, and for 'pallas' a CPU, which interprets them) and XLA's program
+    reads, and for 'pallas' a CPU process that states the GPU it emulates,
+    `generation.assumed`, which interprets them) and XLA's program
     elsewhere, a TPU's above all, which the route reports with the reason; both
     hold it in every differentiation mode. A call no launch takes here (the
     grouped selector's requirements, `grouped_matmul.GROUPED`: a product the
@@ -465,7 +466,7 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     named = 'xla' if implementation == 'xla' else None
     # The template's forward launches as the call leaves them, which take it or leave it to XLA here,
     # before the template's dispatch selects each of its launches: the kernels run in a GPU's process,
-    # or interpreted in a CPU's where 'pallas' asks.
+    # or interpreted in a CPU's emulating an assumed GPU where 'pallas' asks.
     def spec(array):
         return jax.ShapeDtypeStruct(array.shape, compute)
 
@@ -474,7 +475,7 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
         spec(x), spec(kernel), jax.ShapeDtypeStruct(group_sizes.shape, jnp.int32), out_dtype=compute,
         trans_rhs=False, interpret=not triton_runs(), promoted=product.promoted), product=product,
         whole=seen_whole(x) and seen_whole(kernel),
-        placed=triton_runs() or (implementation == 'pallas' and backend() == 'cpu'))
+        placed=triton_runs())
     if not selected(GROUPED, case, named).generic:
         # The GEMM template: its launches where they run the call (each reports its route), XLA's
         # program elsewhere, differentiable at every order.

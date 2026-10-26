@@ -369,7 +369,7 @@ class _Triton(_GroupedLaunch[Tile]):
     def eligible(self, ba, target) -> bool:
         # Every CUDA GPU the template sends the kernels to (`templates.gemm.template`), and
         # a CPU, which interprets them, or traces the CUDA branch a GPU's lowering takes; never a TPU.
-        cuda = generation.capability(generation.effective(target).generation) is not None
+        cuda = generation.capability(target.generation) is not None
         return cuda and _rated(target, ba.arguments['tokens'].dtype)
 
     @staticmethod
@@ -387,7 +387,7 @@ class _Triton(_GroupedLaunch[Tile]):
         the output rows a multiple of wgmma's 64. Either other kind ran 1.2 to 8.5 times slower than the
         fastest tile on an H100 (GMM-h100-2: an accumulator of 256 registers a thread spills; a 32-row
         share falls back to Ampere's MMA)."""
-        wgmma = generation.effective(target).wgmma
+        wgmma = target.wgmma
 
         exact_sums = ba.arguments.get('exact_sums')
         accumulators = 2 if exact_sums else 1
@@ -425,7 +425,7 @@ class _Triton(_GroupedLaunch[Tile]):
         # pipelines a wgmma, which reads one step while the next loads; an A100 and an H100 refuse
         # exactly those bytes, so a Hopper tile is sized for the larger. The prologue's side tiles load
         # in the same steps.
-        held = 0 if generation.effective(target).wgmma else 1
+        held = 0 if target.wgmma else 1
         step = self.loaded(config) * jnp.dtype(ba.arguments['tokens'].dtype).itemsize + _side_tile_bytes(
             ba.arguments['prologue_operands'], ba.arguments['hooks'].prologue_axes, self.extents(config))
         # A contraction of one step has no loop whose dead stages the output's layout conversion reuses:
@@ -514,7 +514,7 @@ class Gmm(_Triton):
         flops = 2 * tiles * config.block_m * depth * width
         steps = tiles * math.ceil(depth / config.block_k) / chunks
         staged = steps * _triton_staged(config.block_m, config.block_n, config.block_k, config.warps,
-                                        generation.effective(target).wgmma) * size
+                                        target.wgmma) * size
         hooks, prologue_sides = ba.arguments['hooks'], ba.arguments['prologue_operands']
         epilogue_sides = ba.arguments['epilogue_operands']
         # Side operands are read again as the operands are: with each column block, and with each row
@@ -609,7 +609,7 @@ class Tgmm(_Triton):
         steps = _row_tiles(rows, groups, config.block_m) / groups
         flops = 2 * steps * config.block_m * config.block_k * config.block_n
         staged = steps * _triton_staged(config.block_k, config.block_n, config.block_m, config.warps,
-                                        generation.effective(target).wgmma) * size
+                                        target.wgmma) * size
         hooks, sides = ba.arguments['hooks'], ba.arguments['prologue_operands']
         rereads = {'rows': groups, 'depth': blocks[0], 'columns': blocks[1]}
         moved = ((blocks[1] * rows * depth + blocks[0] * rows * width) * size
@@ -668,16 +668,13 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     def eligible(self, ba, target) -> bool:
         first, second = (value.dtype for name, value in ba.arguments.items()
                          if name in ('tokens', 'kernel', 'cotangent'))
-        # Interpreted only in a CPU process: the interpreter's callbacks are ordered effects, which a GPU
-        # process's lowering of the platform choice cannot carry in the CPU branch it does not take.
-        interpretable = not ba.arguments['interpret'] or jax.default_backend() == 'cpu'
         # Hooked and exactly summed calls run on warpgroup MMA alone: mma.sync's kernels take them (its
         # side loads, vector reads and running sum lower), but its register model does not yet count what
         # they hold, and its derived tiles spilled (ns-regs2: sm86's normed forward 16 bytes, exact sums 136).
         special = ba.arguments['hooks'] != NO_HOOKS or ba.arguments.get('exact_sums')
-        return (first == second and jnp.dtype(first).itemsize == 2 and interpretable
+        return (first == second and jnp.dtype(first).itemsize == 2
                 and _rated(target, first) and self._family(ba, target) is not None
-                and (generation.effective(target).wgmma or not special)
+                and (target.wgmma or not special)
                 and self._hooks_lower(ba, first, target)
                 and (self.EXACT_SUMS or not ba.arguments.get('exact_sums'))
                 and self.derived(ba, target) is not None)
@@ -705,18 +702,18 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         return _bundle(config, jnp.bfloat16).registers(config.warpgroups)
 
     def _family(self, ba, target) -> mosaic.Family | None:
-        """The bundle the launch runs on `target` (its `effective` target's, a CPU interpreting as an
-        A100): Hopper's warpgroup MMA where it has it, Ampere's mma.sync on a CUDA GPU without it where
-        the launch takes it (`_families`), none on any other device (a TPU's launches are its own)."""
-        facts = generation.effective(target)
-        if generation.capability(facts.generation) is None:
+        """The bundle the launch runs on `target`: Hopper's warpgroup MMA where it has it, Ampere's
+        mma.sync on a CUDA GPU without it where the launch takes it (`_families`), none on any other
+        device (a TPU's launches are its own; a CPU interprets a GPU's only where `generation.assumed`
+        names it)."""
+        if generation.capability(target.generation) is None:
             return None
-        wanted = 'wgmma' if facts.wgmma else 'mma.sync'
+        wanted = 'wgmma' if target.wgmma else 'mma.sync'
         return next((family for family in self._families(ba) if family.name == wanted), None)
 
     def _families(self, ba) -> tuple[mosaic.Family, ...]:
-        """The bundles the launch takes at its operands' dtype, interpreted or lowered (`_families`)."""
-        return bundles.families(ba.arguments['tokens'].dtype, interpreted=bool(ba.arguments['interpret']))
+        """The bundles the launch takes at its operands' dtype (`bundles.families`)."""
+        return bundles.families(ba.arguments['tokens'].dtype)
 
     @abc.abstractmethod
     def _generated_extents(self, ba) -> tuple[int, int | None, int]:
@@ -731,7 +728,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         rows, depth, width = self._generated_extents(ba)
         return mosaic_gpu.derived(family, rows=rows, depth=depth, width=width,
                                   dtype=ba.arguments['tokens'].dtype,
-                                  multiprocessors=_multiprocessors(generation.effective(target)),
+                                  multiprocessors=_multiprocessors(target),
                                   holds=lambda tile: self.legal(ba, tile, target), grouped=depth is not None)
 
     def neighbours(self, ba, config: mosaic_gpu.Tiles) -> tuple[mosaic_gpu.Tiles, ...]:
@@ -896,7 +893,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     @staticmethod
     def _in_flight(config: mosaic_gpu.Tiles, target) -> float:
         """The row tiles a band of the planar snake keeps in flight at once on `target`."""
-        return max(1.0, _multiprocessors(generation.effective(target)) / config.grid_block_n)
+        return max(1.0, _multiprocessors(target) / config.grid_block_n)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1054,7 +1051,7 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
         # 16-byte aligned rows of every operand and output, as its TMA copies and each group's pointers
         # need: every extent a multiple of 8 elements.
         extents = {extent for operand in operands for extent in operand.shape[1:]}
-        built = generation.effective(target).generation
+        built = target.generation
         return (built in cutlass_architectures()
                 and all(operand.dtype == jnp.bfloat16 for operand in operands)
                 and jnp.dtype(ba.arguments['out_dtype']) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32))
@@ -1131,10 +1128,9 @@ class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
         # (`GROUPED`'s 'step_sums' routes such a product to XLA).
         first, second = (value.dtype for name, value in ba.arguments.items()
                          if name in ('tokens', 'kernel', 'cotangent'))
-        interpretable = not ba.arguments['interpret'] or jax.default_backend() == 'cpu'
         rules = mosaic_tpu_lowering.lowering_rules[tpu_core.CoreType.TC]
         return (generation.tpu(target) and target.scoped_vmem is not None
-                and first == second == jnp.bfloat16 and interpretable and _rated(target, first)
+                and first == second == jnp.bfloat16 and _rated(target, first)
                 and self.derived(ba, target) is not None and _hooks_lower(ba, first, rules)
                 and not ba.arguments.get('exact_sums'))
 
@@ -1197,7 +1193,7 @@ class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
         """Whether `config`'s blocks are whole vregs' lanes dividing their extents (the grouped rows' any),
         lay out every side operand (`_lays_out`) and, double-buffered with the fp32 accumulator, fit the
         TPU's scoped VMEM (`Template.legal`'s rule, VMEM for a block's shared memory)."""
-        budget = generation.effective(target).scoped_vmem
+        budget = target.scoped_vmem
         blocks = (config.block_m, config.block_n, config.block_k)
         return (budget is not None
                 and all(block % mosaic_tpu.LANES == 0 and (axis == self.ROW_AXIS or extent % block == 0)
@@ -1209,7 +1205,7 @@ class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
         VMEM for the budget."""
         fits = self.fits(ba, target)
         if not fits:
-            raise base.Unfitted(type(self).__name__, None, generation.effective(target).scoped_vmem or 0,
+            raise base.Unfitted(type(self).__name__, None, target.scoped_vmem or 0,
                                 target.generation)
         return fits
 
@@ -1412,7 +1408,7 @@ def _multiprocessors(target: generation.GpuTarget) -> int:
 def _rated(target: generation.GpuTarget, dtype) -> bool:
     """Whether `target` states the tensor rate a launch over `dtype` operands is costed by: a generation
     that states none runs XLA's grouped matmul, needing no estimate (`GROUPED`'s 'rate')."""
-    return generation.effective(target).tensor_rate(_mode(dtype)) is not None
+    return target.tensor_rate(_mode(dtype)) is not None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1498,7 +1494,7 @@ def _cell(case: "GroupedCase") -> tuple[str, str, str] | None:
     """The `OLD_ROUTES` cell a call is: its GPU's instruction family, its product (a kernel gradient,
     exactly summed or not, or an input gradient or a forward) and whether it is dense; None off a CUDA
     GPU."""
-    target = generation.effective(case.call.target)
+    target = case.call.target
     if generation.capability(target.generation) is None:
         return None
     arguments = next(iter(case.call.bound.values()))[1].arguments
@@ -1566,18 +1562,14 @@ def grouped_case(launches, arguments, options, *, product: Product, whole: bool,
 
 def launched(launches, arguments, options, *, product: Product, whole: bool):
     """The launch of `launches` that runs the call (`arguments`, `options`) as `GROUPED` selects it,
-    ready to call, or None where XLA's program takes it. A GPU process's CPU branch, which never runs,
-    interprets Triton's, the one launch that interprets there (`_Mosaic.eligible`), as the call's own
-    preference: a chosen implementation names the GPU's launch, the branch the call takes. A CPU
-    process's GPU branch, which runs only where a lowering for the GPU takes it, takes a chosen
-    implementation where it can and the order's next launch where it cannot (mma.sync's where this JAX
-    lowers none: `_families`), the CPU branch, which runs, insisting on it."""
+    ready to call, or None where XLA's program takes it. A CPU process's GPU branch, which runs only where
+    a lowering for the GPU takes it, takes a chosen implementation where it can and the order's next
+    launch where it cannot (mma.sync's where this JAX lowers none: `_families`); every branch a process
+    runs insists on it."""
     case = grouped_case(launches, arguments, options, product=product, whole=whole)
-    cpu = jax.default_backend() == 'cpu'
-    stand_in = options['interpret'] and not cpu
-    unrun = not options['interpret'] and cpu
-    named = 'triton' if stand_in else selection.forced(GROUPED.choice) if unrun else None
-    route = selection.select(GROUPED, case, named, insist=not (stand_in or unrun))
+    unrun = not options['interpret'] and jax.default_backend() == 'cpu'
+    named = selection.forced(GROUPED.choice) if unrun else None
+    route = selection.select(GROUPED, case, named, insist=not unrun)
     if route.kernel == 'xla':
         return None
     return functools.partial(case.call.implementation(route.kernel), *arguments, **options)
@@ -1609,13 +1601,20 @@ def tgmm_call(tokens, cotangent, sizes, prologue_operands: tuple = (), *, out_dt
 
 
 def _on_platform(kernel, fallback, interpret_on_cpu: bool):
-    """`kernel` where the call lowers for its target's platform (CUDA, or a TPU's), interpreted on the
-    CPU when asked for, and `fallback` everywhere else: a TPU's program, which never runs on CUDA, holds
-    no CUDA branch, and a GPU's no TPU branch. A new family member runs its template after the
-    hardware-free checks, its native qualification an open item until measured (bible §6)."""
-    tpu = generation.tpu(generation.gpu_target())
+    """`kernel` where the call lowers for its target's platform (CUDA, or a TPU's), and `fallback`
+    everywhere else: a TPU's program, which never runs on CUDA, holds no CUDA branch, and a GPU's no TPU
+    branch. A test's `interpret_on_cpu` interprets the kernel in a CPU process, as the GPU or TPU it
+    emulates (`generation.assumed`), which it must state: interpreted for no device's facts, a launch
+    would have none to derive its tile from, and the call would quietly run `fallback`. A new family
+    member runs its template after the hardware-free checks, its native qualification an open item until
+    measured (bible §6)."""
+    target = generation.gpu_target()
+    tpu = generation.tpu(target)
     branches = {'tpu' if tpu else 'cuda': functools.partial(kernel, interpret=False)}
-    if interpret_on_cpu:
+    if interpret_on_cpu and jax.default_backend() == 'cpu':
+        if not tpu and generation.capability(target.generation) is None:
+            raise ValueError("interpret_on_cpu interprets the kernel as the GPU or TPU this CPU process "
+                             "emulates; state it with generation.assumed(...)")
         branches['cpu'] = functools.partial(kernel, interpret=True)
     return branches, fallback
 

@@ -38,8 +38,8 @@ from typing import Protocol
 
 import jax
 import jax.numpy as jnp
-from jax.custom_derivatives import linear_call
 
+from dew.nn.kernels.generation import linear_map
 from dew.nn.kernels.templates.attention_algebra import power2
 from dew.nn.precision import compensated_add, float32_einsum, float32_matmul
 
@@ -273,7 +273,7 @@ def _decays_tangent(primals, tangents):
     dg, _ = tangents
     grown, decay = decays(g, documents)
     return (grown, decay), (grown * _cumulated(dg, documents)[0],
-                            linear_call(_ranged, _ranged_transpose, decay, dg))
+                            linear_map(_ranged, _ranged_transpose, decay, dg))
 
 
 def factor(a, issue: Issue = portable):
@@ -420,8 +420,8 @@ def _remembered_tangent(issue, name, primals, tangents):
     `_remembered_transpose`, in forward and reverse mode alike."""
     decayed, entered = primals
     d_decayed, d_entered = tangents
-    read = linear_call(lambda decayed, entered: issue(name, decayed, entered),
-                       functools.partial(_remembered_transpose, issue=issue, name=name), decayed, d_entered)
+    read = linear_map(lambda decayed, entered: issue(name, decayed, entered),
+                      functools.partial(_remembered_transpose, issue=issue, name=name), decayed, d_entered)
     return remembered(decayed, entered, issue, name), issue(name, d_decayed, entered) + read
 
 

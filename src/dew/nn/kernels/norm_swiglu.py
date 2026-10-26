@@ -255,9 +255,10 @@ def _dtype_requirements[C: _Typed](name: str, case_type: type[C]) -> tuple[Requi
 
 
 def _runs(case) -> bool:
-    """Whether the Pallas kernels run for `case` here: a GPU Dew's Triton kernels run on, or on a CPU
-    interpreted where the call names them (`case.named`)."""
-    return generation.triton_runs() or (case.named == 'pallas' and generation.backend() == 'cpu')
+    """Whether the Pallas kernels run here: on a GPU Dew's Triton kernels run on (`generation.triton_runs`),
+    the assumed one's within `generation.assumed`. Off one, every call takes XLA's arithmetic, a kernel
+    named per call too; a test interprets the kernels by calling them (`rms_norm`, `swiglu`) itself."""
+    return generation.triton_runs()
 
 
 def _split() -> bool:
@@ -299,8 +300,7 @@ class NormCase:
     and whether it is `empty`; whether its weight is a vector over the features (`scale_fits`), a
     residual branch is the input's shape and dtype (`branch_fits`) and a gate its shape
     (`gate_fits`), and its operands' mesh placement fits (`placed`); whether an activation follows it
-    (`activated`), its statistics are fp32's, and a gated norm's `activation` (None for a plain one);
-    and the implementation the call `named`, None for 'auto'."""
+    (`activated`), its statistics are fp32's, and a gated norm's `activation` (None for a plain one)."""
     dtypes: tuple[np.dtype, ...]
     width: int
     empty: bool
@@ -311,11 +311,10 @@ class NormCase:
     activated: bool
     fp32_statistics: bool
     activation: str | None
-    named: str | None
 
 
-def norm_case(implementation: str, x, scale, dtype, axes, *, branch=None, gate=None, activated=False,
-              fp32_statistics=True, activation=None) -> NormCase:
+def norm_case(x, scale, dtype, axes, *, branch=None, gate=None, activated=False, fp32_statistics=True,
+              activation=None) -> NormCase:
     """The `NormCase` of a norm over `x` and its weight `scale`, a residual `branch` and a `gate`. A
     branch adds in `x`'s dtype, as the stream's own add does; a gate is read in fp32 whatever its float
     dtype, as the XLA arithmetic widens it."""
@@ -327,8 +326,7 @@ def norm_case(implementation: str, x, scale, dtype, axes, *, branch=None, gate=N
         branch_fits=branch is None or (branch.shape == x.shape and branch.dtype == x.dtype),
         gate_fits=gate is None or gate.shape == x.shape,
         placed=_placed(axes, (x, scale, branch, gate), whole_last=True), activated=activated,
-        fp32_statistics=fp32_statistics, activation=activation,
-        named=None if implementation == 'auto' else implementation)
+        fp32_statistics=fp32_statistics, activation=activation)
 
 
 NORM_SUPPORTS: tuple[Requirement[NormCase], ...] = (
@@ -375,7 +373,7 @@ def rms_kernel(implementation: str, x, scale, dtype, fp32_statistics: bool, *,
     do a residual `branch` the stream's own add would broadcast or cast and
     an activation after the norm. `axes`, `x`'s logical axes, places the
     kernel on a mesh (`_placed`)."""
-    case = norm_case(implementation, x, scale, dtype, axes, branch=branch, activated=activated,
+    case = norm_case(x, scale, dtype, axes, branch=branch, activated=activated,
                      fp32_statistics=fp32_statistics)
     return _selected(NORM, case, implementation)
 
@@ -383,7 +381,7 @@ def rms_kernel(implementation: str, x, scale, dtype, fp32_statistics: bool, *,
 def gated_rms_kernel(implementation: str, x, gate, scale, dtype, activation: str, *, axes=None) -> str:
     """Resolve the gated RMSNorm (`gated_rms_norm`), the one kernel family
     `KERNELS` names 'rms_norm'; other gates keep their XLA arithmetic."""
-    return _selected(NORM, norm_case(implementation, x, scale, dtype, axes, gate=gate, activation=activation),
+    return _selected(NORM, norm_case(x, scale, dtype, axes, gate=gate, activation=activation),
                      implementation)
 
 
@@ -391,13 +389,11 @@ def gated_rms_kernel(implementation: str, x, gate, scale, dtype, activation: str
 class SwigluCase:
     """A SiLU product as the SwiGLU selector reads it (`SWIGLU`): its operands' `dtypes` and the dtype
     their product `promotes` to (weak types honoured, as the operands' own promotion is), whether they
-    share a shape the kernel reads (`shape_fits`), whether their mesh placement fits (`placed`), and the
-    implementation the call `named`, None for 'auto'."""
+    share a shape the kernel reads (`shape_fits`) and whether their mesh placement fits (`placed`)."""
     dtypes: tuple[np.dtype, ...]
     promotes: np.dtype
     shape_fits: bool
     placed: bool
-    named: str | None
 
 
 SWIGLU_SUPPORTS: tuple[Requirement[SwigluCase], ...] = (
@@ -441,8 +437,7 @@ def swiglu_kernel(implementation: str, gate, up, *, axes=None) -> str:
     case = SwigluCase(dtypes=(jnp.dtype(gate.dtype), jnp.dtype(up.dtype)),
                       promotes=jnp.dtype(jnp.result_type(gate, up)),
                       shape_fits=gate.shape == up.shape and bool(gate.shape) and gate.size > 0,
-                      placed=_placed(axes, (gate, up), whole_last=False),
-                      named=None if implementation == 'auto' else implementation)
+                      placed=_placed(axes, (gate, up), whole_last=False))
     return _selected(SWIGLU, case, implementation)
 
 
@@ -453,8 +448,7 @@ def packed_swiglu_kernel(implementation: str, gate_up, *, axes=None) -> str:
     case = SwigluCase(dtypes=(jnp.dtype(gate_up.dtype),), promotes=jnp.dtype(gate_up.dtype),
                       shape_fits=gate_up.ndim >= 2 and gate_up.shape[-2] == 2 and gate_up.size > 0,
                       placed=_placed(None if axes is None else (*axes[:-1], None, axes[-1]), (gate_up,),
-                                     whole_last=False),
-                      named=None if implementation == 'auto' else implementation)
+                                     whole_last=False))
     return _selected(SWIGLU, case, implementation)
 
 
@@ -778,10 +772,10 @@ def stream_rms_norm(x, branch, scale, epsilon: float, dtype, offset: bool, after
     scale)` its arithmetic in XLA. The forward reads both addends once and writes the sum beside the norm;
     the reverse takes the stream's own cotangent into the norm's pass, so the sum of the two gradients is
     never a separate pass over the stream; an output nothing reads still gives the reverse a cotangent
-    of zeros, which `linear_call`'s transpose instantiates, and a pre-norm seam reads both. A None
-    branch is `rms_norm`'s, the stream `x` itself. It
-    interprets where no Triton GPU runs it (`generation.triton_runs`), as the CPU suite does, and lowers
-    for the assumed GPU within `generation.assumed`, as the GDN kernels decide. Every order of
+    of zeros, which the linear map's transpose instantiates (`generation.linear_map`), and a pre-norm
+    seam reads both. A None branch is `rms_norm`'s, the stream `x` itself. It
+    interprets where no Triton GPU runs it (`generation.triton_runs`), as the CPU suite calls it, and
+    lowers for the assumed GPU within `generation.assumed`, as the GDN kernels decide. Every order of
     derivative goes through `portable` and each level's value through the kernels
     (`generation.linear_tangent`)."""
     if branch is None:

@@ -1491,7 +1491,7 @@ def _prepared(q, k, v, g, beta, h0, *, starts, max_segments, scale, delta, tiles
     rows = chunks * CHUNK
     given = held = _Operand(rows, _parts(dtype), dtype)
     call = _Call(heads, heads // k.shape[2], width, columns, rows, given, held, per_key, delta, family,
-                 interpret, generation.effective(generation.gpu_target()).multiprocessors or 1)
+                 interpret, generation.gpu_target().multiprocessors or 1)
     hi, lo = prefix(laid(g).reshape(chunks, CHUNK, -1))
     # A decay a head's prefix a head's row of vectors `[HV, R]`, one a key dimension's tiles `[R, HV * Dk]`.
     hi, lo = (x.reshape(rows, -1) if per_key else x.reshape(rows, heads).T for x in (hi, lo))

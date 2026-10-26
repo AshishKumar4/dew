@@ -200,8 +200,8 @@ def gated_product(activation: GatedActivation, *, implementation: str = 'auto',
     (`rounded_to`), the inputs' included: left to XLA, a third of Qwen3-0.6B's
     bf16 products differed from transformers' by up to 2 ulp. fp32 and wider
     round nowhere. A `Situ` computes its own product. SwiGLU's
-    `implementation` defaults to the generation's measured kernel; explicit
-    'pallas' interprets on CPU. GeGLU and SiTU remain XLA products. `axes`,
+    `implementation` defaults to the generation's measured kernel; off a GPU,
+    'pallas' too runs XLA's product. GeGLU and SiTU remain XLA products. `axes`,
     the operands' logical axes, place the kernel on a mesh."""
     if isinstance(activation, Situ):
         return activation

@@ -29,10 +29,12 @@ def test_the_compiled_shapes_reach_the_widest_keys_and_values_the_port_takes():
 
 
 @pytest.mark.parametrize("target, wide", [("sm80", True), ("sm90", True), ("sm86", False), ("sm89", False),
-                                          ("sm120", False), ("sm100", True), ("sm110", False), ("cpu", True)])
+                                          ("sm120", False), ("sm100", True), ("sm110", False),
+                                          ("cpu", False)])
 def test_a_gpu_takes_an_a100s_picks_where_its_block_holds_as_much_shared_memory(target, wide):
-    """An A100's picks on every GPU whose block holds as much shared memory, the 99 KB ones elsewhere,
-    on a GPU the targets do not list (sm110) too, and an A100's where a CPU interprets."""
+    """An A100's picks on every GPU whose block holds as much shared memory, the 99 KB ones elsewhere: on a
+    GPU the targets do not list (sm110), and on a CPU, which has no GPU's facts unless a test states the GPU
+    it emulates (`generation.assumed`)."""
     with generation.assumed(target):
         assert chunked_launch._wide() is wide
 
