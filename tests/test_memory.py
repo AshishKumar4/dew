@@ -12,7 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from flax import linen as nn
+from flax import linen as nn, traverse_util
 from flax.typing import Dtype
 from reference_error import assert_as_exact, with_gradients
 
@@ -26,7 +26,8 @@ MEMORY_SEEDS = 8
 """The declared seeds for check 1 of the memories (`assert_as_exact`): `seeds_for` on armada sizes every
 configuration, its token-by-token, decoded, packed, cached and recurrence paths included, at 8 over the
 drawn weights."""
-SEEDS = {"self-generated gradients": 256, "memory decoder gradient": 256, "memory decoder decode": 32}
+SEEDS = {"self-generated gradients": 256, "memory decoder gradient": 256, "memory decoder decode": 32,
+         "adapted memory": 8}
 """The sites `seeds_for` on armada sizes past `MEMORY_SEEDS`: the self-modifying memory's and the memory
 decoder's gradients, every parameter's leaf, at 256, each reference compared with itself, and the
 decoder's last logits after a cached decode at 32."""
@@ -463,18 +464,19 @@ def test_an_orthogonalized_step_follows_the_paper_with_muons_iteration():
                     truth_fn=written(module, dtype=jnp.float64, gradient=gradient))
 
 
-def decoder(**fields):
-    """A tiny decoder of two Titans-style memory layers, which a scanned stack scans as one group, then
-    two attention layers."""
+def decoder(memory: InContextMemory | None = None, **fields):
+    """A tiny decoder of two memory layers, Titans-style where `memory` is None, which a scanned stack
+    scans as one group, then two attention layers."""
     from model_support import TINY_DECODER
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.layer_plan import LayerKind
     from dew.nn.mixers.memory import InContextMemoryMixer
 
-    memory = InContextMemory(network=MLPMemory(hidden=(16,)), heads=2, head_features=8, chunk=4,
-                             normalize=True, learning_rate=Gate(scale=STEP), momentum=Gate(),
-                             retention=Gate(bias=-2.0))
+    if memory is None:
+        memory = InContextMemory(network=MLPMemory(hidden=(16,)), heads=2, head_features=8, chunk=4,
+                                 normalize=True, learning_rate=Gate(scale=STEP), momentum=Gate(),
+                                 retention=Gate(bias=-2.0))
     return CausalTransformer(**{"vocab_size": 37, **TINY_DECODER, "num_layers": 4, "dtype": jnp.float32,
                                 "layer_types": ("memory", "memory", "attention", "attention"),
                                 "kinds": {"memory": LayerKind(mixer=InContextMemoryMixer(memory))}, **fields})
@@ -530,6 +532,60 @@ def test_a_memory_decoder_trains_scans_remats_and_decodes():
 
     assert_as_exact(decoded, last(plain), draw_model, "memory decoder decode",
                     seeds=SEEDS["memory decoder decode"], truth_fn=last(wide))
+
+
+ADAPTED = {"titans": ("layers_0", "layers_1"), "gated_linear_attention": ("kernel",),
+           "delta_rule": ("kernel",)}
+"""Each configuration's inner kernels by the module names an adapter targets (`dew.lora.LoRA.modules`):
+Titans' two MLP layers and a linear memory's one map, at every head of both memory layers."""
+
+
+def factor_draw(model, lora, seed: int):
+    """A seed's base weights for `model`, `lora` attached over them with its factors drawn a tenth of a
+    normal apart from zero, and its token rows."""
+    ids = np.random.default_rng([1649, seed]).integers(0, 37, (ROWS, LENGTH), dtype=np.int32)
+    adapter = lora.apply(model, model.init(jax.random.key(seed), ids), key=seed)
+    rng = np.random.default_rng([1650, seed])
+    factors = jax.tree.map(lambda leaf: (0.1 * rng.standard_normal(leaf.shape)).astype(np.float32),
+                           adapter.variables["params"])
+    return {**adapter.variables, "params": factors}, ids
+
+
+@pytest.mark.parametrize("name", sorted(ADAPTED))
+def test_an_adapter_on_a_memorys_inner_kernels_trains_drops_and_merges(name):
+    """LoRA on every head's inner kernels of two memory layers (`dew.lora`): fresh, the decoder's logits
+    are the base's bit for bit; its loss's gradient reaches every inner B factor; a forward that carries
+    the dropout stream drops the branches' inputs, so its logits move; and with drawn factors the
+    adapted decoder computes its merge, on par against the merge in float64 (check 1): a retention
+    forgets the adapter's update as it forgets W_0's, and a linear memory's recurrence reads the adapted
+    map."""
+    from dew.lora import LoRA
+
+    model, wide = decoder(layer(name)), decoder(layer(name), dtype=jnp.float64)
+    lora = LoRA(rank=2, modules=ADAPTED[name], dropout=0.5)
+    ids = jnp.asarray(factor_draw(model, lora, 0)[1])
+    base = model.init(jax.random.key(0), ids)
+    adapter = lora.apply(model, base, key=0)
+    adapted = adapter.model
+    np.testing.assert_array_equal(np.asarray(adapted.apply(adapter.variables, ids)),
+                                  np.asarray(model.apply(base, ids)))
+
+    gradient = jax.grad(lambda factors: jnp.sum(adapted.apply({**adapter.variables, "params": factors}, ids)
+                                                ** 2))(adapter.variables["params"])
+    inner = [leaf for path, leaf in traverse_util.flatten_dict(gradient).items()
+             if path[-1] == "lora_B" and "initial" in path]
+    assert len(inner) == 2 * HEADS * len(ADAPTED[name])
+    assert all(np.abs(np.asarray(leaf)).max() > 0 for leaf in inner)
+
+    drawn_factors, ids = factor_draw(model, lora, 0)
+    dropped = adapted.apply(drawn_factors, ids, rngs={"dropout": jax.random.key(3)})
+    assert not np.array_equal(np.asarray(dropped), np.asarray(adapted.apply(drawn_factors, ids)))
+
+    def merged(model):
+        return jax.jit(lambda variables, ids: model.apply(adapter.merge(variables), ids))
+
+    assert_as_exact(jax.jit(adapted.apply), merged(model), functools.partial(factor_draw, model, lora),
+                    f"adapted {name} memory", seeds=SEEDS["adapted memory"], truth_fn=merged(wide))
 
 
 def test_a_memory_refuses_a_bidirectional_decoder():
