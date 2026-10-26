@@ -228,10 +228,6 @@ _DEFAULT_LAYOUT = Layout()
 class Trainer(Generic[Loss, Effects]):
     """Runs an `Objective`: gradients, sharding, EMA, checkpoints and logging."""
 
-    _restaged: bool = False
-    """Whether a schedule's stage has begun in this fit, whose batches may be shaped as no earlier
-    stage's were (`_scheduled`): the step lays its accumulation window out for them."""
-
     def __init__(
         self,
         objective: Objective[Loss, Effects],
@@ -1022,7 +1018,7 @@ class Trainer(Generic[Loss, Effects]):
                         lambda variables: narrowed(variables, candidate.copies),
                         out_shardings=candidate.shardings.compute)(current.variables))
                 if (window > 1 and self.step is None and (current.accumulation is None or (
-                        (self._ramp or self._restaged)
+                        (self._ramp or self._stage_starts)
                         and not current.accumulation.replays(candidate.prepared.accumulation)))):
                     # The window, and with it the split, is the state's from here on.
                     current = dataclasses.replace(self._initialize_accumulation(
@@ -1238,7 +1234,7 @@ class Trainer(Generic[Loss, Effects]):
             with self._traced_on(cpu):
                 batch = transfer(batch, batch_shardings(cpu, batch))
                 if self.accumulation > 1 and (current.accumulation is None or (
-                        (self._ramp or self._restaged)
+                        (self._ramp or self._stage_starts)
                         and not current.accumulation.replays(prepared.accumulation))):
                     current = self._initialize_accumulation(current, batch, shapes, window=self.accumulation)
                 # The device steps run in the accelerator's forward (`HostExecution`).
@@ -1578,8 +1574,8 @@ class Trainer(Generic[Loss, Effects]):
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None else None)
             self._ramp = run.source.stages if isinstance(run.source, RampedStream) else ()
-            self._restaged = False
-            # The steps a stage after the first begins at, each where an update does (`Ramp.stages`).
+            # The steps a stage after the first begins at, each where an update does (`Ramp.stages`): a
+            # ramp's here, a schedule's as each begins (`_scheduled`); the step lays its window out there.
             self._stage_starts = frozenset(accumulate((after.records - stage.records) // stage.batch
                                                       for stage, after in pairwise(self._ramp)))
             if self._ramp:
@@ -1685,7 +1681,6 @@ class Trainer(Generic[Loss, Effects]):
         # stage begins after is dropped as a ramp's stage drops it (`_staged`), and laid out for the
         # stage's batches, which may be shaped as no earlier stage's were (`_runner`).
         self._stage_starts = self._stage_starts | {run.current}
-        self._restaged = True
         run.train = self._prefetched(plan, run, source, state)
         run.source = None  # Lifetime transferred to the prefetch worker.
 
