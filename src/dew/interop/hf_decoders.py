@@ -67,6 +67,10 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.gemma3n import AltUp
 from dew.nn.vision.gemma3n import translate_gemma3n_projector_config, translate_gemma3n_vision_config
 from dew.nn.vision.gemma4 import translate_gemma4_projector_config, translate_gemma4_vision_config
+from dew.nn.vision.gemma4_unified import (
+    translate_projector as unified_projector,
+    translate_vision as unified_vision,
+)
 from dew.nn.vision.llama4 import translate_llama4_projector_config, translate_llama4_vision_config
 from dew.nn.vision.qwen35 import translate_qwen35_projector_config, translate_qwen35_vision_config
 from dew.nn.vision.siglip import translate_gemma_projector_config, translate_siglip_vision_config
@@ -148,8 +152,8 @@ def _wrapper_token_id(hf_config: Mapping[str, object], used: set, *names: str) -
     return refuse(names[0], f"the placeholder positions are marked by {list(names)}, none is set")
 
 
-def _wrapper_fields(model_type: str, used: set[str], text: DecoderFields, tower: Mapping[str, object],
-                    projector: Mapping[str, object], image: int, tokens: int | None,
+def _wrapper_fields(model_type: str, used: set[str], text: DecoderFields, tower: Mapping[str, object] | None,
+                    projector: Mapping[str, object] | None, image: int, tokens: int | None,
                     audio: AudioFields = NO_AUDIO, *, video: int | None = None,
                     extra: tuple[int, ...] = ()) -> WrapperFields:
     """A wrapper's record, its text decoder typed `<model_type>_text`, with the
@@ -249,6 +253,31 @@ def _gemma4_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields
                            video=video, extra=(video, audio_id))
 
 
+def _gemma4_unified_wrapper(hf_config: Mapping[str, object], used: set[str]) -> WrapperFields:
+    """Encoder-free vision patches and raw audio frames projected into the shared decoder."""
+    text = _wrapper_text(hf_config, used, declared_type='gemma4_unified_text')
+    width = record_int(text, 'emb_features')
+    vision = hf_config.get('vision_config')
+    tower = projector = None
+    if vision is not None:
+        vision = _records.record(vision, 'vision_config')
+        tower = unified_vision(vision)
+        projector = unified_projector(vision, width, record_int(tower['fields'], 'mm_embed_dim'))
+    audio = hf_config.get('audio_config')
+    audio_fields: AudioFields = NO_AUDIO
+    audio_id = _records.integer(hf_config.get('audio_token_id', 258881), 'audio_token_id')
+    if audio is not None:
+        audio = _records.record(audio, 'audio_config')
+        audio_fields = {'audio': None, 'audio_projector': unified_projector(
+            audio, width, _records.integer(audio.get('audio_embed_dim', 640), 'audio_embed_dim')),
+                        'audio_token_id': audio_id, 'audio_soft_tokens': None}
+    image = _records.integer(hf_config.get('image_token_id', 258880), 'image_token_id')
+    video = _records.integer(hf_config.get('video_token_id', 258884), 'video_token_id')
+    used.update(('audio_config', 'audio_token_id', 'video_token_id', 'boa_token_id', 'eoa_token_index'))
+    return _wrapper_fields('gemma4_unified', used, text, tower, projector, image, None,
+                           audio_fields, video=video, extra=(video, audio_id))
+
+
 def _qwen35_wrapper(hf_config: Mapping[str, object], used: set) -> WrapperFields:
     """Read a Qwen 3.5 wrapper: NaViT-style tower, merger, decoder."""
     if hf_config.get('language_model_only', False) is not False:
@@ -285,6 +314,7 @@ def _gemma3n_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wrapper
 
 _WRAPPERS: Mapping[str, Callable[[Mapping[str, object], set[str]], WrapperFields]] = {
     "gemma3": _gemma3_wrapper, "llama4": _llama4_wrapper, "gemma4": _gemma4_wrapper,
+    "gemma4_unified": _gemma4_unified_wrapper,
     **dict.fromkeys(QWEN35_TYPES, _qwen35_wrapper), "gemma3n": _gemma3n_wrapper}
 
 
@@ -326,9 +356,11 @@ def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
     ones. A family that reads its media bundle whole keeps the decoder's
     tensors unprefixed.
     """
-    tower_prefix = vision_nn.tower_layout(_kind_name(record, "tower")).prefix
-    projector_prefix = vision_nn.projector_layout(_kind_name(record, "projector")).prefix
-    audio = record.get("audio") is not None
+    tower_prefix = (None if record["tower"] is None else
+                    vision_nn.tower_layout(_kind_name(record, "tower")).prefix)
+    projector_prefix = (None if record["projector"] is None else
+                        vision_nn.projector_layout(_kind_name(record, "projector")).prefix)
+    audio = record.get("audio_projector") is not None
     bundled = _bundled(record["model_type"])
     bare = name.removeprefix("model.")
     if bare.startswith("language_model."):
@@ -336,14 +368,14 @@ def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
         return "language_model", tail if tail.startswith(
             ("model.", "lm_head.weight", "mtp.")
         ) else f"model.{tail}"
-    for prefix in (projector_prefix,) if isinstance(projector_prefix, str) else projector_prefix:
+    for prefix in (projector_prefix,) if isinstance(projector_prefix, str) else projector_prefix or ():
         if bare.startswith(prefix):
             return "projector", bare[len(prefix):]
-    if bare.startswith(tower_prefix):
+    if tower_prefix is not None and bare.startswith(tower_prefix):
         return "tower", bare[len(tower_prefix):]
     if audio and bare.startswith("embed_audio."):
         return "audio_projector", bare[len("embed_audio."):]
-    if audio and bare.startswith("audio_tower."):
+    if record.get("audio") is not None and bare.startswith("audio_tower."):
         return "audio_tower", bare[len("audio_tower."):]
     if ((bare.startswith("mtp.") and record["text_model_type"] in QWEN35_TEXT_TYPES)
             or bare == "lm_head.weight"):
@@ -588,12 +620,15 @@ def read_wrapper(
               for group, held in sources.items()}
     language, readings = read_decoder(tables["language_model"], record["text"], param_dtype=param_dtype,
                                       lazy=lazy, checked=_renamed(checked, sources["language_model"]))
-    tower, tower_layouts = vision_nn.tower_variables(_kind_name(record, "tower"), tables["tower"],
-                                                     param_dtype)
-    projector, projector_layouts = vision_nn.projector_variables(
-        _kind_name(record, "projector"), tables["projector"], param_dtype)
-    variables = {"language_model": language, "tower": tower, "projector": {"params": projector}}
-    placed = {"tower": tower_layouts, "projector": nested(projector_layouts, 0, "params")}
+    variables = {"language_model": language}
+    placed = {}
+    if record["tower"] is not None:
+        tower, tower_layouts = vision_nn.tower_variables(_kind_name(record, "tower"), tables["tower"],
+                                                         param_dtype)
+        projector, projector_layouts = vision_nn.projector_variables(
+            _kind_name(record, "projector"), tables["projector"], param_dtype)
+        variables.update(tower=tower, projector={"params": projector})
+        placed.update(tower=tower_layouts, projector=nested(projector_layouts, 0, "params"))
     audio = record.get("audio")
     if audio is not None:
         encoder = towers.from_record(audio)
@@ -601,6 +636,7 @@ def read_wrapper(
             raise ValueError(f"audio tower {audio['class']!r} has no weight map here")
         variables["audio_tower"], placed["audio_tower"] = audio_nn.audio_weights(
             tables["audio_tower"], encoder, param_dtype=param_dtype)
+    if record.get("audio_projector") is not None:
         audio_projector, audio_layouts = vision_nn.projector_variables(
             _kind_name(record, "audio_projector"), tables["audio_projector"], param_dtype)
         variables["audio_projector"] = {"params": audio_projector}

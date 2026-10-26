@@ -1448,6 +1448,7 @@ towers: Aliases[type[TowerBase], TowerBase] = Aliases("tower", {
     "gemma3n": "dew.nn.vision.gemma3n:Gemma3nVision",
     "gemma3n_audio": "dew.nn.audio:Gemma3nAudio",
     "gemma4": "dew.nn.vision.gemma4:Gemma4Vision",
+    "gemma4_unified": "dew.nn.vision.gemma4_unified:Gemma4UnifiedVision",
     "gemma4_audio": "dew.nn.audio:Gemma4Audio",
     "llama4": "dew.nn.vision.llama4:Llama4Vision",
     "mimo": "dew.nn.vision.mimo:MiMoVision",

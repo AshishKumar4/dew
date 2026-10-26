@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
+from typing import TYPE_CHECKING, Protocol, Self, overload, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -12,6 +12,7 @@ import numpy as np
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
+from dew._model_types import GEMMA4_TYPES
 from dew.batch import Coordinates, coordinates as build_coordinates
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
@@ -19,7 +20,7 @@ from dew.nn.inputs import CrossContext, next_position
 from dew.nn.kv_cache import POSITION
 from dew.nn.protocols import OutputTable, ProjectionGroup, held_groups
 from dew.nn.sharding import explicit_spec
-from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase
+from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase, TowerGeometry
 from dew.nn.wrapping import DecoderWrapper
 
 if TYPE_CHECKING:
@@ -50,9 +51,19 @@ class Fusion:
     media: jax.Array | None
 
 
-def _conditioner_modules(tower: TowerBase, projector: ProjectorBase, dtype, precision):
+@overload
+def _conditioner_modules(tower: TowerBase, projector: ProjectorBase, dtype, precision
+                          ) -> tuple[nn.Module, ProjectorBase]: ...
+
+
+@overload
+def _conditioner_modules(tower: None, projector: ProjectorBase, dtype, precision
+                          ) -> tuple[None, ProjectorBase]: ...
+
+
+def _conditioner_modules(tower: TowerBase | None, projector: ProjectorBase, dtype, precision):
     """A media tower and native projector in the conditioner's compute policy."""
-    return (tower.build().clone(dtype=dtype, precision=precision),
+    return (None if tower is None else tower.build().clone(dtype=dtype, precision=precision),
             projector.clone(dtype=dtype, precision=precision))
 
 
@@ -132,7 +143,7 @@ class AudioConditioner(nn.Module):
     carry the embedder's padding token, as modeling_gemma3n.py does.
     """
 
-    audio: TowerBase
+    audio: TowerBase | None
     projection: ProjectorBase
     soft_tokens: int | None = None
     padding_id: int | None = None
@@ -149,16 +160,19 @@ class AudioConditioner(nn.Module):
         if features.ndim != 4 or mask.shape != features.shape[:3]:
             raise ValueError("input_features must be [B, A, T, F] with a [B, A, T] frame mask")
         batch, clips = features.shape[:2]
-        encoding = self.audio_tower(features.reshape(batch * clips, *features.shape[2:]),
-                              mask.reshape(batch * clips, features.shape[2]))
-        projected = self.audio_projector(encoding.features)
+        flat = features.reshape(batch * clips, *features.shape[2:])
+        valid = mask.reshape(batch * clips, features.shape[2])
+        if self.audio_tower is not None:
+            encoding = self.audio_tower(flat, valid)
+            flat, valid = encoding.features, encoding.mask
+        projected = self.audio_projector(flat)
         if self.soft_tokens is not None:
             if not isinstance(self.audio_projector, HardVocabularyEmbedder) or self.padding_id is None:
                 raise ValueError("fixed audio slots require the Gemma 3n embedder and its padding token")
             padding = self.audio_projector.embed_hard(jnp.full((1, 1), self.padding_id, jnp.int32)).astype(
                 projected.dtype
             )
-            projected = jnp.where(encoding.mask[..., None], projected, padding)
+            projected = jnp.where(valid[..., None], projected, padding)
             missing = self.soft_tokens - projected.shape[1]
             if missing < 0:
                 raise ValueError(
@@ -172,8 +186,11 @@ class AudioConditioner(nn.Module):
 
     def initialize_parameters(self) -> None:
         """Create the audio leaves during a token-only model init."""
-        geometry = self.audio.geometry()
-        mel = geometry.mel_features or 128
+        geometry = TowerGeometry() if self.audio is None else self.audio.geometry()
+        # Without an audio tower, raw frames are the projector's input.
+        mel = self.projection.input_width if self.audio is None else geometry.mel_features or 128
+        if mel is None:
+            raise ValueError("a raw-audio projector declares its input width")
         # Fixed slots take no more encoded frames than they hold: one token's frames a slot.
         frames = 16 if self.soft_tokens is None else (geometry.frames_per_token or 16) * self.soft_tokens
         self({"input_features": jnp.zeros((1, 1, frames, mel), self.dtype or jnp.float32),
@@ -208,8 +225,8 @@ class MultimodalTransformer(DecoderWrapper):
     wraps = "language_model"
 
     language_model: CausalTransformer
-    vision: TowerBase
-    projection: ProjectorBase
+    vision: TowerBase | None
+    projection: ProjectorBase | None
     family: str
     image_token_id: int
     pad_token_id: int = 0
@@ -223,7 +240,7 @@ class MultimodalTransformer(DecoderWrapper):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """Text-only decoder work. Media inputs require their own tower geometry."""
-        if self.audio is not None:
+        if isinstance(self.audio_projection, HardVocabularyEmbedder):
             raise MissingFlopsCount("MultimodalTransformer needs its hard-audio-vocabulary matrix geometry")
         return counted_flops(self.language_model, lengths)
 
@@ -266,13 +283,16 @@ class MultimodalTransformer(DecoderWrapper):
         raise MissingFlopsCount(f"MultimodalTransformer has no matrix usage for {'/'.join(relative)}")
 
     def setup(self):
-        self.conditioner = VisionConditioner(
-            self.vision, self.projection,
-            dtype=self.dtype, precision=self.precision)
-        nn.share_scope(self.conditioner, self)
-        if (self.audio is None) != (self.audio_projection is None):
-            raise ValueError("an audio tower and its projector arrive together")
-        if self.audio is not None and self.audio_projection is not None:
+        if (self.vision is None) != (self.projection is None):
+            raise ValueError("a vision embedding and its projector arrive together")
+        if self.vision is not None and self.projection is not None:
+            self.conditioner = VisionConditioner(
+                self.vision, self.projection,
+                dtype=self.dtype, precision=self.precision)
+            nn.share_scope(self.conditioner, self)
+        if self.audio is not None and self.audio_projection is None:
+            raise ValueError("an audio tower requires its projector")
+        if self.audio_projection is not None:
             self.audio_conditioner = AudioConditioner(
                 self.audio, self.audio_projection, self.audio_soft_tokens,
                 self.vocab_size - 1 if self.family == "gemma3n" else None,
@@ -294,7 +314,7 @@ class MultimodalTransformer(DecoderWrapper):
         ranges, so it runs this path with no payloads too; any other call
         without payloads leaves the decoder its own lookup.
         """
-        if self.family == "gemma4":
+        if self.family in GEMMA4_TYPES:
             placeholder = tokens == self.image_token_id
             for token_id in self.extra_placeholder_ids:
                 placeholder = placeholder | (tokens == token_id)
@@ -331,10 +351,12 @@ class MultimodalTransformer(DecoderWrapper):
                     raise TypeError("Gemma 3n media embedders carry the hard vocabulary")
                 embeddings = embedder.merge_hard_embeddings(embeddings, tokens)
         if conditioning is not None and image_indices is not None:
+            if self.vision is None:
+                raise ValueError("image_indices require a vision embedding")
             embeddings = self.conditioner.fuse(embeddings, image_indices, conditioning, train=train)
         if conditioning is not None and audio_indices is not None:
-            if self.audio is None:
-                raise ValueError("audio_indices require an audio tower")
+            if self.audio_projection is None:
+                raise ValueError("audio_indices require an audio projector")
             embeddings = _place(embeddings, self.audio_conditioner(conditioning), audio_indices)
         return Fusion(decoder_tokens, embeddings, media)
 
@@ -423,8 +445,9 @@ class MultimodalTransformer(DecoderWrapper):
         # The towers read the media; the language model reads the context, and checks it.
         context, media = CrossContext.parted(conditioning)
         if media is None and self.is_initializing():
-            self.conditioner.initialize_parameters()
-            if self.audio is not None:
+            if self.vision is not None:
+                self.conditioner.initialize_parameters()
+            if self.audio_projection is not None:
                 self.audio_conditioner.initialize_parameters()
         fused = self._fused(tokens, image_indices, audio_indices, media, train=train)
         return self.language_model.hidden_states(
