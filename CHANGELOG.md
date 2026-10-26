@@ -10,10 +10,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   (`dew.nn.precision.widened_reduction`, beside `accumulated`), in place of a CPU-only blocked
   reduction; a float64 schedule division is the plain division; and a plan over several devices is
   timed against the batch whole a rung up on every backend: it keeps the first plan unless the other's
-  every sample beats it (`dew.training.planning.faster`), so two runs of one configuration train one
-  program, and a resumed run continues its checkpoint's plan untimed. Dew's tests keep a frontier's
-  first plan (`DEW_UNTIMED_FRONTIER`, a test setting like `DEW_WIDE_CPU_ARITHMETIC`). The sharded LM head maps over the axes that
-  split its tokens alone, every other axis left automatic, in place of holding every axis manual.
+  every sample beats it (`dew.training.planning.faster`), so samples that overlap never switch it (two
+  runs timed apart may still keep different plans), and a resumed run continues its checkpoint's plan
+  untimed. Dew's tests keep a frontier's first plan (`DEW_UNTIMED_FRONTIER`, a test setting like
+  `DEW_WIDE_CPU_ARITHMETIC`).
 - A loaded decoder's pad row takes no gradient wherever its source's table pads it. Kimi Linear, Kimi K3,
   Ouro, Dream, LLaDA-MoE and LLaDA2 now pad `pad_token_id` as their released code does, at their config
   class's own default where a config states none; Dew trained that row before. Qwen 3.5's wrappers load
@@ -95,7 +95,6 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 - An S3 store's conditional writes go through s3fs's own call (`call_s3`), as its reads and plain writes
   do, so a profile's server-side encryption (a KMS key, SSE-C) and its bucket's regional client reach
   them; a refused condition is still `PreconditionFailed`.
-  timed against the batch whole a rung up on every backend.
 - 8-bit Adam state codes each moment value among the six codes around its estimate, its decade by its
   logarithm, instead of searching the whole map: on an A100, lm-dense's update takes 27.32 ms against
   60.39, its full-remat step 167.9 against 196.3 ms and compiles in 82.3 against 209.8 s, the codes
