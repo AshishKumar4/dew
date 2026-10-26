@@ -36,7 +36,7 @@ LMObjective(MyLM(...), seq_len=2048)
 ```
 
 - Flax NNX modules go through Flax's own NNX-to-Linen bridge; Dew has no second module system.
-- Variables are whatever Flax returns (plain dicts, or `FrozenDict` from older code). The Trainer normalizes the tree once at its boundary, so training, saving and restoring see one form.
+- Variables are whatever Flax returns (plain dicts, or `FrozenDict` from older code or a loaded task). The trees an objective holds and the collections its loss writes back are plain dicts (`dew.batch.dicts`), and the Trainer normalizes its state once at its boundary, so placement, training, saving and restoring see one form.
 - Pretrained weights come from `Pretrained.load("Qwen/Qwen3.5-0.8B")`, which returns the module, its variables and its processor.
 
 ### A context read through cross-attention

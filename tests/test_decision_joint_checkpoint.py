@@ -46,6 +46,7 @@ from dew.training.trainer import Trainer
 FIXTURES = Path(__file__).parent / "fixtures"
 TINY = FIXTURES / "joint_checkpoint" / "tiny"
 BACKBONE = FIXTURES / "hf" / "qwen38-dense-tiny"
+LAYA_TINY = FIXTURES / "laya" / "tiny"
 CASES = json.loads((FIXTURES / "laya" / "cases.json").read_text())
 
 
@@ -303,6 +304,60 @@ def test_a_joint_release_saves_as_the_release_it_was_read_from(tmp_path):
     request = CASES["quickstart"]
     assert Decide.of(restored, name="release").systemone(request) == Decide.of(
         bundle, name="release").systemone(request)
+
+
+def released(kind: str, directory: Path) -> Path:
+    """A release of each decision format laid out at `directory`: the joint head beside its Qwen 3.5
+    backbone, a slot-and-pointer head (`readout_head.pt`) beside the same backbone, or Laya's tiny
+    checkpoint."""
+    if kind == "laya":
+        return LAYA_TINY
+    from test_slot_sources import slot_release
+
+    if kind == "slot":
+        source, _ = slot_release(directory, "head")
+        return source
+    directory.mkdir()
+    for source in [*BACKBONE.iterdir(), TINY / "joint_head_config.json", TINY / "joint_head.safetensors"]:
+        (directory / source.name).symlink_to(source.resolve())
+    return directory
+
+
+def written_tensors(directory: Path) -> dict[str, np.ndarray]:
+    """Every tensor a saved release holds, by its name in its file: its safetensors shards and a slot
+    head's `readout_head.pt`."""
+    import torch
+
+    held = {}
+    for path in sorted(directory.glob("*.safetensors")):
+        held.update(load_file(path))
+    if (directory / "readout_head.pt").is_file():
+        held.update({name: tensor.numpy() for name, tensor in
+                     torch.load(directory / "readout_head.pt", weights_only=True).items()})
+    return held
+
+
+@pytest.mark.parametrize("kind", ["joint", "slot", "laya"])
+def test_a_decision_release_exports_every_tensor_it_saves(tmp_path, kind):
+    """A release's `export` is every tensor its `save` writes, the readout's beside the backbone's, by
+    its name in the release's files, so a weight push (`NCCLPush`) sends the whole task, where an
+    inherited export once gave the backbone's tensors alone; `backbone` exports the backbone alone,
+    the saved backbone's tensors."""
+    bundle = Pretrained.load(released(kind, tmp_path / "release"), dtype="float32", attention_impl="xla")
+    exported = bundle.export()
+    bundle.save(tmp_path / "saved")
+    written = written_tensors(tmp_path / "saved")
+    assert exported.keys() == written.keys()
+    for name, tensor in written.items():
+        np.testing.assert_array_equal(np.asarray(exported[name]), tensor, err_msg=name, strict=True)
+    if kind != "laya":
+        backbone = bundle.backbone()
+        assert not hasattr(backbone, "head_variables")
+        backbone.save(tmp_path / "backbone")
+        alone = written_tensors(tmp_path / "backbone")
+        assert alone.keys() < exported.keys()
+        for name, tensor in backbone.export().items():
+            np.testing.assert_array_equal(alone[name], np.asarray(tensor), err_msg=name, strict=True)
 
 
 def test_a_joint_release_fine_tunes_and_reloads_from_the_run(tmp_path):

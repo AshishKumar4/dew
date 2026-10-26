@@ -795,11 +795,11 @@ class Trainer(Generic[Loss, Effects]):
 
     def _banked_frozen(self, tree, stack, release=None):
         """Stack each scanned run's shared leaves of `tree` into one bank
-        (`execution.banked`).
+        (`dew.inference.banks.banked`).
 
         That is the shape a placement and a checkpoint template take, and the
         arrays the state holds."""
-        from dew.training.execution import banked
+        from dew.inference.banks import banked
         return banked(tree, self.bank_sites, stack, release)
 
     def _placed_host(self, initializer, key, shardings: Placement[TrainState]) -> TrainState:
