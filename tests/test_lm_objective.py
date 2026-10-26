@@ -39,6 +39,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import Step
 from dew.objectives.lm import TEXT_KEY, LMObjective, Perplexity, Samples
+from dew.objectives.routing import ExpertBalance
 from dew.sampling import Sampling
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
@@ -957,7 +958,7 @@ def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
     from dew.nn.backbones.decoder_block import Mixture
     model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=2,
                               max_seq_len=8, mixture=Mixture(experts=4, top_k=2, expert_features=16))
-    zed = LMObjective(model, 8, ema_decay=None, router_z_loss=0.3)
+    zed = LMObjective(model, 8, ema_decay=None, balance=ExpertBalance(router_z_loss=0.3))
     initialized = jax.jit(zed.init)
     captured = selection_margins.capture(model)
     config = {"mixture": {"experts": 4, "top_k": 2}}

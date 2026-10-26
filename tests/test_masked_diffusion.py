@@ -59,7 +59,7 @@ def test_biased_masked_objective_scores_the_same_affine_logits_as_its_forward():
     corrupted, is_masked = process.corrupt(mask_key, tokens, times)
     # The objective reads this corruption (`Step.tape`).
     step = Step(jnp.asarray(0), jax.random.key(1), None, tape={"times": times, "mask": is_masked})
-    _, losses, _, _, predicted, _ = objective._token_losses(variables, {'text': tokens}, step, train=False)
+    _, losses, _, _, predicted, _, _ = objective._token_losses(variables, {'text': tokens}, step, train=False)
     logits = model.apply(variables, corrupted).at[..., 31].set(-jnp.inf)
     expected = optax.softmax_cross_entropy_with_integer_labels(logits, tokens)
     # The same 1e-5 relative loss contract as the bias-free chunked head.
@@ -93,7 +93,7 @@ def test_a_media_slot_reaches_the_model_and_is_never_masked_or_scored():
     params["params"]["media"] = jnp.ones(8)
     media = {"text": ModelInputs(tokens, {"image_indices": slots})}
     step = Step(jnp.asarray(0), jax.random.key(1), None)
-    _, losses, _, counted, _, real = objective._token_losses(params, media, step, train=False)
+    _, losses, _, counted, _, real, _ = objective._token_losses(params, media, step, train=False)
     plain = objective._token_losses(params, {"text": tokens}, step, train=False)[1]
 
     np.testing.assert_array_equal(real, slots < 0)
