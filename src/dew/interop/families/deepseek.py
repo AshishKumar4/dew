@@ -16,7 +16,7 @@ from typing import Literal
 
 import numpy as np
 
-from dew import records
+from dew import _records
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
@@ -83,7 +83,7 @@ def _minimax_m2_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
         if hf_config.get(name, expected) != expected:
             refuse(name, f'{reason}; requires {expected!r}')
     used.add('attn_type_list')
-    layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    layers = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     if hf_config.get('attn_type_list', [1] * layers) != [1] * layers:
         refuse('attn_type_list', 'MiniMax-M2 uses full attention in every layer')
     # These release fields are absent from the reference's config/modeling;
@@ -91,8 +91,8 @@ def _minimax_m2_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
     used.update(('use_mtp', 'num_mtp_modules', 'mtp_transformer_layers',
                  'mlp_intermediate_size', 'shared_moe_mode',
                  'output_router_logits', 'router_aux_loss_coef'))
-    head_dim = records.integer(hf_config.get('head_dim', 128), 'head_dim')
-    rotary_dim = records.integer(hf_config.get('rotary_dim', head_dim), 'rotary_dim')
+    head_dim = _records.integer(hf_config.get('head_dim', 128), 'head_dim')
+    rotary_dim = _records.integer(hf_config.get('rotary_dim', head_dim), 'rotary_dim')
     # The release states its rotary under rope_scaling, which transformers reads as rope_parameters
     # and MiniMaxM2RotaryEmbedding builds through its rope_type (modeling_minimax_m2.py:150-165).
     ropes, factor = read_partial_rope(hf_config, used, _MINIMAX_M2_SPELLING,
@@ -107,8 +107,8 @@ def _minimax_m2_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
     config.update(qk_norm_scope='projection', partial_rotary_factor=factor,
                   partial_rotary_type='default')
     config['mixture'] = native_fields(Mixture)(
-        experts=records.integer(hf_config['num_local_experts'], 'num_local_experts'),
-        top_k=records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok'),
+        experts=_records.integer(hf_config['num_local_experts'], 'num_local_experts'),
+        top_k=_records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok'),
         score_function='sigmoid', bias=True)
     used.update(('num_local_experts', 'num_experts_per_tok'))
     return config
@@ -156,8 +156,8 @@ def deepseek_mixture(hf_config: Mapping[str, object], layers: int, used: set, *,
         **deepseek_layout(hf_config, layers, used, sparse_layers=sparse_layers),
         'score_function': 'sigmoid',
         **({'norm_topk_prob': norm_topk} if reads_norm_topk else {}),
-        'groups': records.integer(hf_config.get('n_group') or 1, 'n_group'),
-        'groups_per_token': records.integer(hf_config.get('topk_group') or 1, 'topk_group'),
+        'groups': _records.integer(hf_config.get('n_group') or 1, 'n_group'),
+        'groups_per_token': _records.integer(hf_config.get('topk_group') or 1, 'topk_group'),
         'bias': True,
     })
 
@@ -182,8 +182,8 @@ def _deepseek_v2_mixture(hf_config: Mapping[str, object], layers: int,
     if method not in ('greedy', 'group_limited_greedy'):
         refuse(f"topk_method {method!r}",
                 "DeepseekV2TopkRouter selects greedy or group_limited_greedy")
-    groups = records.integer(hf_config.get('n_group') or 1, 'n_group')
-    per_token = records.integer(hf_config.get('topk_group') or 1, 'topk_group')
+    groups = _records.integer(hf_config.get('n_group') or 1, 'n_group')
+    per_token = _records.integer(hf_config.get('topk_group') or 1, 'topk_group')
     if method == 'greedy' and (groups, per_token) != (1, 1):
         refuse(f"n_group {groups} with topk_method 'greedy'",
                 "the greedy selection ignores the groups")
@@ -217,7 +217,7 @@ def deepseek_routed(hf_config: Mapping[str, object], layers: int, used: set) -> 
                 "transformers builds every layer past the dense ones as MoE, "
                 "whatever this field says")
     # A dense prefix past the stack leaves every layer dense, as DeepseekV3DecoderLayer builds them.
-    first_k = min(records.integer(hf_config.get('first_k_dense_replace', 0) or 0, 'first_k_dense_replace'),
+    first_k = min(_records.integer(hf_config.get('first_k_dense_replace', 0) or 0, 'first_k_dense_replace'),
                   layers)
     if first_k < 0:
         refuse(f"first_k_dense_replace {first_k!r}",
@@ -225,8 +225,8 @@ def deepseek_routed(hf_config: Mapping[str, object], layers: int, used: set) -> 
     pattern = hf_config.get('mlp_layer_types')
     if pattern is not None:
         expected = ['dense'] * first_k + ['sparse'] * (layers - first_k)
-        if list(records.strings(pattern, 'mlp_layer_types')) != expected:
-            refuse(f"mlp_layer_types {list(records.strings(pattern, 'mlp_layer_types'))!r}",
+        if list(_records.strings(pattern, 'mlp_layer_types')) != expected:
+            refuse(f"mlp_layer_types {list(_records.strings(pattern, 'mlp_layer_types'))!r}",
                     "it disagrees with first_k_dense_replace, which is what "
                     "the reference builds")
     return tuple(range(first_k, layers))
@@ -250,21 +250,21 @@ def deepseek_layout(hf_config: Mapping[str, object], layers: int,
         refuse("n_routed_experts",
                 "a DeepSeek MoE layer needs its expert count")
     sparse = deepseek_routed(hf_config, layers, used) if sparse_layers is None else sparse_layers
-    shared = records.integer(hf_config.get('n_shared_experts', 0) or 0, 'n_shared_experts')
+    shared = _records.integer(hf_config.get('n_shared_experts', 0) or 0, 'n_shared_experts')
     shared_features = 0
     if shared:
         width = hf_config.get('moe_intermediate_size')
         if width is None:
             refuse("moe_intermediate_size",
                     "the shared experts need their width")
-        shared_features = shared * records.integer(width, 'moe_intermediate_size')
+        shared_features = shared * _records.integer(width, 'moe_intermediate_size')
     return native_fields(Mixture)(
-        experts=records.integer(experts, 'n_routed_experts'),
-        top_k=records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok'),
+        experts=_records.integer(experts, 'n_routed_experts'),
+        top_k=_records.integer(hf_config['num_experts_per_tok'], 'num_experts_per_tok'),
         layers=sparse,
-        scaling=records.number(hf_config.get('routed_scaling_factor', 1.0), 'routed_scaling_factor'),
+        scaling=_records.number(hf_config.get('routed_scaling_factor', 1.0), 'routed_scaling_factor'),
         shared_features=shared_features,
-        expert_features=records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size'),
+        expert_features=_records.integer(hf_config['moe_intermediate_size'], 'moe_intermediate_size'),
     )
 
 
@@ -282,9 +282,9 @@ def deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
     """
     ropes = read_rope(hf_config, used, PLAIN_SPELLING, ramps=('yarn',), per_kind=False)
     config = base_config(hf_config, used, rope=ropes)
-    layer_types = records.strings(config.get('layer_types'), 'layer_types')
+    layer_types = _records.strings(config.get('layer_types'), 'layer_types')
     model_type = hf_config['model_type']
-    layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    layers = _records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
     # A schedule whose dense layers are all of them routes nothing, as the reference builds it, and the
     # mixture's fields describe nothing it computes.
     routed = deepseek_routed(hf_config, layers, used)
@@ -302,15 +302,15 @@ def deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
             refuse(f"layer_types entry {entry!r}",
                     f"a {model_type} model mixes no attention kinds: "
                     f"every layer is {sparse_name}")
-    nope = records.integer(hf_config['qk_nope_head_dim'], 'qk_nope_head_dim')
-    rope = records.integer(hf_config['qk_rope_head_dim'], 'qk_rope_head_dim')
+    nope = _records.integer(hf_config['qk_nope_head_dim'], 'qk_nope_head_dim')
+    rope = _records.integer(hf_config['qk_rope_head_dim'], 'qk_rope_head_dim')
     head_dim = hf_config.get('head_dim')
-    if head_dim is not None and records.integer(head_dim, 'head_dim') != rope:
+    if head_dim is not None and _records.integer(head_dim, 'head_dim') != rope:
         refuse(f"head_dim {head_dim!r}",
                 "DeepSeek points head_dim at the rope slice, "
                 f"which is {rope} wide here")
     derived = hf_config.get('qk_head_dim')
-    if derived is not None and records.integer(derived, 'qk_head_dim') != nope + rope:
+    if derived is not None and _records.integer(derived, 'qk_head_dim') != nope + rope:
         refuse(f"qk_head_dim {derived!r}",
                 f"it derives as qk_nope_head_dim + qk_rope_head_dim, "
                 f"which is {nope + rope} here")
@@ -332,9 +332,9 @@ def deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
     index: dict[str, int] | None = None
     if sparse:
         index = {
-            'index_topk': records.integer(hf_config['index_topk'], 'index_topk'),
-            'index_n_heads': records.integer(hf_config['index_n_heads'], 'index_n_heads'),
-            'index_head_dim': records.integer(hf_config['index_head_dim'], 'index_head_dim'),
+            'index_topk': _records.integer(hf_config['index_topk'], 'index_topk'),
+            'index_n_heads': _records.integer(hf_config['index_n_heads'], 'index_n_heads'),
+            'index_head_dim': _records.integer(hf_config['index_head_dim'], 'index_head_dim'),
         }
         used.update(('index_topk', 'index_n_heads', 'index_head_dim'))
     # The released checkpoints ship the prediction depth as the layer past
@@ -356,11 +356,11 @@ def deepseek_config(hf_config: Mapping[str, object], used: set[str], *,
         mixer={
             'class': 'mla', 'fields': {
             'q_lora_rank': (None if hf_config.get('q_lora_rank') is None
-                            else records.integer(hf_config['q_lora_rank'], 'q_lora_rank')),
-            'kv_lora_rank': records.integer(kv_rank, 'kv_lora_rank'),
+                            else _records.integer(hf_config['q_lora_rank'], 'q_lora_rank')),
+            'kv_lora_rank': _records.integer(kv_rank, 'kv_lora_rank'),
             'qk_nope_head_dim': nope,
             'qk_rope_head_dim': rope,
-            'v_head_dim': records.integer(v_dim, 'v_head_dim'),
+            'v_head_dim': _records.integer(v_dim, 'v_head_dim'),
             'rope_interleave': bool(interleave),
             'index_topk': None if index is None else index['index_topk'],
             'index_n_heads': None if index is None else index['index_n_heads'],
@@ -505,7 +505,7 @@ def _v4_layer_types(hf_config: Mapping[str, object], layers: int,
                  + ['compressed_sparse_attention' if index % 2
                     else 'heavily_compressed_attention'
                     for index in range(max(layers - 2, 0))])
-    resolved = records.strings(types, 'layer_types')[:layers]
+    resolved = _records.strings(types, 'layer_types')[:layers]
     if len(resolved) != layers:
         refuse(f"layer_types of {len(resolved)} entries",
                 f"the model has {layers} layers, one attention kind each")
@@ -530,7 +530,7 @@ def _v4_mlp_kinds(hf_config: Mapping[str, object], layers: int,
     if types is None:
         hashed = record_int(hf_config, 'num_hash_layers', 3)
         types = ['hash_moe'] * min(layers, hashed) + ['moe'] * max(layers - hashed, 0)
-    resolved = records.strings(types, 'mlp_layer_types')[:layers]
+    resolved = _records.strings(types, 'mlp_layer_types')[:layers]
     if len(resolved) != layers:
         refuse(f"mlp_layer_types of {len(resolved)} entries",
                 f"the model has {layers} layers, one routing kind each")
@@ -763,7 +763,7 @@ def dspark_fields(text: Mapping[str, object], layers: int, ratios: Sequence[obje
                 f"compress_ratios lists {stages} DSpark stages after the {layers} layers")
     return native_fields(DSpark)(stages=stages, block_size=block,
             noise_token_id=record_int(text, 'dspark_noise_token_id'),
-            target_layers=records.integers(text.get('dspark_target_layer_ids', ()),
+            target_layers=_records.integers(text.get('dspark_target_layer_ids', ()),
                                               'dspark_target_layer_ids'),
             markov_rank=record_int(text, 'dspark_markov_rank'),
             experts=record_int(text, 'dspark_n_routed_experts',

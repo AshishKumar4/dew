@@ -9,7 +9,8 @@ from functools import cached_property
 
 import numpy as np
 
-from dew.data.dataset import Batch, Ranges, Records
+from dew.batch import Batch
+from dew.data.dataset import Ranges, Records
 from dew.data.pipeline import Dataset
 from dew.data.storage import Store, local
 
@@ -277,7 +278,7 @@ class TokenFiles(Dataset):
         return None if self.tokens.eos_id is None else _document_ends(self.tokens)
 
     def manifest(self) -> ShardManifest:
-        return _indexed_manifest(self, f"{self.url}:{_SPLIT}", self.url, 1024)
+        return _indexed_manifest(self, self.url, 1024)
 
     def lengths(self) -> np.ndarray | None:
         ends = self.document_ends()

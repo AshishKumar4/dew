@@ -107,6 +107,8 @@ class Aux:
     variables: Variables | None = None     # non-parameter collections to write back
 ```
 
+`Variables` and `Batch`, the two open mappings, are `dew.batch`'s, the batch contract every layer imports from one module: a variables tree and its frozen split (`FROZEN`, `merge`), a batch of named arrays, and the rows and tokens it carries (`VALID_ROWS`, `EXAMPLE_ROWS`, `padded_rows`, `Coordinates`). The mesh's axis names, its default rule table and the axes a batch's rows split over (`MESH_AXES`, `BATCH_AXES`, `DEFAULT_RULES`, `logical_spec`, `row_axes`, `batch_axes`) are `dew.mesh`'s.
+
 `metrics`, `dynamic_scale`, `rngs`, `best_loss` and `epoch` leave the checkpoint (decision 7). `dynamic_scale` becomes a trainer setting and its state a trainer-owned leaf outside the objective's tree.
 
 ### 3.3 `Objective`

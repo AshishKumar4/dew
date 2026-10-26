@@ -44,7 +44,7 @@ import jax.numpy as jnp
 import numpy as np
 from flax import traverse_util as flax_traverse
 
-from dew import records
+from dew import _records
 from dew.interop import decoder_parts, hf_decoders as decoders, parts, sources
 from dew.interop.decoder_families import ENTRIES
 from dew.objectives.base import Variables
@@ -176,10 +176,10 @@ class ModelSource:
         class in another repository (transformers' `repo--module.Class`) is refused: its code is
         neither the repository's, which the load pinned, nor in the digest a verification is recorded
         under (`code`)."""
-        held = records.record(hf_config.get('auto_map') or {}, 'auto_map')
+        held = _records.record(hf_config.get('auto_map') or {}, 'auto_map')
         if remote is None or not any(auto in held for auto in _REMOTE_CLASSES):
             return cls(model_type)
-        references = {auto: records.text(held[auto], f'auto_map {auto}') for auto in _REMOTE_CLASSES
+        references = {auto: _records.text(held[auto], f'auto_map {auto}') for auto in _REMOTE_CLASSES
                       if auto in held}
         elsewhere = sorted(auto for auto, reference in references.items() if '--' in reference)
         if elsewhere:
@@ -265,6 +265,12 @@ class _Sizes:
         spelled = {name: key for name, key in type(defaults).attribute_map.items() if name in _SPELLED}
         return cls(hf_config, spelled, defaults)
 
+    def aliased(self, name: str) -> str:
+        """The key the config class reads `name` under through its attribute map (Longcat Flash's
+        `moe_topk` for `num_experts_per_tok`), every alias of it: for the routed and latent sizes the
+        probe shrinks by their meaning, which each alias keeps."""
+        return name if self.defaults is None else type(self.defaults).attribute_map.get(name, name)
+
     def key(self, name: str) -> str:
         """The config's own key for the standard size `name`."""
         return self.keys.get(name, name)
@@ -275,7 +281,7 @@ class _Sizes:
         and the heads); a stated size that is no whole number is a ValueError."""
         for spelled in (self.key(name), name):
             if self.config.get(spelled) is not None:
-                return records.integer(self.config[spelled], spelled)
+                return _records.integer(self.config[spelled], spelled)
         return None
 
     def stated(self, name: str) -> int:
@@ -283,7 +289,7 @@ class _Sizes:
         where neither gives it."""
         size = self.given(name)
         if size is None and name in _SPELLED and getattr(self.defaults, name, None) is not None:
-            size = records.integer(getattr(self.defaults, name), name)
+            size = _records.integer(getattr(self.defaults, name), name)
         if size is None:
             raise KeyError(name)
         return size
@@ -322,18 +328,27 @@ def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -
         fields[key('num_hidden_layers')] = depth
     # A routed or latent-attention type keeps its structure at small widths:
     # four experts, two per token, and small latent ranks.
+    # A stated query-key width is the latent heads' two parts together; identity ('zero') experts keep
+    # their place beside the routed ones.
     small = {'num_experts': 4, 'n_routed_experts': 4, 'num_local_experts': 4, 'num_experts_per_tok': 2,
              'moe_intermediate_size': 2 * small_hidden, 'shared_expert_intermediate_size': 2 * small_hidden,
+             'expert_ffn_hidden_size': 2 * small_hidden, 'zero_expert_num': 2,
              'kv_lora_rank': _HEAD_DIM, 'q_lora_rank': 2 * _HEAD_DIM, 'qk_nope_head_dim': _HEAD_DIM,
-             'qk_rope_head_dim': _HEAD_DIM // 2, 'v_head_dim': _HEAD_DIM, 'n_group': 1, 'topk_group': 1}
-    fields.update({key: value for key, value in small.items() if key in hf_config})
+             'qk_rope_head_dim': _HEAD_DIM // 2, 'qk_head_dim': _HEAD_DIM + _HEAD_DIM // 2,
+             'v_head_dim': _HEAD_DIM, 'n_group': 1, 'topk_group': 1}
+    fields.update({sizes.aliased(name): value for name, value in small.items()
+                   if sizes.aliased(name) in hf_config})
     if 'first_k_dense_replace' in hf_config:
-        fields['first_k_dense_replace'] = min(records.integer(hf_config['first_k_dense_replace'],
+        fields['first_k_dense_replace'] = min(_records.integer(hf_config['first_k_dense_replace'],
                                                               'first_k_dense_replace'), 1)
     if key('num_key_value_heads') in hf_config:
         fields[key('num_key_value_heads')] = small_kv
     if key('head_dim') in hf_config:
-        fields[key('head_dim')] = _HEAD_DIM
+        # A latent-attention config whose head_dim states its rotary width (Longcat Flash's) keeps the
+        # two equal.
+        stated = hf_config[key('head_dim')]
+        rotary = 'qk_rope_head_dim' in hf_config and stated == hf_config['qk_rope_head_dim']
+        fields[key('head_dim')] = _HEAD_DIM // 2 if rotary else _HEAD_DIM
     # A window or a chunk shrinks below the probe's length, so the probe runs past it.
     for positional in ('sliding_window', 'attention_chunk_size'):
         if isinstance(hf_config.get(positional), int):
@@ -343,7 +358,7 @@ def shrink(hf_config: Mapping[str, object], source: ModelSource | None = None) -
         if isinstance(value, int):
             fields[key] = min(value, _VOCAB - 1)
         elif isinstance(value, list):
-            fields[key] = [min(token, _VOCAB - 1) for token in records.integers(value, key)]
+            fields[key] = [min(token, _VOCAB - 1) for token in _records.integers(value, key)]
     return fields
 
 
@@ -724,11 +739,11 @@ def _recorded(key: str) -> VerifiedMapping | None:
     path = Path(dew_cache_dir()) / _VERIFIED / key / 'mapping.json'
     if not path.is_file():
         return None
-    record = records.record(json.loads(path.read_text()), 'verified mapping')
+    record = _records.record(json.loads(path.read_text()), 'verified mapping')
     return VerifiedMapping(
-        records.text(record['model_type'], 'model_type'), records.text(record['family'], 'family'),
-        records.text(record['reference'], 'reference'), records.number(record['error'], 'error'),
-        records.number(record['bound'], 'bound'), tuple(records.strings(record['inert'], 'inert')))
+        _records.text(record['model_type'], 'model_type'), _records.text(record['family'], 'family'),
+        _records.text(record['reference'], 'reference'), _records.number(record['error'], 'error'),
+        _records.number(record['bound'], 'bound'), tuple(_records.strings(record['inert'], 'inert')))
 
 
 def _record(key: str, verified: VerifiedMapping) -> None:

@@ -8,7 +8,7 @@ from typing import overload
 import grain.python as pygrain
 import numpy as np
 
-from .dataset import Batch
+from dew.batch import Batch
 
 
 def share_tokens(lengths: Sequence[int], room: int, *, caps: Sequence[int | None] | None = None,

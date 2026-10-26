@@ -30,6 +30,47 @@ def fixture_config(name):
     return json.loads((FIXTURES / name / "config.json").read_text())
 
 
+def test_an_explicit_readout_tensor_file_uses_the_native_safe_weight_reader(tmp_path):
+    """A named .pt head is converted by the same safe tensor reader as native checkpoints,
+    without requiring the backbone's conventional weight filename."""
+    import torch
+
+    from dew.interop.sources import tensor_file
+
+    tensors = {"slot": torch.arange(24, dtype=torch.float32).reshape(3, 8),
+               "q.weight": torch.arange(16, dtype=torch.float32).reshape(2, 8) / 16,
+               "k.weight": torch.zeros((2, 8))}
+    path = tmp_path / "readout_head.pt"
+    torch.save(tensors, path)
+    restored = tensor_file(path)
+    assert set(restored) == set(tensors)
+    for name, value in tensors.items():
+        np.testing.assert_array_equal(restored[name], value.numpy())
+
+
+def test_a_saved_processor_record_reloads_its_selected_folder(tmp_path):
+    """A processor selected below a repository root survives the task-settings JSON round trip;
+    the unrelated root config cannot replace its vocabulary and preprocessing."""
+    from token_support import byte_level_tokenizer
+
+    from dew.inference.tasks import TextSettings
+    from dew.interop import Pretrained
+    from dew.interop.pretrained import load_processor
+    from dew.registry import from_record, to_record
+    from dew.sampling import Sampling
+
+    shutil.copytree(FIXTURES / "qwen3-tiny", tmp_path / "release")
+    byte_level_tokenizer(tmp_path / "release")
+    (tmp_path / "config.json").write_text(json.dumps({"model_type": "not_the_selected_release"}))
+    bundle = Pretrained.load(tmp_path, subfolder="release", dtype="float32")
+    settings = TextSettings(seq_len=8, max_new_tokens=2, tokenizer=None,
+                            processor=bundle.processor.source, sampling=Sampling())
+    restored = from_record(TextSettings, json.loads(json.dumps(to_record(settings, TextSettings))))
+    processor = load_processor(restored.processor, bundle.model)
+    for text in ("hello", "hello world"):
+        np.testing.assert_array_equal(processor(text).tokens, bundle.processor(text).tokens)
+
+
 """The commit of SFconvertbot's refs/pr/1 on state-spaces/mamba2-130m."""
 
 
@@ -199,7 +240,8 @@ def test_tier_three_admits_a_causal_lm_it_can_train_and_refuses_the_rest():
     refusal its own: BERT configured as a decoder (`is_decoder`) is one, each position reading the
     tokens before it, and configured as an encoder it reads the later tokens too and is refused; a
     speculative drafter is no model on its own (`DrafterRefused`), whatever its type; a rotary whose
-    tables transformers recomputes from each call's positions (dynamic NTK) cannot be traced; BioGPT's
+    tables transformers recomputes from each call's positions (dynamic NTK) is admitted, its tables
+    computed in the trace (`functional_rotaries`); BioGPT's
     training forward draws its layer drop on the host, which a traced step would fix; a quantized
     source is refused, tier 3 reading float weights; and one whose shrunken model does not run at the
     probe's length (a BERT decoder of 8 positions) is `ProbeUnavailable`, not a model none computes."""
@@ -207,10 +249,17 @@ def test_tier_three_admits_a_causal_lm_it_can_train_and_refuses_the_rest():
     from dew.interop.pretrained import TorchRoute, source_route
 
     assert isinstance(source_route(tiny_config("bert", is_decoder=True).to_dict()), TorchRoute)
+    dynamic = {"rope_type": "dynamic", "rope_theta": 10000.0, "factor": 2.0}
+    assert isinstance(source_route(tiny_config("cohere", rope_parameters=dynamic).to_dict()), TorchRoute)
+    # Longcat Flash routes its top 12 of routed and identity experts; the probe shrinks all three
+    # under the config's own keys (`moe_topk`), so its shrunken router routes within its experts.
+    longcat = tiny_config("longcat_flash", n_routed_experts=16, zero_expert_num=8, moe_topk=12,
+                          num_key_value_heads=4, q_lora_rank=32, kv_lora_rank=16, qk_nope_head_dim=8,
+                          qk_rope_head_dim=8, head_dim=8, v_head_dim=8, expert_ffn_hidden_size=32,
+                          num_layers=1, num_hidden_layers=2)
+    assert isinstance(source_route(longcat.to_dict()), TorchRoute)
     cohere = tiny_config("cohere").to_dict()
     for refused in (tiny_config("bert", is_decoder=False).to_dict(),
-                    tiny_config("cohere", rope_parameters={"rope_type": "dynamic", "rope_theta": 10000.0,
-                                                           "factor": 2.0}).to_dict(),
                     tiny_config("biogpt").to_dict(),
                     {**cohere, "quantization_config": {"quant_method": "gptq", "bits": 4, "group_size": 64,
                                                        "desc_act": False, "sym": True}}):

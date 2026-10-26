@@ -15,7 +15,7 @@ import threading
 import time
 from collections.abc import Iterable, Sequence
 
-from dew.records import JSON
+from dew._records import JSON
 
 DEAD_STATES = frozenset({"TERMINATED", "PREEMPTED", "DELETING"})
 """The states a TPU does not come back from to READY."""

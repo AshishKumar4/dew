@@ -28,7 +28,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew import Trainer
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.data.dataset import Loader
 from dew.data import ByteTokenizer, Memory, presets
 from dew.data.chat import Role
@@ -176,7 +176,7 @@ Dew renders the conversation one prefix at a time to give each token a role. For
 | --- | --- | --- |
 | `text` | `[B, L + 1]` | Token IDs, including the extra next-token target. |
 | `text_roles` | `[B, L + 1]` | `Role` value at each token. |
-| `text_coordinates` | `Coordinates`, `[B, L + 1]` leaves | Each token's packed conversation and its position in it (`dew.nn.inputs.Coordinates`). |
+| `text_coordinates` | `Coordinates`, `[B, L + 1]` leaves | Each token's packed conversation and its position in it (`dew.batch.Coordinates`). |
 
 Train with `LMObjective(model, L, loss_role=Role.ASSISTANT)`. The objective shifts IDs and roles together: input position `i` predicts token `i + 1`, and the role of the target decides whether that prediction counts. It also skips padding and the transitions between packed documents. With `loss_role` set, a batch without `text_roles` raises. Keep evaluation conversations out of the training file; [Evaluation and tracking](../guides/evaluation.md) covers what token metrics measure.
 
@@ -201,7 +201,7 @@ import jax
 import numpy as np
 
 from dew import Trainer
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.data import Memory, presets
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.rl import DPOObjective
@@ -645,7 +645,7 @@ import itertools
 import jax
 import numpy as np
 from dew import Field, InputSpec, Trainer
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.data.dataset import Loader
 from dew.diffusion.presets import Flow
 from dew.nn.backbones import SimpleDiT

@@ -20,7 +20,8 @@ from flax import linen as nn, traverse_util
 from flax.typing import Dtype
 from reference_error import assert_as_exact, with_gradients
 
-from dew.nn.inputs import PLAIN_CALL, AttentionMetadata, MixerCall, coordinates
+from dew.batch import coordinates
+from dew.nn.inputs import PLAIN_CALL, AttentionMetadata, MixerCall
 from dew.nn.memory import CARRY, Gate, InContextMemory, LinearMemory, MLPMemory, Objective, ResidualMemory
 from dew.nn.mlp import GatedMLP
 from dew.nn.precision import L2NORM_EPS
@@ -997,8 +998,7 @@ def test_muon_steps_each_memory_heads_matrices_on_their_own():
     one step of the optimizer runs over the whole tree."""
     import optax
 
-    from dew.config import OptimConfig
-    from dew.optim import muon_weight_dimension_numbers
+    from dew.optim import OptimConfig, muon_weight_dimension_numbers
 
     model = decoder()
     params = model.init(jax.random.key(0), jnp.zeros((2, LENGTH), jnp.int32))["params"]

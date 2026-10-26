@@ -79,6 +79,7 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.interpreters.ad import JVPTracer
 
+from dew.batch import valid_order
 from dew.nn import linear
 from dew.nn.dense import Dense
 from dew.nn.kernels import recurrence, recurrence_chunk
@@ -88,7 +89,7 @@ from dew.optim import _orthogonalized
 from dew.quantization import decoded_frozen_fp8, quantized_products
 
 from .attention import FORWARD_MODE, LayerNorm
-from .inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places, sequence_blocks, valid_order
+from .inputs import PLAIN_CALL, MixerCall, coordinates_of, counted_places, sequence_blocks
 from .precision import at_least_fp32, l2norm
 
 CARRY = MEMORY_RESIDUALS[0]

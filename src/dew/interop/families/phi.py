@@ -4,7 +4,7 @@ import dataclasses
 from collections.abc import Mapping
 from functools import partial
 
-from dew import records
+from dew import _records
 from dew.interop.decoder_parts import (
     PLAIN_SPELLING,
     DecoderFamily,
@@ -29,7 +29,7 @@ def _phi_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     theta, partial, rope = partial_rope(hf, PLAIN_SPELLING, default_factor=.5)
     flat = {**hf, 'rope_theta': theta, 'rope_parameters': rope or None}
     ropes = read_rope(flat, used, PLAIN_SPELLING)
-    activation = records.text(hf.get('hidden_act', 'gelu_new'), 'hidden_act')
+    activation = _records.text(hf.get('hidden_act', 'gelu_new'), 'hidden_act')
     mlp = ungated_mlp(activation, ('gelu_new', 'gelu_pytorch_tanh', 'gelu', 'relu'), 'hidden_act', 'Phi')
     if hf.get('qk_layernorm', False):
         refuse('qk_layernorm', 'Phi q/k LayerNorm has no RMSNorm counterpart')
@@ -39,12 +39,12 @@ def _phi_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     config.update({
         'mlp': mlp, 'mlp_bias': True,
         'norm_type': 'layer', 'norm_bias': True, 'scale_after_cast': False,
-        'norm_eps': records.number(hf.get('layer_norm_eps', 1e-5), 'layer_norm_eps'),
+        'norm_eps': _records.number(hf.get('layer_norm_eps', 1e-5), 'layer_norm_eps'),
         'parallel_residual': True, 'shared_parallel_norm': True, 'head_bias': True,
         'attention_bias': True, 'partial_rotary_factor': partial, 'partial_rotary_type': 'default',
-        'dropout_rate': records.number(hf.get('resid_pdrop', 0.), 'resid_pdrop'),
-        'embedding_dropout_rate': records.number(hf.get('embd_pdrop', 0.), 'embd_pdrop'),
-        'attention_dropout_rate': records.number(hf.get('attention_dropout', 0.) or 0., 'attention_dropout'),
+        'dropout_rate': _records.number(hf.get('resid_pdrop', 0.), 'resid_pdrop'),
+        'embedding_dropout_rate': _records.number(hf.get('embd_pdrop', 0.), 'embd_pdrop'),
+        'attention_dropout_rate': _records.number(hf.get('attention_dropout', 0.) or 0., 'attention_dropout'),
     })
     return config
 

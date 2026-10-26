@@ -22,7 +22,7 @@ import numpy as np
 
 from dew import Trainer
 from dew.data.dataset import Loader
-from dew.config import OptimConfig
+from dew.optim import OptimConfig
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec
@@ -84,7 +84,7 @@ print(dict(MeshSpec(fsdp=4, sequence=2).build().shape))
 
 ### A native mesh
 
-`Trainer(mesh=...)`, `Checkpoints.variables(mesh=...)`, `dew.pipeline(..., mesh=...)` and `Pretrained.load(..., mesh=...)` also take a `jax.sharding.Mesh` you build yourself, with axes of any names. `Layout.rules` maps the model's logical axes onto them, and `Layout(data_axes=...)` names the axes a batch's rows split over, which the run's data shares, its batch placement and its row counts read (`dew.nn.sharding.batch_axes` under the layout's rules, which the trainer puts in context). A rule that names an axis the mesh lacks is refused by name, except Dew's own role axes, which a mesh without them treats as size 1. The data and stage axes never hold a parameter. The expert exchange, sequence-parallel attention, the pipeline and the tensor-parallel heuristics run on the axes named `expert`, `sequence`, `stage` and `tensor`; any other axis, a second fsdp level or a context axis, holds parameters and rows as your rules place them.
+`Trainer(mesh=...)`, `Checkpoints.variables(mesh=...)`, `dew.pipeline(..., mesh=...)` and `Pretrained.load(..., mesh=...)` also take a `jax.sharding.Mesh` you build yourself, with axes of any names. `Layout.rules` maps the model's logical axes onto them, and `Layout(data_axes=...)` names the axes a batch's rows split over, which the run's data shares, its batch placement and its row counts read (`dew.mesh.batch_axes` under the layout's rules, which the trainer puts in context). A rule that names an axis the mesh lacks is refused by name, except Dew's own role axes, which a mesh without them treats as size 1. The data and stage axes never hold a parameter. The expert exchange, sequence-parallel attention, the pipeline and the tensor-parallel heuristics run on the axes named `expert`, `sequence`, `stage` and `tensor`; any other axis, a second fsdp level or a context axis, holds parameters and rows as your rules place them.
 
 ```python
 from dew.training import Layout
@@ -103,7 +103,7 @@ trainer.fit(data, steps=2, log_every=2)
 
 ## Parameter placement
 
-Modules declare logical axes such as `embed`, `mlp`, `heads`, `kv`, `vocab` and `exp`. `Layout.rules` maps each name to mesh axes in precedence order, and the default table, `dew.nn.sharding.DEFAULT_RULES`, puts large dense dimensions on `fsdp` and expert dimensions on `expert`. Under `MeshSpec(tensor=N)`, the widths that Megatron splits are also split over the tensor axis: the MLP hidden width, the query and key-value heads, the attention width that `o_proj` reads, and the vocabulary. The residual width is not split over `tensor`. When a rule's mesh axes do not divide a dimension, Dew tries the next rule for that name, and if none fits, the dimension stays whole.
+Modules declare logical axes such as `embed`, `mlp`, `heads`, `kv`, `vocab` and `exp`. `Layout.rules` maps each name to mesh axes in precedence order, and the default table, `dew.mesh.DEFAULT_RULES`, puts large dense dimensions on `fsdp` and expert dimensions on `expert`. Under `MeshSpec(tensor=N)`, the widths that Megatron splits are also split over the tensor axis: the MLP hidden width, the query and key-value heads, the attention width that `o_proj` reads, and the vocabulary. The residual width is not split over `tensor`. When a rule's mesh axes do not divide a dimension, Dew tries the next rule for that name, and if none fits, the dimension stays whole.
 
 | `Layout` field | Default | Meaning |
 |---|---|---|
@@ -209,7 +209,7 @@ Cached autoregressive generation needs `sequence=1`. A mesh that trains with seq
 
 Whatever `scan_layers` says, `init` draws each run of two or more like layers under one scan, so its program has one draw per run instead of one per layer. At a given seed those layers get new values from the same distribution, and the draw depends on `bank_layers`, which splits the runs. So a run recorded with a Dew version that initialized layer by layer starts from different weights at the same seed. Init under a stage mesh or with `decode=True` still runs the plain loop.
 
-`MeshSpec(stage=N)` turns on the GPipe-style pipeline, and `Trainer(microbatches=M)` (`--trainer.microbatches`) sets how many microbatches a step feeds through its stages, one a stage by default. The layer pattern must repeat across stages and split evenly between them. Only a decoder's layer stack is pipelined; embeddings, the output head and other operations outside the stack are not split across stages. The trainer refuses a stage axis on a model that runs no pipeline, such as a DiT, because every stage would compute the whole step. That refusal raises `dew.nn.sharding.LayoutRefused`, a `ValueError` that names the axis and a layout that does run. Any other error on a layout is a defect.
+`MeshSpec(stage=N)` turns on the GPipe-style pipeline, and `Trainer(microbatches=M)` (`--trainer.microbatches`) sets how many microbatches a step feeds through its stages, one a stage by default. The layer pattern must repeat across stages and split evenly between them. Only a decoder's layer stack is pipelined; embeddings, the output head and other operations outside the stack are not split across stages. The trainer refuses a stage axis on a model that runs no pipeline, such as a DiT, because every stage would compute the whole step. That refusal raises `dew.mesh.LayoutRefused`, a `ValueError` that names the axis and a layout that does run. Any other error on a layout is a defect.
 
 Microbatch m takes rows m, m + M, m + 2M and so on, so each microbatch keeps its rows on the batch shards that already hold them. For that to work, M must divide the number of rows each device holds. For example, a batch of 8 rows over 4 row shards gives each device 2 rows. With four microbatches, some devices would have no rows in a given microbatch and would compute another microbatch's rows again, so a stage × fsdp step would cost 1.43 times one device's matmul FLOPs, where the pipeline bubble accounts for 1.25. The pipeline refuses that schedule. It names a microbatch count that divides the rows a device holds, and a batch size that fits the count you asked for. With 16 rows the same layout costs 1.20 times.
 

@@ -6,7 +6,7 @@ import json
 from collections.abc import Mapping
 from typing import Protocol, runtime_checkable
 
-from dew.records import JSON
+from dew._records import JSON
 
 
 @runtime_checkable
