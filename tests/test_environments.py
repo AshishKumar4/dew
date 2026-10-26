@@ -66,6 +66,71 @@ def test_a_reference_is_named_by_its_installation_and_built_once(tmp_path, monke
     assert len(installs(asked)) == 3
 
 
+def test_a_references_overrides_and_constraints_name_it_by_their_lines(tmp_path, monkeypatch):
+    """A reference that installs a lock with overrides (torch's CUDA build over a CPU lock, say) or
+    constraints is named by those files' lines too: a changed override builds anew, and the same lines at
+    another path reuse the environment."""
+    asked, env = standing_in_uv(tmp_path)
+    monkeypatch.setenv("PATH", env["PATH"])
+    lock, override = tmp_path / "lock.txt", tmp_path / "override.txt"
+    lock.write_text("numpy==2.3.0\n")
+    override.write_text("torch==2.14.1+cu128\n")
+    cache = tmp_path / "envs"
+    arguments = ["-r", str(lock), "--override", str(override)]
+    python = environments.reference("torch", arguments, cache=cache)
+    moved = tmp_path / "moved.txt"
+    moved.write_text(override.read_text())
+    assert environments.reference("torch", ["-r", str(lock), "--override", str(moved)], cache=cache) == python
+    override.write_text("torch==2.15.0+cu128\n")
+    assert environments.reference("torch", arguments, cache=cache) != python
+    assert len(installs(asked)) == 2
+
+
+def test_a_file_a_references_file_reads_names_it_too(tmp_path, monkeypatch):
+    """A reference's override that reads another file (`-r`, `-c`, relative to it, however deep, its
+    operand quoted or named by the environment) is named by that file's lines as well, each file apart: a
+    changed pin in the included file alone builds anew, as does a pin moved between the two, the same lines
+    reuse the environment, and a file reading itself is read once."""
+    asked, env = standing_in_uv(tmp_path)
+    monkeypatch.setenv("PATH", env["PATH"])
+    (tmp_path / "locks").mkdir()
+    lock, override, included = (tmp_path / "lock.txt", tmp_path / "locks/override.txt",
+                                tmp_path / "locks/torch.txt")
+    lock.write_text("numpy==2.3.0\n")
+    override.write_text("-r torch.txt\ntransformers==5.19\n")
+    included.write_text("--constraint=torch.txt\ntorch==2.8.0+cu128\n")
+    cache = tmp_path / "envs"
+    arguments = ["-r", str(lock), "--override", str(override)]
+    python = environments.reference("torch", arguments, cache=cache)
+    assert environments.reference("torch", arguments, cache=cache) == python
+    included.write_text("--constraint=torch.txt\ntorch==2.9.0+cu128\n")
+    changed = environments.reference("torch", arguments, cache=cache)
+    assert changed != python
+    # A pin moved from the included file into the one reading it is a change, though their lines join alike.
+    child = tmp_path / "locks/child.txt"
+    override.write_text("-c child.txt\npackaging\n")
+    child.write_text("six==1.16.0\n")
+    constrained = environments.reference("torch", arguments, cache=cache)
+    override.write_text("-c child.txt\npackaging\nsix==1.16.0\n")
+    child.write_text("")
+    assert environments.reference("torch", arguments, cache=cache) not in (python, changed, constrained)
+    # An operand quoted as a shell word, or named by the environment, is read as pip and uv read it.
+    (tmp_path / "locks/cuda pins.txt").write_text("nvidia-cublas==12.8\n")
+    (tmp_path / "locks/selected.txt").write_text("triton==3.4\n")
+    monkeypatch.setenv("PINS", "selected.txt")
+    override.write_text('-r torch.txt\n-c "cuda pins.txt"  # the CUDA wheels\n-r ${PINS}\n')
+    quoted = environments.reference("torch", arguments, cache=cache)
+    (tmp_path / "locks/selected.txt").write_text("triton==3.5\n")
+    assert environments.reference("torch", arguments, cache=cache) != quoted
+    # A name holding a lone quote is read as written, as uv reads it.
+    (tmp_path / "locks/pins'2026.txt").write_text("tokenizers==0.22\n")
+    override.write_text("-r pins'2026.txt\n")
+    literal = environments.reference("torch", arguments, cache=cache)
+    (tmp_path / "locks/pins'2026.txt").write_text("tokenizers==0.23\n")
+    assert environments.reference("torch", arguments, cache=cache) != literal
+    assert len(installs(asked)) == 8
+
+
 def test_the_command_line_takes_a_references_installation_whole_after_the_separator(tmp_path):
     """Everything after `--` is uv's installation, its own options too (a torch backend), whatever spelling
     of --reference argparse takes, and the Python printed is the environment's, made at the Python asked

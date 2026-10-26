@@ -77,7 +77,7 @@ GEMMA4_ROPE = {'sliding_attention': {'rope_type': 'default', 'rope_theta': 10000
 rope_parameters is absent or null (configuration_gemma4.py:203-208)."""
 
 GEMMA4_DEFAULTS = {'hidden_activation': 'gelu_pytorch_tanh', 'head_dim': 256, 'num_key_value_heads': 4,
-                   'sliding_window': 512}
+                   'sliding_window': 512, 'pad_token_id': 0}
 """The class defaults Gemma 4's text configs share where Dew's readers would
 otherwise fall back to another value (configuration_gemma4.py:152-183)."""
 
@@ -580,8 +580,10 @@ GEMMA3N_TEXT = DecoderFamily(
     weight_path=_gemma3n_path,
     preserve_source_layout=True,
     # Gemma3nTextConfig's window, which an omitted sliding_window means.
-    defaults={'hidden_activation': 'gelu_pytorch_tanh', 'final_logit_softcapping': 30.0,
+    defaults={'max_position_embeddings': 32768, 'hidden_activation': 'gelu_pytorch_tanh',
+              'final_logit_softcapping': 30.0, 'pad_token_id': 0,
               'sliding_window': 512},
+    padding_idx=True,
 )
 
 GEMMA4_TEXT = DecoderFamily(
@@ -601,6 +603,7 @@ GEMMA4_TEXT = DecoderFamily(
     preserve_source_layout=True,
     defaults={**GEMMA4_DEFAULTS, 'hidden_size_per_layer_input': 256,
               'vocab_size_per_layer_input': 262144},
+    padding_idx=True,
 )
 
 GEMMA3_TEXT = DecoderFamily(
@@ -613,8 +616,9 @@ GEMMA3_TEXT = DecoderFamily(
     sandwich_norms=True,
     preserve_source_layout=False,
     # Gemma3TextConfig's defaults for the fields its decoder reads.
-    defaults={'hidden_activation': 'gelu_pytorch_tanh', 'query_pre_attn_scalar': 256,
+    defaults={'hidden_activation': 'gelu_pytorch_tanh', 'query_pre_attn_scalar': 256, 'pad_token_id': 0,
               'sliding_window': 4096, 'head_dim': 256, 'max_position_embeddings': 131072},
+    padding_idx=True,
 )
 
 GEMMA2 = DecoderFamily(
@@ -627,9 +631,10 @@ GEMMA2 = DecoderFamily(
     sandwich_norms=True,
     preserve_source_layout=False,
     # Gemma2Config's defaults for the fields its decoder reads.
-    defaults={'hidden_activation': 'gelu_pytorch_tanh', 'query_pre_attn_scalar': 256,
+    defaults={'hidden_activation': 'gelu_pytorch_tanh', 'query_pre_attn_scalar': 256, 'pad_token_id': 0,
               'final_logit_softcapping': 30.0, 'attn_logit_softcapping': 50.0, 'sliding_window': 4096,
               'head_dim': 256, 'max_position_embeddings': 8192},
+    padding_idx=True,
 )
 
 GEMMA = DecoderFamily(
@@ -640,5 +645,6 @@ GEMMA = DecoderFamily(
     'GemmaForCausalLM',
     lambda model: {},
     preserve_source_layout=False,
-    defaults={'hidden_act': 'gelu_pytorch_tanh'},
+    defaults={'max_position_embeddings': 8192, 'hidden_act': 'gelu_pytorch_tanh', 'pad_token_id': 0},
+    padding_idx=True,
 )

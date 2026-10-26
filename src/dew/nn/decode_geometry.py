@@ -9,7 +9,7 @@ import jax
 import jax.numpy as jnp
 
 from .kernels import generation
-from .precision import float32_products, operand_precision
+from .precision import at_least_fp32, float32_einsum, operand_precision
 
 FOLDED_PAIRS = 16
 """Most query positions times key heads `folded_attention` takes."""
@@ -46,11 +46,10 @@ def folded_attention(query, key, value, mask=None):
     """
     batch, positions, heads, width = query.shape
     keys = key.shape[-3]
-    wide = jnp.promote_types(query.dtype, jnp.float32)
-    logits = jnp.einsum('bxd,byd->bxy', query.reshape(batch, positions * heads, width),
-                        key.reshape(batch, keys * heads, width),
-                        precision=operand_precision(query.dtype),
-                        preferred_element_type=wide)
+    wide = at_least_fp32(query.dtype)
+    logits = float32_einsum('bxd,byd->bxy', query.reshape(batch, positions * heads, width),
+                            key.reshape(batch, keys * heads, width),
+                            precision=operand_precision(query.dtype), preferred_element_type=wide)
     logits = jnp.diagonal(logits.reshape(batch, positions, heads, keys, heads), axis1=2, axis2=4)
     logits = logits * jnp.asarray(1 / math.sqrt(width), wide)  # [B, T, S, N]
     if mask is not None:
@@ -59,7 +58,6 @@ def folded_attention(query, key, value, mask=None):
     probs = jax.nn.softmax(logits.astype(jnp.float32), axis=2).astype(value.dtype)
     # Each query head's probabilities over its own head's keys, zeros elsewhere.
     spread = jnp.moveaxis(probs, 3, 2)[..., None] * jnp.eye(heads, dtype=probs.dtype)[:, None, :]
-    out = jnp.einsum('bxy,byd->bxd', spread.reshape(batch, positions * heads, keys * heads),
-                     value.reshape(batch, keys * heads, value.shape[-1]),
-                     precision=float32_products(value.dtype))
+    out = float32_einsum('bxy,byd->bxd', spread.reshape(batch, positions * heads, keys * heads),
+                         value.reshape(batch, keys * heads, value.shape[-1]))
     return out.reshape(batch, positions, heads, value.shape[-1])

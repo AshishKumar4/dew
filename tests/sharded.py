@@ -25,6 +25,7 @@ import math
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.sharding import NamedSharding, PartitionSpec
 from reference_error import assert_as_exact
 
@@ -53,6 +54,22 @@ def collectives(text: str) -> list[tuple[str, list[tuple[int, ...]]]]:
     parser (`hlo_instructions`): an async pair once, by its `-done`, which holds what moved."""
     return [(kind, list(instruction.shapes)) for instruction in hlo_instructions(text).values()
             if (kind := collective(instruction.op)) and not instruction.op.endswith("-start")]
+
+
+def collective_axes(text: str, mesh: jax.sharding.Mesh) -> set[tuple[str, frozenset[str]]]:
+    """`(op, axes)` of every collective in compiled HLO `text` over `mesh`: the axes along which
+    the devices of one of its groups (`HloInstruction.groups`) differ, each group's positions read
+    in the program's device assignment, `mesh`'s devices in order. An async pair once, by its
+    `-start`, which holds the groups."""
+    found = set()
+    for instruction in hlo_instructions(text).values():
+        if (kind := collective(instruction.op)) is None or instruction.op.endswith("-done"):
+            continue
+        groups = instruction.groups or (tuple(range(mesh.size)),)
+        coordinates = [np.unravel_index(list(group), mesh.devices.shape) for group in groups]
+        found.add((kind, frozenset(name for index, name in enumerate(mesh.axis_names)
+                                   if any(len(set(within[index].tolist())) > 1 for within in coordinates))))
+    return found
 
 
 def collective_bytes(text: str, ops) -> int:

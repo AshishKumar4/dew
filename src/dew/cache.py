@@ -10,12 +10,11 @@ import functools
 import importlib.metadata
 import os
 import sys
-import uuid
 from collections.abc import Callable
+from pathlib import Path
 
 import jax
 
-from dew._host import cpu_class
 from dew.devices import deterministic_ops_requested, xla_flag
 
 
@@ -24,6 +23,16 @@ def dew_cache_dir() -> str:
     return os.path.expanduser(
         os.path.join(os.environ.get("XDG_CACHE_HOME") or os.path.join("~", ".cache"), "dew")
     )
+
+
+def dew_config_dir() -> Path:
+    """Dew's configuration directory, which every configuration file of Dew's is read from:
+    `$DEW_CONFIG_DIR`, else `$XDG_CONFIG_HOME/dew`, else ~/.config/dew."""
+    override = os.environ.get("DEW_CONFIG_DIR")
+    if override:
+        return Path(override)
+    xdg = os.environ.get("XDG_CONFIG_HOME")
+    return (Path(xdg) if xdg else Path.home() / ".config") / "dew"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -93,17 +102,14 @@ def default_compilation_cache_dir() -> str:
     the codec "zlib" in the key, which says "zstandard" only for the
     zstandard package (`jax._src.compilation_cache.get_cache_key`), so an
     older interpreter sharing the directory would read those bytes with the
-    wrong codec. And CPU classes have separate defaults (`dew._host.cpu_class`):
-    XLA:CPU compiles for the features of the host that compiles, which JAX's
-    key leaves out, so a home directory shared by hosts of two classes would
-    hand one a program that does not link there ("Failed to materialize
-    symbols"), after which that process compiles nothing more. Explicit paths
+    wrong codec. Hosts of every CPU class share it: Dew's JAX build keys a
+    CPU program by the host's CPU (0.12.0.1.post13), which XLA:CPU compiles
+    for, so no host reads a program that does not link there. Explicit paths
     passed to enable_compilation_cache remain unchanged.
     """
     if jax.config.jax_compilation_cache_dir:
         return jax.config.jax_compilation_cache_dir
-    return os.path.join(dew_cache_dir(), 'xla', f"python{sys.version_info.major}.{sys.version_info.minor}",
-                        cpu_class())
+    return os.path.join(dew_cache_dir(), 'xla', f"python{sys.version_info.major}.{sys.version_info.minor}")
 
 
 def enable_compilation_cache(path: str):
@@ -264,17 +270,7 @@ def persist_compilations() -> None:
 
 @functools.cache
 def _shared_by_pool(directory: str) -> bool:
-    """Whether every process of the pool reads `directory` as one: a mark process 0 writes there
-    is one each of them finds, over the coordination service (`from_every_process`)."""
-    from dew.coordination import broadcast_from_process_zero, from_every_process
+    """Whether every process of the pool reads `directory` as one (`seen_by_every_process`)."""
+    from dew.coordination import seen_by_every_process
 
-    mark = os.path.join(directory, f".dew-pool-{broadcast_from_process_zero(uuid.uuid4().hex)}")
-    if jax.process_index() == 0:
-        os.makedirs(directory, exist_ok=True)
-        with open(mark, "w"):
-            pass
-    from_every_process(None)  # every process looks once the mark is written
-    found = from_every_process(os.path.exists(mark))
-    if jax.process_index() == 0:
-        os.remove(mark)
-    return all(found)
+    return all(seen_by_every_process(directory))

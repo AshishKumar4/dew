@@ -32,6 +32,7 @@ import numpy as np
 import optax
 
 from dew.hashing import fmix32
+from dew.nn.kernels.generation import backend
 from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import LogicalAxes, declarations, declared_axes
 
@@ -103,8 +104,9 @@ def muon_weight_dimension_numbers(params):
     space, or the expert a router picks. That is the split four labs
     cross-confirmed. Everything else is a matrix and goes to Muon.
 
-    An undeclared matrix of rank two takes Linen's kernel convention,
-    contracting axis 0 into axis 1. An undeclared parameter of higher rank
+    An undeclared matrix of rank two, or one declared with no axis named
+    (replicated, as Gemma 3n's AltUp matrices are), takes Linen's kernel
+    convention, contracting axis 0 into axis 1. An undeclared parameter of higher rank
     raises, because its matrix axes are what this spec cannot guess, and
     orthogonalizing the wrong pair would show up as a worse loss curve.
 
@@ -117,7 +119,9 @@ def muon_weight_dimension_numbers(params):
         if not decays:
             return None
         axes = declared_axes(path, param.ndim, declared)
-        if axes is None:
+        # A declaration that names no axis says how the parameter shards (whole, on every device),
+        # not which of its axes form the matrix, so it reads as an undeclared one (AltUp's).
+        if axes is None or all(axis is None for axis in axes):
             if param.ndim > 2:
                 raise ValueError(
                     f"{jax.tree_util.keystr(path)} has rank {param.ndim} and no "
@@ -339,6 +343,162 @@ def _muonclip_groups(learning_rate, qk_clip_threshold: float = 100.0, **opts):
         scale_by_qk_clip(qk_clip_threshold))
 
 
+NEWTON_SCHULZ = (3.4445, -4.7750, 2.0315)
+"""Muon's quintic Newton-Schulz coefficients, Jordan's (modded-nanogpt), optax's default."""
+
+
+def newton_schulz(update: jax.Array, steps: int = 5,
+                  dimension_numbers: optax.contrib.MuonDimensionNumbers | None = None) -> jax.Array:
+    """`update` orthogonalized by Muon's quintic Newton-Schulz: each matrix over its Frobenius norm (plus
+    1e-8), the wide way round, then `a X + (b A + c A A) X` with `A = X X^T`, `steps` times (`NEWTON_SCHULZ`).
+
+    A rank-2 update is one matrix, its rows the reduction axis (a Linen kernel's); `dimension_numbers` name
+    another update's reduction and output axes as Muon's do, its other axes a stack of matrices. On the
+    CPU each matrix iterates alone (`jax.lax.map`): batched, XLA:CPU's products leave the iteration, which
+    grows small singular values about 3.44 times a step, ten times further from float64; a GPU's batched
+    ones round as one matrix's (an A100: 5.2e-6 either way), and keep the stack in one program (ledger 1650).
+    """
+    numbers = optax.contrib.MuonDimensionNumbers() if dimension_numbers is None else dimension_numbers
+    reduction, output = (tuple(int(axis) % update.ndim for axis in np.atleast_1d(axes))
+                         for axes in (numbers.reduction_axis, numbers.output_axis))
+    stacked = tuple(axis for axis in range(update.ndim) if axis not in reduction + output)
+    order = stacked + reduction + output
+    sizes = tuple(math.prod(update.shape[axis] for axis in axes) for axes in (stacked, reduction, output))
+    def orthogonalized(matrix):
+        return _newton_schulz_matrix(matrix, steps)
+
+    stack = update.transpose(order).reshape(sizes)
+    matrices = jax.lax.map(orthogonalized, stack) if backend() == "cpu" else jax.vmap(orthogonalized)(stack)
+    return matrices.reshape([update.shape[axis] for axis in order]).transpose(np.argsort(order))
+
+
+def _newton_schulz_matrix(matrix: jax.Array, steps: int) -> jax.Array:
+    a, b, c = (jnp.asarray(value, matrix.dtype) for value in NEWTON_SCHULZ)
+    wide = matrix.T if matrix.shape[0] > matrix.shape[1] else matrix
+    wide = wide / (jnp.linalg.norm(wide) + jnp.asarray(1e-8, matrix.dtype))
+    for _ in range(steps):
+        gram = wide @ wide.T
+        wide = a * wide + (b * gram + c * gram @ gram) @ wide
+    return wide.T if matrix.shape[0] > matrix.shape[1] else wide
+
+
+class M3State(NamedTuple):
+    """`scale_by_m3`'s state: the updates made so far, the fast momentum `M1`, the second moment `V`, the slow
+    momentum `M2`, the gradients of the chunk in progress summed, and `M2` orthogonalized as the chunk
+    began, `O2`."""
+    updates: jax.Array
+    fast: optax.Updates
+    second: optax.Updates
+    slow: optax.Updates
+    chunk: optax.Updates
+    slow_direction: optax.Updates
+
+
+def scale_by_m3(*, beta1: float, beta2: float, beta3: float, alpha: float, eps: float, frequency: int,
+                ns_steps: int = 5, weight_dimension_numbers=None) -> optax.GradientTransformation:
+    """Multi-scale Momentum Muon, M3 (Behrouz et al., Nested Learning, arXiv 2512.24695, Algorithm 1):
+    the direction `(O1 + alpha O2) / sqrt(V + eps)`, which `optax.scale_by_learning_rate` steps by.
+
+    Each update adds `beta1 g` to the fast momentum `M1` and `beta2 g**2` to the second moment `V`, the
+    algorithm's sums, neither decaying, and orthogonalizes `M1` by `ns_steps` Newton-Schulz iterations,
+    Muon's (`newton_schulz`, each leaf shaped by its `weight_dimension_numbers`, a tree or a function of
+    the updates as Muon's are; a leaf with none is one matrix, its rows the reduction). Its state is
+    kept in float32 at least (`at_least_fp32`), so a bfloat16 matrix's momenta and gradients sum without
+    rounding to its width, and the directions come back in that dtype. Once every
+    `frequency` updates the slow momentum `M2` adds `beta3` times the chunk's gradients and is
+    orthogonalized, `O2`, which the next chunk's updates read: the first chunk's is zero. The algorithm's
+    sum, over `i = (k-1) f .. k f`, and eq. 75's, over `i = t - C .. t`, each hold f + 1 gradients, the one
+    at a chunk's boundary in two chunks; here each enters `M2` once, with its own chunk's. The paper states
+    no values for its factors, so each is the caller's.
+    """
+    if frequency < 1:
+        raise ValueError(f"M3 updates its slow momentum once every `frequency` updates, got {frequency}")
+
+    def orthogonalized(moment):
+        if weight_dimension_numbers is None:
+            return jax.tree.map(lambda leaf: newton_schulz(leaf, ns_steps), moment)
+        numbers = (weight_dimension_numbers(moment) if callable(weight_dimension_numbers)
+                   else weight_dimension_numbers)
+        return jax.tree.map(lambda leaf, shape: newton_schulz(leaf, ns_steps, shape), moment, numbers,
+                            is_leaf=lambda node: node is None)
+
+    def init_fn(params) -> M3State:
+        zeros = jax.tree.map(lambda param: jnp.zeros(param.shape, at_least_fp32(param.dtype)), params)
+        return M3State(jnp.zeros([], jnp.int32), zeros, zeros, zeros, zeros, zeros)
+
+    def update_fn(updates, state, params=None):
+        del params
+        updates = jax.tree.map(lambda gradient, moment: gradient.astype(moment.dtype), updates, state.fast)
+        count = jnp.asarray(optax.safe_increment(state.updates))
+        fast = jax.tree.map(lambda moment, gradient: moment + beta1 * gradient, state.fast, updates)
+        second = jax.tree.map(lambda moment, gradient: moment + beta2 * jnp.square(gradient), state.second,
+                              updates)
+        direction = jax.tree.map(lambda fast, slow, second: (fast + alpha * slow) / jnp.sqrt(second + eps),
+                                 orthogonalized(fast), state.slow_direction, second)
+        chunk = jax.tree.map(jnp.add, state.chunk, updates)
+
+        def closed(chunk):
+            slow = jax.tree.map(lambda moment, summed: moment + beta3 * summed, state.slow, chunk)
+            return slow, optax.tree.zeros_like(chunk), orthogonalized(slow)
+
+        # The slow momentum and its orthogonalization run once a chunk, not every update.
+        slow, chunk, slow_direction = jax.lax.cond(
+            count % frequency == 0, closed, lambda chunk: (state.slow, chunk, state.slow_direction), chunk)
+        return direction, M3State(count, fast, second, slow, chunk, slow_direction)
+
+    return optax.GradientTransformation(init_fn, update_fn)
+
+
+class DeltaState(NamedTuple):
+    """`delta_gradient_descent`'s state: the updates made so far, which a scheduled rate reads."""
+    updates: jax.Array
+
+
+def delta_gradient_descent(learning_rate: float | optax.Schedule) -> optax.GradientTransformationExtraArgs:
+    """Delta gradient descent (Behrouz et al., Nested Learning, arXiv 2512.24695, eqs. 56-57): each
+    matrix steps to the minimizer of `|W x - u|**2 / 2 + |W - W_t|**2 / (2 eta)`, where `x` is the step's
+    input and `u = -dL/dy` its output's negative gradient, so the step forgets what `W_t` held along `x`.
+
+    By Sherman-Morrison the minimizer is `W_t (I - eta' x x^T) - eta' dL/dW` with
+    `eta' = eta / (1 + eta |x|**2)`, the paper's `eta / (1 + eta)` at its normalized `|x| = 1`. A kernel
+    holds its input on axis 0, as a Linen kernel does (`y = x K`), so its step is
+    `-eta' (x (x^T K) + dL/dK)` over its other axes. The update takes `inputs`, a tree of `x` per leaf,
+    the parameters' structure with None where a leaf has none: that leaf steps by gradient descent, the
+    rule at `x = 0`. An update given no inputs, or no parameters, is refused rather than run as plain
+    gradient descent.
+    """
+
+    def init_fn(params) -> DeltaState:
+        del params
+        return DeltaState(jnp.zeros([], jnp.int32))
+
+    def update_fn(updates, state, params=None, *, inputs=None, **extra_args):
+        # A chain hands every transform each extra argument; the others' are not this one's.
+        del extra_args
+        if params is None or inputs is None:
+            raise ValueError("delta gradient descent steps by each matrix's input and its weights: an update "
+                             "takes `params` and `inputs` (None for a leaf with no input)")
+        rate = jnp.asarray(learning_rate(state.updates) if callable(learning_rate) else learning_rate)
+
+        def stepped(x, gradient, kernel):
+            # A leaf another transform of an `optax.partition` steps reaches this one masked.
+            if isinstance(gradient, optax.MaskedNode):
+                return gradient
+            if x is None:
+                return -rate * gradient
+            if x.shape != kernel.shape[:1]:
+                raise ValueError(f"an input of shape {x.shape} is not the input axis of a kernel shaped "
+                                 f"{kernel.shape}")
+            shrunk = rate / (1 + rate * jnp.sum(jnp.square(x)))
+            along = jnp.tensordot(x, jnp.tensordot(x, kernel, axes=(0, 0)), axes=0)
+            return -shrunk * (along + gradient)
+
+        stepped_updates = jax.tree.map(stepped, inputs, updates, params, is_leaf=lambda leaf: leaf is None)
+        return stepped_updates, DeltaState(jnp.asarray(optax.safe_increment(state.updates)))
+
+    return optax.GradientTransformationExtraArgs(init_fn, update_fn)
+
+
 def stochastic_round_bf16(x: jax.Array, seed: jax.Array) -> jax.Array:
     """`x` rounded to bf16 up or down with the probability of its distance to
     each, from a hash of `seed` and each element's flat index.
@@ -377,19 +537,25 @@ def _bias_corrected(moment, decay, count):
 
 
 def scale_by_adam(b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, *,
-                  nesterov: bool = False) -> optax.GradientTransformation:
+                  nesterov: bool = False, nu_dtype=None) -> optax.GradientTransformation:
     """`optax.scale_by_adam` (optax 0.2.8) with its bias corrections formed in double
     (`_bias_corrected`): optax's moments, state layout (`optax.ScaleByAdamState`) and update,
-    composed from optax's public tree math."""
+    composed from optax's public tree math. `nu_dtype` stores the second moment as `mu_dtype` does
+    the first, each the parameter's dtype where None; a gradient narrower than its moment is
+    widened before either reads it, so an fp16 gradient's square does not underflow first."""
     mu_dtype = None if mu_dtype is None else jax.dtypes.canonicalize_dtype(mu_dtype)
+    nu_dtype = None if nu_dtype is None else jax.dtypes.canonicalize_dtype(nu_dtype)
 
     def init_fn(params):
         return optax.ScaleByAdamState(count=jnp.zeros([], jnp.int32),
                                       mu=optax.tree.zeros_like(params, dtype=mu_dtype),
-                                      nu=optax.tree.zeros_like(params))
+                                      nu=optax.tree.zeros_like(params, dtype=nu_dtype))
 
     def update_fn(updates, state, params=None):
         del params  # Adam reads only the gradients
+        updates = jax.tree.map(lambda update, moment: None if update is None else update.astype(
+            jnp.promote_types(update.dtype, moment.dtype)), updates, state.nu,
+            is_leaf=lambda leaf: leaf is None)
         mu = optax.tree.update_moment(updates, state.mu, b1, 1)
         nu = optax.tree.update_moment_per_elem_norm(updates, state.nu, b2, 2)
         count = optax.safe_increment(state.count)
@@ -484,17 +650,17 @@ def _adam_chain(moments: optax.GradientTransformation, learning_rate, weight_dec
 
 
 def _adam(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, weight_decay=0.0,
-          mask=None, *, nesterov: bool = False):
+          mask=None, *, nesterov: bool = False, nu_dtype=None):
     """optax.adam over `scale_by_adam`, with torch's coupled weight decay."""
-    return _adam_chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov), learning_rate,
-                       weight_decay, mask, coupled=True)
+    return _adam_chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov, nu_dtype=nu_dtype),
+                       learning_rate, weight_decay, mask, coupled=True)
 
 
 def _adamw(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, weight_decay=1e-4,
-           mask=None, *, nesterov: bool = False):
+           mask=None, *, nesterov: bool = False, nu_dtype=None):
     """optax.adamw over `scale_by_adam`."""
-    return _adam_chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov), learning_rate,
-                       weight_decay, mask, coupled=False)
+    return _adam_chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov, nu_dtype=nu_dtype),
+                       learning_rate, weight_decay, mask, coupled=False)
 
 
 def _bf16_adam(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, weight_decay=0.0, mask=None, *,
@@ -741,7 +907,7 @@ class ParamGroup:
     `OptimConfig.param_groups` that has a pattern it matches, as in
     lm-engine, and a parameter that matches no group raises `ValueError`.
 
-    The group's learning rate is its own `schedule` (the config's rate when
+    The group's learning rate is its own `schedule` (the config's `learning_rate` when
     None) times `learning_rate_multiplier`. `b1` schedules the first-moment
     decay of adam, adamw and lamb, as torch's `OneCycleLR(cycle_momentum=True)`
     cycles Adam's beta1; None keeps the optimizer's own. `weight_decay`
@@ -774,16 +940,16 @@ class ParamGroup:
                 raise ValueError(f"param group {self.name!r} bounds its parameters from a lower to a "
                                  f"higher value, got {self.bounds}")
 
-    def rate(self, learning_rate: float | ScheduleBase) -> tuple[float, ScheduleBase | None]:
+    def learning_rate(self, learning_rate: float | ScheduleBase) -> tuple[float, ScheduleBase | None]:
         """This group's rate scale and shape (`scaled`): its own `schedule`,
-        else the config's `rate`, times `learning_rate_multiplier`."""
+        else the config's `learning_rate`, times `learning_rate_multiplier`."""
         scale, shape = scaled(learning_rate if self.schedule is None else self.schedule)
         return scale * self.learning_rate_multiplier, shape
 
     def solver(self, make: Callable[..., optax.GradientTransformation],
                learning_rate: float | ScheduleBase, steps: int | None,
                opts: Mapping[str, object]) -> optax.GradientTransformation:
-        """Build this group's optimizer: `make` at the group's `rate`, its
+        """Build this group's optimizer: `make` at the group's `learning_rate`, its
         scale held in state (`scaled_solver`), with the group's `b1`
         schedule and `bounds`, over a run of `steps` updates.
 
@@ -793,7 +959,7 @@ class ParamGroup:
         if self.b1 is not None and 'b1' not in inspect.signature(make).parameters:
             raise ValueError(f"param group {self.name!r} schedules b1, and its optimizer "
                              f"takes no b1 (adam, adamw and lamb do)")
-        solver = scaled_solver(make, *self.rate(learning_rate), steps, opts, self.b1)
+        solver = scaled_solver(make, *self.learning_rate(learning_rate), steps, opts, self.b1)
         if self.bounds is not None:
             solver = optax.chain(solver, _keep_within(*self.bounds))
         return solver
@@ -936,17 +1102,17 @@ class ScheduleBase:
 
 @dataclasses.dataclass(frozen=True)
 class Cosine(ScheduleBase):
-    """A linear warmup from `init` to `peak`, then a cosine decay to `end` at
+    """A linear warmup from `init_value` to `peak_value`, then a cosine decay to `end_value` at
     step `decay_steps`, or at the run's end when that is None.
 
     It is `optax.warmup_cosine_decay_schedule`.
     `warmup_steps` must be smaller than the decay horizon in schedule steps.
     """
 
-    peak: float = dataclasses.field(metadata={'rate': True})
+    peak_value: float = dataclasses.field(metadata={'rate': True})
     warmup_steps: int = 10000
-    end: float = dataclasses.field(default=0.0, metadata={'rate': True})
-    init: float = dataclasses.field(default=0.0, metadata={'rate': True})
+    end_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
+    init_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
     decay_steps: int | None = None
 
     def values(self, steps: int | None) -> optax.Schedule:
@@ -955,32 +1121,33 @@ class Cosine(ScheduleBase):
             raise ValueError(f"Cosine needs warmup_steps={self.warmup_steps} smaller than "
                              f"decay_steps={decay_steps}")
         return optax.warmup_cosine_decay_schedule(
-            init_value=self.init, peak_value=self.peak, warmup_steps=self.warmup_steps,
+            init_value=self.init_value, peak_value=self.peak_value,
+            warmup_steps=self.warmup_steps,
             decay_steps=decay_steps,
-            end_value=self.end)
+            end_value=self.end_value)
 
 
 @dataclasses.dataclass(frozen=True)
 class PowerTail:
     """The linear tail of a power schedule, from the power law's rate at step
-    `start` to `end` at step `steps`, or at the run's end when that is None."""
+    `start` to `end_value` at step `steps`, or at the run's end when that is None."""
 
     start: int
     steps: int | None = None
-    end: float = dataclasses.field(default=0.0, metadata={'rate': True})
+    end_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
 
 
 @dataclasses.dataclass(frozen=True)
 class Power(ScheduleBase):
     """lm-engine's power schedule (`power_schedule`), a power law of the step after a linear warmup.
 
-    After the warmup, the rate is min(peak, a * (step * c) ** b). With a
+    After the warmup, the rate is min(peak_value, a * (step * c) ** b). With a
     `tail`, a linear decay follows the power law, as in the last 29% of
     Rigel's run. lm-engine's examples set `a` to 4 * batch size and `c` to
     the tokens per step.
     """
 
-    peak: float = dataclasses.field(metadata={'rate': True})
+    peak_value: float = dataclasses.field(metadata={'rate': True})
     warmup_steps: int
     a: float = dataclasses.field(metadata={'rate': True})
     b: float = -0.51
@@ -990,46 +1157,46 @@ class Power(ScheduleBase):
     def values(self, steps: int | None) -> optax.Schedule:
         tail = self.tail
         if tail is None:
-            return power_schedule(self.peak, self.warmup_steps, self.a, self.b, self.c)
+            return power_schedule(self.peak_value, self.warmup_steps, self.a, self.b, self.c)
         return power_schedule(
-            self.peak, self.warmup_steps, self.a, self.b, self.c, decay_start=tail.start,
+            self.peak_value, self.warmup_steps, self.a, self.b, self.c, decay_start=tail.start,
             decay_end=self._horizon(steps if tail.steps is None else tail.steps, "tail.steps"),
-            end_value=tail.end)
+            end_value=tail.end_value)
 
 
 @dataclasses.dataclass(frozen=True)
 class Linear(ScheduleBase):
     """lm-engine's linear schedule (`linear_schedule`), with a warmup, a constant rate and a linear decay.
 
-    The rate warms up from zero to `peak`, stays constant until
+    The rate warms up from zero to `peak_value`, stays constant until
     `decay_start` (the end of the warmup when None), then falls linearly to
-    `end` at `decay_steps` (the run's end when None).
+    `end_value` at `decay_steps` (the run's end when None).
     """
 
-    peak: float = dataclasses.field(metadata={'rate': True})
+    peak_value: float = dataclasses.field(metadata={'rate': True})
     warmup_steps: int = 0
     decay_start: int | None = None
     decay_steps: int | None = None
-    end: float = dataclasses.field(default=0.0, metadata={'rate': True})
+    end_value: float = dataclasses.field(default=0.0, metadata={'rate': True})
 
     def values(self, steps: int | None) -> optax.Schedule:
-        return linear_schedule(self.peak, self.warmup_steps, self.decay_start,
+        return linear_schedule(self.peak_value, self.warmup_steps, self.decay_start,
                                self._horizon(steps if self.decay_steps is None else self.decay_steps,
                                              "decay_steps"),
-                               end_value=self.end)
+                               end_value=self.end_value)
 
 
 @dataclasses.dataclass(frozen=True)
 class OneCycle(ScheduleBase):
     """torch's `OneCycleLR` with its default two phases and cosine annealing.
 
-    The value follows a half cosine from `init` to `peak` at step
-    `warmup_fraction * steps - 1`, then another to `end` at the run's last
-    step, `steps - 1`, and holds `end` after it, where torch raises. `init`
-    is torch's `max_lr / div_factor` (`peak / 25` when None) and `end` its
-    `init / final_div_factor` (`init / 1e4` when None). Adam's momentum cycle
-    under `cycle_momentum=True` is `OneCycle(peak=0.85, init=0.95, end=0.95)`
-    as a group's `b1`.
+    The value follows a half cosine from `init_value` to `peak_value` at step
+    `warmup_fraction * steps - 1`, then another to `end_value` at the run's last
+    step, `steps - 1`, and holds `end_value` after it, where torch raises. `init_value`
+    is torch's `max_lr / div_factor` (`peak_value / 25` when None) and `end_value` its
+    `init_value / final_div_factor` (`init_value / 1e4` when None). Adam's momentum cycle
+    under `cycle_momentum=True` is `OneCycle(peak_value=0.85, init_value=0.95,
+    end_value=0.95)` as a group's `b1`.
 
     optax's `cosine_onecycle_schedule` places its phase boundaries at
     `pct_start * steps` and `steps`, one step later than torch's
@@ -1037,15 +1204,15 @@ class OneCycle(ScheduleBase):
     one step late and it cannot reproduce a torch run.
     """
 
-    peak: float = dataclasses.field(metadata={'rate': True})
-    init: float | None = dataclasses.field(default=None, metadata={'rate': True})
-    end: float | None = dataclasses.field(default=None, metadata={'rate': True})
+    peak_value: float = dataclasses.field(metadata={'rate': True})
+    init_value: float | None = dataclasses.field(default=None, metadata={'rate': True})
+    end_value: float | None = dataclasses.field(default=None, metadata={'rate': True})
     warmup_fraction: float = 0.3
 
     def values(self, steps: int | None) -> optax.Schedule:
         steps = self._horizon(steps, "trainer.steps")
-        init = self.peak / 25 if self.init is None else self.init
-        end = init / 1e4 if self.end is None else self.end
+        init = self.peak_value / 25 if self.init_value is None else self.init_value
+        end = init / 1e4 if self.end_value is None else self.end_value
         # torch's phase ends, kept as floats as torch keeps them.
         rise, last = self.warmup_fraction * steps - 1, steps - 1
         if not 0 < rise < last:
@@ -1057,41 +1224,43 @@ class OneCycle(ScheduleBase):
 
         def value(count) -> jax.Array:
             step = jnp.minimum(jnp.asarray(count, jnp.float32), last)
-            return jnp.where(step <= rise, anneal(init, self.peak, step / rise),
-                             anneal(self.peak, end, (step - rise) / (last - rise)))
+            return jnp.where(step <= rise, anneal(init, self.peak_value, step / rise),
+                             anneal(self.peak_value, end, (step - rise) / (last - rise)))
 
         return value
 
 
 @dataclasses.dataclass(frozen=True)
 class Exponential(ScheduleBase):
-    """A geometric decay from `offset + init` to `offset + end` over
+    """A geometric decay from `offset + init_value` to `offset + end_value` over
     `decay_steps` steps (the run's when None), then constant.
 
     Up to `decay_steps`, the value at step t is
-    `offset + init * (end / init) ** (t / decay_steps)`. That is torch's
-    `ExponentialLR` with `gamma = (end / init) ** (1 / decay_steps)`, stepped
+    `offset + init_value * (end_value / init_value) ** (t / decay_steps)`. That is torch's
+    `ExponentialLR` with `gamma = (end_value / init_value) ** (1 / decay_steps)`, stepped
     `decay_steps` times and then no more, plus `offset`. It is
-    `optax.exponential_decay` with `end` as its bound. SNN-delays anneals
+    `optax.exponential_decay` with `end_value` as its bound. SNN-delays anneals
     DCLS's kernel width this way, the raw width decaying and a constant
     added to it.
     """
 
-    init: float = dataclasses.field(metadata={'rate': True})
-    end: float = dataclasses.field(metadata={'rate': True})
+    init_value: float = dataclasses.field(metadata={'rate': True})
+    end_value: float = dataclasses.field(metadata={'rate': True})
     decay_steps: int | None = None
     offset: float = dataclasses.field(default=0.0, metadata={'rate': True})
 
     def values(self, steps: int | None) -> optax.Schedule:
         span = self._horizon(steps if self.decay_steps is None else self.decay_steps, "decay_steps")
-        if span <= 0 or self.init <= 0 or self.end <= 0:
-            raise ValueError(f"an exponential decay needs positive steps, init and end, got "
-                             f"{span}, {self.init} and {self.end}")
-        decay = optax.exponential_decay(self.init, span, self.end / self.init, end_value=self.end)
+        if span <= 0 or self.init_value <= 0 or self.end_value <= 0:
+            raise ValueError(f"an exponential decay needs positive steps, init_value and end_value, got "
+                             f"{span}, {self.init_value} and {self.end_value}")
+        decay = optax.exponential_decay(self.init_value, span, self.end_value / self.init_value,
+                                        end_value=self.end_value)
         if not self.offset:
             return decay
         return lambda count: self.offset + decay(count)
 
 
-__all__ = ["Cosine", "Exponential", "Linear", "OneCycle", "ParamGroup", "Power", "PowerProfilesState",
-           "PowerTail", "ScheduleBase"]
+__all__ = ["NEWTON_SCHULZ", "Cosine", "DeltaState", "Exponential", "Linear", "M3State", "OneCycle",
+           "ParamGroup", "Power", "PowerProfilesState", "PowerTail", "ScheduleBase", "delta_gradient_descent",
+           "newton_schulz", "scale_by_m3"]

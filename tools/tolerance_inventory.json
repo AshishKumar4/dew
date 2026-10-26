@@ -101,17 +101,9 @@
    "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_data_av.py": {
-   "comparisons": 2,
-   "lane": "Data"
-  },
   "tests/test_data_mixtures.py": {
-   "comparisons": 4,
+   "comparisons": 3,
    "lane": "Training"
-  },
-  "tests/test_dataset_chain.py": {
-   "comparisons": 1,
-   "lane": "Data"
   },
   "tests/test_dc_ae.py": {
    "comparisons": 4,
@@ -149,10 +141,6 @@
    "comparisons": 4,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_decode_drift.py": {
-   "comparisons": 2,
-   "lane": "Accuracy Gate"
-  },
   "tests/test_decoder_export.py": {
    "comparisons": 16,
    "lane": "Models, Serving & RL"
@@ -189,10 +177,6 @@
    "comparisons": 7,
    "lane": "Training"
   },
-  "tests/test_discrete.py": {
-   "comparisons": 8,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_disk_banks.py": {
    "comparisons": 2,
    "lane": "Models, Serving & RL"
@@ -206,7 +190,7 @@
    "lane": "Training"
   },
   "tests/test_dory.py": {
-   "comparisons": 3,
+   "comparisons": 2,
    "lane": "Recurrence & Dory"
   },
   "tests/test_dpo.py": {
@@ -216,10 +200,6 @@
   "tests/test_edm2.py": {
    "comparisons": 2,
    "lane": "Models, Serving & RL"
-  },
-  "tests/test_encoders.py": {
-   "comparisons": 3,
-   "lane": "Data"
   },
   "tests/test_end_to_end.py": {
    "comparisons": 8,
@@ -245,16 +225,12 @@
    "comparisons": 19,
    "lane": "Recurrence & Dory"
   },
-  "tests/test_fla_kda.py": {
-   "comparisons": 1,
-   "lane": "Recurrence & Dory"
-  },
   "tests/test_flaxdiff.py": {
    "comparisons": 6,
    "lane": "Models, Serving & RL"
   },
   "tests/test_flow_matching.py": {
-   "comparisons": 8,
+   "comparisons": 2,
    "lane": "Training"
   },
   "tests/test_flux_source.py": {
@@ -314,7 +290,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_decoders.py": {
-   "comparisons": 21,
+   "comparisons": 20,
    "lane": "Models, Serving & RL"
   },
   "tests/test_hf_lifecycle.py": {
@@ -340,10 +316,6 @@
   "tests/test_image_metrics.py": {
    "comparisons": 5,
    "lane": "Training"
-  },
-  "tests/test_image_stages.py": {
-   "comparisons": 1,
-   "lane": "Data"
   },
   "tests/test_inference.py": {
    "comparisons": 10,
@@ -390,7 +362,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_layer_stack.py": {
-   "comparisons": 21,
+   "comparisons": 20,
    "lane": "Models, Serving & RL"
   },
   "tests/test_linear_attention.py": {
@@ -421,10 +393,6 @@
    "comparisons": 26,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_lora_peft.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_lpips.py": {
    "comparisons": 3,
    "lane": "Training"
@@ -441,10 +409,6 @@
    "comparisons": 3,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_mamba_ssd.py": {
-   "comparisons": 2,
-   "lane": "Recurrence & Dory"
-  },
   "tests/test_masked_diffusion.py": {
    "comparisons": 2,
    "lane": "Models, Serving & RL"
@@ -454,11 +418,11 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_mdlm_reference.py": {
-   "comparisons": 5,
+   "comparisons": 2,
    "lane": "Training"
   },
   "tests/test_mean_flow.py": {
-   "comparisons": 3,
+   "comparisons": 2,
    "lane": "Training"
   },
   "tests/test_mesh_axes.py": {
@@ -514,7 +478,7 @@
    "lane": "Training"
   },
   "tests/test_multimodal_model.py": {
-   "comparisons": 19,
+   "comparisons": 18,
    "lane": "Kernels"
   },
   "tests/test_multiprocess.py": {
@@ -588,10 +552,6 @@
   "tests/test_predictors.py": {
    "comparisons": 4,
    "lane": "Training"
-  },
-  "tests/test_presets.py": {
-   "comparisons": 1,
-   "lane": "Data"
   },
   "tests/test_pretrained_sources.py": {
    "comparisons": 2,
@@ -697,10 +657,6 @@
    "comparisons": 5,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_t5_encoders.py": {
-   "comparisons": 5,
-   "lane": "Data"
-  },
   "tests/test_text_data.py": {
    "comparisons": 1,
    "lane": "Training"
@@ -718,7 +674,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_tools.py": {
-   "comparisons": 28,
+   "comparisons": 25,
    "lane": "Models, Serving & RL"
   },
   "tests/test_torchax_fallback.py": {
@@ -789,10 +745,6 @@
    "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
-  "tools/decode_drift.py": {
-   "comparisons": 3,
-   "lane": "Accuracy Gate"
-  },
   "tools/decoder_export_reference.py": {
    "comparisons": 1,
    "lane": "Models, Serving & RL"
@@ -848,10 +800,6 @@
   "tools/moe_exchange_probe.py": {
    "comparisons": 1,
    "lane": "Training"
-  },
-  "tools/reference_runs/qwen35_pair.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL"
   },
   "tools/reference_runs/torch_qwen35_step.py": {
    "comparisons": 3,

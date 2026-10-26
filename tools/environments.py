@@ -11,8 +11,9 @@ this machine installs (`machine_lock`). Checkouts whose three files agree share
 one environment; a caller runs each checkout's own code with its `src` first on
 PYTHONPATH, ahead of the Dew the environment holds. The second prints the
 Python of a reference environment (torch's, an engine's): INSTALL, uv pip
-install's arguments, installed into CACHE/NAME-<digest of INSTALL, a
-requirements file's lines in place of its path> (`reference`).
+install's arguments, installed into CACHE/NAME-<digest of INSTALL, the lines
+of each file it reads (requirements, constraints, overrides, and the files they
+read) in place of its path> (`reference`).
 
 The standard library alone, so it runs on a machine that holds no environment
 yet: tools/perf_gate.py builds each tree's with it, and so do GPU sessions.
@@ -24,6 +25,8 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -92,12 +95,48 @@ def environment(tree: Path, lock: str, cache: Path = CACHE) -> Path:
                  cwd=tree)
 
 
+FILED = ("-r", "--requirements", "-c", "--constraint", "--constraints", "--override", "--overrides")
+"""uv pip install's options whose argument is a file it reads: a reference is named by those files' lines."""
+NESTED = re.compile(r"^(?:-r|-c|--requirements?|--constraints?)(?:=|\s+)?(.+)$")
+"""A line of a requirements, constraints or overrides file that reads another file, relative to its own: its
+operand quoted as a shell word, `${NAME}` taken from the environment, as pip and uv read it."""
+
+
+def filed(path: Path, seen: frozenset[Path] = frozenset()) -> str | list:
+    """The lines of file `path`, and, where it reads others (`NESTED`), however deep, each once along a path
+    of reads, its lines and theirs each apart, a list `reference` encodes whole: what installing from it
+    reads, so a changed pin in an included file names a new environment, and a pin moved between a file and
+    one it reads is a change too (OrganicMouse: a reference's override read another, whose change reused a
+    stale environment). A file reading none is its lines alone, as it was named before."""
+    text = path.read_text()
+    reads = []
+    for line in text.splitlines():
+        if not (found := NESTED.match(line.strip())):
+            continue
+        # As uv reads an operand: a shell word, or as written where it is none (a name holding one quote).
+        try:
+            words = shlex.split(found[1], comments=True)
+        except ValueError:
+            words = [found[1].strip()]
+        if not words:
+            continue
+        operand = re.sub(r"\$\{(\w+)\}", lambda name: os.environ.get(name[1], name[0]), words[0])
+        if "://" not in operand:
+            reads.append(path.parent / operand)
+    seen |= {path.resolve()}
+    nested = [filed(read, seen) for read in reads if read.resolve() not in seen]
+    return [text, *nested] if nested else text
+
+
 def reference(name: str, install: list[str], python: str = "3.12", cache: Path = CACHE) -> Path:
     """The Python of the reference environment CACHE/`name`-<installation> (`built`): `install`, uv pip
-    install's arguments, at Python `python`. The installation's digest (its arguments, a requirements file's
-    lines in place of its path, and its Python where that is not 3.12, whose names predate the choice) names
-    it, so a changed installation is built anew beside the old one, which a running job may hold."""
-    named = [Path(argument).read_text() if previous == "-r" else argument
+    install's arguments, at Python `python`. The installation's digest (its arguments, the lines of each file
+    it reads in place of its path (`FILED`: a requirements, constraints or overrides file, and every file that
+    reads in turn, `filed`, so a changed override builds anew as a changed requirement does, included or
+    named), and its Python where that is not 3.12, whose names
+    predate the choice) names it, so a changed installation is built anew beside the old one, which a
+    running job may hold."""
+    named = [filed(Path(argument)) if previous in FILED else argument
              for previous, argument in zip(["", *install], install, strict=False)]
     named += [] if python == "3.12" else [f"python {python}"]
     digest = hashlib.sha256(json.dumps(named).encode()).hexdigest()[:12]

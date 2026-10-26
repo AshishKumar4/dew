@@ -14,6 +14,7 @@ from reference_error import assert_as_exact
 from tuned import each_config
 
 from dew.nn.kernels import recurrence, tuning
+from dew.nn.precision import FP32_SUMS
 
 ROWS, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH, TAPS = 16, 2, 4, 16, 32, 4
 """A decode token with grouped heads, idle rows and a four-tap history."""
@@ -164,20 +165,34 @@ def one_tap_draw(dtype, seed: int) -> tuple[recurrence.Step]:
     return (orbit(one_tap_operands(dtype, operand_seed), orbit_seed),)
 
 
+def summed(hooks: recurrence.Hooks):
+    """The XLA form's step with its fp32 products summed in fp32 (`FP32_SUMS`), as the GPU the
+    interpreted kernel stands for sums them, where a CPU test process sums them in float64
+    (`precision.accumulated`): the reference arm of a launch's check, the plain form's float64 run its
+    truth."""
+
+    @jax.jit
+    def run(operands):
+        with jax.default_matmul_precision(FP32_SUMS):
+            return recurrence.step_reference(hooks, operands)
+    return run
+
+
 @pytest.mark.parametrize('hooks', HOOKS + FORMED, ids=str)
 def test_every_hook_combination_steps_as_its_float64_form(hooks):
     """A decode token through the launch, at each config of its space, within tests/reference_error.py's
     rule of the XLA form's fp32 run against its float64 run: its output, its state and, under a conv,
-    its moved history, which is the history's own bits. The idle row's output is zeros and its state
-    and history are its inputs' bits."""
+    its moved history, which is the history's own bits (`summed`'s fp32 run). The idle row's output is
+    zeros and its state and history are its inputs' bits."""
     given = operands(hooks)
     reference_fn = jax.jit(functools.partial(recurrence.step_reference, hooks))
     reference = reference_fn(given)
+
     for config in each_config(recurrence.StepLaunch, functools.partial(recurrence.step, hooks), given):
         with tuning.pinned({recurrence.StepLaunch: config}):
             step = jax.jit(functools.partial(recurrence.step, hooks))
-            assert_as_exact(step, reference_fn, functools.partial(draw, hooks), f'{hooks} {config}',
-                            seeds={**SEEDS, **FORMED_SEEDS}[hooks])
+            assert_as_exact(step, summed(hooks), functools.partial(draw, hooks), f'{hooks} {config}',
+                            seeds={**SEEDS, **FORMED_SEEDS}[hooks], truth_fn=reference_fn)
             out, history, state = step(given)
         np.testing.assert_array_equal(np.asarray(out)[1], 0.0)
         np.testing.assert_array_equal(np.asarray(state)[1], np.asarray(given.state)[1])
@@ -194,10 +209,10 @@ def test_a_bf16_state_steps_as_its_float64_form(hooks):
     given = operands(hooks, seed=1, state_dtype=jnp.bfloat16)
     _, _, state = recurrence.step(hooks, given)
     assert state.dtype == jnp.bfloat16
-    assert_as_exact(jax.jit(functools.partial(recurrence.step, hooks)),
-                    jax.jit(functools.partial(recurrence.step_reference, hooks)),
+    assert_as_exact(jax.jit(functools.partial(recurrence.step, hooks)), summed(hooks),
                     functools.partial(draw, hooks, state_dtype=jnp.bfloat16), f'bf16 state {hooks}',
-                    seeds=BF16_SEEDS[hooks])
+                    seeds=BF16_SEEDS[hooks],
+                    truth_fn=jax.jit(functools.partial(recurrence.step_reference, hooks)))
     np.testing.assert_array_equal(np.asarray(state)[1], np.asarray(given.state)[1])
 
 
@@ -219,7 +234,7 @@ def test_a_write_gate_without_the_delta_rule_scales_what_the_token_writes():
         given = one_tap_operands(dtype, 3)
         for step in (recurrence.step, recurrence.step_reference):
             assert step(one_tap, given)[1].shape == (ROWS, 0, channels)
-        assert_as_exact(jax.jit(functools.partial(recurrence.step, one_tap)),
-                        jax.jit(functools.partial(recurrence.step_reference, one_tap)),
+        assert_as_exact(jax.jit(functools.partial(recurrence.step, one_tap)), summed(one_tap),
                         functools.partial(one_tap_draw, dtype), f'one-tap {jnp.dtype(dtype).name}',
-                        seeds=ONE_TAP_SEEDS[dtype])
+                        seeds=ONE_TAP_SEEDS[dtype],
+                        truth_fn=jax.jit(functools.partial(recurrence.step_reference, one_tap)))

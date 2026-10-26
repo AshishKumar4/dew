@@ -15,7 +15,7 @@ what the reference computes for the same pixels and tokens;
 
 import functools
 import logging
-from collections.abc import Iterator, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -23,6 +23,8 @@ import numpy as np
 from jax.typing import ArrayLike
 
 from dew.artifacts import ImageGrid, uint8_pixels
+from dew.data.images import CAPTIONS
+from dew.nn.precision import accumulated
 from dew.nn.text_encoders import DEFAULT_MODEL as CLIP_CHECKPOINT
 from dew.objectives.base import Batch
 
@@ -77,7 +79,7 @@ def clip_image_text_cosine(images: ArrayLike, input_ids: ArrayLike, attention_ma
     text_embeds = model.get_text_features(input_ids, attention_mask)
     image_embeds = image_embeds / jnp.linalg.norm(image_embeds, axis=-1, keepdims=True)
     text_embeds = text_embeds / jnp.linalg.norm(text_embeds, axis=-1, keepdims=True)
-    return jnp.einsum('nd,nd->n', image_embeds, text_embeds)
+    return accumulated(functools.partial(jnp.einsum, 'nd,nd->n'), image_embeds, text_embeds)
 
 
 def _clip_score(cosine: jax.Array) -> jax.Array:
@@ -86,11 +88,32 @@ def _clip_score(cosine: jax.Array) -> jax.Array:
     return 100.0 * jnp.maximum(cosine, 0.0)
 
 
+def clip_tokens(captions: Sequence[str], *,
+                modelname: str = CLIP_CHECKPOINT) -> tuple[np.ndarray, np.ndarray]:
+    """`captions` as CLIP's own tokenizer reads them, its ids and attention mask, each truncated to
+    CLIP's context rather than overrunning its position table: what every CLIP metric scores."""
+    from dew.data.text import load_tokenizer
+
+    tokenizer = load_tokenizer(modelname)
+    tokens = tokenizer(list(captions), padding="max_length", max_length=tokenizer.model_max_length,
+                       truncation=True, return_tensors="np")
+    return np.asarray(tokens["input_ids"]), np.asarray(tokens["attention_mask"])
+
+
 def _artifact_cosine(artifact: ImageGrid, batch: Batch, field: str, modelname: str) -> jax.Array:
-    """Return the per-image cosine for one sampled grid and its batch's prompts."""
-    text = batch[field]
-    return clip_image_text_cosine(uint8_pixels(artifact.images), text["input_ids"],
-                                  text["attention_mask"], modelname=modelname)
+    """Return the per-image cosine for one sampled grid and its batch's prompts, the host captions in
+    `field` (`EncodeCaptions(keep=...)`) tokenized by CLIP's own tokenizer (`clip_tokens`), whatever
+    tokenizer the model's conditions read. A field of anything but one string a row is refused
+    (ValueError)."""
+    held = batch[field]
+    captions = None if isinstance(held, Mapping) else np.asarray(held)
+    if (captions is None or captions.ndim != 1 or captions.dtype.kind not in "OU"
+            or not all(isinstance(caption, str) for caption in captions.tolist())):
+        raise ValueError(f"CLIP scores the batch's captions as text in {field!r}, which holds "
+                         f"{type(held).__name__} of other values; keep them (EncodeCaptions(keep=...))")
+    input_ids, attention_mask = clip_tokens(captions.tolist(), modelname=modelname)
+    return clip_image_text_cosine(uint8_pixels(artifact.images), input_ids, attention_mask,
+                                  modelname=modelname)
 
 
 class CLIPDistance(ImageMetric):
@@ -100,7 +123,7 @@ class CLIPDistance(ImageMetric):
     report for a new run.
     """
 
-    def __init__(self, modelname: str = CLIP_CHECKPOINT, field: str = "text"):
+    def __init__(self, modelname: str = CLIP_CHECKPOINT, field: str = CAPTIONS):
         def measure(artifact, batch):
             return 1.0 - _artifact_cosine(artifact, batch, field, modelname)
 
@@ -111,11 +134,11 @@ class CLIPScore(ImageMetric):
     """Measures CLIPScore for an image set against its prompts (`score`), or over a validation pass.
 
     Over a validation pass it is the mean over the sampled images and the
-    batch's tokenized prompts in `field`. `modelname` names the CLIP
-    checkpoint.
+    batch's captions in `field`, as host text CLIP's own tokenizer reads
+    (`clip_tokens`). `modelname` names the CLIP checkpoint.
     """
 
-    def __init__(self, modelname: str = CLIP_CHECKPOINT, field: str = 'text'):
+    def __init__(self, modelname: str = CLIP_CHECKPOINT, field: str = CAPTIONS):
         def measure(artifact, batch):
             return _clip_score(_artifact_cosine(artifact, batch, field, self.modelname))
         super().__init__(name='clip_score', measure=measure)
@@ -153,17 +176,11 @@ class CLIPScore(ImageMetric):
         _equal_counts(pixels.shape[0], len(prompts))
         if pixels.shape[0] == 0:
             raise ValueError("clip_score: no images to score")
-        from dew.data.text import load_tokenizer
-        # CLIP's own context bounds a caption, so an overlong one is truncated
-        # to it rather than overrunning the position table.
-        tokenizer = load_tokenizer(self.modelname)
-        tokens = tokenizer(list(prompts), padding="max_length", max_length=tokenizer.model_max_length,
-                           truncation=True, return_tensors="np")
+        input_ids, attention_mask = clip_tokens(prompts, modelname=self.modelname)
         with metric_device():
             for start in range(0, pixels.shape[0], batch_size):
                 stop = start + batch_size
-                cosine = clip_image_text_cosine(pixels[start:stop], tokens["input_ids"][start:stop],
-                                                tokens["attention_mask"][start:stop],
-                                                modelname=self.modelname)
+                cosine = clip_image_text_cosine(pixels[start:stop], input_ids[start:stop],
+                                                attention_mask[start:stop], modelname=self.modelname)
                 yield np.asarray(_clip_score(cosine), dtype=np.float64)
 

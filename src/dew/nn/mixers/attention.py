@@ -83,7 +83,7 @@ def exclusive_self_attention(attention: jax.Array, value: jax.Array) -> jax.Arra
     heads, kv_heads = attention.shape[-2], value.shape[-2]
     if heads % kv_heads:
         raise ValueError(f"{heads} query heads do not group over {kv_heads} value heads")
-    dtype = jnp.promote_types(jnp.promote_types(attention.dtype, value.dtype), jnp.float32)
+    dtype = at_least_fp32(jnp.result_type(attention, value))
     value = jnp.repeat(value.astype(dtype), heads // kv_heads, axis=-2)
     work = attention.astype(dtype)
     norm = jnp.sum(value * value, axis=-1, keepdims=True)
@@ -196,8 +196,8 @@ class CausalSelfAttention(nn.Module):
     them for its kind (`MixerContext`)."""
     qk_norm_weight: bool = True  # False: Llama 4's weightless L2 norm (Llama4TextL2Norm)
     temperature_tuning: tuple[float, float] | None = None
-    """Llama 4's (floor_scale, attn_scale): an unrotated layer scales each
-    query by its position (`temperature_scale`)."""
+    """A (floor_scale, attn_scale) that scales each query by its position
+    (`temperature_scale`), rotated or not: Llama 4's unrotated layers'."""
     gate_projection: Literal['query', 'own'] = 'query'
     """Where the output gate comes from: the doubled query projection
     (Qwen3.5), or a `gate_proj` of its own over the layer's input (Muse
@@ -205,7 +205,7 @@ class CausalSelfAttention(nn.Module):
     multiplies by its sigmoid."""
     bidirectional_images: bool = False
     """Whether a causal layer lets each token of an image (`AttentionMetadata.image_groups`) see the
-    image's later tokens too (Gemma 3's, and Gemma 4's sliding layers')."""
+    image's later tokens too, within its window (Gemma 3's, and Gemma 4's sliding layers')."""
     bidirectional_blocks: bool = False
     """Whether a causal layer lets each token of a block (`AttentionMetadata.block_groups`) see the whole
     block, whatever its window (transformers' `block_sequence_ids`): a decision prompt's blocks, read both
@@ -459,6 +459,36 @@ class CausalSelfAttention(nn.Module):
             value = self.values_norm(value)
         return constrain(key, KV_HEADS), constrain(value, KV_HEADS)
 
+    def _placed_query(self, query, rotary_positions, places, uncached):
+        """The query with its positions applied, and the rotation's angles (None without one): rotated
+        by its places, or under NoPE only scaled to the logit scale the checkpoint asks for.
+        `uncached` is the call's tokens where it reads no cache."""
+        freqs_cos = freqs_sin = None
+        if self.nope:
+            # NoPE rotates nothing; the query still carries the logit scale
+            # the checkpoint asks for, which rotate folds in otherwise.
+            if self.ctx.attention_scale is not None:
+                query = scaled(query, self.ctx.attention_scale * math.sqrt(self.ctx.head_dim))
+        else:
+            freqs_cos, freqs_sin = self._rotary_angles(rotary_positions, query, uncached, places)
+            # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
+            # query carries the ratio to the scale the checkpoint asks for.
+            query = rotate(
+                self._turned(query), freqs_cos, freqs_sin, pairs=self.rotary_pairs,
+                scale=(None if self.ctx.attention_scale is None
+                       else self.ctx.attention_scale * math.sqrt(self.ctx.head_dim)))
+        return query, freqs_cos, freqs_sin
+
+    def _tuned(self, query, places):
+        """The query times its position's temperature (`temperature_tuning`), the last thing done to
+        it before it attends: after its rotation and after any normalization (nGPT's unit sphere), so
+        no normalization undoes it. A scalar a position, rotated kind or not."""
+        if self.temperature_tuning is None:
+            return query
+        scale = temperature_scale(places, *self.temperature_tuning, dtype=at_least_fp32(query.dtype))
+        return query * (scale[..., None, None] if scale.ndim == 2
+                        else scale[None, :, None, None]).astype(query.dtype)
+
     def _rotary_angles(self, rotary_positions, heads: jax.Array, tokens: Coordinates | None = None,
                        places=None):
         """Build the rotary cos and sin this layer rotates its heads by, in
@@ -477,9 +507,9 @@ class CausalSelfAttention(nn.Module):
 
     def _rotary_tables(self, rotary_positions, dtype, reach=None):
         """The rotary cos and sin at `dtype`. Interleaved mRoPE, YaRN and the
-        plain rope each build their own angles; YaRN rotates whole heads at
-        its own frequencies, so it takes neither a partial rotary nor a
-        Llama 3.1 ramp."""
+        plain rope each build their own angles; YaRN ramps the rotated width,
+        a whole head or a 'default' partial rotary's (`rotary_freqs`), at its
+        own frequencies, so it takes no Llama 3.1 ramp."""
         if self.rotary_axes is not None:
             if rotary_positions is None or rotary_positions.ndim != 3:
                 raise ValueError(f"a rotary over {len(self.rotary_axes)} axes reads their ids "
@@ -622,25 +652,8 @@ class CausalSelfAttention(nn.Module):
         rotary_positions = places
         if attention_metadata is not None and attention_metadata.rotary_positions is not None:
             rotary_positions = attention_metadata.rotary_positions
-        freqs_cos = freqs_sin = None
-        if self.nope:
-            # NoPE rotates nothing; the query still carries the logit scale
-            # the checkpoint asks for, which rotate folds in otherwise.
-            if self.ctx.attention_scale is not None:
-                query = scaled(query, self.ctx.attention_scale * math.sqrt(self.ctx.head_dim))
-            if self.temperature_tuning is not None:
-                scale = temperature_scale(places, *self.temperature_tuning, dtype=at_least_fp32(query.dtype))
-                query = query * (scale[..., None, None] if scale.ndim == 2
-                                 else scale[None, :, None, None]).astype(query.dtype)
-        else:
-            uncached = None if decode else tokens
-            freqs_cos, freqs_sin = self._rotary_angles(rotary_positions, query, uncached, places)
-            # Every kernel path scales the logits by 1/sqrt(head_dim) itself, so the
-            # query carries the ratio to the scale the checkpoint asks for.
-            query = rotate(
-                self._turned(query), freqs_cos, freqs_sin, pairs=self.rotary_pairs,
-                scale=(None if self.ctx.attention_scale is None
-                       else self.ctx.attention_scale * math.sqrt(self.ctx.head_dim)))
+        query, freqs_cos, freqs_sin = self._placed_query(query, rotary_positions, places,
+                                                         None if decode else tokens)
         own_value = value
         if not self.ctx.kv_shared:
             if freqs_cos is not None and freqs_sin is not None:
@@ -651,6 +664,7 @@ class CausalSelfAttention(nn.Module):
                 # Post-norm, post-rope, the same tensors the reference hands
                 # its sharing layers (modeling_gemma4.py, Gemma4TextAttention).
                 kv_store[self.ctx.kv_store_key] = (key, value, positions, places, {})
+        query = self._tuned(query, places)
         if decode and attention_metadata is not None and attention_metadata.admitted is not None:
             attention = self._mixed_attended(query, key, value, positions, attention_metadata)
             return self._output(attention, gate, B, S, own_value)
@@ -1182,7 +1196,13 @@ class AttentionMixer(MixerBase):
     """Where the decoder's output gate comes from (`CausalSelfAttention.gate_projection`)."""
     qk_norm_weight: bool = True
     """Whether the decoder's qk norm has a weight (`CausalSelfAttention.qk_norm_weight`): Muse
-    Glimmer's has none (modeling_muse_glimmer.py:307)."""
+    Glimmer's has none (modeling_muse_glimmer.py:307), nor Llama 4's L2 norm."""
+    rotary_pairs: Literal['half', 'adjacent'] = 'half'
+    """The channels each rotary angle turns (`CausalSelfAttention.rotary_pairs`): halves, or
+    adjacent pairs, as Llama 4's rotated layers turn them."""
+    temperature_tuning: tuple[float, float] | None = None
+    """A (floor_scale, attn_scale) that scales each query by its position (`temperature_scale`,
+    arXiv 2501.19399), as Llama 4's unrotated layers do; None scales none."""
 
     # `CausalSelfAttention` reads the mixed call's `Admitted` layout.
     mixed_step = True
@@ -1192,6 +1212,10 @@ class AttentionMixer(MixerBase):
                                        bidirectional_blocks=self.bidirectional_blocks)
 
     def __post_init__(self):
+        if self.temperature_tuning is not None:
+            object.__setattr__(self, "temperature_tuning", tuple(self.temperature_tuning))
+            if len(self.temperature_tuning) != 2 or self.temperature_tuning[0] <= 0:
+                raise ValueError("temperature_tuning is a (floor_scale, attn_scale) with a positive floor")
         if self.mrope_section is not None:
             object.__setattr__(self, "mrope_section", tuple(self.mrope_section))
             if len(self.mrope_section) != 3 or any(value < 0 for value in self.mrope_section):

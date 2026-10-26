@@ -1,7 +1,7 @@
 {
 	"about": "The screen jepa.py left on a terminal, written by site/scripts/capture_snippets.py.",
 	"arguments": [],
-	"script_sha256": "402c0803d4c16b38adf42fb1b0b79a0b22f0dc97b0f388b71255d5ab5e2fd622",
+	"script_sha256": "8c365cead24d564b5caca80d57635313245415b5d392c8fcd08374710ea12af0",
 	"meta": {
 		"where": "a 4-vCPU Cloudflare container",
 		"python": "3.12.15",

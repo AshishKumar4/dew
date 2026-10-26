@@ -111,7 +111,7 @@ Every recipe's configuration extends `RunConfig` with five parts:
 | `model` (`ModelConfig`) | The model's class and its constructor fields, compute dtype and attention kernel among them. | `--model causal_transformer --model.num-layers 12` |
 | `objective` (`ObjectiveConfig`) | The objective's class and the constructor arguments the run states. | `--objective lm --objective.ema-decay 0.999` |
 | `data`, `validation` | Chains: a source, its steps and a preset, recorded with the run. | `--set data.token_windows.seq_len=16` |
-| `optim` (`OptimConfig`) | Optimizer, constant or scheduled rate, weight decay, clipping, optimizer-state dtype. | `--optim.rate 0.0001` |
+| `optim` (`OptimConfig`) | Optimizer, constant or scheduled rate, weight decay, clipping, optimizer-state dtype. | `--optim.learning-rate 0.0001` |
 | `trainer` (`TrainerConfig`) | Run length, checkpoint and logging intervals, mesh and layout, tracking. | `--trainer.steps 1000` |
 
 A dotted flag sets a field inside a configuration object, and `--set path=value`, applied after the flags, sets one inside the run's data chain: `data.<preset>.<setting>` for the preset's settings and `data.source.url` for its store. `--model` picks the model's class by alias or import path (`--model hybrid_dit`, `--model mypackage.models:Net`), and every field that class declares is then a flag of its own, typed by its annotation: `--model.num-layers 12`, `--model.dtype float32`, `--model.precision highest`. A field holding records, such as a UNet's `attention_configs`, takes one JSON value. Naming another class starts from that class's defaults and keeps the recipe's compute dtype. `--objective` works the same way: it picks the objective's class, and each argument of its constructor is a flag, `--objective.<argument>`, except th…
@@ -123,7 +123,7 @@ Each setting's default is the recipe's own, which can differ from the configurat
 | `--model.dtype` | The model's compute dtype, which each recipe's default model states. Parameters are stored in float32. A run-wide matmul precision is `jax.default_matmul_precision`; a model's own is `--model.precision`. |
 | `--model.attention-impl` | A name `AttentionImpl` declares ([dew/nn/attention.py](../src/dew/nn/attention.py)). The example uses `reference` so no device-specific kernel runs. |
 | `--optim.optimizer` | `adam`, `adamw`, `lamb`, `muon` or `muonclip`. |
-| `--optim.rate` | The learning rate: a number, or a schedule's record as JSON (`'{"class": "cosine", "fields": {...}}'`). |
+| `--optim.learning-rate` | The learning rate: a number, or a schedule's record as JSON (`'{"class": "cosine", "fields": {...}}'`). |
 | `--optim.state-dtype` | `bfloat16` stores Adam's moments stochastically rounded, for `adam` and `adamw` only. |
 | `--trainer.steps` / `--trainer.epochs` | Run length; set one, not both. |
 | `--set data.<preset>.batch` | Global batch across all JAX processes, the preset's (`data.token_windows.batch`, `data.images.batch`). |
@@ -137,6 +137,8 @@ A chain's `workers(n)`, `threads(n)` or `loading(Loading(...))` control how the 
 An `epoch` interval needs a dataset with a known size. A stream that cannot save and restore its read position cannot produce a resumable checkpoint, so `fit` refuses a checkpoint interval for it and you have to set `--trainer.checkpoint-every None`. A configured checkpointer still writes the final state.
 
 Muon treats matrix parameters separately from embedding, head and normalization parameters. MuonClip also needs attention QK statistics for its clipping step. The LM recipe turns them on (`qk_stats`) when the optimizer is `muonclip`, and a new objective has to emit them itself. MuonClip clips by rescaling the query and key kernels. A layer that normalizes its queries and keys divides that scale back out of the logits, so MuonClip refuses such a layer. The causal transformer normalizes them by default, so to train it with MuonClip, pass `--optim.optimizer muonclip --model.no-qk-norm`.
+
+Two optimizers from Nested Learning (arXiv 2512.24695) are Optax transforms in `dew.optim`, composed in a Python run's own `optax.chain` rather than named by `--optim.optimizer`. `scale_by_m3` is M3, its Algorithm 1: Muon's orthogonalized momentum over Adam's second moment, plus a slow momentum that gathers each chunk of `frequency` updates and reaches the next chunk's updates, weighted by `alpha`; follow it with `optax.scale_by_learning_rate`, and partition a model's vectors to another optimizer as Muon's do. `delta_gradient_descent` steps each kernel to the minimizer of its eq. 56, forgetting what the kernel held along the step's input `x`: its update takes `inputs=`, the input of each kernel, and suits a memory or fast weight that sees one input a step.
 
 `--optim.state-dtype bfloat16` halves the memory the optimizer state takes. Its effect on step time depends on the device ([Performance measurements](performance.md)).
 

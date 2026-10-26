@@ -285,7 +285,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
         others, own, others_total, prior = (part[row, head, rows] for part in sums)
         m = maxima
         if draw is not None:
-            # Dropout's D: each dropped product centred about its query's first visible one.
+            # Dropout's D: each dropped product centred about its query's first visible tile's least one.
             def terms(j):
                 columns, seen, params, k_tile, v_tile = tile(j)
                 logits, _ = algebra.tile_logits(score_mod, interpreted_dot(q, k_tile.T), seen, q_pos,

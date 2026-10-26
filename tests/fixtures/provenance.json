@@ -531,6 +531,10 @@
    ],
    "note": "Calls AutoencoderDC encode/decode; bundle contains both conv and shuffle cases."
   },
+  "decoder-default-dropout-float64.jaxexport": {
+   "generator": "dew",
+   "note": "The same pre-dropout CPU forward and gradient graph at 42ddfc1, exported in float64 over the weights widened (tools/generate_decoder_dropout_fixture.py --dtype float64): the float32 export's float64 truth for check 1."
+  },
   "decoder-default-dropout.jaxexport": {
    "generator": "dew",
    "note": "Dew's serialized pre-dropout CPU forward and gradient graph at 42ddfc1 (tools/generate_decoder_dropout_fixture.py); a Dew regression golden."
@@ -2002,7 +2006,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -2410,7 +2414,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -3502,6 +3506,28 @@
      "runs": "transformers"
     }
    ]
+  },
+  "t5/tiny-seeds.npz": {
+   "tool": "tools/t5_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "The seeds mode runs transformers' encoder on the committed t5/tiny checkpoint over check 1's seeds (tools/recorded_references.py's record_case, summary): each seed's drawn ids, the fp32 last hidden state's evidence and its float64 truth's sketch, built and run inside tools/torch_precision.py's float64."
+  },
+  "t5/tiny-umt5-seeds.npz": {
+   "tool": "tools/t5_reference.py",
+   "sources": [
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.17.0",
+     "runs": "transformers"
+    }
+   ],
+   "note": "The seeds mode runs transformers' encoder on the committed t5/tiny-umt5 checkpoint over check 1's seeds (tools/recorded_references.py's record_case, summary): each seed's drawn ids, the fp32 last hidden state's evidence and its float64 truth's sketch, built and run inside tools/torch_precision.py's float64."
   },
   "tiny_diffusers.tar.xz": {
    "tool": "tools/diffusers_pipeline_reference.py",

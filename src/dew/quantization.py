@@ -64,7 +64,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.cache import QUANTIZED_TRACE
 from dew.nn.kernels.generation import backend
-from dew.nn.precision import correctly_rounded_divide
+from dew.nn.precision import accumulated, bf16_dot_general, correctly_rounded_divide
 
 if TYPE_CHECKING:
     from qwix import QArray, QuantizationProvider
@@ -232,11 +232,23 @@ def _quantized(model: nn.Module, provider: QuantizationProvider, spec: Quantizat
     """`model` with the matmuls of its `entry_methods` under Qwix's `provider`, in the class Qwix
     makes for the call, a `QuantizedClass` of `spec`,
     each method tracing what it calls under the key `QUANTIZED_TRACE` gives the provider."""
-    methods = entry_methods(model)
+    quantized = quantize_with(model, provider, methods=entry_methods(model),
+                              key=(type(provider).__name__, spec))
+    layer: Any = type(quantized)
+    layer._dew_quantization = spec
+    return quantized
+
+
+def quantize_with(model: nn.Module, provider: QuantizationProvider, *,
+                  methods: Sequence[str] = ("__call__",), key: Hashable | None = None) -> nn.Module:
+    """Qwix's `quantize_model(model, provider, methods=methods)`, each of `methods` tracing what it
+    calls under `key` in `QUANTIZED_TRACE` (by default the provider's kind and the provider): the
+    way Dew runs a model Qwix quantizes with a provider of its own, so Qwix owns the products the
+    thread tracing it forms (`dew.nn.precision.accumulated`) and no other thread's, and its traces
+    stay apart from the plain model's."""
     quantized = _qwix().quantize_model(model, provider, methods=methods)
     layer = type(quantized)
-    layer._dew_quantization = spec
-    key = (type(provider).__name__, spec)
+    key = (type(provider).__name__, provider) if key is None else key
     for name in methods:
         setattr(layer, name, _keyed(getattr(layer, name), key))
     return quantized
@@ -287,23 +299,28 @@ codes for the forward product, `[out, in]`, and for the input gradient,
 `[in, out]`, each beside one float32 scale a row (`frozen_fp8_leaves`)."""
 
 
-def frozen_fp8_leaves(kernel: jax.typing.ArrayLike) -> dict[str, np.ndarray]:
+def frozen_fp8_leaves(kernel: jax.typing.ArrayLike) -> dict[str, jax.Array | np.ndarray]:
     """A frozen `[in, out]` kernel packed once for both products it takes part
     in, each direction's rows scaled on their own by the one FP8 block cast
-    (`dew.interop.codecs.quantize_fp8_blocks` over `(1, width)` blocks): the
+    (`dew.interop.codecs.fp8_block_cast` over `(1, width)` blocks), on the
+    kernel's resident devices without a host gather; a host input stays on the host: the
     forward's `[out, in]` rows contract the input, the input gradient's
     `[in, out]` rows the output's cotangent. A forward row's scale is a
     contracting-axis scale of the other direction, so the two are quantized
     apart. The two E4M3 copies replace the kernel in the train state
     (`frozen_fp8_kernel` decodes it back), two bytes a parameter, a bf16
     kernel's, so the gain over a bf16 base is the products' rate."""
-    from dew.interop.codecs import quantize_fp8_blocks
+    from jax import core
 
-    kernel = np.asarray(kernel, np.float32)
+    from dew.interop.codecs import fp8_block_cast, quantize_fp8_blocks
+
+    resident = isinstance(kernel, (jax.Array, core.Tracer))
+    kernel = jnp.asarray(kernel, jnp.float32) if resident else np.asarray(kernel, np.float32)
     if kernel.ndim != 2:
         raise ValueError(f"a frozen FP8 site packs a two-axis [in, out] kernel, got shape {kernel.shape}")
-    forward, forward_scale = quantize_fp8_blocks(kernel.T, (1, kernel.shape[0]))
-    dgrad, dgrad_scale = quantize_fp8_blocks(kernel, (1, kernel.shape[1]))
+    cast = fp8_block_cast if resident else quantize_fp8_blocks
+    forward, forward_scale = cast(kernel.T, (1, kernel.shape[0]))
+    dgrad, dgrad_scale = cast(kernel, (1, kernel.shape[1]))
     return dict(zip(FROZEN_FP8, (forward, forward_scale, dgrad, dgrad_scale), strict=True))
 
 
@@ -318,37 +335,62 @@ def frozen_fp8_kernel(leaves: Mapping[str, jax.typing.ArrayLike]) -> jax.Array:
 
 def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.Array:
     """`values @ rows.T`, `[M, K]` by E4M3 `[N, K]`, in float32: `values`'
-    rows cast by the FP8 block cast, the codes widened in the dot and both
-    rows' scales applied after it, the form XLA's GPU compiler rewrites to an
-    FP8 GEMM (cuBLASLt)."""
+    rows cast by the FP8 block cast, both sides' codes multiplied exactly and
+    summed in fp32 (`dew.nn.precision.bf16_dot_general`: an E4M3 code is a
+    bf16 value) and both rows' scales applied after. The widened codes are
+    held apart from the product (an optimization barrier), so XLA's GPU
+    compiler does not rewrite it to an FP8 GEMM: Hopper's FP8 tensor cores
+    keep a narrower running sum, and at 512 x 4096 x 4096 on an H100 that
+    GEMM lay 291 times the dequantized float32 product's distance from
+    float64 at the highest precision and 3011 times at the default, where
+    this product lies at 0.53 times it, in 1.7 times the FP8 GEMM's time
+    (receipts ig-fp8-probe3, 4 and 5). The FP8 GEMM returns with a kernel
+    whose sum keeps float32's accuracy (ledger 1625)."""
     from dew.interop.codecs import fp8_block_cast
 
     codes, scales = fp8_block_cast(values, (1, values.shape[1]))
-    product = jax.lax.dot_general(codes.astype(jnp.float32), rows.astype(jnp.float32),
-                                  (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
+    held_codes, held_rows = jax.lax.optimization_barrier(
+        (codes.astype(jnp.bfloat16), rows.astype(jnp.bfloat16)))
+    product = bf16_dot_general(held_codes, held_rows, (((1,), (1,)), ((), ())))
     return product * scales * row_scales.T
 
 
-@jax.custom_vjp
+@jax.custom_jvp
 def frozen_fp8_product(x: jax.Array, forward: jax.Array, forward_scale: jax.Array, dgrad: jax.Array,
                        dgrad_scale: jax.Array) -> jax.Array:
     """`x @ kernel` in float32, `[M, in]` by a frozen kernel packed as
     `frozen_fp8_leaves`: FP8 products forward and for `x`'s gradient, and no
-    gradient for the kernel, which is frozen."""
+    gradient for the kernel, which is frozen. Forward mode (`jax.jvp`, MeanFlow's
+    target) takes the input's tangent times the decoded kernel
+    (`frozen_fp8_kernel`) in float32, the map the FP8 products stand for, and
+    reverse mode runs the FP8 input gradient (`_frozen_fp8_tangent`)."""
     return _fp8_rows(x, forward, forward_scale)
 
 
-def _frozen_fp8_forward(x, forward, forward_scale, dgrad, dgrad_scale):
-    # The input's dtype rides as an empty array, a residual JAX can hold.
-    return _fp8_rows(x, forward, forward_scale), (jnp.zeros((0,), x.dtype), dgrad, dgrad_scale)
+@frozen_fp8_product.defjvp
+def _frozen_fp8_tangent(primals, tangents):
+    """The product's tangent along `x`'s, the packed leaves frozen whatever their tangents: the
+    direction times the decoded forward rows in float32 at the highest precision, a linear call whose
+    transpose is the FP8 input gradient, in `x`'s dtype. Its residuals are the packed leaves and an
+    empty array of `x`'s dtype, all a backward reads, so a staged pullback, a remat or a scan keeps
+    no copy of `x`."""
+    from jax.custom_derivatives import linear_call
 
+    x, forward, forward_scale, dgrad, dgrad_scale = primals
 
-def _frozen_fp8_backward(residuals, cotangent):
-    like, dgrad, dgrad_scale = residuals
-    return _fp8_rows(cotangent, dgrad, dgrad_scale).astype(like.dtype), None, None, None, None
+    def tangent(residuals, direction):
+        rows, row_scales = (jax.lax.stop_gradient(leaf) for leaf in residuals[:2])
+        decoded = rows.astype(jnp.float32) * row_scales.astype(jnp.float32)
+        return accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((1,), (1,)), ((), ())),
+                                             precision=jax.lax.Precision.HIGHEST),
+                           direction.astype(jnp.float32), decoded, preferred_element_type=jnp.float32)
 
+    def transposed(residuals, cotangent):
+        _, _, rows, row_scales, like = residuals
+        return _fp8_rows(cotangent, rows, row_scales).astype(like.dtype)
 
-frozen_fp8_product.defvjp(_frozen_fp8_forward, _frozen_fp8_backward)
+    residuals = (forward, forward_scale, dgrad, dgrad_scale, jnp.zeros((0,), x.dtype))
+    return frozen_fp8_product(*primals), linear_call(tangent, transposed, residuals, tangents[0])
 
 
 def frozen_fp8_dense(module: nn.Module, inputs: jax.Array) -> jax.Array:
@@ -718,9 +760,9 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
     stored tree, `/`-joined) is timed both ways, forward and input
     gradient, by `dew.telemetry.benchmark.samples` on a GPU the process holds
     alone: bf16 operands as a bf16 Dense multiplies them, and the FP8
-    products `frozen_fp8_dense` runs. On an H100 FP8 won from about 2048
-    inputs and outputs and lost below: 0.70x at 1024 by 1024, 1.10x at 4096
-    by 4096, 1.47x at 4096 by 12288 (docs/performance.md). The record names
+    products `frozen_fp8_dense` runs. Those multiply the codes as bf16 values
+    (`_fp8_rows`), slower than a bf16 Dense, so no site measures faster until
+    an FP8 kernel keeps fp32's sums (ledger 1625; docs/performance.md). The record names
     the sites and the generation, so a run reproduces the choice; a GPU
     without FP8 tensor cores is refused by name.
 
@@ -1387,4 +1429,4 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     return served, {**variables, "params": parameters}
 
 
-__all__ = ["InputQuantization", "Quantization", "split_columns"]
+__all__ = ["InputQuantization", "Quantization", "quantize_with", "split_columns"]

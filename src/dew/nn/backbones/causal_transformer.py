@@ -318,6 +318,11 @@ class CausalTransformer(nn.Module):
     embedding_zero_ids: tuple[int, ...] = ()
     """Placeholder ids that the embedding lookup reads as token zero. The labels
     keep the original ids."""
+    padding_idx: int | None = None
+    """The id whose token embedding rows (`embed_tokens`, `embed_tokens_per_layer`) the lookup reads
+    but never trains, as a source's `nn.Embedding(padding_idx=...)` leaves them (Gemma 3n's and Phi's
+    pad_token_id, `TokenEmbedding.padding_idx`); a tied head still trains the row. None trains every
+    row."""
     dropout_rate: float = 0.0
     embedding_dropout_rate: float = 0.0
     attention_dropout_rate: float = 0.0
@@ -386,6 +391,12 @@ class CausalTransformer(nn.Module):
     mask_token_id: int | None = None
     """The vocabulary id that a masked-diffusion objective corrupts tokens to.
     None means plain training."""
+    shifted_logits: bool = False
+    """Whether masked diffusion reads position i's prediction from position i-1's logits, as a
+    checkpoint continued from an autoregressive one predicts the token after each position
+    (Dream-v0); False reads each position's own (LLaDA). The forward ignores it: it says how
+    the checkpoint's logits line up, which `dew.diffusion.discrete.aligned` applies for the
+    masked loss and the sampler alike."""
     scan_layers: bool = False                 # runs of like layers under flax's scan
     bank_layers: int | None = None
     """The most layers one scanned run holds, which is also how many layers its
@@ -524,6 +535,7 @@ class CausalTransformer(nn.Module):
             head_dim=(self.features_per_head if kind.head_dim is None else kind.head_dim),
             partial_rotary_factor=self._kind_rotary(kind),
             sinks=self.attention_sinks if kind.sinks is None else kind.sinks,
+            qk_norm=self.qk_norm if kind.qk_norm is None else kind.qk_norm,
             mixer=kind.mixer)
 
     def _kind_rotary(self, kind: LayerKind) -> float | None:
@@ -596,7 +608,7 @@ class CausalTransformer(nn.Module):
         """Return one layer's mixer geometry as a `MixerContext` built from the resolved kind.
 
         `head_dim`, `rope_theta`, `window`, the two rotary ramps, the partial
-        rotary and the sinks take the layer kind's resolved values
+        rotary, the sinks and the query-key norm take the layer kind's resolved values
         (`kind_of`), and the precision the model's layers take (`products`). Every other field
         is the model's field of the same name. A kind builds its `DecoderBlock` factory
         from this context and its own record, and `setup` chooses the mixer
@@ -610,7 +622,7 @@ class CausalTransformer(nn.Module):
             "k_eq_v": self.attention_k_eq_v and kind.window is None,
             "kv_shared": kv_shared, "kv_store_key": layer_type,
             "partial_rotary_factor": kind.partial_rotary_factor, "attention_sinks": kind.sinks,
-            "init_std": self.init_stds[0], "output_init_std": self.init_stds[1],
+            "qk_norm": kind.qk_norm, "init_std": self.init_stds[0], "output_init_std": self.init_stds[1],
             "precision": self.precision}
         return MixerContext(**resolved, **{field.name: getattr(self, field.name)
                                            for field in dataclasses.fields(MixerContext)
@@ -847,7 +859,7 @@ class CausalTransformer(nn.Module):
 
         self.embed_tokens = TokenEmbedding(
             num_embeddings=self.vocab_size, features=self.emb_features,
-            dtype=self.dtype, name='embed_tokens',
+            dtype=self.dtype, name='embed_tokens', padding_idx=self.padding_idx,
             embedding_init=(TokenEmbedding.embedding_init if self.initializer_range is None
                             else nn.initializers.normal(self.initializer_range)))
         if self.embedding_dropout_rate:
@@ -869,7 +881,7 @@ class CausalTransformer(nn.Module):
             # hidden_size_per_layer_input slice per layer.
             self.embed_tokens_per_layer = TokenEmbedding(
                 num_embeddings=self.per_layer_vocab, features=self.num_layers * ple,
-                dtype=self.dtype, name='embed_tokens_per_layer')
+                dtype=self.dtype, name='embed_tokens_per_layer', padding_idx=self.padding_idx)
             self.per_layer_model_projection = Dense(
                 projections['per_layer_model_projection'][1], use_bias=False,
                 dtype=self.dtype, precision=self.precision,

@@ -121,7 +121,7 @@ data = compile(train, validation=held, seed=7)
 
 `map(step)` after `batch` runs in the training process after batching and workers. It forwards position and ownership. Steps on only one branch affect that branch; `compile(..., host=(step,))` applies a common host step to both branches.
 
-For conditional image training, `Trainer.fit` compiles the chain with the objective's own stages (`objective.data()`), and a diffusion objective's encode the captions (`EncodeCaptions`). Without a caption reader, string fields stay on the host, where metrics read them: the prefetcher places only the fields a device holds.
+For conditional image training, `Trainer.fit` compiles the chain with the objective's own stages (`objective.data()`), and a diffusion objective's encode the captions for its conditions and keep them beside as host text (`EncodeCaptions(keep=CAPTIONS)`), where metrics and rewards read them with their own tokenizer (`CLIPScore` with CLIP's): the prefetcher places only the fields a device holds.
 
 ## Text, chat and packing
 
@@ -186,7 +186,7 @@ A chain's stages run where written. Use `map`, `random_map`, `filter`, `filter_m
 
 `export(pipeline, url, format="parquet" | "array_record")` writes committed shards. Reads follow fsspec URLs. Transactional publication supports local files, memory, S3 and the S3-compatible endpoints that honour its conditional PUTs, GCS, Hub repositories, and any fsspec filesystem that supplies its own conditional writes through a `put_conditional` method (`dew.data.storage.Store`). It refuses other write protocols rather than putting a partial publication. Producer manifests and indexes are the indexed reader's authority. Transport caches use URL chaining such as `dewcache::s3://bucket/path` and are separate from transformed artifacts.
 
-A storage profile names a filesystem and its options once. Profiles live in `~/.config/dew/storage.toml`, or the file `DEW_STORAGE_CONFIG` names, as one table per profile with the `base` protocol it extends. A value written `env:NAME` or `file:PATH` is read from that environment variable or file when the filesystem opens. Cloudflare R2, for example, is an S3 endpoint:
+A storage profile names a filesystem and its options once. Profiles live in `storage.toml` in Dew's configuration directory (`$DEW_CONFIG_DIR`, else `$XDG_CONFIG_HOME/dew`, else `~/.config/dew`), or the file `DEW_STORAGE_CONFIG` names, as one table per profile with the `base` protocol it extends. A value written `env:NAME` or `file:PATH` is read from that environment variable or file when the filesystem opens. Cloudflare R2, for example, is an S3 endpoint:
 
 ```toml
 [r2]

@@ -21,12 +21,14 @@ import optax
 import pytest
 from affine_run import BATCH, TimingRegression as Regression, batches
 from process_support import assert_exits_cleanly
+from recording import RecordingTracker
 
 from dew.artifacts import Representations
 from dew.data import Loading, Rejected, from_grain, mix
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader, mapped
 from dew.data.readers import _Host
+from dew.telemetry.records import FitEnded
 from dew.training import Checkpoints, MeshSpec, Trainer
 from dew.training.distributed import DevicePrefetchIterator, batch_signature, shard_batch, step_reads
 
@@ -325,9 +327,10 @@ def test_a_field_no_compiled_step_reads_stays_on_the_host():
     mesh = MeshSpec().build()
     rows = jax.device_count()
     batch = {"x": np.ones((rows, 3), np.float32), "unused": np.arange(rows), "absent": None}
-    step = jax.jit(lambda state, batch, part: state + jnp.sum(batch["x"]) + part)
+    # A step's arguments as the trainer's: the moving state, the frozen tree, then the batch.
+    step = jax.jit(lambda state, frozen, batch, part: state + frozen + jnp.sum(batch["x"]) + part)
     first = shard_batch(mesh, batch)
-    compiled = step.lower(jnp.zeros(()), first, jnp.int32(0)).compile()
+    compiled = step.lower(jnp.zeros(()), jnp.zeros(()), first, jnp.int32(0)).compile()
     # The trainer publishes the mask under the placed batch's signature.
     signature = batch_signature(first)
     reads = {signature: step_reads(compiled, signature)}
@@ -335,7 +338,7 @@ def test_a_field_no_compiled_step_reads_stays_on_the_host():
     with DevicePrefetchIterator(iter([batch, wider]), mesh, reads=reads) as stream:
         placed, whole = next(stream), next(stream)
     assert isinstance(placed["x"], jax.Array) and isinstance(placed["unused"], np.ndarray)
-    assert float(compiled(jnp.zeros(()), placed, jnp.int32(0))) == 3 * rows
+    assert float(compiled(jnp.zeros(()), jnp.zeros(()), placed, jnp.int32(0))) == 3 * rows
     assert isinstance(whole["unused"], jax.Array)
 
 
@@ -548,15 +551,20 @@ def test_repeated_bounded_fit_releases_each_source_and_reuses_checkpointer(tmp_p
     assert len(opened) == 2
 
 
-def test_unexpected_training_eof_still_closes_and_does_not_save_success(tmp_path):
+def test_a_training_stream_that_runs_out_closes_and_ends_the_run_at_its_last_batch(tmp_path):
+    """A stream of one batch under a run of two steps ends the run at step 1, as a run of one step
+    would end: the stream closed, its final checkpoint written there with the position it stopped at,
+    and the run's outcome completed."""
     source = Source(end=1)
     checkpoints = Checkpoints(str(tmp_path))
+    tracker = RecordingTracker()
     trainer = Trainer(Regression(), optax.sgd(0.01), key=jax.random.key(0),
-                      checkpoints=checkpoints)
-    with pytest.raises(StopIteration):
-        trainer.fit(Loader(lambda partition: source, None, None, 8), steps=2)
+                      checkpoints=checkpoints, tracker=tracker)
+    state = trainer.fit(Loader(lambda partition: source, None, None, 8), steps=2)
     assert source.closed.is_set()
-    assert checkpoints.latest is None
+    assert int(state.step) == checkpoints.latest == 1
+    assert json.loads(checkpoints.restore(share=DataPartition())[1]) == {"position": 1}
+    assert [value.status for _, value in tracker.artifacts if isinstance(value, FitEnded)] == ["completed"]
 
 
 @pytest.mark.parametrize("steps", [0, 2])

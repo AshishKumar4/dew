@@ -41,6 +41,17 @@ def drawn_ids(vocab_size: int, seed: int) -> dict[str, np.ndarray]:
     return {"input_ids": rng.integers(0, vocab_size, (BATCH, LENGTH)).astype(np.int32)}
 
 
+PROMPT_WORDS = ("a", "red", "cat", "on", "mat", "tiny", "photo", "of", "the", "blue", "sea", "under",
+                "light")
+"""The words a drawn prompt joins (`drawn_prompts`)."""
+
+
+def drawn_prompts(salt: int, seed, count: int = 2) -> tuple[str, ...]:
+    """`count` prompts of one to eight `PROMPT_WORDS` drawn from `seed` under a site's `salt`."""
+    rng = np.random.default_rng([salt, int(seed)])
+    return tuple(" ".join(rng.choice(PROMPT_WORDS, size=rng.integers(1, 9))) for _ in range(count))
+
+
 def float64_logits(loaded):
     """The logits of `loaded` (a `Pretrained`) cloned to float64, its weights widened once, as a function
     of a draw (`drawn_ids`) run where x64 is enabled: a recorded decoder's float64 truth, which its
@@ -125,6 +136,24 @@ def packed(latent: np.ndarray) -> np.ndarray:
     return grouped.transpose(0, 1, 3, 5, 2, 4).reshape(batch, height * width // 4, channels * 4)
 
 
+def assert_published_checkpoint(measured, name: str) -> None:
+    """A published checkpoint's batches as `tools.wrapper_checkpoint_parity.measure_checkpoint` measures
+    them: each batch's logits at every position as near its float64 truth as the reference's fp32 run
+    (the gate's one-draw rule), and Dew's greedy continuation the reference's wherever every step's top
+    reference logit clears the next by the gate's selection margin (`selection_margins.MARGIN`), so that
+    float32 rounding cannot pick another token. A continuation with a step nearer a tie decides
+    nothing, and is not compared."""
+    from reference_error import assert_as_exact_as_the_reference
+    from selection_margins import MARGIN, top_margin
+
+    for row in measured:
+        assert row.truth.dtype == np.float64
+        label = f"published {name} {row.modality}"
+        assert_as_exact_as_the_reference(row.dew, row.reference, row.truth, label)
+        if np.all(top_margin(np.asarray(row.continuation_logits, np.float64), 1) > MARGIN):
+            np.testing.assert_array_equal(row.dew_continuation, row.reference_continuation)
+
+
 def assert_same_stored_tensors(written: dict, original: dict) -> None:
     """`written` holds every tensor of `original` and no other, each with its
     dtype, shape and bytes; a scalar's bytes are read through a flat view."""
@@ -189,8 +218,10 @@ def channels_last(array) -> np.ndarray:
 def posterior_of(moments) -> tuple[jax.Array, jax.Array]:
     """The posterior's mean and standard deviation, split from an encoder's stacked moments as
     Diffusers' `DiagonalGaussianDistribution` splits them."""
-    mean, log_variance = jnp.split(moments, 2, axis=-1)
-    return mean, jnp.exp(0.5 * jnp.clip(log_variance, -30.0, 20.0))
+    from dew.nn.autoencoders.kl import posterior_moments
+
+    mean, log_variance = posterior_moments(moments)
+    return mean, jnp.exp(0.5 * log_variance)
 
 
 def assert_coder_vjps(loaded, reference, operand: str, posterior, bound: float) -> None:
@@ -285,3 +316,41 @@ def nvfp4_qdq_case(kind: str) -> tuple[Path, dict[str, np.ndarray]]:
     with np.load(directory / "reference.npz") as reference:
         return directory, dict(reference)
 
+
+def clearing_selections(loaded, draw, label: str):
+    """`draw`, for a decoder that selects discontinuously (a mixture's routing, Gemma 3n's gaussian
+    top-k), redrawn until its selections clear `selection_margins.MARGIN`, so the float32 runs and the
+    float64 run select alike (`selection_margins.clearing`); `draw` itself otherwise."""
+    import jax.numpy as jnp
+    import selection_margins
+
+    if not selection_margins.selects(loaded.model_config):
+        return draw
+    captured = selection_margins.capture(loaded.model)
+
+    def clears(inputs):
+        selections = captured(loaded.variables, jnp.asarray(inputs[0]))
+        return selection_margins.margin(loaded.model_config, selections, label) > selection_margins.MARGIN
+
+    return selection_margins.clearing(draw, clears)
+
+
+def torch_logits(source, precision=None):
+    """A transformers causal LM's logits over int ids as float64 numpy, inside `precision` (a context
+    manager factory, `tools.torch_precision.float64` for a float64 twin, whose code's float32 casts it
+    widens), with no gradient."""
+    import contextlib
+
+    import torch
+
+    def run(ids):
+        with (precision or contextlib.nullcontext)(), torch.no_grad():
+            return source(torch.from_numpy(np.asarray(ids)).long()).logits.double().numpy()
+    return run
+
+
+def token_draw(salt: int, vocab: int, shape: tuple[int, ...]):
+    """Check 1's draw of `shape` token ids below `vocab`, a stream of its own by `salt`."""
+    def draw(seed):
+        return (np.random.default_rng([salt, seed]).integers(0, vocab, shape).astype(np.int32),)
+    return draw

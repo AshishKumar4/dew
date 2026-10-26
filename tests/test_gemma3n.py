@@ -91,7 +91,7 @@ def test_altup_trains_past_its_coefficient_clip_as_the_reference_does():
     from transformers import Gemma3nTextConfig
     from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextAltUp
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     tensors = fixture()
     clip = float(np.median(np.abs(tensors["altup.prediction_coefs.weight"])))
@@ -210,7 +210,7 @@ def reference_decoder(directory, clip, dtype, sparsity=None):
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     config = AutoConfig.from_pretrained(directory)
     config.altup_coef_clip = clip
@@ -259,7 +259,7 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
     from dew.objectives.lm import LMObjective
     from dew.training.state import TrainState
     from dew.training.transaction import Transaction
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     loaded, model, clip = clipped_gemma3n()
     params = loaded.variables["params"]
@@ -330,7 +330,7 @@ def test_the_dense_decoders_gradient_is_the_references():
     import optax
     import torch
 
-    from tools.diffusers_wan_reference import float64
+    from tools.torch_precision import float64
 
     loaded, model, clip = clipped_gemma3n()
     dense = model.clone(activation_sparsity_pattern=(0.0,) * len(model.activation_sparsity_pattern))
@@ -342,13 +342,16 @@ def test_the_dense_decoders_gradient_is_the_references():
                   for dtype in (torch.float32, torch.float64)}
     pad = references[torch.float32].config.pad_token_id
 
+    assert pad is not None
+
     def draw(seed):
-        """Rows of ids drawn uniformly from the vocabulary but the pad id, and the loss's cotangent, one.
-        The reference's embeddings are `nn.Embedding(padding_idx=pad)`, whose pad row takes no gradient
-        whatever reads it, where Dew's takes its own: a padding convention, apart from the arithmetic
-        held here, which ledger row 1372 tracks."""
-        ids = np.setdiff1d(np.arange(int(dense.vocab_size)), [] if pad is None else [pad])
-        rows = ids[np.random.default_rng([0xDE, seed]).integers(0, len(ids), (DENSE_ROWS, STEP_LENGTH))]
+        """Rows of ids drawn uniformly from the vocabulary, each reading the pad id at its sixth place,
+        and the loss's cotangent, one: both embeddings are the reference's
+        `nn.Embedding(padding_idx=pad)` and Dew's `padding_idx`, whose pad rows take no gradient from
+        what reads them."""
+        rows = np.random.default_rng([0xDE, seed]).integers(
+            0, int(dense.vocab_size), (DENSE_ROWS, STEP_LENGTH))
+        rows[:, 5] = pad
         return rows.astype(np.int32), np.float32(1)
 
     def orders(inputs):
@@ -639,6 +642,14 @@ def test_the_sparse_mlp_takes_the_references_cutoff_at_the_ends_of_its_domain(sp
         reference, model, params, hidden = sparse_mlps(sparsity, 64, 4, dtype)
         dew = jax.jit(lambda params, x, model=model: model.apply({"params": params}, x))(params, hidden)
         np.testing.assert_array_equal(np.asarray(dew, np.float32), reference(torch_dtype)["output"])
+
+
+def test_gaussian_topk_carries_a_nan_row_as_relu_does():
+    """A gate row holding a NaN has a NaN cutoff, so it keeps no value and every value is NaN, as relu of
+    its distance from the cutoff is; a finite row beside it is untouched."""
+    rows = jnp.asarray([[0.5, np.nan, -1.0, 2.0], [0.5, 1.0, -1.0, 2.0]], jnp.float32)
+    out = np.asarray(jax.jit(gaussian_topk, static_argnums=1)(rows, 0.5))
+    assert np.all(np.isnan(out[0])) and np.all(np.isfinite(out[1]))
 
 
 @pytest.mark.parametrize("sparsity", [0.5, 0.95])

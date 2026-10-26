@@ -14,6 +14,14 @@ import optax
 import pytest
 from affine_run import Replaying
 from diffusion_stubs import RES, StubText
+from diffusion_support import (
+    applied,
+    as_a_step,
+    float32_update,
+    float64_gradient,
+    moved_weights,
+    objective_gradient,
+)
 from flax import linen as nn
 
 from dew.data.dataset import Loader
@@ -379,8 +387,7 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
         tokens = explicit(rows, masked(jax.tree.map(lambda leaf: np.asarray(leaf, np.float32)
                                                     if np.issubdtype(np.asarray(leaf).dtype, np.floating)
                                                     else leaf, values), rows, at))
-        # The pixels in float64 too, so the loss's normalization, rates and noising run in float64.
-        tokens = {**tokens, "image": np.asarray(tokens["image"], np.float64)}
+        tokens = float64_pixels(tokens)
         with jax.enable_x64(new_val=True):
             wide = DiffusionObjective(source.model.clone(dtype=jnp.float64), source.process, source.inputs,
                                       unconditional_prob=0.0, steps=3, solver=Euler(),
@@ -423,7 +430,8 @@ def test_each_example_draws_its_own_times_noise_and_dropout_on_every_layout():
     example the same times, noise and dropped condition, and so the same noised input, target and
     loss weight, bitwise, as the transaction places each microbatch's rows among the update's
     examples (`example_places`). The model's dropout stays the attempt's (`Step.key`)."""
-    from dew.objectives.base import Recorder, example_stream, stream
+    from dew._distributions import counter_key
+    from dew.objectives.base import Recorder, stream
     from dew.training.distributed import microbatch
     from dew.training.transaction import example_places
 
@@ -457,9 +465,24 @@ def test_each_example_draws_its_own_times_noise_and_dropout_on_every_layout():
     assert len({float(np.asarray(whole["times"])[row]) for row in range(8)}) == 8
     # An example's noise is its documented draw: the update's key folded with the draw's name, then the
     # example's place.
-    third = jax.random.fold_in(jax.random.fold_in(example_stream(update), stream("noise")), 3)
+    third = jax.random.fold_in(jax.random.fold_in(counter_key(update), stream("noise")), 3)
     np.testing.assert_array_equal(np.asarray(whole["noise"])[3],
                                   np.asarray(jax.random.normal(third, (RES, RES, 3), jnp.float32)))
+
+
+def float64_pixels(batch):
+    """`batch` with its pixels in float64, so a float64 truth's loss normalizes them (`unit_range`) and
+    runs its rates and noising in float64; the step's draws stay its float32 ones."""
+    return {**batch, "image": np.asarray(batch["image"], np.float64)}
+
+
+def float64_twin(objective):
+    """`objective` over its model in float64: the truth of its float32 step at the same draws."""
+    import copy
+
+    twin = copy.copy(objective)
+    twin.substitute([objective.model.clone(dtype=jnp.float64)])
+    return twin
 
 
 POOLED_SEEDS = 16
@@ -473,10 +496,8 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
     over drawn weights (check 1), its float64 twin the truth. The weights are the init's, each leaf
     moved by a draw, so the DiT's zero-initialized layers take a gradient too. Drawn by the attempt,
     the halves read other noise than the whole, and the step another update."""
-    import copy
-
     import optax
-    from reference_error import assert_as_exact, widened
+    from reference_error import assert_as_exact
 
     from dew.training import Trainer
     from dew.training.transaction import example_fields
@@ -492,21 +513,7 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
     run = trainer.compile(initial, halves[0])
     fields = example_fields(initial, 0, 1, whole)
     info = Step(jnp.asarray(0), jax.random.fold_in(initial.key, 0), None, **fields)
-    twin = copy.copy(objective)
-    twin.substitute([objective.model.clone(dtype=jnp.float64)])
-
-    def draw(seed):
-        variables = jax.tree.map(np.asarray, template.variables)
-        keys = iter(jax.random.split(jax.random.key(seed), len(jax.tree.leaves(variables["params"]))))
-        def moved_leaf(leaf):
-            return (leaf + 0.02 * np.asarray(jax.random.normal(next(keys), leaf.shape))).astype(leaf.dtype)
-
-        params = jax.tree.map(moved_leaf, variables["params"])
-        return ({**variables, "params": params},)
-
-    def moved(before, after):
-        # sgd(1): the update applied, in float64, is the gradient with the update's float32 rounding.
-        return np.asarray(before, np.float64) - np.asarray(after, np.float64)
+    twin = float64_twin(objective)
 
     def pooled(variables):
         # The step donates its state: each draw steps a copy of the untouched template.
@@ -514,49 +521,60 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
         partial, *_ = run(state, halves[0])
         stepped, *_ = run(partial, halves[1])
         assert int(stepped.updates) == 1
-        return jax.tree.map(moved, variables["params"], jax.tree.map(np.asarray, stepped.variables["params"]))
+        after = jax.tree.map(np.asarray, stepped.variables["params"])
+        return jax.tree.map(applied, variables["params"], after)
 
-    def gradient(objective, variables, batch):
-        def loss(params):
-            return objective.scalar_loss({**variables, "params": params}, batch, info)[0]
+    # The whole batch's step.
+    alone = float32_update(as_a_step(trainer, initial.variables, halves[0],
+                                     lambda variables: objective_gradient(objective, variables, whole, info)))
+    truth = float64_gradient(twin, info)
+    assert_as_exact(pooled, alone, moved_weights(template.variables), "pooled update", seeds=POOLED_SEEDS,
+                    truth_fn=lambda variables: truth(variables, float64_pixels(whole)))
 
-        return jax.grad(loss)(variables["params"])
 
-    whole_gradient = jax.jit(lambda variables: gradient(objective, variables, whole))
-
-    def alone(variables):
-        # The whole batch's step, its update applied in float32 as the trainer applies it.
-        grads = jax.tree.map(np.asarray, whole_gradient(variables))
-        return jax.tree.map(lambda before, grad: moved(before, (before - grad).astype(np.float32)),
-                            variables["params"], grads)
-
-    def truth(variables):
-        with jax.enable_x64(new_val=True):
-            return jax.tree.map(np.asarray, gradient(twin, widened(variables), widened(whole)))
-
-    assert_as_exact(pooled, alone, draw, "pooled update", seeds=POOLED_SEEDS, truth_fn=truth)
+HOST_MASTER_SEEDS = 16
+"""Check 1's declared seeds for the host-master update, sized paired (`seeds_for` with the host step as
+`dew_fn`)."""
 
 
 def test_a_host_master_step_draws_each_examples_noise_as_the_resident_step_does():
     """A step whose variables live on the host runs its loss on the accelerator with the examples'
-    draws the step carries, so it takes the update a resident step takes, to the bit: a host-master
-    run's draws by the attempt would read other times, noise and dropped conditions, and step
-    elsewhere."""
+    draws the step carries, so it takes the update a resident step takes: on par with it over drawn
+    weights (check 1), the objective's float64 twin at the step's draws the truth. The two steps are
+    two programs, which round otherwise: the host's update is its CPU's, though its accelerator
+    programs compile under the resident step's options (`step_compiler_options`). A host-master run's
+    draws by the attempt would read other times, noise and dropped conditions, and step elsewhere."""
     import optax
+    from reference_error import assert_as_exact
 
     from dew.training import Layout, Trainer
+    from dew.training.transaction import example_fields
 
     objective = make_objective(unconditional_prob=0.5)
     batch = make_batch_of(4 * jax.device_count())
 
-    def stepped(layout):
-        trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.PRNGKey(3), layout=layout)
-        state, _, _ = trainer.place()
-        state, *_ = trainer.compile(state, batch)(state, batch)
-        return jax.tree.map(np.asarray, state.variables["params"])
+    def stepping(layout):
+        """The layout's step of drawn weights, its update applied (`applied`), and its placed state."""
+        trainer = Trainer(objective, optax.sgd(1.0), key=jax.random.PRNGKey(3), layout=layout)
+        placed, _, _ = trainer.place()
+        template = jax.tree.map(jnp.copy, placed)
+        run = trainer.compile(placed, batch)
+        where = jax.tree.map(lambda leaf: leaf.sharding, template.variables)
 
-    resident = stepped(Layout(min_shard=1, tolerance=1.))
-    host = stepped(Layout(host=("variables",), min_shard=1, tolerance=1.))
-    for (path, got), want in zip(jax.tree_util.tree_leaves_with_path(host), jax.tree.leaves(resident),
-                                 strict=True):
-        np.testing.assert_array_equal(got, want, err_msg=jax.tree_util.keystr(path))
+        def stepped(variables):
+            # The step donates its state: each draw steps a copy of the untouched template.
+            state = jax.tree.map(jnp.copy, template).replace(variables=jax.device_put(variables, where))
+            state, *_ = run(state, batch)
+            after = jax.tree.map(np.asarray, state.variables["params"])
+            return jax.tree.map(applied, variables["params"], after)
+
+        return stepped, template
+
+    host, _ = stepping(Layout(host=("variables",), min_shard=1, tolerance=1.))
+    resident, template = stepping(Layout(min_shard=1, tolerance=1.))
+    info = Step(jnp.asarray(0), jax.random.fold_in(template.key, 0), None,
+                **example_fields(template, 0, 1, batch))
+    truth = float64_gradient(float64_twin(objective), info)
+    assert_as_exact(host, resident, moved_weights(template.variables), "host-master update",
+                    seeds=HOST_MASTER_SEEDS,
+                    truth_fn=lambda variables: truth(variables, float64_pixels(batch)))

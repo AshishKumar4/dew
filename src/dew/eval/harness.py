@@ -39,8 +39,8 @@ from lm_eval.models.utils import handle_stop_sequences, normalize_gen_kwargs, po
 from dew.inference.tasks import TextGeneration, cache_ceiling
 from dew.interop.generation_config import source_decoding
 from dew.nn.inputs import pad_token_rows
-from dew.nn.kernels.options import compiler_options
-from dew.objectives.base import token_log_probs
+from dew.nn.kernels.options import program
+from dew.objectives.lm.objective import LMObjective, TokenScorer
 
 DEFAULT_CONTEXT = 2048
 """The scoring window for a model that declares no `max_seq_len`."""
@@ -52,23 +52,19 @@ TokenRequest = tuple[tuple[str, str] | None, list[int], list[int]]
 """One `_loglikelihood_tokens` request: the strings, context ids, continuation ids."""
 
 
-@functools.cache
-def _scoring(options: tuple[tuple[str, bool], ...]):
-    """`_scored` compiled with the model's own XLA `options` (`compiler_options`), so a quantized
-    model and another never share it."""
-    return jax.jit(_scored, static_argnums=(0,), compiler_options=dict(options))
-
-
-def _scored(model, variables, rows: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Return the per-target log-probability and whether the target was the argmax.
+def _scored(scorer: TokenScorer, variables, rows: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Return the per-target log-probability and whether the target was the argmax, as the scorer
+    the language-model losses share scores them (`TokenScorer.token_scores`), through its tiled
+    head, which holds a tile of the vocabulary at a time rather than every row's whole logits;
+    compiled with the model's XLA options (`program`).
 
     `rows` is `[B, T]` of token ids; both results are `[B, T - 1]`, entry `i`
     belonging to `rows[:, i + 1]`. Rows are right-padded by the caller, which
     a causal model cannot read backwards, so a short row's own slots hold
     what they would hold alone.
     """
-    logits = model.apply(variables, rows[:, :-1])
-    return token_log_probs(logits, rows[:, 1:]), jnp.argmax(logits, axis=-1) == rows[:, 1:]
+    scores = scorer.token_scores(variables, rows, predict=True)
+    return -scores.losses, scores.correct == 1
 
 
 def _batches(count: int, size: int) -> list[range]:
@@ -106,6 +102,7 @@ class DewLM(TemplateLM):
         self.task = task
         self._processor = processor
         self.batch_size = batch_size
+        self._scorers: dict[int, TokenScorer] = {}
 
     @classmethod
     def from_run(cls, run: str, *, batch_size: int = 1, ema: bool | None = None,
@@ -196,11 +193,10 @@ class DewLM(TemplateLM):
         closes it with nothing (`_opening`): a context and its continuation encode as one row, so an
         EOS a tokenizer closes a sequence with would end the context before its continuation,
         shifting where the continuation starts and scoring an EOS it never wrote. The opening is
-        left off where the text already starts with it, which the tokenizer reads off the text's own
-        BOS spelling, so no row starts with two. `HFLM` asks instead whether the text starts with
-        the BOS's decoded text; the two agree wherever decoding a BOS gives back its spelling, as in
-        released vocabularies. `left_truncate_len` keeps that many of the last ids. Any other option
-        raises TypeError, since `HFLM` reads none.
+        left off where the text already starts with its spelling, as `HFLM` leaves its BOS off where
+        the text starts with the BOS's decoded text (`Processor.spelling`), so no row starts with two.
+        `left_truncate_len` keeps that many of the last ids. Any other option raises TypeError, since
+        `HFLM` reads none.
         """
         if kwargs:
             raise TypeError(f"tok_encode takes no {', '.join(sorted(kwargs))}")
@@ -208,10 +204,14 @@ class DewLM(TemplateLM):
             ids = self._processor.encode(string, specials=True)
         else:
             ids = self._processor.encode(string, specials=False)
-            opening = self._opening
-            if add_special_tokens is None and ids[:len(opening)] != opening:
-                ids = [*opening, *ids]
+            if add_special_tokens is None and not string.startswith(self._opened):
+                ids = [*self._opening, *ids]
         return ids[-left_truncate_len:] if left_truncate_len else ids
+
+    @functools.cached_property
+    def _opened(self) -> str:
+        """The text the run's tokenizer spells its opening with (`_opening`, `Processor.spelling`)."""
+        return self._processor.spelling(self._opening)
 
     @functools.cached_property
     def _opening(self) -> list[int]:
@@ -263,8 +263,9 @@ class DewLM(TemplateLM):
         answers: list[tuple[float, bool]] = []
         for batch in _batches(len(rows), self.batch_size):
             tokens, _ = pad_token_rows([rows[index] for index in batch], padding_side="right")
-            scoring = _scoring(tuple(compiler_options(self.task.model).items()))
-            probabilities, argmax = scoring(self.task.model, self.task.variables, jnp.asarray(tokens))
+            scoring = program(_scored, self.task.model, static_argnums=(0,))
+            probabilities, argmax = scoring(self._scorer(tokens.shape[1]), self.task.variables,
+                                            jnp.asarray(tokens))
             values, matched = np.asarray(probabilities), np.asarray(argmax)
             for offset, index in enumerate(batch):
                 end = len(rows[index]) - 1
@@ -272,6 +273,14 @@ class DewLM(TemplateLM):
                 answers.append((float(values[offset, start:end].sum()),
                                 bool(matched[offset, start:end].all())))
         return answers
+
+    def _scorer(self, width: int) -> TokenScorer:
+        """The task's model scored over rows of `width` ids as a language model's loss scores them
+        (`LMObjective`), every target counted and its head tiled (`_scored`), one for each width a
+        batch pads to."""
+        if width not in self._scorers:
+            self._scorers[width] = LMObjective(self.task.model, width - 1, head_tile="tiled")
+        return self._scorers[width]
 
     def loglikelihood_rolling(self, requests: list[Instance],
                               disable_tqdm: bool = False) -> list[float]:
