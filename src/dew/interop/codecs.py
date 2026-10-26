@@ -176,7 +176,9 @@ each with the unsigned integer of its width its decoded words are copied as."""
 def _scaled_e2m1(dtype: np.dtype) -> np.ndarray:
     """Each exponent byte's scale times the two values each code byte holds, `[256 * 256, 2]` words of
     `dtype` (`_EXACT_E2M1`), row `exponent * 256 + code`: a group decodes by one lookup, no multiply."""
-    products = _E2M1_BYTES[None] * e8m0_scales(np.arange(256, dtype=np.uint8))[:, None, None]
+    # The largest scales times 6 pass float32's range, infinite as `decode_e2m1` decodes them too.
+    with np.errstate(over="ignore"):
+        products = _E2M1_BYTES[None] * e8m0_scales(np.arange(256, dtype=np.uint8))[:, None, None]
     return products.astype(dtype).view(_EXACT_E2M1[dtype]).reshape(256 * 256, 2)
 
 
@@ -207,6 +209,7 @@ def dequantize_mxfp4(blocks: ArrayLike, scales: ArrayLike, dtype: DTypeLike = np
             words[expert] = values
         else:
             decoded[expert] = values.view(work)
+    return decoded
 
 
 def quantize_mxfp4(weight: ArrayLike) -> tuple[np.ndarray, np.ndarray]:
@@ -260,15 +263,15 @@ class SourceQuantization:
     partners: Callable[[str], tuple[str, ...]]
     decode: Callable[[Mapping[str, np.ndarray], str], np.ndarray]
     encode: Callable[[str, np.ndarray], dict[str, np.ndarray]]
-    decode_kept: Callable[[Mapping[str, np.ndarray], str, str], np.ndarray] | None = None
-    """A weight decoded straight into the dtype `param_dtype` keeps it in, for a format that decodes
-    faster so than in float32 and rounds alike; None decodes in float32 and casts."""
     scale_dtype: Callable[[Mapping[str, np.ndarray]], str | None] = lambda tensors: None
     grid: Callable[[str], tuple[str, ...]] = lambda name: ()
     input_scale_dtype: Literal['unrounded', 'float8_e4m3fn'] | None = None
     input_format: Literal['compressed-tensors', 'modelopt'] = 'compressed-tensors'
     input_suffix: Literal['.input_global_scale', '.input_scale'] = '.input_global_scale'
     input_kind: Callable[[str], Literal['nvfp4', 'fp8', 'none']] = lambda name: 'nvfp4'
+    decode_kept: Callable[[Mapping[str, np.ndarray], str, str], np.ndarray] | None = None
+    """A weight decoded straight into the dtype `param_dtype` keeps it in, for a format that decodes
+    faster so than in float32 and rounds alike; None decodes in float32 and casts."""
 
     def tensor_names(self, tensors: Mapping[str, np.ndarray]) -> tuple[str, ...]:
         """The names left once every quantized weight is decoded."""
