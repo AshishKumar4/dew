@@ -550,10 +550,11 @@ def ampere(generation_name: str = "sm80"):
 @pytest.mark.parametrize("out_dtype", [jnp.float32, jnp.bfloat16], ids=["fp32", "bf16"])
 @pytest.mark.parametrize("sizes", [name for name in SIZES if any(SIZES[name])])
 def test_an_ampere_gpu_runs_triton_unnamed_and_mosaics_launch_by_name(sizes, out_dtype):
-    """Without warpgroup MMA, Triton's launch runs the grouped forward unnamed, main's route there: the Mosaic
-    GPU forward's mma.sync tile (`mosaic_gpu.derived`) runs where the call names it until it measures at
-    least as fast (`grouped_matmul.MMA_SYNC_MEASURED`); named, each is as exact as XLA's ragged dot rounded
-    to its output dtype from float64, unrouted rows and empty groups included."""
+    """Without warpgroup MMA, Triton's launch runs the grouped forward unnamed, a cell where it measured
+    faster than the template (`grouped_matmul.OLD_ROUTES`): the Mosaic GPU forward's mma.sync tile
+    (`mosaic_gpu.derived`) runs where the call names it until it measures at least as fast; named, each is
+    as exact as XLA's ragged dot rounded to its output dtype from float64, unrouted rows and empty groups
+    included."""
     x, w, dy, group = operands(SIZES[sizes], jnp.bfloat16)
     truth = oracle.products(x, w, dy, SIZES[sizes])
     group_sizes = jnp.asarray(SIZES[sizes], jnp.int32)

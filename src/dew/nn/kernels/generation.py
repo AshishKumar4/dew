@@ -356,9 +356,12 @@ class GpuTarget:
 # 0.17/0.60 against Triton's 0.22/1.88. A10 (sm86), causal 2x2048: width 64, the FA wheel
 # 0.46/1.32, Triton 0.51/1.51, cuDNN 0.58/1.97; width 32, 0.23/0.82, 0.28/0.99, 0.47/1.67. Grouped
 # products, 8192 tokens x 2048 -> 768 over 64 experts: Dew's Pallas grouped matmul 0.60/2.41 on an
-# A100 and 0.27/0.86 on an H100, XLA's ragged dot 7.54/33.99 and 2.62/14.51; tokamax's ragged_dot
-# has no Triton kernel in 0.0.15 and its Mosaic one's backward takes no mixed dtypes. No tokamax
-# implementation is a row's kernel; Dew calls its own through tokamax's Op. Decode (bf16, one query,
+# A100 and 0.27/0.86 on an H100, XLA's ragged dot 7.54/33.99 and 2.62/14.51. tokamax 0.0.15's
+# ragged_dot ships a Triton backend (TritonRaggedDot: plain, transposed and ragged-contracting products,
+# its VJP through them) that needs the triton and jax-triton packages, which Dew's locks do not carry
+# (locks/cuda12.txt, cuda13.txt), so it was not measured here; its Mosaic one's backward takes no mixed
+# dtypes. Requalifying that Triton backend as a comparator is ledger 153. No tokamax implementation is
+# a row's kernel; Dew calls its own through tokamax's Op. Decode (bf16, one query,
 # A100-SXM4-40GB, 2026-10-21, ced5d3ad9, synchronized ms by dew.telemetry.benchmark.samples): Qwen3-0.6B's
 # 16/8 heads of 128 at 1 to 128 rows over 2048 to 131072 keys, the decode kernel 1.57x faster than
 # cuDNN in geometric mean over the 28 shapes, faster in 21, at most 1.19x the fastest arm (cuDNN
@@ -371,16 +374,18 @@ class GpuTarget:
 # 1.09/5.66 at 4096, 10.3/45.5 at 16384, peak 111 and 885 MB; xla over the spans' mask 1.17/2.71 (747 MB),
 # 3.52/8.06, and 60.6 forward at 16384, its backward out of memory (asked 48 GB); cuDNN over the mask as a
 # bias 0.67/2.55, 1.34/7.45, 17.9/85.8. H100, the template 1.46/2.87, 1.66/3.56, 5.61/28.2; xla
-# 1.69/2.70, 3.86/7.37, 47.5/90.6 (43.6 GB). No target states the row (owner, bible 67b4f84: base/kernels
-# reaches main with main's defaults, a template running by name until a measurement shows it at least as
-# fast and as small on every call its row would serve, BIBLE §4): block calls keep their default, xla over
-# their dense mask (the mask the mixer built for image groups), and the template runs where a call names it.
+# 1.69/2.70, 3.86/7.37, 47.5/90.6 (43.6 GB). sm90 states no row: a default is at least as fast and as small
+# on every call it serves (BIBLE §4), and a row holds for every length, where at 2048 keys the template's
+# forward and backward is 6% slower than xla's mask, though 2.1 and 3.2 times faster at 4096 and 16384.
+# A target without the row keeps the default block calls had before it, xla over their dense mask (the
+# mask the mixer built for image groups). Ledger 1537 retires the row, and the sm90 gate, when attention's
+# choice ranks by cost, which takes the length.
 TARGETS = {target.generation: target for target in (
     # T4: 40 SMs at a 1590 MHz boost, 320 GB/s (the T4 datasheet).
     GpuTarget('sm75', 'Tesla T4', 64 * 1024, dense_peaks={'Tesla T4': {}, 'NVIDIA Tesla T4': {}},
               aliases=('gpu:t4', 't4'), multiprocessors=40, clock_hz=1590e6, memory_bandwidth=320e9),
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
-              {'attention': 'flash', 'attention_narrow': 'flash',
+              {'attention': 'flash', 'attention_blocks': 'template', 'attention_narrow': 'flash',
                'attention_window': 'flash', 'attention_sinks': 'flash',
                'attention_packed': 'flash', 'xla_triton_gemm': 'off', 'decode': 'decode',
                'rms_norm': 'pallas', 'swiglu': 'pallas', 'gate_up': 'joined', 'delta_gates': 'joined',
