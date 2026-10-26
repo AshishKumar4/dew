@@ -17,11 +17,11 @@ block with per-layer sliding windows); its released 32B checkpoint passes the
 same probe from its config, at 65 GB beyond what this suite downloads. Over
 every registered family, `tools/hf_coverage.py` on the 400 most downloaded
 text-generation repos (2026-10-05) finds one more type that loads:
-GLM-4.7-Flash, as kimi_k2, which the offline GLM_FLASH case checks. Two
-sources of GLM-4.7-Flash's own classes, registered as types of their own,
-differ from DeepSeek V3's convention where the probe's eval logits over its
-first positions do not show it: one's table pads no row, the other's rotary
-takes no ramp; the probe refuses each.
+GLM-4.7-Flash, as kimi_k2, which the offline GLM_FLASH case checks. Its
+classes registered as a type of their own verify as DeepSeek V3's convention
+too, and the probe refuses each of two changes its eval logits over the
+first positions would not show: a table that pads no row, and a rotary that
+takes no ramp.
 Measured on CPU against transformers 5.16.1 in fp32, over two rows of 64
 random ids:
 
@@ -111,6 +111,15 @@ def test_a_verified_load_saves_the_source_config_and_reloads(tmp_path, model_typ
                                   np.asarray(loaded.model.apply(loaded.variables, ids)))
 
 
+class _FlashConfig(Glm4MoeLiteConfig):
+    model_type = "registered_flash"
+
+
+class _Flash(Glm4MoeLiteForCausalLM):
+    """GLM-4.7-Flash's own causal LM, under a type of its own."""
+    config_class = _FlashConfig
+
+
 class _UnpaddedConfig(Glm4MoeLiteConfig):
     model_type = "unpadded_flash"
 
@@ -139,23 +148,40 @@ class _RamplessFlash(Glm4MoeLiteForCausalLM):
         self.model.rotary_emb = Glm4MoeLiteRotaryEmbedding(plain)
 
 
-def _registered(config_class, model_class) -> None:
-    """A type of transformers' own classes Dew registers no family for, as transformers registers a
-    new model type: its config and its causal LM through the auto classes."""
+FLASH_TYPES = {"flash": (_FlashConfig, _Flash), "unpadded": (_UnpaddedConfig, _UnpaddedFlash),
+               "rampless": (_RamplessConfig, _RamplessFlash)}
+"""GLM-4.7-Flash's classes as types Dew registers no family for: unchanged, and changed where the
+probe's eval logits over its first positions do not show it."""
+
+
+def _registered(kind: str, **fields) -> dict:
+    """The `kind` of `FLASH_TYPES` registered as transformers registers a new model type (its config and
+    causal LM through the auto classes, and GLM-4.7-Flash's checkpoint conversion, one tensor per expert,
+    which transformers keys by model type), and its config at GLM_FLASH's sizes and `fields`."""
+    from transformers.conversion_mapping import (
+        get_checkpoint_conversion_mapping,
+        register_checkpoint_conversion_mapping,
+    )
+
+    config_class, model_class = FLASH_TYPES[kind]
     AutoConfig.register(config_class.model_type, config_class, exist_ok=True)
     AutoModelForCausalLM.register(config_class, model_class, exist_ok=True)
+    register_checkpoint_conversion_mapping(config_class.model_type,
+                                           get_checkpoint_conversion_mapping("glm4_moe_lite"), overwrite=True)
+    return tiny_config(config_class.model_type, **GLM_FLASH, **fields).to_dict()
 
 
-def test_a_convention_pads_the_row_its_source_pads():
-    """A source whose table pads no row under a config stating a pad id is not DeepSeek V3's
-    convention, whose table pads it: the probe holds each candidate's pad row to the source's own
-    table's, which takes no gradient there (ledger 1593) and which no eval logit shows."""
-    from dew.interop.verify import Unmapped, verify_mapping
+@pytest.mark.parametrize("kind", ["flash", "unpadded"])
+def test_a_convention_pads_the_row_its_source_pads(kind):
+    """GLM-4.7-Flash's classes under a type of their own verify as DeepSeek V3's convention, and the same
+    classes whose table pads no row, under a config stating a pad id, do not: the probe holds each
+    candidate's pad row to the source's own table's, which takes no gradient there (ledger 1593) and
+    which no eval logit shows."""
+    from dew.interop.verify import Unmapped, VerifiedMapping, verify_mapping
 
-    _registered(_UnpaddedConfig, _UnpaddedFlash)
-    config = tiny_config(_UnpaddedConfig.model_type, **GLM_FLASH).to_dict()
+    config = _registered(kind)
     assert config["pad_token_id"] is not None
-    assert isinstance(verify_mapping(config), Unmapped)
+    assert isinstance(verify_mapping(config), Unmapped if kind == "unpadded" else VerifiedMapping)
 
 
 FAR_RAMP = {"rope_type": "yarn", "rope_theta": 1e6, "factor": 40.0, "original_max_position_embeddings": 2**28,
@@ -164,13 +190,13 @@ FAR_RAMP = {"rope_type": "yarn", "rope_theta": 1e6, "factor": 40.0, "original_ma
 probe's rotary, so that at it the ramp rescales no frequency the probe turns."""
 
 
-def test_a_convention_turns_the_ramp_its_source_turns_past_the_original_context():
-    """A source whose rotary turns at the plain frequencies under a config stating a YaRN record is not
-    DeepSeek V3's convention, which ramps them: the probe runs past the record's original context,
-    shrunk below its length as a window is, where the ramp rescales the frequencies it turns."""
-    from dew.interop.verify import Unmapped, verify_mapping
+@pytest.mark.parametrize("kind", ["flash", "rampless"])
+def test_a_convention_turns_the_ramp_its_source_turns_past_the_original_context(kind):
+    """Under a YaRN record, GLM-4.7-Flash's classes under a type of their own verify as DeepSeek V3's
+    convention, and the same classes whose rotary turns at the plain frequencies do not: the probe runs
+    past the record's original context, shrunk below its length as a window is, where the ramp rescales
+    the frequencies it turns."""
+    from dew.interop.verify import Unmapped, VerifiedMapping, verify_mapping
 
-    _registered(_RamplessConfig, _RamplessFlash)
-    config = tiny_config(_RamplessConfig.model_type, **GLM_FLASH, rope_parameters=FAR_RAMP,
-                         max_position_embeddings=2**29).to_dict()
-    assert isinstance(verify_mapping(config), Unmapped)
+    config = _registered(kind, rope_parameters=FAR_RAMP, max_position_embeddings=2**29)
+    assert isinstance(verify_mapping(config), Unmapped if kind == "rampless" else VerifiedMapping)

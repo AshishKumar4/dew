@@ -377,13 +377,15 @@ def token_table(variables) -> tuple[tuple[str, ...], np.ndarray]:
     return path, np.asarray(params[path])
 
 
-def assert_pads_as(model, variables, lookup, wide, pad: int, label: str, *, seeds: int) -> None:
+def assert_pads_as(model, variables, lookup, wide, pad: int, label: str, *, seeds: int,
+                   looked_up=lambda ids: ids) -> None:
     """A decoder's token lookup is its source's (ledger 1593): `model` pads the row `lookup`, the
     source's own token embedding module holding `model`'s table, pads (its `padding_idx`, None where
     the source passes none), and over drawn ids, a quarter of them `pad`, under a drawn cotangent on
     the looked-up rows, the table's gradient holds check 1 against that module's lookup
-    (`nn.Embedding.forward`, before any scale a subclass applies), from its float64 twin `wide`: the
-    pad row's lookups add nothing where it pads and train it where not."""
+    (`nn.Embedding.forward`, before any scale a subclass applies) of the ids the source hands it
+    (`looked_up` of the drawn ones), from its float64 twin `wide`: the pad row's lookups add nothing
+    where it pads and train it where not."""
     import contextlib
 
     import torch
@@ -417,7 +419,7 @@ def assert_pads_as(model, variables, lookup, wide, pad: int, label: str, *, seed
         def run(ids, cotangent):
             with precision():
                 module.zero_grad()
-                rows = torch.nn.Embedding.forward(module, torch.from_numpy(ids).long())
+                rows = torch.nn.Embedding.forward(module, torch.from_numpy(looked_up(ids)).long())
                 (rows * torch.from_numpy(cotangent).to(rows.dtype)).sum().backward()
                 return {"token table": module.weight.grad.double().numpy()}
         return run

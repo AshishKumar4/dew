@@ -93,6 +93,11 @@ TEXT_STATED = {"kimi-k25-tiny", "kimi-k3-tiny"}
 (modeling_kimi_k25.py:586; modeling_kimi_k3.py:919 of moonshotai/Kimi-K3 at f831ab6): the draw states
 it there."""
 
+PLACEHOLDERS = {"kimi-k25-tiny": ("image_token_id", "video_token_id")}
+"""A wrapper whose model looks its media placeholder ids up as token zero before its table
+(modeling_kimi_k25.py:682-685), the ids its config's fields name, as Dew's lookup does
+(`CausalTransformer.embedding_zero_ids`)."""
+
 TEXT_OF = {"qwen35-moe-text": "qwen35-moe-native-tiny"}
 """A text decoder no fixture holds alone, read from a wrapper fixture's text_config."""
 
@@ -108,23 +113,30 @@ def _fixture_config(name: str) -> dict:
     return config["text_config"] if name in TEXT_OF else config
 
 
+def _written(config: dict, directory: Path) -> dict:
+    """`config` written at `directory` as its source builds from it, a head_dim its class leaves None
+    stated: the source reads a stated one (MinistralAttention, `_compute_yarn_parameters`), which
+    MixtralConfig and MinistralConfig leave None where the width divides evenly."""
+    from transformers import AutoConfig
+
+    directory.mkdir(parents=True)
+    (directory / "config.json").write_text(json.dumps(config))
+    if getattr(AutoConfig.from_pretrained(directory), "head_dim", 0) is None:
+        config = {**config, "head_dim": config["hidden_size"] // config["num_attention_heads"]}
+        (directory / "config.json").write_text(json.dumps(config))
+    return config
+
+
 def _source(name: str, directory: Path, **fields) -> Path:
-    """The fixture's config at `directory`, `fields` over its stored ones, and transformers' model of it
-    with the probe's weights (`dew.interop.verify.scatter_weights`), whose norms sit near one: the
-    stored tiny weights leave a hybrid decoder's gated norms at their epsilon, where both float32 arms
-    round heavy-tailed."""
+    """The fixture's config at `directory`, `fields` over its stored ones (`_written`), and transformers'
+    model of it with the probe's weights (`dew.interop.verify.scatter_weights`), whose norms sit near
+    one: the stored tiny weights leave a hybrid decoder's gated norms at their epsilon, where both
+    float32 arms round heavy-tailed."""
     from transformers import AutoConfig, AutoModelForCausalLM
 
     from dew.interop.verify import scatter_weights
 
-    directory.mkdir(parents=True)
-    config = {**_fixture_config(name), **fields}
-    (directory / "config.json").write_text(json.dumps(config))
-    if getattr(AutoConfig.from_pretrained(directory), "head_dim", 0) is None:
-        # The source reads a stated head_dim (MinistralAttention, `_compute_yarn_parameters`), which
-        # MixtralConfig and MinistralConfig leave None where the width divides evenly.
-        config["head_dim"] = config["hidden_size"] // config["num_attention_heads"]
-        (directory / "config.json").write_text(json.dumps(config))
+    _written({**_fixture_config(name), **fields}, directory)
     model = AutoModelForCausalLM.from_config(AutoConfig.from_pretrained(directory))
     scatter_weights(model)
     model.save_pretrained(directory)
@@ -187,9 +199,10 @@ def _padded_config(name: str) -> dict:
 
 
 def _source_embedding(name: str, config: dict, directory: Path, table: np.ndarray):
-    """The source's token embedding module over `config`, holding `table`, and its float64 twin: the
-    text model transformers builds from the config (`TEXT_MODELS`' class where no base model maps it),
-    or for a remote source CI cannot run, the lookup its cited code builds (`REMOTE`)."""
+    """The source's token embedding module over `config` (written at `directory`), holding `table`, and
+    its float64 twin: the text model transformers builds from the config (`TEXT_MODELS`' class where no
+    base model maps it), or for a remote source CI cannot run, the lookup its cited code builds
+    (`REMOTE`)."""
     import importlib
 
     import torch
@@ -203,8 +216,6 @@ def _source_embedding(name: str, config: dict, directory: Path, table: np.ndarra
         def built(dtype):
             return torch.nn.Embedding(*table.shape, padding_idx=pad, dtype=dtype)
     else:
-        directory.mkdir()
-        (directory / "config.json").write_text(json.dumps(config))
         settings = AutoConfig.from_pretrained(directory)
         text_model = TEXT_MODELS.get(config["model_type"])
 
@@ -216,7 +227,7 @@ def _source_embedding(name: str, config: dict, directory: Path, table: np.ndarra
     source = built(torch.float32)
     lookup = source if name in REMOTE else source.get_input_embeddings()
     with torch.no_grad():
-        lookup.weight.copy_(torch.from_numpy(table))
+        lookup.weight.copy_(torch.tensor(table))
     wide = float64_twin(source, lambda: built(torch.float64))
     return lookup, wide if name in REMOTE else wide.get_input_embeddings()
 
@@ -231,14 +242,17 @@ def test_the_pad_row_takes_the_gradient_its_source_gives_it(name, tmp_path):
     from dew.interop.hf_decoders import translate_config
     from dew.registry import models
 
-    config = _padded_config(name)
+    directory = tmp_path / name
+    config = _padded_config(name) if name in REMOTE else _written(_padded_config(name), directory)
     model = models.build("causal_transformer",
                          {**translate_config(config), "dtype": "float32", "attention_impl": "reference"})
     variables = model.init(jax.random.key(0), jnp.zeros((1, 2), jnp.int32))
-    lookup, wide = _source_embedding(name, config, tmp_path / name, token_table(variables)[1])
+    lookup, wide = _source_embedding(name, config, directory, token_table(variables)[1])
     assert (lookup.padding_idx is not None) == (name in PADDED_SEEDS)
+    placeholders = [config[field] for field in PLACEHOLDERS.get(name, ())]
     assert_pads_as(model, variables, lookup, wide, PAD, name,
-                   seeds={**PADDED_SEEDS, **UNPADDED_SEEDS}[name])
+                   seeds={**PADDED_SEEDS, **UNPADDED_SEEDS}[name],
+                   looked_up=lambda ids: np.where(np.isin(ids, placeholders), 0, ids))
 
 
 KIND_RAMPS = {
