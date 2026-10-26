@@ -1199,7 +1199,12 @@ and below every null run's (tools/gate_null_runs.py, from 2^16 runs of at least 
 count a site declares is fixed by draws its verdict never sees."""
 
 
-def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = 512,
+MOST_SEEDS = 512
+"""The most seeds a site's sizing declares (`seeds_for`, `seeds_resolving`): a site that needs more
+takes larger inputs or fewer shared factors, not more seeds."""
+
+
+def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = MOST_SEEDS,
               truth_fn=None, dew_fn=None) -> int:
     """The seeds a site declares: the fewest, doubling from `start`, for which the pooled ratio's
     interval is no wider than PARITY in every leaf. Of the reference compared with itself, its errors on
@@ -1255,18 +1260,23 @@ def _unresolved_against_itself(errors: np.ndarray, names, count: int) -> list[st
             and not _resolves(*_interval(halves[0][:, index], control=halves[1][:, index]))]
 
 
-def seeds_resolving(errors: np.ndarray, names, label: str, *, start: int = FEWEST_SEEDS) -> int:
+def seeds_resolving(errors: np.ndarray, names, label: str, *, start: int = FEWEST_SEEDS,
+                    most: int = MOST_SEEDS) -> int:
     """`seeds_for`'s count for the reference compared with itself, from its errors already measured:
     `errors` holds its squared errors a seed (rows, from seed 0) and a leaf (columns), such as a
-    recording's merged shards, and the count is the fewest, doubling from `start`, that resolves
-    every leaf (`_unresolved_against_itself`), as `seeds_for` doubles. Fails where the rows held
-    run out first: the recording then holds too few seeds for its site."""
-    count = max(start, FEWEST_SEEDS)
-    while 2 * count <= len(errors):
+    recording's merged shards, and the count is the fewest, doubling from `start` to `most`, that
+    resolves every leaf (`_unresolved_against_itself`), as `seeds_for` doubles. Fails past `most`, as
+    `seeds_for` does, and where the rows held run out first: the recording then holds too few seeds."""
+    count, wide = max(start, FEWEST_SEEDS), []
+    while count <= most and 2 * count <= len(errors):
         wide = _unresolved_against_itself(errors, names, count)
         if not wide:
             return count
         count *= 2
+    if count > most:
+        raise AssertionError(f"{label}: the reference compared with itself does not resolve {PARITY} within "
+                             f"{most} seeds at {wide[:4]}; give the site larger inputs or fewer shared "
+                             f"factors")
     raise AssertionError(f"{label}: the reference compared with itself does not resolve {PARITY} within the "
                          f"{len(errors)} seeds recorded, {len(errors) // 2} a half")
 

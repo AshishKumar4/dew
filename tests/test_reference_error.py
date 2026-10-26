@@ -173,6 +173,9 @@ def test_a_recordings_measured_errors_size_its_site_as_seeds_for_would():
     assert seeds_resolving(draws.theirs, draws.names, "product") == count
     with pytest.raises(AssertionError):
         seeds_resolving(draws.theirs[:count], draws.names, "product", start=count)
+    # Past its ceiling it refuses, as seeds_for does, however many seeds are recorded.
+    with pytest.raises(AssertionError):
+        seeds_resolving(draws.theirs, draws.names, "product", most=count // 2)
 
 
 def test_a_torch_arm_pulls_back_the_cotangent_it_is_given():
