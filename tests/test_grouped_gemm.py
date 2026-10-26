@@ -283,14 +283,15 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
     target = UNSEEN[unseen]
     canonical = generation.TARGETS[target.generation]
     family = "wgmma" if target.wgmma else "mma.sync"
+    if not target.wgmma and not mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16)).stores(jnp.bfloat16):
+        pytest.skip("mma.sync stores no bf16 tile on this JAX (Family.stores): these calls run Triton")
     # mma.sync's tiles run the product and the input gradient; the kernel gradient is warpgroup MMA's.
     launched = {"MosaicGmm", "MosaicTgmm"} if target.wgmma else {"MosaicGmm"}
 
     def products(rows, depth, width, groups):
-        # The forward, and its input and kernel gradients as the reverse pass launches them, each alone,
-        # their outputs fp32, which every family stores (`mosaic.Family.stores`).
+        # The forward, and its input and kernel gradients as the reverse pass launches them, each alone.
         sizes = jnp.full((groups,), rows // groups, jnp.int32)
-        forward = functools.partial(template.gemm, group_sizes=sizes, out_dtype=jnp.float32,
+        forward = functools.partial(template.gemm, group_sizes=sizes, out_dtype=jnp.bfloat16,
                                     precision="default", interpret_on_cpu=True)
         bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
         x, w, dy = bf16((rows, depth)), bf16((groups, depth, width)), bf16((rows, width))
@@ -326,12 +327,12 @@ def test_a_gpu_no_one_measured_runs_the_tiles_its_facts_give_exactly(unseen):
         # of it (a frozen operand's cotangent is never formed).
         return w if target.wgmma else jax.lax.stop_gradient(w)
 
-    def projection(dtype=jnp.float32):
+    def projection(dtype=jnp.bfloat16):
         return lambda x, w: expert_projection(x, held(w), group_sizes, dtype, "xla", None)
 
     def through_mosaic(x, w, dy):
         with generation.assumed(target), generation.chosen(grouped_matmul="mosaic_gpu"):
-            return with_gradients(lambda x, w: template.gemm(x, held(w), group_sizes, out_dtype=jnp.float32,
+            return with_gradients(lambda x, w: template.gemm(x, held(w), group_sizes, out_dtype=jnp.bfloat16,
                                                              precision="default",
                                                              interpret_on_cpu=True))(x, w, dy)
 
@@ -578,7 +579,7 @@ def test_an_ampere_gpu_runs_mosaics_launch_first(sizes, out_dtype):
                if ba.arguments["interpret"] == (jax.default_backend() == "cpu")]
         return got, ran
 
-    stored = jnp.dtype(out_dtype).itemsize >= 4
+    stored = mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16)).stores(out_dtype)
     named_launches = (("triton", "Gmm"), *((("mosaic_gpu", "MosaicGmm"),) if stored else ()))
     for named, kernel in named_launches:
         got, ran = running(grouped_matmul=named)

@@ -19,7 +19,7 @@ from reference_error import assert_as_exact, with_gradients
 from tuned import each_config
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
-from dew.nn.kernels.templates import mosaic, product
+from dew.nn.kernels.templates import mosaic, mosaic_sm80, product
 from dew.nn.kernels.templates.gemm import fused, mosaic_gpu, mosaic_tpu, template, triton_dense
 
 pytestmark = pytest.mark.kernel
@@ -251,12 +251,22 @@ def test_the_templates_gradients_hold_check_1(generation_name, case):
 
 
 
+def _stores_bf16(generation_name: str) -> None:
+    """Skips a case whose generation's Mosaic family stores no bf16 tile on this JAX (`Family.stores`):
+    its bf16 calls run another launch there."""
+    family = (mosaic_gpu.FAMILY if generation.gpu_target(generation_name).wgmma
+              else mosaic_sm80.Mma(jnp.dtype(jnp.bfloat16)))
+    if not family.stores(jnp.bfloat16):
+        pytest.skip(f"{family.name} stores no bf16 tile on this JAX (Family.stores)")
+
+
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_every_variant_of_the_mosaic_launches_holds_check_1(generation_name):
     """Each config an opt-in tuning run may time (`KernelOp.variants`: the derived tile and its legal
     neighbours) of the Mosaic GPU forward, and on warpgroup MMA of its kernel gradient, pinned in turn
     and interpreted: as exact as the plain program from float64 truth, so the tuner times only configs
-    proven here. fp32 outputs, which every family stores (`mosaic.Family.stores`)."""
+    proven here. A family that stores no bf16 tile on this JAX (`mosaic.Family.stores`) runs none here."""
+    _stores_bf16(generation_name)
     rows, depth, width = 136, 128, 256
     sizes, split = jnp.asarray([70, 66], jnp.int32), 70
 
@@ -268,9 +278,9 @@ def test_every_variant_of_the_mosaic_launches_holds_check_1(generation_name):
 
     def forward(x, w, dy):
         del dy
-        return template.gemm(x, w, sizes, out_dtype=jnp.float32, interpret_on_cpu=True)
+        return template.gemm(x, w, sizes, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
 
-    def plain_forward(x, w, dy, wide=jnp.float32, out=jnp.float32):
+    def plain_forward(x, w, dy, wide=jnp.float32, out=jnp.bfloat16):
         del dy
         w = w.astype(wide)
         return jnp.concatenate([x[:split].astype(wide) @ w[0], x[split:].astype(wide) @ w[1]]).astype(out)
@@ -302,9 +312,10 @@ def test_a_stacked_matrix_is_read_in_place_at_a_layer(generation_name):
     """A layer of a stacked `[layers, groups, depth, width]` matrix picked by an index (`gemm`'s `layer`):
     as exact as the plain program's product with that layer's matrices from float64 truth, the stack's
     gradient included (zero at every other layer), and the launch reads the whole stack in place, its
-    matrix operand the stack's every group, no slice of it made; fp32 outputs, which every family stores
-    (`mosaic.Family.stores`). The gradients run eagerly, as the Mosaic interpreters' ordered callbacks
-    need."""
+    matrix operand the stack's every group, no slice of it made. A family that stores no bf16 tile on
+    this JAX (`mosaic.Family.stores`) runs none here. The gradients run eagerly, as the Mosaic
+    interpreters' ordered callbacks need."""
+    _stores_bf16(generation_name)
     layers, groups, rows, depth, width = 3, 2, 136, 64, 128
     sizes, layer, split = jnp.asarray([70, 66], jnp.int32), jnp.asarray(1, jnp.int32), 70
 
@@ -315,9 +326,9 @@ def test_a_stacked_matrix_is_read_in_place_at_a_layer(generation_name):
                 jnp.asarray(rng.normal(size=(rows, width)), jnp.bfloat16))
 
     def dew(x, stack):
-        return template.gemm(x, stack, sizes, layer=layer, out_dtype=jnp.float32, interpret_on_cpu=True)
+        return template.gemm(x, stack, sizes, layer=layer, out_dtype=jnp.bfloat16, interpret_on_cpu=True)
 
-    def plain(x, stack, wide=jnp.float32, out=jnp.float32):
+    def plain(x, stack, wide=jnp.float32, out=jnp.bfloat16):
         matrices = stack[1].astype(wide)
         return jnp.concatenate([x[:split].astype(wide) @ matrices[0],
                                 x[split:].astype(wide) @ matrices[1]]).astype(out)
