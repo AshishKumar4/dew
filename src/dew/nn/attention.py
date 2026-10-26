@@ -1108,10 +1108,19 @@ def triton_attention(query, key, value, causal: bool):
 
     It takes grouped key heads and any length itself. A Pallas call has no
     partitioning rule, so on a mesh it runs per shard (`_per_shard`).
+
+    The queries reach it scaled once, at its scale 1: its forward and dQ
+    sweep scale the queries but its dK/dV sweep the keys (tokamax 0.0.15,
+    pallas_triton_vjp), so at large logits that sweep's scores round apart
+    from the forward's and the weights it rebuilds from the forward's
+    residuals go off by their difference's exponential (row 1676: e^76 at
+    logits near 1e4, a MeanFlow step's key and value gradients 1e35 times
+    xla's error).
     """
 
     return _per_shard(lambda query, key, value: tokamax.dot_product_attention(
-        query, key, value, is_causal=causal, implementation='triton'), query, key, value)
+        query * query.shape[-1] ** -0.5, key, value, scale=1.0, is_causal=causal,
+        implementation='triton'), query, key, value)
 
 
 def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
