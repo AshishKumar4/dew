@@ -47,7 +47,7 @@ from dew.nn.protocols import Lacks
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.training import MeshSpec, Trainer
-from tools.torch_precision import float64
+from tools.torch_precision import float64, float64_twin
 
 # CI runs this file in tasks of its own: torchax renames torch's privateuse1 backend process-wide.
 pytestmark = pytest.mark.torchax
@@ -927,17 +927,16 @@ def test_a_slot_release_over_a_tier_3_backbone_scores_and_serves_by_transformers
         bundle = Pretrained.load(tmp_path, dtype="float32")
     assert type(bundle.model).__name__ == "TorchCausalLM"
     task = bundle.pipeline()
-    with float64():
-        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
-                                                             attn_implementation="eager").eval()
-        wide.load_state_dict(model.state_dict())
     reference = copy.deepcopy(model)
     reference.set_attn_implementation("eager")
+    wide = float64_twin(reference)
+
+    def asked(request):
+        return {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
 
     def row(seed):
         request = slot_request(seed)
-        questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
-        [laid] = task.layout.rows(task.tokenizer, task.specials, request["state"], questions)
+        [laid] = task.layout.rows(task.tokenizer, task.specials, request["state"], asked(request))
         return laid
 
     def ours(seed):
@@ -969,10 +968,14 @@ def test_a_slot_release_over_a_tier_3_backbone_scores_and_serves_by_transformers
                     "tier 3 slot release", seeds=SLOT_SEEDS, truth_fn=truth)
 
     request = slot_request(0)
+    [alone] = task(request["state"], asked(request)).values()
     server = ScoringServer.from_task(*task.scoring())
     answered = server.submit(request)
     server.step()
-    assert answered.result() == task.systemone(request)
+    served = answered.result()["answers"]["pick"]
+    assert served["choice"] == alone.choice
+    rounded = [round(float(value), 4) for value in alone.probabilities]
+    assert served["probabilities"] == dict(zip(alone.options, rounded, strict=True))
 
 
 DECODE_SEEDS = {"cohere": 8, "cohere2": 8}
