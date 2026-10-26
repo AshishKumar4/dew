@@ -13,10 +13,10 @@ from typing import TYPE_CHECKING, ClassVar
 import numpy as np
 from flax import linen as nn
 
-from dew import records
+from dew import _records
+from dew.batch import Variables
 from dew.interop.decoder_parts import read_rope_theta
 from dew.interop.weights import placed
-from dew.objectives.base import Variables
 from dew.registry import Record, projectors, towers
 
 if TYPE_CHECKING:
@@ -48,13 +48,6 @@ class TowerLayout:
         SigLIP's pooling head, has none."""
         return self.read(hf_tensors, self.path, param_dtype)
 
-
-def in_params(path: Callable[[str], tuple[str, ...] | None]) -> Callable[[str], tuple[str, ...] | None]:
-    """`path`, whose leaves are parameters, rooted at `params`."""
-    def rooted(name: str) -> tuple[str, ...] | None:
-        leaf = path(name)
-        return None if leaf is None else ("params", *leaf)
-    return rooted
 
 
 @dataclasses.dataclass(frozen=True)
@@ -88,22 +81,11 @@ PIXEL_VALUES_KEY = "pixel_values"
 """The batch field carrying images as the checkpoint's processor emitted them."""
 
 
-class ProjectorBase:
-    """One projector kind's value: its fields, and how it builds its module.
-
-    Each kind is a frozen dataclass of the reference's field names, with an
-    alias in `dew.registry.projectors` (`"gemma"`). `build` turns the value
-    into the Flax module, and `checkpoint` says where its tensors sit. A
-    record that names no known kind raises.
-    """
+class ProjectorBase(nn.Module):
+    """A native projector module whose constructor is its record schema. The registry names
+    its kind and `checkpoint` locates the tensors it consumes."""
 
     checkpoint: ClassVar[ProjectorLayout | None] = None
-
-    def build(self) -> nn.Module:
-        """The Flax module for this value."""
-        raise NotImplementedError(
-            f"{type(self).__name__} names a projector kind but builds no module")
-
 
 def head_width(hidden_size: int, num_heads: int) -> int:
     """Each head's width where `num_heads` split a tower's `hidden_size`
@@ -130,6 +112,9 @@ class TowerGeometry:
     block_size: int | None = None
     channels: int | None = None
     mel_features: int | None = None
+    frames_per_token: int | None = None
+    """How many input frames an audio tower encodes into one token: its convolutions' time strides
+    times any frame reduction after them."""
 
 
 class TowerBase:
@@ -198,24 +183,24 @@ def _held[Layout](layout: Layout | None, what: str, kind: str) -> Layout:
 
 def _vision_section(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     """The vision half of a wrapper config, or a bare vision config."""
-    return records.record(hf_config.get("vision_config", hf_config), "vision_config")
+    return _records.record(hf_config.get("vision_config", hf_config), "vision_config")
 
 
-def merger_projector(hf_config: Mapping[str, object], text_width: int, kind: str) -> Record:
+def merger_projector(hf_config: Mapping[str, object], text_width: int, kind: str, *,
+                     bias: bool = True) -> Record:
     """The `kind` projector record of a wrapper whose vision tower ends in its own merger
     (`out_hidden_size`, `spatial_merge_size`), as Qwen 3.5's and MiMo-V2's do: the merged
     features enter the text embeddings as they are, so a merger width beside the decoder width
     refuses."""
     vision = _vision_section(hf_config)
-    merged = records.integer(vision["out_hidden_size"], "out_hidden_size")
+    merged = _records.integer(vision["out_hidden_size"], "out_hidden_size")
     if merged != int(text_width):
         raise ValueError(f"out_hidden_size ({merged}) is not the decoder width ({text_width}), "
                          "the merger output enters the text embeddings as it is")
-    return {"class": kind, "fields": {
-        "vision_width": records.integer(vision["hidden_size"], "hidden_size"),
-        "merge_size": records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
-        "out_width": merged,
-    }}
+    width = _records.integer(vision["hidden_size"], "hidden_size")
+    merge = _records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size")
+    return {"class": kind, "fields": {"hidden_size": width, "spatial_merge_size": merge,
+                                      "width": width * merge ** 2, "out_width": merged, "bias": bias}}
 
 
 def _side(value: object, field: str) -> int:
@@ -225,17 +210,17 @@ def _side(value: object, field: str) -> int:
             raise ValueError(
                 f"{field} {list(value)!r} is not square, this trunk tiles squares")
         value = value[0]
-    return records.integer(value, field)
+    return _records.integer(value, field)
 
 
 def trunk_geometry(vision: Mapping[str, object]) -> dict[str, int]:
     """The width, MLP width, depth and head count a ViT config states, under
     the trunk fields of the families that share the reference's names."""
     return {
-        "hidden_size": records.integer(vision["hidden_size"], "hidden_size"),
-        "intermediate_size": records.integer(vision["intermediate_size"], "intermediate_size"),
-        "num_layers": records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
-        "num_heads": records.integer(vision["num_attention_heads"], "num_attention_heads"),
+        "hidden_size": _records.integer(vision["hidden_size"], "hidden_size"),
+        "intermediate_size": _records.integer(vision["intermediate_size"], "intermediate_size"),
+        "num_layers": _records.integer(vision["num_hidden_layers"], "num_hidden_layers"),
+        "num_heads": _records.integer(vision["num_attention_heads"], "num_attention_heads"),
     }
 
 
@@ -263,11 +248,11 @@ def rope_base(vision: Mapping[str, object], default: float, *, axial: bool = Fal
     5.17 writes that name where earlier releases wrote 'default', and reads
     either as the one its vision rotary runs (configuration_gemma4.py's
     `default_rope_type`, modeling_gemma4.py's Gemma4VisionRotaryEmbedding)."""
-    entry = records.record(vision.get("rope_parameters") or {}, "rope_parameters")
+    entry = _records.record(vision.get("rope_parameters") or {}, "rope_parameters")
     kind = entry.get("rope_type", entry.get("type"))
     if kind == "none":
         raise ValueError("rope_parameters: a vision tower's rotary type is 'default', not 'none'")
     if axial and kind == "axial":
         entry = {**{name: value for name, value in entry.items() if name != "type"}, "rope_type": "default"}
     theta = read_rope_theta(entry, "rope_parameters")
-    return records.number(vision.get("rope_theta", default), "rope_theta") if theta is None else theta
+    return _records.number(vision.get("rope_theta", default), "rope_theta") if theta is None else theta

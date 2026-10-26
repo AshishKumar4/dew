@@ -642,6 +642,63 @@ def test_a_checkpoints_remat_rungs_step_as_it_does(name):
     _climbs_and_restores(source.model, source.variables, (read.tokens,), method="logits")
 
 
+CONTINUUM_SEEDS = 8
+"""Check 1's declared seeds for a continuum decoder scanned at its top remat rung, and decoding, against
+its plain forward (`seeds_for`)."""
+
+
+def test_a_continuum_level_composes_with_the_scan_the_ladder_and_the_cache():
+    """A decoder with a continuum level (`dew.nn.continuum`) scanned at its top remat rung computes the
+    logits and gradients the same decoder does unscanned and unrematerialized, and its cached decode
+    the logits its own full forward gives each prefix, both on par (check 1) from its float64 twin over
+    drawn variables and tokens: the level stands after the stack, so a scan, a rung's checkpoints and a
+    cache leave it as the head reads it."""
+    from dew.nn.continuum import ContinuumLevel
+
+    plain = CausalTransformer(vocab_size=VOCAB, emb_features=16, num_layers=3, num_heads=2, head_dim=8,
+                              mlp_features=32, max_seq_len=32, attention_impl="xla",
+                              continuum=ContinuumLevel(hidden=4))
+    scanned = _rungs(plain.clone(scan_layers=True))[-1]
+    tokens = jnp.zeros((ROWS, LENGTH), jnp.int32)
+    shapes = jax.eval_shape(lambda: plain.init(jax.random.key(0), tokens))
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        variables = jax.tree.map(lambda leaf: (0.3 * rng.standard_normal(leaf.shape)).astype(np.float32),
+                                 shapes)
+        drawn = rng.integers(0, VOCAB, (ROWS, LENGTH)).astype(np.int32)
+        return variables, drawn, rng.standard_normal((ROWS, LENGTH, VOCAB)).astype(np.float32)
+
+    def stepped(model):
+        def run(variables, drawn, cotangent):
+            output, pull = jax.vjp(lambda params: model.apply({"params": params}, drawn), variables["params"])
+            return output, pull(cotangent)[0]
+        return run
+
+    assert_as_exact(jax.jit(stepped(scanned)), jax.jit(stepped(plain)), draw,
+                    "a scanned, rematerialized continuum decoder", seeds=CONTINUUM_SEEDS,
+                    truth_fn=stepped(_float64(plain)))
+
+    def decoded(model):
+        def run(variables, drawn, _):
+            cache = model.apply(variables, ROWS, method="init_cache", mutable=["cache"])[1]["cache"]
+            steps = []
+            for position in range(LENGTH):
+                logits, held = model.apply({**variables, "cache": cache}, drawn[:, position:position + 1],
+                                           decode=True, mutable=["cache"])
+                cache = held["cache"]
+                steps.append(logits[:, 0])
+            return jnp.stack(steps, axis=1)
+        return run
+
+    def whole(model):
+        return lambda variables, drawn, _: model.apply(variables, drawn)
+
+    assert_as_exact(jax.jit(decoded(plain)), jax.jit(whole(plain)), draw,
+                    "a continuum decoder's cached decode", seeds=CONTINUUM_SEEDS,
+                    truth_fn=whole(_float64(plain)))
+
+
 RECOMPUTED = [case for case in ARCHITECTURES
               if not case.is_jepa and isinstance(models.build(case.architecture, **case.config), Recomputing)]
 
@@ -684,20 +741,24 @@ def test_packed_projections_serve_the_models_numbers(name):
     decode. One wider product can round apart from three (falcon-tiny's
     logits moved by 1.2e-7, Kimi K2's by 7.2e-7, qwen3-next-tiny's by 1.8e-5
     on another CPU), so the drawn tokens are the model's and the logits its
-    bits or as exact as them. A bidirectional decoder, which serves no
-    decode step, declares none."""
+    bits or as exact as them. A bidirectional decoder packs as a causal one does
+    and serves no decode step, so its logits alone are judged."""
     source, read = loaded(name), reads(name, "float32")
     model, variables = source.model, source.variables
     groups = model.inference_projection_groups(variables)
-    if not model.causal:
-        assert groups == ()
-        return
     widths = flatten_dict(variables["params"])
     for group in groups:
         assert all(widths[(*group.path, member, "kernel")].shape[-1] == width
                    for member, width in zip(group.members, group.widths, strict=True))
     packed = _packed(variables, groups)
     assert model.inference_projection_groups(packed) == groups
+    if not model.causal:
+        def logits_truth():
+            return [_float64(model).apply(widened(variables), read.tokens, method="logits")]
+
+        as_exact([model.apply(packed, read.tokens, method="logits")], [read.logits], logits_truth,
+                 f"{name} packed")
+        return
     _, drawn, scores = _greedy(model, variables, read.tokens, decode=True)
     _, packed_drawn, packed_scores = _greedy(model, packed, read.tokens, decode=True)
     same(packed_drawn, drawn)

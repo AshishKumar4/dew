@@ -169,7 +169,8 @@ def test_a_packed_delta_net_lowers_onto_the_port_whatever_documents_its_rows_dec
     (so the row's length, 128, far more than its two chunks) or declared at 64, lowered for an A100 on
     this CPU: its forward and backward run on the port's kernels, which keep only the memories passing
     between a document's chunks, whatever the bound."""
-    from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
+    from dew.batch import coordinates
+    from dew.nn.inputs import AttentionMetadata, MixerCall
     from dew.nn.linear import GatedDeltaNet
 
     layer = GatedDeltaNet(emb_features=64, num_k_heads=2, num_v_heads=2, head_k_dim=32, head_v_dim=32,
@@ -211,11 +212,12 @@ def _experts_lowered(generation: str, implementation: str):
 @pytest.mark.parametrize("generation", GPUS)
 def test_an_expert_layer_lowers_for_the_gpu_with_the_grouped_matmul_its_generation_chooses(generation):
     """'auto' runs the grouped matmul's kernels on every GPU generation, each forward and backward
-    launch of each projection the implementation its cost model picks there (its route says which):
-    Triton's on a GPU without warpgroup MMA, whose two kernels lower, and on Hopper Triton's only where
-    a launch runs it, Mosaic GPU's lowering as no Triton kernel. The experts' SiLU product takes the
-    fused SwiGLU where the row names it, forward and backward, as every fused kernel is differentiated
-    through its portable arithmetic (`generation.linear_tangent`)."""
+    launch of each projection the route its cell takes there (its route says which): the template's
+    Mosaic GPU launch, or the old route `grouped_matmul.OLD_ROUTES` lists. On a GPU without warpgroup
+    MMA the forward runs Mosaic GPU's and the gradients Triton's, whose two kernels lower; on Hopper
+    Triton's runs only where a launch runs it, Mosaic GPU's lowering as no Triton kernel. The experts'
+    SiLU product takes the fused SwiGLU where the row names it, forward and backward, as every fused
+    kernel is differentiated through its portable arithmetic (`generation.linear_tangent`)."""
     with routes() as taken:
         lowered = _experts_lowered(generation, 'auto')
     # The layer's own launches, as traced for `generation`; its initialization runs on the CPU.
@@ -225,7 +227,7 @@ def test_an_expert_layer_lowers_for_the_gpu_with_the_grouped_matmul_its_generati
     assert kernels and kernels <= {'triton', 'mosaic_gpu'}
     lowered_grouped = set(triton_kernels(lowered)) & grouped
     if not gpu_target(generation).wgmma:
-        assert kernels == {'triton'} and lowered_grouped == grouped
+        assert kernels == {'mosaic_gpu', 'triton'} and lowered_grouped == grouped
     assert bool(lowered_grouped) == ('triton' in kernels)
     swiglu = set().union(*(FAMILIES[key][1] for key in chosen(generation, "step") if key[0] == 'swiglu'))
     assert set(triton_kernels(lowered)) - grouped == swiglu

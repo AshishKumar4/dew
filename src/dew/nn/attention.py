@@ -24,18 +24,11 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
+from dew.mesh import SEQUENCE_AXIS, LayoutRefused, logical_spec, mesh_axes
 from dew.nn.dense import Dense, DenseGeneral
 from dew.nn.dropout import Dropout
 
-from .attention_kernels import (
-    ATTENTION,
-    DECODE,
-    SPLASH_BLOCK,
-    SPLASH_LANES,
-    TPU_BACKEND,
-    AttentionCase,
-    decodes,
-)
+from .attention_kernels import ATTENTION, DECODE, SPLASH_LANES, TPU_BACKEND, AttentionCase, decodes
 from .attention_sinks import sink_softmax
 from .decode_geometry import folded_attention, folds
 from .documents import (
@@ -70,13 +63,9 @@ from .sharding import (
     HEADS,
     KV_HEADS,
     SCORES,
-    SEQUENCE_AXIS,
-    LayoutRefused,
     constrain,
     logical_axes,
-    logical_spec,
     manual_map,
-    mesh_axes,
     sequence_shards,
     split_positions,
 )
@@ -406,7 +395,7 @@ def rms_normalized(x, scale, epsilon: float, dtype, scale_offset: bool, scale_af
     the normalized activation before multiplying and rounds the product
     again. `fp32_statistics=False` retains the input-dtype arithmetic.
     `implementation` selects the generation's measured kernel by default;
-    explicit 'pallas' interprets on CPU. The fused VJP retains only the
+    off a GPU, 'pallas' too runs XLA's arithmetic. The fused VJP retains only the
     narrow input, weight and per-row mean square, not fp32 activations.
     Unsupported variants run the checkpointed XLA reference instead
     (`norm_swiglu.rms_kernel`), including float64 and input-dtype statistics.
@@ -1933,7 +1922,7 @@ def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_i
     from dew.nn.kernels import splash
 
     kernel = splash.make_splash_mha(
-        descriptor, block_sizes=splash_block_sizes(query.shape[-3], key.shape[-3], width=query.shape[-1],
+        descriptor, block_sizes=splash.block_sizes(query.shape[-3], key.shape[-3], width=query.shape[-1],
                                                    itemsize=query.dtype.itemsize,
                                                    softcap=softcap is not None),
         attn_logits_soft_cap=softcap, interpret=interpret)
@@ -1947,57 +1936,6 @@ def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_i
                                  jnp.moveaxis(key, -2, -3), jnp.moveaxis(value, -2, -3),
                                  segments)
     return jnp.moveaxis(attended, -3, -2)
-
-
-def splash_backward_vmem(block_q: int, block_kv: int, width: int, itemsize: int, softcap: bool) -> int:
-    """A bound on the scoped VMEM splash's backward kernels plan at XLA's default limit, in bytes, the fused
-    kernel's, which its separate dq and dkv kernels each stay within:
-    its fp32 logits blocks (two, three with a softcap's derivative), each `block_q` by `block_kv`; its
-    query, output-gradient, key and value blocks, each double-buffered in the operands' dtype; and its
-    key and value gradients' fp32 scratch. On a v5e at the 16 MiB default (2026-10-21, 96 configs of
-    widths 64 to 256, both dtypes, a softcap and batches 1 to 8, Dew's own path, and the TPU tier's
-    refused test) it lies past the limit on every config Mosaic refused (16.2 to 22.3 MiB), and within it
-    on all it compiled but eight, which take the next smaller block: a bf16 softcap at width 256 at
-    batches 1 and 2, an f32 softcap at width 128 (which the tier's test run refused at 18.6 MiB), and
-    f32 at width 256 at batch 1. Those calls were causal; a segment ids' or dense mask's blocks are not
-    in the bound."""
-    logits = 4 * block_q * block_kv * (3 if softcap else 2)
-    blocks = 2 * itemsize * width * 2 * (block_q + block_kv)
-    return logits + blocks + 2 * 4 * width * block_kv
-
-
-def splash_block_sizes(q_len: int, kv_len: int, *, width: int, itemsize: int, softcap: bool):
-    """Narrow `SPLASH_BLOCK` to a divisor of each sequence, forward and backward.
-
-    The greatest common divisor divides its sequence, as the mask blocking
-    requires, and stays a multiple of `SPLASH_LANES`, as the key compute block
-    requires. The backward forms each query's delta from its weights, sum_k p
-    * dp, in a pass of the dq kernel's own before its dq and dkv kernels
-    (`dew.nn.kernels.splash`): the flash form, rowsum(o * do), leaves
-    the output's rounding where a query reads one key, whose dq is exactly
-    zero (1.2e-6 from a causal first query on a v5e, where the reference's is
-    0); the sum of its weights cancels there, as the softmax's derivative
-    does. It reads each logits block three times where a fused kernel would
-    read it once. Every block is set: the kernel takes no default. On a TPU whose scoped
-    VMEM limit is measured (`GpuTarget.scoped_vmem`), past which a kernel fails
-    to compile, they halve together, as measured (half of `SPLASH_BLOCK`
-    compiled on every config), while they stay whole lanes, until its plan fits
-    it (`splash_backward_vmem`). Splash takes no VMEM limit of its own (its
-    kernels set none), so the limit is the target's default, which a TPU does
-    not report: where it is unmeasured the blocks stay whole.
-    """
-    from dew.nn.kernels import splash
-
-    block_q, block_kv = math.gcd(SPLASH_BLOCK, q_len), math.gcd(SPLASH_BLOCK, kv_len)
-    budget = generation.gpu_target().scoped_vmem
-    back_q, back_kv = block_q, block_kv
-    while (budget is not None and splash_backward_vmem(back_q, back_kv, width, itemsize, softcap) > budget
-           and min(back_q, back_kv) > SPLASH_LANES):
-        back_q, back_kv = back_q // 2, back_kv // 2
-    return splash.BlockSizes(
-        block_q=block_q, block_kv=block_kv, block_kv_compute=block_kv,
-        block_q_dkv=back_q, block_kv_dkv=back_kv, block_kv_dkv_compute=back_kv,
-        block_q_dq=back_q, block_kv_dq=back_kv)
 
 
 def splash_mask_descriptor(q_len: int, kv_len: int, heads: int, causal: bool,
@@ -2151,6 +2089,12 @@ class QKNorm:
     scale_after_cast: bool = False
 
 
+CROSS_KEY = "cross_key"
+"""The cache variable of a cached call's context keys, `[rows, context_length, kv_heads, head_dim]`."""
+CROSS_VALUE = "cross_value"
+"""The cache variable of a cached call's context values, shaped as its keys."""
+
+
 @logical_axes({
     ("to_q",): ("embed", "heads", "head_dim"),
     ("to_k",): ("embed", "heads", "head_dim"),
@@ -2179,6 +2123,12 @@ class NormalAttention(nn.Module):
     query to its packed document's keys, `key_segment_ids` `[B, S_context]`
     numbering the context's (`CrossDocuments`), at most `max_segments` a
     row, which a fused kernel runs as packed sequences rather than a mask.
+
+    It is every cross-attention's attention, the diffusion blocks' and Wan's
+    and a decoder's gated block's alike (`dew.nn.cross_attention`): `kv_heads`
+    groups the queries over fewer key-value heads, and with `cache_length` a
+    `cached` call keeps a context's keys and values (`CROSS_KEY`,
+    `CROSS_VALUE`), so a decode step without the context reads them.
     """
     query_dim: int
     heads: int = 4
@@ -2193,13 +2143,22 @@ class NormalAttention(nn.Module):
     flat: bool = False
     names: tuple[str, str, str, str] = ("to_q", "to_k", "to_v", "to_out_0")
     rotary_pairs: Literal["half", "adjacent"] = "half"
+    kv_heads: int | None = None
+    """The keys' and values' heads, which the query heads share in equal groups; None gives each
+    query head its own."""
+    cache_length: int | None = None
+    """The most context tokens a row's cached call keeps the keys and values of; None keeps none."""
+
+    @property
+    def key_heads(self) -> int:
+        return self.heads if self.kv_heads is None else self.kv_heads
 
     @nn.nowrap
     def projections(self, context_features: int | None = None) -> dict[str, tuple[int, int]]:
-        inner = self.heads * self.dim_head
+        inner, keys = self.heads * self.dim_head, self.key_heads * self.dim_head
         context = self.query_dim if context_features is None else context_features
         query, key, value, output = self.names
-        return {query: (self.query_dim, inner), key: (context, inner), value: (context, inner),
+        return {query: (self.query_dim, inner), key: (context, keys), value: (context, keys),
                 output: (inner, self.query_dim)}
 
     @nn.nowrap
@@ -2216,35 +2175,75 @@ class NormalAttention(nn.Module):
                 + sum(projection_flops(context_lengths, *maps[name]) for name in (key, value))
                 + cross_attention_flops(lengths, context_lengths, self.heads, self.dim_head, self.dim_head))
 
-    def _heads(self, name: str, x, norm: str | None = None):
+    def _heads(self, name: str, x, norm: str | None = None, *, keyed: bool = False):
+        """`x` projected to `[B, S, heads, head_dim]`, the key-value heads where `keyed`."""
         normed = self.qk_norm if norm is not None else None
         rms = None if normed is None else RMSNorm(
             epsilon=normed.epsilon, scale_after_cast=normed.scale_after_cast, dtype=self.dtype, name=norm)
         projected = projected_heads(
-            x, name, self.heads, self.dim_head, flat=self.flat,
+            x, name, self.key_heads if keyed else self.heads, self.dim_head, flat=self.flat,
             bias=self.use_bias if self.qkv_bias is None else self.qkv_bias, dtype=self.dtype,
             precision=self.precision, across_heads=normed is not None and normed.across_heads, norm=rms)
-        return constrain(projected, HEADS)
+        return constrain(projected, KV_HEADS if keyed and self.kv_heads is not None else HEADS)
+
+    def _keys_values(self, context):
+        """The context's keys and values, its positions split over a sequence axis where its link
+        pays for it (`split_positions`)."""
+        _, k_name, v_name, _ = self.names
+        k_norm = self.qk_norm.names[1] if self.qk_norm is not None else None
+        return split_positions(context, (self.key_heads, self.dim_head),
+                               lambda tokens: (self._heads(k_name, tokens, k_norm, keyed=True),
+                                               self._heads(v_name, tokens, keyed=True)))
+
+    def _cached(self, rows: int, dtype, context):
+        """The keys and values a cached call reads. A call that carries a context computes them
+        from it and, once the cache is allocated, keeps them; a call without one reads what the
+        cache keeps. As with a decoder's own cache, the first cached call allocates the cache and
+        writes nothing. The call reads the keys and values as the cache keeps them, in `dtype`."""
+        if self.cache_length is None:
+            raise ValueError("a cached call keeps a context's keys and values, which this attention has "
+                             "no cache_length for")
+        allocated = self.has_variable("cache", CROSS_KEY)
+        shape = (rows, self.cache_length, self.key_heads, self.dim_head)
+        keys = self.variable("cache", CROSS_KEY, jnp.zeros, shape, dtype)
+        values = self.variable("cache", CROSS_VALUE, jnp.zeros, shape, dtype)
+        if context is None:
+            return keys.value, values.value
+        width = context.shape[1]
+        if width > self.cache_length:
+            raise ValueError(f"a cached call keeps at most {self.cache_length} context tokens a row "
+                             f"(CrossAttention.context_length), got {width}")
+        key, value = (projected.astype(dtype) for projected in self._keys_values(context))
+        if allocated:
+            padding = ((0, 0), (0, self.cache_length - width), (0, 0), (0, 0))
+            keys.value = jnp.pad(key, padding)
+            values.value = jnp.pad(value, padding)
+        return key, value
 
     @nn.compact
     def __call__(self, x, context=None, freqs_cis=None, mask=None, key_value_seq_lengths=None,
-                 segment_ids=None, key_segment_ids=None, max_segments=None):
+                 segment_ids=None, key_segment_ids=None, max_segments=None, *, cached: bool = False,
+                 cache_dtype=None):
+        """`cached` reads and keeps the context's keys and values in the cache (`_cached`), in
+        `cache_dtype` (the module's dtype by default); the context is then None on a step that reads
+        the keys and values its prefill kept."""
         orig_x_shape = x.shape
         if len(x.shape) == 4:
             x = x.reshape((x.shape[0], x.shape[1] * x.shape[2], x.shape[3]))
-        context = x if context is None else context
-        if len(context.shape) == 4:
+        if not cached:
+            context = x if context is None else context
+        if context is not None and len(context.shape) == 4:
             context = context.reshape(
                 (context.shape[0], context.shape[1] * context.shape[2], context.shape[3]))
-        # [B, S, heads, head_dim], column-parallel under a tensor axis; a
-        # context's positions split over a sequence axis where its link pays
-        # for it (`split_positions`).
-        q_name, k_name, v_name, out_name = self.names
-        q_norm, k_norm = self.qk_norm.names if self.qk_norm is not None else (None, None)
+        # [B, S, heads, head_dim], column-parallel under a tensor axis.
+        q_name, _, _, out_name = self.names
+        q_norm = self.qk_norm.names[0] if self.qk_norm is not None else None
         query = self._heads(q_name, x, q_norm)
-        key, value = split_positions(context, (self.heads, self.dim_head),
-                                     lambda tokens: (self._heads(k_name, tokens, k_norm),
-                                                     self._heads(v_name, tokens)))
+        if cached:
+            dtype = cache_dtype or self.dtype or x.dtype
+            key, value = self._cached(x.shape[0], dtype, context)
+        else:
+            key, value = self._keys_values(context)
         if freqs_cis is not None:
             query, key = (rotate(part, *freqs_cis, pairs=self.rotary_pairs) for part in (query, key))
 

@@ -38,6 +38,7 @@ from test_attention_template import (
     own_documents,
 )
 
+from dew.mesh import DEFAULT_RULES
 from dew.nn import attention
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.attention_kernels import ATTENTION, FLASH_PACKED_SEGMENTS, kernel_refusals
@@ -52,7 +53,6 @@ from dew.nn.kernels.templates import (
     attention_route,
     attention_triton,
 )
-from dew.nn.sharding import DEFAULT_RULES
 
 HEADS, KV_HEADS, WIDTH = 4, 2, 32
 MESH_TENSOR, MESH_HEADS = 4, 8

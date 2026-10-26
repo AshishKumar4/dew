@@ -77,7 +77,9 @@ class Tiles:
     the multiprocessors of a cluster (`cluster`: 2 pair two row tiles of one group of `gmm`, which load
     their matrix block once between them, multicast), only for a cooperative tile; `tgmm` takes no pair;
     and the instruction family's bundle that runs it (`family`: Hopper's warpgroup MMA, or Ampere's
-    mma.sync, one warpgroup whose loads `emit_pipeline` issues, the plain product alone)."""
+    mma.sync, one warpgroup whose loads `emit_pipeline` issues, the plain product alone); and the programs
+    a multiprocessor runs at once (`programs`, at most its family's, `mosaic.Family.programs`), each in its
+    share of the multiprocessor's shared memory (`mosaic.program_shared`)."""
     block_m: int
     block_n: int
     block_k: int
@@ -86,6 +88,7 @@ class Tiles:
     warpgroups: int = 1
     cluster: int = 1
     family: str = 'wgmma'
+    programs: int = 1
 
     def __post_init__(self):
         paired = self.cluster == 2 and self.warpgroups == 1
@@ -118,6 +121,9 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
       reads the columns' block whole) and writes its output in the longest runs.
     - Consumers: as many roles as the family has (`Family.consumers`), a warpgroup each, or one where
       rows a tile must divide (not grouped) take no whole role for each, or where no tile of them holds.
+    - Programs: the most a multiprocessor runs at once that the family's registers hold at those
+      consumers (`Family.programs`) and whose share of its shared memory (`mosaic.program_shared`) holds
+      a tile, one at least; a wave is all of them.
     - Rows: the most, in whole roles of its consumers, its consumers' registers hold
       (`mosaic.held_rows`, `mosaic.tile_registers`), and no more than the call's rows rounded up to a
       role's or, where grouped, half a group's in whole roles, at least one role (each group takes a
@@ -138,21 +144,23 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
     steps = [step for step in family.depths(dtype) if depth is None or depth % step == 0]
     busy = 2 + (0 if family.operands_in_registers else _IN_FLIGHT)
 
-    def tiled(consumers: int) -> Tiles | None:
+    def tiled(consumers: int, programs: int) -> Tiles | None:
         role = family.role_rows * consumers
+        shared = mosaic.program_shared(family.most_shared, programs)
         most_rows = max(role, rows // 2 // role * role if grouped else -(-rows // role) * role)
         fallback = None
         for block_n in columns:
             for block_m in range(min(most_rows, mosaic.held_rows(family, consumers, block_n)), 0, -role):
-                band = mosaic.band(multiprocessors, block_m, block_n, width // block_n,
+                band = mosaic.band(multiprocessors * programs, block_m, block_n, width // block_n,
                                    -(-rows // block_m) if grouped else None)
                 # More rows before a deeper step: each reads the columns' block fewer times a FLOP, where
                 # a step's depth only sets how many steps a tile takes (and, in registers, its fragments').
                 for step in steps:
                     tile = mosaic.deepest(
                         lambda stages, block_m=block_m, block_n=block_n, step=step, band=band: Tiles(
-                            block_m, block_n, step, stages, band, warpgroups=consumers, family=family.name),
-                        holds, family.most_shared // ((block_m + block_n) * step))
+                            block_m, block_n, step, stages, band, warpgroups=consumers, family=family.name,
+                            programs=programs),
+                        holds, shared // ((block_m + block_n) * step))
                     if tile is None:
                         continue
                     if tile.stages >= busy:
@@ -164,7 +172,8 @@ def derived(family, *, rows: int, depth: int | None, width: int, dtype, multipro
     # does a call no cooperative tile holds (a wide epilogue's outputs past a block).
     whole = grouped or rows % (family.role_rows * family.consumers) == 0
     return next((tile for consumers in dict.fromkeys((family.consumers if whole else 1, 1))
-                 if (tile := tiled(consumers)) is not None), None)
+                 for programs in range(family.programs(consumers), 0, -1)
+                 if (tile := tiled(consumers, programs)) is not None), None)
 
 
 @dataclasses.dataclass(frozen=True)

@@ -14,18 +14,21 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+import os
 from collections.abc import Callable, Mapping, Sequence
 
 import jax
 import jax.numpy as jnp
 from jax.sharding import AbstractMesh, Mesh
 
-from dew.coordination import from_every_process
+from dew._coordination import from_every_process
+from dew._records import JSON
+from dew.batch import Batch
 from dew.data.dataset import rows_of
+from dew.mesh import LayoutRefused
 from dew.nn.kernels.options import compiler_options
-from dew.nn.sharding import LayoutRefused
-from dew.objectives.base import RECORD, Batch, Objective
-from dew.records import JSON
+from dew.objectives.base import RECORD, Objective
+from dew.state import TrainState, apart, together
 from dew.telemetry.benchmark import samples
 from dew.training.distributed import Placement, batch_divisor
 from dew.training.host import snapshot
@@ -41,7 +44,6 @@ from dew.training.memory import (
     step_fits,
     temporaries_factor,
 )
-from dew.training.state import TrainState, apart, together
 
 _log = logging.getLogger(__name__)
 
@@ -224,23 +226,49 @@ class Planned:
         return {"split": self.split, "rows": rows_of(self.candidate.micro), **self.rung}
 
 
-TIMED_STEPS, TIMED_WARMUP = 10, 2
-"""The steps a frontier's plans are timed over (`step_seconds`), after the
-warmup ones, each plan's own: a split step's first call builds its window."""
+TIMED_STEPS, TIMED_REPEATS, TIMED_WARMUP = 10, 3, 2
+"""A frontier's plans are each timed `TIMED_REPEATS` times over `TIMED_STEPS` steps (`step_seconds`),
+after the warmup ones, each plan's own: a split step's first call builds its window."""
 
 
-def step_seconds(step: Callable, state: TrainState, batch: Batch) -> float:
-    """Seconds a step of `step` takes on `batch` from `state`, the mean of
-    `TIMED_STEPS` queued and synchronized once after `TIMED_WARMUP`
-    (`dew.telemetry.benchmark.samples`), each step consuming the state the
-    one before it returned, as training does."""
+def step_seconds(step: Callable, state: TrainState, batch: Batch) -> list[float]:
+    """Seconds a step of `step` takes on `batch` from `state`, each of `TIMED_REPEATS` samples the mean
+    of `TIMED_STEPS` queued and synchronized once after `TIMED_WARMUP`
+    (`dew.telemetry.benchmark.samples`), each step consuming the state the one before it returned, as
+    training does."""
     held = [state]
 
     def stepped() -> TrainState:
         held[0], *_ = step(held[0], batch)
         return held[0]
 
-    return samples(stepped, warmup=TIMED_WARMUP, repeats=1, calls=TIMED_STEPS)[0]
+    return samples(stepped, warmup=TIMED_WARMUP, repeats=TIMED_REPEATS, calls=TIMED_STEPS)
+
+
+UNTIMED_FRONTIER = "DEW_UNTIMED_FRONTIER"
+"""The environment variable that, set to 1, has a process keep a frontier's first plan untimed: Dew's
+tests' setting (tests/lane_environment.py), never the library's. A frontier's choice follows its
+clock, so two runs timed apart may train different programs, by design; a test whose property is a
+resume's, two pools a run and its resume, would read that choice as its own, where no record pins a
+pool's plan (`dew.training.rungs.recorded_rung`). The choice itself stays tested through `Trainer.compile`'s
+own timer."""
+
+
+def untimed_frontier() -> bool:
+    """Whether this process keeps a frontier's first plan untimed (`UNTIMED_FRONTIER`)."""
+    return os.environ.get(UNTIMED_FRONTIER) == "1"
+
+
+def faster(timings: Sequence[Sequence[float]]) -> int:
+    """The plan of a frontier's `timings` (each plan's samples, `step_seconds`) that runs faster: a later
+    one only where its slowest sample beats every sample of the first's, the first otherwise. A choice
+    within the timings' spread is the clock's noise, which would give two runs of one configuration
+    different plans, and so different models and steps, where neither runs faster."""
+    chosen = 0
+    for index, timing in enumerate(timings[1:], start=1):
+        if max(timing) < min(timings[chosen]):
+            chosen = index
+    return chosen
 
 
 @dataclasses.dataclass
@@ -252,7 +280,7 @@ class Timer:
     state: TrainState
     batch: Batch
 
-    def __call__(self, steps: Sequence[Callable]) -> list[float]:
+    def __call__(self, steps: Sequence[Callable]) -> list[list[float]]:
         # The frozen tree is no step's to change or donate, and the objective's held tree shares it: it
         # is kept as it is, and the moving state alone is copied, freed and restored.
         moving, frozen = apart(self.state)
@@ -314,13 +342,13 @@ class Forecast:
         return min(guesses, default=None)
 
 
-def settled(planned: Planned, plans: Sequence[Planned], seconds: Sequence[float],
+def settled(planned: Planned, plans: Sequence[Planned], seconds: Sequence[Sequence[float]],
             probes: Sequence[Probe]) -> dict[str, JSON]:
     """The record of `planned`, of `plans` a frontier timed at `seconds` a
     step (none where one plan fit first): every compile the search made,
     `probes`, and each timed plan's split, rows, rung and seconds."""
     return {**planned.record(), "probes": [probe.record() for probe in probes],
-            "timed": [{**plan.record(), "seconds": took}
+            "timed": [{**plan.record(), "seconds": min(took)}
                       for plan, took in zip(plans, seconds, strict=True)] if seconds else None}
 
 
@@ -330,9 +358,8 @@ def opens_frontier(split: int, whole: int, mesh: Mesh) -> bool:
     whose collectives the rung's freed memory lets XLA's scheduler overlap with compute. Measured, not
     ranked: Qwen3.5-0.8B on an A100-40 ran 1205.6 ms a step in four microbatches, 1174.1 whole under
     'minimal'; Qwen3.5-9B by fsdp over two A100-80s left 168 of 169 ms of collectives exposed, 15 under
-    'minimal'. A CPU's collectives are its host's copies, nothing to overlap, so its devices open none,
-    and a run over several compiles the steps one device's plan does."""
-    return split != whole or (mesh.devices.size > 1 and mesh.devices.flat[0].platform != "cpu")
+    'minimal'."""
+    return split != whole or mesh.devices.size > 1
 
 
 def plan_step[LossT, EffectsT](

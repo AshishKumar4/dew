@@ -29,10 +29,12 @@ def test_the_compiled_shapes_reach_the_widest_keys_and_values_the_port_takes():
 
 
 @pytest.mark.parametrize("target, wide", [("sm80", True), ("sm90", True), ("sm86", False), ("sm89", False),
-                                          ("sm120", False), ("sm100", True), ("sm110", False), ("cpu", True)])
+                                          ("sm120", False), ("sm100", True), ("sm110", False),
+                                          ("cpu", False)])
 def test_a_gpu_takes_an_a100s_picks_where_its_block_holds_as_much_shared_memory(target, wide):
-    """An A100's picks on every GPU whose block holds as much shared memory, the 99 KB ones elsewhere,
-    on a GPU the targets do not list (sm110) too, and an A100's where a CPU interprets."""
+    """An A100's picks on every GPU whose block holds as much shared memory, the 99 KB ones elsewhere: on a
+    GPU the targets do not list (sm110), and on a CPU, which has no GPU's facts unless a test states the GPU
+    it emulates (`generation.assumed`)."""
     with generation.assumed(target):
         assert chunked_launch._wide() is wide
 
@@ -332,6 +334,7 @@ def test_each_family_holds_its_contract_on_the_pinned_jax(generation_name):
     assert len(found) == len(cases) and not failed, "\n".join(failed)
 
 
+@COMPILES_FOR_TPU
 @pytest.mark.parametrize("tpu", ["v5e", "v6e"])
 def test_each_gemm_tpu_mainloop_compiles_at_its_picks_with_libtpu(tpu):
     """The GEMM template's TPU mainloops (`MosaicTpuGmm` forward and input gradient, `MosaicTpuTgmm`),
@@ -404,7 +407,7 @@ def test_the_resource_gate_refuses_a_spilling_mosaic_kernel():
 def test_splash_compiles_for_a_v5e_with_libtpu():
     """Dew's splash path, forward and backward, compiled by libtpu for a compile-only v5e on this CPU
     (tests/kernel_compile.py): within the v5e's scoped VMEM, as the blocks splash takes are sized
-    (`dew.nn.attention.splash_block_sizes`)."""
+    (`dew.nn.kernels.splash.block_sizes`)."""
     from kernel_compile import compile_tpu_kernels
 
     from dew.nn.attention import scaled_dot_product_attention

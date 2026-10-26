@@ -237,7 +237,14 @@ def k3_kl(log_probs: jax.Array, ref_log_probs: jax.Array) -> jax.Array:
     work = at_least_fp32(log_probs.dtype)
     diff = jnp.asarray(ref_log_probs, work) - log_probs.astype(work)
     diff = jnp.clip(diff, -KL_DIFF_CLAMP, KL_DIFF_CLAMP)
-    return jnp.clip(jnp.exp(diff) - diff - 1, -KL_CLAMP, KL_CLAMP)
+    return jnp.clip(sampled_kl(diff), -KL_CLAMP, KL_CLAMP)
+
+
+def sampled_kl(log_ratio: jax.Array) -> jax.Array:
+    """Schulman's k3 estimate of a KL divergence from each sample's log ratio `r`, `exp(r) - r - 1`,
+    computed as `expm1(r) - r`: where `r` is small, `exp(r) - 1` rounds away the terms the estimate
+    is made of (its `r**2 / 2`), and `expm1` keeps them."""
+    return jnp.expm1(log_ratio) - log_ratio
 
 
 def preference_logsigmoid_terms(policy_chosen: jax.Array, policy_rejected: jax.Array,
@@ -340,7 +347,7 @@ def mismatch_metrics(proximal_log_probs: jax.Array, behavior_log_probs: jax.Arra
     normalized = weights / (masked_mean(weights, keep) + MEAN_EPS)
     spread = masked_mean(jnp.square(normalized), keep)
     return {"kl": masked_mean(behavior - proximal, keep),
-            "k3_kl": masked_mean(jnp.exp(log_ratio) - log_ratio - 1, keep),
+            "k3_kl": masked_mean(sampled_kl(log_ratio), keep),
             "ess": jnp.where(spread > 0, 1.0 / jnp.where(spread > 0, spread, 1.0), 0.0)}
 
 

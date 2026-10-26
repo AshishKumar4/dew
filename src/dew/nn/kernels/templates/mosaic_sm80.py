@@ -17,7 +17,7 @@ from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from dew.nn.kernels.templates import mosaic
+from dew.nn.kernels.templates import cost, mosaic
 
 _TILING: Callable[[tuple[int, int]], object] = plgpu.TilingTransform
 _SWIZZLE: Callable[[int], object] = plgpu.SwizzleTransform
@@ -150,6 +150,16 @@ class Mma(mosaic.Family):
         # multiprocessor's 64K registers.
         _most(consumers)
         return 255
+
+    def programs(self, consumers: int) -> int:
+        # As many as the register file holds at its threads' budget: one warpgroup's 128 threads at 255
+        # registers hold half of it, so two programs run on a multiprocessor, eight warps as cuBLAS's and
+        # CUTLASS's Ampere kernels run, each in half its shared memory: an A100's 81 KiB, a 99 KiB block's
+        # GPU's 49 (sm86, sm89), where a call whose tile it cannot hold (the compile gate's three forms)
+        # keeps one program (`mosaic_gpu.derived`). On an A100 two took 0.73 to 0.93 of one program's
+        # time, a product's geomean over 6 grouped and 4 dense rows, their outputs bitwise one program's
+        # (CONSUMERS2); two consumers in one program took 1.04 to 1.50 (CONSUMERS1).
+        return cost.REGISTERS // (consumers * mosaic.THREADS * self.registers(consumers))
 
     def column_unit(self, dtype) -> int:
         # Its stores move a row through registers, laid over the role's threads, one element or more each.

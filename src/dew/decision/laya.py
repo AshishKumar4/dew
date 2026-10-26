@@ -14,24 +14,18 @@ import re
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Self
 
 import jax
 import numpy as np
 
-from dew import records
+from dew.batch import Variables, part, thaw
 from dew.data.text import HFTokenizer
 from dew.decision.head import DecisionHead
 from dew.decision.layout import MarkerLayout, Specials
 from dew.decision.model import DecisionModel
-from dew.interop import sources
-from dew.interop.decoder_parts import Packed, joined_packed, split_packed
-from dew.interop.hf_decoders import translate_config, translate_weights
-from dew.interop.safetensors_io import read_weights, write_file
-from dew.interop.weights import translate_parameters
+from dew.interop.decoder_parts import Packed, joined_packed
+from dew.interop.safetensors_io import MAX_SHARD_SIZE, save_sharded
 from dew.lora import FACTORS
-from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.objectives.base import Variables, joined, part, thaw
 from dew.registry import from_record
 
 # Laya's head, as nn.TransformerEncoderLayer and its nn.Sequential scorer name it.
@@ -96,69 +90,10 @@ class LayaCheckpoint:
     temperatures: tuple[float, float, float]
     bucket_temperatures: dict[str, float]
 
-    @staticmethod
-    def exists(name_or_dir: str | Path, *, subfolder: str | None = None, revision: str | None = None) -> bool:
-        """Return whether `name_or_dir` (in `subfolder`) holds a Laya checkpoint.
 
-        A Laya checkpoint has an `rl_agent_config.json` next to the weights. For a
-        Hub repo id, it asks the Hub without downloading anything (`sources.has_file`).
-        """
-        config = f"{subfolder}/{CONFIG_FILE}" if subfolder else CONFIG_FILE
-        if Path(name_or_dir).is_dir():
-            return (Path(name_or_dir) / config).is_file()
-        return sources.has_file(str(name_or_dir), config, revision=revision)
 
-    @classmethod
-    def load(cls, name_or_dir: str | Path = LAYA, *, subfolder: str | None = None,
-             revision: str | None = None, dtype: str = "float32", param_dtype: str = "float32",
-             attention_impl: str = "auto") -> Self:
-        """Read the checkpoint at `name_or_dir`, a Hub repo or a directory.
-
-        `subfolder` selects a checkpoint where the repo bundles several.
-        """
-        root = sources.snapshot(str(name_or_dir), revision, weights=(subfolder or "",))
-        directory = root / subfolder if subfolder else root
-        config = records.record(json.loads((directory / CONFIG_FILE).read_text()), CONFIG_FILE)
-        tensors = read_weights(directory)
-        encoder = {name.removeprefix("encoder."): tensor for name, tensor in tensors.items()
-                   if name.startswith("encoder.")}
-        record = translate_config(json.loads((directory / "encoder" / "config.json").read_text()))
-        # The encoder ships ModernBertModel's tensors under a masked-LM config.
-        for field in ("head_transform", "head_bias"):
-            record.pop(field, None)
-        backbone = from_record(CausalTransformer,
-                               {**record, "dtype": dtype, "attention_impl": attention_impl})
-        head = DecisionHead(features=backbone.emb_features,
-                            layers=records.integer(config.get("head_layers", 2), "head_layers"),
-                            dtype=backbone.dtype, attention_impl=attention_impl)
-        head_tensors = split_packed({name: tensor for name, tensor in tensors.items()
-                                     if not name.startswith("encoder.")}, IN_PROJ)
-        variables = joined({
-            "backbone": translate_weights(encoder, record, "modernbert", param_dtype=param_dtype),
-            "head": {"params": translate_parameters(head_tensors, _head_path, param_dtype)}})
-        layout = MarkerLayout(
-            max_len=records.integer(config.get("max_len", 512), "max_len"),
-            head_max_len=records.integer(config.get("head_max_len", 192), "head_max_len"),
-            option_tokens=records.integer(config.get("option_tokens", MarkerLayout.option_tokens),
-                                          "option_tokens"),
-            parallel=config.get("option_layout", "sequential") == "parallel")
-        tokenizer = HFTokenizer(str(directory / "tokenizer"), local_files_only=True)
-        hf = tokenizer.tokenizer
-        specials = Specials(begin=_token(hf.cls_token_id, "cls"), separator=_token(hf.sep_token_id, "sep"),
-                            marker=_token(hf.mask_token_id, "mask"), marker_text=str(hf.mask_token),
-                            pad=_token(hf.pad_token_id, "pad"))
-        listed = config.get("temperature", [1.0, 1.0, 1.0])
-        if not isinstance(listed, list) or len(listed) != 3:
-            raise ValueError("rl_agent_config.json's temperature lists one per question type: "
-                             "choice, score, noul")
-        temperatures = tuple(records.number(value, "temperature") for value in listed)
-        buckets = records.record(config.get("temperature_by_options", {}), "temperature_by_options")
-        return cls(DecisionModel(backbone, head), variables, layout, tokenizer, specials,
-                   (temperatures[0], temperatures[1], temperatures[2]),
-                   {name: records.number(value, name) for name, value in buckets.items()})
-
-    def save(self, directory: str | Path) -> None:
-        """Write this checkpoint in Laya's layout, which `load` and llama.cpp's converter read.
+    def save(self, directory: str | Path, *, max_shard_size: int | str = MAX_SHARD_SIZE) -> None:
+        """Write this checkpoint in Laya's layout, which `Pretrained.load` and llama.cpp's converter read.
 
         That is `model.safetensors` (the encoder's ModernBertModel tensors under
         `encoder.` and the head's under Laya's names), `encoder/config.json`, the
@@ -167,26 +102,12 @@ class LayaCheckpoint:
         ModernBERT encoder and the head Laya's. A backbone under LoRA is written
         with its factors merged into their kernels (`Pretrained.bound`).
         """
-        from dew.interop.pretrained import PretrainedDecoder
-
         head = from_record(DecisionHead, self.model.head)
-        backbone = thaw(part(self.variables, "backbone"))
-        encoder = self.model.backbone
-        bundle = PretrainedDecoder.from_model(encoder, backbone).bound(encoder, backbone)
-        if bundle.adapter is None and any(isinstance(key, jax.tree_util.DictKey) and key.key in FACTORS
-                                          for path, _ in jax.tree_util.tree_leaves_with_path(backbone)
-                                          for key in path):
-            raise ValueError("the backbone carries LoRA factors its model binds to no adapter")
-        if bundle.config.get("model_type") != "modernbert":
-            raise ValueError("Laya's layout holds a ModernBERT encoder, "
-                             f"not a {bundle.config.get('model_type')}")
+        tensors, config = laya_tensors(self.model, self.variables)
         root = Path(directory)
         (root / "encoder").mkdir(parents=True, exist_ok=True)
-        tensors = {f"encoder.{name.removeprefix('model.')}": np.asarray(tensor)
-                   for name, tensor in bundle.export().items()}
-        tensors.update(_head_tensors(thaw(part(self.variables, "head"))["params"]))
-        write_file(tensors, root / "model.safetensors", {"format": "pt"})
-        config = {**bundle.config, "architectures": ["ModernBertModel"]}
+        save_sharded(tensors, root, max_shard_size)
+        config = {**config, "architectures": ["ModernBertModel"]}
         (root / "encoder" / "config.json").write_text(json.dumps(config, indent=2) + "\n")
         self.tokenizer.save_pretrained(root / "tokenizer")
         (root / CONFIG_FILE).write_text(json.dumps({
@@ -197,21 +118,49 @@ class LayaCheckpoint:
         }, indent=2) + "\n")
 
 
+def laya_tensors(model: DecisionModel, variables: Variables
+                 ) -> tuple[dict[str, np.ndarray], Mapping[str, object]]:
+    """Every tensor of a Laya release of `model` over `variables`, by its name in `model.safetensors`
+    (the encoder's ModernBertModel tensors under `encoder.`, the head's under Laya's names), and the
+    encoder's config, which `LayaCheckpoint.save` writes and a release's `export` returns. A backbone
+    under LoRA has its factors merged into their kernels (`Pretrained.bound`)."""
+    from dew.interop.pretrained import PretrainedDecoder
+
+    backbone = thaw(part(variables, "backbone"))
+    encoder = model.backbone
+    bundle = PretrainedDecoder.from_model(encoder, backbone).bound(encoder, backbone)
+    if bundle.adapter is None and any(isinstance(key, jax.tree_util.DictKey) and key.key in FACTORS
+                                      for path, _ in jax.tree_util.tree_leaves_with_path(backbone)
+                                      for key in path):
+        raise ValueError("the backbone carries LoRA factors its model binds to no adapter")
+    if bundle.config.get("model_type") != "modernbert":
+        raise ValueError(f"Laya's layout holds a ModernBERT encoder, not a {bundle.config.get('model_type')}")
+    tensors = {f"encoder.{name.removeprefix('model.')}": np.asarray(tensor)
+               for name, tensor in bundle.export().items()}
+    tensors.update(_head_tensors(thaw(part(variables, "head"))["params"]))
+    return tensors, bundle.config
+
+
 def _head_tensors(params: Mapping[str, object]) -> dict[str, np.ndarray]:
     """`DecisionHead`'s parameters under Laya's tensor names, `_head_path`'s inverse."""
+    from dew.interop.weights import in_params, native_layouts
+
     modules = {path: name for name, path in (*_LAYER.items(), *_SCORER.items())}
-    tensors = {}
-    for path, leaf in jax.tree_util.tree_leaves_with_path(params):
-        keys = tuple(str(key.key) for key in path if isinstance(key, jax.tree_util.DictKey))
+
+    def name_of(path: tuple[str, ...]) -> str:
+        keys = path[1:]
         if keys[0] == "type_embedding":
             module = "type_emb"
         elif keys[0].startswith("layers_"):
             module = f"head.layers.{keys[0].removeprefix('layers_')}.{modules[keys[1:-1]]}"
         else:
             module = modules[keys[:-1]]
-        value = np.asarray(leaf)
         torch_leaf = "bias" if keys[-1] == "bias" else "weight"
-        tensors[f"{module}.{torch_leaf}"] = value.T if keys[-1] == "kernel" else value
+        return f"{module}.{torch_leaf}"
+
+    variables = {"params": params}
+    layouts = native_layouts(variables, name_of, in_params(_head_path))
+    tensors = {layout.name: layout.export(variables) for layout in layouts}
     return joined_packed(tensors, IN_PROJ)
 
 

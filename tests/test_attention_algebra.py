@@ -27,7 +27,7 @@ from test_attention_triton import (
     score_hooks,
 )
 
-from dew.nn.kernels import tuning
+from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import (
     attention as template,
     attention_algebra as algebra,
@@ -38,6 +38,17 @@ from dew.nn.kernels.templates import (
 TILES = (attention_triton.Tiles(32, 32, 4, 2), attention_triton.Tiles(64, 32, 4, 2),
          attention_triton.Tiles(32, 64, 4, 2))
 """The plain-JAX mainloop's tiles under check 1."""
+
+
+@pytest.fixture(autouse=True)
+def _interpreted_as_an_a100():
+    """An interpreted call in a CPU process states the GPU it emulates (`generation.assumed`): the frozen
+    Triton mainloop's tiles and their costs are an A100's, its target's facts, where a CPU has none."""
+    if jax.default_backend() != "cpu":
+        yield
+        return
+    with generation.assumed("sm80"):
+        yield
 
 
 @pytest.mark.parametrize("tiles", TILES, ids=str)

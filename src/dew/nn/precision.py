@@ -29,12 +29,11 @@ from __future__ import annotations
 import contextlib
 import functools
 import os
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
 import numpy as np
-import opt_einsum
 from flax.typing import Dtype, PrecisionLike
 from jax.extend import core
 from jax.typing import DTypeLike
@@ -223,11 +222,10 @@ honors on a CPU."""
 WIDE_CPU_ARITHMETIC = "DEW_WIDE_CPU_ARITHMETIC"
 """The environment variable that, set to 1, has a process's CPU programs take the arithmetic Dew's
 tests hold a CPU to: float32 products summed in float64 and rounded once (`accumulated`, `spread`), a
-loop's running sum of them compensated so it rounds once too (`compensates_loops`), a row's logsumexp
-reduced in levels of short blocks (`dew.objectives.lm.chunked`) and a float64 division divided as
-written (`dew.diffusion.schedules.common.divided`). Read as each program is traced; set by the tests'
-environment (tests/lane_environment.py), never by the library, which without it takes none of these
-forms on any platform. Each such site chooses the wide form by the platform the
+loop's running sum of them compensated so it rounds once too (`compensates_loops`), and a float32
+reduction taken in float64 and rounded once (`widened_reduction`). Read as each program is traced;
+set by the tests' environment (tests/lane_environment.py), never by the library, which without it
+takes none of these forms on any platform. Each such site chooses the wide form by the platform the
 program is lowered for (`platform_dependent`, or for a loop's carry the platform its code is chosen
 for), so a test that lowers for an accelerator keeps the target's."""
 
@@ -263,6 +261,27 @@ def _widened(operands) -> list[jax.Array]:
     multiply in (`products_dtype`), as the product converts them, then widened exactly."""
     dtype = products_dtype(*operands)
     return [operand.astype(dtype).astype(jnp.float64) for operand in operands]
+
+
+def widened_reduction(reduction: Callable[..., Sequence[jax.Array]],
+                      *operands: jax.Array) -> tuple[jax.Array, ...]:
+    """`reduction(*operands)`, a reduction returning arrays: the plain one, but in a process running wide
+    CPU arithmetic (`WIDE_CPU_ARITHMETIC`, Dew's tests) a CPU takes it over the float32 operands widened
+    exactly to float64, each float64 result rounded once back to float32, as `accumulated` takes a
+    product's sums: XLA's CPU compiler runs a reduction with a combine of its own as one loop over the
+    row, rounding at each step. A process without the setting, or operands not float32, take the plain
+    reduction on every platform, chosen by the platform a program is lowered for (`platform_dependent`)."""
+    if not wide_cpu_arithmetic() or not any(operand.dtype == jnp.float32 for operand in operands):
+        return tuple(reduction(*operands))
+
+    def wide(*operands):
+        with jax.enable_x64(new_val=True):
+            reduced = reduction(*(operand.astype(jnp.float64) if operand.dtype == jnp.float32 else operand
+                                  for operand in operands))
+            return tuple(term.astype(jnp.float32) if term.dtype == jnp.float64 else term for term in reduced)
+
+    return tuple(jax.lax.platform_dependent(*operands, cpu=wide, default=lambda *operands: tuple(
+        reduction(*operands))))
 
 
 def accumulated(product: Callable[..., jax.Array], *operands,
@@ -371,35 +390,9 @@ def float32_einsum(subscripts: str, *operands, precision: jax.lax.PrecisionLike 
     `BF16_BF16_F32` algorithm."""
     precision = float32_products(products_dtype(*operands), precision)
     if _bf16_algorithm(precision):
-        return _held(_bf16_contracted(subscripts, *operands), preferred_element_type, *operands)
+        return _held(bf16_einsum(subscripts, *operands, **kwargs), preferred_element_type, *operands)
     return accumulated(functools.partial(jnp.einsum, subscripts, precision=precision, **kwargs), *operands,
                        preferred_element_type=preferred_element_type)
-
-
-def _bf16_contracted(subscripts: str, *operands) -> jax.Array:
-    """`jnp.einsum(subscripts, *operands)` of any expression einsum takes, each of its products
-    `bf16_einsum`'s: the operands contracted two at a time along opt_einsum's path, as `jnp.einsum`
-    contracts them, an index a pair's result drops that only one of the pair holds summed out of
-    that operand first, and an operand's own indices (a sum, a diagonal, a transpose) taken by
-    einsum alone, which forms no product."""
-    _, path = opt_einsum.contract_path(subscripts, *operands, shapes=False)
-    held = list(operands)
-    for indices, _, step, *_ in path.contraction_list:
-        pair = [held.pop(index) for index in indices]
-        given, produced = step.split("->")
-        specs = given.split(",")
-        if len(pair) == 1:
-            held.append(jnp.einsum(step, *pair))
-            continue
-        kept = []
-        for at, (spec, operand) in enumerate(zip(specs, pair, strict=True)):
-            other = specs[1 - at]
-            own = "".join(dict.fromkeys(label for label in spec if label in other or label in produced))
-            kept.append((own, operand if own == spec else jnp.einsum(f"{spec}->{own}", operand)))
-        (left, lhs), (right, rhs) = kept
-        held.append(bf16_einsum(f"{left},{right}->{produced}", lhs, rhs))
-    (contracted,) = held
-    return contracted
 
 
 def _bf16_algorithm(precision: jax.lax.PrecisionLike) -> bool:
@@ -935,50 +928,22 @@ def _transposed(cotangent, operands, numbers, side: int, product) -> jax.Array:
     return jnp.transpose(formed, tuple(int(axis) for axis in np.argsort(order)))
 
 
-def bf16_einsum(subscripts: str, lhs: jax.Array, rhs: jax.Array) -> jax.Array:
-    """`jnp.einsum(subscripts, lhs, rhs)` as `bf16_dot_general` multiplies, of two operands each of
-    whose indices is in the result or in the other operand. An index the two share at sizes 1 and n
-    broadcasts to n, as einsum's does."""
-    numbers, order, shapes = _dot_numbers(subscripts, lhs.shape, rhs.shape)
-    lhs, rhs = (jnp.broadcast_to(operand, shape) for operand, shape in zip((lhs, rhs), shapes, strict=True))
-    return jnp.transpose(bf16_dot_general(lhs, rhs, numbers), order)
+def bf16_einsum(subscripts: str, *operands, **kwargs) -> jax.Array:
+    """`jnp.einsum(subscripts, *operands)` in fp32, its every product `bf16_dot_general`'s: einsum plans
+    the contraction (its path, broadcasts, and each operand's own sums, diagonals and transposes, which
+    form no product and run in fp32) and hands each pairwise product to `bf16_dot_general` as its
+    `_dot_general`. `kwargs` are einsum's own (`optimize`, `out_sharding`)."""
+    return jnp.einsum(subscripts, *operands, preferred_element_type=jnp.float32, _dot_general=_bf16_product,
+                      **kwargs)
 
 
-def _dot_numbers(subscripts: str, lhs_shape: tuple[int, ...], rhs_shape: tuple[int, ...]):
-    """An einsum's `subscripts` over two operands of these shapes as `jax.lax.dot_general`'s dimension
-    numbers, the permutation that takes the dot's result (batch, left free, right free) to the
-    einsum's, and each operand's shape with every index the two share broadcast from 1 to the other's
-    size. An ellipsis spans each operand's remaining axes, aligned from the right."""
-    given, produced = subscripts.replace(" ", "").split("->")
-    left_spec, right_spec = given.split(",")
-    extents = [len(shape) - len(spec.replace("...", "")) for spec, shape in ((left_spec, lhs_shape),
-                                                                              (right_spec, rhs_shape))]
-
-    def labels(spec: str, extent: int) -> list[str]:
-        if "..." not in spec:
-            return list(spec)
-        head, tail = spec.split("...")
-        return [*head, *(f"...{extent - index}" for index in range(extent)), *tail]
-
-    left, right = labels(left_spec, extents[0]), labels(right_spec, extents[1])
-    out = labels(produced, max(extents))
-    batch = [label for label in left if label in right and label in out]
-    contracted = [label for label in left if label in right and label not in out]
-    formed = [*batch, *(label for label in left if label not in right),
-              *(label for label in right if label not in left)]
-    if len(set(left)) < len(left) or len(set(right)) < len(right) or sorted(formed) != sorted(out):
-        raise ValueError(f"{subscripts!r} is not a product of two operands each of whose indices is in "
-                         f"the result or in the other operand")
-    sizes: dict[str, int] = {}
-    for label, size in (*zip(left, lhs_shape, strict=True), *zip(right, rhs_shape, strict=True)):
-        sizes[label] = max(size, sizes.get(label, 1))
-
-    def axes(labels: list[str], named: list[str]) -> tuple[int, ...]:
-        return tuple(labels.index(label) for label in named)
-
-    numbers = ((axes(left, contracted), axes(right, contracted)), (axes(left, batch), axes(right, batch)))
-    shapes = tuple(tuple(sizes[label] for label in labels) for labels in (left, right))
-    return numbers, tuple(formed.index(label) for label in out), shapes
+def _bf16_product(lhs: jax.Array, rhs: jax.Array, dimension_numbers, precision=None,
+                  preferred_element_type: DTypeLike | None = None,
+                  out_sharding: jax.sharding.Sharding | None = None) -> jax.Array:
+    """One of `jnp.einsum`'s pairwise products (its `_dot_general`) as `bf16_dot_general` forms it, in the
+    fp32 `bf16_einsum` asks of every product, placed where einsum asks."""
+    product = bf16_dot_general(lhs, rhs, dimension_numbers)
+    return product if out_sharding is None else jax.sharding.reshard(product, out_sharding)
 
 
 def at_default_precision[Output](fn: Callable[..., Output]) -> Callable[..., Output]:

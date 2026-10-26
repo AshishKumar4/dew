@@ -16,25 +16,27 @@ import jax.numpy as jnp
 from flax import linen as nn
 from flax.core import meta
 
-from dew.nn.dense import Dense
+from dew.cache import INTERCEPTED
+from dew.nn.dense import _plain_dense
 from dew.nn.precision import biased, float32_dot_general
 
-from ..registry import wrapper_layers
 from .kernels.generation import INHERENT, measured_kernel
 from .kernels.selection import Kernel, Op, Requirement, select
 
 
-def _intercepted() -> bool:
-    """Whether the running call is a wrapped model's (`dew.registry.WrapperClass`: an adapter, an
-    input quantization, Dew's Qwix training) or a Qwix-quantized one's, which intercept their
-    layers' own calls. It reads the outermost module whose method is running: Flax keeps them on
-    a stack, which its lifted transforms (`nn.scan`) leave whole where a scanned layer's parents
-    stop at the scan, and which no public call reads; Qwix reads it the same way
-    (qwix/_src/model.py, `_is_in_nn_module`)."""
+def _direct_qwix_interception() -> bool:
+    """Direct Qwix calls expose no public running-provider query. Keep their active ancestor check
+    here until Flax or Qwix exposes it; lifted transforms retain this stack when parents change.
+    A quantized child may run below an ordinary parent, so every active ancestor matters."""
     from flax.linen.module import _context
 
-    root = type(next(module for module in _context.module_stack if module is not None))
-    return bool(wrapper_layers(root)[1]) or any("_unquantized_type" in vars(layer) for layer in root.__mro__)
+    return any("_unquantized_type" in vars(layer) for module in _context.module_stack if module is not None
+               for layer in type(module).__mro__)
+
+
+def _intercepted() -> bool:
+    """A Dew interception scope, or a direct Qwix scope outside Dew's wrapper entry points."""
+    return INTERCEPTED.value or _direct_qwix_interception()
 
 
 @dataclasses.dataclass(frozen=True)
@@ -53,24 +55,29 @@ class JoinCase:
 
 JOIN_SUPPORTS: tuple[Requirement[JoinCase], ...] = (
     Requirement('dense', lambda case: case.dense,
-                "a projection is not a plain Dense, whose call the join reproduces", row=INHERENT),
+                "a projection is not a plain Dense, whose call the join reproduces", row=INHERENT,
+                kind='handoff'),
     Requirement('dot_general', lambda case: case.dot_general,
                 "a projection takes a dot_general other than the join's (`float32_dot_general`)",
-                row=INHERENT),
+                row=INHERENT, kind='handoff'),
     Requirement('uniform', lambda case: case.uniform,
-                "the projections differ in width, bias, dtype, precision or promotion", row=INHERENT),
+                "the projections differ in width, bias, dtype, precision or promotion", row=INHERENT,
+                kind='handoff'),
     Requirement('intercepted', lambda case: not case.intercepted,
                 "the model computes under a wrapper (an adapter, a quantization) that intercepts each "
-                "projection's own call", row=INHERENT),
-    Requirement('kernel', lambda case: case.held, "a projection holds no kernel of its own", row=INHERENT),
+                "projection's own call", row=INHERENT, kind='handoff'),
+    Requirement('kernel', lambda case: case.held, "a projection holds no kernel of its own", row=INHERENT,
+                kind='handoff'),
 )
-"""What one GEMM needs to stand in for the projections' own calls."""
+"""What one GEMM needs to stand in for the projections' own calls: each a handoff, so a call outside
+them runs its projections apart even where the join is chosen, as a wrapped model's projections keep their
+own calls (`selection.Requirement`)."""
 
 
 def join_case(projections: Sequence[nn.Module]) -> JoinCase:
     """The `JoinCase` of `projections`."""
     return JoinCase(
-        dense=all(type(projection) is Dense for projection in projections),
+        dense=all(_plain_dense(projection) for projection in projections),
         dot_general=all(projection.dot_general in (None, float32_dot_general)
                         and projection.dot_general_cls is None for projection in projections),
         uniform=len({(projection.features, projection.use_bias, projection.dtype, projection.precision,

@@ -10,14 +10,16 @@ shared loader calls it.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 from flax.traverse_util import flatten_dict
 
-from dew import records
+from dew import _records
+from dew.batch import Variables
 from dew.diffusion.block import BlockProcess
 from dew.interop.config_records import NativeFields
+from dew.interop.generation_config import eos_field
 from dew.interop.hf_decoders import (
     NOTHING_CHECKED,
     Checked,
@@ -44,7 +46,6 @@ from dew.nn.vision.gemma4 import (
     translate_gemma4_projector_weights,
     translate_gemma4_vision_config,
 )
-from dew.objectives.base import Variables
 from dew.registry import from_record, projectors, towers
 
 VISION_PREFIX = "model.encoder.vision_tower."
@@ -57,15 +58,15 @@ encoder, by the names a Gemma 4 wrapper gives them (`Gemma4Vision.checkpoint`,
 # The wrapper config states these three with a default this assembly supplies
 # when the file omits them, so each reads `config.get` and narrows the answer.
 def _section(config: Mapping[str, object], name: str) -> Mapping[str, object]:
-    return records.record(config[name], name)
+    return _records.record(config[name], name)
 
 
 def _integer(config: Mapping[str, object], name: str, default: int | None = None) -> int:
-    return records.integer(config.get(name, default), name)
+    return _records.integer(config.get(name, default), name)
 
 
 def _number(config: Mapping[str, object], name: str, default: float) -> float:
-    return records.number(config.get(name, default), name)
+    return _records.number(config.get(name, default), name)
 
 
 def text_config(config: Mapping[str, object]) -> Mapping[str, object]:
@@ -184,19 +185,21 @@ def generation_process(config: Mapping[str, object], generation: Mapping[str, ob
 
 
 def generation_config_of(process: BlockProcess, *, max_new_tokens: int | None = None,
-                         pad_token_id: int | None = None) -> dict[str, records.JSON]:
+                         pad_token_id: int | None = None, eos_token_ids: Sequence[int] = ()
+                         ) -> dict[str, _records.JSON]:
     """The generation_config.json transformers' DiffusionGemmaGenerationConfig
     reads, and `generation_process` reads back as `process`: its inverse. The
     canvas and vocabulary are the model's in both, as a block run's process
     takes them from its model (`BlockDiffusionObjective`)."""
     # Floats where BlockProcess also takes an int, as transformers' reader
     # requires (generation_diffusion_gemma.py:181-183, 333).
-    sampler: dict[str, records.JSON] = {"_cls_name": "EntropyBoundSamplerConfig",
+    sampler: dict[str, _records.JSON] = {"_cls_name": "EntropyBoundSamplerConfig",
                                         "entropy_bound": float(process.entropy_bound)}
-    values: dict[str, records.JSON] = {
+    values: dict[str, _records.JSON] = {
         "max_denoising_steps": process.max_steps, "t_min": float(process.t_min),
         "t_max": float(process.t_max), "stability_threshold": process.stability_threshold,
         "confidence_threshold": float(process.confidence_threshold), "sampler_config": sampler,
+        **eos_field(eos_token_ids),
     }
     if max_new_tokens:
         values["max_new_tokens"] = max_new_tokens
@@ -257,8 +260,10 @@ def published_config(model: DiffusionGemma) -> Mapping[str, object]:
         tower, projection = model.conditioner.vision, model.conditioner.projection
         # transformers builds the tower from vision_config and the projector
         # from the tower's epsilon and the text width.
-        if not (isinstance(tower, Gemma4Vision) and projection == Gemma4Projector(
-                text_width=model.text.emb_features, norm_eps=tower.rms_norm_eps)):
+        expected = Gemma4Projector(text_width=model.text.emb_features,
+                                   norm_eps=tower.rms_norm_eps if isinstance(tower, Gemma4Vision) else 1e-6)
+        if not (isinstance(tower, Gemma4Vision)
+                and projection.clone(parent=None, name=None, dtype=None, precision=None) == expected):
             raise ValueError("DiffusionGemma's vision_config describes a Gemma 4 tower and its projector, "
                              f"not {tower!r} with {projection!r}")
         config["vision_config"] = export_gemma4_vision_config(tower)

@@ -35,10 +35,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.coordination import agreed, collective_host
-from dew.nn.inputs import key_seed, request_key, token_id
-from dew.objectives.base import Variables, thaw
-from dew.records import JSON, finite
+from dew._coordination import agreed, collective_host
+from dew._records import JSON, finite
+from dew.batch import Variables, thaw, token_id
+from dew.nn.inputs import key_seed, request_key
 from dew.sampling.decoding import EndOfSequence, StopStrings
 from dew.sampling.text import Generation, Sampling
 
@@ -79,7 +79,7 @@ FINISH_REASONS = frozenset({"stop", "tool_calls", "length", "abort"})
 
 
 def _token_ids(name: str, ids: object) -> tuple[int, ...]:
-    """`ids`, a tuple, each read by `dew.nn.inputs.token_id`'s law."""
+    """`ids`, a tuple, each read by `dew.batch.token_id`'s law."""
     if not isinstance(ids, tuple):
         raise ValueError(f"{name} must be a tuple of token ids, got {type(ids).__name__}")
     return tuple(token_id(token, where=name) for token in ids)
@@ -399,6 +399,20 @@ def _served(variables: Variables, dtype: jnp.dtype) -> Variables:
                         thaw(variables))
 
 
+def _published(source: Pretrained, variables: Variables, dtype: jnp.dtype, *,
+               phase: str) -> Pretrained | None:
+    """`source` holding `variables` in place of its own tree, each of its trees (a composite release's
+    readout beside its backbone, `Pretrained.map_variables`) cast to the serving `dtype` and gathered
+    home on process 0, which alone returns it: what a publisher exports or saves there. Every process
+    of a pool calls it, as every tree of a pool's placement may hold another process's shards."""
+    def gathered(tree: Variables) -> Variables:
+        held = collective_host(_served(tree, dtype), phase=phase, held_by="first")
+        return {} if held is None else held
+
+    published = replace(source, variables=variables).map_variables(gathered)
+    return published if jax.process_index() == 0 else None
+
+
 @dataclass(frozen=True)
 class SafetensorsReload:
     """Publishes a policy version to engine replicas through safetensors on disk.
@@ -430,8 +444,10 @@ class SafetensorsReload:
     A failed push raises an error that names every replica that did not take
     the version. Every process of a pool calls the push.
     `collective_host(held_by="first")` gathers the served tree to process 0,
-    which writes and publishes it, and an agreement point raises a failure on
-    every process, so the others do not hang at the next collective.
+    which writes and publishes it, with every other tree the source writes
+    beside it (a decision release's readout, `_published`), and an agreement
+    point raises a failure on every process, so the others do not hang at the
+    next collective.
     """
 
     source: Pretrained
@@ -450,12 +466,8 @@ class SafetensorsReload:
 
         Every process of a pool calls it.
         """
-        served = collective_host(_served(variables, jnp.dtype(self.dtype)), phase="weight export gather",
-                                 held_by="first")
-        agreed("weight export", lambda: None if served is None else self._save(served))
-
-    def _save(self, variables: Variables) -> None:
-        self.source.save(self.directory, variables=variables)
+        published = _published(self.source, variables, jnp.dtype(self.dtype), phase="weight export gather")
+        agreed("weight export", lambda: None if published is None else published.save(self.directory))
 
     def __call__(self, variables: Variables, version: int) -> None:
         self.write(variables)

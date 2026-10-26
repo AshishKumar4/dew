@@ -31,7 +31,8 @@ import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
 
-from dew._distributions import draw, row_draw, wellformed
+from dew._distributions import counted, draw, row_draw, wellformed
+from dew.batch import Coordinates, Variables, coordinates, real_slots, token_id, token_ids, token_layout
 from dew.diffusion.block import CanvasGeneration, through_eos
 from dew.diffusion.process import Conditioning
 from dew.diffusion.schedules import common
@@ -39,23 +40,16 @@ from dew.interop.weights import decoding_storage
 from dew.nn import categorical
 from dew.nn.inputs import (
     RESPONSE_FIELDS,
-    Coordinates,
     ModelInputs,
     Request,
     continuation_keys,
-    coordinates,
     local_rows,
     mesh_of,
     prompt_major,
-    real_slots,
-    token_id,
-    token_ids,
-    token_layout,
 )
 from dew.nn.kernels.options import program
 from dew.nn.protocols import Logits, ShiftsLogits, TokenModel
 from dew.nn.sharding import explicit_spec
-from dew.objectives.base import Variables
 
 MDLM_STEPS = 128
 """Reveal steps `generate` takes by default, MDLM's `sampling.steps` (configs/config.yaml)."""
@@ -314,7 +308,7 @@ class Unmask:
         """`step`, row `i` drawing its reveals and tokens from `keys[i]` alone (`RowSolver`), as the
         row sampled by itself draws them."""
         chance = self._reveal_chance(process, t, t_next)
-        split = jax.vmap(jax.random.split)(keys)
+        split = jax.vmap(jax.random.split)(counted(keys))
         reveal = jax.vmap(lambda key: jax.random.uniform(key, x.shape[1:]))(split[:, 0]) < chance[:, None]
         revealed = denoise.masked(x) & reveal
         drawn = row_draw(split[:, 1], log_probs, revealed, REVEALED_UNDEFINED)

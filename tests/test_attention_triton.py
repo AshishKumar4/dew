@@ -44,6 +44,17 @@ config, 128-key tiles among them, with the real dot. (Interpreted, XLA:CPU's fp3
 257-by-385 product does, over 10 draws; recorded 2026-10-21, ledger 882.)"""
 
 
+@pytest.fixture(autouse=True)
+def _interpreted_as_an_a100():
+    """An interpreted call in a CPU process states the GPU it emulates (`generation.assumed`): the frozen
+    Triton mainloop's tiles and their costs are an A100's, its target's facts, where a CPU has none."""
+    if jax.default_backend() != "cpu":
+        yield
+        return
+    with generation.assumed("sm80"):
+        yield
+
+
 def geometry(case: dict) -> tuple[int, int]:
     """`case`'s query and key counts: its own `shape`, or the core's (`test_attention_template`)."""
     return case["shape"] if "shape" in case else core_geometry(case)

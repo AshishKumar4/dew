@@ -18,6 +18,7 @@ from flax import linen as nn
 from jax.ad_checkpoint import checkpoint_name
 from jax.typing import DTypeLike
 
+from dew.batch import Coordinates
 from dew.nn.attention import (
     RMSNorm,
     alibi_bias,
@@ -38,7 +39,6 @@ from dew.nn.inputs import (
     PLAIN_CALL,
     Admitted,
     AttentionMetadata,
-    Coordinates,
     MixerCall,
     coordinates_of,
     counted_places,
@@ -62,7 +62,7 @@ from dew.nn.mixer_base import QKV_RESIDUALS, MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain
 from dew.nn.precision import at_least_fp32, float32_dot_general, l2norm, rounded_to, scaled
 from dew.nn.protocols import ProjectionGroup
-from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, mrope_tables, rotary_freqs, rotate
+from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, rotary_freqs, rotate
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
 from dew.nn.visibility import block_starts, visible, windowed
 
@@ -521,27 +521,28 @@ class CausalSelfAttention(nn.Module):
         return rounded_to(tables[0], heads.dtype), rounded_to(tables[1], heads.dtype)
 
     def _rotary_tables(self, rotary_positions, dtype, reach=None):
-        """The rotary cos and sin at `dtype`. Interleaved mRoPE, YaRN and the
-        plain rope each build their own angles; YaRN ramps the rotated width,
+        """The rotary cos and sin at `dtype`. YaRN ramps the rotated width,
         a whole head or a 'default' partial rotary's (`rotary_freqs`), at its
-        own frequencies, so it takes no Llama 3.1 ramp."""
+        own frequencies, so it takes no Llama 3.1 ramp; interleaved M-RoPE
+        turns each pair by the id of the axis it reads, at the frequencies and
+        amplitude of the rope and its ramp."""
         if self.rotary_axes is not None:
             if rotary_positions is None or rotary_positions.ndim != 3:
                 raise ValueError(f"a rotary over {len(self.rotary_axes)} axes reads their ids "
                                  "[B, S, axes] from attention_metadata.rotary_positions")
             return axis_tables(rotary_positions, self.rotary_axes, self.ctx.rope_theta, dtype=dtype)
+        section = None
         if self.mrope_section is not None and rotary_positions is not None and rotary_positions.ndim == 3:
             if self.ctx.partial_rotary_type != "default":
                 raise ValueError("M-RoPE requires default partial rotary")
-            return mrope_tables(rotary_positions, self.mrope_section, self._rot_dim() or self.ctx.head_dim,
-                                self.ctx.rope_theta, dtype=dtype)
+            section = self.mrope_section
         if self.ctx.yarn is not None and self.ctx.rope_scaling is not None:
             raise ValueError("yarn and rope_scaling are two rope scalings; a layer takes one")
         return rotary_freqs(
             rotary_positions, self.ctx.head_dim, self.ctx.rope_theta, rot_dim=self._rot_dim(),
             partial_rotary_type=self.ctx.partial_rotary_type,
             rope_scaling=self.ctx.rope_scaling if self.ctx.yarn is None else self.ctx.yarn,
-            dtype=dtype, reach=reach)
+            dtype=dtype, reach=reach, section=section)
 
     def _group_fields(self) -> tuple[str, ...]:
         """The `AttentionMetadata` fields of groups a causal layer reads: `image_groups` under

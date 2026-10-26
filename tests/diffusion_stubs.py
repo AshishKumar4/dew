@@ -6,10 +6,10 @@ from dataclasses import dataclass
 import jax.numpy as jnp
 import numpy as np
 
+from dew.batch import Variables
 from dew.inputs import CharTable, ConditionEncoder
 from dew.inputs.encoders import char_codes
 from dew.nn.dit import TextContext
-from dew.objectives.base import Variables
 
 RES = 8
 TOKENS = 5
@@ -49,7 +49,7 @@ class StubText(ConditionEncoder[str]):
         return tuple("".join(chr(97 + int(i)) for i in row[row > 1])
                      for row in np.asarray(tokens["input_ids"]))
 
-    def to_json(self):
+    def recorded_fields(self):
         return {"checkpoint": self.checkpoint, "tokens": self.tokens,
                 "features": int(self.params["table"].shape[1]), "vocab": self.vocab}
 

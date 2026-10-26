@@ -291,7 +291,7 @@ def compile_tpu_kernels(cases, generation: str) -> list[dict]:
     mesh = _tpu_device(generation)
     replicated = NamedSharding(mesh, PartitionSpec())
     # The generation assumed as well as its mesh, so a kernel's facts are its target's
-    # (`dew.nn.attention.splash_block_sizes`' scoped VMEM).
+    # (`dew.nn.kernels.splash.block_sizes`' scoped VMEM).
     found: list[dict] = []
     for case in cases:
         record: dict = {"name": case.name, "generation": generation}

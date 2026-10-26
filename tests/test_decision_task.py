@@ -41,6 +41,59 @@ def decide() -> Decide:
     return Decide.from_pretrained(TINY, attention_impl="xla")
 
 
+def test_a_decision_source_loads_through_pretrained_and_its_declared_pipeline(decide, tmp_path):
+    """A Laya component release loads through the public source loader, including a subfolder,
+    and its declared task retains the same answers through export."""
+    from shutil import copytree
+
+    from dew import pipeline
+    from dew.interop import Pretrained
+
+    copytree(TINY, tmp_path / "release")
+    bundle = Pretrained.load(tmp_path, subfolder="release", dtype="float32", attention_impl="xla")
+    task = replace(Decide.of(bundle), name=decide.name)
+    request = CASES["quickstart"]
+    assert task.systemone(request) == decide.systemone(request)
+    original = jax.tree.map(lambda value: np.asarray(value).copy(), bundle.variables)
+    for _ in range(2):
+        assert_same_rounded_answers(replace(bundle.pipeline(), name=decide.name).systemone(request),
+                                    decide.systemone(request), "borrowed bundle task")
+    for held, expected in zip(jax.tree.leaves(bundle.variables), jax.tree.leaves(original), strict=True):
+        np.testing.assert_array_equal(held, expected)
+    bundle.save(tmp_path / "export", variables=bundle.variables, max_shard_size="10KB")
+    served = pipeline(str(tmp_path / "export"), dtype="float32")
+    assert_same_rounded_answers(replace(served, name=decide.name).systemone(request),
+                                decide.systemone(request), "public source pipeline")
+
+
+_ANSWERED = """
+import json
+import sys
+from dew.decision import Decide
+task = Decide.from_pretrained("dew/tiny-laya", subfolder="release", attention_impl="xla")
+print(json.dumps(task.systemone(json.loads(sys.argv[1]))))
+"""
+
+
+def test_a_hub_folder_release_answers_under_the_name_it_was_asked_by(tmp_path):
+    """A release in a folder of a Hub repo answers under the repo and folder it was loaded by, not
+    the cache directory it resolved to, as Laya's server names the model it serves."""
+    import os
+    import subprocess
+    import sys
+    from shutil import copytree
+
+    from interop_support import hub_cache
+
+    copytree(TINY, tmp_path / "repo" / "release")
+    hub_cache(tmp_path / "hub", "dew/tiny-laya", tmp_path / "repo")
+    env = {**os.environ, "HF_HUB_CACHE": str(tmp_path / "hub"), "HF_HUB_OFFLINE": "1", "JAX_PLATFORMS": "cpu"}
+    run = subprocess.run([sys.executable, "-c", _ANSWERED, json.dumps(CASES["quickstart"])],
+                         capture_output=True, text=True, env=env)
+    assert run.returncode == 0, run.stderr[-2000:]
+    assert json.loads(run.stdout.splitlines()[-1])["model"] == "dew/tiny-laya/release"
+
+
 def assert_same_rounded_answers(found: dict, expected: dict, case: str) -> None:
     """Two `systemone(details=True)` answers to `case` from logits that differ
     by fp32 rounding: the same choices, and every reported number within one
@@ -268,9 +321,10 @@ def passed(objective, variables, examples):
     import jax
     import jax.numpy as jnp
 
+    from dew.batch import VALID_ROWS
     from dew.data.dataset import DataPartition
     from dew.decision.task import laid_out
-    from dew.objectives.base import VALID_ROWS, Step
+    from dew.objectives.base import Step
 
     step = Step(jnp.asarray(0), jax.random.key(0), None)
     found = []
@@ -451,9 +505,10 @@ def test_a_task_under_lora_saves_its_factors_merged_and_reads_back_the_same(deci
     the adapted task does, the merged sum rounded once into each kernel
     (`assert_same_rounded_answers`), and differently from the task without the
     adapter."""
+    from dew.batch import part
     from dew.decision.model import DecisionModel
     from dew.lora import LoRA
-    from dew.objectives.base import joined, part
+    from dew.objectives.base import joined
 
     backbone = part(decide.variables, "backbone")
     adapter = LoRA(rank=4, modules=("q_proj", "v_proj")).apply(decide.model.backbone, backbone, key=1)
@@ -668,34 +723,40 @@ def test_runs_of_other_task_settings_or_a_single_run_do_not_average(decide, tmp_
         Decide.averaged(runs)
 
 
-def test_an_averaged_task_of_any_layout_saves_reloads_and_serves_as_it_was(decide, tmp_path):
-    """An average of runs over a question layout other than Laya's, its temperatures refit on held-out
-    answers, saves to a directory of its own as a run (`save`), which `from_run` reads back with its
-    weights, calibration and provenance, answering every case as the task it was. Saving it there
-    again keeps it; a run's own directory, which holds other weights, refuses it."""
+@pytest.mark.parametrize("kind", ["marker", "state-first"])
+def test_an_averaged_task_of_any_layout_saves_reloads_and_serves_as_it_was(decide, tmp_path, kind):
+    """An average of runs, its temperatures refit on held-out answers, saves to a directory of its own
+    as a run (`save`), which `from_run` and `dew.pipeline` read back with its weights, calibration and
+    provenance, answering every case as the task it was: under Laya's markers and a layout of the state
+    first (the joint release's in test_decision_joint_checkpoint). Saving it there again keeps it; a
+    run's own directory, which holds other weights, refuses it."""
     import dataclasses
 
     from dew.decision import StateFirstLayout
+    from dew.inference.loading import pipeline
 
-    other = replace(decide, layout=StateFirstLayout(max_len=decide.layout.max_len,
-                                                    head_max_len=decide.layout.head_max_len))
-    runs = trained_runs(other, tmp_path, 2)
+    if kind == "state-first":
+        decide = replace(decide, layout=StateFirstLayout(max_len=decide.layout.max_len,
+                                                         head_max_len=decide.layout.head_max_len))
+    runs = trained_runs(decide, tmp_path, 2)
     held_out = answered() * 10
     task = Decide.averaged(runs, calibrate_on=held_out)
     assert task.calibration != Calibration()
     directory = str(tmp_path / "averaged")
     task.save(directory)
-    reloaded = Decide.from_run(directory)
-    assert reloaded.layout == task.layout and reloaded.weights == task.weights
-    assert reloaded.calibration == task.calibration
-    for leaf, own in zip(jax.tree.leaves(reloaded.variables), jax.tree.leaves(task.variables), strict=True):
-        assert np.array_equal(np.asarray(leaf), np.asarray(own))
-    for request in CASES.values():
-        questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
-        found, expected = reloaded(request["state"], questions), task(request["state"], questions)
-        assert found.keys() == expected.keys()
-        for name in expected:
-            np.testing.assert_equal(dataclasses.asdict(found[name]), dataclasses.asdict(expected[name]))
-    reloaded.save(directory)
+    for reloaded in (Decide.from_run(directory), pipeline(directory)):
+        assert isinstance(reloaded, Decide)
+        assert reloaded.layout == task.layout and reloaded.weights == task.weights
+        assert reloaded.calibration == task.calibration
+        for leaf, own in zip(jax.tree.leaves(reloaded.variables), jax.tree.leaves(task.variables),
+                             strict=True):
+            assert np.array_equal(np.asarray(leaf), np.asarray(own))
+        for request in CASES.values():
+            questions = {name: Question.from_wire(wire) for name, wire in request["questions"].items()}
+            found, expected = reloaded(request["state"], questions), task(request["state"], questions)
+            assert found.keys() == expected.keys()
+            for name in expected:
+                np.testing.assert_equal(dataclasses.asdict(found[name]), dataclasses.asdict(expected[name]))
+    Decide.from_run(directory).save(directory)
     with pytest.raises(ValueError):
         task.save(runs[0])

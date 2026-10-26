@@ -1,10 +1,8 @@
 """URL fetches use the ordinary pipeline worker and rejection paths."""
 
 import collections
-import contextlib
 import gzip
 import hashlib
-import http.server
 import itertools
 import threading
 import time
@@ -16,14 +14,15 @@ import grain.python as grain
 import numpy as np
 import pytest
 from PIL import Image
+from process_support import serving
 
+from dew.batch import VALID_ROWS
 from dew.data import Files, Loading, Memory, Rejected, images, video
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition
 from dew.data.images import DecodeImage, Resize
 from dew.data.pipeline import Pipeline
 from dew.data.sources.urls import Fetch
-from dew.objectives.base import VALID_ROWS
 
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
 
@@ -67,26 +66,6 @@ def test_fetch_preserves_the_catalog_and_reads_exact_bytes(tmp_path):
     row = Fetch()({"url": path.as_uri(), "caption": "the record"})
     assert not isinstance(row, Rejected)
     assert row["bytes"] == b"source bytes" and row["caption"] == "the record"
-
-
-@contextlib.contextmanager
-def serving(handle):
-    """A local HTTP server answering each GET with `handle(request)`, and its address."""
-    class Handler(http.server.BaseHTTPRequestHandler):
-        def do_GET(self):
-            handle(self)
-
-        def log_message(self, *arguments):
-            pass
-
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
-    thread.start()
-    try:
-        yield f"127.0.0.1:{server.server_port}"
-    finally:
-        server.shutdown()
-        server.server_close()
 
 
 @pytest.mark.parametrize("read", ["indexed", "streamed", "interleaved", "memory"])

@@ -325,9 +325,7 @@ def test_a_stacked_matrix_is_read_in_place_at_a_layer(generation_name):
         assert_as_exact(with_gradients(dew), jax.jit(with_gradients(plain)), draw,
                         f"stacked layer on {generation_name}", seeds=SEEDS,
                         truth_fn=with_gradients(functools.partial(plain, wide=jnp.float64, out=jnp.float64)))
-        # The forward's Mosaic launch, named: an Ampere GPU's grouped forward is an old-route cell
-        # (`grouped_matmul.OLD_ROUTES`).
-        with generation.chosen(grouped_matmul="mosaic_gpu"), tuning.seen() as launches:
+        with tuning.seen() as launches:
             jax.jit(dew).trace(*draw(0)[:2])
     read = {ba.arguments['kernel'].shape for op, ba in launches if isinstance(op, grouped_matmul.MosaicGmm)}
     assert read == {(layers * groups, depth, width)}
@@ -455,7 +453,8 @@ def test_a_dense_product_whose_extents_no_tile_divides_holds_check_1(transpose_r
     def forward(run):
         return lambda x, w, ms, nw, b, cotangent: run(x, w, ms, nw, b)
 
-    with generation.assumed("sm80"), tuning.seen() as launches:
+    # Named: a dense cell runs XLA's dot unnamed (`grouped_matmul.OLD_ROUTES`).
+    with generation.assumed("sm80"), generation.chosen(grouped_matmul="triton"), tuning.seen() as launches:
         truth = functools.partial(plain, wide=jnp.float64, out=jnp.float64)
         assert_as_exact(jax.jit(forward(dew)), jax.jit(forward(plain)), draw, "dense 65x40x100", seeds=SEEDS,
                         truth_fn=forward(truth))
@@ -502,8 +501,9 @@ def test_a_dense_gradient_takes_a_padded_tile_where_no_dividing_one_fits():
 @pytest.mark.skipif(not generation.triton_runs(), reason="needs a GPU the Pallas kernels compile for")
 def test_a_dense_products_exact_sums_survive_one_row_tile():
     """At the highest precision, a dense fp32 product of one row tile and many depth steps (its first grid
-    axis one program, where a program id is a constant) sums each step's product by an IEEE add: its
-    error holds check 1 against XLA's IEEE sums, which a tensor core's truncating accumulation does not."""
+    axis one program, where a program id is a constant) through Triton's launch, named (a dense cell runs
+    XLA's dot unnamed, `grouped_matmul.OLD_ROUTES`), sums each step's product by an IEEE add: its error
+    holds check 1 against XLA's IEEE sums, which a tensor core's truncating accumulation does not."""
     draw = _dense_draw(64, 4096, 128)
 
     def dew(x, w):
@@ -515,7 +515,7 @@ def test_a_dense_products_exact_sums_survive_one_row_tile():
     def truth(x, w):
         return jnp.dot(x.astype(jnp.float64), w.astype(jnp.float64))
 
-    with generation.routes() as taken:
+    with generation.chosen(grouped_matmul="triton"), generation.routes() as taken:
         assert_as_exact(jax.jit(dew), jax.jit(xla), draw, "dense exact sums, one row tile", seeds=SEEDS,
                         truth_fn=truth)
     assert {route.kernel for route in taken if route.choice == 'grouped_matmul'} == {'triton'}
@@ -1475,6 +1475,7 @@ def test_a_paired_product_without_an_epilogue_is_refused():
                          transpose_rhs=False, interpret=True)
 
 
+@lowers("sm90")
 def test_a_hook_that_broadcasts_a_side_operand_lowers_for_hopper_through_triton():
     """Mosaic's layout inference finds no layout for a side operand given back with its dimension of
     one, so the Mosaic launches refuse such a hook: a Hopper call's every launch with one, the forward's
@@ -1533,35 +1534,32 @@ def test_an_interpreted_fp32_sum_that_cancels_at_mixed_magnitudes_is_its_float64
     assert float(product.interpreted(declared, lhs, rhs, (((1,), (0,)), ((), ())))[0, 0]) == 1.0
 
 
-HOOKED_RECEIPTS = {
-    # (shape, case): (Mosaic ms, Triton ms), GMMSB-h100-main at eb378b58d (an H100's tools/bench_scoreboard).
-    ("llama-3-8b gate_up", "plain"): (5.925, 10.191),
-    ("llama-3-8b gate_up", "norm"): (8.171, 12.815),
-    ("llama-3-8b gate_up", "bias"): (5.970, 9.322),
-    ("qwen3-8b gate_up", "plain"): (4.919, 8.818),
-    ("qwen3-8b gate_up", "norm"): (6.950, 11.036),
-    ("qwen3-8b gate_up", "bias"): (4.996, 7.912),
-}
-"""The two Hopper launches' measured times for a dense projection, plain and with each hook the chooser
-ranks right (the gated prologue joins once the model's facts rank it, row 1336)."""
-
-@pytest.mark.parametrize(("shape", "case"), list(HOOKED_RECEIPTS), ids=lambda key: str(key))
-def test_hoppers_chooser_against_the_hooked_receipts(shape, case):
-    """The chooser's launch for a hooked dense projection on an H100 is the one measured faster."""
-    width = {"llama-3-8b gate_up": 28672, "qwen3-8b gate_up": 24576}[shape]
-    bf16, f32 = (functools.partial(jax.ShapeDtypeStruct, dtype=dtype)
-                 for dtype in (jnp.bfloat16, jnp.float32))
-    x, w = bf16((16384, 4096)), bf16((4096, width))
-    hooks = {"plain": {},
-             "norm": {"prologue": normed, "prologue_operands": ((f32((16384,)), ("rows",)),
-                                                                 (f32((4096,)), ("depth",)))},
-             "bias": {"epilogue": biased, "epilogue_operands": ((f32((width,)), ("columns",)),)}}[case]
-
-    def product(x, w):
-        return template.gemm(x, w, None, out_dtype=jnp.bfloat16, **hooks)
-
-    with generation.assumed("sm90"), generation.routes() as taken:
-        jax.jit(product).trace(x, w)
-    mosaic, triton = HOOKED_RECEIPTS[(shape, case)]
-    faster = "mosaic_gpu" if mosaic < triton else "triton"
-    assert {route.kernel for route in taken if route.choice == 'grouped_matmul'} == {faster}
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+def test_each_cell_runs_the_template_unless_its_old_route_measured_faster(generation_name):
+    """On each GPU family, every product (forward, input gradient, kernel gradient; grouped and dense) runs
+    the template's Mosaic launch, unless `grouped_matmul.OLD_ROUTES` lists its cell, which runs its old
+    route (owner, bible da64ae5): nothing ranks a launch at runtime."""
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    rows, depth, width, groups = 4096, 1024, 2048, 8
+    sizes = jnp.full((groups,), rows // groups, jnp.int32)
+    x, dy, grouped, dense = (bf16((rows, depth)), bf16((rows, width)), bf16((groups, depth, width)),
+                             bf16((depth, width)))
+    calls = {
+        ("forward", "grouped"): (lambda x, w: template.gemm(x, w, sizes, out_dtype=jnp.bfloat16), x, grouped),
+        ("input_gradient", "grouped"): (lambda dy, w: template.gemm(dy, w, sizes, transpose_rhs=True,
+                                                                    out_dtype=jnp.bfloat16), dy, grouped),
+        ("kernel_gradient", "grouped"): (lambda x, dy: template.gemm_t(x, dy, sizes, out_dtype=jnp.bfloat16),
+                                         x, dy),
+        ("forward", "dense"): (lambda x, w: template.gemm(x, w, None, out_dtype=jnp.bfloat16), x, dense),
+        ("input_gradient", "dense"): (lambda dy, w: template.gemm(dy, w, None, transpose_rhs=True,
+                                                                  out_dtype=jnp.bfloat16), dy, dense),
+        ("kernel_gradient", "dense"): (lambda x, dy: template.gemm_t(x, dy, None, out_dtype=jnp.bfloat16),
+                                       x, dy),
+    }
+    family = "wgmma" if generation.gpu_target(generation_name).wgmma else "mma.sync"
+    for (made, shape), (call, *operands) in calls.items():
+        cell = (family, made, shape)
+        expected = grouped_matmul.OLD_ROUTES[cell][0] if cell in grouped_matmul.OLD_ROUTES else "mosaic_gpu"
+        with generation.assumed(generation_name), generation.routes() as taken:
+            jax.jit(call).trace(*operands)
+        assert _kernels(taken) == {expected}, (cell, _kernels(taken))

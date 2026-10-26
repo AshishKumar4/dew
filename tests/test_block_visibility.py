@@ -8,6 +8,9 @@ decodes on par with the full pass (check 1), its cache keeping each slot's group
 the block's earlier keys past the window from any earlier call. A non-causal kind keeps its kernel, a
 server keeps a block layer's prefill apart, and a prediction depth reads the groups of the tokens it reads.
 """
+import json
+from pathlib import Path
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -116,6 +119,51 @@ def test_a_block_layer_reads_the_keys_the_block_causal_rule_keeps(layout):
     np.testing.assert_array_equal(np.asarray(blocked), np.asarray(masked))
     jax.tree.map(lambda mine, theirs: np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs)),
                  sown, maxima)
+
+
+HF = Path(__file__).parent / "fixtures" / "hf"
+BLOCKED = {"attention": {"full_attention": "block_bidirectional"}}
+
+
+def test_a_loaded_model_reads_blocks_on_the_kinds_an_override_names(tmp_path):
+    """`Pretrained.load(..., modeling_overrides=)` turns block reading on for the layer kinds it names,
+    on a family whose release states none, through the reader a release's own overrides take: a
+    Llama's attention reads its blocks as the block-causal rule keeps them, bitwise, and without
+    groups computes the plain release's logits, bitwise; a wrapped hybrid's named kind reads blocks and its
+    other kind is the release's; the saved model states the override and reloads reading blocks;
+    and a recurrent kind refuses to read blocks."""
+    from dew.interop import Pretrained
+
+    plain = Pretrained.load(HF / "llama-tiny", dtype="float32", attention_impl="xla")
+    blocked = Pretrained.load(HF / "llama-tiny", dtype="float32", attention_impl="xla",
+                              modeling_overrides=BLOCKED)
+    assert blocked.model.kind_of("full_attention").mixer.bidirectional_blocks
+    ids = jax.random.randint(jax.random.key(0), (2, LENGTH), 0, blocked.model.vocab_size)
+    groups = jnp.asarray(BLOCKS)
+    read = blocked.model.apply(blocked.variables, ids, block_groups=groups)
+    rule = block_causal(BLOCKS)
+    assert (rule & ~np.tril(np.ones((LENGTH, LENGTH), bool))).any()
+    np.testing.assert_array_equal(np.asarray(read), np.asarray(blocked.model.apply(
+        blocked.variables, ids, attention_pairwise_mask=jnp.asarray(rule))))
+    np.testing.assert_array_equal(np.asarray(blocked.model.apply(blocked.variables, ids)),
+                                  np.asarray(plain.model.apply(plain.variables, ids)))
+
+    hybrid = Pretrained.load(HF / "qwen38-dense-tiny", dtype="float32", attention_impl="xla",
+                             modeling_overrides=BLOCKED)
+    release = Pretrained.load(HF / "qwen38-dense-tiny", dtype="float32", attention_impl="xla")
+    assert hybrid.model.language_model.kind_of("full_attention").mixer.bidirectional_blocks
+    assert hybrid.model.language_model.kind_of("linear_attention") == release.model.language_model.kind_of(
+        "linear_attention")
+
+    blocked.save(tmp_path / "saved")
+    stated = json.loads((tmp_path / "saved" / "config.json").read_text())["modeling_overrides"]
+    assert stated == BLOCKED
+    reloaded = Pretrained.load(tmp_path / "saved", dtype="float32", attention_impl="xla")
+    again = reloaded.model.apply(reloaded.variables, ids, block_groups=groups)
+    np.testing.assert_array_equal(np.asarray(again), np.asarray(read))
+    with pytest.raises(ValueError):
+        Pretrained.load(HF / "qwen38-dense-tiny", dtype="float32", attention_impl="xla",
+                        modeling_overrides={"attention": {"linear_attention": "block_bidirectional"}})
 
 
 def test_a_layer_that_reads_no_groups_stays_causal():

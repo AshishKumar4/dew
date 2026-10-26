@@ -14,20 +14,20 @@ import jax
 import jax.numpy as jnp
 from jax.typing import DTypeLike
 
+from dew.batch import Variables
 from dew.interop.components import bind_component
-from dew.objectives.base import Variables
 from dew.registry import DtypeName
 
 from . import dc_ae, flux2, qwen_image, rae, wan
 from .api import AutoEncoder, LatentNormalization, published_source
-from .dc_ae import DCAE, DCAutoencoder, load_dc_ae
+from .dc_ae import DCAutoencoder, load_dc_ae
 from .flux2 import Flux2Autoencoder, load_flux2_vae
 from .kl import AutoencoderKL
-from .qwen_image import QwenImageAutoencoder, QwenImageVAE, load_qwen_image_vae
-from .rae import RAE, RAEAutoencoder, load_rae
+from .qwen_image import QwenImageAutoencoder, load_qwen_image_vae
+from .rae import RAEAutoencoder, load_rae
 from .sd_vae import StableDiffusionVAE, published_normalization
 from .vae import FLAX_REVISIONS, PUBLISHED as KL_PUBLISHED, _vae_path
-from .wan import WanAutoencoder, WanVAE, load_wan_vae
+from .wan import WanAutoencoder, load_wan_vae
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
@@ -76,14 +76,11 @@ def load_kl_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str |
 
 @dataclasses.dataclass(frozen=True)
 class Registration:
-    """One built-in autoencoder: its wrapper, the name its record goes by and the native module its
-    record's 'model' rebuilds (`AutoEncoder.to_json`, `from_json`), the `_class_name`s a published config
-    states (an AutoencoderKL's, where it states none: `nameless`), the loader that builds it from a
-    pipeline's directory or a repo, and the one a standalone load takes, where it has its own (an
-    AutoencoderKL's also reads the SD1-era flax layouts, `StableDiffusionVAE`)."""
+    """One built-in autoencoder a source loads: its wrapper, the `_class_name`s a published config states
+    (an AutoencoderKL's, where it states none: `nameless`), the loader that builds it from a pipeline's
+    directory or a repo, and the one a standalone load takes, where it has its own (an AutoencoderKL's
+    also reads the SD1-era flax layouts, `StableDiffusionVAE`)."""
     wrapper: Callable[..., AutoEncoder]
-    record: str
-    module: type
     published: tuple[str, ...]
     load: Loader
     nameless: bool = False
@@ -96,15 +93,15 @@ def _standalone_kl(source: str, *, revision: str, dtype, params) -> AutoEncoder:
 
 
 REGISTRATIONS: tuple[Registration, ...] = (
-    Registration(StableDiffusionVAE, 'sd_vae', AutoencoderKL, KL_PUBLISHED, load_kl_vae, nameless=True,
+    Registration(StableDiffusionVAE, KL_PUBLISHED, load_kl_vae, nameless=True,
                  standalone=_standalone_kl),
-    Registration(DCAutoencoder, 'dc_ae', DCAE, dc_ae.PUBLISHED, load_dc_ae),
-    Registration(WanAutoencoder, 'wan', WanVAE, wan.PUBLISHED, load_wan_vae),
-    Registration(RAEAutoencoder, 'rae', RAE, rae.PUBLISHED, load_rae),
-    Registration(Flux2Autoencoder, 'flux2', AutoencoderKL, flux2.PUBLISHED, load_flux2_vae),
-    Registration(QwenImageAutoencoder, 'qwen_image', QwenImageVAE, qwen_image.PUBLISHED, load_qwen_image_vae),
+    Registration(DCAutoencoder, dc_ae.PUBLISHED, load_dc_ae),
+    Registration(WanAutoencoder, wan.PUBLISHED, load_wan_vae),
+    Registration(RAEAutoencoder, rae.PUBLISHED, load_rae),
+    Registration(Flux2Autoencoder, flux2.PUBLISHED, load_flux2_vae),
+    Registration(QwenImageAutoencoder, qwen_image.PUBLISHED, load_qwen_image_vae),
 )
-"""Every built-in autoencoder, which saved runs rebuild and sources load alike: one registration each."""
+"""Every built-in autoencoder a source loads: one registration each."""
 
 LOADERS: Mapping[str, Loader] = MappingProxyType({
     name: entry.load for entry in REGISTRATIONS for name in entry.published})
@@ -112,11 +109,11 @@ LOADERS: Mapping[str, Loader] = MappingProxyType({
 (`dew.interop.pipeline_assembly`) builds from, a config naming none taken as an AutoencoderKL's."""
 
 
-def registration(of: type[AutoEncoder] | str | None) -> Registration | None:
-    """The registration of a wrapper class, a record's name or a published `_class_name` (None, an
-    AutoencoderKL's: `Registration.nameless`), None for one no built-in registers."""
-    return next((entry for entry in REGISTRATIONS if of in (entry.wrapper, entry.record)
-                 or of in entry.published or (of is None and entry.nameless)), None)
+def registration(class_name: str | None) -> Registration | None:
+    """The registration of a published `_class_name` (None, an AutoencoderKL's: `Registration.nameless`),
+    None for one no built-in registers."""
+    return next((entry for entry in REGISTRATIONS
+                 if class_name in entry.published or (class_name is None and entry.nameless)), None)
 
 
 def _published(modelname: str, revision: str) -> tuple[str | None, str | None]:
@@ -162,7 +159,7 @@ def load_autoencoder(modelname: str, *, revision: str = "bf16", dtype: DTypeLike
     replace the checkpoint's normalization where given, an autoencoder's
     whose record keeps them: one that normalizes by published per-channel
     statistics records those, so a run rebuilt from its record
-    (`AutoEncoder.from_json`) would lose the override, and refuses it.
+    (`AutoEncoder.bound`) would lose the override, and refuses it.
     """
     class_name, subfolder = _published(modelname, revision)
     entry = registration(class_name)

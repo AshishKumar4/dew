@@ -33,7 +33,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from dew.artifacts import uint8_pixels
 from dew.inference import TextToImage
-from dew.interop import split_revision
+from dew.interop import SourceReference
 from dew.sampling import CFG, DPMSolverMultistep, EulerAncestral, Heun
 
 # Each sampler's solver, step count and classifier-free guidance.
@@ -69,8 +69,8 @@ class Config:
 def load(model: str) -> TextToImage:
     if Path(model).is_dir():
         return TextToImage.from_run(model)
-    repo, revision = split_revision(model)
-    return TextToImage.from_pretrained(repo, revision=revision)
+    source = SourceReference.parse(model)
+    return TextToImage.from_pretrained(source.name, revision=source.revision)
 
 
 def grid(title: str, prompts, seeds, images: np.ndarray) -> Image.Image:

@@ -298,7 +298,7 @@ The public image decoder also reads prepared ArrayRecord byte maps: `shape` hold
 | Preset | Reads per record | Writes per batch |
 |---|---|---|
 | `images(ds, size, *, batch, augment=False, crop_scale=(1, 1), field="image", staging_size=None, draft=False, rejects=True, caption=None, cache=None, records=None, host=())` | `field`: encoded bytes or uint8 `[H, W, 3]` | `image` uint8 `[B, size, size, 3]`; with `caption`, `caption` |
-| `lm(ds, tokenizer, *, seq_len, batch, field="text", eos=None, pack="first-fit", bins=32, stride=None, cache=None, records=None, host=())` | `field`: a string; with `tokenizer=None`, token ids under `text`, such as a token store's documents | `text` int32 `[B, seq_len + 1]`; packed, `text_coordinates`, the windows' documents (`dew.nn.inputs.Coordinates`) |
+| `lm(ds, tokenizer, *, seq_len, batch, field="text", eos=None, pack="first-fit", bins=32, stride=None, cache=None, records=None, host=())` | `field`: a string; with `tokenizer=None`, token ids under `text`, such as a token store's documents | `text` int32 `[B, seq_len + 1]`; packed, `text_coordinates`, the windows' documents (`dew.batch.Coordinates`) |
 | `token_windows(ds, *, seq_len, batch, stride=None, records=None, host=())` | a token store (`TokenFiles`), shuffled, repeated or taken at most | `text` int32 `[B, seq_len + 1]`, windows `stride` apart in the store's stream |
 | `sft(ds, tokenizer, *, seq_len, batch, messages="messages", long="chunk", pack="first-fit", bins=32, cache=None, records=None, host=())` | `messages`: chat turns | the `lm` fields and `text_roles` int8 `[B, seq_len + 1]` ([post-training batches](#post-training-batches)) |
 | `clips(ds, seconds, *, frames, fps, size, batch, sample_rate=None, margin=0, context=0, missing="silence", rejects=True, records=None, host=())` | `mp4`: bytes | `video` uint8 `[B, frames, size, size, 3]`; with `sample_rate`, `audio` float32 `[B, samples]` and `audio_valid` bool `[B, samples]` |
@@ -445,6 +445,7 @@ flowchart TD
 
 - `cache(url)` is a bounded write-through accelerator. It speeds up repeated reads and never freezes inputs or failures.
 - `snapshot(url)` seals an immutable generation, including fetch outcomes and dedup results. A run that pins it resumes exactly.
+- A pool reads fetched records in one of two orders (`tests/test_multiprocess.py`). Fetched after the shuffle, each process fetches its own share, pass after pass, and the pool resumes on its own topology. Read from memory, every process fetches the whole catalog when the chain compiles and shuffles what it kept into one global order, which trains as the same records held locally do and whose count resumes on any number of processes, each fetching the catalog again as it compiles. Either replays exactly only while the server answers as it did: a pool whose processes kept other records is refused before it trains, while bytes that changed under the same records are read as they come. A sealed `snapshot(url)` replays without the server.
 - Random stages draw from per-record keys, so augmentation is the same on every thread count and after a resume. Libraries with global RNG state (torchvision, albumentations) run through adapters that make seed and call one transaction.
 
 ## 9. Performance
