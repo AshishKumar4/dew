@@ -353,8 +353,12 @@ def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, pa
     def kernels(x, weights):
         return run(kernel_conv, x, weights, None, None, parts, dtype, grads, segments=segments)
 
-    want, want_grads = run(xla_conv1d, x, weights, None, None, parts, dtype, grads, segments=segments)
-    exact, exact_grads = truth(x, weights, None, None, parts, grads, segments=segments)
+    # The reference's and the truth's leaves on the host as each is computed, so the device holds one run's
+    # arrays at a time: held there beside the kernels' runs, the 9b's packed rows peaked at 9.2 GiB of an
+    # A100, past a packed job's 8.9 GiB share (row 1724, SE-conv1724-a100-fd8508b5a).
+    want, want_grads = jax.device_get(run(xla_conv1d, x, weights, None, None, parts, dtype, grads,
+                                          segments=segments))
+    exact, exact_grads = jax.device_get(truth(x, weights, None, None, parts, grads, segments=segments))
     pins = [{}] + [{op: config} for op in (short_conv.ConvForward, short_conv.ConvBackward)
                    for config in each_config(op, kernels, x, weights)]
     for pin in pins:
