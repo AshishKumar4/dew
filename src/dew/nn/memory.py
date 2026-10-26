@@ -387,9 +387,7 @@ class InContextMemory(nn.Module):
             return jnp.einsum("bshi,hio->bsho", view, w0, precision=self.precision)
 
         value = steps.value - read_w0(steps.key) if hooks.delta else steps.value
-        begins = real & (steps.places == 0)
-        # The row's first document continues the state and share the row holds; each later one starts.
-        continued = jnp.cumsum(begins, axis=1) <= 1
+        begins, continued = _documents(steps)
         if held is not None and real.shape[1] == 1:
             out, _, state = recurrence.step(hooks, recurrence.Step(
                 held, query=steps.query[:, 0], key=steps.key[:, 0], value=value[:, 0],
@@ -409,7 +407,7 @@ class InContextMemory(nn.Module):
         """A linear memory's cached call (`_recurrent`), the cache holding the recurrence's state
         (`STATE`) and the log of W_0's share each row's document keeps (`KEPT`), zero for a fresh row;
         its first call allocates it."""
-        batch, length = steps.real.shape
+        batch = steps.real.shape[0]
         allocated = self.has_variable("cache", STATE)
         held = self.variable("cache", STATE, jnp.zeros, (batch, *w0.shape), w0.dtype)
         kept = self.variable("cache", KEPT, jnp.zeros, (batch, w0.shape[0]), w0.dtype)
@@ -417,9 +415,7 @@ class InContextMemory(nn.Module):
                                               held=held.value, kept=kept.value)
         if allocated:
             held.value = state
-            last = jnp.max(jnp.where(steps.real, jnp.arange(length), 0), axis=1)
-            kept.value = jnp.where(jnp.any(steps.real, axis=1)[:, None], share[jnp.arange(batch), last],
-                                   kept.value)
+            kept.value = _at_last(share, steps.real, kept.value)
         return reads
 
     # The function, token by token and chunk by chunk.
@@ -548,17 +544,12 @@ class InContextMemory(nn.Module):
         state = self.variable("cache", STATE, lambda: rows)
         momentum = self.variable("cache", MOMENTUM, lambda: rows)
         seen = self.variable("cache", COUNT, jnp.zeros, (batch,), jnp.int32)
-        real = steps.real
-        # The first document is every token up to the call's second document start.
-        continued = jnp.cumsum(real & (steps.places == 0), axis=1) <= 1
-        places = steps.places + jnp.where(continued, seen.value[:, None], 0)
+        places = steps.places + jnp.where(_documents(steps)[1], seen.value[:, None], 0)
         reads, carry = self._stepped(initial, slow, steps._replace(places=places),
                                      (start.value, state.value, momentum.value))
         if allocated:
             start.value, state.value, momentum.value = carry
-            last = jnp.max(jnp.where(real, jnp.arange(real.shape[1]), 0), axis=1, keepdims=True)
-            counted = jnp.take_along_axis(places, last, axis=1)[:, 0] + 1
-            seen.value = jnp.where(jnp.any(real, axis=1), counted, seen.value).astype(jnp.int32)
+            seen.value = _at_last(places + 1, steps.real, seen.value)
         return reads
 
 
@@ -575,6 +566,19 @@ class _Steps(NamedTuple):
     a: jax.Array
     real: jax.Array
     places: jax.Array
+
+
+def _documents(steps: _Steps) -> tuple[jax.Array, jax.Array]:
+    """Each document's first real token `[B, S]`, and the tokens of a call's first document `[B, S]`,
+    every one up to its second document's first: in a cached call, the document its row holds."""
+    begins = steps.real & (steps.places == 0)
+    return begins, jnp.cumsum(begins, axis=1) <= 1
+
+
+def _at_last(values: jax.Array, real: jax.Array, held: jax.Array) -> jax.Array:
+    """`values` `[B, S, ...]` at each row's last real token, and `held` `[B, ...]` in a row with none."""
+    last = jnp.max(jnp.where(real, jnp.arange(real.shape[1]), 0), axis=1)
+    return jnp.where(_lead(jnp.any(real, axis=1), held), values[jnp.arange(real.shape[0]), last], held)
 
 
 def _within(values: jax.Array, begins: jax.Array) -> jax.Array:
