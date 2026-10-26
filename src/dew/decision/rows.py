@@ -33,6 +33,7 @@ from dew.decision.questions import Choice, Question
 
 NONE_OF_THE_ABOVE = "none of the above"
 
+
 @dataclass(frozen=True)
 class Encoding:
     """How a labelled example becomes the row a step packs and trains on.
