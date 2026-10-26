@@ -18,7 +18,6 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 from flax import struct
-from jax.scipy.stats import multivariate_normal
 from jax.typing import ArrayLike
 
 from dew.diffusion.process import Denoiser, Process
@@ -74,11 +73,13 @@ class GaussianTransition:
         if value.shape != mean.shape:
             raise ValueError("a transition density scores one next state per mean")
         safe_variance = jnp.where(variance > 0, variance, 1)
-        rows = value.shape[0]
-        # JAX's isotropic density (a scalar covariance, one per row): log(2 pi) and the log variance
-        # are summed apart, so a variance near float32's largest does not overflow 2 pi times it.
-        log_prob = jax.vmap(multivariate_normal.logpdf)(value.reshape(rows, -1), mean.reshape(rows, -1),
-                                                        jnp.broadcast_to(safe_variance, (rows,)))
+        error = jnp.square(value - mean).sum(axis=tuple(range(1, value.ndim)))
+        dimensions = math.prod(value.shape[1:])
+        # The form of JAX's isotropic `multivariate_normal.logpdf` (a scalar covariance): log(2 pi) and
+        # the log variance summed apart, so a variance near float32's largest does not overflow 2 pi
+        # times it. Each row has its own variance, which that function would take one row at a time.
+        log_prob = -0.5 * (error / safe_variance
+                           + dimensions * (jnp.log(2 * math.pi) + jnp.log(safe_variance)))
         return jnp.where(variance > 0, log_prob, jnp.nan)
 
     def kl(self, reference_mean: ArrayLike) -> jax.Array:

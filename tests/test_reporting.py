@@ -373,6 +373,7 @@ def test_tensorboard_renders_clips_texts_token_losses_and_decisions(tmp_path):
         TENSORS,
         EventAccumulator,
     )
+    from tensorboard.util import tensor_util
 
     from dew.training import TensorBoardTracker
 
@@ -391,8 +392,9 @@ def test_tensorboard_renders_clips_texts_token_losses_and_decisions(tmp_path):
     assert (clip.format, clip.n_frames) == ('GIF', 2)
     assert json.loads(reader.Tensors('val/samples')[0]
                       .tensor_proto.string_val[0]) == {'prompt': '', 'texts': ['text']}
-    losses = reader.Histograms('val/token_losses')[0].histogram_value
-    assert (losses.num, losses.sum) == (1, 0.5)
+    # The histogram plugin's tensor (`histogram_pb`): each bucket's left edge, right edge and count.
+    losses = tensor_util.make_ndarray(reader.Tensors('val/token_losses')[0].tensor_proto)
+    assert losses[:, 2].sum() == 1 and losses[:, 0].min() <= 0.5 <= losses[:, 1].max()
     shown = json.loads(reader.Tensors('val/decisions')[0].tensor_proto.string_val[0])
     assert [row[:4] for row in shown['rows']] == [[0, 0, 2, 2], [0, 1, 0, 0]]
 

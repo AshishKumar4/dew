@@ -597,7 +597,7 @@ def test_a_rows_reveals_are_its_own_under_any_key_implementation(impl):
     denoise = process.denoiser(model, model.init(jax.random.key(0), jnp.zeros((1, 8), jnp.int32)))
     x = jnp.full((rows, 8), MASK, jnp.int32)
     t, s = jnp.full((rows,), 0.9), jnp.full((rows,), 0.4)
-    filled, log_probs = denoise(x, t)
+    filled, log_probs = (jnp.broadcast_to(value, (rows, *value.shape[1:])) for value in denoise(x, t))
     keys = jax.random.split(jax.random.key(3, impl=impl), rows)
 
     def stepped(part):
